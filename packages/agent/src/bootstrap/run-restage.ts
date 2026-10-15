@@ -1,12 +1,11 @@
 /**
- * Agent-process driver for the `kici.restageAgent` fleet-upgrade apply.
- *
- * Intercepted in the ops agent (like `ensureInitRunner`): the privileged
- * resolve — capability gate, availability gate, reach + SSH key, restart spec —
- * runs on the orchestrator; this driver performs the SSH transport (probe →
- * stage → swap → restart) so the bring-up key never reaches user workflow code.
- * The re-staged permanent agent reconnects on its own persistent credential, so
- * no token is minted or handled here (no self-update-handoff).
+ * Agent-process driver for the `kici.restageAgent` fleet-upgrade apply,
+ * intercepted in the ops agent like `ensureInitRunner`. The orchestrator runs
+ * the privileged resolve (capability and availability gates, reach + SSH key,
+ * restart spec); this driver does the SSH transport (probe → stage → swap →
+ * restart), so the bring-up key never reaches user workflow code. The
+ * re-staged agent reconnects on its own persistent credential, so no token is
+ * minted or handled here (no self-update-handoff).
  */
 import { AgentDeliveryMode, type AgentPlatform } from '@kici-dev/shared';
 import type { HostReach } from './reach.js';
@@ -14,7 +13,7 @@ import { probeTargetPlatform } from './probe-platform.js';
 import { restageAgent, type RestageDeps } from './restage-agent.js';
 import type { DeliveryMode } from './stage-agent-payload.js';
 
-/** Material the orchestrator returns for a `kici.restageAgent` authorization. */
+/** The orchestrator's `kici.restageAgent` authorization result. */
 interface RestageMaterial {
   reach: HostReach;
   privateKey: string;
@@ -23,20 +22,18 @@ interface RestageMaterial {
   restart: { stop: string; start: string; installDir?: string };
 }
 
-/** Shape of the `kici.presignAgentPackage` RPC result. */
 interface PresignResult {
   url: string;
   sha256: string | null;
 }
 
-/** Transport that relays an API request to the orchestrator and awaits the result. */
 export type ApiTransport = (method: string, params: Record<string, unknown>) => Promise<unknown>;
 
 /**
- * Resolve the delivery mode for the re-stage. `ssh-push` needs a local payload
- * source; `s3-direct` asks the orchestrator to mint a box-routable presigned URL
- * (keyed by the now-probed platform) and refuses a payload with no sha256
- * (fail-closed — never extract unverifiable bytes on the box).
+ * `ssh-push` needs a local payload source; `s3-direct` asks the orchestrator
+ * for a box-routable presigned URL (keyed by the probed platform) and refuses
+ * a payload with no sha256, fail-closed: never extract unverifiable bytes on
+ * the box.
  */
 async function resolveDelivery(
   transport: ApiTransport,
@@ -61,9 +58,9 @@ async function resolveDelivery(
 }
 
 /**
- * Drive one external-actor re-stage: fetch the material, probe the target
- * platform, resolve delivery, then stage + swap + restart via {@link restageAgent}.
- * Returns `{ restaged: false }` when the host is already on the target version.
+ * One external-actor re-stage: fetch the material, probe the platform, resolve
+ * delivery, then stage + swap + restart via {@link restageAgent}. Returns
+ * `{ restaged: false }` when the host already runs the target version.
  */
 export async function runRestage(
   transport: ApiTransport,

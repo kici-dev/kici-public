@@ -1,20 +1,16 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Record the dependency-cache key of the lock file that registered a workflow.
+ * The registering lock file's dependency-cache key: `lockfile_hash` (`lockfileHash`, the
+ * package-manager lockfile hash) and `siblings_digest` (`siblingsDigest`, the in-repo
+ * `workspace:` sibling closure). An organization-wide run dispatches from its registration, not
+ * a fetched lock file, so this is how it restores dependencies from the cache.
  *
- * `workflow_registrations.lockfile_hash` is the lock file's `lockfileHash` (the
- * package-manager lockfile hash) and `siblings_digest` its `siblingsDigest` (the
- * in-repo `workspace:` sibling closure). Together they key the dependency cache,
- * so an organization-wide run, which dispatches from its registration rather than
- * from a fetched lock file, restores its workflow's dependencies from the cache.
- *
- * Nullable and unbackfilled: null when the lock file records no key, and on every
- * row written before these columns existed. A null `lockfile_hash` means the run
- * installs its dependencies on the agent. Each row heals on its repository's next
+ * Nullable and unbackfilled: null when the lock file records no key and on older rows. A null
+ * `lockfile_hash` installs dependencies on the agent. A row heals on its repository's next
  * default-branch push.
  *
- * Idempotent: guarded on each column's existence, so re-running is a no-op.
+ * Idempotent per column.
  */
 async function colExists(db: Kysely<unknown>, name: string): Promise<boolean> {
   const result = await sql<{ exists: boolean }>`

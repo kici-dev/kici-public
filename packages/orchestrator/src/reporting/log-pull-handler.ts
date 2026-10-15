@@ -1,12 +1,7 @@
 /**
- * Handler for log pull protocol messages on the orchestrator side.
- *
- * Responds to Platform requests for historical logs (log.request).
- * Reads from LogStorage, supports pagination via cursor/limit,
- * and filtering by jobName/stepIndex.
- *
- * Live logs flow via the push-based log.chunk -> BrowserFanOut path
- * and are not handled here.
+ * Answers Platform `log.request` messages for historical logs from LogStorage, with
+ * cursor/limit pagination and jobName/stepIndex filtering. Live logs flow via the
+ * push-based log.chunk -> BrowserFanOut path, not here.
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -19,17 +14,13 @@ const logger = createLogger({ prefix: 'log-pull' });
 export interface LogPullHandlerDeps {
   logStorage: LogStorage;
   executionTracker: ExecutionTracker;
-  /** Callback to send response messages back over WS */
+  /** Sends response messages back over WS */
   send: (message: unknown) => void;
 }
 
 export class LogPullHandler {
   constructor(private readonly deps: LogPullHandlerDeps) {}
 
-  /**
-   * Handle log.request -- read logs from storage and respond.
-   * Supports filtering by jobName and stepIndex, pagination via cursor/limit.
-   */
   async handleRequest(msg: {
     messageId: string;
     executionId: string;
@@ -41,7 +32,7 @@ export class LogPullHandler {
     try {
       const prefix = `executions/${msg.executionId}`;
 
-      // If specific job+step requested
+      // One job + step
       if (msg.jobName !== undefined && msg.stepIndex !== undefined) {
         const path = stepLogPath(msg.executionId, msg.jobName, msg.stepIndex);
         if (!(await this.deps.logStorage.exists(path))) {
@@ -77,7 +68,7 @@ export class LogPullHandler {
         return;
       }
 
-      // If only job requested (all steps)
+      // One job, all steps
       if (msg.jobName !== undefined) {
         const jobPrefix = `${prefix}/job-${msg.jobName}/`;
         const files = await this.deps.logStorage.list(jobPrefix);
@@ -104,7 +95,7 @@ export class LogPullHandler {
         return;
       }
 
-      // All logs for execution
+      // Whole execution
       const files = await this.deps.logStorage.list(prefix);
       const chunks = [];
       for (const file of files) {

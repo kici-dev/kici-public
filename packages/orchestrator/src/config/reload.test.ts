@@ -197,7 +197,6 @@ describe('ConfigReloader', () => {
       expect(result2.success).toBe(false);
       expect(result2.errors).toContain('Reload already in progress');
 
-      // Complete first reload
       resolveFirst!();
       const result1 = await reload1Promise;
       expect(result1.success).toBe(true);
@@ -216,7 +215,6 @@ describe('ConfigReloader', () => {
       const reloader = new ConfigReloader(initialConfig, deps);
       const executeSpy = vi.spyOn(reloader, 'executeReload');
 
-      // Trigger 3 rapid reloads
       reloader.triggerReload('sighup');
       reloader.triggerReload('sighup');
       reloader.triggerReload('sighup');
@@ -224,10 +222,8 @@ describe('ConfigReloader', () => {
       // Before debounce period, no reload should have executed
       expect(executeSpy).not.toHaveBeenCalled();
 
-      // Advance past debounce period
       await vi.advanceTimersByTimeAsync(ConfigReloader.DEBOUNCE_MS + 10);
 
-      // Only one reload should have executed
       expect(executeSpy).toHaveBeenCalledTimes(1);
     });
 
@@ -525,10 +521,8 @@ describe('ConfigReloader', () => {
       // Dispose before debounce fires
       reloader.dispose();
 
-      // Advance past debounce
       await vi.advanceTimersByTimeAsync(ConfigReloader.DEBOUNCE_MS + 100);
 
-      // Reload should NOT have been called
       expect(executeSpy).not.toHaveBeenCalled();
     });
   });

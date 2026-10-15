@@ -17,7 +17,6 @@ import {
 } from 'node:crypto';
 import { encrypt, decrypt, deriveKey, type EncryptedValue } from '@kici-dev/shared';
 
-/** AAD string used when encrypting/decrypting private keys with secret key. */
 /** AAD binding a wrapped run private key to its purpose (AES-GCM authenticated data). */
 export const PRIVATE_KEY_AAD = 'ephemeral-private-key';
 
@@ -101,7 +100,6 @@ export function decryptPrivateKey(
  *
  * @param envelope - { agentPublicKey: base64, encrypted: base64 (IV||AuthTag||Ciphertext) }
  * @param runPrivateKeyDer - DER-encoded run private key Buffer
- * @returns Decrypted plaintext string
  */
 export function decryptSecretOutput(
   envelope: { agentPublicKey: string; encrypted: string },
@@ -124,7 +122,6 @@ export function decryptSecretOutput(
  *
  * @param envelope - `{ ephemeralPublicKey: base64 DER-SPKI, encrypted: base64 IV||tag||ct }`
  * @param encryptionPrivateKeyDer - DER-encoded orchestrator X25519 private key
- * @returns Decrypted plaintext string
  */
 export function decryptDashboardSealedWrite(
   envelope: { ephemeralPublicKey: string; encrypted: string },
@@ -155,7 +152,6 @@ function decryptEcdhEnvelope(
   const privateKey = createPrivateKey({ key: privateKeyDer, format: 'der', type: 'pkcs8' });
   const peerPublicKey = createPublicKey({ key: peerPublicKeyDer, format: 'der', type: 'spki' });
 
-  // ECDH shared secret
   const sharedSecret = diffieHellman({ privateKey, publicKey: peerPublicKey });
 
   // HKDF to derive AES-256 key (domain-separated by `info`)

@@ -6,8 +6,8 @@
  * between the two modes. Mode-specific behavior is injected via the
  * OrchestratorHooks interface.
  *
- * This eliminates ~1300 lines of duplication that previously existed across
- * the two entry points.
+ * This keeps that logic in one place instead of duplicating it across the two
+ * entry points.
  */
 
 import path from 'node:path';
@@ -25,7 +25,6 @@ import {
   stopHttpServer,
   toErrorMessage,
   trackOpenSockets,
-  validateRequiredTools,
   type ColdStore,
 } from '@kici-dev/shared';
 import {
@@ -135,12 +134,12 @@ import {
   ClaimStore,
   DEFAULT_CLAIM_TTL_SECONDS,
   createScalerBackend,
-  requiredToolsFor,
   loadScalerConfig,
   detectLabelSetOverlaps,
   storageHostAccessEntries,
 } from './scaler/index.js';
 import { createScalerFileReload, type ScalerFileReload } from './scaler/file-reload.js';
+import { scalerStartupToolsFailure } from './scaler/startup-tools-check.js';
 import {
   reloadScalersAcrossCluster,
   type SendScalerReload,
@@ -511,7 +510,7 @@ export interface OrchestratorSubsystems {
    * (orchestrator-side) and the Platform-bound MetricsReporter (which
    * concatenates the agent snapshot before WS push so agent metrics
    * land in Mimir per-org alongside `kici_orch_*`) reference the same
-   * store. the metrics enforcement plan.
+   * store.
    */
   agentMetricsAggregator: AgentMetricsAggregator;
   /**
@@ -552,7 +551,6 @@ export interface OrchestratorSubsystems {
  * Mode-specific hooks injected by each entry point.
  */
 export interface OrchestratorHooks {
-  /** Logger prefix for mode-specific messages */
   logPrefix: string;
 
   /**
@@ -611,9 +609,6 @@ export interface OrchestratorHooks {
     onServerStarted?: () => Promise<void>;
   }>;
 
-  /**
-   * Mode startup log message.
-   */
   startupLogMessage: (port: number) => string;
 }
 
@@ -680,18 +675,18 @@ async function initializeScaler(
     );
   }
 
-  // Validate label-set overlaps
   const overlaps = detectLabelSetOverlaps(scalerConfig.scalers);
   if (overlaps.length > 0) {
     logger.error('Scaler config has label-set overlaps', { overlaps });
     await exitWithStartupBackoff('Scaler config has label-set overlaps');
   }
 
-  // Validate required external tools for all configured scalers
-  const toolErrors = validateRequiredTools(requiredToolsFor(scalerConfig.scalers));
-  if (toolErrors.length > 0) {
-    const detail =
-      'Required tools validation failed:\n' + toolErrors.map((e) => `  - ${e}`).join('\n');
+  const detail = scalerStartupToolsFailure(scalerConfig.scalers, {
+    entryPath: process.argv[1],
+    execPath: process.execPath,
+    windows: process.platform === 'win32',
+  });
+  if (detail) {
     logger.error(detail);
     await exitWithStartupBackoff(detail);
   }
@@ -705,8 +700,8 @@ async function initializeScaler(
   // backend's scale request with it.
   const scalerStateStore = new ScalerStateStore(db, config.dbPoolAcquireTimeoutMs);
 
-  // Create backends from config. One shared factory, so a reload can only
-  // construct what startup already exercises.
+  // One shared factory, so a reload can only construct what startup already
+  // exercises.
   const factoryCtx: BackendFactoryContext = {
     scalerConfig,
     tokenStore,
@@ -1189,7 +1184,6 @@ async function initializeSecrets(
   const pgSecretStore = await PgSecretStore.create(db, masterKey, auditLogger, oldMasterKey);
   pgSecretStore.customerSecretsEnabled = config.pgCustomerSecrets;
 
-  // Load registered backends from DB via BackendRegistry (replaces hardcoded Map)
   const backendRegistry = new BackendRegistry(db, masterKey, logger, oldMasterKey);
   // Self-heal: ensure the default `pg` backend row exists (idempotent). Covers
   // DBs where the row was lost to operator error or a buggy purge.
@@ -1204,7 +1198,6 @@ async function initializeSecrets(
     pgSecretStore,
   );
 
-  // Initialize health checker and sync manager for external backends
   const healthChecker = new BackendHealthChecker(backendRegistry, logger);
   const syncManager = new BackendSyncManager(backendRegistry, logger);
 
@@ -1215,25 +1208,21 @@ async function initializeSecrets(
     }),
   );
 
-  // Start periodic health checks and sync for external backends
   healthChecker.startPeriodicCheck(60000);
   syncManager.startPeriodicSync();
 
-  // Let mode-specific code decide whether to create SecretResolver
   const secretResolver =
     hooks.onSecretsInitialized?.({ pgSecretStore, backendStores, db, auditLogger }) ?? null;
 
   const rbac = new RbacEnforcer();
   const tokenManager = new TokenManager(db);
 
-  // Ensure bootstrap admin token exists
   const bootstrapToken = await tokenManager.ensureBootstrapToken(config.bootstrapAdminToken);
   if (bootstrapToken) {
     logger.info('Bootstrap admin token generated', { token: bootstrapToken });
     console.log(`\n  KICI Admin Token: ${bootstrapToken}\n`);
   }
 
-  // Build admin route deps for createApp()
   const adminDeps: AdminRouteDeps = {
     tokenManager,
     rbac,
@@ -2145,7 +2134,6 @@ function initializeCluster(
 ): ClusterInfra {
   const peerClients = new Map<string, PeerClient>();
 
-  // Helper to build local agent inventory for peer heartbeats
   const getLocalInventory = () => ({
     instanceId: config.instanceId,
     timestamp: Date.now(),
@@ -2230,7 +2218,6 @@ function initializeCluster(
       await peerForgetGuardsFor(msg.instanceId, msg.acknowledgeBackstop === true),
     );
 
-  // Raft state store
   const raftStateStore = new RaftStateStore({ db, clusterId: 'default' });
 
   // Orphan recovery (needs raft reference)
@@ -2249,7 +2236,6 @@ function initializeCluster(
     current: null,
   };
 
-  // Raft node
   const raftNode = new RaftNode({
     instanceId: config.instanceId,
     stateStore: raftStateStore,
@@ -2312,7 +2298,6 @@ function initializeCluster(
   });
   raftRef = raftNode;
 
-  // Run coordinator
   // peerHandlerObj is assigned later (after createPeerHandler), so we use a mutable reference.
   let peerHandlerObj: ReturnType<typeof createPeerHandler> | null = null;
   const coordinator = new RunCoordinator({
@@ -2500,7 +2485,6 @@ function initializeCluster(
     },
   });
 
-  // Wire the peer handler into the RunCoordinator for incoming connection message routing
   peerHandlerObj = peerHandlerRef;
 
   // Debounced heartbeat broadcast — collapses rapid agent connect/disconnect events
@@ -2843,7 +2827,7 @@ export async function bootstrapOrchestrator(
   // 11. Create commit status reporter
   const stepLogBuffer = new StepLogBuffer();
   const sourceLocationStore = new SourceLocationStore();
-  // CheckRunReporter no longer takes githubConfig from config
+  // CheckRunReporter takes no githubConfig from config
   // -- it uses providerRegistry which is populated by SourceManager.
   // dashboardUrl is the static base for `details_url` in GitHub Check
   // Runs; the per-org public alias gets late-bound in server.ts /
@@ -2900,8 +2884,7 @@ export async function bootstrapOrchestrator(
   let tryDispatchNextQueuedRef: ((group: string, routingKey: string) => Promise<void>) | undefined =
     undefined;
 
-  // Get mode-specific extras for execution tracker
-  // We'll build a temporary subsystems-like object to pass to the hook.
+  // The hook gets an empty placeholder, not a real subsystems object.
   // The hook only needs the platformClient (if any), which will be wired later.
   // For now, get the callback creators; actual binding happens via closures.
   const trackerExtras = hooks.executionTrackerExtras?.({} as any);
@@ -3392,7 +3375,6 @@ export async function bootstrapOrchestrator(
     },
   });
 
-  // Build ProviderRegistry from DB sources (replaces config-based buildProviderRegistry)
   if (pgSecretStore) {
     providerRegistry = await sourceManager.start();
     providerRegistryRef.current = providerRegistry;
@@ -3620,7 +3602,6 @@ export async function bootstrapOrchestrator(
   // a needs-gated invoke gate through the gate executor.
   invokeGateDepsRef.current = invokeGateDeps;
 
-  // Start event store cleanup and event router LISTEN/NOTIFY
   // EventRouter.start() loads registrations from DB via registrationIndex
   eventStore.startCleanupTimer();
   await eventRouter.start();
@@ -3828,7 +3809,6 @@ export async function bootstrapOrchestrator(
     },
   });
 
-  // Start dispatcher grace window cleanup
   dispatcher.startGraceCleanup();
 
   // 20. Create lock file cache. Sizes and TTL are structural to the LRU, which
@@ -3998,8 +3978,8 @@ export async function bootstrapOrchestrator(
     adminDeps.broadcastAgentTokenRevoke = cluster.broadcastAgentTokenRevoke;
   }
 
-  // 23. (removed) WebhookSecretManager: post-cutover the orchestrator
-  //     no longer pushes webhook secrets to Platform. Platform asks the orch
+  // 23. Webhook secrets stay on the orchestrator: it pushes none to the
+  //     Platform. Platform asks the orch
   //     to verify each inbound webhook via the chunked relay protocol; the
   //     verifyInboundWebhook dispatcher reads secrets directly from
   //     PgSecretStore on demand.
@@ -4042,7 +4022,6 @@ export async function bootstrapOrchestrator(
       ? await buildLocalDevSigner(config.devIdentityKeyFile, logger)
       : undefined;
 
-  // Build subsystems object for hooks
   // Provenance trust root: the live issuer is wired by the mode-specific hook
   // from the Platform `auth.success`; the config/env value seeds the CLI path.
   // For the local dev plane, serve the in-process signer's JWKS directly under
@@ -4548,7 +4527,6 @@ export async function bootstrapOrchestrator(
     };
     const timeoutMs = opts.timeoutMs ?? 15_000;
 
-    // Try outgoing PeerClient first
     const outgoing = cluster.peerClients.get(targetInstanceId);
     if (outgoing && outgoing.state === 'connected') {
       const response = await outgoing.sendConfigReloadAndWait(reloadMsg, timeoutMs);
@@ -4564,7 +4542,6 @@ export async function bootstrapOrchestrator(
       }
     }
 
-    // Fall back to incoming peer-handler connections
     const response = await cluster.peerHandler.sendConfigReloadAndWait(
       targetInstanceId,
       reloadMsg,

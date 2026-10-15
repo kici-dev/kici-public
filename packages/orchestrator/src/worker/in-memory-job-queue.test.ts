@@ -51,14 +51,12 @@ describe('InMemoryJobQueue', () => {
   });
 
   it('dequeueByPinnedAgent returns null when no job is pinned (the worker default)', async () => {
-    // Regression guard: Dispatcher.onAgentAvailable calls this unconditionally;
-    // when it was undefined the worker crashed with
-    // "this.queue.dequeueByPinnedAgent is not a function" right after a job
-    // completed, taking the terminal status with it.
+    // Dispatcher.onAgentAvailable calls this unconditionally; without it the worker
+    // crashes right after a job completes, losing the terminal status.
     const queue = new InMemoryJobQueue();
     await queue.enqueue(makeInput());
     expect(await queue.dequeueByPinnedAgent('agent-1', ['linux'])).toBeNull();
-    // The non-pinned job is still pending (not consumed).
+    // The non-pinned job is not consumed.
     expect(await queue.getDepth()).toBe(1);
   });
 
@@ -79,10 +77,9 @@ describe('InMemoryJobQueue', () => {
 
   // ── The declared shape survives the queue ────────────────────────────────
   //
-  // A drained job's `resources` is what the pre-spawned-agent suitability gate
-  // and the scaler re-drive read. When the queue dropped it, both saw a job
-  // that declares nothing: any warm agent was admitted, and a re-drive spawned
-  // at the label-set default instead of what the job asked for.
+  // The pre-spawned-agent suitability gate and the scaler re-drive read a drained
+  // job's `resources`. Dropped, any warm agent is admitted and a re-drive spawns at
+  // the label-set default instead of what the job asked for.
 
   it('carries a declared shape from jobConfig onto the drained job', async () => {
     const queue = new InMemoryJobQueue();

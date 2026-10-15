@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { DashboardClientError } from '../../remote/dashboard-client.js';
 import { lookupTarget, redactCliConfig, withLookupTarget } from './cli-config.js';
 
-// The shape `kici login` + `kici org use` write to ~/.kici/config.
+// What `kici login` and `kici org use` write.
 const CONFIG = {
   platformEndpoint: 'https://api.kici.dev',
   oidcIssuer: 'https://auth.kici.dev',

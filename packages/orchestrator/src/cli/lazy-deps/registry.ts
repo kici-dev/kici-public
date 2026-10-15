@@ -1,37 +1,21 @@
-/**
- * Metadata registry for lazy dependencies.
- *
- * Each entry describes a downloadable dependency with platform/arch variants,
- * URLs, SHA-256 integrity hashes, and extraction details.
- */
+/** Metadata registry for lazy dependencies, one entry per platform/arch variant. */
 
-/** Metadata for a single lazy dependency variant. */
 export interface LazyDep {
-  /** Dependency name (e.g., "rolldown", "shawl"). */
   name: string;
-  /** Version string. */
   version: string;
-  /** Target Node.js platform. */
   platform: NodeJS.Platform;
-  /** Target architecture (x64, arm64). */
   arch: string;
-  /** Download URL. */
   url: string;
-  /** Expected SHA-256 hash of the downloaded archive. */
+  /** Of the downloaded archive. */
   sha256: string;
   /** Relative path inside the archive to the binary/directory. */
   extractPath: string;
-  /** Archive type for extraction. */
   archiveType: 'tar.gz' | 'zip' | 'binary';
 }
 
-/**
- * Platform+arch key used for variant lookup.
- * Format: `${platform}-${arch}` (e.g., "linux-x64", "darwin-arm64").
- */
 type VariantKey = `${NodeJS.Platform}-${string}`;
 
-/** Registry of all lazy dependencies keyed by name, then platform-arch. */
+/** Keyed by name, then platform-arch. */
 export const LAZY_DEPS: Record<string, Record<VariantKey, LazyDep>> = {
   rolldown: {
     'linux-x64': {
@@ -110,12 +94,8 @@ export const LAZY_DEPS: Record<string, Record<VariantKey, LazyDep>> = {
 };
 
 /**
- * Get dependency metadata for the current (or specified) platform and architecture.
- *
- * @param name - Dependency name (e.g., "rolldown", "shawl")
- * @param platform - Override platform (default: os.platform())
- * @param arch - Override arch (default: process.arch)
- * @throws If the dependency or variant is not found in the registry
+ * Platform and arch default to the running process.
+ * @throws If the dependency or variant is not in the registry.
  */
 export function getDepMetadata(name: string, platform?: NodeJS.Platform, arch?: string): LazyDep {
   const dep = LAZY_DEPS[name];

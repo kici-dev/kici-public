@@ -201,7 +201,6 @@ describe('BaseColdStore', () => {
       'PutObjectCommand', // manifest
     ]);
 
-    // The data + manifest keys are distinct.
     const keys = mock.sends
       .filter((s) => s.name === 'PutObjectCommand')
       .map((s) => s.input.Key as string);
@@ -239,7 +238,6 @@ describe('BaseColdStore', () => {
     expect(summary.chunksWritten).toBe(0);
     expect(summary.skipped.min_chunk).toBe(1);
     expect(markArchivedAndDelete).not.toHaveBeenCalled();
-    // No S3 PUTs should have happened.
     expect(mock.sends.filter((s) => s.name === 'PutObjectCommand')).toHaveLength(0);
   });
 

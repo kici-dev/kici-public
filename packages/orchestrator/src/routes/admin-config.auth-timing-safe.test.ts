@@ -1,19 +1,16 @@
 /**
  * Shape assertions for the admin-config Bearer-token comparison.
  *
- * The token check routes through crypto.timingSafeEqual behind a byte-length
- * guard. These tests assert that shape: a wrong same-length token is compared
- * in constant time, a byte-length mismatch is refused before the compare (so
- * timingSafeEqual never throws a RangeError and turns a 401 into a 500), and
- * the 401/503 outcomes stay unchanged. Timing itself is deliberately never
- * asserted — a timing test is load-sensitive and flaky.
+ * The check runs crypto.timingSafeEqual behind a byte-length guard: a wrong
+ * same-length token is compared in constant time, a byte-length mismatch is
+ * refused before the compare (so timingSafeEqual never throws a RangeError and
+ * turns a 401 into a 500), and the 401/503 outcomes stay unchanged. Timing
+ * itself is deliberately never asserted: it is load-sensitive.
  *
- * node:crypto is mocked module-wide so timingSafeEqual can be observed. The
- * mock spreads the real module, so every other crypto export (and the wrapped
- * timingSafeEqual's real behavior) stays intact. The spy-call assertion in the
- * first test is the positive control: if it passes before the constant-time
- * comparison lands, the mock did not apply and every not.toHaveBeenCalled()
- * below is worthless.
+ * node:crypto is mocked module-wide (spreading the real module) so
+ * timingSafeEqual can be observed. The spy-call assertion in the first test is
+ * the positive control: without it, every not.toHaveBeenCalled() below could
+ * pass with the mock not applied.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -66,19 +63,18 @@ describe('admin-config Bearer token comparison (shape)', () => {
     const app = createApp(ADMIN_TOKEN);
     const res = await app.request('/admin/config/export', {
       method: 'GET',
-      // 8 characters / 8 bytes — same byte length as ADMIN_TOKEN, so the
-      // guard passes and the compare reaches timingSafeEqual.
+      // Same byte length as ADMIN_TOKEN, so the compare reaches timingSafeEqual.
       headers: { Authorization: 'Bearer wrongtok' },
     });
     expect(res.status).toBe(401);
-    // Same body contract the sibling admin-config.test.ts pins: this router wants
-    // the orchestrator secret key, not the bootstrap admin token, and the body
-    // must say so without echoing the token it saw.
+    // Body contract pinned by admin-config.test.ts: this router wants the
+    // orchestrator secret key, not the bootstrap admin token, and must say so
+    // without echoing the token it saw.
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain('KICI_SECRET_KEY');
     expect(body.error).toContain('bootstrap admin token');
     expect(body.error).not.toContain('wrongtok');
-    // Positive control for the whole file: proves the node:crypto mock applied.
+    // Positive control for the file: the node:crypto mock applied.
     expect(cryptoMock.timingSafeEqualSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -100,9 +96,7 @@ describe('admin-config Bearer token comparison (shape)', () => {
       headers: { Authorization: 'Bearer short' },
     });
     expect(res.status).toBe(401);
-    // Same body contract the sibling admin-config.test.ts pins: this router wants
-    // the orchestrator secret key, not the bootstrap admin token, and the body
-    // must say so without echoing the token it saw.
+    // Same body contract as above.
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain('KICI_SECRET_KEY');
     expect(body.error).toContain('bootstrap admin token');
@@ -112,9 +106,8 @@ describe('admin-config Bearer token comparison (shape)', () => {
 
   it('refuses a multi-byte mismatch (equal String.length, differing byte length) without calling timingSafeEqual', async () => {
     const app = createApp(ADMIN_TOKEN);
-    // 8 characters (String.length 8) but 9 UTF-8 bytes: a String.length guard
-    // would let this reach timingSafeEqual, which throws RangeError and turns a
-    // 401 into a 500. The byte-length guard refuses it first.
+    // Equal String.length, one more UTF-8 byte: a String.length guard would let
+    // this reach timingSafeEqual, which throws RangeError (401 → 500).
     const multibyte = 'abcdefgé';
     expect(multibyte.length).toBe(ADMIN_TOKEN.length);
     expect(Buffer.byteLength(multibyte, 'utf8')).not.toBe(Buffer.byteLength(ADMIN_TOKEN, 'utf8'));
@@ -123,9 +116,7 @@ describe('admin-config Bearer token comparison (shape)', () => {
       headers: { Authorization: `Bearer ${multibyte}` },
     });
     expect(res.status).toBe(401);
-    // Same body contract the sibling admin-config.test.ts pins: this router wants
-    // the orchestrator secret key, not the bootstrap admin token, and the body
-    // must say so without echoing the token it saw.
+    // Same body contract as above.
     const body = (await res.json()) as { error: string };
     expect(body.error).toContain('KICI_SECRET_KEY');
     expect(body.error).toContain('bootstrap admin token');

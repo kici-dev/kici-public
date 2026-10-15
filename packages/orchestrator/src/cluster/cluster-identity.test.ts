@@ -202,7 +202,6 @@ describe('ClusterIdentity', () => {
 
       await ci.validateAtStartup('orch-instance-1');
 
-      // S3 sentinel was checked (getObject was called)
       expect(s3Client.getObject).toHaveBeenCalledWith('test-bucket', '.kici-cluster-id');
     });
 

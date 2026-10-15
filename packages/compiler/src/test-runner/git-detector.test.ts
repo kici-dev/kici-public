@@ -8,14 +8,12 @@ describe('detectRepoFromGit', () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    // Create temporary directory for test
     tempDir = path.join(tmpdir(), `kici-test-${Date.now()}`);
     await mkdir(tempDir, { recursive: true });
     await mkdir(path.join(tempDir, '.git'), { recursive: true });
   });
 
   afterEach(async () => {
-    // Clean up temporary directory
     await rm(tempDir, { recursive: true, force: true });
   });
 

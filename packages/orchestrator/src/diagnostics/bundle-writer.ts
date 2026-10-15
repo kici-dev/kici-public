@@ -1,10 +1,7 @@
 /**
- * Debug bundle writer.
- *
- * Creates a sanitized ZIP diagnostic bundle containing config (secrets redacted),
- * recent logs, system info, metrics, cluster state, and execution data.
- * This is the primary support tool -- operators run debug-bundle and share
- * the ZIP for troubleshooting.
+ * Debug bundle writer: a sanitized ZIP of config (secrets redacted), recent logs, system info,
+ * metrics, cluster state, and execution data. The primary support tool -- operators run
+ * debug-bundle and share the ZIP for troubleshooting.
  */
 
 import * as fs from 'node:fs';
@@ -15,26 +12,19 @@ import { redactConfig, addLogsToArchive } from '@kici-dev/shared';
 import type { DiagnosticDeps } from './types.js';
 import { runDiagnostics } from './runner.js';
 
-// Re-export the shared archive primitives so existing internal imports (the
-// diagnostics barrel, the CLI's local bundle) keep resolving from here.
+// Re-exported so internal imports (the diagnostics barrel, the CLI's local bundle) resolve here.
 export { redactConfig, addLogsToArchive } from '@kici-dev/shared';
 
 export interface BundleOptions {
-  /** Where to write the ZIP. */
   outputPath: string;
-  /** Orchestrator instance identifier. */
   orchestratorId: string;
   /** Raw orchestrator config (will be redacted). */
   config: Record<string, unknown>;
-  /** Path to log files directory. */
   logDir?: string;
   /** Hours of logs to include (default: 4). */
   logWindow?: number;
-  /** Dependencies for running diagnostic checks. */
   diagnosticDeps: DiagnosticDeps;
-  /** URL for cluster health endpoint. */
   clusterHealthUrl?: string;
-  /** URL for recent runs endpoint. */
   recentRunsUrl?: string;
 }
 
@@ -46,6 +36,8 @@ export interface BundleOptions {
  * - config/config.json: redacted configuration
  * - system/info.json: OS, Node, CPU, memory info
  * - diagnostics/results.json: health check results
+ * - cluster/health.json: cluster health (if clusterHealthUrl provided and reachable)
+ * - executions/recent.json: recent runs (if recentRunsUrl provided and reachable)
  * - logs/: recent log files (if logDir provided)
  * - logs/summary.json: log statistics
  */
@@ -61,7 +53,6 @@ export async function createDebugBundle(options: BundleOptions): Promise<string>
     recentRunsUrl,
   } = options;
 
-  // Ensure output directory exists
   const dir = path.dirname(outputPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -118,7 +109,7 @@ export async function createDebugBundle(options: BundleOptions): Promise<string>
     await addLogsToArchive(archive, logDir, logWindow);
   }
 
-  // 6. Cluster health (optional, best-effort)
+  // 6. Cluster health (best-effort)
   if (clusterHealthUrl) {
     try {
       const res = await fetch(clusterHealthUrl);
@@ -131,7 +122,7 @@ export async function createDebugBundle(options: BundleOptions): Promise<string>
     }
   }
 
-  // 7. Recent runs (optional, best-effort)
+  // 7. Recent runs (best-effort)
   if (recentRunsUrl) {
     try {
       const res = await fetch(recentRunsUrl);

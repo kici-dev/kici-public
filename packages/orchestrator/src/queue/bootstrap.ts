@@ -1,15 +1,7 @@
 /**
- * Orchestrator scheduled-jobs bootstrap helper.
- *
  * Composes `registerOrchestratorScheduledJob()` calls for all the
- * orchestrator's periodic work. Returns an array of handles so the
- * caller (orchestrator-core.ts) can thread them into
- * `setupGracefulShutdown`.
- *
- * Commit 5 ships the infrastructure; Commit 6 migrates the three
- * legacy setInterval schedulers (queue cleanup, secret cleanup,
- * token cleanup) into this helper. Commit 7 adds the
- * `cold-store-archive` entry.
+ * orchestrator's periodic work. The returned handles let orchestrator-core.ts
+ * thread them into `setupGracefulShutdown`.
  */
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
@@ -24,11 +16,7 @@ export interface OrchestratorScheduledJobsDeps {
   routingKey?: string;
 }
 
-/**
- * Overrides for the per-job handler + cadence. Callers pass the
- * actual tick functions here — the bootstrap helper only composes
- * registrations.
- */
+/** The per-job tick functions and cadences; this helper only composes registrations. */
 export interface OrchestratorScheduledJobRegistrations {
   cleanup?: { intervalMs: number; handler: () => Promise<void> };
   /** Short-tick probe that fast-fails jobs nothing in the fleet can route. */

@@ -1,9 +1,8 @@
 /**
  * Postgres-backed Raft state persistence.
  *
- * Stores the minimal Raft persistent state (currentTerm, votedFor, leaderId)
- * in the raft_state table. One row per cluster (default cluster_id = 'default').
- * State is loaded on node startup and saved on term/vote/leader transitions.
+ * One raft_state row per cluster (default cluster_id = 'default'), loaded on
+ * node startup and saved on term/vote/leader transitions.
  */
 
 import type { Kysely } from 'kysely';
@@ -24,10 +23,7 @@ export class RaftStateStore {
     this.clusterId = deps.clusterId ?? 'default';
   }
 
-  /**
-   * Load persisted Raft state from the DB.
-   * Returns defaults (term=0, votedFor=null, leaderId=null) if no row exists.
-   */
+  /** Returns term=0, votedFor=null, leaderId=null when no row exists. */
   async load(): Promise<RaftPersistentState> {
     const row = await this.db
       .selectFrom('raft_state')
@@ -46,9 +42,6 @@ export class RaftStateStore {
     };
   }
 
-  /**
-   * Upsert full Raft state into the DB.
-   */
   async save(state: RaftPersistentState): Promise<void> {
     await this.db
       .insertInto('raft_state')
@@ -95,9 +88,7 @@ export class RaftStateStore {
       .execute();
   }
 
-  /**
-   * Update just the leader and term fields (lightweight update for heartbeat acceptance).
-   */
+  /** Lightweight leader + term update on heartbeat acceptance. */
   async updateLeader(leaderId: string, term: number): Promise<void> {
     await this.db
       .insertInto('raft_state')

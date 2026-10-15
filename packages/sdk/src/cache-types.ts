@@ -1,14 +1,6 @@
 import { z } from 'zod';
 
-/**
- * Declarative + imperative cache specification.
- *
- * `key` is the immutable cache key — the first save under an exact key wins;
- * re-saving the same exact key is a no-op. `paths` are the files/dirs to
- * archive (repo-root-relative or `~`-prefixed). `restoreKeys` are ordered
- * prefix fallbacks tried (newest matching entry wins) when the exact key
- * misses on restore.
- */
+/** Declarative + imperative cache specification. `restoreKeys` are tried when the exact key misses. */
 export interface CacheSpec {
   /** Exact cache key. First save wins; re-saving an existing key is a no-op. */
   key: string;

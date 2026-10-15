@@ -46,11 +46,9 @@ export function isParallelGroup(x: unknown): x is ParallelGroup {
 }
 
 /**
- * Flatten a job's `steps` into a flat list where each parallel group's children
- * are inlined in array order (the group wrapper is dropped). Used by single-
- * process consumers (the test runner and dry-run preview) that surface each
- * child as its own step but do not run a concurrent scheduler; the concurrent
- * agent path expands groups into observable concurrent tasks instead.
+ * Inline each parallel group's children in array order, dropping the wrapper.
+ * For single-process consumers (the test runner, dry-run preview) with no
+ * concurrent scheduler; the agent expands groups into concurrent tasks instead.
  */
 export function flattenStepInputs(steps: readonly StepInput[]): FlatStepInput[] {
   const flat: FlatStepInput[] = [];

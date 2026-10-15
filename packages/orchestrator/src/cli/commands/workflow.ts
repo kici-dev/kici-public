@@ -1,25 +1,7 @@
 /**
- * Workflow registration commands for kici-admin.
- *
- * Provides operator-facing read access to the workflow_registrations table
- * via the orchestrator's admin HTTP API. Use it instead of querying the
- * registration table with psql: every CLI subcommand here goes through
- * AdminApiClient and the existing /api/v1/admin/registrations route.
- *
- *   workflow list                List registered workflows (table or JSON)
- *
- * Filter flags map 1:1 to the route's query string params:
- *   --org              -> ?customerId=<id>
- *   --routing-key      -> ?routingKey=<key>
- *   --repo             -> ?repoIdentifier=<owner/repo>
- *   --trigger-type     -> ?triggerType=<type>
- *   --event            -> ?event=<eventName>
- *
- * Output:
- *   default            Aligned ASCII table with id, repo_identifier,
- *                      workflow_name, trigger_types, events, disabled
- *                      (plus org_id when --org is omitted)
- *   --json             Raw JSON.stringify of the full response
+ * `kici-admin workflow`: workflow_registrations through the admin API
+ * (/api/v1/admin/registrations), instead of psql. `list` filter flags map 1:1
+ * to the route's query params.
  */
 
 import { readFileSync } from 'node:fs';
@@ -52,11 +34,8 @@ function parseJsonOption(raw: string | undefined, label: string): Record<string,
 }
 
 /**
- * Row shape returned by GET /api/v1/admin/registrations.
- *
- * Mirrors RegistrationRow on the server side, but kept loose here so the
- * CLI doesn't grow a hard import dependency on the orchestrator's
- * registration package.
+ * A GET /api/v1/admin/registrations row: a loose mirror of the server's
+ * RegistrationRow, so the CLI does not import the registration package.
  */
 interface RegistrationRowDTO {
   id: string;
@@ -77,11 +56,7 @@ interface ListResponse {
   total: number;
 }
 
-/**
- * Build the /api/v1/admin/registrations query string from CLI options.
- * Exported only for testing — order is preserved (org → routingKey → repo →
- * triggerType → event) so test assertions can match exact strings.
- */
+/** Fixed param order (org, routingKey, repo, triggerType, event), so tests match exact strings. */
 function buildQueryString(opts: {
   org?: string;
   routingKey?: string;
@@ -99,11 +74,7 @@ function buildQueryString(opts: {
   return qs ? `?${qs}` : '';
 }
 
-/**
- * Extract webhook event names from a registration's lock_entry.triggers[].
- * Non-webhook triggers are skipped. Returns the union of all events across
- * webhook triggers in declaration order, deduplicated.
- */
+/** Deduplicated webhook event names across lock_entry.triggers, in declaration order. */
 function extractWebhookEvents(row: RegistrationRowDTO): string[] {
   const triggers = row.lock_entry?.triggers ?? [];
   const seen = new Set<string>();
@@ -120,9 +91,6 @@ function extractWebhookEvents(row: RegistrationRowDTO): string[] {
   return out;
 }
 
-/**
- * Register the `workflow` command group with kici-admin.
- */
 export function registerWorkflowCommands(program: Command, getClient: () => AdminApiClient): void {
   const wf = program.command('workflow').description('Inspect workflow registrations');
 

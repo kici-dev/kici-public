@@ -174,10 +174,9 @@ describe('cache-blob exemption from the tenant webhook body limit', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  // Mirrors the app.ts wiring: a tiny global webhook cap that skips the
-  // cache-blob prefix, plus a generous per-blob-route bound. A blob larger
-  // than the webhook cap must still be accepted; a same-size POST to a
-  // non-exempt route must be rejected.
+  // Mirrors the app.ts wiring: a tiny global webhook cap that skips the cache-blob prefix, plus
+  // a generous per-blob-route bound. A blob over the webhook cap is accepted; a same-size POST to
+  // a non-exempt route is rejected.
   function buildApp(): Hono {
     const app = new Hono();
     const webhookBodyLimit = bodyLimit({ maxSize: 100 });

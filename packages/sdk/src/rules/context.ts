@@ -30,10 +30,9 @@ export interface CreateRuleContextInput {
 }
 
 /**
- * Build a RuleContext. `changedFiles` is exposed as a getter: it returns the
- * list when `changedFilesStatus === 'fetched'`, otherwise it throws
- * `ChangedFilesUnavailableError`. This is the single construction site for a
- * rule context across the agent, the compiler test-runner, and tests.
+ * The single RuleContext construction site (agent, compiler test-runner, tests).
+ * The `changedFiles` getter throws `ChangedFilesUnavailableError` unless
+ * `changedFilesStatus === 'fetched'`.
  */
 export function createRuleContext(input: CreateRuleContextInput): RuleContext {
   const status: ChangedFilesStatus = input.changedFilesStatus ?? 'fetched';

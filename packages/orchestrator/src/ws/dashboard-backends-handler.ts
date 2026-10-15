@@ -1,8 +1,6 @@
 /**
- * Dashboard backends handler for the orchestrator.
- *
- * Responds to dashboard.backends.* WS messages from Platform by calling the
- * backend registry, health checker, and sync manager, then sending typed responses.
+ * Answers dashboard.backends.* WS messages from Platform via the backend registry,
+ * health checker and sync manager.
  */
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type {
@@ -35,24 +33,21 @@ import { DashboardAccessRecorder } from './dashboard-access.js';
 const logger = createLogger({ prefix: 'dashboard-backends-handler' });
 
 interface DashboardBackendsHandlerDeps {
-  /** Send a response message back to Platform over the WS connection. */
   send: (msg: unknown) => void;
   registry: BackendRegistry;
   healthChecker: BackendHealthChecker;
   syncManager?: BackendSyncManager;
-  /** Database — required for dashboard-write policy lookups. */
+  /** Required for dashboard-write policy lookups. */
   db: Kysely<Database>;
-  /** Access log writer — records one row per read / mutation with actor attribution. */
+  /** Records one row per read / mutation with actor attribution. */
   accessLog?: AccessLogWriter;
-  /** Org ID for access_log rows (null when the orchestrator isn't org-scoped). */
+  /** For access_log rows; null when the orchestrator isn't org-scoped. */
   orgId?: string | null;
-  /** Routing key for access_log rows (null when not run-scoped). */
+  /** For access_log rows; null when not run-scoped. */
   routingKey?: string | null;
 }
 
-/**
- * Convert a BackendDescriptor to a JSON-safe object (dates to ISO strings).
- */
+/** Dates become ISO strings. */
 function descriptorToJson(d: BackendDescriptor): Record<string, unknown> {
   return {
     id: d.id,
@@ -71,11 +66,6 @@ function descriptorToJson(d: BackendDescriptor): Record<string, unknown> {
   };
 }
 
-/**
- * Handler for all dashboard backend WS messages.
- *
- * Dispatches incoming messages by type and calls the appropriate backend services.
- */
 export class DashboardBackendsHandler {
   private readonly deps: DashboardBackendsHandlerDeps;
   private orgId: string | null;
@@ -94,8 +84,8 @@ export class DashboardBackendsHandler {
   }
 
   /**
-   * Update the bound orgId + routingKey. Called from server.ts after resolving
-   * the single tenant org from the `sources` / `generic_webhook_sources` table.
+   * Called from server.ts after resolving the single tenant org from the `sources` /
+   * `generic_webhook_sources` table.
    */
   setOrgContext(orgId: string | null, routingKey: string | null): void {
     this.orgId = orgId;
@@ -103,13 +93,12 @@ export class DashboardBackendsHandler {
   }
 
   /**
-   * Defense-in-depth dashboard-write policy gate. Returns true when the
-   * operation is allowed and the caller should proceed. Returns false
-   * when the policy is disabled — also records a `denied` access_log row
-   * and emits a structured `operation_disabled` envelope on the WS.
+   * Defense-in-depth dashboard-write policy gate. When the policy is disabled it records
+   * a `denied` access_log row, emits a structured `operation_disabled` envelope and
+   * returns false.
    *
-   * Fails open when no org is bound — the orch hasn't resolved a
-   * customer yet, so there's nothing to look up.
+   * Fails open when no org is bound: no customer is resolved yet, so there is nothing to
+   * look up.
    */
   private async enforcePolicy(
     msg: { actor: ActorPrincipal; requestId: string },
@@ -139,10 +128,7 @@ export class DashboardBackendsHandler {
     }
   }
 
-  /**
-   * Route a dashboard backends message to the appropriate handler.
-   * Returns true if the message was handled, false otherwise.
-   */
+  /** Returns false for a message this handler does not own. */
   async handleMessage(msg: DashboardPlatformToOrchMessage): Promise<boolean> {
     switch (msg.type) {
       case 'dashboard.backends.list':
@@ -204,8 +190,8 @@ export class DashboardBackendsHandler {
           'allowed',
           'backend not found',
         );
-        // Not-found is signalled by the absent `backend` field — `error`
-        // is reserved for internal errors (Platform maps it to HTTP 500).
+        // Not-found is the absent `backend` field; `error` is for internal errors
+        // (Platform maps it to HTTP 500).
         this.deps.send({
           type: 'dashboard.backends.get.response',
           requestId: msg.requestId,
@@ -335,9 +321,8 @@ export class DashboardBackendsHandler {
           'allowed',
           'backend not found',
         );
-        // Not-found is signalled by `synced: false` alone — the `error`
-        // field is the internal-error channel, which the Platform maps to
-        // HTTP 500. Omitting it lets the Platform serve a structured 404.
+        // Not-found is `synced: false` alone; `error` is the internal-error channel
+        // (Platform maps it to HTTP 500), so omitting it lets Platform serve a structured 404.
         this.deps.send({
           type: 'dashboard.backends.sync.one.response',
           requestId: msg.requestId,

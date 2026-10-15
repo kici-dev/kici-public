@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
-// Mock os module (homedir + hostname)
 vi.mock('node:os', async () => {
   const actual = await vi.importActual<typeof import('node:os')>('node:os');
   return {
@@ -16,19 +15,16 @@ vi.mock('node:os', async () => {
   };
 });
 
-// Mock the oauth module
 vi.mock('../remote/oauth.js', () => ({
   pkceFlow: vi.fn(),
   deviceFlow: vi.fn(),
   exchangeTokenForPat: vi.fn(),
 }));
 
-// Mock the headless-detect module
 vi.mock('../auth/headless-detect.js', () => ({
   isHeadless: vi.fn().mockResolvedValue(false),
 }));
 
-// Mock the local dev plane (attach prompt).
 const planeStatusMock = vi.fn().mockResolvedValue({ running: false, mode: 'independent' });
 const attachPlaneMock = vi.fn().mockResolvedValue({ mode: 'hybrid', url: 'http://127.0.0.1:4319' });
 vi.mock('../local-plane/plane-manager.js', () => ({
@@ -36,7 +32,7 @@ vi.mock('../local-plane/plane-manager.js', () => ({
   attachPlane: (...a: unknown[]) => attachPlaneMock(...a),
 }));
 
-// Mock readline so the [Y/n] attach prompt returns a scripted answer.
+// The [Y/n] attach prompt returns a scripted answer.
 let scriptedAnswer = 'y';
 vi.mock('node:readline', () => ({
   createInterface: () => ({
@@ -61,10 +57,8 @@ describe('kici login', () => {
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-login-test-'));
     vi.mocked(os.homedir).mockReturnValue(tempDir);
-    // The homedir mock alone does not isolate this suite: getConfigDir()
-    // refuses the ambient config under the KiCI test-isolation marker before
-    // it consults homedir(). Name the same directory the mock produces
-    // explicitly.
+    // The homedir mock alone does not isolate this suite: getConfigDir() refuses
+    // the ambient config under the test-isolation marker before consulting homedir().
     process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
   });
 
@@ -142,12 +136,10 @@ describe('kici login', () => {
 
   describe('OAuth flow', () => {
     beforeEach(() => {
-      // Clear mock call counts between tests
       vi.clearAllMocks();
-      // Re-set homedir mock (clearAllMocks resets it)
+      // clearAllMocks resets the homedir mock.
       vi.mocked(os.homedir).mockReturnValue(tempDir);
       vi.mocked(os.hostname).mockReturnValue('test-machine');
-      // Set env vars for OAuth config
       process.env.KICI_PLATFORM_URL = 'https://platform.example.com';
       process.env.KICI_OIDC_ISSUER = 'https://keycloak.example.com';
       process.env.KICI_OIDC_CLIENT_ID = 'test-cli-client-id';
@@ -567,8 +559,7 @@ describe('kici login', () => {
       planeStatusMock.mockResolvedValue({ running: false, mode: 'independent' });
       attachPlaneMock.mockResolvedValue({ mode: 'hybrid', url: 'http://127.0.0.1:4319' });
       process.env.KICI_PLATFORM_URL = 'https://platform.example.com';
-      // Seed an existing config with an active org + same endpoint so the
-      // login preserves activeOrgId (the prompt only fires with an org).
+      // The prompt fires only with an active org, which login preserves for the same endpoint.
       await saveGlobalConfig({
         platformEndpoint: 'https://platform.example.com',
         activeOrgId: 'org-1',

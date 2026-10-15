@@ -2,18 +2,14 @@
  * `event_log` cold-store adapter (Orchestrator side).
  *
  * Contract:
- *   - tenant column: `routing_key` (NOT NULL on this side — no
- *     synthetic-tenant fallback like access_log / secret_audit_log)
+ *   - tenant column: `routing_key` (NOT NULL — no synthetic-tenant fallback)
  *   - partition column: `received_at`
  *   - warm TTL: 30 days (rows are archived, not hard-deleted)
  *
- * Each row's `payload_key` points at a gzipped webhook body in object
- * storage. Archiving moves the row, `payload_key` included, and leaves the
- * body where it is, so the delivery-detail page reads payloads the same way
- * for hot and cold rows.
+ * Archiving moves the row with its `payload_key` and leaves the gzipped webhook body in object
+ * storage, so the delivery-detail page reads hot and cold payloads the same way.
  *
- * Each archived chunk writes one `access_log` audit row, which the
- * AccessLogAdapter archives in a later cycle.
+ * Each archived chunk writes one `access_log` audit row, archived in a later cycle.
  */
 import { sql, type Kysely, type Selectable } from 'kysely';
 import {

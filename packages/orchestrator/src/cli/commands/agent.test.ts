@@ -1,8 +1,8 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { Command } from 'commander';
 import { PRIVILEGED_ROOT_LABEL, resolveRoleLabels } from '@kici-dev/engine';
+import { runCli } from '../../__test-helpers__/cli.js';
 
-// Mock pg pool — agent direct-DB list uses createPool from @kici-dev/shared
+// Agent direct-DB list uses createPool from @kici-dev/shared.
 const mockPoolQuery = vi.fn();
 const mockPoolEnd = vi.fn();
 
@@ -39,41 +39,7 @@ async function runCommand(
   args: string[],
   client: MockClient = makeMockClient(),
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null; client: MockClient }> {
-  const program = new Command();
-  program.exitOverride();
-  registerAgentCommands(program, () => client as any);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:') && !err.code?.startsWith('commander.')) {
-      console.log = origLog;
-      console.error = origError;
-      process.exit = origExit;
-      throw err;
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode, client };
+  return { ...(await runCli((p) => registerAgentCommands(p, () => client as any), args)), client };
 }
 
 describe('kici-admin agent CLI', () => {
@@ -233,9 +199,7 @@ describe('kici-admin agent CLI', () => {
     expect(parsed).toEqual({ tokens: [], pendingAgents: [] });
   });
 
-  // The revoke output must surface the kick count so operators can
-  // tell at a glance whether the revocation actually closed any
-  // in-flight WS connections.
+  // The kick count shows whether revocation closed any in-flight WS connections.
   it('revoke prints "(kicked N agent connections)" using the API kicked count', async () => {
     const client = makeMockClient();
     client.revokeAgentToken.mockResolvedValue({ kicked: 3 });

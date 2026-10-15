@@ -1,19 +1,13 @@
 /**
- * In-memory execution tracker for worker nodes.
- *
- * Workers have no database access. This lightweight implementation
- * satisfies the same interface subset that the dispatcher and processor
- * call (onExecutionStarted, onJobStatus, onStepStatus, getRunStatus),
- * allowing those subsystems to work unchanged on workers.
- *
- * Optionally forwards status updates via a callback for coordinator relay,
- * and maintains a ring buffer of recently completed jobs for /status.
+ * Execution tracker for DB-less worker nodes. It implements the subset the
+ * dispatcher and processor call (onExecutionStarted, onJobStatus, onStepStatus,
+ * getRunStatus), so they run unchanged on workers. It can forward status updates
+ * to the coordinator, and keeps a ring buffer of recently completed jobs for /status.
  */
 
 import type { ObserverRegistry } from '../ws/observer-registry.js';
 import { TERMINAL_JOB_STATES } from '@kici-dev/engine';
 
-/** Default number of recent completed jobs to retain. */
 const DEFAULT_RECENT_JOBS_LIMIT = 50;
 
 /** A status update forwarded to the coordinator. */
@@ -28,7 +22,6 @@ export interface StatusUpdate {
   data?: Record<string, unknown>;
 }
 
-/** A completed job entry in the ring buffer. */
 interface CompletedJobInfo {
   runId: string;
   jobId: string;
@@ -40,15 +33,14 @@ interface CompletedJobInfo {
 }
 
 interface InMemoryExecutionTrackerOptions {
-  /** Callback to forward status updates to coordinator via P2P. */
+  /** Forwards status updates to the coordinator over P2P. */
   onStatusForward?: (update: StatusUpdate) => void;
-  /** Maximum number of recent completed jobs to keep. Default: 50. */
+  /** Default: 50. */
   recentJobsLimit?: number;
-  /** Optional observer registry for broadcasting to CLI observers. */
+  /** Broadcasts to CLI observers. */
   observerRegistry?: ObserverRegistry;
 }
 
-/** In-memory state for a single job within a run. */
 interface JobState {
   name: string;
   status: string;
@@ -56,7 +48,6 @@ interface JobState {
   completedAt?: number;
 }
 
-/** In-memory state for a single execution run. */
 interface RunState {
   workflowName: string;
   provider: string;
@@ -80,10 +71,7 @@ export class InMemoryExecutionTracker {
     this.observerRegistry = options.observerRegistry;
   }
 
-  /**
-   * Record a new execution run with its initial jobs.
-   * Signature matches ExecutionTracker.onExecutionStarted (positional args).
-   */
+  /** Positional signature matches ExecutionTracker.onExecutionStarted. */
   async onExecutionStarted(
     runId: string,
     workflowName: string,
@@ -112,9 +100,6 @@ export class InMemoryExecutionTracker {
     });
   }
 
-  /**
-   * Update job status. Forwards to coordinator callback if configured.
-   */
   async onJobStatus(
     runId: string,
     jobId: string,
@@ -131,7 +116,6 @@ export class InMemoryExecutionTracker {
 
     job.status = status;
 
-    // Track timing
     if (status === 'running' && !job.startedAt) {
       job.startedAt = timestamp;
     }
@@ -147,7 +131,6 @@ export class InMemoryExecutionTracker {
         durationMs: timestamp - (job.startedAt ?? timestamp),
       });
 
-      // Clean up the run from memory once all its jobs are terminal
       const allTerminal = [...run.jobs.values()].every((j) => TERMINAL_JOB_STATES.has(j.status));
       if (allTerminal) {
         this.runs.delete(runId);
@@ -164,9 +147,6 @@ export class InMemoryExecutionTracker {
     });
   }
 
-  /**
-   * Update step status. Forwards to coordinator callback if configured.
-   */
   async onStepStatus(
     runId: string,
     jobId: string,
@@ -202,21 +182,14 @@ export class InMemoryExecutionTracker {
     if (run.jobs.size === 0) this.runs.delete(runId);
   }
 
-  /**
-   * Get the current status of a run.
-   */
   getRunStatus(runId: string): RunState | null {
     return this.runs.get(runId) ?? null;
   }
 
-  /**
-   * Get recent completed jobs (most recent first).
-   */
+  /** Most recent first. */
   getRecentJobs(): CompletedJobInfo[] {
     return [...this.recentJobs].reverse();
   }
-
-  // ── Internal ──────────────────────────────────────────────────────
 
   private addToRecentJobs(info: CompletedJobInfo): void {
     this.recentJobs.push(info);

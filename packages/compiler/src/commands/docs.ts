@@ -10,16 +10,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOCS_HOME_URL = docsUrl('');
 
 export interface DocsOptions {
-  /** Open the docs site in the default browser. */
   open?: boolean;
 }
 
 export interface DocsLlmOptions {
-  /** Task bundle id to print. Undefined → the llms.txt index; 'full' → llms-full.txt. */
+  /** Undefined → the llms.txt index; 'full' → llms-full.txt. */
   topic?: string;
-  /** Override the bundled output destination (overrides default stdout). */
+  /** Defaults to stdout. */
   out?: string;
-  /** Override the directory holding the llms*.txt files (test seam). */
+  /** Test seam for the directory holding the llms*.txt files. */
   bundleDir?: string;
 }
 
@@ -41,9 +40,7 @@ async function availableTopics(bundleDir: string): Promise<string[]> {
   }
 }
 
-/**
- * Open the published documentation site in the user's default browser.
- */
+/** `open: false` prints the URL instead of opening a browser. */
 export async function docsCommand(options: DocsOptions = {}): Promise<boolean> {
   try {
     if (options.open === false) {
@@ -61,12 +58,9 @@ export async function docsCommand(options: DocsOptions = {}): Promise<boolean> {
 }
 
 /**
- * Print a KiCI LLM docs bundle to stdout (or a file).
- *
- * No topic prints the llms.txt index (a router listing every task bundle).
- * A topic prints that task bundle (e.g. `sdk`, `cli`, `patterns`); `full`
- * prints the everything-bundle. Pipe straight into a coding agent's context
- * to brief it on KiCI authoring without an internet round-trip.
+ * Print an LLM docs bundle, for a coding agent's context without an internet
+ * round-trip. No topic prints the llms.txt index of task bundles; a topic
+ * (e.g. `sdk`) prints that bundle; `full` prints everything.
  */
 export async function docsLlmCommand(options: DocsLlmOptions = {}): Promise<boolean> {
   const filename = bundleFilenameForTopic(options.topic);

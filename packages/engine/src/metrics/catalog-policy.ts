@@ -1,19 +1,14 @@
 /**
- * Hand-maintained label-value policy on top of the auto-generated
- * `MetricLabels` / `MetricKind` allow-list in
- * `./metric-catalog.generated.ts`. Consumed by the Platform's
- * orchestrator-metrics filter to harden the WS `orch.metrics` push path against pollution of the
- * monitoring system.
+ * Hand-maintained label-value policy on top of the generated
+ * `MetricLabels` / `MetricKind` allow-list (`./metric-catalog.generated.ts`).
+ * The Platform's orchestrator-metrics filter uses it to keep the WS
+ * `orch.metrics` push path from polluting the monitoring system.
  *
- * Three layers compose:
- *
- *   1. `MetricNames` (auto) — every catalog metric name.
- *   2. `MetricLabels` (auto) — allow-list of label KEYS per metric.
- *   3. `METRIC_LABEL_POLICY` (here) — value constraints per (metric, key):
- *      either a closed enum (`values`) or a cardinality cap
- *      (`maxUniqueValues`). Labels without a policy entry pass through
- *      unconstrained — they were already on the auto allow-list, so
- *      the producer guarantees the value shape.
+ * Layers: `MetricNames` (generated: every metric name), `MetricLabels`
+ * (generated: allowed label KEYS per metric), and `METRIC_LABEL_POLICY` (here:
+ * per (metric, key) a closed enum `values` or a cap `maxUniqueValues`). A label
+ * with no policy entry passes unconstrained: it is on the allow-list, so the
+ * producer guarantees the value shape.
  *
  * Browser-safe: pure constants, no Node imports.
  */
@@ -22,16 +17,12 @@ import { MetricNames, MetricService, type MetricName } from './metric-catalog.ge
 import { ExecutionRunStatus } from '../protocol/messages/execution-status.js';
 import { ScalerBackendType } from '../scaler/scaler-backend-type.js';
 
-/**
- * Per-label policy: enum-constrained values OR a cardinality cap.
- */
+/** Per-label policy: enum-constrained values OR a cardinality cap. */
 export interface LabelPolicy {
-  /** Closed enum of acceptable label values. */
   values?: readonly string[];
   /**
-   * Cap on distinct values per (orgId, routingKey, metric, labelKey)
-   * tracked by the Platform-side cardinality tracker. Values beyond the
-   * cap collapse to the literal `__overflow__` — total counts are
+   * Cap on distinct values per (orgId, routingKey, metric, labelKey), tracked
+   * by the Platform. Values beyond it collapse to `__overflow__`: totals are
    * preserved, dimensionality is bounded.
    */
   maxUniqueValues?: number;
@@ -41,20 +32,16 @@ export interface LabelPolicy {
 export const OVERFLOW_LABEL_VALUE = '__overflow__';
 
 /**
- * Set of catalog metric names the orchestrator is allowed to push over
- * `orch.metrics`. Derived from `MetricService` so the membership stays
- * in lock-step with codegen: orchestrator owns its own `kici_orch_*`,
- * `kici_cross_source_*`, and `kici_universal_git_*` metrics, plus
- * `kici_agent_*` metrics forwarded by `AgentMetricsAggregator`. Every
+ * Catalog metric names the orchestrator may push over `orch.metrics`, derived
+ * from `MetricService` to stay in lock-step with codegen: its own
+ * `kici_orch_*`, `kici_cross_source_*` and `kici_universal_git_*`, the
+ * `kici_agent_*` series `AgentMetricsAggregator` forwards, and the `runtime`
+ * service's Node.js metrics (`nodejs.*` / `v8js.*`, from
+ * `RuntimeNodeInstrumentation`, describing the orchestrator process). Every
  * `kici_platform_*` / `kici_org_*` / `kici_plan_*` / `kici_valkey_*` /
  * `kici_webhook*` / `kici_ws_*` / `kici_build_*` / `kici_cache_*` /
- * `kici_orgs_*` series is Platform-emitted locally and would be a
- * tenancy violation if accepted from the wire.
- *
- * The synthetic `runtime` service covers the Node.js runtime metrics
- * (`nodejs.*` / `v8js.*`) the orchestrator emits via
- * `RuntimeNodeInstrumentation`. They describe the orchestrator process,
- * so they are valid push payloads alongside `kici_orch_*`.
+ * `kici_orgs_*` series is Platform-emitted; accepting one from the wire would
+ * be a tenancy violation.
  */
 export const ORCH_PUSHED_METRIC_NAMES: ReadonlySet<MetricName> = new Set(
   (Object.entries(MetricService) as Array<[keyof typeof MetricNames, string]>)
@@ -63,36 +50,30 @@ export const ORCH_PUSHED_METRIC_NAMES: ReadonlySet<MetricName> = new Set(
 );
 
 /**
- * Closed enum of the `scaler` label values an agent can carry: every scaler
- * backend type the orchestrator can resolve for a managed agent, plus
- * `stateful` for a static agent no scaler manages (the fallback
- * `AgentMetricsAggregator.resolveScalerLabel` stamps when the lookup returns
- * null). Derived from `ScalerBackendType` rather than restated, so adding a
- * backend cannot silently drop every `kici_agent_*` series that backend's
- * agents emit as `bad_label_value`.
+ * The `scaler` label values an agent can carry: every scaler backend type, plus
+ * `stateful` for a static agent no scaler manages (the
+ * `AgentMetricsAggregator.resolveScalerLabel` fallback when the lookup returns
+ * null). Derived from `ScalerBackendType`, so a new backend's `kici_agent_*`
+ * series are not silently dropped as `bad_label_value`.
  */
 const AGENT_SCALER_VALUES = ['stateful', ...ScalerBackendType.options] as const;
 
 /**
- * Closed enum of scaler-backend TYPE values the orchestrator's own
- * resource-usage gauges carry on their `scalerType` rollup label.
- * `__global__` is the orchestrator-wide rollup row; every other value comes
- * from `ScalerManager`'s own `backends` map, so the enum is `ScalerBackendType`
- * itself — NOT `AGENT_SCALER_VALUES`, which additionally carries the
- * agent-only `stateful` and predates the `event` backend. Exported so the
- * policy tests can assert against it.
+ * The `scalerType` rollup label values on the orchestrator's resource-usage
+ * gauges: `__global__` (the orchestrator-wide row) plus `ScalerBackendType`,
+ * since every other value comes from `ScalerManager`'s `backends` map. NOT
+ * `AGENT_SCALER_VALUES`, which adds the agent-only `stateful`. Exported for
+ * the policy tests.
  */
 export const ORCH_SCALER_VALUES = ['__global__', ...ScalerBackendType.options] as const;
 
 /**
- * Closed enum of the scheduled jobs the orchestrator runs. MUST mirror
- * `OrchestratorScheduledJobName` (`packages/orchestrator/src/queue/scheduled-job.ts`)
- * exactly — a job missing here has its whole `kici_orch_job_*` series
- * dropped by the Platform filter with `reason="bad_label_value"`, so the
- * job silently loses every health metric. The engine cannot import the
- * orchestrator (dependency runs the other way), so the parity assertion
- * lives on the orchestrator side in `scheduled-job.test.ts`. Exported so
- * that test can assert against it.
+ * The orchestrator's scheduled jobs. MUST mirror `OrchestratorScheduledJobName`
+ * (`packages/orchestrator/src/queue/scheduled-job.ts`) exactly: the Platform
+ * filter drops a missing job's whole `kici_orch_job_*` series as
+ * `reason="bad_label_value"`. The engine cannot import the orchestrator, so the
+ * parity assertion lives in the orchestrator's `scheduled-job.test.ts`, which
+ * imports this.
  */
 export const ORCH_JOB_VALUES = [
   'cleanup',
@@ -104,15 +85,13 @@ export const ORCH_JOB_VALUES = [
 ] as const;
 
 /**
- * Per-metric, per-label value policy. Missing entries (or missing label
- * keys within an entry) mean "no value-level constraint" — the label key
- * still has to appear in the auto-generated `MetricLabels[name]` allow
- * list to make it past the filter.
+ * Per-metric, per-label value policy. A missing entry or label key means no
+ * value constraint; the key must still be in the generated `MetricLabels[name]`
+ * allow-list to pass the filter.
  *
- * User-controlled labels (the three flagged below) get a numeric cap
- * instead of an enum. Anything past the cap collapses to
- * `OVERFLOW_LABEL_VALUE` so dashboards keep their counts but cannot be
- * inflated past N+1 distinct series.
+ * User-controlled labels (flagged below) get a numeric cap instead of an enum;
+ * values past it collapse to `OVERFLOW_LABEL_VALUE`, so counts survive but a
+ * label never exceeds N+1 distinct series.
  */
 export const METRIC_LABEL_POLICY: Partial<
   Record<MetricName, Partial<Record<string, LabelPolicy>>>
@@ -134,9 +113,7 @@ export const METRIC_LABEL_POLICY: Partial<
     result: { values: ['matched', 'skipped', 'error', 'handled', 'dispatched'] },
   },
   kici_orch_executions_total: {
-    // Derived from the ExecutionRunStatus Zod enum so the policy can never
-    // drift from the statuses the orchestrator actually emits (pending,
-    // running, success, failed, cancelled, cancelling, held).
+    // Derived from ExecutionRunStatus so it never drifts from emitted statuses.
     status: { values: ExecutionRunStatus.options },
   },
   kici_orch_steps_total: {
@@ -153,11 +130,9 @@ export const METRIC_LABEL_POLICY: Partial<
     source: { values: ['sighup', 'http', 'cluster', 'cli'] },
   },
   kici_orch_scaler_cpus_used: {
-    // `scaler` is the operator-chosen scaler NAME (free-form), with
-    // `__global__` as the orchestrator-wide rollup row — cap it like
-    // `machinePool` rather than enum-constraining it.
+    // `scaler` is the free-form operator-chosen NAME (plus the `__global__`
+    // rollup row), so it is capped like `machinePool`, not enum-constrained.
     scaler: { maxUniqueValues: 50 },
-    // `scalerType` is the backend-type rollup dimension (closed enum).
     scalerType: { values: ORCH_SCALER_VALUES },
     machinePool: { maxUniqueValues: 50 },
   },
@@ -166,9 +141,8 @@ export const METRIC_LABEL_POLICY: Partial<
     scalerType: { values: ORCH_SCALER_VALUES },
     machinePool: { maxUniqueValues: 50 },
   },
-  // Warm-pool gauges fan out per (scaler, labelSet). Both are operator-chosen
-  // and bounded by the scaler config, so cap them the way the sibling gauges
-  // cap `scaler` rather than enum-constraining either.
+  // Warm-pool gauges fan out per (scaler, labelSet), both operator-chosen and
+  // bounded by the scaler config, so both are capped rather than enum-constrained.
   kici_orch_scaler_warm_pool_target: {
     scaler: { maxUniqueValues: 50 },
     labelSet: { maxUniqueValues: 100 },
@@ -184,10 +158,10 @@ export const METRIC_LABEL_POLICY: Partial<
   kici_orch_scaler_warm_pool_spawns_total: { scaler: { maxUniqueValues: 50 } },
   kici_orch_scaler_warm_pool_reaped_total: { scaler: { maxUniqueValues: 50 } },
   kici_orch_install_secrets_decisions_total: {
-    // `hold` covers the workflow-scoped held-run path: a protection gate that
-    // returns hold / wait / queue collapses to a single `hold` decision in the
-    // resolver (the gate action is carried on the structured result, not this
-    // label). `pass` / `reject` are the terminal decisions.
+    // `hold` covers the workflow-scoped held-run path: a gate returning
+    // hold / wait / queue collapses to one `hold` decision
+    // (the gate action rides the structured result, not this label).
+    // `pass` / `reject` are terminal.
     decision: { values: ['pass', 'reject', 'hold'] },
     reason: {
       values: [
@@ -328,13 +302,11 @@ export const METRIC_LABEL_POLICY: Partial<
     scaler: { values: AGENT_SCALER_VALUES },
   },
   kici_agent_connection_status: { scaler: { values: AGENT_SCALER_VALUES } },
-  // Node.js runtime metrics (RuntimeNodeInstrumentation). Their attribute
-  // keys are the dotted OTel names the filter sees on the wire. The
-  // instrument labels are low-cardinality and bounded by V8/libuv internals,
-  // but a cap keeps a buggy instrumentation version from inflating series
-  // counts. The `scaler` label appears only on the agent-forwarded variant
-  // (the AgentMetricsAggregator stamps it); the orchestrator's own runtime
-  // metrics omit it, so the enum constraint fires only when present.
+  // Node.js runtime metrics (RuntimeNodeInstrumentation), keyed by the dotted
+  // OTel attribute names seen on the wire. Their labels are bounded by
+  // V8/libuv internals; the caps guard against a buggy instrumentation version.
+  // Only the agent-forwarded variant carries `scaler` (AgentMetricsAggregator
+  // stamps it), so that constraint fires only when present.
   'nodejs.eventloop.delay.max': { scaler: { values: AGENT_SCALER_VALUES } },
   'nodejs.eventloop.delay.mean': { scaler: { values: AGENT_SCALER_VALUES } },
   'nodejs.eventloop.delay.min': { scaler: { values: AGENT_SCALER_VALUES } },

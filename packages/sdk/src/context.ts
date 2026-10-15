@@ -106,28 +106,16 @@ export function isHostJobOutputs<T = Record<string, unknown>>(
  */
 export interface KnownSecretKeys {}
 
-/**
- * Check if an interface has been augmented (has any keys).
- * Uses distributive-safe pattern: [keyof T] extends [never].
- */
+/** True when T has any keys; the `[keyof T]` tuple wrap keeps it non-distributive. */
 type IsAugmented<T> = [keyof T] extends [never] ? false : true;
 
-/**
- * Step secrets with async get/expose accessors.
- * Use ctx.secrets.get('KEY') to retrieve a value, ctx.secrets.expose('KEY') to inject into env.
- *
- * When KnownSecretKeys is augmented (via .d.ts generation), only the `get`/`expose`
- * key parameter is narrowed to the known keys — every other accessor
- * (`has`, `getMeta`, `list`, `mountFile`, `exposeFile`) is preserved verbatim
- * from StepSecrets. When empty (no augmentation), the whole StepSecrets surface
- * accepts any string key.
- */
 /**
  * The augmented secrets surface: narrows `get`/`expose` to the provided key set
  * while preserving every other StepSecrets accessor (`has`, `getMeta`, `list`,
  * `mountFile`, `exposeFile`) verbatim. Deriving from StepSecrets via `Omit`
  * keeps the file-mount accessors from silently dropping off whenever the
- * StepSecrets surface grows a new method.
+ * StepSecrets surface grows a new method. Without augmentation (`kici types`),
+ * the whole StepSecrets surface accepts any string key.
  */
 export type AugmentedStepSecrets<TKeys> = Omit<StepSecrets, 'get' | 'expose'> & {
   get(key: keyof TKeys): Promise<string>;
@@ -188,9 +176,8 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    */
   matrix?: MatrixValues;
   /**
-   * Hostname of the agent this job instance is running on.
-   * Set only for jobs that use `runsOnAll` (host fan-out — one pinned execution
-   * per matching host). Undefined for jobs without host fan-out.
+   * Hostname of the agent this job instance is running on. Set only for jobs
+   * that use `runsOnAll` (host fan-out — one pinned execution per matching host).
    */
   host?: string;
   /**
@@ -205,8 +192,7 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    */
   fanout?: FanoutPosition;
   /**
-   * Raw webhook payload from the git provider.
-   * Contains the full, unmodified payload as received from the webhook.
+   * Raw, unmodified webhook payload from the git provider.
    * In local preview/run mode (`kici preview` / `kici run --local`), contains the simulated payload.
    * Use this for provider-specific data not covered by normalized fields.
    */
@@ -256,11 +242,7 @@ export interface StepContext<TInputs = Record<string, unknown>> {
    * For non-global workflows, this is undefined (use env.GITHUB_WORKSPACE or CWD).
    */
   sourceRepo?: RepoInfo;
-  /**
-   * The resolved context name for this job.
-   * Set when the job declares a `context` property.
-   * Undefined for jobs without a context.
-   */
+  /** The resolved context name; undefined unless the job declares a `context` property. */
   context?: string;
   /**
    * Secrets resolved for this job's context.

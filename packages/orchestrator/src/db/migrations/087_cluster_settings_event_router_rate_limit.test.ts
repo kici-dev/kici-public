@@ -3,12 +3,13 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './087_cluster_settings_event_router_rate_limit.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 087: asserts `cluster_settings.event_router_rate_limit_per_workflow_per_minute`
- * exists and is nullable after migrations 001..087, and that up/down are
- * idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 087: asserts
+ * `cluster_settings.event_router_rate_limit_per_workflow_per_minute` exists and is nullable
+ * after migrations 001..087, and that up/down are idempotent. Gated on
+ * `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;

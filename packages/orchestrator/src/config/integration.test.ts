@@ -240,7 +240,6 @@ describe('Config Integration Tests', () => {
       const { db, state } = createMockDbForStore();
       const store = new SharedConfigStore(db, TEST_MASTER_KEY);
 
-      // Seed a config with sensitive fields
       const config = {
         platform: {
           url: 'wss://api.kici.dev/ws',
@@ -255,18 +254,15 @@ describe('Config Integration Tests', () => {
       const version = await store.save(config, 'cli:seed', 'Integration test seed');
       expect(version).toBe(1);
 
-      // Verify sensitive fields were encrypted in storage
       const storedRow = state.rows[0];
       const storedConfig = JSON.parse(storedRow.config as string);
       expect(storedConfig.platform.token).not.toBe('platform-token-value');
       expect(storedConfig.secrets.key).not.toBe('master-key-value');
 
-      // Verify encrypted_paths are tracked
       const encryptedPaths = storedRow.encrypted_paths as string[];
       expect(encryptedPaths).toContain('platform.token');
       expect(encryptedPaths).toContain('secrets.key');
 
-      // Get latest should return decrypted values
       const latest = await store.getLatest();
       expect(latest).not.toBeNull();
       expect(latest!.version).toBe(1);
@@ -293,11 +289,9 @@ describe('Config Integration Tests', () => {
       const redacted = await store.exportRedacted();
       expect(redacted).not.toBeNull();
 
-      // Sensitive fields should be redacted
       expect((redacted as any).platform.token).toBe(REDACTED_VALUE);
       expect((redacted as any).secrets.key).toBe(REDACTED_VALUE);
 
-      // Non-sensitive fields should be visible
       expect((redacted as any).platform.url).toBe('wss://api.kici.dev/ws');
     });
   });
@@ -336,22 +330,17 @@ describe('Config Integration Tests', () => {
 
       const reloader = new ConfigReloader(initialConfig, deps);
 
-      // Verify initial state
       expect(reloader.getCurrentConfig().logLevel).toBe('info');
 
-      // Trigger reload
       const result = await reloader.executeReload({ source: 'sighup' });
 
-      // Verify reload succeeded
       expect(result.success).toBe(true);
       expect(result.fieldsChanged).toContain('logLevel');
 
-      // Verify new config applied
       expect(reloader.getCurrentConfig().logLevel).toBe('debug');
       expect(configApplied).toHaveLength(1);
       expect(configApplied[0].logLevel).toBe('debug');
 
-      // Verify scaler reload was called
       expect(deps.onScalerReload).toHaveBeenCalled();
     });
   });
@@ -361,7 +350,6 @@ describe('Config Integration Tests', () => {
       const { db, state } = createMockDbForStore();
       const store = new SharedConfigStore(db, null);
 
-      // Seed version 1
       const v1Config = {
         agentAuth: 'token' as const,
         queue: { maxDepth: 100 },
@@ -369,7 +357,6 @@ describe('Config Integration Tests', () => {
       const v1 = await store.save(v1Config, 'cli:seed', 'Version 1');
       expect(v1).toBe(1);
 
-      // Seed version 2 with different values
       const v2Config = {
         agentAuth: 'none' as const,
         queue: { maxDepth: 200 },
@@ -377,17 +364,14 @@ describe('Config Integration Tests', () => {
       const v2 = await store.save(v2Config, 'cli:seed', 'Version 2');
       expect(v2).toBe(2);
 
-      // Rollback to version 1
       const v3 = await store.rollback(1, 'cli:rollback');
       expect(v3).toBe(3);
 
-      // Version 3 should have version 1's content
       const v3Row = state.rows.find((r) => r.version === 3);
       expect(v3Row).toBeDefined();
       expect(v3Row!.description).toBe('Rollback to version 1');
       expect(v3Row!.created_by).toBe('cli:rollback');
 
-      // The config content should match version 1
       const v1Row = state.rows.find((r) => r.version === 1);
       expect(v3Row!.config).toBe(v1Row!.config);
     });
@@ -403,7 +387,7 @@ describe('Config Integration Tests', () => {
   });
 
   describe('5. Env var mapping', () => {
-    it('only KICI_-prefixed vars are honored (P5: legacy unprefixed forms ignored)', () => {
+    it('only KICI_-prefixed vars are honored (legacy unprefixed forms ignored)', () => {
       const yamlConfig = makeMinimalLocal();
       const dbConfig: SharedConfig = {
         agentAuth: 'token',
@@ -414,8 +398,7 @@ describe('Config Integration Tests', () => {
         KICI_DATABASE_URL: 'postgres://kici-env',
         KICI_QUEUE_MAX_DEPTH: '2000',
 
-        // Legacy unprefixed — no longer honored after P5 of the env-var
-        // standardization plan.
+        // Legacy unprefixed — not honored.
         DATABASE_URL: 'postgres://legacy',
       };
 
@@ -426,7 +409,7 @@ describe('Config Integration Tests', () => {
       expect(result.queueMaxDepth).toBe(2000);
     });
 
-    it('legacy DATABASE_URL / PLATFORM_URL / PLATFORM_TOKEN do not apply (P5)', () => {
+    it('legacy DATABASE_URL / PLATFORM_URL / PLATFORM_TOKEN do not apply', () => {
       const yamlConfig = makeMinimalLocal();
       const dbConfig: SharedConfig = {
         agentAuth: 'token',
@@ -440,7 +423,7 @@ describe('Config Integration Tests', () => {
 
       const result = resolveFullConfig(yamlConfig, dbConfig, env);
 
-      // P5 dropped the legacy forms — they fall through to YAML defaults.
+      // The legacy forms are ignored — the values fall through to YAML defaults.
       expect(result.databaseUrl).toBe('pg://integration-test');
       expect(result.platformUrl).toBeUndefined();
       expect(result.platformToken).toBeUndefined();

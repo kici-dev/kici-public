@@ -83,8 +83,8 @@ describe('withChangedFiles', () => {
 });
 
 describe('normalizeRoundEvent', () => {
-  // The re-run dispatches this event, not the stamped copy withChangedFiles
-  // returns, so an init job's new-branch diff reads the default branch from it.
+  // The re-run dispatches this event, not withChangedFiles' stamped copy, so an
+  // init job's new-branch diff reads the default branch from it.
   // fails-when: the re-run event carries no defaultBranch and a GitLab new branch reads as range-less
   it('stamps the default branch the normalizer names', () => {
     const normalizer = {

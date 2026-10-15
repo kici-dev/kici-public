@@ -1,19 +1,16 @@
 /**
- * Orchestrator-side handler for the `dashboard.run.state` system reconciliation
- * read.
+ * Handler for the `dashboard.run.state` system reconciliation read.
  *
- * The Platform's `RunMirrorReconciler` issues this request for a run that is
- * stuck non-terminal in the Platform mirror to recover a terminal frame that was
- * dropped on a live Platform↔orchestrator connection. It projects the current
- * `execution_runs` + `execution_jobs` state for one run into the same
- * `StateReplayRun` shape the reconnect `state.replay` push carries, so the
- * Platform can drive it through the shared `upsertRunMirror` helper.
+ * The Platform's `RunMirrorReconciler` sends it for a run stuck non-terminal in
+ * the Platform mirror, to recover a terminal frame dropped on a live
+ * connection. It projects `execution_runs` + `execution_jobs` for one run into
+ * the `StateReplayRun` shape of the reconnect `state.replay` push, so the
+ * Platform drives it through the shared `upsertRunMirror` helper. Pure (deps
+ * passed as arguments), so the `server.ts` wiring stays a thin adapter and the
+ * logic is unit-testable without a live Platform connection.
  *
- * Unlike the user-plane `dashboard.run.detail` read, this handler does NOT write
- * an `access_log` row: it is a system reconciliation read (a `system` actor),
- * not a user data access. The handler is pure (deps passed as arguments) so the
- * WS wiring in `server.ts` stays a thin adapter and the logic is unit-testable
- * without a live Platform connection.
+ * Unlike `dashboard.run.detail`, it writes NO `access_log` row: it is a
+ * `system`-actor reconciliation read, not a user data access.
  */
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
@@ -82,9 +79,7 @@ export async function handleRunState(
     status: row.status as ExecutionRunStatus,
     ...(row.routing_key && { routingKey: row.routing_key }),
     repoIdentifier: row.repo_identifier,
-    // Recorded only when it differs from `repo_identifier`, so its presence
-    // marks a cross-repository global run. The reconciler drives this
-    // projection through `upsertRunMirror`, so dropping it here would recover a
+    // Set only for a cross-repository global run; dropping it would recover a
     // global run into the mirror as an ordinary per-repository one.
     ...(row.workflow_repo_identifier && {
       workflowRepoIdentifier: row.workflow_repo_identifier,

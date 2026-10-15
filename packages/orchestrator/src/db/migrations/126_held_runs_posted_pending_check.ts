@@ -4,25 +4,19 @@ import { type Kysely, sql } from 'kysely';
  * Add `held_runs.posted_pending_check boolean` — whether this hold's pending
  * `KiCI Security` check actually reached the provider.
  *
- * `postCheckStatus` CREATES the named check run when it finds none, so
- * terminalizing a check the hold never posted does not close anything: it puts
- * a completed `KiCI Security` run on a commit that had none. Whether a hold
- * posted one was derived from the row's SHAPE, which answers what the code
- * INTENDED — a post that the provider refused, or that no check poster was in
- * reach to attempt, leaves a shape that says "posted" and a commit that has
- * nothing. The column records what happened instead of what was meant.
+ * `postCheckStatus` CREATES the named check run when it finds none, so terminalizing a check
+ * the hold never posted fabricates a completed `KiCI Security` run. The row's SHAPE only says
+ * what the code intended: a refused post, or one no check poster could attempt, still reads
+ * "posted". This column records what happened.
  *
- * Nullable, with no default, and the three values are distinct:
+ * Nullable, no default:
  *
- * - `true` — the post returned successfully. The hold owns the check.
- * - `false` — no post was attempted, or one was attempted and failed. Nothing
- *   to terminalize; a settle would fabricate.
- * - `null` — the row predates this column, so nothing recorded either way. The
- *   shape derivation still answers for it. A `false` DEFAULT would instead
- *   declare every hold pending at deploy time un-posted and strand the checks
- *   they really do have.
+ * - `true` — the post succeeded; the hold owns the check.
+ * - `false` — no post, or a failed one. Nothing to terminalize; a settle would fabricate.
+ * - `null` — the row predates this column; the shape derivation still answers for it. A `false`
+ *   DEFAULT would mark every hold pending at deploy time un-posted and strand its real check.
  *
- * Idempotent: a re-run on a DB that already has the column is a no-op.
+ * Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colCheck = await sql<{ exists: boolean }>`

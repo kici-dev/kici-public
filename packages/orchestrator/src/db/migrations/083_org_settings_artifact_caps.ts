@@ -4,15 +4,13 @@ import { type Kysely, sql } from 'kysely';
  * Add `org_settings.artifact_max_bytes` + `artifact_max_per_run` (both nullable
  * BIGINT).
  *
- * Per-org overrides of the per-artifact size cap and per-run artifact count cap
- * for user-facing artifacts (ctx.artifacts). NULL falls back to the cluster-wide
- * default (`config.artifactMaxBytes` / `config.artifactMaxPerRun`,
- * `KICI_ARTIFACT_MAX_BYTES` / `KICI_ARTIFACT_MAX_PER_RUN`). Operators tune them
- * per tenant via `kici-admin org-settings artifacts set-max-bytes` /
- * `set-max-per-run`.
+ * Per-org overrides of the per-artifact size cap and per-run count cap for
+ * user-facing artifacts (ctx.artifacts). NULL falls back to the cluster default
+ * (`config.artifactMaxBytes` / `config.artifactMaxPerRun`,
+ * `KICI_ARTIFACT_MAX_BYTES` / `KICI_ARTIFACT_MAX_PER_RUN`). Set via
+ * `kici-admin org-settings artifacts set-max-bytes` / `set-max-per-run`.
  *
- * Idempotent: guarded on column existence; a re-run on a DB that already has a
- * column is a no-op.
+ * Idempotent: guarded on column existence.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const cols = ['artifact_max_bytes', 'artifact_max_per_run'] as const;

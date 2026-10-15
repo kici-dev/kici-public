@@ -16,7 +16,6 @@ function makeDeps() {
   };
 }
 
-/** Narrow the vi.fn() doubles above onto the sink's dep types. */
 function sinkDeps(deps: ReturnType<typeof makeDeps>, source: 'local' | 'peer') {
   return {
     source,
@@ -61,8 +60,8 @@ describe('createLogChunkSink', () => {
 
   it('falls back to the job id when the job name is unknown', async () => {
     const deps = makeDeps();
-    // The resolver itself performs the durable fallback, returning the job id
-    // when neither in-memory state nor dispatch_queue names the job.
+    // The resolver does the durable fallback: the job id when neither in-memory state nor
+    // dispatch_queue names the job.
     deps.executionTracker.resolveJobName.mockResolvedValue('job-1');
     await createLogChunkSink(sinkDeps(deps, 'local'))(chunk);
 

@@ -58,11 +58,9 @@ describe('readNeedsVerdict', () => {
 });
 
 /**
- * A db that reports one needs edge whose upstream sits at `upstreamStatus`,
- * and reports no pending approval hold (so `hasPendingHold` lets us through).
- *
- * `run_on` admits only `success`, so a `failed` upstream yields the skip branch
- * and a `running` upstream yields the not-yet-satisfied branch.
+ * A db with one needs edge whose upstream sits at `upstreamStatus`, and no
+ * pending approval hold. `run_on` admits only `success`, so `failed` yields the
+ * skip branch and `running` the not-yet-satisfied branch.
  */
 function needsDb(upstreamStatus: string) {
   return {
@@ -170,20 +168,17 @@ describe('dispatchReadyJob needs guard', () => {
     );
 
     expect(onJobStatus).not.toHaveBeenCalled();
-    // Non-vacuous by construction: the context survives only if the guard
-    // returned BEFORE consumePendingJobContext. Consuming it with nothing to
-    // terminalize would delete the last resume path.
+    // The context survives only if the guard returned before
+    // consumePendingJobContext; consuming it would delete the last resume path.
     expect(await consumePendingJobContext(undefined, 'run-untracked', 'deploy')).toBeDefined();
   });
 
   it('leaves an already-dispatched job alone rather than resolving it by name', async () => {
-    // The one state where `findSyntheticJobId` misses AND an `execution_jobs`
-    // row for (run_id, job_name) exists is a job whose placeholder was already
-    // swapped for a real dispatched id — a job that already ran. Resolving it
-    // by name would let this gate overwrite a running or `success` row with
-    // `skipped`, because the tracker's upsert carries no terminal-status guard.
-    // The stub therefore reports a real row for every by-name read; the gate
-    // must still terminalize nothing.
+    // `findSyntheticJobId` misses while an `execution_jobs` row for
+    // (run_id, job_name) exists only once the placeholder was swapped for a real
+    // dispatched id. Resolving it by name would let this gate overwrite a running
+    // or `success` row with `skipped` (the tracker's upsert has no terminal-status
+    // guard), so the stub reports a real row for every by-name read.
     const onJobStatus = vi.fn().mockResolvedValue(undefined);
     const dispatchedRowDb = {
       selectFrom: (table: string) => ({
@@ -259,10 +254,9 @@ describe('dispatchReadyJob needs guard', () => {
 
 describe('skip propagation', () => {
   it('routes the skip through onJobStatus, which is what drives evaluateDownstreams', async () => {
-    // The propagation itself lives in ExecutionTracker.runSchedulerHook, which
-    // runs only when onJobStatus is given a TERMINAL status AND a job_id that
-    // resolves to a tracked job. Both are this guard's responsibility, so both
-    // are asserted here.
+    // ExecutionTracker.runSchedulerHook propagates only when onJobStatus gets a
+    // terminal status and a job_id that resolves to a tracked job; this guard
+    // owns both, so both are asserted here.
     const onJobStatus = vi.fn().mockResolvedValue(undefined);
     await storePendingJobContext(undefined, 'run-prop', 'deploy', {
       jobInput: { runId: 'run-prop', jobName: 'deploy', jobConfig: {} } as never,

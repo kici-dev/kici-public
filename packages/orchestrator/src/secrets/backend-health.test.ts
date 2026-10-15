@@ -212,7 +212,6 @@ describe('BackendHealthChecker', () => {
 
       checker.startPeriodicCheck(1000);
 
-      // Advance 1 interval
       await vi.advanceTimersByTimeAsync(1000);
 
       expect(registry.listBackends).toHaveBeenCalled();

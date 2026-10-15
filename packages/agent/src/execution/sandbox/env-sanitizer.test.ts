@@ -51,7 +51,6 @@ describe('buildSanitizedEnv', () => {
   });
 
   it('does not include undefined system vars', () => {
-    // Ensure TMPDIR is not set
     delete process.env.TMPDIR;
 
     const env = buildSanitizedEnv({});
@@ -202,14 +201,12 @@ describe('buildSanitizedEnv trusted-env profile', () => {
     process.env.PATH = '/usr/bin';
     process.env.AWS_ACCESS_KEY_ID = 'AKIA'; // ambient — must stay hidden
 
-    // trustedEnv comes from agent config only; a jobConfig-derived value that
-    // happens to be named KICI_TRUSTED_ENV is just a passed env var and MUST
-    // NOT flip Layer 1 into passthrough.
+    // trustedEnv comes from agent config only; a jobConfig KICI_TRUSTED_ENV is
+    // a plain env var and must not flip Layer 1 into passthrough.
     const env = buildSanitizedEnv({ KICI_TRUSTED_ENV: 'true' }, { trustedEnv: false });
 
     expect(env).not.toHaveProperty('AWS_ACCESS_KEY_ID');
-    // The literal value still merges as a normal Layer-3 env var, but confers
-    // no host-env access.
+    // It still merges as a Layer-3 env var, but confers no host-env access.
     expect(env.KICI_TRUSTED_ENV).toBe('true');
   });
 });
@@ -267,7 +264,6 @@ describe('ALLOWED_SYSTEM_VARS', () => {
   });
 
   it('is a readonly tuple', () => {
-    // Verify it is an array (as const produces a readonly tuple)
     expect(Array.isArray(ALLOWED_SYSTEM_VARS)).toBe(true);
     expect(ALLOWED_SYSTEM_VARS.length).toBeGreaterThan(0);
   });

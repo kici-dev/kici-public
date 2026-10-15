@@ -10,9 +10,8 @@ import { createMockDb as createSharedMockDb } from '../__test-helpers__/mock-db.
 // ── Mock helpers ──────────────────────────────────────────────────
 
 /**
- * Cluster-settings reader stub. `getNumber` returns `override` when provided,
- * else the caller's `fallback` (the config.ts default) — mirroring the real
- * reader's null-column behavior.
+ * `getNumber` returns `override` when provided, else the caller's `fallback`,
+ * mirroring the real reader's null-column behavior.
  */
 function makeClusterSettingsStub(override?: number): ClusterSettingsReader {
   return {
@@ -39,22 +38,16 @@ function createMockExecutionTracker(): ExecutionTracker {
 }
 
 /**
- * Create a mock Kysely DB with configurable query results.
- * Each selectFrom call creates a fresh chain so query results are
- * delivered in the correct order regardless of method chaining.
- *
- * NOTE: This test uses a specialized mock (sequential selectFrom results
- * via a call counter) instead of the shared createMockDb() from
- * '../__test-helpers__/mock-db.js' because OrphanRecovery calls selectFrom
- * multiple times in a single scan and needs different results each time.
+ * Each selectFrom call returns the next queued result. The shared createMockDb()
+ * does not fit: OrphanRecovery calls selectFrom several times per scan and needs
+ * a different result each time.
  */
 function createMockDb(config: {
   staleRuns?: any[];
   jobs?: any[];
   /**
    * Row returned by the `hasRecentProgress` aggregate (the 2nd `selectFrom` of
-   * a recovery pass). Undefined (the default) means "no progress recorded", so
-   * the run stays orphan-eligible — the shape every pre-existing test assumes.
+   * a recovery pass). Undefined means no progress, so the run stays orphan-eligible.
    */
   progress?: {
     last_heartbeat_at?: Date | null;
@@ -223,7 +216,6 @@ describe('OrphanRecovery', () => {
       await recovery.scanForOrphans();
 
       expect(raft.isLeader).toHaveBeenCalled();
-      // DB should NOT be queried
       expect(mockDb.selectFrom).not.toHaveBeenCalled();
 
       recovery.stop();
@@ -324,7 +316,6 @@ describe('OrphanRecovery', () => {
       const raft = createMockRaft(true);
       const tracker = createMockExecutionTracker();
 
-      // All jobs are terminal
       const terminalJobs = [
         { job_id: 'job-1', job_name: 'test', status: 'success', last_heartbeat_at: null },
         { job_id: 'job-2', job_name: 'lint', status: 'success', last_heartbeat_at: null },
@@ -357,7 +348,6 @@ describe('OrphanRecovery', () => {
       // No peers connected with the routing key -- coordinator is dead
       await recovery.scanForOrphans();
 
-      // Should delegate run completion to executionTracker
       expect(tracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-1');
       expect(tracker.emitInfraEvent).toHaveBeenCalledWith(
         'run-1',
@@ -411,9 +401,7 @@ describe('OrphanRecovery', () => {
 
       await recovery.scanForOrphans();
 
-      // Should have updated the stuck job to failed
       expect(tracker.updateInMemoryJob).toHaveBeenCalledWith('run-1', 'job-1', 'failed');
-      // Should delegate run completion to executionTracker
       expect(tracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-1');
 
       recovery.stop();
@@ -727,7 +715,6 @@ describe('OrphanRecovery', () => {
 
       await recovery.scanForOrphans();
 
-      // Should delegate run completion to executionTracker
       expect(tracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-1');
 
       recovery.stop();
@@ -754,15 +741,12 @@ describe('OrphanRecovery', () => {
 
       recovery.start();
 
-      // Advance time to trigger scan
       vi.advanceTimersByTime(1000);
 
-      // isLeader is called by the scan
       expect(raft.isLeader).toHaveBeenCalled();
 
       recovery.stop();
 
-      // Reset the mock
       (raft.isLeader as ReturnType<typeof vi.fn>).mockClear();
 
       // After stop, advancing time should NOT trigger more scans
@@ -790,7 +774,7 @@ describe('OrphanRecovery', () => {
 
       vi.advanceTimersByTime(1000);
 
-      // Should only have been called once (one interval, not two)
+      // One interval, not two.
       expect(raft.isLeader).toHaveBeenCalledTimes(1);
 
       recovery.stop();

@@ -1,32 +1,24 @@
 /**
- * kici orchestrators commands
- *
- * Inspect the org's connected orchestrator clusters and pick a per-org default
- * for `kici run remote`. `list` reads the Platform orchestrators index;
- * `use <name>` records `config.defaultClusters[orgId]` so a developer with a
- * preferred cluster types no `--orchestrator` flag.
+ * `kici orchestrators`: `list` reads the Platform orchestrators index; `use
+ * <name>` records `config.defaultClusters[orgId]`, the per-org default `kici run
+ * remote` uses when no `--orchestrator` flag is given.
  */
 
 import pc from 'picocolors';
 import { loadGlobalConfig, mergeGlobalConfig, type GlobalConfig } from '../remote/config.js';
 
-/** Options shared by the orchestrators subcommands. */
 export interface OrchestratorsOptions {
-  /** Target organization id (overrides config.activeOrgId). */
+  /** Overrides config.activeOrgId. */
   org?: string;
 }
 
-/** One connected orchestrator cluster, as returned by the Platform index. */
 interface OrchestratorEntry {
   clusterName: string | null;
   routingKeys: string[];
   orchVersion: string | null;
 }
 
-/**
- * Resolve the authenticated config + the target org id, printing an actionable
- * error and returning null when either is missing.
- */
+/** Prints an actionable error and returns null when the login or org is missing. */
 async function resolveOrgContext(
   options: OrchestratorsOptions,
 ): Promise<{ config: GlobalConfig; orgId: string } | null> {
@@ -51,10 +43,7 @@ async function resolveOrgContext(
   return { config, orgId };
 }
 
-/**
- * Fetch the org's connected orchestrator clusters from the Platform index.
- * Returns null on an auth/HTTP failure (after printing an error).
- */
+/** Returns null, after printing an error, on an auth or HTTP failure. */
 async function fetchOrchestrators(
   config: GlobalConfig,
   orgId: string,
@@ -81,9 +70,6 @@ async function fetchOrchestrators(
   return body.orchestrators ?? [];
 }
 
-/**
- * List the org's connected orchestrator clusters, marking the per-org default.
- */
 export async function orchestratorsListCommand(options: OrchestratorsOptions): Promise<boolean> {
   const ctx = await resolveOrgContext(options);
   if (!ctx) return false;
@@ -116,12 +102,7 @@ export async function orchestratorsListCommand(options: OrchestratorsOptions): P
   return true;
 }
 
-/**
- * Set the per-org default orchestrator cluster.
- *
- * Validates the cluster name against the org's connected clusters before
- * writing it to `config.defaultClusters[orgId]`.
- */
+/** Validates the name against the org's connected clusters before saving it. */
 export async function orchestratorsUseCommand(
   clusterName: string,
   options: OrchestratorsOptions,

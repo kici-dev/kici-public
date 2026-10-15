@@ -9,7 +9,7 @@ import {
   notificationsChannelsRemoveCommand,
 } from './notifications.js';
 
-/** Install a fake NotificationsClient with the given method stubs. */
+/** Fakes NotificationsClient with the given method stubs. */
 function stubClient(methods: Partial<Record<string, ReturnType<typeof vi.fn>>>): void {
   vi.spyOn(clientModule.NotificationsClient, 'load').mockResolvedValue(
     methods as unknown as clientModule.NotificationsClient,

@@ -67,10 +67,8 @@ describe('chunkReplayRuns', () => {
   });
 
   it('keeps the run bound at or under the wire cap', () => {
-    // The load-bearing relation, asserted directly rather than by restating 500:
-    // a chunk bound above STATE_REPLAY_MAX_RUNS would rebuild exactly the
-    // unsendable frame this module exists to prevent. Raising the bound past the
-    // schema cap must fail here rather than in production.
+    // Asserted as a relation, not a restated 500: a chunk bound above
+    // STATE_REPLAY_MAX_RUNS rebuilds the unsendable frame this module prevents.
     expect(REPLAY_CHUNK_MAX_RUNS).toBeLessThanOrEqual(STATE_REPLAY_MAX_RUNS);
   });
 

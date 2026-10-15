@@ -1,38 +1,18 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * `execution_runs` / `execution_jobs` / `execution_steps` cold-store
- * schema additions.
+ * Cold-store columns for `execution_runs` / `execution_jobs` / `execution_steps`.
  *
- * Part of the cold-storage archival system.
+ * Each table gets `archived_at` and `archive_object_key` (both NULL), set inside the archive tx
+ * before the DELETE; survivors carry NULL, as `run_events` does in the Platform's schema.
  *
- * Each table gets `archived_at TIMESTAMPTZ NULL` and
- * `archive_object_key TEXT NULL` (set inside the archive tx before the
- * DELETE; survivors carry NULL — the same pattern `run_events` carries
- * in the Platform's schema).
+ * The archiver partitions by `routing_key`, which only `execution_runs` carried; jobs and steps
+ * get it denormalized (avoiding a 3-table JOIN per archive cycle) with a one-shot backfill from
+ * their runs. New inserts must populate it (enforced at the application layer). It stays
+ * NULLable so a missed insert site still lands; `listEligiblePartitions` skips NULL tenants.
  *
- * Tenant column denormalization: the orchestrator side partitions by
- * `routing_key`, but only `execution_runs` carries the column today.
- * `execution_jobs` and `execution_steps` reference the run by `run_id`
- * and would otherwise need a 3-table JOIN at every archive cycle. We
- * denormalize `routing_key` onto both tables and backfill from the
- * existing run rows. Backfill is one-shot inside this migration. New
- * inserts must populate the column going forward (enforced at the
- * application layer).
- *
- * The denormalized column is left NULLable for safety: if an insert
- * site is missed in the rollout, the row still lands in PG; the
- * cold-store adapter's `listEligiblePartitions` skips NULLs (no
- * tenant ⇒ no archive). A follow-up migration may tighten to NOT NULL
- * once we're confident every insert site is updated.
- *
- * Composite indexes added for the archiver's
- * `listEligiblePartitions` discovery query
- * (`GROUP BY routing_key, DATE(created_at)`):
- *
- *   - `idx_execution_runs_routing_key_created  (routing_key, created_at)`
- *   - `idx_execution_jobs_routing_key_created  (routing_key, created_at)`
- *   - `idx_execution_steps_routing_key_created (routing_key, created_at)`
+ * The `(routing_key, created_at)` indexes serve the archiver's `listEligiblePartitions` query
+ * (`GROUP BY routing_key, DATE(created_at)`).
  */
 
 export async function up(db: Kysely<unknown>): Promise<void> {

@@ -1,26 +1,23 @@
 /**
  * Decide whether a container job's `.kici/` install may run on the agent host.
  *
- * The host install exists so a registry the job network cannot reach still
- * works. It must never run code the repository controls on the agent host, so
- * this module is a positive allowlist: a checkout qualifies only when every
- * input the install reads is a plain, registry-only npm or pnpm project. Any
- * other shape — yarn, a workspace, a pnpm hook, a git / file / tarball-URL
- * dependency, a workflow or repository registry or a lockfile URL outside the
- * origins the operator allows, a symlinked manifest, an `.npmrc` with a
- * control character — is refused, and the job container installs the
- * dependencies as it always has.
+ * The host install lets a registry the job network cannot reach still work. It
+ * must never run repository-controlled code on the agent host, so this is a
+ * positive allowlist: only a plain, registry-only npm or pnpm project
+ * qualifies. Anything else — yarn, a workspace, a pnpm hook, a git / file /
+ * tarball-URL dependency, a registry or lockfile URL outside the allowed
+ * origins, a symlinked manifest, an `.npmrc` with a control character — is
+ * refused, and the job container installs instead.
  *
- * The host install runs outside the job network's egress filter, so every
- * origin it contacts must be one the operator chose: the public npm registry,
- * the `KICI_HOST_INSTALL_REGISTRIES` origins, and the registries in the agent
- * user's own `~/.npmrc`. A workflow's `registries:` block and `.kici/.npmrc`
- * are repository input and never widen that set.
+ * The host install runs outside the job network's egress filter, so it may
+ * contact only operator-chosen origins: the public npm registry, the
+ * `KICI_HOST_INSTALL_REGISTRIES` origins, and the agent user's `~/.npmrc`
+ * registries. A workflow's `registries:` and `.kici/.npmrc` are repository
+ * input and never widen that set.
  *
- * Every read here is of data files (JSON / YAML / `.npmrc`); nothing in the
- * checkout is executed or imported. `.npmrc` files are read with npm's own
- * parser (`npmrc-allowlist.ts`), so this check and the install see the same
- * keys.
+ * Only data files (JSON / YAML / `.npmrc`) are read; nothing in the checkout
+ * is executed or imported. `.npmrc` is read with npm's own parser
+ * (`npmrc-allowlist.ts`), so this check and the install see the same keys.
  */
 
 import { lstat, readFile } from 'node:fs/promises';
@@ -87,11 +84,7 @@ export interface HostInstallPlan {
   packageManager: PackageManager.Npm | PackageManager.Pnpm;
   /** Basename of the lockfile inside `.kici/`, or `null` when there is none. */
   lockfile: string | null;
-  /**
-   * The registries the install may fetch package tarballs from: npm's public
-   * registry, the `KICI_HOST_INSTALL_REGISTRIES` origins and the registries in
-   * the agent user's own `~/.npmrc`.
-   */
+  /** Where the install may fetch tarballs: the operator-chosen origins (module doc). */
   registries: readonly URL[];
   /** npm's parser and the allowlisted entries the install's `.npmrc` is written from. */
   npmrc: { ini: IniCodec; operator: NpmrcEntries; repo: NpmrcEntries };
@@ -244,9 +237,8 @@ export function findNonRegistryOverride(overrides: unknown, path: string): strin
 }
 
 /**
- * Whether an npm lockfile `version` names a non-registry source: anything but a
- * version, a range, a dist-tag or an `npm:` alias. npm fetches a locked package
- * that has no `resolved` URL from what its version names, so
+ * Whether an npm lockfile `version` names a non-registry source. npm fetches a
+ * locked package with no `resolved` URL from what its version names, so
  * `http:127.0.0.1:9/x.tgz` or a host path is a source, not a version.
  */
 function isExoticNpmLockValue(value: unknown): boolean {
@@ -485,9 +477,8 @@ async function checkLockfile(
 }
 
 /**
- * Refuse a workflow-declared registry (the job's `registries:`) whose origin
- * is not in `allowed`. The workflow chose it, and its token would be sent
- * there from outside the job network's egress filter.
+ * Refuse a job `registries:` entry off the `allowed` origins: the workflow
+ * chose it, and its token would go there from outside the egress filter.
  */
 function checkWorkflowRegistries(
   workflow: readonly NpmRegistrySpec[],
@@ -531,14 +522,13 @@ function checkRepoRegistries(repo: NpmrcEntries, allowed: ReadonlySet<string>): 
 }
 
 /**
- * Refuse a kept registry-auth value that references a variable npm, pnpm or
- * Node reads. The install passes an install secret only under a name such a
- * value references, so this keeps a secret named `HTTPS_PROXY` or
- * `NODE_OPTIONS` out of the install's environment.
+ * Refuse a kept registry-auth value referencing a variable npm, pnpm or Node
+ * reads. An install secret is passed only under a name such a value
+ * references, so this keeps e.g. `HTTPS_PROXY` or `NODE_OPTIONS` out.
  */
 function checkAuthEnvReferences(npmrc: HostInstallPlan['npmrc']): Refused | null {
-  // Only portable variable names are tested: `authEnvReferences` also yields the
-  // whole reference text, such as `NPM_TOKEN?`, which no install secret is named.
+  // Only portable names: `authEnvReferences` also yields raw reference text
+  // such as `NPM_TOKEN?`, which no install secret is named.
   const toolRead = [...authEnvReferences([npmrc.operator, npmrc.repo])]
     .filter(isEnvVarName)
     .filter(isToolReadEnvName);
@@ -602,7 +592,6 @@ async function resolveNpmrc(
 }
 
 /**
- * Decide whether the `.kici/` of `workflowDir` may be installed on the host.
  * Package-manager detection matches the in-container install: the repository
  * root's manifests first, then `.kici/`, then npm.
  */

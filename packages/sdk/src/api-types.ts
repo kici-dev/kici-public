@@ -1,9 +1,8 @@
 /**
  * Typed KiCI API available to workflows via ctx.kici.
  *
- * Each namespace groups related methods. Under the hood, calls are serialized
- * to { method: 'namespace.method', params } and sent over the agent's WS
- * connection to the orchestrator. Adding a new API method:
+ * Each call is serialized to { method: 'namespace.method', params } and sent
+ * over the agent's WS connection to the orchestrator. Adding a new API method:
  *
  * 1. Add the typed method here (with param + return types)
  * 2. Register the handler in the orchestrator's AgentApiRegistry
@@ -211,16 +210,13 @@ export type KiciApiTransport = (
 ) => Promise<unknown>;
 
 /**
- * Build a typed KiciApi proxy from a raw transport function.
+ * Build a typed KiciApi proxy over the untyped WS/IPC transport.
  *
- * This is the bridge between the typed SDK interface and the untyped WS/IPC
- * transport. Each method call is mapped to { method: 'namespace.method', params }.
- *
- * `jobCtx` carries the per-job execution context (the job the step is running
- * in). It is supplied by the agent's sandbox step context so `oidc.token()` can
- * bind its request to that job; the workflow author never supplies it. It is
- * omitted for contexts with no running job (e.g. DynamicJobFn re-evaluation),
- * where `oidc.token()` throws rather than silently misattributing a token.
+ * `jobCtx` names the job the step runs in. The agent's sandbox step context
+ * supplies it so `oidc.token()` can bind its request to that job; the workflow
+ * author never supplies it. It is omitted where no job runs (e.g. DynamicJobFn
+ * re-evaluation), and there `oidc.token()` throws rather than misattributing a
+ * token.
  */
 export function buildKiciApi(transport: KiciApiTransport, jobCtx?: { jobId: string }): KiciApi {
   return {
@@ -228,9 +224,8 @@ export function buildKiciApi(transport: KiciApiTransport, jobCtx?: { jobId: stri
       list: () => transport('infrastructure.list', {}) as Promise<InfrastructureListResult>,
     },
     inventory: {
-      // `inventory` works without `jobCtx` (unlike `oidc.token`): the roster is
-      // cluster-scoped, not job-bound, so it is available to dynamic-job
-      // re-evaluation as well as steps.
+      // No `jobCtx` needed: the roster is cluster-scoped, so dynamic-job
+      // re-evaluation can query it too.
       query: (selector) =>
         transport('inventory.query', { ...(selector ?? {}) }) as Promise<HostInventoryEntry[]>,
       get: (agentId) =>
@@ -260,8 +255,8 @@ export function buildKiciApi(transport: KiciApiTransport, jobCtx?: { jobId: stri
             );
           }
           if (opts.repositories.length === 0) {
-            // An empty list would mint across the whole installation. Refuse:
-            // a write grant must always name a specific repository.
+            // An empty list would mint across the whole installation; a write
+            // grant must name a specific repository.
             return Promise.reject(
               new Error('git.github.getToken requires at least one repository'),
             );

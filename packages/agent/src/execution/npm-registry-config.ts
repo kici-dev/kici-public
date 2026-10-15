@@ -1,31 +1,22 @@
 /**
- * Apply private-npm-registry auth to a workflow's `.kici/.npmrc` for the
- * lifetime of one `npm install` invocation, then restore the file on cleanup.
+ * Applies private-npm-registry auth to a workflow's `.kici/.npmrc` for one
+ * `npm install`, then restores the file on cleanup. The closure cleanup
+ * (like `setupSshAuth.cleanup()` in `checkout/git-clone.ts`) exists because
+ * the committed `.kici/.npmrc` may carry literal `${VAR}` placeholders or
+ * unrelated scope mappings that must NOT be clobbered permanently.
  *
- * Why a closure-cleanup pattern (mirrors `setupSshAuth.cleanup()` in
- * `packages/agent/src/checkout/git-clone.ts`): the customer's committed
- * `.kici/.npmrc` may carry literal `${VAR}` placeholders or an unrelated
- * scope mapping. We must NOT clobber it permanently — we just want to
- * append the agent-managed registry/auth lines for this single install,
- * then revert.
- *
- * Token bytes never end up in the on-disk `.npmrc`. Each registry's token
- * is exposed as a job-scoped env var (`KICI_NPM_TOKEN_${jobIdShort}_<i>`)
- * and the on-disk auth line carries the env var reference (`${VAR}`). npm
- * substitutes at read time. The job-scoped nonce makes the env var name
+ * Token bytes never reach the on-disk `.npmrc`: each token is a job-scoped env
+ * var (`KICI_NPM_TOKEN_${jobIdShort}_<i>`), the auth line carries `${VAR}`, and
+ * npm substitutes at read time. The job-scoped nonce makes the name
  * unguessable from outside the install subprocess.
  *
- * Merge order: customer-committed `.npmrc` lines come FIRST, agent-generated
- * lines come LAST. npm's last-wins semantics make the agent's line shadow
- * any literal `_authToken=...` the customer accidentally committed for a
- * registry KiCI manages — refuses to let a committed secret beat a managed
- * one.
+ * Customer lines come FIRST, agent lines LAST: npm's last-wins makes the
+ * managed line shadow any literal `_authToken=...` committed for a registry
+ * KiCI manages.
  *
- * `installEnvSecrets` is a separate channel for customers who prefer the
- * "commit a `.kici/.npmrc` with `${MY_TOKEN}` and supply MY_TOKEN as a
- * scoped secret" pattern. Each entry becomes
- * an env var on the install subprocess; the customer's existing `.npmrc`
- * uses it as `${MY_TOKEN}`.
+ * `installEnvSecrets` is a separate channel for the "commit `${MY_TOKEN}` in
+ * `.kici/.npmrc` and supply MY_TOKEN as a scoped secret" pattern: each entry
+ * becomes an env var on the install subprocess.
  */
 
 import { readFile, writeFile, unlink } from 'node:fs/promises';
@@ -42,16 +33,14 @@ export interface NpmRegistrySpec {
 export interface ApplyNpmRegistryConfigArgs {
   /** Absolute path to the workflow's `.kici/` directory. */
   kiciDir: string;
-  /** Resolved registries from the orchestrator. Empty/undefined = no-op. */
   npmRegistries: readonly NpmRegistrySpec[] | undefined;
   /** Bare-name resolved secrets to project as install env vars. */
   installEnvSecrets: Record<string, string> | undefined;
-  /** Short (8 char) job-scoped nonce — used as suffix on synthesized env-var names. */
+  /** Short (8 char) job-scoped nonce, the suffix of synthesized env-var names. */
   jobIdShort: string;
   /**
-   * Disable package lifecycle scripts. Read by the berry flavor, which controls
-   * them through `.yarnrc.yml` (`enableScripts`) rather than a CLI flag.
-   * Defaults to true when omitted.
+   * Disable lifecycle scripts (default true). Read by the berry flavor, which
+   * controls them through `.yarnrc.yml` (`enableScripts`), not a CLI flag.
    */
   ignoreScripts?: boolean;
 }
@@ -65,7 +54,6 @@ export interface ApplyNpmRegistryConfigResult {
   cleanup: () => Promise<void>;
 }
 
-/** No-op result returned when nothing needs to be applied. */
 function noopResult(): ApplyNpmRegistryConfigResult {
   return {
     extraEnv: {},
@@ -74,12 +62,10 @@ function noopResult(): ApplyNpmRegistryConfigResult {
   };
 }
 
-/** Build the synthesized env-var name for registry index `i`. */
 export function tokenEnvName(jobIdShort: string, index: number): string {
   return `KICI_NPM_TOKEN_${jobIdShort}_${index}`;
 }
 
-/** Render the agent-managed block of `.npmrc` lines. */
 export function renderAgentLines(
   registries: readonly NpmRegistrySpec[],
   jobIdShort: string,
@@ -89,9 +75,9 @@ export function renderAgentLines(
   for (let i = 0; i < registries.length; i++) {
     const reg = registries[i];
     const envVar = tokenEnvName(jobIdShort, i);
-    // Strip the URL's protocol; npm's auth-token line uses `//host/path/`
-    // (RFC 3986 authority + path, sans scheme). Both http and https map to
-    // the same `//host/` form so an http-toggled registry still authenticates.
+    // npm's auth-token key is `//host/path/` (RFC 3986 authority + path, no
+    // scheme); http and https map to the same key, so an http-toggled
+    // registry still authenticates.
     const authKey = reg.url.replace(/^https?:/, '');
     if (reg.scope) {
       lines.push(`${reg.scope}:registry=${reg.url}`);
@@ -106,7 +92,7 @@ export function renderAgentLines(
   return `# kici-managed: applied for one npm install only\n${lines.join('\n')}\n`;
 }
 
-/** Read original `.npmrc` bytes; null if the file does not exist. */
+/** Null when the file does not exist. */
 async function readOriginalNpmrc(npmrcPath: string): Promise<string | null> {
   try {
     return await readFile(npmrcPath, 'utf8');
@@ -117,11 +103,7 @@ async function readOriginalNpmrc(npmrcPath: string): Promise<string | null> {
   }
 }
 
-/**
- * Apply the merged `.npmrc` and return env + redaction + cleanup. Caller
- * runs the npm install with `extraEnv` merged in, then awaits cleanup()
- * inside the install's `finally`.
- */
+/** The caller runs the install with `extraEnv` merged in and awaits cleanup() in its `finally`. */
 export async function applyNpmRegistryConfig(
   args: ApplyNpmRegistryConfigArgs,
 ): Promise<ApplyNpmRegistryConfigResult> {
@@ -134,8 +116,6 @@ export async function applyNpmRegistryConfig(
   const npmrcPath = join(args.kiciDir, '.npmrc');
   const original = await readOriginalNpmrc(npmrcPath);
 
-  // Build the synthesized token env vars. Use a job-scoped nonce so the var
-  // name is unguessable from outside this install subprocess.
   const tokenEnv: Record<string, string> = {};
   const tokensForRedaction: string[] = [];
   for (let i = 0; i < registries.length; i++) {
@@ -176,13 +156,12 @@ export async function applyNpmRegistryConfig(
   };
 }
 
-/** Mask every token in `tokensForRedaction` out of `input` before logging. */
 export function redactNpmOutput(input: string, tokens: readonly string[]): string {
   if (!input) return input;
   let out = input;
   for (const token of tokens) {
     if (!token) continue;
-    // Split-join is a literal replace (no regex escaping required).
+    // Split-join is a literal replace (no regex escaping).
     out = out.split(token).join('***REDACTED***');
   }
   return out;

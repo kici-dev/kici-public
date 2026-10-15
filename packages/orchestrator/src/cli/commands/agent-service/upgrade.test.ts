@@ -1,11 +1,6 @@
 /**
- * Tests for the agent upgrade command's commander wiring.
- *
- * The upgrade body delegates to performVersionedUpgrade (covered separately
- * in shared/versioned-upgrade.test.ts). These tests verify the agent
- * subcommand registers the folder-anchored option set: --instance-dir is
- * present, --name has no default, and the action threads opts through to the
- * shared upgrade helper with component: 'agent'.
+ * Commander wiring of `agent upgrade` only; the body is performVersionedUpgrade,
+ * covered in shared/versioned-upgrade.test.ts.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -36,8 +31,6 @@ describe('agent upgrade — folder-anchored', () => {
   });
 
   it('refuses without --instance-dir/--name (delegates refusal to performVersionedUpgrade)', () => {
-    // The `--name` option no longer has a default — commander parses without
-    // injecting a value, leaving it undefined for the action callback.
     const cmd = program.commands.find((c) => c.name() === 'upgrade')!;
     const nameOption = cmd.options.find((o) => o.long === '--name');
     expect(nameOption).toBeDefined();
@@ -65,7 +58,6 @@ describe('agent upgrade — folder-anchored', () => {
       instanceDir: '/tmp/some-dir',
       version: '0.3.0',
     });
-    // No default --name in the parsed opts.
     expect((opts as { name?: string }).name).toBeUndefined();
   });
 });

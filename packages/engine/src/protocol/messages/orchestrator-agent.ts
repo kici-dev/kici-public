@@ -24,20 +24,7 @@ import type { LockJob } from '../../trigger/types.js';
 export const CacheRefScope = z.enum(['shared', 'isolated']);
 export type CacheRefScope = z.infer<typeof CacheRefScope>;
 
-/**
- * Frozen snapshot of upstream job outputs for a result-aware dynamic generator.
- *
- * Captured once when the deferred eval job is dispatched (its upstreams are
- * terminal at that point) and replayed unchanged on agent-side re-eval, so the
- * generator sees the same `ctx.needs` data on both passes.
- *
- * - `jobs` maps an upstream job name to its outputs record.
- * - `groups` maps a dynamic group name to its ordered member job names.
- * - `statuses` maps an upstream job name to its terminal status, so the
- *   generator's `ctx.needs.<job>.status` reflects the frozen upstream outcome.
- * - `invokeResults` maps an invoke-gate job name to its ordered per-run results,
- *   so the generator's `ctx.needs.<gate>.result` reflects each summoned run.
- */
+/** One run an invoke gate triggered, with its declared outputs. */
 export const invokeResultSchema = z.object({
   repo: z.string(),
   workflow: z.string(),
@@ -47,6 +34,20 @@ export const invokeResultSchema = z.object({
 });
 export type InvokeResult = z.infer<typeof invokeResultSchema>;
 
+/**
+ * Frozen snapshot of upstream job outputs for a result-aware dynamic generator.
+ *
+ * Captured once when the deferred eval job is dispatched (its upstreams are
+ * terminal at that point) and replayed unchanged on agent-side re-eval, so the
+ * generator sees the same `ctx.needs` data on both passes.
+ *
+ * - `jobs` maps an upstream job name to its outputs record.
+ * - `groups` maps a dynamic group name to its ordered member job names.
+ * - `statuses` maps an upstream job name to its terminal status
+ *   (`ctx.needs.<job>.status`).
+ * - `invokeResults` maps an invoke-gate job name to its ordered per-run results
+ *   (`ctx.needs.<gate>.result`).
+ */
 export const upstreamSnapshotSchema = z.object({
   jobs: z.record(z.string(), z.record(z.string(), z.unknown())),
   groups: z.record(z.string(), z.array(z.string())),
@@ -58,8 +59,7 @@ export type UpstreamSnapshot = z.infer<typeof upstreamSnapshotSchema>;
 // --- Orchestrator -> Agent messages ---
 
 /**
- * Structured git-clone auth material. Carries everything the agent needs to
- * authenticate a single `git clone`:
+ * Auth material for a single `git clone`:
  *
  *   - `kind: 'basic'` — HTTPS Basic auth (PAT / password). `secret` is the
  *     token, `user` is the Basic-auth username (defaults filled in by the
@@ -67,9 +67,8 @@ export type UpstreamSnapshot = z.infer<typeof upstreamSnapshotSchema>;
  *   - `kind: 'ssh'` — SSH key auth. `secret` is the PEM-encoded private key.
  *     `sshHostKeyPolicy` + `sshKnownHostsPem` drive StrictHostKeyChecking.
  *
- * Used by `sourceAuth` and `workflowAuth` on `jobDispatchSchema` so a single
- * global-workflow dispatch can carry two different credentials (one per
- * clone target — required for cross-provider global workflows).
+ * `jobDispatchSchema` carries one each in `sourceAuth` and `workflowAuth`, as
+ * a cross-provider global workflow needs a credential per clone target.
  */
 export const gitAuthSchema = z
   .object({
@@ -84,10 +83,8 @@ export const gitAuthSchema = z
     sshKnownHostsPem: z.string().optional(),
   })
   .superRefine((val, ctx) => {
-    // Mirror the agent-side guard in `setupSshAuth` (packages/agent/src/checkout/ssh-auth.ts):
-    // pinned host-key checking with no known_hosts content is a misconfiguration that
-    // would only surface at clone time. Reject at the protocol layer so a bad orchestrator
-    // dispatch fails fast with a clear error instead of crashing the agent mid-job.
+    // Mirrors the agent's `setupSshAuth` guard (packages/agent/src/checkout/ssh-auth.ts),
+    // so a bad dispatch fails fast here instead of crashing the agent mid-job at clone time.
     if (val.kind === 'ssh' && val.sshHostKeyPolicy === 'pinned' && !val.sshKnownHostsPem) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -127,11 +124,7 @@ export const jobDispatchSchema = z.object({
   concurrencyWaitTimeoutMs: z.coerce.number().optional(),
   /** URL or file:// path to a pre-packed `.kici/` source tarball. If present, agent extracts it into workDir instead of cloning the repo. */
   sourceTarUrl: z.string().optional(),
-  /**
-   * SHA-256 of the source tarball's own bytes, for integrity verification
-   * before extraction. The sibling of `depsHash`, which has always carried
-   * the dependency tarball's real digest.
-   */
+  /** SHA-256 of the source tarball's bytes, verified before extraction (sibling of `depsHash`). */
   sourceTarDigest: z.string().optional(),
   /** URL or file:// path to pre-built dependency tarball. If present, agent extracts to .kici/node_modules/ instead of running install. */
   depsUrl: z.string().optional(),
@@ -146,16 +139,16 @@ export const jobDispatchSchema = z.object({
    * agent has to freeze before its identity token exists (the deferred path).
    *
    * Every field is what `buildIdTokenClaims` derives from the run row, so a
-   * frozen statement built from this is field-for-field what a live mint
-   * would have produced — and the server can therefore cross-check it. The
-   * agent's local guess is NOT: the job's checkout `ref` is a pull request's
-   * HEAD branch where the claim is the BASE branch, and `workflowRef` here is
-   * the `<name>@<sha>` claim rather than a global workflow's clone ref.
+   * frozen statement matches a live mint field for field and the server can
+   * cross-check it. The agent's local guess does not: its checkout `ref` is a
+   * pull request's HEAD branch where the claim is the BASE branch, and
+   * `workflowRef` here is the `<name>@<sha>` claim, not a global workflow's
+   * clone ref.
    *
    * Absent when the orchestrator has no provenance issuer configured, or when
-   * a worker dispatches a rerouted job. The agent then falls back to its local
-   * guess. That fallback statement fails the capture cross-check, so the
-   * defer is dropped rather than stored unchecked.
+   * a worker dispatches a rerouted job. The agent then uses its local guess,
+   * which fails the capture cross-check, so the defer is dropped rather than
+   * stored unchecked.
    */
   provenanceContext: provenanceContextSchema.optional(),
   /** Plain outputs from upstream jobs (keyed by job name, then by step name). Populated for downstream jobs with `needs` dependencies. */
@@ -177,22 +170,18 @@ export const jobDispatchSchema = z.object({
    */
   sourceAuth: gitAuthSchema.optional(),
   /**
-   * Structured clone auth for the **workflow** repo in a global-workflow
-   * dispatch (when the workflow is authored on a different source than the
-   * source repo). When `jobConfig.isGlobalWorkflow === true` and the two
-   * providers differ, the orchestrator populates `sourceAuth` from the
-   * inbound bundle and `workflowAuth` from the registration's bundle.
-   *
-   * For same-provider global workflows this is typically absent and the
-   * agent reuses `sourceAuth` for both clones.
+   * Clone auth for the **workflow** repo in a global-workflow dispatch. When
+   * `jobConfig.isGlobalWorkflow === true` and the two providers differ, the
+   * orchestrator fills `sourceAuth` from the inbound bundle and `workflowAuth`
+   * from the registration's bundle. For a same-provider global workflow it is
+   * typically absent and the agent reuses `sourceAuth` for both clones.
    */
   workflowAuth: gitAuthSchema.optional(),
   /**
-   * Private npm registries the agent should authenticate against before
-   * `npm install`. Each entry's `token` is the resolved value (the
-   * orchestrator already looked it up via the per-environment
-   * secretResolver path; protection-rule gates have already passed at this
-   * point). Untrusted contributors get an empty list.
+   * Private npm registries the agent authenticates against before
+   * `npm install`. Each `token` is already resolved by the orchestrator's
+   * per-environment secretResolver, after protection-rule gates passed.
+   * Untrusted contributors get an empty list.
    */
   npmRegistries: z
     .array(
@@ -205,12 +194,9 @@ export const jobDispatchSchema = z.object({
     )
     .optional(),
   /**
-   * Registry credentials for pulling this job's container image, already
-   * resolved by the orchestrator (the lock carries secret NAMES; the agent
-   * never resolves them itself).
-   *
-   * Absent when the job's image needs no registry credential — the agent
-   * then pulls anonymously.
+   * Registry credentials for pulling this job's container image, resolved by
+   * the orchestrator (the lock carries secret NAMES; the agent never resolves
+   * them). Absent ⇒ the agent pulls anonymously.
    */
   containerRegistryAuth: z
     .object({
@@ -220,10 +206,9 @@ export const jobDispatchSchema = z.object({
     })
     .optional(),
   /**
-   * Extra resolved secrets to project as env vars on the install
-   * subprocess. Keyed by the bare secret name (the qualified env: prefix
-   * is stripped at resolution time). For use with a customer-committed
-   * `.kici/.npmrc` containing `${VAR}` placeholders.
+   * Resolved secrets projected as env vars on the install subprocess, keyed
+   * by bare secret name (the env: prefix is stripped at resolution), for a
+   * customer-committed `.kici/.npmrc` with `${VAR}` placeholders.
    */
   installEnvSecrets: z.record(z.string(), z.string()).optional(),
   /** Org id that owns this run — namespaces the user-facing cache (per-tenant isolation). */
@@ -231,10 +216,8 @@ export const jobDispatchSchema = z.object({
   /** Repo identifier (e.g. "owner/repo") — second namespacing level for the user-facing cache. */
   repoId: z.string().optional(),
   /**
-   * Cache write scope for this job. `shared` lets the job write the
-   * org-shared default-branch cache; `isolated` confines writes to a
-   * per-run scope while still allowing shared-scope reads. Absent ⇒ treated
-   * as `isolated` by the agent (fail-closed).
+   * Cache write scope for this job (see {@link CacheRefScope}). Absent ⇒ the
+   * agent treats it as `isolated` (fail-closed).
    */
   cacheRefScope: CacheRefScope.optional(),
 });
@@ -257,28 +240,21 @@ export const registerAckSchema = z.object({
   labels: z.array(z.string()),
   scalerManaged: z.boolean().default(false),
   /**
-   * Set when the orchestrator's scaler bound a specific queued job to this
-   * agent at spawn time and is preparing the dispatch.job message right now.
-   * Scaler-managed agents that see this flag MUST NOT arm the short
-   * KICI_SCALER_IDLE_TIMEOUT timer on register — the dispatch is in flight
-   * and may take a few seconds to arrive (provider lookup, secret merging,
-   * upstream output fetching all happen between register.ack and dispatch.job
-   * for jobs with `needs:` dependencies). Without this flag the agent races
-   * the orchestrator and self-shuts down before the dispatch arrives.
-   * If the dispatch never arrives (orchestrator crash, etc.) the agent's
-   * KICI_SCALER_PENDING_DISPATCH_TIMEOUT (default 60s) acts as a safety net.
+   * Set when the scaler bound a specific queued job to this agent at spawn
+   * time and is preparing its dispatch. A scaler-managed agent that sees it
+   * MUST NOT arm the short KICI_SCALER_IDLE_TIMEOUT timer on register: the
+   * dispatch may take seconds (provider lookup, secret merging, upstream
+   * output fetching for `needs:` jobs), and the agent would self-shut down
+   * first. If the dispatch never arrives (orchestrator crash, etc.),
+   * KICI_SCALER_PENDING_DISPATCH_TIMEOUT (default 60s) is the safety net.
    */
   pendingDispatch: z.boolean().optional(),
   /**
-   * Set when this agent was pre-spawned to wait for work (a warm pool) rather
-   * than for a specific queued job. Such an agent MUST NOT arm any
-   * idle-shutdown timer on register: it is meant to sit ready until the
-   * orchestrator either dispatches a job to it or destroys it.
-   *
-   * The orchestrator's warm-pool reaper is the sole authority on its lifetime.
-   * An agent that also ran its own idle timer would self-terminate behind the
-   * reaper's back, re-creating the spawn/reap churn that reaping only surplus
-   * agents exists to prevent.
+   * Set when this agent was pre-spawned into a warm pool rather than for a
+   * queued job. Such an agent MUST NOT arm any idle-shutdown timer on
+   * register: the orchestrator's warm-pool reaper is the sole authority on its
+   * lifetime, and an agent idle timer would re-create the spawn/reap churn
+   * that reaping only surplus agents exists to prevent.
    *
    * Absent for a job-bound spawn and for a static agent.
    */
@@ -385,14 +361,13 @@ export const jobStatusSchema = z.object({
  * exists, evaluating each candidate's `filter` and then its `DynamicJobFn`s on
  * a single dual checkout.
  *
- * `jobs` carries `LockJob[]` as an unvalidated pass-through, the same shape and
- * for the same reason as `jobDispatchSchema.jobConfig`: the lock-file job shape
- * has no Zod mirror anywhere in this package, its single source of truth is the
- * `LockJob` interface in `trigger/types.ts`, and a hand-written Zod copy would
- * drift and start rejecting legitimate generated jobs.
+ * `jobs` carries `LockJob[]` as an unvalidated pass-through, like
+ * `jobDispatchSchema.jobConfig`: the single source of truth is the `LockJob`
+ * interface in `trigger/types.ts`, and a hand-written Zod copy would drift and
+ * reject legitimate generated jobs.
  *
- * Every field beyond the verdict itself is `.optional()`: an undecided or
- * job-less verdict omits them.
+ * Every field beyond the verdict is optional: an undecided or job-less verdict
+ * omits them.
  */
 export const globalEvalCandidateResultSchema = z.object({
   /** The candidate workflow's name, as it appears in the lock file. */
@@ -444,13 +419,12 @@ export type JobRejectReason = z.infer<typeof JobRejectReason>;
 /**
  * Explicit dispatch rejection (agent -> orchestrator).
  *
- * Sent when the agent cannot accept a job.dispatch (already running a job,
- * or draining). The orchestrator undoes its dispatch accounting and requeues
- * the job for another agent. Protocol invariant: every job.dispatch is
- * answered — accepted with `job.ack` (a `job.status` with state `running`
- * also resolves the deadline), or refused with this message. An unanswered
- * dispatch is treated as lost once the ack deadline expires (requeue +
- * disconnect the agent) and is also covered by disconnect-time triage.
+ * Sent when the agent cannot accept a job.dispatch (busy or draining); the
+ * orchestrator undoes its dispatch accounting and requeues the job. Protocol
+ * invariant: every job.dispatch is answered with `job.ack` (or a `job.status`
+ * of `running`) or with this message. An unanswered dispatch is lost once the
+ * ack deadline expires (requeue + disconnect the agent), and disconnect-time
+ * triage also covers it.
  */
 export const jobRejectSchema = z.object({
   type: z.literal('job.reject'),
@@ -464,12 +438,9 @@ export const jobRejectSchema = z.object({
 /**
  * Positive dispatch acknowledgment (agent -> orchestrator).
  *
- * Sent immediately when the agent receives a job.dispatch and accepts it
- * (after the drain/busy checks, before execution begins). The orchestrator
- * arms a deadline when it sends a dispatch; `job.ack`, `job.reject`, or a
- * `job.status` with state `running` resolves it. A dispatch with no answer
- * inside the deadline is treated as lost: the orchestrator requeues the job
- * and disconnects the unresponsive agent.
+ * Sent as soon as the agent accepts a job.dispatch (after the drain/busy
+ * checks, before execution). It resolves the orchestrator's dispatch deadline;
+ * see {@link jobRejectSchema} for the invariant.
  */
 export const jobAckSchema = z.object({
   type: z.literal('job.ack'),
@@ -528,13 +499,11 @@ export const agentStepStatusSchema = z.object({
   /** Parallel-group correlation id shared by a group's children (e.g. `g0`). */
   groupId: z.string().optional(),
   /**
-   * Total raw bytes streamed by this step's LogStreamer at terminal time.
-   * Counts agent-side raw bytes (the same count fed to the transient
-   * `kici_agent_log_bytes_total` counter), so it reflects what the customer
-   * actually emitted — not gzip archive size or post-processing size.
-   * Set on terminal step states only. Reused by the orchestrator to
-   * accumulate per-job and per-run totals for the operator-side
-   * `kici_org_log_bytes` capacity-planning gauge.
+   * Total raw bytes this step's LogStreamer streamed (the count fed to
+   * `kici_agent_log_bytes_total`): what the customer emitted, not the gzip
+   * archive or post-processing size. Set on terminal step states only. The
+   * orchestrator sums it per job and per run for the `kici_org_log_bytes`
+   * capacity-planning gauge.
    */
   logBytesStreamed: z.number().int().nonnegative().optional(),
 });
@@ -570,26 +539,23 @@ export const jobConcurrencyReportSchema = z.object({
 /**
  * Orchestrator -> Agent: acknowledge concurrency report with action to take.
  *
- * The orchestrator sends this in two situations:
- * 1. As a direct response to a `job.concurrency.report` message — `requestId`
- *    correlates to the report. Action is `proceed`, `wait`, or `cancel`.
- * 2. As an UNSOLICITED follow-up after the agent received `wait`. When a slot
- *    in the concurrency group is released (by completion, cancellation, or
- *    superseding), the orchestrator picks the FIFO-next queued waiter and
- *    sends `{ action: 'proceed' }` to the agent that's still parked on its
- *    second `waitForConcurrencyAck` call. `runId` / `jobId` are present in
- *    this case so the agent can sanity-check the wake-up matches its job.
- *    The agent's pending-ack slot resolves regardless of `requestId` (single
- *    in-flight ack per workflow-runner process).
+ * Sent in two situations:
+ * 1. In reply to a `job.concurrency.report`; `requestId` correlates to it.
+ * 2. UNSOLICITED, after the agent received `wait`: when a slot in the group is
+ *    released (completion, cancellation, or superseding), the orchestrator
+ *    sends `{ action: 'proceed' }` to the FIFO-next waiter, still parked on
+ *    its second `waitForConcurrencyAck` call. `runId` / `jobId` let the agent
+ *    sanity-check the wake-up. The pending-ack slot resolves regardless of
+ *    `requestId` (one in-flight ack per workflow-runner process).
  */
 export const jobConcurrencyAckSchema = z.object({
   type: z.literal('job.concurrency.ack'),
   requestId: z.string(),
   action: z.enum(['proceed', 'wait', 'cancel']),
   reason: z.string().optional(),
-  /** Optional run identifier for unsolicited slot-release wake-ups. */
+  /** Set on unsolicited slot-release wake-ups. */
   runId: z.string().optional(),
-  /** Optional job identifier for unsolicited slot-release wake-ups. */
+  /** Set on unsolicited slot-release wake-ups. */
   jobId: z.string().optional(),
 });
 
@@ -605,10 +571,9 @@ export const configAckSchema = z.object({
 /**
  * Agent -> Orchestrator: request a pre-signed upload URL for cache storage.
  *
- * Each tarball is stored under its own content hash, so the orchestrator needs
- * that hash to sign the upload URL: `sourceTarDigest` for a source upload,
- * `depsHash` for a deps upload. The agent has already packed and hashed the
- * tarball by the time it asks.
+ * Each tarball is stored under its own content hash, so the agent packs and
+ * hashes it first and sends the hash the orchestrator signs the URL for:
+ * `sourceTarDigest` for a source upload, `depsHash` for a deps upload.
  */
 const cacheUploadRequestSchema = z.discriminatedUnion('cacheType', [
   z.object({
@@ -778,9 +743,8 @@ export const provenanceUploadDeferSchema = z.object({
   /** Primary subject digest (lowercase hex). */
   subjectDigest: z.string(),
   /**
-   * Requested token audience for the later mint. Bounded to match the LIVE
-   * mint's `oidcTokenRequestParamsSchema` — the two are the same
-   * agent-supplied value and had no reason to differ.
+   * Requested token audience for the later mint. Bounded like the live mint's
+   * `oidcTokenRequestParamsSchema`, as both carry the same agent-supplied value.
    */
   audience: z.string().min(1).max(255),
   /** Bundle media type. */
@@ -846,8 +810,7 @@ export const artifactsUploadResponseSchema = z.object({
    * applies — the requested name violates the artifact-name contract, artifact
    * uploads are not configured on the orchestrator, the job's run could not be
    * resolved, the job is not owned by this agent, or the orchestrator hit an
-   * internal error. A safe, fixed,
-   * human-readable string; never a raw exception.
+   * internal error. A safe, fixed, human-readable string; never a raw exception.
    */
   error: z.string().optional(),
 });
@@ -880,9 +843,9 @@ export type ArtifactCompleteAckOutcome = z.infer<typeof ArtifactCompleteAckOutco
 
 /**
  * Orchestrator -> Agent: the outcome of committing an
- * `artifacts.upload.complete`. The agent awaits it and fails the workflow step on `failed`/timeout, so a lost commit surfaces as a
- * failed step instead of a green run with a missing artifact. `requestId`
- * echoes the complete message's `messageId`.
+ * `artifacts.upload.complete`. The agent fails the step on `failed`/timeout, so
+ * a lost commit is a failed step, not a green run with a missing artifact.
+ * `requestId` echoes the complete message's `messageId`.
  */
 export const artifactsUploadCompleteAckSchema = z.object({
   type: z.literal('artifacts.upload.complete.ack'),
@@ -927,8 +890,7 @@ export const artifactsDownloadResponseSchema = z.object({
    * reflects an orchestrator failure — artifact downloads are not configured,
    * the job's run could not be resolved, the job is not owned by this agent, or
    * the orchestrator hit an internal error — rather than a genuinely missing
-   * artifact. A safe, fixed,
-   * human-readable string; never a raw exception.
+   * artifact. A safe, fixed, human-readable string; never a raw exception.
    */
   error: z.string().optional(),
 });
@@ -970,10 +932,9 @@ export const eventEmitResponseSchema = z.object({
 /**
  * Agent -> Orchestrator: exchanges a single-use claim code (delivered on a
  * `kici.scaler.scale-up` event) for freshly minted ephemeral agent credentials.
- * A provisioned agent normally sends this itself to self-bootstrap — the claim
- * code is the authorization, so it may send it before it authenticates or
- * registers. A provisioning workflow can also send it to obtain the token
- * directly.
+ * The claim code is the authorization, so a provisioned agent can send it to
+ * self-bootstrap before it authenticates or registers; a provisioning
+ * workflow can also send it to obtain the token directly.
  */
 export const scalerClaimCredentialsSchema = z.object({
   type: z.literal('scaler.claim-credentials'),
@@ -1033,8 +994,7 @@ export const agentMetricsSchema = z.object({
 });
 
 // --- Agent auth protocol messages ---
-// Used during WebSocket connection establishment between agent and orchestrator.
-// Mirrors the Platform tier's auth.request/auth.success/auth.failure from auth.ts for cross-tier consistency.
+// Agent WebSocket handshake; mirrors the Platform tier's auth.request/success/failure (auth.ts).
 
 /** Auth request sent by agent to orchestrator when connecting via WebSocket. */
 export const agentAuthRequestSchema = z.object({
@@ -1043,21 +1003,21 @@ export const agentAuthRequestSchema = z.object({
   protocolVersion: z.number().int().positive(),
 });
 
-/** Auth success response sent by orchestrator to agent after successful authentication. */
+/** Auth success response from orchestrator to agent. */
 export const agentAuthSuccessSchema = z.object({
   type: z.literal('auth.success'),
   connectionId: z.string(),
 });
 
-/** Auth failure response sent by orchestrator to agent when authentication fails. */
+/** Auth failure response from orchestrator to agent. */
 export const agentAuthFailureSchema = z.object({
   type: z.literal('auth.failure'),
   reason: z.string(),
 });
 
 // --- Agent private API (request-response over WS) ---
-// Generic envelope for typed API calls. New methods are registered in AgentApiRegistry
-// on the orchestrator side — no protocol schema changes needed per method.
+// Generic envelope: a new method registers in the orchestrator's AgentApiRegistry,
+// with no protocol schema change.
 
 /**
  * How long an agent waits for the `agent.api.response` to one
@@ -1137,11 +1097,10 @@ export const StepApprovalOutcome = z.enum(['approved', 'rejected', 'expired']);
 export type StepApprovalOutcome = z.infer<typeof StepApprovalOutcome>;
 
 /**
- * Drift payload carried on a `when: 'drift'` step-approval hold. Captured from
- * the step's check/summarize: `summaryMarkdown` is the author's `summarize(drift)`
- * rendering, `drift` is the structured drift blob. Rendered in the dashboard
- * approval queue + the CLI so the operator sees the computed diff before
- * approving the apply.
+ * Drift payload on a `when: 'drift'` step-approval hold: `summaryMarkdown` is
+ * the author's `summarize(drift)` rendering, `drift` the structured blob. The
+ * dashboard approval queue and the CLI show it, so the operator sees the
+ * computed diff before approving the apply.
  */
 export const stepApprovalPayloadSchema = z.object({
   summaryMarkdown: z.string(),
@@ -1150,16 +1109,12 @@ export const stepApprovalPayloadSchema = z.object({
 export type StepApprovalPayload = z.infer<typeof stepApprovalPayloadSchema>;
 
 /**
- * Agent -> Orchestrator: a step carrying an `approval` gate is about to run and
- * the agent is blocking its step loop until the orchestrator resolves the
- * approval. The orchestrator creates a step-scoped `held_runs` row from the
- * normalized requirement and replies with `step.approval-resolved` once the
- * hold is approved, rejected, or expired. The agent keeps heartbeats flowing
- * during the wait so it is not reaped as stale. For a `when: 'drift'` gate the
- * request carries the computed drift `payload`.
- *
- * NOT fast-pathed — the `log.chunk` / `heartbeat` manual-validator invariant is
- * untouched by this message.
+ * Agent -> Orchestrator: a step with an `approval` gate is about to run, and
+ * the agent blocks its step loop until the approval resolves. The
+ * orchestrator creates a step-scoped `held_runs` row and replies with
+ * `step.approval-resolved` once the hold is approved, rejected, or expired.
+ * The agent keeps heartbeats flowing during the wait so it is not reaped as
+ * stale. NOT fast-pathed (no manual validator).
  */
 export const stepApprovalRequestSchema = z.object({
   type: z.literal('step.approval-request'),
@@ -1174,8 +1129,8 @@ export const stepApprovalRequestSchema = z.object({
   reason: z.string(),
   /**
    * Per-gate timeout override (seconds) from the SDK `approval.timeout`.
-   * Absent ⇒ the orchestrator uses the org-default `approval_expiry_seconds`.
-   * The orchestrator owns the authoritative `expiresAt` computation.
+   * Absent ⇒ the org-default `approval_expiry_seconds`. The orchestrator owns
+   * the authoritative `expiresAt` computation.
    */
   timeoutSeconds: approvalTimeoutSecondsSchema.optional(),
   /** Computed drift payload, present only for `when: 'drift'` gates. */
@@ -1184,8 +1139,7 @@ export const stepApprovalRequestSchema = z.object({
 export type StepApprovalRequest = z.infer<typeof stepApprovalRequestSchema>;
 
 /**
- * Orchestrator -> Agent: resolution of a step-level approval hold. `requestId`
- * correlates to the originating `step.approval-request.messageId`. On
+ * Orchestrator -> Agent: resolution of a step-level approval hold. On
  * `approved` the agent runs the step with its live workspace intact; on
  * `rejected`/`expired` it fails the job with a clear reason.
  */

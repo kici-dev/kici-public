@@ -14,9 +14,8 @@ import { resolveEventChangedFiles, stampChangedFiles, withDefaultBranch } from '
 import type { OriginalRunRow, RerunDeps } from './rerun.js';
 
 /**
- * Load the original webhook payload from object storage. Returns
- * null for cron/schedule runs (no payload was stored) or when the payload
- * cannot be parsed.
+ * Load the original webhook payload from object storage. Null for cron/schedule
+ * runs (none stored) or an unparseable payload.
  */
 export async function loadWebhookPayload(
   originalRunId: string,
@@ -28,7 +27,6 @@ export async function loadWebhookPayload(
   try {
     return JSON.parse(payloadResult.data);
   } catch {
-    // Corrupted or unparseable payload — treat as missing
     return null;
   }
 }
@@ -41,12 +39,9 @@ export interface RerunProviderBinding {
 }
 
 /**
- * Resolve the provider bundle and stored provider context for a run being
- * re-run.
- *
- * Shared by the workflow re-run and the evaluation-round re-run so the two
- * cannot disagree about which source a run belongs to, or about how its
- * `provider_context` column is parsed.
+ * Resolve the provider bundle and stored provider context for a re-run. Shared
+ * by the workflow and evaluation-round re-runs so they cannot disagree about a
+ * run's source or how `provider_context` is parsed.
  */
 export function resolveRerunProviderBinding(
   originalRun: OriginalRunRow,
@@ -71,15 +66,13 @@ export function resolveRerunProviderBinding(
 
 /** How a refusal to rebuild a re-run's inputs names the run and the way forward. */
 export interface RerunRefusal {
-  /** The sentence's opening, naming the run: `Cannot re-run …`. */
+  /** `Cannot re-run …`. */
   subject: string;
-  /** How the run relates to its event: `was deciding` for a round, `ran for` for a run. */
+  /** `was deciding` for a round, `ran for` for a run. */
   eventVerb: string;
-  /** What the caller can do instead. */
   remedy: string;
 }
 
-/** The refusal wording for a global evaluation round. */
 export function roundRefusal(originalRun: OriginalRunRow): RerunRefusal {
   return {
     subject: `Cannot re-run evaluation round ${originalRun.run_id}`,
@@ -91,19 +84,16 @@ export function roundRefusal(originalRun: OriginalRunRow): RerunRefusal {
 /**
  * The provider event name + action the original delivery carried.
  *
- * `execution_runs` records neither: the event name arrives in a provider header,
- * not in the payload, so it cannot be recovered from the stored payload either.
- * The delivery's own `event_log` row is where it lives, and a round's run row
- * carries the delivery id that addresses it. That row is written at the end of
- * the delivery, after the round's failure is recorded, so it is present for
- * every re-run an operator can actually reach.
+ * Neither `execution_runs` nor the stored payload has it (the event name is a
+ * provider header); it lives in the delivery's `event_log` row, addressed by
+ * the run row's delivery id. That row is written at the end of the delivery,
+ * after the round's failure is recorded, so every reachable re-run has it.
  *
- * Addressed by `(org_id, delivery_id)` — the table's own uniqueness — never by
- * the delivery id alone. A generic source's delivery id is taken verbatim from
- * a sender-supplied header, so one tenant can choose an id another tenant's
- * round already carries; a lookup by id alone would then re-evaluate one org's
- * global workflows against another org's event shape, and with no `ORDER BY`
- * the row it picked would not even be stable.
+ * Addressed by `(org_id, delivery_id)` — the table's uniqueness — never by
+ * delivery id alone: a generic source takes it verbatim from a sender-supplied
+ * header, so one tenant can reuse another's id, and an id-only lookup would
+ * re-evaluate one org's globals against another org's event (and pick an
+ * unstable row, with no `ORDER BY`).
  */
 export async function loadDeliveryEventName(
   originalRun: OriginalRunRow,
@@ -136,12 +126,10 @@ export async function loadDeliveryEventName(
 export const RELEASED_DECISION: TrustPolicyOutcome = { action: 'pass' };
 
 /**
- * The normalized form of the delivery the round was deciding, stamped with the
- * repository's default branch as the delivery stamped it: the jobs a re-run
- * dispatches carry this event, and an agent derives a new-branch diff from it.
- *
- * Read-only, and it throws — so it runs before the requestId claim, never
- * inside the re-evaluation.
+ * The normalized delivery the round was deciding, stamped with the default
+ * branch as the delivery stamped it: a re-run's jobs carry this event, and an
+ * agent derives a new-branch diff from it. Read-only and throwing, so it runs
+ * before the requestId claim, never inside the re-evaluation.
  */
 export function normalizeRoundEvent(
   originalRun: OriginalRunRow,
@@ -162,12 +150,9 @@ export function normalizeRoundEvent(
 
 /**
  * Stamp the re-evaluated event with the source repository's default branch and
- * changed files.
- *
- * The resolve is unconditional: the delivery path skips it when no trigger in
- * the source repo's lock file uses path patterns, and a scoped re-evaluation
- * has no such lock file to bound it. A bundle with no fetcher, or a fetch
- * error, carries `unavailable`.
+ * changed files. Unconditional, unlike the delivery path: a scoped
+ * re-evaluation has no source lock file to tell whether path patterns are
+ * used. No fetcher, or a fetch error, carries `unavailable`.
  */
 export async function withChangedFiles(opts: {
   event: SimulatedEvent;

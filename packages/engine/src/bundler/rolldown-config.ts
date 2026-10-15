@@ -1,8 +1,6 @@
 /**
- * Shared rolldown configuration for workflow bundling.
- *
- * Both the compiler and agent import this factory to guarantee identical
- * bundle output, which is critical for content hash verification.
+ * Shared rolldown configuration for workflow bundling. The compiler and the
+ * agent both use it so bundle output, and so the content hash, is identical.
  */
 
 export interface WorkflowBundleOptions {
@@ -14,12 +12,9 @@ export interface WorkflowBundleOptions {
 }
 
 /**
- * Create a rolldown configuration for workflow bundling.
+ * Create a rolldown configuration for workflow bundling. The output is
+ * identical whether the compiler or the agent calls it, so content hashes match.
  *
- * The returned config produces identical output regardless of whether
- * it's called from the compiler or agent, ensuring content hash consistency.
- *
- * @param options - Bundle configuration
  * @returns rolldown InputOptions with output config
  */
 export function createWorkflowBundleConfig(options: WorkflowBundleOptions) {
@@ -38,16 +33,12 @@ export function createWorkflowBundleConfig(options: WorkflowBundleOptions) {
       file: options.outfile,
       format: 'es' as const,
       sourcemap: options.sourcemap ?? false,
-      // Force a single output chunk even when transitive deps use dynamic
-      // `import()` (e.g. a deploy workflow that imports library modules
-      // which lazy-load `pg` / `@aws-sdk/client-s3`). Without this, Rolldown
-      // hits "output.dir required for multiple chunks" — and switching to
-      // output.dir would break the single-file `executeConfig()` flow in the
-      // compiler's hot path. `inlineDynamicImports: true` is deprecated in
-      // newer Rolldown in favor of `codeSplitting: false`, but at the
-      // currently-pinned version the deprecated option is still the one
-      // that actually takes effect (the suggested replacement isn't in the
-      // type surface yet).
+      // Force a single chunk even when transitive deps use dynamic `import()`
+      // (e.g. library modules that lazy-load `pg` / `@aws-sdk/client-s3`).
+      // Otherwise Rolldown demands output.dir, which breaks the compiler's
+      // single-file `executeConfig()` flow. `codeSplitting: false` replaces this
+      // option in newer Rolldown, but at the pinned version only
+      // `inlineDynamicImports` takes effect (the replacement is not typed yet).
       inlineDynamicImports: true,
     },
   };

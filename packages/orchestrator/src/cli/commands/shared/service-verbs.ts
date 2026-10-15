@@ -1,10 +1,8 @@
 /**
- * The service lifecycle verbs shared by `kici-admin agent` and `kici-admin orchestrator`:
- * `uninstall`, `start`, `stop`, `restart` and `logs`.
- *
- * Target resolution goes through resolveInstanceTarget — the priority chain every
- * lifecycle command uses (--instance-dir > --name > CWD manifest > refusal with
- * candidate list). `--name` has no default.
+ * `uninstall`, `start`, `stop`, `restart` and `logs`, shared by `kici-admin agent`
+ * and `kici-admin orchestrator`. Targets resolve through resolveInstanceTarget
+ * (--instance-dir > --name > CWD manifest > refusal with candidates); `--name`
+ * has no default.
  */
 
 import type { Command } from 'commander';
@@ -168,11 +166,7 @@ function registerStop(parent: Command, component: ServiceComponent): void {
   );
 }
 
-/**
- * Register `uninstall`, `start`, `stop` and `restart` on a component's command group.
- * Commander lists subcommands in registration order, so the caller places this
- * between `install` and `status`.
- */
+/** Commander lists subcommands in registration order: call this between `install` and `status`. */
 export function registerServiceLifecycleVerbs(parent: Command, component: ServiceComponent): void {
   registerUninstall(parent, component);
   addVerb(
@@ -190,7 +184,7 @@ export function registerServiceLifecycleVerbs(parent: Command, component: Servic
   ).action(requireInstalledThen(component, 'restart'));
 }
 
-/** Register `logs` on a component's command group (listed after `status`). */
+/** Listed after `status`. */
 export function registerServiceLogsVerb(parent: Command, component: ServiceComponent): void {
   addVerb(
     parent,

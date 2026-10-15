@@ -24,7 +24,6 @@ export type IngestShedReason = z.infer<typeof IngestShedReason>;
 export type AdmitResult =
   { admitted: true; release: () => void } | { admitted: false; reason: IngestShedReason };
 
-/** Per-call admission options. */
 export interface AdmitOptions {
   /**
    * When true (HTTP direct ingress), a request that cannot be admitted

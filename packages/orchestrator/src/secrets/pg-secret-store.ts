@@ -81,17 +81,14 @@ export class PgSecretStore implements SecretStore {
    * Follows the same dual-key pattern as decryptPrivateKey() in ephemeral-keys.ts.
    */
   private decryptWithFallback(encrypted: EncryptedValue, aad: string): string {
-    // Try current key first
     try {
       return decrypt(encrypted, this.masterKey, aad);
     } catch {
-      // If no old key, re-throw
       if (!this.oldMasterKey) {
         throw new Error(`Failed to decrypt secret with current key (AAD: ${aad})`);
       }
     }
 
-    // Fall back to old key
     try {
       return decrypt(encrypted, this.oldMasterKey, aad);
     } catch {
@@ -184,9 +181,6 @@ export class PgSecretStore implements SecretStore {
       .execute();
   }
 
-  /**
-   * Delete a secret from a scope.
-   */
   async deleteSecret(orgId: string, scope: string, key: string): Promise<void> {
     await this.db
       .deleteFrom('scoped_secrets')
@@ -296,7 +290,6 @@ export class PgSecretStore implements SecretStore {
     const existing = await this.listKeys(orgId, scope);
     if (existing.length > 0) return; // Scope already exists with real keys
 
-    // Check if sentinel already exists
     const sentinel = await this.db
       .selectFrom('scoped_secrets')
       .select('id')
@@ -391,7 +384,6 @@ export class PgSecretStore implements SecretStore {
           .execute();
       }
 
-      // Update context bindings referencing the old scope
       await trx
         .updateTable('context_bindings')
         .set({ scope_pattern: newScope })

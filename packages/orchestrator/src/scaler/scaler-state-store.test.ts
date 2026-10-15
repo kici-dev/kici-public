@@ -15,10 +15,9 @@ interface RenderedComparison {
  * Run the expression-builder callback an `updateTable().where(...)` was given
  * and return the predicate it builds.
  *
- * The mock db records the callback but never invokes it, so a `where` written
- * as `(eb) => eb.or([...])` is invisible to a `toHaveBeenCalledWith` assertion —
- * a test that only asserted the flat `where` arms would pass no matter what the
- * callback contains. Returns `null` when no callback arm was added at all.
+ * The mock db records the callback but never invokes it, so a `(eb) => eb.or(...)`
+ * arm is invisible to `toHaveBeenCalledWith`. Returns `null` when no callback arm
+ * was added.
  */
 function renderUpdatePredicate(
   mocks: MockDb['mocks'],
@@ -44,13 +43,12 @@ interface RenderedSubquery {
  * Run the expression-builder callback a `deleteFrom().where(...)` was given and
  * return the predicate it builds, whatever shape it has.
  *
- * Same blind spot as `renderUpdatePredicate`, with a sharper consequence: the
- * mock never invokes the callback, so asserting only that one was passed holds
- * just as well for `exists` as for `not exists` — and that inversion is the
- * difference between a purge that spares live rows and one that deletes exactly
- * them. The return type stays `unknown` so the caller matches the whole shape
- * and reports the wrong one, rather than dereferencing a `not` arm a bare
- * `exists` does not have. Returns `null` when no callback arm was added at all.
+ * Same blind spot as `renderUpdatePredicate`: asserting only that a callback was
+ * passed holds for `exists` as well as `not exists`, the difference between a
+ * purge that spares live rows and one that deletes exactly them. The return type
+ * stays `unknown` so the caller matches the whole shape rather than
+ * dereferencing a `not` arm a bare `exists` lacks. Returns `null` when no
+ * callback arm was added.
  */
 function renderDeletePredicate(mocks: MockDb['mocks']): unknown {
   const callback = mocks.deleteWhere.mock.calls
@@ -66,9 +64,8 @@ function renderDeletePredicate(mocks: MockDb['mocks']): unknown {
         whereRef: (left: string, op: string, right: string) => typeof sub;
       } = {
         from,
-        // The SELECT list of an EXISTS is semantically inert, so it is accepted
-        // for chaining and deliberately not recorded — pinning it would fail
-        // the test on a rewrite that changes nothing.
+        // An EXISTS select list is inert: accepted for chaining, not recorded, so
+        // a rewrite that changes nothing does not fail the test.
         select: () => sub,
         whereRef: (left: string, op: string, right: string) => {
           sub.refs = [left, op, right];
@@ -344,11 +341,10 @@ describe('ScalerStateStore', () => {
       expect(await store.purgeProvisionOutcomes(cutoff)).toBe(3);
       expect(mocks.deleteFrom).toHaveBeenCalledWith('scaler_provision_outcomes');
       expect(mocks.deleteWhere).toHaveBeenCalledWith('updated_at', '<', cutoff);
-      // The second predicate is the load-bearing one: an outcome whose spawn row
-      // still exists can still be asked about, however old it is. It is an
-      // expression-builder arm, so a flat `toHaveBeenCalledWith` cannot see it —
-      // render it and assert the negation, the table and the correlation, since
-      // a bare `exists` would delete precisely the rows this guard must spare.
+      // The load-bearing predicate: an outcome whose spawn row still exists can
+      // still be asked about, however old. Render the expression-builder arm and
+      // assert the negation, the table and the correlation — a bare `exists`
+      // would delete precisely the rows this guard must spare.
       expect(
         renderDeletePredicate(mocks),
         'the spawn-row existence guard is missing, or is not a NOT EXISTS',
@@ -635,11 +631,10 @@ describe('ScalerStateStore', () => {
         '=',
         ScalerBackendType.enum.event,
       );
-      // The ownership arm is an expression-builder callback, so the flat
-      // `toHaveBeenCalledWith` above cannot see it: run the callback and read
-      // the predicate it builds. Both arms have to be there — the NULL arm
-      // alone leaves an instance unable to re-adopt its own row after a restart
-      // (silent leak), and the self arm alone would let anyone steal a peer's.
+      // The ownership arm is an expression-builder callback, invisible to the flat
+      // assertions above. Both arms must be there: the NULL arm alone leaves an
+      // instance unable to re-adopt its own row after a restart (silent leak),
+      // and the self arm alone would let anyone steal a peer's.
       expect(renderUpdatePredicate(mocks)).toEqual({
         or: [
           { column: 'adopted_by', op: 'is', value: null },
@@ -655,10 +650,8 @@ describe('ScalerStateStore', () => {
     });
 
     it('renders no predicate for an update built from flat where arms only', async () => {
-      // The control for the assertion above: `renderUpdatePredicate` reports
-      // `null` when nothing added an expression-builder arm, so the adopt test
-      // genuinely fails on a flat `where('adopted_by', 'is', null)` rather than
-      // passing on whatever the helper happens to return.
+      // Control for the adopt test: with no expression-builder arm the helper
+      // reports `null`, so a flat `where('adopted_by', 'is', null)` fails it.
       const { db, mocks } = createMockDb({ updatedRow: undefined });
       await new ScalerStateStore(db).redeemClaim('hash-1');
       expect(mocks.updateWhere).toHaveBeenCalledWith('consumed_at', 'is', null);
@@ -736,11 +729,9 @@ describe('ScalerStateStore', () => {
       ]);
     });
 
-    // The ownership columns are written only when the caller supplies them, so a
-    // spawn-time upsert from a caller that knows nothing about instance ownership
-    // cannot null out a value some other write already established. A refactor
-    // back to `?? null` would reintroduce exactly that HA bug, so both branches of
-    // the upsert are pinned here.
+    // Ownership columns are written only when supplied, so a spawn-time upsert
+    // from an ownership-unaware caller cannot null out a value another write
+    // set. `?? null` would reintroduce that HA bug; both upsert branches are pinned.
 
     it('omits ownership columns the caller did not supply', async () => {
       const { db, mocks } = createMockDb();

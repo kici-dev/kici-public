@@ -2,7 +2,6 @@
  * Shared helpers for orchestrator entry points (server.ts and standalone.ts).
  *
  * Extracted to eliminate code duplication between the two entry points.
- * Both entry points import these helpers instead of maintaining separate copies.
  */
 
 import { statSync } from 'node:fs';
@@ -117,7 +116,6 @@ export function extractRepoIdentifier(repoUrl: string): string {
 
 /**
  * Diff two provider source arrays by routingKey.
- * Returns which sources were added and which were removed.
  *
  * Used during config reload to determine which source.register and
  * source.deregister messages to send.

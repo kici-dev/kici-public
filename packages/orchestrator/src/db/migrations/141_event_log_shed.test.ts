@@ -6,15 +6,10 @@ import pg from 'pg';
 import { EventLogStatus } from '@kici-dev/engine';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m141 from './141_event_log_shed.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 141.
- *
- * Creates a uniquely-named throwaway database, applies migrations 001..141 via
- * the production migration provider, and asserts that the event_log status
- * CHECK constraint accepts 'shed' (and still rejects garbage). The throwaway
- * database is dropped in teardown.
+ * Real-Postgres test for migration 141, on a throwaway database migrated through 141.
  *
  * Gated on `KICI_TEST_ADMIN_DATABASE_URL`: skips green when unset, fails loudly
  * when set but unreachable.
@@ -40,12 +35,10 @@ describe('migration 141 exports', () => {
 });
 
 /**
- * The CHECK constraint is the head of the status vocabulary, so it must name
- * every member of the engine enum the writer records with. A status added to
- * the enum with no migration behind it is rejected by Postgres at write time
- * on every deployed cluster — a failure this DB-free check moves to authoring
- * time. Read from the migration source rather than a copy of the list, so the
- * two sides of the comparison stay independent.
+ * The CHECK constraint must name every member of the engine status enum the writer uses; an
+ * enum member with no migration behind it is rejected by Postgres at write time on every
+ * cluster, and this DB-free check catches that at authoring time. It reads the migration
+ * source, not a copy of the list, so the two sides stay independent.
  */
 describe('migration 141 covers the whole EventLogStatus vocabulary', () => {
   const source = readFileSync(
@@ -69,8 +62,7 @@ describeDb('migration 141_event_log_shed', () => {
   let db: Kysely<unknown>;
   let pool: pg.Pool;
 
-  // describeDb only runs when KICI_TEST_ADMIN_DATABASE_URL is set, so the
-  // non-null assertion is safe inside the suite body.
+  // Safe: describeDb only runs when KICI_TEST_ADMIN_DATABASE_URL is set.
   const adminUrl = ADMIN_URL!;
 
   /** Insert a row with the given status, returning whether it was accepted. */
@@ -132,10 +124,8 @@ describeDb('migration 141_event_log_shed', () => {
   });
 
   it('down() removes shed from the allowed set', async () => {
-    // The earlier "accepts" tests seeded shed rows in this shared throwaway DB.
-    // down() restores the narrower constraint, which a real rollback can only
-    // do once no surviving row uses the retired status — so clear them first
-    // (the operator-side prerequisite this test exercises).
+    // down() restores the narrower constraint, which a real rollback can only do once no row
+    // uses the retired status: clear the rows the earlier tests seeded first.
     await sql`DELETE FROM event_log WHERE status = 'shed'`.execute(db);
     await m141.down(db);
     expect(await statusAccepted('shed')).toBe(false);

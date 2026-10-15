@@ -7,15 +7,12 @@ import type { WebhookInfo } from '../webhook/handler.js';
  * A delivery for a generic source whose own provider bundle is missing from
  * the registry.
  *
- * The registry is an in-memory cache of `generic_webhook_sources`, written by
- * three paths that are all on the WRITE side (startup enumeration, the admin
- * handler, the LISTEN/NOTIFY drain). None of them can promise the entry is
- * present at the moment a delivery arrives, and the miss used to be silent:
- * the lookup fell back to the shared `generic:default` bundle, whose
- * normalizer reports every payload as carrying no repository, so the pipeline
- * dropped the delivery at its no-repo exit. The symptom: a repo-bearing `push`
- * answered 202 and recorded only as `received` with `matched_count = 0` — no
- * run, no dispatch, and nothing above `debug` to say why.
+ * The registry caches `generic_webhook_sources` and is written only on the
+ * write side (startup enumeration, the admin handler, the LISTEN/NOTIFY
+ * drain), so no path promises the entry exists when a delivery arrives. An
+ * unrefreshed miss falls back to the shared `generic:default` bundle, whose
+ * normalizer reports no repository: a repo-bearing `push` answers 202, records
+ * only `received` with `matched_count = 0`, and logs nothing above `debug`.
  */
 const ROUTING_KEY = 'generic:org-1:source-1';
 
@@ -57,10 +54,8 @@ const info: WebhookInfo = {
 };
 
 /**
- * Both bundles stop at the no-repo exit so the assertions stay on bundle
- * SELECTION — which is the defect — rather than dragging lock-file
- * resolution and dispatch into the test. Which normalizer was asked is the
- * whole question.
+ * Both bundles stop at the no-repo exit, so the assertions test only which
+ * normalizer was asked (bundle selection), not lock-file resolution or dispatch.
  */
 function makeDeps(registry: ProviderRegistry, ensureProviderBundle?: () => Promise<boolean>) {
   return {
@@ -77,8 +72,7 @@ describe('processWebhook provider-bundle refresh', () => {
     registry.register('generic', defaultBundle);
     const sourceBundle = makeBundle('local', () => null);
 
-    // Stands in for the orchestrator's closure: reads the source row and
-    // registers its bundle.
+    // Stands in for the orchestrator closure: reads the source row, registers its bundle.
     const ensure = vi.fn(async () => {
       registry.registerByRoutingKey(ROUTING_KEY, sourceBundle);
       return true;

@@ -1,19 +1,17 @@
 /**
- * The workspace of an evaluation job of a global workflow: a deferred init job,
- * a generator evaluation, or a pre-run global eval round.
+ * Workspace of a global workflow's evaluation job (deferred init job, generator
+ * evaluation, or pre-run eval round), in the same layout as its other jobs.
  *
- * It is the layout every other job of that workflow uses. The workflow
- * repository is cloned at the registration's commit into `workflow/`, and its
- * `.kici/` is what the evaluation loads. The source repository the event came
- * from is cloned into `source/`, where a filter, a generator or a dynamic field
- * reads it. The clone goes through the same request builder and the same
- * `cloneJobRepos` the host checkout and the sandbox runner use, so the three
- * cannot disagree about which repository each credential opens.
+ * The workflow repository is cloned at the registration's commit into
+ * `workflow/`, whose `.kici/` the evaluation loads; the event's source
+ * repository goes into `source/`, read by filters, generators and dynamic
+ * fields. The clone uses the same request builder and `cloneJobRepos` as the
+ * host checkout and the sandbox runner, so the three cannot disagree on which
+ * repository each credential opens.
  *
- * The dependency tarball and the cached source pack both carry the workflow
- * repository's `.kici/`, so both restore into `workflow/` and never into the
- * source tree. A dependency restore that fails falls back to installing into
- * `workflow/.kici/`.
+ * The dependency tarball and cached source pack both carry the workflow repo's
+ * `.kici/`, so both restore into `workflow/`, never the source tree. A failed
+ * dependency restore falls back to installing into `workflow/.kici/`.
  */
 
 import fs from 'node:fs/promises';
@@ -32,12 +30,9 @@ export interface GlobalEvalWorkspaceArgs {
   dispatch: JobDispatch;
   workDir: string;
   log: (msg: string) => void;
-  /** How an inline dependency install runs when no dependency tarball was restored. */
+  /** Inline dependency install settings, used when no tarball was restored. */
   install: { baseEnv: NodeJS.ProcessEnv; allowInstallScripts: boolean | undefined };
-  /**
-   * Runs on the workflow checkout after the clone and before the dependencies:
-   * a test run's overlay, which may change `.kici/package.json`.
-   */
+  /** A test run's overlay, after the clone and before deps; may change `.kici/package.json`. */
   afterClone?: (workflowDir: string) => Promise<void>;
   /** Told the `.kici/` directory and whether it declares dependencies, before the install decision. */
   onDepsCheck?: (kiciDir: string, hasPackageJson: boolean) => void;
@@ -52,11 +47,7 @@ async function fileExists(p: string): Promise<boolean> {
   }
 }
 
-/**
- * Clone both repositories, then materialize the workflow repository's
- * dependencies and cached source over its checkout. Returns the layout it
- * filled.
- */
+/** Clone both repositories, then restore deps and cached source over the workflow checkout. */
 export async function materializeGlobalEvalWorkspace(
   args: GlobalEvalWorkspaceArgs,
 ): Promise<JobWorkspaceLayout> {

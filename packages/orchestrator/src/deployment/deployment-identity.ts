@@ -14,20 +14,16 @@ import {
  *
  * npm lays a posix global install out as `<prefix>/lib/node_modules/<pkg>/…`, so
  * the bin directory is `<prefix>/bin`. The split is on the FIRST `node_modules`
- * segment, matching `resolveNpmInstallTarget`'s convention, because the
- * orchestrator has two install shapes: standalone, and loaded through
- * kici-admin's own nested `node_modules`. Splitting on the first segment yields
- * `<prefix>/lib` for both; splitting on the last would yield
- * `<prefix>/lib/node_modules/kici-admin` for the nested shape and derive a bin
- * directory that does not exist.
+ * segment, matching `resolveNpmInstallTarget`: the orchestrator installs either
+ * standalone or nested in kici-admin's own `node_modules`, and only the first
+ * segment yields `<prefix>/lib` for both (the last would derive a bin directory
+ * that does not exist).
  *
- * The preceding segment must be `lib`, which is what distinguishes a global
- * install from a local `node_modules` tree, a pnpm global store, or a container
- * image root. Without that check a local install under `/srv/kici` would derive
- * `/srv/bin` and a same-named binary sitting there would be pinned wrongly —
- * the very class of wrong-path answer this resolver exists to prevent. Only
- * `systemd` / `launchd` reach this code, so the posix layout is the only one
- * that has to hold.
+ * The preceding segment must be `lib`, which distinguishes a global install from
+ * a local `node_modules` tree, a pnpm global store, or a container image root.
+ * Without it a local install under `/srv/kici` derives `/srv/bin` and pins a
+ * same-named binary there. Only `systemd` / `launchd` reach this code, so only
+ * the posix layout has to hold.
  */
 function globalBinDirFrom(entryPath: string | undefined): string | undefined {
   if (!entryPath) return undefined;
@@ -62,12 +58,10 @@ const SHELL_SAFE_WORD = /^[A-Za-z0-9_@%+=:,./-]+$/;
 /**
  * A path rendered so a POSIX shell parses it as a single word.
  *
- * The invocation this module builds exists to be pasted into a shell, so a node
- * or shim path holding whitespace (a home directory with a space, a macOS
- * runtime under a spaced folder) otherwise splits into the wrong arguments and
- * the pasted command fails. Quoting is applied only when the path needs it:
- * every ordinary posix install path is a safe word, so the emitted string stays
- * byte-identical for them.
+ * The invocation is pasted into a shell, so a path holding whitespace (a home
+ * directory with a space, a macOS runtime under a spaced folder) would otherwise
+ * split into the wrong arguments. Quoting applies only when needed, so an
+ * ordinary posix install path is emitted byte-identical.
  */
 function shellWord(value: string): string {
   return SHELL_SAFE_WORD.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
@@ -79,27 +73,21 @@ function shellWord(value: string): string {
  *
  * Two candidates are tried in order:
  *
- *  1. `<npm global bin>/kici-admin`, derived from where this module itself
- *     lives. This is the correct answer when npm's global prefix differs from
- *     the node install prefix — e.g. an operator who set
- *     `npm config set prefix ~/.npm-global` while running a system node.
- *  2. `<dirname(execPath)>/kici-admin`, correct for version-manager layouts
+ *  1. `<npm global bin>/kici-admin`, derived from this module's location: right
+ *     when npm's global prefix differs from node's (e.g.
+ *     `npm config set prefix ~/.npm-global` with a system node).
+ *  2. `<dirname(execPath)>/kici-admin`, right for version-manager layouts
  *     (mise / nvm / fnm) where the two prefixes coincide.
  *
- * Candidate 1 wins a tie because it is the shim belonging to the install this
- * process is actually running from; a stale shim elsewhere on the system must
- * not be pinned in preference to it.
+ * Candidate 1 wins a tie: it belongs to the install this process runs from, and
+ * a stale shim elsewhere must not be pinned over it.
  *
- * Global installs only, matching `resolveNpmInstallTarget`'s scope: an
- * orchestrator installed locally into a project's own `node_modules` keeps its
- * shim in `node_modules/.bin`, which is never a candidate, so it resolves to
- * `undefined` and gets the bare form.
+ * Global installs only, matching `resolveNpmInstallTarget`: a local install
+ * keeps its shim in `node_modules/.bin`, never a candidate, so it gets
+ * `undefined`. The dashboard then falls back to a PATH-resolved bare
+ * `kici-admin`, which beats naming a path that is not there.
  *
- * Returning `undefined` is deliberate: the dashboard falls back to a
- * PATH-resolved bare `kici-admin`, which beats naming a path that is not there.
- *
- * Both halves are rendered as POSIX shell words, so the pair survives a path
- * that holds whitespace when the operator pastes it.
+ * Both halves are rendered as POSIX shell words.
  */
 export function resolveAdminInvocation(
   execPath: string,
@@ -123,31 +111,25 @@ const WINDOWS_ADMIN_LAUNCHER = 'kici-admin.cmd';
  * when it cannot be located.
  *
  * Deliberately NOT built on {@link globalBinDirFrom}: npm lays a Windows global
- * install out as `<prefix>\node_modules\<pkg>` with no `lib` folder, and links
- * the shims directly into `<prefix>` rather than `<prefix>\bin`. The posix
- * helper requires a `lib` segment, so it returns `undefined` for every real
- * Windows install — reusing it would ship a resolver that can never fire.
+ * install out as `<prefix>\node_modules\<pkg>` with no `lib` folder and links
+ * the shims into `<prefix>`, not `<prefix>\bin`, so the posix helper would
+ * return `undefined` for every real Windows install.
  *
  * Three candidate directories are tried in order:
  *
- *  1. The npm global prefix implied by this module's own location, split on the
- *     FIRST `node_modules` segment (matching the posix helper's convention, so
- *     the nested-under-kici-admin install shape resolves too). A prefix holding
- *     a `package.json` is REJECTED: that is a local project install, whose shim
- *     lives in `node_modules\.bin`, and a same-named launcher sitting in the
- *     project root must not be pinned. npm's own global prefix carries no
- *     `package.json`, which is what distinguishes the two.
- *  2. The light-package deploy directory, which lays out
- *     `<deployDir>\lib\<target>.cjs` beside `<deployDir>\kici-admin.cmd`. Gated
- *     on the entry's parent directory actually being named `lib` so an
- *     unrelated bundle layout cannot derive a directory and pin whatever
- *     happens to sit there.
- *  3. `dirname(execPath)`, for the case where node and the launcher are
- *     co-located.
+ *  1. The npm global prefix implied by this module's location, split on the
+ *     FIRST `node_modules` segment as the posix helper does, so the shape nested
+ *     under kici-admin resolves too. A prefix holding a `package.json` is
+ *     REJECTED: npm's global prefix has none, so it marks a local project
+ *     install, whose shim lives in `node_modules\.bin`; a same-named launcher in
+ *     the project root must not be pinned.
+ *  2. The light-package deploy directory (`<deployDir>\lib\<target>.cjs` beside
+ *     `<deployDir>\kici-admin.cmd`), only when the entry's parent directory is
+ *     named `lib`, so an unrelated bundle layout cannot pin whatever sits there.
+ *  3. `dirname(execPath)`, when node and the launcher are co-located.
  *
- * Every path is built with `path.win32`, so the derivation is deterministic
- * when this runs on a posix test host rather than depending on the ambient
- * separator.
+ * Every path is built with `path.win32`, so the derivation is deterministic on a
+ * posix test host.
  *
  * A candidate directory that is not absolute is skipped. The check has to be on
  * the DIRECTORY, not on the joined result: `path.win32.dirname('C:node.exe')`
@@ -199,19 +181,17 @@ export function resolveWindowsAdminPath(
  * Read the orchestrator's deployment shape from the env the installer injects
  * (`KICI_DEPLOY_MODE` / `KICI_DEPLOY_CONTAINER` / `KICI_DEPLOY_CONTAINER_RUNTIME`).
  * Hand-run / dev orchestrators carry no `KICI_DEPLOY_*` env and report `unknown`.
- * Surrounding whitespace is stripped from all three before they are read: the
- * values reach the process through an env file, where a hand edit or a writer
- * that leaves the trailing byte on can attach a space or a newline. The shape
- * is known in that case, so degrading the whole identity to `unknown` — and
- * dropping the pinned invocation with it — would discard an answer we have.
- * Container fields are kept only for the `compose` mode. For posix bare-metal
- * (`systemd` / `launchd`) the identity carries a pinned `<node> <kici-admin>`
- * `adminInvocation` when the shim can be located on disk; for `windows` it
- * instead carries a raw, unquoted `adminPath` naming the `kici-admin.cmd`
- * launcher. Each is omitted when its target cannot be located, so the reader
- * falls back to a PATH-resolved `kici-admin`. The two never coexist: they are
- * different kinds of value (a shell command vs a bare path) because the Windows
- * shells cannot share one quoting.
+ *
+ * All three are trimmed: they arrive through an env file, where a hand edit or a
+ * writer can attach a space or a newline, and the shape is still known —
+ * degrading to `unknown` would drop the pinned invocation too.
+ *
+ * Container fields are kept only for `compose`. Posix bare-metal (`systemd` /
+ * `launchd`) carries a pinned `<node> <kici-admin>` `adminInvocation`; `windows`
+ * carries a raw, unquoted `adminPath` to `kici-admin.cmd`. Each is omitted when
+ * its target cannot be located, so the reader falls back to a PATH-resolved
+ * `kici-admin`. They never coexist: a shell command vs a bare path, because the
+ * Windows shells cannot share one quoting.
  */
 export function readDeploymentIdentity(
   env: NodeJS.ProcessEnv = process.env,
@@ -265,20 +245,16 @@ export function readDeploymentIdentity(
  * it in its own config — so every orchestrator reports it, including hand-run
  * ones and installs that predate the stamp.
  *
- * Values are trimmed for the same reason the deployment reader trims them:
- * they arrive through an env file, where a hand edit or a writer that leaves
- * the trailing byte on attaches a space or a newline. A known path carrying a
- * stray space is still a known path, and dropping it would discard an answer
- * we have.
+ * Values are trimmed for the reason `readDeploymentIdentity` gives: a known
+ * path carrying a stray space from an env file is still a known path.
  *
  * No path is checked for existence. On bare metal such a check would pass; in
  * a compose container it would fail for every path, because these are HOST
  * paths the container cannot see — blanking the value for exactly the
  * deployment shape that needs it most.
  *
- * This is a standalone reader rather than a branch of `readDeploymentIdentity`
- * because that function returns early for `compose`, and anything placed after
- * that return does nothing for compose deployments.
+ * Standalone rather than a branch of `readDeploymentIdentity`, which returns
+ * early for `compose`.
  */
 export function readConfigPaths(
   env: NodeJS.ProcessEnv = process.env,

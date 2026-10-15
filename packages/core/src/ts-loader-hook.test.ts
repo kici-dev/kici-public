@@ -5,10 +5,9 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { load } from './ts-loader-hook.js';
 
-// The runtime `.ts` loader transforms via oxc-transform (Rust), never importing
-// `typescript`, so it is independent of which compiler runs type-check / emit.
-// This test proves the loader still strips modern TS-era syntax and yields the
-// correct runtime value after the type-check/emit toolchain moved to the TS7 native `tsc`.
+// The loader uses oxc-transform and never imports `typescript`, so it is
+// independent of the type-check / emit compiler (the TS7 native `tsc`). This
+// proves it still strips modern TS syntax and yields correct runtime values.
 
 const neverNextLoad = () => {
   throw new Error('nextLoad must not be called for a .ts URL');
@@ -18,9 +17,8 @@ describe('ts-loader-hook load()', () => {
   it('strips modern TS syntax via oxc and yields the runtime value', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'kici-ts-loader-'));
     try {
-      // TS7-era syntax: `satisfies`, a `const` type parameter (on a function,
-      // where it is valid), an `enum`, and a type-only export — all of which
-      // must be erased to valid runtime JS.
+      // TS7-era syntax that must become valid runtime JS (a `const` type
+      // parameter is valid only on a function).
       const tsSource = [
         'export const answer = (42 satisfies number);',
         'export type Id<K extends string> = K;',
@@ -42,7 +40,6 @@ describe('ts-loader-hook load()', () => {
       expect(code).not.toContain('extends string');
       expect(code).toContain('Color');
 
-      // Execute the transformed JS to prove the runtime values are correct.
       const jsPath = join(dir, 'sample.mjs');
       await writeFile(jsPath, code, 'utf8');
       const mod = await import(pathToFileURL(jsPath).href);

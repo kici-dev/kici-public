@@ -7,8 +7,7 @@ import {
 import { dssePae } from '@kici-dev/engine/provenance/dsse';
 import { attestProvenance, subjectDigestString } from './attest.js';
 
-// A minimal unsigned JWT carrying the claims the builder needs (decodeJwt does
-// not verify, so an unsigned token is fine for the unit test).
+// Unsigned is enough: decodeJwt does not verify.
 function fakeToken() {
   const claims = {
     iss: 'https://issuer',

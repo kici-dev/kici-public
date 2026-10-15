@@ -1,11 +1,9 @@
 import { register } from 'node:module';
 
-// The oxc-transform ESM loader hook lets the CLI load workflow .ts files on the
-// fly (full TypeScript coverage: enums, parameter properties, namespaces) and
-// rewrites `./foo.js` specifiers to `./foo.ts` when only the .ts sibling exists.
-// Registering it makes every subsequent import in this process round-trip
-// through the hook's resolve(), so we register lazily — only the commands that
-// actually load user .ts pay the cost, and only once per process.
+// The oxc-transform ESM loader hook loads workflow .ts (enums, parameter
+// properties and namespaces included) and rewrites `./foo.js` to `./foo.ts` when
+// only the .ts exists. Every later import then goes through its resolve(), so it
+// registers lazily, once, only for commands that load user .ts.
 let registered = false;
 
 export function ensureTsLoaderHook(): void {

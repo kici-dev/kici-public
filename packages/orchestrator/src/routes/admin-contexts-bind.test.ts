@@ -18,7 +18,7 @@ function buildMockDb(opts: {
   const envWhere1 = vi.fn().mockReturnValue({ where: envWhere2 });
   const envSelectAll = vi.fn().mockReturnValue({ where: envWhere1 });
 
-  // 4-where chain on the existence check (org, env, scope, host).
+  // Existence check where-chain: org, env, scope, host.
   const existExecuteTakeFirst = vi.fn().mockResolvedValue(opts.existingBinding ?? null);
   const chainWhere = (depth: number): any =>
     depth === 0

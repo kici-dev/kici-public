@@ -2,19 +2,17 @@ import type { Kysely } from 'kysely';
 import type { Database, RemoteSourceRow } from '../db/types.js';
 
 /**
- * Deterministic routing key for an org's Platform-relayed remote runs. A
- * Platform-relayed `test.trigger` carries this key; `resolveOrgId` maps it back
- * to the canonical org id via the `remote_sources` row.
+ * Routing key a Platform-relayed `test.trigger` carries; `resolveOrgId` maps it
+ * back to the org id via the `remote_sources` row.
  */
 export function remoteRoutingKeyFor(orgId: string): string {
   return `remote:${orgId}`;
 }
 
 /**
- * Idempotently upsert the `remote_sources` anchor for an org. Called on every
- * Platform (re)connect once the orchestrator learns its canonical org id from
- * `auth.success`. The unique `(customer_id)` constraint makes this a safe
- * self-heal — re-running updates `cluster_id` if the cluster identity changed.
+ * Idempotently upsert an org's `remote_sources` anchor on every Platform
+ * (re)connect, after `auth.success`. The unique `(customer_id)` constraint
+ * makes it a self-heal that updates a changed `cluster_id`.
  */
 export async function provisionRemoteSource(
   db: Kysely<Database>,
@@ -36,7 +34,6 @@ export async function provisionRemoteSource(
     .execute();
 }
 
-/** Read the auto-provisioned remote-source row for an org, if it exists. */
 export async function getRemoteSource(
   db: Kysely<Database>,
   orgId: string,

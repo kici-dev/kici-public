@@ -46,28 +46,25 @@ describe('buildGeneratorContext', () => {
     const a = buildGeneratorContext({ ...base, repos });
     const b = buildGeneratorContext({ ...base, repos });
 
-    // Compare the whole serializable surface, not a hand-picked subset: a field
-    // added to the context later is covered without touching this test. The
-    // non-serializable members ($ / log / kici) are identity-compared below.
+    // The whole serializable surface, so a new context field is covered without
+    // touching this test. $ / log / kici are identity-compared below.
     expect(a).toEqual(b);
 
-    // Guard against a vacuous pass: the assertion above must be able to FAIL.
-    // If `repos` stopped reaching the context, this control would still be
-    // deep-equal to `a` and the determinism claim would be worthless.
+    // Positive control: if `repos` stopped reaching the context, this would
+    // deep-equal `a` and the determinism assertion would be vacuous.
     const divergent = buildGeneratorContext({
       ...base,
       repos: { ...repos, sourceRepo: { ...repos.sourceRepo, sha: 'ccc' } },
     });
     expect(a).not.toEqual(divergent);
 
-    // The two calls must also carry the SAME injected collaborators, not merely
-    // structurally-equal ones — `toEqual` on an empty `kici` stub is vacuous.
+    // The SAME injected collaborators, not structurally-equal ones: `toEqual` on
+    // an empty `kici` stub is vacuous.
     expect(a.$).toBe(b.$);
     expect(a.log).toBe(b.log);
     expect(a.kici).toBe(b.kici);
 
-    // And the key ORDER must match: two evaluations that agree on values but
-    // build the object differently still serialize differently.
+    // Key ORDER too: equal values built in another order serialize differently.
     expect(Object.keys(a)).toEqual(Object.keys(b));
     expect(Object.keys(a.ctx)).toEqual(Object.keys(b.ctx));
   });

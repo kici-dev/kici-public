@@ -20,19 +20,12 @@ export function firstStepLocation(job: Job): SourceLocation | undefined {
   return undefined;
 }
 
-/**
- * Best available location for a job-scoped error: its first step's captured
- * location when a step exists, else the workflow source file at line 1
- * (`job()` itself captures no call-site).
- */
+/** The first step's location, else line 1 of the workflow file: `job()` captures no call-site. */
 export function locationForJob(job: Job, workflowFile: string): SourceLocation {
   return firstStepLocation(job) ?? { file: workflowFile, line: 1, column: 1 };
 }
 
-/**
- * Location for a workflow-scoped error: `workflow()` captures no call-site, so
- * the best anchor is the workflow's source file at line 1.
- */
+/** `workflow()` captures no call-site, so the anchor is line 1 of its file. */
 export function locationForWorkflow(file: string): SourceLocation {
   return { file, line: 1, column: 1 };
 }

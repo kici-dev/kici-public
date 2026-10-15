@@ -1,17 +1,11 @@
 /**
- * Clone a job's repositories — from the host or from inside the sandbox.
+ * Clone a job's repositories, from the host or from inside the sandbox.
  *
- * This used to live only inside the workflow runner, which meant the clone
- * always happened wherever the runner ran: for a container job, inside the
- * customer's image, which therefore had to ship git. Extracting it lets the
- * AGENT clone on the host and copy the tree in, so the image needs no git —
- * and it puts clone-time credentials on the host, where the credential helper
- * already works, rather than needing a route into a container hardened with
- * `CapDrop: ALL`.
- *
- * Both callers run the SAME code: the runner keeps calling it for bare-metal
- * and for the legacy container path, and the agent calls it for a host-side
- * checkout. A second implementation would be two subtly different clones.
+ * A host-side clone lets the agent copy the tree into a container job, so the
+ * customer's image needs no git, and clone-time credentials stay on the host
+ * where the credential helper works, with no route into a `CapDrop: ALL`
+ * container. The runner calls the same code for bare-metal and the legacy
+ * container path: a second implementation would be two subtly different clones.
  */
 
 import { mkdir } from 'node:fs/promises';
@@ -39,7 +33,7 @@ export interface CloneJobReposDirs {
 }
 
 export interface CloneJobReposDeps {
-  /** Whether this job runs a global workflow (workflow repo + source repo). */
+  /** A global workflow clones the workflow repo + the source repo. */
   isGlobal: boolean;
   /** Progress sink. The runner routes this to IPC; the agent to its logger. */
   log: (line: string) => void;
@@ -48,11 +42,8 @@ export interface CloneJobReposDeps {
 }
 
 /**
- * Clone whatever this job needs, or nothing.
- *
- * Three modes, unchanged from where this logic used to live: full-repo overlay
- * (no clone), global dual-clone (workflow repo + source repo), and the ordinary
- * single-repo clone.
+ * Clone whatever this job needs: nothing (full-repo overlay), a global
+ * dual-clone, or the ordinary single-repo clone.
  */
 export async function cloneJobRepos(
   request: CloneJobReposRequest,

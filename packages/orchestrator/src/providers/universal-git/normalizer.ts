@@ -23,8 +23,6 @@ import {
 } from './config.js';
 
 /**
- * Webhook normalizer for universal-git sources.
- *
  * Each instance is bound to one source's expanded config (preset-resolved
  * `payloadPaths` + `eventMapping`). The orchestrator constructs one per
  * registered `generic_webhook_sources` row with a non-null `git_config`.
@@ -311,7 +309,6 @@ function extractSenderUserId(payload: Record<string, unknown>): string | undefin
   const fromSender = sender?.id;
   if (typeof fromSender === 'number' && Number.isFinite(fromSender)) return String(fromSender);
   if (typeof fromSender === 'string' && fromSender.length > 0) return fromSender;
-  // GitLab push/MR payloads use `user_id`.
   const fromUser = payload.user_id;
   if (typeof fromUser === 'number' && Number.isFinite(fromUser)) return String(fromUser);
   if (typeof fromUser === 'string' && fromUser.length > 0) return fromUser;

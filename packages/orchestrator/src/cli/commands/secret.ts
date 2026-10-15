@@ -1,12 +1,4 @@
-/**
- * Secret management commands for kici-admin.
- *
- * Provides scoped secret operations:
- *   secret scopes, list, set, delete
- *   secret scope create|rename|delete
- *
- * Secret values are write-only -- there is no "get value" command.
- */
+/** `kici-admin secret`: scoped secrets. Values are write-only; there is no "get value" command. */
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -115,7 +107,6 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
             dryRun?: boolean;
           },
         ) => {
-          // Resolve (orgId, scope, key) from positional OR sugar form.
           const hasPositional = Boolean(posOrgId || posScope || posKey);
           const hasSugar = Boolean(opts.org || opts.context || opts.key);
           if (hasPositional && hasSugar) {
@@ -158,10 +149,8 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
 
           const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
           if (dbUrl) {
-            // The direct-DB branch writes the row itself, bypassing the admin
-            // route, the dashboard handler and PgSecretStore — so it needs its
-            // own guard against a key that would make the at-rest AAD
-            // ambiguous. The HTTP branch below is covered by the route.
+            // Direct-DB bypasses the route, the dashboard handler and PgSecretStore,
+            // so it guards here against a key that makes the at-rest AAD ambiguous.
             assertValidSecretKey(key);
             await setContextSecretDirect(dbUrl, {
               orgId,
@@ -174,8 +163,7 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
             await getClient().setSecret(orgId, scope, key, value);
             console.log(`Secret '${key}' set in scope '${scope}' for org ${orgId}.`);
           }
-          // A scope named after a context is how that context's secrets are
-          // written (the --context sugar form sets scope = context name).
+          // A context's secrets live in the scope named after it (--context sets that scope).
           await warnIfContextUnbound({
             orgId,
             name: scope,
@@ -213,9 +201,8 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
 }
 
 /**
- * `secret scope create|rename|delete` — the operator path for the dashboard's
- * scope writes (`secrets.scope.*` in the dashboard-write policy). HTTP only,
- * like `secret scopes`: each verb calls the orchestrator admin API.
+ * `secret scope create|rename|delete`: the operator path for the dashboard's
+ * `secrets.scope.*` writes. HTTP only, like `secret scopes`.
  */
 function registerSecretScopeCommands(sec: Command, getClient: () => AdminApiClient): void {
   const scope = sec.command('scope').description('Create, rename or delete a secret scope');

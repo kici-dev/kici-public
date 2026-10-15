@@ -22,9 +22,6 @@ export const REDACTED_VALUE = '***REDACTED***';
  */
 const AAD_PREFIX = 'config-field:';
 
-/**
- * Deep-clone an object using structured clone.
- */
 function deepClone<T>(obj: T): T {
   return structuredClone(obj);
 }
@@ -33,7 +30,6 @@ function deepClone<T>(obj: T): T {
  * Get a value at a nested path in an object.
  * Returns undefined if the path doesn't exist.
  *
- * @param obj - The object to traverse
  * @param path - Dot-separated path (e.g., 'providers.github.appId')
  */
 export function deepGet(obj: Record<string, unknown>, path: string): unknown {
@@ -85,7 +81,6 @@ export function deepSet(obj: Record<string, unknown>, path: string, value: unkno
  * providers.github is an array of 2 items resolves to:
  * ['providers.github.0.privateKey', 'providers.github.1.privateKey']
  *
- * @param obj - The object to inspect
  * @param pattern - Dot-separated path with optional '*' wildcards
  * @returns Array of concrete dot-separated paths that exist in the object
  */

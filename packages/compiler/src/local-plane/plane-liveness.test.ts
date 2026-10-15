@@ -148,16 +148,13 @@ describe('classifyPlane', () => {
 
 describe('classifyPlane default probes', () => {
   it('classifies a holder that accepts but never answers, instead of hanging on it', async () => {
-    // The wedged orphan this module exists for: the socket completes the TCP
-    // handshake and then goes silent. Without a probe deadline the HTTP client
-    // waits out its own multi-minute default and the CLI hangs with it.
+    // The wedged orphan this module exists for: TCP handshake, then silence.
+    // Without a probe deadline the CLI hangs for the HTTP client's multi-minute default.
     const accepted: net.Socket[] = [];
     const server = net.createServer((s) => {
       accepted.push(s); // Accept the connection and never write a response.
     });
-    // Port 0 lets the kernel pick a free one: a hardcoded port is one concurrent
-    // listener away from an unhandled EADDRINUSE that reads as an unrelated
-    // crash rather than as this test's subject.
+    // Port 0: a hardcoded port risks an EADDRINUSE that reads as an unrelated crash.
     await new Promise<void>((r) => server.listen({ port: 0, host: '127.0.0.1' }, () => r()));
     const port = (server.address() as net.AddressInfo).port;
     try {
@@ -166,8 +163,7 @@ describe('classifyPlane default probes', () => {
       expect(c.kind).toBe('foreign-unknown');
       expect(Date.now() - started).toBeLessThan(15_000);
     } finally {
-      // The probe's aborted socket is still accepted here, and `close` alone
-      // waits for it, so drop live connections before closing.
+      // `close` alone waits for the probe's aborted socket.
       for (const s of accepted) s.destroy();
       await new Promise<void>((r) => server.close(() => r()));
     }

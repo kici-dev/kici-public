@@ -316,7 +316,6 @@ describe('SecretResolver', () => {
 
     // Should succeed — vault-prod being down doesn't affect pg-only bindings
     expect(result).toEqual({ DB_PASSWORD: 'pw' });
-    // Warning should be logged
     expect(logger.warn).toHaveBeenCalledWith(
       'Secret backends unreachable during collection',
       expect.objectContaining({
@@ -334,7 +333,6 @@ describe('SecretResolver', () => {
       makeScopedSecret({ scope: 'aws/prod/db', key: 'DB_PASSWORD', encryptedValue: 'enc:pw' }),
     ]);
 
-    // Vault backend is unreachable
     const vaultStore: MockSecretStore = {
       getAllSecrets: vi.fn().mockRejectedValue(new Error('Connection refused')),
       decrypt: vi.fn(),
@@ -377,7 +375,6 @@ describe('SecretResolver', () => {
     const result = await resolver.resolveForContext('org-1', { id: 'env-1', name: 'production' });
 
     expect(result).toEqual({ DB_PASSWORD: 'pw' });
-    // No warning should be logged when all backends are healthy
     expect(logger.warn).not.toHaveBeenCalled();
   });
 
@@ -387,7 +384,6 @@ describe('SecretResolver', () => {
       makeBinding({ id: 'bind-2', scopePattern: 'vault-prod:**' }),
     ]);
 
-    // PG backend secrets
     secretStore.getAllSecrets.mockResolvedValue([
       makeScopedSecret({ scope: 'aws/prod', key: 'DB_PASSWORD', encryptedValue: 'enc:pg-pw' }),
     ]);
@@ -395,7 +391,6 @@ describe('SecretResolver', () => {
       s.encryptedValue.replace('enc:', ''),
     );
 
-    // Vault backend secrets
     const vaultStore: MockSecretStore = {
       getAllSecrets: vi.fn().mockResolvedValue([
         makeScopedSecret({

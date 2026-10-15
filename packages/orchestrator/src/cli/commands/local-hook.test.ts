@@ -38,7 +38,6 @@ describe('installPostReceiveHook', () => {
     const hookPath = installPostReceiveHook(repo, script);
     expect(hookPath).toBe(join(repo, '.git', 'hooks', 'post-receive'));
     expect(readFileSync(hookPath, 'utf8')).toBe(script);
-    // Executable bit set.
     expect(statSync(hookPath).mode & 0o111).not.toBe(0);
   });
 

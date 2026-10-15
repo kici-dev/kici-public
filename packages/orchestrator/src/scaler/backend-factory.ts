@@ -2,10 +2,9 @@
  * The single construction path for scaler backends.
  *
  * Both startup hosts (`orchestrator-core`, `worker-core`) and
- * `ScalerManager.reload` call this, so a backend built by a reload is built
- * exactly the way startup builds one. Host differences (DB-backed vs in-memory
- * IP allocation, event support) arrive as context fields rather than forked
- * code.
+ * `ScalerManager.reload` call this, so a reload builds a backend exactly as
+ * startup does. Host differences (DB-backed vs in-memory IP allocation, event
+ * support) arrive as context fields, not forked code.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -32,10 +31,7 @@ export interface IpAllocatorParams {
 export interface BackendFactoryContext {
   /** The whole config — supplies `defaults.resources` and the firecracker network block. */
   scalerConfig: ScalerConfig;
-  /**
-   * Always supplied when available; the event backend's claim store needs it
-   * regardless of the auth mode.
-   */
+  /** Always supplied when available: the event claim store needs it in any auth mode. */
   tokenStore?: AgentTokenStore;
   /** True when `config.agentAuth === 'token'`; gates token injection for the three local backends. */
   injectAgentToken: boolean;
@@ -56,21 +52,17 @@ export interface BackendFactoryContext {
   /** DB-backed on a coordinator, in-memory on a worker. */
   ipAllocator: (params: IpAllocatorParams) => IpAllocator;
   /**
-   * The already-constructed scaler state store. The event backend's claim
-   * store writes its pending-claim rows through it. Absent on the worker,
-   * which has no database — and so no event backend either.
+   * The event backend's claim store writes pending-claim rows through it.
+   * Absent on the worker, which has no database and so no event backend.
    */
   stateStore?: ScalerStateStore;
   /** Absent ⇒ the `event` type is unsupported on this host (worker mode). */
   eventEmitterProvider?: () => ScalerEventEmitterLike;
   /**
-   * Whether an agent id is currently registered on this host.
-   *
-   * The container backend's orphan sweep uses it to tell a running agent that
-   * is doing work from one whose agent never registered. Absent ⇒ the sweep
-   * assumes every running container is registered, which is the fail-safe
-   * direction: it leaves an orphan for the next pass rather than killing a
-   * live agent.
+   * The container orphan sweep uses it to tell a working agent from one that
+   * never registered. Absent ⇒ every running container counts as registered,
+   * the fail-safe direction: an orphan waits for the next pass rather than a
+   * live agent being killed.
    */
   isAgentRegistered?: (agentId: string) => boolean;
   logger: ReturnType<typeof createLogger>;
@@ -175,10 +167,9 @@ export async function createScalerBackend(
   }
 
   if (s.type === ScalerBackendType.enum.event) {
-    // The event backend performs no local compute: it emits scale-up /
-    // scale-down events to a provisioning workflow and mints ephemeral
-    // credentials lazily through its own claim store. Both the emitter and a
-    // DB-backed state store are mandatory, so the worker cannot host one.
+    // No local compute: it emits scale events to a provisioning workflow and
+    // mints ephemeral credentials lazily through its claim store. It needs the
+    // emitter and a DB-backed state store, so a worker cannot host one.
     const store = ctx.tokenStore;
     const provider = ctx.eventEmitterProvider;
     const stateStore = ctx.stateStore;

@@ -1,7 +1,7 @@
 /**
- * Firecracker host-bridge diagnostic. Emits one row per configured Firecracker
- * scaler backend: the bridge interface + its gateway addr + its nft table must
- * all be present, else the scaler cannot spawn microVMs.
+ * One row per configured Firecracker scaler backend: the bridge interface, its
+ * gateway addr and its nft table must all be present, else the scaler cannot
+ * spawn microVMs.
  */
 import type { DiagnosticDeps, DiagnosticResult } from '../types.js';
 import {
@@ -14,7 +14,7 @@ interface CheckOpts {
   verify?: (cfg: FirecrackerBridgeConfig) => Promise<BridgeHealth>;
 }
 
-/** Backend instances that expose host-bridge config (the Firecracker backend). */
+/** The Firecracker backend exposes host-bridge config. */
 interface BridgeConfigProvider {
   getBridgeConfig?: () => FirecrackerBridgeConfig;
 }

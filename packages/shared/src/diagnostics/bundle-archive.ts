@@ -24,9 +24,8 @@ export const MAX_LOG_BYTES = 50 * 1024 * 1024;
  * so the per-instance filename pattern produced by
  * `buildLogFilename()` is picked up without additional configuration.
  *
- * Exported for reuse by the `kici-admin debug-bundle` CLI command, which
- * runs outside the orchestrator process but still needs to include the
- * same log files in its locally-assembled bundle.
+ * Also used by the `kici-admin debug-bundle` command, which assembles its
+ * bundle locally, outside the orchestrator process.
  */
 export async function addLogsToArchive(
   archive: Archiver,
@@ -58,7 +57,6 @@ export async function addLogsToArchive(
     const stat = fs.statSync(filePath);
 
     if (totalBytes + stat.size > MAX_LOG_BYTES) {
-      // Skip remaining files to stay under cap
       break;
     }
 
@@ -72,7 +70,6 @@ export async function addLogsToArchive(
     // heavily-redacted set overshoot the cap it exists to enforce.
     totalBytes += Buffer.byteLength(content, 'utf-8');
 
-    // Count lines and patterns
     const lines = content.split('\n');
     totalLines += lines.length;
     for (const line of lines) {
@@ -81,7 +78,6 @@ export async function addLogsToArchive(
     }
   }
 
-  // Log summary
   const summary = { totalLines, errors, warnings, totalBytes };
   archive.append(JSON.stringify(summary, null, 2), { name: 'logs/summary.json' });
 }

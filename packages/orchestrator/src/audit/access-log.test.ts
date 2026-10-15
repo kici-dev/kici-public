@@ -6,6 +6,7 @@ import type { ColdStore } from '@kici-dev/shared';
 import { AccessLogWriter } from './access-log.js';
 import type { Database } from '../db/types.js';
 import type { AccessLogColdRow } from '../cold-store/load-access-log-range.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
 
@@ -132,8 +133,8 @@ describe.skipIf(!DATABASE_URL)('AccessLogWriter', () => {
       source: 'platform_proxy',
       outcome: 'allowed',
     });
-    // `run.cancel` is an always-recorded action, so this plain-user row lands
-    // deterministically with a null agent_label (no sampling involved).
+    // `run.cancel` is always recorded (no sampling), so this plain-user row lands
+    // deterministically with a null agent_label.
     await writer.record({
       orgId: 'org-1',
       routingKey: null,
@@ -164,19 +165,12 @@ describe.skipIf(!DATABASE_URL)('AccessLogWriter', () => {
 
 describe('AccessLogWriter (mocked — failure swallow)', () => {
   it('swallows insert errors and logs instead of throwing', async () => {
-    // Minimal Kysely-shape mock that throws on insertInto -> execute
-    const db = {
-      insertInto: vi.fn(() => ({
-        values: vi.fn(() => ({
-          execute: vi.fn().mockRejectedValue(new Error('fake db outage')),
-        })),
-      })),
-    } as unknown as Kysely<Database>;
+    const { db, mocks } = createMockDb();
+    mocks.insertExecute.mockRejectedValue(new Error('fake db outage'));
 
     const writer = new AccessLogWriter(db);
-    // Use a `denied` outcome so the sampler is bypassed and the insert
-    // path is actually exercised — the swallow contract is the focus
-    // of this test.
+    // A `denied` outcome bypasses the sampler, so the insert path (and its swallow
+    // contract) is exercised.
     await expect(
       writer.record({
         orgId: 'org-1',
@@ -189,14 +183,15 @@ describe('AccessLogWriter (mocked — failure swallow)', () => {
         outcome: 'denied',
       }),
     ).resolves.toBeUndefined();
+    // The rejecting insert ran; without it the swallow is never exercised.
+    expect(mocks.insertExecute).toHaveBeenCalledTimes(1);
   });
 });
 
 describe('AccessLogWriter (mocked — agent label column)', () => {
   function captureWriter() {
-    const valuesFn = vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) }));
-    const db = { insertInto: vi.fn(() => ({ values: valuesFn })) } as unknown as Kysely<Database>;
-    return { writer: new AccessLogWriter(db), valuesFn };
+    const { db, mocks } = createMockDb();
+    return { writer: new AccessLogWriter(db), valuesFn: mocks.insertValues };
   }
 
   it('writes agent_label when the actor is an agent-annotated user', async () => {
@@ -246,22 +241,15 @@ describe('AccessLogWriter (mocked — agent label column)', () => {
 });
 
 describe('AccessLogWriter (mocked — best-effort contract)', () => {
-  // Every caller uses `void this.accessLog.record(...)` (fire-and-forget),
-  // so an unhandled rejection from any code path inside record() would
-  // crash the orchestrator under Node's default rejection handling. The
-  // class doc explicitly states this is a best-effort writer that MUST
-  // NOT take down dashboard reads.
+  // Every caller fires and forgets `void this.accessLog.record(...)`, so any
+  // rejection inside record() would crash the orchestrator under Node's default
+  // handling. It is a best-effort writer that MUST NOT take down dashboard reads.
 
   it('swallows errors thrown by the rate limiter', async () => {
-    // Limiter that throws — simulates a future limiter implementation
-    // bug or a resource-constrained environment where the limiter's
-    // backing store fails. Use a `rate_limit`-class action so the
-    // limiter is consulted (allowed + non-platform_operator path).
-    const db = {
-      insertInto: vi.fn(() => ({
-        values: vi.fn(() => ({ execute: vi.fn().mockResolvedValue(undefined) })),
-      })),
-    } as unknown as Kysely<Database>;
+    // A throwing limiter (a limiter bug or a failing backing store). A
+    // `rate_limit`-class action makes the limiter be consulted (allowed +
+    // non-platform_operator path).
+    const { db } = createMockDb();
     const writer = new AccessLogWriter(db, undefined, {
       permit: () => {
         throw new Error('limiter exploded');
@@ -284,13 +272,8 @@ describe('AccessLogWriter (mocked — best-effort contract)', () => {
 
 describe('AccessLogWriter (mocked — sampler integration)', () => {
   function makeMockDb() {
-    const execute = vi.fn().mockResolvedValue(undefined);
-    const db = {
-      insertInto: vi.fn(() => ({
-        values: vi.fn(() => ({ execute })),
-      })),
-    } as unknown as Kysely<Database>;
-    return { db, execute };
+    const { db, mocks } = createMockDb();
+    return { db, execute: mocks.insertExecute };
   }
 
   it('drops a sampled-out allowed read', async () => {
@@ -390,12 +373,10 @@ describe('AccessLogWriter (mocked — sampler integration)', () => {
 });
 
 describe('AccessLogWriter.getById (cold-store fallback)', () => {
-  // The lookup matrix: hot hit, hot miss
-  // (with and without a cold-store wired), cold hit with `--org`, cold
-  // hit without `--org` (synthetic tenant), cold miss, and cold-store
-  // throws. The fallback exists because `query()` already merges hot+cold
-  // via `loadAccessLogRange`, so paginated lists surface archived rows but
-  // the legacy `getById` would 404 on the same ids.
+  // Lookup matrix: hot hit, hot miss (with and without a cold store), cold hit
+  // with and without `--org` (synthetic tenant), cold miss, and cold-store throw.
+  // `query()` already merges hot+cold via `loadAccessLogRange`, so without the
+  // fallback `getById` would 404 on ids the paginated list shows.
   const SAMPLE_HOT = {
     id: 'hot-1',
     org_id: 'org-1',
@@ -423,14 +404,11 @@ describe('AccessLogWriter.getById (cold-store fallback)', () => {
   } as AccessLogColdRow;
 
   function makeSelectMockDb(rowToReturn: AccessLogColdRow | undefined) {
-    const executeTakeFirst = vi.fn().mockResolvedValue(rowToReturn);
-    const where = vi.fn(() => ({ executeTakeFirst }));
-    const selectAll = vi.fn(() => ({ where }));
-    const selectFrom = vi.fn(() => ({ selectAll }));
+    const { db, mocks } = createMockDb({ selectFirstRow: rowToReturn });
     return {
-      db: { selectFrom } as unknown as Kysely<Database>,
-      executeTakeFirst,
-      selectFrom,
+      db,
+      executeTakeFirst: mocks.selectExecuteTakeFirst,
+      selectFrom: mocks.selectFrom,
     };
   }
 
@@ -452,10 +430,9 @@ describe('AccessLogWriter.getById (cold-store fallback)', () => {
       }
       return gen();
     });
-    // The real ColdStore exposes more than these, but getById only touches
-    // fetchRange and the warm cutoff it resolves internally — cast through
-    // unknown to satisfy the structural interface without stubbing the rest.
-    // 30 days is `minAccessLogWarmDays()`, the value the adapter archives at.
+    // getById only touches fetchRange and the warm cutoff it resolves, so cast
+    // through unknown instead of stubbing the rest of ColdStore. 30 days is
+    // `minAccessLogWarmDays()`, the value the adapter archives at.
     const warmCutoff = vi.fn(() => new Date(Date.now() - 30 * 86_400_000));
     return { coldStore: { fetchRange, warmCutoff } as unknown as ColdStore, fetchRange };
   }
@@ -500,8 +477,8 @@ describe('AccessLogWriter.getById (cold-store fallback)', () => {
 
   it('falls back to cold-store with the synthetic tenant when no orgId is given', async () => {
     const { db } = makeSelectMockDb(undefined);
-    // The synthetic tenant scan emits NULL-org_id rows (orchestrator-level
-    // events such as `archive_chunk`, `purge_chunk`).
+    // The synthetic tenant scan emits NULL-org_id rows (orchestrator-level events
+    // such as `archive_chunk`, `purge_chunk`).
     const syntheticRow = { ...SAMPLE_COLD, org_id: null, id: 'cold-synthetic' } as AccessLogColdRow;
     const { coldStore, fetchRange } = makeColdStoreMock({ rows: [syntheticRow] });
     const writer = new AccessLogWriter(db, coldStore);
@@ -531,10 +508,9 @@ describe('AccessLogWriter.getById (cold-store fallback)', () => {
     });
     const writer = new AccessLogWriter(db, coldStore);
 
-    // Best-effort contract: a transient cold-store error MUST NOT throw
-    // out of getById, otherwise `kici-admin access-log show` and the
-    // dashboard detail handler would surface a 500 instead of a normal
-    // 404 fallthrough.
+    // Best-effort contract: a transient cold-store error MUST NOT throw out of
+    // getById, or `kici-admin access-log show` and the dashboard detail handler
+    // would return a 500 instead of the 404 fallthrough.
     const out = await writer.getById('cold-1', { orgId: 'org-1' });
     expect(out).toBeNull();
     expect(fetchRange).toHaveBeenCalledTimes(1);
@@ -554,18 +530,17 @@ describe('AccessLogWriter.recordInTransaction', () => {
   };
 
   it('writes through the executor it is given, not the writer\u2019s own pool', async () => {
-    // If it used `this.db` the row would commit independently of the mutation
-    // it audits, which is the whole thing the transactional variant prevents.
-    const values = vi.fn().mockReturnValue({ execute: vi.fn().mockResolvedValue(undefined) });
-    const executor = { insertInto: vi.fn().mockReturnValue({ values }) };
-    const ownPool = { insertInto: vi.fn() };
+    // On `this.db` the row would commit independently of the mutation it audits,
+    // which the transactional variant exists to prevent.
+    const executor = createMockDb();
+    const ownPool = createMockDb();
 
-    const writer = new AccessLogWriter(ownPool as unknown as Kysely<Database>);
-    await writer.recordInTransaction(executor as unknown as Transaction<Database>, ENTRY);
+    const writer = new AccessLogWriter(ownPool.db);
+    await writer.recordInTransaction(executor.db as Transaction<Database>, ENTRY);
 
-    expect(executor.insertInto).toHaveBeenCalledWith('access_log');
-    expect(ownPool.insertInto).not.toHaveBeenCalled();
-    expect(values.mock.calls[0][0]).toMatchObject({
+    expect(executor.mocks.insertInto).toHaveBeenCalledWith('access_log');
+    expect(ownPool.mocks.insertInto).not.toHaveBeenCalled();
+    expect(executor.mocks.insertValues.mock.calls[0][0]).toMatchObject({
       org_id: 'org-tx',
       action: 'trust_policy.updated',
     });
@@ -576,13 +551,14 @@ describe('AccessLogWriter.recordInTransaction', () => {
     // reads; the transactional variant must do the opposite, or the caller's
     // mutation would commit unaudited.
     const boom = new Error('insert exploded');
-    const failing = {
-      insertInto: () => ({ values: () => ({ execute: () => Promise.reject(boom) }) }),
-    } as unknown as Transaction<Database>;
+    const { db: failing, mocks } = createMockDb();
+    mocks.insertExecute.mockRejectedValue(boom);
 
-    const writer = new AccessLogWriter(failing as unknown as Kysely<Database>);
+    const writer = new AccessLogWriter(failing);
     await expect(writer.recordInTransaction(failing, ENTRY)).rejects.toThrow('insert exploded');
     // Contrast: the best-effort path swallows the same failure.
     await expect(writer.record(ENTRY)).resolves.toBeUndefined();
+    // Both paths reached the rejecting insert, so the contrast is real.
+    expect(mocks.insertExecute).toHaveBeenCalledTimes(2);
   });
 });

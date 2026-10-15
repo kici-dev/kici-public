@@ -1,12 +1,7 @@
-/**
- * Job complete trigger helper - creates triggers for job completion events.
- * Returns a frozen JobCompleteTriggerConfig directly.
- */
-
 import type { JobCompleteConfigInput, JobCompleteTriggerConfig } from './types.js';
 
 /**
- * Create a job completion trigger configuration.
+ * Create a frozen job completion trigger.
  *
  * @example
  * // Match any job completion

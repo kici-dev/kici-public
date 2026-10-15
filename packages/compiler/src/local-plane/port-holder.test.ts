@@ -162,8 +162,7 @@ describe('terminatePid', () => {
   });
 
   it('gives up on a pid that survives SIGKILL instead of polling forever', async () => {
-    // A pid that never disappears however hard it is signalled — a zombie
-    // awaiting reaping, or a task stuck in uninterruptible I/O.
+    // E.g. a zombie awaiting reaping, or a task stuck in uninterruptible I/O.
     const sent: Array<NodeJS.Signals | 0> = [];
     const started = Date.now();
     await terminatePid(424242, 20, {

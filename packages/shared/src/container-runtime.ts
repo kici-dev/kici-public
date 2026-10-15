@@ -3,33 +3,26 @@
  * KiCI: the orchestrator's container scaler backend, its bare-metal backend in
  * container mode, and the AGENT's own job-container sandbox.
  *
- * They live in `@kici-dev/shared` rather than in the orchestrator because the
- * agent needs the same runtime injection: when an ordinary agent nests a job
- * container from a customer's image, that image is no more likely to ship Node
- * than the one a scaler spawns. Two copies of "materialize the KiCI runtime"
- * would be two chances to disagree on the parts that are easy to get wrong —
- * the volume key, the root-owned copy, and the self-verification.
+ * They live in `@kici-dev/shared` because the agent needs the same runtime
+ * injection: a customer's job image is no more likely to ship Node than the one
+ * a scaler spawns. One copy keeps the volume key, the root-owned copy and the
+ * self-verification from disagreeing.
  *
- * They are separate composable functions rather than one `spawnAgentContainer`
- * that owns the whole sequence, because the create/start step is genuinely
- * caller-specific — network isolation, label sets, bind lists and log capture
- * differ per caller — while the steps below are identical everywhere.
+ * They are composable functions rather than one `spawnAgentContainer`, because
+ * the create/start step is caller-specific (network isolation, labels, binds,
+ * log capture) while the steps below are identical everywhere.
  *
- * `dockerode` is a TYPE-ONLY import here: every function takes an already-built
- * client, so `@kici-dev/shared` does not depend on it at runtime and a consumer
- * that never imports this module never pulls it in.
+ * `dockerode` is a TYPE-ONLY import: every function takes a built client, so
+ * `@kici-dev/shared` does not depend on it at runtime.
  */
 
 import { z } from 'zod';
 import type Docker from 'dockerode';
 
 /**
- * When to pull an image.
- *
- * Defined here rather than in the orchestrator's scaler types because
- * `pullImageIfMissing` lives here and both the orchestrator and the agent call
- * it. The orchestrator's `scaler/types.ts` re-exports it, so the scaler config
- * schema and every operator-facing value stay exactly as they were.
+ * When to pull an image. Defined here because both the orchestrator and the
+ * agent call `pullImageIfMissing`; the orchestrator's `scaler/types.ts`
+ * re-exports it for the scaler config schema.
  */
 export const ImagePullPolicy = z.enum(['Always', 'IfNotPresent', 'Never']);
 export type ImagePullPolicy = z.infer<typeof ImagePullPolicy>;
@@ -58,18 +51,15 @@ export interface PullImageOptions {
 }
 
 /**
- * Pull `image` according to the pull policy. Returns whether a pull ran.
- *
- * Authenticated when an authconfig is supplied — a private registry otherwise
- * fails the pull with a 401 that reads like a missing image.
+ * Pull `image` per the pull policy; returns whether a pull ran. Without an
+ * authconfig a private registry fails with a 401 that reads like a missing image.
  */
 export async function pullImageIfMissing(opts: PullImageOptions): Promise<boolean> {
   const { docker, image, authconfig, signal } = opts;
   const policy = opts.pullPolicy ?? ImagePullPolicy.enum.IfNotPresent;
 
-  // `Never` means the operator guarantees the image is already there — a pull
-  // would defeat the point (an air-gapped host, or a locally-built image with
-  // no registry to pull from).
+  // `Never`: the operator guarantees the image is present (air-gapped host, or a
+  // locally built image with no registry).
   if (policy === ImagePullPolicy.enum.Never) return false;
 
   if (policy === ImagePullPolicy.enum.IfNotPresent) {
@@ -103,23 +93,19 @@ export const RUNTIME_MOUNT = '/opt/kici';
 export const RUNTIME_NODE_MOUNT = `${RUNTIME_MOUNT}/node`;
 
 /**
- * Bind spec that injects the KiCI runtime into a container.
- *
- * Read-only is load-bearing: a job that could rewrite the runtime would control
- * the interpreter every later step runs under.
+ * Bind spec that injects the KiCI runtime into a container. Read-only is
+ * load-bearing: a job that could rewrite the runtime would control the
+ * interpreter every later step runs under.
  */
 export function runtimeInjectBind(hostRuntimeDir: string): string {
   return `${hostRuntimeDir}:${RUNTIME_MOUNT}:ro`;
 }
 
 /**
- * Image label naming the init an agent image ships in its runtime tree.
- *
- * The scalers start an agent inside a job's own image from the injected
- * runtime, so its init has to come from that runtime too: the job's image is
- * not required to ship one. An agent image built before the label existed
- * carries no init in its runtime tree, and its agent starts as PID 1 as it
- * always did.
+ * Image label naming the init an agent image ships in its runtime tree. The
+ * scalers start an agent inside a job's own image, which need not ship an init,
+ * so the init comes from the injected runtime. An agent image without the label
+ * has no init there, and its agent starts as PID 1.
  */
 export const RUNTIME_INIT_LABEL = 'kici.runtime.init';
 
@@ -139,21 +125,16 @@ const RUNTIME_INIT_COMMANDS: Record<RuntimeInit, readonly string[]> = {
 };
 
 /**
- * The init command to start an injected agent under, from the agent image's
- * labels.
- *
- * Empty when the image names no init, or one this release does not know: that
- * agent then starts as PID 1 and says so in its startup log.
+ * The init command for an injected agent, from the agent image's labels. Empty
+ * when the image names no init or an unknown one: that agent starts as PID 1
+ * and says so in its startup log.
  */
 export function runtimeInitCommand(labels: Record<string, string> | null | undefined): string[] {
   const init = RuntimeInit.safeParse(labels?.[RUNTIME_INIT_LABEL]);
   return init.success ? [...RUNTIME_INIT_COMMANDS[init.data]] : [];
 }
 
-/**
- * The agent image's labels. The image is already present: the runtime volume
- * was materialized from it.
- */
+/** The agent image's labels. Precondition: the image is present (the runtime volume came from it). */
 export async function agentImageLabels(
   docker: Docker,
   agentImage: string,
@@ -168,13 +149,11 @@ export async function agentImageLabels(
  * Command that starts the agent from the INJECTED runtime, under `init` (from
  * {@link runtimeInitCommand}) when the agent image ships one.
  *
- * Only meaningful when the runtime is mounted. A spawned job image has its own
- * default CMD — python's shell, a node REPL, whatever the customer's image
- * declares — so without overriding it the container starts that instead and no
- * agent ever registers. The job then waits for an agent that will never arrive.
+ * Only meaningful when the runtime is mounted. Without this override a job image
+ * starts its own default CMD, no agent registers, and the job waits forever.
  *
- * Absolute on both halves: the image is not required to ship Node, and the
- * agent lives inside the runtime tree rather than at the image's own /app.
+ * Absolute on both halves: the image need not ship Node, and the agent lives in
+ * the runtime tree, not the image's own /app.
  */
 export function injectedAgentCommand(init: readonly string[] = []): string[] {
   return [
@@ -187,18 +166,15 @@ export function injectedAgentCommand(init: readonly string[] = []): string[] {
 /**
  * Which part of an agent image's `/opt/kici` tree a caller needs.
  *
- * - `all` — node PLUS the agent application. What a spawn that runs the AGENT
- *   ITSELF out of the volume needs (the per-job-image topologies), because the
- *   entrypoint resolves inside the mounted tree.
- * - `node` — the Node tree alone, mounted at `/opt/kici/node`. What an agent
- *   nesting a job container needs: the runner bundle is bind-mounted from that
- *   agent's OWN build, so the runner and the agent driving it can never be two
- *   different versions.
+ * - `all` — node PLUS the agent application, for a spawn that runs the AGENT
+ *   ITSELF from the volume (the per-job-image topologies).
+ * - `node` — the Node tree alone, mounted at `/opt/kici/node`, for an agent
+ *   nesting a job container: the runner bundle is bind-mounted from that
+ *   agent's OWN build, so runner and agent versions can never differ.
  *
- * They are separate volumes rather than one tree mounted twice because the
- * sandbox binds its runner and loader hook at fixed paths under `/opt/kici`.
- * Mounting the whole tree read-only at `/opt/kici` would put those two binds
- * INSIDE a read-only mount, whose mountpoints cannot be created.
+ * Separate volumes, not one tree mounted twice: the sandbox binds its runner and
+ * loader hook at fixed paths under `/opt/kici`, and mountpoints inside a
+ * read-only mount cannot be created.
  */
 export const RuntimeSubtree = z.enum(['all', 'node']);
 export type RuntimeSubtree = z.infer<typeof RuntimeSubtree>;
@@ -206,16 +182,13 @@ export type RuntimeSubtree = z.infer<typeof RuntimeSubtree>;
 /**
  * Name of the shared volume holding the KiCI runtime, keyed by image IDENTITY.
  *
- * Keyed by the image's content id, never its name:tag. A moving tag such as
- * `:latest` is rebuilt in place, so a name-keyed volume is reused after the
- * image it was copied from has been replaced, which is exactly the "silently
- * reusing the previous version's binaries" failure this is supposed to
- * prevent: a reused volume populated from an older image can leave the mounted
- * runtime empty, and every spawned container then fails to start.
+ * Keyed by the image's content id, never its name:tag: a moving tag such as
+ * `:latest` is rebuilt in place, and a name-keyed volume would silently reuse
+ * the previous version's binaries — a reused volume from an older image can
+ * leave the mounted runtime empty, so every spawned container fails to start.
  *
- * The subtree is part of the name for the same reason: an `all` volume and a
- * `node` volume have different roots, so sharing one name would mount a tree
- * whose `bin/node` is one level off.
+ * The subtree is in the name too: `all` and `node` volumes have different roots,
+ * so sharing a name would mount a tree whose `bin/node` is one level off.
  */
 export function runtimeVolumeName(
   imageId: string,
@@ -246,26 +219,21 @@ const RUNTIME_OUT = '/kici-runtime-out';
 /**
  * Marker file proving the volume holds a COMPLETE runtime.
  *
- * Volume existence is not population. A volume is created before the copy runs,
- * so a concurrent caller's `inspect()` succeeds against a volume that is still
- * being filled, and it mounts a half-copied tree — which surfaces far from the
- * cause, typically as a zod ESM SyntaxError from a partially written module.
- * The marker is written LAST, after the populator's own `test -x` checks, so it
- * can only appear on a tree that already verified.
+ * Volume existence is not population: the volume is created before the copy, so
+ * a concurrent caller's `inspect()` succeeds mid-fill and mounts a half-copied
+ * tree (typically a zod ESM SyntaxError far from the cause). The marker is
+ * written LAST, after the populator's `test -x` checks, so it only appears on a
+ * verified tree.
  */
 const RUNTIME_COMPLETE_MARKER = `${RUNTIME_OUT}/.kici-runtime-complete`;
 
 /**
  * The self-verifying copy each subtree runs in the populator container.
  *
- * The verification is not decoration. `cp -a` of an absent or empty source
- * exits 0, leaving an EMPTY volume — and the spawn then creates a container
- * whose runtime mount has no node, which dies at start with no error recorded
- * anywhere near the cause.
- *
- * The completion marker is the LAST command in both branches: written any
- * earlier it would land on a tree that has not been verified, which is the
- * exact failure it exists to prevent.
+ * The verification is load-bearing: `cp -a` of an absent or empty source exits
+ * 0, leaving an EMPTY volume, and the spawned container then dies at start with
+ * no error near the cause. The completion marker must stay the LAST command in
+ * both branches, so it never lands on an unverified tree.
  */
 function populatorCommand(subtree: RuntimeSubtree): string {
   const out = RUNTIME_OUT;
@@ -297,37 +265,31 @@ async function populatorOutput(container: Docker.Container): Promise<string> {
 /**
  * Materialize the KiCI runtime into a named volume that job containers mount.
  *
- * The runtime lives inside the `kici-agent` image, but a bind mount needs a
- * HOST path — and the orchestrator (or the agent) may itself be containerized,
- * so it cannot assume /opt/kici exists on the host filesystem. Copying the tree
- * out of the image into a named volume once, then mounting that volume, works
- * the same whether the caller runs on bare metal or in a container.
+ * The runtime lives inside the `kici-agent` image, but a bind mount needs a HOST
+ * path, and a containerized caller cannot assume /opt/kici exists on the host.
+ * A named volume copied from the image works on bare metal and in a container.
  *
- * Idempotent: the volume is created once per (agent image, subtree) and reused.
- * Returns the volume name to mount.
+ * Idempotent: one volume per (agent image, subtree), reused. Returns the volume
+ * name to mount.
  */
 export async function ensureRuntimeVolume(opts: EnsureRuntimeVolumeOptions): Promise<string> {
   const { docker, agentImage, signal } = opts;
   const subtree = opts.subtree ?? RuntimeSubtree.enum.all;
 
-  // Pull FIRST: the volume name is derived from the image's content id, which
-  // requires the image to be present.
+  // Pull FIRST: the volume name derives from the image's content id.
   await pullImageIfMissing({ docker, image: agentImage, ...(signal ? { signal } : {}) });
   const inspected = (await docker.getImage(agentImage).inspect()) as { Id?: string };
   const imageId = inspected.Id ?? agentImage;
   const name = runtimeVolumeName(imageId, subtree);
 
-  // One populate per volume, however many callers arrive at once. Two agents
-  // spawning together used to both see "no such volume", both create it, and
-  // both copy into the same mount — so the loser mounted a tree the winner was
-  // still writing. Sharing the in-flight promise makes the second caller await
-  // the first rather than race it.
+  // One populate per volume per process: concurrent callers share the in-flight
+  // promise, so none mounts a tree another caller is still writing.
   const inFlight = inFlightRuntimeVolumes.get(name);
   if (inFlight) return await inFlight;
 
   const populating = materializeRuntimeVolume({ ...opts, subtree, name }).finally(() => {
-    // ALWAYS clear, settled either way: a retained rejected promise would make
-    // every later spawn of this image fail forever — worse than the race.
+    // ALWAYS clear: a retained rejected promise would fail every later spawn of
+    // this image forever.
     inFlightRuntimeVolumes.delete(name);
   });
   inFlightRuntimeVolumes.set(name, populating);
@@ -340,13 +302,12 @@ const inFlightRuntimeVolumes = new Map<string, Promise<string>>();
 /**
  * Does this volume carry the completion marker?
  *
- * A short-lived container is the only way to read a named volume's contents:
- * the daemon owns the mount, and the caller may itself be containerized, so
- * there is no host path to stat. Mounted the same way the populator mounts it
- * (root, same bind) so the probe sees exactly what the populator wrote.
+ * A short-lived container is the only way to read a named volume: the daemon
+ * owns the mount and a containerized caller has no host path to stat. It mounts
+ * like the populator (root, same bind) to see exactly what it wrote.
  *
- * Any failure to answer reads as NOT populated. Repopulating a good volume
- * costs one redundant copy; mounting an unverified one is the bug.
+ * Any failure reads as NOT populated: a redundant copy is cheap, mounting an
+ * unverified volume is the bug.
  */
 async function runtimeVolumeIsPopulated(args: {
   docker: Docker;
@@ -360,9 +321,8 @@ async function runtimeVolumeIsPopulated(args: {
       Image: agentImage,
       User: '0:0',
       Cmd: ['sh', '-c', `test -f ${RUNTIME_COMPLETE_MARKER}`],
-      // Labelled so the orphan reaper can find it. This runs on every spawn, so
-      // an unlabelled one strands a container nothing can identify if the
-      // process is killed between create and remove.
+      // Labelled for the orphan reaper: a kill between create and remove would
+      // otherwise strand an unidentifiable container, on every spawn.
       Labels: { 'kici-managed': 'true' },
       HostConfig: { Binds: [`${name}:${RUNTIME_OUT}`], AutoRemove: false },
     });
@@ -382,9 +342,7 @@ async function materializeRuntimeVolume(
 ): Promise<string> {
   const { docker, agentImage, subtree, name } = opts;
 
-  // Existence is not population, so an existing volume is probed rather than
-  // trusted. Skip the probe entirely when there is no volume: there is nothing
-  // to read, and starting a container to learn that wastes a spawn.
+  // An existing volume is probed, not trusted; a missing one skips the probe.
   const exists = await docker
     .getVolume(name)
     .inspect()
@@ -397,28 +355,23 @@ async function materializeRuntimeVolume(
   opts.onProgress?.(`materializing the KiCI runtime from ${agentImage}`);
   await docker.createVolume({ Name: name, Labels: { 'kici-managed': 'true' } });
 
-  // A throwaway container whose only job is to copy the tree out of the image
-  // into the volume. `cp -a` preserves the executable bits the node binary
-  // needs; losing those would surface as a confusing "permission denied".
+  // A throwaway copy container. `cp -a` keeps the node binary's executable bits
+  // (losing them surfaces as a confusing "permission denied").
   const populator = await docker.createContainer({
     Image: agentImage,
-    // Root, explicitly. The agent image runs as `node`, and a freshly created
-    // named volume is owned by root — so under rootful docker the copy fails
-    // with a bare "exited 1" that says nothing about permissions. Rootless
-    // podman maps the user and happens to work, which is exactly why this only
-    // shows up under rootful docker. The populator runs no customer code: it
-    // copies one tree and exits.
+    // Root, explicitly: the agent image runs as `node` and a new named volume is
+    // root-owned, so rootful docker fails the copy with a bare "exited 1"
+    // (rootless podman maps the user and hides this). The populator runs no
+    // customer code.
     User: '0:0',
     Cmd: ['sh', '-c', populatorCommand(subtree)],
     // Same reaper contract as the volume it fills.
     Labels: { 'kici-managed': 'true' },
     HostConfig: { Binds: [`${name}:${RUNTIME_OUT}`], AutoRemove: false },
   });
-  // Dropping the populator is what releases its reference to the volume. The
-  // daemon refuses to remove a volume any container still references — a
-  // STOPPED one counts — so a reap attempted while the populator is still
-  // registered fails and is swallowed, leaving the dead volume on disk to be
-  // found later as a leak. Runs once, from whichever path reaches it first.
+  // Dropping the populator releases its volume reference: the daemon refuses to
+  // remove a volume any container (even a STOPPED one) references, so a reap
+  // before the drop fails silently and leaks the volume. Runs once.
   let populatorDropped = false;
   const dropPopulator = async (): Promise<void> => {
     if (populatorDropped) return;
@@ -431,43 +384,33 @@ async function materializeRuntimeVolume(
     const result = (await populator.wait()) as { StatusCode?: number };
     if (result.StatusCode !== 0) {
       const output = await populatorOutput(populator);
-      // Carry the container's own output. Without it the failure reads only as
-      // "exited 1", which says nothing about whether the tree was missing, the
-      // volume unwritable, or the disk full — one full debugging session was
-      // spent recovering exactly that.
+      // Carry the container's output: a bare "exited 1" does not say whether the
+      // tree was missing, the volume unwritable, or the disk full.
       throw new Error(
         `runtime copy exited ${result.StatusCode ?? 'unknown'}` +
           (output ? `: ${output}` : ' with no output'),
       );
     }
   } catch (err) {
-    // Remove the half-populated volume, but ONLY when it is this call's to
-    // remove — which takes BOTH conditions below, not either one.
+    // Remove the half-populated volume ONLY when it is this call's — BOTH
+    // conditions below, not either one.
     //
-    // The in-flight map serialises populates within a process; it cannot see
-    // another one. Agents run one process each and share a daemon, so two of
-    // them reach the same volume name concurrently: the loser finds no marker,
-    // starts its own copy, and collides with the winner's ("Text file busy").
-    // Removing there would yank the volume out from under a populate that is
-    // about to succeed, and the winner would then return a name whose volume
-    // the daemon re-creates EMPTY at mount time — a worse failure than the one
-    // being cleaned up after. The daemon's own reference check is only a
-    // partial guard: verified against both the Docker engine and podman's
-    // compat endpoint, a reap is refused with 409 while the peer's populator is
-    // still registered, and `force` does not override that — but the refusal
-    // stops once that container is gone, which is the window the marker covers.
-    // (The podman *CLI*'s `--force` does destroy the holding containers; the
-    // compat API dockerode speaks does not.)
+    // The in-flight map cannot see other processes. Agents share a daemon, so
+    // two can populate one volume name at once: the loser collides with the
+    // winner ("Text file busy"), and removing then would yank the volume from a
+    // populate about to succeed, which the daemon re-creates EMPTY at mount
+    // time. The daemon's reference check is a partial guard: Docker and podman's
+    // compat endpoint refuse the reap with 409 while the peer's populator is
+    // registered, and `force` does not override that, but the refusal ends once
+    // that container is gone — the window the marker covers. (The podman CLI's
+    // `--force` destroys the holding containers; the compat API does not.)
     //
-    // `exists` alone does not establish ownership: it is a snapshot taken
-    // BEFORE the copy, and the whole window between that snapshot and this
-    // failure is time another process had to create the volume and fill it. So
-    // the marker is re-read here, and a volume that now reads complete is left
-    // alone whatever the snapshot said.
+    // `exists` is a snapshot from BEFORE the copy, so it does not prove
+    // ownership; the marker is re-read and a volume that now reads complete is
+    // left alone.
     //
-    // Leaving a volume this call did not create costs nothing: the missing
-    // marker already stops anyone mounting it, and the next successful
-    // populate copies over it.
+    // Leaving a volume this call did not create is free: the missing marker
+    // stops anyone mounting it, and the next populate copies over it.
     await dropPopulator();
     if (!exists && !(await runtimeVolumeIsPopulated({ docker, name, agentImage }))) {
       await docker

@@ -1,9 +1,7 @@
 /**
- * Shared HTTP plumbing for the `kici approve` / `kici reject` held-run
- * commands. Resolves auth + endpoint from the global config (PAT preferred,
- * API key fallback; Platform endpoint preferred, orchestrator fallback) and
- * exposes thin list / approve / reject helpers against the Platform dashboard
- * API.
+ * HTTP helpers for `kici approve` / `kici reject` against the Platform
+ * dashboard API, authenticated with the PAT and Platform endpoint from the
+ * global config.
  */
 
 import pc from 'picocolors';
@@ -12,11 +10,9 @@ import { loadGlobalConfig } from '../remote/config.js';
 import type { HeldRunSummary } from '@kici-dev/engine';
 
 /**
- * A failed held-runs request, carrying the HTTP status so a caller can tell a
- * caller who will NEVER have the data (401 / 403 — no permission on the
- * held-runs surface) from a transport or server failure that may succeed next
- * time. `kici runs show` reads holds as optional detail, and reminding such a
- * caller on every single invocation is noise, not information.
+ * Carries the HTTP status so a caller can tell a permanent 401 / 403 from a
+ * failure that may succeed next time. `kici runs show` reads holds as optional
+ * detail, so repeating a permission error on every invocation is noise.
  */
 export class HeldRunRequestError extends Error {
   constructor(
@@ -33,7 +29,6 @@ export class HeldRunRequestError extends Error {
   }
 }
 
-/** Resolved auth context for a held-run command. */
 export interface HeldRunContext {
   endpoint: string;
   token: string;
@@ -41,13 +36,9 @@ export interface HeldRunContext {
 }
 
 /**
- * Resolve the auth context, printing a clear error and returning null when the
- * CLI is not authenticated / no active org is set.
- *
- * `quiet` suppresses the error output for a caller whose own command does not
- * depend on the held-run surface — `kici runs show` reads holds as extra
- * detail on a run it can already display, so an unresolvable context must not
- * make it print an authentication error for a command that worked.
+ * Null, after printing an error, when the CLI is not authenticated or has no
+ * active org. `quiet` suppresses the error for a caller that reads holds only
+ * as extra detail (`kici runs show`), so a working command prints no auth error.
  */
 export async function resolveHeldRunContext(
   options: { quiet?: boolean } = {},
@@ -82,7 +73,6 @@ function authHeaders(token: string): Record<string, string> {
   };
 }
 
-/** List the held runs for a single run id. */
 export async function listHeldRunsForRun(
   ctx: HeldRunContext,
   runId: string,
@@ -97,10 +87,8 @@ export async function listHeldRunsForRun(
 }
 
 /**
- * POST an approve decision for a held run. Returns true on success. When
- * `autoApprove` is set, marks the approval as a `kici run --approve-all`
- * breakglass so the orchestrator audits it as `held_run.auto_approve`
- * (eligibility is still enforced server-side — never a bypass).
+ * True on success. `autoApprove` marks a `kici run --approve-all` breakglass,
+ * audited as `held_run.auto_approve`; eligibility is still enforced server-side.
  */
 export async function postApprove(
   ctx: HeldRunContext,
@@ -117,7 +105,7 @@ export async function postApprove(
   return true;
 }
 
-/** POST a reject decision (with reason) for a held run. Returns true on success. */
+/** True on success. */
 export async function postReject(
   ctx: HeldRunContext,
   heldRunId: string,
@@ -136,7 +124,6 @@ export async function postReject(
   return true;
 }
 
-/** Build a user-facing error string from a failed response. */
 async function describeError(response: Response): Promise<string> {
   let detail: string | undefined;
   try {

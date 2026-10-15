@@ -1,9 +1,6 @@
 /**
- * `kici-admin orchestrator install` command.
- *
- * Registers the orchestrator as a native system service on the current platform.
- * Auto-detects platform and privilege level, creates config directories,
- * writes env file, and registers the service with the init system.
+ * `kici-admin orchestrator install`: registers the orchestrator as a native
+ * service, auto-detecting platform and privilege level.
  */
 
 import type { Command } from 'commander';
@@ -59,15 +56,11 @@ interface InstallOptions {
   force?: boolean;
 }
 
-/**
- * Spin up a dev PostgreSQL container using Docker or Podman.
- * Returns the DATABASE_URL for the container.
- */
+/** Start a dev PostgreSQL container (Podman or Docker); returns its DATABASE_URL. */
 function startDevPostgres(containerName: string): string {
   const password = crypto.randomBytes(16).toString('hex');
   const port = 15432;
 
-  // Detect container runtime
   let runtime = 'podman';
   try {
     execSync('podman --version', { stdio: 'ignore' });
@@ -80,7 +73,6 @@ function startDevPostgres(containerName: string): string {
     }
   }
 
-  // Check if container already exists
   try {
     const existing = execSync(
       `${runtime} ps -a --filter name=${containerName} --format "{{.Names}}"`,
@@ -99,12 +91,9 @@ function startDevPostgres(containerName: string): string {
   }
 
   console.log(`Starting dev PostgreSQL container "${containerName}" on port ${port}...`);
-  // Pass POSTGRES_PASSWORD via --env-file rather than -e KEY=value argv so
-  // the password never lands in the operator's `ps aux` output or shell
-  // history. Tempfile is created with 0600 and removed in a finally — the
-  // plaintext window is the few microseconds podman takes to read the
-  // file before forking the container. POSTGRES_DB stays on the argv since
-  // it isn't sensitive.
+  // POSTGRES_PASSWORD goes via a 0600 --env-file, not argv, so it never lands
+  // in `ps aux` or shell history; the finally removes it, so the plaintext
+  // window is the moment podman takes to read it. POSTGRES_DB is not sensitive.
   const tmpEnvFile = path.join(kiciMkdtemp('kici-dev-pg-'), 'postgres.env');
   try {
     fs.writeFileSync(tmpEnvFile, `POSTGRES_PASSWORD=${password}\n`, { mode: 0o600 });
@@ -167,9 +156,9 @@ Token vocabulary:
     .option('--force', 'Overwrite an existing same-named foreign instance')
     .action(
       cliAction(async (opts: InstallOptions, command: Command) => {
-        // A kici-admin from a standalone package has no import.meta.resolve:
-        // without --binary it cannot locate the server, so it stops here,
-        // before the wizard or any file.
+        // A standalone-package kici-admin has no import.meta.resolve: without
+        // --binary it cannot locate the server, so it stops before the wizard
+        // or any file.
         const resolveModule: ModuleResolver | undefined =
           typeof import.meta.resolve === 'function'
             ? (specifier) => import.meta.resolve(specifier)
@@ -193,9 +182,8 @@ Token vocabulary:
           process.exit(1);
         }
         const orchestratorMode = parsedMode.data;
-        // --mode carries a Commander default, so opts.mode is always set. Only
-        // the source tells an operator who typed `--mode independent` from one
-        // who typed nothing, and the env-file path needs that distinction.
+        // --mode has a Commander default; only the option source tells a typed
+        // `--mode independent` from nothing, and the env-file path needs that.
         const modeExplicit = command.getOptionValueSource('mode') !== 'default';
 
         const platform = detectPlatform(opts.platform as ServicePlatform | undefined);
@@ -209,17 +197,14 @@ Token vocabulary:
         console.log(`Service name: ${serviceName}`);
         console.log(`Instance dir: ${instanceDir}`);
 
-        // Create service manager early so the create-path guard can reconcile
-        // the index against the driver's native scan.
+        // Created early so the create-path guard can reconcile the index
+        // against the driver's native scan.
         const manager = await createServiceManager(platform);
 
         // Create-path guard: refuse to clobber a same-named foreign instance
-        // (one already installed at a different path, or one discovered in the
-        // init system with no manifest yet). --force overrides.
-        //
-        // The scan names no driver, so it covers every candidate one: a compose
-        // orchestrator of this name on a systemd host is a clobber the
-        // single-driver scan could not see.
+        // (installed at a different path, or in the init system with no
+        // manifest yet); --force overrides. The scan covers every candidate
+        // driver, so a same-named compose orchestrator on a systemd host counts.
         const existingInstances = await listInstances({
           component: 'orchestrator',
           isUserLevel: userLevel,
@@ -242,23 +227,20 @@ Token vocabulary:
           process.exit(1);
         }
 
-        // Resolve directories
         const configDir = getConfigDir(serviceName, userLevel);
         const logDir = getLogDir(serviceName, userLevel);
 
-        // Ensure directories exist
         fs.mkdirSync(configDir, { recursive: true });
         fs.mkdirSync(logDir, { recursive: true });
 
         const envFilePath = path.join(configDir, `${serviceName}.env`);
 
         // On Windows a file mode protects nothing: restrict the folder before
-        // the first secret lands in it, so the env file and the temporary file
-        // its write stages through are never readable by other accounts. A
-        // user-level folder sits in the profile of its user, already private.
+        // the first secret lands, so neither the env file nor the temporary file
+        // its write stages through is readable by other accounts. A user-level
+        // folder is already private in its user's profile.
         if (platform === 'windows' && !userLevel) restrictEnvFileAccess(envFilePath);
 
-        // Handle --dev mode: spin up Postgres container
         let devDbUrl: string | undefined;
         if (opts.dev) {
           const containerName = `${serviceName}-dev-pg`;
@@ -266,9 +248,9 @@ Token vocabulary:
           console.log(`Dev PostgreSQL URL: ${devDbUrl}`);
         }
 
-        // Resolve which config source materialises the env file (wizard on a
-        // bare interactive TTY, an explicit --env-file copy, or an enumerated
-        // stub for every non-interactive/scripted install), then delegate.
+        // The env file comes from the wizard on a bare interactive TTY, an
+        // explicit --env-file copy, or an enumerated stub for every
+        // non-interactive/scripted install.
         const envMode = resolveWizardMode({
           wizard: opts.wizard,
           envFile: opts.envFile,
@@ -285,12 +267,10 @@ Token vocabulary:
           modeExplicit,
         });
 
-        // Inject the deployment-identity env vars so the running orchestrator
-        // can report its own deployment shape in source.register (drives the
-        // dashboard's per-orchestrator kici-admin command helper). For compose,
-        // resolve the container runtime; a probe failure yields no runtime line
-        // rather than aborting the install. Idempotent: re-install replaces any
-        // existing KICI_DEPLOY_* lines.
+        // Deployment-identity env vars let the orchestrator report its shape in
+        // source.register (the dashboard's per-orchestrator kici-admin command
+        // helper). A compose runtime probe failure yields no runtime line rather
+        // than aborting. Re-install replaces existing KICI_DEPLOY_* lines.
         let composeRuntime: 'podman' | 'docker' | undefined;
         if (platform === 'compose') {
           try {
@@ -311,10 +291,9 @@ Token vocabulary:
           'utf-8',
         );
 
-        // Resolve the run command. With an explicit --binary we run it
-        // directly (assumed self-launching). Otherwise we run Node against the
-        // installed orchestrator server entry — server.js for platform/hybrid,
-        // standalone.js for independent — because `npm install -g kici-admin`
+        // An explicit --binary runs directly (assumed self-launching). Otherwise
+        // Node runs the server entry (server.js for platform/hybrid,
+        // standalone.js for independent), because `npm install -g kici-admin`
         // exposes only the CLI bin, not a self-launching server binary.
         const entryScript = opts.binary
           ? undefined
@@ -329,7 +308,6 @@ Token vocabulary:
           entryScript,
         });
 
-        // Check for Firecracker scaler in env file and warn if non-root
         if (userLevel) {
           try {
             const envContent = fs.readFileSync(envFilePath, 'utf-8');
@@ -341,19 +319,18 @@ Token vocabulary:
               console.warn('Re-run as root (sudo) to install a system-level service.\n');
             }
           } catch {
-            // Ignore read errors
+            // Unreadable env file: no warning.
           }
         }
 
-        // Build ServiceConfig
         const config: ServiceConfig = {
           name: serviceName,
           ...SERVICE_TEXT.orchestrator,
           executablePath,
           args,
-          // The node running this install command is the node the spawned
-          // agents use; bake its bin dir onto the service PATH so the
-          // required-tools check passes even when --binary wraps node.
+          // The node running install is the node spawned agents use; its bin
+          // dir on the service PATH passes the required-tools check even when
+          // --binary wraps node.
           nodeBinDir: path.dirname(process.execPath),
           envFilePath,
           workingDirectory: configDir,
@@ -366,11 +343,9 @@ Token vocabulary:
 
         await manager.install(config);
 
-        // Write the instance manifest into the deploy folder. This is the
-        // single source of truth every lifecycle command reads to reconstruct
-        // the ServiceConfig without re-deriving paths. A re-install of this
-        // instance updates the manifest already there: it keeps the migration
-        // heads and creation time, and records the version the launcher runs.
+        // The manifest is the single source of truth lifecycle commands read to
+        // rebuild the ServiceConfig. A re-install updates it in place, keeping
+        // migration heads and creation time and recording the launcher's version.
         const manifest: InstanceManifest = {
           component: 'orchestrator',
           name: serviceName,
@@ -390,7 +365,6 @@ Token vocabulary:
         );
         if (manifestWarning) console.warn(`Warning: ${manifestWarning}`);
 
-        // Register the instance in the host-wide index cache.
         try {
           appendIndexEntry(kiciRoot, {
             component: 'orchestrator',
@@ -400,9 +374,8 @@ Token vocabulary:
             instanceDir,
           });
         } catch (err) {
-          // appendIndexEntry throws on a same-name-different-dir collision; at
-          // this point the unit is already installed, so warn loudly rather
-          // than tear down the install.
+          // appendIndexEntry throws on a same-name-different-dir collision; the
+          // unit is already installed, so warn loudly rather than tear it down.
           console.warn(`Warning: instance index append failed: ${(err as Error).message}`);
         }
 

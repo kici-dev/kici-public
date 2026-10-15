@@ -1,6 +1,6 @@
 import { CheckMode } from '@kici-dev/engine';
 
-/** The two check-mode flags accepted by `kici run remote`. */
+/** `kici run remote` check-mode flags. */
 export interface CheckModeFlags {
   /** --check: report drift, change nothing. */
   check?: boolean;
@@ -9,13 +9,9 @@ export interface CheckModeFlags {
 }
 
 /**
- * Resolve the run {@link CheckMode} from the `--check` / `--fail-on-drift` flags.
- *
- * - no flags -> `apply` (the unchanged default: converge).
- * - `--check` -> `check` (report-only, changes nothing).
- * - `--check --fail-on-drift` -> `check-fail-on-drift` (fails the run on drift).
- *
- * `--fail-on-drift` without `--check` is an error — it only modifies check mode.
+ * No flags → `apply` (converge); `--check` → `check`; both →
+ * `check-fail-on-drift`. `--fail-on-drift` alone is an error: it only modifies
+ * check mode.
  */
 export function resolveCheckMode(flags: CheckModeFlags): CheckMode {
   if (flags.failOnDrift && !flags.check) {

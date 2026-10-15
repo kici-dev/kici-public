@@ -1,15 +1,10 @@
 import type { Command } from 'commander';
 
 /**
- * Whether the version banner should be suppressed for the command about to run.
- *
- * Structured-output (`--json`) and quiet (`--quiet`) invocations must keep stdout
- * free of human-facing chrome so callers can parse stdout directly. Walks the
- * command chain checking each command's OWN opts (not `optsWithGlobals()`): a
- * flag set anywhere in the chain suppresses the banner, and reading own opts
- * avoids a parent's default value shadowing a subcommand's explicit flag —
- * `kici run` defines `--quiet` for its routed action, which under
- * `optsWithGlobals()` would mask `kici run remote --quiet`.
+ * `--json` and `--quiet` keep stdout free of chrome so callers can parse it. A
+ * flag anywhere in the chain suppresses the banner. Each command's OWN opts are
+ * read, not `optsWithGlobals()`, under which the `--quiet` default `kici run`
+ * defines would mask `kici run remote --quiet`.
  */
 export function shouldSuppressBanner(actionCommand: Command): boolean {
   let cmd: Command | null = actionCommand;

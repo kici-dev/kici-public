@@ -84,9 +84,8 @@ describe('resolveHeldRunId', () => {
   it('errors when a job filter matches multiple non-step holds', () => {
     const result = resolveHeldRunId([workflowHold, jobHold], { job: 'deploy' });
     expect(result.ok).toBe(false);
-    // The message must name a filter that can actually separate them. It used
-    // to say "cannot disambiguate" and then offer `--job`, which is the filter
-    // that had just failed.
+    // The message must name a filter that can separate them, never `--job`,
+    // the filter that just failed.
     if (!result.ok) {
       expect(result.error).toContain('--hold-type <type>');
       expect(result.error).toContain('--hold <id>');
@@ -120,10 +119,9 @@ describe('resolveHeldRunId candidate listing', () => {
   });
 
   it('names the ids when two candidates would otherwise render identically', () => {
-    // The old listing de-duplicated on the rendered description, so two
-    // distinct holds collapsed to `Candidates: deploy.` — one entry, naming a
-    // filter that had already failed, with no way to pick either one. The ids
-    // are what `--hold <id>` takes, so they have to be printed.
+    // De-duplicating on the rendered description would collapse two distinct
+    // holds to `Candidates: deploy.`, with no way to pick either. The ids are
+    // what `--hold <id>` takes, so they are printed.
     const dupes: HeldRunSummary[] = [
       { ...pendingHolds[0], id: 'h1' },
       { ...pendingHolds[0], id: 'h1b' },
@@ -196,12 +194,11 @@ describe('resolveHeldRunId candidate listing', () => {
 });
 
 /**
- * One job can carry more than one pending hold. An SDK `requireApproval` paired
+ * One job can carry more than one pending hold: an SDK `requireApproval` paired
  * with a security-typed context gate writes two job-scoped rows under one job
- * name, because two independent requirements gate the job and both have to be
- * answered. `--job` cannot separate those, so `kici approve` / `kici reject`
- * and the MCP `approve_run` / `reject_run` tools were dead ends for that shape:
- * both error paths named a disambiguator that could not disambiguate.
+ * name, and both must be answered. `--job` cannot separate them, so
+ * `kici approve` / `kici reject` and the MCP `approve_run` / `reject_run` tools
+ * need the hold type or the hold id.
  */
 describe('resolveHeldRunId — two holds on one job', () => {
   const reviewer: HeldRunSummary = {

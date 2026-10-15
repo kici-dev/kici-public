@@ -76,11 +76,9 @@ describe('hasher', () => {
       expect(computeContentHash(source, 1, 'f\nA')).not.toBe(computeContentHash(source, 1, 'f\nB'));
     });
 
-    // Regression: Git for Windows ships with `core.autocrlf=true` set in the
-    // system gitconfig, so a `git clone` of a Linux-authored repo on a Windows
-    // host writes CRLF into the working tree. Without normalization the
-    // Windows agent computed a different hash than the Linux compiler and
-    // every dispatched workflow failed with "lock file is out of date".
+    // Git for Windows sets `core.autocrlf=true` system-wide, so a Windows clone
+    // has CRLF. Without normalization the Windows agent's hash differs from the
+    // Linux compiler's and every workflow fails "lock file is out of date".
     it('LF and CRLF source produce identical hashes (autocrlf parity)', () => {
       const lf = 'export const x = 1;\nexport const y = 2;\n';
       const crlf = 'export const x = 1;\r\nexport const y = 2;\r\n';
@@ -98,17 +96,15 @@ describe('hasher', () => {
 
 describe('COMPILE_SCHEMA_VERSION is single-sourced', () => {
   it('is the same binding the agent verifies against', () => {
-    // The compiler writes the hash and the agent re-verifies it. If the two
-    // disagree, EVERY workflow load fails its drift gate. Both now re-export
-    // one definition from `@kici-dev/core`, so agreement is structural rather
-    // than a pair of literals a commit has to keep in step.
+    // The compiler writes the hash and the agent re-verifies it; if they
+    // disagree, EVERY workflow load fails its drift gate. Both re-export one
+    // `@kici-dev/core` definition, so agreement is structural.
     expect(COMPILE_SCHEMA_VERSION).toBe(CORE_COMPILE_SCHEMA_VERSION);
   });
 
   it('is re-exported, not re-declared, by the compiler and the agent', () => {
-    // A re-introduced local literal would silently restore the drift hazard, so
-    // assert neither file declares its own. Read as text, because importing the
-    // agent package here would invert the dependency direction.
+    // A local literal would restore the drift hazard. Read as text: importing
+    // the agent package would invert the dependency direction.
     const here = path.dirname(fileURLToPath(import.meta.url));
     for (const rel of ['./hasher.ts', '../../../agent/src/execution/workflow-loader.ts']) {
       const src = readFileSync(path.join(here, rel), 'utf8');

@@ -75,8 +75,6 @@ export class LockFileTooLargeError extends Error {
 }
 
 /**
- * Universal-git implementation of LockFileFetcher.
- *
  * Bound to a single source (orgId + sourceId + config). The orchestrator
  * constructs one per registered universal-git source.
  */

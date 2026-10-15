@@ -3,18 +3,16 @@ import { type Kysely, sql } from 'kysely';
 /**
  * HA ownership for event-scaler provisions.
  *
- * - `scaler_pending_claims` — the pending provisioning claim, moved out of the
- *   per-process map in `ClaimStore` so any coordinator can redeem a code. Single
- *   use is enforced by `consumed_at`, set by a conditional UPDATE.
- * - `scaler_spawning_agents.*` — `owner_instance_id` scopes recovery and the
- *   per-instance reaper; `adopted_by` / `adopted_at` record which coordinator the
- *   agent actually reached; `mandatory_labels` / `provisioning_targets` / `roles`
- *   / `backend_type` make the row self-describing, so a coordinator with no
- *   matching scaler entry can still stamp the taint and emit the teardown.
+ * - `scaler_pending_claims` — pending provisioning claims, in the DB so any coordinator can
+ *   redeem a code. A conditional UPDATE of `consumed_at` enforces single use.
+ * - `scaler_spawning_agents.*` — `owner_instance_id` scopes recovery and the per-instance
+ *   reaper; `adopted_by` / `adopted_at` record the coordinator the agent reached;
+ *   `mandatory_labels` / `provisioning_targets` / `roles` / `backend_type` let a coordinator
+ *   with no matching scaler entry still stamp the taint and emit the teardown.
  * - `scaler_reservations.owner_instance_id` — same scoping for reservations.
  *
- * All columns are nullable and backfill as NULL. A NULL `owner_instance_id`
- * reads as "unknown owner", never as "not mine".
+ * Nullable, backfilled NULL. A NULL `owner_instance_id` reads as "unknown owner", never as
+ * "not mine".
  *
  * Idempotent: guarded on each object's existence.
  */
@@ -112,9 +110,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
 
 export async function down(db: Kysely<unknown>): Promise<void> {
   await sql`DROP TABLE IF EXISTS public.scaler_pending_claims`.execute(db);
-  // Dropping a column drops its indexes, which covers every index this migration
-  // adds except this one: `scaler_name` pre-dates 119 (migration 022), so the
-  // index survives the column-drop loop below and has to go explicitly.
+  // `scaler_name` pre-dates 119 (migration 022), so this index survives the column drops below.
   await sql`DROP INDEX IF EXISTS public.idx_scaler_spawning_agents_scaler_name`.execute(db);
   for (const [name] of SPAWNING_COLUMNS) {
     await sql`

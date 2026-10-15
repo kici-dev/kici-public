@@ -4,12 +4,11 @@ import type { GenericInitConfig } from '@kici-dev/sdk';
 import type { InitDirective } from './directives.js';
 import { PRESET_REGISTRY, AUTO_DETECT_TABLE, type PresetName } from './registry.js';
 
-/** Options for agent-side directive expansion. */
 export interface ExpandOptions {
   cloneRoot: string;
   /** Host platform; defaults to process.platform. */
   platform?: NodeJS.Platform;
-  /** Optional info logger (e.g. to emit a pseudo-step line). */
+  /** Info logger (e.g. for a pseudo-step line). */
   log?: (message: string) => void;
 }
 
@@ -22,7 +21,7 @@ async function fileExists(p: string): Promise<boolean> {
   }
 }
 
-/** Scan the clone root for marker files and return matched presets in table order. */
+/** Presets whose marker files exist in the clone root, in table order. */
 async function autoDetect(cloneRoot: string): Promise<PresetName[]> {
   const matched: PresetName[] = [];
   for (const row of AUTO_DETECT_TABLE) {
@@ -48,10 +47,7 @@ async function expandPreset(
   });
 }
 
-/**
- * Expand normalized directives into concrete generic init configs, reading the
- * clone root for preset cache keys and `'auto'` marker detection.
- */
+/** Reads the clone root for preset cache keys and `'auto'` marker detection. */
 export async function expandInitDirectives(
   directives: InitDirective[],
   opts: ExpandOptions,

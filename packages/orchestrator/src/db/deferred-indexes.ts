@@ -1,24 +1,19 @@
 /**
  * Indexes built after boot, outside the migration set.
  *
- * A migration cannot build an index without locking the table it indexes.
- * Kysely runs the whole pending batch inside one transaction and offers no
- * per-migration opt-out, and PostgreSQL rejects `CREATE INDEX CONCURRENTLY`
- * inside a transaction block outright — so a migration's only option is a
- * plain `CREATE INDEX`, which holds an exclusive lock for the whole build. On
- * a table holding millions of rows that is a multi-minute outage bolted onto
- * an upgrade.
+ * Kysely runs the pending batch in one transaction with no per-migration opt-out, and PostgreSQL
+ * rejects `CREATE INDEX CONCURRENTLY` inside a transaction block, so a migration can only use a
+ * plain `CREATE INDEX`: an exclusive lock for the whole build, a multi-minute upgrade outage on a
+ * table of millions of rows.
  *
- * So an index on a table that scales with run volume goes here instead. Each
- * entry is built `CONCURRENTLY` on its own connection with no statement
- * timeout, under an advisory lock distinct from the migration lock, after the
- * server is already serving. `IF NOT EXISTS` makes every build idempotent, and
- * a failed build retries on the next boot.
+ * So an index on a table that scales with run volume goes here. Each entry is built
+ * `CONCURRENTLY` on its own connection with no statement timeout, under an advisory lock distinct
+ * from the migration lock, after the server is serving. `IF NOT EXISTS` makes every build
+ * idempotent, and a failed build retries on the next boot.
  *
- * A repository check enforces that new indexes on those tables land here
- * rather than in a migration. The build itself is `deferred-index-build.ts`;
- * this module holds only the list, so a CLI can read it without loading the
- * orchestrator's metrics.
+ * A repository check enforces that new indexes on those tables land here. The build is
+ * `deferred-index-build.ts`; this module holds only the list, so a CLI can read it without
+ * loading the orchestrator's metrics.
  */
 export interface DeferredIndex {
   /** Index name, matching the one the SQL creates. */
@@ -28,12 +23,10 @@ export interface DeferredIndex {
 }
 
 /**
- * Every index the retention sweep and the age-based readers depend on.
- *
- * Each one supports a `... < cutoff` scan that would otherwise walk the whole
- * table on every cleanup tick. The tables already carry indexes for their
- * serving-path queries; these cover the aging path, whose predicate is not
- * prefixed by an organization or routing key.
+ * Every index the retention sweep and the age-based readers depend on: each supports a
+ * `... < cutoff` scan that would otherwise walk the whole table every cleanup tick. Serving-path
+ * indexes exist already; these cover the aging path, whose predicate has no org or routing-key
+ * prefix.
  */
 export const DEFERRED_INDEXES: ReadonlyArray<DeferredIndex> = [
   {
@@ -67,17 +60,12 @@ export const DEFERRED_INDEXES: ReadonlyArray<DeferredIndex> = [
             ON public.held_runs USING btree (status, created_at)`,
   },
   {
-    // The one index here that serves a WRITE rather than a scan.
-    // `execution_runs.parent_run_id` is a self-referencing foreign key with no
-    // index, so every DELETE of a run makes PostgreSQL run the referencing-side
-    // check `SELECT 1 FROM execution_runs WHERE $1 = parent_run_id` as a
-    // sequential scan — once per deleted row. At 5,000 rows a batch that is
-    // 5,000 full scans in one statement, which the serving pool's 30s
-    // statement_timeout cancels long before it finishes, so run retention never
-    // makes progress. Partial because a rerun is rare: the FK check compares
-    // with a strict operator, which the planner proves implies the predicate,
-    // so it uses the index (verified against PostgreSQL 18: Seq Scan before,
-    // Index Scan after). The retention sweep's own parent guard reads it too.
+    // Serves a WRITE, not a scan. Without it, every run DELETE makes PostgreSQL check the
+    // self-referencing `parent_run_id` FK with a sequential scan per deleted row: a 5,000-row
+    // batch is 5,000 full scans, which the serving pool's 30s statement_timeout cancels, so run
+    // retention never progresses. Partial because a rerun is rare: the FK check's strict
+    // operator lets the planner prove the predicate (PostgreSQL 18: Seq Scan before, Index Scan
+    // after). The retention sweep's own parent guard reads it too.
     name: 'execution_runs_parent_run_id_idx',
     sql: `CREATE INDEX CONCURRENTLY IF NOT EXISTS execution_runs_parent_run_id_idx
             ON public.execution_runs USING btree (parent_run_id)

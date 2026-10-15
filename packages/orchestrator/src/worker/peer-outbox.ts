@@ -75,14 +75,11 @@ export class PeerOutbox {
   }
 
   /**
-   * Synchronous, durably-fsynced enqueue. The terminal job status is on disk
-   * before this method returns — there is no async window in which an
-   * un-flushed write can be lost if the worker process is killed moments
-   * later (e.g. a worker orchestrator that crashes during microVM teardown
-   * right after the job completes). The asynchronous {@link enqueue} is
-   * fire-and-forget at its call site, so its fsync can be dropped when the
-   * event loop never runs again; this variant blocks the (infrequent,
-   * once-per-job-terminal) call path until the bytes are durable instead.
+   * Synchronous, fsynced enqueue: the terminal job status is on disk before this
+   * returns, so a worker killed moments later (e.g. crashing during microVM
+   * teardown) cannot lose it. The async {@link enqueue} is fire-and-forget at its
+   * call site, so its fsync is lost when the event loop never runs again; this
+   * variant blocks the once-per-job-terminal path until the bytes are durable.
    */
   enqueueSync(coordUrl: string, message: JobProgress): void {
     const rec: OutboxRecord = { coordUrl, message, persistedAt: this.now() };

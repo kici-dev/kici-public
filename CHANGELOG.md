@@ -2,6 +2,24 @@
 
 Release notes for the public KiCI packages.
 
+## v0.18.0 — 2026-10-15
+
+### Features
+
+- kici-admin orchestrator status prints an Agent binary line: the kici-agent installed with the Node.js runtime the service runs, which is the path to use as a bare-metal binaryPath
+
+### Fixes
+
+- kici-admin orchestrator upgrade checks every bare-metal scaler binaryPath before it installs anything: it stops when a binaryPath is not executable or is a Node.js version-manager shim, warns about a version-manager alias and about an agent from another runtime, and --rollback and --pick print the same findings as warnings; the orchestrator refuses a shim binaryPath at startup and on a scaler config reload, and its startup error names the kici-agent installed with its own runtime
+- The published @kici-dev/shared package no longer contains declaration files for its own tests.
+- kici-admin db fresh no longer fails with "database is being accessed by other users" when a client reconnects while the database is dropped
+- A Windows orchestrator with the local log store now saves webhook payloads and step logs whose names contain a character Windows refuses in a file name, such as the colons in every generic-source delivery id, and lists stored logs with forward-slash keys
+- An orchestrator with no Platform connection now records webhook deliveries, contexts, secrets, held runs and access-log entries for an organization id longer than 16 characters; a database migration widens those org_id columns to 255 characters without rewriting the tables
+
+### Other
+
+- The published orchestrator package no longer contains internal test helpers.
+
 ## v0.17.0 — 2026-10-10
 
 ### Features

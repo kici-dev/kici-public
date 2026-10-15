@@ -27,11 +27,9 @@ import { toCommandError } from '../command-error.js';
  * Network policy controlling RFC1918 and internet access for the agents or job
  * containers in one label set.
  *
- * Lives here rather than beside the scaler's own types because both the
- * orchestrator's scaler (agent containers and Firecracker VMs) and the agent's
- * container backend (nested job containers) build rules from it. The
- * orchestrator re-exports it from `scaler/types.ts` so its call sites are
- * unchanged.
+ * Lives here because both the orchestrator's scaler (agent containers and
+ * Firecracker VMs) and the agent's container backend (nested job containers)
+ * build rules from it; the orchestrator re-exports it from `scaler/types.ts`.
  */
 export interface NetworkPolicy {
   /** CIDR ranges allowed as exceptions to the default RFC1918 block */
@@ -198,16 +196,13 @@ export const METADATA_RANGE = '169.254.0.0/16';
  * Subnet of the agent's `kici-jobs` bridge, on which the agent keys ONE drop set
  * covering every nested job container — including one that does not exist yet.
  *
- * It lives here rather than beside the agent's own network constants because
- * the Firecracker host provisioner has to recognise those rules to leave them
- * alone, and the orchestrator carries `@kici-dev/agent` only as a devDependency.
- * The agent module re-exports it, so its own call sites are unchanged.
+ * Lives here because the Firecracker host provisioner must recognise those
+ * rules to leave them alone, and the orchestrator carries `@kici-dev/agent`
+ * only as a devDependency. The agent module re-exports it.
  */
 export const JOB_NETWORK_SUBNET = '172.31.0.0/16';
 
-/**
- * Options for nft command execution.
- */
+/** Options for nft command execution. */
 interface NftOptions {
   /**
    * Wrap the `nft` invocation with `sudo -n` so non-root orchestrators (e.g.
@@ -276,10 +271,8 @@ export async function probeNftables(opts: NftOptions = {}): Promise<string | nul
 
 /**
  * Validate that nftables is available and the process has NET_ADMIN capability.
- * Attempts `nft list tables` -- if it fails:
- *   - ENOENT: nft binary not installed
- *   - EPERM: nft binary present but NET_ADMIN capability missing
- * Throws with a clear error message in both cases.
+ * Throws a specific error for ENOENT (nft binary not installed) and EPERM (nft
+ * present, NET_ADMIN missing), and a generic one for any other failure.
  */
 export async function validateNftablesAvailability(opts: NftOptions = {}): Promise<void> {
   const message = await probeNftables(opts);
@@ -304,13 +297,13 @@ export async function validateNftablesAvailability(opts: NftOptions = {}): Promi
 
 /**
  * Ensure the nftables table and the chains this module writes to exist.
- * Idempotent -- safe to call multiple times.
+ * Idempotent.
  *
- * Every chain is verified individually. A bare "does the table exist?" check is
+ * Every chain is ensured individually. A bare "does the table exist?" check is
  * not enough: the Firecracker host provisioner creates the table before this
- * module ever runs, so a table with no `forward` chain satisfied the old early
- * return — and then every `addIsolationRules` failed with nft's "No such file
- * or directory", leaving every VM on that host with no isolation rules at all.
+ * module runs, so a table with no `forward` chain would pass it, and every
+ * `addIsolationRules` would then fail with nft's "No such file or directory",
+ * leaving every VM on that host without isolation rules.
  *
  * @param opts - `table` selects the table; `requireBaselineChain` additionally
  * ensures the regular {@link BASELINE_CHAIN} exists (Firecracker hosts, whose
@@ -469,7 +462,7 @@ export async function removeHostIsolationRules(
  *
  * The Firecracker host provisioner puts its six source-scoped baseline rules
  * here and reaches them with a `jump` appended as the `forward` chain's LAST
- * rule. Two properties follow, and both are load-bearing:
+ * rule. Two load-bearing properties follow:
  *
  *  - **Per-VM rules always win.** They are inserted at the `forward` head, so
  *    every one of them is evaluated before the jump. A per-VM `accept`
@@ -477,8 +470,8 @@ export async function removeHostIsolationRules(
  *    destination, and a per-VM `denyAll` drop is terminal before the
  *    baseline's blanket internet `accept` can let the packet out.
  *  - **A self-heal can rebuild the baseline without touching live VMs.** The
- *    provisioner flushes and refills only this chain, so it never has to
- *    `delete table` — which used to drop every running VM's isolation rules
+ *    provisioner flushes and refills only this chain and never runs
+ *    `delete table`, which drops every running VM's isolation rules
  *    fail-open.
  *
  * A regular chain reached by `jump` rather than a second base chain at a lower
@@ -515,23 +508,18 @@ export function buildIsolationRuleOps(
 ): string[][] {
   const rules: string[][] = [];
 
-  // 1. Gateway exception.
   rules.push([...matchClause, 'ip', 'daddr', gatewayIp, 'accept']);
 
-  // 2. Allowlisted CIDRs.
   for (const cidr of networkPolicy?.allowlist ?? []) {
     rules.push([...matchClause, 'ip', 'daddr', cidr, 'accept']);
   }
 
-  // 3. Block RFC1918 ranges.
   for (const range of RFC1918_RANGES) {
     rules.push([...matchClause, 'ip', 'daddr', range, 'drop']);
   }
 
-  // 4. Block cloud metadata.
   rules.push([...matchClause, 'ip', 'daddr', METADATA_RANGE, 'drop']);
 
-  // 5. Deny all remaining traffic if requested.
   if (networkPolicy?.denyAll) {
     rules.push([...matchClause, 'drop']);
   }
@@ -549,7 +537,6 @@ export function buildIsolationRuleOps(
  *
  * @param identifier - Network interface name or source IP to match (e.g., "veth-abc123" or "172.30.0.5")
  * @param gatewayIp - Gateway IP that must remain accessible (e.g., "10.0.0.1")
- * @param networkPolicy - Optional policy with allowlist and denyAll settings
  * @param matchMode - How to match traffic: 'iifname' for interface name (default), 'saddr' for source IP
  */
 export async function addIsolationRules(
@@ -563,7 +550,6 @@ export async function addIsolationRules(
     matchMode === 'iifname' ? `interface ${identifier}` : `source IP ${identifier}`;
   logger.info(`Adding isolation rules for ${matchLabel} (gateway: ${gatewayIp})`);
 
-  // Build match clause tokens based on mode
   const matchClause: string[] =
     matchMode === 'iifname' ? ['iifname', identifier] : ['ip', 'saddr', identifier];
 
@@ -595,13 +581,10 @@ export async function addIsolationRules(
  * subnet source as a prefix object, which its classifier treats as "not a
  * per-agent rule" on purpose.
  *
- * Returning `null` rather than throwing keeps "the chain is not there" distinct
- * from "the chain is there and holds nothing", exactly as {@link readInputChain}
- * does for the sibling chain. The distinction is load-bearing in the install
- * direction: a caller checking whether a rule set is present must read a missing
- * chain as NOT installed and go install it, and a throw instead aborts the whole
- * ensure path — which for the agent's job network degrades to a container on an
- * unfiltered bridge.
+ * Returns `null` rather than throwing, as {@link readInputChain} does: a caller
+ * checking whether a rule set is present must read a missing chain as NOT
+ * installed and install it, while a throw aborts the whole ensure path — which
+ * for the agent's job network degrades to a container on an unfiltered bridge.
  */
 export async function readForwardChain(opts: NftOptions = {}): Promise<string | null> {
   try {
@@ -660,10 +643,7 @@ export async function removeIsolationRules(
   }
 }
 
-/**
- * Re-export NftOptions type for use by callers (Firecracker / container backends)
- * that need to pass the requireSudo flag through to these functions.
- */
+/** Re-exported for the Firecracker and container backends, which pass `requireSudo` through. */
 export type { NftOptions };
 
 /** One rule in the forward chain, as reported by `nft -j -a list chain`. */
@@ -730,9 +710,9 @@ export async function listForwardRules(opts: NftOptions = {}): Promise<NftForwar
  * settles the question. Position is why: the host's inbound established/related
  * rule LEADS with `iifname "<egress iface>"` — a concrete name carrying no `*`
  * — and names the wildcard only later, in `oifname`. Returning on the first
- * concrete interface therefore claimed that rule for a nonexistent agent named
- * after the host NIC, so the provisioning sweep spared it and every re-provision
- * left another stale copy behind.
+ * concrete interface would claim that rule for a nonexistent agent named after
+ * the host NIC, so the provisioning sweep would spare it and every re-provision
+ * would leave another stale copy behind.
  */
 function identifierOf(expr: unknown): string | null {
   if (!Array.isArray(expr)) return null;
@@ -801,7 +781,6 @@ export async function deleteForwardRules(
  *
  * @param nftOutput - Raw output from `nft -a list chain ip kici <chain>`
  * @param identifier - String to search for in each rule line (interface name or UID)
- * @returns Array of numeric rule handles
  */
 export function parseRuleHandles(nftOutput: string, identifier: string): number[] {
   const handles: number[] = [];
@@ -817,11 +796,8 @@ export function parseRuleHandles(nftOutput: string, identifier: string): number[
   for (const line of lines) {
     // Skip non-rule lines (chain header, closing brace, etc.)
     if (!line.includes('# handle')) continue;
-
-    // Check if this rule references our identifier
     if (!boundaryRe.test(line)) continue;
 
-    // Extract handle number from `# handle N`
     const match = line.match(/# handle (\d+)/);
     if (match) {
       handles.push(parseInt(match[1], 10));

@@ -1,20 +1,16 @@
 /**
  * Firecracker execution sandbox (defense-in-depth).
  *
- * The Firecracker backend already provides VM-level isolation (separate kernel,
- * filesystem, network namespace). This sandbox adds defense-in-depth by running
- * the workflow runner as a child process with sanitized environment inside the VM.
- *
- * This prevents customer workflow code from:
+ * The VM already isolates kernel, filesystem and network namespace. This
+ * sandbox also runs the workflow runner as a child process with a sanitized
+ * environment inside the VM, which keeps customer workflow code from:
  * - Accessing MMDS metadata (orchestrator URL, agent config)
  * - Reading agent environment variables (KICI_*, DATABASE_URL, etc.)
  * - Interfering with the agent process directly
  *
- * The fork mechanism is identical to BareMetalSandbox (sandbox=false) -- no
- * bwrap needed since the VM itself provides PID/IPC/network/filesystem isolation.
- *
- * VM lifecycle (start/stop) is managed by the Firecracker scaler backend,
- * NOT by this sandbox. The sandbox only manages the child process within the VM.
+ * It forks like BareMetalSandbox (sandbox=false), without bwrap: the VM
+ * provides PID/IPC/network/filesystem isolation. The Firecracker scaler
+ * backend owns the VM lifecycle; this sandbox owns only the child process.
  */
 
 import type {
@@ -25,7 +21,6 @@ import type {
 } from './types.js';
 import { createForkRunner, type ForkRunnerHandle } from './fork-runner.js';
 
-/** Configuration options for FirecrackerSandbox. */
 interface FirecrackerSandboxOptions {
   /** Absolute path to the compiled workflow-runner.js inside the VM. */
   runnerPath: string;
@@ -33,13 +28,7 @@ interface FirecrackerSandboxOptions {
   env: Record<string, string>;
 }
 
-/**
- * Firecracker execution sandbox implementation.
- *
- * Thin defense-in-depth wrapper that forks the workflow runner with sanitized
- * environment inside a Firecracker VM. The VM provides the real isolation;
- * this sandbox ensures credential separation within the VM.
- */
+/** The VM provides the real isolation; this sandbox adds credential separation inside it. */
 export class FirecrackerSandbox implements ExecutionSandbox {
   private readonly runnerPath: string;
   private readonly env: Record<string, string>;
@@ -51,27 +40,17 @@ export class FirecrackerSandbox implements ExecutionSandbox {
     this.env = options.env;
   }
 
-  /**
-   * No-op: VM is already running, managed by the Firecracker scaler backend.
-   */
+  /** Records workDir only: the scaler backend started the VM before the agent. */
   async setup(options: SandboxSetupOptions): Promise<void> {
-    // Firecracker VM lifecycle is managed by the scaler backend.
-    // By the time the agent starts, the VM is already running.
     this.workDir = options.workDir;
   }
 
-  /**
-   * Execute a job by forking the workflow runner with sanitized environment.
-   *
-   * Identical to BareMetalSandbox (sandbox=false) -- no bwrap needed since
-   * the VM itself provides full isolation.
-   */
   async executeJob(options: JobExecutionOptions): Promise<JobExecutionResult> {
     this.runner = createForkRunner(
       {
         runnerPath: this.runnerPath,
         env: this.env,
-        useBwrap: false, // VM provides isolation, no bwrap needed
+        useBwrap: false, // the VM provides isolation
         workDir: this.workDir,
       },
       options,
@@ -81,9 +60,8 @@ export class FirecrackerSandbox implements ExecutionSandbox {
   }
 
   /**
-   * Abort the running job.
-   *
-   * Sends abort IPC message, then SIGTERM after 10s, SIGKILL after 15s.
+   * Sends the abort IPC message and SIGTERM at once, then SIGKILL after the
+   * grace period (30s by default).
    */
   async abort(): Promise<void> {
     if (this.runner) {
@@ -91,11 +69,7 @@ export class FirecrackerSandbox implements ExecutionSandbox {
     }
   }
 
-  /**
-   * Kill child process if still running.
-   *
-   * VM lifecycle (shutdown) is managed by the scaler backend, not this sandbox.
-   */
+  /** Kills the child if still running; the scaler backend shuts the VM down. */
   async teardown(): Promise<void> {
     if (this.runner) {
       this.runner.kill();

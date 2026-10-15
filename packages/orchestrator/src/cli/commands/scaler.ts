@@ -12,11 +12,10 @@
  *                         running orchestrator (recovery for a wedged node whose
  *                         data disk is full).
  *
- * `reap-orphans` loads the orchestrator's LOCAL config (no HTTP admin API, no
- * DB) and runs the liveness-driven reaper, which spares every live VM. It is the sanctioned operator path for
- * the ENOSPC bootstrap deadlock: when the data disk is 100% full the
- * orchestrator crash-loops before its in-process orphan sweep can run, so a
- * tool that frees disk WITHOUT the orchestrator is required.
+ * `reap-orphans` loads the LOCAL config (no admin API, no DB) and runs the
+ * liveness-driven reaper, which spares every live VM. It is the operator path
+ * for the ENOSPC bootstrap deadlock: on a full data disk the orchestrator
+ * crash-loops before its own orphan sweep can run.
  */
 import type { Command } from 'commander';
 import { loadLocalConfig } from '../../config/loader.js';
@@ -52,7 +51,6 @@ export async function isOrchestratorHealthy(port: number, basePath: string): Pro
   }
 }
 
-/** The `scaler orphans` options as Commander parses them. */
 export interface ScalerOrphansOptions {
   target?: string;
   all: boolean;
@@ -238,12 +236,7 @@ async function stopOrphans(
   return allStopped && notSent.length === 0 ? 0 : 1;
 }
 
-/**
- * `kici-admin scaler orphans`: list the live Firecracker VMs a node's
- * orchestrator does not track, and with `--stop` stop the orphaned ones.
- *
- * @returns the process exit code
- */
+/** @returns the process exit code */
 export async function runScalerOrphans(
   client: OrphansClient,
   opts: ScalerOrphansOptions,
@@ -262,7 +255,6 @@ function collectVm(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
-/** Register `scaler orphans` (admin HTTP API) on the `scaler` group. */
 function registerOrphansCommand(scaler: Command, getClient: () => AdminApiClient): void {
   scaler
     .command('orphans')
@@ -333,7 +325,6 @@ export async function runScalerReload(
   return body.results.some((r) => FAILED_RELOAD_OUTCOMES.has(r.outcome)) ? 1 : 0;
 }
 
-/** Register `scaler reload` (admin HTTP API) on the `scaler` group. */
 function registerReloadCommand(scaler: Command, getClient: () => AdminApiClient): void {
   scaler
     .command('reload')
@@ -369,9 +360,8 @@ export function registerScalerCommands(program: Command, getClient: () => AdminA
     .action(
       cliAction(async (opts: { config?: string; force: boolean; json: boolean }) => {
         const local = await loadLocalConfig(opts.config);
-        // Resolve the scaler config path from the same sources the orchestrator
-        // itself uses: the local YAML's scaler.configPath, or the env var that
-        // env-only workers (the rootless edge peers this command recovers) set.
+        // The orchestrator's own sources: the YAML's scaler.configPath, or the
+        // env var env-only workers (rootless edge peers) set.
         const scalerConfigPath = local.scaler?.configPath ?? process.env.KICI_SCALER_CONFIG_PATH;
         const scalerConfigDir = local.scaler?.configDir ?? process.env.KICI_SCALER_CONFIG_DIR;
         if (!scalerConfigPath) {
@@ -400,9 +390,8 @@ export function registerScalerCommands(program: Command, getClient: () => AdminA
           process.exit(0);
         }
 
-        // Orchestrator is down/wedged (or --force): FC reap is liveness-driven
-        // (safe); container reap is unconditional but safe because the
-        // orchestrator is not running.
+        // Down, wedged or --force: FC reap is liveness-driven; container reap is
+        // unconditional, safe because the orchestrator is not running.
         const counts = await reapAllOrphans({ scalerConfig, includeContainers: true });
         const total = Object.values(counts).reduce((a, b) => a + b, 0);
 

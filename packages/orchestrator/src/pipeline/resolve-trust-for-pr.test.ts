@@ -2,19 +2,17 @@ import { describe, it, expect } from 'vitest';
 import { resolveTrustForPR } from './process-webhook.js';
 
 /**
- * Trust resolution is derived from the git ref alone. Every ref in the base
- * repo is trusted — a default-branch push, a topic-branch push, a same-repo PR
- * — because only a write-or-higher contributor can put a ref there. A fork
- * head ref is the single untrusted case and resolves to `unknown`.
+ * Trust derives from the git ref alone: every base-repo ref is trusted (only a
+ * write-or-higher contributor can create one); a fork head ref resolves to
+ * `unknown`.
  *
- * The tier feeds two consumers: `deriveCacheRefScope` (trusted → org-shared
- * cache, everything else → per-run isolated) and lock-file-source selection
- * (`head` for a trusted PR ref, `base` otherwise).
+ * The tier feeds `deriveCacheRefScope` (trusted → org-shared cache, else
+ * per-run isolated) and lock-file-source selection (`head` for a trusted PR
+ * ref, `base` otherwise).
  *
- * A PR event resolves a tier only for a provider that sets `hasForkModel`.
- * Elsewhere the fork signal is read from fixed payload keys many forges omit,
- * so it fails toward trust; such a PR deliberately resolves nothing and reads
- * the base lock.
+ * A PR resolves a tier only for a provider with `hasForkModel`; elsewhere the
+ * fork signal fails toward trust, so such a PR resolves nothing and reads the
+ * base lock.
  */
 
 function makeArgs(opts: {
@@ -74,8 +72,7 @@ describe('resolveTrustForPR — non-PR trust resolution', () => {
   });
 
   it('marks a non-default-branch push from a fork-model provider as trusted', async () => {
-    // The ref lives in the base repo, so only a write-or-higher contributor
-    // could have created it.
+    // Only a write-or-higher contributor can create a base-repo ref.
     const out = await resolveTrustForPR(
       makeArgs({
         event: 'push',
@@ -141,10 +138,9 @@ describe('resolveTrustForPR — PR trust resolution', () => {
   });
 
   it('resolves no tier for a PR from a provider with no fork model', async () => {
-    // universal-git normalizes Gitea/Gogs/GitLab pull_request events and reports
-    // an `isForkPR` built from two repo names read off fixed payload keys that
-    // many forges omit, which reads `false` when either is absent. Trusting it
-    // would hand a fork's HEAD lock file to trigger evaluation.
+    // universal-git's `isForkPR` (Gitea/Gogs/GitLab) reads `false` when a forge
+    // omits either repo-name payload key; trusting it would hand a fork's HEAD
+    // lock file to trigger evaluation.
     const out = await resolveTrustForPR(
       makeArgs({
         event: 'pull_request',

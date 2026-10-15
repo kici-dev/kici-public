@@ -1,17 +1,11 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { jsonResponse } from '@kici-dev/test-support/http';
 import { orchestratorsListCommand, orchestratorsUseCommand } from './orchestrators.js';
 
 vi.mock('../remote/config.js', () => ({
   loadGlobalConfig: vi.fn(),
   mergeGlobalConfig: vi.fn().mockResolvedValue({}),
 }));
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
 
 describe('kici orchestrators', () => {
   const fetchMock = vi.fn();

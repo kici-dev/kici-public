@@ -1,9 +1,6 @@
 /**
- * kici reject command
- *
- * Rejects a held approval gate for a run (requires `--reason`). Resolves the
- * held element by `--job` / `--step` (or the sole pending hold), then records
- * the rejection via the Platform dashboard API (PAT auth).
+ * `kici reject`: reject a run's held approval gate (requires `--reason`), found
+ * by `--job` / `--step` or as the sole pending hold, via the Platform API.
  */
 
 import pc from 'picocolors';
@@ -11,35 +8,21 @@ import { logger, toErrorMessage } from '@kici-dev/core';
 import { resolveHeldRunContext, listHeldRunsForRun, postReject } from './held-run-client.js';
 import { resolveHeldRunId } from '@kici-dev/engine';
 
-/** Options for the reject command. */
 export interface RejectOptions {
-  /** Match a hold by its job name. */
   job?: string;
-  /** Match a step-scoped hold by its step index. */
+  /** A step-scoped hold's step index. */
   step?: string;
-  /**
-   * Match one hold by its own id. The escape hatch for an ambiguity nothing
-   * else resolves; the error listing prints the ids when it needs to.
-   */
+  /** A hold id: the escape hatch for an ambiguity nothing else resolves (the error lists ids). */
   hold?: string;
   /**
-   * Narrow to holds of one type (`reviewer` / `timer` / `concurrency` /
-   * `security`). A job carrying an SDK `requireApproval` AND a security-typed
-   * context gate has two pending holds under one job name, and this is what
-   * separates them.
+   * `reviewer` / `timer` / `concurrency` / `security`. It separates the two
+   * holds of a job with both an SDK `requireApproval` and a security context gate.
    */
   holdType?: string;
-  /** Required rejection reason. */
+  /** Required. */
   reason?: string;
 }
 
-/**
- * Reject a held approval gate.
- *
- * @param runId - The run whose hold to reject.
- * @param options - Job/step filters plus the required reason.
- * @returns true on success, false on error.
- */
 export async function rejectCommand(runId: string, options: RejectOptions = {}): Promise<boolean> {
   try {
     if (!options.reason) {

@@ -1,19 +1,13 @@
 /**
  * Egress filtering for nested job containers.
  *
- * A job container joins a dedicated `kici-jobs` bridge network, and the agent
- * installs the same RFC1918 + cloud-metadata nftables drops the orchestrator's
- * scaler installs for agent containers. Without them a job container keeps the
- * runtime's default bridge, which reaches `169.254.169.254` and the host's whole
- * private network — a step can take the instance role or sweep the customer's
- * internal services.
+ * A job container joins the dedicated `kici-jobs` bridge, behind the same
+ * RFC1918 + cloud-metadata nftables drops the scaler installs for agent
+ * containers (one shared `@kici-dev/shared` builder). On the runtime's default
+ * bridge a step could reach `169.254.169.254` and the host's private network.
  *
- * The rule builder is `@kici-dev/shared`'s, so the agent and the scaler apply
- * one implementation rather than two copies that drift.
- *
- * `network: 'host'` (from `KICI_SANDBOX_NETWORK=host` or a per-job
- * `sandbox: { network: 'host' }` grant) bypasses this by construction: asking
- * for the host namespace is asking for the host's network.
+ * `network: 'host'` (`KICI_SANDBOX_NETWORK=host` or a per-job
+ * `sandbox: { network: 'host' }` grant) bypasses this by construction.
  */
 
 import type Docker from 'dockerode';
@@ -34,75 +28,58 @@ import {
 
 const logger = createLogger({ prefix: 'job-network' });
 
-/** Bridge network every filtered job container joins. */
 export const JOB_NETWORK_NAME = 'kici-jobs';
 /**
- * Subnet for {@link JOB_NETWORK_NAME}. Distinct from the scaler's agent network.
- *
- * Defined in `@kici-dev/shared/net` and re-exported here: the Firecracker host
- * provisioner must recognise this subnet's rules to leave them alone, and it
- * cannot import from the agent package.
+ * Distinct from the scaler's agent network. Lives in `@kici-dev/shared/net`
+ * because the Firecracker host provisioner, which cannot import the agent,
+ * must recognise its rules to leave them alone.
  */
 export { JOB_NETWORK_SUBNET };
 /** Gateway for {@link JOB_NETWORK_NAME} — the one destination the rules allow. */
 export const JOB_NETWORK_GATEWAY = '172.31.0.1';
 
-/** Port the bridge gateway's DNS resolver listens on. */
 const DNS_PORT = 53;
 
 /**
- * Resolve what a job container may reach on the host.
+ * What a job container may reach ON the host: DNS on the bridge gateway only.
+ * A job talks to the agent through `docker exec` and holds no agent
+ * credentials. The DNS carve-out is required: rootful podman runs its resolver
+ * on the gateway, so without it no name resolves (Docker resolves inside the
+ * container's netns).
  *
- * The default is DNS on the bridge gateway and nothing else. A job container
- * talks to the agent through `docker exec` rather than over the network, and it
- * holds none of the agent's credentials, so name resolution is the one host
- * service it genuinely needs. That carve-out is not cosmetic: rootful podman
- * runs its resolver on the gateway, a host address, so a container with no such
- * rule cannot resolve any name at all. Docker answers inside the container's
- * own netns and is unaffected either way.
- *
- * The set is derived HERE, from the agent's own configuration, and takes no
- * argument that could widen it. A `NetworkPolicy` reaching
- * {@link applyJobEgressRules} governs the FORWARD hook only — what the job
- * reaches through the host — so its `hostAccess` is deliberately not consulted:
- * a job that could name its own host reachability is the escape hatch this
- * boundary exists to close, and a signature that cannot carry one is what makes
- * that structural rather than a convention.
+ * Derived from agent config with no widening argument. A `NetworkPolicy` passed
+ * to {@link applyJobEgressRules} governs only the FORWARD hook; its `hostAccess`
+ * is deliberately ignored, since a job naming its own host reachability is the
+ * escape hatch this boundary closes, and this signature makes that structural.
  */
 export function resolveJobHostAccess(gateway: string = JOB_NETWORK_GATEWAY): string[] {
   return [`${gateway}:${DNS_PORT}`];
 }
 
 /**
- * Ensure the `kici-jobs` network exists, the nftables table is ready, and the
- * subnet's default egress drops are installed.
+ * Ensure the `kici-jobs` network, the nftables table and the subnet's egress
+ * drops, before any job container exists. Drops key on the subnet, not a
+ * container address, so a customer image's `ENTRYPOINT` never runs unfiltered.
  *
- * The drops land here — before any job container is created — and are keyed on
- * the subnet rather than on a container address, so a customer image's own
- * `ENTRYPOINT` never runs unfiltered.
- *
- * Returns whether egress filtering is actually in force. A host without `nft`
- * or without `NET_ADMIN` — a rootless agent, most commonly — warns loudly and
- * degrades to the network with no rules rather than refusing to run any job:
- * `kici-admin agent install` is a compat-protected surface, and hard-requiring
- * NET_ADMIN would break every existing rootless install with no additive path.
- * The same trade-off the scaler already made for agent containers.
+ * Returns whether filtering is in force. Without `nft` or `NET_ADMIN` (commonly
+ * a rootless agent) it warns and degrades to no rules rather than refusing jobs:
+ * `kici-admin agent install` is compat-protected, and requiring NET_ADMIN would
+ * break existing rootless installs with no additive path. The scaler makes the
+ * same trade-off for agent containers.
  */
 export async function ensureJobNetwork(docker: Docker): Promise<boolean> {
   try {
-    // Order matters: the nft probe runs FIRST, so a host that cannot filter
-    // never joins the bridge either. Joining without rules would be a network
-    // change that buys nothing, and it would fail the job outright on a runtime
-    // whose client cannot create the network.
+    // The nft probe runs FIRST, so a host that cannot filter never joins the
+    // bridge: that would buy nothing and fails jobs on a runtime that cannot
+    // create the network.
     await validateNftablesAvailability();
     await ensureKiciTable();
     await ensureJobSubnetEgressRules(JOB_NETWORK_SUBNET, JOB_NETWORK_GATEWAY);
 
-    // The bridge may already exist — made by a hand, or by a version that used
-    // a different range — and a container on it gets THAT subnet's addresses,
-    // which the set installed above would not match. Cover the real range too
-    // rather than refusing: refusing returns false, which puts the container on
-    // the runtime's default bridge with no filtering at all.
+    // An existing bridge (hand-made, or from a version with another range)
+    // hands out ITS subnet, which the set above misses. Cover that range too:
+    // refusing returns false, which leaves the container on the default bridge
+    // with no filtering at all.
     const actual = await ensureJobNetworkExists(docker);
     if (actual.subnet !== JOB_NETWORK_SUBNET || actual.gateway !== JOB_NETWORK_GATEWAY) {
       logger.warn(
@@ -128,41 +105,26 @@ export async function ensureJobNetwork(docker: Docker): Promise<boolean> {
 /**
  * Install the default RFC1918 + cloud-metadata drops for the whole job subnet.
  *
- * Keyed on `ip saddr 172.31.0.0/16`, so one rule set covers every container
- * that will ever join the bridge — including one that does not exist yet. A
- * customer image's own `ENTRYPOINT` therefore starts behind the drops: there is
- * no window between the container running and its rules landing, because the
- * rules do not depend on the container.
+ * Keyed on `ip saddr <subnet>`, so it covers every container that will ever
+ * join, and a customer `ENTRYPOINT` never runs before its rules land.
  *
- * The per-container rules {@link applyJobEgressRules} adds stay the layer above
- * these, and stay effective: `addIsolationRules` inserts at the chain head, so
- * a rule keyed on one container's address is evaluated before the subnet set
- * and a per-job `accept` still wins over the subnet `drop`. The exception is a
- * repair (below), which puts a fresh subnet set at the head — above the
- * per-container rules of jobs that were already running. That reordering has no
- * effect while `applyJobEgressRules` is called with no policy, since the two
- * sets then hold identical verdicts; a per-job policy would have to reinstall
- * its own rules after a repair to keep winning.
+ * The per-container rules from {@link applyJobEgressRules} sit above these:
+ * `addIsolationRules` inserts at the chain head, so a per-job `accept` beats the
+ * subnet `drop`. A repair puts a fresh subnet set above already-running jobs'
+ * per-container rules; harmless while those carry no policy (identical
+ * verdicts), but a per-job policy would have to reinstall its rules after a repair.
  *
- * Idempotent, because `ensureJobNetwork` runs once per job and an unconditional
- * install would leak a rule set per job: the chain is read first and the install
- * is skipped when it already carries the set.
+ * Idempotent (it runs once per job): the install is skipped only when the chain
+ * holds EVERY expected rule. Each rule is its own `nft insert`, so an
+ * interrupted install leaves a partial set; skipping on one match would leave
+ * the host permanently missing, say, the `10.0.0.0/8` drop. Matching the exact
+ * {@link buildIsolationRuleOps} text also rejects the scaler's near-misses in
+ * this chain: a per-container rule at `172.31.0.10`, and an operator allowlist
+ * naming this subnet as a DESTINATION.
  *
- * The skip requires EVERY expected rule, never merely one of them. The install
- * is one `nft insert` per rule, so a failure or a kill part-way through
- * leaves some of the set in the chain; a check that skipped on the first match
- * would then read a chain missing the `10.0.0.0/8` drop as covered, and every
- * later job on that host would join the bridge behind permanently partial
- * filtering with nothing to heal it. Comparing against the rule text
- * {@link buildIsolationRuleOps} emits is also what rejects the two near-misses
- * the scaler writes into this same chain — a per-container rule at
- * `172.31.0.10`, and an operator allowlist naming this subnet as a DESTINATION.
- *
- * A partial set is repaired by installing the whole set again rather than by
- * deleting first: the fresh block lands at the chain head, complete and in
- * order, so a job container already running behind the surviving rules is never
- * left unfiltered even briefly. The superseded rules below it are inert
- * duplicates.
+ * Repair reinstalls the whole set rather than deleting first: the fresh block
+ * lands complete at the chain head, so a running container is never unfiltered
+ * even briefly; the superseded rules below are inert duplicates.
  */
 async function ensureJobSubnetEgressRules(subnet: string, gateway: string): Promise<void> {
   await ensureJobSubnetHostRules(subnet, gateway);
@@ -182,17 +144,12 @@ async function ensureJobSubnetEgressRules(subnet: string, gateway: string): Prom
 }
 
 /**
- * Install the subnet-wide host-access rules — what a job container may reach ON
- * the host, as opposed to through it.
+ * Install the subnet-wide host-access rules (what a job may reach ON the host,
+ * not through it), keyed on the subnet for the same pre-start reason.
  *
- * Keyed on the subnet for the same reason the forward set is: it covers a
- * container that does not exist yet, so a customer image's `ENTRYPOINT` never
- * runs in the window before the per-container rules land.
- *
- * Idempotent against the chain's own text rather than by remove-then-insert.
- * Removing first would take the drop away from every running job container for
- * as long as the re-insert takes, which is the one direction that must not
- * fail open.
+ * Idempotent against the chain text, not remove-then-insert: removing first
+ * would drop protection from every running job container for the duration,
+ * failing open.
  */
 async function ensureJobSubnetHostRules(subnet: string, gateway: string): Promise<void> {
   const hostAccess = resolveJobHostAccess(gateway);
@@ -217,15 +174,12 @@ interface JobNetworkAddressing {
 }
 
 /**
- * Create the `kici-jobs` bridge network, tolerating a concurrent creator.
+ * Create the `kici-jobs` bridge, tolerating a concurrent creator.
  *
- * Returns the addressing job containers will actually get. That is the
- * canonical pair whenever this call created the network, and whatever an
- * already-present network carries otherwise — which is the only thing the drop
- * set can honestly be keyed on. A network someone else made under this name
- * with a different subnet would leave every job container outside a set keyed
- * on the constant, and the pre-start window this whole module exists to close
- * would reopen for it.
+ * Returns the addressing containers will get: canonical when this call created
+ * it, otherwise what the present network carries, the only honest key for the
+ * drop set. Keying on the constant would leave a differently addressed network
+ * outside the set and reopen the pre-start window.
  */
 async function ensureJobNetworkExists(docker: Docker): Promise<JobNetworkAddressing> {
   const canonical = { subnet: JOB_NETWORK_SUBNET, gateway: JOB_NETWORK_GATEWAY };
@@ -244,8 +198,7 @@ async function ensureJobNetworkExists(docker: Docker): Promise<JobNetworkAddress
     logger.info(`Created job network ${JOB_NETWORK_NAME}`);
     return canonical;
   } catch (err) {
-    // 409: another agent (or another job on this agent) created it first. Read
-    // back what THEY made rather than assuming they asked for what we did.
+    // 409: another agent or job created it first; read back what THEY made.
     if ((err as { statusCode?: number }).statusCode === 409) {
       return (await findJobNetwork(docker)) ?? canonical;
     }
@@ -260,8 +213,7 @@ async function findJobNetwork(docker: Docker): Promise<JobNetworkAddressing | un
   );
   if (!found) return undefined;
 
-  // A network with no IPAM config at all reports nothing to key on, so the
-  // canonical pair is the honest fallback: the per-container rules still land.
+  // No IPAM config: fall back to canonical; the per-container rules still land.
   const config = (found.IPAM?.Config ?? [])[0] as { Subnet?: string; Gateway?: string } | undefined;
   return {
     subnet: config?.Subnet ?? JOB_NETWORK_SUBNET,
@@ -270,18 +222,14 @@ async function findJobNetwork(docker: Docker): Promise<JobNetworkAddressing | un
 }
 
 /**
- * Apply the per-container egress rules once the container has an IP.
+ * Apply per-container egress rules once the container has an IP.
  *
- * This is the per-job layer, not the control: the subnet drop set
- * {@link ensureJobNetwork} installs is already in the chain and already covers
- * this container. What a per-container rule set adds is a place to key a future
- * per-job policy — an allowlist or `denyAll` — on one address rather than on
- * the whole bridge.
+ * Not the control: the subnet drops already cover this container. The
+ * per-container set is where a future per-job policy (allowlist or `denyAll`)
+ * keys on one address.
  *
- * Returns the container IP the rules are keyed on, so teardown can remove
- * exactly those rules; `undefined` when no IP could be read, which is logged
- * rather than thrown — a job whose rules could not be keyed still runs behind
- * the subnet drops, and the operator sees why.
+ * Returns the IP the rules key on, for teardown. A missing IP is logged, not
+ * thrown: the job still runs behind the subnet drops, and the operator sees why.
  */
 export async function applyJobEgressRules(
   docker: Docker,
@@ -307,11 +255,9 @@ export async function applyJobEgressRules(
 }
 
 /**
- * Remove the per-container rules at teardown.
- *
- * Never throws: a failed cleanup must not turn a finished job into a failed
- * one. A leaked rule set is keyed on an IP the network will reuse, so it is
- * reported at `warn` for the operator rather than swallowed.
+ * Remove the per-container rules at teardown. Never throws, so cleanup cannot
+ * fail a finished job; a leaked set is keyed on an IP the network reuses, so it
+ * is reported at `warn`.
  */
 export async function removeJobEgressRules(containerIp: string | undefined): Promise<void> {
   if (!containerIp) return;

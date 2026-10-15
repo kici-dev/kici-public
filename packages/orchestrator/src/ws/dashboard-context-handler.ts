@@ -1,14 +1,6 @@
 /**
- * Dashboard context handler for the orchestrator.
- *
- * Responds to dashboard.contexts.* and dashboard.held-runs.* WS messages
- * from Platform by calling the appropriate stores (ContextStore, VariableStore,
- * BindingStore, PgSecretStore) and sending typed responses.
- *
- * Each handler:
- * 1. Extracts orgId from the dependency context
- * 2. Calls the appropriate store method
- * 3. Returns a response message with requestId and data (or error)
+ * Answers dashboard.contexts.* and dashboard.held-runs.* WS messages from Platform via
+ * the ContextStore, VariableStore, BindingStore and PgSecretStore.
  */
 import type { Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -88,10 +80,9 @@ import { safeJsonParse } from '../helpers/json.js';
 const logger = createLogger({ prefix: 'dashboard-context-handler' });
 
 /**
- * Normalize a `held_runs.payload` jsonb column into the
- * `{ summaryMarkdown, drift }` shape the held-runs list response carries. The
- * Kysely driver may return jsonb already parsed (object) or as a string; both
- * are coerced. Returns null for an absent payload (every non-drift hold).
+ * Normalizes `held_runs.payload` into the held-runs list's `{ summaryMarkdown, drift }`.
+ * The driver may return jsonb parsed or as a string; both are coerced. Returns null for
+ * an absent payload (every non-drift hold).
  */
 function normalizeHeldRunPayload(raw: unknown): { summaryMarkdown: string; drift: unknown } | null {
   if (raw == null) return null;
@@ -105,43 +96,29 @@ function normalizeHeldRunPayload(raw: unknown): { summaryMarkdown: string; drift
   return null;
 }
 
-/**
- * Secret store interface (subset of PgSecretStore methods used here).
- *
- * Alias of the shared `ScopedSecretStore` so the WS plane and the HTTP admin
- * plane route scopes against one contract.
- */
+/** Aliases `ScopedSecretStore` so the WS and HTTP admin planes share one scope contract. */
 type SecretStoreForDashboard = ScopedSecretStore;
 
 export interface DashboardContextHandlerDeps {
-  /** Organization ID for all operations. */
   orgId: string;
-  /** Send a response message back to Platform over the WS connection. */
   send: (msg: unknown) => void;
   contextStore: ContextStore;
   variableStore: VariableStore;
   bindingStore: BindingStore;
   secretStore: SecretStoreForDashboard;
-  /** Load fresh backend stores from registry (creates new store instances with current credentials). */
+  /** Creates fresh store instances from the registry with current credentials. */
   loadBackendStores?: () => Promise<Map<string, SecretStoreForDashboard>>;
-  /** Database for held_runs queries. */
   db: Kysely<Database>;
-  /** Access log writer — records one row per read / mutation with actor attribution. */
+  /** Records one row per read / mutation with actor attribution. */
   accessLog?: AccessLogWriter;
-  /** Routing key for access_log rows (null when not run-scoped). */
+  /** For access_log rows; null when not run-scoped. */
   routingKey?: string | null;
-  /**
-   * Held-run store + resume hook for the approve/reject flow. The approve/reject
-   * handlers route through the shared `applyDecision` applier (eligibility
-   * check, real attribution, multi-clause accumulation, and the
-   * resume-after-approval re-dispatch).
-   */
+  /** Held-run store + resume hooks; approve/reject route through the shared `applyDecision`. */
   approvals: ApprovalHandlerDeps;
   /**
-   * Dashboard-encryption key resolver. Present when KICI_SECRET_KEY is
-   * configured. Under the `encrypted` posture the secret/variable set handlers
-   * decrypt the browser-sealed envelope with the resolved private key. Absent ⇒
-   * `encrypted` writes fail closed (`encryption_unavailable`).
+   * Present when KICI_SECRET_KEY is configured; under the `encrypted` posture the
+   * secret/variable set handlers decrypt the browser-sealed envelope with its private key.
+   * Absent ⇒ `encrypted` writes fail closed (`encryption_unavailable`).
    */
   dashboardEncryption?: {
     resolve: () => Promise<ResolvedDashboardEncryptionKey | null>;
@@ -177,11 +154,6 @@ export interface ApprovalHandlerDeps {
   settleSecurityCheck?: ApplyDecisionDeps['settleSecurityCheck'];
 }
 
-/**
- * Handler for all dashboard context and held run WS messages.
- *
- * Dispatches incoming messages by type and calls the appropriate store.
- */
 export class DashboardContextHandler {
   private readonly deps: DashboardContextHandlerDeps;
   private routingKey: string | null;
@@ -197,21 +169,19 @@ export class DashboardContextHandler {
     );
   }
 
-  /** Update the orgId used for all operations (called when resolved from DB). */
+  /** Called when the org is resolved from the DB. */
   setOrgId(orgId: string): void {
     this.deps.orgId = orgId;
   }
 
-  /** Update the routing key bound to access_log rows. */
   setRoutingKey(routingKey: string | null): void {
     this.routingKey = routingKey;
   }
 
   /**
-   * Defense-in-depth dashboard-write policy gate. Returns true when the
-   * operation is allowed and the caller should proceed. Returns false when
-   * the policy is disabled — also records a `denied` access_log row and
-   * sends a structured `operation_disabled` envelope back to Platform.
+   * Defense-in-depth dashboard-write policy gate. When the policy is disabled it records
+   * a `denied` access_log row, sends a structured `operation_disabled` envelope and
+   * returns false.
    */
   private async enforcePolicy(
     msg: { actor: ActorPrincipal; requestId: string },
@@ -241,7 +211,6 @@ export class DashboardContextHandler {
     }
   }
 
-  /** Run a single-call request through `audited` with this handler's recorder and response channel. */
   private audited(
     req: AuditedRequest,
     body: () => Promise<Record<string, unknown> | void>,
@@ -258,13 +227,11 @@ export class DashboardContextHandler {
   }
 
   /**
-   * Resolve the plaintext value for a secret/variable set under the write
-   * policy. When the client sends a `sealed` envelope, decrypt it with the
-   * orchestrator's X25519 key (honored regardless of posture — the client chose
-   * to seal, so never expose that plaintext through the Platform). Otherwise,
-   * under the `encrypted` posture a plaintext `value` is refused (fail-closed);
-   * under `permissive` the plaintext `value` is used. Returns the plaintext or a
-   * structured error code the caller records + sends back.
+   * Plaintext for a secret/variable set. A `sealed` envelope is decrypted with the
+   * orchestrator's X25519 key under any posture: the client chose to seal, so that
+   * plaintext never transits the Platform. Otherwise `encrypted` refuses a plaintext
+   * `value` (fail-closed) and `permissive` uses it. Errors are structured codes the
+   * caller records and sends back.
    */
   private async resolveWriteValue(
     msg: { value?: string; sealed?: DashboardSealedEnvelope },
@@ -296,10 +263,7 @@ export class DashboardContextHandler {
     return { plaintext: msg.value };
   }
 
-  /**
-   * Route a dashboard message to the appropriate handler.
-   * Returns true if the message was handled, false otherwise.
-   */
+  /** Returns false for a message this handler does not own. */
   async handleMessage(msg: DashboardPlatformToOrchMessage): Promise<boolean> {
     switch (msg.type) {
       // Context CRUD
@@ -398,10 +362,9 @@ export class DashboardContextHandler {
   // ── Context CRUD ──────────────────────────────────────────────
 
   private async handleEnvList(msg: ContextListRequest): Promise<void> {
-    // Scope to the request's target org when the Platform carries one, else to
-    // the connection-level org. The orchestrator's DB only holds its own
-    // tenant's rows, so honoring the requested org returns that org's data or
-    // an empty list — never another tenant's secrets.
+    // Prefer the Platform-carried request org over the connection org. The DB holds only
+    // this tenant's rows, so the requested org yields its data or an empty list, never
+    // another tenant's secrets.
     const orgId = msg.orgId ?? this.deps.orgId;
     await this.audited(
       {
@@ -436,11 +399,9 @@ export class DashboardContextHandler {
   }
 
   /**
-   * Map each context id to the distinct secret key names reachable through
-   * its scope bindings. Joins `context_bindings` → `scoped_secrets` on the
-   * scope pattern, excluding the `__empty__` sentinel. Returns key names only —
-   * never values. Scoped to the caller-resolved org (the request's target org,
-   * else the connection-level org).
+   * Context id → distinct secret key names reachable through its scope bindings
+   * (`context_bindings` → `scoped_secrets` on the scope pattern, minus the `__empty__`
+   * sentinel). Key names only, never values, scoped to the caller-resolved org.
    */
   private async loadSecretKeysByEnv(
     orgId: string,
@@ -605,16 +566,15 @@ export class DashboardContextHandler {
         name: u.name,
         type: u.contextType,
         globPattern: u.globPattern,
-        // `undefined` = the message did not mention the field, leave it alone;
-        // `null` = clear it. The two are distinct on the wire (every field here
-        // is `.nullable().optional()`), so they are forwarded verbatim —
-        // collapsing them makes "turn this off" a silent no-op.
+        // `undefined` = leave the field alone; `null` = clear it. Both are distinct on the
+        // wire (`.nullable().optional()`) and forwarded verbatim: collapsing them makes
+        // "turn this off" a silent no-op.
         branchRestrictions: u.branchRestrictions,
         repoPatterns: u.repoPatterns,
         concurrencyLimit: u.concurrencyLimit,
         concurrencyStrategy: u.concurrencyStrategy,
-        // The column stores a JSON array; the wire carries a count. Three-way
-        // rather than `??`, so an explicit null survives as a clear.
+        // The column stores a JSON array; the wire carries a count. Three-way, not `??`,
+        // so an explicit null survives as a clear.
         requiredReviewers:
           u.requiredReviewers === undefined
             ? undefined
@@ -1021,7 +981,7 @@ export class DashboardContextHandler {
 
   // ── Secrets ───────────────────────────────────────────────────────
 
-  /** Load fresh backend stores, falling back to single secretStore wrapped in a Map. */
+  /** Falls back to the single secretStore wrapped in a Map. */
   private async getBackendStores(): Promise<Map<string, SecretStoreForDashboard>> {
     if (this.deps.loadBackendStores) {
       return this.deps.loadBackendStores();
@@ -1029,11 +989,7 @@ export class DashboardContextHandler {
     return new Map([['pg', this.deps.secretStore]]);
   }
 
-  /**
-   * Resolve the correct backend store for a prefixed scope (e.g., 'vault:aws/prod').
-   * Returns the store and the scope to pass to it.
-   * All stores expect unprefixed scopes — the backend prefix is stripped.
-   */
+  /** For a prefixed scope (e.g. 'vault:aws/prod'); stores expect it with the prefix stripped. */
   private async resolveStoreForScope(prefixedScope: string): Promise<{
     store: SecretStoreForDashboard;
     scope: string;
@@ -1074,14 +1030,12 @@ export class DashboardContextHandler {
           }
 
           for (const scope of scopes) {
-            // Filter internal scopes — strip backend prefix before checking
+            // Skip internal scopes, judged without the backend prefix.
             const colonIdx = scope.indexOf(':');
             const path = colonIdx >= 0 ? scope.slice(colonIdx + 1) : scope;
             if (path.startsWith('__')) continue;
 
-            // PG scopes are stored unprefixed in the DB.
-            // External backends also return raw scopes.
-            // Always prefix with backend name for the frontend.
+            // PG and external backends return raw scopes; the frontend needs the prefix.
             const prefixedScope = scope.startsWith(`${backendName}:`)
               ? scope
               : `${backendName}:${scope}`;
@@ -1099,8 +1053,8 @@ export class DashboardContextHandler {
             }
 
             if (keys.length === 0) {
-              // Include empty scopes so the frontend shows the scope tree
-              // (e.g., Vault directory scopes that contain sub-scopes but no direct keys)
+              // Empty scopes keep the frontend's scope tree (e.g. Vault directory scopes with
+              // sub-scopes but no direct keys).
               secrets.push({ scope: prefixedScope, key: '', createdAt: '', updatedAt: '' });
             } else {
               for (const key of keys) {
@@ -1110,7 +1064,6 @@ export class DashboardContextHandler {
           }
         }
 
-        // Sort by scope then key for consistent ordering
         secrets.sort((a, b) => a.scope.localeCompare(b.scope) || a.key.localeCompare(b.key));
 
         return {
@@ -1152,10 +1105,9 @@ export class DashboardContextHandler {
     try {
       const { store, scope } = await this.resolveStoreForScope(msg.scope);
       assertValidScopeName(scope);
-      // Write-path only, mirroring the HTTP admin route. A `:` in the key would
-      // make the at-rest AAD `orgId:scope:key` ambiguous. The wire schema stays
-      // `key: z.string()` on purpose — a strict schema on a relayed dashboard
-      // message fails the whole message instead of degrading one field.
+      // Write-path only, mirroring the HTTP admin route: a `:` in the key makes the
+      // at-rest AAD `orgId:scope:key` ambiguous. The wire stays `key: z.string()` on
+      // purpose: a strict schema fails the whole relayed message, not one field.
       assertValidSecretKey(msg.key);
       await store.setSecret(this.deps.orgId, scope, msg.key, resolved.plaintext);
       this.access.record(
@@ -1251,19 +1203,16 @@ export class DashboardContextHandler {
           ),
       },
       async () => {
-        // Both scopes resolve against ONE snapshot of the backend map. Loading it
-        // twice would let a backend registered or removed between the two loads
-        // decide the comparison below — the same qualifier could resolve to a
-        // backend in one snapshot and fall through to the default in the other,
-        // which is exactly the cross-backend rename this guard must catch.
+        // Both scopes resolve against ONE backend-map snapshot. Two loads let a backend
+        // registered or removed in between resolve one qualifier differently in each,
+        // which is exactly the cross-backend rename the guard below must catch.
         const stores = await this.getBackendStores();
         const from = resolveScope(msg.oldScope, stores, this.deps.secretStore);
         const to = resolveScope(msg.newScope, stores, this.deps.secretStore);
-        // A rename is a per-backend operation — the source store re-encrypts each
-        // row under the new scope's AAD. Moving a scope BETWEEN backends is a
-        // copy plus a delete, which this path does not perform, so reject it
-        // outright rather than silently renaming inside the source backend and
-        // reporting success. Mirrors the HTTP admin route's 400.
+        // A rename is per-backend: the source store re-encrypts each row under the new
+        // scope's AAD. A cross-backend move is a copy plus a delete this path does not
+        // perform, so reject it rather than silently renaming inside the source backend.
+        // Mirrors the HTTP admin route's 400.
         if (from.backendName !== to.backendName) {
           throw new Error(
             `Cannot rename a scope across backends ` +
@@ -1274,8 +1223,8 @@ export class DashboardContextHandler {
         if (!from.store.renameScope) {
           throw new Error('Backend does not support scope rename');
         }
-        // Validate only the destination name — renaming a pre-existing malformed
-        // scope to a conforming one is the built-in cleanup path.
+        // Only the destination is validated: renaming a malformed scope to a conforming one
+        // is the built-in cleanup path.
         assertValidScopeName(to.path);
         await from.store.renameScope(this.deps.orgId, from.path, to.path);
       },
@@ -1322,10 +1271,8 @@ export class DashboardContextHandler {
         const limit = msg.limit ?? 20;
         const offset = msg.offset ?? 0;
 
-        // Over-fetch by one to detect whether a further page exists without a
-        // separate count query: if the DB returns more than `limit` rows, there
-        // is at least one more page. The probe row is sliced off below and never
-        // reaches the client.
+        // Over-fetch by one to detect a further page without a count query; the probe row
+        // is sliced off below and never reaches the client.
         const fetched = await this.deps.db
           .selectFrom('execution_runs')
           .select([
@@ -1376,11 +1323,9 @@ export class DashboardContextHandler {
   // ── Held runs ─────────────────────────────────────────────────────
 
   private async handleHeldRunsList(msg: HeldRunsListRequest): Promise<void> {
-    // Scope to the request's target org when the Platform carries one, else to
-    // the connection-level org. A remote run's hold lives under the run's own
-    // `remote_sources` org, which differs from this connection's primary
-    // webhook-source org, so honoring the requested org is what surfaces the
-    // hold to `kici approve` / `--approve-all`.
+    // Prefer the Platform-carried request org over the connection org: a remote run's
+    // hold lives under its `remote_sources` org, not this connection's webhook-source
+    // org, and only the requested org surfaces it to `kici approve` / `--approve-all`.
     const orgId = msg.orgId ?? this.deps.orgId;
     await this.audited(
       {
@@ -1433,7 +1378,7 @@ export class DashboardContextHandler {
 
         const rows = await query.execute();
 
-        // Fetch per-hold decisions for multi-clause progress + attribution.
+        // Per-hold decisions, for multi-clause progress + attribution.
         const holdIds = rows.map((r) => r.id);
         const decisionRows =
           holdIds.length > 0
@@ -1466,11 +1411,9 @@ export class DashboardContextHandler {
             // Verbatim: the wire field is `z.string()`, so a type this build does
             // not know still reaches the reader.
             holdType: r.hold_type,
-            // Emitted verbatim: both are plain-text columns and the wire fields
-            // are `z.string()`, so a status this build does not know (or one a
-            // newer orchestrator writes) still reaches the reader instead of
-            // failing validation for the whole message. `?? 'context'` is a real
-            // default for the nullable column read, not a cast.
+            // Verbatim: plain-text columns and `z.string()` wire fields, so an unknown
+            // status (e.g. from a newer orchestrator) reaches the reader instead of failing
+            // the whole message. `?? 'context'` is a real default for the nullable column.
             queueType: r.queue_type ?? HeldRunQueueType.enum.context,
             status: r.status,
             requestedAt: toIsoString(r.created_at),
@@ -1489,10 +1432,9 @@ export class DashboardContextHandler {
             contributorUsername: r.contributor_username ?? null,
             trustTier: r.trust_tier ?? null,
             jobId: r.job_id,
-            // Still a cast: the wire field is a strict `HoldScope` enum while the
-            // column is plain text. Safe today because `hold_scope` is only ever
-            // written from `HoldScope` (and defaults to 'job'); widen the wire
-            // field the moment that stops being true.
+            // A cast: the wire field is a strict `HoldScope` enum, the column plain text.
+            // Safe while `hold_scope` is only written from `HoldScope` (default 'job');
+            // widen the wire field the moment that stops being true.
             holdScope: (r.hold_scope ?? HoldScope.enum.job) as HoldScope,
             stepIndex: r.step_index ?? null,
             requirement:
@@ -1531,14 +1473,13 @@ export class DashboardContextHandler {
   }
 
   /**
-   * Resolve the actor's Keycloak sub for approval attribution. Only `user` and
+   * The actor's Keycloak sub for approval attribution. Only `user` and
    * `platform_operator` actors carry a `sub`; others fall back to a stable id.
    *
-   * The `service:` namespace comes from {@link adminActorSub} rather than a
-   * literal here: `applyDecision`'s self-approval gate compares this value
-   * against {@link triggererSubjectFor}'s output, so the two renderings of one
-   * principal have to be produced by the same code or the gate compares strings
-   * that can never be equal.
+   * The `service:` namespace comes from {@link adminActorSub}, not a literal:
+   * `applyDecision`'s self-approval gate compares this against
+   * {@link triggererSubjectFor}'s output, so both renderings must come from the same
+   * code or the gate compares strings that can never be equal.
    */
   private actorSub(actor: HeldRunApproveRequest['actor']): string {
     if (actor.type === 'user' || actor.type === 'platform_operator') return actor.sub;
@@ -1547,7 +1488,7 @@ export class DashboardContextHandler {
     return `system:${actor.component}`;
   }
 
-  /** Read org_settings.allow_self_approval (default true). */
+  /** org_settings.allow_self_approval, default true. */
   private async readAllowSelfApproval(orgId: string = this.deps.orgId): Promise<boolean> {
     try {
       const row = await this.deps.db
@@ -1562,14 +1503,13 @@ export class DashboardContextHandler {
   }
 
   /**
-   * Route an approve/reject through the shared `applyDecision` applier:
-   * eligibility check, real attribution, multi-clause accumulation, and the
-   * resume-after-approval re-dispatch. Sends the matching response message.
+   * Routes an approve/reject through the shared `applyDecision` applier: eligibility,
+   * real attribution, multi-clause accumulation and the resume-after-approval
+   * re-dispatch.
    *
-   * The response goes out as soon as the decision is durable, not when its
-   * consequence finishes — see `ApplyDecisionResult.consequence`. The audit
-   * entry is attached to that consequence instead, so there is still exactly one
-   * per decision and it still carries the real outcome.
+   * The response goes out once the decision is durable, not when its consequence
+   * finishes (`ApplyDecisionResult.consequence`). The audit entry attaches to the
+   * consequence, so there is exactly one per decision carrying the real outcome.
    */
   private async applyApprovalDecision(
     msg: HeldRunApproveRequest | HeldRunRejectRequest,
@@ -1599,9 +1539,8 @@ export class DashboardContextHandler {
             .select('triggered_by')
             .where('run_id', '=', runId)
             .executeTakeFirst();
-          // The same mapper the admin route uses. A bare prefix strip is wrong
-          // in three of the five actor shapes and left this gate inert for each
-          // of them — see `triggererSubjectFor`.
+          // The admin route's mapper: a bare prefix strip is wrong in three of the five
+          // actor shapes and makes this gate inert for them (`triggererSubjectFor`).
           return triggererSubjectFor(row?.triggered_by);
         },
         onJobRelease: (signal) => approvals.resumeJob(signal),
@@ -1633,14 +1572,11 @@ export class DashboardContextHandler {
       return;
     }
 
-    // The decision is durable, so it is answered now. A `released` or
-    // `rejected` decision still has a consequence to run — the resume replay,
-    // or the reject's run cancellation and check-run completion — and it is
-    // deliberately not part of this answer: the Platform proxies every
-    // dashboard request under one ten-second relay budget, and a workflow-scoped
-    // fork-PR resume measured 9.8 s of that, so an approval that fully
-    // succeeded was answering 504 and the operator's natural retry then hit
-    // "already resolved".
+    // The decision is durable, so answer now. A `released` / `rejected` consequence
+    // (resume replay, or run cancellation and check-run completion) is deliberately
+    // outside this answer: the Platform proxies every dashboard request under one
+    // ten-second relay budget, a workflow-scoped fork-PR resume measured 9.8 s, and a
+    // successful approval answering 504 sends the operator's retry into "already resolved".
     this.deps.send({ type: responseType, requestId: msg.requestId });
 
     const consequence = result.consequence;
@@ -1660,14 +1596,12 @@ export class DashboardContextHandler {
       return;
     }
 
-    // ONE audit entry per decision, written when its consequence settles so the
-    // recorded outcome is the real one. This is where a failed resume surfaces
-    // for the operator: `kici-admin access-log` and the dashboard's activity
-    // view both read this table, and the entry carries the failure message.
-    // The applier logs it too, and `resumeWorkflow` independently fails the run
-    // and completes the check runs it stranded. The entry is not awaited — a
-    // consequence can outlive this handler's turn, and blocking the dashboard
-    // message loop on it is exactly the coupling being removed.
+    // ONE audit entry per decision, written when its consequence settles so the outcome
+    // is real. A failed resume surfaces here for the operator (`kici-admin access-log`
+    // and the dashboard's activity view read this table); the applier logs it too, and
+    // `resumeWorkflow` independently fails the run and completes its stranded check
+    // runs. Not awaited: a consequence can outlive this turn, and must not block the
+    // dashboard message loop.
     runDetached(
       logger,
       'Held-run decision audit',

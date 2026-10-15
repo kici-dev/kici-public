@@ -1,19 +1,14 @@
 /**
- * Host side of the git credential helper.
+ * Host side of the git credential helper. Git spawns the helper as its own
+ * process, so it reaches the agent through a per-job unix socket plus a tiny
+ * executable shim that speaks git's credential protocol on stdin/stdout.
  *
- * Git spawns the helper as its own process, so it cannot call into the agent
- * directly. This module gives it a route: a per-job unix socket the agent
- * listens on, plus a tiny executable shim that connects to it and speaks git's
- * credential protocol on stdin/stdout.
+ * The shim imports only `node:net`, so it needs no module resolution, no
+ * bundle, and no knowledge of where the agent was installed.
  *
- * The shim is deliberately self-contained — no imports beyond `node:net` — so it
- * needs no module resolution, no bundle, and no dependency on where the agent
- * was installed. Its only job is to move bytes.
- *
- * Scope: this is the HOST path, which covers bare-metal jobs. A container job
- * clones and executes inside the container today and has no route to this
- * socket; that is fixed by the dual-mode container work, which moves the clone
- * to the host and injects `/opt/kici` read-only.
+ * Scope: the HOST path, which covers bare-metal jobs. A container job clones on
+ * the host, but its steps run inside the container, which has no route to this
+ * socket.
  */
 
 import { createServer, type Server, type Socket } from 'node:net';
@@ -28,10 +23,10 @@ export interface HelperQuery {
 }
 export type HelperAnswer = { username: string; password: string } | null;
 
-/** The shim source. Kept inline so the helper has no build step of its own. */
+/** Kept inline so the helper has no build step of its own. */
 export function shimSource(socketPath: string): string {
-  // Self-contained on purpose: a require of anything agent-owned would tie the
-  // helper to an install layout git knows nothing about.
+  // A require of anything agent-owned would tie the helper to an install
+  // layout git knows nothing about.
   return `#!/usr/bin/env node
 'use strict';
 const net = require('node:net');
@@ -78,36 +73,30 @@ process.stdin.on('end', () => {
 export interface CredentialHelperHost {
   /** Absolute path to pass as `credential.helper`. */
   helperPath: string;
-  /** Stop listening and release the socket. */
   close(): Promise<void>;
 }
 
 /**
- * Start the per-job helper socket and materialize the shim.
- *
- * `answer` is the agent's resolver: it consults the grant table and asks the
- * orchestrator broker. Returning null means "no credential", which the shim
- * turns into an empty reply so git falls through to its own mechanisms.
+ * `answer` returning null means "no credential": the shim sends an empty reply
+ * and git falls through to its own mechanisms.
  */
 export async function startCredentialHelperHost(args: {
-  /** Job-scoped directory to hold the socket and the shim. */
+  /** Job-scoped directory for the socket and the shim. */
   dir: string;
   answer: (query: HelperQuery) => Promise<HelperAnswer>;
 }): Promise<CredentialHelperHost> {
   await mkdir(args.dir, { recursive: true, mode: 0o700 });
   const socketPath = join(args.dir, 'git-credential.sock');
-  // `.cjs` on purpose: the shim uses `require`, and a job directory may sit
-  // under a package.json declaring `"type": "module"`, which would otherwise
-  // make Node parse it as ESM and fail before it ever connects.
+  // `.cjs`: the shim uses `require`, and a job directory under a
+  // `"type": "module"` package.json would otherwise make Node parse it as ESM.
   const helperPath = join(args.dir, 'git-credential-kici.cjs');
 
   await writeFile(helperPath, shimSource(socketPath), { mode: 0o700 });
   await chmod(helperPath, 0o700);
 
-  // `allowHalfOpen` is required, not a tuning knob. The shim half-closes its
-  // write side to signal end-of-query; without this Node ends our writable side
-  // at the same moment, so the reply — resolved asynchronously by the broker —
-  // is written to an already-closed socket and git silently sees no credential.
+  // `allowHalfOpen` is required: the shim half-closes to signal end-of-query,
+  // and without it Node ends our side too, so the async broker reply hits a
+  // closed socket and git silently sees no credential.
   const server = createServer({ allowHalfOpen: true }, (socket) =>
     handleConnection(socket, args.answer),
   );
@@ -142,8 +131,8 @@ function handleConnection(socket: Socket, answer: (q: HelperQuery) => Promise<He
     }
     answer(query).then(
       (result) => socket.end(JSON.stringify(result) + '\n'),
-      // Never surface the error text: it can carry forge output. The miss is
-      // enough — the orchestrator side logs the detail.
+      // Never surface the error text (it can carry forge output); the
+      // orchestrator side logs the detail.
       () => socket.end('null\n'),
     );
   });

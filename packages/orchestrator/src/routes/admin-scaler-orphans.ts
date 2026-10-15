@@ -12,9 +12,10 @@
  *   stop the approved VMs nothing tracks (`scaler.manage`).
  *
  * The node is this coordinator, or the peer `target` names, reached over the
- * authenticated peer channel. The coordinator adds the one tracker only it
- * can answer — a non-terminal job in its dispatch queue bound to the VM's
- * agent — and never forwards a bound VM to the node's stop.
+ * authenticated peer channel. The coordinator adds the trackers only it can
+ * answer — a non-terminal job in its dispatch queue bound to the VM's agent,
+ * and the agent registered with it or a peer — and never forwards a VM either
+ * tracker covers to the node's stop.
  */
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
@@ -45,7 +46,6 @@ import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-scaler-orphans' });
 
-/** What the routes need from the coordinator they run on. */
 export interface ScalerOrphansRouteDeps {
   /** This coordinator's instance id. */
   instanceId: string;

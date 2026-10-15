@@ -30,11 +30,10 @@ const regexCache = new Map<string, RegExp>();
 /**
  * Compile (and cache) the `RegExp` for a regex matcher.
  *
- * `g` and `y` are stripped before compiling and before building the memo key.
- * They are worse than useless here: `matcherSatisfiedBy` below loops `.test()`
- * over a label *set*, so one successful match would leave `lastIndex` pointing
- * into the middle of the next label. Stripping at the reader also tolerates a
- * lock file written by a compiler that predates the producer-side strip.
+ * `g` and `y` are stripped before compiling and keying: `matcherSatisfiedBy`
+ * loops `.test()` over a label set, so a match would leave `lastIndex` inside
+ * the next label. Stripping at the reader also covers a lock file from a
+ * compiler without the producer-side strip.
  */
 export function compileRegexMatcher(m: { source: string; flags: string }): RegExp {
   const flags = stripStatefulRegexFlags(m.flags);

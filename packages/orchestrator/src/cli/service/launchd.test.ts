@@ -1,15 +1,8 @@
-/**
- * Tests for the launchd service manager.
- *
- * Mocks child_process and fs to verify plist generation,
- * lifecycle commands, and status parsing without requiring
- * a real macOS environment.
- */
+/** Mocks child_process and fs, so no real macOS environment is needed. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ServiceConfig } from './types.js';
 
-// Mock child_process
 vi.mock('node:child_process', () => ({
   execFileSync: vi.fn(),
   spawn: vi.fn(() => ({
@@ -19,7 +12,6 @@ vi.mock('node:child_process', () => ({
   })),
 }));
 
-// Mock node:fs
 vi.mock('node:fs', () => ({
   default: {
     writeFileSync: vi.fn(),
@@ -37,7 +29,6 @@ vi.mock('node:fs', () => ({
   readdirSync: vi.fn(() => []),
 }));
 
-// Mock node:os
 vi.mock('node:os', () => ({
   default: {
     homedir: vi.fn(() => '/Users/testuser'),
@@ -212,7 +203,6 @@ describe('launchd service manager', () => {
 
       expect(plist).toContain('<key>EnvironmentVariables</key>');
       expect(plist).toContain('<key>PATH</key>');
-      // execBinDir is prepended, followed by the macOS default tail.
       expect(plist).toContain(
         '<string>/opt/homebrew/Cellar/node/24.0.0/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>',
       );
@@ -223,16 +213,13 @@ describe('launchd service manager', () => {
       const config = makeConfig({ executablePath: '/usr/local/bin/node' });
       const plist = manager.generatePlist(config);
 
-      // execBinDir prepended to the env-file PATH, single PATH key.
       expect(plist).toContain('<string>/usr/local/bin:/custom/bin</string>');
       expect((plist.match(/<key>PATH<\/key>/g) ?? []).length).toBe(1);
-      // Other env-file vars survive.
       expect(plist).toContain('<key>FOO</key>');
     });
 
     it('uses nodeBinDir for PATH over the executable dir when set (--binary wrapper case)', () => {
       mockedReadFileSync.mockReturnValue('');
-      // executablePath is a wrapper script; nodeBinDir is the real node dir.
       const config = makeConfig({
         executablePath: '/Users/op/kici/service/kici-orchestrator',
         nodeBinDir: '/Users/op/.cache/kici/node-binaries/v24.15.0/bin',
@@ -242,7 +229,6 @@ describe('launchd service manager', () => {
       expect(plist).toContain(
         '<string>/Users/op/.cache/kici/node-binaries/v24.15.0/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>',
       );
-      // The wrapper dir is NOT used as the PATH prefix.
       expect(plist).not.toContain('<string>/Users/op/kici/service:/opt/homebrew/bin');
     });
 
@@ -324,7 +310,7 @@ describe('launchd service manager', () => {
 
     it('bootstraps the plist into the system domain for a LaunchDaemon', async () => {
       const config = makeConfig({ isUserLevel: false });
-      // Mock isLoaded to return false (no existing instance to boot out).
+      // No existing instance loaded, so install goes straight to bootstrap.
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
         if (Array.isArray(args) && args[0] === 'print') {
           throw Object.assign(new Error('not loaded'), { status: 113 });
@@ -443,10 +429,9 @@ describe('launchd service manager', () => {
     });
 
     it('chowns the log dir to UserName when installing system-level with a non-root run user', async () => {
-      // System-level LaunchDaemon + UserName set → log dir was created by
-      // the installing root user, but launchd opens stdout/stderr as the
-      // spawned-user identity. Without the chown, the daemon would never
-      // spawn (state stays "spawn scheduled", no log output ever).
+      // Root creates the log dir, but launchd opens stdout/stderr as UserName.
+      // Without the chown the daemon never spawns (state stays "spawn
+      // scheduled", no log output).
       const config = makeConfig({ isUserLevel: false, user: 'alice' });
       mockedExecFileSync.mockImplementation((bin: unknown, args: unknown) => {
         if (Array.isArray(args) && args[0] === 'print') {
@@ -1207,10 +1192,9 @@ describe('launchd service manager', () => {
       });
     });
 
-    // A plist we could not read is not a plist that is gone. Skipping it drops
-    // a live instance from the scan, and `listInstances` then prunes its index
-    // row — the same defect as returning `[]` from the whole scan, one file at
-    // a time. `chmod 000` on an installed plist is the failing input.
+    // An unreadable plist is not a gone plist: skipping it drops a live
+    // instance from the scan, and `listInstances` prunes its index row.
+    // `chmod 000` on an installed plist is the failing input.
     //
     // fails-when: the per-file catch goes back to an unconditional `continue`
     // — `list(true)` resolves to `[]` and `rejects.toThrow` fails.
@@ -1232,10 +1216,9 @@ describe('launchd service manager', () => {
       await expect(manager.list(true)).rejects.toThrow(/com\.kici\.locked\.plist/);
     });
 
-    // breaks-if-wrong: the removal-mid-scan case the original skip existed for
-    // must still skip. A plist that vanished between the readdir and the read
-    // is genuinely not installed, so throwing there would drop the whole
-    // launchd scan on an ordinary concurrent uninstall.
+    // breaks-if-wrong: a plist that vanished between the readdir and the read
+    // is genuinely not installed; throwing there would drop the whole launchd
+    // scan on an ordinary concurrent uninstall.
     //
     // fails-when: the ENOENT branch is dropped and every read failure throws.
     it('list() skips a plist that vanished between the readdir and the read', async () => {
@@ -1263,8 +1246,8 @@ describe('launchd service manager', () => {
         ].join('\n');
       });
 
-      // The surviving sibling is what proves the scan continued past the gap
-      // rather than aborting: an empty-array assertion would pass either way.
+      // The surviving sibling proves the scan continued past the gap; an
+      // empty-array assertion would pass either way.
       await expect(manager.list(true)).resolves.toEqual([
         {
           name: 'foo',

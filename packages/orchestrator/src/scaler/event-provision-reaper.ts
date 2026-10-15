@@ -10,20 +10,17 @@ const logger = createLogger({ prefix: 'event-provision-reaper' });
 /**
  * How long a provision outcome is kept once its spawn row is gone.
  *
- * Deliberately a constant rather than a `cluster_settings` knob: unlike the
- * claim retention beside it, there is no operational decision here. The only
- * reader is the stale-spawn prune, and the interval the row must survive is
- * derived from windows the reaper already resolves — so a knob would be surface
- * with nothing behind it. The purge floors this against twice the spawn
- * deadline, so raising `KICI_SCALER_SPAWN_TIMEOUT_MS` for a slow cloud widens
- * the retention with it.
+ * A constant, not a `cluster_settings` knob: unlike the claim retention, it
+ * carries no operational decision. Its only reader is the stale-spawn prune,
+ * and the interval the row must survive derives from windows the reaper already
+ * resolves. The purge floors it at twice the spawn deadline, so raising
+ * `KICI_SCALER_SPAWN_TIMEOUT_MS` for a slow cloud widens the retention with it.
  */
 export const PROVISION_OUTCOME_RETENTION_MS = 86_400_000;
 
 /**
- * The live values one sweep runs against. Read together at the top of each tick
- * so a sweep is internally consistent even if an operator changes a knob
- * halfway through.
+ * The live values one sweep runs against, read together at the top of each tick
+ * so a knob changed mid-sweep cannot make the sweep inconsistent.
  */
 export interface ReaperWindows {
   /** How often the leader sweeps. A change reschedules the timer after this tick. */
@@ -48,21 +45,17 @@ export interface ReaperWindows {
 /**
  * The flap grace the reaper actually runs on.
  *
- * `reroute_flap_grace_ms` is shared with the rerouted-job guard, and the two
- * consumers do not carry the same risk: the reroute guard force-fails a run it
- * could have waited for, while this one deletes a customer's running instance.
- * An operator lowering the knob for reroute reasons must not silently collapse
- * that protection to two consecutive sweeps.
+ * `reroute_flap_grace_ms` is shared with the rerouted-job guard, which only
+ * force-fails a run it could have waited for; this consumer deletes a
+ * customer's running instance. Lowering the knob for reroute reasons must not
+ * silently collapse that protection to two consecutive sweeps.
  *
- * The floor is two peer-stale-timeout windows — the very derivation the knob's
- * own default (`DEFAULT_REROUTE_FLAP_GRACE_MS`) comes from, applied as a floor
- * rather than a default. It has to cover the worst honest gap between an agent
- * being alive and being visible here: an agent reconnect backing off to its cap
- * (60s), plus the peer heartbeat interval (30s) during which a freshly
- * reconnected peer advertises no agents at all. Two stale windows (120s at the
- * defaults) covers that 90s; one (60s) would not.
- *
- * A raised knob is honoured as-is: the floor only ever raises.
+ * The floor is two peer-stale-timeout windows, the derivation of the knob's own
+ * default (`DEFAULT_REROUTE_FLAP_GRACE_MS`) applied as a floor. It covers the
+ * worst honest gap between an agent being alive and visible here: a reconnect
+ * backing off to its cap (60s) plus the peer heartbeat interval (30s) in which a
+ * freshly reconnected peer advertises no agents. Two windows (120s at the
+ * defaults) cover that 90s; one (60s) would not. The floor only ever raises.
  */
 export function reaperFlapGraceMs(flapGraceMs: number, peerStaleTimeoutMs: number): number {
   return Math.max(flapGraceMs, 2 * peerStaleTimeoutMs);
@@ -80,18 +73,16 @@ export interface ReaperPeerView {
  * The reaper's `canReap` predicate, over static config plus the live peer
  * registry.
  *
- * Extracted and exported so the wiring itself is testable. The bug this closes
- * lived in exactly this expression — `clusterViewSufficient` was unit-tested
- * throughout, while the call site that fed it the wrong count was not, so the
- * guard read permissive on a Platform-mode HA pair through two review rounds.
- * A component whose false positive deletes a customer's running instances
- * cannot have an untested load-bearing line.
+ * Exported so the wiring itself is tested, not only `clusterViewSufficient`: a
+ * call site feeding it the wrong count reads permissive on a Platform-mode HA
+ * pair, and a component whose false positive deletes a customer's running
+ * instances cannot have an untested load-bearing line.
  *
- * The peer count is the max of the two sources because neither alone covers
- * both modes: `KICI_CLUSTER_PEERS` is set only in independent mode, while a
- * Platform-mode cluster learns its peers from the matchmaker and leaves that
- * array empty. `getCoordinatorPeers()` filters on role, not on connectivity, so
- * a peer lost to a partition stays counted and the guard stays armed.
+ * The peer count is the max of two sources because neither covers both modes:
+ * `KICI_CLUSTER_PEERS` is set only in independent mode, while a Platform-mode
+ * cluster learns its peers from the matchmaker and leaves that array empty.
+ * `getCoordinatorPeers()` filters on role, not connectivity, so a peer lost to
+ * a partition stays counted and the guard stays armed.
  */
 export function canReapForCluster(configuredPeerCount: number, peers: ReaperPeerView): boolean {
   return clusterViewSufficient(
@@ -103,11 +94,10 @@ export function canReapForCluster(configuredPeerCount: number, peers: ReaperPeer
 /**
  * Whether an adopting coordinator should still be treated as live.
  *
- * Mirrors `shouldDeferReroutedJob`, and for the same reason: `PeerRegistry`
- * flips `connected` the instant a peer WS closes, with no grace of its own, so
- * sampling it alone cannot tell a link blip between two healthy processes from
- * a dead coordinator — while the agent is still attached to that peer running a
- * customer job. A peer we have never heard of is genuinely gone.
+ * Mirrors `shouldDeferReroutedJob`: `PeerRegistry` flips `connected` the
+ * instant a peer WS closes, with no grace, so sampling it alone cannot tell a
+ * link blip between two healthy processes (whose agent still runs a customer
+ * job) from a dead coordinator. A peer never heard of is genuinely gone.
  */
 export function adopterIsLive(
   peer: { connected: boolean; lastHeartbeatAt: number } | undefined,
@@ -131,13 +121,11 @@ export function adopterIsLive(
  * backstop; not standing down costs the customer their fleet.
  *
  * `knownCoordinatorPeerCount` must count peers this coordinator has *ever*
- * handshaken with, not the ones named in static config. `KICI_CLUSTER_PEERS` is
- * set only in multi-orchestrator independent mode: the documented HA-pair recipe
- * runs Platform mode and joins by token, so peers arrive through the Platform
- * matchmaker and the static array stays empty. Keying on it left the guard inert
- * on precisely the topology it exists to protect. A known peer survives a
- * partition because `evictStalePeers` only marks it disconnected, so the guard
- * stays armed for as long as the partition lasts.
+ * handshaken with, not the ones in static config: `KICI_CLUSTER_PEERS` is set
+ * only in independent mode, and the documented HA-pair recipe runs Platform mode
+ * with peers from the matchmaker, so keying on it leaves the guard inert on the
+ * topology it exists to protect. `evictStalePeers` only marks a known peer
+ * disconnected, so the guard stays armed for the whole partition.
  *
  * A coordinator that has never met a peer is a single-coordinator deployment,
  * not a partitioned one, so it is never blocked.
@@ -154,21 +142,17 @@ export interface EventProvisionReaperOptions {
   listCandidates: (spawnCutoff: Date) => Promise<ReapCandidate[]>;
   /**
    * Whether an instance id is still a live cluster member (self counts as live).
-   * `flapGraceMs` is passed in so the implementation can treat a peer that
-   * disconnected moments ago as live — `peer.connected` alone flips on WS close
-   * with no grace at all.
+   * `flapGraceMs` lets a peer that disconnected moments ago count as live:
+   * `peer.connected` flips on WS close with no grace.
    */
   isPeerLive: (instanceId: string, flapGraceMs: number) => boolean;
   /** Whether an agent id is registered anywhere in the cluster we can see. */
   isAgentRegistered: (agentId: string) => boolean;
   /**
-   * Whether this coordinator can see enough of the cluster to act on its
-   * behalf. False on a node that *knows* coordinator peers but is connected to
-   * none of them, which is exactly the shape a network partition produces.
-   *
-   * "Knows" spans both modes: peers named in static config, plus peers this
-   * instance has handshaken with. Keying on static config alone is what left
-   * this guard inert on a Platform-mode HA pair, which configures none.
+   * Whether this coordinator sees enough of the cluster to act for it: false on
+   * a node that *knows* coordinator peers (static config plus every peer it
+   * handshook with) but is connected to none, the shape a partition produces.
+   * Static config alone leaves the guard inert on a Platform-mode HA pair.
    */
   canReap: () => boolean;
   /** Emit the teardown and drop the row. */
@@ -177,21 +161,19 @@ export interface EventProvisionReaperOptions {
   purgeExpiredClaims: (cutoff: Date) => Promise<number>;
   /**
    * Delete provision outcomes older than the cutoff whose spawn row is gone;
-   * returns rows deleted. Runs on the same leader-gated sweep as the claim
-   * purge, which is the orchestrator's one precedent for a timer-driven purge
-   * of scaler bookkeeping.
+   * returns rows deleted. Runs on the leader-gated sweep beside the claim purge,
+   * the orchestrator's one precedent for a timer-driven scaler-bookkeeping purge.
    */
   purgeProvisionOutcomes: (cutoff: Date) => Promise<number>;
   /**
-   * Read the live windows for one sweep. Backed by `cluster_settings`, so an
-   * operator retunes the reaper on a running cluster; each read falls back to
-   * the orchestrator's configured default when the column is NULL.
+   * The live windows for one sweep, from `cluster_settings` so an operator
+   * retunes a running cluster; a NULL column falls back to the configured default.
    */
   resolveWindows: () => Promise<ReaperWindows>;
   /**
-   * Interval used for the very first schedule, before any knob has been read.
-   * `onBecomeLeader` is synchronous (it is a Raft callback), so the timer starts
-   * at the configured default and the first tick reconciles it to the live value.
+   * The first schedule's interval. `onBecomeLeader` is a synchronous Raft
+   * callback, so the timer starts at the configured default and the first tick
+   * reconciles it to the live value.
    */
   bootIntervalMs: number;
 }
@@ -261,25 +243,21 @@ export class EventProvisionReaper {
   /**
    * agentId → when this reaper first observed the agent registered nowhere.
    *
-   * This is the debounce that makes "unseen" mean sustained absence rather than
-   * one unlucky sample. It is leader-local observation, deliberately not a
-   * database column: `adopted_at` is refreshed by a coordinator re-adopting its
-   * own agent, so a restart loop on the adopter would keep resetting the clock
-   * on its own stranded provision.
+   * The debounce that makes "unseen" mean sustained absence, not one unlucky
+   * sample. Leader-local, deliberately not a database column: a coordinator
+   * re-adopting its own agent refreshes `adopted_at`, so a restart loop on the
+   * adopter would keep resetting the clock on its own stranded provision.
    */
   private readonly strandedSince = new Map<string, number>();
   /**
    * How many entries of `strandedSince` the last sweep found absent for at
    * least the flap grace.
    *
-   * The gauge publishes this rather than `strandedSince.size`, because the two
-   * answer different questions. `size` counts every agent currently observed
-   * absent, and an agent transits that set on every ordinary reconnect — a 30s
-   * peer heartbeat against a 60s sweep, and `PeerRegistry` emptying a peer's
-   * agent list on any disconnect, mean one flap enrols every peer-adopted agent
-   * at once. So `size` is routinely non-zero on a healthy cluster, while
-   * `verdict()` refuses to act on anything below the flap grace. Publishing the
-   * past-grace count makes the gauge measure the same thing the reaper does.
+   * The gauge publishes this, not `strandedSince.size`: an agent transits that
+   * set on every ordinary reconnect (a 30s peer heartbeat against a 60s sweep,
+   * and `PeerRegistry` empties a peer's agent list on any disconnect, so one
+   * flap enrols every peer-adopted agent), so `size` is routinely non-zero on a
+   * healthy cluster. The past-grace count measures what `verdict()` acts on.
    */
   private unseenPastGrace = 0;
   /**
@@ -343,10 +321,9 @@ export class EventProvisionReaper {
     try {
       windows = await this.opts.resolveWindows();
     } catch (err) {
-      // Without windows there is no defensible cutoff, so skip the sweep rather
-      // than fall back to a guess. `ClusterSettingsReader.getNumber` already
-      // degrades a sick DB to the configured default, so reaching here means
-      // something worse than an unreadable settings row.
+      // No windows, no defensible cutoff: skip rather than guess.
+      // `ClusterSettingsReader.getNumber` already degrades a sick DB to the
+      // default, so this is worse than an unreadable settings row.
       logger.error('event-provision reap tick could not resolve its windows', {
         error: toErrorMessage(err),
       });
@@ -376,10 +353,8 @@ export class EventProvisionReaper {
         );
         this.reapBlocked = true;
       }
-      // The stranded clocks were measured against a cluster view this node no
-      // longer has, so they say nothing. Drop them: once the partition heals,
-      // the absence must be re-observed for a full window before anything is
-      // condemned.
+      // The stranded clocks measured a cluster view this node no longer has.
+      // Once the partition heals, absence is re-observed for a full window.
       this.strandedSince.clear();
       this.unseenPastGrace = 0;
       this.publishGauges(true);
@@ -389,10 +364,8 @@ export class EventProvisionReaper {
     try {
       await this.sweepCandidates(windows);
     } finally {
-      // Always, on every exit from the sweep: a gauge frozen at its last reading
-      // reports a state the reaper is no longer in. `finally` rather than a
-      // trailing call because the candidate loop can return early on a
-      // leadership change.
+      // On every exit: a frozen gauge reports a state the reaper left. `finally`
+      // because the candidate loop returns early on a leadership change.
       this.publishGauges(false);
     }
   }
@@ -523,11 +496,10 @@ export class EventProvisionReaper {
   /**
    * Adopt a changed sweep interval by rebuilding the timer.
    *
-   * Re-read every sweep rather than only at a leadership transition: a knob an
-   * operator can set but that is silently ignored until the next election is
-   * worse than no knob at all. A value that is not a usable interval is ignored
-   * — a zero or negative `setInterval` period would spin the sweep as fast as
-   * the event loop allows.
+   * Re-read every sweep, not only at a leadership transition: a knob silently
+   * ignored until the next election is worse than none. An unusable value is
+   * ignored, since a zero or negative `setInterval` period spins the sweep as
+   * fast as the event loop allows.
    */
   private reconcileInterval(intervalMs: number): void {
     if (!this.isLeader) return;
@@ -642,12 +614,9 @@ export class EventProvisionReaper {
       return null;
     }
     if (!candidate.ownerInstanceId) {
-      // A row with neither an owner nor an adopter predates migration 119. It
-      // is left for a human, and it is the one stand-down in this file with
-      // nothing else to show for it — the agent is not registered, so no other
-      // arm ever reports it. Logged once per absence, on the same transition
-      // the absence clock is seeded on, so a row that is genuinely stuck is
-      // visible instead of silently spared on every sweep forever.
+      // Pre-migration-119 row, left for a human. No other arm ever reports it
+      // (the agent is not registered), so it is logged once per absence, on the
+      // transition that seeds the absence clock, instead of spared silently.
       if (!this.unknownOwnerLogged.has(candidate.agentId)) {
         this.unknownOwnerLogged.add(candidate.agentId);
         logger.warn('Sparing an event-scaler provision whose owner is unknown', {
@@ -658,9 +627,8 @@ export class EventProvisionReaper {
       }
       return null;
     }
-    // `listCandidates` already applied the spawn deadline in SQL; re-checking it
-    // here keeps the verdict self-contained rather than trusting the caller's
-    // predicate to stay in step with this one.
+    // `listCandidates` already applied the spawn deadline in SQL; the re-check
+    // keeps the verdict self-contained.
     if (now - candidate.spawnedAt.getTime() < windows.spawnTimeoutMs) return null;
     return ScaleDownReason.enum['spawn-timeout'];
   }

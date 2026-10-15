@@ -5,16 +5,15 @@ import { ActorType, actorPrincipalSchema } from './actor.js';
  * Access log enums + dashboard protocol schemas.
  *
  * The orchestrator `access_log` table captures every read AND
- * orchestrator-admin mutation attributable to an ActorPrincipal. These enums
- * are the single source of truth for the column values; SQL, CLI filters,
- * dashboard UI, and tests all import from here.
+ * orchestrator-admin mutation attributable to an ActorPrincipal; these enums
+ * are the single source of truth for its column values.
  *
- * secret_audit_log stays as-is for secret *mutations* (create/update/delete).
- * access_log covers secret *reveals* (read-side attribution) and all other
- * reads/mutations surfaced via Platform proxy or orchestrator admin HTTP.
+ * Secret *mutations* go to secret_audit_log. access_log covers secret *reveals*
+ * and all other reads/mutations surfaced via Platform proxy or orchestrator
+ * admin HTTP.
  */
 
-/** Where the access-log entry was originated from. */
+/** Where the access-log entry originated. */
 export const AccessLogSource = z.enum(['platform_proxy', 'admin_http', 'admin_cli', 'agent']);
 export type AccessLogSource = z.infer<typeof AccessLogSource>;
 
@@ -48,8 +47,8 @@ export const AccessLogTargetType = z.enum([
 export type AccessLogTargetType = z.infer<typeof AccessLogTargetType>;
 
 /**
- * Dotted-namespace action names. Every handler that writes an access_log
- * row uses one of these values; a new handler means adding a new entry here.
+ * Dotted-namespace action names; every handler that writes an access_log row
+ * uses one, so a new handler adds an entry here.
  */
 export const AccessLogAction = z.enum([
   'run.detail.read',
@@ -58,10 +57,9 @@ export const AccessLogAction = z.enum([
   'runs.filters.read',
   'sources.list.read',
   /**
-   * Dashboard read of the orchestrator's admin-token inventory, served for the
-   * Platform's RBAC drift report. Reading who holds admin tokens is itself
-   * privileged, so the read is audited even though the response carries no
-   * credential material.
+   * Dashboard read of the admin-token inventory for the Platform's RBAC drift
+   * report. Audited because knowing who holds admin tokens is privileged, even
+   * though the response carries no credential material.
    */
   'admin_tokens.list.read',
   'run.payload.read',
@@ -73,9 +71,8 @@ export const AccessLogAction = z.enum([
   'run.rerun',
   'run.manual_schedule',
   /**
-   * Platform-relayed `kici run remote` trigger. Emitted by the orchestrator's
-   * `test.relay.trigger` handler with the developer's PAT identity as actor,
-   * so a remote run is attributable to who launched it.
+   * Platform-relayed `kici run remote` trigger, emitted by the
+   * `test.relay.trigger` handler with the developer's PAT identity as actor.
    */
   'run.trigger',
   'job.cancel',
@@ -121,9 +118,8 @@ export const AccessLogAction = z.enum([
   'fleet.host.remove',
   /**
    * Bootstrap init-runner bring-up over SSH (`ctx.kici.bootstrap.ensureInitRunner`).
-   * Emitted by the orchestrator's bring-up handler: the actor is the ops agent,
-   * the target is the fresh host. Recorded `denied` when the calling agent lacks
-   * the `kici:capability:ssh-transport` capability.
+   * Actor is the ops agent, target the fresh host; recorded `denied` when the
+   * agent lacks the `kici:capability:ssh-transport` capability.
    */
   'fleet.init_runner.bringup',
   /**
@@ -140,81 +136,71 @@ export const AccessLogAction = z.enum([
   'global_workflows.get.read',
   'global_workflows.update',
   /**
-   * Per-org dashboard-write policy flip (set or reset). Emitted once per
-   * changed operation by the orch admin `PATCH
-   * /admin/org-settings/dashboard-writes` route. The `actor_meta` columns
-   * `operation`, `prior_state`, `new_state`, and `reset` (when applicable)
-   * identify which switch moved.
+   * Per-org dashboard-write policy flip (set or reset), one row per changed
+   * operation from `PATCH /admin/org-settings/dashboard-writes`. `actor_meta`
+   * carries `operation`, `prior_state`, `new_state` and, when applicable,
+   * `reset`.
    */
   'org_settings.dashboard_write_policy.update',
   /**
-   * Org trust-policy write via the orch admin `PATCH /admin/trust-policy`
-   * route (driven by `kici-admin trust-policy set`). Only reachable on an
-   * independent orchestrator — a Platform-attached one refuses the PATCH,
-   * because the Platform owns the policy there. `actor_meta` carries the
-   * requested `patch` plus the resulting `policy`, so an operator loosening
-   * `forkPolicy` to `allow` is attributable. Written inside the same
-   * transaction as the policy row.
+   * Org trust-policy write via `PATCH /admin/trust-policy`
+   * (`kici-admin trust-policy set`). Only an independent orchestrator accepts
+   * it; a Platform-attached one refuses, because the Platform owns the policy
+   * there. `actor_meta` carries the requested `patch` and the resulting
+   * `policy`, so loosening `forkPolicy` to `allow` is attributable. Written in
+   * the policy row's transaction.
    *
-   * Past tense, unlike every sibling here (`…update` / `…set` / `…delete`),
-   * and deliberately so: `trust_policy.update` is already taken by the
+   * Past tense on purpose, unlike every sibling: `trust_policy.update` is the
    * Platform→orchestrator WebSocket push that delivers the policy
-   * (`platform-orchestrator.ts`). Two different things named identically —
-   * one a wire frame, one an audited local mutation — would be far more
-   * confusing than the tense break. Do NOT "fix" this to `.update`.
+   * (`platform-orchestrator.ts`), and naming an audited local mutation
+   * identically would confuse more than the tense break. Do NOT "fix" this to
+   * `.update`.
    */
   'trust_policy.updated',
   /**
-   * Approval-directory member registration or removal via the orch admin
-   * `PATCH` / `DELETE /admin/trust-policy/directory` routes (driven by
-   * `kici-admin trust-policy directory-set` / `directory-remove`). Reachable
-   * only on an independent orchestrator — a Platform-attached one refuses both,
-   * because the Platform owns the directory there. `actor_meta` carries the
-   * `userId` acted on, plus the registration for a write, so an operator
-   * granting themselves `write` CI trust is attributable. Written inside the
-   * same transaction as the directory row.
+   * Approval-directory member registration or removal via `PATCH` / `DELETE
+   * /admin/trust-policy/directory` (`kici-admin trust-policy directory-set` /
+   * `directory-remove`). Only an independent orchestrator accepts it; a
+   * Platform-attached one refuses, because the Platform owns the directory
+   * there. `actor_meta` carries the `userId` acted on, plus the registration
+   * for a write, so self-granting `write` CI trust is attributable. Written in
+   * the directory row's transaction.
    *
-   * Past tense for the same reason as `trust_policy.updated` above:
-   * `trust_policy.update` is the Platform→orchestrator wire frame that delivers
-   * the directory, and reusing that name for an audited local mutation would
-   * conflate two different things.
+   * Past tense for the same reason as `trust_policy.updated`: the
+   * `trust_policy.update` wire frame also delivers the directory.
    */
   'trust_directory.updated',
   /**
-   * Cluster-name rename via the orch admin `PUT /admin/cluster-name`
-   * route (driven by `kici-admin cluster-name set`). The `actor_meta`
-   * columns carry `prior_value` and `new_value`. Cluster-name is
-   * orch-scoped, so `org_id` is null on these rows.
+   * Cluster-name rename via `PUT /admin/cluster-name` (`kici-admin
+   * cluster-name set`). `actor_meta` carries `prior_value` and `new_value`;
+   * `org_id` is null because cluster-name is orch-scoped.
    */
   'cluster_name.update',
   /**
-   * Deferred-attestation outbox drain / re-arm via the orch admin
-   * `POST /admin/attestations/retry` route (driven by `kici-admin attestations
-   * retry`). `actor_meta` carries `include_rejected`, `run_id`, and the
-   * `minted`/`still_pending`/`rejected` counts. The `include_rejected` re-arm
-   * clears a terminal `rejected_at` marker, so it is always audited.
+   * Deferred-attestation outbox drain / re-arm via `POST
+   * /admin/attestations/retry` (`kici-admin attestations retry`). `actor_meta`
+   * carries `include_rejected`, `run_id`, and the
+   * `minted`/`still_pending`/`rejected` counts. Always audited, because the
+   * `include_rejected` re-arm clears a terminal `rejected_at` marker.
    */
   'attestation.retry',
   /**
-   * Live orphaned Firecracker VMs stopped via the orch admin
-   * `POST /admin/scaler/orphans/stop` route (driven by `kici-admin scaler
-   * orphans --stop`). `target_id` is the node's instance id; `actor_meta`
-   * carries `target`, `vm_ids` and the per-VM `results`.
+   * Live orphaned Firecracker VMs stopped via `POST /admin/scaler/orphans/stop`
+   * (`kici-admin scaler orphans --stop`). `target_id` is the node's instance
+   * id; `actor_meta` carries `target`, `vm_ids` and the per-VM `results`.
    */
   'scaler.orphan.stop',
   /**
-   * The scaler config re-read via the orch admin `POST /admin/scaler/reload`
-   * route (driven by `kici-admin scaler reload`), on the receiving orchestrator
-   * and, unless `single`, on every peer it is connected to. `target_id` is the
-   * receiving instance id; `actor_meta` carries `single` and the per-instance
-   * `results`.
+   * Scaler config re-read via `POST /admin/scaler/reload` (`kici-admin scaler
+   * reload`) on the receiving orchestrator and, unless `single`, every
+   * connected peer. `target_id` is the receiving instance id; `actor_meta`
+   * carries `single` and the per-instance `results`.
    */
   'scaler.reload',
   /**
    * A departed peer dropped from the coordinators' live peer registries via
-   * the orch admin `POST /admin/peers/forget` route (driven by `kici-admin peer
-   * forget`). `target_id` is the forgotten instance id; `actor_meta` carries the
-   * per-coordinator `results`.
+   * `POST /admin/peers/forget` (`kici-admin peer forget`). `target_id` is the
+   * forgotten instance id; `actor_meta` carries the per-coordinator `results`.
    */
   'peer.forget',
   'access_log.list.read',
@@ -227,11 +213,9 @@ export const AccessLogAction = z.enum([
   /** Cold-store purge deleted an expired chunk from S3 + PG bookkeeping. */
   'purge_chunk',
   /**
-   * Direct-DB kici-admin mutations (source 'admin_cli'). Emitted by the
-   * mutating db subcommands so an operator's provisioning + maintenance DDL is
-   * audited identically to the HTTP/WS admin path. Non-transactional DDL means
-   * the row is recorded best-effort after the operation succeeds (or with
-   * outcome 'error' on failure).
+   * Direct-DB kici-admin mutations (source 'admin_cli'), audited like the
+   * HTTP/WS admin path. The DDL is non-transactional, so the row is recorded
+   * best-effort after the operation (outcome 'error' on failure).
    */
   'db.fresh',
   'db.migrate',
@@ -244,11 +228,10 @@ export const AccessLogAction = z.enum([
 export type AccessLogAction = z.infer<typeof AccessLogAction>;
 
 /**
- * Single row as surfaced to the dashboard / CLI. Includes optional
- * displayName/email for `user` and `platform_operator` actors — those are
- * resolved Platform-side by joining `actor_id` against the Keycloak-backed
- * `users` table. The orchestrator never returns them; it emits a minimal
- * row and Platform enriches before forwarding to the browser.
+ * Single row as surfaced to the dashboard / CLI. The orchestrator emits a
+ * minimal row; the Platform adds displayName/email for `user` and
+ * `platform_operator` actors by joining `actor_id` against the Keycloak-backed
+ * `users` table before forwarding to the browser.
  */
 export const accessLogItemSchema = z.object({
   id: z.string(),
@@ -268,9 +251,8 @@ export const accessLogItemSchema = z.object({
   outcome: AccessLogOutcome,
   errorMessage: z.string().nullable(),
   /**
-   * Agent provenance label promoted from the dedicated `agent_label` column
-   * (not parsed out of `actor_meta`) so consumers can filter/display it
-   * directly. Null for ordinary human / API-key / system actors.
+   * Agent provenance label from the dedicated `agent_label` column (not parsed
+   * out of `actor_meta`). Null for human / API-key / system actors.
    */
   agentLabel: z.string().nullable().optional(),
   createdAt: z.string(),

@@ -2,24 +2,20 @@
  * The one definition of "this `.kici/` tree's content".
  *
  * The compiler writes it into the lock file as a workflow's `contentHash`
- * input; the agent recomputes it over the extracted tree as the drift gate. One
- * implementation, imported by both, is what makes those two numbers comparable
- * — a second copy is how a producer and its verifier drift apart.
+ * input; the agent recomputes it over the extracted tree as the drift gate. Both
+ * import this one implementation, so the two numbers stay comparable.
  *
  * The digest covers the whole directory because the artifact it names is the
  * whole directory: `source-packer.ts` packs all of `.kici/` minus
- * `.kici/node_modules/`. Hashing only the workflow entry file left the identity
- * covering one file while the object it keyed covered a tree, so editing an
- * imported helper — `.kici/lib/deploy.ts` under `.kici/workflows/deploy.ts` —
- * moved no hash, hit the source cache, restored the previous tarball, ran the
- * OLD helper, and reported green. The drift gate could not catch it either,
- * because it re-hashed the same single file.
+ * `.kici/node_modules/`. A digest over only the workflow entry file missed an
+ * edit to an imported helper (`.kici/lib/deploy.ts`): the hash did not move, the
+ * source cache restored the old tarball, the OLD helper ran green, and the drift
+ * gate re-hashed the same single file.
  *
- * Which files it covers is **declared**, not hard-coded: `.kici/.kiciignore`
- * replaces the default exclusion set when present, and `kici-ignore.ts` holds
- * both the defaults and the matcher. That file explains why the set had to
- * become declarative — the agent rewrites `package-lock.json` and `.npmrc`
- * inside the tree it is asked to re-hash.
+ * Which files it covers is **declared**: `.kici/.kiciignore` replaces the
+ * default exclusion set when present, and `kici-ignore.ts` holds the defaults,
+ * the matcher, and why the set is declarative (the agent rewrites
+ * `package-lock.json` and `.npmrc` inside the tree it re-hashes).
  *
  * Determinism, in the order it matters:
  *
@@ -31,18 +27,15 @@
  *   `kici.lock.json`, whatever `.kici/types/` the packing clone held, and any
  *   other path `.kiciignore` excludes.
  * - **Line-ending normalized**, so a Windows agent whose checkout carries CRLF
- *   agrees with a Linux compiler's LF. Same normalization the single-file hash
- *   has always applied.
+ *   agrees with a Linux compiler's LF.
  * - **`\0`-delimited** path and content, so no rename can be disguised as a
  *   content edit (`a/bc` + `d` and `a/b` + `cd` hash differently).
  *
- * A symlink contributes its target string, never the bytes behind it. That is
- * what keeps the walk terminating, and it is why the exclusion set resolves a
- * link to decide whether a directory-only pattern covers it — see
- * `matchesAsDirectory`. It also bounds which links are safe to hash at all:
- * only one whose target survives pack → extract unchanged, which
- * `findDigestReproducibilityWarnings` checks against the tree the compiler is
- * about to hash.
+ * A symlink contributes its target string, never the bytes behind it, which
+ * keeps the walk terminating. The exclusion set still resolves a link to decide
+ * whether a directory-only pattern covers it (`matchesAsDirectory`). Only a link
+ * whose target survives pack → extract unchanged is safe to hash;
+ * `findDigestReproducibilityWarnings` checks that before the compiler hashes.
  */
 
 import fs from 'node:fs/promises';
@@ -61,9 +54,8 @@ import {
   runRewrittenWarning,
 } from './kici-ignore.js';
 
-// Re-exported through this module because it is the one the compiler and agent
-// already import; `.kiciignore` is a property of the digest, so a consumer
-// should not need a second entry point to describe it.
+// Re-exported here, the module the compiler and agent already import:
+// `.kiciignore` is a property of the digest, so it needs no second entry point.
 export {
   KICI_DIGEST_DEFAULT_EXCLUSIONS,
   KICI_DIGEST_FORCED_EXCLUSIONS,
@@ -76,8 +68,7 @@ export {
 export interface KiciIgnoreRules {
   /**
    * `'file'` when `.kici/.kiciignore` supplied the patterns, `'default'` when
-   * it was absent. Replace semantics live in this distinction: a file that
-   * exists IS the list, and the defaults do not merge into it.
+   * it was absent. A file that exists IS the list; the defaults never merge in.
    */
   readonly source: 'file' | 'default';
   /** The declared patterns, exactly as parsed. Forced entries are not in here. */
@@ -95,12 +86,10 @@ export interface KiciIgnoreRules {
  * digest covers, how the hash input is built, the artifact model).
  * This is NOT the lock file schema version.
  *
- * It lives here, beside the digest it qualifies, because the compiler that
- * writes a `contentHash` and the agent that re-verifies it must mix in the same
- * number or every hash disagrees. `@kici-dev/compiler` `lockfile/hasher.ts` and
+ * The compiler that writes a `contentHash` and the agent that re-verifies it
+ * must mix in the same number, so `@kici-dev/compiler` `lockfile/hasher.ts` and
  * `@kici-dev/agent` `execution/workflow-loader.ts` both re-export this one
- * definition — a second copy is how a producer and its verifier drift apart,
- * which is the same reason `hashKiciSourceTree` above is single-sourced.
+ * definition.
  *
  * What each version means:
  *
@@ -114,11 +103,9 @@ export interface KiciIgnoreRules {
  *   identity covers the same files the source tarball carries.
  * - 6 → 7: the covered set became declarative — `.kici/.kiciignore` — and the
  *   default exclusions grew to cover `.npmrc`, `package-lock.json` and
- *   `pnpm-lock.yaml`. A run rewrites those inside the very tree the agent must
- *   re-hash, so the previous set covered files the agent itself changed and the
- *   drift gate rejected runs whose source had not moved. Every repo's
- *   `contentHash` therefore moves; old lock files are stale and are regenerated
- *   by `kici compile`.
+ *   `pnpm-lock.yaml`, which a run rewrites inside the tree the agent re-hashes
+ *   (the drift gate rejected runs whose source had not moved). Every repo's
+ *   `contentHash` moves; `kici compile` regenerates the stale lock files.
  */
 export const COMPILE_SCHEMA_VERSION = 7;
 
@@ -126,12 +113,11 @@ export const COMPILE_SCHEMA_VERSION = 7;
  * Resolve the exclusion rules for `kiciDir`, reading `.kici/.kiciignore`.
  *
  * Separate from `hashKiciSourceTree` because the compiler needs the warnings
- * without needing a digest — and because a caller that wants to explain the
- * exclusion set should not have to re-implement how it was chosen.
+ * without a digest, and a caller explaining the exclusion set should not
+ * re-implement how it was chosen.
  *
- * An unreadable file falls back to the defaults: the digest's job is to be
- * computable, and a read failure that silently emptied the exclusion set would
- * make every subsequent run drift instead.
+ * An unreadable file falls back to the defaults: a read failure that emptied
+ * the exclusion set would make every subsequent run drift.
  */
 export async function loadKiciIgnoreRules(kiciDir: string): Promise<KiciIgnoreRules> {
   let patterns: readonly string[] = KICI_DIGEST_DEFAULT_EXCLUSIONS;
@@ -163,49 +149,42 @@ export async function loadKiciIgnoreRules(kiciDir: string): Promise<KiciIgnoreRu
  * dependencies ship in the deps tarball instead. Stated as the tar member
  * prefix so this and `source-packer.ts`'s filter test the same string.
  *
- * This governs the tarball, not the digest. The digest's exclusion set is
- * declared in `.kici/.kiciignore` (defaults in `kici-ignore.ts`), which covers
- * `node_modules/` among others — so the tarball stays a superset of the hashed
- * set, as it always was for `kici.lock.json`.
+ * This governs the tarball, not the digest. The digest's exclusion set
+ * (`.kici/.kiciignore`, defaults in `kici-ignore.ts`) covers `node_modules/`
+ * among others, so the tarball stays a superset of the hashed set.
  */
 export const KICI_SOURCE_EXCLUDED_PREFIX = '.kici/node_modules';
 
 /**
  * The compiler's own output, which lives inside the directory it hashes.
  *
- * Retained as the `.kici/`-prefixed tar member name; the digest enforces this
+ * Kept as the `.kici/`-prefixed tar member name; the digest enforces this
  * exclusion through `KICI_DIGEST_FORCED_EXCLUSIONS`, which no `.kiciignore` can
- * switch off, for the reason spelled out below.
+ * switch off.
  *
- * Excluding it is not a relaxation — it is the only way the digest can exist.
- * The compiler walks `.kici/` to compute a workflow's `contentHash`, then
- * writes that hash INTO `.kici/kici.lock.json`; an agent walking the extracted
- * tree afterwards would see the new lock file and compute a different digest,
- * so the drift gate would reject every run. The input to a hash cannot contain
- * the hash. `lockfileHash` has always had the same shape and avoids it the same
- * way, by naming exactly one file rather than a tree.
+ * Excluding it is the only way the digest can exist: the compiler hashes
+ * `.kici/`, then writes that hash INTO `.kici/kici.lock.json`, so an agent
+ * re-hashing the extracted tree would see the new lock file and reject every
+ * run. The input to a hash cannot contain the hash; `lockfileHash` avoids it the
+ * same way, by naming exactly one file rather than a tree.
  *
- * The lock file still ships in the tarball, and its own integrity comes from
- * elsewhere: the orchestrator fetches it at the commit SHA, so it is provenance
- * that vouches for it, never `contentHash`.
+ * The lock file still ships in the tarball. The orchestrator fetches it at the
+ * commit SHA, so provenance vouches for it, never `contentHash`.
  */
 export const KICI_SOURCE_EXCLUDED_LOCK = '.kici/kici.lock.json';
 
 /**
  * The compiler's generated type declarations, for the same reason and one more.
  *
- * Retained as the `.kici/`-prefixed tar member prefix; the digest excludes it
+ * Kept as the `.kici/`-prefixed tar member prefix; the digest excludes it
  * through the `types/` entry of `KICI_DIGEST_DEFAULT_EXCLUSIONS`, which a
  * `.kiciignore` may override — the reasons below are strong but, unlike the
  * lock file's, not arithmetic.
  *
- * `kici compile` refreshes `.kici/types/secrets.d.ts` after it has already
- * hashed the tree, so the ordering problem above applies verbatim. The stronger
- * reason is that `kici init` gitignores `.kici/types/`: the declarations are a
- * per-developer snapshot of one org's secret keys, never committed. So the
- * directory exists on the machine that compiles and is absent from the clone
- * the agent hashes — the two digests could not agree even if nothing wrote
- * during the compile.
+ * `kici compile` refreshes `.kici/types/secrets.d.ts` after hashing the tree, so
+ * the lock file's ordering problem applies. More strongly, `kici init`
+ * gitignores `.kici/types/` (a per-developer snapshot of one org's secret keys),
+ * so it exists where the compiler hashes and is absent from the agent's clone.
  *
  * Excluding it costs the gate nothing: a `.d.ts` is erased before anything
  * runs, so no behavior it could describe reaches a job.
@@ -217,25 +196,22 @@ export const KICI_SOURCE_EXCLUDED_TYPES_PREFIX = '.kici/types/';
  *
  * `Dirent.isDirectory()` describes the link itself, so a symlinked
  * `.kici/node_modules` reads as a file and the directory-only `node_modules/`
- * pattern misses it. The compiler then hashes a `symlink:<target>` member that
- * no agent can hold: the tarball drops `.kici/node_modules` by prefix, and the
- * restore materialises a real directory the exclusion does match. The producer
- * and its verifier disagree on a tree nobody edited, and recompiling reproduces
- * the same lock.
+ * pattern misses it. The compiler would then hash a `symlink:<target>` member
+ * no agent can hold (the tarball drops `.kici/node_modules` by prefix and the
+ * restore materialises a real directory), and recompiling reproduces the same
+ * lock.
  *
- * So classification resolves the link and the walk does not. An entry that
- * survives exclusion is still recorded as a member and still contributes its
- * target string; nothing here follows a link to read what is behind it, which
- * is what keeps the walk terminating and keeps the hashed set equal to what the
- * tarball carries.
+ * So classification resolves the link and the walk does not: a surviving entry
+ * still contributes its target string, and nothing follows a link to read what
+ * is behind it. That keeps the walk terminating and the hashed set equal to
+ * what the tarball carries.
  *
  * A link that cannot be resolved — dangling, cyclic (the kernel's own
  * `ELOOP`), or unreadable — is a file, which is what it contributes anyway.
  *
- * This is a deliberate deviation from gitignore, where `node_modules/` does not
- * match a symlinked `node_modules`. The purpose of the entry is "exclude the
- * dependency tree, whatever shape it takes on disk", and a link to the
- * dependency tree is the dependency tree.
+ * A deliberate deviation from gitignore, where `node_modules/` does not match a
+ * symlinked `node_modules`: the entry means "exclude the dependency tree,
+ * whatever shape it takes on disk".
  */
 async function matchesAsDirectory(abs: string, entry: Dirent): Promise<boolean> {
   if (entry.isDirectory()) return true;
@@ -267,9 +243,7 @@ async function collectSourcePaths(kiciDir: string, rules: KiciIgnoreRules): Prom
       if (entry.isDirectory()) {
         await walk(abs, rel);
       } else {
-        // Files and symlinks alike. A symlink contributes its target string
-        // rather than its target's bytes, which keeps the walk terminating and
-        // still moves the digest when the link is repointed.
+        // Files and symlinks alike; repointing a link still moves the digest.
         found.push(member);
       }
     }
@@ -400,15 +374,13 @@ function underRunRewritten(rel: string): string | undefined {
 /**
  * Warnings about members the agent cannot reproduce, read off the actual tree.
  *
- * `findUncoveredRunRewrittenPaths` interrogates the *patterns* with a synthetic
- * directory probe and never consults the filesystem, so it is structurally
- * blind to a shape mismatch: a `.kici/node_modules` that is a dangling link, or
- * a link to a file, classifies as a file, escapes the directory-only
- * `node_modules/` entry, and is hashed — while the tarball omits it by prefix
- * and the agent's tree never holds it. This walks the tree instead.
+ * `findUncoveredRunRewrittenPaths` probes only the *patterns*, so it is blind
+ * to a shape mismatch: a `.kici/node_modules` that is a dangling link, or a
+ * link to a file, escapes the directory-only `node_modules/` entry and is
+ * hashed, while the tarball omits it by prefix. This walks the tree instead.
  *
- * Two faults, both of which end in the same unrecoverable place — a lock the
- * agent rejects and a recompile that reproduces it:
+ * Both faults end in a lock the agent rejects and a recompile that reproduces
+ * it:
  *
  * - a hashed member that is, or lies under, a path a run rewrites;
  * - a hashed symlink whose target cannot survive pack → extract.
@@ -464,12 +436,10 @@ export async function findDigestReproducibilityWarnings(
 /**
  * The sentence a drift error adds when the hashed tree carries symlinks.
  *
- * "Run 'kici compile'" is the right remedy for ordinary drift and is actively
- * misleading here: a symlink the tarball omits or extraction rewrites makes the
- * producer's hash unreachable on this side, so recompiling reproduces the same
- * lock forever. Naming the links turns an unrecoverable loop into something the
- * error text alone explains. Empty when the tree carries none, so an ordinary
- * drift error is unchanged.
+ * "Run 'kici compile'" fixes ordinary drift but misleads here: a symlink the
+ * tarball omits or extraction rewrites makes the producer's hash unreachable,
+ * so recompiling reproduces the same lock forever. Empty when the tree carries
+ * no symlinks, so an ordinary drift error is unchanged.
  */
 export function hashedSymlinkDriftNote(symlinks: readonly SourceSymlink[]): string {
   if (symlinks.length === 0) return '';
@@ -485,10 +455,9 @@ export function hashedSymlinkDriftNote(symlinks: readonly SourceSymlink[]): stri
 
 /**
  * Locate the `.kici` directory a workflow file lives under, or null when it
- * does not live under one (a config file outside the convention). Walks
- * ancestors rather than taking the directory as a parameter, so every entry
- * point that loads a workflow module resolves the same tree without threading
- * one more argument through each of them.
+ * does not live under one (a config file outside the convention). Walking
+ * ancestors lets every entry point that loads a workflow module resolve the
+ * same tree without threading the directory through.
  */
 export function findKiciDir(entryPath: string): string | null {
   let dir = path.dirname(path.resolve(entryPath));

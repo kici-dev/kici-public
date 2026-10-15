@@ -17,13 +17,12 @@ export interface UpsertActiveEncryptionKeyInput {
 }
 
 /**
- * Repository for the orchestrator's dashboard-encryption (X25519) keys. One
- * `active` key seals browser writes; a rotated-out key is `revoked`, which drops
- * it from the published JWKS ({@link listNonRevoked}) so new seals only ever use
- * the current key, while its row — and therefore its wrapped private half —
- * stays on record ({@link getByKid}) so an envelope a browser already sealed to
- * the old `kid` still decrypts. Mirrors the activate/demote transaction shape of
- * `OrchestratorSigningKeyRepo`.
+ * The orchestrator's dashboard-encryption (X25519) keys. One `active` key seals
+ * browser writes. A rotated-out key is `revoked`: it leaves the published JWKS
+ * ({@link listNonRevoked}) so new seals use only the current key, but its row
+ * and wrapped private half stay ({@link getByKid}) so envelopes sealed to the
+ * old `kid` still decrypt. Mirrors `OrchestratorSigningKeyRepo`'s
+ * activate/demote transaction shape.
  */
 export class DashboardEncryptionKeyRepo {
   constructor(private readonly db: Kysely<Database>) {}
@@ -69,9 +68,9 @@ export class DashboardEncryptionKeyRepo {
   }
 
   /**
-   * Activate `input.kid`. If already active, no-op. Otherwise demote any
-   * current active key to `revoked` and insert this kid as `active`, in one
-   * transaction. Returns true when a NEW kid was activated (caller audits).
+   * Activate `input.kid` (no-op when already active), demoting the current
+   * active key to `revoked` in one transaction. Returns true when a NEW kid was
+   * activated (caller audits).
    */
   async upsertActive(input: UpsertActiveEncryptionKeyInput): Promise<boolean> {
     return this.db.transaction().execute(async (trx) => {

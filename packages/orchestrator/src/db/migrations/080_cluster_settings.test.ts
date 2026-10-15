@@ -3,15 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m080 from './080_cluster_settings.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 080.
- *
- * Creates a uniquely-named throwaway database, applies migrations 001..080
- * via the production migration provider, and asserts the singleton
- * `cluster_settings` table exists with all 8 nullable knob columns and a
- * CHECK-constrained fixed primary key.
+ * Real-Postgres test for migration 080: the singleton `cluster_settings` table with its
+ * nullable knob columns and CHECK-constrained fixed primary key, on a throwaway database.
  *
  * Gated on `KICI_TEST_ADMIN_DATABASE_URL`: skips when unset, fails loudly when
  * set but unreachable.

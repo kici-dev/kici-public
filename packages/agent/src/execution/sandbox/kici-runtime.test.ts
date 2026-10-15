@@ -16,9 +16,8 @@ describe('kici-runtime', () => {
   });
 
   it('never launches via the image’s own node', () => {
-    // The whole point of injecting a runtime is that the customer image is not
-    // required to ship Node at all — so the argv must be absolute and rooted in
-    // the mount, never a bare `node` resolved from the image's PATH.
+    // The customer image need not ship Node, so the argv is absolute and rooted
+    // in the mount, never a bare `node` from the image's PATH.
     const [exe] = runnerLaunchArgv('/opt/kici/workflow-runner.js');
     expect(exe).toBe(KICI_RUNTIME_NODE);
     expect(exe.startsWith(`${KICI_RUNTIME_MOUNT}/`)).toBe(true);
@@ -36,8 +35,7 @@ describe('kici-runtime', () => {
   });
 
   it('refuses an architecture the published runtime does not cover', () => {
-    // Failing here is far better than mounting an x64 runtime into an arm64
-    // container and surfacing it as `exec format error` mid-job.
+    // Rather than an x64 runtime failing in an arm64 container with `exec format error` mid-job.
     expect(() => resolveRuntimeSource('mips64' as never)).toThrow(/unsupported/i);
   });
 });

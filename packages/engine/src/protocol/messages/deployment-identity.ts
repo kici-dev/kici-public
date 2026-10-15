@@ -9,35 +9,29 @@ export const DeploymentContainerRuntimeSchema = z.enum(['podman', 'docker']);
 export type DeploymentContainerRuntime = z.infer<typeof DeploymentContainerRuntimeSchema>;
 
 /**
- * The orchestrator's self-reported deployment shape, used to build the correct
- * kici-admin invocation in the dashboard Infrastructure page. Container fields are
- * populated only for the `compose` mode; a hand-run orchestrator reports
- * `mode: 'unknown'` with no container fields. `adminInvocation` is the pinned
- * `<node> <kici-admin>` invocation for posix bare-metal (`systemd` / `launchd`),
- * set by the orchestrator from its own `process.execPath` so a copied command
- * runs under the unit's pinned runtime rather than whatever `node` the
- * operator's shell resolves. The orchestrator locates the shim on disk and omits
- * the field when it cannot, so a reader may always fall back to a PATH-resolved
- * bare `kici-admin`. It is a live-host runtime path, carried only on the
- * in-memory identity (never persisted).
+ * The orchestrator's self-reported deployment shape, from which the dashboard
+ * Infrastructure page builds the right kici-admin invocation. Container fields
+ * are set only in `compose` mode; a hand-run orchestrator reports
+ * `mode: 'unknown'` with none.
  *
- * The value is a shell command, not a pair of raw paths: either half is
- * single-quoted (POSIX `'\''` escaping) when its path holds whitespace or another
- * shell metacharacter, so it can be pasted as-is. A reader that only displays it
- * needs no special handling; a reader that wants the shim path back out has to
- * split it as shell words rather than on the last space.
+ * `adminInvocation` (posix bare metal: `systemd` / `launchd`) is the pinned
+ * `<node> <kici-admin>` command, built from the orchestrator's own
+ * `process.execPath` so a copied command runs under the unit's pinned runtime,
+ * not whatever `node` the operator's shell resolves. It is a shell command, not
+ * a pair of raw paths: either half is single-quoted (POSIX `'\''` escaping) when
+ * its path holds whitespace or another shell metacharacter, so it pastes as-is.
+ * A display-only reader needs no handling; a reader extracting the shim path
+ * splits it as shell words, not on the last space.
  *
- * `adminPath` is the Windows counterpart and is set only for `mode: 'windows'`:
- * the absolute path of the `kici-admin.cmd` launcher, when the orchestrator can
- * locate it. Unlike `adminInvocation` it is a RAW path and never a command —
- * nothing about it is quoted or escaped. That is deliberate: cmd.exe runs a
- * double-quoted path in command position while PowerShell merely *prints* it
- * (it needs the `&` call operator), so the same path has to be written two
- * different ways and only the reader knows which shell it is rendering for. A
- * producer that pre-quoted would take that choice away. It is a live-host
- * runtime path, carried only on the in-memory identity (never persisted), and
- * omitted when the launcher cannot be located so a reader falls back to a
- * PATH-resolved bare `kici-admin.cmd`.
+ * `adminPath` (`mode: 'windows'` only) is the absolute path of the
+ * `kici-admin.cmd` launcher, RAW and never quoted or escaped: cmd.exe runs a
+ * double-quoted path in command position while PowerShell only *prints* it (it
+ * needs the `&` call operator), so only the reader knows how to write it.
+ *
+ * Both are live-host runtime paths carried only on the in-memory identity
+ * (never persisted), and omitted when the orchestrator cannot locate the file,
+ * so a reader falls back to a PATH-resolved bare `kici-admin` /
+ * `kici-admin.cmd`.
  */
 export const DeploymentIdentitySchema = z.object({
   mode: DeploymentModeSchema,

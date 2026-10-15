@@ -35,7 +35,7 @@ async function makeDeferredFixture(
     tamperHash?: boolean;
     /**
      * Model a statement that disagrees with the server-signed claims while its
-     * hash still matches: the forgery the hash-only branch let through.
+     * hash still matches: the forgery a hash-only check would accept.
      */
     statementSha?: string;
     /** Drop `attestation_origin` from the token, leaving only the statement's. */
@@ -74,9 +74,9 @@ async function makeDeferredFixture(
   const identityToken = await new SignJWT({
     kici_run_id: 'run-1',
     kici_job_id: 'job-1',
-    // The build facts a deferred mint DOES carry. `opts.deferred` affects only
-    // `statement_hash` and `attestation_origin`, so these are the same server
-    // truth a live token carries — which is why the cross-check is possible.
+    // The build facts a deferred mint DOES carry: the origin affects only
+    // `statement_hash` and `attestation_origin`, so these match a live token's
+    // server truth, which makes the cross-check possible.
     repository: 'github.com/acme/api',
     ref: 'refs/heads/main',
     sha: 'deadbeef',
@@ -133,7 +133,7 @@ interface Fixture {
 }
 
 async function makeFixture(overrides: FixtureOverrides = {}): Promise<Fixture> {
-  // Identity key (acts as the Platform JWKS key).
+  // Identity key (acts as the issuer's JWKS key).
   const idKp = await generateKeyPair('ES256', { extractable: true });
   const idJwkPub = (await exportJWK(idKp.publicKey)) as JWK;
   idJwkPub.alg = 'ES256';
@@ -474,9 +474,8 @@ describe('verifyKiciBundle', () => {
 
 describe('verifyKiciBundle — build-context cross-check for every origin', () => {
   it('HARD FAILS a deferred bundle whose statement sha disagrees with the signed claim', async () => {
-    // The forgery the hash-only branch let through: a statement naming a
-    // release SHA the build never touched, with a hash the token really does
-    // commit to.
+    // The forgery a hash-only check would accept: a statement naming a release
+    // SHA the build never touched, with a hash the token really commits to.
     const { bundle, jwks } = await makeDeferredFixture('deferred', {
       statementSha: 'f'.repeat(40),
     });
@@ -510,9 +509,9 @@ describe('verifyKiciBundle — build-context cross-check for every origin', () =
 
   it('ignores a statement-declared attestationOrigin when the signed claim is absent', async () => {
     // `internalParameters.attestationOrigin` is unsigned and producer-written,
-    // so honouring it let a producer pick the weaker branch by writing one
-    // field. Without the signed claim the bundle is treated as `live`, which is
-    // the STRICTER reading — `statement_hash` is then not consulted at all.
+    // so honouring it would let a producer pick the weaker branch. Without the
+    // signed claim the bundle is `live`, the STRICTER reading, and
+    // `statement_hash` is not consulted.
     const { bundle, jwks } = await makeDeferredFixture('deferred', {
       omitOriginClaim: true,
       tamperHash: true,

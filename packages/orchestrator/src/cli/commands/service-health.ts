@@ -1,15 +1,13 @@
 /**
- * Reads a locally installed KiCI service's health endpoints and formats what
- * they report. `kici-admin orchestrator status` and `kici-admin agent status`
- * both render through here, so the two sections agree on layout and on how a
- * missing field is handled.
+ * Reads a local KiCI service's health endpoints. `kici-admin orchestrator
+ * status` and `kici-admin agent status` both render through here, so they agree
+ * on layout and on missing-field handling.
  */
 
 import fs from 'node:fs';
 import { formatUptime, type BuildFingerprint, type LivenessBase } from '@kici-dev/shared';
 import { readEnvValue } from '../service/backup-timer.js';
 
-/** How long a health request waits unless the caller passes its own timeout. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 3000;
 
 /** Hex digits of a bundle hash to show: the length the build prints in its `deps:` line. */
@@ -18,7 +16,6 @@ const SHORT_HASH_LENGTH = 12;
 /** Bind addresses that mean "every interface", reached on `localhost`. */
 const WILDCARD_HOSTS = new Set(['', '0.0.0.0', '::', '[::]']);
 
-/** A label and its value: one line of a status section. */
 export type StatusRow = readonly [label: string, value: string];
 
 /**
@@ -51,7 +48,7 @@ export function readEnvContent(
 export interface LocalEndpoint {
   host: string;
   port: number;
-  /** The prefix the service's routes are mounted under; empty when they sit at `/`. */
+  /** Empty when routes sit at `/`. */
   pathPrefix: string;
 }
 
@@ -89,10 +86,7 @@ export type LocalJsonResult<T> =
   | { kind: 'http-error'; status: number }
   | { kind: 'no-answer' };
 
-/**
- * GET a JSON body from a service on this host. `acceptStatuses` names the
- * non-2xx codes whose body is still an answer; `headers` carries credentials.
- */
+/** `acceptStatuses` names the non-2xx codes whose body is still an answer. */
 export async function requestLocalJson<T>(
   endpoint: LocalEndpoint,
   pathname: string,

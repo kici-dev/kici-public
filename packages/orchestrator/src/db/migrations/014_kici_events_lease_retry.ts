@@ -1,36 +1,23 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add lease + retry + DLQ columns to `kici_events` so the EventRouter can
- * deliver events at-least-once with bounded retries and a visible
- * dead-letter queue.
+ * Lease + retry + DLQ columns on `kici_events`, so the EventRouter delivers
+ * events at-least-once with bounded retries and a visible dead-letter queue.
+ * Marking a row processed before dispatch lost the event when
+ * `onEventMatched` threw, and a crash between the cron fire claim and the
+ * event write advanced `cron_last_fired.last_fired_at` with no event row.
  *
- * Before this migration, EventRouter used `claimForProcessing` (UPDATE
- * processed=true WHERE processed=false RETURNING *) and dispatched after
- * the row was already marked processed. If `onEventMatched` threw, the
- * event was silently lost. Same loss surface for cron fires, since
- * `tryClaimFire` and `eventStore.write` were two separate transactions:
- * a crash between them advanced `cron_last_fired.last_fired_at` without
- * persisting the event row.
- *
- * After this migration:
- *  - `claimed_at`, `claimed_by`: lease-based claim. Replaces the
- *    "flip processed=true upfront" pattern. A lease is taken on dispatch,
- *    released on success (processed=true) or failure (cleared + retry scheduled).
- *  - `attempts`: incremented on each lease attempt. Enables bounded retry.
- *  - `last_error`: most recent dispatch failure message (truncated by
- *    application code to 4 KB).
- *  - `next_retry_at`: earliest moment the leader-only retry scanner should
- *    re-publish `pg_notify` for this event.
- *  - `dlq_at`, `dlq_reason`: terminal DLQ marker. Once `dlq_at IS NOT NULL`
- *    the row is no longer eligible for lease/retry. Surfaced in the
+ *  - `claimed_at`, `claimed_by`: a lease taken on dispatch, released on
+ *    success (processed=true) or failure (cleared + retry scheduled).
+ *  - `attempts`: incremented per lease attempt; bounds retries.
+ *  - `last_error`: latest dispatch failure (truncated by the app to 4 KB).
+ *  - `next_retry_at`: earliest moment the leader-only retry scanner
+ *    re-publishes `pg_notify` for this event.
+ *  - `dlq_at`, `dlq_reason`: terminal DLQ marker; a row with
+ *    `dlq_at IS NOT NULL` is never leased or retried again. Shown on the
  *    dashboard admin DLQ page.
  *
- * Partial indexes keep these new lookups cheap without blowing up the index
- * size on the hot path (most rows are processed=true and irrelevant to the
- * scanner).
- *
- * Idempotent (`ADD COLUMN IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS`).
+ * Partial indexes skip the hot-path processed=true rows. Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`

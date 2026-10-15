@@ -1,18 +1,11 @@
-// Node ESM loader hook: transforms `.ts` / `.tsx` files on import via
-// `oxc-transform`, the Rust-based transformer that backs Rolldown. Registered
-// via `module.register('@kici-dev/shared/ts-loader-hook', ...)` from the `kici`
-// CLI and the agent's sandbox process — one source of truth so CLI-local
-// behavior matches agent-side execution.
-//
-// Usage:
-//   import { register } from 'node:module';
+// Node ESM loader hook transforming `.ts` / `.tsx` on import via `oxc-transform`
+// (the transformer behind Rolldown). Both the `kici` CLI and the agent's sandbox
+// register it, so CLI-local behavior matches agent-side execution:
 //   register('@kici-dev/shared/ts-loader-hook', import.meta.url);
 //
-// The `resolve` half rewrites `./foo.js` specifiers to `./foo.ts` when only
-// the `.ts` sibling exists on disk (TypeScript-ESM convention with
-// `allowImportingTsExtensions`). The `load` half intercepts `.ts` / `.tsx`
-// URLs, reads the source, runs `oxc-transform`, and returns JS with an inline
-// base64 source map so stack traces point at the original `.ts` line.
+// `resolve` rewrites `./foo.js` to `./foo.ts` when only the `.ts` sibling
+// exists (TypeScript-ESM convention). `load` emits JS with an inline base64
+// source map so stack traces point at the original `.ts` line.
 
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';

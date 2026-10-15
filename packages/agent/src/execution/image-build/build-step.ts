@@ -1,11 +1,8 @@
 /**
- * Run a job's image build and render it as a step in the run.
- *
- * The build happens on the AGENT, before the sandbox exists, so it cannot use
- * the runner's IPC pseudo-step channel that the cache phase uses — that channel
- * belongs to a process which has not started yet. It uses the agent-side seam
- * the synthetic `build` / `init` / `global-eval` jobs already use: a step-status
- * pair plus a log streamer bound to a step index.
+ * Run a job's image build and render it as a run step. The build runs on the
+ * AGENT before the sandbox exists, so the runner's IPC pseudo-step channel is
+ * unavailable; it uses the agent-side seam of the synthetic `build` / `init` /
+ * `global-eval` jobs: step-status pairs plus a log streamer bound to a step index.
  */
 
 import { ExecutionStepStatus, SetupStepType } from '@kici-dev/engine';
@@ -13,27 +10,20 @@ import { toErrorMessage } from '@kici-dev/shared';
 import type { LockJob } from '@kici-dev/engine';
 import { resolveJobImageBuildSpec, type JobImageBuildSpec } from './resolve-build-spec.js';
 
-/** Step name the run timeline shows for a job's image build. */
 export const CONTAINER_BUILD_STEP_NAME = 'container:build';
 
 /**
- * Step index the image build reports under.
+ * A large positive constant, because:
  *
- * A large positive constant, for two reasons that are easy to trip over:
+ * - `step.status` is `z.number().int().nonnegative()`: a negative index closes
+ *   the socket mid-job, and the check-run reporter (`steps[stepIndex]`) and the
+ *   dashboard (`stepIndex >= 0`) read one as absent.
+ * - It must clear every in-sandbox allocator index; the cache phase tops out
+ *   near `stepCount * 3 + 100 + (stepCount + 1) * 1000`, several hundred steps
+ *   of headroom.
  *
- * - `step.status` carries `z.number().int().nonnegative()`, so a negative index
- *   is not available. An agent that sent one would be
- *   disconnected mid-job (an invalid message closes the socket), and two
- *   consumers read a negative index as absent — the check-run reporter writes
- *   `steps[stepIndex]`, and the dashboard gates log fetching on `stepIndex >= 0`.
- * - It must clear every index the in-sandbox allocators reach. The cache phase
- *   tops out around `stepCount * 3 + 100 + (stepCount + 1) * 1000`, so this
- *   clears a job of several hundred steps with room to spare.
- *
- * DISPLAY ORDER does not come from this index. The step is tagged with the
- * `container:build` {@link SetupStepType}, and readers sort setup pseudo-steps
- * ahead of the real steps by type — so the build renders where it ran, first,
- * without a negative index or a protocol change.
+ * Display order comes from the `container:build` {@link SetupStepType} tag, not
+ * this index: readers sort setup pseudo-steps first by type.
  */
 export const CONTAINER_BUILD_STEP_INDEX = 1_000_000;
 
@@ -42,7 +32,7 @@ export interface RunJobImageBuildArgs {
   workDir: string;
   jobId: string;
   jobName: string;
-  /** Perform the build. Injected so the step logic is testable without a host. */
+  /** Injected so the step logic is testable without a host. */
   build: (spec: JobImageBuildSpec, onLog: (line: string) => void) => Promise<void>;
   /** Every line of build output, in order, for the run log. */
   onLog: (line: string) => void;
@@ -55,13 +45,9 @@ export interface RunJobImageBuildArgs {
 }
 
 /**
- * Build the job's image when it declared a Dockerfile, and return the tag the
- * sandbox should run.
- *
- * Returns `undefined` when there is nothing to build — a job with no container,
- * or one that names a finalized image. That is the common case and emits no
- * step at all: a run timeline should not grow an empty entry for work that did
- * not happen.
+ * Build the job's declared Dockerfile and return the tag the sandbox runs.
+ * Nothing to build (no container, or a finalized image) returns `undefined` and
+ * emits no step, so the timeline gains no empty entry.
  */
 export async function runJobImageBuild(args: RunJobImageBuildArgs): Promise<string | undefined> {
   const { container, workDir, jobId, jobName, build, onLog, sendStepStatus } = args;
@@ -75,9 +61,8 @@ export async function runJobImageBuild(args: RunJobImageBuildArgs): Promise<stri
   });
   if (!spec) return undefined;
 
-  // `stepType` rides in `data` — the free-form channel the tracker persists to
-  // `execution_steps.step_type`, and the same one the cache pseudo-steps use.
-  // It is what makes this step sort ahead of the real ones.
+  // `stepType` rides in `data`, persisted to `execution_steps.step_type` as for
+  // the cache pseudo-steps; it sorts this step ahead of the real ones.
   const setup = { stepType: SetupStepType.enum['container:build'] };
 
   sendStepStatus(CONTAINER_BUILD_STEP_NAME, ExecutionStepStatus.enum.running, setup);

@@ -1,18 +1,14 @@
 /**
- * Agent-side init-runner bring-up.
+ * Init-runner bring-up. Runs in the AGENT process, never the workflow sandbox,
+ * so the bring-up SSH key and bootstrap token never reach user workflow code.
  *
- * Runs in the AGENT process (never the workflow sandbox), so the bring-up SSH
- * key and bootstrap token the orchestrator hands back never reach user
- * workflow code. The flow:
- *
- *   1. Call the orchestrator's privileged `kici.ensureInitRunner` handler — it
- *      gates on this agent's `kici:capability:ssh-transport` capability,
- *      resolves the target's reach + SSH key, mints a single-use bootstrap
- *      token, audits, and returns the material (or `{ broughtUp: false }` when
- *      the target already has a live agent).
- *   2. Over SSH (ephemeral key, never on disk): drop a launcher onto the target
- *      that starts `kici-agent` with the bootstrap env (token + agent id +
- *      orchestrator URL + labels), and start it detached.
+ *   1. The orchestrator's privileged `kici.ensureInitRunner` handler gates on
+ *      this agent's `kici:capability:ssh-transport` capability, resolves the
+ *      target's reach + SSH key, mints a single-use bootstrap token, audits, and
+ *      returns the material (`{ broughtUp: false }` when the target already has
+ *      a live agent).
+ *   2. Over SSH (ephemeral key, never on disk), a launcher starts `kici-agent`
+ *      detached with the bootstrap env.
  *
  * The init-runner then connects → `auth.request` (bootstrap token) →
  * `agent.register` auto-enroll as a temporary `kici:init` agent.
@@ -25,7 +21,7 @@ import { stageAgentPayload, type DeliveryMode } from './stage-agent-payload.js';
 import type { AgentPayloadSource } from './payload-source.js';
 import { shQuote } from '@kici-dev/core';
 
-/** Material the orchestrator returns for a bring-up (mirrors the handler result). */
+/** Mirrors the `kici.ensureInitRunner` handler result. */
 interface BringupMaterial {
   broughtUp: boolean;
   reach?: HostReach;
@@ -36,54 +32,46 @@ interface BringupMaterial {
   labels?: string[];
   /** The orchestrator's own version — the self-contained payload version to stage. */
   version?: string;
-  /** Per-host delivery mode the orchestrator chose (default `ssh-push`). */
+  /** The orchestrator's per-host choice (default `ssh-push`). */
   deliveryMode?: AgentDeliveryMode;
 }
 
-/** Shape of the `kici.presignAgentPackage` RPC result. */
+/** The `kici.presignAgentPackage` RPC result. */
 interface PresignResult {
   url: string;
   sha256: string | null;
 }
 
-/** Transport that relays an API request to the orchestrator and awaits the result. */
 export type ApiTransport = (method: string, params: Record<string, unknown>) => Promise<unknown>;
 
-/** Remote path for the generated bring-up launcher. */
 const LAUNCHER_REMOTE_PATH = '/tmp/kici-init-runner.sh';
 
 export interface EnsureInitRunnerDeps extends SshDeps {
   /**
-   * A fixed command used to start the init-runner on the target — the
-   * golden-image escape hatch. When set, payload staging is SKIPPED (the image
-   * already ships `kici-agent` + a Node runtime at this path). Leave unset for a
-   * stock rescue box: the payload source below is staged instead.
+   * Golden-image escape hatch: a fixed start command, which skips
+   * payload staging (the image ships `kici-agent` + a Node runtime). Unset for a
+   * stock rescue box, which gets the payload source staged.
    */
   agentCommand?: string;
   /**
-   * The source of the self-contained agent+Node payload staged onto a bare box.
-   * When set (and no `agentCommand` override), `ensureInitRunner` probes the
-   * target platform, stages the version-keyed payload, and boots it on its
-   * vendored Node. Constructed from `KICI_AGENT_PAYLOAD_DIR` at the agent entry.
+   * The self-contained agent+Node payload for a bare box: without
+   * `agentCommand`, the target platform is probed and the version-keyed payload
+   * staged and booted on its vendored Node. Built from `KICI_AGENT_PAYLOAD_DIR`
+   * at the agent entry.
    */
   payloadSource?: AgentPayloadSource;
   /**
-   * Force the delivery mode, overriding the orchestrator's per-host choice.
-   * Normally the orchestrator picks the mode (from the host's `s3_reachable`
-   * hint) and returns it in the bring-up material; this is a test/escape hatch.
+   * Test/escape hatch overriding the orchestrator's per-host choice (made from
+   * the host's `s3_reachable` hint).
    */
   delivery?: DeliveryMode;
-  /** Override the on-box extract dir (default `/opt/kici-init`). */
+  /** Default `/opt/kici-init`. */
   extractDir?: string;
   /** Ops-agent-side file-hash boundary, injectable for tests. */
   hashLocalFile?: (filePath: string) => Promise<string>;
 }
 
-/**
- * Build the launcher script that starts the init-runner on the target with its
- * bootstrap env. Detached (`setsid … &`) so the SSH session can return while
- * the agent keeps running and dials the orchestrator.
- */
+/** Detached (`setsid … &`) so the SSH session returns while the agent keeps running. */
 function buildLauncher(
   material: Required<
     Pick<BringupMaterial, 'bootstrapToken' | 'targetAgentId' | 'orchestratorUrl' | 'labels'>
@@ -95,13 +83,10 @@ function buildLauncher(
     `KICI_AGENT_ID=${shQuote(material.targetAgentId)}`,
     `KICI_ORCHESTRATOR_URL=${shQuote(material.orchestratorUrl)}`,
     `KICI_LABELS=${shQuote(material.labels.join(','))}`,
-    // Advertise ONLY the bootstrap-token-authorized labels. Without this the
-    // agent auto-derives the default role labels (kici:role:builder /
-    // kici:role:init-runner) which the single-use bootstrap token does not
-    // authorize, and the orchestrator rejects the register at Gate 1
-    // ("labels exceed token-bound scope"). An init-runner is a temporary agent
-    // that runs its host's pinned child by agent-id pinning, not by role, so it
-    // needs no execution roles.
+    // Advertise ONLY the token-authorized labels: auto-derived role labels
+    // (kici:role:builder / kici:role:init-runner) fail the register at Gate 1
+    // ("labels exceed token-bound scope"). An init-runner runs its host's child
+    // by agent-id pinning, not by role, so it needs no execution roles.
     'KICI_ROLES=',
     'KICI_EXECUTION_MODE=bare-metal',
     'KICI_PORT=0',
@@ -116,14 +101,9 @@ function buildLauncher(
 }
 
 /**
- * Resolve the command the launcher invokes to start the init-runner.
- *
- * - A `deps.agentCommand` override short-circuits staging (golden image).
- * - Otherwise a payload source is required: probe the target's platform, stage
- *   the version-keyed self-contained payload over SSH, and return the staged
- *   launcher path (which boots the agent on its vendored Node — no system Node).
- * - No override AND no source is a misconfiguration, not a silent Node
- *   assumption — throw a clear error.
+ * `deps.agentCommand` wins (golden image). Otherwise stages the payload and
+ * returns its launcher path, which boots on the vendored Node, never a system
+ * Node. No command and no source (outside s3-direct) throws.
  */
 async function resolveAgentCommand(
   transport: ApiTransport,
@@ -138,9 +118,8 @@ async function resolveAgentCommand(
       `orchestrator returned no version for ${material.targetAgentId} — cannot stage a payload`,
     );
   }
-  // Fast-fail before the (SSH round-trip) probe: an ssh-push bring-up with no
-  // local payload source is a misconfiguration. s3-direct pulls on the box, so
-  // it needs no local source and this guard does not apply.
+  // Fail before the SSH-round-trip probe; s3-direct pulls on the box and needs
+  // no local source.
   const forcedS3Direct =
     deps.delivery?.mode === AgentDeliveryMode.enum['s3-direct'] ||
     material.deliveryMode === AgentDeliveryMode.enum['s3-direct'];
@@ -167,11 +146,10 @@ async function resolveAgentCommand(
 }
 
 /**
- * Decide how the payload reaches the box. An explicit `deps.delivery` override
- * wins (test/escape hatch); otherwise honor the orchestrator's per-host choice.
- * For `s3-direct` we ask the orchestrator (which knows the probed platform now)
- * to mint a box-routable presigned URL via `kici.presignAgentPackage`; a payload
- * with no sha256 is refused (fail-closed — never extract unverifiable bytes).
+ * `deps.delivery` wins, else the orchestrator's per-host choice. `s3-direct`
+ * gets a box-routable presigned URL for the probed platform from
+ * `kici.presignAgentPackage`; one with no sha256 is refused (fail-closed:
+ * never extract unverifiable bytes).
  */
 async function resolveDelivery(
   transport: ApiTransport,
@@ -197,11 +175,7 @@ async function resolveDelivery(
   return { mode: 's3-direct', presignedUrl: presigned.url, sha256: presigned.sha256 };
 }
 
-/**
- * Bring up a temporary init-runner on `targetAgentId`. Returns `{ broughtUp }`:
- * false when the target already had a live agent (the orchestrator no-op'd),
- * true when this call dropped + started the init-runner.
- */
+/** `broughtUp` is false when the target already had a live agent. */
 export async function ensureInitRunner(
   transport: ApiTransport,
   targetAgentId: string,
@@ -221,7 +195,7 @@ export async function ensureInitRunner(
     agentCommand,
   );
 
-  // Ship the launcher (never echo the token/key into argv) and run it.
+  // Pushed as a file so the token/key never appear in argv.
   await sshPush(reach, privateKey, launcher, LAUNCHER_REMOTE_PATH, {}, deps);
   const run = await sshExec(
     reach,

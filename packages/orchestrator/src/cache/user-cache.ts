@@ -2,25 +2,22 @@
  * User-facing cache layer wrapping CacheStorage.
  *
  * Namespacing: `cache/<orgId>/<repoId>/<refScope>/<key>-<discriminator>.tar.gz`.
- * The discriminator is a hash of the exact cache key, so two keys differing
- * only by case stay two objects even on a case-insensitive store. `refScope`
- * is `shared` for trusted refs (org-shared, default-branch cache)
- * or `iso/<runId>` for untrusted refs (per-run isolated scope). Restores from
- * an untrusted ref read the shared scope as a fallback but writes can NEVER
- * land in the shared scope — the GitHub Actions cache-isolation model. Keyed
- * strictly per org so no tenant can read another tenant's cache.
+ * The discriminator is a hash of the exact cache key, so keys differing only by
+ * case stay two objects on a case-insensitive store. `refScope` is `shared` for
+ * trusted refs (org-shared, default-branch cache) or `iso/<runId>` for
+ * untrusted refs. An untrusted ref reads the shared scope as a fallback but can
+ * NEVER write it — the GitHub Actions cache-isolation model. Keyed strictly per
+ * org so no tenant can read another tenant's cache.
  *
- * Saves are immutable (first save under an exact key wins) and atomic
- * (upload to a `.tmp-<uuid>` key, then server-side copy to the final key and
- * delete the temp), so a crashed save never leaves a corrupt final entry.
+ * Saves are immutable (first save under an exact key wins) and atomic (upload
+ * to `.tmp-<uuid>`, server-side copy to the final key, delete the temp), so a
+ * crashed save never leaves a corrupt final entry.
  *
- * Eviction: per-org byte quota plus the TTL the backing CacheStorage already
- * enforces lazily on access. On a save that pushes the org over quota,
- * least-recently-used entries (oldest `lastAccessedAt`, read from the storage
- * backend's metadata) are evicted until under quota; each eviction is logged.
- * The companion `.hash` / `.size` sidecar objects carry the integrity
- * hash and size accounting outside the tarball's own (presigned, metadata-less)
- * upload.
+ * Eviction: per-org byte quota plus the TTL the backing CacheStorage enforces
+ * lazily on access. A save that pushes the org over quota evicts LRU entries
+ * (oldest `lastAccessedAt` from backend metadata) until under quota, logging
+ * each. The `.hash` / `.size` sidecars carry the integrity hash and size
+ * accounting outside the presigned, metadata-less tarball upload.
  */
 import { randomUUID } from 'node:crypto';
 import { createLogger } from '@kici-dev/shared';
@@ -31,23 +28,22 @@ import { KEY_DISCRIMINATOR_LENGTH, keyDiscriminator } from '../storage/key-discr
 const logger = createLogger({ prefix: 'user-cache' });
 
 /**
- * Cluster-wide default quota: 5 GiB. Serves as the fallback when an org has no
- * per-org override in `org_settings.user_cache_quota_bytes`. The cluster-wide
- * value is itself operator-configurable via KICI_USER_CACHE_QUOTA_BYTES.
+ * Cluster-wide default quota: 5 GiB, used when an org has no
+ * `org_settings.user_cache_quota_bytes` override. Operator-configurable via
+ * KICI_USER_CACHE_QUOTA_BYTES.
  */
 export const DEFAULT_USER_CACHE_QUOTA_BYTES = 5 * 1024 * 1024 * 1024;
 /**
- * Cluster-wide default entry TTL: 7 days. Fallback when an org has no per-org
- * override in `org_settings.user_cache_ttl_ms`. The cluster-wide value is
- * operator-configurable via KICI_USER_CACHE_TTL_MS.
+ * Cluster-wide default entry TTL: 7 days, used when an org has no
+ * `org_settings.user_cache_ttl_ms` override. Operator-configurable via
+ * KICI_USER_CACHE_TTL_MS.
  */
 export const DEFAULT_USER_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
- * Per-org override of the cache quota + TTL, read from `org_settings` at
- * operation time. A field left `undefined` means "no per-org override" — the
- * cluster-wide default applies. Injected into `UserCache` so the cache stays
- * decoupled from the DB layer (and unit-testable with a stub reader).
+ * Per-org quota + TTL override, read from `org_settings` at operation time; an
+ * `undefined` field means the cluster-wide default applies. Injected so the
+ * cache stays decoupled from the DB layer (and unit-testable with a stub).
  */
 export interface UserCacheOrgLimits {
   quotaBytes?: number;
@@ -60,13 +56,9 @@ export type UserCacheOrgLimitsReader = (orgId: string) => Promise<UserCacheOrgLi
 /** Tarball suffix for committed cache entries. */
 const TAR_SUFFIX = '.tar.gz';
 
-/**
- * Stem prefix of an in-flight upload, `.tmp-<uuid>.tar.gz`: the presigned PUT
- * target a save lands on before commit copies it to its final key.
- */
+/** Stem of an in-flight upload, `.tmp-<uuid>.tar.gz`, before commit copies it to its final key. */
 const TEMP_UPLOAD_STEM = '.tmp-';
 
-/** Whether a listed object is an in-flight upload rather than a cache entry. */
 function isTempUpload(key: string): boolean {
   return key.slice(key.lastIndexOf('/') + 1).startsWith(TEMP_UPLOAD_STEM);
 }
@@ -76,24 +68,19 @@ const KEY_DISCRIMINATOR_TAIL = new RegExp(`^(.*)-([0-9a-f]{${KEY_DISCRIMINATOR_L
 
 /**
  * Whether a listed object is a committed entry, `<stem>-<discriminator>.tar.gz`.
- *
- * This is the filter the `restoreKeys` prefix scan applies to a listing, and it
- * is what keeps two other kinds of object out of a restore: an in-flight
- * `.tmp-<uuid>.tar.gz` upload, which is a partial tarball until commit copies
- * it to its final key, and an object under the retired un-discriminated layout,
- * which nothing writes.
+ * The `restoreKeys` prefix scan filters on it, which keeps out an in-flight
+ * `.tmp-` upload (a partial tarball until commit) and an object under the
+ * retired un-discriminated layout, which nothing writes.
  */
 function isCommittedEntry(key: string): boolean {
   return key.endsWith(TAR_SUFFIX) && KEY_DISCRIMINATOR_TAIL.test(key.slice(0, -TAR_SUFFIX.length));
 }
 
 /**
- * Recover the reported cache key from a committed entry's stem.
- *
- * The value on this path is already the sanitized, lossy form, so this only
- * needs to undo the discriminator the key format appends. A stem that itself
- * ends in a discriminator-shaped tail loses it — that affects only the string
- * reported back as `matchedKey`, never which object is served.
+ * Recover the reported cache key from a committed entry's (already sanitized,
+ * lossy) stem by undoing the appended discriminator. A stem that itself ends in
+ * a discriminator-shaped tail loses it — that affects only the reported
+ * `matchedKey`, never which object is served.
  */
 function stripKeyDiscriminator(stem: string): string {
   return KEY_DISCRIMINATOR_TAIL.exec(stem)?.[1] ?? stem;
@@ -101,13 +88,10 @@ function stripKeyDiscriminator(stem: string): string {
 
 /**
  * Sanitize a path segment so a key can never escape its org/repo/scope
- * namespace. Beyond stripping disallowed characters, a segment consisting
- * only of dots (`.`, `..`, …) is replaced wholesale: such a segment is a
- * dot-segment that HTTP/S3 path canonicalization collapses (`a/./b` → `a/b`,
- * `a/../b` → `b`), which both corrupts the namespace and breaks the SigV4
- * signature on a pre-signed PUT/GET. Repo identifiers like `.` (the internal
- * provider's repo id) hit exactly this case, so the all-dots guard keeps the
- * object key canonical and the namespace boundary intact.
+ * namespace. An all-dots segment (`.`, `..`, …) is also rewritten: HTTP/S3
+ * path canonicalization collapses it (`a/./b` → `a/b`, `a/../b` → `b`), which
+ * corrupts the namespace and breaks the SigV4 signature on a pre-signed
+ * PUT/GET. The internal provider's repo id `.` hits exactly this case.
  */
 function sanitizeSegment(s: string): string {
   const cleaned = s.replace(/[^A-Za-z0-9._-]/g, '_');
@@ -169,38 +153,29 @@ function readPrefixes(ref: UserCacheRef): string[] {
 }
 
 /**
- * Object key for a committed cache entry.
- *
- * The trailing discriminator is a hash of the EXACT cache key, and it is what
- * keeps `build` and `Build` apart on a case-insensitive namespace — the
- * filesystem backend on a macOS or Windows host, where the two would
- * otherwise resolve to one object and a restore could return the other key's
- * tarball.
- *
- * It is deliberately a SUFFIX: `restoreByPrefix` matches `restoreKeys` by
- * string prefix, so appending leaves those semantics untouched. The only
- * parse that has to know about it is the `matchedKey` slice.
+ * Object key for a committed cache entry. The trailing discriminator, a hash of
+ * the EXACT cache key, keeps `build` and `Build` apart on a case-insensitive
+ * namespace (the filesystem backend on macOS or Windows), where a restore could
+ * otherwise return the other key's tarball. It is deliberately a SUFFIX:
+ * `restoreByPrefix` matches `restoreKeys` by string prefix, so only the
+ * `matchedKey` slice has to know about it.
  */
 function finalKey(prefix: string, key: string): string {
   return `${prefix}${sanitizeSegment(key)}-${keyDiscriminator(key)}${TAR_SUFFIX}`;
 }
 
-/**
- * The object key a committed save under `key` lands on for this ref. This is
- * the writer's own path: `beginSave` and `commitSave` address the entry
- * through it.
- */
+/** The writer's object key for `key` under this ref, used by `beginSave` and `commitSave`. */
 function userCacheEntryKey(ref: UserCacheRef, key: string): string {
   return finalKey(writePrefix(ref), key);
 }
 
 export class UserCache {
   private readonly storage: CacheStorage;
-  /** Cluster-wide default quota (the `KICI_USER_CACHE_QUOTA_BYTES` value). */
+  /** `KICI_USER_CACHE_QUOTA_BYTES`. */
   private readonly defaultQuotaBytes: number;
-  /** Cluster-wide default TTL (the `KICI_USER_CACHE_TTL_MS` value). */
+  /** `KICI_USER_CACHE_TTL_MS`. */
   private readonly defaultTtlMs: number;
-  /** Optional per-org override reader; absent = always use the cluster defaults. */
+  /** Absent = always use the cluster defaults. */
   private readonly orgLimitsReader?: UserCacheOrgLimitsReader;
 
   constructor(opts: {
@@ -209,7 +184,7 @@ export class UserCache {
     quotaBytes?: number;
     /** Cluster-wide default TTL (env-var default). */
     ttlMs?: number;
-    /** Per-org override reader (org_settings). When unset, defaults apply. */
+    /** Per-org override reader (org_settings). */
     orgLimitsReader?: UserCacheOrgLimitsReader;
   }) {
     this.storage = opts.storage;
@@ -219,10 +194,9 @@ export class UserCache {
   }
 
   /**
-   * Resolve the effective quota + TTL for an org: the per-org override from
-   * `org_settings` when present, otherwise the cluster-wide default. A reader
-   * failure falls back to the defaults (logged) — the cache must never fail a
-   * restore/save because the settings lookup hiccupped.
+   * Per-org override when present, else the cluster default. A reader failure
+   * falls back to the defaults (logged): a settings-lookup hiccup must never
+   * fail a restore/save.
    */
   private async resolveLimits(org: string): Promise<{ quotaBytes: number; ttlMs: number }> {
     if (!this.orgLimitsReader) {
@@ -334,13 +308,11 @@ export class UserCache {
   }
 
   /**
-   * Evict least-recently-used entries for the org until total tarball size <= the per-org quota.
-   *
-   * An in-flight `.tmp-` upload is never a candidate. A presigned PUT carries
-   * no metadata, so it would rank oldest and be reclaimed first — freeing
-   * nothing, since it has no `.size` — and the concurrent commit would then
-   * fail on its copy to the final key. Retired un-discriminated entries stay
-   * in the set: they hold accounted bytes and are evictable like any other.
+   * Evict the org's LRU entries until total tarball size <= the per-org quota.
+   * An in-flight `.tmp-` upload is never a candidate: with no metadata it would
+   * rank oldest and be reclaimed first, freeing nothing (no `.size`) and failing
+   * the concurrent commit's copy. Retired un-discriminated entries stay
+   * candidates: they hold accounted bytes.
    */
   private async enforceQuota(ref: UserCacheRef): Promise<void> {
     const { quotaBytes } = await this.resolveLimits(ref.org);
@@ -356,10 +328,8 @@ export class UserCache {
       sized.push({ key: k, size });
     }
     if (total <= quotaBytes) return;
-    // Over quota: order candidates by last-access recency (ascending = least
-    // recently used first). Fetch the access metadata only now — the common
-    // under-quota path above never pays for it. A missing metadata read means
-    // an orphan/corrupt entry: rank it oldest so it is reclaimed first.
+    // Access metadata is fetched only when over quota, so the common path never
+    // pays for it. Missing metadata means an orphan/corrupt entry: rank it oldest.
     const candidates: { key: string; size: number; lastAccessed: number }[] = [];
     for (const e of sized) {
       const meta = await this.storage.getMetadata(e.key);

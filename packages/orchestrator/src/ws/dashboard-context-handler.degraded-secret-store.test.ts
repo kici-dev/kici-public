@@ -1,14 +1,12 @@
 /**
- * An orchestrator running without a pg secret store serves the dashboard from a
- * degraded store. Reads honestly report nothing; writes MUST refuse, because a
- * write that resolves while discarding the value tells the operator a
- * credential is stored when nothing stored it.
+ * An orchestrator without a pg secret store serves the dashboard from a degraded store.
+ * Reads honestly report nothing; writes MUST refuse, because a write that resolves while
+ * discarding the value tells the operator a credential is stored when nothing stored it.
  *
- * These tests assert the outcome the dashboard actually observes -- an `error`
- * on the response -- rather than the shape of the store's return value, so a
- * store that silently resolves cannot pass them.
+ * The tests assert what the dashboard observes (an `error` on the response), not the
+ * store's return value, so a store that silently resolves cannot pass them.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +15,7 @@ import type { DashboardContextHandlerDeps } from './dashboard-context-handler.js
 import type { DashboardPlatformToOrchMessage } from '@kici-dev/engine';
 import { invalidateDashboardWritePolicyCache } from '../policy/dashboard-write-policy.js';
 import { createUnavailableSecretStore, type ScopedSecretStore } from '../secrets/scope-routing.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 /** The store the orchestrator falls back to when it has no pg secret store. */
 const degradedStore: ScopedSecretStore = createUnavailableSecretStore();
@@ -53,16 +52,7 @@ function createDeps(secretStore: ScopedSecretStore): DashboardContextHandlerDeps
     // These tests drive no approval; the held-run deps are never read.
     approvals: {} as any,
     secretStore,
-    db: {
-      selectFrom: vi.fn().mockReturnThis(),
-      select: vi.fn().mockReturnThis(),
-      selectAll: vi.fn().mockReturnThis(),
-      where: vi.fn().mockReturnThis(),
-      orderBy: vi.fn().mockReturnThis(),
-      limit: vi.fn().mockReturnThis(),
-      execute: vi.fn().mockResolvedValue([]),
-      executeTakeFirst: vi.fn().mockResolvedValue(undefined),
-    } as any,
+    db: createMockDb().db,
     sent,
   };
 }
@@ -157,9 +147,8 @@ describe('degraded secret store refuses dashboard writes', () => {
   });
 
   // The degraded store leaves the optional scope methods unimplemented, so the
-  // scope-CRUD handlers take their unsupported-backend path. That path already
-  // refuses; these pin it, because an unimplemented optional method that
-  // silently succeeded would be the same defect in a different shape.
+  // scope-CRUD handlers take their refusing unsupported-backend path. Pinned because an
+  // unimplemented optional method that silently succeeded is the same defect.
   it.each([
     ['create', { type: 'dashboard.contexts.secrets.scope.create', scope: 'aws/prod' }],
     [

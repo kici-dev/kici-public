@@ -5,19 +5,14 @@ import { type Kysely, sql } from 'kysely';
  * the structural marker for a run row that records a global evaluation round
  * rather than a workflow.
  *
- * The re-run path must recognise such a run: re-running it re-executes the
- * evaluation, not a workflow. The only discriminator available to it otherwise
- * is the round job's `__globaleval__` name prefix, which a customer workflow
- * may carry — a name a customer chooses cannot decide which code path a re-run
- * takes. A column stamped where the round failure is recorded is
+ * Re-running such a run re-executes the evaluation, not a workflow. The only
+ * other discriminator is the round job's `__globaleval__` name prefix, which a
+ * customer workflow may carry, so a customer-chosen name would pick the re-run
+ * code path; a column stamped where the round failure is recorded is
  * collision-proof.
  *
- * `NOT NULL DEFAULT false` because the question has exactly two answers: every
- * pre-existing row is an ordinary run, and there is no third "unknown" reading
- * a null would carry.
- *
- * Idempotent: the add is guarded on existence and the drop uses IF EXISTS, so a
- * re-run is a no-op.
+ * `NOT NULL DEFAULT false`: every pre-existing row is an ordinary run, and no
+ * third "unknown" answer exists for a null to carry. Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

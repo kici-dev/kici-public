@@ -57,13 +57,11 @@ export interface InboundVerifyOutcome {
 const logger = createLogger({ prefix: 'platform-client' });
 
 /**
- * Every message `type` this orchestrator recognizes on an inbound Platform frame:
- * the mainline Platform→orchestrator union (dashboard request types included) plus
- * the extra recognition-chain schemas `handleNonStandardMessage` tries separately
- * (log-pull, cluster join). A known-but-invalid frame (its `type` is in this set
- * but validation failed) is malformed, not version skew, so
- * `buildUnsupportedMessageNack` returns null and no spurious skew NACK is sent.
- * Derived from the schema discriminators so it can never drift.
+ * Every inbound Platform frame `type` this orchestrator recognizes: the mainline
+ * union (dashboard requests included) plus the schemas `handleNonStandardMessage`
+ * tries separately (log-pull, cluster join). A known type that fails validation
+ * is malformed, not version skew, so no spurious skew NACK is sent. Derived from
+ * the schema discriminators so it can never drift.
  */
 const PLATFORM_TO_ORCH_KNOWN_TYPES: ReadonlySet<string> = new Set<string>([
   ...PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
@@ -85,10 +83,7 @@ export type ReplaySendResult = {
   skipped?: 'empty' | 'invalid' | 'disconnected' | 'breaker';
 };
 
-/**
- * A webhook source this orchestrator manages, registered with the Platform after
- * auth.success. Defined in `../entry-helpers.ts`; re-exported for existing importers.
- */
+/** Re-exported from `../entry-helpers.ts` for existing importers. */
 export type { ProviderSource } from '../entry-helpers.js';
 import type { ProviderSource } from '../entry-helpers.js';
 
@@ -103,9 +98,8 @@ import type { ProviderSource } from '../entry-helpers.js';
 export const ADMITTED_PIPELINE_LIFETIME_MS = 5 * 60 * 1000;
 
 /**
- * How long a connection must stay open after authenticating before it counts as
- * healthy enough to reset the reconnect backoff. Authentication succeeding is
- * not proof of viability — the state replay send is still ahead of it.
+ * Uptime after auth before a connection resets the reconnect backoff: auth alone
+ * is not proof of viability, since the state replay send is still ahead.
  */
 const CONNECTION_STABLE_MS = 30_000;
 
@@ -185,13 +179,12 @@ const DASHBOARD_FRAME_LOG_FIELDS = [
 export interface PlatformClientOptions {
   /** WebSocket URL of the Platform relay. */
   url: string;
-  /** API key for authentication. */
+  /** API key. */
   token: string;
-  /** Callback invoked when a webhook relay is received from Platform. */
   onWebhookRelay: (relay: WebhookRelay) => Promise<void>;
-  /** Provider sources to register after authentication. */
+  /** Registered after authentication. */
   providerSources?: ProviderSource[];
-  /** Orchestrator cluster instance ID (sent in source.register for peer correlation). */
+  /** Sent in source.register for peer correlation. */
   instanceId?: string;
   /** `cluster_meta.cluster_name`; the Platform routes per-orch dashboard requests by it. */
   clusterName?: string;
@@ -200,29 +193,28 @@ export interface PlatformClientOptions {
    * clusters in one org share a `clusterName`; HA siblings share one DB and so one id.
    */
   clusterId?: string;
-  /** Reachable address for peer-to-peer connections (from KICI_CLUSTER_ADDRESS env var). Null if not configured. */
+  /** Peer-to-peer address (KICI_CLUSTER_ADDRESS); null if not configured. */
   address?: string | null;
-  /** Orchestrator version string (e.g. "0.0.1"). Sent in source.register for diagnostics. */
+  /** e.g. "0.0.1". Sent in source.register for diagnostics. */
   version?: string;
-  /** Orchestrator config mode. Sent in source.register for diagnostics. */
+  /** Sent in source.register for diagnostics. */
   mode?: string;
-  /** Scaler backends configured (e.g. ["container", "firecracker"]). Sent in source.register for diagnostics. */
+  /** e.g. ["container", "firecracker"]. Sent in source.register for diagnostics. */
   scalerBackends?: string[];
-  /** How the orchestrator process was deployed. Sent in source.register so the dashboard can build the correct kici-admin invocation. */
+  /** Sent in source.register so the dashboard builds the correct kici-admin invocation. */
   deployment?: DeploymentIdentity;
-  /** Where this orchestrator's own config files live on its host. Sent in source.register so the dashboard can point an operator at them. */
+  /** Host config file locations, sent in source.register for the dashboard to show. */
   configPaths?: ConfigPaths;
-  /** Whether this orchestrator has S3 log storage configured. Sent in source.register for pool validation. */
+  /** S3 log storage configured. Sent in source.register for pool validation. */
   s3LogAccess?: boolean;
-  /** Queue timeout in ms. Sent in source.register for Platform safety-net GC. */
+  /** Ms. Sent in source.register for Platform safety-net GC. */
   queueTimeoutMs?: number;
-  /** Heartbeat interval in ms. Default: 30000 (30s). */
+  /** Ms. Default: 30000 (30s). */
   heartbeatIntervalMs?: number;
-  /** Maximum reconnect delay in ms. Default: 60000 (60s). */
+  /** Ms. Default: 60000 (60s). */
   maxReconnectDelayMs?: number;
-  /** Maximum event buffer size. Default: 10000. */
+  /** Default: 10000. */
   maxBufferSize?: number;
-  /** Optional callback for log pull requests from Platform. */
   onLogPullRequest?: FrameHandler<{
     messageId: string;
     executionId: string;
@@ -232,7 +224,7 @@ export interface PlatformClientOptions {
     limit?: number;
   }>;
 
-  /** Optional callback for peer discovery (from Platform matchmaker). */
+  /** Peer discovery from the Platform matchmaker. */
   onPeerDiscover?: (peer: {
     connectionId: string;
     instanceId?: string;
@@ -240,7 +232,7 @@ export interface PlatformClientOptions {
     routingKeys: string[];
     orchRole?: OrchRole;
   }) => void;
-  /** Optional callback invoked after successful authentication and source registration. */
+  /** Invoked after authentication and source registration. */
   onAuthenticated?: () => void | Promise<void>;
   /** Connected worker peers for `cluster.membership`; undefined off-coordinator → none reported. */
   getWorkerPeers?: () => Array<{ instanceId: string }>;
@@ -267,15 +259,14 @@ export interface PlatformClientOptions {
   onRunCancel?: FrameHandler<RunCancelRequest>;
   /** Handlers for the {@link DASHBOARD_FRAME_TYPES} read frames; a type with none is dropped. */
   dashboardHandlers?: DashboardFrameHandlers;
-  /** Dashboard environment / held-run messages. */
   onDashboardEnvMessage?: FrameHandler<DashboardPlatformToOrchMessage>;
   /** `kici run remote` control-plane relay requests; the handler replies keyed by `requestId`. */
   onTestRelay?: FrameHandler<TestRelayRequest>;
   onTrustPolicyUpdate?: FrameHandler<TrustPolicyUpdate>;
   onStaleCheckrunCleanup?: FrameHandler<StaleCheckrunCleanup>;
-  /** Optional handler for join.request frames relayed by the Platform. It answers every such frame. */
+  /** Answers every Platform-relayed join.request frame. */
   onJoinRequest?: (raw: unknown) => Promise<JoinResponse>;
-  /** Custom orchestrator capabilities to merge with ORCH_CAPABILITIES in auth.request. */
+  /** Merged with ORCH_CAPABILITIES in auth.request. */
   orchCapabilities?: Partial<OrchCapabilities>;
   /**
    * Verify a reassembled chunked-relay webhook. Without it every chunked relay
@@ -302,7 +293,6 @@ export interface PlatformClientOptions {
   onShedCapture?: (meta: RelayStartMeta, body: Buffer, reason: string) => Promise<void>;
 }
 
-/** Error `*.response` frame shape for a dashboard request that failed validation. */
 export interface DashboardRequestErrorFrame {
   type: string;
   requestId: string;
@@ -313,10 +303,8 @@ export interface DashboardRequestErrorFrame {
 }
 
 /**
- * Build the error `*.response` frame for a dashboard request that failed schema
- * validation, distinguishing a request type this build has never heard of
- * (version mismatch → upgrade the orchestrator) from a known type with a
- * malformed body (genuine client error).
+ * Distinguishes a request type this build has never heard of (version mismatch →
+ * upgrade the orchestrator) from a known type with a malformed body.
  */
 export function classifyDashboardRequestError(
   raw: { type: string; requestId: string },
@@ -446,10 +434,8 @@ export class PlatformClient {
   }
 
   constructor(options: PlatformClientOptions) {
-    // Prime the breaker counter so its series exists from boot. An OTel counter
-    // that has never been incremented exports nothing, and an alert against an
-    // absent series can never fire — the "dark alert" class this repo already
-    // tracks. A rare-event counter must be born at zero, not on first trip.
+    // A never-incremented OTel counter exports nothing and its alert can never
+    // fire, so a rare-event counter is born at zero.
     stateReplayBreakerTripsTotal.add(0);
     this.url = options.url;
     this.token = options.token;
@@ -543,11 +529,9 @@ export class PlatformClient {
       return;
     }
 
-    // Admission control BEFORE signature verify: verify does a DB read, so
-    // gating after it would leave an unverified flood un-throttled. Admit on the
-    // Platform-established routing key (available pre-verify). The WS ack is
-    // awaited synchronously by Platform (5 s budget), so this path never queues
-    // — the controller grants immediately or sheds `shed_retry_later` (429).
+    // Admission BEFORE signature verify (a DB read), keyed on the
+    // Platform-established routing key. The Platform awaits the WS ack (5 s
+    // budget), so this never queues: grant now or shed `shed_retry_later` (429).
     const admit = this.onAdmit ? await this.onAdmit(meta.routingKey) : undefined;
     if (admit && !admit.admitted) {
       logger.warn('Chunked webhook.relay shed by ingest admission control', {
@@ -556,10 +540,8 @@ export class PlatformClient {
         routingKey: meta.routingKey,
         reason: admit.reason,
       });
-      // Additively record the shed delivery: an `event_log` breadcrumb so it is
-      // distinguishable from a delivery that never arrived, and a durable
-      // overflow row for replay once capacity recovers. Best-effort — a
-      // recording failure never blocks the shed_retry_later ack.
+      // The `event_log` breadcrumb tells a shed from a delivery that never
+      // arrived; the overflow row replays once capacity recovers. Best-effort.
       if (this.onShedCapture) {
         try {
           await this.onShedCapture(meta, body, admit.reason);
@@ -602,9 +584,7 @@ export class PlatformClient {
       return;
     }
 
-    // Feed `onWebhookRelay` a WebhookRelay: JSON bodies are parsed, anything
-    // else travels as a `{rawBody, contentType}` envelope so non-JSON generic
-    // webhooks still route.
+    // Non-JSON bodies travel as `{rawBody, contentType}` so generic webhooks route.
     const contentType = meta.headers['content-type'] ?? 'application/octet-stream';
     let payload: unknown;
     if (contentType.includes('application/json') || contentType === '') {

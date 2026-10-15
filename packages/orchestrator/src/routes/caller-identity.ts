@@ -1,12 +1,9 @@
 /**
- * Caller identity for orchestrator HTTP routes that act on behalf of the
- * person or tool presenting a credential.
- *
- * Today the one credential is an admin token, resolved through the shared
- * bearer-auth boundary (`resolveBearerAuth`), so the 401 / 503 semantics are
- * identical to every admin route. The caller is a tagged union so a later
- * credential kind (a signed command, for one) joins as another variant without
- * touching the routes that consume it.
+ * Caller identity for HTTP routes acting for whoever presents a credential.
+ * The one credential is an admin token, resolved through `resolveBearerAuth`,
+ * so the 401 / 503 semantics match every admin route. The caller is a tagged
+ * union so another credential kind (e.g. a signed command) can join as a
+ * variant without touching the consuming routes.
  */
 import type { Context } from 'hono';
 import { ActorType, type ActorPrincipal } from '@kici-dev/engine';
@@ -30,10 +27,6 @@ export type CallerOutcome =
   { ok: true; caller: TokenCaller } | { ok: false; status: 401 | 403 | 503; error: string };
 
 /**
- * Resolve the request's caller.
- *
- * @param c - The request context (the `Authorization` header is read).
- * @param deps - The token validator and log scope, as for `resolveBearerAuth`.
  * @param opts.requireUnscoped - Refuse a routing-key-scoped token with 403.
  *   Routes whose routing key the server chooses set it: a scoped token has no
  *   key of its own to compare there, so accepting it would widen its reach.

@@ -1,15 +1,14 @@
 /**
  * KICI_ENV / KICI_PATH temp-file contract.
  *
- * Before each step the agent points the KICI_ENV and KICI_PATH env vars at fresh
- * temp files. A step's shell commands append `KEY=value` lines to $KICI_ENV and
- * one directory per line to $KICI_PATH. After the step the agent parses both
- * files into an EnvDelta and feeds it through applyEnvDelta() -- the same path
- * the JS API (ctx.setEnv / ctx.addPath) uses -- then truncates the files for the
- * next step.
+ * Before each step the agent points KICI_ENV and KICI_PATH at fresh temp files;
+ * shell commands append `KEY=value` lines to $KICI_ENV and one directory per
+ * line to $KICI_PATH. After the step the agent parses both into an EnvDelta,
+ * applies it through applyEnvDelta() (the path ctx.setEnv / ctx.addPath use),
+ * and truncates the files for the next step.
  *
  * Format v1: single-line `KEY=value` for env (no embedded newlines); one
- * directory per line for path. Blank lines and lines without `=` are ignored.
+ * directory per line for path.
  */
 
 import { writeFile, readFile } from 'node:fs/promises';
@@ -18,19 +17,18 @@ import { join } from 'node:path';
 import { makeTempDir } from '@kici-dev/core/tmp';
 import type { EnvDelta } from './env-delta.js';
 
-/** The pair of temp files the step's shell appends to. */
 export interface EnvFiles {
-  /** Path of the file steps append `KEY=value` lines to (KICI_ENV). */
+  /** KICI_ENV. */
   envFile: string;
-  /** Path of the file steps append one directory per line to (KICI_PATH). */
+  /** KICI_PATH. */
   pathFile: string;
 }
 
 /**
- * Parse `KEY=value` lines into a record. Blank lines, lines without `=`, and
- * lines with an empty key are ignored. The split is on the first `=` only, so a
- * value may contain `=`. The key is trimmed; the value is taken verbatim after
- * the first `=`. Last assignment to a key wins.
+ * Blank lines, lines without `=`, and lines with an empty key are ignored. Each
+ * line is trimmed, then split on its first `=` only, so a value may contain
+ * `=`; the key is trimmed again and the value is the rest of the trimmed line.
+ * The last assignment to a key wins.
  */
 export function parseEnvFileContent(content: string): Record<string, string> {
   const out: Record<string, string> = {};
@@ -46,7 +44,7 @@ export function parseEnvFileContent(content: string): Record<string, string> {
   return out;
 }
 
-/** Parse one trimmed directory per non-blank line, preserving order. */
+/** One trimmed directory per non-blank line, in order. */
 export function parsePathFileContent(content: string): string[] {
   const out: string[] = [];
   for (const rawLine of content.split('\n')) {
@@ -57,7 +55,7 @@ export function parsePathFileContent(content: string): string[] {
   return out;
 }
 
-/** Create fresh, empty env + path files inside a private temp dir under `baseDir`. */
+/** Fresh, empty files inside a private temp dir under `baseDir`. */
 export async function createEnvFiles(baseDir: string): Promise<EnvFiles> {
   const { path: dir } = await makeTempDir('env', { base: baseDir });
   const envFile = join(dir, 'env');
@@ -67,12 +65,11 @@ export async function createEnvFiles(baseDir: string): Promise<EnvFiles> {
   return { envFile, pathFile };
 }
 
-/** Convenience: create env files under the OS temp dir. */
 export function createEnvFilesInTmp(): Promise<EnvFiles> {
   return createEnvFiles(tmpdir());
 }
 
-/** Read + parse both files into an EnvDelta. Missing/empty files yield an empty delta. */
+/** Missing or empty files yield an empty delta. */
 export async function readEnvDelta(files: EnvFiles): Promise<EnvDelta> {
   const [envContent, pathContent] = await Promise.all([
     readFile(files.envFile, 'utf8').catch(() => ''),
@@ -84,7 +81,7 @@ export async function readEnvDelta(files: EnvFiles): Promise<EnvDelta> {
   };
 }
 
-/** Truncate both files to empty so the next step starts clean. */
+/** So the next step starts clean. */
 export async function truncateEnvFiles(files: EnvFiles): Promise<void> {
   await Promise.all([writeFile(files.envFile, ''), writeFile(files.pathFile, '')]);
 }

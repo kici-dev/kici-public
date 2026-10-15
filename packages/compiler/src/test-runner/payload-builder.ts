@@ -5,29 +5,23 @@ import { parseEventArg } from './event-types.js';
 import type { SimulatedEvent, ChangedFilesStatus } from '@kici-dev/engine';
 
 export interface PayloadOptions {
-  /** Path to custom fixture file */
+  /** Path to a custom fixture file. */
   payload?: string;
-  /** Override branch name */
   branch?: string;
-  /** Override PR number */
   pr?: number;
-  /** Override repository (owner/name) */
+  /** `owner/name`. */
   repo?: string;
-  /** Override commit SHA */
   sha?: string;
-  /** Simulate changed file paths for onChangedFiles trigger matching */
+  /** Changed paths for onChangedFiles trigger matching. */
   files?: string[];
   /**
-   * Simulate `changedFiles` availability for rule evaluation. Defaults to
-   * `'fetched'` (the author's file list is a genuine diff); set `'unavailable'`
-   * to test a rule's `ctx.changedFilesStatus` guard on a diff-less event.
+   * Defaults to `'fetched'` (the file list is a genuine diff); `'unavailable'`
+   * tests a rule's `ctx.changedFilesStatus` guard on a diff-less event.
    */
   changedFilesStatus?: ChangedFilesStatus;
 }
 
-/**
- * Deep merge objects (simple implementation for fixture overrides).
- */
+/** Arrays replace; null and undefined overrides are ignored. */
 function deepMerge(
   base: Record<string, unknown>,
   overrides: Record<string, unknown>,
@@ -55,21 +49,17 @@ function deepMerge(
   return result;
 }
 
-/**
- * Build event payload from default fixture, custom file, and CLI overrides.
- */
+/** Default fixture or custom file, then the CLI overrides. */
 export async function buildEventPayload(
   eventArg: string,
   options: PayloadOptions,
 ): Promise<SimulatedEvent> {
   const eventType = parseEventArg(eventArg);
 
-  // Internal event types bypass GitHub fixtures -- build payload directly
   if (isInternalEventType(eventType)) {
     return buildInternalEventPayload(eventType, options);
   }
 
-  // Load base payload
   let payload: Record<string, unknown>;
   if (options.payload) {
     const content = await readFile(options.payload, 'utf-8');
@@ -78,10 +68,8 @@ export async function buildEventPayload(
     payload = getDefaultFixture(eventArg) as Record<string, unknown>;
   }
 
-  // Auto-detect repo if not overridden
   const repoInfo = options.repo ? null : await detectRepoFromGit();
 
-  // Build overrides from CLI options
   const overrides: Record<string, unknown> = {};
 
   if (options.repo) {
@@ -99,7 +87,6 @@ export async function buildEventPayload(
     };
   }
 
-  // Apply SHA override based on event type
   if (options.sha) {
     switch (eventType.type) {
       case 'push':
@@ -117,11 +104,10 @@ export async function buildEventPayload(
       case 'workflow_run':
         overrides.workflow_run = { head_sha: options.sha };
         break;
-      // For comment, release, dispatch, create, delete, fork, star, watch: no SHA field to override
+      // Other events carry no SHA field.
     }
   }
 
-  // Apply branch override based on event type
   if (options.branch) {
     switch (eventType.type) {
       case 'push':
@@ -151,11 +137,10 @@ export async function buildEventPayload(
           head_branch: options.branch,
         };
         break;
-      // For comment, dispatch, status, fork, star, watch: use default branch from repo
+      // Other events use the repository's default branch.
     }
   }
 
-  // Apply PR number override
   if (
     options.pr &&
     (eventType.type === 'pull_request' ||
@@ -169,10 +154,8 @@ export async function buildEventPayload(
     };
   }
 
-  // Merge base with overrides
   const mergedPayload = deepMerge(payload, overrides);
 
-  // Extract branch info for trigger matching based on event type
   let targetBranch = 'main';
   let sourceBranch: string | undefined;
 
@@ -200,7 +183,7 @@ export async function buildEventPayload(
     }
 
     case 'comment': {
-      // Comments on PRs have pull_request data in the issue
+      // A PR comment carries its pull_request data in the issue.
       const issue = mergedPayload.issue as Record<string, unknown> | undefined;
       const pr = issue?.pull_request as Record<string, unknown> | undefined;
       targetBranch = (pr?.base_ref as string) ?? defaultBranch;
@@ -228,7 +211,7 @@ export async function buildEventPayload(
     case 'create':
     case 'delete':
       targetBranch = (mergedPayload.ref as string) ?? defaultBranch;
-      // Override ref_type when the parsed event specifies it (e.g., create:tag, delete:tag)
+      // e.g. create:tag, delete:tag
       if ('refType' in eventType && eventType.refType) {
         mergedPayload.ref_type = eventType.refType;
       }
@@ -264,7 +247,6 @@ export async function buildEventPayload(
   };
 }
 
-/** Internal event type union for type narrowing */
 type InternalEventType =
   | { type: 'kici_event'; eventName: string }
   | { type: 'workflow_complete'; workflowName: string; status: string }
@@ -274,9 +256,7 @@ type InternalEventType =
   | { type: 'schedule'; cronExpression?: string; timezone?: string }
   | { type: 'lifecycle'; lifecycleEvent: string };
 
-/**
- * Type guard for internal (non-GitHub) event types.
- */
+/** Internal means non-GitHub. */
 function isInternalEventType(
   eventType: import('./event-types.js').EventType,
 ): eventType is InternalEventType {
@@ -291,17 +271,13 @@ function isInternalEventType(
   ].includes(eventType.type);
 }
 
-/**
- * Build SimulatedEvent for internal event types.
- * These events don't have GitHub webhook fixtures -- payload is constructed directly.
- */
+/** Internal events have no GitHub fixture, so the payload is built here unless a file is given. */
 async function buildInternalEventPayload(
   eventType: InternalEventType,
   options: PayloadOptions,
 ): Promise<SimulatedEvent> {
   let payload: Record<string, unknown>;
 
-  // Allow custom payload file override
   if (options.payload) {
     const content = await readFile(options.payload, 'utf-8');
     payload = JSON.parse(content);

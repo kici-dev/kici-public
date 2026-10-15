@@ -1,16 +1,12 @@
 /**
- * File-drift preview primitive for idempotent steps that copy or rsync
- * files to a remote target. Companion to `idempotency.ts`: a `check()`
- * that ships files can call into a helper layer (an rsync preview, for
- * example) to get a typed list of
- * per-file changes, then surface those entries inside the step's drift
- * value so the confirm prompt shows the operator exactly which files
- * would change and how.
+ * File-drift preview for idempotent steps that copy or rsync files to a remote
+ * target (companion to `idempotency.ts`): a `check()` surfaces typed per-file
+ * changes in its drift value, so the confirm prompt shows which files would
+ * change and how.
  *
- * The source of truth for the categorisation is rsync's own
- * `--itemize-changes` (`-i`) output, captured under `--dry-run` (`-n`).
- * Running rsync with the same flags the apply path uses guarantees the
- * preview and the actual transfer agree.
+ * The categorisation comes from rsync's own `--itemize-changes` (`-i`) output
+ * under `--dry-run` (`-n`), run with the apply path's flags so preview and
+ * transfer agree.
  *
  * The itemize code rsync prints is 11 characters: `YXcstpoguax`.
  *   Y = update type (`<` sent, `>` received, `.` no transfer, `*` message, `c`/`h`)
@@ -31,10 +27,9 @@
 import { createTwoFilesPatch } from 'diff';
 import { diffEnvFiles, renderEnvDiff } from './idempotency-env-diff.js';
 
-// Hardcoded ANSI escapes (not picocolors) so `color: true` deterministically
-// emits escapes regardless of the host terminal's isColorSupported probe.
-// The tee in release-prod writes raw bytes to both stdout and the log file;
-// the operator opens the log with `less -R` to render the colors.
+// Hardcoded ANSI escapes (not picocolors) so `color: true` emits escapes
+// regardless of the terminal's isColorSupported probe: the release-prod tee
+// writes raw bytes to the log file, read with `less -R`.
 const ANSI_RED = '\x1b[31m';
 const ANSI_GREEN = '\x1b[32m';
 const ANSI_CYAN = '\x1b[36m';
@@ -46,27 +41,20 @@ export type FileChangeCategory = 'new' | 'content' | 'mode' | 'time-only';
 export type ContentSkipReason = 'binary' | 'too-large' | 'read-failed' | 'sensitive';
 
 /**
- * Renderer hint for the diff body. The default `'unified-text'` produces
- * a `createTwoFilesPatch`-style block (the v1 shape). `'env-semantic'`
- * routes through the env-file diff renderer (keys + classification, with
- * value masking by default). `'yaml-semantic'` routes through the yaml
- * deep-diff renderer (dotted-path leaf entries, with masking on sensitive
- * paths). `'suppressed'` hides the body and prints a skip-reason marker —
- * used for genuinely-opaque content the caller refuses to capture.
+ * Renderer hint for the diff body: `'unified-text'` (default) is a
+ * `createTwoFilesPatch`-style block; `'env-semantic'` diffs env keys with
+ * values masked by default; `'yaml-semantic'` diffs dotted-path leaves with
+ * sensitive paths masked; `'suppressed'` prints only a skip-reason marker,
+ * for opaque content the caller refuses to capture.
  */
 export type FileDiffMode = 'unified-text' | 'env-semantic' | 'yaml-semantic' | 'suppressed';
 
 /**
- * Per-file drift entry as carried inside a phase's Drift value.
- * `localPath` and `remotePath` are filled in by the caller that owns the
- * rsync invocation (the parser only sees the relative path rsync prints).
- *
- * `localContent` / `remoteContent` are populated by the caller when the
- * payload is small UTF-8 text — they drive the inline unified-diff block
- * in the confirm prompt. `contentSkipped` flags the cases where content
- * was intentionally not captured (binary, too large, read failure) so
- * the renderer can show an explicit "no diff available" row instead of
- * silently dropping the entry.
+ * Per-file drift entry inside a phase's Drift value. The caller that owns the
+ * rsync invocation fills `localPath` / `remotePath` (the parser sees only the
+ * relative path rsync prints), and fills the content fields only for small
+ * UTF-8 text. `contentSkipped` makes the renderer show an explicit
+ * "no diff available" row instead of silently dropping the entry.
  */
 export interface FileDriftEntry {
   localPath: string;
@@ -78,38 +66,31 @@ export interface FileDriftEntry {
   localContent?: string;
   /** Remote file bytes (UTF-8). Set for category `content` when content was successfully captured. Undefined for `new`. */
   remoteContent?: string;
-  /** Set when content capture was intentionally skipped — used by the renderer to explain the gap. */
+  /** Set when content capture was intentionally skipped. */
   contentSkipped?: ContentSkipReason;
   /**
    * SHA-256 hex of the remote file bytes. Set for category `content` whenever
-   * the box could hash the file — independent of whether the bytes themselves
-   * were captured, so a suppressed, over-size or binary payload still has an
-   * identity a consumer can compare across previews without holding content.
+   * the box could hash the file, even when the bytes were not captured, so a
+   * suppressed, over-size or binary payload stays comparable across previews.
    */
   remoteDigest?: string;
   /**
-   * Fleet machine the remote side of this comparison lives on. Stamped by the
-   * preview helpers, which already know the box. Consumers that aggregate
-   * drift across a whole fleet need it to attribute a file to a machine —
-   * `remotePath` alone is identical on every box.
+   * Fleet machine the remote side lives on, stamped by the preview helpers.
+   * Fleet-wide aggregation needs it: `remotePath` is identical on every box.
    */
   box?: string;
   /**
-   * Renderer hint. When omitted, the renderer auto-detects from
-   * `remotePath`: `.env` → `'env-semantic'`, `.yaml` / `.yml` →
-   * `'yaml-semantic'`, otherwise → `'unified-text'`. Explicit values
-   * override the auto-detect. Set to `'suppressed'` to opt out of any
-   * inline body and rely on `contentSkipped` for the explanation row.
+   * Renderer hint; overrides auto-detection from `remotePath` (see
+   * {@link resolveDiffMode}). `'suppressed'` drops the inline body and relies
+   * on `contentSkipped` for the explanation row.
    */
   diffMode?: FileDiffMode;
 }
 
 /**
- * Auto-detect the diff mode for a given entry. Explicit `entry.diffMode`
- * always wins. Otherwise the suffix of `remotePath` is the only signal —
- * we deliberately do NOT sniff `localContent` bytes because the goal of
- * the helper is to produce a deterministic, callsite-readable hint that
- * matches the caller's intent.
+ * Explicit `entry.diffMode` wins; otherwise the `remotePath` suffix decides
+ * (`.env` → env, `.yaml`/`.yml` → yaml, else unified-text). Content bytes are
+ * deliberately not sniffed, so the hint stays deterministic and callsite-readable.
  */
 export function resolveDiffMode(entry: FileDriftEntry): FileDiffMode {
   if (entry.diffMode) return entry.diffMode;
@@ -127,16 +108,10 @@ export interface ItemizeRecord {
 }
 
 /**
- * Parse one line of `rsync --itemize-changes` output. Returns null for
- * lines that are not actionable file drift entries:
- *   - "sending incremental file list" header line
- *   - blank / whitespace-only lines
- *   - summary lines ("sent N bytes received M bytes …", "total size is X")
- *   - directory metadata entries (e.g. `.d..t...... ./`) — directories
- *     are created by rsync as a side-effect of file entries, no separate
- *     reporting needed
- *   - in-sync entries (rsync emits these only at -vv; we run at -v, so
- *     they normally don't appear — but we filter defensively)
+ * Parse one line of `rsync --itemize-changes` output. Returns null for lines
+ * that are not actionable file drift: headers, blank and summary lines,
+ * directory entries (rsync creates directories as a side-effect of file
+ * entries), and in-sync entries (emitted only at -vv; filtered defensively).
  */
 export function parseItemizeLine(line: string): ItemizeRecord | null {
   if (line.length < 13) return null;
@@ -195,44 +170,29 @@ const SKIP_REASON_DISPLAY: Record<ContentSkipReason, string> = {
 export interface RenderDriftOpts {
   /** When true, append a unified-diff block under each `new`/`content` entry. */
   withContent?: boolean;
-  /** When true, color the diff with ANSI red/green via picocolors. */
+  /** When true, color the diff with ANSI red/green. */
   color?: boolean;
   /** Cap on diff body lines per entry (excluding header). Default 200. */
   maxLines?: number;
   /**
-   * When true, env-semantic and yaml-semantic renderers will print the
-   * actual values instead of masking them. Off by default so the confirm
-   * prompt and the tee'd log file never carry plaintext credentials
-   * without an explicit operator opt-in.
+   * When true, the env- and yaml-semantic renderers print values unmasked.
+   * Off by default so the prompt and tee'd log never carry plaintext
+   * credentials without an explicit operator opt-in.
    */
   revealEnvValues?: boolean;
   /**
-   * Restrict which categories get a diff body rendered. Entries whose
-   * category is NOT in this set show only the per-file row, no diff.
-   * Default: `['new', 'content']` (every visible drift body). Useful for
-   * `--diff-only=content` operator workflows that want to suppress the
-   * potentially-huge full-file body of newly-introduced files.
+   * Categories that get a diff body; others show only the per-file row.
+   * Default `['new', 'content']`. `--diff-only=content` uses it to suppress
+   * the potentially huge full-file body of new files.
    */
   diffOnlyCategories?: FileChangeCategory[];
 }
 
 /**
- * Render the unified-diff block for a single FileDriftEntry. Returns an
- * array of pre-indented lines (no surrounding indent applied by this
- * function — the caller decides nesting). The first line is the diff
- * header (`--- a/path` / `+++ b/path`), followed by hunk bodies.
- *
- * `mode` and `time-only` entries return an empty array — no diff to show.
- * Entries with `contentSkipped` set return a single line explaining the
- * skip reason. Entries with no content captured (older callers that
- * didn't fill the fields) also return empty — the caller falls back to
- * the label-only row.
- *
- * This function ALWAYS renders the unified-text shape regardless of the
- * entry's `diffMode` — it's the v1 path. The renderer dispatch in
- * `renderFileDrifts` decides which shape to invoke per entry; this
- * helper stays the unified-text branch for callers that want to render
- * a single entry in unified shape.
+ * Render one entry as a unified diff, ignoring `diffMode`; the caller applies
+ * indentation. Output starts at the `--- a/path` header. `mode` / `time-only`
+ * entries and entries with no captured content return `[]` (the caller keeps
+ * the label-only row); `contentSkipped` returns one skip-reason line.
  */
 export function renderFileDriftWithDiff(
   entry: FileDriftEntry,
@@ -258,9 +218,7 @@ export function renderFileDriftWithDiff(
     undefined,
     { context: 3 },
   );
-  // createTwoFilesPatch always emits a leading "Index:" / "===" preamble
-  // we don't want, plus a header line we DO want. Drop everything up to
-  // and including the first `--- ` line, then re-emit our own header.
+  // Drop createTwoFilesPatch's "Index:" / "===" preamble before the `--- ` header.
   const rawLines = patch.split('\n');
   const headerIdx = rawLines.findIndex((l) => l.startsWith('--- '));
   const body = headerIdx >= 0 ? rawLines.slice(headerIdx) : rawLines;
@@ -275,17 +233,10 @@ export function renderFileDriftWithDiff(
 }
 
 /**
- * Dispatch helper: given a single entry and the render opts, pick the
- * right renderer based on `resolveDiffMode(entry)`. Returns the diff body
- * lines (no surrounding indent applied) — same shape as
- * `renderFileDriftWithDiff` so the caller can nest each line identically
- * regardless of which renderer fired.
- *
- * The placeholder `yaml-semantic` branch deliberately falls back to the
- * unified-text rendering when this entry hasn't been routed through a
- * yaml-aware caller. The dedicated `renderYamlDiff` lives in
- * `idempotency-yaml-diff.ts`; the dispatch wire-up happens here once it's
- * imported.
+ * Render one entry's diff body with the renderer `resolveDiffMode(entry)`
+ * picks, in the same un-indented shape as `renderFileDriftWithDiff`.
+ * `yaml-semantic` falls back to unified-text unless `idempotency-yaml-diff.ts`
+ * has been imported (see {@link setYamlDiffRenderer}).
  */
 export function renderFileDriftBody(entry: FileDriftEntry, opts: RenderDriftOpts = {}): string[] {
   if (entry.category === 'mode' || entry.category === 'time-only') return [];
@@ -300,32 +251,17 @@ export function renderFileDriftBody(entry: FileDriftEntry, opts: RenderDriftOpts
     return renderEnvDiffBody(entry, opts);
   }
   if (mode === 'yaml-semantic') {
-    // Late import to keep `idempotency-files.ts` free of a hard dep
-    // on the `yaml` package at module-load time. The dispatch lives
-    // here so callers don't have to import the yaml module directly.
-    // The wiring is done dynamically via `require` semantics in ESM
-    // would force async; instead we expose the renderer via a
-    // setter (`setYamlDiffRenderer` below) that the yaml module
-    // calls at its own load time.
+    // A setter-registered renderer keeps this module free of a load-time
+    // `yaml` dependency; a dynamic import would force this path async.
     if (yamlDiffRenderer) {
       return yamlDiffRenderer(entry, opts);
     }
-    // Falls through to unified-text when no yaml renderer is wired
-    // (e.g. a downstream consumer of `@kici-dev/shared/idempotency-files`
-    // that hasn't imported the yaml module). The unified-text body still
-    // gives the operator a usable diff.
+    // No yaml renderer wired: fall through to a still-usable unified-text body.
   }
   return renderFileDriftWithDiff(entry, { color: opts.color, maxLines: opts.maxLines });
 }
 
-/**
- * Bridge between the env-diff module and the file-drift renderer. Reads
- * `localContent` + `remoteContent` from the entry and delegates to
- * `diffEnvFiles` + `renderEnvDiff` from `idempotency-env-diff.ts`.
- *
- * NEW entries (no `remoteContent`) treat the remote side as an empty file
- * — every local key becomes an `added` entry.
- */
+/** NEW entries treat the remote side as empty, so every local key is `added`. */
 function renderEnvDiffBody(entry: FileDriftEntry, opts: RenderDriftOpts): string[] {
   const local = entry.localContent ?? '';
   const remote = entry.category === 'new' ? '' : (entry.remoteContent ?? '');
@@ -335,11 +271,8 @@ function renderEnvDiffBody(entry: FileDriftEntry, opts: RenderDriftOpts): string
 }
 
 /**
- * Yaml renderer registration. The yaml module (`idempotency-yaml-diff.ts`)
- * calls `setYamlDiffRenderer` at its own load time so the file-drift
- * renderer can dispatch to it without taking a static dependency on the
- * `yaml` npm package. Callers that never import the yaml module fall
- * through to unified-text rendering, which is the safe default.
+ * `idempotency-yaml-diff.ts` calls `setYamlDiffRenderer` at load time, so this
+ * module dispatches to it without a static `yaml` dependency.
  */
 type YamlDiffRenderer = (entry: FileDriftEntry, opts: RenderDriftOpts) => string[];
 let yamlDiffRenderer: YamlDiffRenderer | null = null;
@@ -357,19 +290,15 @@ function colorize(line: string, color: boolean): string {
 }
 
 /**
- * Render a FileDriftEntry[] as an aligned multi-line block suitable for
- * inclusion in a confirm-prompt summary.
+ * Render entries as an aligned block for a confirm-prompt summary:
  *
  *   3 file(s) drifted: 1 new, 1 content, 1 mode
  *     NEW      placeholder.html
  *     CONTENT  haproxy.cfg
  *     MODE     scripts/certbot-pre-stop.sh
  *
- * When `opts.withContent` is true, each `new`/`content` row is followed
- * by an indented unified-diff block (colored if `opts.color`).
- *
- * Returns the rendered lines (no surrounding indent applied). Caller
- * decides how to nest the block in a wider prompt.
+ * With `opts.withContent`, each row in `diffOnlyCategories` is followed by an
+ * indented diff body. The caller applies the outer indentation.
  */
 export function renderFileDrifts(entries: FileDriftEntry[], opts: RenderDriftOpts = {}): string[] {
   if (entries.length === 0) return [];

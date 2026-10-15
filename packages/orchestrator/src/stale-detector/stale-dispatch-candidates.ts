@@ -21,27 +21,20 @@ export interface StaleDispatchCandidate {
 }
 
 /**
- * The dispatch rows that have gone unacknowledged long enough to reap.
+ * The dispatch rows that have gone unacknowledged long enough to reap. Separate from the
+ * detector so its raw-SQL predicates are asserted against a real Postgres, not a mock.
  *
- * Split out of the detector so the three predicates that decide the verdict can
- * be asserted against a real Postgres — they are raw SQL, and a mock records
- * them without evaluating them.
- *
- * - **Both bounds read the DISPATCH clock**, not the enqueue clock.
- *   `created_at` is when the job was queued, so keying on it measured "enqueued
- *   more than two minutes ago and not yet reported running" — true of every job
- *   that waited behind a busy fleet. A job claimed at 3:00 after a scaler cold
- *   start, then cloning its repo and installing dependencies, was reaped at 3:30
- *   with "dispatch never acknowledged" while the agent ran it to completion for
- *   nothing.
- * - **The COALESCE is the rolling-upgrade bridge.** A row dispatched before
- *   `dispatched_at` existed carries NULL and keeps exactly the previous
- *   behaviour. That is also what makes startup recovery's decision to spare an
- *   unknown-owner row safe: a spared orphan is still reaped here.
- * - **An acked dispatch is never reaped.** A row whose `ack_deadline` was
- *   cleared while `ack_agent_id` is stamped was acknowledged, and the ack path
- *   owns it. This scan's residual job is the never-acked, crashed-coordinator
- *   case; the heartbeat sub-scans cover a job that acked and then went quiet.
+ * - **Both bounds read the DISPATCH clock**, not the enqueue clock. `created_at` measures
+ *   "enqueued long ago and not yet running", true of every job that waited behind a busy
+ *   fleet: a job claimed after a scaler cold start would be reaped mid-clone with "dispatch
+ *   never acknowledged" while the agent ran it to completion for nothing.
+ * - **The COALESCE is the rolling-upgrade bridge.** A row dispatched before `dispatched_at`
+ *   existed carries NULL and falls back to `created_at`. That also makes startup recovery's
+ *   sparing of an unknown-owner row safe: a spared orphan is still reaped here.
+ * - **An acked dispatch is never reaped.** A row with `ack_deadline` cleared and
+ *   `ack_agent_id` stamped was acknowledged, and the ack path owns it. This scan covers the
+ *   never-acked, crashed-coordinator case; the heartbeat sub-scans cover a job that acked and
+ *   then went quiet.
  */
 export async function selectStaleDispatchCandidates(
   db: Kysely<Database>,
@@ -62,8 +55,7 @@ export async function selectStaleDispatchCandidates(
       'er.workflow_name',
       'er.repo_identifier',
       'er.workflow_repo_identifier',
-      // The run's trust posture, forwarded onto the check-run completion so a
-      // job reaped on a fork run still explains its reduced privileges.
+      // Trust posture, so a job reaped on a fork run still explains its reduced privileges.
       'er.trust_tier',
       'er.lock_file_source',
       'er.sha',
@@ -75,8 +67,7 @@ export async function selectStaleDispatchCandidates(
     .where(sql<SqlBool>`COALESCE(dq.dispatched_at, dq.created_at) < ${threshold}`)
     .where(sql<SqlBool>`COALESCE(dq.dispatched_at, dq.created_at) > ${timeBound}`)
     .where(sql<SqlBool>`(dq.ack_deadline IS NOT NULL OR dq.ack_agent_id IS NULL)`)
-    // Skip rows where the agent has already started running the job —
-    // those are supervised by the heartbeat scanners.
+    // A running job belongs to the heartbeat scanners.
     .where((eb) =>
       eb.or([eb('ej.status', 'is', null), eb('ej.status', '!=', ExecutionJobStatus.enum.running)]),
     )

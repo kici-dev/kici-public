@@ -19,7 +19,7 @@ export interface WorkflowModification {
  * Compares workflow names and configurations:
  * - Added: in head but not base
  * - Removed: in base but not head
- * - Modified: in both but triggers, jobs, or steps differ
+ * - Modified: in both but triggers, jobs (steps included), or rules differ
  *
  * @param baseLockFile - Lock file from the base branch (null for new repos)
  * @param headLockFile - Lock file from the head commit (null means nothing to detect)
@@ -29,12 +29,10 @@ export function detectWorkflowModifications(
   baseLockFile: LockFile | null,
   headLockFile: LockFile | null,
 ): WorkflowModification[] {
-  // If head lock file is null, nothing to detect
   if (!headLockFile) return [];
 
   const modifications: WorkflowModification[] = [];
 
-  // Build maps by workflow name
   const baseWorkflows = new Map<string, LockWorkflow>();
   if (baseLockFile) {
     for (const wf of baseLockFile.workflows) {
@@ -47,7 +45,6 @@ export function detectWorkflowModifications(
     headWorkflows.set(wf.name, wf);
   }
 
-  // Check for added and modified workflows
   for (const [name, headWf] of headWorkflows) {
     const baseWf = baseWorkflows.get(name);
     if (!baseWf) {
@@ -57,7 +54,6 @@ export function detectWorkflowModifications(
     }
   }
 
-  // Check for removed workflows
   for (const name of baseWorkflows.keys()) {
     if (!headWorkflows.has(name)) {
       modifications.push({ workflowName: name, changeType: 'removed' });
@@ -69,20 +65,17 @@ export function detectWorkflowModifications(
 
 /**
  * Check if a workflow has changed between base and head versions.
- * Compares triggers and jobs (excluding volatile fields like contentHash).
+ * Compares triggers, jobs and rules (excluding volatile fields like contentHash).
  */
 function hasWorkflowChanged(baseWf: LockWorkflow, headWf: LockWorkflow): boolean {
-  // Compare triggers
   if (JSON.stringify(baseWf.triggers) !== JSON.stringify(headWf.triggers)) {
     return true;
   }
 
-  // Compare jobs
   if (JSON.stringify(baseWf.jobs) !== JSON.stringify(headWf.jobs)) {
     return true;
   }
 
-  // Compare rules
   if (JSON.stringify(baseWf.rules) !== JSON.stringify(headWf.rules)) {
     return true;
   }

@@ -1,6 +1,5 @@
 /**
- * resolveInstance — the single entry point every lifecycle command uses to
- * decide which installed service it's operating on.
+ * resolveInstance picks the installed service every lifecycle command acts on.
  *
  * Priority:
  *   1. --instance-dir <path>       → read manifest at <path>
@@ -8,14 +7,9 @@
  *   3. CWD manifest                → read ./.kici-<component>.json
  *   4. otherwise                   → refuse with a candidate list (throws)
  *
- * listInstances reconciles the on-disk index (cache) with the drivers'
- * native scans (source of truth). The reconciled result is rewritten back to
- * the index to self-heal stale entries.
- *
- * Discovery is platform-plural and operation is platform-singular. A host can
- * hold both a systemd install and a compose install, so finding an instance
- * scans every candidate driver; acting on the one that was found uses the
- * single driver its manifest names.
+ * Discovery is platform-plural and operation is platform-singular: a host can
+ * hold both a systemd and a compose install, so finding an instance scans every
+ * candidate driver, and acting on it uses the single driver its manifest names.
  */
 
 import path from 'node:path';
@@ -32,13 +26,10 @@ export interface ListedInstance extends DiscoveredInstance {
 }
 
 /**
- * The drivers that can plausibly hold an install on this host.
- *
- * `--platform` forces one driver, so an operator keeps an escape hatch to
- * today's exact single-driver behaviour on every path. Otherwise the host's own
- * init system is joined by compose, which runs on any host with a container
- * runtime — a compose install on a systemd box is the case the single-driver
- * scan could not see.
+ * The drivers that can plausibly hold an install on this host. `--platform`
+ * forces one driver, the operator's single-driver escape hatch. Otherwise the
+ * host's init system is joined by compose, which runs on any host with a
+ * container runtime, so a compose install on a systemd box is found.
  */
 export function candidatePlatforms(override?: ServicePlatform): ServicePlatform[] {
   if (override) return [override];
@@ -46,7 +37,6 @@ export function candidatePlatforms(override?: ServicePlatform): ServicePlatform[
   return host === 'compose' ? ['compose'] : [host, 'compose'];
 }
 
-/** Build a driver per candidate platform. */
 async function candidateManagers(override?: ServicePlatform): Promise<ServiceManager[]> {
   return Promise.all(candidatePlatforms(override).map((p) => defaultCreateManager(p)));
 }
@@ -56,8 +46,8 @@ export interface ListInstancesArgs {
   isUserLevel: boolean;
   kiciRoot: string;
   /**
-   * The drivers to scan. Omit to scan every candidate driver for this host.
-   * Each driver is authoritative only over its own platform's index rows.
+   * Omit to scan every candidate driver for this host. Each driver is
+   * authoritative only over its own platform's index rows.
    */
   managers?: ServiceManager[];
 }
@@ -71,27 +61,19 @@ interface DriverScan {
 /**
  * Scan every driver that can answer, dropping the ones that cannot.
  *
- * A driver reporting `available() === false` is omitted entirely rather than
- * contributing an empty scan: its registry is unreachable, so it has nothing to
- * say about whether its instances still exist.
+ * A driver whose `available()` is false is omitted rather than contributing an
+ * empty scan: an unreachable registry says nothing about whether its instances
+ * exist. A driver whose scan throws is omitted on the same terms, since the
+ * registry can go down between the two calls; the error must neither read as an
+ * empty scan nor escape a command that only wanted to resolve a name.
  *
- * A driver whose scan throws is omitted on the same terms. `available()` is a
- * separate call, so a registry can go down in the gap between the two, and a
- * driver that reports a failed read as an error rather than as `[]` must not
- * have that error read as an empty scan — nor propagate out of a lifecycle
- * command that only wanted to resolve a name.
+ * Both drops are ANNOUNCED on stderr with the platform and reason, so an
+ * operator reads "could not look" rather than "not installed" — the
+ * distinction `service-installation.md` promises.
  *
- * Both drops are ANNOUNCED on stderr, naming the platform and the reason. A
- * dropped driver silently shortens the candidate list, so an operator whose
- * instance is missing would otherwise read "not installed" for what is really
- * "could not look" — and before this branch the throwing case was not swallowed
- * at all, so the error at least reached them. The warning is what keeps the
- * distinction the operator docs promise (`service-installation.md`) legible.
- *
- * `available()` is called INSIDE the same try: it runs a probe of its own
- * (compose shells out to the container runtime), so it can reject, and a
- * rejection there must drop this one driver rather than fail the whole
- * `Promise.all` and take every other platform's scan down with it.
+ * `available()` runs INSIDE the same try: its own probe (compose shells out to
+ * the container runtime) can reject, and that must drop only this driver, not
+ * fail the whole `Promise.all`.
  */
 async function scanDrivers(
   managers: ServiceManager[],
@@ -123,23 +105,21 @@ async function scanDrivers(
 
 /**
  * Reconcile <kiciRoot>/instances.json with the drivers' native scans, then
- * rewrite the index so it mirrors the scanned instances that have a known
- * instanceDir. Two self-heal directions happen here:
+ * rewrite the index to mirror the scanned instances with a known instanceDir:
  *
  *   - backward: drop index entries whose unit no longer exists.
  *   - forward: adopt an instanceDir a driver recovered from the unit marker
- *     when the index entry is missing or carries no dir — so a lost or emptied
- *     index rebuilds itself from the init system on the next read.
+ *     when the index entry is missing or has no dir, so a lost or emptied
+ *     index rebuilds itself on the next read.
  *
- * The init system is therefore the source of truth for the name→folder mapping
- * (via the X-KiCI-InstanceDir / KiCIInstanceDir / dev.kici.instance-dir / [KiCI-DIR]
- * markers), and the index is a pure cache. Returns the merged list filtered to
- * the requested component + isUserLevel.
+ * The init system is the source of truth for the name→folder mapping (via the
+ * X-KiCI-InstanceDir / KiCIInstanceDir / dev.kici.instance-dir / [KiCI-DIR]
+ * markers); the index is a pure cache. Returns the list filtered to the
+ * requested component + isUserLevel.
  *
- * The rewrite is scoped to the platforms that were actually scanned. A driver
- * speaks for its own platform's rows and for no others, so a systemd scan
- * cannot delete a compose install's row, and a driver that could not reach its
- * registry deletes nothing at all.
+ * The rewrite is scoped to the scanned platforms: a systemd scan cannot delete
+ * a compose install's row, and a driver that could not reach its registry
+ * deletes nothing.
  */
 export async function listInstances(args: ListInstancesArgs): Promise<ListedInstance[]> {
   const { component, isUserLevel, kiciRoot } = args;
@@ -162,23 +142,18 @@ export async function listInstances(args: ListInstancesArgs): Promise<ListedInst
       const idx = indexByKey.get(`${scan.platform}\0${s.name}`);
       listed.push({
         ...s,
-        // The driver is the authority on its own platform, so a row it returns is
-        // stamped with it — which is what keeps every reconciled row inside the
+        // Stamping the driver's platform keeps every reconciled row inside the
         // scanned scope below.
         platform: scan.platform,
         component,
-        // Prefer the index's recorded dir; fall back to the dir the driver
-        // recovered from the unit marker.
         instanceDir: idx?.instanceDir ?? s.instanceDir,
         source: idx ? 'index+scan' : 'scan',
       });
     }
   }
 
-  // The desired index state for the scanned platforms of this component+scope:
-  // one entry per scanned instance whose instanceDir is known. Dead entries
-  // (unit gone) drop out because they aren't in the scan; scan-recovered dirs
-  // get adopted.
+  // Dead entries (unit gone) drop out because they aren't in the scan;
+  // scan-recovered dirs get adopted.
   const reconciled: IndexEntry[] = [];
   for (const l of listed) {
     if (!l.instanceDir) continue;
@@ -201,7 +176,7 @@ export async function listInstances(args: ListInstancesArgs): Promise<ListedInst
   return listed;
 }
 
-/** Order-insensitive equality of two index-entry sets (by their full identity). */
+/** Order-insensitive equality by full identity. */
 function sameIndexSet(a: IndexEntry[], b: IndexEntry[]): boolean {
   if (a.length !== b.length) return false;
   const key = (e: IndexEntry) =>
@@ -211,10 +186,9 @@ function sameIndexSet(a: IndexEntry[], b: IndexEntry[]): boolean {
 }
 
 /**
- * Thrown by resolveInstance when `--name <n>` is given but no installed
- * instance matches. Lifecycle commands catch this to treat stop/uninstall of
- * a never-installed instance as an idempotent no-op. Distinct from the
- * ambiguous-refusal and missing-manifest errors, which stay hard failures.
+ * Thrown when `--name <n>` matches no installed instance. Lifecycle commands
+ * catch it so stop/uninstall of a never-installed instance is an idempotent
+ * no-op; the ambiguous-refusal and missing-manifest errors stay hard failures.
  */
 export class InstanceNotFoundError extends Error {
   readonly component: Component;
@@ -232,23 +206,16 @@ export interface ResolveArgs {
   opts: ResolveOptions;
   cwd: string;
   kiciRoot: string;
-  /**
-   * Every driver discovery should scan. Omit to scan every candidate driver
-   * for this host.
-   */
+  /** Omit to scan every candidate driver for this host. */
   managers?: ServiceManager[];
   /**
-   * Privilege scope to resolve against. Must match the caller's resolved
-   * --system / --user-level decision so candidate lists and name lookups see
-   * the correct set of installed instances.
+   * Must match the caller's resolved --system / --user-level decision so
+   * candidate lists and name lookups see the right installed instances.
    */
   isUserLevel: boolean;
 }
 
-/**
- * Resolve the target instance for the current lifecycle invocation.
- * Throws with a refusal/candidate-listing error when ambiguous.
- */
+/** Throws a refusal listing the candidates when ambiguous. */
 export async function resolveInstance(args: ResolveArgs): Promise<ResolvedInstance> {
   const { component, opts, cwd, kiciRoot, isUserLevel, managers } = args;
 
@@ -319,12 +286,6 @@ export async function resolveInstance(args: ResolveArgs): Promise<ResolvedInstan
   throw new Error(formatRefusal(component, candidates));
 }
 
-/**
- * Format the refusal message and candidate table.
- *
- * When candidates is empty, returns the "no instances installed" guidance.
- * When candidates exist, lists them with their instanceDir (or "(no manifest)").
- */
 export function formatRefusal(component: Component, candidates: ListedInstance[]): string {
   if (candidates.length === 0) {
     return (
@@ -355,21 +316,14 @@ function formatNameNotFound(
   return `${component} instance "${name}" not found. Installed:\n${rows}`;
 }
 
-/** What {@link resolveInstanceTarget} is asked. */
 export interface ResolveTargetArgs {
   component: Component;
   opts: ResolveOptions;
   cwd: string;
   kiciRoot: string;
-  /**
-   * Privilege scope to resolve against. Must match the caller's resolved
-   * --system / --user-level decision.
-   */
+  /** Must match the caller's resolved --system / --user-level decision. */
   isUserLevel: boolean;
-  /**
-   * The `--platform` flag. When set it forces the driver for both discovery and
-   * operation, which is the operator's escape hatch to a single-driver run.
-   */
+  /** `--platform`: forces the driver for both discovery and operation. */
   platformOverride?: ServicePlatform;
   /** Driver factory. Defaults to the service barrel's createServiceManager. */
   createManager?: (platform: ServicePlatform) => Promise<ServiceManager>;
@@ -384,13 +338,9 @@ export interface ResolvedTarget {
 }
 
 /**
- * Resolve the target instance and the driver that manages it.
- *
- * The question a lifecycle command asks is about the install, not the host: a
- * compose install stays a compose install on a systemd box. So discovery scans
- * every candidate driver, and the manifest that discovery produced then names
- * the single driver the command operates through. The two need not be the same
- * object, and only the second has to be right.
+ * Resolve the target instance and its driver. A compose install stays a compose
+ * install on a systemd box, so discovery scans every candidate driver and the
+ * found manifest names the single driver the command operates through.
  */
 export async function resolveInstanceTarget(args: ResolveTargetArgs): Promise<ResolvedTarget> {
   const create = args.createManager ?? defaultCreateManager;

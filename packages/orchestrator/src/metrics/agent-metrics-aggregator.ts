@@ -1,34 +1,21 @@
 /**
- * In-memory aggregator for agent-pushed metrics.
- *
- * Agents push their OTel metrics snapshots via the WS `agent.metrics` message.
- * This aggregator stores the latest snapshot per agent and produces a
- * cardinality-bounded view by **collapsing all agents within the same
- * scaler pool into one series per (metric, labels, scaler)**. The
- * `agent_id` label is intentionally NOT emitted — including it would
- * make Mimir cardinality grow with the number of agents that have ever
- * existed (every ephemeral firecracker microVM minted a fresh ID), which
- * is unbounded. The caller-side dashboard filters by `scaler` instead,
- * which has a fixed enum of values (`stateful`, plus every
- * `ScalerBackendType`).
+ * In-memory aggregator for the OTel snapshots agents push via the WS `agent.metrics` message.
+ * Keeps the latest snapshot per agent and **collapses each scaler pool into one series per
+ * (metric, labels, scaler)**. `agent_id` is NOT emitted: every ephemeral firecracker microVM
+ * mints a fresh ID, so Mimir cardinality would grow without bound. Dashboards filter by
+ * `scaler` instead, a fixed enum (`stateful` plus every `ScalerBackendType`).
  *
  * Aggregation rules per metric kind:
  *   - counter / upDownCounter / gauge → SUM across agents in the pool
  *   - histogram → bucket-by-bucket SUM, plus summed `_count` / `_sum`
  *
- * Trade-off: counter rates are approximate during agent churn. If
- * agent A reports `100` at t1 and disconnects, then agent B starts
- * fresh at `0` for t2, the combined series steps 100 → 0 — which
- * Prometheus interprets as a reset and `rate()` handles correctly.
- * Over a longer window though (e.g. a day with many ephemeral agents
- * appearing + disappearing), the integrated count can under-count.
- * The orchestrator-side counters (`kici_orch_*`) are the canonical
- * source for absolute totals; the agent counters here are for live
- * "what's happening right now" panels.
+ * Trade-off: counter rates are approximate during agent churn. A series stepping 100 → 0
+ * when one agent leaves and a fresh one starts is a reset `rate()` handles, but over a long
+ * window with many ephemeral agents the integrated count can under-count. `kici_orch_*`
+ * counters are the canonical absolute totals; these feed live "right now" panels.
  *
- * Cleanup: after an agent disconnects, its snapshot is retained for one
- * configurable retention period (default 30s, ~2x scrape interval) so
- * Prometheus can scrape it at least once before it disappears.
+ * A disconnected agent's snapshot is kept for one retention period (default 30s, ~2x scrape
+ * interval) so Prometheus scrapes it at least once.
  */
 
 /** Shape of a single metric data point pushed by the agent. */
@@ -52,11 +39,9 @@ export class AgentMetricsAggregator {
   private store = new Map<string, AgentEntry>();
   private defaultRetentionMs: number;
   /**
-   * Optional lookup: agentId → scaler backend type (e.g. `container`,
-   * `firecracker`, `bare-metal`). Returning null marks the agent as
-   * static / stateful — we then stamp the `scaler` label as `'stateful'`.
-   * Wired from ScalerManager.getBackendType in production. Tests can
-   * leave it undefined; in that case the `scaler` label is omitted.
+   * agentId → scaler backend type (e.g. `container`, `firecracker`, `bare-metal`); null
+   * stamps `scaler="stateful"`. Wired from ScalerManager.getBackendType; when undefined
+   * (tests), the `scaler` label is omitted.
    */
   private readonly getScalerForAgent?: (agentId: string) => string | null;
 
@@ -68,28 +53,23 @@ export class AgentMetricsAggregator {
     this.getScalerForAgent = opts?.getScalerForAgent;
   }
 
-  /**
-   * Resolve the `scaler` label for one agentId. Centralized so both the
-   * structured snapshot (Mimir push) and the Prometheus text
-   * exporter (HTTP /metrics) stamp identical values.
-   */
+  /** Shared so the Mimir push and the HTTP /metrics exporter stamp identical values. */
   private resolveScalerLabel(agentId: string): string | undefined {
     if (!this.getScalerForAgent) return undefined;
     const backend = this.getScalerForAgent(agentId);
     return backend ?? 'stateful';
   }
 
-  /** Store or replace metrics for an agent. */
   update(agentId: string, metrics: MetricSnapshot[]): void {
     this.store.set(agentId, {
       metrics,
       updatedAt: Date.now(),
-      // Clear disconnectedAt if agent is sending metrics again (reconnected)
+      // A reporting agent has reconnected.
       disconnectedAt: undefined,
     });
   }
 
-  /** Mark an agent as disconnected (start the retention countdown). */
+  /** Starts the retention countdown. */
   markDisconnected(agentId: string): void {
     const entry = this.store.get(agentId);
     if (entry) {
@@ -108,12 +88,7 @@ export class AgentMetricsAggregator {
     }
   }
 
-  /**
-   * Build a stable string key for grouping metrics across agents. The
-   * key encodes the metric name plus every label except `agent_id`
-   * (which is dropped) and including the resolved `scaler`. Sorted so
-   * insertion order can't sneak into the key.
-   */
+  /** Grouping key: the name plus every label except `agent_id`, sorted so order is irrelevant. */
   private groupKey(name: string, labels: Record<string, string>): string {
     const entries = Object.entries(labels)
       .filter(([k]) => k !== 'agent_id')
@@ -122,22 +97,14 @@ export class AgentMetricsAggregator {
   }
 
   /**
-   * Walk every stored snapshot and bucket points into per-(metric, labels)
-   * groups, summing counter / gauge values and merging histogram buckets
-   * across all agents in each bucket. The bucketing key includes the
-   * `scaler` label and excludes `agent_id`, so the output is one series
-   * per (metric, labels-except-agent_id, scaler) combination.
-   *
-   * Returns one MetricSnapshot per group so both `getStructuredSnapshot`
-   * and `getPrometheusText` can iterate the same shape.
+   * One summed MetricSnapshot per (metric, labels-except-agent_id, scaler), the shape both
+   * `getStructuredSnapshot` and `getPrometheusText` iterate.
    */
   private aggregateAcrossAgents(): MetricSnapshot[] {
     interface Acc {
       type: MetricSnapshot['type'];
       labels: Record<string, string>;
-      // Counter / gauge / upDownCounter accumulator
       sumValue: number;
-      // Histogram accumulators
       buckets: Map<number, number>;
       bucketCount: number;
       bucketSum: number;
@@ -183,9 +150,7 @@ export class AgentMetricsAggregator {
 
     const result: MetricSnapshot[] = [];
     for (const [key, acc] of groups) {
-      // The key includes the metric name (before `__`); strip the type
-      // suffix we appended to keep counter / gauge of the same name
-      // separate (defensive, shouldn't happen in practice).
+      // Strip the `__<type>` suffix that keeps a same-named counter and gauge apart (defensive).
       const name = key.split('|', 1)[0]!.split('__')[0]!;
       if (acc.type === 'histogram') {
         const buckets = [...acc.buckets.entries()]
@@ -212,17 +177,9 @@ export class AgentMetricsAggregator {
   }
 
   /**
-   * Produce a structured snapshot of all stored agent metrics in the
-   * `OrchMetrics['metrics']` wire shape — same format the orchestrator's
-   * own `MetricsReporter` produces from its OTel exporter. Used by the
-   * Platform-bound Mimir push pipeline so agent metrics land in Mimir
-   * per-org alongside `kici_orch_*` .
-   *
-   * Output is **already aggregated across agents per scaler** — see the
-   * class docstring for the cardinality rationale and counter trade-off.
-   *
-   * Runs `cleanup()` first so disconnected agents past their retention
-   * window stop being emitted.
+   * Agent metrics in the `OrchMetrics['metrics']` wire shape (as `MetricsReporter` produces),
+   * for the Platform-bound Mimir push, so they land per-org alongside `kici_orch_*`. Already
+   * aggregated per scaler (see the class docstring). Runs `cleanup()` first.
    */
   getStructuredSnapshot(): MetricSnapshot[] {
     this.cleanup();
@@ -231,12 +188,8 @@ export class AgentMetricsAggregator {
   }
 
   /**
-   * Produce Prometheus exposition text for all stored agent metrics,
-   * aggregated across agents per scaler. See `getStructuredSnapshot` for
-   * the aggregation rules. Runs auto-cleanup before generating output.
-   *
-   * Groups metrics by name and emits `# TYPE` directives so Prometheus
-   * correctly interprets histograms, counters, and gauges.
+   * Prometheus exposition text, aggregated per scaler, with one `# TYPE` directive per name.
+   * Runs `cleanup()` first.
    */
   getPrometheusText(): string {
     this.cleanup();
@@ -244,7 +197,6 @@ export class AgentMetricsAggregator {
 
     const aggregated = this.aggregateAcrossAgents();
 
-    // Group by metric name so we emit one `# TYPE` directive per name.
     const byName = new Map<string, { type: MetricSnapshot['type']; entries: MetricSnapshot[] }>();
     for (const m of aggregated) {
       let g = byName.get(m.name);
@@ -257,12 +209,11 @@ export class AgentMetricsAggregator {
 
     const lines: string[] = [];
     for (const [name, group] of byName) {
-      // Prometheus requires underscores, not dots, in metric names
+      // Prometheus names and label names allow no dots.
       const safeName = name.replace(/\./g, '_');
       lines.push(`# TYPE ${safeName} ${mapPrometheusType(group.type)}`);
 
       for (const metric of group.entries) {
-        // Sanitize label names (dots → underscores).
         const safeLabels: Record<string, string> = {};
         for (const [k, v] of Object.entries(metric.labels ?? {})) {
           safeLabels[k.replace(/\./g, '_')] = v;
@@ -294,18 +245,15 @@ export class AgentMetricsAggregator {
       lines.push(`${name}_bucket{${formatLabels(bucketLabels)}} ${bucket.count}`);
     }
 
-    // +Inf bucket
     const infLabels = { ...baseLabels, le: '+Inf' };
     lines.push(`${name}_bucket{${formatLabels(infLabels)}} ${totalCount}`);
 
-    // _count and _sum
     const labelStr = formatLabels(baseLabels);
     lines.push(`${name}_count{${labelStr}} ${totalCount}`);
     lines.push(`${name}_sum{${labelStr}} ${metric.sum ?? 0}`);
   }
 }
 
-/** Map internal metric type to Prometheus exposition type keyword. */
 function mapPrometheusType(type: MetricSnapshot['type']): string {
   switch (type) {
     case 'counter':
@@ -323,7 +271,7 @@ function escapeLabelValue(v: string): string {
   return v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
 }
 
-/** Format a labels object as Prometheus label string: key1="val1",key2="val2" */
+/** `key1="val1",key2="val2"` */
 function formatLabels(labels: Record<string, string>): string {
   return Object.entries(labels)
     .map(([k, v]) => `${k}="${escapeLabelValue(v)}"`)

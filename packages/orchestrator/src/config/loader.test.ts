@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { loadLocalConfig, SENSITIVE_FIELD_PATHS } from './loader.js';
 
-/** Create a temp directory for test config files */
 async function createTmpDir(): Promise<string> {
   const dir = join(tmpdir(), `kici-config-test-${randomUUID().slice(0, 8)}`);
   await mkdir(dir, { recursive: true });

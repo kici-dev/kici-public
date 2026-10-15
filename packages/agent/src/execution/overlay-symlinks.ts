@@ -1,10 +1,10 @@
 /**
  * Directory symlinks an overlay recreates in the repository.
  *
- * The uploader ships a symlink whose target is a directory as its link text in
- * the manifest's `symlinks` map. Before anything is applied, each one must point
- * inside the repository at every step the kernel takes to resolve it; once the
- * files and deletions are applied, each one is created.
+ * The uploader ships each directory symlink's link text in the manifest's
+ * `symlinks` map. Before anything applies, each must stay inside the repository
+ * at every step the kernel takes to resolve it; each is created after the files
+ * and deletions apply.
  */
 
 import fs from 'node:fs/promises';
@@ -13,7 +13,6 @@ import path from 'node:path';
 /** Symlinks followed while resolving one path before it is refused (the Linux limit). */
 export const MAX_LINK_HOPS = 40;
 
-/** A directory symlink the overlay creates. */
 export interface CheckedLink {
   key: string;
   dest: string;
@@ -21,9 +20,8 @@ export interface CheckedLink {
 }
 
 /**
- * The repository as a directory symlink sees it once it is created: the
- * overlay's deletions are applied and its other directory symlinks exist. Both
- * are keyed by real repo-relative path.
+ * The repository as a new directory symlink sees it: the overlay's deletions
+ * applied and its other directory symlinks present, keyed by real repo-relative path.
  */
 export interface LinkView {
   realRoot: string;
@@ -31,12 +29,11 @@ export interface LinkView {
   pending: ReadonlyMap<string, string>;
 }
 
-/** True when `target` is `root` itself or lies beneath it. */
 export function isWithin(root: string, target: string): boolean {
   return target === root || target.startsWith(root + path.sep);
 }
 
-/** The link text at `abs` when a symlink is there once the overlay's deletions ran. */
+/** The link text at `abs` after the overlay's deletions, if a symlink is there. */
 async function linkTextAt(view: LinkView, abs: string): Promise<string | undefined> {
   const rel = path.relative(view.realRoot, abs);
   const pending = view.pending.get(rel);
@@ -47,15 +44,13 @@ async function linkTextAt(view: LinkView, abs: string): Promise<string | undefin
 }
 
 /**
- * Resolve link text `text`, created in the real directory `startDir`, one
- * component at a time the way the kernel does: `..` climbs from the real
- * directory reached so far, and every symlink met is followed — one already on
- * disk, or one the same overlay creates. Returns why the text is refused, or
- * undefined when every step stays inside the repository.
+ * Resolve `text`, created in real directory `startDir`, one component at a time
+ * as the kernel does: `..` climbs from the real directory reached so far, and
+ * every symlink met (on disk, or created by this overlay) is followed. Returns
+ * why the text is refused, or undefined when every step stays inside.
  *
- * Resolving the text with `path.resolve` alone is not enough: it collapses `..`
- * before following links, so `a/..` looks like the current directory even when
- * `a` is a link to somewhere else.
+ * `path.resolve` alone is not enough: it collapses `..` before following links,
+ * so `a/..` looks like `.` even when `a` links elsewhere.
  */
 async function walkLinkText(
   view: LinkView,
@@ -91,10 +86,9 @@ async function walkLinkText(
 }
 
 /**
- * Why a directory symlink created at the real path `realDest` reading `text` is
- * refused, or undefined when it stays inside the repository: its text must be
- * relative, resolve inside the repository as written, and stay inside it at
- * every step the kernel takes to resolve it.
+ * Why a directory symlink at real path `realDest` reading `text` is refused, or
+ * undefined: the text must be relative, resolve inside the repository as
+ * written, and stay inside at every kernel resolution step.
  */
 export async function linkRefusal(
   realDest: string,
@@ -114,9 +108,9 @@ export async function linkRefusal(
 }
 
 /**
- * Remove a directory an overlay entry replaces with a file or a symlink. The
- * check before applying proved it holds nothing but directories once the
- * overlay's deletions ran; a file or link found here anyway is not removed.
+ * Remove a directory an overlay entry replaces with a file or symlink. The
+ * pre-apply check proved it holds only directories after deletions; a file or
+ * link found anyway throws instead of being removed.
  */
 export async function removeEmptyTree(dir: string, key: string): Promise<void> {
   for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
@@ -131,9 +125,9 @@ export async function removeEmptyTree(dir: string, key: string): Promise<void> {
 }
 
 /**
- * Create each checked directory symlink, replacing whatever the clone has at
- * its path: a file or a link is unlinked (never followed), and an emptied
- * directory is removed. Returns the number created.
+ * Create each checked directory symlink, replacing what the clone has there: a
+ * file or link is unlinked (never followed), an emptied directory removed.
+ * Returns the number created.
  */
 export async function applySymlinks(links: readonly CheckedLink[]): Promise<number> {
   for (const { key, dest, text } of links) {

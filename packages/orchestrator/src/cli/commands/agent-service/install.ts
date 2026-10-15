@@ -1,15 +1,8 @@
 /**
- * `kici-admin agent install` command.
- *
- * Registers the agent as a native system service on the current platform.
- * Accepts orchestrator URL and token for connecting to the orchestrator.
- *
- * Targeting is folder-anchored: the install writes an instance manifest
- * into the deploy folder (`--instance-dir`, default: CWD) and appends a
- * row to the host-wide instance index so every lifecycle command can
- * reconstruct the ServiceConfig without re-deriving paths. A create-path
- * guard refuses to clobber a same-named foreign instance unless `--force`
- * is passed.
+ * `kici-admin agent install`: registers the agent as a native service.
+ * Folder-anchored: it writes an instance manifest into `--instance-dir`
+ * (default: CWD) and a host-wide index row, from which every lifecycle command
+ * rebuilds the ServiceConfig. A same-named foreign instance is refused without `--force`.
  */
 
 import type { Command } from 'commander';
@@ -99,9 +92,8 @@ export function registerAgentInstall(agent: Command): void {
     .option('--force', 'Overwrite an existing same-named foreign instance')
     .action(
       cliAction(async (opts: InstallOptions) => {
-        // A kici-admin from a standalone package has no import.meta.resolve:
-        // without --binary it cannot locate the server, so it stops here,
-        // before the wizard or any file.
+        // A standalone kici-admin has no import.meta.resolve, so without --binary
+        // it stops here, before the wizard or any file.
         const resolveModule: ModuleResolver | undefined =
           typeof import.meta.resolve === 'function'
             ? (specifier) => import.meta.resolve(specifier)
@@ -124,17 +116,13 @@ export function registerAgentInstall(agent: Command): void {
         console.log(`Service name: ${serviceName}`);
         console.log(`Instance dir: ${instanceDir}`);
 
-        // Create service manager early so the create-path guard can reconcile
-        // the index against the driver's native scan.
+        // Created before the create-path guard, which reconciles the index against the native scan.
         const manager = await createServiceManager(platform);
 
-        // Create-path guard: refuse to clobber a same-named foreign instance
-        // (one already installed at a different path, or one discovered in the
-        // init system with no manifest yet). --force overrides.
-        //
-        // The scan names no driver, so it covers every candidate one: a compose
-        // agent of this name on a systemd host is a clobber the
-        // single-driver scan could not see.
+        // Refuse to clobber a same-named foreign instance (installed at another
+        // path, or found in the init system with no manifest) unless --force.
+        // The scan names no driver, so it also sees e.g. a compose agent of this
+        // name on a systemd host.
         const existingInstances = await listInstances({
           component: 'agent',
           isUserLevel: userLevel,
@@ -150,23 +138,20 @@ export function registerAgentInstall(agent: Command): void {
           process.exit(1);
         }
 
-        // Resolve directories
         const configDir = getConfigDir(serviceName, userLevel);
         const logDir = getLogDir(serviceName, userLevel);
 
-        // Ensure directories exist
         fs.mkdirSync(configDir, { recursive: true });
         fs.mkdirSync(logDir, { recursive: true });
 
         const envFilePath = path.join(configDir, `${serviceName}.env`);
 
         // On Windows a file mode protects nothing: restrict the folder before
-        // the first secret lands in it, so the env file and the temporary file
-        // its write stages through are never readable by other accounts. A
-        // user-level folder sits in the profile of its user, already private.
+        // the first secret lands, so neither the env file nor the temporary file
+        // its write stages through is readable by other accounts. A user-level
+        // folder is already private in its user's profile.
         if (platform === 'windows' && !userLevel) restrictEnvFileAccess(envFilePath);
 
-        // Handle wizard mode
         if (opts.wizard) {
           const { runAgentWizard } = await import('../../wizard/agent-wizard.js');
           const wizardConfig = await runAgentWizard();
@@ -202,20 +187,16 @@ export function registerAgentInstall(agent: Command): void {
           console.log(`Created env file at ${envFilePath}`);
         }
 
-        // The env file carries KICI_AGENT_TOKEN, so it is owner-readable only.
-        // Each branch above stages its write through a sibling temporary at
-        // that mode, so the file is never briefly readable by anyone else. This
-        // chmod covers the remaining case: an install that wrote nothing
-        // because the file was already there, at whatever mode it had.
+        // The env file carries KICI_AGENT_TOKEN, so it is owner-readable only. The
+        // writes above stage through a temp file at that mode; this chmod covers
+        // a pre-existing file the install left untouched.
         if (fs.existsSync(envFilePath)) {
           fs.chmodSync(envFilePath, ENV_FILE_MODE);
         }
 
-        // Resolve the run command. With an explicit --binary we run it directly
-        // (assumed self-launching). Otherwise we run Node against the installed
-        // agent server entry (dist/server.js) — `npm install -g kici-admin`
-        // exposes only the CLI bin, not a self-launching agent server binary, so
-        // a bare Node with no script argument would just open a REPL.
+        // --binary runs directly (assumed self-launching). Otherwise Node runs the
+        // agent server entry: `npm install -g kici-admin` exposes only the CLI
+        // bin, and a bare Node with no script opens a REPL.
         const entryScript = opts.binary
           ? undefined
           : resolveServerScript('@kici-dev/agent/server', 'agent', resolveModule);
@@ -225,14 +206,12 @@ export function registerAgentInstall(agent: Command): void {
           entryScript,
         });
 
-        // Build ServiceConfig
         const config: ServiceConfig = {
           name: serviceName,
           ...SERVICE_TEXT.agent,
           executablePath,
           args,
-          // Bake the install-time node bin dir onto the service PATH so
-          // workflow steps can find node even when --binary wraps it.
+          // On the service PATH, so steps find node even when --binary wraps it.
           nodeBinDir: path.dirname(process.execPath),
           envFilePath,
           workingDirectory: configDir,
@@ -244,11 +223,9 @@ export function registerAgentInstall(agent: Command): void {
 
         await manager.install(config);
 
-        // Write the instance manifest into the deploy folder. This is the
-        // single source of truth every lifecycle command reads to reconstruct
-        // the ServiceConfig without re-deriving paths. A re-install of this
-        // instance updates the manifest already there: it keeps the creation
-        // time, and records the version the launcher runs.
+        // The manifest is the source of truth for every lifecycle command. A
+        // re-install updates it, keeping the creation time and recording the
+        // version the launcher runs.
         const manifest: InstanceManifest = {
           component: 'agent',
           name: serviceName,
@@ -268,7 +245,6 @@ export function registerAgentInstall(agent: Command): void {
         );
         if (manifestWarning) console.warn(`Warning: ${manifestWarning}`);
 
-        // Register the instance in the host-wide index cache.
         try {
           appendIndexEntry(kiciRoot, {
             component: 'agent',
@@ -278,9 +254,8 @@ export function registerAgentInstall(agent: Command): void {
             instanceDir,
           });
         } catch (err) {
-          // appendIndexEntry throws on a same-name-different-dir collision; at
-          // this point the unit is already installed, so warn loudly rather
-          // than tear down the install.
+          // Throws on a same-name, different-dir collision; the unit is already
+          // installed, so warn rather than tear it down.
           console.warn(`Warning: instance index append failed: ${(err as Error).message}`);
         }
 

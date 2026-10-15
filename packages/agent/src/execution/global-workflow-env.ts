@@ -1,20 +1,15 @@
 /**
- * The single writer of the seven `KICI_*` ambient env keys a global workflow's
- * user code sees.
+ * The single writer of the `KICI_*` ambient env keys a global workflow's user
+ * code sees, shared by the sandbox and the pre-dispatch global eval round in
+ * the agent process. It cannot live in `sandbox/workflow-runner.ts`: that
+ * module calls `main()` at import time.
  *
- * It lives here rather than in `sandbox/workflow-runner.ts` because that module
- * calls `main()` at import time — it is the sandbox process entry point — so the
- * agent's own process cannot import it. The pre-dispatch global eval round runs
- * in the agent process and must set exactly the same keys the sandbox does.
- *
- * Why exactly the same keys: `extractAndNormalizeSteps` hands a `DynamicJobFn`
- * `process.env` as its `env`, and a generator is evaluated twice — once
- * pre-dispatch, once inside the sandbox to recover the step closures a `LockJob`
- * cannot carry. A generator that reads `process.env.KICI_SOURCE_REPO_PATH` and
- * gets a value on one call and `undefined` on the other has seen two different
- * worlds, which `extractStepsFromDynamicJob` turns into a hard determinism
- * failure. `buildGeneratorContext` keeps the two contexts' *shape* identical; it
- * cannot keep the ambient env identical, which is what this does.
+ * Both sides must set exactly the same keys. A `DynamicJobFn` gets
+ * `process.env` as its `env` and is evaluated twice (pre-dispatch, then in the
+ * sandbox to recover the step closures a `LockJob` cannot carry); a value on
+ * one call and `undefined` on the other is a hard determinism failure in
+ * `extractStepsFromDynamicJob`. `buildGeneratorContext` keeps the contexts'
+ * shape identical; this keeps the ambient env identical.
  */
 
 import type { RepoInfo } from '@kici-dev/sdk';
@@ -45,28 +40,20 @@ export const GLOBAL_WORKFLOW_ENV_KEYS = [
 ] as const;
 
 /**
- * Inject the seven global-workflow env keys and return a restorer that puts
- * `process.env` back exactly as it was — each key reset to its prior value, or
- * deleted if it had none.
+ * Inject the global-workflow env keys and return a restorer that resets each
+ * key to its prior value, or deletes it if it had none.
  *
- * **The restorer is mandatory for any caller in a long-lived process.** The
- * sandbox may ignore it: it runs one job per forked child, which exits. The
- * pre-dispatch global eval round may NOT: it runs in the agent process, which
- * serves many dispatches from one `JobRunner`. Leaving the keys set there is
- * this module's own hazard running backwards — a later NON-global
- * `DynamicJobFn` evaluation builds its generator context with
- * `env: process.env` still carrying `KICI_IS_GLOBAL_WORKFLOW=true` and a
- * `KICI_SOURCE_REPO_PATH` pointing at a deleted work directory, while that
- * job's own sandbox re-evaluation sees neither (`buildSanitizedEnv` scrubs the
- * whole `KICI_*` namespace on the trusted profile, and the default profile is
- * allowlist-only). That is the same two-worlds determinism failure, injected
- * into an unrelated job.
+ * **The restorer is mandatory in a long-lived process.** The sandbox may skip
+ * it (one job per forked child, which exits); the agent-process eval round may
+ * not. Left set there, a later non-global `DynamicJobFn` sees
+ * `KICI_IS_GLOBAL_WORKFLOW=true` and a `KICI_SOURCE_REPO_PATH` to a deleted
+ * work directory while its sandbox re-evaluation sees neither
+ * (`buildSanitizedEnv` drops `KICI_*` on both profiles): the same determinism
+ * failure, in an unrelated job.
  *
- * `RepoInfo.ref` / `.sha` are optional, so an evaluation with no checkout
- * metadata writes an empty string rather than leaving the key unset — matching
- * how `KICI_WORKFLOW_REPO` already handles a missing identifier. Assigning
- * `undefined` to a `process.env` key would stringify to `"undefined"`, which is
- * worse than either.
+ * A missing `RepoInfo.ref` / `.sha` writes an empty string, as
+ * `KICI_WORKFLOW_REPO` does for a missing identifier; assigning `undefined`
+ * would stringify to `"undefined"`.
  */
 export function applyGlobalWorkflowEnv(repos: GlobalWorkflowRepos): () => void {
   const prior = GLOBAL_WORKFLOW_ENV_KEYS.map((key) => [key, process.env[key]] as const);

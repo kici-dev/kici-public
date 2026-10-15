@@ -128,7 +128,6 @@ describe('secret output full round-trip', () => {
     const { publicKey, privateKey } = generateRunKeyPair();
     const runPublicKeyBase64 = publicKey.toString('base64');
 
-    // Agent 1 encrypts
     const agent1Outputs = simulateAgentEncrypt(
       { TOKEN_A: 'value-from-agent-1' },
       runPublicKeyBase64,
@@ -159,7 +158,6 @@ describe('secret output full round-trip', () => {
       run1.publicKey.toString('base64'),
     );
 
-    // Attempting to decrypt with run2's private key should fail
     expect(() => decryptSecretOutput(agentOutputs['SECRET'], run2.privateKey)).toThrow();
   });
 

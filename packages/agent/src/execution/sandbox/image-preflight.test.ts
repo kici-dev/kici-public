@@ -70,8 +70,7 @@ describe('assertImageRunnable', () => {
     await assertImageRunnable(docker, 'python:3.12-slim');
     expect(PROBE_PATHS).toContain('/bin/sh');
     expect(PROBE_PATHS).toContain('/lib/ld-musl-x86_64.so.1');
-    // The probe must never start the container — a shell-less or musl image
-    // cannot run anything, and starting one would be a second failure mode.
+    // A shell-less or musl image cannot run anything; starting it adds a failure mode.
     expect(createContainer).toHaveBeenCalledTimes(1);
   });
 });

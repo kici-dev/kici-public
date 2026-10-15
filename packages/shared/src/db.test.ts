@@ -56,12 +56,11 @@ describe('createPool error handling', () => {
 });
 
 /**
- * The `onAcquire` hook. Driven by stubbing `pg.Pool.prototype.connect` rather
- * than by reaching a real database: `createPool` captures the prototype method
- * as the delegate at construction time, so a stub installed first IS the
- * underlying acquire. That keeps this file database-free like the rest of it,
- * and lets a rejection be shaped exactly (an acquire timeout vs a connection
- * error), which a live pool cannot do on demand.
+ * The `onAcquire` hook, driven by stubbing `pg.Pool.prototype.connect`:
+ * `createPool` captures it as the delegate at construction, so a stub installed
+ * first IS the acquire. That keeps the file database-free and shapes a
+ * rejection exactly (acquire timeout vs connection error), which a live pool
+ * cannot do on demand.
  */
 describe('createPool onAcquire', () => {
   afterEach(() => vi.restoreAllMocks());

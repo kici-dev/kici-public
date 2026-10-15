@@ -2,15 +2,14 @@
  * A coordinator's own peer credential.
  *
  * Credential rows are otherwise written only by the inbound side of a token
- * join, so a coordinator without a join token would never hold one and every
- * outbound peer connection it opened would fail to authenticate. Every
- * coordinator writes to the shared cluster database, the same authority
- * `kici-admin peer create-token` writes to, so the coordinator's
- * `PeerAuthCoordinator` runs this the first time a peer client has no other
- * way to authenticate. A coordinator that never dials a peer never runs it.
+ * join, so a coordinator without a join token would hold none and fail every
+ * outbound peer auth. A coordinator writes the shared cluster database, the
+ * authority `kici-admin peer create-token` writes, so its `PeerAuthCoordinator`
+ * runs this the first time a peer client has no other way to authenticate; a
+ * coordinator that never dials a peer never runs it.
  *
- * A credential an operator revoked is never re-issued. An operator revoke
- * leaves the instance no unrevoked row and marks nothing else; the supersede in
+ * An operator-revoked credential is never re-issued. An operator revoke leaves
+ * no unrevoked row and marks nothing else; the supersede in
  * `PeerCredentialStore.save()` always inserts an unrevoked row, and a
  * retirement (below) marks the row with `RETIRED_BY_INSTANCE_KEY`.
  *
@@ -66,11 +65,10 @@ export enum RejectionCorroboration {
 }
 
 /**
- * The `corroborateRejection` callback a coordinator's `PeerAuthCoordinator`
- * runs before it deletes its credential file after a peer rejected it. Any
- * dialled endpoint can send a rejection, so the coordinator's own database
- * decides: an expired or revoked row does not hold the credential, and the file
- * then goes so the self-issue path reconciles.
+ * The `corroborateRejection` callback run before deleting the credential file
+ * after a peer rejected it. Any dialled endpoint can send a rejection, so the
+ * coordinator's own database decides: an expired or revoked row does not hold
+ * the credential, and the file then goes so the self-issue path reconciles.
  */
 export function coordinatorRejectionCorroborator(opts: {
   db: Kysely<Database>;

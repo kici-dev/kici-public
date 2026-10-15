@@ -3,12 +3,12 @@
  * (`cluster_meta.cluster_id`) and the durable S3 sentinel
  * (`<prefix>/.kici-cluster-id`).
  *
- * Used by `kici-admin cluster reconcile-identity`, which a deploy can run as a
- * pre-orchestrator-start self-heal step. Talks DB + S3 directly (never the
- * orchestrator HTTP admin API) so it works while the orchestrator process is
- * down — which is exactly when a "Cluster identity mismatch" boot failure needs
- * fixing. Default direction restores the DB FROM the durable sentinel (the
- * cross-restart / peer anchor); `sentinel-from-db` reverses it.
+ * Backs `kici-admin cluster reconcile-identity`, a pre-start self-heal step. It
+ * talks DB + S3 directly, never the orchestrator HTTP admin API, so it works
+ * while the orchestrator is down — exactly when a "Cluster identity mismatch"
+ * boot failure needs fixing. The default direction restores the DB from the
+ * durable sentinel (the cross-restart / peer anchor); `sentinel-from-db`
+ * reverses it.
  */
 import { createPool } from '@kici-dev/shared';
 import type { IdempotentStep } from '@kici-dev/shared/idempotency';
@@ -19,10 +19,9 @@ export type ReconcileDirection = 'db-from-sentinel' | 'sentinel-from-db';
 export interface ReconcileS3Config {
   bucket: string;
   /**
-   * Optional storage prefix (mirrors `KICI_STORAGE_PREFIX`). The sentinel lives
-   * at `<prefix>/.kici-cluster-id`; must match the prefix the orchestrator boots
-   * with. When omitted, `clusterSentinelKey` resolves the bucket root — the same
-   * as the orchestrator's `DEFAULT_CACHE_STORAGE_S3_PREFIX` (empty) default.
+   * Mirrors `KICI_STORAGE_PREFIX` and must match the orchestrator's boot prefix.
+   * When omitted, the sentinel sits at the bucket root, matching the empty
+   * `DEFAULT_CACHE_STORAGE_S3_PREFIX` default.
    */
   prefix?: string;
   region?: string;
@@ -98,9 +97,8 @@ async function writeSentinel(s3: ReconcileS3Config, clusterId: string): Promise<
 }
 
 /**
- * Indirection object for the DB + S3 reads/writes, so the unit test can stub
- * the I/O without an ESM partial-mock dance. `buildReconcileStep` calls every
- * reader/writer through this object; the test overrides its members directly.
+ * `buildReconcileStep` calls all I/O through this object, so the unit test
+ * stubs its members without an ESM partial mock.
  */
 export const reconcileIo = {
   readClusterIdFromDb,
@@ -110,10 +108,9 @@ export const reconcileIo = {
 };
 
 /**
- * Build the idempotent step that reconciles the cluster identity in the given
- * direction. `check()` returns drift when the two sides disagree (or null when
- * in sync); `apply()` performs the single write that brings them into
- * agreement. Run it through `runIdempotentStep` (`@kici-dev/core/idempotency`).
+ * `check()` returns drift when the sides disagree (null when in sync);
+ * `apply()` performs the single write that brings them into agreement. Run it
+ * through `runIdempotentStep` (`@kici-dev/core/idempotency`).
  */
 export function buildReconcileStep(deps: {
   databaseUrl: string;

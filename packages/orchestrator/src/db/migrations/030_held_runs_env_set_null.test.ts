@@ -3,22 +3,15 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m030 from './030_held_runs_env_set_null.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 030.
+ * Real-Postgres test for migration 030: applies 001..030 via the production
+ * provider in a uniquely-named throwaway database (dropped in teardown) and
+ * asserts held_runs.environment_id is nullable with an ON DELETE SET NULL FK.
  *
- * Creates a uniquely-named throwaway database inside the admin Postgres
- * server, applies migrations 001..030 via the production migration
- * provider, and asserts that held_runs.environment_id is nullable with an
- * ON DELETE SET NULL foreign key. The throwaway database is dropped in
- * teardown, so the test never mutates any shared schema or data.
- *
- * The admin connection string comes solely from
- * `KICI_TEST_ADMIN_DATABASE_URL`. The suite is gated on the presence of that
- * env var: when it is unset the suite skips, so it stays runnable in
- * environments without a database. When it is set but the server is
- * unreachable, the test fails loudly rather than skipping green.
+ * Gated on `KICI_TEST_ADMIN_DATABASE_URL`: unset skips; set but unreachable
+ * fails loudly rather than skipping green.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 
@@ -58,8 +51,7 @@ describeDb('migration 030_held_runs_env_set_null', () => {
     return result.rows[0]?.confdeltype;
   };
 
-  // describeDb only runs when KICI_TEST_ADMIN_DATABASE_URL is set, so the
-  // non-null assertion is safe inside the suite body.
+  // describeDb only runs when KICI_TEST_ADMIN_DATABASE_URL is set.
   const adminUrl = ADMIN_URL!;
 
   beforeAll(async () => {
@@ -73,8 +65,7 @@ describeDb('migration 030_held_runs_env_set_null', () => {
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
 
-    // Apply migrations 001..030 via the production provider so the
-    // held_runs table the constraint attaches to actually exists.
+    // Apply 001..030 so the held_runs table the constraint attaches to exists.
     const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
@@ -85,7 +76,6 @@ describeDb('migration 030_held_runs_env_set_null', () => {
 
     const adminPool = new pg.Pool({ connectionString: adminUrl });
     try {
-      // Terminate any lingering backends before dropping.
       await terminateTestDbBackends(adminPool, TEST_DB);
       await adminPool.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {
@@ -114,7 +104,6 @@ describeDb('migration 030_held_runs_env_set_null', () => {
     expect(await columnIsNullable()).toBe('NO');
     expect(await fkDeleteAction()).toBe('a');
 
-    // Re-apply so the schema is restored to the migrated state.
     await m030.up(db);
     expect(await columnIsNullable()).toBe('YES');
     expect(await fkDeleteAction()).toBe('n');

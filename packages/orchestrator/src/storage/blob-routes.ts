@@ -1,14 +1,10 @@
 /**
- * HTTP routes for the filesystem cache backend.
+ * Filesystem cache backend routes. `FilesystemCacheStorage` mints signed
+ * `http://<orch>/api/v1/cache/blob/<key>?sig=<token>` URLs for agent GETs and PUTs; these
+ * routes verify the HMAC token, reject path traversal, and stream to / from `basePath`.
  *
- * `FilesystemCacheStorage` mints signed `http://<orch>/api/v1/cache/blob/<key>?sig=<token>`
- * URLs that the agent uses to GET cached bytes or PUT new uploads. These
- * routes verify the HMAC token, reject path traversal, and stream content
- * to / from disk under the configured `basePath`.
- *
- * The S3 backend doesn't go through these routes — it uses real pre-signed
- * URLs against the S3 endpoint. These routes are mounted only when the
- * filesystem backend is active (`deps.fsCache` truthy in app.ts).
+ * Mounted only when the filesystem backend is active (`deps.fsCache` in app.ts); S3 uses real
+ * pre-signed URLs instead.
  */
 
 import type { Hono } from 'hono';
@@ -23,13 +19,9 @@ import { stream as honoStream } from 'hono/streaming';
 import { verifyToken } from './sign-url.js';
 
 /**
- * URL prefix for the filesystem-backend blob transfer route. The app-level
- * webhook body-size cap MUST exempt this prefix: blob PUTs carry internal
- * artifacts (dependency tarballs up to `cacheMaxTarballBytes`, 500MB by
- * default), which the S3 backend uploads direct-to-S3 uncapped. Binding them
- * to the tenant-webhook body limit would 413 legitimate large caches on the
- * filesystem backend. The PUT route below enforces its own `maxUploadBytes`
- * bound instead.
+ * The app-level webhook body-size cap MUST exempt this prefix: blob PUTs carry dependency
+ * tarballs up to `cacheMaxTarballBytes` (500MB default), which S3 uploads uncapped, and the
+ * webhook limit would 413 them. The PUT route enforces its own `maxUploadBytes` instead.
  */
 export const CACHE_BLOB_PATH_PREFIX = '/api/v1/cache/blob/';
 
@@ -37,9 +29,8 @@ export interface FsCacheRouteDeps {
   basePath: string;
   signingSecret: string;
   /**
-   * Upper bound on a single blob PUT, in bytes. Aligned with the dep-cache's
-   * `cacheMaxTarballBytes` (500MB default) so the filesystem backend accepts
-   * the same artifact sizes the S3 backend does.
+   * Bytes per blob PUT; aligned with `cacheMaxTarballBytes` (500MB default) so the filesystem
+   * backend accepts the sizes S3 does.
    */
   maxUploadBytes: number;
 }
@@ -94,8 +85,7 @@ export function registerBlobRoutes(app: Hono, deps: FsCacheRouteDeps): void {
     const filePath = join(basePath, key);
     await fsPromises.mkdir(dirname(filePath), { recursive: true });
 
-    // Atomic write: stream into a temp sibling, fsync, rename. Prevents
-    // half-written files from being readable if the connection drops.
+    // Temp sibling, fsync, rename: a dropped connection never leaves a readable half-file.
     const tmpPath = `${filePath}.tmp-${randomBytes(6).toString('hex')}`;
     const handle = await fsPromises.open(tmpPath, 'w');
     try {
@@ -117,16 +107,14 @@ export function registerBlobRoutes(app: Hono, deps: FsCacheRouteDeps): void {
 }
 
 /**
- * Validate a cache key. Returns an error message string if invalid, or
- * `null` if the key is acceptable. Rejects:
+ * Returns an error message, or `null` for an acceptable key. Rejects:
  *
  *   - empty / NUL-containing keys
  *   - `..` path-traversal segments
  *   - leading or empty path segments (`/foo`, `foo//bar`)
  *
- * The same validation runs both at URL-signing time
- * (`FilesystemCacheStorage.resolvePath`) and at request-handling time, so a
- * malicious URL with a bad path can't reach the filesystem.
+ * Runs at URL-signing time (`FilesystemCacheStorage.resolvePath`) and at request time, so a
+ * malicious URL with a bad path cannot reach the filesystem.
  */
 function validateKey(key: string): string | null {
   if (!key || key.includes('\0')) return 'Invalid key';

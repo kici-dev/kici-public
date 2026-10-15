@@ -381,10 +381,10 @@ const npmTool = await resolveHostNpm();
 const pnpmTool = await resolvePinnedPnpm();
 
 /**
- * Real installs against the agent's own npm and the pinned pnpm, on projects
- * with no dependencies (no network). Each case has a positive control: the
- * same hostile file, used by the same package manager run the ordinary way in
- * the checkout, does execute — so the host path's clean result is not a
+ * Real installs with the agent's own npm and the pinned pnpm, on projects with
+ * no dependencies (no network). Each case's positive control runs the same
+ * hostile file through the same package manager the ordinary way in the
+ * checkout and sees it execute, so the host path's clean result is not a
  * vector that could never fire.
  */
 describe('runHostIsolatedInstall — real package managers', () => {
@@ -431,11 +431,10 @@ describe('runHostIsolatedInstall — real package managers', () => {
         }),
       );
 
-      // The eligibility check refuses this project; the installer itself must
-      // hold even when called directly: --allow-git=none refuses the fetch and
-      // the repository's .npmrc is never the config npm reads. The error must
-      // name the git refusal: one raised before the fetch (a missing lockfile,
-      // say) would leave the flag untested.
+      // Eligibility refuses this project, but the installer must hold when
+      // called directly: --allow-git=none refuses the fetch, and npm never reads
+      // the repository's .npmrc. The error must name the git refusal; one raised
+      // before the fetch (e.g. a missing lockfile) leaves the flag untested.
       const failure = (await runHostIsolatedInstall({
         kiciDir: kici,
         plan: {
@@ -459,10 +458,10 @@ describe('runHostIsolatedInstall — real package managers', () => {
       // so npm spawns the repository's git= program to fetch the dependency.
       expect(existsSync(marker)).toBe(false);
 
-      // Positive control: npm run in the checkout the ordinary way (scripts
-      // disabled) spawns it. `--allow-git=all` is npm 11's default; npm 12
-      // defaults to none, so the control states it to stay live on every npm
-      // the host install runs (11.10.0 and later all know the flag).
+      // Positive control: npm in the checkout the ordinary way (scripts
+      // disabled) spawns it. `--allow-git=all` is npm 11's default and npm 12's
+      // is none, so the control states it to stay live on every host-install npm
+      // (11.10.0 and later know the flag).
       try {
         execFileSync(
           npmTool!.nodeExe,

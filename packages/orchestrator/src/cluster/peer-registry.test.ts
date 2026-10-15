@@ -2,6 +2,34 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { PeerLinkDirection, PeerRegistry } from './peer-registry.js';
 import { PeerAuthScheme, type PeerHeartbeat } from '@kici-dev/engine';
 
+type PeerInit = Parameters<PeerRegistry['addPeer']>[0];
+
+/** The `addPeer` argument the cases start from: `orch-1` on `conn-1`, no address, no keys. */
+function peerInit(overrides: Partial<PeerInit> = {}): PeerInit {
+  return {
+    instanceId: 'orch-1',
+    connectionId: 'conn-1',
+    address: null,
+    routingKeys: [],
+    ...overrides,
+  };
+}
+
+/** A term-1 heartbeat from `orch-1`: no leader, not draining, no agents, no S3 log access. */
+function peerHeartbeat(overrides: Partial<PeerHeartbeat> = {}): PeerHeartbeat {
+  return {
+    type: 'peer.heartbeat',
+    instanceId: 'orch-1',
+    term: 1,
+    leaderId: null,
+    draining: false,
+    agents: [],
+    capabilities: { s3LogAccess: false },
+    timestamp: Date.now(),
+    ...overrides,
+  };
+}
+
 describe('authScheme per link direction', () => {
   const add = (r: PeerRegistry) =>
     r.addPeer({ instanceId: 'p', connectionId: 'c', address: null, routingKeys: [] });
@@ -57,12 +85,7 @@ describe('PeerRegistry', () => {
 
   describe('addPeer / removePeer', () => {
     it('should add a peer and retrieve it', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: 'ws://192.168.1.10:8080',
-        routingKeys: ['github:42'],
-      });
+      registry.addPeer(peerInit({ address: 'ws://192.168.1.10:8080', routingKeys: ['github:42'] }));
 
       const peer = registry.getPeer('orch-1');
       expect(peer).toBeDefined();
@@ -79,20 +102,10 @@ describe('PeerRegistry', () => {
     });
 
     it('should reset capabilities on re-add (clean reconnect)', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: 'ws://192.168.1.10:8080',
-        routingKeys: ['github:42'],
-      });
+      registry.addPeer(peerInit({ address: 'ws://192.168.1.10:8080', routingKeys: ['github:42'] }));
 
-      // Simulate heartbeat to add agents
-      const heartbeat: PeerHeartbeat = {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
+      const heartbeat: PeerHeartbeat = peerHeartbeat({
         leaderId: 'orch-1',
-        draining: false,
         agents: [
           {
             agentId: 'agent-1',
@@ -105,19 +118,19 @@ describe('PeerRegistry', () => {
           },
         ],
         capabilities: { s3LogAccess: true },
-        timestamp: Date.now(),
-      };
+      });
       registry.updateHeartbeat('orch-1', heartbeat);
 
       // Disconnect first, then re-add (realistic reconnect scenario)
       registry.markDisconnected('orch-1');
 
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-2',
-        address: 'ws://192.168.1.10:8080',
-        routingKeys: ['github:42', 'github:99'],
-      });
+      registry.addPeer(
+        peerInit({
+          connectionId: 'conn-2',
+          address: 'ws://192.168.1.10:8080',
+          routingKeys: ['github:42', 'github:99'],
+        }),
+      );
 
       const peer = registry.getPeer('orch-1');
       expect(peer!.connectionId).toBe('conn-2');
@@ -130,12 +143,7 @@ describe('PeerRegistry', () => {
     });
 
     it('should remove a peer', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       expect(registry.getPeerCount()).toBe(1);
 
@@ -151,12 +159,7 @@ describe('PeerRegistry', () => {
     });
 
     it('should handle null address', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       expect(registry.getPeer('orch-1')!.address).toBeNull();
     });
@@ -166,16 +169,9 @@ describe('PeerRegistry', () => {
 
   describe('updateHeartbeat', () => {
     it('should update agent inventory from heartbeat', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
-      const heartbeat: PeerHeartbeat = {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
+      const heartbeat: PeerHeartbeat = peerHeartbeat({
         term: 2,
         leaderId: 'orch-2',
         draining: true,
@@ -201,7 +197,7 @@ describe('PeerRegistry', () => {
         ],
         capabilities: { s3LogAccess: true, logRoutingOverride: 'direct' },
         timestamp: 1700000000000,
-      };
+      });
 
       registry.updateHeartbeat('orch-1', heartbeat);
 
@@ -226,12 +222,7 @@ describe('PeerRegistry', () => {
       // Diagnostics groups a peer's agents under the correct scaler row, so the
       // heartbeat's per-agent scalerName must survive into the registry. Legacy
       // peers that omit the field surface as null (treated as static/stateful).
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       registry.updateHeartbeat('orch-1', {
         type: 'peer.heartbeat',
@@ -273,83 +264,61 @@ describe('PeerRegistry', () => {
     });
 
     it('should replace previous agent inventory on heartbeat update', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       // First heartbeat with 2 agents
-      registry.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [
-          {
-            agentId: 'agent-1',
-            labels: ['linux'],
-            activeJobs: 0,
-            maxConcurrency: 2,
-            platform: 'linux',
-            arch: 'x64',
-            mandatoryLabels: [],
-          },
-          {
-            agentId: 'agent-2',
-            labels: ['linux'],
-            activeJobs: 0,
-            maxConcurrency: 2,
-            platform: 'linux',
-            arch: 'x64',
-            mandatoryLabels: [],
-          },
-        ],
-        capabilities: { s3LogAccess: false },
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat(
+        'orch-1',
+        peerHeartbeat({
+          agents: [
+            {
+              agentId: 'agent-1',
+              labels: ['linux'],
+              activeJobs: 0,
+              maxConcurrency: 2,
+              platform: 'linux',
+              arch: 'x64',
+              mandatoryLabels: [],
+            },
+            {
+              agentId: 'agent-2',
+              labels: ['linux'],
+              activeJobs: 0,
+              maxConcurrency: 2,
+              platform: 'linux',
+              arch: 'x64',
+              mandatoryLabels: [],
+            },
+          ],
+        }),
+      );
 
       expect(registry.getPeer('orch-1')!.agents).toHaveLength(2);
 
       // Second heartbeat with 1 agent (agent-2 went away)
-      registry.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [
-          {
-            agentId: 'agent-1',
-            labels: ['linux'],
-            activeJobs: 1,
-            maxConcurrency: 2,
-            platform: 'linux',
-            arch: 'x64',
-            mandatoryLabels: [],
-          },
-        ],
-        capabilities: { s3LogAccess: false },
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat(
+        'orch-1',
+        peerHeartbeat({
+          agents: [
+            {
+              agentId: 'agent-1',
+              labels: ['linux'],
+              activeJobs: 1,
+              maxConcurrency: 2,
+              platform: 'linux',
+              arch: 'x64',
+              mandatoryLabels: [],
+            },
+          ],
+        }),
+      );
 
       expect(registry.getPeer('orch-1')!.agents).toHaveLength(1);
       expect(registry.getPeer('orch-1')!.agents[0].activeJobs).toBe(1);
     });
 
     it('should ignore heartbeat for unknown peer', () => {
-      registry.updateHeartbeat('unknown', {
-        type: 'peer.heartbeat',
-        instanceId: 'unknown',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat('unknown', peerHeartbeat({ instanceId: 'unknown' }));
 
       expect(registry.getPeer('unknown')).toBeUndefined();
     });
@@ -359,46 +328,21 @@ describe('PeerRegistry', () => {
 
   describe('configVersion', () => {
     it('should initialize configVersion to 0', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       expect(registry.getPeer('orch-1')!.configVersion).toBe(0);
     });
 
     it('should update configVersion from heartbeat', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
-      registry.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        configVersion: 5,
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat('orch-1', peerHeartbeat({ configVersion: 5 }));
 
       expect(registry.getPeer('orch-1')!.configVersion).toBe(5);
     });
 
     it('should treat missing configVersion as 0 (backward compat)', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       registry.updateHeartbeat('orch-1', {
         type: 'peer.heartbeat',
@@ -416,33 +360,13 @@ describe('PeerRegistry', () => {
     });
 
     it('should reset configVersion on reconnect (clean start)', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
-      registry.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        configVersion: 3,
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat('orch-1', peerHeartbeat({ configVersion: 3 }));
 
       // Disconnect, then reconnect — starts clean
       registry.markDisconnected('orch-1');
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-2',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ connectionId: 'conn-2' }));
 
       expect(registry.getPeer('orch-1')!.configVersion).toBe(0);
     });
@@ -452,24 +376,9 @@ describe('PeerRegistry', () => {
       const reg = new PeerRegistry({ onConfigVersionBehind: callback });
       reg.setLocalConfigVersion(2);
 
-      reg.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      reg.addPeer(peerInit());
 
-      reg.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        configVersion: 5,
-        timestamp: Date.now(),
-      });
+      reg.updateHeartbeat('orch-1', peerHeartbeat({ configVersion: 5 }));
 
       expect(callback).toHaveBeenCalledWith(5);
     });
@@ -479,24 +388,9 @@ describe('PeerRegistry', () => {
       const reg = new PeerRegistry({ onConfigVersionBehind: callback });
       reg.setLocalConfigVersion(3);
 
-      reg.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      reg.addPeer(peerInit());
 
-      reg.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        configVersion: 3,
-        timestamp: Date.now(),
-      });
+      reg.updateHeartbeat('orch-1', peerHeartbeat({ configVersion: 3 }));
 
       expect(callback).not.toHaveBeenCalled();
     });
@@ -506,24 +400,9 @@ describe('PeerRegistry', () => {
       const reg = new PeerRegistry({ onConfigVersionBehind: callback });
       // localConfigVersion defaults to 0
 
-      reg.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      reg.addPeer(peerInit());
 
-      reg.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        configVersion: 5,
-        timestamp: Date.now(),
-      });
+      reg.updateHeartbeat('orch-1', peerHeartbeat({ configVersion: 5 }));
 
       expect(callback).not.toHaveBeenCalled();
     });
@@ -533,24 +412,9 @@ describe('PeerRegistry', () => {
       const reg = new PeerRegistry({ onConfigVersionBehind: callback });
       reg.setLocalConfigVersion(3);
 
-      reg.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      reg.addPeer(peerInit());
 
-      reg.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        configVersion: 0,
-        timestamp: Date.now(),
-      });
+      reg.updateHeartbeat('orch-1', peerHeartbeat({ configVersion: 0 }));
 
       expect(callback).not.toHaveBeenCalled();
     });
@@ -630,46 +494,21 @@ describe('PeerRegistry', () => {
 
   describe('registryVersion', () => {
     it('should initialize registryVersion to 0', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       expect(registry.getPeer('orch-1')!.registryVersion).toBe(0);
     });
 
     it('should update registryVersion from heartbeat', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
-      registry.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        registryVersion: 7,
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat('orch-1', peerHeartbeat({ registryVersion: 7 }));
 
       expect(registry.getPeer('orch-1')!.registryVersion).toBe(7);
     });
 
     it('should treat missing registryVersion as 0 (backward compat)', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       registry.updateHeartbeat('orch-1', {
         type: 'peer.heartbeat',
@@ -687,33 +526,13 @@ describe('PeerRegistry', () => {
     });
 
     it('should reset registryVersion on reconnect (clean start)', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
-      registry.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        registryVersion: 4,
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat('orch-1', peerHeartbeat({ registryVersion: 4 }));
 
       // Disconnect, then reconnect — starts clean
       registry.markDisconnected('orch-1');
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-2',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ connectionId: 'conn-2' }));
 
       expect(registry.getPeer('orch-1')!.registryVersion).toBe(0);
     });
@@ -723,24 +542,9 @@ describe('PeerRegistry', () => {
       const reg = new PeerRegistry({ onRegistryVersionBehind: callback });
       reg.setLocalRegistryVersion(2);
 
-      reg.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      reg.addPeer(peerInit());
 
-      reg.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        registryVersion: 5,
-        timestamp: Date.now(),
-      });
+      reg.updateHeartbeat('orch-1', peerHeartbeat({ registryVersion: 5 }));
 
       expect(callback).toHaveBeenCalledWith(5);
     });
@@ -750,24 +554,9 @@ describe('PeerRegistry', () => {
       const reg = new PeerRegistry({ onRegistryVersionBehind: callback });
       reg.setLocalRegistryVersion(3);
 
-      reg.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      reg.addPeer(peerInit());
 
-      reg.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        registryVersion: 3,
-        timestamp: Date.now(),
-      });
+      reg.updateHeartbeat('orch-1', peerHeartbeat({ registryVersion: 3 }));
 
       expect(callback).not.toHaveBeenCalled();
     });
@@ -777,24 +566,9 @@ describe('PeerRegistry', () => {
       const reg = new PeerRegistry({ onRegistryVersionBehind: callback });
       // localRegistryVersion defaults to 0
 
-      reg.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      reg.addPeer(peerInit());
 
-      reg.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        registryVersion: 5,
-        timestamp: Date.now(),
-      });
+      reg.updateHeartbeat('orch-1', peerHeartbeat({ registryVersion: 5 }));
 
       expect(callback).not.toHaveBeenCalled();
     });
@@ -804,24 +578,9 @@ describe('PeerRegistry', () => {
       const reg = new PeerRegistry({ onRegistryVersionBehind: callback });
       reg.setLocalRegistryVersion(3);
 
-      reg.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      reg.addPeer(peerInit());
 
-      reg.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        registryVersion: 0,
-        timestamp: Date.now(),
-      });
+      reg.updateHeartbeat('orch-1', peerHeartbeat({ registryVersion: 0 }));
 
       expect(callback).not.toHaveBeenCalled();
     });
@@ -840,12 +599,7 @@ describe('PeerRegistry', () => {
       }>,
       opts?: { draining?: boolean; connected?: boolean },
     ) {
-      registry.addPeer({
-        instanceId,
-        connectionId: `conn-${instanceId}`,
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId, connectionId: `conn-${instanceId}` }));
 
       registry.updateHeartbeat(instanceId, {
         type: 'peer.heartbeat',
@@ -978,32 +732,23 @@ describe('PeerRegistry', () => {
     // ── Scaler-aware capacity checks ──────────────────────────────────
 
     it('should find peer with zero agents but scaler capacity for matching labels', () => {
-      registry.addPeer({
-        instanceId: 'orch-scaler',
-        connectionId: 'conn-scaler',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-scaler', connectionId: 'conn-scaler' }));
 
       // Heartbeat with zero agents but scaler capacity
-      registry.updateHeartbeat('orch-scaler', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-scaler',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          {
-            labelSets: [['linux', 'x64']],
-            maxAgents: 5,
-            activeCount: 2,
-            labelSetMandatoryLabels: [[]],
-          },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat(
+        'orch-scaler',
+        peerHeartbeat({
+          instanceId: 'orch-scaler',
+          scalerCapacity: [
+            {
+              labelSets: [['linux', 'x64']],
+              maxAgents: 5,
+              activeCount: 2,
+              labelSetMandatoryLabels: [[]],
+            },
+          ],
+        }),
+      );
 
       const matches = registry.findPeersWithCapacity([['linux', 'x64']]);
       expect(matches).toHaveLength(1);
@@ -1011,62 +756,44 @@ describe('PeerRegistry', () => {
     });
 
     it('should NOT find peer with scaler capacity at max', () => {
-      registry.addPeer({
-        instanceId: 'orch-full',
-        connectionId: 'conn-full',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-full', connectionId: 'conn-full' }));
 
-      registry.updateHeartbeat('orch-full', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-full',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          {
-            labelSets: [['linux', 'x64']],
-            maxAgents: 3,
-            activeCount: 3,
-            labelSetMandatoryLabels: [[]],
-          },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat(
+        'orch-full',
+        peerHeartbeat({
+          instanceId: 'orch-full',
+          scalerCapacity: [
+            {
+              labelSets: [['linux', 'x64']],
+              maxAgents: 3,
+              activeCount: 3,
+              labelSetMandatoryLabels: [[]],
+            },
+          ],
+        }),
+      );
 
       const matches = registry.findPeersWithCapacity([['linux', 'x64']]);
       expect(matches).toHaveLength(0);
     });
 
     it('should NOT find peer with scaler capacity for non-matching labels', () => {
-      registry.addPeer({
-        instanceId: 'orch-wrong',
-        connectionId: 'conn-wrong',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-wrong', connectionId: 'conn-wrong' }));
 
-      registry.updateHeartbeat('orch-wrong', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-wrong',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          {
-            labelSets: [['darwin', 'arm64']],
-            maxAgents: 5,
-            activeCount: 0,
-            labelSetMandatoryLabels: [[]],
-          },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat(
+        'orch-wrong',
+        peerHeartbeat({
+          instanceId: 'orch-wrong',
+          scalerCapacity: [
+            {
+              labelSets: [['darwin', 'arm64']],
+              maxAgents: 5,
+              activeCount: 0,
+              labelSetMandatoryLabels: [[]],
+            },
+          ],
+        }),
+      );
 
       const matches = registry.findPeersWithCapacity([['linux', 'x64']]);
       expect(matches).toHaveLength(0);
@@ -1077,7 +804,6 @@ describe('PeerRegistry', () => {
         { agentId: 'a1', labels: ['linux'], activeJobs: 0, maxConcurrency: 2 },
       ]);
 
-      // Verify no scalerCapacity set
       expect(registry.getPeer('orch-legacy')!.scalerCapacity).toBeUndefined();
 
       const matches = registry.findPeersWithCapacity([['linux']]);
@@ -1087,30 +813,21 @@ describe('PeerRegistry', () => {
 
     // ── per-label-set gate on peer scaler-capacity entries ──────────────
     it('routes to peer with gated scaler when required labels include mandatory', () => {
-      registry.addPeer({
-        instanceId: 'orch-gpu',
-        connectionId: 'conn-gpu',
-        address: null,
-        routingKeys: [],
-      });
-      registry.updateHeartbeat('orch-gpu', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-gpu',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          {
-            labelSets: [['linux', 'gpu']],
-            maxAgents: 5,
-            activeCount: 0,
-            labelSetMandatoryLabels: [['gpu']],
-          },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-gpu', connectionId: 'conn-gpu' }));
+      registry.updateHeartbeat(
+        'orch-gpu',
+        peerHeartbeat({
+          instanceId: 'orch-gpu',
+          scalerCapacity: [
+            {
+              labelSets: [['linux', 'gpu']],
+              maxAgents: 5,
+              activeCount: 0,
+              labelSetMandatoryLabels: [['gpu']],
+            },
+          ],
+        }),
+      );
 
       const matches = registry.findPeersWithCapacity([['linux', 'gpu']]);
       expect(matches).toHaveLength(1);
@@ -1118,30 +835,21 @@ describe('PeerRegistry', () => {
     });
 
     it('blocks routing to gated peer when required labels miss the mandatory label', () => {
-      registry.addPeer({
-        instanceId: 'orch-gated',
-        connectionId: 'conn-gated',
-        address: null,
-        routingKeys: [],
-      });
-      registry.updateHeartbeat('orch-gated', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-gated',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          {
-            labelSets: [['linux', 'gpu']],
-            maxAgents: 5,
-            activeCount: 0,
-            labelSetMandatoryLabels: [['gpu']],
-          },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-gated', connectionId: 'conn-gated' }));
+      registry.updateHeartbeat(
+        'orch-gated',
+        peerHeartbeat({
+          instanceId: 'orch-gated',
+          scalerCapacity: [
+            {
+              labelSets: [['linux', 'gpu']],
+              maxAgents: 5,
+              activeCount: 0,
+              labelSetMandatoryLabels: [['gpu']],
+            },
+          ],
+        }),
+      );
 
       // Required labels are a subset of the labelSet, but missing the gate.
       const matches = registry.findPeersWithCapacity([['linux']]);
@@ -1149,30 +857,21 @@ describe('PeerRegistry', () => {
     });
 
     it('routes to peer when the scaler advertises an empty gate', () => {
-      registry.addPeer({
-        instanceId: 'orch-legacy',
-        connectionId: 'conn-legacy',
-        address: null,
-        routingKeys: [],
-      });
-      registry.updateHeartbeat('orch-legacy', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-legacy',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          {
-            labelSets: [['linux', 'x64']],
-            maxAgents: 5,
-            activeCount: 0,
-            labelSetMandatoryLabels: [[]],
-          },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-legacy', connectionId: 'conn-legacy' }));
+      registry.updateHeartbeat(
+        'orch-legacy',
+        peerHeartbeat({
+          instanceId: 'orch-legacy',
+          scalerCapacity: [
+            {
+              labelSets: [['linux', 'x64']],
+              maxAgents: 5,
+              activeCount: 0,
+              labelSetMandatoryLabels: [[]],
+            },
+          ],
+        }),
+      );
 
       const matches = registry.findPeersWithCapacity([['linux']]);
       expect(matches).toHaveLength(1);
@@ -1180,30 +879,21 @@ describe('PeerRegistry', () => {
     });
 
     it('empty required labels do not match a gated scaler (mirrors local matcher)', () => {
-      registry.addPeer({
-        instanceId: 'orch-gated',
-        connectionId: 'conn-gated',
-        address: null,
-        routingKeys: [],
-      });
-      registry.updateHeartbeat('orch-gated', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-gated',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          {
-            labelSets: [['linux', 'gpu']],
-            maxAgents: 5,
-            activeCount: 0,
-            labelSetMandatoryLabels: [['gpu']],
-          },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-gated', connectionId: 'conn-gated' }));
+      registry.updateHeartbeat(
+        'orch-gated',
+        peerHeartbeat({
+          instanceId: 'orch-gated',
+          scalerCapacity: [
+            {
+              labelSets: [['linux', 'gpu']],
+              maxAgents: 5,
+              activeCount: 0,
+              labelSetMandatoryLabels: [['gpu']],
+            },
+          ],
+        }),
+      );
 
       // Empty required labels: a gated scaler cannot match.
       const matches = registry.findPeersWithCapacity([[]]);
@@ -1211,30 +901,21 @@ describe('PeerRegistry', () => {
     });
 
     it('rejects an unqualified bare-metal job against a windows-tainted scaler', () => {
-      registry.addPeer({
-        instanceId: 'orch-win',
-        connectionId: 'conn-win',
-        address: null,
-        routingKeys: [],
-      });
-      registry.updateHeartbeat('orch-win', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-win',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          {
-            labelSets: [['windows', 'bare-metal']],
-            maxAgents: 2,
-            activeCount: 0,
-            labelSetMandatoryLabels: [['windows']],
-          },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-win', connectionId: 'conn-win' }));
+      registry.updateHeartbeat(
+        'orch-win',
+        peerHeartbeat({
+          instanceId: 'orch-win',
+          scalerCapacity: [
+            {
+              labelSets: [['windows', 'bare-metal']],
+              maxAgents: 2,
+              activeCount: 0,
+              labelSetMandatoryLabels: [['windows']],
+            },
+          ],
+        }),
+      );
 
       // An OS-agnostic bare-metal job must not land on the windows pool.
       expect(registry.findPeersWithCapacity([['bare-metal']])).toHaveLength(0);
@@ -1245,34 +926,24 @@ describe('PeerRegistry', () => {
     });
 
     it('gates a structured-field windows pool with a non-canonical plain label', () => {
-      registry.addPeer({
-        instanceId: 'orch-win2022',
-        connectionId: 'conn-win2022',
-        address: null,
-        routingKeys: [],
-      });
-      // The pool's plain label is `windows-2022`, and the orchestrator derived the taint from the structured `platform`
-      // field and advertises `mandatoryLabels: ['windows']` plus the matchable
-      // `windows` token injected into the labelSet. The peer registry reads the
-      // advertised gate verbatim, so the cross-peer gate is provenance-agnostic.
-      registry.updateHeartbeat('orch-win2022', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-win2022',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          {
-            labelSets: [['windows-2022', 'bare-metal', 'windows']],
-            maxAgents: 2,
-            activeCount: 0,
-            labelSetMandatoryLabels: [['windows']],
-          },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-win2022', connectionId: 'conn-win2022' }));
+      // Plain label `windows-2022`; the taint derives from the structured `platform`
+      // field, advertised as `mandatoryLabels: ['windows']` plus a `windows` token in
+      // the labelSet. The registry reads the gate verbatim, whatever its provenance.
+      registry.updateHeartbeat(
+        'orch-win2022',
+        peerHeartbeat({
+          instanceId: 'orch-win2022',
+          scalerCapacity: [
+            {
+              labelSets: [['windows-2022', 'bare-metal', 'windows']],
+              maxAgents: 2,
+              activeCount: 0,
+              labelSetMandatoryLabels: [['windows']],
+            },
+          ],
+        }),
+      );
 
       // An unqualified bare-metal job must not land on the structured windows pool.
       expect(registry.findPeersWithCapacity([['bare-metal']])).toHaveLength(0);
@@ -1283,12 +954,7 @@ describe('PeerRegistry', () => {
     });
 
     it('matches a peer agent whose labels differ from the requirement only by case', () => {
-      registry.addPeer({
-        instanceId: 'orch-case',
-        connectionId: 'conn-case',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-case', connectionId: 'conn-case' }));
       registry.updateHeartbeat('orch-case', {
         type: 'peer.heartbeat',
         instanceId: 'orch-case',
@@ -1321,12 +987,7 @@ describe('PeerRegistry', () => {
     });
 
     it('honours a peer-agent mandatory gate that differs from the requirement only by case', () => {
-      registry.addPeer({
-        instanceId: 'orch-gate',
-        connectionId: 'conn-gate',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-gate', connectionId: 'conn-gate' }));
       registry.updateHeartbeat('orch-gate', {
         type: 'peer.heartbeat',
         instanceId: 'orch-gate',
@@ -1361,12 +1022,7 @@ describe('PeerRegistry', () => {
   // ── findPeersWithLabels mandatoryLabels gate ──────────────────────────
   describe('findPeersWithLabels mandatoryLabels gate', () => {
     it('blocks gated peer when required labels miss the mandatory label', () => {
-      registry.addPeer({
-        instanceId: 'orch-gated',
-        connectionId: 'conn-gated',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-gated', connectionId: 'conn-gated' }));
       registry.updateHeartbeat('orch-gated', {
         type: 'peer.heartbeat',
         instanceId: 'orch-gated',
@@ -1393,42 +1049,30 @@ describe('PeerRegistry', () => {
     });
 
     it('exposes gated peer when required labels include the mandatory label', () => {
-      registry.addPeer({
-        instanceId: 'orch-gated',
-        connectionId: 'conn-gated',
-        address: null,
-        routingKeys: [],
-      });
-      registry.updateHeartbeat('orch-gated', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-gated',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          {
-            labelSets: [['linux', 'gpu']],
-            maxAgents: 5,
-            activeCount: 5,
-            labelSetMandatoryLabels: [['gpu']],
-          },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-gated', connectionId: 'conn-gated' }));
+      registry.updateHeartbeat(
+        'orch-gated',
+        peerHeartbeat({
+          instanceId: 'orch-gated',
+          scalerCapacity: [
+            {
+              labelSets: [['linux', 'gpu']],
+              maxAgents: 5,
+              activeCount: 5,
+              labelSetMandatoryLabels: [['gpu']],
+            },
+          ],
+        }),
+      );
 
       const matches = registry.findPeersWithLabels([['linux', 'gpu']]);
       expect(matches).toHaveLength(1);
     });
 
     it('matches a peer agent whose labels differ from the requirement only by case', () => {
-      registry.addPeer({
-        instanceId: 'orch-case-labels',
-        connectionId: 'conn-case-labels',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(
+        peerInit({ instanceId: 'orch-case-labels', connectionId: 'conn-case-labels' }),
+      );
       registry.updateHeartbeat('orch-case-labels', {
         type: 'peer.heartbeat',
         instanceId: 'orch-case-labels',
@@ -1458,33 +1102,25 @@ describe('PeerRegistry', () => {
     });
 
     it('honours a peer-agent mandatory gate that differs from the requirement only by case', () => {
-      registry.addPeer({
-        instanceId: 'orch-case-gate',
-        connectionId: 'conn-case-gate',
-        address: null,
-        routingKeys: [],
-      });
-      registry.updateHeartbeat('orch-case-gate', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-case-gate',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [
-          {
-            agentId: 'a1',
-            labels: ['gpu'],
-            activeJobs: 0,
-            maxConcurrency: 1,
-            platform: 'linux',
-            arch: 'x64',
-            mandatoryLabels: ['GPU'],
-          },
-        ],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [],
-        timestamp: Date.now(),
-      });
+      registry.addPeer(peerInit({ instanceId: 'orch-case-gate', connectionId: 'conn-case-gate' }));
+      registry.updateHeartbeat(
+        'orch-case-gate',
+        peerHeartbeat({
+          instanceId: 'orch-case-gate',
+          agents: [
+            {
+              agentId: 'a1',
+              labels: ['gpu'],
+              activeJobs: 0,
+              maxConcurrency: 1,
+              platform: 'linux',
+              arch: 'x64',
+              mandatoryLabels: ['GPU'],
+            },
+          ],
+          scalerCapacity: [],
+        }),
+      );
 
       expect(registry.findPeersWithLabels([['gpu']])).toHaveLength(1);
       expect(registry.findPeersWithLabels([['cuda']])).toHaveLength(0);
@@ -1499,12 +1135,7 @@ describe('PeerRegistry', () => {
       capacity: Record<string, unknown>[],
       activeCount = 0,
     ): void => {
-      registry.addPeer({
-        instanceId,
-        connectionId: `conn-${instanceId}`,
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId, connectionId: `conn-${instanceId}` }));
       registry.updateHeartbeat(instanceId, {
         type: 'peer.heartbeat',
         instanceId,
@@ -1620,19 +1251,13 @@ describe('PeerRegistry', () => {
 
   describe('markDisconnected / markConnected', () => {
     it('should mark peer as disconnected and then reconnected', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       expect(registry.getPeer('orch-1')!.connected).toBe(true);
 
       registry.markDisconnected('orch-1');
       expect(registry.getPeer('orch-1')!.connected).toBe(false);
 
-      // Peer still exists
       expect(registry.getPeerCount()).toBe(1);
       expect(registry.getConnectedPeerCount()).toBe(0);
 
@@ -1642,37 +1267,27 @@ describe('PeerRegistry', () => {
     });
 
     it('should clear agents on disconnect ( capability eviction)', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
-      // Add agents via heartbeat
-      registry.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [
-          {
-            agentId: 'agent-1',
-            labels: ['linux', 'x64'],
-            activeJobs: 0,
-            maxConcurrency: 2,
-            platform: 'linux',
-            arch: 'x64',
-            mandatoryLabels: [],
-          },
-        ],
-        capabilities: { s3LogAccess: false },
-        scalerCapacity: [
-          { labelSets: [['linux']], maxAgents: 5, activeCount: 1, labelSetMandatoryLabels: [[]] },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat(
+        'orch-1',
+        peerHeartbeat({
+          agents: [
+            {
+              agentId: 'agent-1',
+              labels: ['linux', 'x64'],
+              activeJobs: 0,
+              maxConcurrency: 2,
+              platform: 'linux',
+              arch: 'x64',
+              mandatoryLabels: [],
+            },
+          ],
+          scalerCapacity: [
+            { labelSets: [['linux']], maxAgents: 5, activeCount: 1, labelSetMandatoryLabels: [[]] },
+          ],
+        }),
+      );
 
       expect(registry.getPeer('orch-1')!.agents).toHaveLength(1);
       expect(registry.getPeer('orch-1')!.scalerCapacity).toHaveLength(1);
@@ -1695,49 +1310,35 @@ describe('PeerRegistry', () => {
 
   describe('addPeer reconnect (clean start)', () => {
     it('should start with empty agents on reconnect, not preserve stale data', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
-      // Populate agents via heartbeat
-      registry.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [
-          {
-            agentId: 'agent-1',
-            labels: ['macos', 'arm64'],
-            activeJobs: 1,
-            maxConcurrency: 2,
-            platform: 'darwin',
-            arch: 'arm64',
-            mandatoryLabels: [],
-          },
-        ],
-        capabilities: { s3LogAccess: true },
-        scalerCapacity: [
-          { labelSets: [['macos']], maxAgents: 3, activeCount: 2, labelSetMandatoryLabels: [[]] },
-        ],
-        timestamp: Date.now(),
-      });
+      registry.updateHeartbeat(
+        'orch-1',
+        peerHeartbeat({
+          agents: [
+            {
+              agentId: 'agent-1',
+              labels: ['macos', 'arm64'],
+              activeJobs: 1,
+              maxConcurrency: 2,
+              platform: 'darwin',
+              arch: 'arm64',
+              mandatoryLabels: [],
+            },
+          ],
+          capabilities: { s3LogAccess: true },
+          scalerCapacity: [
+            { labelSets: [['macos']], maxAgents: 3, activeCount: 2, labelSetMandatoryLabels: [[]] },
+          ],
+        }),
+      );
 
       expect(registry.getPeer('orch-1')!.agents).toHaveLength(1);
       expect(registry.getPeer('orch-1')!.scalerCapacity).toHaveLength(1);
 
       // Disconnect, then reconnect with new connection
       registry.markDisconnected('orch-1');
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-2',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ connectionId: 'conn-2' }));
 
       const peer = registry.getPeer('orch-1')!;
       expect(peer.connectionId).toBe('conn-2');
@@ -1768,12 +1369,7 @@ describe('PeerRegistry', () => {
         }>;
       },
     ) {
-      registry.addPeer({
-        instanceId,
-        connectionId: `conn-${instanceId}`,
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId, connectionId: `conn-${instanceId}` }));
 
       registry.updateHeartbeat(instanceId, {
         type: 'peer.heartbeat',
@@ -1871,24 +1467,9 @@ describe('PeerRegistry', () => {
 
   describe('isStale', () => {
     it('should return true when heartbeat is older than threshold', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
-      // Set heartbeat to 60 seconds ago
-      registry.updateHeartbeat('orch-1', {
-        type: 'peer.heartbeat',
-        instanceId: 'orch-1',
-        term: 1,
-        leaderId: null,
-        draining: false,
-        agents: [],
-        capabilities: { s3LogAccess: false },
-        timestamp: Date.now() - 60_000,
-      });
+      registry.updateHeartbeat('orch-1', peerHeartbeat({ timestamp: Date.now() - 60_000 }));
 
       expect(registry.isStale('orch-1', 30_000)).toBe(true);
       expect(registry.isStale('orch-1', 90_000)).toBe(false);
@@ -1906,18 +1487,8 @@ describe('PeerRegistry', () => {
       expect(registry.getPeerCount()).toBe(0);
       expect(registry.getConnectedPeerCount()).toBe(0);
 
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
-      registry.addPeer({
-        instanceId: 'orch-2',
-        connectionId: 'conn-2',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
+      registry.addPeer(peerInit({ instanceId: 'orch-2', connectionId: 'conn-2' }));
 
       expect(registry.getPeerCount()).toBe(2);
       expect(registry.getConnectedPeerCount()).toBe(2);
@@ -1933,18 +1504,8 @@ describe('PeerRegistry', () => {
 
   describe('getAllPeers / getConnectedPeers', () => {
     it('should return all peers including disconnected', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
-      registry.addPeer({
-        instanceId: 'orch-2',
-        connectionId: 'conn-2',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
+      registry.addPeer(peerInit({ instanceId: 'orch-2', connectionId: 'conn-2' }));
 
       registry.markDisconnected('orch-2');
 
@@ -1963,13 +1524,14 @@ describe('PeerRegistry', () => {
 
   describe('role field', () => {
     it('addPeer with role=worker sets role on PeerInfo', () => {
-      registry.addPeer({
-        instanceId: 'worker-1',
-        connectionId: 'conn-w1',
-        address: 'ws://worker:8080',
-        routingKeys: [],
-        role: 'worker',
-      });
+      registry.addPeer(
+        peerInit({
+          instanceId: 'worker-1',
+          connectionId: 'conn-w1',
+          address: 'ws://worker:8080',
+          role: 'worker',
+        }),
+      );
 
       const peer = registry.getPeer('worker-1');
       expect(peer).toBeDefined();
@@ -1977,12 +1539,7 @@ describe('PeerRegistry', () => {
     });
 
     it('addPeer without role defaults to coordinator', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: 'ws://orch:8080',
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ address: 'ws://orch:8080' }));
 
       const peer = registry.getPeer('orch-1');
       expect(peer).toBeDefined();
@@ -1990,27 +1547,13 @@ describe('PeerRegistry', () => {
     });
 
     it('getWorkerPeers returns only worker peers', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-        role: 'coordinator',
-      });
-      registry.addPeer({
-        instanceId: 'worker-1',
-        connectionId: 'conn-w1',
-        address: null,
-        routingKeys: [],
-        role: 'worker',
-      });
-      registry.addPeer({
-        instanceId: 'worker-2',
-        connectionId: 'conn-w2',
-        address: null,
-        routingKeys: [],
-        role: 'worker',
-      });
+      registry.addPeer(peerInit({ role: 'coordinator' }));
+      registry.addPeer(
+        peerInit({ instanceId: 'worker-1', connectionId: 'conn-w1', role: 'worker' }),
+      );
+      registry.addPeer(
+        peerInit({ instanceId: 'worker-2', connectionId: 'conn-w2', role: 'worker' }),
+      );
 
       const workers = registry.getWorkerPeers();
       expect(workers).toHaveLength(2);
@@ -2018,26 +1561,11 @@ describe('PeerRegistry', () => {
     });
 
     it('getCoordinatorPeers returns only coordinator peers', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-        role: 'coordinator',
-      });
-      registry.addPeer({
-        instanceId: 'orch-2',
-        connectionId: 'conn-2',
-        address: null,
-        routingKeys: [],
-      }); // defaults to coordinator
-      registry.addPeer({
-        instanceId: 'worker-1',
-        connectionId: 'conn-w1',
-        address: null,
-        routingKeys: [],
-        role: 'worker',
-      });
+      registry.addPeer(peerInit({ role: 'coordinator' }));
+      registry.addPeer(peerInit({ instanceId: 'orch-2', connectionId: 'conn-2' })); // defaults to coordinator
+      registry.addPeer(
+        peerInit({ instanceId: 'worker-1', connectionId: 'conn-w1', role: 'worker' }),
+      );
 
       const coordinators = registry.getCoordinatorPeers();
       expect(coordinators).toHaveLength(2);
@@ -2049,14 +1577,8 @@ describe('PeerRegistry', () => {
 
   describe('evictStalePeers', () => {
     it('marks peers with old heartbeat as disconnected', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
-      // Advance time past the stale timeout
       vi.advanceTimersByTime(70_000);
 
       registry.evictStalePeers(60_000);
@@ -2068,20 +1590,9 @@ describe('PeerRegistry', () => {
     });
 
     it('returns list of evicted instanceIds', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
-      registry.addPeer({
-        instanceId: 'orch-2',
-        connectionId: 'conn-2',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
+      registry.addPeer(peerInit({ instanceId: 'orch-2', connectionId: 'conn-2' }));
 
-      // Advance past timeout
       vi.advanceTimersByTime(70_000);
 
       const evicted = registry.evictStalePeers(60_000);
@@ -2089,16 +1600,10 @@ describe('PeerRegistry', () => {
     });
 
     it('skips already-disconnected peers', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       registry.markDisconnected('orch-1');
 
-      // Advance past timeout
       vi.advanceTimersByTime(70_000);
 
       const evicted = registry.evictStalePeers(60_000);
@@ -2106,12 +1611,7 @@ describe('PeerRegistry', () => {
     });
 
     it('does not evict peers with recent heartbeats', () => {
-      registry.addPeer({
-        instanceId: 'orch-1',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit());
 
       // Advance only 30s (under 60s threshold)
       vi.advanceTimersByTime(30_000);
@@ -2122,22 +1622,12 @@ describe('PeerRegistry', () => {
     });
 
     it('evicts only stale peers, keeps fresh ones', () => {
-      registry.addPeer({
-        instanceId: 'stale-peer',
-        connectionId: 'conn-1',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId: 'stale-peer' }));
 
       // Advance 50s, then add a fresh peer
       vi.advanceTimersByTime(50_000);
 
-      registry.addPeer({
-        instanceId: 'fresh-peer',
-        connectionId: 'conn-2',
-        address: null,
-        routingKeys: [],
-      });
+      registry.addPeer(peerInit({ instanceId: 'fresh-peer', connectionId: 'conn-2' }));
 
       // Advance another 20s (stale-peer = 70s, fresh-peer = 20s)
       vi.advanceTimersByTime(20_000);
@@ -2152,13 +1642,7 @@ describe('PeerRegistry', () => {
   // ── getConnectedWorkerPeers + connectedAt ───────────────────────────
   describe('getConnectedWorkerPeers', () => {
     function addWorker(instanceId: string): void {
-      registry.addPeer({
-        instanceId,
-        connectionId: instanceId,
-        address: null,
-        routingKeys: [],
-        role: 'worker',
-      });
+      registry.addPeer(peerInit({ instanceId, connectionId: instanceId, role: 'worker' }));
     }
 
     it('excludes disconnected workers', () => {
@@ -2169,13 +1653,7 @@ describe('PeerRegistry', () => {
     });
 
     it('excludes coordinator peers, which hold their own Platform connection', () => {
-      registry.addPeer({
-        instanceId: 'c-1',
-        connectionId: 'c-1',
-        address: null,
-        routingKeys: [],
-        role: 'coordinator',
-      });
+      registry.addPeer(peerInit({ instanceId: 'c-1', connectionId: 'c-1', role: 'coordinator' }));
       addWorker('w-1');
       expect(registry.getConnectedWorkerPeers().map((p) => p.instanceId)).toEqual(['w-1']);
     });
@@ -2189,32 +1667,22 @@ describe('PeerRegistry', () => {
   describe('connectedAt', () => {
     it('records when a peer connected, so eviction can pick the newest', () => {
       const before = Date.now();
-      registry.addPeer({
-        instanceId: 'w-1',
-        connectionId: 'w-1',
-        address: null,
-        routingKeys: [],
-        role: 'worker',
-      });
+      registry.addPeer(peerInit({ instanceId: 'w-1', connectionId: 'w-1', role: 'worker' }));
       expect(registry.getPeer('w-1')?.connectedAt).toBeGreaterThanOrEqual(before);
     });
 
     it('does not reset connectedAt on a reconnect of a still-connected peer', () => {
-      registry.addPeer({
-        instanceId: 'w-1',
-        connectionId: 'w-1',
-        address: null,
-        routingKeys: [],
-        role: 'worker',
-      });
+      registry.addPeer(peerInit({ instanceId: 'w-1', connectionId: 'w-1', role: 'worker' }));
       const first = registry.getPeer('w-1')!.connectedAt;
-      registry.addPeer({
-        instanceId: 'w-1',
-        connectionId: 'w-1b',
-        address: '1.2.3.4',
-        routingKeys: ['k'],
-        role: 'worker',
-      });
+      registry.addPeer(
+        peerInit({
+          instanceId: 'w-1',
+          connectionId: 'w-1b',
+          address: '1.2.3.4',
+          routingKeys: ['k'],
+          role: 'worker',
+        }),
+      );
       expect(registry.getPeer('w-1')!.connectedAt).toBe(first);
     });
   });

@@ -1,9 +1,4 @@
-/**
- * Agent token management commands for kici-admin.
- *
- * Provides CRUD operations for agent authentication tokens:
- *   agent register, list, revoke
- */
+/** `kici-admin agent register|list|revoke`: agent token management. */
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -12,28 +7,20 @@ import { PRIVILEGED_ROOT_LABEL, resolveRoleLabels } from '@kici-dev/engine';
 import { cliAction, DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP } from './shared/cli-action.js';
 
 /**
- * The authorized label scope a static agent token is minted with.
+ * The authorized label scope a static agent token is minted with: the
+ * operator's `--labels`, plus
  *
- * Beyond the operator's own `--labels` set, the authorized scope carries:
+ * - each mandatory (taint) label, which must also be advertisable;
+ * - the whole `kici:role:*` namespace. An agent derives its roles from its own
+ *   host and advertises them at registration, so a scope without them fails the
+ *   register-time gate (`Agent labels exceed token-bound scope`); the mint site
+ *   cannot know which roles the host will derive.
  *
- * - A mandatory (taint) label must also be advertisable (the selector side),
- *   so union it into the authorized labels — a taint the agent can't even
- *   advertise would be incoherent.
- * - Every real agent derives its `kici:role:*` labels from its own host and
- *   advertises them at registration, so a scope omitting them can never admit
- *   the agent that presents it: the orchestrator's register-time scope gate
- *   closes the connection with `Agent labels exceed token-bound scope`. A role
- *   the agent can't even advertise is incoherent for the same reason a taint
- *   is. The mint site cannot know which roles the target host will derive — the
- *   agent discovers them from its own capabilities — so the whole role
- *   namespace is authorized and the agent advertises the subset it has.
+ * The operator's labels still bound everything else: `--labels linux,x64`
+ * refuses an agent advertising `gpu`. An agent with no roles sets `KICI_ROLES=`.
  *
- * The operator's own labels still bound everything else: a token minted with
- * `--labels linux,x64` still refuses an agent advertising `gpu`. An agent that
- * must carry no roles at all sets `KICI_ROLES=` on its own side.
- *
- * Returns undefined when the operator supplied no labels and no taint — an
- * unscoped token, which the register-time gate skips entirely.
+ * Undefined with no labels and no taint: an unscoped token, which the
+ * register-time gate skips.
  */
 export function authorizedAgentTokenLabels(
   baseLabels: readonly string[],
@@ -44,9 +31,6 @@ export function authorizedAgentTokenLabels(
   return [...new Set([...operatorLabels, ...resolveRoleLabels(undefined)])];
 }
 
-/**
- * Format agent tokens as a table.
- */
 function formatAgentTokenTable(tokens: any[]): string {
   if (tokens.length === 0) return 'No agent tokens found.';
 
@@ -139,8 +123,7 @@ export function registerAgentCommands(program: Command, getClient: () => AdminAp
             );
           }
           if (dbUrl) {
-            // Read agent_tokens directly — pending agents are orchestrator
-            // in-memory state and cannot be surfaced offline.
+            // Pending agents live in orchestrator memory, so offline reads show none.
             const { createPool } = await import('@kici-dev/shared');
             const pool = createPool(dbUrl);
             try {
@@ -182,14 +165,12 @@ export function registerAgentCommands(program: Command, getClient: () => AdminAp
           const result = await getClient().listAgentTokens(
             opts.type ? { type: opts.type } : undefined,
           );
-          // When --include-pending is set, hit the pending endpoint too.
           let pendingAgents: any[] = [];
           if (opts.includePending) {
             try {
               pendingAgents = await getClient().get<any[]>('/api/v1/agent-tokens/pending');
             } catch (err) {
-              // If the route is not yet deployed on this orchestrator, emit
-              // a warning rather than failing the whole command.
+              // An orchestrator without the route warns, not fails.
               console.error(
                 `warning: --include-pending failed (${toErrorMessage(err)}); continuing without pending list.`,
               );
@@ -217,10 +198,8 @@ export function registerAgentCommands(program: Command, getClient: () => AdminAp
     .action(
       cliAction(async (id: string) => {
         const { kicked } = await getClient().revokeAgentToken(id);
-        // Surface the kick count so the operator knows the
-        // revocation actually closed in-flight WS — a 0 count on a
-        // token they expected to be live is a useful diagnostic
-        // (token never connected, or already disconnected on its own).
+        // The kick count confirms in-flight WS closed; 0 on an expected-live
+        // token means it never connected or already disconnected.
         const noun = kicked === 1 ? 'connection' : 'connections';
         console.log(`Agent token ${id} revoked (kicked ${kicked} agent ${noun}).`);
       }),

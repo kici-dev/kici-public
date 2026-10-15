@@ -12,14 +12,12 @@ export interface InstallClosureOptions {
 }
 
 /**
- * The `@kici-dev/agent@<spec>` argument for the install.
+ * The `@kici-dev/agent@<spec>` install argument.
  *
- * In production the agent is published to npm at the exact single-version, so we
- * pin it verbatim (`@kici-dev/agent@0.2.0`) — the payload is provably the version
- * the orchestrator runs. In development (`KICI_DEV=true`) the local Verdaccio
- * registry only carries prerelease builds (`<version>-<buildCounter>`), so we
- * match the current base version's prereleases instead — the same
- * prerelease-compatible resolution the rest of the dev tooling uses.
+ * In production it pins the exact single-version (`@kici-dev/agent@0.2.0`), so the payload is
+ * provably the version the orchestrator runs. In development (`KICI_DEV=true`) local Verdaccio
+ * carries only prereleases (`<version>-<buildCounter>`), so it matches the base version's
+ * prereleases, as the rest of the dev tooling does.
  */
 export function agentInstallSpec(version: string): string {
   if (process.env.KICI_DEV === 'true') return `@kici-dev/agent@^${version}-0`;
@@ -29,16 +27,14 @@ export function agentInstallSpec(version: string): string {
 /**
  * `npm install @kici-dev/agent@<version>` for the TARGET platform into prefixDir.
  *
- * `--cpu`/`--os` make npm resolve every transitive optional native binding (incl.
- * `@oxc-transform/binding-<platform>`) for the target platform, not the host —
- * the same mechanism `scripts/package.mjs` relies on for oxc. `--omit=dev` keeps
- * the closure to the runtime tree. When the published `@kici-dev/agent` ships an
- * `npm-shrinkwrap.json`, npm resolves the exact released + tested tree.
+ * `--cpu`/`--os` resolve every transitive optional native binding (incl.
+ * `@oxc-transform/binding-<platform>`) for the target, not the host, as `scripts/package.mjs`
+ * does for oxc. `--omit=dev` keeps the runtime tree only. A published `npm-shrinkwrap.json`
+ * pins the exact released + tested tree.
  */
 export async function installAgentClosure(opts: InstallClosureOptions): Promise<void> {
   const { npmOs, npmCpu } = splitAgentPlatform(opts.platform);
   mkdirSync(opts.prefixDir, { recursive: true });
-  // Seed a minimal package.json so `npm install --prefix` treats prefixDir as the root.
   writeFileSync(
     path.join(opts.prefixDir, 'package.json'),
     JSON.stringify({ name: 'kici-agent-payload', version: '0.0.0', private: true }) + '\n',

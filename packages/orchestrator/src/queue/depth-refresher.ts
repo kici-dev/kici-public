@@ -1,29 +1,20 @@
 /**
  * Periodic refresher for the dispatch-queue depth breakdown.
  *
- * Runs on a fixed interval (default 5s) — short enough that the
- * Prometheus observable-gauge callback (which reads the JobQueue's
- * synchronous cache) never serves data older than one refresh tick,
- * long enough that a single orchestrator does not hammer the DB.
+ * Each tick calls {@link JobQueue.getDepthBreakdown} to refresh the queue's
+ * cache and feeds {@link setDispatchQueueDepthBreakdown}, so
+ * `kici_orch_dispatch_queue_depth` / `..._by_label` are recent when Prometheus
+ * scrapes (the observable-gauge callback reads that synchronous cache). The
+ * default 5s interval keeps data within one tick without hammering the DB.
  *
- * Two responsibilities:
+ * It also watches for sustained backpressure: pending depth at or above
+ * {@link DepthRefresherOptions.thresholdGetter | threshold} for two consecutive
+ * ticks emits a `logger.warn` pointing at the per-label Grafana panel. The
+ * two-in-a-row guard suppresses transient spikes without a cooldown.
  *
- *   1. Call {@link JobQueue.getDepthBreakdown} to refresh the internal
- *      cache and feed {@link setDispatchQueueDepthBreakdown} so
- *      `kici_orch_dispatch_queue_depth` / `..._by_label` are always
- *      recent when Prometheus scrapes.
- *   2. Watch for sustained backpressure: when the pending depth stays
- *      at or above {@link RefresherOptions.thresholdGetter | threshold}
- *      for two consecutive refreshes, emit a `logger.warn` that points
- *      operators at the per-label Grafana panel. The two-in-a-row
- *      guard suppresses transient spikes without needing a cooldown.
- *
- * Threshold is resolved lazily on every tick via `thresholdGetter` so
- * live config reloads (SIGHUP / cluster propagation) take effect
- * immediately without restarting the refresher.
- *
- * A threshold of `0` disables the warning entirely — the refresher
- * still runs so metrics keep flowing.
+ * The threshold is read every tick so live config reloads (SIGHUP / cluster
+ * propagation) apply without a restart. `0` disables the warning; metrics keep
+ * flowing.
  */
 import type { Logger } from '@kici-dev/shared';
 import { DispatchQueueStatus, type JobQueue } from './job-queue.js';
@@ -34,37 +25,28 @@ export interface DepthRefresherOptions {
   queue: JobQueue;
   logger: Logger;
   /**
-   * How often to refresh the cache / evaluate the warning threshold.
-   * Defaults to 5 seconds — short enough that Prometheus's default 15s
-   * scrape interval never sees data older than one tick.
+   * Default 5 seconds, so Prometheus's default 15s scrape interval never sees
+   * data older than one tick.
    */
   intervalMs?: number;
-  /**
-   * Called on every tick to get the current backpressure warn
-   * threshold. `0` disables warnings.
-   */
+  /** Read every tick: the backpressure warn threshold. `0` disables warnings. */
   thresholdGetter: () => number;
-  /**
-   * Optional hook invoked after each successful tick, for tests.
-   */
+  /** Test hook, invoked after each successful tick. */
   onTick?: (pendingDepth: number) => void;
 }
 
 export interface DepthRefresher {
-  /** Start the periodic timer. Idempotent. */
+  /** Idempotent. */
   start(): void;
-  /** Stop the periodic timer. Idempotent. */
+  /** Idempotent. */
   stop(): void;
-  /** Run one refresh synchronously (used at startup and in tests). */
+  /** Runs one refresh (used at startup and in tests). */
   refreshNow(): Promise<void>;
 }
 
 /**
- * Create a dispatch-queue depth refresher.
- *
- * The returned object is NOT started automatically — call `start()`
- * after the orchestrator is otherwise ready. `stop()` must be called
- * during shutdown to avoid leaking the interval handle.
+ * NOT started automatically: call `start()` once the orchestrator is otherwise
+ * ready, and `stop()` during shutdown to avoid leaking the interval handle.
  */
 export function createDepthRefresher(options: DepthRefresherOptions): DepthRefresher {
   const intervalMs = options.intervalMs ?? 5_000;
@@ -86,9 +68,8 @@ export function createDepthRefresher(options: DepthRefresherOptions): DepthRefre
       if (threshold > 0 && pending >= threshold) {
         consecutiveOverThreshold += 1;
         if (consecutiveOverThreshold >= 2) {
-          // Keep the log structured: operators grep by `event` and the
-          // `byLabel` field is the useful payload — it tells them which
-          // label pool is starved so they can scale the right scaler.
+          // Operators grep by `event`; `byLabel` tells them which label pool is
+          // starved so they can scale the right scaler.
           options.logger.warn('dispatch queue depth above backpressure threshold', {
             event: 'queue.backpressure.sustained',
             pending,
@@ -104,8 +85,8 @@ export function createDepthRefresher(options: DepthRefresherOptions): DepthRefre
 
       options.onTick?.(pending);
     } catch (err) {
-      // Refresher must never crash the orchestrator — the metric
-      // goes stale until the next successful tick.
+      // Never crash the orchestrator: the metric goes stale until the next
+      // successful tick.
       options.logger.error('dispatch queue depth refresh failed', {
         error: err instanceof Error ? err.message : String(err),
       });
@@ -115,14 +96,12 @@ export function createDepthRefresher(options: DepthRefresherOptions): DepthRefre
   return {
     start() {
       if (timer) return;
-      // Kick off an immediate refresh so the gauge is non-zero the moment
-      // Prometheus scrapes after startup, then let the interval take over.
+      // Refresh immediately so the first scrape after startup sees real data.
       runDetached(options.logger, 'Queue depth refresh', () => tick());
       timer = setInterval(() => {
         runDetached(options.logger, 'Queue depth refresh', () => tick());
       }, intervalMs);
-      // Allow process to exit even if the timer is still running (tests,
-      // graceful shutdown edge cases).
+      // Let the process exit with the timer live (tests, shutdown edge cases).
       timer.unref();
     },
     stop() {

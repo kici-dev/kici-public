@@ -1,8 +1,4 @@
-/**
- * Tests for the shared approve/reject applier. Exercises eligibility gating,
- * multi-clause accumulation, the release+resume path for job scope, the step
- * branch, and rejection.
- */
+/** The shared approve/reject applier. */
 import { describe, it, expect, vi } from 'vitest';
 
 import { installGateJobId, SECURITY_HOLD_JOB_IDS } from '@kici-dev/engine';
@@ -41,13 +37,9 @@ function makeDeps(store: any, overrides: Partial<ApplyDecisionDeps> = {}): Apply
 }
 
 /**
- * Apply a decision AND wait for its post-commit consequence.
- *
- * `applyDecision` deliberately returns at the durable record and hands the
- * consequence back unawaited (see `ApplyDecisionResult.consequence`), so a test
- * asserting a resume, a settle, or a reject delegate has to join it. Every case
- * below that asserts a side effect of the decision uses this; the two cases that
- * assert the DETACHMENT itself call `applyDecision` directly.
+ * Apply a decision AND wait for its post-commit consequence, which
+ * `applyDecision` hands back unawaited (`ApplyDecisionResult.consequence`).
+ * Cases asserting the DETACHMENT itself call `applyDecision` directly.
  */
 async function applyAndSettle(
   ...args: Parameters<typeof applyDecision>
@@ -201,10 +193,9 @@ describe('applyDecision', () => {
   });
 
   it('routes an explicit workflow-scoped release to onJobRelease (re-dispatch the held root job)', async () => {
-    // A workflow-level SDK `requireApproval: true` holds a real root job under a
-    // workflow-scoped, explicit-triggered hold. Releasing it must re-dispatch
-    // that job (job path) — NOT take the install-gate resume path, which has no
-    // pending workflow context and would fail the run.
+    // SDK `requireApproval: true` holds a real root job under a workflow-scoped,
+    // explicit-triggered hold. Release must re-dispatch it (job path), NOT take
+    // the install-gate resume path, which has no pending workflow context.
     const workflowHold = { ...pendingHold, hold_scope: 'workflow', job_id: 'release' };
     const store = makeStore({
       getById: vi.fn().mockResolvedValue(workflowHold),
@@ -249,13 +240,11 @@ describe('applyDecision', () => {
       expect.objectContaining({ approverSub: 'u-alice', decision: 'reject' }),
       'no',
     );
-    // The rejecter's own reason travels with the runId and becomes the run's
-    // cancellation reason. Dropping it left the wiring site to invent one, and
-    // the string it invented named the install gate — so a rejected fork PR was
-    // cancelled as "Workflow install gate rejected".
-    // The hold row travels beside it: it is what tells the handler an install
-    // gate (no `KiCI Security` check) from the trust policy's PR-wide hold or
-    // an SDK workflow-level `requireApproval` (each with one to complete).
+    // The rejecter's reason becomes the run's cancellation reason; a wiring site
+    // inventing one would mislabel a rejected fork PR as an install-gate reject.
+    // The hold row tells the handler an install gate (no `KiCI Security` check)
+    // from the trust policy's PR-wide hold or an SDK workflow-level
+    // `requireApproval` (each with one to complete).
     expect(onWorkflowReject).toHaveBeenCalledWith(
       expect.objectContaining({ run_id: 'run-1', job_id: installGateJobId('CI') }),
       'no',
@@ -263,9 +252,7 @@ describe('applyDecision', () => {
   });
 
   it('passes no reason through when the rejecter supplied none', async () => {
-    // The control: the reason is forwarded, not synthesised here. A handler
-    // that received a value for a reasonless reject would mean this layer had
-    // started naming the cause itself.
+    // The control: the reason is forwarded, never synthesised by this layer.
     const workflowHold = { ...pendingHold, hold_scope: 'workflow', job_id: installGateJobId('CI') };
     const store = makeStore({ getById: vi.fn().mockResolvedValue(workflowHold) });
     const onWorkflowReject = vi.fn().mockResolvedValue(true);
@@ -339,9 +326,8 @@ describe('applyDecision', () => {
   });
 
   /**
-   * The hold's row leaves `pending` here, and `listOverdue` only ever sees
-   * pending rows — so if this applier does not terminalize the hold's
-   * `KiCI Security` check, nothing downstream ever will.
+   * The row leaves `pending` here and `listOverdue` sees only pending rows, so
+   * only this applier can terminalize the hold's `KiCI Security` check.
    */
   describe('terminalizes the security check of the hold it just ended', () => {
     function releasingStore() {
@@ -359,9 +345,8 @@ describe('applyDecision', () => {
     }
 
     it('settles an approved JOB-scoped hold, before the resume', async () => {
-      // Before the resume, not after: a replayed dispatch can hold again and
-      // post its own pending status, and that pending status has to be the last
-      // write rather than this `success`.
+      // Before the resume: a replayed dispatch can hold again, and its pending
+      // status must be the last write, not this `success`.
       const order: string[] = [];
       const settleSecurityCheck = vi.fn().mockImplementation(async () => {
         order.push('settle');
@@ -386,8 +371,7 @@ describe('applyDecision', () => {
     });
 
     it('does not settle an approve that has not satisfied its clauses', async () => {
-      // The control: only the release settles. A hold still awaiting a second
-      // approver is still held, and a `success` here would say otherwise.
+      // The control: a hold awaiting a second approver is still held, so no settle.
       const store = makeStore({
         getById: vi.fn().mockResolvedValue({
           ...pendingHold,
@@ -452,10 +436,9 @@ describe('applyDecision', () => {
     });
 
     it('settles a workflow-scoped reject the delegate did NOT write a check for', async () => {
-      // The suppression is bound to a check having been written, not to the
-      // delegate resolving — an install-gate hold and a still-contended commit
-      // both come back `false`, and the settler declines again for the same
-      // reason rather than fabricating one.
+      // Suppression is bound to a check having been written, not to the delegate
+      // resolving: an install-gate hold and a still-contended commit both return
+      // `false`, and the settler declines rather than fabricating a check.
       const workflowHold = {
         ...pendingHold,
         hold_scope: 'workflow',
@@ -476,10 +459,9 @@ describe('applyDecision', () => {
     });
 
     it('still settles the check when the workflow-reject delegate throws', async () => {
-      // The reject has already landed in the database by the time the delegate
-      // runs, and the delegate is the only thing that would have reported it on
-      // the commit. Letting its throw escape aborted the applier and stranded
-      // the pending check — the `/kici reject` handler catches the same call.
+      // The reject is already durable and the delegate is the only reporter on
+      // the commit, so its throw must not escape and strand the pending check
+      // (the `/kici reject` handler catches the same call).
       const workflowHold = {
         ...pendingHold,
         hold_scope: 'workflow',
@@ -500,10 +482,9 @@ describe('applyDecision', () => {
     });
 
     it('attributes a delegated reject the same way whichever path settled it', async () => {
-      // `rejectWorkflow` builds its summary with no actor, so the settle that
-      // stands in for a throwing delegate must not name one either. Otherwise
-      // the same rejection reads "Rejected by …" only when the delegate
-      // happened to throw — a difference the rejecter never made.
+      // `rejectWorkflow` builds its summary with no actor, so the stand-in settle
+      // for a throwing delegate names none either, or the summary would depend on
+      // whether the delegate threw.
       const workflowHold = {
         ...pendingHold,
         hold_scope: 'workflow',
@@ -529,10 +510,9 @@ describe('applyDecision', () => {
     });
 
     it('names the rejecter on a hold that had no delegate to match', async () => {
-      // The counterpart of the case above, so the omission is bound to standing
-      // in for a delegate rather than to workflow scope. A job-scoped reject is
-      // never delegated, so this settle is the only writer of that summary and
-      // there is no other rendering for it to disagree with.
+      // Counterpart of the case above, binding the omission to standing in for a
+      // delegate, not to workflow scope: a job-scoped reject is never delegated,
+      // so this settle is the summary's only writer.
       const store = makeStore({ getById: vi.fn().mockResolvedValue(pendingHold) });
       const settleSecurityCheck = vi.fn().mockResolvedValue(true);
 
@@ -546,11 +526,10 @@ describe('applyDecision', () => {
     });
   });
   /**
-   * The applier answers at the durable record, not at the consequence. The
-   * defect this closes: releasing a workflow-scoped fork-PR hold replayed the
-   * whole stored dispatch context before acking, which took 9.8 s inside the
-   * Platform's 10 s relay budget — so an approval that fully succeeded answered
-   * 504, and the operator's natural retry hit "already resolved".
+   * The applier answers at the durable record, not the consequence: replaying
+   * a fork-PR hold's whole dispatch context can take 9.8 s of the Platform's
+   * 10 s relay budget, so a successful approval would answer 504 and the
+   * operator's retry would hit "already resolved".
    */
   describe('answers at the durable record, not at the consequence', () => {
     function releasingStore() {
@@ -589,8 +568,7 @@ describe('applyDecision', () => {
       expect(onJobRelease).toHaveBeenCalledTimes(1);
       expect(releaseResume).toBeDefined();
 
-      // A row flip without a dispatch looks like it works and does nothing, so
-      // the consequence is joined and asserted rather than assumed.
+      // A row flip without a dispatch looks like it works, so join and assert.
       releaseResume!();
       await expect(result.consequence).resolves.toEqual({ ok: true });
     });
@@ -607,8 +585,8 @@ describe('applyDecision', () => {
       // The decision landed: the approval is durable whatever the resume did.
       expect(result.accepted).toBe(true);
       expect(result.status).toBe('released');
-      // And the failure is not swallowed — it is reported on the handle, which
-      // is what each caller turns into its `error` access-log entry.
+      // Not swallowed: reported on the handle, which callers turn into their
+      // `error` access-log entry.
       await expect(result.consequence).resolves.toEqual({
         ok: false,
         error: 'resume exploded',
@@ -616,9 +594,8 @@ describe('applyDecision', () => {
     });
 
     it('carries no consequence for a decision that changed nothing', async () => {
-      // The control: only a terminal decision has a consequence. A non-satisfying
-      // approve leaves the hold pending, so a caller that audits on the handle
-      // must still audit this one immediately rather than waiting forever.
+      // The control: a non-satisfying approve leaves the hold pending and has no
+      // consequence, so a caller auditing on the handle audits it immediately.
       const twoClauseHold = {
         ...pendingHold,
         approval_requirement: {
@@ -643,9 +620,8 @@ describe('applyDecision', () => {
     });
 
     it('detaches a reject the same way, and still runs its delegate', async () => {
-      // Same shape, same reason: rejecting a workflow-scoped hold cancels the
-      // run and completes a provider check run per job the held dispatch had
-      // queued, which is unbounded work behind the same relay budget.
+      // Same reason: a workflow-scoped reject cancels the run and completes a
+      // check run per queued job — unbounded work behind the same relay budget.
       const workflowHold = {
         ...pendingHold,
         hold_scope: 'workflow',

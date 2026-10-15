@@ -32,11 +32,10 @@ export function invokeSource(
   if (typeof event !== 'string' || event.trim().length === 0) {
     throw new Error('invokeSource: event name must be a non-empty string');
   }
-  // The same reservation `ctx.emit` enforces: `kici.` names KiCI system events,
-  // and `__` names the events the orchestrator mints for itself — whose runs are
-  // dispatched as a trusted ref. A gate is a workflow-authored emit, so it must
-  // not be the way around either. This fails at compile time; the orchestrator
-  // refuses it again at dispatch.
+  // The `ctx.emit` reservation: `kici.` is KiCI system events, `__` the
+  // orchestrator's own events, whose runs dispatch as a trusted ref. A
+  // workflow-authored gate must not bypass it. Fails at compile time; the
+  // orchestrator refuses it again at dispatch.
   const reservedPrefix = reservedEventNamePrefix(event);
   if (reservedPrefix) {
     throw new Error(

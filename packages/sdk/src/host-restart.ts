@@ -1,21 +1,13 @@
 /**
  * Workflow-level host restart + wait-for-host-alive steps.
  *
- * KiCI agents run ON each host while executing a job, so a workflow can reboot
- * the machine it runs on (the Ansible `reboot` + `wait_for_connection` pattern,
- * adapted to KiCI's no-remote-exec model). The flow is job-boundary:
- *
- * - `restartHost()` is the LAST step of a "restart" job. It signals the
- *   orchestrator that this host is about to reboot (which holds the pinned
- *   post-restart job and treats the imminent disconnect as expected), reports
- *   success, and the agent issues the OS reboot once the step completes.
- * - The post-restart work is a SEPARATE job pinned to the same host
- *   (`runsOn: [hostId]`) that `needs` the restart job. The orchestrator holds
- *   it until the host completes a reboot cycle, then dispatches it.
- * - `waitForHostAlive(probe)` is the optional first step of that post-restart
- *   job: the "host is back" guarantee comes free from the pinned-hold (the job
- *   only dispatches after the agent reconnects); this step adds a
- *   service-readiness gate for hosts where "agent connected" ≠ "services ready".
+ * KiCI agents run ON each host, so a workflow can reboot the machine it runs on
+ * (the Ansible `reboot` + `wait_for_connection` pattern, adapted to KiCI's
+ * no-remote-exec model). The flow crosses a job boundary: `restartHost()` ends
+ * a "restart" job, and the orchestrator treats the disconnect as expected and
+ * holds the pinned post-restart job until the host completes a reboot cycle.
+ * `waitForHostAlive(probe)` optionally gates that job on service readiness,
+ * for hosts where "agent connected" ≠ "services ready".
  */
 
 import { waitForStep } from './wait-for.js';

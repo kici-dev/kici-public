@@ -13,22 +13,17 @@ import type { LockJob } from '../trigger/types.js';
 export const MAX_FANOUT_JOBS = 256;
 
 /**
- * Hard ceiling on the raw combination product a matrix may materialize.
- *
- * Distinct from {@link MAX_FANOUT_JOBS} on purpose. `MAX_FANOUT_JOBS` bounds
- * the FINAL children after include/exclude and is checked after expansion;
- * this bounds what may be allocated in the first place, and is checked before.
- * They cannot be collapsed into one check: excludes only ever reduce the count,
- * so a matrix whose raw product is 300 but which excludes down to 200 is legal
- * and must keep working. The ceiling is deliberately far above any realistic
- * matrix — its only job is to turn an out-of-memory kill into a typed error.
+ * Hard ceiling on the raw combination product a matrix may materialize, checked
+ * before expansion. {@link MAX_FANOUT_JOBS} bounds the FINAL children after
+ * include/exclude; the two cannot merge, because a raw product of 300 that
+ * excludes down to 200 is legal. The ceiling sits far above any realistic
+ * matrix: its only job is to turn an out-of-memory kill into a typed error.
  */
 export const MAX_MATRIX_MATERIALIZATION = 100_000;
 
 /**
- * The kind of fan-out a materialized child belongs to. `matrix` children come
- * from a matrix expansion (one per combination); `host` children come from a
- * `runsOnAll` fan-out (one pinned execution per roster host).
+ * The fan-out a child belongs to: `matrix` (one per combination) or `host`
+ * (`runsOnAll`, one pinned execution per roster host).
  */
 export enum VariantKind {
   matrix = 'matrix',
@@ -36,15 +31,13 @@ export enum VariantKind {
 }
 
 /**
- * Why a fan-out produced no dispatchable children. Drives whether the zeroed
- * job's synthetic terminal row is recorded as a failure or a skip:
+ * Why a fan-out produced no dispatchable children, which decides the zeroed
+ * job's synthetic terminal row:
  *
- * - `error` — a genuine failure: invalid matrix (zero combinations / over the
- *   cap), an unavailable roster, or `onUnreachable: 'fail'` with an absent host.
- *   The synthetic job is `failed`.
- * - `narrowed-empty` — the fan-out intentionally resolved to zero usable hosts
- *   (e.g. `onUnreachable: 'skip'` skipped every unreachable host). The synthetic
- *   job is `skipped`.
+ * - `error` → `failed`: invalid matrix (zero combinations / over the cap), an
+ *   unavailable roster, or `onUnreachable: 'fail'` with an absent host.
+ * - `narrowed-empty` → `skipped`: the fan-out intentionally resolved to zero
+ *   usable hosts (e.g. `onUnreachable: 'skip'` skipped every host).
  */
 export enum FanoutCause {
   error = 'error',
@@ -52,10 +45,9 @@ export enum FanoutCause {
 }
 
 /**
- * Thrown when a job's fan-out cannot be materialized into dispatchable children:
- * an invalid matrix, an unavailable / zeroed host roster. The `cause` discriminates
- * a genuine failure from an intentional narrow-to-empty so the caller can record
- * the zeroed job's synthetic row as `failed` or `skipped` accordingly.
+ * Thrown when a job's fan-out cannot be materialized (invalid matrix, unavailable
+ * or zeroed host roster). `cause` tells the caller whether to record the zeroed
+ * job's synthetic row as `failed` or `skipped`.
  */
 export class FanoutError extends Error {
   override readonly name = 'FanoutError';
@@ -69,35 +61,25 @@ export class FanoutError extends Error {
   }
 }
 
-/**
- * A roster host resolved as a target of a `runsOnAll` fan-out. Carries the
- * identity the dispatcher pins to and the agent facts exposed as `ctx.agent`.
- */
+/** A `runsOnAll` target host: the identity the dispatcher pins to, and `ctx.agent` facts. */
 export interface ResolvedHostAgent {
-  /** Agent id the child pins to. */
   agentId: string;
   /** Hostname (falls back to agentId). */
   host: string;
-  /** The host's label set. */
   labels: readonly string[];
   platform?: string;
   arch?: string;
   /** Which orchestrator owns the live WS (null = not currently connected). */
   connectedInstanceId?: string | null;
   /**
-   * True when this host is a declared-but-un-agented `includeUninitialized`
-   * target: it has no live agent, so the dispatcher first brings up a temporary
-   * init-runner over SSH before the child's pinned steps can land. False / absent
-   * for a live host (runs on its own agent directly).
+   * True for a declared-but-un-agented `includeUninitialized` target: with no
+   * live agent, the dispatcher first brings up a temporary init-runner over SSH.
+   * False / absent for a live host, which runs on its own agent.
    */
   needsBringup?: boolean;
 }
 
-/**
- * One dispatchable unit produced from a lock job. `variantKind` is `matrix` for
- * a matrix combination child and `host` for a `runsOnAll` per-host child; absent
- * for a non-fanned job.
- */
+/** One dispatchable unit produced from a lock job. */
 export interface MaterializedJob {
   /** The originating lock job. Its matrix/include/exclude are NOT dispatched as-is. */
   lockJob: LockJob;
@@ -105,49 +87,37 @@ export interface MaterializedJob {
   baseName: string;
   /** `${baseName} (${suffix})` for fanned children, else `baseName`. */
   expandedName: string;
-  /** Present only for fanned children. */
+  /** Absent for a non-fanned job. */
   variantKind?: VariantKind;
-  /** The combination values for a matrix child; absent for non-matrix jobs. */
   variantValues?: MatrixValues;
-  /**
-   * True when the job carries a dynamic matrix the orchestrator cannot expand —
-   * it must route through the agent-eval flow and be re-materialized from the result.
-   */
+  /** A dynamic matrix: routed through the agent-eval flow and re-materialized from its result. */
   pendingDynamicMatrix?: boolean;
   // --- host-variant fields (set only when variantKind === VariantKind.host) ---
-  /** The agent this child is pinned to. */
   pinnedAgentId?: string;
-  /** The host this child runs on (also the variant label / name suffix). */
+  /** Also the variant label / name suffix. */
   host?: string;
-  /** The resolved host agent facts, exposed to the step as `ctx.agent`. */
+  /** Exposed to the step as `ctx.agent`. */
   agent?: ResolvedHostAgent;
   /** Which orchestrator owns the pinned agent's live WS (null = not connected). */
   connectedInstanceId?: string | null;
-  /**
-   * True for a declared-but-un-agented `includeUninitialized` host child: the
-   * dispatcher brings up a temporary init-runner over SSH before its pinned
-   * steps land. Mirrors `agent.needsBringup`.
-   */
+  /** Mirrors `agent.needsBringup`. */
   needsBringup?: boolean;
   // --- fan-out position (set only for multi-child fan-outs) ---
   /**
-   * 0-based position of this child in the deterministically-ordered fan-out
-   * (host: by `agentId`; matrix: by variant label). Exposed to the agent as
-   * `ctx.fanout.index`. Absent on a non-fan-out (single-child) job.
+   * 0-based position in the deterministic fan-out order (host: by `agentId`;
+   * matrix: by variant label), exposed as `ctx.fanout.index`. Absent on a
+   * single-child job.
    */
   fanoutIndex?: number;
-  /** Number of children in this fan-out. Exposed as `ctx.fanout.total`. */
+  /** Exposed as `ctx.fanout.total`. */
   fanoutTotal?: number;
 }
 
 /**
- * Stamp a deterministic `fanoutIndex`/`fanoutTotal` onto each child of a
- * multi-child fan-out. `fanoutIndex` is the child's rank in the order defined by
- * `keyOf` (host: `agentId`; matrix: variant label), independent of emission
- * order — the orchestrator's wave dispatch keys on `fanoutIndex`, so emission
- * order need not be touched (this preserves the matrix naming order). A single
- * child gets no position (non-fan-out job; `ctx.fanout` stays
- * undefined). Mutates and returns the same array.
+ * Stamp `fanoutIndex` (rank by `keyOf`) and `fanoutTotal` onto each child of a
+ * multi-child fan-out, in place. Emission order is left alone, preserving the
+ * matrix naming order, because the orchestrator's wave dispatch keys on
+ * `fanoutIndex`. A single child gets no position (`ctx.fanout` stays undefined).
  */
 function assignFanoutPositions(
   children: MaterializedJob[],
@@ -166,7 +136,7 @@ function assignFanoutPositions(
   return children;
 }
 
-/** Variant label of a child = the text inside the trailing `(...)` of its expanded name. */
+/** The text inside the trailing `(...)` of the expanded name. */
 function variantLabelOf(child: MaterializedJob): string {
   return child.expandedName.slice(child.baseName.length + 2, -1);
 }
@@ -178,12 +148,10 @@ export interface FanoutResult {
 }
 
 /**
- * The job-config envelope fields that identify a materialized child: the
- * expanded `name`, the `baseJobName` (what the agent exposes as `ctx.job.name`),
- * and `matrixValues` (exposed as `ctx.matrix`). Every dispatch site spreads
- * these into its job config so the envelopes stay identical. The raw
- * matrix/include/exclude are intentionally NOT included — they are consumed at
- * dispatch time, not shipped to the agent.
+ * The job-config envelope fields identifying a materialized child; `baseJobName`
+ * is the agent's `ctx.job.name` and `matrixValues` its `ctx.matrix`. Every
+ * dispatch site spreads these so the envelopes stay identical. The raw
+ * matrix/include/exclude are consumed at dispatch time, never shipped to the agent.
  */
 export function matrixEnvelopeFields(mat: MaterializedJob): {
   name: string;
@@ -201,9 +169,8 @@ export function matrixEnvelopeFields(mat: MaterializedJob): {
 }
 
 /**
- * The fan-out position envelope fields (`fanoutIndex`/`fanoutTotal`) of a
- * materialized child, shared by the matrix + host envelope builders. Both are
- * present together or absent together (a non-fan-out child has neither).
+ * The fan-out position envelope fields, shared by the matrix and host builders.
+ * Both are present or both absent (a non-fan-out child has neither).
  */
 export function fanoutEnvelopeFields(mat: MaterializedJob): {
   fanoutIndex?: number;
@@ -215,14 +182,10 @@ export function fanoutEnvelopeFields(mat: MaterializedJob): {
 }
 
 /**
- * Build materialized children from a resolved dynamic-matrix combination list
- * (produced by the agent eval flow). Mirrors the static-matrix branch of
- * {@link materializeFanout} but takes the already-resolved combinations and
- * enforces the same cap / zero-combination guards.
- *
- * Duplicate combinations are refused here rather than on the agent, so the
- * failure surfaces beside the zero-combination and cap errors for the same
- * path.
+ * Build children from a dynamic-matrix combination list resolved by the agent
+ * eval flow, with the same cap / zero-combination guards as the static branch
+ * of {@link materializeFanout}. Duplicates are refused here rather than on the
+ * agent, so they surface beside the other errors for this path.
  */
 export function materializeResolvedMatrix(
   lockJob: LockJob,
@@ -234,9 +197,8 @@ export function materializeResolvedMatrix(
       `dynamic matrix for job '${lockJob.name}' resolved to zero combinations`,
     );
   }
-  // Cap first: it is O(1) and names the more fundamental problem, so an
-  // oversized matrix is not re-reported as whichever duplicate it happens to
-  // contain — and the O(n) duplicate scan never runs on an unbounded list.
+  // Cap before the duplicate scan: O(1), it names the more fundamental problem,
+  // and the O(n) scan never runs on an unbounded list.
   if (combos.length > MAX_FANOUT_JOBS) {
     throw new FanoutError(
       lockJob.name,
@@ -268,10 +230,9 @@ export function materializeResolvedMatrix(
 }
 
 /**
- * The job-config envelope fields that identify a materialized host child: the
- * expanded `name`, the `baseJobName`, the `pinnedAgentId`, the `host` (exposed as
- * `ctx.host` and persisted as `variant_label`), and the resolved `agent` facts
- * (exposed as `ctx.agent`). The matrix sibling is {@link matrixEnvelopeFields}.
+ * The job-config envelope fields identifying a host child; `host` is exposed as
+ * `ctx.host` and persisted as `variant_label`, `agent` as `ctx.agent`. The
+ * matrix sibling is {@link matrixEnvelopeFields}.
  */
 export function hostEnvelopeFields(mat: MaterializedJob): {
   name: string;
@@ -295,11 +256,10 @@ export function hostEnvelopeFields(mat: MaterializedJob): {
 }
 
 /**
- * Build materialized host children from a resolved target-host list (produced by
- * the roster-backed resolution branch at dispatch time). Emits one pinned child
- * per host, sibling to {@link materializeResolvedMatrix}. `maxHosts` is the
- * orchestrator `maxFanoutHosts` config (default 1024) — NOT {@link MAX_FANOUT_JOBS}
- * (the 256 matrix cap is GitHub-Actions author-error parity, irrelevant to fleet size).
+ * Build one pinned child per host from the target-host list the roster-backed
+ * resolution produces at dispatch time. `maxHosts` is the orchestrator
+ * `maxFanoutHosts` config (default 1024), NOT {@link MAX_FANOUT_JOBS}: the 256
+ * matrix cap is GitHub Actions author-error parity, irrelevant to fleet size.
  */
 export function materializeResolvedHosts(
   lockJob: LockJob,
@@ -365,18 +325,16 @@ export function materializeFanout(staticJobs: readonly LockJob[]): FanoutResult 
       continue;
     }
 
-    // Static matrix: expand → include/exclude → suffix naming via
-    // `formatExpandedJobName`, the single renderer every fan-out path shares so
-    // the dashboard's matrix grouping and the `byMatrix` outputs key agree.
+    // `formatExpandedJobName` is the single renderer every fan-out path shares,
+    // so the dashboard's matrix grouping and the `byMatrix` outputs key agree.
     const values = matrix.values;
     if (!values) {
       throw new FanoutError(lockJob.name, `static matrix for job '${lockJob.name}' has no values`);
     }
     let expanded: MatrixValues[];
     try {
-      // Count first: a lock file we did not generate (hand-edited, or produced
-      // by another tool) can carry a product large enough to exhaust memory
-      // before the post-expansion cap below is ever consulted.
+      // Count first: a hand-edited or foreign lock file can carry a product that
+      // exhausts memory before the post-expansion cap is consulted.
       const rawCount = matrixCombinationCount(values);
       if (rawCount > MAX_MATRIX_MATERIALIZATION) {
         throw new FanoutError(
@@ -403,8 +361,7 @@ export function materializeFanout(staticJobs: readonly LockJob[]): FanoutResult 
         `matrix for job '${lockJob.name}' expands to zero combinations`,
       );
     }
-    // Cap before the duplicate scan: O(1), and it names the more fundamental
-    // problem rather than whichever duplicate an oversized matrix contains.
+    // Cap before the duplicate scan (see materializeResolvedMatrix).
     if (combos.length > MAX_FANOUT_JOBS) {
       throw new FanoutError(
         lockJob.name,

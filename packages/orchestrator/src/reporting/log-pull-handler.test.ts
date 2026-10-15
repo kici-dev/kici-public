@@ -6,13 +6,11 @@ import type { ExecutionTracker } from './execution-tracker.js';
 
 // -- In-memory LogStorage mock ────────────────────────────────────
 
-// The mock calls assertSafeLogPath on every path-taking verb so it refuses
-// exactly what the real backends refuse. A fake that accepts inputs the
-// product rejects eventually certifies handler behaviour that does not exist.
+// Every path-taking verb calls assertSafeLogPath, so the mock refuses exactly what the real
+// backends refuse; a laxer fake certifies handler behaviour that does not exist.
 class MockLogStorage implements LogStorage {
   private files = new Map<string, string>();
 
-  /** Seed a file in the mock storage. */
   seed(path: string, content: string): void {
     this.files.set(path, content);
   }
@@ -28,9 +26,8 @@ class MockLogStorage implements LogStorage {
   }
 
   async finalize(path: string): Promise<void> {
-    // Nothing to seal (the mock stores appends immediately), but the path is
-    // still validated: S3LogStorage.finalize() routes through objectKey() and
-    // rejects a malformed key, so the mock must not be laxer than it.
+    // Nothing to seal, but S3LogStorage.finalize() rejects a malformed key via objectKey(),
+    // so the mock validates too.
     assertSafeLogPath(path);
   }
 
@@ -218,7 +215,6 @@ describe('LogPullHandler', () => {
 
     it('supports cursor-based pagination', async () => {
       const { handler, logStorage, send } = setup();
-      // Create a log file larger than the requested limit
       const largeLine = '{"ts":"2026-01-01T00:00:00Z","msg":"' + 'x'.repeat(100) + '"}\n';
       logStorage.seed('executions/run-1/job-build/step-0.log', largeLine.repeat(10));
 
@@ -240,7 +236,6 @@ describe('LogPullHandler', () => {
 
     it('returns storage_error on LogStorage failure', async () => {
       const { handler, logStorage, send } = setup();
-      // Make list() throw
       vi.spyOn(logStorage, 'list').mockRejectedValueOnce(new Error('disk failure'));
 
       await handler.handleRequest({

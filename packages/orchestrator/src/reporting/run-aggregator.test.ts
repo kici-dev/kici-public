@@ -3,12 +3,9 @@ import { visibleRoutingReason, aggregateRunDetail, buildRunDetailJobs } from './
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 /**
- * A per-table select mock: `selectFrom(table)` returns a chain whose terminal
- * resolves the rows configured for that table, and each `selectFrom` call is
- * counted per table. Lets a test assert the aggregate queries every table
- * exactly once and returns a specific per-table shape (the shared createMockDb
- * returns one row set for every table, which cannot express distinct child
- * rows).
+ * Per-table select mock: `selectFrom(table)` resolves that table's configured rows and counts
+ * calls per table, so a test can assert each table is queried exactly once with a distinct
+ * shape (the shared createMockDb returns one row set for every table).
  */
 function createPerTableSelectDb(config: {
   rows: Record<string, unknown[]>;
@@ -110,8 +107,7 @@ describe('aggregateRunDetail', () => {
 
     const detail = await aggregateRunDetail(db as never, 'r9');
 
-    // Each of the five tables is queried exactly once (run header + four
-    // concurrent child reads).
+    // Run header + four concurrent child reads, each exactly once.
     for (const table of [
       'execution_runs',
       'execution_jobs',
@@ -270,9 +266,8 @@ describe('visibleRoutingReason', () => {
   });
 
   it('hides a stale reason on a job that has since left the queue', () => {
-    // More than twenty call sites move a job out of pending/queued and most do
-    // not know this column exists, so the guard has to live at the read
-    // boundary — a finished job must never render as "waiting for an agent".
+    // 20+ call sites move a job out of pending/queued, most unaware of this column, so the guard
+    // lives at the read boundary — a finished job must never render as "waiting for an agent".
     for (const status of ['running', 'success', 'failed', 'cancelled', 'unroutable', 'skipped']) {
       expect(visibleRoutingReason(status, 'no agent matches runsOn [gpu]')).toBeNull();
     }

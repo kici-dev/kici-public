@@ -2,10 +2,9 @@ import type { AgentPlatform } from '@kici-dev/shared';
 import { agentPackageKey } from './upload.js';
 
 /**
- * Read side of the cache-bucket agent-package store: mint a box-routable
- * presigned GET URL and read the payload's sha256 sidecar. Satisfied by the
- * orchestrator S3 cache storage client (`getUrl` presigns against the external,
- * container-routable endpoint; `get` reads the `.sha256` object).
+ * Read side of the cache-bucket agent-package store, satisfied by the orchestrator
+ * S3 cache storage client: `getUrl` presigns against the external,
+ * container-routable endpoint; `get` reads the `.sha256` sidecar.
  */
 export interface AgentPackageDownloadStorage {
   getUrl(key: string): Promise<string | null>;
@@ -25,11 +24,9 @@ export function parseSha256Sidecar(contents: string): string | null {
 }
 
 /**
- * Mint a presigned GET URL for a version-keyed agent payload and read its
- * sha256 sidecar. Returns null when the payload object is absent (an
- * unresolvable version) so the caller fails fast with a clear error rather than
- * staging stale bytes. The URL is box-routable (external endpoint); no standing
- * S3 credential ever leaves the orchestrator.
+ * Returns null when the payload object is absent (an unresolvable version), so
+ * the caller fails fast rather than staging stale bytes. The URL is box-routable
+ * (external endpoint); no standing S3 credential ever leaves the orchestrator.
  */
 export async function presignAgentPackageDownload(
   storage: AgentPackageDownloadStorage,

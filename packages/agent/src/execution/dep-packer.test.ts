@@ -17,7 +17,7 @@ import { writeFileSync } from 'node:fs';
 import { packNodeModules } from './dep-packer.js';
 import { restoreDeps } from './dep-restore.js';
 
-/** Write a packed tarball to disk and return a file:// URL for restore. */
+/** A file:// URL for restore. */
 async function tarballUrl(dir: string, tarball: Buffer): Promise<string> {
   const p = join(dir, 'deps.tar.gz');
   writeFileSync(p, tarball);
@@ -65,8 +65,7 @@ describe('packNodeModules + restoreDeps round-trip', () => {
     await mkdir(zodStore, { recursive: true });
     await writeFile(join(zodStore, 'index.js'), 'zod');
 
-    // Two in-repo workspace siblings with built output; sdk depends
-    // on core via a workspace symlink (transitive closure).
+    // Two built workspace siblings; sdk links core (transitive closure).
     const sdkDir = join(src, 'packages', 'sdk');
     const coreDir = join(src, 'packages', 'core');
     await mkdir(join(sdkDir, 'dist'), { recursive: true });
@@ -121,10 +120,9 @@ describe('packNodeModules + restoreDeps round-trip', () => {
     await writeFile(join(src, 'pnpm-lock.yaml'), '');
     await writeFile(join(pnpmStore, 'shared.d.ts'), 'export {};\n');
 
-    // pnpm hard-links each store file into the virtual store; identical files
-    // of one package share a store inode. This order (plain, link, plain,
-    // plain, link, plain) is the one that stops node-tar's own hard-link
-    // handling for good.
+    // pnpm hard-links store files into the virtual store, so identical files of
+    // one package share an inode. This order (plain, link, plain, plain, link,
+    // plain) stops node-tar's own hard-link handling for good.
     const pkg = join(src, 'node_modules', '.pnpm', 'zod@1.0.0', 'node_modules', 'zod');
     await mkdir(pkg, { recursive: true });
     for (const name of ['a.js', 'c.js', 'd.js', 'f.js']) await writeFile(join(pkg, name), name);

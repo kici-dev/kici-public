@@ -1,13 +1,7 @@
 /**
- * In-memory job queue for worker nodes.
- *
- * Workers receive jobs directly from the coordinator via P2P dispatch,
- * not from a database queue. This implementation satisfies the JobQueue
- * interface with ephemeral in-memory storage, allowing the dispatcher
- * subsystem to work unchanged on workers.
- *
- * Jobs enqueued here (when no agent is immediately available) are stored
- * in memory and dequeued when an agent with matching labels connects.
+ * Ephemeral JobQueue for worker nodes, which get jobs from the coordinator over
+ * P2P rather than a database queue, so the dispatcher runs unchanged on workers.
+ * A job enqueued with no agent available waits here until a matching agent connects.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -25,23 +19,18 @@ import {
 } from '../queue/job-queue.js';
 
 /**
- * Combined dispatch eligibility check for the in-memory queue:
- *   - subset match (`agent ⊇ runsOn`)
- *   - exclusion (no `excludeLabels` element appears in `agentLabels`)
- *   - mandatory-labels gate (`runsOn ⊇ agentMandatoryLabels`)
- *
- * Mirrors the SQL predicate stack in `JobQueue.dequeueForLabels` /
- * `dequeueById` so worker-side dispatch enforces the same gate the
- * coordinator-side DB queue does.
+ * Dispatch eligibility: subset (`agent ⊇ runsOn`), exclusion (no `excludeLabels`
+ * in `agentLabels`), and the mandatory-labels gate (`runsOn ⊇ agentMandatoryLabels`).
+ * Mirrors the SQL predicates of `JobQueue.dequeueForLabels` / `dequeueById`, so
+ * the worker enforces the coordinator's gate.
  */
 function matchesGate(
   job: QueuedJob,
   agentLabels: string[],
   agentMandatoryLabels: string[],
 ): boolean {
-  // The job's own selectors are already canonical (`InMemoryJobQueue.enqueue`
-  // folds them). Fold the agent's side here so the worker gate reaches the same
-  // verdict the coordinator's DB queue does for the same agent.
+  // `enqueue` already folded the job's selectors; fold the agent's side so the
+  // verdict matches the coordinator's DB queue.
   const labels = canonicalizeLabels(agentLabels);
   const gate = canonicalizeLabels(agentMandatoryLabels);
   const labelsMatch =
@@ -67,10 +56,9 @@ export class InMemoryJobQueue {
   /** Per-job re-dispatch counter (parity with dispatch_queue.dispatch_attempts). */
   private readonly attempts = new Map<string, number>();
   /**
-   * Jobs the owning coordinator stopped (a cancel), or that this worker gave back
-   * after its spawn retries ran out. A stopped job is never claimed, listed or
-   * re-pended, which is this queue's counterpart of the database queue's
-   * stopped-run guard. The mark goes with the job's entry.
+   * Jobs the owning coordinator stopped (a cancel), or this worker gave back after
+   * its spawn retries ran out. Never claimed, listed or re-pended — the counterpart
+   * of the database queue's stopped-run guard. The mark goes with the job's entry.
    */
   private readonly stopped = new Set<string>();
 
@@ -98,26 +86,20 @@ export class InMemoryJobQueue {
     return false;
   }
 
-  /** Enqueue a job in memory and return its ID. */
   async enqueue(input: QueuedJobInput): Promise<string> {
     const id = input.jobId ?? randomUUID();
-    // `resources` is materialized exactly as the DB-backed queue does it
-    // (`JobQueue.rowToQueuedJob`): the top-level field is a convenience mirror
-    // of `jobConfig.resources`, and on the DB path only the latter survives the
-    // round trip. Not carrying it here left every consumer that reads a drained
-    // job's declared shape seeing a job that declares nothing — the
-    // agent suitability gate (`canAgentRunJob`) would admit
-    // any warm agent, and the scaler re-drive would spawn at the label-set
-    // default instead of what the job asked for.
+    // Materialize `resources` as `JobQueue.rowToQueuedJob` does (the top-level
+    // field mirrors `jobConfig.resources`). Without it a drained job declares
+    // nothing: `canAgentRunJob` admits any warm agent, and the scaler re-drive
+    // spawns at the label-set default.
     this.jobs.set(id, {
       id,
       resources: input.resources ?? resourcesFromJobConfig(input.jobConfig),
       runId: input.runId,
       workflowName: input.workflowName,
       jobName: input.jobName,
-      // Folded at the write, mirroring what `JobQueue.rowToQueuedJob` folds at
-      // the read: the in-memory queue has no row to read back, so this is its
-      // one ingress into the canonical matching domain.
+      // Folded at write, as `JobQueue.rowToQueuedJob` folds at read: this is the
+      // in-memory queue's one ingress into the canonical matching domain.
       runsOnLabels: canonicalizeLabels(input.runsOnLabels),
       jobConfig: input.jobConfig,
       repoUrl: input.repoUrl,
@@ -144,9 +126,8 @@ export class InMemoryJobQueue {
   }
 
   /**
-   * Returns a generated UUID for direct-dispatch tracking, or honors the
-   * caller's pre-allocated jobId when set (cluster reroute path). The in-memory
-   * queue has no unique-key constraint, so an insert is always treated as new.
+   * Honors a pre-allocated jobId (cluster reroute) or generates one. No unique-key
+   * constraint here, so an insert is always new.
    */
   async insertDispatched(
     input: QueuedJobInput,
@@ -156,12 +137,8 @@ export class InMemoryJobQueue {
   }
 
   /**
-   * Dequeue the first pending job matching the given labels.
-   *
-   * `agentMandatoryLabels` mirrors the DB-backed `JobQueue.dequeueForLabels`
-   * gate: a job is only dequeued when its `runsOnLabels` includes every
-   * label in the gate set. Empty (default) is a no-op for static / non-scaler
-   * agents — the gate trivially passes.
+   * First pending job matching the labels. `agentMandatoryLabels` mirrors the
+   * `JobQueue.dequeueForLabels` gate; empty (static / non-scaler agents) passes.
    */
   async dequeueForLabels(
     agentLabels: string[],
@@ -172,8 +149,7 @@ export class InMemoryJobQueue {
     for (const [id, job] of this.jobs) {
       if (job.status !== DispatchQueueStatus.Pending || this.stopped.has(id)) continue;
       if (!matchesGate(job, agentLabels, agentMandatoryLabels)) continue;
-      // Same extra gate the DB-backed queue applies: labels cannot express
-      // whether a scaler agent may run this job at all.
+      // As in the DB queue: labels cannot express whether a scaler agent may run it.
       if (canServe && !canServe(job)) continue;
       job.status = DispatchQueueStatus.Dispatched;
       this.jobs.delete(id);
@@ -184,13 +160,9 @@ export class InMemoryJobQueue {
   }
 
   /**
-   * Dequeue a specific pending job by id, validating that the agent's labels
-   * still satisfy the job's runsOn / excludeLabels and the agent's
-   * `mandatoryLabels` gate. Mirrors the DB-backed `JobQueue.dequeueById`
-   * used by `Dispatcher.dispatchBoundJob()` when a scaler-managed agent
-   * registers and the scaler had bound a queued jobId to that agent at
-   * spawn time. Returns null if the job is missing, no longer Pending,
-   * labels no longer match, or the agent's gate is not satisfied.
+   * Mirrors `JobQueue.dequeueById`, which `Dispatcher.dispatchBoundJob()` calls
+   * when a scaler agent registers for the jobId it was spawned for. Null when the
+   * job is missing, not Pending, or fails {@link matchesGate}.
    */
   async dequeueById(
     jobId: string,
@@ -208,20 +180,14 @@ export class InMemoryJobQueue {
   }
 
   /**
-   * Dequeue the oldest pending job pinned to a specific agent. Mirrors the
-   * DB-backed `JobQueue.dequeueByPinnedAgent` that `Dispatcher.onAgentAvailable`
-   * calls — host-fanout children pinned to THIS agent drain before the generic
-   * label drain. Like the DB version, a pinned job relaxes the label-subset
-   * gate (the agent is its designated runner) and only the JS regex
-   * post-filter is applied.
+   * Oldest pending job pinned to the agent; mirrors `JobQueue.dequeueByPinnedAgent`
+   * (host-fanout children drain before the label drain). A pinned job skips the
+   * label-subset gate; only the JS regex post-filter applies.
    *
-   * The worker receives jobs via direct P2P dispatch and does not currently
-   * pin jobs to agents, so in practice no in-memory job carries a
-   * `pinnedAgentId` and this returns null — `onAgentAvailable` then falls back
-   * to `dequeueForLabels`. Implementing it (rather than leaving it undefined)
-   * is mandatory: `Dispatcher.onAgentAvailable` invokes it unconditionally, so
-   * its absence threw `TypeError: this.queue.dequeueByPinnedAgent is not a
-   * function` as an unhandled rejection that crashed the worker.
+   * Workers do not pin jobs, so this returns null in practice and
+   * `onAgentAvailable` falls back to `dequeueForLabels`. It must exist:
+   * `Dispatcher.onAgentAvailable` calls it unconditionally, and a missing method
+   * is an unhandled `TypeError` that crashes the worker.
    */
   async dequeueByPinnedAgent(agentId: string, agentLabels?: string[]): Promise<QueuedJob | null> {
     for (const [id, job] of this.jobs) {
@@ -240,7 +206,6 @@ export class InMemoryJobQueue {
     return null;
   }
 
-  /** Return count of pending jobs. */
   async getDepth(): Promise<number> {
     let count = 0;
     for (const job of this.jobs.values()) {
@@ -252,7 +217,6 @@ export class InMemoryJobQueue {
   /** No-op — the job is already tracked in `dispatched` from dequeue. */
   async markDispatched(_jobId: string, _agentId: string): Promise<void> {}
 
-  /** Drop the dispatched entry — the job reached a terminal state. */
   async markFailed(jobId: string, _reason: string): Promise<void> {
     this.dispatched.delete(jobId);
     this.jobs.delete(jobId);
@@ -260,20 +224,17 @@ export class InMemoryJobQueue {
     this.stopped.delete(jobId);
   }
 
-  /** Drop the dispatched entry — the job completed. */
   async markCompleted(jobId: string): Promise<void> {
     this.dispatched.delete(jobId);
     this.attempts.delete(jobId);
     this.stopped.delete(jobId);
   }
 
-  /** No-op. */
   async markRecovering(_jobId: string): Promise<void> {}
 
   /**
-   * No-op. The worker's dispatch-ack deadline lives entirely in the
-   * in-memory timer; HA-safe persistence belongs to the coord's DB-backed
-   * queue, not the worker's in-memory queue.
+   * No-op: the worker's ack deadline lives in its in-memory timer; HA-safe
+   * persistence belongs to the coordinator's DB queue.
    */
   async setAckDeadline(_jobId: string, _deadline: Date, _agentId: string): Promise<void> {}
 
@@ -295,11 +256,9 @@ export class InMemoryJobQueue {
   }
 
   /**
-   * Return a dispatched job to pending for re-dispatch, bumping its attempt
-   * counter unless `countAttempt` is false. Mirrors the DB-backed
-   * `JobQueue.requeue`. Returns the attempt count, or null when the job is
-   * not currently dispatched. A stopped job is dropped instead of re-pended, and
-   * also returns null.
+   * Mirrors `JobQueue.requeue`: re-pend a dispatched job, bumping attempts unless
+   * `countAttempt` is false. Returns the attempt count, or null when the job is not
+   * dispatched or is stopped (a stopped job is dropped instead).
    */
   async requeue(jobId: string, opts: { countAttempt?: boolean } = {}): Promise<number | null> {
     const job = this.dispatched.get(jobId);
@@ -320,20 +279,18 @@ export class InMemoryJobQueue {
   }
 
   /**
-   * The sealed-secrets back-off of `JobQueue.isDeferredUnopenable`. A worker's
-   * in-memory jobs are never sealed, so none is ever deferred; the dispatcher's
-   * requeue redispatch asks every queue this.
+   * `JobQueue.isDeferredUnopenable`'s sealed-secrets back-off, which the requeue
+   * redispatch asks every queue. Worker jobs are never sealed, so never deferred.
    */
   isDeferredUnopenable(_jobId: string): boolean {
     return false;
   }
 
-  /** Full job lookup across pending and dispatched jobs. */
+  /** Pending or dispatched. */
   async getFullJobById(jobId: string): Promise<QueuedJob | null> {
     return this.jobs.get(jobId) ?? this.dispatched.get(jobId) ?? null;
   }
 
-  /** Return all pending jobs. */
   async getPendingJobs(): Promise<QueuedJob[]> {
     return [...this.jobs.values()].filter(
       (j) => j.status === DispatchQueueStatus.Pending && !this.stopped.has(j.id),
@@ -341,23 +298,19 @@ export class InMemoryJobQueue {
   }
 
   /**
-   * Oldest-first listing of pending jobs, capped at `limit` — the worker-side
-   * twin of `JobQueue.listPending`. The dispatcher's capacity-freed re-drive
-   * (`retryPendingScaleRequests`) reads it on every worker whose scaler frees
-   * a slot; `worker-core` wires that hook exactly as the coordinator does.
-   * Insertion order is the enqueue order, which is what `created_at ASC` gives
-   * the DB queue.
+   * Twin of `JobQueue.listPending`: oldest first (insertion order = `created_at
+   * ASC`), capped at `limit`. `retryPendingScaleRequests` reads it on every worker
+   * whose scaler frees a slot; `worker-core` wires that hook as the coordinator does.
    */
   async listPending(limit: number): Promise<QueuedJob[]> {
     return (await this.getPendingJobs()).slice(0, Math.max(0, limit));
   }
 
-  /** Always returns empty array. */
   async getDispatchedJobIdsByRunId(_runId: string): Promise<string[]> {
     return [];
   }
 
-  /** Lookup across pending and dispatched jobs (id / runId / status). */
+  /** Pending or dispatched. */
   async getJobById(
     jobId: string,
   ): Promise<{ id: string; runId: string; status: DispatchQueueStatus } | null> {
@@ -365,17 +318,14 @@ export class InMemoryJobQueue {
     return job ? { id: job.id, runId: job.runId, status: job.status as DispatchQueueStatus } : null;
   }
 
-  /** Always returns false. */
   async markFailedIfRecovering(_jobId: string, _reason: string): Promise<boolean> {
     return false;
   }
 
-  /** Always returns false. */
   async markDispatchedIfRecovering(_jobId: string, _agentId: string): Promise<boolean> {
     return false;
   }
 
-  /** Always returns empty array. */
   async getJobsByStatus(
     _status: DispatchQueueStatus,
   ): Promise<
@@ -384,7 +334,6 @@ export class InMemoryJobQueue {
     return [];
   }
 
-  /** No-op — nothing to expire. */
   async markExpired(): Promise<number> {
     return 0;
   }

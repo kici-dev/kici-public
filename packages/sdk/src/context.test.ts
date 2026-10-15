@@ -55,7 +55,6 @@ describe('context types', () => {
   describe('KnownSecretKeys', () => {
     it('KnownSecretKeys is an empty interface by default', () => {
       expectTypeOf<KnownSecretKeys>().toEqualTypeOf<KnownSecretKeys>();
-      // Verify it has no keys when not augmented
       expectTypeOf<keyof KnownSecretKeys>().toEqualTypeOf<never>();
     });
   });
@@ -94,9 +93,8 @@ describe('context types', () => {
     });
 
     it('preserves has/getMeta/list/mountFile/exposeFile verbatim from StepSecrets', () => {
-      // Regression guard: augmentation must never drop the file-mount accessors.
-      // These vanished once because the augmented branch was a hand-maintained
-      // inline object literal that fell out of sync with StepSecrets.
+      // Regression guard: the file-mount accessors vanished once, when the augmented
+      // branch was a hand-maintained literal that fell out of sync with StepSecrets.
       expectTypeOf<Aug['has']>().toEqualTypeOf<StepSecrets['has']>();
       expectTypeOf<Aug['getMeta']>().toEqualTypeOf<StepSecrets['getMeta']>();
       expectTypeOf<Aug['list']>().toEqualTypeOf<StepSecrets['list']>();

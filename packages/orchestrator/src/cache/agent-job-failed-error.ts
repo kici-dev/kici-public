@@ -2,9 +2,8 @@ import type { InitFailure } from '@kici-dev/engine';
 
 /**
  * Reject reason for a pending init / dynamic-eval job the agent reported as
- * failed. Carries the optional structured initFailure the agent attached to
- * job.status.data so the orchestrator catch can record the correct category
- * instead of collapsing everything to a string.
+ * failed. Carries the agent's optional structured `job.status.data` initFailure
+ * so the catch records the correct category, not just a string.
  */
 export class AgentJobFailedError extends Error {
   readonly name = 'AgentJobFailedError';

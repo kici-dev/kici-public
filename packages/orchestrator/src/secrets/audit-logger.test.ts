@@ -1,18 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
-import type { Kysely } from 'kysely';
+import { describe, expect, it } from 'vitest';
 import type { AuditEntry } from '@kici-dev/engine';
 import { AuditLogger } from './audit-logger.js';
-import type { Database } from '../db/types.js';
-
-function makeMockDb() {
-  const execute = vi.fn().mockResolvedValue(undefined);
-  const db = {
-    insertInto: vi.fn(() => ({
-      values: vi.fn(() => ({ execute })),
-    })),
-  } as unknown as Kysely<Database>;
-  return { db, execute };
-}
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 function entry(overrides: Partial<AuditEntry> = {}): AuditEntry {
   return {
@@ -32,7 +21,10 @@ function entry(overrides: Partial<AuditEntry> = {}): AuditEntry {
 
 describe('AuditLogger.log — resolve / resolve_named sampling', () => {
   it('samples allowed `resolve` entries to ~1%', async () => {
-    const { db, execute } = makeMockDb();
+    const {
+      db,
+      mocks: { insertExecute: execute },
+    } = createMockDb();
     const logger = new AuditLogger(db);
     for (let i = 0; i < 1000; i++) {
       await logger.log(entry({ runId: `run-${i}`, jobId: `job-${i}` }));
@@ -43,7 +35,10 @@ describe('AuditLogger.log — resolve / resolve_named sampling', () => {
   });
 
   it('always records denied resolves', async () => {
-    const { db, execute } = makeMockDb();
+    const {
+      db,
+      mocks: { insertExecute: execute },
+    } = createMockDb();
     const logger = new AuditLogger(db);
     for (let i = 0; i < 50; i++) {
       await logger.log(entry({ outcome: 'denied', runId: `run-${i}` }));
@@ -52,7 +47,10 @@ describe('AuditLogger.log — resolve / resolve_named sampling', () => {
   });
 
   it('always records `setSecret` mutations regardless of sampling', async () => {
-    const { db, execute } = makeMockDb();
+    const {
+      db,
+      mocks: { insertExecute: execute },
+    } = createMockDb();
     const logger = new AuditLogger(db);
     for (let i = 0; i < 20; i++) {
       await logger.log(entry({ action: 'setSecret', secretKeys: ['K'] }));
@@ -61,7 +59,10 @@ describe('AuditLogger.log — resolve / resolve_named sampling', () => {
   });
 
   it('always records `deleteSecret` mutations', async () => {
-    const { db, execute } = makeMockDb();
+    const {
+      db,
+      mocks: { insertExecute: execute },
+    } = createMockDb();
     const logger = new AuditLogger(db);
     for (let i = 0; i < 20; i++) {
       await logger.log(entry({ action: 'deleteSecret' }));
@@ -70,7 +71,10 @@ describe('AuditLogger.log — resolve / resolve_named sampling', () => {
   });
 
   it('always records `rotateKey` operations', async () => {
-    const { db, execute } = makeMockDb();
+    const {
+      db,
+      mocks: { insertExecute: execute },
+    } = createMockDb();
     const logger = new AuditLogger(db);
     for (let i = 0; i < 10; i++) {
       await logger.log(entry({ action: 'rotateKey' }));
@@ -79,7 +83,10 @@ describe('AuditLogger.log — resolve / resolve_named sampling', () => {
   });
 
   it('always records `secret-outputs.reveal` operations', async () => {
-    const { db, execute } = makeMockDb();
+    const {
+      db,
+      mocks: { insertExecute: execute },
+    } = createMockDb();
     const logger = new AuditLogger(db);
     for (let i = 0; i < 10; i++) {
       await logger.log(entry({ action: 'secret-outputs.reveal' }));

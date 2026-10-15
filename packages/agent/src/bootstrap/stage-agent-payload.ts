@@ -1,11 +1,10 @@
 /**
  * Stage a self-contained agent payload onto a bring-up target.
  *
- * The reusable core mechanism behind fresh-box bring-up: resolve a version-keyed
- * payload from an `AgentPayloadSource`, verify it, deliver it to the box, verify
- * it again ON the box before extracting, and return the launcher path. The
- * launcher boots the agent on its VENDORED Node, so a stock rescue box (no Node)
- * becomes a connected agent.
+ * The core of fresh-box bring-up: resolve a version-keyed payload from an
+ * `AgentPayloadSource`, verify it, deliver it, verify it again on the box
+ * before extracting, and return the launcher path. The launcher boots the agent
+ * on its vendored Node, so a stock rescue box with no Node becomes an agent.
  *
  * Two delivery modes: `ssh-push` (the ops agent pulls the payload from its
  * source, then streams it to the box over a binary-safe scp) and `s3-direct`
@@ -21,20 +20,12 @@ import type { HostReach } from './reach.js';
 import type { AgentPayloadSource } from './payload-source.js';
 import { shQuote } from '@kici-dev/core';
 
-/**
- * How the payload reaches the box. `s3-direct` carries the box-pullable
- * presigned URL + the expected sha256 the box verifies before extract (so the
- * payload never transits the ops agent).
- */
+/** `s3-direct` carries the sha256 the box verifies before extracting. */
 export type DeliveryMode =
   { mode: 'ssh-push' } | { mode: 's3-direct'; presignedUrl: string; sha256: string };
 
 export interface StageDeps extends SshDeps {
-  /**
-   * Where payload tarballs come from for the `ssh-push` path (object storage via
-   * `S3PayloadSource`, or a local dir for air-gap). Not needed for `s3-direct`
-   * (the box pulls the presigned URL itself).
-   */
+  /** Required for `ssh-push` only: `S3PayloadSource`, or a local dir for air-gap. */
   payloadSource?: AgentPayloadSource;
   /** Where the payload is extracted on the box (default `/opt/kici-init`). */
   extractDir?: string;
@@ -50,10 +41,8 @@ export interface StageOpts {
 
 /** Default extract dir; overridable for a rescue env whose `/opt` is read-only. */
 const DEFAULT_EXTRACT_DIR = '/opt/kici-init';
-/** Remote landing path for the pushed payload tarball. */
 const REMOTE_TARBALL_PATH = '/tmp/kici-agent-payload.tar.gz';
 
-/** Streamed sha256 of a local file (the default ops-agent-side verify). */
 function hashFileSha256(filePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = createHash('sha256');
@@ -65,9 +54,9 @@ function hashFileSha256(filePath: string): Promise<string> {
 }
 
 /**
- * Verify the resolved payload on the ops agent BEFORE any transfer. A payload
- * with no sidecar hash is unverifiable and refused (fail-closed); a hash
- * mismatch throws so corrupt/tampered bytes never leave this process.
+ * Runs on the ops agent before any transfer. A payload with no sidecar hash is
+ * refused (fail-closed), and a mismatch throws, so corrupt or tampered bytes
+ * never leave this process.
  */
 async function verifyLocalPayload(
   tarballPath: string,
@@ -88,11 +77,7 @@ async function verifyLocalPayload(
   return expectedSha256;
 }
 
-/**
- * On the box: verify the pushed tarball's hash, then extract it into
- * `extractDir`. `sha256sum -c` fails the whole `&&` chain if the hash differs,
- * so extraction only ever runs on verified bytes.
- */
+/** `sha256sum -c` breaks the `&&` chain on a mismatch, so only verified bytes extract. */
 async function verifyAndExtractRemote(
   reach: HostReach,
   privateKey: string,
@@ -138,11 +123,9 @@ async function stageSshPush(
 }
 
 /**
- * `s3-direct`: the box pulls the presigned URL itself, verifies the sha256, and
- * extracts — all in one `sshExec`, so the 50 MB payload never transits the ops
- * agent. Fail-closed: `sha256sum -c` breaks the `&&` chain on mismatch, so the
- * box only ever extracts verified bytes, and `curl -f` fails the chain on a
- * non-2xx (expired/absent presign).
+ * One `sshExec` pulls, verifies and extracts on the box. `sha256sum -c` breaks
+ * the `&&` chain on a mismatch, and `curl -f` on a non-2xx (an expired or
+ * absent presign).
  */
 async function stageS3Direct(
   reach: HostReach,
@@ -171,10 +154,7 @@ async function stageS3Direct(
   }
 }
 
-/**
- * Stage a payload onto `reach` and return the launcher path the caller runs as
- * the init-runner's `agentCommand`.
- */
+/** Returns the launcher path the caller runs as the init-runner's `agentCommand`. */
 export async function stageAgentPayload(
   reach: HostReach,
   privateKey: string,

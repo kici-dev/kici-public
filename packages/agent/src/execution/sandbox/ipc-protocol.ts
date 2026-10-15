@@ -3,10 +3,9 @@ import type { SandboxStepResult } from './types.js';
 import type { DepRestoreReport } from '../dep-restore-report.js';
 
 /**
- * Structured clone auth. Wire-compatible with `gitAuthSchema` on the
- * orchestrator-agent protocol and `GitAuth` in `checkout/git-clone.ts`.
- * Declared independently here so the sandbox IPC module has no runtime
- * dependency on the engine protocol package.
+ * Structured clone auth, wire-compatible with the protocol's `gitAuthSchema` and
+ * `GitAuth` in `checkout/git-clone.ts`. Declared here so the sandbox IPC module
+ * has no runtime dependency on the engine protocol package.
  */
 export interface GitAuthDispatch {
   kind: 'basic' | 'ssh';
@@ -16,7 +15,7 @@ export interface GitAuthDispatch {
   sshKnownHostsPem?: string;
 }
 
-// --- Runner -> Agent messages (from workflow runner to agent process) ---
+// --- Runner -> Agent messages ---
 
 /** Workflow runner is initialized and ready to receive a job. */
 interface ReadyMessage {
@@ -31,9 +30,9 @@ interface StepStartMessage {
   /** Distinguishes regular steps from hook executions (e.g., 'hook:onCancel', 'hook:cleanup'). Defaults to 'step'. */
   step_type?: string;
   /**
-   * Initial state for the step. Defaults to `running`. A parallel-group child
-   * queued behind `maxParallel` is announced as `pending` before it acquires a
-   * slot; it later emits a second `step.start` with `running` when it launches.
+   * Defaults to `running`. A parallel-group child queued behind `maxParallel` is
+   * announced as `pending`, then emits a second `step.start` with `running` once
+   * it acquires a slot.
    */
   state?: 'running' | 'pending';
   /** Step concurrency role; absent means an ordinary sequential step. */
@@ -57,27 +56,26 @@ interface StepCompleteMessage {
     exitCode?: number;
     signal?: string;
   };
-  /** Step return value (outputs). Present on success when step returns non-void. */
+  /** Step return value; present on success when the step returns non-void. */
   outputs?: Record<string, unknown>;
   /** Distinguishes regular steps from hook executions (e.g., 'hook:onCancel', 'hook:cleanup'). Defaults to 'step'. */
   step_type?: string;
   /** Secret key names accessed by this step via ctx.secrets.get() or ctx.secrets.expose(). Never contains values. */
   secretsAccessed?: string[];
   /**
-   * Structured per-step metadata forwarded to the orchestrator's `step.status`
-   * `data` field (and persisted for the dashboard timeline). The cache
-   * pseudo-steps carry `{ cacheOutcome, key, matchedKey?, bytes? }` here.
+   * Forwarded to the orchestrator's `step.status` `data` field and persisted for
+   * the dashboard timeline. Cache pseudo-steps carry
+   * `{ cacheOutcome, key, matchedKey?, bytes? }`.
    */
   data?: Record<string, unknown>;
   /**
-   * Idempotent per-step outcome (`CheckStepOutcome`). Present only when the run
-   * carried a check mode and the step has a `check` facet (or was a plain step
-   * skipped under check mode). Orthogonal to `status`.
+   * Present only when the run carried a check mode and the step has a `check`
+   * facet (or was a plain step skipped under check mode). Orthogonal to `status`.
    */
   checkOutcome?: CheckStepOutcome;
-  /** Human-readable drift summary (`summarize(drift)`). Present when drift was detected. */
+  /** `summarize(drift)`; present when drift was detected. */
   driftSummary?: string;
-  /** Structured drift value returned by `check()`. Present when drift was detected. */
+  /** The value `check()` returned; present when drift was detected. */
   drift?: unknown;
 }
 
@@ -91,11 +89,11 @@ interface LogLineMessage {
 }
 
 /**
- * Sent exactly once, at the end of the runner's setup and before it loads the
- * workflow module: the outcome of the job's dependency restore, or no report
- * when no restore ran. The runner's own logger output never reaches the agent
- * log, so this is how the restore does; the agent's relay closes on the first
- * such message, so one sent later by workflow code is ignored.
+ * Sent exactly once, after runner setup and before the workflow module loads:
+ * the dependency restore outcome, or no report when no restore ran. The
+ * runner's logger output never reaches the agent log, so the restore outcome
+ * travels here. The agent's relay closes on the first such message, so a later
+ * one sent by workflow code is ignored.
  */
 interface DepRestoreReportMessage {
   type: 'dep-restore.report';
@@ -103,28 +101,26 @@ interface DepRestoreReportMessage {
 }
 
 /**
- * Discriminator for {@link StepSecretMountMessage} -- distinguishes a bare
- * `ctx.secrets.mountFile` call from a `ctx.secrets.exposeFile` call (the
- * latter additionally sets an env var on the step's process).
+ * Discriminator for {@link StepSecretMountMessage}: `ctx.secrets.mountFile` or
+ * `ctx.secrets.exposeFile`, which also sets an env var on the step's process.
  */
 export type StepSecretMountKind = 'mountFile' | 'exposeFile';
 
 /**
  * Audit event emitted once per `ctx.secrets.mountFile` / `exposeFile` call.
- * Carries only key names + the resulting path / env var -- never the file
- * content. Persisted by the orchestrator alongside `secretsAccessed` so the
- * dashboard can render the materialised-file audit trail.
+ * Carries only key names and the resulting path / env var, never the file
+ * content. The orchestrator persists it alongside `secretsAccessed` for the
+ * dashboard's materialised-file audit trail.
  */
 interface StepSecretMountMessage {
   type: 'step.secret_mount';
   stepIndex: number;
-  /** Source secret keys (in concatenation order). */
+  /** Source secret keys, in concatenation order. */
   sources: string[];
-  /** Absolute path the file was materialised to inside the step sandbox. */
+  /** Absolute path of the materialised file inside the step sandbox. */
   target: string;
-  /** Env var set when `kind === 'exposeFile'`; otherwise omitted. */
+  /** Set only when `kind === 'exposeFile'`. */
   envVar?: string;
-  /** Discriminator between `mountFile` and `exposeFile`. */
   kind: StepSecretMountKind;
 }
 
@@ -133,11 +129,11 @@ interface JobCompleteMessage {
   type: 'job.complete';
   status: 'success' | 'failed';
   stepResults: SandboxStepResult[];
-  /** Error message when the job failed before step execution (e.g. clone, deps, compile). */
+  /** Set when the job failed before step execution (e.g. clone, deps, compile). */
   error?: string;
-  /** Aggregated step outputs by step name. Present on success when steps produce outputs. */
+  /** Step outputs by step name; present on success when steps produce outputs. */
   outputs?: Record<string, Record<string, unknown>>;
-  /** Secret output values collected during step execution (plaintext -- encryption happens in the agent before WS send). */
+  /** Plaintext secret outputs; the agent encrypts them before the WS send. */
   secretOutputs?: Record<string, string>;
   /** Names of sibling jobs dropped by DynamicJobFn re-evaluation drift. */
   droppedJobs?: string[];
@@ -168,30 +164,23 @@ export interface CompletionHooksDoneMessage {
 /** Request to emit a custom event from a workflow step (runner -> agent). */
 export interface EventEmitRequest {
   type: 'event.emit';
-  /** Unique ID for correlating the response back to the caller. */
+  /** Correlates the response. */
   requestId: string;
-  /** Custom event name (e.g. 'deploy-complete'). */
+  /** E.g. 'deploy-complete'. */
   eventName: string;
-  /** Event payload (arbitrary JSON-serializable data). */
+  /** Arbitrary JSON-serializable data. */
   payload: Record<string, unknown>;
-  /** Optional targeting for cross-repo delivery. */
+  /** Cross-repo delivery targeting. */
   target?: { repos?: string[] };
 }
 
 /** Report evaluated concurrency group key (runner -> agent -> orchestrator). */
 export interface ConcurrencyReportMessage {
   type: 'concurrency.report';
-  /** Evaluated concurrency group key (e.g. 'deploy-main'). */
+  /** E.g. 'deploy-main'. */
   group: string;
 }
 
-/**
- * Discriminated union of all messages sent from the workflow runner to the agent.
- *
- * The workflow runner sends these via:
- * - Node.js IPC channel (`process.send()`) for bare-metal/Firecracker backends
- * - stdout JSON-lines for container backend (`docker exec`)
- */
 /** API request from runner to agent (relayed to orchestrator via WS). */
 export interface AgentApiRequestIpc {
   type: 'agent.api.request';
@@ -214,16 +203,14 @@ export type CacheRequestOp = 'restore' | 'beginSave' | 'completeSave';
 
 /**
  * Request a user-facing cache operation (runner -> agent). The sandbox runner
- * can't open a WS, so it sends this IPC; the agent relays it to the
- * orchestrator over the WS as a `cache.user.*` message and pipes the response
- * back as a {@link CacheResponseIpc}. Mirrors the {@link AgentApiRequestIpc}
- * relay pattern.
+ * cannot open a WS, so the agent relays this to the orchestrator as a
+ * `cache.user.*` message and pipes the response back as a
+ * {@link CacheResponseIpc}.
  */
 export interface CacheRequestIpc {
   type: 'cache.request';
   /** UUID for correlating the response. */
   requestId: string;
-  /** Which cache operation to perform. */
   op: CacheRequestOp;
   /** Exact cache key (all ops). */
   key: string;
@@ -241,11 +228,10 @@ export type GitGrantOp = 'elevate' | 'revoke';
 /**
  * Open or close a write window for one repository (runner -> agent).
  *
- * `withWrite` sends `elevate` before running its callback and `revoke` in a
- * `finally`. The grant lives in the AGENT's grant table — the credential helper
- * git spawns is a separate process and consults the agent, not the runner —
- * which is why this is an agent-directed IPC call rather than an orchestrator
- * one. Mirrors the {@link CacheRequestIpc} relay pattern.
+ * `withWrite` sends `elevate` before its callback and `revoke` in a `finally`.
+ * The grant lives in the AGENT's grant table, because the credential helper git
+ * spawns is a separate process that consults the agent, not the runner; so this
+ * is an agent-directed IPC call rather than an orchestrator one.
  */
 export interface GitGrantRequestIpc {
   type: 'git.grant.request';
@@ -265,16 +251,14 @@ export interface GitGrantRequestIpc {
  * Request a step-level approval hold (runner -> agent). The sandbox runner
  * blocks the step loop before a `requireApproval` step; the agent relays this
  * as a `step.approval-request` WS message and pipes the orchestrator's
- * resolution back as a {@link StepApprovalResolvedIpc}. Mirrors the
- * {@link CacheRequestIpc} relay pattern.
+ * resolution back as a {@link StepApprovalResolvedIpc}.
  */
 export interface StepApprovalRequestIpc {
   type: 'approval.request';
   /** UUID for correlating the response. */
   requestId: string;
-  /** Step index within the job. */
   stepIndex: number;
-  /** Step name (for the hold reason / logs). */
+  /** Used in the hold reason and logs. */
   stepName: string;
   /** AND-list of approver clauses (empty = any approval-capable member). */
   clauses: Array<{ team: string } | { user: string }>;
@@ -293,17 +277,15 @@ export type ProvenanceRequestOp = 'requestUploadUrl' | 'complete' | 'defer';
  * Request a provenance bundle upload operation (runner -> agent). The agent
  * relays it over the WS as a `provenance.upload.request` / `.complete` /
  * `.defer` and pipes the response back as a {@link ProvenanceResponseIpc}.
- * Mirrors the {@link CacheRequestIpc} relay pattern.
  *
  * `defer` captures a frozen, DSSE-signed statement for later minting (the
- * transient mint-failure path): no upload happens; the orchestrator persists
- * the envelope in its deferred-attestation outbox instead.
+ * transient mint-failure path): nothing uploads, and the orchestrator persists
+ * the envelope in its deferred-attestation outbox.
  */
 export interface ProvenanceRequestIpc {
   type: 'provenance.request';
   /** UUID for correlating the response. */
   requestId: string;
-  /** Which provenance operation to perform. */
   op: ProvenanceRequestOp;
   /** Primary subject digest (lowercase hex) — the storage-key discriminator. */
   subjectDigest: string;
@@ -328,15 +310,14 @@ export type ArtifactRequestOp = 'beginUpload' | 'completeUpload' | 'download';
  * Request a user-facing artifact operation (runner -> agent). The agent relays
  * it over the WS as an `artifacts.upload.request` / `.complete` /
  * `artifacts.download.request` and pipes the response back as an
- * {@link ArtifactResponseIpc}. Mirrors the {@link CacheRequestIpc} relay pattern.
+ * {@link ArtifactResponseIpc}.
  */
 export interface ArtifactRequestIpc {
   type: 'artifacts.request';
   /** UUID for correlating the response. */
   requestId: string;
-  /** Which artifact operation to perform. */
   op: ArtifactRequestOp;
-  /** Artifact name (all ops). */
+  /** All ops. */
   name: string;
   /** Packed tarball size in bytes — drives the enforcement gates. `beginUpload` only. */
   declaredSizeBytes?: number;
@@ -344,6 +325,11 @@ export interface ArtifactRequestIpc {
   sha256?: string;
 }
 
+/**
+ * Every message the workflow runner sends the agent: over the Node.js IPC
+ * channel (`process.send()`) for bare-metal/Firecracker backends, and as stdout
+ * JSON lines for the container backend (`docker exec`).
+ */
 export type RunnerToAgentMessage =
   | ReadyMessage
   | StepStartMessage
@@ -363,7 +349,7 @@ export type RunnerToAgentMessage =
   | GitGrantRequestIpc
   | StepApprovalRequestIpc;
 
-// --- Agent -> Runner messages (from agent process to workflow runner) ---
+// --- Agent -> Runner messages ---
 
 /** Instruct the workflow runner to execute a job. */
 interface ExecuteMessage {
@@ -394,17 +380,10 @@ export interface ConcurrencyAckMessage {
   type: 'concurrency.ack';
   /** Action to take: proceed with execution, wait (release slot), or cancel the job. */
   action: 'proceed' | 'wait' | 'cancel';
-  /** Optional reason for wait or cancel. */
+  /** Reason for `wait` or `cancel`. */
   reason?: string;
 }
 
-/**
- * Discriminated union of all messages sent from the agent to the workflow runner.
- *
- * The agent sends these via:
- * - Node.js IPC channel (`child.send()`) for bare-metal/Firecracker backends
- * - stdin JSON-line for container backend (`docker exec`)
- */
 /** API response from agent to runner (relayed from orchestrator via WS). */
 export interface AgentApiResponseIpc {
   type: 'agent.api.response';
@@ -519,13 +498,11 @@ export interface ArtifactResponseIpc {
   /** beginUpload: enforcement-gate refusal reason (present only on `rejected`). */
   reason?: 'duplicate_name' | 'size_cap' | 'run_cap' | 'org_quota';
   /**
-   * Orchestrator non-enforcement refusal detail — set when a `rejected` upload
-   * or a `not_found` download reflects a name that violates the artifact-name
-   * contract, or an orchestrator problem (artifacts not configured, unresolvable
-   * run, internal error), rather than an enforcement gate or a genuinely missing
-   * artifact. Distinct from `error` below, which is a relay/transport failure
-   * the sandbox turns into a thrown error: this field flows into the normal
-   * rejection render instead.
+   * Set when a `rejected` upload or `not_found` download comes from a name that
+   * violates the artifact-name contract or an orchestrator problem (artifacts
+   * not configured, unresolvable run, internal error), not from an enforcement
+   * gate or a missing artifact. Unlike `error` (a relay failure the sandbox
+   * throws), it flows into the normal rejection render.
    */
   rejectionDetail?: string;
   /** download: `found` (presigned GET minted) or `not_found`. */
@@ -540,6 +517,11 @@ export interface ArtifactResponseIpc {
   error?: string;
 }
 
+/**
+ * Every message the agent sends the workflow runner: over the Node.js IPC
+ * channel (`child.send()`) for bare-metal/Firecracker backends, and as stdin
+ * JSON lines for the container backend (`docker exec`).
+ */
 export type AgentToRunnerMessage =
   | ExecuteMessage
   | AbortMessage
@@ -555,10 +537,8 @@ export type AgentToRunnerMessage =
 // --- Job execution request ---
 
 /**
- * All data the workflow runner needs to execute a job inside the sandbox.
- *
- * Sent from the agent to the runner as part of the `execute` message.
- * The runner uses this to clone, install deps, compile, and execute steps.
+ * The `execute` message payload: everything the workflow runner needs to clone,
+ * install deps, compile and execute a job inside the sandbox.
  */
 export interface JobExecutionRequest {
   /**
@@ -567,75 +547,56 @@ export interface JobExecutionRequest {
    */
   allowInstallScripts?: boolean;
   /**
-   * Run UUID. Threaded into the step context so the OIDC token relay can name
-   * the job/run a request is bound to. Correlation only — the orchestrator
-   * re-derives ownership and the runId from its own dispatch state.
+   * Threaded into the step context so the OIDC token relay can name the run a
+   * request is bound to. Correlation only: the orchestrator re-derives ownership
+   * and the runId from its own dispatch state.
    */
   runId: string;
   /**
-   * Job UUID. Sent with `ctx.kici.oidc.token()` requests so the orchestrator
-   * can verify the agent owns this job before relaying a mint request.
+   * Sent with `ctx.kici.oidc.token()` requests so the orchestrator can verify
+   * the agent owns this job before relaying a mint request.
    */
   jobId: string;
-  /** Working directory inside the sandbox (e.g. /workspace). */
+  /** E.g. /workspace. */
   workDir: string;
-  /** Repository URL for git clone. */
   repoUrl: string;
-  /** Git ref to checkout (branch or tag). */
+  /** Branch or tag. */
   ref: string;
-  /** Git commit SHA. */
   sha: string;
-  /** Structured auth for the source repo clone. */
   sourceAuth?: GitAuthDispatch;
-  /**
-   * Structured auth for the workflow repo clone (global workflows only).
-   * Falls back to `sourceAuth` when absent.
-   */
+  /** Workflow repo clone auth (global workflows only); falls back to `sourceAuth`. */
   workflowAuth?: GitAuthDispatch;
 
-  /** URL to a pre-packed `.kici/` source tarball (skip clone if present). */
+  /** Pre-packed `.kici/` source tarball; the clone is skipped when present. */
   sourceTarUrl?: string;
   /**
-   * Absolute path to the agent's git credential helper, when one is available.
-   *
-   * The runner configures it on every clone it makes, so each later git network
-   * operation asks the agent for a freshly minted credential rather than
-   * relying on one captured at clone time. Absent for a container job, whose
-   * git has no route to the agent's socket — see the dual-mode container work.
+   * The agent's git credential helper. The runner configures it on every clone,
+   * so each later git network operation asks the agent for a freshly minted
+   * credential instead of one captured at clone time. Absent for a container
+   * job, whose git has no route to the agent's socket.
    */
   credentialHelperPath?: string;
-  /** SHA-256 hash of the source tarball bytes for integrity verification. */
+  /** SHA-256 of the source tarball bytes, for integrity verification. */
   sourceTarDigest?: string;
 
-  /** URL to pre-built dependency tarball (skip install if present). */
+  /** Pre-built dependency tarball; the install is skipped when present. */
   depsUrl?: string;
-  /** SHA-256 hash of the dependency tarball for integrity verification. */
+  /** SHA-256 of the dependency tarball, for integrity verification. */
   depsHash?: string;
 
-  /** Workflow name to execute. */
   workflowName: string;
   /**
-   * Job name used to locate the job in the compiled workflow and to populate
-   * `ctx.job.name`. For a matrix child this is the BASE job name (the job is
-   * defined once in source); the combination is exposed only via `ctx.matrix`.
+   * Locates the job in the compiled workflow and populates `ctx.job.name`. For a
+   * matrix child this is the BASE job name (the job is defined once in source);
+   * the combination is exposed only via `ctx.matrix`.
    */
   jobName: string;
-  /** Runs-on label for the job. */
   runsOn: string;
-  /**
-   * Matrix combination values for this child (e.g. `{ variant: 'a' }`), exposed
-   * to steps as `ctx.matrix`. Absent for non-matrix jobs.
-   */
+  /** Matrix child values (e.g. `{ variant: 'a' }`), exposed as `ctx.matrix`. */
   matrixValues?: Record<string, unknown>;
-  /**
-   * For a `runsOnAll` host-fanout child: the hostname this child runs on,
-   * exposed to steps as `ctx.host`. Absent for non-host jobs.
-   */
+  /** `runsOnAll` host-fanout child only: its hostname, exposed as `ctx.host`. */
   host?: string;
-  /**
-   * For a `runsOnAll` host-fanout child: the resolved agent facts, exposed to
-   * steps as `ctx.agent`. Absent for non-host jobs.
-   */
+  /** `runsOnAll` host-fanout child only: the resolved agent facts, exposed as `ctx.agent`. */
   agent?: {
     host: string;
     labels: string[];
@@ -643,202 +604,194 @@ export interface JobExecutionRequest {
     arch?: string;
   };
   /**
-   * Operator-supplied, validated + coerced + defaulted workflow-dispatch inputs
-   * (from `kici run --input`), exposed to steps + rules as `ctx.dispatchInputs`.
-   * Absent for webhook runs.
+   * Operator-supplied workflow-dispatch inputs (`kici run --input`), already
+   * validated, coerced and defaulted; exposed to steps and rules as
+   * `ctx.dispatchInputs`. Absent for webhook runs.
    */
   dispatchInputs?: Record<string, unknown>;
   /**
-   * For a fan-out child (`runsOnAll` host or matrix combination): the 0-based
-   * deterministic position in the fan-out, assembled into `ctx.fanout`. Absent
-   * for non-fan-out jobs.
+   * Fan-out child only (`runsOnAll` host or matrix combination): the 0-based
+   * deterministic position, assembled into `ctx.fanout`.
    */
   fanoutIndex?: number;
-  /** For a fan-out child: the number of children in this fan-out. */
+  /** Fan-out child only: the number of children in the fan-out. */
   fanoutTotal?: number;
 
-  /** Secrets to merge into step environment (highest precedence). */
+  /** Merged into the step environment at the highest precedence. */
   secrets?: Record<string, string>;
-  /** Namespaced secrets by context name for ctx.secrets['context-name'].KEY access. */
+  /** By context name, for `ctx.secrets['context-name'].KEY`. */
   namespacedSecrets?: Record<string, Record<string, string>>;
-  /** Secret metadata: the backend and scope each secret key resolved from. */
+  /** The backend and scope each secret key resolved from. */
   secretMeta?: Record<string, { value: string; backend: string; scope: string }>;
 
-  /** Source file path for workflow compilation (relative to repo root). */
+  /** Relative to the repo root. */
   sourceFile?: string;
-  /** Content hash of the source file for cache key. */
+  /** Source file hash, used in the cache key. */
   contentHash?: string;
-  /** Resolved hash files for content-addressed caching. */
+  /** For content-addressed caching. */
   resolvedHashFiles?: string[];
 
-  /** Max log size per step in bytes (runner enforces truncation). */
+  /** Per step, in bytes; the runner truncates past it. */
   maxLogSizeBytes?: number;
-  /** Default step timeout in milliseconds. */
   defaultStepTimeoutMs?: number;
-  /** Total job wall-clock timeout in milliseconds (init + all steps + hooks). When set, the runner aborts the job on breach and reports TimeoutReason.job_timeout. From the lock job's `timeout`. */
+  /** Job wall-clock timeout (init + all steps + hooks), from the lock job's `timeout`. On breach the runner aborts the job and reports TimeoutReason.job_timeout. */
   jobTimeoutMs?: number;
 
-  /** Container configuration passthrough (for container-aware steps). */
+  /** Passthrough for container-aware steps. */
   container?: Record<string, unknown>;
   /** Normalized event envelope (type/action/targetBranch/payload…) for rule evaluation and step context. */
   event?: Record<string, unknown>;
-  /** Git provider that originated the triggering event (e.g. 'github', 'forgejo'). */
+  /** Git provider of the triggering event (e.g. 'github', 'forgejo'). */
   provider?: string;
   /**
    * The orchestrator's own view of this build, from the job dispatch.
    *
-   * Verification load-bearing. A deferred attestation's frozen statement is
-   * built from this so it is field-for-field what a live mint would have
-   * produced, and the orchestrator therefore cross-checks it against its own
-   * run row before storing it. Absent when the dispatch carries none, in
-   * which case the agent falls back to its local guess — a statement the
-   * capture check rejects, so the defer is dropped rather than stored unchecked.
+   * Verification load-bearing: a deferred attestation's frozen statement is
+   * built from it so it matches a live mint field for field, and the
+   * orchestrator cross-checks it against its own run row before storing it.
+   * When absent the agent falls back to its local guess, which the capture check
+   * rejects, so the defer is dropped rather than stored unchecked.
    */
   provenanceContext?: ProvenanceContext;
-  /** Whether to checkout the repo (default: true). */
+  /** Default: true. */
   checkout?: boolean;
-  /** Whether this job is part of a developer-initiated run triggered by `kici run`. */
+  /** Part of a developer-initiated `kici run`. */
   isTestRun?: boolean;
   /**
-   * Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`).
-   * Threaded from the dispatch event. In check / check-fail-on-drift mode the
-   * runner previews drift and never invokes a checked step's apply (`run`).
-   * Defaults to `apply` when unset.
+   * Run mode for idempotent steps, threaded from the dispatch event; defaults to
+   * `apply`. In check / check-fail-on-drift mode the runner previews drift and
+   * never invokes a checked step's apply (`run`).
    */
   checkMode?: CheckMode;
   /**
-   * Between-jobs out-of-band cleanup re-run. When true, the runner reuses the
-   * preserved workdir (no clone, no deps, no concurrency / rule / step
-   * evaluation) and runs ONLY the job's `onFailure` + `cleanup` hooks with a
-   * synthesized failed outcome — the durable re-run for a job whose runner was
-   * hard-killed before its in-band completion hooks ran. Bare-metal / in-place
-   * only; the supervisor never sets it for a normally-finished job.
+   * Between-jobs out-of-band cleanup re-run. The runner reuses the preserved
+   * workdir (no clone, no deps, no concurrency / rule / step evaluation) and runs
+   * ONLY the job's `onFailure` + `cleanup` hooks with a synthesized failed
+   * outcome: the durable re-run for a job whose runner was hard-killed before its
+   * in-band completion hooks ran. Bare-metal / in-place only; the supervisor
+   * never sets it for a normally-finished job.
    */
   cleanupOnly?: boolean;
-  /** When true, skip git clone -- use overlay tarball as complete workspace. */
+  /** Skip git clone and use the overlay tarball as the complete workspace. */
   fullRepo?: boolean;
 
-  /** URL to download the encrypted overlay tarball (test runs with uncommitted changes). */
+  /** Encrypted overlay tarball (test runs with uncommitted changes). */
   tarballUrl?: string;
-  /** Base64-encoded CLI ephemeral public key for overlay decryption (DER/SPKI). */
+  /** Base64 CLI ephemeral public key (DER/SPKI) for overlay decryption. */
   cliPublicKey?: string;
-  /** Base64-encoded orchestrator ephemeral private key for overlay decryption (DER/PKCS8). */
+  /** Base64 orchestrator ephemeral private key (DER/PKCS8) for overlay decryption. */
   orchestratorPrivateKey?: string;
 
-  /** Base64-encoded X25519 public key for the run (for encrypting secret outputs). */
+  /** Base64 X25519 run public key, for encrypting secret outputs. */
   runPublicKey?: string;
 
-  /** Resolved context name (resolved by orchestrator). */
+  /** Resolved by the orchestrator. */
   context?: string;
-  /** Environment variables from orchestrator (org-level + source overrides, layers 4-5). */
+  /** Org-level + source overrides (env layers 4-5). */
   contextVars?: Record<string, string>;
-  /** Job env from lock file env field (layer 6, evaluated by orchestrator). */
+  /** The lock file `env` field (env layer 6), evaluated by the orchestrator. */
   jobEnv?: Record<string, string>;
 
   // --- Global workflow fields ---
 
-  /** Whether this is a global workflow (dual-clone: workflow repo + source repo). */
+  /** Dual clone: workflow repo + source repo. */
   isGlobalWorkflow?: boolean;
-  /** Clone URL for the workflow (registering) repo. Only set when isGlobalWorkflow is true. */
+  /** Clone URL of the workflow (registering) repo; set only when isGlobalWorkflow is true. */
   workflowRepoUrl?: string;
-  /** Git ref for the workflow repo. */
   workflowRef?: string;
-  /** Git commit SHA for the workflow repo. */
   workflowSha?: string;
-  /** Repository identifier for the workflow repo (e.g., "org/workflow-repo"). */
+  /** E.g. "org/workflow-repo". */
   workflowRepoIdentifier?: string;
 
-  /** Whether the workflow has a concurrency group function to evaluate. */
+  /** The workflow has a concurrency group function to evaluate. */
   hasConcurrencyGroup?: boolean;
-  /** Concurrency group evaluation timeout in milliseconds (default: 30000). */
+  /** Default: 30000. */
   concurrencyEvaluationTimeoutMs?: number;
   /**
-   * Orchestrator-resolved concurrency-slot wait timeout (ms), pushed on
-   * `job.dispatch` from the fleet-wide `cluster_settings.concurrency_wait_timeout_ms`.
-   * Absent when the dispatch omits it — the runner falls back to its own default.
+   * Concurrency-slot wait timeout, from the fleet-wide
+   * `cluster_settings.concurrency_wait_timeout_ms` on `job.dispatch`. When
+   * absent the runner uses its own default.
    */
   concurrencyWaitTimeoutMs?: number;
-  /** Git branch for concurrency group context. */
+  /** For the concurrency group context. */
   branch?: string;
 
-  /** Plain outputs from upstream jobs (keyed by job name, then by step name). For ctx.jobOutputs(). */
+  /** Plain upstream outputs by job name, then step name; for ctx.jobOutputs(). */
   upstreamJobOutputs?: Record<string, Record<string, unknown>>;
 
-  /** Terminal status of each upstream job (keyed by job name; per-child for fan-out). For ctx.needs.<job>.status. */
+  /** Upstream terminal status by job name (per child for fan-out); for ctx.needs.<job>.status. */
   upstreamJobStatuses?: Record<string, import('@kici-dev/engine').ExecutionJobStatus>;
 
-  /** This job's declared upstream needs (normalized lock edges) used to shape ctx.needs for steps. */
+  /** Declared upstream needs (normalized lock edges); shapes ctx.needs for steps. */
   jobNeeds?: readonly unknown[];
 
   /**
-   * Per-invoke-gate results for any upstream invoke gate this job `needs`, keyed
-   * by gate job name. Populated for a standard `run:`/step downstream job so
+   * Results of each upstream invoke gate this job `needs`, by gate job name.
+   * Populated for a standard `run:`/step downstream job so
    * `ctx.needs['<gate>'].result` is an `InvokeResult[]` rather than the fan-out
    * group shape its proxy children would otherwise imply.
    */
   upstreamInvokeResults?: Record<string, import('@kici-dev/engine').InvokeResult[]>;
 
-  /** Resolved private npm registries for `npm install` auth (token bytes already filled). */
+  /** Private npm registries for `npm install` auth, token bytes already filled. */
   npmRegistries?: ReadonlyArray<{
     url: string;
     scope?: string;
     alwaysAuth: boolean;
     token: string;
   }>;
-  /** Bare-name secrets to project as install-subprocess env vars. */
+  /** Bare-name secrets projected as install-subprocess env vars. */
   installEnvSecrets?: Record<string, string>;
-  /** Short job-scoped nonce — used as suffix on synthesized npm-token env vars. */
+  /** Short job-scoped nonce, the suffix of synthesized npm-token env vars. */
   jobIdShort?: string;
 
   /**
-   * Source of a dynamically generated job (from DynamicJobFn).
-   * When set, the workflow runner re-evaluates the DynamicJobFn to extract
-   * step functions instead of looking up the job in the static jobs array.
+   * Set for a job generated by a DynamicJobFn: the runner re-evaluates the
+   * DynamicJobFn to extract step functions instead of looking up the job in the
+   * static jobs array.
    */
   dynamicSource?: {
     /** Index of the DynamicJobFn in the workflow's jobs array. */
     index: number;
-    /** Original event payload (passed to DynamicJobFn for re-evaluation). */
+    /** Original event payload, passed to the DynamicJobFn again. */
     event: Record<string, unknown>;
-    /** Expected job names from the original eval (for determinism validation). */
+    /** Job names from the original eval, for determinism validation. */
     expectedJobNames?: string[];
     /**
-     * Frozen upstream-output snapshot for a result-aware generator. When present
-     * the re-eval rebuilds `ctx.needs` from this snapshot (never a live read),
-     * so the generator sees the same upstream data as the original eval.
+     * Frozen upstream-output snapshot for a result-aware generator: the re-eval
+     * rebuilds `ctx.needs` from it (never a live read), so the generator sees the
+     * same upstream data as the original eval.
      */
     upstreamSnapshot?: import('@kici-dev/engine').UpstreamSnapshot;
-    /** Declared upstream needs (normalized lock edges) used to shape ctx.needs. */
+    /** Declared upstream needs (normalized lock edges); shapes ctx.needs. */
     declaredNeeds?: readonly unknown[];
   };
 }
 
 // --- Eval child IPC ---
 //
-// The eval child is where every customer-authored EVALUATION runs: the workflow
-// module load, a workflow `filter`, the dynamic `env` / `environment` /
+// The eval child runs every customer-authored EVALUATION: the workflow module
+// load, a workflow `filter`, the dynamic `env` / `environment` /
 // `concurrencyGroup` / `matrix` functions, a `DynamicJobFn`, and a global eval
-// round. It is a separate child from the step runner, with its own message
-// union, deliberately.
+// round. It is deliberately a separate child from the step runner, with its own
+// message union.
 //
-// Customer code in a child has arbitrary code execution IN THAT CHILD, so it
-// can `process.send` any message the agent-side handler for that child accepts.
-// The step runner's handler accepts the whole `RunnerToAgentMessage` union,
-// which carries the privileged cache, provenance, artifact, git-grant and
-// step-approval relays. Reusing it would hand a `matrix` function reachability
-// to all of those — a privilege expansion wearing the clothes of a sandbox.
+// Customer code in a child can `process.send` any message that child's
+// agent-side handler accepts. The step runner's handler accepts all of
+// `RunnerToAgentMessage`, including the privileged cache, provenance, artifact,
+// git-grant and step-approval relays; reusing it would give a `matrix` function
+// reach to all of them.
 //
-// This union carries exactly what an evaluation already has today: its log
-// lines, its result, and the agent API relay that `ctx.kici` is built on and
-// that a `DynamicJobFn` and a global-eval generator already hold. Nothing else.
+// This union carries only what an evaluation already has: its log lines, its
+// result, and the agent API relay behind `ctx.kici`, which a `DynamicJobFn` and
+// a global-eval generator already hold.
 
-/** Which evaluation the child should perform. */
 export type EvalRequestKind = 'init' | 'dynamic-job' | 'build-verify' | 'global-eval';
 
 /**
- * One evaluation request. `config` is the dispatch's own `jobConfig` and
- * `dispatch` the fields the evaluation reads, both passed through verbatim so
- * the child builds the same contexts the agent used to build in-process.
+ * One evaluation request. `config` (the dispatch's `jobConfig`) and `dispatch`
+ * (the fields an evaluation reads) pass through verbatim, so the child builds
+ * the same contexts the agent would.
  *
  * Carries no `secrets` and no `namespacedSecrets`: no evaluation surface
  * consumes them, and adding them would put job secrets in the one process that
@@ -848,9 +801,8 @@ export interface EvalRequest {
   kind: EvalRequestKind;
   /** Absolute path of the already-materialized working directory. */
   workDir: string;
-  /** The dispatch's `jobConfig`, verbatim. */
   config: Record<string, unknown>;
-  /** The dispatch fields an evaluation reads (repo URL, ref, sha, auth, …). */
+  /** E.g. repo URL, ref, sha, auth. */
   dispatch: Record<string, unknown>;
 }
 

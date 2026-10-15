@@ -1,13 +1,11 @@
 /**
  * Startup disk-space guard for Firecracker nodes.
  *
- * When the data disk hits 100%, the orchestrator can no longer write its
- * log/DB files and crash-loops on ENOSPC at startup — so the in-process orphan
- * sweep that would free space never runs (bootstrap deadlock). This guard runs
- * BEFORE the heavy startup writes: if free space on the chroot volume is below
- * a threshold, it reaps orphan FC chroots inline (liveness-driven, safe) and
- * lets startup proceed only if enough space was freed. Logs to stderr because
- * the file logger may itself be unable to write.
+ * At 100% disk the orchestrator crash-loops on ENOSPC at startup, so the
+ * in-process orphan sweep that would free space never runs (bootstrap deadlock).
+ * This guard runs BEFORE the heavy startup writes: below the threshold it reaps
+ * orphan FC chroots inline (liveness-driven, safe), and startup proceeds only if
+ * enough space was freed. Logs to stderr: the file logger may be unable to write.
  */
 import { statfs } from 'node:fs/promises';
 import { reapFirecrackerOrphans, type ReapCounts } from './reap-orphans.js';
@@ -46,9 +44,8 @@ async function freeBytes(
 }
 
 /**
- * Run the disk guard. Returns reaped/recovered status; the caller decides
- * whether to proceed or exit with backoff. No-ops (recovered=true) when there
- * is no FC scaler or free space is already above threshold.
+ * The caller decides whether to proceed or exit with backoff. No-ops
+ * (recovered=true) when there is no FC scaler or free space is above threshold.
  */
 export async function runDiskGuard(opts: DiskGuardOpts): Promise<DiskGuardResult> {
   const threshold = opts.thresholdBytes ?? DEFAULT_DISK_GUARD_THRESHOLD_BYTES;

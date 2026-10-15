@@ -1,14 +1,10 @@
 /**
- * Typed event payload discriminated union for rule authors.
+ * Typed event payload discriminated union for rule authors: narrowing on
+ * `ctx.event.type` autocompletes the commonly accessed GitHub payload fields,
+ * and each payload's index signature resolves untyped fields to `unknown`.
  *
- * Provides autocomplete when narrowing on `ctx.event.type` in rule functions.
- * Each variant carries partial GitHub payload types for the most commonly
- * accessed fields. The index signature on each payload interface allows
- * accessing fields not explicitly typed (they resolve to `unknown`).
- *
- * The runtime shape mirrors SimulatedEvent from @kici-dev/engine — these types
- * are the user-facing view of the same data. Keep them in sync when adding new
- * event types or SimulatedEvent fields.
+ * The user-facing view of SimulatedEvent from @kici-dev/engine; keep the two in
+ * sync when adding event types or SimulatedEvent fields.
  */
 
 // ---------------------------------------------------------------------------
@@ -393,13 +389,11 @@ export interface ManualScheduleEventPayload extends EventBase {
  * Compile-time fallback member of the {@link EventPayload} union for event
  * types not yet modeled here.
  *
- * Its `type` is the literal `'unknown'` (not `string`) so that the union stays
- * a *proper* discriminated union — a non-literal discriminant would collapse
- * narrowing on `event.type` for every other member. At runtime, an event of an
- * unmodeled kind still carries its real type string in `event.type`; this
- * interface only governs how TypeScript narrows it. Code that must handle
- * arbitrary future types can compare the raw value via `String(event.type) ===
- * '...'`, or use the {@link isEventType} guard for the known types.
+ * Its `type` is the literal `'unknown'` (not `string`): a non-literal
+ * discriminant would collapse narrowing on `event.type` for every other member.
+ * At runtime an unmodeled event still carries its real type string in
+ * `event.type`. To handle arbitrary future types, compare
+ * `String(event.type) === '...'`, or use {@link isEventType} for known types.
  */
 export interface UnknownEventPayload extends EventBase {
   type: 'unknown';

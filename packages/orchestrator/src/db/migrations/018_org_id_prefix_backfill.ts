@@ -4,28 +4,19 @@ import { type Kysely, sql } from 'kysely';
  * Prefix every orchestrator-side tenant string with `org_` to align
  * with Platform's prefixed canonical org ID format (`org_<12-char>`).
  *
- * Migration 017 widened the column types but deliberately left rows
- * un-backfilled, reasoning that pre-migration runtime data could be
- * orphaned and regenerated on the next deploy. That works for
- * historical artefacts (execution_runs, event_log, access_log) but
- * NOT for tenant-state tables the orchestrator needs to recognise the
- * tenant's org at routing time (`sources`, `generic_webhook_sources`,
- * `workflow_registrations`, `org_settings`) and the env-config tables
- * referenced from runtime requests (`environments`,
- * `environment_bindings`, `environment_source_overrides`,
- * `environment_variables`).
+ * Migration 017 widened the columns but left rows un-backfilled, which is
+ * fine for historical artefacts (execution_runs, event_log, access_log) but
+ * not for tenant-state tables the orchestrator resolves the org from at
+ * routing time (`sources`, `generic_webhook_sources`,
+ * `workflow_registrations`, `org_settings`) or the env-config tables runtime
+ * requests reference (`environments`, `environment_bindings`,
+ * `environment_source_overrides`, `environment_variables`).
  *
- * This migration walks both column families — `org_id` and
- * `customer_id` — and applies the same `'org_' || value` prefix to
- * every row whose value is not the platform-admin sentinel
- * `kici-admin`. After it runs, the orchestrator's `WHERE org_id = $1`
- * / `WHERE customer_id = $1` filters match the prefixed canonical IDs
- * that Platform now sends.
+ * Prefixes both column families (`org_id`, `customer_id`) with `'org_'`,
+ * except the platform-admin sentinel `kici-admin`, so `WHERE org_id = $1` /
+ * `WHERE customer_id = $1` match the prefixed IDs Platform sends.
  *
- * Idempotency: the `WHERE NOT LIKE 'org\\_%'` guard makes the
- * migration a no-op on rows already prefixed (e.g. a re-run after a
- * fresh deploy populated some rows already), so applying it twice is
- * safe.
+ * Idempotent: the `NOT LIKE 'org\\_%'` guard skips already-prefixed rows.
  */
 
 const ORG_ID_TABLES = [

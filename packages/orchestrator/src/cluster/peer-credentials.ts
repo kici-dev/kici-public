@@ -1,12 +1,7 @@
 /**
- * Peer credential management for cluster authentication.
- *
- * Provides two persistence layers:
- * 1. DB CRUD (PeerCredentialStore) — coordinator stores credentials for all peers
- * 2. File I/O (readCredentialFile/writeCredentialFile) — workers persist their
- *    credential locally for reconnection after restart
- *
- * Credential files are written with 0600 permissions to protect the secret.
+ * Peer credentials: the coordinator stores every peer's credential in the DB
+ * (PeerCredentialStore); workers persist their own in a local 0600 file to
+ * reconnect after restart.
  */
 import { mkdir, readFile, writeFile, chmod } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -20,15 +15,11 @@ export enum PeerCredentialIssuance {
 }
 
 /**
- * `metadata` key set when a coordinator retires the self-issued credential its
- * previous run left behind. An operator revoke never sets it, which is how a
- * retirement is told apart from a revoke.
+ * `metadata` key set when a coordinator retires its previous run's self-issued
+ * credential. An operator revoke never sets it, which tells the two apart.
  */
 export const RETIRED_BY_INSTANCE_KEY = 'retiredByInstance';
 
-/**
- * A peer credential record stored in the coordinator's database.
- */
 export interface PeerCredential {
   id: string;
   instanceId: string;
@@ -45,10 +36,9 @@ export interface PeerCredential {
 }
 
 /**
- * Data persisted in this orchestrator's local credential file
- * (~/.kici/credential.json). The credential is identity-scoped: one file per
- * orchestrator, shared across every peer-client this orchestrator runs. See
- * the `sendAuthRequest` doc in peer-client.ts for the history.
+ * The local credential file (~/.kici/credential.json). Identity-scoped: one file
+ * per orchestrator, shared by all its peer-clients (see `sendAuthRequest` in
+ * peer-client.ts).
  */
 export interface CredentialFileData {
   instanceId: string;
@@ -61,25 +51,17 @@ export interface CredentialFileData {
 /** Default credential expiry: 90 days. */
 const DEFAULT_EXPIRY_DAYS = 90;
 
-/**
- * Database CRUD operations for peer credentials.
- * Used by the coordinator to manage credentials for all cluster members.
- */
+/** The coordinator's DB store of every cluster member's credential. */
 export class PeerCredentialStore {
   constructor(private readonly db: Kysely<any>) {}
 
   /**
-   * Save a new peer credential, revoking any prior active credential for the
-   * same instanceId (the `peer_credentials_active_uniq` partial unique index
-   * permits exactly one active credential per instanceId).
+   * Save a credential, revoking the instanceId's prior active one
+   * (`peer_credentials_active_uniq` permits one active credential per instanceId).
    *
-   * Returns `{ revokedCount }` — how many previously-active credentials this
-   * save revoked. Because a coordinator's peer-clients share one
-   * identity-scoped credential, a `revokedCount > 0` here means every sibling
-   * peer-client of `instanceId` that was authenticating with the old
-   * credential is now invalidated and will be rejected on its next proof. The
-   * caller logs this so a revoke that cascades sibling rejections is visible in
-   * the orchestrator logs.
+   * `revokedCount > 0` means every sibling peer-client of `instanceId` still on the
+   * old shared credential is rejected on its next proof; the caller logs it so a
+   * cascade of sibling rejections is visible.
    */
   async save(opts: {
     instanceId: string;
@@ -95,8 +77,8 @@ export class PeerCredentialStore {
 
     const runOnce = async (): Promise<number> => {
       return this.db.transaction().execute(async (trx) => {
-        // Revoke old credentials for this instanceId to prevent stale hash buildup.
-        // Each reconnection issues a new credential; the old one is no longer valid.
+        // Each reconnection issues a new credential; revoke the old so stale hashes
+        // do not build up.
         const revokeResult = await trx
           .updateTable('peer_credentials' as any)
           .set({ revoked_at: new Date() })
@@ -123,10 +105,9 @@ export class PeerCredentialStore {
       });
     };
 
-    // Retry-once on PG unique_violation ('23505'): the partial unique index
-    // peer_credentials_active_uniq makes the UPDATE+INSERT racing two
-    // concurrent saves a TOCTOU loser. The retry's UPDATE now sees the
-    // winner's committed row and revokes it before re-inserting.
+    // Retry once on PG unique_violation ('23505'): two concurrent saves race the
+    // UPDATE+INSERT against peer_credentials_active_uniq; the loser's retry sees
+    // the winner's committed row and revokes it before re-inserting.
     try {
       return { revokedCount: await runOnce() };
     } catch (err: unknown) {
@@ -137,9 +118,7 @@ export class PeerCredentialStore {
     }
   }
 
-  /**
-   * Find a non-revoked, non-expired credential by its hash.
-   */
+  /** Non-revoked, non-expired credential by hash. */
   async findByCredentialHash(hash: string): Promise<PeerCredential | null> {
     const row = await this.db
       .selectFrom('peer_credentials' as any)
@@ -152,9 +131,7 @@ export class PeerCredentialStore {
     return row ? mapRow(row) : null;
   }
 
-  /**
-   * Find a non-revoked, non-expired credential by instance ID.
-   */
+  /** Newest non-revoked, non-expired credential for the instance. */
   async findByInstanceId(instanceId: string): Promise<PeerCredential | null> {
     const row = await this.db
       .selectFrom('peer_credentials' as any)
@@ -200,10 +177,9 @@ export class PeerCredentialStore {
   }
 
   /**
-   * Revoke `instanceId`'s unrevoked, self-issued row whose hash is
-   * `credentialHash`, recording who retired it. Every condition sits in the
-   * WHERE clause, so a row that changed meanwhile is left alone.
-   * Returns whether a row was retired.
+   * Revoke `instanceId`'s unrevoked self-issued row with `credentialHash`,
+   * recording who retired it. Every condition is in the WHERE clause, so a row
+   * that changed meanwhile is left alone. Returns whether a row was retired.
    */
   async retireSelfIssued(opts: {
     instanceId: string;
@@ -226,10 +202,7 @@ export class PeerCredentialStore {
     return Number((result as { numUpdatedRows?: bigint })?.numUpdatedRows ?? 0n) > 0;
   }
 
-  /**
-   * Update the last_seen_at timestamp for a credential.
-   * Optionally records which coordinator validated it.
-   */
+  /** Bump last_seen_at; optionally record the validating coordinator. */
   async updateLastSeen(credentialHash: string, validatedBy?: string): Promise<void> {
     const updates: Record<string, unknown> = { last_seen_at: new Date() };
     if (validatedBy) updates.last_validated_by = validatedBy;
@@ -241,9 +214,6 @@ export class PeerCredentialStore {
       .execute();
   }
 
-  /**
-   * Revoke a peer's credential by instance ID.
-   */
   async revoke(instanceId: string): Promise<void> {
     await this.db
       .updateTable('peer_credentials' as any)
@@ -253,10 +223,7 @@ export class PeerCredentialStore {
       .execute();
   }
 
-  /**
-   * Revoke all active credentials.
-   * @returns The number of credentials revoked.
-   */
+  /** @returns The number of credentials revoked. */
   async revokeAll(): Promise<number> {
     const result = await this.db
       .updateTable('peer_credentials' as any)
@@ -267,9 +234,7 @@ export class PeerCredentialStore {
     return Number((result as any)?.numUpdatedRows ?? 0);
   }
 
-  /**
-   * List all active (non-revoked, non-expired) credentials.
-   */
+  /** Non-revoked, non-expired credentials, oldest first. */
   async listActive(): Promise<PeerCredential[]> {
     const rows = await this.db
       .selectFrom('peer_credentials' as any)
@@ -283,9 +248,6 @@ export class PeerCredentialStore {
   }
 }
 
-/**
- * Map a database row to a PeerCredential interface.
- */
 function mapRow(row: any): PeerCredential {
   return {
     id: row.id,
@@ -304,15 +266,7 @@ function mapRow(row: any): PeerCredential {
   };
 }
 
-/**
- * Write credential data to a JSON file with restrictive permissions.
- *
- * Creates the parent directory (e.g., ~/.kici/) with 0700 if it doesn't exist.
- * The credential file is written with 0600 permissions (owner read/write only).
- *
- * @param filePath - Absolute path to the credential file
- * @param data - Credential data to persist
- */
+/** Write the credential file 0600, creating its parent directory 0700 if missing. */
 export async function writeCredentialFile(
   filePath: string,
   data: CredentialFileData,
@@ -321,16 +275,11 @@ export async function writeCredentialFile(
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const json = JSON.stringify(data, null, 2) + '\n';
   await writeFile(filePath, json, { mode: 0o600 });
-  // Ensure permissions are correct even if the file already existed
+  // writeFile's mode applies only on create.
   await chmod(filePath, 0o600);
 }
 
-/**
- * Read credential data from a JSON file.
- *
- * @param filePath - Absolute path to the credential file
- * @returns Parsed credential data, or null if the file doesn't exist
- */
+/** @returns The parsed credential file, or null if it does not exist. */
 export async function readCredentialFile(filePath: string): Promise<CredentialFileData | null> {
   try {
     const content = await readFile(filePath, 'utf-8');
@@ -344,13 +293,9 @@ export async function readCredentialFile(filePath: string): Promise<CredentialFi
 }
 
 /**
- * Construct a PeerCredentialStore bound to a Postgres URL, returning the
- * store plus a disposer that closes the underlying pool. Lets tests
- * exercise the real Kysely-backed store without importing pg/kysely.
- *
- * Intended for tests of the store's own CRUD methods — production
- * code constructs the store with an already-allocated Kysely instance
- * shared with the orchestrator.
+ * A store bound to a Postgres URL plus a pool disposer, so tests exercise the real
+ * store without importing pg/kysely. Test-only: production passes the
+ * orchestrator's shared Kysely instance.
  */
 export async function createPeerCredentialStoreFromUrl(
   databaseUrl: string,

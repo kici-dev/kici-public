@@ -1,12 +1,9 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `cluster_settings.agent_token_ttl_ms` (nullable BIGINT).
- *
- * Fleet-wide ephemeral agent-token TTL (ms), resolved by the leader at spawn. NULL → cluster default (`config.agentTokenTtlMs`, `KICI_AGENT_TOKEN_TTL_MS`).
- *
- * Idempotent: guarded on column existence; a re-run on a DB that already has
- * the column is a no-op.
+ * `cluster_settings.agent_token_ttl_ms` (nullable BIGINT): fleet-wide ephemeral
+ * agent-token TTL (ms), resolved by the leader at spawn. NULL → cluster default
+ * (`config.agentTokenTtlMs`, `KICI_AGENT_TOKEN_TTL_MS`). Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

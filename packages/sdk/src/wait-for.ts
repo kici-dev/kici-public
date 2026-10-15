@@ -1,34 +1,13 @@
 /**
- * SDK wait-for helpers for workflow authors.
+ * SDK wait-for helpers: pause a workflow until an external condition holds
+ * (a resource provisioned, a file present, an endpoint healthy, a job
+ * terminal), with the same shape as `idempotent` / `idempotentStep`. Errors
+ * from `check()` are swallowed by default, matching the poll-until-healthy
+ * pattern.
  *
- * Workflows often need to pause until an external condition becomes
- * true — a resource finishes provisioning, a file appears on disk, an
- * HTTP endpoint returns a healthy response, an external job reaches a
- * terminal state. The helpers in this file express that pattern with
- * the same shape as `idempotent` / `idempotentStep`:
- *
- * - `check()` returns the resolved value when the condition is met, or
- *   `null` to keep polling.
- * - Optional `onSuccess(value)` runs once after the wait succeeds; its
- *   return value becomes the step result.
- * - Optional `onTimeout({ elapsedMs, attempts })` runs if the deadline
- *   is exceeded; its return value becomes the step result. If absent,
- *   the helper throws a typed `WaitForTimeoutError` so the step fails.
- * - Errors thrown by `check()` are swallowed by default (matching the
- *   "poll-until-healthy" pattern). Opt out via `swallowErrors: false`.
- *
- * Cancellation: the helper has no `AbortSignal` plumbing. A `check()`
- * that takes longer than `intervalMs` is not aborted mid-flight; the
- * loop only inspects the deadline at the top of each iteration. The
- * step's own `timeout` field is the hard kill.
- *
- * Two entry points:
- *
- * - `waitFor(options)` — generic helper callable from any step, hook,
- *   or bare async function. Resolves to the discriminated result.
- * - `waitForStep(name, options)` — factory returning an SDK `Step`
- *   whose run function executes `waitFor(...)` and propagates status
- *   lines into `ctx.log.info`.
+ * Cancellation: there is no `AbortSignal` plumbing. A `check()` slower than
+ * `intervalMs` is not aborted; the deadline is inspected only at the top of
+ * each iteration. The step's own `timeout` field is the hard kill.
  */
 
 import { step } from './step.js';
@@ -39,38 +18,30 @@ import { sleep } from '@kici-dev/engine';
 export interface WaitForOptions<TValue, TSuccess = void, TTimeout = void> {
   /** Optional name surfaced in status lines and the timeout error. */
   name?: string;
-  /** Polled inspection. Return the resolved value when the condition
-   *  is met, or `null` to keep polling. */
+  /** Return the resolved value when the condition is met, or `null` to keep polling. */
   check: () => Promise<TValue | null>;
-  /** Time between successive `check()` invocations, in milliseconds.
-   *  Defaults to 2000. */
+  /** Milliseconds between `check()` calls. Defaults to 2000. */
   intervalMs?: number;
-  /** Total time budget for the wait, in milliseconds. Defaults to
-   *  60000. The deadline is inspected at the top of each iteration. */
+  /** Total budget in milliseconds. Defaults to 60000. The deadline is
+   *  inspected at the top of each iteration. */
   timeoutMs?: number;
-  /** Time to wait before the first `check()` invocation, in
-   *  milliseconds. Defaults to 0. */
+  /** Milliseconds before the first `check()`. Defaults to 0. */
   initialDelayMs?: number;
-  /** Optional success action. Runs once after `check()` returns a
-   *  non-null value. Its return value is surfaced as `result` on the
-   *  'succeeded' outcome. */
+  /** Runs once after `check()` returns non-null; its return value is
+   *  `result` on the 'succeeded' outcome. */
   onSuccess?: (value: TValue) => Promise<TSuccess>;
-  /** Optional timeout action. Runs when the deadline is exceeded. Its
-   *  return value is surfaced as `result` on the 'timed-out' outcome.
-   *  When omitted, the helper throws a `WaitForTimeoutError` instead. */
+  /** Runs when the deadline is exceeded; its return value is `result` on
+   *  the 'timed-out' outcome. When omitted, a `WaitForTimeoutError` is
+   *  thrown instead. */
   onTimeout?: (info: { elapsedMs: number; attempts: number }) => Promise<TTimeout>;
-  /** When `true` (default), errors thrown by `check()` are logged and
-   *  swallowed so polling continues. When `false`, the first error
-   *  propagates out of the helper. */
+  /** When `true` (default), `check()` errors are logged and polling
+   *  continues. When `false`, the first error propagates. */
   swallowErrors?: boolean;
   /** Sink for status lines. Defaults to console.log. */
   log?: (line: string) => void;
 }
 
-/**
- * The discriminated result of a `waitFor` invocation. Narrow on
- * `outcome` to read the correct branch.
- */
+/** The result of `waitFor`; narrow on `outcome`. */
 export type WaitForResult<TValue, TSuccess = void, TTimeout = void> =
   | {
       outcome: 'succeeded';
@@ -86,17 +57,13 @@ export type WaitForResult<TValue, TSuccess = void, TTimeout = void> =
       result: TTimeout;
     };
 
-/**
- * Thrown by `waitFor` when the deadline is exceeded and no
- * `onTimeout` callback was supplied. The instance fields expose the
- * wait stats so callers can branch on them in a catch block.
- */
+/** Thrown by `waitFor` when the deadline passes and no `onTimeout` was supplied. */
 export class WaitForTimeoutError extends Error {
-  /** The step name supplied via `WaitForOptions.name` (or 'waitFor'). */
+  /** `WaitForOptions.name`, or 'waitFor'. */
   readonly stepName: string;
-  /** Wall-clock duration of the wait, in milliseconds. */
+  /** Wall-clock milliseconds. */
   readonly elapsedMs: number;
-  /** Number of `check()` invocations that ran before the timeout. */
+  /** `check()` calls that ran before the timeout. */
   readonly attempts: number;
 
   constructor(stepName: string, elapsedMs: number, attempts: number) {
@@ -131,9 +98,8 @@ async function runCheckOnce<TValue>(
 }
 
 /**
- * Generic wait-for helper for use inside any step, hook, or bare
- * async function. Polls `check()` on a fixed interval until it returns
- * a non-null value or the deadline is exceeded.
+ * Poll `check()` on a fixed interval until it returns non-null or the deadline
+ * passes. Callable from any step, hook, or bare async function.
  */
 export async function waitFor<TValue, TSuccess = void, TTimeout = void>(
   opts: WaitForOptions<TValue, TSuccess, TTimeout>,
@@ -182,11 +148,7 @@ export async function waitFor<TValue, TSuccess = void, TTimeout = void>(
   throw new WaitForTimeoutError(name, elapsedMs, attempts);
 }
 
-/**
- * Factory returning an SDK Step whose run function executes
- * `waitFor(...)`. Status lines are routed through `ctx.log.info`.
- * The step's typed return value is the WaitForResult union.
- */
+/** An SDK Step that runs `waitFor(...)`, logging status lines via `ctx.log.info`. */
 export function waitForStep<TValue, TSuccess = void, TTimeout = void>(
   name: string,
   opts: Omit<WaitForOptions<TValue, TSuccess, TTimeout>, 'name' | 'log'>,

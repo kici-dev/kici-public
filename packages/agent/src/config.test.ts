@@ -12,7 +12,6 @@ describe('loadConfig', () => {
 
   beforeEach(() => {
     process.env = { ...originalEnv };
-    // Clear all KICI_ env vars
     for (const key of Object.keys(process.env)) {
       if (key.startsWith('KICI_')) {
         delete process.env[key];
@@ -517,7 +516,6 @@ describe('loadConfig', () => {
       process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
       process.env.KICI_SECERT_KEY = 'oops';
       process.env.KICI_DEV = 'true';
-      // Should not throw — KICI_DEV downgrades to warn
       expect(() => loadConfig()).not.toThrow();
     });
 

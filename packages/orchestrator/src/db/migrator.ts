@@ -1,8 +1,6 @@
 /**
- * Auto-migrate module with PostgreSQL advisory lock for HA safety.
- *
- * Uses pg_advisory_lock to ensure only one orchestrator instance runs
- * migrations at a time, preventing conflicts in multi-instance deployments.
+ * Auto-migrate under a `pg_advisory_lock`, so only one orchestrator instance
+ * runs migrations at a time in a multi-instance deployment.
  */
 import { Migrator, type MigrationResult, type MigrationProvider } from 'kysely/migration';
 import type { Kysely } from 'kysely';
@@ -22,12 +20,10 @@ interface MigrateOptions {
 /**
  * Build a pool reserved for schema work.
  *
- * Migrations run DDL and backfills that legitimately take minutes on a
- * database holding real history, so they must not inherit the hot path's
- * `statement_timeout`. pg treats `0` as "no limit". Kysely's `Migrator`
- * acquires its own connections from whatever pool backs the `Kysely` instance
- * it is given, so the exemption has to be set on the pool — a `SET` issued on
- * one client would not reach the connections that run the migrations.
+ * DDL and backfills can take minutes on real history, so they must not inherit
+ * the hot path's `statement_timeout` (`0` means no limit). Kysely's `Migrator`
+ * takes connections from the pool behind its `Kysely` instance, so the
+ * exemption goes on the pool: a `SET` on one client would not reach them.
  *
  * `max: 2` covers the advisory-lock client plus the one Kysely checks out.
  */
@@ -53,10 +49,9 @@ export async function withMigrationPool<T>(
 }
 
 /**
- * Wrap every migration's `up` so each one's own elapsed time is measured,
- * including the one that fails. Kysely reports results only after the whole
- * batch settles and exposes no per-migration hook, so timing has to be
- * attached to the provider.
+ * Time every migration's `up`, the failing one included. Kysely reports results
+ * only after the whole batch and has no per-migration hook, so timing lives on
+ * the provider.
  */
 function instrumentProvider(
   provider: MigrationProvider,
@@ -95,9 +90,9 @@ export function isStatementTimeoutError(message: string): boolean {
 }
 
 /**
- * Restate a migration failure so the log names the migration that failed and,
- * on a cancelled statement, the way out. The bare driver message names
- * neither, which is what left an operator with a boot loop and no next step.
+ * Restate a migration failure so the log names the failed migration and, on a
+ * cancelled statement, the way out. The bare driver message names neither,
+ * which left an operator with a boot loop and no next step.
  */
 export function describeMigrationFailure(message: string, migrationName?: string): string {
   const where = migrationName ? `migration ${migrationName} failed: ` : 'migration failed: ';
@@ -112,11 +107,8 @@ interface MigrationStatusEntry {
 }
 
 /**
- * Run all pending migrations with an advisory lock for concurrency safety.
- *
- * Acquires pg_advisory_lock before migrating to prevent concurrent
- * migration attempts from multiple orchestrator instances. The lock
- * is always released in the finally block, even on error.
+ * Run all pending migrations under the advisory lock, which blocks concurrent
+ * attempts from other orchestrator instances and is released even on error.
  */
 export async function runMigrations(opts: MigrateOptions): Promise<MigrationResult[]> {
   const client = await opts.pool.connect();
@@ -161,11 +153,9 @@ export async function runMigrations(opts: MigrateOptions): Promise<MigrationResu
       logger.info(`Applied ${applied.length} migration(s)`);
     }
 
-    // Record the content hash on every successful run — including warm DBs
-    // where zero migrations were applied. Without this, a long-lived DB whose
-    // migrations are all applied keeps reporting "content hash missing" from
-    // `db check-schema`, making the freshness gate useless on exactly the
-    // databases it matters for.
+    // Record the content hash on every successful run, even with zero applied:
+    // otherwise a fully migrated long-lived DB keeps reporting "content hash
+    // missing" from `db check-schema`.
     const hash = await computeMigrationsHash(createMigrationProvider());
     await storeMigrationContentHash(opts.pool, hash);
 
@@ -203,11 +193,9 @@ export interface MigrateToResult {
 }
 
 /**
- * A provider carrying only the migrations the ledger records as executed.
- *
- * Used to hash what the database actually holds, rather than what the binary
- * ships. Reads the ledger through the migrator that just ran it, so the two
- * can never disagree about which migrations survived.
+ * A provider carrying only the migrations the ledger records as executed, to
+ * hash what the database holds rather than what the binary ships. It reads the
+ * ledger through the migrator that just ran, so the two cannot disagree.
  */
 async function appliedSubsetProvider(
   migrator: Migrator,
@@ -224,14 +212,13 @@ async function appliedSubsetProvider(
 /**
  * Migrate the ledger to a named migration, in either direction.
  *
- * The point of this is rollback: a previous release's static provider does not
- * carry the newer migrations' names, so Kysely refuses to start against a
- * ledger that records them (`corrupted migrations: previously executed
- * migration <name> is missing`). Reverting to the head that release was
- * running at is what makes the old binary bootable again.
+ * For rollback: an older release's provider lacks the newer migrations, so
+ * Kysely refuses its ledger (`corrupted migrations: previously executed
+ * migration <name> is missing`). Reverting to that release's head makes the
+ * old binary bootable again.
  *
- * It runs under the same advisory lock as {@link runMigrations}, so a peer
- * cannot be applying migrations while this reverts them.
+ * Runs under the same advisory lock as {@link runMigrations}, so no peer
+ * applies migrations while this reverts them.
  */
 export async function migrateTo(opts: MigrateOptions, name: string): Promise<MigrateToResult> {
   const client = await opts.pool.connect();
@@ -269,13 +256,9 @@ export async function migrateTo(opts: MigrateOptions, name: string): Promise<Mig
     for (const n of applied) logger.info(`${n} ... OK`);
 
     // The content hash follows the LEDGER, not the code: `db check-schema`
-    // compares the stored value against a hash of the binary's whole migration
-    // set, so storing that same whole-set hash after a revert would report
-    // "schema is current" on a database that is deliberately behind. Hashing
-    // the applied subset leaves the two unequal, which is the drift the
-    // operator needs to see; a move forward to the head applies every
-    // migration, so the subset is the whole set and the check goes green on
-    // its own.
+    // compares it against the binary's whole-set hash, so storing that after a
+    // revert would call a deliberately-behind DB current. The applied-subset
+    // hash shows the drift; at the head the subset is the whole set.
     await storeMigrationContentHash(
       opts.pool,
       await computeMigrationsHash(await appliedSubsetProvider(migrator, provider)),

@@ -1,16 +1,12 @@
 /**
- * The four evaluations the eval child performs, with the IPC shell factored out.
+ * The evaluations the eval child performs, without its IPC shell. Kept apart
+ * from `eval-runner.ts` so a unit test drives the real code that loads customer
+ * workflow modules through the child's own seam, not an imitation that drifts.
  *
- * Separated from `eval-runner.ts` so this — the code that actually loads and
- * runs a customer workflow module — is directly testable, and so a unit test can
- * drive the real evaluation through the same seam the child uses rather than a
- * hand-written imitation of it that would drift.
- *
- * Every `process.env` read below is correct BECAUSE it runs in the eval child:
- * there `process.env` is the sanitized environment the child was forked with,
- * carrying no agent credential. The same expressions were the defect while these
- * evaluations ran in the agent process, which is why they moved rather than
- * being rewritten.
+ * Every `process.env` read below is correct only because it runs in the eval
+ * child, whose `process.env` is the sanitized environment it was forked with,
+ * carrying no agent credential. In the agent process the same reads would leak
+ * it, so these evaluations must not move back there.
  */
 
 import { join } from 'node:path';
@@ -65,13 +61,10 @@ function makeEvalLogger(deps: EvalDispatchDeps) {
 }
 
 /**
- * Where one of a run's evaluation jobs loads the workflow module, and the repo
- * pair its customer code sees.
- *
- * A global workflow's module is loaded from the workflow repository's checkout,
- * and its code sees that checkout and the source repository's as the pair every
- * other evaluation of it gets. Any other workflow loads from the work dir and
- * gets no pair.
+ * Where an evaluation job loads the workflow module, and the repo pair its code
+ * sees. A global workflow loads from the workflow repository's checkout and sees
+ * the same pair as every other evaluation of it; any other workflow loads from
+ * the work dir with no pair.
  */
 interface EvalTarget {
   workflowDir: string;
@@ -92,9 +85,8 @@ function evalTarget(request: EvalRequest): EvalTarget {
 }
 
 /**
- * Run an evaluation with a global workflow's `KICI_*` keys set, as the round and
- * the sandbox set them for the same workflow, and restore them afterwards. Runs
- * `fn` unchanged for any other workflow.
+ * Sets a global workflow's `KICI_*` keys around `fn`, as the round and the
+ * sandbox do, then restores them. Runs `fn` unchanged for any other workflow.
  */
 async function withGlobalWorkflowEnv<T>(target: EvalTarget, fn: () => Promise<T>): Promise<T> {
   if (!target.repos) return fn();
@@ -146,7 +138,7 @@ interface InitEvalConfig {
   resolvedHashFiles?: string[];
 }
 
-/** Whether an evaluation job must build the diff: a filter or deferred paths read it. */
+/** A filter or deferred paths read the diff. */
 function needsDiff(config: { hasFilter?: boolean; deferredPaths?: string[][] }): boolean {
   return config.hasFilter === true || (config.deferredPaths?.length ?? 0) > 0;
 }
@@ -274,8 +266,7 @@ async function runDynamicJob(request: EvalRequest, deps: EvalDispatchDeps): Prom
       const context = buildGeneratorContext({
         workflowName: config.workflowName,
         event: config.event,
-        // The sanitized environment this child was forked with — no agent
-        // credential is in it, which is the whole point of the child.
+        // The sanitized fork environment: no agent credential is in it.
         env: process.env as Record<string, string | undefined>,
         ...(needs && { needs }),
         // The pair the sandbox re-evaluation of the same generator gets.
@@ -304,11 +295,9 @@ async function runDynamicJob(request: EvalRequest, deps: EvalDispatchDeps): Prom
 }
 
 /**
- * Load the workflow module to verify the cloned source matches the lock file's
- * `contentHash`, before the agent packs the source tarball.
- *
- * The verification is `loadWorkflowSource`'s own, and importing the module is
- * what makes it customer code — module top-level runs.
+ * Verifies the cloned source matches the lock file's `contentHash` before the
+ * agent packs the source tarball. `loadWorkflowSource` does the check, and the
+ * import runs module top-level code, so it is customer code.
  */
 async function runBuildVerify(request: EvalRequest, deps: EvalDispatchDeps): Promise<unknown> {
   const config = request.config as {
@@ -356,10 +345,7 @@ async function runGlobalEval(request: EvalRequest, deps: EvalDispatchDeps): Prom
   );
 }
 
-/**
- * Run one evaluation request. The single entry point the eval child's IPC shell
- * calls, and the seam a unit test drives.
- */
+/** The single entry point the eval child's IPC shell calls, and the seam a unit test drives. */
 export async function runEvalRequest(
   request: EvalRequest,
   deps: EvalDispatchDeps,

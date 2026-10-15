@@ -1,17 +1,12 @@
 /**
- * Shared types for the service management system.
- *
- * Defines the ServiceManager interface contract and supporting types
- * used by all platform-specific service managers (systemd, launchd,
- * Windows Services, Docker/Podman Compose).
+ * The ServiceManager contract shared by every platform driver (systemd,
+ * launchd, Windows Services, Docker/Podman Compose).
  */
 
-/** Supported service platforms. */
 export type ServicePlatform = 'systemd' | 'launchd' | 'windows' | 'compose';
 
 /** Restart behavior on service failure. */
 export interface RestartPolicy {
-  /** Whether to restart on failure. */
   enabled: boolean;
   /** Backoff delays in seconds between restart attempts. */
   delays: number[];
@@ -30,9 +25,8 @@ export const DEFAULT_RESTART_POLICY: RestartPolicy = {
 };
 
 /**
- * The display name and description a component's service is registered with.
- * `install` and every upgrade that registers a service again use it, so an
- * upgraded registration carries the same text as a fresh one.
+ * Shared by `install` and every re-registering upgrade, so an upgraded
+ * registration carries the same text as a fresh one.
  */
 export const SERVICE_TEXT: Record<
   'orchestrator' | 'agent',
@@ -48,208 +42,163 @@ export const SERVICE_TEXT: Record<
   },
 };
 
-/** Configuration for installing a service. */
 export interface ServiceConfig {
   /** Service identifier (e.g., "kici-orchestrator"). */
   name: string;
-  /** Human-readable display name. */
   displayName: string;
-  /** Service description. */
   description: string;
-  /** Path to the executable binary. */
   executablePath: string;
   /**
-   * Arguments passed to {@link executablePath} in the unit's run command.
-   * For a Node-launched server this is the resolved server script path
-   * (e.g. `["/opt/kici/dist/server.js"]`); empty for a self-launching binary.
+   * Arguments after {@link executablePath} in the unit's run command: the
+   * resolved server script path for a Node-launched server
+   * (e.g. `["/opt/kici/dist/server.js"]`), empty for a self-launching binary.
    */
   args?: string[];
   /**
-   * Node bin dir to guarantee on the generated unit's PATH.
-   *
-   * The bare-metal scaler spawns the kici-agent node script, so `node` must be
-   * findable on the orchestrator's PATH. When the service is installed with an
-   * explicit `--binary` (a wrapper script), {@link executablePath} points at the
-   * wrapper, not node — so its dirname is the wrong directory. The install path
-   * sets this to `path.dirname(process.execPath)` (the node actually running the
-   * install command), which is the correct node bin dir regardless of `--binary`.
-   * Optional: lifecycle commands that don't regenerate the unit leave it unset,
-   * and the unit generators fall back to `dirname(executablePath)`.
+   * Node bin dir to guarantee on the generated unit's PATH, because the
+   * bare-metal scaler spawns the kici-agent node script. With an explicit
+   * `--binary` wrapper, {@link executablePath} is the wrapper, so its dirname
+   * is wrong; install sets this to `path.dirname(process.execPath)`. Lifecycle
+   * commands that don't regenerate the unit leave it unset, and the generators
+   * fall back to `dirname(executablePath)`.
    */
   nodeBinDir?: string;
   /** Path to the environment file (.env). */
   envFilePath: string;
-  /** Working directory for the service process. */
   workingDirectory: string;
-  /** User to run the service as (Unix only). */
+  /** Unix only. */
   user?: string;
   /** Whether this is a user-level (non-root) service. */
   isUserLevel: boolean;
-  /** Restart policy configuration. */
   restartPolicy: RestartPolicy;
   /**
-   * Which KiCI component this service runs. Embedded in the unit (X-KiCI-Component
-   * for systemd, KiCIComponent for launchd, dev.kici.component label for compose,
-   * description prefix for Windows) so per-driver `list()` scans can classify
-   * a discovered unit without relying on naming conventions.
-   *
-   * Optional during lifecycle ops that don't regenerate the unit; required on install.
+   * Embedded in the unit (X-KiCI-Component for systemd, KiCIComponent for
+   * launchd, dev.kici.component label for compose, description prefix for
+   * Windows) so `list()` classifies a unit without naming conventions.
+   * Required on install; optional for ops that don't regenerate the unit.
    */
   component?: 'orchestrator' | 'agent';
   /**
-   * The deploy folder that holds this instance's manifest. Embedded in the unit
+   * The deploy folder holding this instance's manifest. Embedded in the unit
    * (X-KiCI-InstanceDir for systemd, KiCIInstanceDir for launchd,
    * dev.kici.instance-dir for compose, a description suffix for Windows) so
-   * per-driver `list()` scans can recover the deploy folder straight from the
-   * init system — making the instance index a true rebuildable cache rather
-   * than the sole source of the name→folder mapping.
-   *
-   * Optional during lifecycle ops that don't regenerate the unit; set on install.
+   * `list()` recovers it from the init system, making the instance index a
+   * rebuildable cache rather than the sole name→folder mapping. Set on
+   * install; optional for ops that don't regenerate the unit.
    */
   instanceDir?: string;
 }
 
 /**
- * The launch command an installed init unit will actually execute, parsed
- * back out of the unit/plist/service registration. `execPath` is the binary
- * the init system runs (for a Node-launched server, the node binary); `args`
- * are everything after it (for a Node-launched server, the resolved entry
- * script path). Returned by {@link ServiceManager.readLaunchSpec}.
+ * The launch command an installed unit executes, parsed back out of the
+ * unit/plist/service registration. For a Node-launched server `execPath` is
+ * the node binary and `args` the resolved entry script path.
  */
 export interface LaunchSpec {
   execPath: string;
   args: string[];
 }
 
-/** Current state of a service. */
 export type ServiceState = 'running' | 'stopped' | 'failed' | 'unknown';
 
-/** Runtime status information for a service. */
 export interface ServiceStatus {
-  /** Current service state. */
   state: ServiceState;
-  /** Process ID if running. */
   pid?: number;
-  /** Uptime in seconds if running. */
+  /** Seconds. */
   uptime?: number;
-  /** ISO timestamp when the service last started. */
+  /** ISO timestamp of the last start. */
   startedAt?: string;
 }
 
-/** Options for the logs command. */
 export interface LogOptions {
-  /** Show logs since this duration (e.g., "1h", "30m"). */
+  /** A duration (e.g., "1h", "30m"). */
   since?: string;
-  /** Filter by log level. */
   level?: 'error' | 'warn' | 'info';
   /** Output as JSON lines. */
   json?: boolean;
-  /** Follow (tail -f) mode. */
+  /** Tail -f mode. */
   follow?: boolean;
 }
 
-/** Result of a per-driver discovery scan. */
 export interface DiscoveredInstance {
   name: string;
-  /** Always set; the driver knows its own platform. */
   platform: ServicePlatform;
   isUserLevel: boolean;
-  /** The component this unit belongs to, decoded from the unit's KiCI marker. */
+  /** Decoded from the unit's KiCI marker. */
   component: 'orchestrator' | 'agent';
   /**
-   * The deploy folder recovered from the unit's KiCI instance-dir marker, when
-   * the unit carries one. Undefined for units installed before the marker
-   * existed (the index cache remains the fallback for those).
+   * From the unit's instance-dir marker. Undefined for units installed before
+   * the marker existed; the index cache is their fallback.
    */
   instanceDir?: string;
 }
 
-/**
- * Interface that all platform-specific service managers must implement.
- *
- * Each method operates on a service identified by the ServiceConfig.
- */
 export interface ServiceManager {
   /**
-   * The platform this driver manages. Discovery scans several drivers at once
-   * (a host can hold both a systemd install and a compose install), and each
-   * driver's scan is authoritative only over its own platform's index rows —
-   * including when that scan comes back empty. An empty scan carries no row to
-   * read a platform off, so the driver states it here.
+   * Discovery scans several drivers at once, and each scan is authoritative
+   * only over its own platform's index rows, even when empty. An empty scan has
+   * no row to read a platform off, so the driver states it here.
    */
   readonly platform: ServicePlatform;
 
   /**
-   * Whether this driver can inspect its registry right now. A driver that
-   * answers `false` is excluded from discovery, and the index rows for its
-   * platform are left untouched — an empty scan from a driver whose registry is
-   * unreachable is not evidence that the instances are gone.
+   * Whether this driver can inspect its registry now. On `false` the driver is
+   * excluded from discovery and its platform's index rows are left untouched:
+   * an empty scan of an unreachable registry is not evidence the instances
+   * are gone.
    *
-   * Absent means always available: an init system a driver targets is either
-   * present or the driver is not a candidate for the host at all — which is
-   * why the two filesystem-backed drivers (systemd, launchd) omit it and let
-   * an unreadable unit directory throw out of `list()` instead. Compose and
-   * Windows implement it because their registry is a service that can be down
-   * or hung while the host and the client binary are fine.
+   * Absent means always available. systemd and launchd omit it and let an
+   * unreadable unit directory throw out of `list()`; compose and Windows
+   * implement it because their registry is a service that can be down or hung
+   * while the host and client binary are fine.
    *
-   * A driver that implements it MUST probe the registry itself, not the client
-   * that talks to it: `<runtime> compose version` and `where powershell` both
-   * answer on a host whose registry is down, which is the shape that reported
-   * available, scanned empty, and pruned live rows.
+   * An implementation MUST probe the registry itself, not its client:
+   * `<runtime> compose version` and `where powershell` both answer while the
+   * registry is down, which once reported available, scanned empty, and
+   * pruned live rows.
    *
-   * Discovery calls this INSIDE its own error handling, so a probe that
-   * rejects drops only this driver.
+   * Discovery calls this INSIDE its own error handling, so a rejecting probe
+   * drops only this driver.
    */
   available?(): Promise<boolean>;
 
-  /** Install and register the service with the init system. */
   install(config: ServiceConfig): Promise<void>;
 
   /** Remove the service registration (preserves config/data). */
   uninstall(config: ServiceConfig): Promise<void>;
 
-  /** Start the service. */
   start(config: ServiceConfig): Promise<void>;
 
-  /** Stop the service. */
   stop(config: ServiceConfig): Promise<void>;
 
-  /** Restart the service (stop + start). */
+  /** Stop + start. */
   restart(config: ServiceConfig): Promise<void>;
 
-  /** Get the current service status. */
   status(config: ServiceConfig): Promise<ServiceStatus>;
 
-  /** Stream or display service logs. */
   logs(config: ServiceConfig, options: LogOptions): Promise<void>;
 
-  /** Check if the service is currently installed/registered. */
   isInstalled(config: ServiceConfig): Promise<boolean>;
 
   /**
-   * Discover KiCI-managed services on this platform. The driver enumerates
-   * its native registry (systemctl/launchctl/sc/podman) and decodes each
-   * unit's component marker. Used by resolve.ts#listInstances to reconcile
-   * the index cache against ground truth.
+   * Enumerate KiCI-managed services in the native registry
+   * (systemctl/launchctl/sc/podman), decoding each unit's component marker.
+   * resolve.ts#listInstances reconciles the index cache against it.
+   * `isUserLevel` selects scope on systemd and launchd; ignored elsewhere.
    *
-   * `isUserLevel` selects user vs system scope on platforms where that matters
-   * (systemd, launchd); ignored on Windows/compose.
-   *
-   * An empty array means the registry answered and holds no KiCI services —
-   * the reconcile prunes this platform's index rows on that basis. A driver
-   * that could not read its registry must therefore throw rather than return
-   * `[]`; discovery drops a throwing driver exactly as it drops one whose
-   * `available()` said false.
+   * An empty array means the registry answered with no KiCI services, and the
+   * reconcile prunes this platform's index rows. A driver that could not read
+   * its registry must throw rather than return `[]`; discovery drops a
+   * throwing driver as it drops one whose `available()` said false.
    */
   list(isUserLevel: boolean): Promise<DiscoveredInstance[]>;
 
   /**
-   * Read the launch command the installed unit will actually execute, parsed
-   * back out of the init system's own record (systemd ExecStart, launchd
-   * ProgramArguments, windows service binPath). Returns null when the unit is
-   * not installed, its launch spec can't be parsed, or the platform has no
-   * node-launched entry to resolve (compose). Used by the npm-source upgrade to
-   * verify the version that will run before reporting success.
+   * Parse the launch command from the init system's own record (systemd
+   * ExecStart, launchd ProgramArguments, windows service binPath). Null when
+   * the unit is not installed, its spec can't be parsed, or the platform has
+   * no node-launched entry (compose). The npm-source upgrade verifies the
+   * version that will run with it before reporting success.
    */
   readLaunchSpec(config: ServiceConfig): Promise<LaunchSpec | null>;
 }

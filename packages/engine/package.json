@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/engine",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Shared business logic for the KiCI CI/CD stack: protocol, triggers, state machine, and provider interfaces used by the Platform relay, orchestrator, and compiler.",
   "keywords": [
     "ci",
@@ -143,7 +143,7 @@
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "build": "node ../../scripts/build-ts.mjs && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/engine --name @kici-dev/engine"

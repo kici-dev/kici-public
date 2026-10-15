@@ -1,16 +1,12 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `cluster_settings.version` (monotonic BIGINT, bumped on each settings
- * change).
+ * `cluster_settings.version`, monotonic and bumped on each settings change. The leader
+ * advertises it on `peer.heartbeat`, so DB-less workers detect a change and pull the
+ * worker-relevant settings snapshot. DB-backed, so a newly elected leader continues
+ * monotonically after failover.
  *
- * The leader advertises this version on `peer.heartbeat` so DB-less workers can
- * detect a change and pull the worker-relevant settings snapshot. DB-backed
- * (not an in-memory counter) so it survives leader failover: a newly-elected
- * leader continues monotonically from the row's current value.
- *
- * Idempotent: guarded on column existence; a re-run on a DB that already has
- * the column is a no-op.
+ * Idempotent: guarded on column existence.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

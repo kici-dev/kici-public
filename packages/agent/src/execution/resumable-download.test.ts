@@ -286,7 +286,7 @@ describe('downloadToFile', () => {
   });
 
   it('keeps durations non-negative when the wall clock steps backwards', async () => {
-    // A negative duration fails the report schema, and the whole report is dropped.
+    // A negative duration fails the report schema, dropping the whole report.
     // fails-when: a duration is measured with Date.now()
     const url = await serve((req, res) => serveRange(req, res));
     let wall = 2_000_000_000_000;

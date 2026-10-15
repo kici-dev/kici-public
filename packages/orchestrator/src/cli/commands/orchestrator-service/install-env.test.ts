@@ -246,16 +246,14 @@ describe('writeInstallEnvFile', () => {
     expect(content).toContain('KICI_WEBHOOK_PUBLIC_URL=https://ci.example.com');
   });
 
-  // The install bakes the service unit's entry point from KICI_MODE, so
-  // `--mode` has to land in the copied file. Asserting the written line alone
-  // would not show that: `selectServerEntry` is what install actually calls,
-  // and it reads only an uncommented assignment.
+  // The unit's entry point comes from KICI_MODE, so `--mode` must land in the
+  // copied file. The test goes through `selectServerEntry`, which install
+  // calls and which reads only an uncommented assignment.
   it('env-file mode writes a named --mode, so the unit runs the standalone entry', async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-env-'));
     vi.spyOn(console, 'log').mockImplementation(() => {});
     const source = path.join(dir, 'source.env');
-    // The shape `kici-admin join` writes: KICI_MODE appears only in the header
-    // comment, so nothing uncommented declares it.
+    // As `kici-admin join` writes it: KICI_MODE only in the header comment.
     fs.writeFileSync(source, '#   KICI_MODE=hybrid\nKICI_DATABASE_URL=postgres://x\n', 'utf-8');
     const envFilePath = path.join(dir, 'svc.env');
     await writeInstallEnvFile({
@@ -291,8 +289,7 @@ describe('writeInstallEnvFile', () => {
     expect(selectServerEntry(content)).toBe('standalone');
   });
 
-  // A named --mode is the operator's most recent instruction, so it replaces
-  // the assignment already in the file rather than appending a second one.
+  // A named --mode is the latest instruction: it replaces, not appends.
   it('env-file mode replaces an existing KICI_MODE when --mode names another', async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-env-'));
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -367,12 +364,11 @@ describe('install env file permissions', () => {
     bootstrapAdminToken: 't',
   };
 
-  // fails-when: any write path leaves the file group- or world-readable. It
-  //   holds KICI_SECRET_KEY, KICI_DATABASE_URL and KICI_PLATFORM_TOKEN, so a
-  //   0644 file publishes the cluster's master key to every local account.
-  //   Each case drives a different branch: the wizard and stub branches create
-  //   the file, the env-file branch copies one (inheriting the source's mode),
-  //   and the last starts from a file that already exists at 0644.
+  // fails-when: any write path leaves the file group- or world-readable; with
+  //   KICI_SECRET_KEY, KICI_DATABASE_URL and KICI_PLATFORM_TOKEN in it, 0644
+  //   publishes the master key to every local account. One case per branch:
+  //   wizard and stub create, env-file copies (inheriting the source's mode),
+  //   and the last starts from an existing 0644 file.
   it.each([
     [
       'wizard',
@@ -412,16 +408,15 @@ describe('install env file permissions', () => {
     await write(envFilePath);
 
     expect(fs.statSync(envFilePath).mode & 0o777).toBe(ENV_FILE_MODE);
-    // breaks-if-wrong: the installing user must still be able to read the file
-    // back — `install` re-reads it to stamp KICI_DEPLOY_* and to pick the
-    // server entry point, and the service unit reads it at every start.
+    // breaks-if-wrong: the installing user must still read it: `install` stamps
+    // KICI_DEPLOY_* and picks the entry point from it, and the unit reads it
+    // at every start.
     expect(fs.readFileSync(envFilePath, 'utf-8').length).toBeGreaterThan(0);
   });
 
-  // The assertions above read the mode after the write, which says nothing
-  // about the moment before the chmod. A second hard link on the destination
-  // makes that moment observable: a write through the old inode would put
-  // KICI_SECRET_KEY on a file that is still 0644 until the chmod lands.
+  // A mode read after the write misses the moment before the chmod; a second
+  // hard link exposes it, as a write through the old inode would put
+  // KICI_SECRET_KEY on a still-0644 file.
   // fails-when: the copy path uses copyFileSync + chmod.
   it('never writes the copied secrets through a pre-existing world-readable file', async () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-env-mode-'));

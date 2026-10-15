@@ -39,8 +39,6 @@ export interface UniversalGitAuth extends ProviderGitAuth {
 }
 
 /**
- * Universal-git implementation of CloneTokenProvider.
- *
  * Bound to a single source (orgId + sourceId + config). The orchestrator
  * constructs one per registered universal-git source.
  */

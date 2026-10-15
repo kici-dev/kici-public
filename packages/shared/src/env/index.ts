@@ -1,10 +1,6 @@
 /**
- * @kici-dev/shared/env — env schema helpers shared across services.
- *
- * Subpath export so server-side packages can `import { defineEnv } from
- * '@kici-dev/shared/env'`. This subpath is intentionally NOT re-exported
- * from the package root: it pulls Zod and is only meaningful in Node-side
- * config loaders, not from browser code.
+ * Env schema helpers for services. Deliberately NOT re-exported from the
+ * package root: it pulls Zod and only Node-side config loaders use it.
  */
 
 export {

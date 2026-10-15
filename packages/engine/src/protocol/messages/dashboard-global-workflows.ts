@@ -1,18 +1,12 @@
 /**
- * Dashboard REST-over-WS protocol messages for org-level global workflow settings.
- *
- * Platform forwards these requests over the coordinator WS to the orchestrator,
- * which owns the `org_settings` table. The orchestrator responds with the
- * current (or patched) row projected into the shape below.
+ * Dashboard REST-over-WS messages for org-level global workflow settings. The
+ * Platform forwards them over the coordinator WS to the orchestrator, which
+ * owns `org_settings` and answers with the current (or patched) row projected
+ * into the shape below.
  *
  * Exposed via the `@kici-dev/engine/protocol/dashboard-global-workflows` subpath
- * export (not the barrel) so server consumers can import without pulling
- * anything unrelated into the dashboard bundle.
- *
- * Each repo-list entry is a `{routingKey?, pattern}` object. When
- * `routingKey` is absent, the entry applies to events / workflows from any
- * source in the org. When present, it qualifies the entry to a single
- * webhook source (e.g., `github:42` vs `generic:org:abcd`).
+ * (not the barrel) so server consumers pull nothing unrelated into the
+ * dashboard bundle.
  *
  * Two independent policy axes (see GlobalWorkflowPolicy in the orchestrator):
  *   - `allowedRepos` restricts which repos may AUTHOR global workflows.
@@ -23,8 +17,9 @@ import { negatedPatternReason } from '../../repo/pattern-negation.js';
 import { actorPrincipalSchema } from './actor.js';
 
 /**
- * One entry in either repo-pattern list. `routingKey` is the
- * source-qualifier; when absent the entry applies to any source in the org.
+ * One entry in either repo-pattern list. `routingKey` limits it to one webhook
+ * source (e.g. `github:42` vs `generic:org:abcd`); absent, it applies to any
+ * source in the org.
  */
 export const repoPatternEntrySchema = z.object({
   routingKey: z.string().min(1).optional(),
@@ -37,21 +32,19 @@ export type RepoPatternEntry = z.infer<typeof repoPatternEntrySchema>;
  * Why a pattern may not be stored on a global-workflow policy list, or null
  * when it is acceptable.
  *
- * The lists match each entry as a single glob, so a negated pattern inverts to
- * "everything except" — on an allow list that allows almost every repo, on a
- * deny list it denies almost every repo. The list's own direction already
- * encodes allow/deny, so negation forms are rejected at write time.
+ * Each entry matches as a single glob, so a negated pattern inverts to
+ * "everything except": an allow list would allow, and a deny list deny, almost
+ * every repo. The list's direction already encodes allow/deny, so negations are
+ * rejected at write time.
  *
- * This is deliberately not folded into `repoPatternEntrySchema`: the schema is
- * also the read path for rows already in `org_settings`, which must keep
- * parsing. Evaluation handles a stored negation form by failing closed.
+ * Not folded into `repoPatternEntrySchema`: that schema also reads rows already
+ * in `org_settings`, which must keep parsing. Evaluation fails closed on a
+ * stored negation.
  *
- * Which forms count as a negation is not decided here: it comes from the one
- * classifier in `repo/pattern-negation.js`, shared with the Platform's
- * repo-scope allow-list. Keeping the verdict in one place is what stops this
- * list and that one from reading the same pattern language two different ways —
- * notably the regular-expression assertions `(?!…)` / `(?<!…)`, which picomatch
- * compiles into a real inversion, and `[!…]`, which it does not.
+ * What counts as a negation comes from the one classifier in
+ * `repo/pattern-negation.js`, shared with the Platform's repo-scope allow-list
+ * so both read the pattern language the same way — notably `(?!…)` / `(?<!…)`,
+ * which picomatch compiles into a real inversion, and `[!…]`, which it does not.
  */
 export function invalidRepoPatternReason(pattern: string): string | null {
   if (pattern.trim() === '') return 'pattern is empty';
@@ -63,9 +56,9 @@ export function invalidRepoPatternReason(pattern: string): string | null {
 }
 
 /**
- * Projected org-level global workflow settings. `.strict()`: the projection
- * once carried an unenforced elevated-access list, so an orchestrator still
- * echoing one is on a build this protocol floor refuses.
+ * Projected org-level global workflow settings. `.strict()` rejects an
+ * orchestrator that echoes the removed elevated-access list: it runs a build
+ * below this protocol floor.
  */
 export const globalWorkflowSettingsSchema = z
   .object({
@@ -73,8 +66,7 @@ export const globalWorkflowSettingsSchema = z
     /**
      * The effective fleet-wide master switch
      * (`cluster_settings.global_workflows_enabled`, set with `kici-admin
-     * cluster-settings`). Read-only here — the dashboard renders it as a status
-     * badge; it is not a per-org value and cannot be flipped from the dashboard.
+     * cluster-settings`). Not per-org: the dashboard shows it read-only as a badge.
      */
     enabled: z.boolean(),
     allowedRepos: z.array(repoPatternEntrySchema).nullable(),
@@ -96,15 +88,11 @@ export const globalWorkflowsGetRequestSchema = z.object({
 });
 
 /**
- * Patch the global-workflow settings row (upserts if missing).
+ * Patch the global-workflow settings row (upserts if missing). `null` clears a
+ * list column (`allowedRepos: null` means "all repos pass the allow-list").
  *
- * Every field is optional. `null` clears the corresponding list column
- * (e.g., `allowedRepos: null` means "all repos pass the allow-list").
- *
- * The master enable switch is NOT here: it is fleet-wide
- * (`cluster_settings.global_workflows_enabled`, set with `kici-admin
- * cluster-settings`), not per-org. `.strict()` so a client that still sends
- * `enabled` gets a validation failure instead of a silently dropped field.
+ * The master switch is fleet-wide, not here. `.strict()` so a client that
+ * still sends `enabled` fails validation instead of having it silently dropped.
  */
 export const globalWorkflowsUpdateRequestSchema = z
   .object({

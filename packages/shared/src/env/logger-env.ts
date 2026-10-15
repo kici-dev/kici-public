@@ -1,18 +1,11 @@
 /**
- * Shared LoggerEnv schema.
+ * Env vars read before per-service config loads (by `logger.ts`, and by
+ * `kiciTmpBase()` for `KICI_TMPDIR`), so they cannot live in the service
+ * schemas. This schema feeds each service's known-KICI_* list and the
+ * "Logger / shared" section of `docs/operator/env-reference.md`.
  *
- * The logger (packages/core/src/logger.ts) reads these env vars *before*
- * the per-service config loads — as does `kiciTmpBase()`
- * (packages/core/src/tmp.ts) for the `KICI_TMPDIR` entry below — so we can't
- * include them in the service schemas the normal way. We still want them in
- * `docs/operator/env-reference.md` and in `validateUnknownKiciVars()`'s
- * known-var set, so this schema documents them in one place. Each service
- * includes the keys here when computing its "known KICI_* vars" list, and the
- * docs generator emits a "Logger / shared" section from this schema.
- *
- * IMPORTANT: do not change the runtime behaviour of `logger.ts` from this
- * schema — the schema is documentation + the unknown-var allowlist, not the
- * source of truth for the logger.
+ * IMPORTANT: this schema is documentation + the unknown-var allowlist, not the
+ * logger's source of truth; it does not change `logger.ts` runtime behaviour.
  */
 
 import { z } from 'zod';
@@ -22,12 +15,7 @@ export const LoggerEnvSchema = z.object({
   KICI_LOG_DIR: z.string().optional(),
   KICI_LOG_MAX_SIZE: z.string().default('500m'),
   KICI_LOG_RETENTION_DAYS: z.coerce.number().default(7),
-  /**
-   * Output format selection: `auto` (default — JSON when stdout is piped,
-   * plain text when stdout is a TTY), `plain` (always pretty), or `json`
-   * (always structured). Runtime services pin this to `json` so a stray
-   * journal-attached PTY can never flip them into plain mode.
-   */
+  /** Runtime services pin `json` so a journal-attached PTY cannot flip them to plain. */
   KICI_LOG_FORMAT: z.enum(['auto', 'plain', 'json']).default('auto'),
   /** Set by the orchestrator process; used as a filename suffix. */
   KICI_CLUSTER_INSTANCE_ID: z.string().optional(),
@@ -35,11 +23,7 @@ export const LoggerEnvSchema = z.object({
   KICI_AGENT_ID: z.string().optional(),
   /** Set by the platform process; used as a filename suffix. */
   KICI_PLATFORM_INSTANCE_ID: z.string().optional(),
-  /**
-   * Base directory for KiCI-created temp files (repo clones, build scratch,
-   * deploy render dirs). Read by `kiciTmpBase()` before any service config
-   * loads; defaults to the OS temp dir when unset.
-   */
+  /** Read by `kiciTmpBase()` before any service config loads. */
   KICI_TMPDIR: z.string().optional(),
   /** Read by `@kici-dev/shared/load-service-env-file` before any config loads. */
   KICI_ENV_FILE: z.string().optional(),
@@ -58,7 +42,7 @@ export const LOGGER_ENV_VARS = [
   'KICI_ENV_FILE',
 ] as const;
 
-/** Doc-friendly description map (consumed by the env-reference generator). */
+/** Consumed by the env-reference generator. */
 export const LOGGER_ENV_FIELD_SPECS: EnvFieldSpec[] = [
   {
     envVar: 'KICI_CLUSTER_INSTANCE_ID',

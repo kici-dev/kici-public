@@ -161,7 +161,6 @@ describe('findBackendForLabels', () => {
   });
 
   it('matches subset (job labels subset of scaler labels)', () => {
-    // ['linux'] is a subset of ['linux', 'docker'] — should match
     const result = findBackendForLabels(['linux'], scalers);
     expect(result).toEqual({ scalerName: 'docker-linux', labelSetIndex: 0 });
   });
@@ -178,7 +177,7 @@ describe('findBackendForLabels', () => {
 
   it('skips backends with excluded labels', () => {
     const result = findBackendForLabels(['linux'], scalers, ['gpu']);
-    // Should match docker-linux (no gpu label) rather than bare-metal-gpu (has gpu)
+    // docker-linux has no gpu label; bare-metal-gpu has one.
     expect(result).toEqual({ scalerName: 'docker-linux', labelSetIndex: 0 });
   });
 
@@ -227,9 +226,7 @@ describe('findBackendForLabels', () => {
     });
 
     it('blocks generic job from gated scaler even when subset matches its labelSet', () => {
-      // ['linux'] is a subset of gpu-pool's ['linux', 'gpu'] labelSet, but
-      // the label set's gate requires `gpu` in runsOn — so gpu-pool is
-      // skipped and generic wins.
+      // ['linux'] is a subset of gpu-pool's label set, but its gate requires `gpu`.
       const result = findBackendForLabels(['linux'], gatedScalers);
       expect(result).toEqual({ scalerName: 'generic', labelSetIndex: 0 });
     });
@@ -273,9 +270,7 @@ describe('findBackendForLabels', () => {
           labelSetMandatoryLabels: [['gpu', 'cuda']],
         },
       ];
-      // Missing one of the mandatory labels → blocked.
       expect(findBackendForLabels(['linux', 'gpu'], scalers)).toBeNull();
-      // All mandatory labels present → matches.
       expect(findBackendForLabels(['linux', 'gpu', 'cuda'], scalers)).toEqual({
         scalerName: 'gpu+cuda',
         labelSetIndex: 0,
@@ -295,8 +290,7 @@ describe('findBackendForLabels', () => {
           labelSetMandatoryLabels: [[]],
         },
       ];
-      // Empty target: the gated scaler is first, but the matcher walks past
-      // it because its gate is non-empty, and lands on the plain one.
+      // The matcher walks past the first scaler because its gate is non-empty.
       const result = findBackendForLabels([], scalers);
       expect(result).toEqual({ scalerName: 'plain-second', labelSetIndex: 0 });
     });

@@ -1,20 +1,8 @@
 /**
- * `kici-admin agent upgrade` command.
- *
- * Upgrades the agent using the versioned directory layout:
- * - Extracts new version alongside old versions
- * - Updates symlink (Unix) or service registration (Windows) atomically
- * - Preserves old versions for rollback
- * - No database migrations (agents are stateless)
- *
- * Targeting is folder-anchored: the resolution priority is
- *   1. `--instance-dir <path>`
- *   2. `--name <name>`
- *   3. CWD manifest (`./.kici-agent.json`)
- *   4. otherwise refuses with a candidate-list error.
- *
- * `--name` no longer has a default — every invocation must resolve via one
- * of the above paths.
+ * `kici-admin agent upgrade`: the versioned-directory upgrade
+ * (`performVersionedUpgrade`), with no database migrations because agents are
+ * stateless. `--name` has no default: the target resolves from
+ * `--instance-dir`, `--name`, or the CWD `./.kici-agent.json`.
  */
 
 import type { Command } from 'commander';

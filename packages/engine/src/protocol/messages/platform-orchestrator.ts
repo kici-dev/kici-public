@@ -21,31 +21,20 @@ import { runEventMessageSchema, jobContextMessageSchema } from './run-events.js'
 
 // --- Platform -> Orchestrator messages ---
 
-/**
- * Org trust policy — Platform-owned tenant policy pushed to the orchestrator.
- * The orchestrator caches and enforces it; it never owns it. Named separately
- * from the enclosing message so the orchestrator's evaluator and cache can type
- * against the policy alone.
- */
-/** Seconds in an hour. */
 export const SECONDS_PER_HOUR = 3600;
 
 /**
- * Documented default window a security hold stays open: 72 hours.
- *
- * The single owner of the value: the fail-closed policy, the orchestrator's
- * stored-policy default, and the hold-sizing fallback all read it, so the
- * number cannot drift between the two packages that enforce it.
+ * Documented default window a security hold stays open: 72 hours. The
+ * fail-closed policy, the orchestrator's stored-policy default, and the
+ * hold-sizing fallback all read it, so it cannot drift between the two
+ * packages that enforce it.
  */
 export const DEFAULT_APPROVAL_EXPIRY_SECONDS = 72 * SECONDS_PER_HOUR;
 
 /**
- * The shortest expressible security-hold window.
- *
- * One second, not a rounder-looking number: the floor exists to stop a zero or
- * negative value minting an already-expired hold, and any strictly positive
- * integer discharges that. A larger floor would be an invented usability
- * opinion that also puts the window back out of reach of a test.
+ * The shortest security-hold window. One second, not a rounder number: the
+ * floor only stops a zero or negative value minting an already-expired hold,
+ * and a larger floor would put short windows out of reach of a test.
  */
 export const MIN_APPROVAL_EXPIRY_SECONDS = 1;
 
@@ -53,10 +42,9 @@ export const MIN_APPROVAL_EXPIRY_SECONDS = 1;
 export const MAX_APPROVAL_EXPIRY_SECONDS = 8760 * SECONDS_PER_HOUR;
 
 /**
- * The org-level fork switch: the setting an org's trust policy carries for how
- * fork pull requests are treated. Each value names what the operator is
- * choosing; which values the orchestrator's trust-policy gate honours, and the
- * mechanism it uses, are owned there rather than here.
+ * The org trust policy's fork switch: how fork pull requests are treated. Each
+ * value names the operator's choice; which values the orchestrator's
+ * trust-policy gate honours, and how, is owned there.
  *
  * - `ignore` — the operator declines fork pull requests.
  * - `hold` — the operator requires approval first; the policy's approval expiry
@@ -68,32 +56,33 @@ export const ForkPolicy = z.enum(['ignore', 'hold', 'allow']);
 export type ForkPolicy = z.infer<typeof ForkPolicy>;
 
 /**
- * How much CI authority one org member holds.
- *
- * The level the `/kici approve` comment path reads once it has resolved a
- * commenter to a KiCI user id: `write` or `admin` may release a security hold,
- * `read` and `none` may not. Named here rather than spelled inline so the wire
- * schema, the orchestrator's admin route, and `kici-admin` all offer exactly
- * the same four values.
+ * How much CI authority one org member holds. The `/kici approve` comment path
+ * reads it once it has resolved a commenter to a KiCI user id: `write` or
+ * `admin` may release a security hold, `read` and `none` may not. Shared by the
+ * wire schema, the orchestrator's admin route, and `kici-admin`.
  */
 export const CiTrustLevel = z.enum(['none', 'read', 'write', 'admin']);
 export type CiTrustLevel = z.infer<typeof CiTrustLevel>;
 
 /**
- * `.strict()`: the policy object once carried per-arm fields the gate never
- * read, so a sender still emitting one is on a build this protocol floor
- * refuses — a stray field is a version-skew signal, not something to ignore.
+ * Org trust policy: Platform-owned tenant policy pushed to the orchestrator,
+ * which caches and enforces it but never owns it. Named apart from the
+ * enclosing message so the orchestrator's evaluator and cache can type against
+ * the policy alone.
+ *
+ * `.strict()`: a sender emitting the per-arm fields the gate never read is on a
+ * build this protocol floor refuses, so a stray field is a version-skew signal,
+ * not something to ignore.
  */
 export const trustPolicySchema = z
   .object({
     forkPolicy: ForkPolicy,
     /**
-     * Seconds a security hold stays open.
-     *
-     * Integer and at least {@link MIN_APPROVAL_EXPIRY_SECONDS}: the column is
-     * INTEGER, so a fractional value throws inside the fire-and-forget persist
-     * and the policy is then silently never stored, and a non-positive window
-     * mints an already-expired hold.
+     * Seconds a security hold stays open. Integer because the column is
+     * INTEGER: a fractional value throws inside the fire-and-forget persist and
+     * the policy is silently never stored. At least
+     * {@link MIN_APPROVAL_EXPIRY_SECONDS}: a non-positive window mints an
+     * already-expired hold.
      */
     approvalExpirySeconds: z.number().int().min(MIN_APPROVAL_EXPIRY_SECONDS),
   })
@@ -111,22 +100,20 @@ export const trustPolicyUpdateSchema = z.object({
       provider: z.string(),
       providerUsername: z.string(),
       /**
-       * Immutable IDP-side numeric id (e.g. GitHub's `id`).
-       * Nullable during the backfill window for legacy rows that
-       * predate the column. Trust resolver prefers this over
-       * `providerUsername` and (in the strict end-state) refuses
-       * trust when both sides have it null.
+       * Immutable IDP-side numeric id (e.g. GitHub's `id`); nullish for legacy
+       * rows that predate the column. The trust resolver matches strictly on
+       * this id, never on `providerUsername`, and refuses a match when either
+       * side lacks it.
        */
       providerUserId: z.string().nullish(),
     }),
   ),
   memberCiTrustLevels: z.record(z.string(), CiTrustLevel),
   /**
-   * Operator-defined teams and their member user ids. The orchestrator has no
-   * identity store, so team membership is delivered here (next to
-   * `identityLinks`) and cached in-memory. The approval resolver matches a
-   * `{team}` clause by looking up the team's members in this list.
-   * `.default([])` keeps an older Platform that doesn't send it valid.
+   * Operator-defined teams and their member user ids, delivered here and cached
+   * in memory because the orchestrator has no identity store. The approval
+   * resolver matches a `{team}` clause against this list. `.default([])` keeps
+   * an older Platform that does not send it valid.
    */
   teamMemberships: z
     .array(
@@ -143,18 +130,14 @@ export type TrustPolicyUpdate = z.infer<typeof trustPolicyUpdateSchema>;
  * Internal shape of a fully-reassembled, HMAC-verified webhook relay handed
  * to the orchestrator's `onWebhookRelay` callback.
  *
- * NOT a wire-parseable schema: this shape is intentionally absent from the
- * `platformToOrchestratorMessageSchema` discriminated union so that a rogue
- * or compromised Platform process cannot fabricate one and bypass the
- * on-orchestrator HMAC verification gate. The only legitimate construction
- * site is `completeChunkedRelay` in `packages/orchestrator/src/ws/platform-client.ts`,
- * which synthesizes this shape AFTER `onVerifyInbound` returns `'accepted'`.
- *
- * The Platform migration that dropped the webhook secret columns
- * makes the orch-side `verifyInboundWebhook` (called from `onVerifyInbound` on
- * the chunked relay path `webhook.relay.start` / `webhook.relay.chunk`) the
- * sole trust boundary against a malicious Platform; keeping this schema OUT
- * of the wire union enforces that invariant statically.
+ * NOT wire-parseable: it is absent from `platformToOrchestratorMessageSchema`
+ * so a rogue or compromised Platform cannot fabricate one and bypass the
+ * on-orchestrator HMAC verification. The Platform holds no webhook secrets, so
+ * the orch-side `verifyInboundWebhook` (called from `onVerifyInbound` on the
+ * chunked `webhook.relay.start` / `webhook.relay.chunk` path) is the sole trust
+ * boundary against a malicious Platform. The only construction site is
+ * `completeChunkedRelay` in `packages/orchestrator/src/ws/platform-client.ts`,
+ * AFTER `onVerifyInbound` returns `'accepted'`.
  */
 export const webhookRelaySchema = z.object({
   type: z.literal('webhook.relay'),
@@ -169,10 +152,9 @@ export const webhookRelaySchema = z.object({
 });
 
 /**
- * HMAC verification + processing result returned by orchestrator in webhook.ack.
- *
- * Used in the chunked relay protocol where the orchestrator (not Platform)
- * verifies the inbound HMAC signature against its locally-stored secret.
+ * Verification + processing result in `webhook.ack`. On the chunked relay the
+ * orchestrator, not the Platform, verifies the inbound HMAC signature against
+ * its locally-stored secret.
  *
  * - `accepted`: signature verified (or method is `none`/IP allowlist OK), webhook
  *   handed to the existing webhook processing pipeline.
@@ -199,26 +181,24 @@ export const WebhookRelayResult = z.enum([
 export type WebhookRelayResult = z.infer<typeof WebhookRelayResult>;
 
 /**
- * Maximum total body size accepted by the chunked webhook relay protocol.
- * 25 MiB matches GitHub's own webhook payload cap. Senders that need higher must
- * connect their orchestrator directly (bypassing Platform).
+ * Maximum total body size of the chunked webhook relay: 25 MiB, GitHub's own
+ * webhook payload cap. Senders that need more connect to their orchestrator
+ * directly, bypassing the Platform.
  */
 export const WEBHOOK_RELAY_MAX_BODY_BYTES = 25 * 1024 * 1024;
 
 /**
- * Recommended raw chunk size for the chunked relay protocol. 64 KiB raw becomes
- * ~85 KiB base64 in JSON; permessage-deflate compresses it well. Sender (Platform)
- * picks the actual size; receiver (orchestrator) just enforces totalSize and chunkCount.
+ * Recommended raw chunk size for the chunked relay: 64 KiB raw is ~85 KiB
+ * base64 in JSON, which permessage-deflate compresses well. The Platform picks
+ * the actual size; the orchestrator enforces only totalSize and chunkCount.
  */
 export const WEBHOOK_RELAY_CHUNK_SIZE = 64 * 1024;
 
 /**
- * Start frame of the chunked webhook relay protocol (Platform -> orchestrator).
- * Carries metadata + signature inputs only; body bytes follow in subsequent
- * webhook.relay.chunk frames correlated by messageId.
- *
- * The orchestrator allocates a per-messageId reassembly buffer on receipt.
- * No webhook.ack is sent until the final chunk completes the stream.
+ * Start frame of the chunked webhook relay (Platform -> orchestrator): metadata
+ * and signature inputs only; body bytes follow in webhook.relay.chunk frames
+ * with the same messageId. The orchestrator allocates a per-messageId
+ * reassembly buffer and sends no webhook.ack until the final chunk.
  */
 export const webhookRelayStartSchema = z.object({
   type: z.literal('webhook.relay.start'),
@@ -234,18 +214,13 @@ export const webhookRelayStartSchema = z.object({
   /** Inbound HTTP request client IP for IP-allowlist verification (generic webhooks). */
   clientIp: z.string().nullish(),
   /**
-   * Selected inbound headers the orchestrator may need (lowercased keys). Senders
-   * SHOULD include only headers the verification path uses (signature alt-name,
-   * x-hub-signature, etc.) and route metadata; bulk header forwarding is an
-   * anti-pattern.
+   * Selected inbound headers (lowercased keys). Senders SHOULD include only
+   * headers the verification path uses (signature alt-name, x-hub-signature,
+   * etc.) and route metadata, never bulk headers.
    */
   headers: z.record(z.string(), z.string()),
-  /**
-   * Total body size in bytes. Sum of decoded chunk sizes MUST equal this value;
-   * mismatch yields rejected_misconfigured. Capped at WEBHOOK_RELAY_MAX_BODY_BYTES.
-   */
+  /** Total body size in bytes; a decoded-chunk sum that differs yields rejected_misconfigured. */
   totalSize: z.number().int().min(0).max(WEBHOOK_RELAY_MAX_BODY_BYTES),
-  /** Number of chunk frames the orchestrator should expect (>= 1). */
   chunkCount: z.number().int().min(1),
   /** Trace ID propagated across tiers for distributed tracing. */
   requestId: z.string().optional(),
@@ -253,19 +228,18 @@ export const webhookRelayStartSchema = z.object({
 export type WebhookRelayStart = z.infer<typeof webhookRelayStartSchema>;
 
 /**
- * One chunk of the body. Sequence is 0-indexed and MUST arrive strictly in order;
- * the final=true chunk completes the stream and triggers verify+process on the
- * orchestrator. Decoded chunk bytes (sum across the stream) MUST equal totalSize
+ * One body chunk. Chunks MUST arrive strictly in `sequence` order; the
+ * `final` chunk completes the stream and triggers verify+process on the
+ * orchestrator. The decoded bytes across the stream MUST sum to the `totalSize`
  * declared in webhook.relay.start.
  */
 export const webhookRelayChunkSchema = z.object({
   type: z.literal('webhook.relay.chunk'),
   messageId: z.string(),
-  /** 0-indexed chunk number; must match the orchestrator's expected next sequence. */
+  /** 0-indexed; must match the orchestrator's expected next sequence. */
   sequence: z.number().int().min(0),
   /** Base64-encoded chunk bytes. */
   data: z.string(),
-  /** True on the last chunk in the stream. Triggers verify+process on the orchestrator. */
   final: z.boolean(),
 });
 export type WebhookRelayChunk = z.infer<typeof webhookRelayChunkSchema>;
@@ -282,7 +256,7 @@ export const peerDiscoverSchema = z.object({
   }),
 });
 
-/** Full peer list update pushed by Platform to all pool members when membership changes. Replaces peer.discover. */
+/** Full peer list pushed by the Platform to all pool members on a membership change. Replaces peer.discover. */
 export const peerUpdateSchema = z.object({
   type: z.literal('peer.update'),
   peers: z.array(
@@ -297,10 +271,10 @@ export const peerUpdateSchema = z.object({
 });
 
 /**
- * Stale check run cleanup request sent by Platform when a replacement orchestrator
- * reconnects after the previous one died. Contains metadata for runs that were
- * marked timed_out_stale by Platform, so the orchestrator can update stuck GitHub
- * check runs that the dead orchestrator left as "in_progress".
+ * Sent by the Platform when a replacement orchestrator reconnects after the
+ * previous one died: the runs the Platform marked timed_out_stale, so the
+ * orchestrator can update the GitHub check runs the dead one left
+ * "in_progress".
  */
 export const staleCheckrunCleanupSchema = z.object({
   type: z.literal('stale.checkrun.cleanup'),
@@ -313,17 +287,15 @@ export const staleCheckrunCleanupSchema = z.object({
       sha: z.string(),
       workflowName: z.string(),
       /**
-       * The repository that DEFINES the workflow, when that is not the
-       * repository the run acted on — an organization-wide workflow dispatched
-       * against another repository. The orchestrator qualifies the check-run
-       * names it looks for with it, so a cleanup cannot time out the acted-on
-       * repository's own same-named check; see the orchestrator's
-       * `workflowLabel`.
+       * The repository that DEFINES the workflow, when it is not the one the
+       * run acted on (an organization-wide workflow dispatched against another
+       * repository). The orchestrator qualifies the check-run names it looks
+       * for with it, so a cleanup cannot time out the acted-on repository's own
+       * same-named check; see the orchestrator's `workflowLabel`.
        *
-       * Additive and optional. The Platform sends it on exactly the condition
-       * that writes the mirror column — only when the two repositories differ —
-       * so an absent field and a value equal to `repoIdentifier` mean the same
-       * thing and both name the unqualified check.
+       * The Platform sends it only when the two repositories differ, the same
+       * condition that writes the mirror column, so an absent field and a value
+       * equal to `repoIdentifier` both name the unqualified check.
        */
       workflowRepoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
       jobNames: z.array(z.string()),
@@ -333,9 +305,8 @@ export const staleCheckrunCleanupSchema = z.object({
 export type StaleCheckrunCleanup = z.infer<typeof staleCheckrunCleanupSchema>;
 
 /**
- * Platform capability advertisement, sent once by the Platform after the
- * orchestrator authenticates. Payload is `platformCapabilitiesSchema`, which
- * defines no flag at protocol 4.
+ * Sent once by the Platform after the orchestrator authenticates.
+ * `platformCapabilitiesSchema` defines no flag at protocol 4.
  */
 export const platformCapabilitiesMessageSchema = z.object({
   type: z.literal('platform.capabilities'),
@@ -346,18 +317,17 @@ export type PlatformCapabilitiesMessage = z.infer<typeof platformCapabilitiesMes
 // --- Orchestrator -> Platform messages ---
 
 /**
- * Periodic OTel metrics push from orchestrator to Platform for centralized observability.
+ * Periodic OTel metrics push from orchestrator to Platform.
  *
- * Schema bounds are the first line of defence against pollution of the
- * Platform's monitoring system: a malformed or hostile push fails Zod
- * parse at the WS edge and never reaches the aggregator or the Mimir
- * relay. The content-level allow-list (catalog) is enforced one step
- * deeper, in the Platform's orchestrator-metrics filter.
+ * The schema bounds are the first defence against polluting the Platform's
+ * monitoring: a malformed or hostile push fails Zod parse at the WS edge and
+ * never reaches the aggregator or the Mimir relay. The content allow-list
+ * (catalog) is enforced deeper, in the Platform's orchestrator-metrics filter.
  *
- * Caps:
- * - 2000 metric data points per push (one orch ships ~60 today)
+ * Caps, with headroom over current use:
+ * - 2000 metric data points per push (one orch ships ~60)
  * - 128-char metric name, 64-char label key, 256-char label value
- * - 15 labels per series (KiCI metrics carry ~5 today)
+ * - 15 labels per series (KiCI metrics carry ~5)
  * - 30 explicit histogram buckets (largest histogram has 9 boundaries)
  */
 export const orchMetricsSchema = z.object({
@@ -394,14 +364,11 @@ export const CLUSTER_MEMBERSHIP_MAX_WORKERS = 512;
 /**
  * Worker-peer membership snapshot, sent by a coordinator to the Platform.
  *
- * A snapshot rather than a delta: a dropped or reordered frame self-heals on
+ * A snapshot rather than a delta, so a dropped or reordered frame self-heals on
  * the next send instead of corrupting a running tally. The Platform stores the
- * reported size on `platform_connections` and aggregates it into the org's
- * combined orchestrator count.
- *
- * The array bound is the first line of defence, for the same reason
- * `orchMetricsSchema` bounds its own arrays: a malformed or hostile push must
- * fail Zod parse at the WS edge and never reach the aggregate.
+ * size on `platform_connections` and adds it to the org's combined
+ * orchestrator count. The array bound makes a malformed or hostile push fail
+ * Zod parse at the WS edge, as in `orchMetricsSchema`.
  */
 export const clusterMembershipSchema = z.object({
   type: z.literal('cluster.membership'),
@@ -416,15 +383,15 @@ export type ClusterMembership = z.infer<typeof clusterMembershipSchema>;
  * Per-coordinator orchestrator ceiling, pushed by the Platform.
  *
  * `maxWorkerPeers` is an ABSOLUTE ceiling on this coordinator's connected
- * worker peers, not a remaining allowance. The Platform computes it by
- * excluding this connection's own workers from the org total, so it does not
- * move when a local worker joins or leaves — the coordinator can enforce
- * against its live peer count with no round trip and no staleness window.
+ * worker peers, not a remaining allowance. The Platform excludes this
+ * connection's own workers from the org total, so the value does not move when
+ * a local worker joins or leaves and the coordinator enforces against its live
+ * peer count with no round trip and no staleness window.
  *
- * `orgLimit` and `orgTotal` are informational: they let the coordinator's
- * rejection reason say why, rather than closing opaquely. `evictExcess` is set
- * once the org has been over its limit for longer than the grace window, and
- * asks the coordinator to drain its newest workers down to the ceiling.
+ * `orgLimit` and `orgTotal` are informational, so the coordinator's rejection
+ * reason can say why. `evictExcess` is set once the org has been over its limit
+ * for longer than the grace window, and asks the coordinator to drain its
+ * newest workers down to the ceiling.
  */
 export const planHeadroomSchema = z.object({
   type: z.literal('plan.headroom'),
@@ -435,22 +402,15 @@ export const planHeadroomSchema = z.object({
 });
 export type PlanHeadroom = z.infer<typeof planHeadroomSchema>;
 
-/**
- * Acknowledgment that a webhook was received and processing started.
- *
- * The orchestrator reports the HMAC verification outcome via `result`, and may
- * include a non-secret-bearing diagnostic in `reason` when result is a
- * rejection.
- */
+/** Acknowledgment that a webhook was received and processing started. */
 export const webhookAckSchema = z.object({
   type: z.literal('webhook.ack'),
   messageId: z.string(),
   deliveryId: z.string(),
-  /** Verification + processing outcome. */
   result: WebhookRelayResult,
   /**
-   * Optional non-secret-bearing diagnostic for rejection cases. MUST NOT
-   * include any secret material (HMAC keys, bearer tokens, computed signatures).
+   * Diagnostic for a rejection. MUST NOT include any secret material (HMAC
+   * keys, bearer tokens, computed signatures).
    */
   reason: z.string().nullish(),
 });
@@ -474,31 +434,29 @@ export const logChunkSchema = z.object({
   stepIndex: z.number(),
   lines: z.array(z.string()),
   timestamp: z.number(),
-  /** Which stream these lines came from. */
   stream: LogStream,
 });
 
 /**
- * Phase of an orchestration/provisioning log line. Mirrors the phases the
- * orchestrator writes into its per-job orchestration/provisioning JSONL files
- * and that the dashboard splits the run-detail orch-log viewer by. `unknown`
- * is the fallback for a line whose stored phase is missing/unrecognized.
+ * Phase of an orchestration/provisioning log line, as written into the
+ * orchestrator's per-job JSONL files; the dashboard's run-detail orch-log viewer
+ * splits by it. `unknown` covers a missing or unrecognized stored phase.
  */
 export const OrchLogPhase = z.enum(['dispatch', 'setup', 'provisioning', 'teardown', 'unknown']);
 export type OrchLogPhase = z.infer<typeof OrchLogPhase>;
 
 /**
- * Live orchestration/provisioning log line(s) pushed orchestrator -> Platform.
+ * Live orchestration/provisioning log lines pushed orchestrator -> Platform.
  *
- * Emitted at the orchestrator's `writeOrchLog` / provisioning-write tap points
- * (in addition to persisting to LogStorage, which stays the authoritative
- * backfill source). Platform fans this out to browser subscribers keyed by
- * `(runId, jobId)` as an `orch-log.lines` message. `lines` carries the raw
- * message strings for this phase; `ts` is the write timestamp (ms).
+ * Emitted at the orchestrator's `writeOrchLog` / provisioning-write tap points,
+ * alongside persisting to LogStorage, which stays the authoritative backfill
+ * source. The Platform fans it out to browser subscribers keyed by
+ * `(runId, jobId)` as `orch-log.lines`. `lines` are the raw message strings for
+ * this phase; `ts` is the write timestamp (ms).
  *
- * Best-effort: a push failure never breaks dispatch (fire-and-forget at the
- * write site). Not correlated/acked, so — unlike step `log.chunk` — it is not
- * fast-pathed and carries no `messageId`.
+ * Best-effort: fire-and-forget at the write site, so a push failure never
+ * breaks dispatch. Unlike step `log.chunk` it is not acked or fast-pathed and
+ * carries no `messageId`.
  */
 export const orchLogChunkSchema = z.object({
   type: z.literal('orch-log.chunk'),
@@ -519,13 +477,11 @@ export const cacheStatsSchema = z.object({
 export type CacheStats = z.infer<typeof cacheStatsSchema>;
 
 /**
- * Runtime broadcast of an updated dashboard-write policy. Carries the
- * orch's full capabilities object (same shape as `orchCapabilitiesSchema`
- * via `auth.request`) so Platform's per-org cache can be replaced
- * wholesale rather than merged. Emitted by the orch whenever an
- * operator flips a switch via `kici-admin org-settings dashboard-writes`;
- * Platform receives it, updates its cache, and re-broadcasts the
- * relevant subset to any connected dashboard SPA sessions.
+ * Runtime broadcast of an updated dashboard-write policy, sent whenever an
+ * operator flips a switch via `kici-admin org-settings dashboard-writes`. It
+ * carries the orch's full capabilities object (as in `auth.request`) so the
+ * Platform replaces its per-org cache wholesale rather than merging, then
+ * re-broadcasts the relevant subset to connected dashboard sessions.
  */
 const orchCapabilitiesUpdateSchema = z.object({
   type: z.literal('orch.capabilities.update'),
@@ -536,15 +492,12 @@ const orchCapabilitiesUpdateSchema = z.object({
 
 /** All messages that flow from Platform to Orchestrator.
  *
- * The single-frame `webhookRelaySchema` is intentionally NOT a member of this
- * union: that shape carries an attacker-controlled `payload` and pre-existed
- * the chunked relay's on-orch HMAC verification, so accepting it on the wire
- * would let a compromised Platform fabricate webhook deliveries that
- * bypass the only trust boundary against a malicious Platform (see the
- * docblock on `webhookRelaySchema` above and the Platform migration that
- * dropped the webhook secret columns).
- * The chunked path `webhook.relay.start` + `webhook.relay.chunk` is the sole
- * legitimate route from Platform to `onWebhookRelay`. */
+ * The single-frame `webhookRelaySchema` is NOT a member: its `payload` is
+ * attacker-controlled, and accepting it on the wire would let a compromised
+ * Platform fabricate deliveries that bypass on-orch HMAC verification (see
+ * `webhookRelaySchema`). The chunked `webhook.relay.start` +
+ * `webhook.relay.chunk` path is the sole route from the Platform to
+ * `onWebhookRelay`. */
 export const platformToOrchestratorMessageSchema = z.discriminatedUnion('type', [
   webhookRelayStartSchema,
   webhookRelayChunkSchema,
@@ -556,29 +509,22 @@ export const platformToOrchestratorMessageSchema = z.discriminatedUnion('type', 
   peerDiscoverSchema,
   peerUpdateSchema,
   staleCheckrunCleanupSchema,
-  // Platform capability advertisement (Platform → orchestrator direction).
   platformCapabilitiesMessageSchema,
-  // Per-coordinator orchestrator ceiling (Platform → coordinator direction).
   planHeadroomSchema,
-  // Negative acknowledgment: the Platform's diagnosable reply when it receives
-  // an orchestrator frame whose type it does not understand (version skew).
-  // A member of BOTH direction unions since either side can NACK the other.
+  // The reply to a frame whose type the receiver does not understand (version
+  // skew). In BOTH direction unions since either side can NACK the other.
   nackSchema,
-  // Every dashboard request the Platform can proxy to the orchestrator.
-  // Derived from the dashboard-direction union so the two can never drift:
-  // a dashboard request type absent from this wire union is silently
-  // dropped by the orchestrator's frame parser and surfaces only as a
-  // dashboard proxy timeout.
+  // Derived from the dashboard-direction union so the two cannot drift: a
+  // dashboard request type missing here is silently dropped by the
+  // orchestrator's frame parser and surfaces only as a dashboard proxy timeout.
   ...dashboardPlatformToOrchSchema.options,
 ]);
 
 /** All messages that flow from Orchestrator to Platform.
  *
- * Note: Dashboard response messages (dashboard.run.detail.response,
- * dashboard.step.logs.response, dashboard.orch.logs.response) are intentionally
- * excluded here. They are parsed separately via dashboardOrchToPlatformSchema so
- * the Platform WS handler can route them to the DashboardProxy for request
- * correlation. */
+ * Dashboard response messages (dashboard.run.detail.response, etc.) are
+ * excluded: they are parsed via dashboardOrchToPlatformSchema so the Platform
+ * WS handler routes them to the DashboardProxy for request correlation. */
 export const orchestratorToPlatformMessageSchema = z.discriminatedUnion('type', [
   webhookAckSchema,
   executionEventSchema,
@@ -597,10 +543,7 @@ export const orchestratorToPlatformMessageSchema = z.discriminatedUnion('type', 
   runEventMessageSchema,
   jobContextMessageSchema,
   orchMetricsSchema,
-  // Worker-peer membership snapshot (coordinator → Platform direction).
   clusterMembershipSchema,
-  // Negative acknowledgment: the orchestrator's diagnosable reply when it
-  // receives a Platform frame whose type it does not understand (version skew).
   nackSchema,
 ]);
 
@@ -610,11 +553,11 @@ export const orchestratorToPlatformMessageSchema = z.discriminatedUnion('type', 
 type TypeLiteralObjectSchema = { shape: { type: { value: string } } };
 
 /**
- * Extract the discriminator `type` values a schema recognizes: every option of a
- * discriminated union, or the single `type` literal of an object schema. Reuses
- * the `schema.options.map((o) => o.shape.type.value)` idiom already used for
- * `DASHBOARD_REQUEST_TYPES`, so a recognized-type set derived through this helper
- * can never drift from the schema it is built from.
+ * The discriminator `type` values a schema recognizes: every option of a
+ * discriminated union, or the single `type` literal of an object schema. Same
+ * `schema.options.map((o) => o.shape.type.value)` idiom as
+ * `DASHBOARD_REQUEST_TYPES`, so a set derived through it cannot drift from its
+ * schema.
  */
 export function collectDiscriminatorTypes(
   schema: { options: readonly TypeLiteralObjectSchema[] } | TypeLiteralObjectSchema,
@@ -637,10 +580,10 @@ export const ORCH_TO_PLATFORM_RECOGNIZED_TYPES: ReadonlySet<string> = new Set(
 );
 
 /**
- * Every message `type` the Platform→orchestrator mainline union recognizes
- * (dashboard request types included — they are members of this union). The
- * orchestrator's platform client unions this with its extra recognition-chain
- * schemas to make the same known-but-invalid vs unknown decision.
+ * Every message `type` the Platform→orchestrator mainline union recognizes,
+ * dashboard request types included. The orchestrator's platform client unions
+ * it with its extra recognition-chain schemas for the same known-but-invalid vs
+ * unknown decision.
  */
 export const PLATFORM_TO_ORCH_RECOGNIZED_TYPES: ReadonlySet<string> = new Set(
   collectDiscriminatorTypes(platformToOrchestratorMessageSchema),
@@ -655,5 +598,5 @@ export type PeerDiscover = z.infer<typeof peerDiscoverSchema>;
 export type PeerUpdate = z.infer<typeof peerUpdateSchema>;
 export type PlatformToOrchestratorMessage = z.infer<typeof platformToOrchestratorMessageSchema>;
 export type OrchestratorToPlatformMessage = z.infer<typeof orchestratorToPlatformMessageSchema>;
-// Note: ExecutionStatus and StepStatusForward types are exported from execution-status.ts.
-// Do not re-export here to avoid duplicate type definitions.
+// ExecutionStatus and StepStatusForward types live in execution-status.ts; re-exporting
+// them here would duplicate the type definitions.

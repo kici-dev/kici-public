@@ -1,20 +1,14 @@
 /**
- * Serializes SDK Job[] objects returned by a DynamicJobFn into LockJob[] format.
+ * Serializes the SDK Job[] a DynamicJobFn returns into LockJob[]: the runtime
+ * equivalent of the compiler's transformJob() in lockfile/generator.ts.
  *
- * This is the runtime equivalent of the compiler's transformJob() in lockfile/generator.ts.
- * It converts rich SDK Job objects (with function references) into the minimal lock file
- * representation that the orchestrator can process.
+ * Dynamic env/environment/concurrencyGroup/matrix functions run inline against
+ * the parent DynamicJobFn's eval context, each under `withTimeout` (60s, as in
+ * `init-runner.ts`), and embed as static lock fields; `undefined`/`null` leaves
+ * the field unset.
  *
- * Dynamic env/environment/concurrencyGroup/matrix functions on generated jobs are
- * evaluated inline against the eval context (the same `event`, `$`, `log`, `env`
- * already passed to the parent DynamicJobFn) and embedded as static lock fields.
- * Each dynamic function call is wrapped in `withTimeout` (default 60s) mirroring
- * `init-runner.ts`. Functions returning `undefined`/`null` leave the field unset.
- *
- * Constraints:
- * - Generated jobs are limited to MAX_DYNAMIC_JOBS per DynamicJobFn invocation
- * - Generated job names must be unique within the same DynamicJobFn output, and
- *   across a whole eval round when the caller threads a shared `seenNames` set
+ * Constraints: at most MAX_DYNAMIC_JOBS per invocation; names unique within one
+ * output, and across an eval round when the caller threads a shared `seenNames`.
  */
 
 import type { $ as Shell } from 'zx';
@@ -49,10 +43,8 @@ import { formatLabelMatcher, resolveWhenToRunOn } from '@kici-dev/engine';
 import { withTimeout } from './timeout-util.js';
 
 /**
- * Thrown when resolving a job's dynamic matrix fails (the matrix function threw
- * or timed out, or returned an unsupported value). Lets the agent attribute the
- * failure to the matrix_expansion init-failure category instead of the generic
- * dynamic_eval bucket.
+ * The dynamic matrix threw, timed out or returned an unsupported value; lets the
+ * agent file it under the matrix_expansion init-failure category, not dynamic_eval.
  */
 export class MatrixExpansionError extends Error {
   readonly name = 'MatrixExpansionError';
@@ -66,42 +58,29 @@ export class MatrixExpansionError extends Error {
   }
 }
 
-/** Maximum number of jobs a single DynamicJobFn can generate. */
 export const MAX_DYNAMIC_JOBS = 100;
 
-/** Default per-call timeout for evaluating dynamic env/matrix functions on generated jobs. */
 const DYNAMIC_FIELD_TIMEOUT_MS = 60_000;
 
 /**
- * Context required to resolve dynamic env/environment/concurrencyGroup/matrix
- * functions on generated jobs. The eval agent already has every field needed
- * (it's the same context that was just passed to the parent DynamicJobFn), so
- * we thread it through the serializer rather than re-creating it.
+ * Context for resolving dynamic fields on generated jobs: the same context the
+ * parent DynamicJobFn just received, threaded through rather than rebuilt.
  */
 export interface SerializerContext {
-  /** Normalized event envelope — passed as the first argument to env/environment/concurrencyGroup fns. */
+  /** First argument to env/environment/concurrencyGroup fns. */
   event: Record<string, unknown>;
-  /** zx shell — passed to dynamic matrix fns. */
   $: typeof Shell;
-  /** Logger — passed to dynamic matrix fns. */
   log: Logger;
-  /** Environment variables — passed to dynamic matrix fns. */
   env: Record<string, string | undefined>;
-  /** Workflow name — surfaced through DynamicMatrixContext.ctx.workflow.name. */
+  /** Surfaced as DynamicMatrixContext.ctx.workflow.name. */
   workflowName: string;
 }
 
 /**
- * Convert an array of SDK Job objects into LockJob format for the orchestrator.
- *
- * @param jobs - Jobs returned by a DynamicJobFn
- * @param ctx - Eval-time context used to resolve dynamic fields on generated jobs
- * @param seenNames - Optional accumulator of job names already emitted earlier
- *   in the same eval round; when supplied, a name already present throws and
- *   every generated name is added so later generators in the round see it
- * @returns Serialized LockJob array ready for orchestrator dispatch
- * @throws Error if validation fails (duplicates, limit exceeded) or if a user-supplied
- *   dynamic function throws / times out / returns an unsupported value
+ * @param seenNames - Names already emitted earlier in the eval round; a repeat
+ *   throws, and every generated name is added for later generators
+ * @throws Error on a duplicate name, an exceeded limit, or a dynamic function
+ *   that throws, times out or returns an unsupported value
  */
 export async function serializeJobsToLock(
   jobs: Job[],
@@ -116,9 +95,7 @@ export async function serializeJobsToLock(
     );
   }
 
-  // Validate unique names — within this generator's output AND, when the caller
-  // threads a shared `seenNames` accumulator through a round of generators,
-  // across every generator's output in that round.
+  // Unique within this output and, with a shared `seenNames`, across the round.
   const generatedNames = new Set<string>();
   const roundNames = seenNames ?? new Set<string>();
   for (const job of jobs) {
@@ -129,7 +106,7 @@ export async function serializeJobsToLock(
     roundNames.add(job.name);
   }
 
-  // Resolve sequentially to keep determinism (ordering + error attribution).
+  // Sequential for deterministic ordering and error attribution.
   const result: LockJob[] = [];
   for (const job of jobs) {
     result.push(
@@ -152,16 +129,13 @@ async function serializeJob(
   staticNames: Set<string>,
   allowedGroups: Set<string>,
 ): Promise<LockJob> {
-  // An invoke gate never dispatches to an agent, so it names no target — skip
-  // runsOn normalization (which requires a selector) and emit empty matchers.
+  // An invoke gate dispatches to no agent, so it has no selector to normalize.
   const { include: runsOn, exclude: excludeLabels } =
     job.invoke && job.runsOn === undefined
       ? { include: [] as LabelMatcher[], exclude: [] as LabelMatcher[] }
       : normalizeRunsOnToMatchers(job.runsOn as never, `generated job '${job.name}' runsOn`);
 
-  // Resolve dynamic context/env/concurrencyGroup against the eval context.
-  // Either spelling (`context` or `contexts`) normalizes to an ordered
-  // list of resolved names emitted as static lock contexts entries.
+  // `context` or `contexts` normalizes to an ordered list of static lock contexts.
   const envRefs = job.contexts ?? (job.context !== undefined ? [job.context] : undefined);
   let resolvedContexts: Array<{ value: string; dynamic: boolean }> | undefined;
   if (envRefs !== undefined && envRefs.length > 0) {
@@ -223,7 +197,6 @@ async function serializeJob(
 
   const resolvedNeeds = resolveNeeds(job.needs, generatedNames, staticNames, allowedGroups);
 
-  // Extract dependsOnGroups from resolved needs (NeedsGroupEntry items)
   const dependsOnGroups = resolvedNeeds
     .filter((n): n is NeedsGroupEntry => typeof n === 'object' && 'group' in n)
     .map((n) => n.group);
@@ -246,8 +219,7 @@ async function serializeJob(
     ...(resolvedConcurrencyGroup !== undefined
       ? { concurrencyGroup: resolvedConcurrencyGroup }
       : {}),
-    // A generated invoke gate carries its `invoke` action across the eval-round
-    // wire so the orchestrator executes it as a gate, exactly like a static one.
+    // Carried over the eval-round wire so the orchestrator runs it as a gate, like a static one.
     ...(job.invoke
       ? {
           invoke: {
@@ -264,13 +236,10 @@ async function serializeJob(
 }
 
 /**
- * Resolve needs references. Jobs can reference other jobs by name (string),
- * Job object reference, DynamicGroupRef, or NeedsEntry/NeedsGroupEntry objects.
- * Validates against generatedNames union staticNames union allowedGroups.
- *
- * Returns the lock file representation: strings for concrete refs,
- * NeedsEntry for { name, when }, NeedsGroupEntry for group refs (each `when`
- * normalized to a runOn status-set).
+ * Resolve needs (name, Job, DynamicGroupRef, NeedsEntry / NeedsGroupEntry)
+ * against generated + static names and allowedGroups. Emits strings for concrete
+ * refs, NeedsEntry / NeedsGroupEntry otherwise, each `when` normalized to a runOn
+ * status-set.
  */
 function resolveNeeds(
   needs: Job['needs'],
@@ -283,7 +252,6 @@ function resolveNeeds(
   const allNames = new Set([...generatedNames, ...staticNames]);
 
   return needs.map((dep) => {
-    // String reference: check against generated + static names
     if (typeof dep === 'string') {
       if (!allNames.has(dep)) {
         throw new Error(
@@ -294,7 +262,6 @@ function resolveNeeds(
       return dep;
     }
 
-    // DynamicGroupRef: validate group name is in allowedGroups
     if (isDynamicGroupRef(dep)) {
       const groupRef = dep as DynamicGroupRef;
       if (!allowedGroups.has(groupRef.group)) {
@@ -303,14 +270,12 @@ function resolveNeeds(
             `(available groups: ${[...allowedGroups].join(', ') || 'none'})`,
         );
       }
-      // Return as NeedsGroupEntry for the lock file
       return {
         group: groupRef.group,
         runOn: resolveWhenToRunOn(groupRef.when),
       } as NeedsGroupEntry;
     }
 
-    // Object with 'group' field (NeedsGroupEntry-like): validate group name
     if (typeof dep === 'object' && dep !== null && 'group' in dep) {
       const groupDep = dep as { group: string; when?: NeedsWhenInput };
       if (!allowedGroups.has(groupDep.group)) {
@@ -325,7 +290,6 @@ function resolveNeeds(
       } as NeedsGroupEntry;
     }
 
-    // Object with 'name' field (NeedsEntry-like): validate name
     if (typeof dep === 'object' && dep !== null && 'name' in dep && !('steps' in dep)) {
       const namedDep = dep as { name: string; when?: NeedsWhenInput };
       if (!allNames.has(namedDep.name)) {
@@ -340,7 +304,7 @@ function resolveNeeds(
       } as NeedsEntry;
     }
 
-    // Job object reference — check it's not a DynamicJobFn
+    // Job object reference; a DynamicJobFn is rejected.
     if (isDynamicJobFn(dep as any)) {
       throw new Error('Job dependency cannot be a DynamicJobFn');
     }
@@ -355,11 +319,7 @@ function resolveNeeds(
   });
 }
 
-/**
- * Serialize step definitions to lock file format.
- * Steps are minimal in the lock file — just metadata. The actual run functions
- * are loaded from the workflow bundle at execution time.
- */
+/** Steps carry only metadata; run functions load from the workflow bundle at execution time. */
 function serializeSteps(steps: readonly StepInput[]): LockStepEntry[] {
   let flatIndex = 0;
   return steps.map((entry): LockStepEntry => {
@@ -377,9 +337,7 @@ function serializeSteps(steps: readonly StepInput[]): LockStepEntry[] {
   });
 }
 
-/** Serialize one sequential step (or bare function) to a flat `LockStep`. */
 function serializeSequentialStep(stepOrFn: StepInput, index: number): LockStep {
-  // Bare function steps (anonymous)
   if (typeof stepOrFn === 'function') {
     return {
       name: `step-${index}`,
@@ -407,9 +365,8 @@ function serializeSequentialStep(stepOrFn: StepInput, index: number): LockStep {
 }
 
 /**
- * Serialize matrix configuration. Static array/object matrices are embedded as-is;
- * dynamic matrix functions are invoked against the eval context (mirroring the
- * DynamicMatrixContext signature) and the resulting array/object is embedded.
+ * Static matrices embed as-is; a dynamic matrix function runs against the eval
+ * context (DynamicMatrixContext) and its result embeds.
  */
 async function serializeMatrix(
   matrix: NonNullable<Job['matrix']>,
@@ -430,7 +387,6 @@ async function serializeMatrix(
     };
   }
 
-  // Dynamic matrix function — invoke against the eval context.
   const matrixCtx: DynamicMatrixContext = {
     $: ctx.$,
     ctx: {

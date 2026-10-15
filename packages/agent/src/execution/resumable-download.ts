@@ -1,29 +1,26 @@
 /**
  * Download a URL into a file at network speed, resuming a cut transfer.
  *
- * The body goes to disk and nowhere else, so nothing slow sits between the
- * socket and the file: a consumer that holds the body back for minutes (tar
- * extraction of a large `node_modules`) keeps the connection open that long,
- * and an object store that closes it meanwhile fails the transfer.
+ * The body goes only to disk, so nothing slow sits between socket and file: a
+ * consumer that holds the body back for minutes (tar extraction of a large
+ * `node_modules`) keeps the connection open that long, and an object store
+ * that closes it meanwhile fails the transfer.
  *
  * The client is `node:http` / `node:https`, not `fetch`. undici destroys a
  * response body with `TypeError: terminated` (cause `UND_ERR_SOCKET`, "other
  * side closed") when the server closes the keep-alive connection while the
- * body stream is paused with bytes still unparsed — even when every byte has
- * arrived. A file write stream pauses the body often enough to hit that on a
- * server that closes right after the response. `node:http` completes a
- * `Content-Length` body the server closed after, and it is the client the
- * agent's other object-storage transfers (`download.ts`) already use. The
- * default global agent honors `NODE_USE_ENV_PROXY` as `fetch` does, on
- * every Node.js release the packages support (24.5.0 and later).
+ * paused body still has unparsed bytes, even when every byte has arrived; a
+ * file write stream pauses often enough to hit that. `node:http` completes a
+ * `Content-Length` body the server closed after, and `download.ts` already
+ * uses it. The default global agent honors `NODE_USE_ENV_PROXY` as `fetch`
+ * does, on every supported Node.js release (24.5.0 and later).
  *
- * Resume: after a failed attempt, when the first response carried an `ETag`
- * and a `Content-Length`, the next attempt asks for the missing tail with
- * `Range: bytes=<on disk>-` and `If-Match: <etag>`. The tail is appended only
- * when the server answers `206` with a `Content-Range` that starts at exactly
- * the byte on disk and names the same total; a `200` rewrites the file from
- * zero with that same response, and any other answer restarts from zero on the
- * next attempt. So the file never splices bytes from two different objects.
+ * Resume: when the first response carried an `ETag` and a `Content-Length`,
+ * a retry asks for the missing tail with `Range: bytes=<on disk>-` and
+ * `If-Match: <etag>`. The tail is appended only on a `206` whose
+ * `Content-Range` starts at exactly the byte on disk and names the same total;
+ * a `200` rewrites the file from zero, and any other answer restarts from zero
+ * on the next attempt. So the file never splices bytes from two objects.
  */
 
 import http from 'node:http';

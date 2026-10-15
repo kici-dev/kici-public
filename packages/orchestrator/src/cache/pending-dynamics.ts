@@ -1,11 +1,6 @@
 /**
- * Pending dynamic-eval tracker for coordinating DynamicJobFn evaluation pipeline.
- *
- * The orchestrator dispatches a dynamic eval job for runtime job generation and
- * waits for the agent to evaluate the DynamicJobFn and return the generated
- * `LockJob[]` array. The underlying tracker logic lives in
- * `PendingTracker<LockJob[]>`; this subclass wires the dynamic-eval-specific
- * logger prefix and disconnect error.
+ * Awaits the `LockJob[]` an agent returns after evaluating a DynamicJobFn
+ * (runtime job generation). Logic lives in `PendingTracker`.
  */
 
 import type { LockJob } from '@kici-dev/engine';

@@ -1,4 +1,4 @@
-/** kici runs show — run summary + jobs/steps tree (replaces `kici status`). */
+/** `kici runs show`: run summary plus the jobs/steps tree. */
 import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
 import type {
@@ -38,9 +38,8 @@ export async function runsShowCommand(
     const detail = await client.getRunDetail(runId);
     const holds = await loadHolds(runId);
     if (options.json) {
-      // `heldRunsUnavailable` is what separates "this run has no holds" from
-      // "the holds could not be read" — both render as an empty array, and a
-      // machine consumer cannot tell them apart without it.
+      // `heldRunsUnavailable` separates "no holds" from "holds unreadable": both
+      // are an empty array.
       console.log(
         JSON.stringify(
           {
@@ -66,28 +65,22 @@ export async function runsShowCommand(
   }
 }
 
-/** The holds for a run, or the reason they could not be read. */
 interface HoldsResult {
   holds: HeldRunSummary[];
   /** Why the held-runs surface could not be reached; undefined when it was. */
   unavailable?: string;
   /**
-   * True when the reason is that this caller may not read held runs at all.
-   * Such a caller will never have the data, so the human-readable note is
-   * suppressed — it would print on every invocation, including successful runs
-   * with nothing held. The reason still reaches `--json` via `unavailable`.
+   * The caller may not read held runs at all, so it never will: the note is
+   * suppressed, or it would print on every invocation. `--json` still gets the
+   * reason via `unavailable`.
    */
   unavailableSilently?: boolean;
 }
 
 /**
- * Read the approval holds recorded for a run.
- *
- * The holds are extra detail on a run this command can already display, so a
- * failure here degrades to a note rather than failing the command: an operator
- * asking why a job did not run still gets the run, its jobs and its init
- * failure. The auth context is resolved quietly for the same reason — a config
- * that cannot reach the held-runs API is not an error for `runs show`.
+ * Holds are extra detail, so a failure degrades to a note: an operator asking
+ * why a job did not run still gets the run, its jobs and its init failure. The
+ * auth context resolves quietly for the same reason.
  */
 async function loadHolds(runId: string): Promise<HoldsResult> {
   try {
@@ -123,9 +116,8 @@ function printHeader(run: RunListItem): void {
 }
 
 /**
- * The run-scoped init failure — why the run never started a step (an
- * unresolvable lock file, a secret it could not read, a gate it never passed).
- * Nothing is printed when the run started normally.
+ * Why the run never started a step: an unresolvable lock file, an unreadable
+ * secret, a gate it never passed.
  */
 function printInitFailure(initFailure: InitFailure | undefined): void {
   if (!initFailure) return;
@@ -154,11 +146,10 @@ function printJobs(jobs: DashboardJobDetail[]): void {
 }
 
 /**
- * Why a single job failed: its job-scoped init failure (a job the context rules
- * rejected carries `context_rules` plus the context and rule that rejected it),
- * or its plain error message. The init failure wins when both are present —
- * the two carry the same text on a rejected job, and the category is the part
- * that tells the reader whether a gate or a step failed.
+ * The job-scoped init failure (a context-rules rejection carries
+ * `context_rules` plus the context and rule) or the plain error message. The
+ * init failure wins: on a rejected job both carry the same text, and only the
+ * category tells whether a gate or a step failed.
  */
 function printJobFailure(job: DashboardJobDetail): void {
   if (job.initFailure) {
@@ -171,7 +162,6 @@ function printJobFailure(job: DashboardJobDetail): void {
   if (job.errorMessage) console.log(`    ${pc.red('error')}: ${job.errorMessage}`);
 }
 
-/** The approval holds recorded against the run, or a note when unreadable. */
 function printHolds(result: HoldsResult): void {
   if (result.unavailable) {
     if (!result.unavailableSilently) {

@@ -59,11 +59,10 @@ describe('restoreSource', () => {
   });
 
   it('keeps a dependency tree the deps restore already wrote', async () => {
-    // Every call path restores the deps tarball into `.kici/node_modules`
-    // BEFORE the source tarball, and the source tarball omits that directory —
-    // so replacing `.kici` wholesale would strand the workflow with no
-    // `@kici-dev/sdk` to import, and the inline install that would repair it is
-    // skipped exactly when a `depsUrl` was dispatched.
+    // The deps tarball lands in `.kici/node_modules` BEFORE the source tarball, which
+    // omits it; replacing `.kici` wholesale would strand the workflow with no
+    // `@kici-dev/sdk`, and the repairing inline install is skipped whenever a
+    // `depsUrl` was dispatched.
     const sdkIndex = path.join(workDir, '.kici/node_modules/@kici-dev/sdk/index.js');
     await fs.mkdir(path.dirname(sdkIndex), { recursive: true });
     await fs.writeFile(sdkIndex, 'export const sdk = 1;\n');
@@ -84,8 +83,7 @@ describe('restoreSource', () => {
   });
 
   it('restores unverified when no digest is dispatched', async () => {
-    // A source that did not come from the content-addressed cache carries no
-    // digest, so the restore proceeds unverified rather than failing the job.
+    // A source outside the content-addressed cache has no digest: restore, don't fail.
     const { file } = await packTarball({ 'workflows/w.ts': 'export default 1;\n' });
     await restoreSource(workDir, pathToFileURL(file).href);
     await expect(fs.access(path.join(workDir, '.kici/workflows/w.ts'))).resolves.toBeUndefined();

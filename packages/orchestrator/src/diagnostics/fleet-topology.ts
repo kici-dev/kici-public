@@ -1,10 +1,8 @@
 /**
- * Fleet topology enumeration.
- *
  * Builds the cluster tree for `debug-bundle --fleet --list` / `--pick` from the
  * local agent registry plus the heartbeat-cached peer inventory — no fan-out.
- * Each peer's cached agent list is already maintained by ~30s heartbeats, so
- * enumeration is a cheap in-memory read.
+ * ~30s heartbeats already keep each peer's agent list, so enumeration is a
+ * cheap in-memory read.
  */
 
 /** A node in the enumerated fleet topology. */
@@ -26,9 +24,7 @@ export interface FleetTopology {
 export interface FleetTopologyDeps {
   /** This collector's own instanceId (the root orchestrator). */
   instanceId: string;
-  /** This collector's role. */
   role: 'coordinator' | 'worker';
-  /** This collector's hostname, if known. */
   hostname?: string;
   /** This node's directly-connected agents. */
   listLocalAgents: () => { agentId: string; labels: string[] }[];
@@ -55,7 +51,6 @@ function labelsToRecord(labels: string[]): Record<string, string> {
 export function buildFleetTopology(deps: FleetTopologyDeps): FleetTopology {
   const nodes: FleetTopologyNode[] = [];
 
-  // Root orchestrator (the collector).
   nodes.push({
     kind: 'orchestrator',
     id: deps.instanceId,
@@ -65,7 +60,6 @@ export function buildFleetTopology(deps: FleetTopologyDeps): FleetTopology {
     parentId: null,
   });
 
-  // Root's own agents.
   for (const a of deps.listLocalAgents()) {
     nodes.push({
       kind: 'agent',

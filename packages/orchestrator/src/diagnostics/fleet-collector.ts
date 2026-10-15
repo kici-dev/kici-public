@@ -1,12 +1,9 @@
 /**
- * Recursive fleet subtree assembler.
- *
- * Every orchestrator runs this to produce a self-similar subtree ZIP:
- * local/ + nested agents/<id>.zip + workers/<id>.zip + peers/<id>.zip, plus
- * fleet-manifest.json recording per-node status. Dead branches are recorded,
- * never fatal (Promise.allSettled at each level). The loop guard
- * (includeCoordinatorMesh) is true only on the root call; every downstream peer
- * request sets it false so the coordinator mesh never echoes.
+ * Recursive fleet subtree assembler. Every orchestrator produces a self-similar ZIP: local/,
+ * nested agents/<id>.zip, workers/<id>.zip and peers/<id>.zip, plus fleet-manifest.json with
+ * per-node status. Dead branches are recorded, never fatal (Promise.allSettled per level).
+ * The loop guard (includeCoordinatorMesh) is true only on the root call, so the coordinator
+ * mesh never echoes.
  */
 import { z } from 'zod';
 import { ZipArchive } from 'archiver';
@@ -16,21 +13,21 @@ export const FleetNodeStatus = z.enum(['ok', 'timeout', 'error', 'unreachable'])
 export type FleetNodeStatus = z.infer<typeof FleetNodeStatus>;
 
 export interface FleetCollectorDeps {
-  /** This orchestrator's instanceId (the manifest owner). */
+  /** The manifest owner. */
   instanceId: string;
-  /** Build this node's own debug bundle as a Buffer (createDebugBundle output). */
+  /** createDebugBundle output. */
   buildLocalBundle: () => Promise<Buffer>;
-  /** List this node's directly-connected agents. */
+  /** Directly-connected agents only. */
   listAgents: () => { agentId: string }[];
-  /** Request a connected agent's mini-bundle over the agent WS channel. */
+  /** Over the agent WS channel. */
   requestAgentBundle: (agentId: string) => Promise<Buffer>;
-  /** List this node's downstream peers (coordinator-mesh peers + its workers). */
+  /** Coordinator-mesh peers plus this node's workers. */
   listPeers: () => {
     instanceId: string;
     role: 'coordinator' | 'worker';
     kind: 'peer' | 'worker';
   }[];
-  /** Request a peer's subtree bundle over the peer WS channel (loop-guarded false). */
+  /** Over the peer WS channel; callers pass includeCoordinatorMesh=false. */
   requestPeerSubtree: (instanceId: string, includeCoordinatorMesh: boolean) => Promise<Buffer>;
 }
 
@@ -72,7 +69,6 @@ export async function collectFleetSubtree(
 
   const nodes: ManifestNode[] = [];
 
-  // local subtree bundle (this node's own createDebugBundle output)
   try {
     const local = await deps.buildLocalBundle();
     archive.append(local, { name: 'local/bundle.zip' });
@@ -91,7 +87,6 @@ export async function collectFleetSubtree(
   const wantWorker = (id: string): boolean =>
     opts.selection.all || opts.selection.workerInstanceIds.includes(id);
 
-  // agents — every selected, directly-connected agent
   await Promise.allSettled(
     deps
       .listAgents()
@@ -112,9 +107,8 @@ export async function collectFleetSubtree(
       }),
   );
 
-  // peers + workers. Coordinator-mesh peers are traversed only when the loop
-  // guard is open (root call); workers are always traversed when selected.
-  // Every downstream request forces includeCoordinatorMesh=false.
+  // Mesh peers only when the loop guard is open (root call); selected workers always. Every
+  // downstream request forces includeCoordinatorMesh=false.
   const peers = deps
     .listPeers()
     .filter((p) => (p.kind === 'worker' ? wantWorker(p.instanceId) : opts.includeCoordinatorMesh));

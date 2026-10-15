@@ -1,11 +1,6 @@
 /**
- * Cache storage module.
- *
- * Pluggable storage backends:
- *   - S3CacheStorage         — production / multi-host
- *   - FilesystemCacheStorage — single-host / test sandbox
- *
- * Use createCacheStorage() to instantiate from a discriminated config.
+ * Cache storage backends: S3CacheStorage (production / multi-host) and FilesystemCacheStorage
+ * (single-host / test sandbox), built by createCacheStorage() from a discriminated config.
  */
 
 export type {
@@ -24,9 +19,6 @@ import type { CacheStorage, CacheStorageConfig } from './types.js';
 import { S3CacheStorage } from './s3.js';
 import { FilesystemCacheStorage } from './filesystem.js';
 
-/**
- * Create a cache storage backend from configuration.
- */
 export function createCacheStorage(config: CacheStorageConfig): CacheStorage {
   if (config.type === 's3') {
     return new S3CacheStorage({

@@ -8,20 +8,15 @@ export interface SandboxRequest {
   network?: SandboxNetworkMode;
 }
 
-/**
- * The resolution outcome: either an authorized grant (possibly `undefined` when
- * the request is a no-op / non-escalating) or a total, loud denial.
- */
+/** An authorized grant (`undefined` for a no-op / non-escalating request) or a total denial. */
 export type SandboxGrantResolution =
   { grant?: ResolvedSandboxGrant } | { denied: { reason: string } };
 
 /**
- * Resolve a workflow-declared sandbox request against the operator's allow-list
- * (the single enforcement point). Deny is loud and total — a request for any
- * capability or host-network the operator did not allow-list fails the run with
- * a reason naming the offending cap/knob; a disallowed cap is never silently
- * stripped and run anyway. Pure (no I/O), so the allow-list is injected and the
- * function is exhaustively unit-testable.
+ * The single enforcement point of a sandbox request against the operator's
+ * allow-list. Deny is loud and total: any capability or host-network not
+ * allow-listed fails the run with a reason naming it; a disallowed cap is never
+ * silently stripped and run anyway. Pure: the allow-list is injected.
  */
 export function resolveSandboxGrant(
   request: SandboxRequest | undefined,
@@ -58,9 +53,8 @@ export function resolveSandboxGrant(
 
   const grant: ResolvedSandboxGrant = {};
   if (caps.length) grant.capabilities = caps;
-  // 'default' means "use the sandbox's configured default" — do NOT emit it (config
-  // wins), so a grant can never silently loosen an operator-imposed network posture.
-  // Only 'none' (tighten) and the permission-gated 'host' are emitted.
+  // 'default' is never emitted (config wins), so a grant cannot silently loosen an
+  // operator-imposed network posture; only 'none' and the gated 'host' are.
   if (request.network === 'none' || request.network === 'host') grant.network = request.network;
   return { grant: Object.keys(grant).length ? grant : undefined };
 }

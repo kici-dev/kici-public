@@ -1,19 +1,15 @@
 /**
- * Tests for `kici-admin runs` CLI subcommands.
- *
- * Verifies that the commands:
- *  - Talk to /api/v1/admin/runs via AdminApiClient (NEVER touches the DB)
- *  - Map each --flag to the correct query string parameter
- *  - Render default tables with correct headers
- *  - Emit raw JSON when --json is supplied
- *  - Compose the split run-detail endpoints (runs show → getRun + getRunJobs)
- *  - Expose the new jobs / ephemeral-key / secret-outputs subcommands
+ * `kici-admin runs` talks to /api/v1/admin/runs via AdminApiClient (NEVER the
+ * DB), maps each --flag to its query parameter, renders tables or raw JSON
+ * (--json), composes the split run-detail endpoints (runs show → getRun +
+ * getRunJobs), and exposes the jobs / ephemeral-key / secret-outputs
+ * subcommands.
  */
 
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { Command } from 'commander';
 import { registerRunsCommands } from './runs.js';
 import type { AdminApiClient } from '../api-client.js';
+import { runCli } from '../../__test-helpers__/cli.js';
 
 interface CommandResult {
   stdout: string;
@@ -89,54 +85,8 @@ const sampleJob = {
 };
 
 async function runCommand(args: string[], client: Partial<AdminApiClient>): Promise<CommandResult> {
-  const program = new Command();
-  program.exitOverride();
-
   const getClient = () => client as AdminApiClient;
-  registerRunsCommands(program, getClient);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  const origStderrWrite = process.stderr.write;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-  process.stderr.write = ((msg: string | Uint8Array) => {
-    errors.push(
-      typeof msg === 'string' ? msg.replace(/\n$/, '') : Buffer.from(msg).toString('utf8'),
-    );
-    return true;
-  }) as any;
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:')) {
-      console.log = origLog;
-      console.error = origError;
-      process.stderr.write = origStderrWrite;
-      process.exit = origExit;
-      if (err.code?.startsWith('commander.'))
-        return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
-      throw err;
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.stderr.write = origStderrWrite;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
+  return runCli((p) => registerRunsCommands(p, getClient), args, { captureStderrWrite: true });
 }
 
 describe('kici-admin runs CLI commands', () => {

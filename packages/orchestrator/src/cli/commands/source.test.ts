@@ -1,15 +1,11 @@
-/**
- * Tests for `kici-admin source` CLI subcommands.
- *
- * Coverage focus is the `list-presets` subcommand — the rest of the `source`
- * surface needs a live admin API and is out of scope here.
- */
+/** `kici-admin source` subcommand tests. */
 
 import { describe, expect, it, vi } from 'vitest';
 import { Command } from 'commander';
 import { registerSourceCommands, renderSourceListText, resolveWebhookSecret } from './source.js';
 import type { AdminApiClient } from '../api-client.js';
 import { UNIVERSAL_GIT_PRESETS } from '../../providers/universal-git/index.js';
+import { runCli } from '../../__test-helpers__/cli.js';
 
 interface CommandResult {
   stdout: string;
@@ -18,45 +14,7 @@ interface CommandResult {
 }
 
 async function runCommand(args: string[], client: Partial<AdminApiClient>): Promise<CommandResult> {
-  const program = new Command();
-  program.exitOverride();
-  registerSourceCommands(program, () => client as AdminApiClient);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: unknown[]) => logs.push(a.join(' '));
-  console.error = (...a: unknown[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as never;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err) {
-    const message = (err as { message?: string } | null)?.message ?? '';
-    if (!message.startsWith('EXIT:')) {
-      const code = (err as { code?: string } | null)?.code;
-      if (!code?.startsWith('commander.')) {
-        console.log = origLog;
-        console.error = origError;
-        process.exit = origExit;
-        throw err;
-      }
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
+  return runCli((p) => registerSourceCommands(p, () => client as AdminApiClient), args);
 }
 
 describe('kici-admin source list-presets', () => {
@@ -66,9 +24,8 @@ describe('kici-admin source list-presets', () => {
     for (const name of Object.keys(UNIVERSAL_GIT_PRESETS)) {
       expect(stdout).toContain(name);
     }
-    // The "custom" preset has no row in UNIVERSAL_GIT_PRESETS (it's handled
-    // inline by the Zod schema) but is still mentioned in the footer so
-    // operators know it exists.
+    // "custom" has no UNIVERSAL_GIT_PRESETS row (the Zod schema handles it) but
+    // the footer names it.
     expect(stdout).toContain('custom');
     expect(stdout).toContain('Push events');
   });
@@ -96,8 +53,7 @@ describe('kici-admin source list-presets', () => {
   });
 
   it('does not make any API calls', async () => {
-    // list-presets is a pure local dump — it must work against a client that
-    // has no network methods wired up at all.
+    // list-presets is local only: the client has no network methods.
     const client = {} as Partial<AdminApiClient>;
     const { exitCode } = await runCommand(['source', 'list-presets'], client);
     expect(exitCode).toBeNull();
@@ -486,11 +442,9 @@ describe('kici-admin source add local', () => {
   });
 
   it('updates --clone-url-base alone, preserving the stored repoBasePath', async () => {
-    // The regression: --clone-url-base used to apply only inside the --path
-    // branch, so this exact invocation exited "no fields to update" and changed
-    // nothing — while --help advertised the flag. Switching a local source from
-    // file:// to a git daemon changes only the clone base, so this was the one
-    // edit the flag exists for.
+    // --clone-url-base applies without --path: switching a local source from
+    // file:// to a git daemon changes only the clone base, the edit the flag
+    // exists for.
     const received: Array<{ id: string; data: Record<string, unknown> }> = [];
     const client: Partial<AdminApiClient> = {
       getGenericSource: async () =>
@@ -636,10 +590,9 @@ describe('kici-admin source direct-DB (--database-url) surface', () => {
 });
 
 describe('kici-admin source --database-url dispatch (bypasses HTTP client)', () => {
-  /** Run a `--database-url` command against an unreachable DB. The direct
-   *  branch fails at connect (never touching getClient), which the action
-   *  catches and turns into process.exit(1) — proving the HTTP path was
-   *  skipped. Returns whether the HTTP client factory was ever called. */
+  /** Runs a `--database-url` command against an unreachable DB, which fails at
+   *  connect and exits 1 without touching getClient. Returns whether the HTTP
+   *  client factory was called. */
   async function runDirect(
     args: string[],
   ): Promise<{ httpUsed: boolean; exitCode: number | null }> {

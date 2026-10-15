@@ -1,14 +1,12 @@
 /**
- * Tests for the periodic dispatch-queue depth refresher.
+ * The periodic dispatch-queue depth refresher:
+ *  - every tick refreshes `setDispatchQueueDepthBreakdown`, so the Prometheus
+ *    observable gauge serves fresh values;
+ *  - a `logger.warn` fires once the pending depth stays at or above the
+ *    threshold for two consecutive ticks (~10s at the default 5s interval);
+ *    threshold `0` disables it.
  *
- * The refresher has two responsibilities:
- *  - On every tick, refresh `setDispatchQueueDepthBreakdown` so the
- *    Prometheus observable gauge always serves fresh values.
- *  - Emit a `logger.warn` once the pending depth stays at or above
- *    the configured threshold for two consecutive ticks (~10s at the
- *    default 5s interval). Threshold `0` disables the warning entirely.
- *
- * Tests drive `refreshNow()` manually so we don't depend on real timers.
+ * Tests drive `refreshNow()` rather than real timers.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createDepthRefresher } from './depth-refresher.js';
@@ -140,8 +138,8 @@ describe('createDepthRefresher', () => {
     await refresher.refreshNow();
 
     expect(logger.error).toHaveBeenCalledTimes(1);
-    // onTick must NOT fire when the refresh failed — gauges should go stale,
-    // not report stale-from-prior-state with a misleading recent timestamp.
+    // onTick must NOT fire on a failed refresh: gauges go stale rather than
+    // report prior state with a misleading recent timestamp.
     expect(onTick).not.toHaveBeenCalled();
   });
 

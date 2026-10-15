@@ -92,8 +92,8 @@ export class RelayBufferRegistry {
   }
 
   /**
-   * Begin a new reassembly stream. Allocates an entry keyed by `meta.messageId`
-   * (passed through the meta object's caller — actually keyed externally below).
+   * Begin a new reassembly stream. Allocates an entry keyed by the `messageId`
+   * argument, not by a field of `meta`.
    *
    * Returns an error if `messageId` is already in flight (Platform sent two
    * `start` frames with the same id, indicates a sender bug or abuse).

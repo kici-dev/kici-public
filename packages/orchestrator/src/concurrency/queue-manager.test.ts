@@ -1,10 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { ConcurrencyQueueManager, type QueuedJob } from './queue-manager.js';
 
-/**
- * Mock DB for queue manager tests.
- * Simulates Kysely's fluent query builder with in-memory storage.
- */
+/** Kysely's fluent query builder over in-memory storage. */
 function createMockDb() {
   const rows: Array<{
     id: string;
@@ -102,7 +99,6 @@ function createMockDb() {
           return Promise.resolve(undefined);
         }
 
-        // Recursive where chain that supports arbitrary depth
         function makeWhereChain(): any {
           return {
             where: vi.fn().mockImplementation((col: string, _op: string, val: string) => {
@@ -144,7 +140,6 @@ function createMockDb() {
     updateTable: vi.fn().mockImplementation(() => buildUpdateChain()),
     transaction: vi.fn().mockReturnValue({
       execute: vi.fn().mockImplementation(async (fn: (trx: any) => Promise<any>) => {
-        // Transaction delegates to the same in-memory store
         const trx = {
           selectFrom: vi.fn().mockImplementation(() => buildSelectChain()),
           updateTable: vi.fn().mockImplementation(() => buildUpdateChain()),

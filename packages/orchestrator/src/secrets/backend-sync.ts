@@ -65,10 +65,8 @@ export class BackendSyncManager {
       // 'acmeOrg00001/cloud/aws'. PG stores return flat scope names.
       const rawScopes = await store.listScopes('');
 
-      // Apply scope filter
       const filteredScopes = filterScopes(rawScopes, backend.scopeFilter);
 
-      // Update registry with results
       await this.registry.updateSyncStatus(name, filteredScopes.length);
 
       this.logger.info('Backend sync completed', {

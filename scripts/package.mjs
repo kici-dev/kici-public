@@ -118,17 +118,15 @@ Platforms: ${PACKAGE_PLATFORMS.map(platformLabel).join(', ')}`);
   process.exit(0);
 }
 
-// Native modules that can't be bundled -- they need .node binary files at runtime.
+// Native modules need their .node binaries at runtime, so they stay unbundled.
 const NATIVE_EXTERNALS = ['pg-native', 'better-sqlite3', 'cpu-features', /\.node$/];
 
 // --- Configuration ---
 
 const outputDir = path.resolve(args['output-dir']);
 
-// Resolve Node.js version
 const nodeVersion = args['node-version'] || process.version.replace(/^v/, '');
 
-// Resolve package version
 function getPackageVersion() {
   if (args.version) return args.version;
   try {
@@ -156,17 +154,15 @@ try {
 const { targets, platforms, types } = selection;
 const planned = planArchives({ version: packageVersion, targets, platforms, types });
 
-// `--list` prints the archives this run would build and builds nothing: no
-// directory is created. A release reads it to name its assets.
+// `--list` creates no directory. A release reads it to name its assets.
 if (args.list) {
   console.log(JSON.stringify(planned));
   process.exit(0);
 }
 
 // The build-time constants scripts/build-service.mjs bakes into the npm and
-// image bundles. Without them a packaged orchestrator or kici-admin reports
-// version 0.0.1 and a packaged agent `unknown`. Every caller runs this script
-// from the repo root.
+// image bundles; without them a packaged orchestrator or kici-admin reports
+// version 0.0.1 and an agent `unknown`. Callers run from the repo root.
 const defines = serviceDefines({
   version: packageVersion,
   buildDate: new Date().toISOString(),
@@ -175,10 +171,8 @@ const defines = serviceDefines({
   engineMeta: readDepMeta('engine', { repoRoot: process.cwd() }),
 });
 
-// The image-digest record the kici-admin installer pins compose images from.
-// A release passes the record it wrote for its images; without it the
-// packages carry none and the installer pins `:latest`. A missing or malformed
-// record fails here, before any bundle is built.
+// The record the kici-admin installer pins compose images from (none: it pins
+// `:latest`). A missing or malformed record fails before any bundle is built.
 const imageDigestRecordPath = args['image-digest-record']
   ? path.resolve(args['image-digest-record'])
   : null;
@@ -203,14 +197,10 @@ const nodeCacheBase = path.join(
 mkdirSync(outputDir, { recursive: true });
 
 /**
- * Per-invocation scratch dir for the intermediate rolldown output.
- *
- * The bundles are platform-independent, so several concurrent invocations
- * (a build that packages several platforms at once, one invocation each)
- * would otherwise write and read the SAME `<outputDir>/<target>.cjs` / `.mjs`.
- * One process reading a file another is mid-write produces a silently truncated
- * — even empty — bundle, which ships as a service that starts and exits 0.
- * Scoping the intermediates per process keeps parallel packaging safe.
+ * Per-invocation scratch dir for the rolldown output. Concurrent invocations
+ * (one per platform) would otherwise share `<outputDir>/<target>.cjs`, and
+ * reading a file another process is mid-writing yields a silently truncated
+ * bundle that ships as a service which starts and exits 0.
  */
 const bundleScratchDir = path.join(
   outputDir,
@@ -230,9 +220,8 @@ const virtualPackages = {
 };
 
 /**
- * The KiCI workspace packages, name → directory, and name → version. A KiCI
- * package installed into a package's node_modules is described from its
- * workspace.
+ * Workspace package name → directory and → version: a KiCI package installed
+ * into node_modules is described from its workspace.
  */
 const workspaceManifests = readdirSync('packages')
   .filter((dir) => existsSync(path.join('packages', dir, 'package.json')))
@@ -245,7 +234,7 @@ const workspaceVersions = new Map(
   workspaceManifests.map((w) => [w.manifest.name, w.manifest.version]),
 );
 
-/** Smallest plausible bundle. Anything below this is a truncated/empty write. */
+/** Smallest plausible bundle; anything smaller is a truncated write. */
 const MIN_BUNDLE_BYTES = 4096;
 
 /** Fail loudly on a truncated or empty bundle instead of shipping a dead service. */
@@ -266,8 +255,6 @@ function outputModuleIds(output) {
 }
 
 /**
- * Bundle one target. Returns the bundle and the ids of the modules in it.
- *
  * @returns {Promise<{ bundlePath: string, moduleIds: string[] }>}
  */
 async function bundleTarget(target) {
@@ -276,7 +263,7 @@ async function bundleTarget(target) {
 
   const { build } = await import('rolldown');
 
-  // Try CJS format first (works when entry has no top-level await)
+  // CJS works only when the entry has no top-level await.
   try {
     const output = await build({
       input: path.resolve(target.entry),
@@ -300,7 +287,7 @@ async function bundleTarget(target) {
     }
   }
 
-  // Fallback: bundle as ESM (supports TLA), then wrap for CJS compatibility
+  // Fallback: bundle as ESM, then wrap it in a CJS async IIFE.
   console.log(`  [bundle] TLA detected, falling back to ESM+wrapper for CJS compatibility`);
   const esmPath = bundlePath.replace('.cjs', '.mjs');
 
@@ -320,7 +307,6 @@ async function bundleTarget(target) {
     },
   });
 
-  // Wrap ESM output in a CJS-compatible async IIFE.
   const esmContent = readFileSync(esmPath, 'utf-8');
   let converted = esmContent;
 
@@ -355,16 +341,13 @@ async function bundleTarget(target) {
     /^import\s+["']([^"']+)["'];?\s*$/gm,
     (_, mod) => `require("${mod}");`,
   );
-  // Replace import.meta references with CJS equivalents
   converted = converted.replace(/import\.meta\.url/g, '`file://${__filename}`');
   converted = converted.replace(/import\.meta\.dirname/g, '__dirname');
   converted = converted.replace(/import\.meta\.filename/g, '__filename');
   converted = converted.replace(/import\.meta\.env/g, 'process.env');
   converted = converted.replace(/import\.meta/g, '({ url: `file://${__filename}` })');
-  // Remove export statements
   converted = converted.replace(/^export\s+\{[^}]*\};?\s*$/gm, '');
   converted = converted.replace(/^export\s+default\s+/gm, 'module.exports = ');
-  // Replace package.json requires with a stub
   converted = converted.replace(
     /require\(["']\.\.\/package\.json["']\)/g,
     '({ version: "0.0.0-bundled" })',
@@ -379,15 +362,12 @@ async function bundleTarget(target) {
   return { bundlePath, moduleIds: outputModuleIds(esmOutput) };
 }
 
-// --- Step 2.5: Bundle companion files ---
+// --- Bundle companion files ---
 
 /**
- * Bundle the agent's workflow-runner as a separate CJS file.
- *
- * The agent spawns workflow-runner.js as a child process (sandboxed execution),
- * so it can't be included in the main agent bundle. The runner needs to exist
- * as a separate file at lib/sandbox/workflow-runner.js relative to the agent
- * bundle (matching resolveRunnerPath() in job-runner.ts).
+ * Bundle the agent's workflow-runner as a separate CJS file. The agent spawns
+ * it as a sandboxed child process, so it lives at lib/sandbox/workflow-runner.js
+ * beside the agent bundle (resolveRunnerPath() in job-runner.ts).
  *
  * @returns {Promise<{ bundlePath: string, moduleIds: string[] }>}
  */
@@ -416,33 +396,27 @@ async function bundleWorkflowRunner() {
   return { bundlePath: runnerOut, moduleIds: outputModuleIds(output) };
 }
 
-// --- Step 2.6: Runtime companion deps (for workflow-runner's loader hook) ---
+// --- Runtime companion deps (for workflow-runner's loader hook) ---
 
 /**
- * Install `oxc-transform` + scaffold the minimal `@kici-dev/core/ts-loader-hook`
- * subpath export into `pkgDir/node_modules/`.
+ * Install `oxc-transform` and a minimal `@kici-dev/core/ts-loader-hook` stub
+ * into `pkgDir/node_modules/`.
  *
- * Background: workflow-runner.cjs (bundled by `bundleWorkflowRunner`) calls
- * `register('@kici-dev/core/ts-loader-hook', import.meta.url)` to install a
- * Node ESM loader hook that transforms `.ts` files on import via
- * `oxc-transform`. `register()` resolves its specifier at *runtime* against
- * the bundled file's location — bundling does NOT inline the target.
+ * workflow-runner.cjs calls `register('@kici-dev/core/ts-loader-hook',
+ * import.meta.url)`, a loader hook that transforms `.ts` imports via
+ * `oxc-transform`. `register()` resolves at runtime against the bundle's
+ * location — bundling does NOT inline it — so both must be real files reachable
+ * from `lib/sandbox/workflow-runner.js` by the node_modules walk;
+ * `pkgDir/node_modules/` is one directory up from `lib/` in every extracted layout.
  *
- * Both specifiers must therefore exist as real files on disk, reachable from
- * `pkgDir/lib/sandbox/workflow-runner.js` via Node's node_modules walk. We
- * ship them at `pkgDir/node_modules/` (the package root), which is one
- * directory up from `lib/` in every extracted layout.
- *
- * `oxc-transform` ships native NAPI bindings per (os, arch) via sibling
- * `@oxc-transform/binding-<platform>` packages, so we install for the TARGET
- * platform (not the host) via `npm install --cpu=<arch> --os=<os>`.
+ * `oxc-transform` ships per-(os, arch) NAPI bindings as
+ * `@oxc-transform/binding-<platform>` packages, so it installs for the TARGET
+ * platform, not the host.
  */
 function installRuntimeCompanions(pkgDir, platform) {
-  // 1. Install oxc-transform for the target platform FIRST. `npm install`
-  // rewrites node_modules against its own package-lock.json, so if we seed
-  // @kici-dev/core before this step, npm removes it ("removed 1 package").
-  // Version pinned to whatever @kici-dev/core depends on so the hook and
-  // the native bindings stay in lock step.
+  // oxc-transform installs FIRST: `npm install` rewrites node_modules against
+  // its own lock file and would remove an already-seeded @kici-dev/core. The
+  // version follows @kici-dev/core's dependency so hook and bindings match.
   const corePkgJson = JSON.parse(
     readFileSync(path.join(process.cwd(), 'packages/core/package.json'), 'utf-8'),
   );
@@ -466,18 +440,14 @@ function installRuntimeCompanions(pkgDir, platform) {
     { stdio: 'pipe', timeout: 120_000 },
   );
 
-  // 2. Copy @kici-dev/core/ts-loader-hook + chunks (platform-agnostic) AFTER
-  // npm finishes writing node_modules. The stub package provides only the
-  // `./ts-loader-hook` subpath export — everything else in @kici-dev/core
-  // is either bundled into the agent output or irrelevant here.
+  // The stub exports only `./ts-loader-hook`: the rest of @kici-dev/core is
+  // bundled into the agent or unused here.
   const nodeModulesDir = path.join(pkgDir, 'node_modules');
   const coreDistSrc = path.join(process.cwd(), 'packages/core/dist');
   const coreStubDir = path.join(nodeModulesDir, '@kici-dev/core');
   mkdirSync(path.join(coreStubDir, 'dist'), { recursive: true });
-  // Copy ts-loader-hook.js and every local `.js` chunk it transitively imports,
-  // resolved from the actual `./`-relative specifiers. A hardcoded chunk-*.js
-  // glob missed rolldown's shared runtime chunk (emitted as
-  // rolldown-runtime-<hash>.js), leaving the stub's ts-loader-hook.js with an
+  // Follow the real `./` specifiers transitively: a chunk-*.js glob misses
+  // rolldown's shared rolldown-runtime-<hash>.js chunk and leaves an
   // unresolvable import.
   const coreSeen = new Set();
   const coreQueue = ['ts-loader-hook.js'];
@@ -519,8 +489,7 @@ function installRuntimeCompanions(pkgDir, platform) {
 
 /**
  * Write the license, notice and source files at the package root. The notices
- * cover the packages bundled into the target and the packages installed
- * beside the bundle.
+ * cover both bundled and installed packages.
  */
 function writeLicenseFiles(pkgDir, target, type, nodeDistDir, bundled) {
   const licenseText = readFileSync(path.join(target.licenseDir, LICENSE_FILE), 'utf-8');
@@ -542,21 +511,15 @@ function writeLicenseFiles(pkgDir, target, type, nodeDistDir, bundled) {
   );
 }
 
-/**
- * Assemble a package directory for the given target, platform, and type.
- */
 function assemblePackage(bundlePath, target, platform, type, nodeDistDir, companions, bundled) {
   const dirName = packageDirName(target.name, packageVersion, platform, type);
   const pkgDir = path.join(outputDir, dirName);
 
-  // Clean and create
   if (existsSync(pkgDir)) rmSync(pkgDir, { recursive: true });
   mkdirSync(path.join(pkgDir, 'lib'), { recursive: true });
 
-  // Copy bundle
   copyFileSync(bundlePath, path.join(pkgDir, 'lib', `${target.name}.cjs`));
 
-  // Copy companion files (e.g., workflow-runner for agent)
   if (companions) {
     for (const { src, dest } of companions) {
       const destPath = path.join(pkgDir, 'lib', dest);
@@ -569,21 +532,17 @@ function assemblePackage(bundlePath, target, platform, type, nodeDistDir, compan
     copyFileSync(imageDigestRecordPath, path.join(pkgDir, IMAGE_DIGEST_RECORD_FILE));
   }
 
-  // Install runtime companions for kici-agent (hook + oxc-transform). The
-  // bundled workflow-runner.cjs registers `@kici-dev/core/ts-loader-hook` at
-  // runtime; without the hook + its oxc-transform native binding present at
-  // pkgDir/node_modules/, every customer workflow import fails with
-  // ERR_MODULE_NOT_FOUND. Skip for non-agent targets to keep packages small.
+  // Without the loader hook and its oxc-transform binding, every customer
+  // workflow import fails with ERR_MODULE_NOT_FOUND. Agent only, to keep the
+  // other packages small.
   if (target.name === 'kici-agent') {
     installRuntimeCompanions(pkgDir, platform);
   }
 
-  // Copy the Node.js runtime and npm (full packages only).
   if (type === 'full' && nodeDistDir) {
     copyNodeDistIntoPackage(nodeDistDir, pkgDir, platform);
   }
 
-  // Write launcher script
   const isWindows = platform.os === 'win';
   const launcherName = `${target.name}${platform.launcherExt}`;
   let launcherContent;
@@ -607,13 +566,9 @@ function assemblePackage(bundlePath, target, platform, type, nodeDistDir, compan
 
 // --- Step 4: Create archive ---
 
-/**
- * Create an archive from a package directory.
- * Uses tar.gz for Unix platforms and zip for Windows.
- */
 async function createArchive(pkgDir, dirName, format, outputPath) {
   if (format === 'tar.gz') {
-    // Use tar command for reliable tar.gz creation with proper permissions
+    // tar(1) preserves the file permissions.
     const parentDir = path.dirname(pkgDir);
     execSync(`tar -czf "${outputPath}" -C "${parentDir}" "${dirName}"`, { stdio: 'pipe' });
   } else if (format === 'zip') {
@@ -627,9 +582,8 @@ async function createArchive(pkgDir, dirName, format, outputPath) {
 
 /**
  * Read a built archive back and fail when it lacks a license, notice or source
- * file, or when its notices omit a package whose code it carries: the check
- * reads the packages from the archive's own bundles and node_modules. The
- * archive is deleted on failure, so no incomplete package is left to publish.
+ * file, or when its notices omit a package found in its own bundles and
+ * node_modules. A failing archive is deleted, so it cannot be published.
  */
 function verifyArchive(archivePath, dirName, format, type) {
   let problems;
@@ -671,7 +625,7 @@ async function packageAll() {
   console.log(`  Output: ${outputDir}`);
   console.log('');
 
-  // Step 1: Bundle all targets (platform-independent)
+  // Step 1: bundle every target (platform-independent).
   const bundles = new Map();
   for (const target of targets) {
     try {
@@ -684,8 +638,8 @@ async function packageAll() {
     }
   }
 
-  // Step 1.5: the agent's workflow runner. An agent package without it cannot
-  // run a job, so a failure here drops the agent packages.
+  // An agent package without the workflow runner cannot run a job, so a
+  // failure here drops the agent packages.
   let workflowRunner = null;
   if (bundles.has('kici-agent')) {
     try {
@@ -698,8 +652,8 @@ async function packageAll() {
     }
   }
 
-  // Step 1.6: the packages whose code each target's bundles carry, with their
-  // license texts. A bundled package with no license text drops the target.
+  // Each target's bundled packages with their license texts; a bundled
+  // package with no license text drops the target.
   const bundledPackages = new Map();
   for (const target of targets) {
     const bundle = bundles.get(target.name);
@@ -717,7 +671,7 @@ async function packageAll() {
     }
   }
 
-  // Steps 2-4: for each (target, platform, type), assemble and archive
+  // Steps 2-4, per (target, platform, type).
   for (const target of targets) {
     const bundle = bundles.get(target.name);
     if (!bundle) continue;

@@ -1,12 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { loadLocalSecrets } from './secret-loader.js';
 
-// Mock fs/promises
 vi.mock('node:fs/promises', () => ({
   readFile: vi.fn(),
 }));
 
-// Mock the existing secrets-file loader
 vi.mock('../test-runner/secrets-file.js', () => ({
   loadSecretsFile: vi.fn(),
 }));
@@ -19,7 +17,6 @@ const mockLoadSecretsFile = vi.mocked(loadSecretsFile);
 
 beforeEach(() => {
   vi.resetAllMocks();
-  // Default: all files missing
   mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
   mockLoadSecretsFile.mockResolvedValue({ flat: {}, contexts: {} });
 });
@@ -47,7 +44,7 @@ describe('loadLocalSecrets', () => {
     });
 
     const result = await loadLocalSecrets('/project/.kici');
-    // All environment values merged flat -- later environments override earlier
+    // Later environments override earlier ones in the flat merge.
     expect(result.flat.API_KEY).toBeDefined();
   });
 
@@ -63,13 +60,11 @@ describe('loadLocalSecrets', () => {
   });
 
   it('applies merge precedence: .secrets < .env.local < secrets.yaml < --env flags', async () => {
-    // .secrets has lowest priority
     mockLoadSecretsFile.mockResolvedValue({
       flat: { KEY: 'from-secrets', ONLY_SECRETS: 'only' },
       contexts: {},
     });
 
-    // .env.local overrides .secrets
     mockReadFile.mockImplementation(async (filePath) => {
       if (String(filePath).endsWith('.env.local')) {
         return 'KEY=from-env-local\nONLY_ENV=env-only\n';
@@ -82,16 +77,13 @@ describe('loadLocalSecrets', () => {
 
     const result = await loadLocalSecrets('/project/.kici', ['KEY=from-flag']);
 
-    // --env flag wins over everything
     expect(result.flat.KEY).toBe('from-flag');
-    // Each source's unique keys survive
     expect(result.flat.ONLY_SECRETS).toBe('only');
     expect(result.flat.ONLY_ENV).toBe('env-only');
     expect(result.flat.ONLY_YAML).toBe('yaml-only');
   });
 
   it('silently ignores missing files (no errors)', async () => {
-    // All files missing (default mock behavior)
     const result = await loadLocalSecrets('/project/.kici');
     expect(result.flat).toEqual({});
     expect(result.contexts).toEqual({});
@@ -129,7 +121,6 @@ describe('loadLocalSecrets', () => {
     expect(result.flat.SINGLE).toBe('single-quoted');
     expect(result.flat.UNQUOTED).toBe('no-quotes');
     expect(result.flat.EMPTY_QUOTED).toBe('');
-    // Mismatched quotes should NOT be stripped
     expect(result.flat.MIXED).toBe('"mismatched\'');
     expect(result.flat.SPACES).toBe('value with spaces');
   });

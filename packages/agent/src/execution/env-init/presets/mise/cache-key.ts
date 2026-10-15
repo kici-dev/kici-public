@@ -6,9 +6,8 @@ import { join } from 'node:path';
 const MISE_CONFIG_FILES = ['mise.toml', '.mise.toml', '.tool-versions'] as const;
 
 /**
- * Derive the default mise cache key from the committed mise config under
- * `cloneRoot`. Concatenates whichever of {@link MISE_CONFIG_FILES} exist (in
- * fixed order) and hashes them. Returns `mise-noconfig` when none exist.
+ * The default mise cache key: a hash of whichever {@link MISE_CONFIG_FILES}
+ * exist under `cloneRoot`, or `mise-noconfig` when none do.
  */
 export async function miseCacheKey(cloneRoot: string): Promise<string> {
   const hash = createHash('sha256');
@@ -20,7 +19,7 @@ export async function miseCacheKey(cloneRoot: string): Promise<string> {
       hash.update(buf);
       found = true;
     } catch {
-      // file absent — skip
+      // absent
     }
   }
   if (!found) return 'mise-noconfig';

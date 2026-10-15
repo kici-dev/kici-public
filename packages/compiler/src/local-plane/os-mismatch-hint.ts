@@ -1,11 +1,7 @@
 /**
- * Detect when a routed local run cannot match the host OS.
- *
- * The local dev plane satisfies the host's own `kici:os:*` label (the scaler
- * injects the host's derived OS labels into its bare-metal label sets). A job
- * that requests a DIFFERENT OS than the host — e.g. a workflow authored on Linux
- * run on a Mac — matches no local backend and dispatches nothing. This surfaces
- * that as an honest hint instead of a silent "nothing happened".
+ * The local plane offers only the host's own `kici:os:*` labels (the scaler
+ * injects them into its bare-metal label sets), so a job requesting another OS
+ * dispatches nothing. This turns that silence into a hint.
  */
 
 import { deriveOsArchLabels } from '@kici-dev/engine';
@@ -27,11 +23,7 @@ interface LockFile {
   workflows?: LockWorkflow[];
 }
 
-/**
- * One hint per job whose `runsOn` requires a `kici:os:*` label the host does not
- * provide. Empty when every job either omits an OS selector or requests the
- * host's own OS.
- */
+/** One hint per job whose `runsOn` requires a `kici:os:*` label the host lacks. */
 export function detectOsMismatchHints(lock: unknown, platform: string, arch: string): string[] {
   const hostOsLabels = new Set(
     deriveOsArchLabels(platform, arch).filter((l) => l.startsWith(OS_LABEL_PREFIX)),

@@ -1,17 +1,10 @@
 /**
- * Side-effect-free helpers for the shared real-Postgres `globalSetup`
- * (`scripts/db-test-postgres.ts`).
- *
- * They live in their own module so the decision logic — which test modules
- * need a database, and which container runtime to use — is unit-testable
- * without starting anything.
+ * Side-effect-free helpers for `scripts/db-test-postgres.ts`, split out so the
+ * decision logic is unit-testable without starting a container.
  */
 import { $ } from 'zx';
 
-/**
- * Throwaway Postgres image for the gated suites. The repository's container-pin
- * tooling rewrites this pin in place when the image is bumped.
- */
+/** The container-pin tooling rewrites this pin in place when the image is bumped. */
 export const DB_TEST_PG_IMAGE = 'dhi.io/postgres:18.6-debian13';
 
 /** Env var the gated suites read at module scope to decide whether to run. */
@@ -23,24 +16,27 @@ export const DB_SKIP_ENV = 'KICI_SKIP_DB_TESTS';
 export type ContainerRuntime = 'podman' | 'docker';
 
 /**
- * Each package with such suites carries a Postgres-free static guard at
- * `src/db/migration-test-targets.test.ts`. Each reads every per-migration
- * test's source off disk and asserts it targets its own migration, so its own
- * source contains the gate env var as a string literal. Neither needs a
- * database — the shared path suffix excludes both, so running one alone never
- * spins a container.
+ * Each package's Postgres-free static guard at this path reads every
+ * per-migration test's source, so it contains the gate env var as a literal.
+ * Excluding the suffix keeps running a guard alone from spinning a container.
  */
 const STATIC_GUARD_SUFFIX = 'src/db/migration-test-targets.test.ts';
 
-/** True when this test module actually needs a real database. */
+/**
+ * Source markers that mean a test module needs a real database: the gate env
+ * var a hand-written suite reads, and the names of the suite harnesses from
+ * `@kici-dev/test-support/test-db`, which read the env var on the suite's
+ * behalf. Bare names, not `name(`: a call with a type argument
+ * (`describeWithTestDb<Database>(`) has no `(` after the name.
+ */
+export const DB_GATED_MARKERS: readonly string[] = [DB_GATE_ENV, 'describeWithTestDb', 'useTestDb'];
+
 export function isDbGatedSource(source: string, moduleId: string): boolean {
   if (moduleId.replaceAll('\\', '/').endsWith(STATIC_GUARD_SUFFIX)) return false;
-  return source.includes(DB_GATE_ENV);
+  return DB_GATED_MARKERS.some((marker) => source.includes(marker));
 }
 
 /**
- * Probe a runtime by asking it for its version.
- *
  * `nothrow` covers a non-zero exit; the try/catch covers the spawn-time
  * failure (binary not on PATH), which zx still raises synchronously.
  */
@@ -55,11 +51,9 @@ function defaultProbe(cmd: string): boolean {
 }
 
 /**
- * Resolve the container runtime explicitly.
- *
  * Deliberately NOT `podman … || docker …`: on a host with both, `podman ps`
- * exits 0 with empty output so the `||` never falls through and docker is never
- * seen. A build host may have either runtime, so both must work.
+ * exits 0 with empty output, so the `||` never reaches docker. A build host may
+ * have either runtime.
  */
 export function resolveContainerRuntime(
   probe: (cmd: string) => boolean = defaultProbe,
@@ -73,14 +67,11 @@ export function resolveContainerRuntime(
 }
 
 /**
- * Filter a selected spec list down to the modules that need a database.
- *
  * Matches on file CONTENT, not path: many gated suites live outside `db/`
- * (notifications, routes, secrets, OIDC, webhooks, auth), so a path glob would
- * miss them.
+ * (notifications, routes, secrets, OIDC, webhooks, auth).
  *
- * A module that cannot be read is skipped rather than fatal: a stale spec entry
- * must not take down a run that would otherwise not need a database at all.
+ * An unreadable module is skipped, not fatal: a stale spec entry must not take
+ * down a run that would otherwise not need a database.
  */
 export function selectedDbGatedFiles(
   moduleIds: string[],
@@ -108,15 +99,12 @@ export function selectedDbGatedFiles(
 const CONTAINER_NAME_RE = /^kici-db-test-pg-\d+-([0-9a-z]+)$/;
 
 /**
- * Select leaked throwaway Postgres containers old enough to reap.
- *
- * The name carries its own creation time, so a stray can be aged without asking
- * the runtime.
+ * Ages each container by the creation time in its name, without asking the runtime.
  *
  * A name that does not match, or whose timestamp does not parse, is NEVER
  * selected: killing a live test's database is far worse than leaving a stray
- * behind for the next run to collect. Strictly older than `maxAgeMs`, so a
- * container exactly at the threshold is kept.
+ * for the next run. Strictly older than `maxAgeMs`: a container exactly at the
+ * threshold is kept.
  */
 export function selectStaleDbTestContainers(
   names: string[],

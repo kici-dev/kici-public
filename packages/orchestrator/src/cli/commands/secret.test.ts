@@ -3,6 +3,7 @@ import { Command } from 'commander';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { runCli } from '../../__test-helpers__/cli.js';
 
 const mockSetContextSecretDirect = vi.fn();
 const mockListContextsDirect = vi.fn();
@@ -50,41 +51,7 @@ async function runCommand(
   args: string[],
   client: MockClient = makeMockClient(),
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null; client: MockClient }> {
-  const program = new Command();
-  program.exitOverride();
-  registerSecretCommands(program, () => client as any);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:') && !err.code?.startsWith('commander.')) {
-      console.log = origLog;
-      console.error = origError;
-      process.exit = origExit;
-      throw err;
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode, client };
+  return { ...(await runCli((p) => registerSecretCommands(p, () => client as any), args)), client };
 }
 
 describe('kici-admin secret CLI', () => {
@@ -135,8 +102,7 @@ describe('kici-admin secret CLI', () => {
     });
 
     it('refuses a direct-DB write whose key would make the AAD ambiguous', async () => {
-      // Direct-DB writes the row itself, so it never reaches the admin route or
-      // PgSecretStore — it needs its own guard.
+      // Direct-DB bypasses the admin route and PgSecretStore, so it needs its own guard.
       mockSetContextSecretDirect.mockResolvedValue({ inserted: true });
       const { stderr, exitCode } = await runCommand([
         'secret',

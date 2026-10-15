@@ -9,10 +9,8 @@ import type { WorkflowWithSource } from '../types.js';
 import { ensureTsLoaderHook } from './ts-loader.js';
 
 /**
- * Map a caught runtime error's stack to a `SourceLocation` in the entry file.
- * Scans for the first stack frame referencing `entryPoint` (ignoring the
- * `?t=` cache-buster and the `file://` scheme) and returns its line/column;
- * falls back to `entryPoint` at line 1 when no frame matches.
+ * Map an error stack to the first frame in `entryPoint` (ignoring the `?t=`
+ * cache-buster and the `file://` scheme); falls back to line 1.
  */
 function locateInEntry(stack: string | undefined, entryPoint: string): SourceLocation {
   const fallback: SourceLocation = { file: entryPoint, line: 1, column: 1 };
@@ -35,53 +33,40 @@ export interface ExecutionResult {
   configPath: string;
 }
 
-/** Result of discovering workflows from .kici/workflows/ directory */
 export interface DiscoveryResult {
-  /** All workflows discovered from .kici/workflows/ with source tracking */
   workflows: WorkflowWithSource[];
-  /** Absolute path to .kici/workflows/ directory */
+  /** Absolute path to `.kici/workflows/`. */
   workflowDir: string;
-  /** Absolute path to .kici/ directory */
+  /** Absolute path to `.kici/`. */
   kiciDir: string;
 }
-
-// ---------------------------------------------------------------------------
-// Shared module loader (private)
-// ---------------------------------------------------------------------------
 
 interface LoadResult {
   module: Record<string, unknown>;
   /**
-   * The hash input for this workflow's lock-file `contentHash`: a digest over
-   * the whole `.kici/` tree minus `.kici/node_modules/`
-   * (`hashKiciSourceTree`), which is exactly the set of files the source
-   * tarball carries.
+   * Hash input for the lock-file `contentHash`: a digest of the whole `.kici/`
+   * tree minus `.kici/node_modules/` (`hashKiciSourceTree`), exactly the files
+   * the source tarball carries.
    *
-   * It covers the tree rather than the entry file because the object the hash
-   * keys is the tree. When it was the entry file alone, editing an imported
-   * helper moved no hash, so the source cache hit, the agent restored the
-   * previous tarball, and the OLD helper ran green. Git-SHA provenance does
-   * not cover that: the cache path is what defeats it.
+   * It covers the tree, not the entry file, because the source cache keys the
+   * tree: hashing the entry file alone let an edited imported helper hit the
+   * cache, so the agent restored the old tarball and the OLD helper ran green.
+   * Git-SHA provenance does not cover that.
    *
-   * Falls back to the entry file's own text for a config file that does not
-   * live under a `.kici/` directory, and is undefined when neither can be read
-   * — the generator then emits no hash and no drift gate.
+   * Falls back to the entry file's text outside a `.kici/` directory, and is
+   * undefined when neither can be read — the generator then emits no hash and
+   * no drift gate.
    */
   hashBundleSource?: string;
 }
 
 /**
- * Load a TypeScript workflow/config module by direct dynamic import.
- *
- * Relies on the `@kici-dev/core/ts-loader-hook` ESM loader hook, registered
- * lazily via `ensureTsLoaderHook()` just before the dynamic import (the same
- * hook the agent registers in its sandbox process). No Rolldown bundling:
- * host-repo imports and
- * transitive deps with dynamic import() resolve via Node's normal ESM loader
- * against the workspace's node_modules — the same module graph any other
- * `pnpm exec tsx` invocation would see. This keeps ops-style workflows (which
- * import repo-local modules like scripts/lib/*) working the same as minimal
- * workflows that only touch @kici-dev/sdk.
+ * Load a TypeScript module by dynamic import through the
+ * `@kici-dev/core/ts-loader-hook` ESM hook (the same hook the agent registers in
+ * its sandbox). No Rolldown bundling: host-repo imports and transitive dynamic
+ * `import()`s resolve through Node's ESM loader against the workspace's
+ * node_modules, so workflows importing repo-local modules (scripts/lib/*) work
+ * like ones that only touch @kici-dev/sdk.
  */
 async function loadModule(
   entryPoint: string,
@@ -97,7 +82,7 @@ async function loadModule(
     try {
       hashBundleSource = await fs.readFile(entryPoint, 'utf-8');
     } catch {
-      // Non-fatal for hashing — generator will fall back to empty hash
+      // Non-fatal: the generator falls back to an empty hash.
     }
   }
 
@@ -116,28 +101,19 @@ async function loadModule(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 /**
  * Execute a TypeScript config file and extract workflow definitions.
  *
- * Process:
- * 1. Resolve the path and verify the file exists and is readable
- * 2. Register the oxc-transform TS loader hook and dynamic-import the module
- *    (TypeScript compiled on the fly by the hook — no bundling, no temp files)
- * 3. Extract workflow definitions from the module's default/named exports
- * 4. Return the workflows with source tracking
+ * Imports the module through the oxc-transform TS loader hook (TypeScript
+ * compiled on the fly — no bundling, no temp files) and collects workflows from
+ * its default and named exports, with source tracking.
  *
  * @param configPath - Path to workflow file (relative or absolute)
- * @returns Workflows exported from the config
  * @throws CompilerError on file not found, TypeScript errors, or missing exports
  */
 export async function executeConfig(configPath: string): Promise<ExecutionResult> {
   const absolutePath = path.resolve(configPath);
 
-  // Check file exists
   try {
     await fs.access(absolutePath);
   } catch {
@@ -146,7 +122,7 @@ export async function executeConfig(configPath: string): Promise<ExecutionResult
     });
   }
 
-  // Read TypeScript source (validates readability)
+  // Validates readability.
   try {
     await fs.readFile(absolutePath, 'utf-8');
   } catch {
@@ -166,15 +142,8 @@ export async function executeConfig(configPath: string): Promise<ExecutionResult
 }
 
 /**
- * Extract workflow definitions from a module's exports with source tracking.
- *
- * Supports:
- * - Default export: single workflow or array of workflows
- * - Named exports: any export that is a Workflow object
- *
- * @param module - The imported module
- * @param filePath - Absolute path to the source file
- * @returns Array of WorkflowWithSource objects
+ * Collect workflows from the default export (one workflow or an array) and
+ * from every named export that is a Workflow.
  */
 function extractWorkflows(
   module: Record<string, unknown>,
@@ -183,7 +152,6 @@ function extractWorkflows(
 ): WorkflowWithSource[] {
   const workflows: WorkflowWithSource[] = [];
 
-  // Check default export first
   if (module.default) {
     const defaultExport = module.default;
 
@@ -213,7 +181,6 @@ function extractWorkflows(
     }
   }
 
-  // Check named exports
   for (const [key, value] of Object.entries(module)) {
     if (key === 'default') continue;
 
@@ -240,10 +207,7 @@ function extractWorkflows(
   return workflows;
 }
 
-/**
- * Type guard to check if a value is a Workflow object.
- * Uses _tag discriminant from SDK.
- */
+/** Workflow type guard on the SDK `_tag` discriminant. */
 function isWorkflow(value: unknown): value is Workflow {
   return (
     typeof value === 'object' &&
@@ -254,27 +218,19 @@ function isWorkflow(value: unknown): value is Workflow {
 }
 
 /**
- * Resolve the .kici directory path, handling the case where the user
- * is already inside the .kici directory (or a subdirectory of it).
- *
- * Resolution order:
- * 1. If the resolved path has a workflows/ subdirectory, use it directly
- * 2. If CWD itself is named .kici and has workflows/, use CWD
- * 3. Fall through to the original resolved path (downstream code will error)
- *
- * @param kiciDir - Path to .kici directory (defaults to '.kici')
- * @returns Absolute path to the .kici directory
+ * Resolve the absolute `.kici` directory (default `.kici`):
+ * 1. the resolved path, when it has a `workflows/` subdirectory;
+ * 2. else, for the default, CWD when it is itself a `.kici` with `workflows/`;
+ * 3. else the resolved path, and downstream code reports the error.
  */
 export function resolveKiciDir(kiciDir?: string): string {
   const raw = kiciDir ?? '.kici';
   const resolved = path.resolve(raw);
 
-  // Happy path: resolved dir has workflows/ -> we're at repo root
   if (existsSync(path.join(resolved, 'workflows'))) {
     return resolved;
   }
 
-  // If using default and CWD is itself the .kici dir
   if (raw === '.kici') {
     const cwd = process.cwd();
     if (path.basename(cwd) === '.kici' && existsSync(path.join(cwd, 'workflows'))) {
@@ -282,28 +238,19 @@ export function resolveKiciDir(kiciDir?: string): string {
     }
   }
 
-  // Fall through -- downstream code will produce a proper error
   return resolved;
 }
 
 /**
- * Discover and execute all workflow files from .kici/workflows/ directory.
+ * Execute every top-level `*.ts` file in `.kici/workflows/` and collect its
+ * workflows.
  *
- * Process:
- * 1. Locate .kici/workflows/ directory (defaults to .kici relative to cwd)
- * 2. Find all *.ts files in the directory
- * 3. Execute each file to extract workflow definitions
- * 4. Collect and return all workflows
- *
- * @param kiciDir - Path to .kici directory (defaults to '.kici' relative to cwd)
- * @returns Discovery result with all workflows and directory paths
  * @throws CompilerError if .kici/workflows/ doesn't exist or no workflows found
  */
 export async function discoverWorkflows(kiciDir?: string): Promise<DiscoveryResult> {
   const absoluteKiciDir = resolveKiciDir(kiciDir);
   const workflowDir = path.join(absoluteKiciDir, 'workflows');
 
-  // Check if .kici/workflows/ exists
   try {
     const stat = await fs.stat(workflowDir);
     if (!stat.isDirectory()) {
@@ -320,7 +267,6 @@ export async function discoverWorkflows(kiciDir?: string): Promise<DiscoveryResu
     throw err;
   }
 
-  // Find all *.ts files in .kici/workflows/
   let files: string[];
   try {
     const entries = await fs.readdir(workflowDir, { withFileTypes: true });
@@ -339,7 +285,6 @@ export async function discoverWorkflows(kiciDir?: string): Promise<DiscoveryResu
     });
   }
 
-  // Execute each workflow file and collect workflows with source tracking
   const allWorkflows: WorkflowWithSource[] = [];
   for (const file of files) {
     const result = await executeWorkflowFile(file);
@@ -360,15 +305,7 @@ export async function discoverWorkflows(kiciDir?: string): Promise<DiscoveryResu
   };
 }
 
-/**
- * Execute a single workflow file and extract workflow definitions.
- * Similar to executeConfig but for individual workflow files.
- *
- * @param filePath - Absolute path to workflow file
- * @returns Execution result with workflows from this file
- */
 async function executeWorkflowFile(filePath: string): Promise<ExecutionResult> {
-  // Verify the file exists before proceeding
   try {
     await fs.access(filePath);
   } catch {

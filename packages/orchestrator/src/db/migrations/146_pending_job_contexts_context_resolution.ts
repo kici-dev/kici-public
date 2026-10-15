@@ -12,7 +12,7 @@ import { type Kysely, sql } from 'kysely';
  * held, and on every row written before this column existed. Such a row
  * dispatches its stored input unchanged.
  *
- * Idempotent: guarded on the column's existence, so re-running is a no-op.
+ * Idempotent: guarded on the column's existence.
  */
 async function colExists(db: Kysely<unknown>): Promise<boolean> {
   const result = await sql<{ exists: boolean }>`

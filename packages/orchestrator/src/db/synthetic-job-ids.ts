@@ -8,17 +8,15 @@
  * jobs), and it is swapped for the real job id the moment the job actually
  * dispatches (`dispatchReadyJob` → `findSyntheticJobId` → `addJobsToRun`).
  *
- * Lives here, beside the table it describes, because both the writers
- * (`pipeline/`) and the readers that must exclude these rows from an occupancy
- * count (`contexts/`) key on it, and neither layer imports the other.
+ * Lives here because the writers (`pipeline/`) and the readers that exclude
+ * these rows from an occupancy count (`contexts/`) both key on it, and neither
+ * layer imports the other.
  */
 export const NEEDS_PENDING_JOB_ID_PREFIX = 'needs-pending-';
 
 /**
- * SQL `LIKE` pattern matching every placeholder `job_id`.
- *
- * `_` is a single-character wildcard in `LIKE`, so the literal underscore-free
- * prefix above needs no escaping — kept as one constant anyway so a caller can
- * never spell the pattern and the prefix differently.
+ * SQL `LIKE` pattern matching every placeholder `job_id`. The prefix has no
+ * `_` wildcard, so it needs no escaping; one constant keeps a caller from
+ * spelling the pattern and the prefix differently.
  */
 export const NEEDS_PENDING_JOB_ID_LIKE = `${NEEDS_PENDING_JOB_ID_PREFIX}%`;

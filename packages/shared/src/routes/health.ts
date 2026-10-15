@@ -67,17 +67,12 @@ export interface AgentLivenessInfo extends BuildFingerprint {
 }
 
 export interface HealthRoutesDeps<T extends object = Record<string, unknown>> {
-  /**
-   * Optional extra fields to include in the liveness response.
-   * Called on every `/health` request.
-   */
+  /** Extra fields for the liveness response, called on every `/health` request. */
   livenessInfo?: () => T;
 
   /**
-   * Optional readiness checks. Each key is a check name, each value
-   * indicates whether that check passed.
-   * Called on every `/ready` request.
-   * If omitted, the service is always considered ready.
+   * Readiness checks by name, `true` when passed. Called on every `/ready`
+   * request; when omitted, the service is always ready.
    */
   readinessCheck?: () => Promise<Record<string, boolean>>;
 }
@@ -87,19 +82,12 @@ export interface HealthRoutesDeps<T extends object = Record<string, unknown>> {
  *
  * - GET /health - Liveness probe (always 200)
  * - GET /ready  - Readiness probe (200 if all checks pass, 503 if any fail)
- *
- * @param deps - Optional liveness info provider and readiness check function
- * @returns Hono app with /health and /ready endpoints
  */
 export function createHealthRoutes<T extends object = Record<string, unknown>>(
   deps: HealthRoutesDeps<T> = {},
 ): Hono {
   const app = new Hono();
 
-  /**
-   * Liveness probe - always returns 200.
-   * Includes timestamp, uptime, and any extra info from livenessInfo().
-   */
   app.get('/health', (c) => {
     const base: LivenessBase = {
       status: LivenessStatus.Ok,
@@ -109,10 +97,6 @@ export function createHealthRoutes<T extends object = Record<string, unknown>>(
     return c.json({ ...base, ...deps.livenessInfo?.() });
   });
 
-  /**
-   * Readiness probe - returns 200 when all checks pass, 503 otherwise.
-   * If no readiness check is provided, always returns 200.
-   */
   app.get('/ready', async (c) => {
     const checks = deps.readinessCheck ? await deps.readinessCheck() : {};
     const ready = Object.values(checks).every((v) => v);

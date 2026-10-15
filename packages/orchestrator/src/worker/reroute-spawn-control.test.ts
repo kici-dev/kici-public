@@ -12,6 +12,7 @@ import type { ScalerEvent } from '../scaler/types.js';
 import { InMemoryJobQueue } from './in-memory-job-queue.js';
 import { InMemoryExecutionTracker } from './in-memory-execution-tracker.js';
 import { createRerouteSpawnControl, type ScaleRequest } from './reroute-spawn-control.js';
+import { startRun } from '../__test-helpers__/tracker.js';
 
 const RUN = 'run-1';
 const JOB = 'job-1';
@@ -111,18 +112,14 @@ async function setup(spawnRetry: RerouteSpawnRetry) {
     routingKey: 'rk',
   });
   jobOwnership.set(JOB, 'wss://coord');
-  await executionTracker.onExecutionStarted(
-    RUN,
-    'ci',
-    'github',
-    '',
-    'main',
-    'abc',
-    'd-1',
-    {},
-    null,
-    [{ jobId: JOB, jobName: 'build' }],
-  );
+  await startRun(executionTracker, {
+    runId: RUN,
+    repoIdentifier: '',
+    ref: 'main',
+    sha: 'abc',
+    deliveryId: 'd-1',
+    jobs: [{ jobId: JOB, jobName: 'build' }],
+  });
   return {
     queue,
     executionTracker,

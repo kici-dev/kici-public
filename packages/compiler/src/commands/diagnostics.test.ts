@@ -79,9 +79,8 @@ describe('diagnosticsCommand', () => {
     expect(printed).toContain('linux');
   });
 
-  // The hosted Platform always runs a newer build than a pinned CLI, so an
-  // alert vocabulary this build has never seen must still render rather than
-  // abort the command.
+  // The hosted Platform runs a newer build than a pinned CLI, so an unknown
+  // alert vocabulary must render, not abort.
   it('renders an alert whose type and severity this build does not know', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue(
       fakeClient({

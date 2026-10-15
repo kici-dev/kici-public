@@ -10,8 +10,7 @@ import { type Kysely, sql } from 'kysely';
  *   request `sandbox: { network: 'host' }`. NULL / absent reads as `false`
  *   (deny host networking).
  *
- * Both default to the safe deny-all posture with zero operator action; the
- * operator opts in per capability / for host networking via
+ * Both default to deny-all; the operator opts in via
  * `kici-admin org-settings sandbox-allowlist`.
  *
  * Idempotent: a re-run on a DB that already has a column skips that column.

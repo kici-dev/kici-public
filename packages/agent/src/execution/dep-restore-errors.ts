@@ -1,9 +1,7 @@
 /**
- * Errors a dependency restore rejects with. Each carries the report of the
- * restore that failed, so a caller can log it without re-deriving anything.
- *
- * Kept apart from `dep-restore.ts` so a test that mocks the restore still gets
- * the real classes, and `instanceof` keeps meaning the same thing.
+ * Errors a dependency restore rejects with; each carries the failed restore's
+ * report for the caller to log. Kept apart from `dep-restore.ts` so a test
+ * that mocks the restore still gets the real classes and `instanceof` holds.
  */
 
 import type { DepRestoreReport } from './dep-restore-report.js';

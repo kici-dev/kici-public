@@ -1,6 +1,4 @@
-/**
- * Shared constants for fleet log collection.
- */
+/** Fleet log collection constants. */
 
 /** Default per-node deadline for a fleet bundle request (overridable via --fleet-timeout). */
 export const FLEET_NODE_TIMEOUT_MS = 60_000;

@@ -3,10 +3,10 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Add `cluster_settings.max_fanout_hosts` (nullable INTEGER).
  *
- * Fleet-wide cap on `runsOnAll` per-host fan-out children. NULL → cluster default (`config.maxFanoutHosts`, `KICI_MAX_FANOUT_HOSTS`).
+ * Fleet-wide cap on `runsOnAll` per-host fan-out children. NULL → cluster default
+ * (`config.maxFanoutHosts`, `KICI_MAX_FANOUT_HOSTS`).
  *
- * Idempotent: guarded on column existence; a re-run on a DB that already has
- * the column is a no-op.
+ * Idempotent: guarded on column existence.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

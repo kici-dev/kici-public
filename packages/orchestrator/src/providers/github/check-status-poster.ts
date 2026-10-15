@@ -81,7 +81,6 @@ export class GitHubCheckStatusPoster implements CheckStatusPoster {
     const [owner, repo] = repoIdentifier.split('/');
 
     try {
-      // Try to find existing check run with the same name on this commit
       const { data: existingChecks } = await octokit.checks.listForRef({
         owner,
         repo,
@@ -90,7 +89,6 @@ export class GitHubCheckStatusPoster implements CheckStatusPoster {
       });
 
       if (existingChecks.check_runs.length > 0) {
-        // Update existing check run
         await octokit.checks.update({
           owner,
           repo,
@@ -101,7 +99,6 @@ export class GitHubCheckStatusPoster implements CheckStatusPoster {
           output: { title, summary },
         });
       } else {
-        // Create new check run
         await octokit.checks.create({
           owner,
           repo,
@@ -140,7 +137,6 @@ export class GitHubCheckStatusPoster implements CheckStatusPoster {
     const octokit = this.getOctokit(credentials);
     const [owner, repo] = repoIdentifier.split('/');
 
-    // Build summary listing the modifications
     const lines = modifications.map((m) => `- **${m.changeType}**: \`${m.workflowName}\``);
     const summary = [
       'This PR adds/modifies workflows -- changes will take effect after merge.',

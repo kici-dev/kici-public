@@ -1,29 +1,19 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add three tables persisting `ScalerManager` per-coord state:
+ * Persists `ScalerManager` per-coord state:
  *
- *  - `scaler_spawning_agents`: agents spawned via Docker/Podman/Firecracker
- *    that have not yet registered via WS. Carries the `bound_job_id` so a
- *    replacement coord still issues the eager-dispatch hop on register.
+ *  - `scaler_spawning_agents`: spawned agents not yet registered via WS. `bound_job_id` lets a
+ *    replacement coord still issue the eager-dispatch hop on register.
+ *  - `scaler_agent_jobs`: agentId → (runId, jobId) for scaler-lifecycle event routing; inserted
+ *    on `correlateAgentToJob`, deleted on disconnect / job completion.
+ *  - `scaler_reservations`: outstanding reservations by agentId. Usage counters are derived,
+ *    recomputed on coord boot as `SUM(...) GROUP BY scaler_name`, so the cap check stays correct.
  *
- *  - `scaler_agent_jobs`: agentId → (runId, jobId) correlation for
- *    scaler-lifecycle event routing. Inserted on `correlateAgentToJob`,
- *    deleted on disconnect / job completion.
+ * Without them a coord crash mid-spawn orphans the agent, strands the reservation until backend
+ * GC disconnects the WS minutes later, and leaves a hole in the run timeline.
  *
- *  - `scaler_reservations`: outstanding resource reservations keyed by
- *    agentId. Per-scaler / global usage counters are derived state —
- *    recomputed on coord boot as `SUM(...) GROUP BY scaler_name` so the
- *    cap-check critical section stays correct.
- *
- * Without these tables, a coord crash mid-spawn orphans the agent (eager
- * dispatch lost), strands the reservation (resource leak until backend
- * GC eventually disconnects the WS, minutes later), and loses every
- * scaler-lifecycle event emitted before correlation (execution-tracker
- * sees a hole in the run timeline).
- *
- * Idempotent: a re-run on a DB that already has any of these tables
- * leaves the existing one alone.
+ * Idempotent: an existing table is left alone.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const tableExists = async (name: string): Promise<boolean> => {

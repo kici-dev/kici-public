@@ -34,28 +34,18 @@ import {
 /** HKDF info string binding derived keys to this protocol version. */
 const HKDF_INFO = 'kici-peer-v1';
 
-/** IV length for AES-256-GCM. */
+/** AES-256-GCM IV and auth tag lengths, in bytes. */
 const IV_LEN = 12;
 
-/** Authentication tag length for AES-256-GCM. */
 const TAG_LEN = 16;
 
-/**
- * An X25519 key pair for ECDH key exchange.
- * The public key is DER SPKI-encoded for wire transport.
- */
 export interface EcdhKeyPair {
   /** DER SPKI-encoded X25519 public key. */
   publicKey: Buffer;
-  /** X25519 private key object (not exported to wire). */
+  /** Never sent on the wire. */
   privateKey: KeyObject;
 }
 
-/**
- * Generate a new X25519 key pair for ECDH key exchange.
- *
- * @returns Key pair with DER SPKI public key and KeyObject private key
- */
 export function generateEcdhKeyPair(): EcdhKeyPair {
   const pair = generateKeyPairSync('x25519');
   const publicKeyDer = pair.publicKey.export({ type: 'spki', format: 'der' });
@@ -63,15 +53,8 @@ export function generateEcdhKeyPair(): EcdhKeyPair {
 }
 
 /**
- * Derive a 32-byte AES-256 session key from an ECDH key exchange.
- *
- * Performs X25519 Diffie-Hellman, then derives the session key via
- * HKDF-SHA256 with the provided nonce as salt.
- *
- * @param localPrivateKey - This node's X25519 private key
- * @param remotePubKeyDer - Remote node's DER SPKI-encoded X25519 public key
- * @param nonce - Random nonce (used as HKDF salt for per-session uniqueness)
- * @returns 32-byte session key suitable for AES-256-GCM
+ * Derive a 32-byte AES-256 session key: X25519 Diffie-Hellman, then HKDF-SHA256
+ * with the nonce as salt for per-session uniqueness.
  */
 export function deriveSessionKey(
   localPrivateKey: KeyObject,
@@ -88,10 +71,8 @@ export function deriveSessionKey(
 }
 
 /**
- * Encrypt a plaintext message with a session key using AES-256-GCM.
+ * AES-256-GCM with a 32-byte session key.
  *
- * @param plaintext - The message to encrypt
- * @param sessionKey - 32-byte session key from deriveSessionKey
  * @returns Base64-encoded string: IV (12) || AuthTag (16) || Ciphertext
  */
 export function encryptMessage(plaintext: string, sessionKey: Buffer): string {
@@ -104,11 +85,8 @@ export function encryptMessage(plaintext: string, sessionKey: Buffer): string {
 }
 
 /**
- * Decrypt a message encrypted with encryptMessage.
+ * Decrypt the output of encryptMessage.
  *
- * @param encrypted - Base64-encoded string: IV (12) || AuthTag (16) || Ciphertext
- * @param sessionKey - 32-byte session key (must match the key used for encryption)
- * @returns Decrypted plaintext string
  * @throws If the session key is wrong or the ciphertext has been tampered with
  */
 export function decryptMessage(encrypted: string, sessionKey: Buffer): string {

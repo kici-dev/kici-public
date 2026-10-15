@@ -1,16 +1,12 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the database-side retention windows to `cluster_settings`.
+ * Database-side retention windows on `cluster_settings`. Cold-store
+ * archive-then-delete needs `KICI_COLD_STORE_ENABLED=true` and a bucket; without
+ * them (the default and the quickstart path) `execution_steps`, `event_log` and
+ * `access_log` would grow without bound on the operator's disk.
  *
- * Retention was object-store-first: every aging table routed through
- * cold-store archive-then-delete, which needs `KICI_COLD_STORE_ENABLED=true`
- * and a bucket. With neither — the default, and the quickstart path — nothing
- * aged at all, so `execution_steps`, `event_log` and `access_log` grew without
- * bound on the operator's own disk.
- *
- * Four nullable windows, in days, plus the stamp that gates the first
- * deletion:
+ * Nullable windows, in days, plus the stamp that gates the first deletion:
  *
  *   - `run_retention_days`        — terminal runs and their jobs and steps
  *   - `audit_retention_days`      — access_log, secret_audit_log, event_log
@@ -20,13 +16,9 @@ import { type Kysely, sql } from 'kysely';
  *     window. Deletion begins a week after this, so an upgrade never removes
  *     history on its first night.
  *
- * NULL means the orchestrator's own configured default applies; 0 disables
- * that window, mirroring `dispatch_queue_ttl_days`.
- *
- * Cluster-global rather than per-tenant: the sweep runs once per fleet on the
- * cleanup tick, with no tenant in scope at the read site.
- *
- * Idempotent: each column is guarded on existence, so a re-run is a no-op.
+ * NULL = the orchestrator's configured default; 0 disables that window,
+ * mirroring `dispatch_queue_ttl_days`. Cluster-global because the sweep runs
+ * once per fleet on the cleanup tick, with no tenant in scope. Idempotent.
  */
 const COLUMNS: ReadonlyArray<{ name: string; type: string }> = [
   { name: 'run_retention_days', type: 'INTEGER' },

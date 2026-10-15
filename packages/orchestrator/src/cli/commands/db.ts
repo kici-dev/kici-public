@@ -12,10 +12,9 @@
  *   db reindex                    REINDEX DATABASE CONCURRENTLY (direct DB)
  *   db refresh-collation-version  ALTER DATABASE REFRESH COLLATION VERSION (direct DB)
  *
- * The direct-DB subcommands cannot go through HTTP because the target database
- * may not exist yet or is about to be dropped. They follow the same pattern
- * as `kici-admin peer create-token` — open a pool from KICI_DATABASE_URL /
- * DATABASE_URL / --database-url.
+ * Direct-DB subcommands skip HTTP because the target database may not exist
+ * yet or is about to be dropped; like `kici-admin peer create-token`, they open
+ * a pool from KICI_DATABASE_URL / DATABASE_URL / --database-url.
  */
 
 import os from 'node:os';
@@ -156,9 +155,8 @@ async function runBackupTimerCommand(opts: BackupOptions): Promise<void> {
     throw new Error('`--install-timer` and `--uninstall-timer` are mutually exclusive.');
   }
   const userLevel = resolveUserLevel(opts);
-  // The timer is written for the install, so its platform is the install's, not
-  // the host's: a compose orchestrator on a systemd box must hit the compose
-  // refusal rather than get a systemd unit pointed at a container.
+  // The install's platform, not the host's: a compose orchestrator on a systemd
+  // box hits the compose refusal, not a systemd unit aimed at a container.
   const { resolved, platform } = await resolveInstanceTarget({
     component: 'orchestrator',
     opts: { instanceDir: opts.instanceDir, name: opts.name },
@@ -540,9 +538,8 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
           username: opts.user,
           password: opts.password,
         });
-        // create-readonly-user connects to the target DB itself (which owns the
-        // access_log table), so record there — not the KICI_DATABASE_URL
-        // fallback used by the bootstrap-DB provisioning subcommands.
+        // Record in the target DB, which owns access_log, not the bootstrap
+        // subcommands' KICI_DATABASE_URL fallback.
         await recordAdminCliAccess(
           {
             action: 'db.create_readonly_user',

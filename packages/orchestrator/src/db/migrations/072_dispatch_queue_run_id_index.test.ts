@@ -5,15 +5,12 @@ import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './072_dispatch_queue_run_id_index.js';
 import type { Database } from '../types.js';
 import { JobQueue, DispatchQueueStatus } from '../../queue/job-queue.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 072. Creates a throwaway database, applies
- * migrations 001..072, and asserts `idx_dispatch_queue_run_id` exists after up()
- * and is gone after down() (then recreated idempotently). A second block proves
- * `pruneTerminalDispatchRows` deletes only terminal rows past the retention
- * window, never a non-terminal or in-window row. Gated on
- * `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 072: `idx_dispatch_queue_run_id` exists after up(), is gone
+ * after down(), and recreates idempotently. It also proves `pruneTerminalDispatchRows` deletes
+ * only terminal rows past the retention window. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;

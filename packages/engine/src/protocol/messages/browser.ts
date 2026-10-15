@@ -1,12 +1,4 @@
-/**
- * Browser-Platform WebSocket protocol schemas.
- *
- * Defines all message types for the browser <-> Platform WS connection:
- * - Browser -> Platform: auth, log subscribe/unsubscribe, status subscribe/unsubscribe
- * - Platform -> Browser: auth response, log lines, gap, run/job/step status, error
- *
- * Follows the same Zod-based pattern as platform-orchestrator.ts and other protocol schemas.
- */
+/** Browser <-> Platform WebSocket protocol schemas. */
 import { z } from 'zod';
 import { browserRunEventSchema, browserJobContextSchema } from './run-events.js';
 import { browserEventLogPayloadChunkSchema } from './dashboard.js';
@@ -46,11 +38,10 @@ export const browserLogUnsubscribeSchema = z.object({
 });
 
 /**
- * Browser subscribes to live orchestration/provisioning logs for a job.
- *
- * Keyed by `(runId, jobId)` — no `stepIndex` (orch logs are job-level, not
- * per-step). On subscribe the Platform backfills persisted history via the
- * `dashboard.orch.logs` RPC, then streams live `orch-log.lines`.
+ * Browser subscribes to a job's live orchestration/provisioning logs, which are
+ * job-level, so there is no `stepIndex`. On subscribe the Platform backfills
+ * persisted history via the `dashboard.orch.logs` RPC, then streams live
+ * `orch-log.lines`.
  */
 export const browserOrchLogSubscribeSchema = z.object({
   type: z.literal('orch-log.subscribe'),
@@ -68,9 +59,8 @@ export const browserOrchLogUnsubscribeSchema = z.object({
 /** Browser subscribes to org-level status updates (run/job/step status changes). */
 export const browserStatusSubscribeSchema = z.object({
   type: z.literal('status.subscribe'),
-  /** Scope of status subscription. Currently only 'org' is supported. */
   scope: z.literal('org'),
-  /** The org to subscribe to. Required so the Platform can route updates for the correct org. */
+  /** Required so the Platform routes updates for the correct org. */
   orgId: z.string().min(1),
 });
 
@@ -85,13 +75,12 @@ export const browserPingSchema = z.object({
 });
 
 /**
- * Browser asks Platform to begin streaming the body of an event-log delivery.
+ * Browser asks the Platform to stream the body of an event-log delivery.
  *
- * The dashboard generates `requestId` (uuid) per fetch so it can correlate
- * incoming chunks. `orgId` is NOT taken from the wire — Platform's
- * browser-handler resolves the run's owning org from the user's membership
- * and gates on `event_log:read_payload`. Same trust model as the existing
- * `log.subscribe` message.
+ * The dashboard generates a `requestId` (uuid) per fetch to correlate incoming
+ * chunks. `orgId` is the org the dashboard is viewing; the Platform's
+ * browser-handler verifies the user's active membership in it (as for
+ * `status.subscribe`) and gates on `event_log:read_payload` in that org.
  */
 export const browserEventLogPayloadFetchSchema = z.object({
   type: z.literal('event-log.payload.fetch'),
@@ -135,7 +124,7 @@ export const browserLogLinesSchema = z.object({
   jobId: z.string(),
   stepIndex: z.number(),
   lines: z.array(z.string()),
-  /** Total line count (cumulative offset so browser knows position). */
+  /** Cumulative line count, so the browser knows its position. */
   lineCount: z.number(),
   /**
    * Which stream these lines came from. Absent when the producing orchestrator
@@ -145,19 +134,17 @@ export const browserLogLinesSchema = z.object({
 });
 
 /**
- * Platform sends orchestration/provisioning log lines for a subscribed job.
- *
- * Delivered in two forms over the same message:
+ * Platform sends orchestration/provisioning log lines for a subscribed job, in
+ * two forms:
  * - **Backfill** (on subscribe): `lines` are the persisted JSONL strings from
- *   the `dashboard.orch.logs` RPC (each carrying its own `phase`/`ts`), so the
+ *   the `dashboard.orch.logs` RPC, each carrying its own `phase`/`ts`, so the
  *   top-level `phase`/`ts` are omitted.
- * - **Live** (streamed after backfill): `lines` are raw message strings for a
- *   single `phase` at timestamp `ts`.
+ * - **Live** (after backfill): `lines` are raw message strings for a single
+ *   `phase` at timestamp `ts`.
  *
- * The dashboard normalizes both by attempting to JSON-parse each line and
- * falling back to the envelope `phase`/`ts`, and dedups on `(ts, phase,
- * message)` so an overlap between the backfill snapshot and the first live
- * chunk is not double-appended.
+ * The dashboard JSON-parses each line, falls back to the envelope `phase`/`ts`,
+ * and dedups on `(ts, phase, message)` so an overlap between the backfill
+ * snapshot and the first live chunk is not appended twice.
  */
 export const browserOrchLogLinesSchema = z.object({
   type: z.literal('orch-log.lines'),
@@ -178,27 +165,20 @@ export const browserGapSchema = z.object({
 });
 
 /**
- * Reason a live-log stream was terminated by the Platform.
- *
- * Currently only `plan_limit_live_log_minutes` (daily live-log minute cap
- * exceeded). New reasons land here as the Platform grows more enforcement
- * surfaces (e.g. retention, manual operator kick).
+ * Why the Platform terminated a live-log stream. `plan_limit_live_log_minutes`:
+ * the org exceeded its daily live-log minute cap.
  */
 export const browserLogStreamTerminatedReason = z.enum(['plan_limit_live_log_minutes']);
 export type BrowserLogStreamTerminatedReason = z.infer<typeof browserLogStreamTerminatedReason>;
 
 /**
- * Platform notifies browser that a live-log stream has been terminated.
+ * Platform notifies browser that a live-log stream has been terminated:
+ * 1. **At subscribe time:** the org is already over the daily live-log minute
+ *    cap, so the subscription is never registered.
+ * 2. **Mid-stream:** the periodic metering tick saw the org cross the cap; every
+ *    active log subscriber in that org gets this and is unregistered.
  *
- * Sent in two cases:
- * 1. **At subscribe time:** the org is already over the daily live-log
- *    minute cap when the browser sends `log.subscribe`. The Platform
- *    sends `log.stream.terminated` and never registers the subscription.
- * 2. **Mid-stream:** the periodic metering tick observed the org just
- *    crossed the cap. The Platform sends `log.stream.terminated` to all
- *    active log subscribers in that org and unregisters them.
- *
- * Browsers should display the upgrade prompt and NOT auto-resubscribe.
+ * Browsers show the upgrade prompt and do NOT auto-resubscribe.
  */
 export const browserLogStreamTerminatedSchema = z.object({
   type: z.literal('log.stream.terminated'),
@@ -206,7 +186,7 @@ export const browserLogStreamTerminatedSchema = z.object({
   jobId: z.string(),
   stepIndex: z.number(),
   reason: browserLogStreamTerminatedReason,
-  /** Optional human-readable message for the dashboard to display. */
+  /** Human-readable message for the dashboard to display. */
   message: z.string().optional(),
 });
 

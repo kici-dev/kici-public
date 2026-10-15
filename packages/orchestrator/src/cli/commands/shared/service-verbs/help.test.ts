@@ -1,7 +1,6 @@
 /**
- * Pins the user-visible shape of the `kici-admin agent` and `kici-admin orchestrator`
- * service command groups: the order Commander lists their subcommands in, and the
- * full `--help` text of each lifecycle verb.
+ * Pins the subcommand order and each lifecycle verb's `--help` for
+ * `kici-admin agent` and `kici-admin orchestrator`.
  */
 
 import { describe, it, expect } from 'vitest';

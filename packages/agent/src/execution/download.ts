@@ -1,9 +1,4 @@
-/**
- * Shared HTTP/HTTPS download utility.
- *
- * Extracted from workflow-loader.ts to avoid duplication across
- * dep-restore.ts and workflow-loader.ts.
- */
+/** HTTP/HTTPS download and pre-signed upload helpers shared by dep-restore.ts and workflow-loader.ts. */
 
 import https from 'node:https';
 import http from 'node:http';
@@ -13,36 +8,26 @@ import { redactUrl } from './resumable-download.js';
 
 const logger = createLogger({ prefix: 'agent:download' });
 
-/** Download timeout: 5 minutes. */
 const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
- * Per-attempt upload timeout: 5 minutes, matching the download's.
- *
- * Without one, a wedged socket — a half-open connection an object store never
- * answers on — hangs the PUT until the whole job's timeout kills the step, and
- * the failure surfaces as "the job timed out" rather than "the upload stalled".
- * A timeout also makes the retry ladder reachable for that failure mode: an
- * `ETIMEDOUT` is a transport error, so it retries, where an indefinite hang can
- * never reach a second attempt.
- *
- * Applied per attempt, so a large cache tarball on a slow link gets the full
- * budget again on each retry rather than sharing one across all three.
+ * Per-attempt upload timeout, matching the download's. Without one, a
+ * half-open socket hangs the PUT until the job timeout kills the step, the
+ * failure reads "the job timed out" instead of "the upload stalled", and the
+ * retry ladder is never reached. Per attempt, so a large tarball on a slow
+ * link gets the full budget on each retry.
  */
 const UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
- * Retries a pre-signed upload makes after its first attempt, matching the
- * dependency download's ceiling (`DEFAULT_DOWNLOAD_LIMITS.maxAttempts` in
- * `resumable-download.ts`, three attempts in total) so both halves of the
- * agent's object-storage traffic give up at the same point.
+ * Retries after the first attempt. Matches `DEFAULT_DOWNLOAD_LIMITS.maxAttempts`
+ * in `resumable-download.ts` so uploads and downloads give up at the same point.
  */
 export const UPLOAD_MAX_RETRIES = 2;
 
-/** Base delay before the first retry; doubles for each subsequent one. */
+/** Doubles for each subsequent retry. */
 const UPLOAD_RETRY_BASE_DELAY_MS = 500;
 
-/** Error carrying the HTTP status a pre-signed upload was answered with. */
 class PresignedUploadHttpError extends Error {
   constructor(readonly statusCode: number) {
     super(`HTTP ${statusCode} uploading to pre-signed URL`);
@@ -51,29 +36,17 @@ class PresignedUploadHttpError extends Error {
 }
 
 /**
- * Whether a failed upload attempt is worth repeating.
- *
- * A transport failure (connection refused, reset, DNS) never reached a
- * responder, and 5xx / 429 are the object-storage overload signals AWS
- * documents as retry-with-backoff (S3 answers `SlowDown` with 503). Every other
- * status is a decision the server will repeat: a 403 from an expired or
- * malformed signature, a 400 from a malformed request. Retrying those burns the
- * ceiling without a chance of success and delays the real error.
+ * Transport failures (refused, reset, DNS) never reached a responder, and
+ * 5xx / 429 are the overload signals AWS documents as retry-with-backoff (S3
+ * answers `SlowDown` with 503). Any other status (403 bad signature, 400
+ * malformed request) repeats, so retrying only delays the real error.
  */
 function isRetryableUploadFailure(err: unknown): boolean {
   if (!(err instanceof PresignedUploadHttpError)) return true;
   return err.statusCode >= 500 || err.statusCode === 429;
 }
 
-/**
- * Download content from an HTTP/HTTPS URL.
- *
- * Includes a 5-minute timeout to prevent the agent from hanging indefinitely
- * on slow or unresponsive endpoints.
- *
- * @param url - The URL to download from
- * @returns The response body as a Buffer
- */
+/** 5-minute timeout so a slow or unresponsive endpoint cannot hang the agent. */
 export function downloadUrl(url: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const client = url.startsWith('https:') ? https : http;
@@ -119,10 +92,8 @@ function putOnce(resolvedUrl: string, data: Buffer, timeoutMs: number): Promise<
         res.on('error', reject);
       },
     );
-    // `setTimeout` here is inactivity on the socket, not a deadline: it fires
-    // when nothing has been read or written for the interval. Destroying the
-    // request is what turns the stall into an `ECONNRESET`/`ETIMEDOUT` the
-    // caller can retry, rather than a promise that never settles.
+    // Socket inactivity, not a deadline. Destroying the request turns the stall
+    // into a retryable error rather than a promise that never settles.
     req.setTimeout(timeoutMs, () => {
       req.destroy(new Error(`Pre-signed upload timed out after ${timeoutMs}ms`));
     });
@@ -132,31 +103,20 @@ function putOnce(resolvedUrl: string, data: Buffer, timeoutMs: number): Promise<
 }
 
 /**
- * Upload a buffer to a pre-signed S3 URL via HTTP PUT, retrying a transient
- * failure.
+ * PUT a buffer to a pre-signed S3 URL (bundles, dep tarballs), retrying a
+ * transient failure ({@link isRetryableUploadFailure}). Localhost / 127.0.0.1
+ * URLs are rewritten via `resolveOrchestratorUrl` so the filesystem cache
+ * backend's signed URLs work from container agents that can't reach the
+ * orchestrator's host loopback.
  *
- * Used for direct-to-S3 uploads of bundles and dep tarballs. Localhost /
- * 127.0.0.1 URLs are rewritten via `resolveOrchestratorUrl` so the
- * filesystem cache backend's signed URLs work from container agents that
- * can't reach the orchestrator's host loopback directly.
- *
- * **Why retrying is safe here.** A pre-signed PUT writes one whole object at a
- * single key: there is no multipart session, no append, and no
- * server-generated identity, so a repeat attempt writes the same bytes to the
- * same key and the last write wins. S3 also only makes an object visible once
- * the body has been received in full, so an attempt that died mid-body left
- * nothing behind. A retry therefore cannot double-write or produce a torn
+ * **Retrying is safe**: a pre-signed PUT writes one whole object at one key (no
+ * multipart, no append, no server-generated identity), and S3 exposes an object
+ * only once its body arrived in full, so a retry cannot double-write or tear an
  * object — which is why every AWS SDK retries PUTs by default.
  *
- * Only a failure that can plausibly differ next time is repeated — see
- * {@link isRetryableUploadFailure}.
- *
- * @param url - The pre-signed URL to upload to
- * @param data - The buffer to upload
  * @param opts.baseDelayMs - Backoff before the first retry (doubles thereafter)
- * @param opts.timeoutMs - Per-attempt socket-inactivity timeout (see
- *   {@link UPLOAD_TIMEOUT_MS}); an override exists so a test can drive the
- *   stall path without waiting out the production budget.
+ * @param opts.timeoutMs - Per-attempt socket-inactivity timeout; overridable so
+ *   a test can drive the stall path without the production budget.
  */
 export async function uploadToPresignedUrl(
   url: string,

@@ -5,13 +5,11 @@ import { ContextStore } from '../contexts/context-store.js';
 import { RbacEnforcer } from '../secrets/rbac.js';
 
 /**
- * `minimumTrust` on the three bodies that carry it — create, policy, template.
- *
- * The trust gate compares against exactly one requirement (`'trusted'`), so the
- * routes must refuse every other spelling at the door: a value that passed the
- * body would be persisted verbatim and read back as a requirement the gate
- * never holds on. The store is stubbed at the prototype so `deps.db` is never
- * touched — the question is what the handler forwards, not what SQL runs.
+ * `minimumTrust` on the create, policy and template bodies. The trust gate
+ * knows exactly one requirement (`'trusted'`), so the routes refuse every other
+ * spelling: one that passed would be persisted verbatim as a requirement the
+ * gate never holds on. The store is stubbed at the prototype, so `deps.db` is
+ * never touched: the test pins what the handler forwards, not what SQL runs.
  */
 function stubStore(existing: boolean): {
   create: ReturnType<typeof vi.spyOn>;

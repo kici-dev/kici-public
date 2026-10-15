@@ -43,13 +43,10 @@ export function packageFilePaths(dirName) {
 // ─── Which package a bundled module belongs to ───────────────────────────────
 
 /**
- * The directory of the npm package a bundled module comes from.
- *
- * Under `node_modules/` it is the package right after the last `node_modules`
- * segment, so a nested `package.json` inside a package cannot split it.
- * Elsewhere (a workspace package) it is the nearest directory up whose
- * `package.json` has a name. A bundler-generated module (`\0…`) maps to the
- * directory `virtualDirs` names for its prefix, and any other one is refused:
+ * The directory of the npm package a bundled module comes from: the package
+ * after the last `node_modules` segment (so a nested `package.json` cannot
+ * split it), else the nearest directory up whose `package.json` has a name. A
+ * bundler-generated module (`\0…`) maps through `virtualDirs`, or is refused:
  * code with no known origin has no license to name.
  *
  * @param {string} id a module id from the bundler's output
@@ -217,10 +214,9 @@ export function collectBundledPackages(moduleIds, opts = {}) {
 }
 
 /**
- * Every package installed under `nodeModulesDir`, nested ones included. A
- * package whose name `workspaceDirs` maps is a KiCI package, described from
- * its workspace directory: the package manifest there carries the release
- * version and the license file.
+ * Every package installed under `nodeModulesDir`, nested ones included. A KiCI
+ * package (named in `workspaceDirs`) is described from its workspace, whose
+ * manifest carries the release version and the license file.
  *
  * @param {string} nodeModulesDir
  * @param {Map<string, string>} workspaceDirs package name → workspace directory
@@ -399,22 +395,19 @@ export function archiveCheckPaths(entries, dirName) {
 }
 
 /**
- * The packages whose code an archive carries, read from the archive itself:
- * the `//#region <module>` marker rolldown writes before each module in a
- * bundle, and the manifests under the package's node_modules. It does not use
- * the list the notices were written from, so it catches a package that list
- * missed. The limit: rolldown writes no marker for a CommonJS module it inlines
- * into another module's region, so a package whose code is only inlined that
- * way is not seen here. A bundle module in no known package is a problem, and
- * so is a bundle with no marker, whose module list cannot be read.
+ * The packages whose code an archive carries, read from the archive itself —
+ * rolldown's `//#region <module>` markers and the node_modules manifests — not
+ * from the list the notices were written from, so it catches what that list
+ * missed. Limit: rolldown writes no marker for a CommonJS module inlined into
+ * another module's region, so code inlined only that way is unseen. A module
+ * in no known package, and a bundle with no marker, are problems.
  *
  * @param {{ archive: { entries: Set<string>, files: Map<string, Buffer> },
  *   dirName: string, root: string, virtualPackages: Record<string, string>,
  *   workspaceVersions: Map<string, string> }} opts
- *   `root` is the directory the bundler ran in, which region paths are
- *   relative to; `virtualPackages` maps a generated-module prefix to the
- *   `name@version` that generates it; `workspaceVersions` maps a KiCI package
- *   name to the release version.
+ *   `root` is the bundler's working directory, which region paths are relative
+ *   to; `virtualPackages` maps a generated-module prefix to its generator's
+ *   `name@version`; `workspaceVersions` maps a KiCI package to the release version.
  * @returns {{ keys: Set<string>, problems: string[] }}
  */
 export function archivePackageInventory({

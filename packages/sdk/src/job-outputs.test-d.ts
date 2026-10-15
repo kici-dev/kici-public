@@ -51,8 +51,8 @@ describe('Job<TOutputs> — merged-steps inference', () => {
       runsOn: 'kici:os:linux',
       steps: [step(async () => ({ x: 1 }))],
     });
-    // An id-less step contributes no typed key; the job stays loose so untyped
-    // cross-job reads keep compiling (Record<string, unknown>).
+    // An id-less step adds no typed key; the job stays loose, so untyped
+    // cross-job reads keep compiling.
     expectTypeOf(j.result.anything).toEqualTypeOf<unknown>();
   });
 
@@ -64,14 +64,12 @@ describe('Job<TOutputs> — merged-steps inference', () => {
   });
 });
 
-// Void run-shorthand jobs must be assignable into workflow({ jobs: [...] }).
-// Regression: Job.result lacked the void guard that Step.result has, so a
-// run: shorthand returning nothing inferred Job<void>, whose result collapsed
-// to `void` and was not assignable to OutputProxy<Record<string, unknown>>.
+// A void run-shorthand job is assignable into workflow({ jobs: [...] }): without
+// Step.result's void guard, Job<void>'s result collapses to `void`, which is not
+// assignable to OutputProxy<Record<string, unknown>>.
 describe('Job<void> — void run-shorthand assignability', () => {
   it('makes a void run-shorthand job assignable to JobOrFactory (inline)', () => {
-    // Inline form — the exact case from the bug report. The `void workflow(...)`
-    // statement is the assertion: it must type-check.
+    // The `void workflow(...)` statement is the assertion: it must type-check.
     void workflow('wf', {
       jobs: [
         job('setup', {
@@ -154,9 +152,8 @@ describe('typed ctx.needs from job references', () => {
   it('falls back to the loose open map when a group need is mixed in (no regression)', () => {
     job('mixed', {
       runsOn: 'kici:os:linux',
-      // A group ref cannot be keyed by a literal name; mixing it with a typed job
-      // ref must NOT drop the group's key — the whole map stays loosely open so
-      // both `ctx.needs.ci` and `ctx.needs.shards` remain accessible.
+      // A group ref has no literal name, so mixing it in keeps the whole map
+      // loosely open: both `ctx.needs.ci` and `ctx.needs.shards` stay reachable.
       needs: [ci, dynamicGroup('shards')],
       run: async (ctx) => {
         expectTypeOf(ctx.needs.ci).not.toBeNever();

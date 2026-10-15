@@ -120,18 +120,15 @@ describe('jobStatusForwardSchema', () => {
   });
 
   it('accepts agentId and orchestratorId as optional nullable fields', () => {
-    // With both fields
     const withBoth = jobStatusForwardSchema.parse(validJobStatus);
     expect(withBoth.agentId).toBe('scaler-container-abc123');
     expect(withBoth.orchestratorId).toBe('orch-node1-deadbeef');
 
-    // Without both fields
     const { agentId, orchestratorId, ...withoutIds } = validJobStatus;
     const parsed = jobStatusForwardSchema.parse(withoutIds);
     expect(parsed.agentId).toBeUndefined();
     expect(parsed.orchestratorId).toBeUndefined();
 
-    // With null values
     const withNulls = jobStatusForwardSchema.parse({
       ...validJobStatus,
       agentId: null,
@@ -302,14 +299,12 @@ describe('stateReplaySchema', () => {
   });
 
   it('accepts jobs with optional agentId', () => {
-    // With agentId
     const parsed = stateReplaySchema.parse(validStateReplay);
     expect(parsed.runs[0].jobs[0].agentId).toBe('scaler-container-abc123');
 
-    // Without agentId (second job in fixture)
+    // The fixture's second job has no agentId.
     expect(parsed.runs[0].jobs[1].agentId).toBeUndefined();
 
-    // With null agentId
     const withNull = stateReplaySchema.parse({
       ...validStateReplay,
       runs: [

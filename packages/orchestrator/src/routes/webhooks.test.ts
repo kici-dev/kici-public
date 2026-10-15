@@ -11,8 +11,7 @@ function createMockDeps(
       getByOrgAndName: vi.fn().mockResolvedValue(null),
       checkIdempotency: vi.fn().mockResolvedValue(false),
     } as any,
-    // The route no longer dedups; the pipeline (behind onWebhook) owns the
-    // atomic dedup claim. The default onWebhook reports a processed delivery.
+    // The pipeline (behind onWebhook) owns the atomic dedup claim, not the route.
     onWebhook: vi.fn().mockResolvedValue(WebhookIngestOutcome.enum.processed),
     ...overrides,
   };
@@ -21,10 +20,8 @@ function createMockDeps(
 describe('generic webhook routes', () => {
   describe('payload size check', () => {
     it('rejects payloads exceeding max_payload_bytes using byte length', async () => {
-      // Multi-byte character: U+1F600 (😀) = 4 bytes in UTF-8, but only 2 JS chars (surrogate pair)
-      // Craft a payload with multi-byte chars that exceeds byte limit but not char count
+      // Over the byte limit but under it in chars (surrogate pairs).
       const emoji = '😀'; // 4 bytes UTF-8, 2 chars in JS
-      // Create payload of 60 emojis: 120 JS chars, but 240 UTF-8 bytes
       const body = emoji.repeat(60);
       const bodyByteLength = Buffer.byteLength(body, 'utf-8'); // 240 bytes
       expect(body.length).toBe(120); // JS char count < 200
@@ -63,8 +60,7 @@ describe('generic webhook routes', () => {
         headers: { 'Content-Type': 'text/plain' },
       });
 
-      // Should be rejected (413) because byte length (240) exceeds limit (200),
-      // even though char count (120) is under the limit
+      // 240 bytes > 200-byte limit, though 120 chars is under it.
       expect(res.status).toBe(413);
       const json = await res.json();
       expect(json.reason).toBe('Payload too large');
@@ -107,7 +103,6 @@ describe('generic webhook routes', () => {
         },
       });
 
-      // Should not be 413 (payload is well under limit)
       expect(res.status).not.toBe(413);
     });
   });
@@ -155,7 +150,6 @@ describe('generic webhook routes', () => {
 
       const app = createGenericWebhookRoutes(deps);
 
-      // Send webhook to source A with idempotency key "shared-key-123"
       const resA = await app.request('http://localhost/webhook/org-1/generic/source-a', {
         method: 'POST',
         body: JSON.stringify({ data: 'from-a' }),
@@ -167,7 +161,7 @@ describe('generic webhook routes', () => {
       });
       expect(resA.status).toBe(202);
 
-      // Send webhook to source B with the SAME idempotency key
+      // Source B, SAME idempotency key.
       const resB = await app.request('http://localhost/webhook/org-1/generic/source-b', {
         method: 'POST',
         body: JSON.stringify({ data: 'from-b' }),
@@ -178,10 +172,9 @@ describe('generic webhook routes', () => {
         },
       });
 
-      // Source B should also be accepted (202), not blocked as duplicate (200)
+      // 202, not a duplicate's 200.
       expect(resB.status).toBe(202);
 
-      // Both webhooks should have been processed
       expect(deps.onWebhook).toHaveBeenCalledTimes(2);
     });
 
@@ -439,12 +432,9 @@ describe('generic webhook routes', () => {
       expect(captured[0].routingKey).toBe('generic:org-1:stripe-events');
     });
 
-    // Regression coverage for WARNING 9: server.ts onWebhookRelay must
-    // resolve provider from the registered bundle (not blindly cast the
-    // routing-key prefix). The relay path is exercised through the
-    // ProviderRegistry — register a stub github bundle and confirm the
-    // resolved provider is 'github'. This protects the legacy github
-    // routing flow while we add bundle-first resolution for local sources.
+    // server.ts onWebhookRelay must resolve the provider from the registered
+    // bundle, not blindly cast the routing-key prefix; this pins the github
+    // routing flow alongside bundle-first resolution for local sources.
     it('onWebhookRelay github:* routing key resolves provider via registered github bundle', async () => {
       const { ProviderRegistry } = await import('../provider-registry.js');
       const registry = new ProviderRegistry();
@@ -547,14 +537,10 @@ describe('generic webhook routes', () => {
   });
   describe('acknowledgement timing', () => {
     /**
-     * The behaviour this whole change exists for: the response must not wait
-     * for the match-and-dispatch pipeline.
-     *
-     * The route is wired to the REAL accept seam here rather than a stub, with
-     * a pipeline that never resolves on its own. Against the previous
-     * await-the-pipeline wiring the request never completes, which is
-     * exactly the production failure — a provider abandons the delivery at 10
-     * seconds while a matched workflow's build phase is capped at 600.
+     * The response must not wait for the match-and-dispatch pipeline: a
+     * provider abandons a delivery at 10 seconds while a build phase is capped
+     * at 600. Wired to the REAL accept seam, not a stub, with a pipeline that
+     * never resolves on its own, so an await-the-pipeline wiring never completes.
      */
     it('responds while the pipeline is still running', async () => {
       const source = {

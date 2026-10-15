@@ -4,10 +4,7 @@ import type { Role } from '../secrets/rbac.js';
 import { RbacEnforcer } from '../secrets/rbac.js';
 import { SecretScopeExistsError, SecretScopeNotFoundError } from '../secrets/pg-secret-store.js';
 
-/**
- * Create mock admin route dependencies.
- * All methods are vi.fn() stubs for isolated testing.
- */
+/** Every method is a vi.fn() stub. */
 function createMockDeps(overrides?: Partial<AdminRouteDeps>): AdminRouteDeps {
   return {
     tokenManager: {
@@ -61,7 +58,7 @@ async function request(
     init.body = JSON.stringify(opts.body);
   }
 
-  // Paths starting with / are absolute, otherwise prepend admin prefix
+  // A path starting with /../ escapes the admin prefix; every other path gets it.
   const url = path.startsWith('/../')
     ? `http://localhost${path.slice(3)}`
     : `http://localhost/api/v1/admin${path}`;
@@ -77,7 +74,6 @@ describe('admin routes', () => {
     deps = createMockDeps();
     app = createAdminRoutes(deps);
 
-    // Default: validate returns owner role
     (deps.tokenManager.validate as any).mockResolvedValue({
       id: 'user-1',
       role: 'owner' as Role,
@@ -423,8 +419,7 @@ describe('admin routes', () => {
     });
 
     it('DELETE /secrets/:orgId/:scope/:key still accepts a colon-bearing key', async () => {
-      // A secret stored before this rule must stay deletable — that asymmetry
-      // is what keeps existing data reachable.
+      // A secret stored before this rule stays deletable, keeping old data reachable.
       (deps.secretStore.deleteSecret as any).mockResolvedValue(undefined);
       const res = await request(app, 'DELETE', '/secrets/org-1/aws%2Fprod/c%3Ad', {
         token: validToken,
@@ -565,11 +560,10 @@ describe('admin routes', () => {
     });
 
     it('routes pg: to the CONFIGURED store, never the registry-built one', async () => {
-      // The registry synthesizes its own PgSecretStore for the default `pg`
-      // row — one with customerSecretsEnabled defaulted to true, key version
-      // hardcoded to 1, and no old-master-key fallback. Routing `pg:<path>`
-      // there would bypass the operator's pgCustomerSecrets toggle and make
-      // `pg:x` behave differently from `x`.
+      // The registry's own PgSecretStore for the default `pg` row defaults
+      // customerSecretsEnabled to true, hardcodes key version 1, and has no
+      // old-master-key fallback; routing `pg:<path>` there would bypass the
+      // pgCustomerSecrets toggle and make `pg:x` differ from `x`.
       const registryPgStore = {
         listScopes: vi.fn(),
         listKeys: vi.fn(),
@@ -877,7 +871,6 @@ describe('admin routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.tokens).toHaveLength(2);
-      // Verify no hash field is present
       for (const t of body.tokens) {
         expect(t).not.toHaveProperty('token_hash');
         expect(t).toHaveProperty('tokenPrefix');
@@ -967,9 +960,8 @@ describe('admin routes', () => {
         disconnectByTokenId: vi.fn().mockReturnValue(1),
       };
 
-      // No `broadcastAgentTokenRevoke` -- standalone deployments don't have a
-      // peer fabric. The local kick is sufficient and the route must still
-      // return 200 with the kicked count.
+      // No `broadcastAgentTokenRevoke`: standalone has no peer fabric, and the
+      // local kick still returns 200 with the kicked count.
       const depsWithTokens = createMockDeps({
         tokenStore: mockTokenStore as any,
         agentRegistry: mockAgentRegistry as any,
@@ -1020,14 +1012,11 @@ describe('admin routes', () => {
       expect(res.status).toBe(404);
       const body = await res.json();
       expect(body.error).toBe('Agent token not found or already revoked');
-      // Verify list() is NOT called (no longer needed to distinguish 404 vs 409)
+      // list() is not needed to distinguish 404 from 409.
       expect(mockTokenStore.list).not.toHaveBeenCalled();
-      // Kick path must NOT run when the DB row was already revoked /
-      // missing -- there is no token to "kick" and the count would be
-      // misleading.
+      // No kick for an already-revoked / missing row: the count would mislead.
       expect(mockAgentRegistry.disconnectByTokenId).not.toHaveBeenCalled();
-      // Same for the cross-peer fan-out: a 404 means the row was never
-      // revoked here, so there is no event to broadcast.
+      // Nor a cross-peer fan-out: a 404 means nothing was revoked here.
       expect(broadcastAgentTokenRevoke).not.toHaveBeenCalled();
     });
 
@@ -1052,8 +1041,7 @@ describe('admin routes', () => {
         token: validToken,
       });
       expect(res.status).toBe(503);
-      // Token store revoke MUST NOT run -- a 204 / 200 with no kick path
-      // would silently regress the fix.
+      // Revoke MUST NOT run: a 204 / 200 with no kick path is a silent revoke.
       expect(mockTokenStore.revoke).not.toHaveBeenCalled();
     });
   });
@@ -1218,14 +1206,12 @@ describe('admin routes', () => {
     });
   });
 
-  // A scope is a single already-decoded Hono path param. The handler must NOT
-  // decode it a second time — a second decode throws a URIError (500) when the
-  // literal scope carries a stray `%`. `validateScopeName` restricts scope
-  // segments to [A-Za-z0-9_.-], so a `%`-bearing scope can never be created;
-  // the fix here turns a 500 on client-controlled input into a clean structured
-  // response, and is not an exploitable wrong-scope mutation for valid scopes.
-  // The sibling PUT /secrets/:orgId/:scope/:key route already reads the param
-  // plain — that is the shape this route now matches.
+  // A scope is an already-decoded Hono path param; a second decode throws a
+  // URIError (500) on a stray `%`. `validateScopeName` restricts segments to
+  // [A-Za-z0-9_.-], so a `%`-bearing scope can never be created: decoding once
+  // turns a 500 on client input into a structured response, and was never an
+  // exploitable wrong-scope mutation for valid scopes. Same shape as the sibling
+  // PUT /secrets/:orgId/:scope/:key route.
   describe('scope path param is decoded exactly once (no double-decode)', () => {
     it('DELETE scope forwards a literal-% scope verbatim (was a 500)', async () => {
       // URL segment `100%25done` decodes (once, by Hono) to the literal `100%done`.

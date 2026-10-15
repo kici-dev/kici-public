@@ -1,27 +1,23 @@
 /**
- * Tests for the `/api/v1/admin/held-runs` admin routes — the local
- * (`kici-admin`) answer to a held run.
+ * `/api/v1/admin/held-runs`: the local (`kici-admin`) answer to a held run.
+ * Each property is asserted against the REAL `applyDecision` applier and the
+ * REAL `RbacEnforcer`, not a stub:
  *
- * Four load-bearing properties, each asserted against the REAL `applyDecision`
- * applier and the REAL `RbacEnforcer` rather than a stub:
- *
- * 1. **The Platform-attached refusal.** It is server-side and covers BOTH the
- *    read and the decision, so a caller hitting the API directly cannot answer
- *    a hold the Platform's own held-run trust gate never authorized.
- * 2. **A release actually dispatches.** The assertions are on the resume
- *    callback firing with the hold's own run and job, never on the row having
- *    changed — a release path that flips the row and dispatches nothing looks
- *    identical from the row.
+ * 1. **The Platform-attached refusal** is server-side and covers BOTH the read
+ *    and the decision, so a direct API caller cannot answer a hold the
+ *    Platform's own held-run trust gate never authorized.
+ * 2. **A release actually dispatches.** Assertions are on the resume callback
+ *    firing with the hold's run and job, never on the row: a release that flips
+ *    the row and dispatches nothing looks identical from the row.
  * 3. **The approver subject is the token's, namespaced.** No request field can
  *    name who the approval is attributed to, so `held_run_approvals` cannot
  *    record a person the operator merely typed.
- * 4. **A step-scoped hold is refused**, because approving one here would leave
- *    its agent waiting with the row out of the stale detector's reach.
+ * 4. **A step-scoped hold is refused**: approving one here would leave its
+ *    agent waiting with the row out of the stale detector's reach.
  *
- * The harness mounts the routes under an OUTER Hono app whose middleware seeds
- * `role` BEFORE the handlers run, matching `admin-trust-policy.test.ts`:
- * seeding on the same instance the handlers are registered on runs the
- * middleware too late, and stubbing the enforcer would make every permission
+ * The routes mount under an OUTER Hono app whose middleware seeds `role` BEFORE
+ * the handlers run (as in `admin-trust-policy.test.ts`): seeding on the same
+ * instance runs too late, and stubbing the enforcer would make every permission
  * check a no-op.
  */
 import { describe, expect, it, vi } from 'vitest';
@@ -83,11 +79,9 @@ function makeHold(over: Partial<HeldRun> = {}): HeldRun {
 }
 
 /**
- * An in-memory held-run store that runs the real applier against real state.
- *
- * A `vi.fn()`-per-method stub would let every assertion below pass while the
- * hold stayed pending — the transition from `pending` is what makes the
- * applier's release arm run at all.
+ * In-memory store so the real applier runs against real state. A
+ * `vi.fn()`-per-method stub would pass every assertion while the hold stayed
+ * pending: the transition from `pending` is what makes the release arm run.
  */
 function makeStore(holds: HeldRun[]) {
   const decisions: HeldRunApproval[] = [];
@@ -155,11 +149,9 @@ interface DbRows {
 }
 
 /**
- * A query-builder fake that answers per TABLE rather than per predicate.
- *
- * Deliberately predicate-blind: the org / run scoping of these two reads lives
- * in SQL the real Kysely builder emits, so a fake that pretended to apply
- * `.where(...)` would assert its own filtering rather than the route's.
+ * Answers per TABLE, deliberately predicate-blind: the org / run scoping lives
+ * in SQL the real Kysely builder emits, so a fake applying `.where(...)` would
+ * assert its own filtering rather than the route's.
  */
 function makeDb(rows: DbRows): Kysely<Database> {
   const builder = (table: keyof DbRows) => {
@@ -239,14 +231,11 @@ function makeApp(opts: {
   return {
     app,
     /**
-     * POST a decision AND let its post-commit consequence run.
-     *
-     * The route answers at the durable record and runs the resume / reject
-     * delegate afterwards (see `ApplyDecisionResult.consequence`), so a
-     * side-effect assertion cannot read the effect off the answer. Every mock in
-     * this harness settles on the microtask queue with no timer or I/O in it, so
-     * yielding one macrotask turn drains the whole chain — deterministically,
-     * not by racing it.
+     * POSTs a decision AND lets its post-commit consequence run. The route
+     * answers at the durable record and runs the resume / reject delegate
+     * afterwards (`ApplyDecisionResult.consequence`). Every mock here settles on
+     * the microtask queue with no timer or I/O, so one macrotask turn drains the
+     * whole chain deterministically.
      */
     request: async (body: Record<string, unknown>): Promise<Response> => {
       const res = await app.request('/held-runs/decision', decide(body));
@@ -284,8 +273,7 @@ describe('admin held-run routes', () => {
         const res = await h.request(approveBody);
         expect(res.status).toBe(409);
         expect((await res.json()).error).toBe(PLATFORM_MANAGED_HELD_RUN_MESSAGE);
-        // The refusal is BEFORE the applier, so nothing was recorded and — the
-        // part that matters — nothing was dispatched.
+        // The refusal is BEFORE the applier: nothing recorded, nothing dispatched.
         expect(h.holds[0].status).toBe(HeldRunStatus.Pending);
         expect(h.decisions).toHaveLength(0);
         expect(h.onJobRelease).not.toHaveBeenCalled();
@@ -390,8 +378,7 @@ describe('admin held-run routes', () => {
 
     it('records the approval under the token’s own namespaced subject', async () => {
       const h = makeApp({ userId: 'ops-token' });
-      // A caller-supplied identity is not a field the schema has, so it is
-      // dropped: the recorded approver can only ever be the token.
+      // The schema has no identity field, so these are dropped.
       await h.request({ ...approveBody, actorSub: 'alice', approverSub: 'alice' });
       expect(h.decisions).toHaveLength(1);
       expect(h.decisions[0].approver_user_id).toBe(adminActorSub('ops-token'));
@@ -530,7 +517,7 @@ describe('admin held-run routes', () => {
   });
 
   // Without `--as` the approver subject is `service:<token>`, which satisfies
-  // neither a `{user}` clause nor a `{team}` membership — so a clause-bearing
+  // neither a `{user}` clause nor a `{team}` membership, so a clause-bearing
   // hold on an independent orchestrator could only expire.
   describe('answering as a registered member (--as)', () => {
     const userClauseHold = () =>
@@ -574,9 +561,9 @@ describe('admin held-run routes', () => {
       expect(h.onJobRelease).toHaveBeenCalledTimes(1);
     });
 
-    // The flag is a subject, so an unvalidated one would satisfy any clause by
-    // naming it. `mallory` is not in the directory even though the clause names
-    // her, so the refusal cannot be the clause failing to match.
+    // An unvalidated subject would satisfy any clause by naming it. The clause
+    // names `mallory` but the directory does not, so the refusal cannot be the
+    // clause failing to match.
     it('refuses an id the approval directory does not carry, and dispatches nothing', async () => {
       const h = makeApp({
         members: { alice: 'write' },
@@ -693,9 +680,8 @@ describe('admin held-run routes', () => {
     });
 
     it('answers before a slow resume finishes, then audits what the resume did', async () => {
-      // The defect this closes lives one surface over — the Platform relay's
-      // ten-second budget — but the shape is this route's too: an answer that
-      // waits for the resume is an answer whose latency is the dispatch's.
+      // An answer that waits for the resume takes the dispatch's latency (on the
+      // Platform relay surface that breaks its ten-second budget).
       let releaseResume: (() => void) | undefined;
       const h = makeApp({
         userId: 'ops-token',
@@ -712,8 +698,8 @@ describe('admin held-run routes', () => {
       const res = await h.request(approveBody);
       expect(res.status).toBe(200);
       expect((await res.json()).status).toBe('released');
-      // Answered while the resume is still in flight, and nothing was audited
-      // yet — the entry belongs to the outcome, not to the answer.
+      // Answered mid-resume, with nothing audited yet: the entry belongs to the
+      // outcome, not to the answer.
       expect(releaseResume).toBeDefined();
       expect(h.auditRows.find((r) => r.action === 'held_run.approve')).toBeUndefined();
 
@@ -726,10 +712,9 @@ describe('admin held-run routes', () => {
     });
 
     it('audits a resume that FAILED as an error, so a stranded release is not silent', async () => {
-      // Where a failed resume surfaces for an operator: one `held_run.approve`
-      // row, outcome `error`, carrying the failure message — readable with
-      // `kici-admin access-log`. The approval itself still landed, because it
-      // was durable before the resume was ever attempted.
+      // A failed resume surfaces as one `held_run.approve` row, outcome `error`,
+      // with the failure message (`kici-admin access-log`). The approval itself
+      // still landed: it was durable before the resume was attempted.
       const h = makeApp({
         userId: 'ops-token',
         release: { onJobRelease: vi.fn().mockRejectedValue(new Error('dispatcher exploded')) },
@@ -742,8 +727,7 @@ describe('admin held-run routes', () => {
       const row = h.auditRows.find((r) => r.action === 'held_run.approve');
       expect(row).toMatchObject({ outcome: 'error' });
       expect(row?.errorMessage).toContain('dispatcher exploded');
-      // The control: a resume that works is audited `allowed`, so `error` above
-      // is the failure and not this route's only rendering.
+      // Control: a working resume is audited `allowed`.
       const ok = makeApp({ userId: 'ops-token' });
       await ok.request(approveBody);
       expect(ok.auditRows.find((r) => r.action === 'held_run.approve')).toMatchObject({
@@ -797,10 +781,10 @@ describe('admin held-run routes', () => {
 
 describe('the self-approval gate is live on this surface', () => {
   it('writes the triggerer subject in the same vocabulary the approver subject uses', () => {
-    // The property, stated against the REAL producer of `triggered_by`: a
-    // service-account trigger and this route's own subject must compare equal.
-    // The bare-strip transform every other caller applies yields `ops-token`,
-    // which never equals `service:ops-token` — so the gate would be inert.
+    // Against the REAL producer of `triggered_by`: a service-account trigger and
+    // this route's subject must compare equal. The bare-strip transform other
+    // callers apply yields `ops-token`, never `service:ops-token`, so the gate
+    // would be inert.
     const triggeredBy = stringifyActor({ type: 'service_account', id: 'ops-token' });
     expect(triggererSubjectFor(triggeredBy)).toBe(adminActorSub('ops-token'));
     expect(triggererSubjectFor(triggeredBy)).not.toBe('ops-token');
@@ -830,8 +814,7 @@ describe('the self-approval gate is live on this surface', () => {
   });
 
   it('allows the same token when the org left self-approval on, so the refusal is the setting', async () => {
-    // The positive control: identical fixture, only `allow_self_approval`
-    // differs. Without it the refusal above could come from anything.
+    // Positive control: identical fixture, only `allow_self_approval` differs.
     const h = makeApp({
       userId: 'ops-token',
       dbRows: {

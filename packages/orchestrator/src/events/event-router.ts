@@ -148,8 +148,7 @@ export interface EventRouterOptions {
 /**
  * EventRouter delivers internal events to matching workflows via PostgreSQL LISTEN/NOTIFY.
  *
- * Follows the WebhookSecretManager pattern: raw pg.PoolClient for LISTEN,
- * Kysely for queries.
+ * Uses a raw pg.PoolClient for LISTEN and Kysely for queries.
  *
  * On start, performs a catch-up scan for events missed during downtime.
  * On notification, leases the event from DB, matches against registered
@@ -324,13 +323,11 @@ export class EventRouter {
   async emitInTx(event: EmitEventInput, tx: Transaction<Database>): Promise<string> {
     const chainDepth = event.chainDepth ?? 0;
 
-    // Check circuit breaker -- chain depth
     const depthCheck = this.circuitBreaker.checkChainDepth(chainDepth);
     if (!depthCheck.allowed) {
       throw new Error(`Circuit breaker tripped: ${depthCheck.reason}`);
     }
 
-    // Check circuit breaker -- rate limit.
     // System events (`__`- or `kici.`-prefixed) are orchestrator-emitted and
     // cannot loop, so the event-storm rate limiter (a guard for user ctx.emit)
     // does not apply — see isRateExemptEventName. User events are keyed per
@@ -346,7 +343,7 @@ export class EventRouter {
       }
     }
 
-    // Persist event. TTL is a fleet-wide cluster tunable (live override wins).
+    // TTL is a fleet-wide cluster tunable (live override wins).
     const ttlSeconds =
       (await this.clusterSettings?.getNumber(
         'event_router_event_ttl_seconds',
@@ -527,7 +524,6 @@ export class EventRouter {
     });
     const simulatedEvent = this.buildSimulatedEvent(event);
 
-    // Map stored event to trigger type for index lookup
     const triggerType = this.eventToTriggerType(event);
     let registrations = this.registrationIndex.getByEventType(triggerType);
 
@@ -570,7 +566,6 @@ export class EventRouter {
       }
     }
 
-    // Filter by target repos when cross-repo targeting is specified.
     // If the event has targetRepos, only deliver to registrations whose repo matches.
     if (event.targetRepos && event.targetRepos.length > 0) {
       const targetSet = new Set(event.targetRepos);
@@ -589,15 +584,13 @@ export class EventRouter {
     let dispatched = 0;
     let buffered = false;
     let blocked = false;
-    // Group registrations by customer for trust boundary checks
     for (const reg of registrations) {
-      // Cross-customer trust check: if event is from a different customer, verify trust.
+      // Cross-repo trust check: if the event comes from another repo, verify trust.
       // When using registrations, the trust boundary is customer-scoped (not routing-key-scoped).
-      // For now, we use a simple source routing key comparison; same source routing key = same customer trust.
+      // Cross-customer trust would compare the source routing key with every routing key of the
+      // registered workflow's customer; for simplicity, the check compares repos and passes an
+      // empty target routing key.
       if (event.sourceRoutingKey) {
-        // Derive a representative routing key for the registration's customer.
-        // Cross-customer trust is checked when source routing key differs from any routing key
-        // associated with the registered workflow's customer. For simplicity, compare repos.
         if (event.sourceRepo && event.sourceRepo !== reg.repoIdentifier) {
           const trusted = await this.trustStore.isTrusted(
             event.sourceRepo,
@@ -621,7 +614,6 @@ export class EventRouter {
 
       const syntheticLockFile = registrationLockFile(reg);
 
-      // Match against the registered workflow
       const decisions = matchAllWorkflows(syntheticLockFile.workflows, simulatedEvent);
       const matchedDecisions = decisions.filter((d) => d.matched);
       if (matchedDecisions.length === 0) continue;

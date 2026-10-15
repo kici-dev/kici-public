@@ -85,7 +85,6 @@ describe('SourceStore', () => {
         privateKey: 'key',
       });
 
-      // Verify the values passed to insertInto contain routing_key
       const valuesCall = mocks.insertValues.mock.calls[0][0];
       expect(valuesCall.routing_key).toBe('github:99999');
     });

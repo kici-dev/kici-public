@@ -3,10 +3,9 @@
  *
  * A job binds an ordered list of contexts: the workflow-level names
  * (`LockWorkflow.contexts`) first, then its own (`LockJob.contexts`). This
- * module resolves that list into concrete context names (static values
- * verbatim; every dynamic element is resolved by the agent's init job) and
- * folds the per-context secrets/variables last-wins. It keeps the heavy fold logic
- * out of `dispatchMatchedWorkflow`, which must stay under the function-length cap.
+ * module resolves that list (dynamic elements via the agent's init job) and
+ * folds per-context secrets/variables last-wins, keeping that fold out of
+ * `dispatchMatchedWorkflow`, which must stay under the function-length cap.
  */
 import {
   mergeOrderedMaps,
@@ -19,17 +18,15 @@ import type { SecretResolverApi } from '../secrets/secret-resolver.js';
 import type { VariableStore } from '../contexts/variable-store.js';
 
 /**
- * Placeholder written into the persisted bound-env list for a dynamic element
- * the orchestrator does not resolve at dispatch. The agent's init eval later
- * overwrites the list with the resolved name.
+ * Persisted bound-env placeholder for a dynamic element; the agent's init eval
+ * later overwrites it with the resolved name.
  */
 export const DYNAMIC_ENV_PLACEHOLDER = '(dynamic)';
 
-/** Ordered resolved context names plus whether any element still needs agent init. */
 export interface ResolvedJobContexts {
   /** Resolved static names, in order. */
   names: string[];
-  /** True when a dynamic element must be resolved by an agent init job. */
+  /** A dynamic element must be resolved by an agent init job. */
   needsInit: boolean;
 }
 
@@ -37,14 +34,12 @@ export interface ResolvedJobContexts {
 export type ContextRef = NonNullable<LockJob['contexts']>[number];
 
 /**
- * The ordered context elements a job binds: the workflow-level names first,
- * then the job's own. Placing the workflow names first means a job-level
- * context wins a key collision, since later contexts override earlier ones.
+ * The ordered context elements a job binds: workflow-level names first, so a
+ * job-level context wins a key collision.
  *
- * A workflow-level name the job also binds statically is dropped from the
- * workflow part, so each context is gated and resolved once, at the job's own
- * position. Every gating site reads its names through this function, so a
- * workflow-level context passes the same gates a job-level one does.
+ * A workflow-level name the job also binds statically is dropped, so each
+ * context is gated and resolved once, at the job's position. Every gating site
+ * reads through this function, so workflow-level contexts pass the same gates.
  */
 export function effectiveContextRefs(
   workflow: Pick<LockWorkflow, 'contexts'>,
@@ -58,11 +53,7 @@ export function effectiveContextRefs(
   return [...inherited, ...own];
 }
 
-/**
- * Resolve the ordered bound-context names from a lock job and its workflow. Static elements
- * use their value verbatim; a dynamic element is resolved by the agent's init
- * job and flags `needsInit`.
- */
+/** Static elements use their value verbatim; a dynamic element flags `needsInit`. */
 export function resolveJobContextNames(
   workflow: Pick<LockWorkflow, 'contexts'>,
   lockJob: Pick<LockJob, 'contexts'>,
@@ -74,20 +65,15 @@ export function resolveJobContextNames(
       names.push(e.value);
       continue;
     }
-    // A dynamic element is resolved by the agent init job.
     needsInit = true;
   }
   return { names, needsInit };
 }
 
 /**
- * Build the ordered bound-context display list for persistence at dispatch.
- * Unlike {@link resolveJobContextNames}, this never drops an unresolved
- * element: a static element uses its value, and any dynamic element (which the
- * orchestrator no longer resolves at dispatch) becomes the `(dynamic)`
- * placeholder — so the persisted column reflects every declared slot in order.
- * The deferred-init flow-back overwrites the placeholder once the agent
- * resolves the name. Returns an empty array when the job binds no context.
+ * Build the ordered bound-context display list persisted at dispatch. Unlike
+ * {@link resolveJobContextNames}, a dynamic element becomes the `(dynamic)`
+ * placeholder rather than being dropped, so every declared slot is kept in order.
  */
 export function buildJobContextDisplayNames(
   workflow: Pick<LockWorkflow, 'contexts'>,
@@ -106,14 +92,10 @@ export interface MultiEnvMergedData {
 }
 
 /**
- * Resolve and fold variables + secrets across the ordered list of matched
- * contexts, last-wins. Each context is resolved with the existing
- * single-env logic (longest-scope-path-wins preserved within each context),
- * then folded in array order so a later context overrides an earlier key.
- * Secrets are also returned namespaced per context so qualified
- * `<env>:<secret>` references still resolve. `entries` carries the matched
- * `Context` for each name (in order); variables and secrets both resolve by the
- * matched context's id, so a glob context contributes what its own row holds.
+ * Resolve and fold variables + secrets across the matched contexts, last-wins
+ * (longest-scope-path-wins within each context). Secrets are also returned
+ * namespaced per context so qualified `<env>:<secret>` references resolve. Both
+ * resolve by the matched row's id, so a glob context contributes its own row.
  */
 export async function resolveMultiEnvMergedData(args: {
   deps: { variableStore?: VariableStore; secretResolver?: SecretResolverApi };

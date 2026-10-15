@@ -1,11 +1,6 @@
 /**
- * Inspect-bundle CLI command for kici-admin.
- *
- * Parses a previously-created debug bundle ZIP and displays a structured
- * summary with colorized output. Works fully offline -- no running
- * orchestrator or network access needed.
- *
- * Usage: kici-admin inspect-bundle <path>
+ * `kici-admin inspect-bundle <path>`: summarize a debug bundle ZIP. Fully
+ * offline: needs no running orchestrator or network.
  */
 
 import type { Command } from 'commander';
@@ -13,7 +8,6 @@ import { readDebugBundle, type BundleSummary } from '../../diagnostics/bundle-re
 import { formatBytes } from '@kici-dev/shared';
 import { cliAction } from './shared/cli-action.js';
 
-/** ANSI color codes for terminal output. */
 const COLORS = {
   green: '\x1b[32m',
   yellow: '\x1b[33m',
@@ -24,9 +18,6 @@ const COLORS = {
   bold: '\x1b[1m',
 } as const;
 
-/**
- * Colorize a check status string for terminal output.
- */
 function colorizeStatus(status: string): string {
   switch (status) {
     case 'pass':
@@ -40,18 +31,13 @@ function colorizeStatus(status: string): string {
   }
 }
 
-/**
- * Format and print a bundle summary to stdout.
- */
 function printSummary(summary: BundleSummary): void {
   const lines: string[] = [];
 
-  // Header
   lines.push('');
   lines.push(`${COLORS.bold}Debug bundle summary${COLORS.reset}`);
   lines.push('='.repeat(60));
 
-  // Manifest info
   lines.push('');
   lines.push(`${COLORS.cyan}Bundle info${COLORS.reset}`);
   lines.push(`  Generated:      ${summary.manifest.generated_at}`);
@@ -65,7 +51,6 @@ function printSummary(summary: BundleSummary): void {
   lines.push(`  Node:           ${summary.manifest.node_version}`);
   lines.push(`  Platform:       ${summary.manifest.platform}`);
 
-  // System info
   if (Object.keys(summary.systemInfo).length > 0) {
     lines.push('');
     lines.push(`${COLORS.cyan}System${COLORS.reset}`);
@@ -84,7 +69,6 @@ function printSummary(summary: BundleSummary): void {
     }
   }
 
-  // Health checks
   if (summary.checkResults.length > 0) {
     lines.push('');
     lines.push(`${COLORS.cyan}Health checks${COLORS.reset}`);
@@ -102,7 +86,6 @@ function printSummary(summary: BundleSummary): void {
       lines.push(`  ${status}  | ${name} | ${message} | ${duration}`);
     }
 
-    // Summary counts
     const passCount = summary.checkResults.filter((c) => c.status === 'pass').length;
     lines.push('');
     lines.push(
@@ -112,7 +95,6 @@ function printSummary(summary: BundleSummary): void {
     );
   }
 
-  // Log summary
   if (summary.logSummary) {
     lines.push('');
     lines.push(`${COLORS.cyan}Logs${COLORS.reset}`);
@@ -121,7 +103,6 @@ function printSummary(summary: BundleSummary): void {
     lines.push(`  Warnings:     ${summary.logSummary.warnings}`);
   }
 
-  // Config issues
   if (summary.configIssues.length > 0) {
     lines.push('');
     lines.push(`${COLORS.yellow}Config issues${COLORS.reset}`);
@@ -134,10 +115,7 @@ function printSummary(summary: BundleSummary): void {
   console.log(lines.join('\n'));
 }
 
-/**
- * Register the inspect-bundle command on the CLI program.
- * No getClient needed -- this command works fully offline.
- */
+/** Takes no getClient: the command works offline. */
 export function registerInspectBundleCommand(program: Command): void {
   program
     .command('inspect-bundle <path>')

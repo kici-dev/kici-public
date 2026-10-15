@@ -41,10 +41,10 @@ describe('LogMasker', () => {
 
   it('masks longer values before shorter ones (prevents partial masks)', () => {
     const masker = new LogMasker();
-    // 'abc' is a substring of 'abcdef'. The longer value should be masked first.
+    // 'abc' is a substring of 'abcdef'; the longer value must mask first.
     masker.registerSecrets({ LONG: 'abcdef', SHORT: 'abc' });
 
-    // 'abcdef' should be fully masked, not partially masked to '***def'
+    // Not partially masked to '***def'.
     expect(masker.mask('secret: abcdef')).toBe('secret: ***');
   });
 
@@ -76,7 +76,6 @@ describe('LogMasker', () => {
 
   it('deduplicates identical secret values', () => {
     const masker = new LogMasker();
-    // Two keys with the same value should not cause issues
     masker.registerSecrets({ KEY1: 'sameval', KEY2: 'sameval' });
 
     expect(masker.mask('value: sameval')).toBe('value: ***');
@@ -126,15 +125,15 @@ describe('LogMasker', () => {
       const masker = new LogMasker();
       masker.registerSecrets({ SHORT: 'ab' });
 
-      // 'ab' is < 3 chars, so it's skipped entirely (no raw, no base64)
+      // Under 3 chars: skipped entirely, raw and base64.
       expect(masker.hasSecrets()).toBe(false);
-      // Buffer.from('ab').toString('base64') === 'YWI=' -- should NOT be masked
+      // base64('ab') === 'YWI=', must NOT be masked.
       expect(masker.mask('encoded: YWI=')).toBe('encoded: YWI=');
     });
 
     it('deduplicates base64 variants across secrets', () => {
       const masker = new LogMasker();
-      // Two secrets with the same value produce the same base64 -- no regex error
+      // Same value, same base64: no regex error.
       masker.registerSecrets({ KEY1: 'sameval', KEY2: 'sameval' });
 
       const b64 = Buffer.from('sameval').toString('base64');
@@ -147,7 +146,7 @@ describe('LogMasker', () => {
       masker.registerSecrets({ TOKEN: 'my>secret' });
 
       expect(masker.mask('encoded: bXk+c2VjcmV0')).toBe('encoded: ***');
-      // Raw value also masked (contains > which is not regex-special, but verifies both work)
+      // '>' is not regex-special; checks raw masking alongside base64.
       expect(masker.mask('raw: my>secret')).toBe('raw: ***');
     });
 
@@ -155,10 +154,8 @@ describe('LogMasker', () => {
       const masker = new LogMasker();
       masker.registerSecrets({ CLONE_TOKEN: 'ghp_abc123xyz' });
 
-      // Raw token is masked
       expect(masker.mask('Authorization: token ghp_abc123xyz')).toBe('Authorization: token ***');
 
-      // Base64 of the token value itself is also masked
       // Buffer.from('ghp_abc123xyz').toString('base64') === 'Z2hwX2FiYzEyM3h5eg=='
       expect(masker.mask('Encoded token: Z2hwX2FiYzEyM3h5eg==')).toBe('Encoded token: ***');
     });

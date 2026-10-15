@@ -37,8 +37,8 @@ describe('globalEvalRoundCacheKey', () => {
   });
 
   it('separates a push from a pull_request at identical shas', () => {
-    // The concrete wrong-hit the sha-only key allowed: a push to `main` at
-    // commit X and a PR synchronize whose head is commit X.
+    // The wrong-hit a sha-only key allows: a push to `main` at commit X and a
+    // PR synchronize whose head is commit X.
     expect(
       globalEvalRoundCacheKey({
         ...BASE,

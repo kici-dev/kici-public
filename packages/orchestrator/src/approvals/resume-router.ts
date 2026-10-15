@@ -1,7 +1,7 @@
 /**
  * Route a released hold to the resume path its shape requires.
  *
- * Extracted so the callers — the approve/reject applier, the stale detector's
+ * Shared so the callers — the approve/reject applier, the stale detector's
  * wait-timer sweep, and the `/kici approve|reject` comment handler — cannot
  * drift. The discrimination is scope AND trigger source: a workflow-scoped hold
  * raised by a policy resumes by rebuilding a workflow dispatch context, which
@@ -17,7 +17,7 @@
 import { HoldScope, TriggerSource } from '@kici-dev/engine';
 import type { ReleaseSignal } from '../contexts/held-runs.js';
 
-/** The three resume paths a released hold can take. */
+/** The resume paths a released hold can take. */
 export interface ResumeHandlers {
   onStepRelease?: (signal: ReleaseSignal) => Promise<void>;
   onWorkflowRelease?: (signal: ReleaseSignal) => Promise<void>;

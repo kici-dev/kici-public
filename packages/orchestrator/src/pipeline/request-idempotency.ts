@@ -4,17 +4,15 @@ import { sql } from 'kysely';
 import type { Database } from '../db/types.js';
 
 /**
- * Atomically claim a run-minting request by its Platform `requestId`. Returns
- * the run id to use. `claimed: false` means a sibling coordinator already owns
- * this requestId (a relay failover re-sent the same request): the caller MUST
- * return `{ newRunId }` WITHOUT creating or dispatching a run, so one user
- * click yields exactly one run.
+ * Atomically claim a run-minting request by its Platform `requestId`, returning
+ * the run id to use. `claimed: false` means a sibling coordinator owns it (a
+ * relay failover re-send): the caller MUST return `{ newRunId }` WITHOUT
+ * creating or dispatching a run, so one click yields exactly one run.
  *
- * Shared by `run.rerun.request` and `run.manual_schedule.request` — both mint a
- * fresh run and both ride the Platform's timeout-driven failover path. HA
- * coordinator siblings share one orchestrator DB, so the `INSERT … ON CONFLICT
- * (request_id) DO NOTHING` is the single point of arbitration: exactly one hop
- * inserts and wins; the loser reads back the winner's `new_run_id`.
+ * Used by `run.rerun.request` and `run.manual_schedule.request`, which both mint
+ * a run and ride the Platform's timeout-driven failover. HA siblings share one
+ * orchestrator DB, so `INSERT … ON CONFLICT (request_id) DO NOTHING` is the
+ * single arbiter; the loser reads back the winner's `new_run_id`.
  */
 export async function claimRequestId(
   db: Kysely<Database>,
@@ -27,9 +25,8 @@ export async function claimRequestId(
     .onConflict((oc) => oc.column('request_id').doNothing())
     .returning('new_run_id')
     .executeTakeFirst();
-  // A row came back only when our INSERT actually landed (no conflict). The
-  // returned id equals `candidate`; return `candidate` directly so the result
-  // does not depend on the driver echoing the RETURNING row.
+  // A row comes back only when the INSERT landed. Return `candidate` itself so
+  // the result does not depend on the driver echoing the RETURNING row.
   if (inserted) return { newRunId: candidate, claimed: true };
   const existing = await db
     .selectFrom('request_idempotency')
@@ -40,9 +37,8 @@ export async function claimRequestId(
 }
 
 /**
- * Prune `request_idempotency` rows older than 1h. The request budget is ~10s,
- * so a claimed requestId is never re-sent after an hour; keeping the table
- * bounded avoids unbounded growth on a long-lived coordinator.
+ * Prune `request_idempotency` rows older than 1h: the request budget is ~10s,
+ * so no claimed requestId is re-sent after an hour, and the table stays bounded.
  *
  * @returns the number of rows deleted.
  */

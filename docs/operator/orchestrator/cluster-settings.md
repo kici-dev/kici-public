@@ -19,8 +19,9 @@ environment variable — see the
 overrides that default at runtime; clearing it (`reset`) falls back to the
 default.
 
-One group is the exception to "on a live orchestrator": the six cache-sizing
-knobs (`--lockfile-cache-*` and `--content-cache-*`) are read once at boot and
+One group is the exception to "on a live orchestrator": the cache-sizing
+knobs (`--lockfile-cache-*`, `--content-cache-*` and `--global-eval-cache-max`)
+are read once at boot and
 [apply at the next orchestrator restart](#cache-knobs-apply-at-the-next-restart).
 Every other knob takes effect on the running process.
 
@@ -40,7 +41,7 @@ kici-admin cluster-settings reset
 
 Changes take effect within a short cache window (the orchestrator re-reads the
 row roughly every 10 seconds; tune with `KICI_CLUSTER_SETTINGS_CACHE_TTL_MS`) —
-except for the six cache-sizing knobs, which
+except for the cache-sizing knobs, which
 [apply at the next orchestrator restart](#cache-knobs-apply-at-the-next-restart).
 If the database is briefly unreachable, the orchestrator keeps using the
 built-in defaults rather than blocking, so a settings read never stalls a hot

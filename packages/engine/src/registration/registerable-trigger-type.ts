@@ -1,29 +1,21 @@
 import { z } from 'zod';
 
 /**
- * Trigger types whose owning workflows must be stored in workflow_registrations
- * so the orchestrator can resolve them from an index lookup instead of
- * re-fetching a lock file per inbound event.
- *
- * Two families live in this list:
+ * Trigger types whose owning workflows are stored in workflow_registrations, so
+ * the orchestrator resolves them by index lookup instead of re-fetching a lock
+ * file per inbound event.
  *
  *   1. Non-Git-provider triggers (kici_event, schedule, webhook, lifecycle, …)
- *      — these have no per-repo lock file pipeline to fall back to, so the
- *      registration index is the authoritative source for matching.
+ *      have no per-repo lock file pipeline, so the index is authoritative.
  *
- *   2. Git-provider triggers (push, pr, tag, release, …) — these ARE still
- *      matched via the per-event lock file pipeline on the same-source path
- *      (e.g. a real GitHub push webhook). Registering them in addition is
- *      what makes cross-source dispatch work for a generic webhook that
- *      targets an externally-hosted repo: the cross-source
- *      branch looks up `(customer_id, repo_identifier)` and reuses the
- *      stored `provider_context` (installation id, app id, …) to mint
- *      credentials for the actual provider bundle that owns the repo.
- *      Without this, a workflow whose only trigger is `push()` is invisible
- *      to cross-source dispatch and generic webhooks targeting its repo
- *      silently no-op.
- *
- * Access values: RegisterableTriggerType.enum.kici_event, etc.
+ *   2. Git-provider triggers (push, pr, tag, release, …) are still matched via
+ *      the per-event lock file pipeline on the same-source path. Registering
+ *      them too enables cross-source dispatch for a generic webhook targeting an
+ *      externally hosted repo: the cross-source branch looks up
+ *      `(customer_id, repo_identifier)` and reuses the stored `provider_context`
+ *      (installation id, app id, …) to mint credentials for the provider bundle
+ *      that owns the repo. Otherwise a `push()`-only workflow is invisible to
+ *      cross-source dispatch, and generic webhooks targeting its repo silently no-op.
  */
 export const RegisterableTriggerType = z.enum([
   // Non-Git-provider triggers
@@ -35,9 +27,8 @@ export const RegisterableTriggerType = z.enum([
   'schedule',
   'lifecycle',
   'webhook',
-  // Git-provider triggers (indexed for cross-source dispatch).
-  // These continue to be evaluated via the per-event lock file pipeline on the
-  // same-source path; registration is an additive index, not a replacement.
+  // Git-provider triggers: an additive index for cross-source dispatch, not a
+  // replacement for the same-source lock file pipeline.
   'push',
   'pr',
   'tag',

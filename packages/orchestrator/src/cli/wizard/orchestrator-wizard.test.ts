@@ -4,8 +4,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path, { dirname, resolve } from 'node:path';
 
-// The prompt layer is mocked so the wizard can be driven headlessly. The pure
-// helpers below (formatSourceAddHint, checkPrivateKeyReadable) touch none of it.
+// Prompts are mocked to drive the wizard headlessly.
 vi.mock('./prompts.js', () => ({
   promptDbUrl: vi.fn(async () => 'postgresql://kici:pw@localhost:5432/kici'),
   promptPort: vi.fn(async () => 4000),
@@ -29,7 +28,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 // wizard -> cli -> src -> orchestrator -> packages -> <repo root>
 const composePath = resolve(here, '../../../../../examples/quickstart/compose/docker-compose.yaml');
 
-/** Extract the KICI_PLATFORM_URL value from the quickstart compose file. */
+/** KICI_PLATFORM_URL from the quickstart compose file. */
 function quickstartPlatformUrl(): string {
   const text = readFileSync(composePath, 'utf8');
   const match = text.match(/KICI_PLATFORM_URL:\s*(\S+)/);
@@ -109,8 +108,8 @@ describe('runOrchestratorWizard — mode prompt', () => {
   beforeEach(() => {
     vi.mocked(promptSelect).mockResolvedValue('hybrid');
     vi.mocked(promptOptionalUrl).mockResolvedValue(undefined);
-    // The last confirm in the wizard asks whether to add a GitHub App source;
-    // the earlier two accept the generated secrets. Decline the source.
+    // The first two confirms accept generated secrets; the last, the GitHub
+    // App source, is declined.
     vi.mocked(promptConfirm).mockImplementation(
       async (_msg: string, def?: boolean) => def !== false,
     );
@@ -139,8 +138,8 @@ describe('runOrchestratorWizard — mode prompt', () => {
     const cfg = await runOrchestratorWizard();
     expect(promptOptionalUrl).toHaveBeenCalledTimes(1);
     expect(vi.mocked(promptOptionalUrl).mock.calls[0][0]).toMatch(/optional/i);
-    // An empty answer leaves the mode hybrid with no advertised ingress —
-    // identical to platform-relay behaviour, plus a served-but-unadvertised route.
+    // An empty answer: hybrid with no advertised ingress, i.e. platform relay
+    // plus a served-but-unadvertised route.
     expect(cfg.mode).toBe('hybrid');
     expect(cfg.webhookPublicUrl).toBeUndefined();
   });

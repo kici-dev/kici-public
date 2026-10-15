@@ -28,13 +28,11 @@ declare const KICI_VERSION: string;
 declare const KICI_BUILD_DATE: string;
 
 /**
- * The current CLI build's identity — semver plus build date — read at call time
- * from the Rolldown-injected build constants (`scripts/build-ts.mjs`). The
- * build date tells two builds at the same semver apart; the CLI is rebuilt
- * whenever it or the orchestrator and agent it runs change. Read on each call
- * rather than captured in a module const so unit tests can inject the constants
- * via `globalThis`. Falls back to `0.0.0` / `unknown` when running from source
- * (unbuilt tree / vitest), where the defines are absent.
+ * The CLI build's semver and build date, from the Rolldown-injected constants
+ * (`scripts/build-ts.mjs`). The build date tells apart two builds at one semver;
+ * the CLI is rebuilt whenever it or the orchestrator and agent it runs change.
+ * Read per call, not cached, so unit tests can inject the constants via
+ * `globalThis`. Falls back to `0.0.0` / `unknown` when run from source.
  */
 export function currentBuildIdentity(): { version: string; buildDate: string } {
   return {
@@ -47,10 +45,8 @@ export function currentBuildIdentity(): { version: string; buildDate: string } {
 export type PlaneMode = 'independent' | 'hybrid';
 
 /**
- * Attachment record for a hybrid plane: the Platform relay it dials, the org it
- * is scoped to, and the Platform api_keys id of its minted orchestrator key (for
- * later revoke). The orchestrator token itself is NEVER stored here — it lives
- * in a sibling 0600 file so it can't land in a world-readable stamp.
+ * Attachment record for a hybrid plane. The orchestrator token is NEVER stored
+ * here — it lives in a sibling 0600 file so it can't land in a world-readable stamp.
  */
 export interface PlaneAttachment {
   /** Orchestrator KICI_PLATFORM_URL — a ws(s)://…/ws relay URL. */
@@ -58,7 +54,7 @@ export interface PlaneAttachment {
   /** HTTPS Platform API base (provenance/verify context, key revoke). */
   platformApiBase: string;
   orgId: string;
-  /** Platform api_keys id of the minted orchestrator key. */
+  /** Platform api_keys id of the minted orchestrator key, kept for revoke. */
   keyId: string;
 }
 
@@ -71,14 +67,12 @@ export interface PlaneStamp {
   /** Build date of the CLI that booted this plane (see planeBuildIsStale). */
   buildDate: string;
   stampVersion: number;
-  /** Offline (independent) vs attached (hybrid). */
   mode: PlaneMode;
 }
 
 export interface PlaneStatus {
   /** True only when the plane is serving — a live-but-unready plane is false. */
   running: boolean;
-  /** Liveness of the plane port: stopped, serving, live-but-not-serving, or held by someone else. */
   state: PlaneState;
   /** Failing `/ready` checks, when the plane is live but not serving. */
   checks?: Record<string, boolean>;
@@ -89,17 +83,12 @@ export interface PlaneStatus {
   url?: string;
   /** Bootstrap admin token the CLI presents to the plane's admin API. */
   adminToken?: string;
-  /** Offline (independent) vs attached (hybrid). */
   mode: PlaneMode;
   /** Present iff mode === 'hybrid'. */
   attachment?: PlaneAttachment;
 }
 
-/**
- * Read the plane's persisted Platform orchestrator token (mode 0600), or null
- * when the plane is independent/offline. Kept out of the stamp so the token
- * never lands in a world-readable file.
- */
+/** The persisted Platform orchestrator token (mode 0600), or null when the plane is independent. */
 export function readPlatformToken(): string | null {
   try {
     const t = fs.readFileSync(planePaths().platformTokenFile, 'utf-8').trim();
@@ -109,22 +98,19 @@ export function readPlatformToken(): string | null {
   }
 }
 
-/** Persist the Platform orchestrator token (mode 0600). */
 export function writePlatformToken(token: string): void {
   const { platformTokenFile, root } = planePaths();
   fs.mkdirSync(root, { recursive: true });
   fs.writeFileSync(platformTokenFile, token, { mode: 0o600 });
 }
 
-/** Remove the persisted Platform orchestrator token (on detach). */
 export function clearPlatformToken(): void {
   fs.rmSync(planePaths().platformTokenFile, { force: true });
 }
 
 /**
- * Read the durable attachment record (survives `kici local down`), or null when
- * the plane is not attached. This — not the running stamp — is the source of
- * truth for "is this plane attached to the Platform".
+ * The durable attachment record (survives `kici local down`), or null. This, not
+ * the running stamp, is the source of truth for whether the plane is attached.
  */
 export function readAttachment(): PlaneAttachment | null {
   try {
@@ -134,22 +120,19 @@ export function readAttachment(): PlaneAttachment | null {
   }
 }
 
-/** Persist the durable attachment record (never the token). */
 export function writeAttachment(attachment: PlaneAttachment): void {
   const { attachmentFile, root } = planePaths();
   fs.mkdirSync(root, { recursive: true });
   fs.writeFileSync(attachmentFile, JSON.stringify(attachment, null, 2));
 }
 
-/** Remove the durable attachment record (on detach). */
 export function clearAttachment(): void {
   fs.rmSync(planePaths().attachmentFile, { force: true });
 }
 
 /**
- * Read the plane's persisted bootstrap admin token, generating + persisting one
- * (mode 0600) on first boot. A warm plane reuses the same token across CLI
- * invocations so a running orchestrator keeps accepting the CLI's admin calls.
+ * The plane's bootstrap admin token, generated (mode 0600) on first boot. It is
+ * stable across CLI invocations so a running orchestrator keeps accepting the CLI.
  */
 export function readOrCreateAdminToken(): string {
   const { adminTokenFile, root } = planePaths();
@@ -157,7 +140,7 @@ export function readOrCreateAdminToken(): string {
     const existing = fs.readFileSync(adminTokenFile, 'utf-8').trim();
     if (existing) return existing;
   } catch {
-    // Missing / unreadable — generate a fresh token below.
+    // Missing or unreadable: generate below.
   }
   fs.mkdirSync(root, { recursive: true });
   const token = `kici-local-${randomBytes(24).toString('hex')}`;
@@ -165,7 +148,7 @@ export function readOrCreateAdminToken(): string {
   return token;
 }
 
-/** Read the plane's admin token without generating one (null when absent). */
+/** The plane's admin token, never generated (null when absent). */
 export function planeAdminToken(): string | null {
   try {
     const t = fs.readFileSync(planePaths().adminTokenFile, 'utf-8').trim();
@@ -176,11 +159,10 @@ export function planeAdminToken(): string | null {
 }
 
 /**
- * Read the plane's local master secret key, generating + persisting a fresh 64
- * hex-char key (mode 0600) on first boot. Stable across boots so DB-encrypted
- * material stays decryptable. Freshly generated — never derived from any sops
- * secret. Enables the orchestrator's secrets subsystem, which gates its admin
- * API surface.
+ * The plane's master secret key: 64 hex chars (mode 0600), generated on first
+ * boot and never derived from a sops secret. Stable across boots so DB-encrypted
+ * material stays decryptable. It enables the orchestrator's secrets subsystem,
+ * which gates its admin API surface.
  */
 export function readOrCreateSecretKey(): string {
   const { secretKeyFile, root } = planePaths();
@@ -188,7 +170,7 @@ export function readOrCreateSecretKey(): string {
     const existing = fs.readFileSync(secretKeyFile, 'utf-8').trim();
     if (existing) return existing;
   } catch {
-    // Missing / unreadable — generate a fresh key below.
+    // Missing or unreadable: generate below.
   }
   fs.mkdirSync(root, { recursive: true });
   const key = randomBytes(32).toString('hex');
@@ -196,24 +178,21 @@ export function readOrCreateSecretKey(): string {
   return key;
 }
 
-/** Absolute path of the dev-signed identity's private JWK key file. */
 export function devIdentityKeyFile(): string {
   return path.join(planePaths().devIdentityDir, 'identity.jwk');
 }
 
-/** Absolute path of the dev-signed identity's public JWK (written by the plane orchestrator). */
+/** Written by the plane orchestrator, not the CLI. */
 export function devIdentityPublicJwkFile(): string {
   return path.join(planePaths().devIdentityDir, 'identity.pub.jwk');
 }
 
 /**
- * Read the plane's dev-signed identity keypair, generating + persisting a fresh
- * EC P-256 private JWK (mode 0600) on first boot. Stable across boots so a
- * `kici local trust-root` export stays valid for previously-minted tokens.
- * Freshly generated — NEVER derived from any sops secret or real key. Only the
- * private key is written here; the plane orchestrator derives + writes the
- * public JWK next to it. Returns the private-key file path passed to the
- * orchestrator via KICI_DEV_IDENTITY_KEY_FILE.
+ * Ensure the dev-signed identity's EC P-256 private JWK (mode 0600) exists,
+ * generated on first boot and NEVER derived from a sops secret or real key.
+ * Stable across boots so a `kici local trust-root` export stays valid for
+ * previously-minted tokens. The orchestrator writes the public JWK beside it.
+ * Returns the path passed via KICI_DEV_IDENTITY_KEY_FILE.
  */
 export function readOrCreateDevIdentity(): string {
   const keyFile = devIdentityKeyFile();
@@ -221,7 +200,7 @@ export function readOrCreateDevIdentity(): string {
     const existing = fs.readFileSync(keyFile, 'utf-8').trim();
     if (existing) return keyFile;
   } catch {
-    // Missing / unreadable — generate a fresh keypair below.
+    // Missing or unreadable: generate below.
   }
   fs.mkdirSync(planePaths().devIdentityDir, { recursive: true, mode: 0o700 });
   const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
@@ -245,7 +224,6 @@ function writeStamp(stamp: PlaneStamp): void {
   fs.writeFileSync(pidfile, String(stamp.orchestratorPid));
 }
 
-/** Remove the plane's on-disk record (pidfile + stamp). */
 export function clearStamp(): void {
   const { pidfile, stampFile } = planePaths();
   fs.rmSync(pidfile, { force: true });
@@ -253,14 +231,11 @@ export function clearStamp(): void {
 }
 
 /**
- * Whether a running plane described by `existing` was booted from a different
- * CLI build than the current one — a semver bump OR a different build date (the
- * latter covers intermediate builds that share a semver). Returns
- * false when there is no stamp, or when the current build has no concrete
- * identity (`buildDate === 'unknown'`, i.e. running from source / a test),
- * so a source-context `planeUp` never reboots a healthy plane spuriously. A
- * stamp an older CLI wrote has no `buildDate` field, reads as `undefined`,
- * and therefore triggers a one-time reboot on the first upgrade.
+ * Whether the plane was booted by a different CLI build: another semver OR
+ * another build date. False with no stamp, or when the current build date is
+ * `unknown` (run from source), so a source-context `planeUp` never reboots a
+ * healthy plane. A stamp from an older CLI lacks `buildDate`, so the first
+ * upgrade reboots once.
  */
 export function planeBuildIsStale(existing: PlaneStamp | null): boolean {
   if (!existing) return false;
@@ -273,18 +248,14 @@ function orchestratorUrl(port: number): string {
   return `http://127.0.0.1:${port}`;
 }
 
-/** Absolute path of the plane orchestrator's log file. */
 export function planeLogPath(): string {
   return planePaths().logFile;
 }
 
 /**
- * Read the plane's current status from whatever holds the plane port.
- *
- * `running` means "serving": a live orchestrator whose `/ready` fails is
- * reported as `unready`, with the failing checks, rather than as stopped —
- * inferring "not running" from an unready probe hides a process that still owns
- * the port.
+ * The plane's status, read from whatever holds the plane port. A live
+ * orchestrator whose `/ready` fails reports `unready` with its failing checks,
+ * not stopped: calling it stopped would hide a process that still owns the port.
  */
 export async function planeStatus(): Promise<PlaneStatus> {
   const stamp = readStamp();
@@ -325,7 +296,7 @@ export async function planeStatus(): Promise<PlaneStatus> {
   };
 }
 
-/** Attach parameters for a hybrid plane boot (see attachPlane). */
+/** See attachPlane. */
 export interface PlaneUpAttach {
   platformWsUrl: string;
   platformToken: string;
@@ -340,13 +311,9 @@ export interface PlaneUpOptions {
 }
 
 /**
- * Tear the plane down ahead of a fresh boot, refusing to continue when the port
- * was not released.
- *
- * Booting over a still-held port only re-fails later, as a readiness timeout
- * that names the log instead of the survivor — so the teardown's own reason (the
- * pid still holding the port) is raised here, while it is still the accurate
- * one.
+ * Tear the plane down before a fresh boot; throws when the port was not released.
+ * Booting over a held port would fail later as a readiness timeout naming the
+ * log, not the survivor, so the accurate reason is raised here.
  */
 async function tearDownForBoot(): Promise<void> {
   const result = await planeDown();
@@ -359,13 +326,10 @@ async function tearDownForBoot(): Promise<void> {
 }
 
 /**
- * Ensure the plane port is either reusable or vacant before a boot.
- *
- * Returns the running plane when it may be reused as-is, or null when the caller
- * must boot fresh. A plane no stamp accounts for is reclaimed rather than
- * adopted: reuse would serve `kici run --local` from an orchestrator of unknown
- * build, with an unknown scaler configuration, which is exactly the state a
- * stamped plane's staleness check exists to prevent.
+ * Returns the running plane when it may be reused, or null when the caller must
+ * boot fresh. An unstamped plane is reclaimed, not adopted: reuse would serve
+ * `kici run --local` from an orchestrator of unknown build and scaler config,
+ * the state the staleness check exists to prevent.
  */
 async function prepareForBoot(
   port: number,
@@ -394,12 +358,9 @@ async function prepareForBoot(
       return null;
 
     case 'ours-ready': {
-      // A running plane booted from a different CLI build (semver OR build
-      // date) is stale — reuse would serve `kici run --local` at the old
-      // version. Reboot from the current dist, KEEPING the Postgres data dir:
-      // an identity change is not an on-disk layout change, so the
-      // orchestrator's boot migration (KICI_AUTO_MIGRATE=true) reconciles it.
-      // A mode change (independent↔hybrid) forces the same reboot.
+      // A stale build or a mode change reboots, KEEPING the Postgres data dir:
+      // a build change is not a layout change, so the orchestrator's boot
+      // migration (KICI_AUTO_MIGRATE=true) reconciles it.
       const modeChanged = (existing?.mode ?? 'independent') !== requestedMode;
       if (planeBuildIsStale(existing) || modeChanged) {
         await tearDownForBoot();
@@ -422,26 +383,22 @@ async function prepareForBoot(
 }
 
 /**
- * Start (or reuse) the local dev plane. Idempotent: a healthy running plane this
- * config dir stamped, **whose stamped mode matches the requested mode**, is
- * returned as-is. Otherwise the port is reclaimed if it is another KiCI plane,
- * and Postgres + the orchestrator are booted with a fresh stamp + pidfile. When
- * `attach` is present the orchestrator boots hybrid against the Platform relay;
- * otherwise it boots independent with the dev-signed identity. Throws when the
- * port is held by a process that is not a KiCI plane orchestrator.
+ * Start or reuse the local dev plane. Idempotent: a healthy plane this config dir
+ * stamped, **in the requested mode**, is returned as-is. Otherwise the port is
+ * reclaimed if another KiCI plane holds it, and Postgres and the orchestrator
+ * boot with a fresh stamp. `attach` boots hybrid against the Platform relay;
+ * without it the plane boots independent with the dev-signed identity. Throws
+ * when a non-KiCI process holds the port.
  */
 export async function planeUp(opts: PlaneUpOptions = {}): Promise<PlaneStatus> {
   const { orchestrator: port } = planePorts();
   const existing = readStamp();
   const requestedMode: PlaneMode = opts.attach ? 'hybrid' : 'independent';
 
-  // An incompatible on-disk layout (stampVersion bump) cannot be migrated in
-  // place, so the plane is torn down and the data dir wiped before a fresh
-  // boot. A kiciVersion-only change keeps the data and relies on the
-  // orchestrator's boot migration (KICI_AUTO_MIGRATE=true).
+  // A stampVersion bump is a layout change that cannot migrate in place, so the
+  // data dir is wiped; a kiciVersion-only change keeps it.
   if (existing && existing.stampVersion !== PLANE_STAMP_VERSION) {
-    // Throws when the port was not released — wiping the data dir under a plane
-    // that is still running would destroy a live Postgres' storage.
+    // Throws when the port is still held: wiping under a live Postgres destroys it.
     await tearDownForBoot();
     fs.rmSync(planePaths().pgData, { recursive: true, force: true });
   } else {
@@ -492,8 +449,8 @@ export async function planeUp(opts: PlaneUpOptions = {}): Promise<PlaneStatus> {
     stampVersion: PLANE_STAMP_VERSION,
     mode: requestedMode,
   };
-  // Stamped before the readiness wait: a wait that fails, or a CLI killed
-  // during it, must still leave a record of the pid we spawned.
+  // Stamped before the readiness wait, so a failed wait or a killed CLI still
+  // leaves a record of the spawned pid.
   writeStamp(stamp);
 
   try {
@@ -521,20 +478,17 @@ export async function planeUp(opts: PlaneUpOptions = {}): Promise<PlaneStatus> {
 }
 
 /**
- * Whether the stamped pid is still one of this build's plane orchestrators.
+ * Whether the stamped pid is still one of this build's plane orchestrators,
+ * matched by its live command line against the entry this build launches.
  *
- * The stamp outlives the process it names — a crash, a `kill -9`, or a reboot
- * all leave it behind — so once the operating system recycles that pid onto an
- * unrelated process, signalling it blind would stop a stranger's program. Every
- * other signal path in the plane is identity-verified (`reclaimPlanePort` only
- * ever signals a pid confirmed to hold the port or to answer `/health` as a KiCI
- * orchestrator); this keeps the stamp-driven path to the same standard by
- * matching the live command line against the entry this build would launch.
+ * The stamp outlives its process (crash, `kill -9`, reboot), so a recycled pid
+ * signalled blind would stop a stranger's program. This holds the stamp path to
+ * the standard of `reclaimPlanePort`, which signals only a pid proven to hold
+ * the port or to answer `/health` as a KiCI orchestrator.
  *
- * Returns false whenever identity cannot be established — an unreadable command
- * line, an unresolvable entry, or a plane launched from a different install.
- * That is deliberate: not signalling leaves a process running, while signalling
- * the wrong pid kills one.
+ * Returns false whenever identity cannot be established (unreadable command
+ * line, unresolvable entry, another install): a missed signal leaves a process
+ * running, a wrong one kills one.
  */
 async function stampedPidIsOurOrchestrator(pid: number): Promise<boolean> {
   const cmdline = await processCommandLine(pid);
@@ -543,7 +497,7 @@ async function stampedPidIsOurOrchestrator(pid: number): Promise<boolean> {
     try {
       if (cmdline.includes(resolveEntry())) return true;
     } catch {
-      // Entry not resolvable from here — no evidence, try the other.
+      // Unresolvable entry is no evidence: try the other.
     }
   }
   return false;
@@ -558,12 +512,10 @@ export interface PlaneDownResult {
 }
 
 /**
- * Stop the local dev plane and confirm the port was released.
- *
- * Teardown is reconstructed from whatever holds the port, not only from the
- * stamp: a plane this config dir never stamped still occupies the port and is
- * still ours to stop. The pidfile and stamp are cleared only once the port is
- * verified free, so a survivor never loses the pid that identifies it.
+ * Stop the local dev plane and confirm the port was released. Teardown works
+ * from whatever holds the port, not only the stamp, since an unstamped plane is
+ * still ours to stop. The stamp is cleared only once the port is verified free,
+ * so a survivor never loses the pid that identifies it.
  */
 export async function planeDown(): Promise<PlaneDownResult> {
   const stamp = readStamp();
@@ -580,11 +532,9 @@ export async function planeDown(): Promise<PlaneDownResult> {
     };
   }
 
-  // A stamped orchestrator that is alive but is NOT the port holder — a boot
-  // still between spawn and bind, or one that lost its listener — was never
-  // touched by the reclaim above, because the reclaim only ever signals the
-  // holder. Stop it here, or `down` reports success over a process that is
-  // about to take the port back.
+  // The reclaim signals only the port holder. A live stamped orchestrator that
+  // does not hold the port (between spawn and bind, or listener lost) is
+  // stopped here, or `down` succeeds over a process about to retake the port.
   if (
     stamp &&
     stamp.orchestratorPid !== reclaim.killedPid &&
@@ -604,13 +554,11 @@ export async function planeDown(): Promise<PlaneDownResult> {
   if (stamp) {
     await stopPlanePostgres(stamp.pgKind);
   } else if (classification.kind !== 'free') {
-    // A plane we never stamped leaves no record of its Postgres backend. Only
-    // the embedded backend is stopped: it is scoped to this plane's own data
-    // dir, and returns early when there is no postmaster.pid there. The podman
-    // fallback container carries a fixed host-global name that is not scoped by
-    // KICI_CONFIG_DIR or port, so removing it here could tear down a different
-    // plane's database — a survivor is preferable to that, and the next boot
-    // replaces the container anyway (`podman run --replace`).
+    // An unstamped plane has no record of its Postgres backend. Only the
+    // embedded one is stopped: it is scoped to this plane's data dir and no-ops
+    // without a postmaster.pid. The podman container has a host-global name not
+    // scoped by KICI_CONFIG_DIR or port, so removing it could kill another
+    // plane's database; the next boot replaces it (`podman run --replace`).
     await stopPlanePostgres('embedded');
   }
   clearStamp();
@@ -618,10 +566,9 @@ export async function planeDown(): Promise<PlaneDownResult> {
 }
 
 /**
- * Attach the local dev plane to the hosted Platform: mint an org-scoped
- * orchestrator key with the logged-in PAT, then (re)boot the plane hybrid
- * against the Platform relay. Registration with the Platform is implicit — the
- * hybrid orchestrator's PlatformClient sends `source.register` on WS auth.
+ * Mint an org-scoped orchestrator key with the logged-in PAT, then reboot the
+ * plane hybrid. Registration is implicit: the orchestrator's PlatformClient
+ * sends `source.register` on WS auth.
  */
 export async function attachPlane(args: {
   apiBase: string;
@@ -647,10 +594,8 @@ export async function attachPlane(args: {
 }
 
 /**
- * Detach the local dev plane: best-effort revoke the minted orchestrator key on
- * the Platform, clear the durable attachment + token, then reboot the plane
- * independent (offline). The revoke is non-fatal — a detach must succeed even
- * offline or with an expired PAT.
+ * Revoke the minted key, clear the attachment and token, and reboot independent.
+ * The revoke is best-effort: a detach must succeed offline or with an expired PAT.
  */
 export async function detachPlane(opts: { pat?: string } = {}): Promise<PlaneStatus> {
   const attachment = readAttachment();

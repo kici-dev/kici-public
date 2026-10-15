@@ -17,10 +17,8 @@ export interface RequestContext {
 }
 
 /**
- * AsyncLocalStorage instance for propagating request context
- * through async call chains without explicit parameter passing.
+ * Propagates request context through async call chains.
  *
- * Usage:
  * ```ts
  * requestContext.run({ requestId: crypto.randomUUID() }, async () => {
  *   // All code in this callback (and its async descendants) can read the context
@@ -30,20 +28,12 @@ export interface RequestContext {
  */
 export const requestContext = new AsyncLocalStorage<RequestContext>();
 
-/**
- * Get the current request context, or an empty object if outside a `run()` scope.
- * Safe to call anywhere -- never throws.
- */
+/** The current request context, or `{}` outside a `run()` scope. Never throws. */
 export function getRequestContext(): Partial<RequestContext> {
   return requestContext.getStore() ?? {};
 }
 
-/**
- * Merge additional fields into the current request context.
- * No-op if called outside a `run()` scope.
- *
- * @param fields - Partial context fields to merge into the current store
- */
+/** Merge fields into the current request context; no-op outside a `run()` scope. */
 export function enrichRequestContext(fields: Partial<RequestContext>): void {
   const store = requestContext.getStore();
   if (store) {

@@ -27,9 +27,8 @@ describe('global-workflow trace entries', () => {
     expect(decision.checks).toContainEqual(
       expect.objectContaining({ check: TraceCheck.GlobalFilter, passed: false }),
     );
-    // Positive control: the trigger check that DID pass is still in the trace,
-    // so the assertion above is reading an appended entry rather than an
-    // emptied-out array.
+    // Positive control: the passing trigger check is still in the trace, so the
+    // assertion above reads an appended entry, not an emptied-out array.
     expect(decision.checks).toContainEqual(
       expect.objectContaining({ check: 'event type', passed: true }),
     );
@@ -187,8 +186,8 @@ describe('trace text bounding', () => {
       'r'.repeat(5_000),
     );
 
-    // The `check` label is a fixed vocabulary and is left alone; the three
-    // fields fed from event content are each bounded on their own.
+    // The `check` label is a fixed vocabulary and is left alone; `pattern`,
+    // `value` and `reason` carry event content and are each bounded.
     expect(entry.check).toBe('paths');
     expect(entry.pattern.length).toBeLessThanOrEqual(TRACE_TEXT_MAX + 1);
     expect(entry.value.length).toBeLessThanOrEqual(TRACE_TEXT_MAX + 1);

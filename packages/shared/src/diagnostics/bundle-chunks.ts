@@ -44,11 +44,9 @@ interface ChunkRequestPending {
 /**
  * Correlation core for any "send a request, await a chunked response" channel.
  *
- * Key-agnostic so both the orchestrator-agent channel (keyed by requestId) and
- * the peer channel (keyed by messageId) share one implementation. Pending
- * requests reject on timeout, on an error frame, or on disconnect. No
- * orchestrator-initiated request/response primitive existed before fleet
- * collection; this is it.
+ * Key-agnostic so the orchestrator-agent channel (keyed by requestId) and the
+ * peer channel (keyed by messageId) share one implementation. Pending requests
+ * reject on timeout, on an error frame, or on disconnect.
  */
 export class ChunkRequestWaiter {
   private pending = new Map<string, ChunkRequestPending>();

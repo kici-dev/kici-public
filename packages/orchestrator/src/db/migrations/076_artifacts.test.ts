@@ -4,13 +4,9 @@ import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 
 /**
- * Real-Postgres test for migration 076.
- *
- * Creates a throwaway database, applies migrations 001..076 via the
- * production migration provider, and asserts the `artifacts` table + its
- * `UNIQUE (run_id, name)` immutability constraint and indexes exist, and that
- * the `artifact_quota_bytes` / `artifact_ttl_ms` columns landed on
- * `org_settings`. Dropped in teardown.
+ * Real-Postgres test for migration 076 (`artifacts` with its `UNIQUE (run_id, name)`
+ * immutability constraint, and the `org_settings` artifact quota / TTL columns), on a
+ * throwaway database migrated through 076.
  *
  * Gated on `KICI_TEST_ADMIN_DATABASE_URL`: skips when unset, fails when set but
  * unreachable.

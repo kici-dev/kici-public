@@ -173,10 +173,8 @@ describe('BareMetalScalerBackend container mode', () => {
   });
 
   it('applies the configured limits, the isolated network and a pid ceiling', async () => {
-    // This path used to write its own HostConfig with no Memory, no NanoCpus
-    // and no hardening — and `effectiveLimits` was not even a parameter, so a
-    // job could take the host down with the memory limit its operator had set.
-    // It also sat on the runtime's default bridge with full LAN, RFC1918 and
+    // Without these, a job ignores its operator's memory limit and can take the
+    // host down, and the runtime's default bridge gives it full LAN, RFC1918 and
     // cloud-metadata reach.
     const backend = makeBackend();
 
@@ -211,8 +209,8 @@ describe('BareMetalScalerBackend container mode', () => {
   });
 
   it('tracks the agent before starting it, and untracks a container that fails to start', async () => {
-    // A throw from `start()` used to leave a started container that nothing
-    // tracked, and `cleanupOrphans` does not cover bare-metal at all.
+    // A throw from `start()` must not leave an untracked container:
+    // `cleanupOrphans` does not cover bare-metal at all.
     const backend = makeBackend();
     // Fail only the AGENT container's start: `ensureRuntimeVolume` probes the
     // volume with a container of its own first, and a `…Once` would be spent
@@ -313,9 +311,8 @@ describe('BareMetalScalerBackend container mode', () => {
   });
 
   it('keeps the local-process path for a pool that declares a binary', async () => {
-    // A `container:` job on a classic bare-metal pool already worked the other
-    // way round — a local agent nesting a job container. Opting it into
-    // job-image mode automatically would flip the topology of working jobs.
+    // A `container:` job on a classic bare-metal pool runs as a local agent
+    // nesting a job container; auto job-image mode would flip working jobs.
     const backend = new BareMetalScalerBackend({
       name: 'classic',
       labelSets: [{ labels: ['linux'], binaryPath: '/usr/bin/kici-agent' }],
@@ -333,8 +330,8 @@ describe('BareMetalScalerBackend container mode', () => {
 
   it('does not touch a container runtime for an ordinary process spawn', async () => {
     const backend = makeBackend();
-    // No container on the spawn context => the historical local-process path,
-    // which must not require (or probe for) a runtime at all.
+    // No container on the spawn context => the local-process path, which must
+    // not require (or probe for) a runtime at all.
     await backend
       .spawn(['linux'], 'agent-5', 'ws://orch/ws', () => {}, undefined, { boundJobId: 'job-9' })
       .catch(() => undefined);

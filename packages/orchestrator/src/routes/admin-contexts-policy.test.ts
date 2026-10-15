@@ -8,9 +8,8 @@ import { RbacEnforcer } from '../secrets/rbac.js';
  * PATCH /contexts/:name/policy — how the handler forwards nullable protection
  * fields, and where it rejects a value the gates cannot survive.
  *
- * The store is stubbed at the prototype so `deps.db` is never touched: the
- * question here is which `updates` keys the handler builds, not what SQL the
- * store emits.
+ * The store is stubbed at the prototype (`deps.db` is never touched): this tests
+ * which `updates` keys the handler builds, not the SQL the store emits.
  */
 function stubStore(): {
   getByName: ReturnType<typeof vi.spyOn>;
@@ -76,8 +75,8 @@ describe('PATCH /contexts/:name/policy — clearing nullable fields', () => {
   });
 
   it('clears every nullable protection field on the same request', async () => {
-    // Anti-divergence pin: these three share one schema and one handler, so a
-    // future edit that special-cases any of them shows up here.
+    // Anti-divergence pin: they share one schema and one handler, so special-casing
+    // any of them shows up here.
     const { update } = stubStore();
 
     const res = await patchPolicy({
@@ -97,8 +96,7 @@ describe('PATCH /contexts/:name/policy — clearing nullable fields', () => {
 
 describe('PATCH /contexts/:name/policy — zero hold expiry', () => {
   it('rejects a zero hold expiry without touching the store', async () => {
-    // A 0-second expiry puts `holdUntil` at the current instant, so every
-    // reviewer hold on the context is created already overdue and swept to
+    // A 0-second expiry creates every reviewer hold already overdue, swept to
     // `expired` — cancelling the job the hold was meant to gate.
     const { update } = stubStore();
 

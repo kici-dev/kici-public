@@ -1,15 +1,12 @@
 /**
- * Tests for the shared subject + event-claim derivation.
- *
- * The property under test is the one a cloud trust policy depends on: a
- * pull-request run and a trusted push to the same base branch must not mint
- * the same subject — and re-running that pull request must not undo the split.
- * A re-run records `trigger_event: 'rerun'`, so the subject is derived from
+ * The property a cloud trust policy depends on: a pull-request run and a
+ * trusted push to the same base branch never mint the same subject, and
+ * re-running that pull request does not undo the split. A re-run records
+ * `trigger_event: 'rerun'`, so the subject derives from
  * `subject_trigger_event ?? trigger_event`.
  *
- * The matrix below is deliberately two-sided. Asserting only the new behaviour
- * would pass with the fallback broken, which is the case every row written
- * before the column existed takes.
+ * The matrix is two-sided: asserting only the column path would pass with the
+ * fallback broken, the path every row without the column takes.
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -81,9 +78,8 @@ describe('buildIdTokenSubject — subject_trigger_event', () => {
     };
     const rerunOfPush = { ...BASE, trigger_event: 'rerun', subject_trigger_event: 'push' };
 
-    // Positive control: the two rows agree on every field the branch-shaped
-    // subject is built from, so a subject derived from those alone is
-    // necessarily equal — which is exactly the collision under test.
+    // Positive control: the rows agree on every field of the branch-shaped
+    // subject, so a subject built from those alone collides.
     expect(rerunOfPr.repo_identifier).toBe(rerunOfPush.repo_identifier);
     expect(rerunOfPr.ref).toBe(rerunOfPush.ref);
     expect(rerunOfPr.workflow_name).toBe(rerunOfPush.workflow_name);

@@ -3,7 +3,7 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './113_execution_runs_workflow_repo_index.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
  * Real-Postgres test for migration 113: the partial index on
@@ -42,11 +42,9 @@ describeDb('migration 113_execution_runs_workflow_repo_index', () => {
   };
 
   /**
-   * Plan the predicate `registration-run-match.ts` builds, with sequential
-   * scans disabled. Disabling the seq scan asks the planner what it CAN use
-   * rather than what it prefers at this row count, which is the property under
-   * test — a seeded table small enough to run fast is also small enough that
-   * the planner would seq-scan it whatever indexes exist.
+   * Plan the predicate `registration-run-match.ts` builds with seq scans off,
+   * which asks what the planner CAN use rather than what it prefers: a seeded
+   * table this small would be seq-scanned whatever indexes exist.
    */
   const planDefiningRepoPredicate = async (): Promise<string> => {
     const r = await sql<{ 'QUERY PLAN': string }>`
@@ -121,15 +119,11 @@ describeDb('migration 113_execution_runs_workflow_repo_index', () => {
     await down(db);
     expect(await indexDef(INDEX)).toBeUndefined();
 
-    // The load-bearing half of this test: with the index gone the planner has
-    // nothing for `workflow_repo_identifier`, so even with seq scans disabled
-    // it falls back to scanning the table — which is exactly the regression the
-    // migration exists to prevent.
+    // Load-bearing: without the index, even with seq scans off, the planner
+    // scans the table — the regression the migration exists to prevent.
     const plan = await planDefiningRepoPredicate();
     expect(plan).not.toContain(INDEX);
-    // One unindexable arm makes the whole disjunction unindexable, so the
-    // planner scans the table even with `enable_seqscan = off`. This is the
-    // pre-migration behaviour, asserted directly rather than assumed.
+    // One unindexable arm makes the whole disjunction unindexable.
     expect(plan, `plan without the index should scan:\n${plan}`).toContain(
       'Seq Scan on execution_runs',
     );

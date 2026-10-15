@@ -523,7 +523,7 @@ describe('platformToBrowserMessageSchema', () => {
   });
 });
 
-// --- New schemas: run.new and job.new ---
+// --- run.new and job.new ---
 
 describe('browserRunNewSchema', () => {
   const valid = {
@@ -616,7 +616,7 @@ describe('browserJobNewSchema', () => {
   });
 });
 
-// --- Enhanced step.status with timing fields ---
+// --- step.status timing fields ---
 
 describe('browserStepStatusSchema (enhanced)', () => {
   it('accepts optional startedAt, completedAt, durationMs', () => {
@@ -649,7 +649,7 @@ describe('browserStepStatusSchema (enhanced)', () => {
   });
 });
 
-// --- platformToBrowserMessageSchema includes new types ---
+// --- platformToBrowserMessageSchema accepts run.new and job.new ---
 
 describe('platformToBrowserMessageSchema (new types)', () => {
   it('accepts run.new', () => {

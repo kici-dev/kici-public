@@ -3,28 +3,20 @@ import os from 'node:os';
 import path from 'node:path';
 
 /**
- * On-disk layout version of the local dev plane. Bumped when a plane an older
- * build stamped cannot be reused — an incompatible state-dir layout, or an
- * orchestrator database this build cannot migrate — so it is recreated rather
- * than reused.
+ * On-disk layout version of the local dev plane. Bump it when an older build's
+ * plane cannot be reused (incompatible state-dir layout, or a database this
+ * build cannot migrate), so it is recreated.
  */
 export const PLANE_STAMP_VERSION = 5;
 
 /**
- * Root directory of the local dev plane's state, following the same
- * `KICI_CONFIG_DIR` → `~/.kici` convention the rest of the CLI uses.
+ * The plane's state root under `KICI_CONFIG_DIR` (else `~/.kici`).
  *
  * RESOLVED THROUGH SYMLINKS, deliberately. The plane is a singleton on fixed
- * ports, so a caller may reach it through a config dir that only symlinks
- * `local` at the durable one, to run against a throwaway config dir carrying
- * no credentials while still reusing the warm plane.
- *
- * Without resolving, the plane's Postgres is started with a data directory
- * addressed through that ephemeral path and keeps it open. When the caller
- * removes its temp dir, Postgres PANICs — `could not open file
- * "<tmp>/local/pgdata/global/pg_control"` — and shuts the whole plane down,
- * taking every later phase with it. Resolving first means Postgres only ever
- * sees the durable path, so a caller's temp dir can come and go beneath it.
+ * ports, so a throwaway, credential-free config dir may symlink `local` at the
+ * durable one to reuse the warm plane. Unresolved, Postgres would hold its data
+ * dir open through that temp path and PANIC when it is removed (`could not
+ * open file "<tmp>/local/pgdata/global/pg_control"`), taking the plane down.
  *
  * A path that does not exist yet resolves to itself: a fresh plane creates it.
  */
@@ -38,9 +30,6 @@ export function planeRoot(): string {
   }
 }
 
-/**
- * Absolute paths for every artefact the plane persists under its state root.
- */
 export function planePaths(): {
   root: string;
   pgData: string;
@@ -66,45 +55,37 @@ export function planePaths(): {
     pidfile: path.join(root, 'plane.pid'),
     stampFile: path.join(root, 'stamp.json'),
     logFile: path.join(root, 'orchestrator.log'),
-    // Postmaster log, handed to `pg_ctl -l`. Named here rather than composed at
-    // the call site so the file pg_ctl opens and the file rotation renames can
-    // never drift apart.
+    // Postmaster log for `pg_ctl -l`, named here so the file pg_ctl opens and
+    // the file rotation renames cannot drift apart.
     pgLogFile: path.join(root, 'orchestrator.log.pg'),
     // Written once the embedded cluster holds the `kici_local` database; its
     // absence makes the next start finish an interrupted bootstrap.
     pgBootstrapStamp: path.join(root, 'pgdata.bootstrapped'),
     socketDir: path.join(root, 'sock'),
-    // Bootstrap admin token the CLI presents to the plane's admin API (mode 0600).
+    // Mode 0600.
     adminTokenFile: path.join(root, 'admin-token'),
-    // Platform orchestrator key (mode 0600) the plane presents when booted
-    // hybrid/attached. Kept out of the stamp JSON so the token never lands in a
-    // world-readable file. Absent when the plane is independent/offline.
+    // Platform orchestrator key for a hybrid boot (mode 0600), kept out of the
+    // stamp so it never lands in a world-readable file. Absent when independent.
     platformTokenFile: path.join(root, 'platform-token'),
-    // Durable attachment record ({ platformWsUrl, platformApiBase, orgId,
-    // keyId } — never the token). Survives `kici local down` so a stopped-but-
-    // attached plane re-boots hybrid on the next `kici local up` or
-    // `kici run --local` (both route through `resolvePlaneForRun`, which honors
-    // this record). `kici local up --offline` boots independent for that session
-    // without clearing it; only `detach` clears the record.
+    // Durable attachment record (never the token). It survives `kici local down`,
+    // so the next `kici local up` or `kici run --local` (via
+    // `resolvePlaneForRun`) re-boots hybrid. `kici local up --offline` boots
+    // independent without clearing it; only `detach` clears it.
     attachmentFile: path.join(root, 'attachment.json'),
-    // Local master secret key (freshly generated, mode 0600). Enables the plane
-    // orchestrator's secrets subsystem, which gates its admin API surface.
+    // Master secret key (mode 0600); see readOrCreateSecretKey.
     secretKeyFile: path.join(root, 'secret-key'),
-    // Bare-metal scaler YAML the plane orchestrator loads via KICI_SCALER_CONFIG_PATH.
+    // Loaded via KICI_SCALER_CONFIG_PATH.
     scalerConfigFile: path.join(root, 'scaler.yaml'),
-    // Executable wrapper the bare-metal scaler spawns (execs `node <kici-agent>`).
+    // The bare-metal scaler spawns it; it execs `node <kici-agent>`.
     agentWrapperFile: path.join(root, 'agent-wrapper.sh'),
-    // Dev-signed identity keypair dir (populated in a later step; reserved here).
+    // Dev-signed identity keypair; see readOrCreateDevIdentity.
     devIdentityDir: path.join(root, 'dev-identity'),
-    // Filesystem cache-storage dir so ctx.cache save/restore works offline.
+    // Backs ctx.cache offline.
     cacheDir: path.join(root, 'cache'),
   };
 }
 
-/**
- * Fixed localhost ports for the plane's orchestrator (HTTP+WS) and Postgres.
- * Overridable via `KICI_LOCAL_ORCH_PORT` / `KICI_LOCAL_PG_PORT`.
- */
+/** Fixed localhost ports, overridable via `KICI_LOCAL_ORCH_PORT` / `KICI_LOCAL_PG_PORT`. */
 export function planePorts(): { orchestrator: number; postgres: number } {
   const orchestrator = Number(process.env.KICI_LOCAL_ORCH_PORT ?? 4319);
   const postgres = Number(process.env.KICI_LOCAL_PG_PORT ?? 45432);

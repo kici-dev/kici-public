@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
-// Mock os module
 vi.mock('node:os', async () => {
   const actual = await vi.importActual<typeof import('node:os')>('node:os');
   return {
@@ -15,7 +14,6 @@ vi.mock('node:os', async () => {
   };
 });
 
-// Mock global fetch
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
@@ -31,10 +29,8 @@ describe('kici org', () => {
     vi.clearAllMocks();
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-org-test-'));
     vi.mocked(os.homedir).mockReturnValue(tempDir);
-    // The homedir mock alone does not isolate this suite: getConfigDir()
-    // refuses the ambient config under the KiCI test-isolation marker before
-    // it consults homedir(). Name the same directory the mock produces
-    // explicitly.
+    // The homedir mock alone does not isolate this suite: getConfigDir() refuses
+    // the ambient config under the test-isolation marker before consulting homedir().
     process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
     consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -68,9 +64,8 @@ describe('kici org', () => {
       const output = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
       expect(output).toContain('Personal');
       expect(output).toContain('My team');
-      // Active org should have a marker
       expect(output).toMatch(/\*.*Personal/);
-      // Ownership column renders owner/member, not (undefined)
+      // Not "(undefined)".
       expect(output).toContain('(owner)');
       expect(output).toContain('(member)');
     });

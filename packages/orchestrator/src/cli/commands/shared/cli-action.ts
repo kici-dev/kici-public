@@ -28,10 +28,7 @@ export function parseIntOption(raw: string | undefined, label: string): number |
   return n;
 }
 
-/**
- * Wrap a Commander action so any thrown error prints `Error: <message>` to
- * stderr and exits 1.
- */
+/** A thrown error prints `Error: <message>` to stderr and exits 1. */
 export function cliAction<A extends unknown[]>(
   fn: (...args: A) => Promise<void> | void,
 ): (...args: A) => Promise<void> {

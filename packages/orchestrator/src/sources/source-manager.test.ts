@@ -166,13 +166,11 @@ describe('SourceManager', () => {
       // Reset call counts after initial load
       vi.mocked(sourceStore.listSources).mockClear();
 
-      // Simulate NOTIFY
       mockClient._emitNotification('sources_change');
 
       // Before debounce fires, listSources should NOT be called
       expect(sourceStore.listSources).not.toHaveBeenCalled();
 
-      // Advance past debounce
       await vi.advanceTimersByTimeAsync(150);
 
       expect(sourceStore.listSources).toHaveBeenCalledOnce();
@@ -190,7 +188,6 @@ describe('SourceManager', () => {
       await manager.start();
       vi.mocked(sourceStore.listSources).mockClear();
 
-      // Fire 5 rapid notifications
       mockClient._emitNotification('sources_change');
       await vi.advanceTimersByTimeAsync(50);
       mockClient._emitNotification('sources_change');
@@ -201,10 +198,8 @@ describe('SourceManager', () => {
       await vi.advanceTimersByTimeAsync(50);
       mockClient._emitNotification('sources_change');
 
-      // Wait for debounce
       await vi.advanceTimersByTimeAsync(250);
 
-      // Should only reload once
       expect(sourceStore.listSources).toHaveBeenCalledOnce();
     });
   });

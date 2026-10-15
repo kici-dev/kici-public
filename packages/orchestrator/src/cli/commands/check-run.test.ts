@@ -1,6 +1,6 @@
 // Covers surface: cli:kici-admin:check-run list
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { Command } from 'commander';
+import { runCli } from '../../__test-helpers__/cli.js';
 
 const mockListCheckRunTrackingDirect = vi.fn();
 
@@ -17,41 +17,7 @@ const { registerCheckRunCommands } = await import('./check-run.js');
 async function runCommand(
   args: string[],
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  const program = new Command();
-  program.exitOverride();
-  registerCheckRunCommands(program);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:') && !err.code?.startsWith('commander.')) {
-      console.log = origLog;
-      console.error = origError;
-      process.exit = origExit;
-      throw err;
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
+  return runCli((p) => registerCheckRunCommands(p), args);
 }
 
 const ROW = {
@@ -129,9 +95,8 @@ describe('kici-admin check-run CLI', () => {
     expect(JSON.parse(stdout).rows[0].check_run_id).toBe('9876543210');
   });
 
-  // A row with a null check_run_id is the whole point of the command. It has
-  // two meanings, and CREATE_STATE is the only thing that separates them, so
-  // the row must render rather than be dropped.
+  // A null check_run_id row is the point of the command: only CREATE_STATE
+  // separates its two meanings, so it must render, not be dropped.
   it('renders a null check_run_id as an em dash rather than omitting the row', async () => {
     mockListCheckRunTrackingDirect.mockResolvedValue({
       rows: [
@@ -219,9 +184,8 @@ describe('kici-admin check-run CLI', () => {
     expect(mockListCheckRunTrackingDirect).not.toHaveBeenCalled();
   });
 
-  // TERMINAL_SENT is the column that separates "we never sent the terminal
-  // update" from "the provider is lagging" — the attribution the command exists
-  // for. Both renderings have to be right.
+  // TERMINAL_SENT separates "the terminal update was never sent" from "the
+  // provider is lagging", the attribution the command exists for.
   it('renders TERMINAL_SENT as a timestamp when the terminal update was sent', async () => {
     mockListCheckRunTrackingDirect.mockResolvedValue({ rows: [ROW] });
     const { stdout } = await runCommand([

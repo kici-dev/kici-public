@@ -1,17 +1,10 @@
 /**
- * Read-through helper for `event_log` (Orchestrator).
+ * Read-through helper for `event_log`; mirrors the Platform-side `load-event-log-range.ts`.
  *
- * Mirrors the Platform-side `load-event-log-range.ts`. Tenant column is
- * `routing_key` (NOT NULL on this side) so cold-store partitioning
- * doesn't need a synthetic-tenant fallback. Partition column is
- * `received_at`.
- *
- * The orchestrator's `event_log` row carries the `payload_key` reference
- * (an S3 object that holds the gzipped webhook body). Cold-store
- * archives the row metadata and preserves `payload_key` verbatim — the
- * payload blob itself stays in object storage indefinitely so the
- * dashboard's payload-detail view continues to resolve archived
- * deliveries identically to hot ones.
+ * Tenant column is `routing_key` (NOT NULL here, so no synthetic-tenant fallback); partition
+ * column is `received_at`. Cold-store archives the row metadata and keeps `payload_key` (the
+ * S3 object holding the gzipped webhook body) verbatim; the blob stays in object storage
+ * indefinitely, so the payload-detail view resolves archived deliveries like hot ones.
  */
 import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
@@ -19,10 +12,8 @@ import type { Database } from '../db/types.js';
 import type { EventLogColdStoreRow } from './tables/event-log.js';
 
 /**
- * Re-exported, not re-declared: the alias is defined beside the cold-store
- * adapter that owns the table, and a second identical declaration here is what
- * a homonym sweep flags. Kept as an export so this module's public surface is
- * unchanged for its consumers.
+ * Re-exported, not re-declared: the alias lives beside the cold-store adapter that owns the
+ * table (a second declaration trips the homonym sweep); the export keeps this module's surface.
  */
 export type { EventLogColdStoreRow };
 
@@ -31,11 +22,7 @@ const logger = createLogger({ prefix: 'load-event-log-range' });
 export interface LoadOrchEventLogRangeArgs {
   db: Kysely<Database>;
   coldStore: ColdStore | undefined;
-  /**
-   * Routing key (tenant column on this side). Required when
-   * `includeArchived` is true — cold-store fetch is keyed by tenant.
-   * The hot list endpoint also typically narrows by routing_key.
-   */
+  /** Tenant column; required for `includeArchived` because the cold-store fetch is keyed by it. */
   routingKey: string;
   /** Optional org filter (event_log carries org_id for cross-tier joins). */
   orgId?: string;
@@ -94,9 +81,7 @@ export async function loadEventLogRange(
   const remaining = limit - hotRows.length;
   if (remaining <= 0) return hotRows;
 
-  // Cold-side offset: when the caller paginates past the hot tail the
-  // earlier pages already consumed some cold rows, so skip them. Count
-  // the hot rows that match the filter in-range, then offset cold by
+  // Pages past the hot tail already consumed some cold rows: offset cold by
   // `offset - hotCount` (mirrors `load-secret-audit-log-range.ts`).
   let hotCountQuery = db
     .selectFrom('event_log')
@@ -115,9 +100,7 @@ export async function loadEventLogRange(
   const coldToTs = toTs && toTs < warmCutoff ? toTs : warmCutoff;
   const coldRows: EventLogColdStoreRow[] = [];
 
-  // The cold stream arrives newest-first, so the page is complete once
-  // `coldOffset + remaining` matching rows are in hand; the rest of the
-  // archive is never read.
+  // The cold stream is newest-first: stop once `coldOffset + remaining` rows match.
   try {
     for await (const row of coldStore.fetchRange<EventLogColdStoreRow>({
       db: 'orchestrator',
@@ -137,11 +120,8 @@ export async function loadEventLogRange(
     }
   } catch (err) {
     if (hotRows.length === 0) {
-      // No hot fallback for this page — the caller paginated past the
-      // hot tail and cold was the only source. Returning [] would look
-      // like end-of-results to the caller and silently drop the
-      // remaining cold rows. Propagate so the upstream HTTP handler
-      // surfaces a typed error instead.
+      // Cold was the only source: [] would read as end-of-results and silently drop the
+      // remaining cold rows, so propagate for the HTTP handler to surface a typed error.
       logger.error('cold-store fetchRange failed with no hot fallback; propagating', {
         routingKey,
         error: toErrorMessage(err),
@@ -161,9 +141,8 @@ export async function loadEventLogRange(
 /**
  * Detail lookup by `(orgId, deliveryId)`. The dashboard handler joins
  * cross-tier on this composite key. Hot first; on miss scans cold for
- * the matching tenant. The caller must know `routingKey` to scope the
- * cold scan — when only `orgId+deliveryId` are known, callers fall
- * back to enumerating all routing keys for the org (rare; the dashboard
+ * the matching tenant. The caller must pass `routingKey` to scope the
+ * cold scan; without it a hot miss returns `null` (the dashboard
  * always knows the routing_key from the Platform-side row).
  */
 export async function loadEventLogByDeliveryId(args: {
@@ -172,9 +151,9 @@ export async function loadEventLogByDeliveryId(args: {
   orgId: string;
   deliveryId: string;
   /**
-   * Optional routing-key hint. When omitted, the cold scan iterates
-   * every routing_key for the org — bounded but slower. The dashboard
-   * always provides this hint from the Platform-side join.
+   * Routing-key hint that scopes the cold scan. When omitted, the cold
+   * scan is skipped with a warning and a hot miss returns `null`. The
+   * dashboard always provides this hint from the Platform-side join.
    */
   routingKey?: string;
 }): Promise<EventLogColdStoreRow | null> {
@@ -189,11 +168,8 @@ export async function loadEventLogByDeliveryId(args: {
   if (hotRow) return hotRow;
   if (!coldStore) return null;
 
-  // Find the routing_key. If the caller didn't pass it, sniff it from
-  // a previously-archived row in the same org via SELECT (the row's
-  // `archive_object_key` was stamped before DELETE — but rows are
-  // gone by now, so this branch is unreachable in steady state). The
-  // robust path: the caller passes routingKey; we error-log if absent.
+  // The archived rows are gone from the hot table, so the routing_key cannot be
+  // looked up here: without the caller's hint, warn and skip the cold scan.
   if (!routingKey) {
     logger.warn('cold-store delivery lookup without routingKey hint — scan skipped', {
       orgId,

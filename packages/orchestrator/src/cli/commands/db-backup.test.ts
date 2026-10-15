@@ -1,8 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 
-// `createDbBackup` drives the module-level seams (pg_dump exec + stat), so the
-// two host modules behind them are replaced. Every other test in this file
-// injects its own seam and is unaffected.
+// `createDbBackup` uses the module-level seams (pg_dump exec + stat), so their
+// host modules are replaced; the other tests inject their own seams.
 vi.mock('node:child_process', () => ({
   execFile: vi.fn(
     (
@@ -42,8 +41,9 @@ import {
   type BackupManifest,
   type PruneIo,
 } from './db-backup.js';
+import { createMockDb } from '../../__test-helpers__/mock-db.js';
 
-/** Minimal `pool.query` stand-in covering the three reads the backup makes. */
+/** Minimal `pool.query` stand-in covering the reads the backup makes. */
 function fakePool(serverVersionNum = '160003') {
   return {
     query: async (sql: string) => {
@@ -54,18 +54,6 @@ function fakePool(serverVersionNum = '160003') {
       return { rows: [{ value: 'cluster-abc' }] };
     },
   } as unknown as import('pg').Pool;
-}
-
-/** Captures the row `recordBackupRun` inserts. */
-function fakeDb(sink: { row?: Record<string, unknown> }) {
-  return {
-    insertInto: () => ({
-      values: (row: Record<string, unknown>) => {
-        sink.row = row;
-        return { execute: async () => undefined };
-      },
-    }),
-  } as unknown as Parameters<typeof createDbBackup>[0]['db'];
 }
 
 describe('db-backup helpers', () => {
@@ -128,10 +116,10 @@ describe('db-backup helpers', () => {
     const [bin, args, opts] = run.mock.calls[0];
     expect(bin).toBe('pg_dump');
     expect(args).toEqual(['-Fc', '--file', '/tmp/out.dump']);
-    // Credentials must NEVER appear on the command line (/proc/cmdline is world-readable).
+    // Credentials ride in the environment, NEVER the command line
+    // (/proc/cmdline is world-readable).
     expect(args.join(' ')).not.toContain('secret');
     expect(args.join(' ')).not.toContain('postgres://');
-    // They ride in the environment instead.
     expect((opts as { env: NodeJS.ProcessEnv }).env.PGPASSWORD).toBe('secret');
     expect((opts as { env: NodeJS.ProcessEnv }).env.PGDATABASE).toBe('db');
     expect((opts as { env: NodeJS.ProcessEnv }).env.PGHOST).toBe('h');
@@ -216,13 +204,13 @@ describe('restoreKeyWarning', () => {
 
 describe('createDbBackup', () => {
   it('dumps, writes the manifest, and records the backup run', async () => {
-    const sink: { row?: Record<string, unknown> } = {};
+    const { db, mocks } = createMockDb();
     const now = new Date('2026-09-04T10:11:12.000Z');
 
     const result = await createDbBackup({
       databaseUrl: 'postgres://u:p@h:5432/kici',
       outputPath: '/backups/kici.dump',
-      db: fakeDb(sink),
+      db,
       pool: fakePool(),
       now,
     });
@@ -235,7 +223,8 @@ describe('createDbBackup', () => {
     expect(result.manifest.clusterId).toBe('cluster-abc');
     expect(result.manifest.migrationsHash).toMatch(/^[0-9a-f]{64}$/);
 
-    expect(sink.row).toMatchObject({
+    // The row `recordBackupRun` inserts.
+    expect(mocks.insertValues.mock.calls[0][0]).toMatchObject({
       dump_path: '/backups/kici.dump',
       byte_size: '4096',
       secret_key_version: 3,
@@ -248,7 +237,7 @@ describe('createDbBackup', () => {
       createDbBackup({
         databaseUrl: 'postgres://u:p@h:5432/kici',
         outputPath: '/backups/kici.dump',
-        db: fakeDb({}),
+        db: createMockDb().db,
         pool: fakePool('170001'),
         now: new Date(),
       }),
@@ -266,7 +255,7 @@ describe('createDbBackup', () => {
       createDbBackup({
         databaseUrl: 'postgres://u:p@h:5432/kici',
         outputPath: '/backups/kici.dump',
-        db: fakeDb({}),
+        db: createMockDb().db,
         pool,
         now: new Date(),
       }),

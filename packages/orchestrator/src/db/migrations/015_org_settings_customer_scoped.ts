@@ -3,32 +3,25 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Org-scope `org_settings` and qualify each glob entry by source.
  *
- * `org_settings` was keyed by `routing_key`, meaning each webhook
- * source had its own independent global-workflow configuration. With multi-
- * source orgs, the dashboard's per-org settings page only ever showed the
- * first source it found and silently hid the rest.
- *
- * This migration:
+ * A `routing_key`-keyed table gave each webhook source its own
+ * global-workflow config, and the per-org dashboard page showed only the
+ * first source of a multi-source org.
  *
  *   1. Adds a `customer_id text` column.
  *   2. Backfills `customer_id` from `sources` / `generic_webhook_sources` by
- *      `routing_key`. Rows whose `routing_key` cannot be resolved (orphans
- *      from deleted sources) are dropped — they were already unreachable.
+ *      `routing_key`. Unresolvable rows (orphans from deleted sources) are
+ *      dropped — they were already unreachable.
  *   3. Converts the three repo-list `text[]` columns to `jsonb` arrays of
- *      `{routingKey?: string, pattern: string}` entries. Each existing entry
- *      is qualified with its original `routing_key` so semantics are preserved
- *      verbatim — a glob that previously only saw events on `github:42` still
- *      only sees events on `github:42`.
- *   4. Merges rows by `customer_id`. `global_workflows_enabled` collapses with
- *      logical OR; the three list columns concatenate.
- *   5. Drops the old `routing_key` column and PK; new PK is `customer_id`.
+ *      `{routingKey?: string, pattern: string}`. Each entry is qualified with
+ *      its original `routing_key`, so a glob that saw only `github:42` events
+ *      still sees only `github:42` events.
+ *   4. Merges rows by `customer_id`: `global_workflows_enabled` is OR-ed, the
+ *      list columns concatenate.
+ *   5. Drops the `routing_key` column and PK; the new PK is `customer_id`.
  *
- * Idempotent: a re-run on an already-migrated DB sees `customer_id` exists
- * and the list columns are already jsonb, so it is a no-op.
+ * Idempotent: an existing `customer_id` column makes a re-run a no-op.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
-  // Quick idempotency check: if customer_id already exists, the migration
-  // already ran. Skip the rewrite entirely.
   const colCheck = await sql<{ customer_id_exists: boolean }>`
     SELECT EXISTS (
       SELECT 1 FROM information_schema.columns
@@ -39,8 +32,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
   `.execute(db);
   if (colCheck.rows[0]?.customer_id_exists) return;
 
-  // 1. Stage a side table that holds (routing_key, customer_id, ...legacy lists).
-  //    Backfill customer_id from sources / generic_webhook_sources.
+  // 1. Stage (routing_key, customer_id, ...legacy lists), resolving customer_id.
   await sql`
     CREATE TEMP TABLE _org_settings_stage AS
     SELECT os.routing_key,
@@ -59,8 +51,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
             AND gws.deleted_at IS NULL
   `.execute(db);
 
-  // 2. Surface orphans (no resolvable customer_id). They were silently
-  //    unreachable already; log them for the operator and drop them.
+  // 2. Orphans (no resolvable customer_id) were already unreachable: log, then drop.
   const orphans = await sql<{ routing_key: string }>`
     SELECT routing_key FROM _org_settings_stage WHERE customer_id IS NULL
   `.execute(db);
@@ -77,8 +68,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
   }
   await sql`DELETE FROM _org_settings_stage WHERE customer_id IS NULL`.execute(db);
 
-  // 3. Build the merged-by-customer rows in a second temp table. For each
-  //    customer_id we OR the enabled flag and concat the qualified lists.
+  // 3. Merge by customer_id: OR the enabled flag, concat the qualified lists.
   await sql`
     CREATE TEMP TABLE _org_settings_merged AS
     SELECT customer_id,
@@ -131,8 +121,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
      GROUP BY customer_id
   `.execute(db);
 
-  // 4. Replace the live table. The cleanest path on Postgres is DROP +
-  //    CREATE — the table is small and the migration is single-shot.
+  // 4. DROP + CREATE the live table: it is small and the migration is single-shot.
   await sql`DROP TABLE public.org_settings`.execute(db);
   await sql`
     CREATE TABLE public.org_settings (
@@ -172,11 +161,8 @@ export async function up(db: Kysely<unknown>): Promise<void> {
 }
 
 export async function down(db: Kysely<unknown>): Promise<void> {
-  // Down is best-effort: we cannot reliably split merged rows back into
-  // per-routing-key rows without consulting the source list again, and we
-  // do not store the original entries' provenance after the merge. The
-  // intent here is to leave the schema in a recoverable shape rather than
-  // round-trip the data perfectly.
+  // Best-effort: merged rows cannot be split back per routing key (entry
+  // provenance is not stored), so down restores the schema shape, not the data.
   const colCheck = await sql<{ customer_id_exists: boolean }>`
     SELECT EXISTS (
       SELECT 1 FROM information_schema.columns

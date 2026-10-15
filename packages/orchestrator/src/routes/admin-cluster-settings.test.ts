@@ -8,10 +8,9 @@ import {
 } from '../cluster/settings-propagation.js';
 
 /**
- * Minimal stateful Kysely stub for the single-row `cluster_settings` path.
- * Records one row keyed by id='default' and mimics the exact query chain the
- * route uses: selectFrom().selectAll().where().executeTakeFirst() for reads and
- * insertInto().values().onConflict(...).execute() for the upsert.
+ * Stateful Kysely stub for the single-row `cluster_settings` path, mimicking
+ * the route's exact chains: selectFrom().selectAll().where().executeTakeFirst()
+ * and insertInto().values().onConflict(...).execute().
  */
 function makeClusterSettingsDbStub() {
   const rows = new Map<string, Record<string, unknown>>();
@@ -275,9 +274,8 @@ describe('admin cluster-settings route', () => {
   });
 
   it('PATCH rejects a cache entry-count above the boot-safety ceiling (Zod)', async () => {
-    // An accepted over-ceiling value is persisted and then read at boot, where
-    // the LRU constructor throws on it — crashing the orchestrator before this
-    // very route is listening to take the correction.
+    // An accepted over-ceiling value is read at boot, where the LRU constructor
+    // throws, crashing the orchestrator before this route can take a correction.
     for (const field of ['lockfileCacheMax', 'contentCacheMax']) {
       const { db } = makeClusterSettingsDbStub();
       const app = buildApp(db);
@@ -307,14 +305,12 @@ describe('admin cluster-settings route', () => {
   it('PATCH bumps version on a real settings change', async () => {
     const { db, rows } = makeClusterSettingsDbStub();
     const app = buildApp(db);
-    // First real change: version 0 → 1.
     await app.request('/cluster-settings', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ agentTokenTtlMs: 1_800_000 }),
     });
     expect(Number(rows.get('default')?.version)).toBe(1);
-    // A second, distinct change: version 1 → 2.
     await app.request('/cluster-settings', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -332,14 +328,12 @@ describe('admin cluster-settings route', () => {
       body: JSON.stringify({ agentTokenTtlMs: 1_800_000 }),
     });
     expect(Number(rows.get('default')?.version)).toBe(1);
-    // Empty body: no columns provided → no bump.
     await app.request('/cluster-settings', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
     });
     expect(Number(rows.get('default')?.version)).toBe(1);
-    // Same value re-submitted: no change → no bump.
     await app.request('/cluster-settings', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -363,9 +357,8 @@ describe('admin cluster-settings route', () => {
   });
 
   it('accepts checkRunTrackingTtlDays = 0, the documented disable value', async () => {
-    // Every other numeric knob floors at 1 or higher, so a copy-pasted
-    // `.min(1)` would still pass the round-trip above while making the sweep
-    // impossible to turn off. This is the assertion that catches it.
+    // A copy-pasted `.min(1)` would pass the round-trip above while making the
+    // sweep impossible to turn off.
     const { db } = makeClusterSettingsDbStub();
     const app = buildApp(db);
     const patch = await app.request('/cluster-settings', {
@@ -390,9 +383,9 @@ describe('admin cluster-settings route', () => {
   });
 
   describe('global eval timeout ordering', () => {
-    // The agent's round budget starts only once the round job is RUNNING, so a
-    // wait ceiling at or below it fires on every round that merely waited for a
-    // free agent — every round fails, silently and permanently.
+    // The round budget starts only once the round job is RUNNING, so a wait
+    // ceiling at or below it fires on every round that waited for a free agent:
+    // every round fails, silently and permanently.
     const patchJson = (body: unknown) => ({
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
@@ -422,14 +415,12 @@ describe('admin cluster-settings route', () => {
           )
         ).status,
       ).toBe(200);
-      // Now lower ONLY the ceiling — the check is on effective values, so the
-      // stored budget is what it is compared against.
+      // Lower ONLY the ceiling: the check compares effective values.
       const res = await app.request(
         '/cluster-settings',
         patchJson({ globalEvalWaitTimeoutMs: 60_000 }),
       );
       expect(res.status).toBe(400);
-      // And the rejected value did not land.
       const get = (await (await app.request('/cluster-settings')).json()) as {
         settings: Record<string, unknown>;
       };
@@ -447,9 +438,8 @@ describe('admin cluster-settings route', () => {
     });
 
     it('rejects a backoff ceiling below its base, in one patch and against the stored row', async () => {
-      // `min(base * 2^(n-1), ceiling)` with a ceiling under the base collapses
-      // to a constant from the very first failure, so the growth the two knobs
-      // exist to express never happens and nothing at runtime reports it.
+      // `min(base * 2^(n-1), ceiling)` with a ceiling under the base is constant
+      // from the first failure: no growth, and nothing at runtime reports it.
       const { db } = makeClusterSettingsDbStub();
       const app = buildApp(db);
       const both = await app.request(
@@ -462,8 +452,7 @@ describe('admin cluster-settings route', () => {
       expect(both.status).toBe(400);
       expect(JSON.stringify(await both.json())).toContain('scalerProvisionBackoffMaxMs');
 
-      // Control: the ordered pair lands, so the rejection above is the ordering
-      // and not the knobs being unwritable.
+      // Control: the ordered pair lands, so the rejection is the ordering.
       expect(
         (
           await app.request(

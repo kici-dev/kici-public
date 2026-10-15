@@ -1,11 +1,8 @@
 /**
- * A global job binds its own `contexts:`, checked against the workflow
- * repository, and a sibling job that binds none receives nothing.
- *
- * The secrets a global job binds belong to the repository that defines the
- * workflow, so a context's `repoPatterns` rule is checked against that
- * repository — never against the repository the event came from, which the
- * workflow's author does not control.
+ * A global job binds its own `contexts:`, and a sibling job that binds none
+ * receives nothing. The secrets belong to the workflow's repository, so a
+ * context's `repoPatterns` is checked against it — never against the event's
+ * source repository, which the workflow's author does not control.
  *
  * The fixture shape mirrors `process-webhook-globals-payload.test.ts`.
  */
@@ -14,6 +11,7 @@ import { ContextGateRejectReason } from '@kici-dev/engine';
 import { processWebhook } from './process-webhook.js';
 import { makeJobContextRow } from './dispatch-matched-workflow.test-helpers.js';
 import type { WebhookInfo } from '../webhook/handler.js';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 const SOURCE_REPO = 'acme/app';
 const GLOBAL_REPO = 'acme/org-workflows';
@@ -36,13 +34,12 @@ function makeInfo(): WebhookInfo {
 
 /** A global workflow whose `publish` job binds `deploy` and whose `scan` job binds nothing. */
 function makeGlobalRegistration() {
-  const job = (name: string) => ({
-    _type: 'static',
-    name,
-    runsOn: [{ kind: 'exact', value: 'default' }],
-    needs: [],
-    steps: [{ name, hasOutputs: false }],
-  });
+  const job = (name: string) =>
+    staticJob({
+      name,
+      runsOn: [{ kind: 'exact', value: 'default' }],
+      steps: [{ name, hasOutputs: false }],
+    });
   return {
     id: 'reg-global-1',
     routingKey: 'github:1',

@@ -1,9 +1,8 @@
 /**
  * The peer-channel half of `kici-admin scaler reload`: answering a
  * peer.scaler.reload.request with this node's own scaler file reload, and
- * correlating the response with the request that is waiting for it. Shared by
- * the outgoing `PeerClient` and the incoming peer handler, which carry the same
- * message pair.
+ * correlating the response with its waiting request. Shared by the outgoing
+ * `PeerClient` and the incoming peer handler.
  */
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import {

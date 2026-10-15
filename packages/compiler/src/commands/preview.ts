@@ -14,15 +14,11 @@ import type { Workflow } from '@kici-dev/sdk';
 import { flattenStepInputs } from '@kici-dev/sdk/internal';
 import { parseEventArg } from '../test-runner/event-types.js';
 
-/** Options for the kici preview command (dry-run trigger preview) */
 export interface PreviewOptions extends PayloadOptions {
-  /** Filter to specific workflow */
   workflow?: string;
-  /** Filter to specific job */
   job?: string;
-  /** Enable debug output */
   debug?: boolean;
-  /** Path to .kici directory (defaults to .kici) */
+  /** Defaults to `.kici`. */
   kiciDir?: string;
   /** Flat secret overrides: KEY=VALUE */
   secret?: string[];
@@ -30,21 +26,18 @@ export interface PreviewOptions extends PayloadOptions {
   context?: string[];
 }
 
-/** Options for the kici run remote command */
+/** Options for `kici run remote`. */
 export interface RemoteRunOptions extends PreviewOptions {
-  /** Run all available fixtures */
   all?: boolean;
-  /** Interactively pick fixtures to run (multi-select checkbox). */
+  /** Interactive multi-select of fixtures. */
   pick?: boolean;
-  /** Run matching fixtures concurrently */
   parallel?: boolean;
-  /** Fire and forget (print runIds, don't stream) */
+  /** `false` (`--no-wait`): fire and forget, print runIds, don't stream. */
   wait?: boolean;
-  /** Suppress output except final result */
+  /** Suppress output except the final result. */
   quiet?: boolean;
-  /** Output structured JSON result */
   json?: boolean;
-  /** Output JUnit XML result */
+  /** JUnit XML output path. */
   junit?: string;
   /**
    * `--routing-key`: accepted and ignored.
@@ -54,35 +47,29 @@ export interface RemoteRunOptions extends PreviewOptions {
   routingKey?: string;
   /** `--orchestrator-url`: run on this orchestrator directly, skipping the Platform. */
   orchestratorUrl?: string;
-  /** Show recent run history */
   history?: boolean;
   /** --env KEY=VALUE flag values, uploaded as per-run secrets. */
   envFlags?: string[];
-  /** Target organization id (overrides config.activeOrgId). */
+  /** Overrides config.activeOrgId. */
   org?: string;
-  /** Target orchestrator cluster name (overrides the per-org default). */
+  /** Orchestrator cluster name; overrides the per-org default. */
   orchestrator?: string;
-  /**
-   * Run mode resolved from --check / --fail-on-drift, threaded onto the dispatch
-   * payload so the orchestrator runs the agent step loop in the requested mode.
-   * Defaults to `apply`.
-   */
+  /** From --check / --fail-on-drift, carried on the dispatch payload. Defaults to `apply`. */
   checkMode?: CheckMode;
   /** `--target <selector>` values (repeatable), AND-combined into host narrowing. */
   targets?: string[];
   /** `--target-allow-empty`: a target that zeroes a runsOnAll job skips it instead of failing. */
   targetAllowEmpty?: boolean;
   /**
-   * `--approve-all` (alias `--yes`): auto-approve every approval gate this run
-   * holds on (run-scoped only — the run id this invocation dispatched). The
-   * operator must still be clause-eligible per hold; an ineligible hold blocks.
+   * `--approve-all` (alias `--yes`): auto-approve every gate of the run this
+   * invocation dispatched. The operator must still be clause-eligible per hold;
+   * an ineligible hold blocks.
    */
   approveAll?: boolean;
   /** `--input KEY=VALUE` values (repeatable): typed workflow-dispatch inputs. */
   inputs?: string[];
 }
 
-/** Result of a single remote fixture run */
 export interface RemoteRunResult {
   fixtureId: string;
   runId: string;
@@ -94,10 +81,8 @@ export interface RemoteRunResult {
 }
 
 /**
- * Main preview command entry point.
- *
- * `kici preview <event>` is a dry-run trigger preview only — it executes nothing.
- * If the argument looks like a fixture name (not a known event type), prints a migration message.
+ * `kici preview <event>`: a dry-run trigger preview that executes nothing. A
+ * fixture-name argument prints a migration message.
  */
 export async function previewCommand(
   event: string | undefined,
@@ -109,7 +94,6 @@ export async function previewCommand(
   }
 
   try {
-    // No event provided
     if (!event) {
       logger.info(pc.bold('\nUsage: kici preview <event>\n'));
       logger.info(pc.gray('Preview which workflows and jobs would run for a given event.\n'));
@@ -125,8 +109,6 @@ export async function previewCommand(
       return true;
     }
 
-    // Check if the event looks like a fixture name rather than a known event type.
-    // If parseEventArg throws and the arg doesn't contain a colon, it's probably a fixture name.
     if (!isKnownEventArg(event)) {
       logger.info(
         pc.yellow(
@@ -137,7 +119,6 @@ export async function previewCommand(
       return false;
     }
 
-    // Run dry-run trigger preview
     return await previewEvent(event, options);
   } catch (error) {
     const message = toErrorMessage(error);
@@ -151,35 +132,25 @@ export async function previewCommand(
   }
 }
 
-/**
- * Check if the argument is a known event type.
- * Returns true if parseEventArg succeeds, false if it looks like a fixture name.
- */
+/** False when the argument looks like a fixture name rather than an event. */
 function isKnownEventArg(arg: string): boolean {
   try {
     parseEventArg(arg);
     return true;
   } catch {
-    // parseEventArg throws for unknown events.
-    // If the arg contains a colon, it might be an event pattern we don't recognize yet.
-    // Without a colon, it's likely a fixture name.
+    // A colon suggests an unrecognized event pattern; without one, a fixture name.
     return arg.includes(':');
   }
 }
 
-/**
- * Local-only dry-run mode: compile workflows, match triggers, display what would execute.
- */
+/** Local-only dry run: compile workflows, match triggers, display what would execute. */
 export async function previewEvent(event: string, options: PreviewOptions): Promise<boolean> {
   try {
-    // Resolve .kici directory
     const kiciDir = resolveKiciDir(options.kiciDir);
     logger.info(pc.gray(`KiCI directory: ${kiciDir}`));
 
-    // Load secrets from .kici/.secrets file + CLI overrides
     await loadTestSecrets(kiciDir, options.secret, options.context);
 
-    // Build event payload
     logger.info(pc.gray(`Event: ${event}`));
     const simulatedEvent = await buildEventPayload(event, options);
     logger.info(pc.gray(`Target branch: ${simulatedEvent.targetBranch}`));
@@ -190,11 +161,9 @@ export async function previewEvent(event: string, options: PreviewOptions): Prom
       logger.info(pc.gray(`Changed files: ${simulatedEvent.changedFiles.join(', ')}`));
     }
 
-    // Load workflows
     const { workflows } = await loadWorkflows(kiciDir);
     const lockWorkflows = workflowsToLockFormat(workflows);
 
-    // Match triggers
     const decisions = matchAllWorkflows(lockWorkflows, simulatedEvent);
     const matchedWorkflows = workflows.filter((_, i) => decisions[i].matched);
 
@@ -202,7 +171,6 @@ export async function previewEvent(event: string, options: PreviewOptions): Prom
       pc.gray(`Workflows: ${workflows.length} total, ${matchedWorkflows.length} matched\n`),
     );
 
-    // Apply filters
     let filteredWorkflows = matchedWorkflows;
     if (options.workflow) {
       filteredWorkflows = matchedWorkflows.filter((w) => w.name === options.workflow);
@@ -212,7 +180,6 @@ export async function previewEvent(event: string, options: PreviewOptions): Prom
       }
     }
 
-    // Display dry-run output
     displayDryRun(lockWorkflows, decisions, { workflow: options.workflow, job: options.job });
     return true;
   } catch (error) {
@@ -227,36 +194,27 @@ export async function previewEvent(event: string, options: PreviewOptions): Prom
   }
 }
 
-// --- Internal helpers ---
-
-/**
- * Load lock file if exists, otherwise discover workflows.
- */
+/** Workflows are always discovered (for their runtime functions); the lock file is optional. */
 async function loadWorkflows(
   kiciDir: string,
 ): Promise<{ lockFile?: LockFile; workflows: Workflow[] }> {
   const lockFilePath = path.join(kiciDir, 'kici.lock.json');
 
-  // Try to load existing lock file
   try {
     const lockContent = await readFile(lockFilePath, 'utf-8');
     const lockFile = JSON.parse(lockContent) as LockFile;
     logger.info(pc.gray(`Using lock file: ${lockFilePath}`));
 
-    // Also need to discover workflows to get runtime functions
     const result = await discoverWorkflows(kiciDir);
     return { lockFile, workflows: result.workflows.map((w) => w.workflow) };
   } catch {
-    // No lock file, discover workflows
     logger.info(pc.gray(`Discovering workflows from ${kiciDir}/workflows/`));
     const result = await discoverWorkflows(kiciDir);
     return { workflows: result.workflows.map((w) => w.workflow) };
   }
 }
 
-/**
- * Convert SDK Workflow to lock-file-like structure for trigger matching.
- */
+/** A lock-like shape for trigger matching. */
 function workflowsToLockFormat(workflows: Workflow[]): LockWorkflow[] {
   return workflows.map((w) => ({
     name: w.name,
@@ -313,9 +271,7 @@ function workflowsToLockFormat(workflows: Workflow[]): LockWorkflow[] {
   }));
 }
 
-/**
- * Load test secrets from .kici/.secrets file and merge CLI overrides.
- */
+/** `.kici/.secrets` merged with CLI overrides. */
 async function loadTestSecrets(
   kiciDir: string,
   secretFlags?: string[],

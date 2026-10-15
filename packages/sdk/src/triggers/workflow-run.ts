@@ -1,7 +1,4 @@
-/**
- * Workflow run trigger helper - creates triggers for workflow_run events.
- * Returns a frozen WorkflowRunTriggerConfig directly.
- */
+/** Trigger helper for workflow_run events; returns a frozen config. */
 
 import type { BranchPattern, WorkflowRunConfigInput, WorkflowRunTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';

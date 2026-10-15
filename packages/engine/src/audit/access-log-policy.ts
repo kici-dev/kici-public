@@ -1,25 +1,23 @@
 /**
  * Per-action access-log policy + sampling helper.
  *
- * Single source of truth for the keep / sample / rate-limit decision used by
- * the orchestrator's `access_log` writer. The policy table is exhaustive
- * over `AccessLogAction.options` so a new enum value without a policy entry
- * is a compile-time error.
+ * Single source of truth for the keep / sample / rate-limit decision of the
+ * orchestrator's `access_log` writer. The policy table is exhaustive over
+ * `AccessLogAction.options`, so a new enum value without an entry is a
+ * compile-time error.
  *
  * Override layers (applied in `shouldRecordAccess`, in order):
  *
  * 1. `outcome !== 'allowed'` → always record (denied/error are full-fidelity).
  * 2. `actor.type === 'platform_operator'` → always record (compliance: any
  *    activity by a non-org member must be auditable in full).
- * 3. agent-attributed actor (`actor.agent` present) → always record. The
- *    agent-provenance guarantee is that every action an agent takes is fully
- *    auditable; a sampled subset would break it.
- * 4. The per-action `POLICY_BY_ACTION` decision (`always` / `sample` /
- *    `rate_limit`).
+ * 3. agent-attributed actor (`actor.agent` present) → always record: every
+ *    action an agent takes must be fully auditable.
+ * 4. The per-action `POLICY_BY_ACTION` decision.
  *
- * Browser-safe: this module MUST NOT import any Node built-ins (`node:crypto`
- * etc.). It is re-exported via the `@kici-dev/engine` barrel which the
- * dashboard imports. Sampling uses a tiny inline FNV-1a 32-bit hash.
+ * Browser-safe: this module MUST NOT import Node built-ins (`node:crypto`
+ * etc.), because the dashboard imports the `@kici-dev/engine` barrel that
+ * re-exports it. Sampling uses an inline FNV-1a 32-bit hash.
  */
 import { z } from 'zod';
 import { AccessLogAction, type AccessLogOutcome } from '../protocol/messages/access-log.js';
@@ -35,18 +33,16 @@ export type AccessLogPolicy =
   | { kind: 'rate_limit'; perMinutePerActor: number };
 
 /**
- * Minimal interface for the rate-limit decision so the engine stays
- * dependency-free. Orchestrator wires in a real `SamplingRateLimiter`.
+ * Rate-limit decision seam, so the engine stays dependency-free. The
+ * orchestrator wires in a real `SamplingRateLimiter`.
  */
 export interface AccessLogRateLimiter {
   permit(action: AccessLogAction, actorKey: string, perMinute: number): boolean;
 }
 
 /**
- * Per-action recording policy (the platform-operator override is applied
- * separately in `shouldRecordAccess`).
- *
- * Exhaustive over `AccessLogAction.options` — TypeScript catches additions.
+ * Per-action recording policy. The outcome, platform-operator and agent
+ * overrides are applied separately in `shouldRecordAccess`.
  */
 export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   // High-volume tenant reads (sampled).
@@ -147,16 +143,15 @@ export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
 };
 
 /**
- * Tiny FNV-1a 32-bit hash. Used for stable hash-based sampling so a single
- * actor's request stream lands in the same sampling bucket repeatedly.
- *
- * Pure JS, no Node built-ins (engine barrel must stay browser-safe).
+ * FNV-1a 32-bit hash for stable sampling: one actor's request stream lands in
+ * the same bucket every time. Pure JS, so the engine barrel stays
+ * browser-safe.
  */
 export function fnv1a32(input: string): number {
   let hash = 0x811c9dc5; // FNV-1a 32-bit offset basis
   for (let i = 0; i < input.length; i++) {
     hash ^= input.charCodeAt(i) & 0xff;
-    // 32-bit FNV prime multiplication via Math.imul for correct overflow.
+    // Math.imul gives correct 32-bit overflow.
     hash = Math.imul(hash, 0x01000193);
   }
   return hash >>> 0; // unsigned 32-bit
@@ -181,14 +176,9 @@ function actorKey(actor: ActorPrincipal): string {
 /**
  * Decide whether to write an `access_log` row for the given action.
  *
- * @param action     The action being attempted.
- * @param outcome    `allowed` / `denied` / `error`.
- * @param actor      The principal performing the action.
- * @param requestId  The orchestrator request id (used for stable sampling).
- * @param limiter    Rate-limiter instance (only consulted for `rate_limit`
- *                   actions; tests can pass a stub).
- *
- * Returns `true` to write the row, `false` to drop.
+ * @param requestId  The orchestrator request id (salts stable sampling).
+ * @param limiter    Consulted only for `rate_limit` actions.
+ * @returns `true` to write the row, `false` to drop it.
  */
 export function shouldRecordAccess(
   action: AccessLogAction,
@@ -200,14 +190,11 @@ export function shouldRecordAccess(
   // Override 1: denied/error always recorded (forensic value).
   if (outcome !== 'allowed') return true;
 
-  // Override 2: platform_operator activity always recorded
-  // (operator break-glass is non-tenant-attributable).
+  // Override 2: operator break-glass is non-tenant-attributable.
   if (actor.type === 'platform_operator') return true;
 
-  // Override 3: agent-attributed actions always recorded — the agent-provenance
-  // guarantee (every action an agent takes is fully auditable) requires the
-  // complete trail, never a sampled subset. Covers both credential families
-  // (`user` PATs and `api_key` org keys) via the single label extractor.
+  // Override 3: agent actions need the complete trail, never a sample.
+  // `agentLabelOf` covers both `user` PATs and `api_key` org keys.
   if (agentLabelOf(actor) !== null) return true;
 
   const policy = POLICY_BY_ACTION[action];
@@ -215,12 +202,11 @@ export function shouldRecordAccess(
     case 'always':
       return true;
     case 'sample': {
-      // Stable hash on actor key + requestId so a single user's poll trace
-      // stays coherent (either every poll lands in the sample, or none does
-      // for that requestId-paired sequence).
+      // Hashing actor key + requestId keeps one user's poll trace coherent:
+      // every poll of that sequence lands in the sample, or none does.
       const seed = `${actorKey(actor)}|${requestId ?? ''}`;
       const h = fnv1a32(seed);
-      // h ∈ [0, 2^32). Compare normalised to [0, 1).
+      // h ∈ [0, 2^32), normalised to [0, 1).
       return h / 0x100000000 < policy.allowedRate;
     }
     case 'rate_limit':
@@ -228,21 +214,7 @@ export function shouldRecordAccess(
   }
 }
 
-/**
- * Decide whether to write a `secret_audit_log` row for `resolve` /
- * `resolve_named`. Volume class is per-job (every step's secret resolution),
- * so the sample rate is much lower than `access_log`.
- *
- * The secret-resolver's `AuditEntry` doesn't carry an `ActorPrincipal` —
- * we synthesise a stable key from `runId` / `jobId` so a single job's
- * trace either lands wholesale in the sample or doesn't.
- *
- * @param entry      The audit entry being written (action, outcome, runId,
- *                   jobId, userId, role).
- * @param requestId  Optional sampler salt (defaults to the entry's runId
- *                   /jobId composite); kept for symmetry with
- *                   `shouldRecordAccess`.
- */
+/** The `secret_audit_log` entry fields the resolve sampler reads. */
 export interface SecretResolveSampleInput {
   outcome: 'allowed' | 'denied';
   runId: string | null;
@@ -251,16 +223,21 @@ export interface SecretResolveSampleInput {
   role: string | null;
 }
 
+/**
+ * Decide whether to write a `secret_audit_log` row for `resolve` /
+ * `resolve_named`. Volume is per-job (every step resolves secrets), so the
+ * sample rate is much lower than `access_log`.
+ *
+ * `AuditEntry` carries no `ActorPrincipal`, so the sampler keys on `runId`,
+ * then `jobId`, then `userId`: a single job's trace lands in the sample
+ * wholesale or not at all.
+ */
 export function shouldRecordSecretResolve(entry: SecretResolveSampleInput): boolean {
-  // Override 1: denied / error always recorded.
-  // (`secret_audit_log.outcome` is `'allowed' | 'denied'` — there's no
-  // `'error'` variant; both denied paths are forensic-class.)
+  // Denied is always recorded (`secret_audit_log.outcome` has no `'error'`).
   if (entry.outcome !== 'allowed') return true;
 
-  // Override 2: secret resolves never run as platform_operator (the
-  // resolver runs in the job execution path). For symmetry we still
-  // synthesise a system actor key from runId/jobId so the sampling
-  // decision is stable for a given job's trace.
+  // Secret resolves never run as platform_operator (the resolver runs in the
+  // job execution path), so no operator override applies.
   const key = `system:${entry.runId ?? entry.jobId ?? entry.userId ?? 'unknown'}`;
   const h = fnv1a32(key);
   // 1% sample rate.

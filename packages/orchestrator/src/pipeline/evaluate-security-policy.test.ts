@@ -1,8 +1,6 @@
 /**
- * Unit tests for `evaluateSecurityPolicy` — the per-PR-event reader that turns
- * the stored org fork policy into a decision the pipeline enforces.
- *
- * Covers the properties the evaluator itself cannot: provider scoping, what an
+ * `evaluateSecurityPolicy` turns the stored org fork policy into a per-PR-event
+ * decision. Covers what the evaluator itself cannot: provider scoping, what an
  * unreadable policy means, and that a non-PR event is never gated.
  */
 import { describe, expect, it, vi } from 'vitest';
@@ -127,12 +125,10 @@ describe('evaluateSecurityPolicy', () => {
   });
 
   it('HOLDS when the policy read throws — it does not reuse the absent-row default', async () => {
-    // An unreadable policy is not evidence that the PR is fine, and it is not
-    // evidence the org left its policy unconfigured either. Answering both with
-    // `ignore` would drop the fork PRs of an org that chose `hold` or `allow`,
-    // leaving nothing behind but an orchestrator-side warning — a transient
-    // database error turning into a silent disappearance. Holding is fail-closed
-    // on the same terms and stays recoverable.
+    // An unreadable policy proves neither that the PR is fine nor that the org
+    // left its policy unconfigured. Answering with `ignore` would silently drop
+    // the fork PRs of an org that chose `hold` or `allow` on a transient DB
+    // error; holding is fail-closed and stays recoverable.
     const outcome = await evaluateSecurityPolicy({
       ...BASE,
       deps: depsWith({ get: vi.fn().mockRejectedValue(new Error('db down')) }),
@@ -166,9 +162,8 @@ describe('evaluateSecurityPolicy', () => {
   });
 
   it('a thrown read still passes a same-repo PR — the hold is scoped to forks', async () => {
-    // The read-failure policy is a fork switch like any other, so the
-    // evaluator's own guards run first. Holding every same-repo PR on a
-    // database blip would be a far broader outage than the one it prevents.
+    // The read-failure policy is a fork switch, so the evaluator's guards run
+    // first: holding every same-repo PR on a DB blip is a broader outage.
     const outcome = await evaluateSecurityPolicy({
       ...BASE,
       deps: depsWith({ get: vi.fn().mockRejectedValue(new Error('db down')) }),
@@ -238,9 +233,8 @@ describe('evaluateSecurityPolicy', () => {
   });
 
   it('does not gate a same-repo PR, whatever the stored policy', async () => {
-    // Trust resolution returns `trusted` for a base-repo ref, and the fork
-    // switch never fires on a non-fork event either — so the strictest policy
-    // still passes an ordinary PR.
+    // A base-repo ref resolves `trusted` and the fork switch never fires on a
+    // non-fork event, so the strictest policy still passes an ordinary PR.
     for (const value of ForkPolicy.options) {
       const outcome = await evaluateSecurityPolicy({
         ...BASE,

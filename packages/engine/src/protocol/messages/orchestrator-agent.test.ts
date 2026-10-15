@@ -312,8 +312,7 @@ describe('jobDispatchSchema', () => {
   });
 
   it('parses job.dispatch without containerRegistryAuth (older orchestrator)', () => {
-    // An orchestrator that predates per-job registry auth sends no field, and
-    // the agent must still pull anonymously rather than reject the dispatch.
+    // No field: the agent pulls anonymously rather than reject the dispatch.
     const parsed = jobDispatchSchema.parse(validDispatch);
     expect(parsed.containerRegistryAuth).toBeUndefined();
   });
@@ -768,8 +767,7 @@ describe('gitAuthSchema', () => {
   });
 
   it('accepts kind=basic with pinned-style fields ignored (refinement is SSH-only)', () => {
-    // Refinement should not fire for kind=basic even if pinned policy is somehow set
-    // (e.g. stale configuration that switched kinds without clearing SSH-only fields).
+    // E.g. a config that switched kinds without clearing its SSH-only fields.
     expect(() =>
       gitAuthSchema.parse({
         kind: 'basic',
@@ -2097,10 +2095,9 @@ describe('registerAckSchema capabilities', () => {
 
 describe('rate.limit.warning', () => {
   it('routes through the orch->agent union so the agent can name a dropped frame', () => {
-    // The orchestrator has always sent this frame when its per-connection
-    // limiter refuses one; the agent's parser rejected it as an invalid
-    // message, so a throttled agent could not tell its output was being
-    // dropped. fails-when: the schema leaves the union — the parse throws.
+    // Sent when the per-connection limiter refuses a frame; the agent must parse
+    // it to know its output is being dropped.
+    // fails-when: the schema leaves the union — the parse throws.
     const msg = { type: 'rate.limit.warning' as const, retryAfterMs: 250 };
     expect(rateLimitWarningSchema.parse(msg)).toEqual(msg);
     const viaUnion = orchestratorToAgentMessageSchema.parse(msg);

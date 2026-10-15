@@ -1,20 +1,16 @@
 /**
  * Pending-claim store for the event scaler backend.
  *
- * When the event backend spawns, it registers a pending claim and emits a
- * scale-up event carrying a single-use `claimCode` (never the token itself).
- * The provisioning workflow forwards that code to the instance it boots, and the
- * agent exchanges it — over the `scaler.claim-credentials` RPC — for a freshly
- * minted ephemeral agent token it then registers with. The claim code is the
- * authorization for that RPC, so the agent can redeem it before it authenticates
- * or registers; a workflow can also redeem the code itself and deliver the token.
- * The token is therefore minted lazily (only when a real provision claims it) and
- * is single-use: a leaked or replayed claim code mints nothing.
+ * A spawn registers a pending claim and emits a scale-up event carrying a
+ * single-use `claimCode`, never the token. The booted instance (or the workflow
+ * itself) redeems the code over the `scaler.claim-credentials` RPC for a freshly
+ * minted ephemeral agent token. The code is that RPC's authorization, so it is
+ * redeemable before the agent authenticates or registers. The token is minted
+ * lazily and single-use: a leaked or replayed code mints nothing.
  *
- * The claim is persisted in `scaler_pending_claims` rather than held in a
- * per-process map, so a code minted by one coordinator can be redeemed by any
- * other coordinator behind the same shared endpoint. Only the sha256 of the
- * code is stored, so a DB read can never hand back a redeemable secret.
+ * Claims live in `scaler_pending_claims`, not a per-process map, so any
+ * coordinator behind the same shared endpoint can redeem a code. Only the code's
+ * sha256 is stored, so a DB read never hands back a redeemable secret.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -24,16 +20,12 @@ import { sha256 } from '@kici-dev/shared';
 import type { ScalerStateStore } from './scaler-state-store.js';
 
 /**
- * TTL (seconds) a pending claim code stays redeemable when the scaler entry
- * does not set `claimTtlSeconds`. Long enough for a provisioning workflow to
- * boot an instance, short enough that a leaked code ages out quickly.
+ * Pending claim TTL (seconds) when the scaler entry sets no `claimTtlSeconds`:
+ * long enough to boot an instance, short enough that a leaked code ages out.
  */
 export const DEFAULT_CLAIM_TTL_SECONDS = 300;
 
-/**
- * Function that mints an ephemeral agent token bound to an agent id + labels.
- * Modelled on `AgentTokenStore.createEphemeral(agentId, labels, ttlMs)`.
- */
+/** Mints an ephemeral agent token; modelled on `AgentTokenStore.createEphemeral`. */
 export type CreateEphemeralToken = (
   agentId: string,
   labels: string[],
@@ -54,18 +46,14 @@ export interface ClaimSpec {
 
 /** What a successful claim returns to the provisioning workflow. */
 export interface ClaimedCredentials {
-  /** The freshly minted, single-use-per-claim ephemeral agent token. */
+  /** Minted fresh on each claim. */
   agentToken: string;
-  /** Agent id the instance must register with. */
   agentId: string;
-  /** Orchestrator WS URL to connect back to. */
   orchestratorUrl: string;
-  /** Labels the token authorizes. */
   labels: string[];
 }
 
 export interface ClaimStoreOptions {
-  /** Mints the ephemeral agent token when a claim is honored. */
   createEphemeral: CreateEphemeralToken;
   /** Shared persistence, so any coordinator can redeem a code. */
   stateStore: ScalerStateStore;
@@ -77,13 +65,11 @@ export interface ClaimStoreOptions {
   scalerName?: string;
   /** Injected clock (epoch ms) — no ambient `Date.now()` so TTLs are testable. */
   now?: () => number;
-  /** Default TTL of a pending claim code (seconds) before it expires. */
+  /** Default pending claim code TTL (seconds). */
   ttlDefaultSec: number;
 }
 
-/**
- * Shared store of pending provisioning claims, backed by `scaler_pending_claims`.
- */
+/** Shared store of pending provisioning claims, backed by `scaler_pending_claims`. */
 export class ClaimStore {
   private readonly createEphemeral: CreateEphemeralToken;
   private readonly stateStore: ScalerStateStore;
@@ -99,21 +85,14 @@ export class ClaimStore {
     this.ttlDefaultMs = opts.ttlDefaultSec * 1000;
   }
 
-  /**
-   * Replace the default pending-claim TTL. Called when a config reload changes
-   * the owning scaler's `claimTtlSeconds`, so the new value applies without an
-   * orchestrator restart.
-   */
+  /** Applies a reloaded `claimTtlSeconds` without an orchestrator restart. */
   setDefaultTtlSeconds(seconds: number): void {
     this.ttlDefaultMs = seconds * 1000;
   }
 
   /**
-   * Register a pending claim and return its single-use code. The code is a
-   * 256-bit cryptographically-random token — unguessable, so it can travel in
-   * the (persisted) scale-up event without leaking the agent token. Only the
-   * sha256 of the code is persisted, so a DB read can never hand back a
-   * redeemable secret.
+   * Register a pending claim and return its single-use code: 256 random bits,
+   * so it can travel in the persisted scale-up event without leaking the token.
    */
   async register(spec: ClaimSpec): Promise<string> {
     const code = randomBytes(32).toString('hex');
@@ -172,10 +151,8 @@ export class ClaimStore {
   }
 
   /**
-   * A redemption-only store never writes a claim row, so it is constructed
-   * without a scaler name. Reaching `register` without one is a wiring bug, not
-   * a runtime condition — fail loudly rather than persisting a row nothing can
-   * attribute.
+   * Reaching `register` on a redemption-only store is a wiring bug: fail loudly
+   * rather than persist a row nothing can attribute.
    */
   private requireScalerName(): string {
     if (!this.scalerName) {

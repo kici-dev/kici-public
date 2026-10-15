@@ -46,10 +46,9 @@ describe('completeUndispatchedHoldChecks', () => {
   });
 
   it('prefers the effective routing key and provider the setup phase overlaid', async () => {
-    // `setupDispatchContext` posts the queued checks under the overlaid values,
-    // and the GitHub App credential lookup keys on the routing key — so reading
-    // `info` alone would authenticate a cross-source dispatch against the wrong
-    // app and resolve nothing.
+    // The queued checks were posted under the overlaid values, and the GitHub App
+    // credential lookup keys on the routing key: `info` alone would authenticate a
+    // cross-source dispatch against the wrong app.
     await storePendingWorkflowContext(
       undefined,
       makeContext({ effectiveProvider: 'github', effectiveRoutingKey: 'github:99' }),
@@ -72,8 +71,7 @@ describe('completeUndispatchedHoldChecks', () => {
   });
 
   it('falls back to the pre-overlay routing key when no effective one was stored', async () => {
-    // The control for the case above: a per-repository dispatch overlays
-    // nothing, so `info` is the right source and the fallback must be reached.
+    // Control: a per-repository dispatch overlays nothing, so `info` is right.
     await storePendingWorkflowContext(undefined, makeContext());
     const { completeUndispatchedCheckRuns, reporter } = makeReporter();
 

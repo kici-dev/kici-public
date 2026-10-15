@@ -9,10 +9,9 @@
  * Use it, for example, to force a cold-store-archive tick without waiting
  * for the hourly cadence.
  *
- * The access_log row is written directly (not via the typed
- * AccessLogWriter) because `scheduled_job.trigger` is not in the
- * protocol-level AccessLogAction enum — matching the pattern the
- * scheduler wrapper itself uses for `scheduled_job.tick` failure rows.
+ * The access_log row is written directly, not via the typed AccessLogWriter,
+ * because `scheduled_job.trigger` is not in the protocol-level AccessLogAction
+ * enum; the scheduler wrapper does the same for `scheduled_job.tick` failures.
  */
 
 import { Hono } from 'hono';
@@ -68,9 +67,7 @@ export function createAdminScheduledJobsRoutes(deps: AdminScheduledJobsRoutesDep
     const actorId = c.get('userId');
     logger.info('Admin-triggered scheduled job tick', { name, actor: actorId });
 
-    // Best-effort audit row. Uses raw insert because the action string
-    // is not in the protocol AccessLogAction enum — same pattern as
-    // the tick-failure audit in the scheduler wrapper.
+    // Best-effort raw insert; see the module header for why.
     void deps.db
       .insertInto('access_log')
       .values({

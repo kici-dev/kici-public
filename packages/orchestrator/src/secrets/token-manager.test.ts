@@ -11,40 +11,10 @@
  * - ensureBootstrapToken returns null when tokens already exist
  * - ensureBootstrapToken uses env override when provided
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { TokenManager } from './token-manager.js';
-
-// ── Mock Kysely builder ─────────────────────────────────────────
-
-import { createMockDb as _createMockDb } from '../__test-helpers__/mock-db.js';
-
-interface MockDbConfig {
-  selectFirstRow?: Record<string, unknown> | undefined;
-  selectRows?: Record<string, unknown>[];
-  insertedRow?: Record<string, unknown>;
-}
-
-/**
- * Create a mock Kysely DB for TokenManager tests.
- * Returns { db, updateSet, updateWhere, ... } for backward compatibility.
- */
-function createMockDb(opts: MockDbConfig = {}) {
-  const { db, mocks } = _createMockDb({
-    selectFirstRow: opts.selectFirstRow,
-    selectRows: opts.selectRows ?? [],
-    insertedRow: opts.insertedRow ?? { id: 'tok-001' },
-  });
-
-  return {
-    db,
-    terminal: null, // Not used in assertions
-    executeTakeFirst: mocks.selectExecuteTakeFirst,
-    execute: mocks.selectExecute,
-    updateSet: mocks.updateSet,
-    updateWhere: mocks.updateWhere,
-  };
-}
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 // ── Tests ───────────────────────────────────────────────────────
 
@@ -85,7 +55,7 @@ describe('TokenManager', () => {
     });
 
     it('persists expires_at when an expiry is supplied', async () => {
-      const { db, mocks } = _createMockDb({ insertedRow: { id: 'tok-exp-1' } });
+      const { db, mocks } = createMockDb({ insertedRow: { id: 'tok-exp-1' } });
       const tm = new TokenManager(db as any);
       const expiresAt = new Date('2026-12-31T00:00:00.000Z');
 
@@ -97,7 +67,7 @@ describe('TokenManager', () => {
     });
 
     it('leaves expires_at null when no expiry is supplied (non-expiring token)', async () => {
-      const { db, mocks } = _createMockDb({ insertedRow: { id: 'tok-noexp-1' } });
+      const { db, mocks } = createMockDb({ insertedRow: { id: 'tok-noexp-1' } });
       const tm = new TokenManager(db as any);
 
       await tm.generateToken('forever', 'admin');
@@ -108,7 +78,7 @@ describe('TokenManager', () => {
     });
 
     it('persists subject when an intended holder is supplied', async () => {
-      const { db, mocks } = _createMockDb({ insertedRow: { id: 'tok-subj-1' } });
+      const { db, mocks } = createMockDb({ insertedRow: { id: 'tok-subj-1' } });
       const tm = new TokenManager(db as any);
 
       await tm.generateToken('alice-ops', 'admin', null, null, 'alice@example.test');
@@ -119,7 +89,7 @@ describe('TokenManager', () => {
     });
 
     it('leaves subject null when no holder is supplied (the unlinked finding)', async () => {
-      const { db, mocks } = _createMockDb({ insertedRow: { id: 'tok-nosubj-1' } });
+      const { db, mocks } = createMockDb({ insertedRow: { id: 'tok-nosubj-1' } });
       const tm = new TokenManager(db as any);
 
       await tm.generateToken('anonymous', 'admin');
@@ -225,7 +195,10 @@ describe('TokenManager', () => {
 
   describe('revokeToken', () => {
     it('marks token as revoked', async () => {
-      const { db, updateSet } = createMockDb();
+      const {
+        db,
+        mocks: { updateSet },
+      } = createMockDb();
       const tm = new TokenManager(db as any);
 
       await tm.revokeToken('tok-revoke');
@@ -271,7 +244,7 @@ describe('TokenManager', () => {
     it('never sets an expiry on the generated bootstrap token', async () => {
       // Pin: a bootstrap token must never silently expire and lock out an
       // operator. The generated-path insert must carry expires_at = null.
-      const { db, mocks } = _createMockDb({ selectFirstRow: undefined });
+      const { db, mocks } = createMockDb({ selectFirstRow: undefined });
       const tm = new TokenManager(db as any);
 
       await tm.ensureBootstrapToken();

@@ -1,22 +1,19 @@
 /**
  * Per-orchestrator coordinator that owns the shared peer credential file.
  *
- * A single orchestrator runs N peer-clients (one per cluster peer) that all
- * share one identity-scoped credential file. Left uncoordinated, a reconnect
- * storm makes each sibling independently token-join (each join revokes the
- * prior credential, invalidating the others) and delete the shared file on any
- * rejection — a credential revocation cascade. This coordinator serializes all
- * file access through one in-process mutex so only one peer-client token-joins
- * per storm, and it never deletes a credential file a sibling has refreshed.
+ * An orchestrator's peer-clients (one per peer) share one identity-scoped
+ * credential file. Uncoordinated, a reconnect storm makes each sibling token-join
+ * (each join revokes the prior credential, invalidating the others) and delete the
+ * shared file on any rejection — a revocation cascade. One in-process mutex
+ * serializes all file access, so one peer-client token-joins per storm, and a file
+ * a sibling has refreshed is never deleted.
  *
- * A coordinator without a join token also wires a `selfIssue` callback. When a
- * decision finds no credential and no token, the callback issues the
- * coordinator its own credential, once per storm, under the same mutex.
+ * A coordinator without a join token wires `selfIssue`: with no credential and no
+ * token, it issues its own credential, once per storm, under the same mutex.
  *
- * A coordinator also wires `corroborateRejection`. Any dialled endpoint can
- * send a rejection, so before it deletes the file the coordinator asks its own
- * cluster database: a credential the database holds as valid, or a database it
- * cannot read, keeps the file.
+ * A coordinator also wires `corroborateRejection`. Any dialled endpoint can send a
+ * rejection, so before deleting the file it asks its own cluster database: a
+ * credential the database holds as valid, or an unreadable database, keeps the file.
  */
 import { unlink } from 'node:fs/promises';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -84,15 +81,9 @@ export class PeerAuthCoordinator {
     instanceId: string;
     joinToken?: string;
     joinWaitTimeoutMs?: number;
-    /**
-     * Issues this coordinator its own credential when a decision finds no
-     * credential and no join token. Only a coordinator wires it.
-     */
+    /** Self-issues a credential when there is none and no join token. Coordinator-only. */
     selfIssue?: () => Promise<CoordinatorCredentialOutcome>;
-    /**
-     * Asks this coordinator's own cluster database whether it holds a rejected
-     * credential as valid. Only a coordinator with a database wires it.
-     */
+    /** Asks the own cluster DB whether it holds a rejected credential as valid. */
     corroborateRejection?: (credential: string) => Promise<RejectionCorroboration>;
   }) {
     this.credentialFile = opts.credentialFile;
@@ -222,8 +213,7 @@ export class PeerAuthCoordinator {
     return this.withLock(async () => {
       const cred = await this.readValidCredential();
       if (cred && cred.credential !== provedCredential) {
-        // A sibling refreshed the file since this proof was computed — do not
-        // delete it; the next decideAuth will use the fresh credential.
+        // A sibling refreshed the file since this proof: keep it for the next decideAuth.
         logger.info('Credential refreshed by sibling; retrying credential auth', {
           instanceId: this.instanceId,
           reason,

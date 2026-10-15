@@ -1,37 +1,26 @@
 /**
- * Idempotent-step primitive: a check / prompt / apply runner that is
- * UI-agnostic and embeddable across the product.
- *
- * The pattern: every destructive operation on shared state (prod infra,
- * npm, git remotes, DNS, TF state, workflow step side effects) is wrapped
- * as an IdempotentStep whose check() returns a typed drift value or null.
- * Null means the system is already in the desired state — the runner
- * silently skips, optionally invoking whenInSync() to surface the
- * already-satisfied resource (e.g. an existing resource id). A non-null
- * drift means apply() would change state — the runner asks the caller's
- * confirm() before invoking apply(), unless yes or dryRun overrides are
- * set. apply() returns the typed result of the change for the caller.
- *
- * The runner has no UI dependency. CLI consumers pass an inquirer-backed
- * confirm; future SDK / agent consumers pass their own policy function.
+ * UI-agnostic check / prompt / apply runner. Every destructive operation on
+ * shared state (prod infra, npm, git remotes, DNS, TF state, workflow step
+ * side effects) is an IdempotentStep whose check() returns typed drift or
+ * null. Null means already in the desired state: the runner skips, optionally
+ * calling whenInSync(). Non-null drift goes through the caller's confirm()
+ * before apply(), unless `yes` or `dryRun` is set. CLI consumers pass an
+ * inquirer-backed confirm; other consumers pass their own policy function.
  */
 
 export interface IdempotentStep<TDrift, TInSync = void, TApplied = void> {
   /** Human-readable name; appears in logs and the confirm prompt. */
   name: string;
-  /** Read-only inspection. Returns drift value if apply() would change
-   *  state, or null if the system is already in the desired state. */
+  /** Read-only. Returns drift if apply() would change state, else null. */
   check: () => Promise<TDrift | null>;
   /** Multi-line description of what apply() would do, given drift. */
   summarize: (drift: TDrift) => string;
-  /** Destructive action that brings the system into the desired state.
-   *  Its return value is surfaced in StepResult.result on the 'applied'
-   *  outcome. */
+  /** Brings the system into the desired state; its return value is
+   *  StepResult.result on the 'applied' outcome. */
   apply: (drift: TDrift) => Promise<TApplied>;
-  /** Optional: runs when check() returns null. Use this to fetch the
-   *  already-satisfied resource (e.g. read the existing id when a
-   *  create-if-missing was already done). Return value is surfaced in
-   *  StepResult.result on the 'skipped' outcome. */
+  /** Runs when check() returns null, to fetch the already-satisfied resource
+   *  (e.g. an existing id); its return value is StepResult.result on the
+   *  'skipped' outcome. */
   whenInSync?: () => Promise<TInSync>;
 }
 

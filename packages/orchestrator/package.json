@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/orchestrator",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Customer-deployable orchestrator for the KiCI CI/CD stack. Receives webhook events (direct or via Platform relay), matches triggers against the lock file, and dispatches jobs to connected agents.",
   "keywords": [
     "ci",
@@ -63,7 +63,7 @@
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-service.mjs && tsc --emitDeclarationOnly",
+    "build": "node ../../scripts/build-service.mjs && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "db:migrate": "kysely migrate:latest",
@@ -110,6 +110,7 @@
   },
   "devDependencies": {
     "@kici-dev/agent": "workspace:*",
+    "@kici-dev/test-support": "workspace:*",
     "@types/archiver": "^8.0.0",
     "@types/dockerode": "^4.0.1",
     "@types/ws": "^8.18.1",

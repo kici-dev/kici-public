@@ -3,13 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './066_pending_attestations_rejected.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 066. Creates a throwaway database, applies
- * migrations 001..066, and asserts the pending_attestations.rejected_at column
- * exists and is nullable; down() drops it and up() is idempotent. Gated on
- * `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 066: `pending_attestations.rejected_at` exists and is
+ * nullable, down() drops it, up() is idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;

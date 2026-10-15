@@ -111,17 +111,14 @@ describe('RegistrationIndex', () => {
 
       await index.loadFromDb();
 
-      // github:42:owner/repo-a should have 2 workflows
       const repo1 = index.getByRoutingKeyAndRepo('github:42', 'owner/repo-a');
       expect(repo1).toHaveLength(2);
       expect(repo1.map((r) => r.workflowName)).toEqual(['wf-1', 'wf-2']);
 
-      // github:99:owner/repo-b should have 1 workflow
       const repo2 = index.getByRoutingKeyAndRepo('github:99', 'owner/repo-b');
       expect(repo2).toHaveLength(1);
       expect(repo2[0].workflowName).toBe('wf-3');
 
-      // Version should be set
       expect(index.getVersion()).toBe(3);
     });
 
@@ -151,7 +148,6 @@ describe('RegistrationIndex', () => {
 
       await index.loadFromDb();
 
-      // kici_event should match 2 workflows
       const kiciEvents = index.getByTriggerType('kici_event');
       expect(kiciEvents).toHaveLength(2);
       expect(kiciEvents.map((r) => r.workflowName).sort()).toEqual([
@@ -159,7 +155,6 @@ describe('RegistrationIndex', () => {
         'multi-trigger',
       ]);
 
-      // schedule should match 2 workflows
       const schedules = index.getByTriggerType('schedule');
       expect(schedules).toHaveLength(2);
       expect(schedules.map((r) => r.workflowName).sort()).toEqual(['cron-job', 'multi-trigger']);

@@ -44,8 +44,7 @@ describe('formatHealthSection', () => {
   });
 
   it('never returns the heading alone', () => {
-    // fails-when: a body with no recognised field yields a bare heading — the
-    // reported defect, reached through a different body.
+    // fails-when: a body with no recognised field yields a bare heading.
     const lines = formatHealthSection('--- X ---', [], 10);
 
     expect(lines).toHaveLength(3);

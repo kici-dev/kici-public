@@ -110,9 +110,8 @@ function rejectionMessage(tracker: ReturnType<typeof makeTracker>): string | und
 }
 
 /**
- * The `workflowRepo` provenance argument of an `onExecutionStarted` call: the
- * one argument shaped `{ identifier, sha, branch }`. Located by shape so the
- * lookup survives parameters being added.
+ * The `{ identifier, sha, branch }` provenance argument of an `onExecutionStarted`
+ * call, located by shape so the lookup survives added parameters.
  */
 function provenanceArg(args: unknown[]): unknown {
   return args.find(
@@ -528,7 +527,7 @@ describe('dispatchMatchedWorkflow — clone tokens of a rerouted job', () => {
   });
 
   it('a rerouted same-repo job carries no workflow clone token', async () => {
-    // breaks-if-wrong: a same-repo reroute must keep today's single source token
+    // breaks-if-wrong: a same-repo reroute must keep its single source token
     const { workflow, runContexts } = await routedRunContexts({});
     expect(runContexts()).toHaveLength(1);
     expect(runContexts()[0]).not.toHaveProperty('workflowCloneToken');

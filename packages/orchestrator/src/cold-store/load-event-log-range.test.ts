@@ -1,19 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
-import type { Kysely } from 'kysely';
 import type { ColdStore } from '@kici-dev/shared';
 import { loadEventLogRange, type EventLogColdStoreRow } from './load-event-log-range.js';
-import type { Database } from '../db/types.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 /**
- * Direct unit tests for `loadEventLogRange`. Mirror the
- * `load-access-log-range.test.ts` and `load-secret-audit-log-range.test.ts`
- * coverage of the cold-store error branch — without these, a transient
- * cold-store failure on a paginated request that has no hot rows
- * (offset past the warm tail) would silently look like end-of-data.
- *
- * `loadEventLogByDeliveryId` is a separate single-row detail lookup
- * with a deliberate "best-effort, never throws" contract; it is NOT
- * exercised here on purpose.
+ * Mirrors the cold-store error coverage of the access-log and secret-audit-log loaders: a
+ * transient cold failure on a page with no hot rows (offset past the warm tail) must not look
+ * like end-of-data. `loadEventLogByDeliveryId` is best-effort and never throws, so it is not
+ * exercised here.
  */
 
 const COLD_DAY = new Date('2026-01-01T00:00:00.000Z'); // older than warm cutoff
@@ -67,9 +61,7 @@ function makeColdStoreMock(opts: {
       }
       return throwingGen();
     }
-    // Honour `order` the way the real store does: rows are seeded
-    // oldest-first, so a reader that forgets to ask for `desc` gets the
-    // oldest rows and its ordering assertions fail.
+    // Honour `order` like the real store, so a reader that forgets `desc` gets the oldest rows.
     const seed = [...(opts.rows ?? [])].sort((a, b) => {
       const d = new Date(a.received_at).getTime() - new Date(b.received_at).getTime();
       return args.order === 'desc' ? -d : d;
@@ -84,30 +76,11 @@ function makeColdStoreMock(opts: {
 }
 
 /**
- * Mock the two Kysely queries `loadEventLogRange` issues against the
- * hot table: the page SELECT (`selectFrom → selectAll → where* →
- * orderBy → limit → offset → execute`, returns hotRows) and the
- * cold-offset count (`selectFrom → select → where* → executeTakeFirst`,
- * returns `{ n }`). Each `where(...)` returns the same builder so the
- * optional filter chain works regardless of how many filters the caller
- * supplies. `hotCount` is the total matching hot-row count used to
- * compute the cold-side offset; it defaults to the seeded page length.
+ * Mocks the hot page SELECT (returns hotRows) and the cold-offset count (returns `{ n }`).
+ * `hotCount` is the total matching hot-row count that sets the cold offset.
  */
-function makeMockDb(
-  hotRows: EventLogColdStoreRow[],
-  hotCount: number = hotRows.length,
-): Kysely<Database> {
-  const builder: Record<string, unknown> = {};
-  builder.select = vi.fn(() => builder);
-  builder.selectAll = vi.fn(() => builder);
-  builder.where = vi.fn(() => builder);
-  builder.orderBy = vi.fn(() => builder);
-  builder.limit = vi.fn(() => builder);
-  builder.offset = vi.fn(() => builder);
-  builder.execute = vi.fn().mockResolvedValue(hotRows);
-  builder.executeTakeFirst = vi.fn().mockResolvedValue({ n: String(hotCount) });
-  const selectFrom = vi.fn(() => builder);
-  return { selectFrom } as unknown as Kysely<Database>;
+function makeMockDb(hotRows: EventLogColdStoreRow[], hotCount: number = hotRows.length) {
+  return createMockDb({ selectRows: hotRows, selectFirstRow: { n: String(hotCount) } }).db;
 }
 
 describe('loadEventLogRange cold-store error propagation', () => {
@@ -169,8 +142,7 @@ describe('loadEventLogRange cold-store error propagation', () => {
   });
 
   it('skips cold entirely when the requested window starts after the store warm cutoff', async () => {
-    // Cutoff 100 days back, caller asks for the last 10 days — nothing can
-    // have been archived in that window, so cold must not be consulted.
+    // Cutoff 100 days back and a 10-day window: nothing in it can be archived.
     const { coldStore, fetchRange } = makeColdStoreMock({
       rows: [SAMPLE_COLD_1],
       warmCutoff: new Date(Date.now() - 100 * 86_400_000),
@@ -190,9 +162,8 @@ describe('loadEventLogRange cold-store error propagation', () => {
   });
 
   it('consults cold when the store warm cutoff is lowered below the requested window', async () => {
-    // The mirror case, and the regression: a 2-day cutoff means rows older
-    // than 2 days are archived, so a 10-day window MUST reach cold. A reader
-    // holding a 30-day literal would have skipped the read entirely.
+    // A 2-day cutoff archives older rows, so a 10-day window MUST reach cold; a reader holding a
+    // 30-day literal would skip the read.
     const { coldStore, fetchRange } = makeColdStoreMock({
       rows: [SAMPLE_COLD_1],
       warmCutoff: new Date(Date.now() - 2 * 86_400_000),
@@ -255,9 +226,7 @@ describe('loadEventLogRange cold ordering + offset', () => {
   it('offsets the cold slice by (offset - hotCount) when paginating past the hot tail', async () => {
     const { coldStore } = makeColdStoreMock({ rows: [COLD_OLD, COLD_MID, COLD_NEW] });
 
-    // 2 hot rows total in range; caller is on a page whose offset (3)
-    // lands one row into the cold stream → coldOffset = 1, so the newest
-    // cold row was already returned on the previous page.
+    // 2 hot rows and offset 3 → coldOffset = 1: the newest cold row was on the previous page.
     const result = await loadEventLogRange({
       db: makeMockDb([], 2),
       coldStore,

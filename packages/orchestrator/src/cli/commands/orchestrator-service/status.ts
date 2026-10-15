@@ -1,15 +1,8 @@
 /**
- * `kici-admin orchestrator status` command.
- *
- * Shows OS-level service status (state, PID, uptime) and queries the
- * running orchestrator's `/health` and `/ready` endpoints for its version,
- * build fingerprint, uptime and readiness (database reachable, boot finished).
- * With an admin token (`--token` / KICI_ADMIN_TOKEN) it also asks the
- * instance's admin API which org the Platform attached it to.
- *
- * Target resolution goes through resolveInstanceTarget — the same priority chain
- * every lifecycle command uses (--instance-dir > --name > CWD manifest >
- * refusal with candidate list).
+ * `kici-admin orchestrator status`: OS-level service state plus the running
+ * orchestrator's `/health` and `/ready`, and, with an admin token (`--token` /
+ * KICI_ADMIN_TOKEN), the Platform org from the instance's admin API. Targets
+ * resolve through resolveInstanceTarget, like every lifecycle command.
  */
 
 import type { Command } from 'commander';
@@ -18,10 +11,12 @@ import {
   resolveInstanceTarget,
   resolveUserLevel,
   DEFAULT_RESTART_POLICY,
+  type LaunchSpec,
   type ServiceConfig,
   type ServicePlatform,
   type ServiceStatus,
 } from '../../service/index.js';
+import { agentBinaryFromLaunch, isExecutableFile } from '../../../scaler/agent-binary-location.js';
 import { composeFilePath } from '../../service/compose-path.js';
 import { readEnvValue } from '../../service/backup-timer.js';
 import {
@@ -54,10 +49,9 @@ import { cliAction } from '../shared/cli-action.js';
 const READINESS_MARGIN_MS = 3000;
 
 /**
- * How long to wait for `/ready`. Its database check waits up to the pool's
- * acquire timeout before it reports `database: false`, so the wait covers that
- * timeout plus a margin. An acquire timeout of 0 lets the pool wait without
- * limit; the default then bounds the wait.
+ * `/ready`'s database check waits up to the pool acquire timeout, so the wait
+ * covers that plus a margin. An acquire timeout of 0 (unbounded) falls back to
+ * the default.
  */
 export function readinessTimeoutMs(envContent: string): number {
   const configured = Number(readEnvValue(envContent, 'KICI_DB_POOL_ACQUIRE_TIMEOUT_MS'));
@@ -69,16 +63,13 @@ export function readinessTimeoutMs(envContent: string): number {
 /** Column the values of the orchestrator section start at. */
 const VALUE_COLUMN = 12;
 
-/**
- * A `/health` body. Every field is optional: an orchestrator older than this
- * CLI may report fewer of them.
- */
+/** Every field is optional: an orchestrator older than this CLI may report fewer. */
 type OrchestratorHealth = Partial<LivenessResponse<OrchestratorLivenessInfo>>;
 
 /** A `/ready` body, which arrives with a 503 when a check fails. */
 type OrchestratorReadiness = Partial<ReadinessResponse>;
 
-/** The scaler config the env file names, by path first and directory second. */
+/** By path first, directory second. */
 function readScalerConfig(envContent: string): string | undefined {
   return (
     readEnvValue(envContent, 'KICI_SCALER_CONFIG_PATH') ??
@@ -87,13 +78,9 @@ function readScalerConfig(envContent: string): string | undefined {
 }
 
 /**
- * The config files this install owns, for an operator who wants to inspect
- * them. Derived from the instance manifest and the env file on disk, not from
- * the running service, so it answers just as well for a stopped one.
- *
- * No path is checked for existence: on bare metal such a check would pass, but
- * a compose install names host paths the check would have to run against a
- * container, blanking the answer for the shape that needs it most.
+ * The install's config files, from the manifest and env file on disk, so a
+ * stopped service answers too. No existence check: for a compose install it
+ * would have to run against the container, blanking the answer.
  */
 export function formatConfigPaths(args: {
   platform: ServicePlatform;
@@ -110,15 +97,30 @@ export function formatConfigPaths(args: {
   return lines;
 }
 
-/** What `status` learned about the orchestrator's Platform org. */
+interface AgentBinary {
+  path: string;
+  installed: boolean;
+}
+
+/**
+ * The `kici-agent` beside the launch command's runtime: the path for a
+ * bare-metal scaler's `binaryPath`. Null without a `kici-admin` npm install
+ * (an archive install or a standalone package).
+ */
+function resolveAgentBinary(spec: LaunchSpec | null, windows: boolean): AgentBinary | null {
+  const agent = spec ? agentBinaryFromLaunch(spec, windows) : null;
+  return agent ? { path: agent, installed: isExecutableFile(agent) } : null;
+}
+
+function formatAgentBinaryLine(agent: AgentBinary): string {
+  return `Agent binary:  ${agent.path}${agent.installed ? '' : ' (not installed)'}`;
+}
+
 type StatusOrg =
   | { platformAttachment: PlatformAttachment; attachedOrgId: string | null }
   | { platformAttachment: 'unknown'; reason: string };
 
-/**
- * Ask the instance's admin API which org the Platform attached it to. Needs an
- * admin token; the answer is never read from the unauthenticated `/health`.
- */
+/** Needs an admin token: the org is never read from the unauthenticated `/health`. */
 async function readStatusOrg(
   endpoint: LocalEndpoint,
   token: string | undefined,
@@ -151,7 +153,6 @@ async function readStatusOrg(
   return { platformAttachment, attachedOrgId: attachedOrgId ?? null };
 }
 
-/** The `Org:` line of the orchestrator section. */
 function formatOrgRow(org: StatusOrg): StatusRow {
   switch (org.platformAttachment) {
     case PlatformAttachment.enum.attached:
@@ -174,7 +175,6 @@ function formatReadiness(readiness: OrchestratorReadiness): string {
   return failing.length > 0 ? `no (failing: ${failing.join(', ')})` : 'no';
 }
 
-/** Format the status output as a readable table. */
 function formatStatus(
   serviceStatus: ServiceStatus,
   health: OrchestratorHealth | null,
@@ -214,7 +214,6 @@ function formatStatus(
   return lines.join('\n');
 }
 
-/** Build JSON output combining service + health data. */
 function buildJsonOutput(
   serviceStatus: ServiceStatus,
   health: OrchestratorHealth | null,
@@ -222,11 +221,13 @@ function buildJsonOutput(
   org: StatusOrg | null,
   serviceName: string,
   configPaths: Record<string, string>,
+  agentBinary: AgentBinary | null,
 ): Record<string, unknown> {
   return {
     service: serviceName,
     ...serviceStatus,
     configPaths,
+    agentBinary: agentBinary ?? undefined,
     health: health ?? undefined,
     readiness: readiness ?? undefined,
     org: org ?? undefined,
@@ -260,14 +261,10 @@ export function registerStatusCommand(parent: Command): void {
         const userLevel = resolveUserLevel(opts);
         const kiciRoot = kiciConfigRoot(userLevel);
 
-        // `platform` is the one the seam already resolved — `--platform` when
-        // given, otherwise the manifest's. It is the platform `manager` speaks,
-        // so reporting the config paths off it keeps the two consistent:
-        // re-deriving from the manifest would name a compose file under
-        // `--platform systemd`, describing an install the driver being reported
-        // on is not operating. Neither is the host's own platform, which
-        // `detectPlatform` would answer with systemd for any systemd Linux,
-        // including one whose orchestrator is a compose install.
+        // Report paths off the seam's resolved platform (`--platform`, else the
+        // manifest's), the one `manager` speaks. The manifest would name a
+        // compose file under `--platform systemd`; the host's `detectPlatform`
+        // says systemd on any systemd Linux, even for a compose install.
         const {
           resolved,
           manager,
@@ -303,6 +300,15 @@ export function registerStatusCommand(parent: Command): void {
           envContent,
         });
 
+        // A compose service runs its agents from the image, not from a host runtime.
+        const agentBinary =
+          installPlatform === 'compose'
+            ? null
+            : resolveAgentBinary(
+                await manager.readLaunchSpec(config).catch(() => null),
+                installPlatform === 'windows',
+              );
+
         let health: OrchestratorHealth | null = null;
         let readiness: OrchestratorReadiness | null = null;
         let org: StatusOrg | null = null;
@@ -331,7 +337,15 @@ export function registerStatusCommand(parent: Command): void {
         if (opts.json) {
           console.log(
             JSON.stringify(
-              buildJsonOutput(serviceStatus, health, readiness, org, config.name, jsonConfigPaths),
+              buildJsonOutput(
+                serviceStatus,
+                health,
+                readiness,
+                org,
+                config.name,
+                jsonConfigPaths,
+                agentBinary,
+              ),
               null,
               2,
             ),
@@ -340,6 +354,7 @@ export function registerStatusCommand(parent: Command): void {
           console.log(formatStatus(serviceStatus, health, readiness, org, config.name));
           console.log('');
           console.log(configPathLines.join('\n'));
+          if (agentBinary) console.log(formatAgentBinaryLine(agentBinary));
         }
       }),
     );

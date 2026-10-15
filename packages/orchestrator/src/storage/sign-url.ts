@@ -1,30 +1,21 @@
 /**
- * HMAC-signed URL tokens for the filesystem cache backend.
- *
- * Pre-signed S3 URLs are not available for filesystem storage, so the
- * filesystem backend mints HMAC-SHA256 tokens that the orchestrator's HTTP
- * blob route verifies before serving / writing a file. Token shape:
+ * HMAC-SHA256 URL tokens for the filesystem cache backend (which has no pre-signed S3 URLs);
+ * the blob route verifies them before serving / writing a file. Token shape:
  *
  *   `${expiresUnixMs}.${hexSig}`
  *
- * Signature input: `${method}:${key}:${expiresUnixMs}` with HMAC-SHA256 keyed
- * by a per-orchestrator-process secret (random 32-byte hex at boot, persists
- * for the lifetime of the process). Tokens become invalid on orchestrator
- * restart — fine for the filesystem backend's single-host / test-sandbox use
- * case.
+ * Signs `${method}:${key}:${expiresUnixMs}` with a per-process secret (random 32 bytes at
+ * boot), so tokens die on orchestrator restart — fine for single-host / test-sandbox use.
  */
 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
-/** Default URL lifetime: 1 hour (matches S3 backend's PUT-URL lifetime). */
+/** Default URL lifetime: 1 hour. */
 export const DEFAULT_SIGN_URL_TTL_MS = 60 * 60 * 1000;
 
 export type SignedMethod = 'GET' | 'PUT';
 
-/**
- * Generate a fresh per-process signing secret. Caller stores it on the
- * orchestrator config object so the same value is used for sign + verify.
- */
+/** The caller stores it on the orchestrator config, so sign and verify share it. */
 export function generateSigningSecret(): string {
   return randomBytes(32).toString('hex');
 }
@@ -42,9 +33,6 @@ export interface SignedToken {
   expiresMs: number;
 }
 
-/**
- * Mint a signed token for the given (method, key, expiry) triple.
- */
 export function signToken(
   secret: string,
   method: SignedMethod,
@@ -60,10 +48,7 @@ export type VerifyResult =
   | { ok: true; expiresMs: number }
   | { ok: false; reason: 'malformed' | 'expired' | 'bad-signature' };
 
-/**
- * Verify a token. Constant-time signature compare on hex digest length;
- * rejects malformed shapes and expired tokens up-front.
- */
+/** Constant-time signature compare; rejects malformed and expired tokens up-front. */
 export function verifyToken(
   secret: string,
   method: SignedMethod,

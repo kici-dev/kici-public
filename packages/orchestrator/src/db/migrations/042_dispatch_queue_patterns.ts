@@ -1,18 +1,11 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add pattern columns to dispatch_queue. Exact labels stay in runs_on_labels /
- * exclude_labels (the SQL @> prefilter); regex matchers go here and are applied
- * as a JS post-filter at drain time, since Postgres `~` regex semantics differ
- * from JavaScript `RegExp` and the engine's `matcherSatisfiedBy` is the single
- * matching authority.
- *
- * - `runs_on_patterns jsonb NOT NULL DEFAULT '[]'` — regex matchers the agent's
- *   labels must satisfy.
- * - `exclude_patterns jsonb NOT NULL DEFAULT '[]'` — regex matchers that
- *   disqualify an agent.
- *
- * Idempotent: re-running on a DB that already has the columns is a no-op.
+ * Add dispatch_queue `runs_on_patterns` (regex matchers the agent's labels must satisfy) and
+ * `exclude_patterns` (matchers that disqualify an agent). Exact labels stay in runs_on_labels /
+ * exclude_labels (the SQL @> prefilter); patterns are a JS post-filter at drain time, because
+ * Postgres `~` differs from JavaScript `RegExp` and the engine's `matcherSatisfiedBy` is the
+ * single matching authority. Idempotent.
  */
 async function colExists(db: Kysely<unknown>, table: string, name: string): Promise<boolean> {
   const result = await sql<{ exists: boolean }>`

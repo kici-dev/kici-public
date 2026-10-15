@@ -24,12 +24,10 @@ export function evaluateConcurrencyGate(
     return { action: 'pass' };
   }
 
-  // Below limit = pass
   if (currentRunningCount < env.concurrencyLimit) {
     return { action: 'pass' };
   }
 
-  // At or above limit
   if (env.concurrencyStrategy === ConcurrencyStrategy.enum['cancel-pending']) {
     return {
       // `action` here is the gate vocabulary (`'hold' | 'wait' | 'queue'`), a

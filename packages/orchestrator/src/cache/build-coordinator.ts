@@ -1,13 +1,7 @@
 /**
- * Build coordinator for coalescing concurrent build requests.
- *
- * Ensures only one build runs per content hash. Subsequent requests
- * for the same hash coalesce on the same Promise, avoiding duplicate
- * compilation work.
- *
- * On success: all waiters resolve.
- * On failure: all waiters reject with the build error.
- * On timeout: all waiters reject with a timeout error.
+ * Coalesces concurrent build requests: one build per content hash, and later
+ * requests for the hash share its Promise. Every waiter resolves on success
+ * and rejects with the build error or the timeout error otherwise.
  */
 
 import { createLogger } from '@kici-dev/shared';
@@ -22,17 +16,8 @@ export class BuildCoordinator {
     this.timeoutMs = options.timeoutMs ?? 600_000; // 10 min default
   }
 
-  /**
-   * Ensure a build is running for the given content hash.
-   *
-   * If already in-flight, returns the existing promise (coalescing).
-   * If not, calls triggerBuild() and tracks the promise.
-   *
-   * @param contentHash - The content hash identifying the bundle to build
-   * @param triggerBuild - Async function that performs the actual build
-   */
+  /** Return the in-flight build for `contentHash`, or start one via triggerBuild. */
   ensureBuild(contentHash: string, triggerBuild: () => Promise<void>): Promise<void> {
-    // Coalesce: if a build is already in-flight, wait on it
     const existing = this.inFlight.get(contentHash);
     if (existing) {
       logger.debug(`ensureBuild(${contentHash}): coalescing on existing build`);
@@ -41,14 +26,11 @@ export class BuildCoordinator {
 
     logger.info(`ensureBuild(${contentHash}): starting new build`);
 
-    // Create a build promise with timeout
     const buildPromise = this.runWithTimeout(contentHash, triggerBuild);
 
-    // Track in inFlight map
     this.inFlight.set(contentHash, buildPromise);
 
-    // Ensure cleanup on completion (success or failure)
-    // Use a separate .then/.catch so the returned promise isn't affected
+    // A separate .then so the returned promise is unaffected by the cleanup.
     buildPromise.then(
       () => {
         this.inFlight.delete(contentHash);
@@ -63,24 +45,15 @@ export class BuildCoordinator {
     return buildPromise;
   }
 
-  /**
-   * Check if a build is currently in-flight for a content hash.
-   */
   isBuilding(contentHash: string): boolean {
     return this.inFlight.has(contentHash);
   }
 
-  /**
-   * Get the number of in-flight builds (for metrics/debugging).
-   */
+  /** For metrics / debugging. */
   getInFlightCount(): number {
     return this.inFlight.size;
   }
 
-  /**
-   * Run triggerBuild with a timeout. Rejects with a descriptive
-   * error if the build exceeds timeoutMs.
-   */
   private runWithTimeout(contentHash: string, triggerBuild: () => Promise<void>): Promise<void> {
     let timer: ReturnType<typeof setTimeout>;
     const timeout = new Promise<never>((_, reject) => {

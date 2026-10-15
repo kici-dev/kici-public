@@ -1,24 +1,6 @@
 /**
- * Inbound webhook delivery log commands for kici-admin.
- *
- * Operator-facing read access to the orchestrator's event_log table via the
- * admin HTTP API. Use it instead of raw psql / log-grep when an operator
- * asks "did delivery <id> arrive, and what did its payload look like".
- *
- *   event-log list   List inbound deliveries with filters
- *   event-log show   Show a single delivery (optionally with payload)
- *
- * Filter flags for `list`:
- *   --org             -> ?orgId=
- *   --routing-key     -> ?routingKey=
- *   --event           -> ?event=
- *   --action          -> ?action=
- *   --status          -> ?status=
- *   --from            -> ?from= (ISO timestamp)
- *   --to              -> ?to=   (ISO timestamp)
- *   --delivery-id     -> ?deliveryId= (substring)
- *   --limit / --offset
- *   --json            Emit raw JSON
+ * `kici-admin event-log`: read access to the inbound webhook delivery log
+ * (event_log) over the admin API — did delivery <id> arrive, and with what payload.
  */
 
 import type { Command } from 'commander';

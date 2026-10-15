@@ -115,14 +115,13 @@ kici compile --check
 
       const hookPath = path.join(tempDir, '.husky', 'pre-commit');
       const stats = await stat(hookPath);
-      // Check that execute bits are set (at least one of owner/group/other)
+      // At least one of owner/group/other.
       expect(stats.mode & 0o111).toBeTruthy();
     });
   });
 
   describe('git (raw)', () => {
     beforeEach(async () => {
-      // Create .git directory for git hook tests
       await mkdir(path.join(tempDir, '.git'), { recursive: true });
     });
 
@@ -181,12 +180,10 @@ kici compile
 
       const hookPath = path.join(tempDir, '.git', 'hooks', 'pre-commit');
       const stats = await stat(hookPath);
-      // Check that execute bits are set
       expect(stats.mode & 0o111).toBeTruthy();
     });
 
     it('fails gracefully when not in git repo', async () => {
-      // Create a completely separate temp dir without .git
       const nonGitDir = path.join(
         os.tmpdir(),
         `kici-no-git-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -335,7 +332,6 @@ commit-msg:
 
       expect(result.success).toBe(true);
       const content = await readFile(path.join(tempDir, 'lefthook.yml'), 'utf-8');
-      // kici-compile must be under pre-commit, not commit-msg
       const preCommitIdx = content.indexOf('pre-commit:');
       const commitMsgIdx = content.indexOf('commit-msg:');
       const kiciIdx = content.indexOf('kici-compile:');
@@ -359,7 +355,6 @@ pre-commit:
 
       expect(result.success).toBe(true);
       const content = await readFile(path.join(tempDir, 'lefthook.yml'), 'utf-8');
-      // kici-compile must be under pre-commit section
       const preCommitIdx = content.indexOf('pre-commit:');
       const kiciIdx = content.indexOf('kici-compile:');
       expect(kiciIdx).toBeGreaterThan(preCommitIdx);
@@ -499,17 +494,14 @@ pre-commit:
     });
 
     it('uses process.cwd() when no cwd option provided', async () => {
-      // This test verifies the function doesn't throw when cwd is not provided
-      // We can't easily test the actual cwd usage, but we can verify it doesn't error
+      // An explicit cwd stands in for process.cwd(), which would touch the real repo.
       await mkdir(path.join(tempDir, '.husky'), { recursive: true });
 
-      // Mock process.cwd by using explicit cwd option
       const result = await installHook('husky', { cwd: tempDir });
       expect(result.success).toBe(true);
     });
 
     it('installs hook in common git dir when inside a worktree', async () => {
-      // Simulate a git worktree:
       // main-repo/.git/              (the common git dir)
       // main-repo/.git/worktrees/wt/ (worktree-specific dir with commondir file)
       // worktree/.git                (file pointing to worktree-specific dir)
@@ -522,16 +514,14 @@ pre-commit:
       await mkdir(worktreeGitDir, { recursive: true });
       await mkdir(worktreeDir, { recursive: true });
 
-      // worktree/.git file points to the worktree-specific dir
       await writeFile(path.join(worktreeDir, '.git'), `gitdir: ${worktreeGitDir}\n`);
-      // commondir file in worktree dir points back to common git dir
       await writeFile(path.join(worktreeGitDir, 'commondir'), '../..\n');
 
       const result = await installHook('git', { cwd: worktreeDir });
 
       expect(result.success).toBe(true);
       expect(result.action).toBe('created');
-      // Hook should be in the COMMON .git/hooks/, not in the worktree-specific dir
+      // The common .git/hooks/, not the worktree-specific dir.
       expect(result.path).toBe(path.join(mainGitDir, 'hooks', 'pre-commit'));
 
       const content = await readFile(path.join(mainGitDir, 'hooks', 'pre-commit'), 'utf-8');
@@ -539,9 +529,7 @@ pre-commit:
     });
 
     it('handles nested subdirectory for git hooks', async () => {
-      // Create git repo at root
       await mkdir(path.join(tempDir, '.git'), { recursive: true });
-      // Create subdirectory
       const subDir = path.join(tempDir, 'src', 'components');
       await mkdir(subDir, { recursive: true });
 

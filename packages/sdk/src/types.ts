@@ -46,9 +46,8 @@ export interface SourceLocation {
 }
 
 /**
- * OutputProxy<T> represents a lazy proxy over step/job outputs.
- * At the type level it mirrors T's shape for type-safe property access.
- * At runtime it's a Proxy that defers property access to an OutputsMap.
+ * Lazy proxy over step/job outputs: typed as T's shape, and at runtime a Proxy
+ * that defers property access to an OutputsMap.
  */
 export type OutputProxy<T> = {
   readonly [K in keyof T]: T[K];
@@ -166,10 +165,9 @@ export type OutputSchema = Record<string, z.ZodTypeAny>;
 export type InferOutputs<T extends OutputSchema> = z.infer<z.ZodObject<T>>;
 
 /**
- * Step definition returned by step() factory.
- *
- * TResult is the inferred return type of the run function (defaults to void for backward compat).
- * The optional `outputs` field holds a Zod schema for runtime validation but does NOT drive the generic.
+ * Step definition returned by step() factory. TResult is the inferred return
+ * type of the run function (default void); the optional `outputs` Zod schema
+ * validates at runtime but does NOT drive the generic.
  */
 export interface Step<TResult = void, TName extends string = string> {
   readonly _tag: 'Step';
@@ -226,10 +224,7 @@ export interface Step<TResult = void, TName extends string = string> {
  */
 export type BareStepFn<TResult = void> = (ctx: StepContext) => Promise<TResult>;
 
-/**
- * Union type for items accepted in a job's steps array.
- * Accepts Step objects, bare async functions, and concurrent parallel groups.
- */
+/** An item of a job's steps array: a Step, a bare async function, or a concurrent parallel group. */
 export type StepInput = Step<any> | BareStepFn<any> | import('./parallel.js').ParallelGroup;
 
 /** Options for step() factory - simple form (just async function) */
@@ -264,10 +259,7 @@ export interface NormalizedRetry {
   retryIf?: (err: unknown) => boolean;
 }
 
-/**
- * Facets shared by both the plain and the check variant of {@link StepOptions}.
- * These compose unchanged whether or not a step declares a `check` facet.
- */
+/** Facets shared by the plain and the check variant of {@link StepOptions}. */
 export interface StepOptionsBase {
   /** Optional Zod schema for runtime output validation. */
   outputs?: OutputSchema;
@@ -289,10 +281,7 @@ export interface StepOptionsBase {
   approval?: ApprovalConfig;
 }
 
-/**
- * Plain step options: `run` takes only the context — the existing, fully
- * backward-compatible shape. No `check` facet.
- */
+/** Plain step options: `run` takes only the context, with no `check` facet. */
 export interface StepOptionsPlain<TResult = void> extends StepOptionsBase {
   run: (ctx: StepContext) => Promise<TResult>;
   check?: undefined;
@@ -385,7 +374,6 @@ export interface DynamicJobContext {
 
 /**
  * Async function that generates jobs dynamically at runtime.
- * Signature: async ({$, ctx, log, env}) => Job[]
  *
  * **Determinism contract:** this function is called twice — once during the eval
  * phase (to discover which jobs to create) and once during execution (to extract
@@ -405,9 +393,7 @@ export type DynamicJobFn = (context: DynamicJobContext) => Promise<Job[]>;
  */
 export type JobOrFactory = Job | DynamicJobFn;
 
-/**
- * Type guard to check if a JobOrFactory is a dynamic job generator.
- */
+/** Whether a JobOrFactory is a dynamic job generator. */
 export function isDynamicJobFn(item: JobOrFactory): item is DynamicJobFn {
   return typeof item === 'function';
 }
@@ -1053,12 +1039,8 @@ export interface JobOptions {
 }
 
 /**
- * Private npm registry declaration. Tells the agent to authenticate against
- * a private package registry before running `npm install`.
- *
- * `tokenSecret` uses qualified `<context>:<secret-name>` syntax — the
- * orchestrator resolves the secret through the named context's secret
- * bindings at dispatch time. Example: `tokenSecret: 'production:NPM_TOKEN'`.
+ * Private npm registry the agent authenticates against before running
+ * `npm install`. Example: `tokenSecret: 'production:NPM_TOKEN'`.
  */
 export interface Registry {
   /** Registry URL (e.g. `https://npm.pkg.github.com`). */
@@ -1151,9 +1133,8 @@ export interface Workflow {
 /** Options for workflow() factory */
 export interface WorkflowOptions {
   /**
-   * Jobs in the workflow.
-   * Can be static Job objects or async functions that generate jobs.
-   * Dynamic job functions are evaluated at agent runtime.
+   * Jobs in the workflow: static Job objects or async functions that generate
+   * jobs. Dynamic job functions are evaluated at agent runtime.
    */
   jobs: JobOrFactory[];
   /** Trigger conditions - when should this workflow run */
@@ -1219,7 +1200,6 @@ export interface WorkflowOptions {
   approval?: ApprovalConfig;
 }
 
-// Re-export trigger and rule types for external use
 export type { TriggerConfig, PrTriggerConfig, PushTriggerConfig } from './triggers/types.js';
 export type { Rule, RuleContext, RuleCheckFn, RuleResult } from './rules/types.js';
 export type { Matrix, MatrixInclude, MatrixExclude, MatrixValues } from './matrix/types.js';

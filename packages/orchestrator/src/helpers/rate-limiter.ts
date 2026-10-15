@@ -22,7 +22,6 @@ export class SlidingWindowRateLimiter {
 
   /**
    * Check if a new event is allowed for the given key.
-   * @param key - The rate limit bucket key.
    * @param maxOverride - Per-call limit override (uses constructor default if omitted).
    */
   check(key: string, maxOverride?: number): { allowed: boolean; retryAfterMs?: number } {
@@ -35,7 +34,6 @@ export class SlidingWindowRateLimiter {
 
     let timestamps = this.state.get(key);
     if (timestamps) {
-      // Trim timestamps that have aged out of the window.
       const firstValid = timestamps.findIndex((t) => t > windowStart);
       if (firstValid > 0) {
         timestamps.splice(0, firstValid);

@@ -1,21 +1,18 @@
 /**
  * Per-file adoption sweep for the shared admin bearer-auth boundary.
  *
- * `routes/admin-auth.test.ts` proves the boundary itself behaves: a lookup that
- * cannot complete becomes a structured 503 instead of an unhandled throw. That
- * says nothing about whether a given admin router actually routes through it.
- * A router carrying its own `await deps.tokenManager.validate(token)` with no
- * `try`/`catch` compiles, passes every per-file test, and still answers a
- * database fault with a bare 500.
+ * `routes/admin-auth.test.ts` proves the boundary turns a lookup that cannot
+ * complete into a structured 503, not that each router uses it. A router with
+ * its own unguarded `await deps.tokenManager.validate(token)` compiles, passes
+ * its per-file tests, and answers a database fault with a bare 500.
  *
- * So this sweep drives each DB-backed admin router end-to-end with a validator
- * that throws, and asserts the boundary's own 503 body. The assertion can only
- * hold when the router uses the shared factory: a hand-rolled middleware lets
- * the throw escape, and Hono's default handler answers 500 with no JSON body.
- * A future admin router that reintroduces its own copy fails here.
+ * So this sweep drives each DB-backed admin router with a throwing validator
+ * and asserts the boundary's own 503 body, which holds only through the shared
+ * factory: a hand-rolled middleware lets the throw escape to Hono's default
+ * 500 with no JSON body.
  *
- * Non-auth dependencies are deliberately absent -- the request is answered
- * inside the middleware, so no handler ever reads them.
+ * Non-auth dependencies are absent: the middleware answers the request, so no
+ * handler reads them.
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { Hono } from 'hono';

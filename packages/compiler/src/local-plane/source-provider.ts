@@ -1,19 +1,13 @@
 /**
- * LocalSourceProvider — resolve the workdir a `kici run --local` dispatch
- * registers as a `file://` source for the plane.
+ * Resolves the workdir a `kici run --local` dispatch registers as a `file://`
+ * source. The plane reads `<repoBasePath>/.kici/kici.lock.json` and the agent
+ * clones `file://<repoBasePath>` at a committed sha, so the workdir must be a git
+ * repo whose HEAD carries the workflow and lock to run.
  *
- * The plane orchestrator's local provider fetches the lock from
- * `<repoBasePath>/.kici/kici.lock.json` and the ephemeral agent clones
- * `file://<repoBasePath>` at a committed sha. So the resolved workdir must be a
- * git repo whose HEAD carries the workflow + lock the run should execute.
- *
- * Two profiles:
- * - **default (isolated):** an isolated tmp clone at HEAD with the local overlay
- *   (dirty + untracked files) applied and committed onto a `kici-local` branch,
- *   so the clone-by-sha the agent performs sees uncommitted work without
- *   touching the developer's tree.
- * - **`--in-place`:** the repo root directly (ambient state, the profile the CI
- *   deploy jobs use). Cleanup is a no-op.
+ * - **default (isolated):** a tmp clone at HEAD with dirty and untracked files
+ *   committed onto a `kici-local` branch, so the agent sees uncommitted work
+ *   without touching the developer's tree.
+ * - **`--in-place`:** the repo root directly (the profile CI deploy jobs use).
  */
 
 import { execFileSync, execSync } from 'node:child_process';
@@ -30,34 +24,26 @@ import {
 import { selectOverlayFiles } from '../remote/uploader.js';
 import { shQuote } from '@kici-dev/core';
 
-/** The `kici-local` branch the isolated profile commits its overlay onto. */
 export const LOCAL_RUN_BRANCH = 'kici-local';
 
-/** Max number of overlay files copied concurrently. */
+/** Max overlay files copied concurrently. */
 const COPY_BATCH_SIZE = 32;
 
-/** A resolved workdir plus the git coordinates the plane trigger needs. */
 export interface ResolvedWorkdir {
   /** Absolute path registered as the local source `repoBasePath`. */
   dir: string;
-  /** Git ref the synthetic push carries (`refs/heads/<branch>`). */
+  /** `refs/heads/<branch>`, carried by the synthetic push. */
   ref: string;
-  /** Committed HEAD sha the agent clones + checks out. */
+  /** Committed HEAD sha the agent clones. */
   sha: string;
-  /** Branch short name (matched by the workflow's push filter). */
+  /** Matched by the workflow's push filter. */
   branch: string;
-  /** Remove the tmp workdir (no-op for `--in-place`). */
+  /** No-op for `--in-place`. */
   cleanup: () => Promise<void>;
   /** Paths the isolated checkout leaves out (submodules, dangling symlinks), one line per kind. */
   warnings: string[];
 }
 
-/**
- * Resolve the workdir for an offline routed run.
- *
- * @param opts.inPlace - Use the repo root directly instead of an isolated clone.
- * @param opts.repoRoot - The developer's repo root.
- */
 export async function resolveWorkdir(opts: {
   inPlace: boolean;
   repoRoot: string;
@@ -66,7 +52,6 @@ export async function resolveWorkdir(opts: {
   return opts.inPlace ? resolveInPlace(opts.repoRoot) : resolveIsolated(opts.repoRoot);
 }
 
-/** In-place: the repo root, triggered at its current branch + HEAD. */
 function resolveInPlace(repoRoot: string): ResolvedWorkdir {
   const branch = gitOut(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']);
   const sha = gitOut(repoRoot, ['rev-parse', 'HEAD']);
@@ -82,16 +67,9 @@ function resolveInPlace(repoRoot: string): ResolvedWorkdir {
   };
 }
 
-/**
- * Isolated: a tmp clone at HEAD with the local overlay applied and committed
- * onto the `kici-local` branch, then commits so the agent's clone-by-sha
- * carries the work.
- */
 async function resolveIsolated(repoRoot: string): Promise<ResolvedWorkdir> {
-  // Retained-until-GC clone dir: allocated in persist mode so it is not
-  // auto-registered to any temp scope — its lifetime is owned by the returned
-  // `cleanup`, or by the catch below when building the clone fails.
-  // mkdtemp creates it mode-0700; `git clone` into the empty dir is fine.
+  // Persist mode keeps it out of any temp scope: the returned `cleanup`, or the
+  // catch below, owns its lifetime. mkdtemp creates it mode 0700.
   const workdir = await makeTempDir('local-run', { persist: true });
   try {
     return await materializeIsolated(repoRoot, workdir.path, () => workdir.cleanup());
@@ -103,7 +81,6 @@ async function resolveIsolated(repoRoot: string): Promise<ResolvedWorkdir> {
   }
 }
 
-/** Build the isolated clone in `tmpDir` and commit the overlay onto it. */
 async function materializeIsolated(
   repoRoot: string,
   tmpDir: string,
@@ -113,9 +90,8 @@ async function materializeIsolated(
   const { sha } = selection;
   const entries = await classifySelection(repoRoot, selection);
 
-  // Base tree at HEAD: local clone then pin to the exact SHA. `--no-hardlinks`
-  // copies the object store (hardlinks cannot span filesystems: repo under
-  // $HOME, tmp under /tmp on a separate mount would otherwise fail).
+  // `--no-hardlinks`: hardlinks cannot span filesystems (repo under $HOME, tmp
+  // on a separate /tmp mount).
   execSync(`git clone --no-hardlinks --quiet ${shQuote(repoRoot)} ${shQuote(tmpDir)}`, {
     stdio: 'ignore',
   });
@@ -123,8 +99,8 @@ async function materializeIsolated(
 
   await applyOverlay(repoRoot, tmpDir, entries);
 
-  // Commit the overlay onto a named branch so the agent's clone-by-sha (and the
-  // orchestrator's ref-scoped trigger) resolve a sha that carries it.
+  // So the agent's clone-by-sha and the ref-scoped trigger resolve a sha that
+  // carries the overlay.
   execFileSync('git', ['checkout', '-B', LOCAL_RUN_BRANCH], { cwd: tmpDir, stdio: 'ignore' });
   execFileSync('git', ['add', '-A'], { cwd: tmpDir, stdio: 'ignore' });
   if (gitOut(tmpDir, ['status', '--porcelain'])) {
@@ -157,10 +133,9 @@ async function materializeIsolated(
 }
 
 /**
- * Apply the classified overlay to the clone. Deletions run first, so a path the
- * developer turned from a file or symlink into a directory (or back) is gone
- * before its new content lands; then files and file symlinks; then directory
- * symlinks, once the directories they replace are emptied.
+ * Deletions first, so a path that changed between file, symlink and directory
+ * is gone before its new content lands; then files and file symlinks; then
+ * directory symlinks, once the directories they replace are emptied.
  */
 async function applyOverlay(
   repoRoot: string,
@@ -185,11 +160,10 @@ async function applyOverlay(
 }
 
 /**
- * Remove the overlay's deletions from the clone, one at a time: a deletion and
- * the entry that replaces it must not race. A submodule the developer removed
- * is an empty directory in the clone, which checks out no submodule, so that
- * path is removed as an empty directory. Only a path the clone's index records
- * as a submodule is removed that way, and never recursively.
+ * One at a time: a deletion and the entry that replaces it must not race. A
+ * removed submodule is an empty directory in the clone (which checks out no
+ * submodules); only a path the clone's index records as a submodule is removed
+ * that way, never recursively.
  */
 async function removeDeletions(tmpDir: string, deletions: string[]): Promise<void> {
   const stats = await Promise.all(
@@ -207,10 +181,8 @@ async function removeDeletions(tmpDir: string, deletions: string[]): Promise<voi
 }
 
 /**
- * Make room for an overlay entry in the clone and return its path: create the
- * parent directories and remove whatever is at the path. A directory there is
- * the clone's copy of a directory the developer replaced, whose tracked files
- * the deletions already removed.
+ * Creates parents and removes whatever is at the path. A directory there is one
+ * the developer replaced, whose tracked files the deletions already removed.
  */
 async function clearDestination(tmpDir: string, file: string): Promise<string> {
   const dest = path.join(tmpDir, file);
@@ -223,10 +195,7 @@ async function clearDestination(tmpDir: string, file: string): Promise<string> {
   return dest;
 }
 
-/**
- * Copy a single overlay file, preserving its mode. Symlinks are recreated as
- * links (not dereferenced) — the same shape the remote tarball preserves.
- */
+/** Preserves the mode; symlinks stay links, as in the remote tarball. */
 async function copyOverlayFile(repoRoot: string, tmpDir: string, file: string): Promise<void> {
   const src = path.join(repoRoot, file);
   const dest = await clearDestination(tmpDir, file);
@@ -239,7 +208,6 @@ async function copyOverlayFile(repoRoot: string, tmpDir: string, file: string): 
   await fs.chmod(dest, srcStat.mode);
 }
 
-/** Throw an actionable error if `repoRoot` is not a git work tree. */
 function requireGitRepo(repoRoot: string): void {
   try {
     execSync('git rev-parse --is-inside-work-tree', { cwd: repoRoot, stdio: 'ignore' });
@@ -269,7 +237,6 @@ export function readParentSha(dir: string, sha: string): string | undefined {
   }
 }
 
-/** Run a git command in `cwd` and return trimmed stdout. */
 function gitOut(cwd: string, args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }

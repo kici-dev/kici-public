@@ -1,8 +1,3 @@
-/**
- * PR trigger helper - creates triggers for pull request events.
- * Returns a frozen PrTriggerConfig directly (no builder pattern).
- */
-
 import {
   type BranchPattern,
   type PrConfigInput,
@@ -13,8 +8,7 @@ import {
 } from './types.js';
 
 /**
- * Create a PR trigger configuration.
- * Returns a frozen (immutable) PrTriggerConfig object directly.
+ * Create a pull request trigger. Returns a frozen PrTriggerConfig directly (no builder).
  *
  * @example
  * // No-arg: default events, no branch/path filters

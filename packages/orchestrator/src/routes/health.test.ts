@@ -3,8 +3,8 @@ import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import { createHealthRoutes } from './health.js';
 
-// A minimal Kysely stub whose `selectFrom(...).select(...).limit(...).execute()`
-// resolves, so the readiness DB check passes and we isolate the warm bit.
+// A Kysely stub whose `selectFrom(...).select(...).limit(...).execute()`
+// resolves, so the readiness DB check passes and the warm bit is isolated.
 function stubDbOk(): Kysely<Database> {
   const chain = {
     select: () => chain,

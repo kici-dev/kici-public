@@ -1,8 +1,9 @@
 /**
  * Shared, browser-safe verification core for KiCI provenance bundles (Mode A).
  *
- * Given a KiCI-signed bundle, the Platform JWKS, and an out-of-band trusted
- * issuer, `verifyKiciBundle` establishes the full Mode-A chain offline:
+ * Given a KiCI-signed bundle, the issuing orchestrator's JWKS, and an
+ * out-of-band trusted issuer, `verifyKiciBundle` establishes the full Mode-A
+ * chain offline:
  *
  *  - the identity JWT verifies against the supplied JWKS with `iss` PINNED to
  *    the caller-supplied `expectedIssuer` (never the token's own `iss`) and the
@@ -14,12 +15,11 @@
  *    statement sound;
  *  - when an artifact digest is supplied, a subject digest must match it.
  *
- * The core uses only `jose` (isomorphic) and `crypto.subtle`/`atob`/`TextDecoder`
- * (present in modern browsers and Node 24) — no `node:fs`, no `fetch`, no
- * `Buffer` — so the exact same function runs in the `kici verify-attestation`
- * CLI and the dashboard's verified badge. Exported at the subpath
- * `@kici-dev/engine/provenance/verify`; it is deliberately NOT re-exported from
- * the engine barrel (the barrel must stay free of the `jose` dependency).
+ * Only `jose` (isomorphic) and `crypto.subtle`/`atob`/`TextDecoder` — no
+ * `node:fs`, `fetch` or `Buffer` — so the same function runs in the
+ * `kici verify-attestation` CLI and the dashboard's verified badge. Exported at
+ * the subpath `@kici-dev/engine/provenance/verify`, deliberately NOT from the
+ * engine barrel, which must stay free of the `jose` dependency.
  */
 import {
   calculateJwkThumbprint,
@@ -101,8 +101,8 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
   };
   const failures: string[] = [];
 
-  // Dispatch on media type. Anything that is not the KiCI Mode-A media type is
-  // a Sigstore-style bundle this verifier does not yet handle.
+  // Any media type other than KiCI Mode-A is a Sigstore-style bundle this
+  // verifier does not handle.
   const mediaType = (opts.bundle as { mediaType?: unknown } | null)?.mediaType;
   if (mediaType !== KICI_PROVENANCE_BUNDLE_MEDIA_TYPE) {
     return { verified: false, mode: 'sigstore', checks, failures: ['mode_b_unsupported'] };
@@ -116,10 +116,8 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
   const bundle = parsed.data;
   checks.schema = 'pass';
 
-  // Decode + parse the in-toto statement carried in the DSSE payload. A
-  // malformed payload (non-base64, or base64 of non-JSON bytes) makes `atob`
-  // or `JSON.parse` throw — guard it so a bad payload becomes a verification
-  // failure (`verified:false`), never a thrown error (the never-throw contract).
+  // A malformed DSSE payload makes `atob` or `JSON.parse` throw; the guard turns
+  // it into `verified:false` (the never-throw contract).
   let statement: KiciProvenanceStatement | undefined;
   let statementBytes: Uint8Array | undefined;
   try {
@@ -147,9 +145,8 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
       {
         issuer: opts.expectedIssuer,
         audience: opts.expectedAudience,
-        // Pin ES256 explicitly (defense-in-depth against alg-confusion / alg:none):
-        // KiCI provenance is ES256-only, so never accept any other JWS algorithm
-        // regardless of what the token header or a JWKS key claims.
+        // KiCI provenance is ES256-only: pin it against alg-confusion / alg:none,
+        // whatever the token header or a JWKS key claims.
         algorithms: ['ES256'],
       },
     );
@@ -185,31 +182,22 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
     failures.push('dsse_signature_invalid');
   }
 
-  // Mint-timing origin, from the SIGNED claim only. Both minters have always
-  // emitted it unconditionally, so a token without one predates the deferral
-  // feature and IS live.
   const attestationOrigin = resolveAttestationOrigin(claims);
 
-  // Build-context check, run for EVERY origin.
+  // Build-context check, run for EVERY origin. A deferred token is not exempt:
+  // `buildIdTokenClaims` emits `repository`, `ref`, `sha` and `workflow_ref`
+  // from the run row on every mint (`opts.deferred` affects only
+  // `statement_hash` and `attestation_origin`), so its claims are the same
+  // server truth a live one carries.
   //
-  // The statement must equal the token claims field-by-field, whatever the
-  // mint timing. A deferred token is not exempt: `buildIdTokenClaims` emits
-  // `repository`, `ref`, `sha` and `workflow_ref` from the run row on every
-  // mint — `opts.deferred` affects only `statement_hash` and
-  // `attestation_origin` — so the claims a deferred token carries are the same
-  // server truth a live one carries, and the cross-check is possible.
+  // A non-live origin also requires the statement-hash binding, IN ADDITION:
+  // the hash stops a deferred identity being re-bound to a different frozen
+  // statement, and the cross-check stops the frozen statement disagreeing with
+  // the run it claims (a hash-only rule accepts a `sha` naming a release the
+  // build never touched).
   //
-  // For a non-live origin the statement-hash binding is required IN ADDITION.
-  // It is not replaced: the hash is what stops a deferred identity being
-  // re-bound to a different frozen statement at retry time, while the
-  // cross-check is what stops the frozen statement disagreeing with the run it
-  // claims. A bundle whose hash matched but whose `sha` named a release it was
-  // never built from used to verify, because the hash branch never looked at
-  // `sha`.
-  //
-  // `statementBytes` is defined whenever `statement` is (both are assigned
-  // together above), so gating on it here only aids TS narrowing for the hash
-  // path — it never changes the runtime branch taken.
+  // `statementBytes` is set whenever `statement` is; gating on it only aids TS
+  // narrowing and never changes the branch taken.
   if (statement && claims && statementBytes) {
     const contextOk = crossCheckBuildContext(statement, claims);
     if (!contextOk) failures.push('build_context_mismatch');
@@ -245,17 +233,14 @@ export async function verifyKiciBundle(opts: VerifyKiciBundleOptions): Promise<V
 /**
  * Derive the mint-timing origin from the SIGNED token claim.
  *
- * There is deliberately no fallback to the frozen statement's
- * `internalParameters.attestationOrigin`. That field is unsigned and
- * producer-written (the agent sets it itself), so honouring it let a producer
- * choose which verification branch ran by writing one field — a per-bundle
- * opt-out of the check.
+ * Deliberately no fallback to the frozen statement's
+ * `internalParameters.attestationOrigin`: that field is unsigned and
+ * agent-written, so honouring it lets a producer pick the verification branch
+ * — a per-bundle opt-out of the check.
  *
- * A token carrying no claim is treated as `live`, which is now the STRICTER
- * reading: `live` requires the field-by-field cross-check and nothing else can
- * satisfy it. Both minters have emitted the claim unconditionally since the
- * deferral feature shipped, so a token without one predates it and is live in
- * fact as well as by default.
+ * A token with no claim is `live`, the STRICTER reading. Both minters emit the
+ * claim unconditionally, so a token without one predates the deferral feature
+ * and is live in fact as well as by default.
  */
 function resolveAttestationOrigin(claims: Record<string, unknown> | undefined): AttestationOrigin {
   const fromClaim = AttestationOrigin.safeParse(claims?.attestation_origin);
@@ -267,15 +252,11 @@ function resolveAttestationOrigin(claims: Record<string, unknown> | undefined): 
  *
  * Only the **claims** side is normalized (`?? ''`): the producer coerces a
  * null/absent `repository` / `ref` / `workflow_ref` claim into the
- * schema-required empty string and omits `commit` entirely when `sha` is
- * falsy, so a null/absent claim is compared against that coerced `''` /
- * omitted-commit. The **statement** side stays strict — a non-empty
- * attacker-controlled statement field never matches a null claim
- * (`'evil/repo' === (null ?? '')` → `'evil/repo' === ''` → false), and an
- * empty statement field never matches a non-null claim — so this relaxation
- * is forgery-safe in exactly one direction: empty/absent statement ⇔
- * null/absent claim, and nothing else. `runId` / `jobId` are always minted,
- * so they stay strict.
+ * schema-required empty string and omits `commit` when `sha` is falsy. The
+ * **statement** side stays strict — a non-empty statement field never matches a
+ * null claim, and an empty one never matches a non-null claim — so the only
+ * relaxation is empty/absent statement ⇔ null/absent claim, which is
+ * forgery-safe. `runId` / `jobId` are always minted, so they stay strict.
  */
 export function crossCheckBuildContext(
   statement: KiciProvenanceStatement,

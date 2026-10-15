@@ -1,20 +1,16 @@
 /**
- * Phase G (workflow-modification detection) unit tests for
- * `applyWorkflowModificationsAndSecurityHold`.
- *
- * Guards the two behavioral contracts of the phase: the neutral "workflow
- * changes" check is posted on its OWN dedicated poster method, and the phase
- * posts no pending "Held for approval" check (that belongs to the dispatch
- * gate, which creates a real resolvable hold).
- *
- * Detection and legibility only: it reports whether workflow files changed, and
- * that report feeds no dispatch decision — the org trust policy is the fork
- * switch, evaluated from the fork signal and the tier alone
+ * Phase G (workflow-modification detection) tests for
+ * `applyWorkflowModificationsAndSecurityHold`: the neutral "workflow changes"
+ * check is posted on its OWN poster method, and the phase posts no pending
+ * "Held for approval" check (the dispatch gate does, with a real resolvable
+ * hold). The modification report feeds no dispatch decision: the org trust
+ * policy is the fork switch, evaluated from the fork signal and the tier alone
  * (`trust-policy-gate.test.ts`).
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { LockFile, LockWorkflow } from '@kici-dev/engine';
 import { applyWorkflowModificationsAndSecurityHold } from './process-webhook.js';
+import { lockFileFixture, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 function makeWorkflow(name: string): LockWorkflow {
   return {
@@ -23,24 +19,20 @@ function makeWorkflow(name: string): LockWorkflow {
     compileSchemaVersion: 1,
     triggers: [{ _type: 'push', branches: [{ type: 'glob', pattern: 'main' }], paths: [] }],
     jobs: [
-      {
-        _type: 'static',
-        name: 'build',
+      staticJob({
         runsOn: 'default',
-        needs: [],
         steps: [{ name: 'install', hasOutputs: false }],
-      },
+      }),
     ],
   } as unknown as LockWorkflow;
 }
 
 function makeLockFile(workflows: LockWorkflow[]): LockFile {
-  return {
+  return lockFileFixture({
     schemaVersion: 9,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
     contentHash: 'deadbeef',
     workflows,
-  } as unknown as LockFile;
+  });
 }
 
 function callHelper(
@@ -81,10 +73,8 @@ describe('applyWorkflowModificationsAndSecurityHold (phase G)', () => {
 
     const state = callHelper(postCheckStatus, postWorkflowModificationCheck, 'unknown');
 
-    // Neutral informational check posted via the dedicated method (own check name).
     expect(postWorkflowModificationCheck).toHaveBeenCalledTimes(1);
-    // Phase G no longer posts the pending "Held for approval" check — the dispatch
-    // gate does, alongside the real held_runs row.
+    // The dispatch gate posts "Held for approval", alongside the real held_runs row.
     expect(postCheckStatus.mock.calls.some((c) => c[3] === 'Held for approval')).toBe(false);
     // Phase G reports the signal; the trust-policy gate decides the outcome.
     expect(state.hasWorkflowModifications).toBe(true);

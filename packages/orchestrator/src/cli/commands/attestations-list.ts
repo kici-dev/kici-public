@@ -1,14 +1,12 @@
 /**
- * `kici-admin attestations list` runner — a read-only projection of the
- * orchestrator `attestations` table into a JSON envelope mirroring
- * `runs list --json`'s shape. The DB read is injected so the row→envelope
- * mapping is unit-testable without a Postgres connection (mirrors
- * attestations-retry.ts's injected-transport pattern).
+ * `kici-admin attestations list`: a read-only projection of the `attestations`
+ * table into a `runs list --json`-shaped envelope. The DB read is injected so
+ * the mapping is testable without Postgres (mirrors attestations-retry.ts's
+ * injected-transport pattern).
  */
 import type { Kysely } from 'kysely';
 import type { Database } from '../../db/types.js';
 
-/** One attestation row as read from the orchestrator DB (snake_case columns). */
 export interface AttestationListDbRow {
   id: string;
   run_id: string;
@@ -18,7 +16,6 @@ export interface AttestationListDbRow {
   created_at: Date;
 }
 
-/** One attestation as rendered in the CLI JSON envelope (camelCase). */
 export interface AttestationListItem {
   id: string;
   runId: string;
@@ -28,7 +25,7 @@ export interface AttestationListItem {
   createdAt: string;
 }
 
-/** Scope + bound for a list read. Filters are applied by the read fn. */
+/** The read fn applies the filters. */
 export interface AttestationListOptions {
   limit: number;
   runId?: string;
@@ -40,11 +37,7 @@ export interface AttestationListResult {
   attestations: AttestationListItem[];
 }
 
-/**
- * Map the injected DB read into the CLI envelope. `limit` / `runId` / `jobId`
- * are honored by the injected `read` fn (the real one is a Kysely query); this
- * runner owns only the row→envelope projection, so it stays pure and testable.
- */
+/** `read` honours the options; this owns only the row→envelope projection. */
 export async function runAttestationList(
   read: (opts: AttestationListOptions) => Promise<AttestationListDbRow[]>,
   opts: AttestationListOptions,
@@ -62,10 +55,7 @@ export async function runAttestationList(
   };
 }
 
-/**
- * Build the real DB read: a Kysely query over `attestations`, newest first,
- * with optional run/job filters and a row cap.
- */
+/** The real read, newest first. */
 export function readAttestations(
   db: Kysely<Database>,
 ): (opts: AttestationListOptions) => Promise<AttestationListDbRow[]> {

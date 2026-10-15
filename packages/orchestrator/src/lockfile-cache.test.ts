@@ -11,14 +11,14 @@ import {
   CACHE_MAX_ENTRIES_CEILING,
   clampCacheMaxEntries,
 } from './cluster/cluster-settings-reader.js';
+import { lockFileFixture } from './__test-helpers__/lock-fixtures.js';
 
-const SAMPLE_LOCK: LockFile = {
+const SAMPLE_LOCK: LockFile = lockFileFixture({
   schemaVersion: SCHEMA_VERSION,
   minReaderVersion: SCHEMA_VERSION,
-  source: { file: '.kici/workflows/ci.ts', export: '#default' },
   contentHash: 'h',
   workflows: [],
-} as unknown as LockFile;
+});
 
 function makeFetcher(
   impl: LockFileFetcher['fetchLockFile'],
@@ -168,13 +168,12 @@ describe('LockFileCache single-flight', () => {
 
 describe('LockFileCache byte bound', () => {
   const bigLock = (h: string): LockFile =>
-    ({
+    lockFileFixture({
       schemaVersion: SCHEMA_VERSION,
       minReaderVersion: SCHEMA_VERSION,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
       contentHash: h.repeat(5000),
       workflows: [],
-    }) as unknown as LockFile;
+    });
 
   it('evicts by byte size when maxBytes is exceeded', async () => {
     const cache = new LockFileCache({ max: 100, ttl: 60_000, maxBytes: 6000 });

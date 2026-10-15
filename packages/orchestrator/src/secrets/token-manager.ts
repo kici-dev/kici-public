@@ -69,7 +69,6 @@ export class TokenManager {
    *
    * On success, fires a non-blocking update to last_used_at.
    *
-   * @param token - The plaintext token to validate.
    * @returns Token info if valid, null if invalid/expired/revoked.
    */
   async validate(token: string): Promise<{
@@ -113,9 +112,6 @@ export class TokenManager {
     };
   }
 
-  /**
-   * Revoke a token by ID.
-   */
   async revokeToken(tokenId: string): Promise<void> {
     await this.db
       .updateTable('admin_tokens')
@@ -201,7 +197,6 @@ export class TokenManager {
       return envToken;
     }
 
-    // Check if any non-revoked tokens exist
     const existing = await this.db
       .selectFrom('admin_tokens')
       .select('id')
@@ -209,11 +204,9 @@ export class TokenManager {
       .executeTakeFirst();
 
     if (existing) {
-      // Tokens already exist, no bootstrap needed
       return null;
     }
 
-    // No tokens at all -- generate a bootstrap token
     const { token } = await this.generateToken('bootstrap', 'owner', null);
     return token;
   }

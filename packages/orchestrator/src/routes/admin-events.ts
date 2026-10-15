@@ -1,11 +1,7 @@
 /**
- * Admin API routes for generic webhook sources and trust management.
- *
- * Provides CRUD endpoints for managing generic webhook sources (create, list,
- * get, update, delete, enable, disable) and cross-repo trust relationships.
- *
- * All routes are protected by Bearer token authentication via the existing
- * admin auth middleware pattern from admin.ts.
+ * Admin API CRUD for generic webhook sources (create, list, get, update,
+ * delete, enable, disable) and cross-repo trust relationships. Every route
+ * requires Bearer token auth, the admin auth middleware pattern from admin.ts.
  */
 
 import { Hono } from 'hono';
@@ -35,11 +31,9 @@ interface AdminEventRouteDeps {
   tokenManager: TokenManager;
   rbac: RbacEnforcer;
   /**
-   * The in-process bundle registry. The POST /generic-sources handler
-   * registers a local / universal-git bundle into this registry
-   * immediately after the source row lands in the DB, so the next
-   * webhook against that source resolves the right normalizer without
-   * waiting for an orchestrator restart.
+   * POST /generic-sources registers a local / universal-git bundle here right
+   * after the row lands, so the next webhook resolves the right normalizer
+   * without an orchestrator restart.
    */
   providerRegistry: ProviderRegistry;
   /** Passed through to `registerProviderBundleForSource` (universal-git bundle
@@ -51,27 +45,22 @@ interface AdminEventRouteDeps {
   /** Fleet-wide settings reader; threads the live lock-file cap into newly-registered universal-git sources. */
   clusterSettings?: ClusterSettingsReader;
   /**
-   * The canonical Platform organization id this orchestrator authenticated
-   * as, or `undefined` when it is not Platform-connected (independent mode)
-   * or has not authenticated yet.
+   * The Platform org id this orchestrator authenticated as; `undefined` in
+   * independent mode or before authentication.
    *
-   * A generic source mints the routing key `generic:<orgId>:<id>`, and the
-   * Platform refuses to register a key naming an organization other than the
-   * authenticated one. So a source created under a mismatched org would
-   * register, be rejected, and silently never deliver — and its published
-   * webhook URL, which the Platform composes from the Platform org id, would
-   * 404. The create handler refuses the mismatch up front instead.
+   * A generic source mints `generic:<orgId>:<id>`, and the Platform refuses a
+   * key naming another org, so a mismatched source would silently never
+   * deliver and its webhook URL (composed from the Platform org id) would 404.
+   * The create handler refuses the mismatch up front.
    */
   getPlatformOrgId?: () => string | undefined;
   /**
-   * Optional — when provided, the `POST /api/v1/admin/events/emit` route is
-   * mounted so operators can INSERT into `kici_events` + `pg_notify` via HTTP.
-   * Mirrors `emitKiciEventDirect` in `@kici-dev/shared` (direct-DB CLI mode).
+   * When set, mounts `POST /api/v1/admin/events/emit` (INSERT into `kici_events`
+   * + `pg_notify` over HTTP). Mirrors `emitKiciEventDirect` in `@kici-dev/shared`
+   * (direct-DB CLI mode).
    */
   pool?: pg.Pool;
 }
-
-// -- Zod schemas for request validation --
 
 const createSourceSchema = z.object({
   orgId: z.string().min(1),
@@ -90,8 +79,7 @@ const createSourceSchema = z.object({
   providerType: z.enum(['generic', 'local']).optional(),
   /** Universal-git config. When set, source is cloneable + lock-file-aware. */
   gitConfig: UniversalGitConfigSchema.optional(),
-  /** Local filesystem source config (`{ repoBasePath, cloneUrlBase? }`).
-   *  Set together with providerType='local'. Stored in the same git_config column. */
+  /** `{ repoBasePath, cloneUrlBase? }`, set with providerType='local'; stored in git_config. */
   localConfig: LocalSourceConfigSchema.optional(),
 });
 
@@ -111,7 +99,7 @@ const updateSourceSchema = z.object({
   providerType: z.enum(['generic', 'local']).optional(),
   /** `null` explicitly clears the config; omit the field to leave it untouched. */
   gitConfig: UniversalGitConfigSchema.nullable().optional(),
-  /** Local filesystem source config. `null` clears it; omit to leave untouched. */
+  /** `null` clears it; omit to leave untouched. */
   localConfig: LocalSourceConfigSchema.nullable().optional(),
 });
 
@@ -124,11 +112,9 @@ const createTrustSchema = z.object({
 });
 
 /**
- * Payload for `POST /api/v1/admin/events/emit`. Mirrors `EmitKiciEventOpts`
- * in `@kici-dev/shared/db-admin.ts` (the direct-DB helper). The payload is a
- * plain JSON object — arrays and primitives are rejected because the
- * `kici_events.payload` column is defined as `jsonb` with an object shape
- * throughout the codebase.
+ * Body of `POST /api/v1/admin/events/emit`; mirrors `EmitKiciEventOpts` in
+ * `@kici-dev/shared/db-admin.ts`. Arrays and primitives are rejected: the
+ * codebase treats `kici_events.payload` (`jsonb`) as an object everywhere.
  */
 const emitEventSchema = z.object({
   eventName: z.string().min(1),
@@ -137,16 +123,10 @@ const emitEventSchema = z.object({
   sourceRepo: z.string().optional(),
 });
 
-/**
- * Create admin API routes for generic webhook sources and trust management.
- *
- * @param deps - Admin event route dependencies
- * @returns Hono app with admin event routes mounted at /api/v1/admin/*
- */
+/** Routes mounted at /api/v1/admin/*. */
 export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
 
-  // -- Bearer token auth middleware --
   const authMiddleware = createBearerAuthMiddleware({
     tokenManager: deps.tokenManager,
     scope: 'admin-events',
@@ -156,11 +136,8 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEnv
   app.use('/api/v1/admin/trust', authMiddleware);
   app.use('/api/v1/admin/trust/*', authMiddleware);
 
-  // ---- Generic Source CRUD ----
-
-  // Create a new generic webhook source. The new source mints a fresh
-  // `generic:<orgId>:<id>` routing key the caller cannot pre-claim, so
-  // routing-key-scoped tokens are refused.
+  // The new source mints a fresh `generic:<orgId>:<id>` routing key the caller
+  // cannot pre-claim, so routing-key-scoped tokens are refused.
   app.post('/api/v1/admin/generic-sources', requireUnscoped, async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'context.create');
     const body = await c.req.json();
@@ -184,11 +161,8 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEnv
     }
 
     const source = await deps.sourceManager.create(parsed);
-    // Register the per-routing-key provider bundle so the next webhook
-    // against this source resolves the right normalizer. Without this,
-    // a local-typed source would 404 (registry lookup miss) or a
-    // universal-git source would fall through the plain-generic
-    // payload-only path until an orchestrator restart picked up the row.
+    // Without this, until a restart a local source would 404 (registry miss)
+    // and a universal-git source would take the plain-generic payload-only path.
     registerProviderBundleForSource(source, {
       providerRegistry: deps.providerRegistry,
       config: deps.config,
@@ -198,8 +172,7 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEnv
     return c.json({ source }, 201);
   });
 
-  // List sources for an org. Routing-key-scoped tokens see only their
-  // own source within the requested org.
+  // Routing-key-scoped tokens see only their own source within the org.
   app.get('/api/v1/admin/generic-sources', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'context.read');
     const orgId = c.req.query('orgId');
@@ -238,11 +211,9 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEnv
     if (!source) {
       return c.json({ error: 'Source not found' }, 404);
     }
-    // Live registry refresh on the issuing peer: clear any prior
-    // bundle (handles provider_type changes that flip a row from
-    // 'local' / universal-git back to plain 'generic'), then
-    // re-apply the helper. Other peers pick up the same change via
-    // the migration-019 pg_notify + GenericSourcesChangeListener.
+    // Refresh this peer's registry; unregister first handles a provider_type
+    // flip back to plain 'generic'. Other peers follow via the migration-019
+    // pg_notify + GenericSourcesChangeListener.
     deps.providerRegistry.unregister(source.routing_key);
     registerProviderBundleForSource(source, {
       providerRegistry: deps.providerRegistry,
@@ -272,9 +243,7 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEnv
       await deps.sourceManager.softDelete(id);
     }
 
-    // Unregister the per-routing-key bundle locally. The pg_notify
-    // round-trip from migration 019 propagates the same change to
-    // every other peer's listener.
+    // Local only; the migration-019 pg_notify propagates it to other peers.
     deps.providerRegistry.unregister(source.routing_key);
 
     return c.json({ deleted: true, hard }, 200);
@@ -290,8 +259,7 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEnv
     const denied = enforceRoutingKeyScope(c, source.routing_key);
     if (denied) return denied;
     await deps.sourceManager.enable(id);
-    // Re-register the bundle locally so a webhook fired immediately
-    // after the 200 reaches the right normalizer on this peer.
+    // So a webhook right after the 200 reaches the right normalizer here.
     registerProviderBundleForSource(source, {
       providerRegistry: deps.providerRegistry,
       config: deps.config,
@@ -311,20 +279,14 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEnv
     const denied = enforceRoutingKeyScope(c, source.routing_key);
     if (denied) return denied;
     await deps.sourceManager.disable(id);
-    // Drop the per-routing-key bundle locally — webhook dispatch
-    // checks `enabled=true` server-side anyway, but leaving a stale
-    // bundle in the registry would still cost memory + miss
-    // would-be-fallback semantics.
+    // Dispatch checks `enabled=true` anyway, but a stale bundle would cost
+    // memory and miss would-be-fallback semantics.
     deps.providerRegistry.unregister(source.routing_key);
     return c.json({ enabled: false }, 200);
   });
 
-  // ---- Trust CRUD ----
-
-  // Create trust relationship. Routing-key-scoped tokens may only
-  // create trusts whose `sourceRoutingKey` matches their scope (the
-  // typical operator workflow: "let repo X consume events from my
-  // routing key").
+  // Routing-key-scoped tokens may create only trusts whose `sourceRoutingKey`
+  // matches their scope ("let repo X consume events from my routing key").
   app.post('/api/v1/admin/trust', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'context.create');
     const body = await c.req.json();
@@ -364,13 +326,10 @@ export function createAdminEventRoutes(deps: AdminEventRouteDeps): Hono<AdminEnv
     return c.json({ deleted: true }, 200);
   });
 
-  // ---- Event emission ----
-  //
-  // Mirrors `emitKiciEventDirect` in `@kici-dev/shared/db-admin.ts`. INSERTs
-  // a row into `kici_events` and fires `pg_notify('kici_event_channel', <id>)`
-  // so the orchestrator EventRouter picks the event up immediately. Matched
-  // write-grade RBAC permission is `context.create` — emitting an event is a
-  // mutation that fans out into the workflow dispatch pipeline.
+  // Mirrors `emitKiciEventDirect` in `@kici-dev/shared/db-admin.ts`; the
+  // `pg_notify('kici_event_channel', <id>)` lets the EventRouter pick the event
+  // up immediately. Requires `context.create`: an emit is a mutation that fans
+  // out into workflow dispatch.
   if (deps.pool) {
     app.use('/api/v1/admin/events/emit', authMiddleware);
     app.post('/api/v1/admin/events/emit', async (c) => {

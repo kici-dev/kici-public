@@ -1,18 +1,13 @@
 /**
- * Tests for the `/api/v1/admin/trust-policy` admin routes.
+ * The `/api/v1/admin/trust-policy` admin routes. The load-bearing assertions:
  *
- * Two load-bearing assertions:
- *
- * 1. The PATCH refusal on a Platform-attached orchestrator. It is server-side,
- *    so a caller hitting the API directly cannot write a policy the next
- *    Platform push would silently clobber.
- * 2. RBAC. The harness mounts the routes under an OUTER Hono app whose
- *    middleware seeds `role` BEFORE the handlers run, and uses the real
- *    `RbacEnforcer` — mirroring `admin-cluster-settings.test.ts`. Seeding the
- *    role on the same instance the handlers are registered on runs the
- *    middleware too late (`c.get('role')` is undefined) and stubbing the
- *    enforcer makes every permission check a no-op, so the suite would be
- *    green about nothing.
+ * 1. The server-side PATCH refusal on a Platform-attached orchestrator, so a
+ *    direct API caller cannot write a policy the next Platform push would
+ *    silently clobber.
+ * 2. RBAC. As in `admin-cluster-settings.test.ts`, an OUTER Hono app seeds
+ *    `role` BEFORE the handlers run, with the real `RbacEnforcer`. Seeding on
+ *    the handlers' own instance runs too late (`c.get('role')` is undefined),
+ *    and a stubbed enforcer makes every check a no-op: green about nothing.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
@@ -54,10 +49,9 @@ const STORED_DIRECTORY: StoredTrustDirectory = {
 };
 
 /**
- * Rows the fake transaction accumulated, exposed for assertions. Typed as the
- * real `AccessLogRecord` so an assertion can only name fields the route
- * genuinely writes — a narrower local shape silently hid `actor`, which is the
- * whole point of the row.
+ * Rows the fake transaction committed. Typed as the real `AccessLogRecord` so
+ * an assertion can name only fields the route writes; a narrower local shape
+ * can silently hide `actor`, the whole point of the row.
  */
 type AuditRow = AccessLogRecord;
 
@@ -71,8 +65,8 @@ function makeApp(opts: {
   role?: Role;
   routingKey?: string | null;
   /**
-   * Platform liveness getter. Omitted by default, which is the independent /
-   * older-orchestrator shape: the route then reports no connection state.
+   * Platform liveness getter. Omitted by default (the independent /
+   * older-orchestrator shape): the route then reports no connection state.
    */
   platformConnected?: () => boolean;
 }) {
@@ -80,10 +74,9 @@ function makeApp(opts: {
   const auditRows: AuditRow[] = [];
 
   // The directory fake holds real state and runs the REAL merge helpers, so a
-  // route test proves what actually gets stored rather than that a stub was
-  // called. `upsertLocalMember` / `removeLocalMember` stage their audit row
-  // through the same `staged` transaction shape as the policy fake below, and
-  // commit it only once `onWrite` resolved.
+  // test proves what gets stored, not that a stub was called.
+  // `upsertLocalMember` / `removeLocalMember` stage their audit row through the
+  // policy fake's `staged` transaction shape and commit once `onWrite` resolved.
   let liveDirectory: StoredTrustDirectory | null = opts.storedDirectory ?? null;
   const loadDirectory = vi.fn(async () => liveDirectory);
   const commitDirectory = async (
@@ -124,10 +117,9 @@ function makeApp(opts: {
     upsertLocalMember,
     removeLocalMember,
   } as unknown as TrustDirectoryStore;
-  // Mimics the real store: it runs the merge in a transaction and invokes
-  // `onWrite` with that transaction, so a thrown audit write rolls the policy
-  // write back. The fake commits by pushing to `auditRows` only if `onWrite`
-  // resolved.
+  // Like the real store, the merge runs in a transaction handed to `onWrite`,
+  // so a thrown audit write rolls the policy write back: the fake pushes to
+  // `auditRows` only once `onWrite` resolved.
   const upsertLocal =
     opts.upsertLocal ??
     vi.fn(
@@ -230,10 +222,9 @@ async function patchPolicy(app: Hono, body: Record<string, unknown>) {
 
 describe('trust-policy route harness', () => {
   it('actually seeds the role the handlers read', async () => {
-    // Guards the defect this harness was rebuilt to remove: with the seeding
-    // middleware registered after the handlers, `role` is undefined and the
-    // real enforcer refuses everything — so an all-green suite would be green
-    // about nothing. A 200 here proves the middleware runs first.
+    // With the seeding middleware registered after the handlers, `role` is
+    // undefined and the real enforcer refuses everything. A 200 here proves
+    // the middleware runs first.
     const { app } = makeApp({ mode: 'independent', stored: STORED, role: 'owner' });
     const { status } = await getPolicy(app);
     expect(status).toBe(200);
@@ -275,9 +266,9 @@ describe('GET /trust-policy', () => {
   });
 
   it('reports the same fail-closed defaults in independent mode with no row', async () => {
-    // An independent orchestrator has no upstream authority, which is a reason
-    // to be stricter rather than more permissive: it gets the same policy, and
-    // the values it reports are the ones actually applied.
+    // No upstream authority is a reason for strictness, not permissiveness:
+    // an independent orchestrator gets the same policy, and reports the values
+    // actually applied.
     const { app } = makeApp({ mode: 'independent', stored: null });
     const { body } = await getPolicy(app);
     expect(body.policy).toMatchObject({
@@ -339,9 +330,8 @@ describe('GET /trust-policy/directory', () => {
   });
 
   it('returns a null directory rather than 404 when nothing was ever pushed', async () => {
-    // The absence IS the answer an operator is asking for — "no directory is
-    // cached, so no approval can be attributed" — so it is a 200 carrying null,
-    // not an error the CLI would print as a failure.
+    // "No directory cached, so no approval can be attributed" IS the answer,
+    // so a 200 carrying null, not an error the CLI would print as a failure.
     const { app } = makeApp({ mode: 'platform', storedDirectory: null });
     const { status, body } = await getDirectory(app);
     expect(status).toBe(200);
@@ -379,8 +369,7 @@ describe('GET /trust-policy/directory', () => {
   });
 
   it('re-reads the connection state on every request', async () => {
-    // Captured once, a reconnect would need the route re-mounted to be seen —
-    // and the route is mounted at boot.
+    // Captured once, a reconnect would go unseen: the route mounts at boot.
     let connected = false;
     const { app } = makeApp({
       mode: 'platform',
@@ -403,9 +392,8 @@ describe('GET /trust-policy/directory', () => {
 
   it('exposes exactly two write verbs, both member-scoped', async () => {
     // PATCH and DELETE act on ONE member. There is deliberately no whole-
-    // document writer: a PUT would let an operator replace the directory
-    // wholesale, which is the Platform push's own semantics and would silently
-    // drop `teamMemberships` the operator cannot see from the CLI.
+    // document PUT: replacing the directory is the Platform push's semantics,
+    // and would silently drop `teamMemberships` the CLI cannot show.
     const { app } = makeApp({ mode: 'independent', storedDirectory: STORED_DIRECTORY });
     for (const method of ['PUT', 'POST']) {
       const res = await app.request('/trust-policy/directory?customerId=org-1', {
@@ -432,9 +420,9 @@ describe('GET /trust-policy/directory', () => {
   });
 
   it('refuses a routing-key-scoped principal', async () => {
-    // Same reasoning as the policy: the directory is per-org, and a scoped token
-    // carries no org-wide authority. The guard is registered per exact path, so
-    // this also pins that the nested path did not slip past it.
+    // As for the policy: the directory is per-org, and a scoped token has no
+    // org-wide authority. The guard is per exact path, so this also pins the
+    // nested path.
     const { app, loadDirectory } = makeApp({
       mode: 'platform',
       storedDirectory: STORED_DIRECTORY,
@@ -489,9 +477,8 @@ describe('PATCH /trust-policy', () => {
   });
 
   it('refuses a body carrying a removed policy arm with a structured 400', async () => {
-    // The shape a 0.8.x `kici-admin trust-policy set --unknown-contributor-policy`
-    // still sends. Ignoring the key would report success for a knob that no
-    // longer exists.
+    // What a 0.8.x `kici-admin trust-policy set --unknown-contributor-policy`
+    // still sends; ignoring the key would report success for a removed knob.
     //
     // fails-when: the schema drops `.strict()` and the unknown key is ignored
     // (200, and the write goes through without it).
@@ -610,13 +597,12 @@ describe('trust-policy audit', () => {
       outcome: 'allowed',
       meta: { patch: { forkPolicy: 'allow' }, policy: { forkPolicy: 'allow' } },
     });
-    // Attribution is the reason this row exists: a policy that loosens
-    // `forkPolicy` must name the principal that loosened it, taken from the
-    // admin token the auth middleware resolved (`userId`), not a placeholder.
+    // Attribution is why this row exists: a loosened `forkPolicy` names the
+    // principal from the admin token the auth middleware resolved (`userId`),
+    // not a placeholder.
     expect(auditRows[0]?.actor).toEqual({ type: 'service_account', id: 'tester' });
-    // The executor handed to the writer must be the store's transaction, not
-    // the writer's own pool — otherwise the row commits independently of the
-    // policy it audits.
+    // The writer gets the store's transaction, not its own pool, or the row
+    // commits independently of the policy it audits.
     const trx = vi.mocked(accessLog.recordInTransaction).mock.calls[0]?.[0];
     expect(trx).toHaveProperty('staged');
   });
@@ -691,8 +677,8 @@ describe('PATCH /trust-policy/directory', () => {
   });
 
   it('rejects a registration with no provider numeric id', async () => {
-    // `findIdentityLink` matches on the numeric id alone, so a link without one
-    // is inert. Refuse at the door rather than storing something that can never
+    // `findIdentityLink` matches on the numeric id alone, so a link without
+    // one is inert: refuse it rather than store something that can never
     // authorize anybody.
     const { app, upsertLocalMember } = makeApp({ mode: 'independent' });
     for (const bad of [{ providerUserId: '' }, { providerUserId: undefined }]) {

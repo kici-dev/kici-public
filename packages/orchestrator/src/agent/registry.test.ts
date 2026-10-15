@@ -3,8 +3,6 @@ import { AgentRegistry, BUSY_HOLD_MAX_MS, BusyHoldOutcome } from './registry.js'
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 import { hasContainerRuntime } from '../scaler/agent-fit.js';
 
-// ── Tests ───────────────────────────────────────────────────────
-
 describe('AgentRegistry', () => {
   let registry: AgentRegistry;
 
@@ -203,11 +201,9 @@ describe('AgentRegistry', () => {
       expect(entry!.labels).toEqual(new Set(['linux', 'gpu']));
       expect(entry!.activeJobs).toBe(0); // Reset on re-register
 
-      // Old WS should no longer be in reverse map
       expect(registry.getByWs(ws1)).toBeUndefined();
       expect(registry.getByWs(ws2)).toBeDefined();
 
-      // Count should still be 1 (not 2)
       expect(registry.getActiveCount()).toBe(1);
     });
   });
@@ -331,10 +327,9 @@ describe('AgentRegistry', () => {
   });
 
   describe('draining', () => {
-    // A warm-pool destroy takes seconds (a container `stop({ t: 5 })`, or a
-    // Firecracker SendCtrlAltDel plus its grace) while the registry entry
-    // survives until the WebSocket closes. Every dispatch in that window landed
-    // on an agent already exiting.
+    // A warm-pool destroy takes seconds (container `stop({ t: 5 })`, or a
+    // Firecracker SendCtrlAltDel plus grace) while the entry survives until the
+    // WebSocket closes; a dispatch in that window lands on an exiting agent.
     it('excludes a draining agent from findAvailable', () => {
       registry.register('agent-1', mockWs(), ['linux']);
       registry.register('agent-2', mockWs(), ['linux']);
@@ -380,9 +375,8 @@ describe('AgentRegistry', () => {
     });
 
     it('reports the active-job count at the moment of the mark', () => {
-      // `listIdle` reads activeJobs a tick before the destroy is issued, so a
-      // job claimed in between must be visible to the caller — which is what
-      // lets it back out rather than killing an agent mid-job.
+      // `listIdle` reads activeJobs a tick before the destroy, so a job claimed
+      // in between must be visible, letting the caller back out mid-job.
       registry.register('agent-1', mockWs(), ['linux']);
       registry.incrementActiveJobs('agent-1');
       expect(registry.markDraining('agent-1')).toBe(1);
@@ -418,10 +412,8 @@ describe('AgentRegistry', () => {
       registry.register('agent-1', ws1, ['linux', 'docker']);
       registry.register('agent-2', ws2, ['linux']);
 
-      // Both have 'linux'
       expect(registry.findAvailable(['linux'])).toHaveLength(2);
 
-      // Only agent-1 has both 'linux' and 'docker'
       const result = registry.findAvailable(['linux', 'docker']);
       expect(result).toHaveLength(1);
       expect(result[0].agentId).toBe('agent-1');
@@ -434,7 +426,6 @@ describe('AgentRegistry', () => {
       registry.register('agent-1', ws1, ['linux']);
       registry.register('agent-2', ws2, ['linux']);
 
-      // Make agent-1 busy
       registry.incrementActiveJobs('agent-1');
 
       const available = registry.findAvailable(['linux']);
@@ -551,14 +542,11 @@ describe('AgentRegistry', () => {
 
   describe('mandatoryLabels gate (k8s-style taints)', () => {
     it('gated agent rejects jobs whose runsOn does not include every gate label', () => {
-      // Gated agent: requires `gpu` to appear in runsOn even though
-      // its label set already contains it.
+      // The gate requires `gpu` in runsOn even though the agent carries it.
       registry.register('gated', mockWs(), ['linux', 'gpu'], 'linux', 'x64', undefined, 1, {
         mandatoryLabels: ['gpu'],
       });
 
-      // runsOn=['linux'] is a subset of the agent's labels but does NOT
-      // include `gpu` — gate fails.
       expect(registry.findAvailable(['linux'])).toHaveLength(0);
       expect(registry.hasMatchingAgent(['linux'])).toBe(false);
     });
@@ -575,10 +563,9 @@ describe('AgentRegistry', () => {
     });
 
     it('non-gated agent accepts both gated and non-gated runsOn', () => {
-      // Static agent with no mandatoryLabels — historical behavior preserved.
+      // No mandatoryLabels: subset matching is enough.
       registry.register('static', mockWs(), ['linux', 'gpu']);
 
-      // No gate, subset matching is enough.
       expect(registry.findAvailable(['linux'])).toHaveLength(1);
       expect(registry.findAvailable(['linux', 'gpu'])).toHaveLength(1);
       expect(registry.hasMatchingAgent(['linux'])).toBe(true);
@@ -590,8 +577,7 @@ describe('AgentRegistry', () => {
         mandatoryLabels: ['gpu'],
       });
 
-      // Empty runsOn matches every agent BY SUBSET, but the gate cannot be
-      // satisfied by an empty required-labels set.
+      // Empty runsOn matches every agent BY SUBSET, but never satisfies a gate.
       expect(registry.findAvailable([])).toHaveLength(0);
       expect(registry.hasMatchingAgent([])).toBe(false);
     });
@@ -608,7 +594,6 @@ describe('AgentRegistry', () => {
         mandatoryLabels: ['gpu'],
       });
 
-      // Even though gate passes, exclusion fails.
       expect(registry.findAvailable(['linux', 'gpu'], [], ['beta'])).toHaveLength(0);
       expect(registry.hasMatchingAgent(['linux', 'gpu'], [], ['beta'])).toBe(false);
     });
@@ -619,12 +604,10 @@ describe('AgentRegistry', () => {
       });
       registry.register('static', mockWs(), ['linux', 'gpu']);
 
-      // runsOn=['linux'] only matches the static agent (gate blocks the gated one).
       const result = registry.findAvailable(['linux']);
       expect(result.map((e) => e.agentId).sort()).toEqual(['static']);
       expect(registry.hasMatchingAgent(['linux'])).toBe(true);
 
-      // runsOn=['linux','gpu'] matches both.
       const both = registry.findAvailable(['linux', 'gpu']);
       expect(both.map((e) => e.agentId).sort()).toEqual(['gated', 'static']);
       expect(registry.hasMatchingAgent(['linux', 'gpu'])).toBe(true);
@@ -634,8 +617,7 @@ describe('AgentRegistry', () => {
       registry.register('gated', mockWs(), ['linux', 'gpu'], 'linux', 'x64', undefined, 1, {
         mandatoryLabels: ['gpu'],
       });
-      // Re-register with the same gate (mirrors the agent-handler.ts
-      // re-register branch threading the existing entry's gate back through).
+      // Mirrors agent-handler.ts's re-register branch threading the gate back.
       registry.register('gated', mockWs(), ['linux', 'gpu'], 'linux', 'x64', undefined, 1, {
         mandatoryLabels: ['gpu'],
       });
@@ -653,10 +635,9 @@ describe('AgentRegistry', () => {
     });
 
     it('folds a scaler-supplied gate onto the entry it stores', () => {
-      // The scaler config folds `mandatoryLabels` at load, but the value also
-      // reaches here from an adopted spawn record and from the re-register
-      // branch's `[...existingEntry.mandatoryLabels]`. The entry is what every
-      // gate check reads, so the fold is asserted where it is stored.
+      // The scaler config folds at load, but the value also arrives from an
+      // adopted spawn record and the re-register branch. Every gate check reads
+      // the entry, so the fold is asserted where it is stored.
       registry.register('a1', mockWs(), ['GPU', 'Linux'], 'linux', 'x64', '1.0.0', 1, {
         mandatoryLabels: ['GPU'],
       });
@@ -681,9 +662,8 @@ describe('AgentRegistry', () => {
     });
 
     it('excludes on a differently-cased exclude label', () => {
-      // The fold must reach the exclusion arm too: a job excluding `Spot` from
-      // an agent labelled `spot` would otherwise land on exactly the agent it
-      // named — a silent widening rather than a silent no-match.
+      // Without the fold here, a job excluding `Spot` lands on exactly the
+      // `spot` agent it named — a silent widening.
       registry.register('a1', mockWs(), ['linux', 'spot']);
       expect(registry.findAvailable(['linux'], [], ['Spot'])).toHaveLength(0);
       expect(registry.hasMatchingAgent(['linux'], [], ['Spot'])).toBe(false);
@@ -741,7 +721,7 @@ describe('AgentRegistry', () => {
       registry.register('agent-1', ws, ['linux']);
       const before = registry.get('agent-1')!.lastHeartbeatAt;
 
-      // Small delay to ensure timestamp differs
+      // No delay between the reads, so the assertion is >=, not >.
       registry.updateHeartbeat('agent-1');
       const after = registry.get('agent-1')!.lastHeartbeatAt;
 
@@ -794,13 +774,8 @@ describe('AgentRegistry', () => {
     });
   });
 
-  // ── Token-id reverse index lifecycle ─────────────────
-  //
-  // The registry exposes `disconnectByTokenId(tokenId)` so the admin
-  // DELETE /api/v1/agent-tokens/:id route can synchronously kick every
-  // in-flight WS authenticated by a now-revoked token. The lifecycle
-  // tests below pin the index's behavior across register / re-register
-  // / unregister / kick.
+  // `disconnectByTokenId` lets the admin DELETE /api/v1/agent-tokens/:id route
+  // synchronously kick every in-flight WS authenticated by a revoked token.
   describe('disconnectByTokenId / token-id reverse index', () => {
     it('register populates the index and entry.tokenId reflects metadata', () => {
       const ws = mockWs();
@@ -826,8 +801,8 @@ describe('AgentRegistry', () => {
 
       registry.unregister('agent-1');
 
-      // Re-registering under the same tokenId must succeed (the set was
-      // not left "0-size and stuck" -- removeFromIndexes deletes empty sets)
+      // The token's set was not left "0-size and stuck" (removeFromIndexes
+      // deletes empty sets), so a disconnect by that tokenId finds no agent.
       expect(registry.disconnectByTokenId('tok-A')).toBe(0);
     });
 
@@ -908,12 +883,10 @@ describe('AgentRegistry', () => {
         tokenId: 'tok-NEW',
       });
 
-      // Old token bucket no longer holds agent-1
       expect(registry.disconnectByTokenId('tok-OLD')).toBe(0);
       expect(ws1.close).not.toHaveBeenCalled();
       expect(ws2.close).not.toHaveBeenCalled();
 
-      // New token bucket does
       expect(registry.disconnectByTokenId('tok-NEW')).toBe(1);
       expect(ws2.close).toHaveBeenCalledWith(4010, 'Token revoked');
     });
@@ -934,9 +907,8 @@ describe('AgentRegistry', () => {
     });
   });
 
-  // sister to disconnectByTokenId: scheduleExpiryKick fires the
-  // same kick path on natural TTL expiration, so an expired token's
-  // in-flight WS closes the way a revoked token's does.
+  // scheduleExpiryKick runs the disconnectByTokenId kick on TTL expiry, so an
+  // expired token's WS closes the way a revoked token's does.
   describe('scheduleExpiryKick / TTL kick timer', () => {
     beforeEach(() => {
       vi.useFakeTimers();
@@ -953,7 +925,6 @@ describe('AgentRegistry', () => {
       });
       registry.scheduleExpiryKick('tok-A', new Date(Date.now() + 10_000));
 
-      // Before TTL: WS still open, agent still registered.
       expect(ws.close).not.toHaveBeenCalled();
       expect(registry.get('agent-1')).toBeDefined();
 
@@ -994,16 +965,13 @@ describe('AgentRegistry', () => {
         tokenId: 'tok-A',
       });
       registry.scheduleExpiryKick('tok-A', new Date(Date.now() + 10_000));
-      // A reconnect under the same token re-enters the schedule call.
-      // Even with a longer expiresAt, the existing timer wins (the
-      // token's expires_at doesn't change across reconnects, so this
-      // is the safe behavior; if it ever did change, that's a token
-      // re-issue, not a reconnect).
+      // A reconnect re-enters the schedule call; the existing timer wins even
+      // with a longer expiresAt, since expires_at never changes across
+      // reconnects (a change would be a token re-issue).
       registry.scheduleExpiryKick('tok-A', new Date(Date.now() + 60 * 60 * 1000));
 
       vi.advanceTimersByTime(10_001);
 
-      // The original 10s timer fired.
       expect(ws.close).toHaveBeenCalledTimes(1);
     });
 
@@ -1014,11 +982,9 @@ describe('AgentRegistry', () => {
       });
       registry.scheduleExpiryKick('tok-A', new Date(Date.now() + 10_000));
 
-      // Admin revokes before TTL elapses.
       registry.disconnectByTokenId('tok-A');
       expect(ws.close).toHaveBeenCalledTimes(1);
 
-      // Advancing past the original TTL must not re-fire (timer cleared).
       vi.advanceTimersByTime(10_001);
       expect(ws.close).toHaveBeenCalledTimes(1);
     });
@@ -1032,8 +998,6 @@ describe('AgentRegistry', () => {
 
       registry.unregister('agent-1');
 
-      // Timer cleared — advancing past TTL must not call close on the
-      // (now-orphan) ws reference.
       vi.advanceTimersByTime(10_001);
       expect(ws.close).not.toHaveBeenCalled();
     });
@@ -1067,12 +1031,10 @@ describe('AgentRegistry', () => {
       });
       registry.scheduleExpiryKick('tok-shared', new Date(Date.now() + 10_000));
 
-      // Agent A disconnects naturally (one of two agents under this token).
       registry.unregister('agent-A');
 
       vi.advanceTimersByTime(10_001);
 
-      // Timer still fires for the surviving agent B.
       expect(wsA.close).not.toHaveBeenCalled(); // already gone via unregister
       expect(wsB.close).toHaveBeenCalledWith(4010, 'Token revoked');
       expect(registry.get('agent-B')).toBeUndefined();

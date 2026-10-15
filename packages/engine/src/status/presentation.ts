@@ -3,13 +3,9 @@
  * a total precedence order for roll-up aggregates, canonical-status resolution,
  * and a per-status failure classification.
  *
- * Pure Zod (browser-safe): the engine barrel re-exports this module and the
- * dashboard imports the barrel, so no Node built-in may appear here.
- *
- * Consumers keep their own presentation tables (badge colour, terminal colour,
- * emoji, webhook event type) — those are medium-specific. What lives here is
- * the vocabulary itself and the two questions every consumer asks about it:
- * "which of these statuses wins?" and "is this status a failure?".
+ * Pure Zod: the dashboard imports it through the engine barrel, so no Node
+ * built-in may appear here. Medium-specific tables (badge colour, terminal
+ * colour, emoji, webhook event type) stay with each consumer.
  */
 import { z } from 'zod';
 import { ExecutionJobStatus, ExecutionRunStatus } from '../protocol/messages/execution-status.js';
@@ -31,10 +27,9 @@ const CANONICAL_SET: ReadonlySet<string> = new Set<string>(CANONICAL_STATUSES);
 /**
  * Precedence rank for roll-up aggregates — LOWER wins.
  *
- * Exhaustive by type: adding a value to either engine enum breaks this file's
- * typecheck. That is the whole point — `STATUS_PRECEDENCE` below is a plain
- * array, and an array literal missing a member would compile silently, so the
- * ordered list is derived from this record rather than written by hand.
+ * Exhaustive by type: a new value in either engine enum breaks this file's
+ * typecheck. `STATUS_PRECEDENCE` is derived from this record because an array
+ * literal missing a member would compile silently.
  *
  *  - Failures outrank in-flight states, so one failed shard reddens a matrix
  *    group immediately rather than waiting for its siblings to settle.
@@ -45,13 +40,10 @@ const CANONICAL_SET: ReadonlySet<string> = new Set<string>(CANONICAL_STATUSES);
  *    workflow did not do what it declared.
  *  - `cancelled` sits below the actively-executing states (`running`,
  *    `recovering`, `cancelling`) but ABOVE the not-yet-started ones (`held`,
- *    `queued`, `pending`). A band with a live child is still running whatever
- *    happened to its cancelled sibling; a band whose only news is that a child
- *    was cancelled reads "Cancelled" rather than "Queued", because the
- *    cancellation is the thing an operator needs to see.
- *  - `success` outranks `skipped`, so a matrix where three shards were narrowed
- *    out and one passed reads green. Only a group with no successful child
- *    reads "Skipped".
+ *    `queued`, `pending`): a band with a live child is still running, and
+ *    otherwise the cancellation is what an operator needs to see.
+ *  - `success` outranks `skipped`, so a matrix with narrowed-out shards and
+ *    one pass reads green. Only a group with no successful child reads "Skipped".
  */
 const STATUS_RANK: Readonly<Record<CanonicalStatus, number>> = Object.freeze({
   [ExecutionJobStatus.enum.failed]: 0,
@@ -69,7 +61,7 @@ const STATUS_RANK: Readonly<Record<CanonicalStatus, number>> = Object.freeze({
   [ExecutionJobStatus.enum.skipped]: 12,
 });
 
-/** Canonical statuses ordered worst-first. Derived from `STATUS_RANK`. */
+/** Canonical statuses ordered worst-first. */
 export const STATUS_PRECEDENCE: readonly CanonicalStatus[] = Object.freeze(
   [...CANONICAL_STATUSES].sort((a, b) => STATUS_RANK[a] - STATUS_RANK[b]),
 );
@@ -86,16 +78,12 @@ export function toCanonicalStatus(status: string): CanonicalStatus | undefined {
  * The winning status for a group of children, by `STATUS_RANK` precedence.
  *
  * Returns `undefined` when no input resolves, so the caller decides what to
- * show rather than being handed a fabricated status. A roll-up must never
- * invent "queued" or "success" for a child it did not recognise.
+ * show; a roll-up never invents "queued" or "success" for an unrecognised child.
  *
- * An unrecognised child in an OTHERWISE resolvable group is skipped, so the
- * aggregate reports the worst status this build understands. That is a
- * deliberate trade: the alternative — refusing to aggregate at all — would blank
- * the group header for one unknown child. It does mean an older bundle talking
- * to a newer orchestrator can report a group as `success` when an unrecognised
- * sibling was in fact a failure; the per-child badges still render each unknown
- * status on its own terms, which is where the discrepancy is visible.
+ * An unrecognised child in an OTHERWISE resolvable group is skipped, since
+ * refusing to aggregate would blank the group header for one unknown child. So
+ * an older bundle talking to a newer orchestrator can report `success` when an
+ * unrecognised sibling failed; the per-child badges still show that status.
  */
 export function worstStatus(statuses: readonly string[]): CanonicalStatus | undefined {
   let best: CanonicalStatus | undefined;
@@ -130,10 +118,9 @@ export type StatusFailureClass = z.infer<typeof StatusFailureClass>;
  * Failure classification for every canonical status. Exhaustive by type, for
  * the same reason as `STATUS_RANK`.
  *
- * `drift_dropped` is a `failure`: the job was dropped by determinism drift on
- * the executing agent, so a job the workflow declared did not run. The run
- * roll-up and the `on-failure` needs-edge both read this one table, which is
- * what stops them from disagreeing.
+ * `drift_dropped` is a `failure`: determinism drift on the executing agent
+ * dropped a job the workflow declared. The run roll-up and the `on-failure`
+ * needs-edge both read this one table, so they cannot disagree.
  */
 export const STATUS_FAILURE_CLASS: Readonly<Record<CanonicalStatus, StatusFailureClass>> =
   Object.freeze({
@@ -154,10 +141,8 @@ export const STATUS_FAILURE_CLASS: Readonly<Record<CanonicalStatus, StatusFailur
 
 /** True when a status means the workflow did not do what it declared. */
 export function isFailureStatus(status: string): boolean {
-  // Lowercases first, like the presentation helpers. This one is read by both
-  // the engine's `on-failure` expansion and the orchestrator's run roll-up, and
-  // a case-sensitive classification would answer `false` for a status those two
-  // otherwise agree on.
+  // Lowercases first, like the presentation helpers: the engine's `on-failure`
+  // expansion and the orchestrator's run roll-up both read it, and must agree.
   const canonical = toCanonicalStatus(status.toLowerCase());
   return (
     canonical !== undefined && STATUS_FAILURE_CLASS[canonical] === StatusFailureClass.enum.failure

@@ -1,25 +1,17 @@
 /**
- * kici admin drain-worker command
- *
- * Sends POST /drain to a worker instance to trigger graceful drain.
- * Part of the three drain mechanisms: SIGTERM, POST /drain, admin CLI.
+ * `kici admin drain-worker`: POST /drain to a worker for a graceful drain. The
+ * other drain mechanisms are SIGTERM and calling POST /drain directly.
  */
 
 import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
 
-/** Options for the drain-worker command */
 export interface DrainWorkerOptions {
-  /** Worker URL (e.g., http://worker-host:<port>) */
+  /** e.g. http://worker-host:<port> */
   url: string;
 }
 
-/**
- * Send a drain request to a worker instance.
- *
- * @param options - Drain worker options
- * @returns true on success, false on error
- */
+/** @returns true on success, false on error */
 export async function drainWorkerCommand(options: DrainWorkerOptions): Promise<boolean> {
   const { url } = options;
 

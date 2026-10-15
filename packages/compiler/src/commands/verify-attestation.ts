@@ -1,21 +1,15 @@
 /**
  * `kici verify-attestation [artifact] --bundle <path|url> [--trust-root <url|file>]`
  *
- * Offline verification of a KiCI-signed provenance bundle: read the bundle,
- * resolve the trusted issuer + JWKS out-of-band, optionally digest the artifact,
- * and hand everything to the shared browser-safe `verifyKiciBundle` core in
- * `@kici-dev/engine`. The engine owns all crypto; this command is the thin Node
- * wrapper (fs / fetch / artifact digest / output).
+ * Offline verification of a KiCI-signed provenance bundle. The engine's
+ * browser-safe `verifyKiciBundle` owns all crypto; this is the Node wrapper
+ * (fs, fetch, artifact digest, output).
  *
- * `--trust-root` is optional: when omitted it defaults to the CONFIGURED
- * ORCHESTRATOR (its own `.well-known`), which owns provenance signing — the
- * natural root of trust for a self-hosted customer. With neither, the command
- * fails and names both remedies: the hosted KiCI Platform publishes no
- * provenance issuer. Pass `--trust-root` to verify against a different
- * environment or an offline `{ issuer, jwks }` file (air-gap). The token `iss` is always pinned to the
- * trust root out-of-band — a bundle can never name its own trusted issuer.
- *
- * Returns a boolean (verified) so `cli.ts` can map it to an exit code (0/1).
+ * `--trust-root` defaults to the configured orchestrator's `.well-known`: the
+ * orchestrator owns provenance signing, and the hosted Platform publishes no
+ * provenance issuer. With neither, the command fails naming both remedies. The
+ * token `iss` is pinned to the trust root out-of-band, so a bundle can never
+ * name its own trusted issuer.
  */
 import { readFile } from 'node:fs/promises';
 import { logger, sha256File, toErrorMessage } from '@kici-dev/core';
@@ -26,16 +20,13 @@ import { resolveTrustRoot, type TrustRoot } from '../provenance-trust-root.js';
 import { getConfigPath, loadGlobalConfig } from '../remote/config.js';
 
 export interface VerifyAttestationOptions {
-  /** Path or `http(s)` URL to the attestation bundle JSON. Required. */
+  /** Path or `http(s)` URL. Required. */
   bundle?: string;
-  /**
-   * Trusted issuer URL (online discovery) or a self-contained `{ issuer, jwks }`
-   * file. Optional — defaults to the configured orchestrator.
-   */
+  /** Issuer URL (online discovery) or an offline `{ issuer, jwks }` file. */
   trustRoot?: string;
-  /** Expected token audience (defaults to the KiCI provenance audience). */
+  /** Defaults to the KiCI provenance audience. */
   audience?: string;
-  /** Emit the structured `VerifyResult` as JSON instead of human output. */
+  /** Emit the structured `VerifyResult`. */
   json?: boolean;
 }
 
@@ -49,10 +40,8 @@ export async function verifyAttestationCommand(
       return false;
     }
 
-    // Trust root: the explicit --trust-root, else the configured orchestrator
-    // (the `endpoint` URL in the CLI config → its .well-known), the natural root
-    // of trust for a self-hosted customer whose orchestrator owns provenance
-    // signing. `kici login` sets only the Platform endpoint, never this one.
+    // The config's `endpoint` is the orchestrator; `kici login` sets only the
+    // Platform endpoint, never this one.
     const globalConfig = await loadGlobalConfig().catch(() => null);
     const trustRoot = options.trustRoot ?? globalConfig?.endpoint;
     if (!trustRoot) {

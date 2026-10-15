@@ -1,71 +1,29 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { Hono } from 'hono';
 import { createAdminContextRoutes } from './admin-contexts.js';
 import { RbacEnforcer } from '../secrets/rbac.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 /**
- * Mock Kysely chain that supports the three chains used by the
- * variable CRUD routes:
- *
- *   envStore.getByName(orgId, name)
- *     → selectFrom('contexts').selectAll().where().where().executeTakeFirst()
- *   variableStore.listVars(orgId, envId)
- *     → selectFrom('context_variables').selectAll().where().where().execute()
- *   variableStore.setVar(orgId, envId, key, value, locked)
- *     → insertInto('context_variables').values(...).onConflict(...).execute()
- *   variableStore.deleteVar(orgId, envId, key)
- *     → deleteFrom('context_variables').where().where().where().execute()
+ * The variable CRUD routes read the context row (`executeTakeFirst`) and the
+ * variable list (`execute`), upsert through `onConflict(...).execute()` and
+ * delete through `deleteFrom(...).where()...execute()`.
  */
 function buildMockDb(opts: {
   envRow?: { id: string; org_id: string; name: string } | null;
   listVars?: Array<{ key: string; value: string; locked: boolean; updated_at: string }>;
-}): {
-  db: any;
-  insertExecute: ReturnType<typeof vi.fn>;
-  deleteExecute: ReturnType<typeof vi.fn>;
-  insertValues: ReturnType<typeof vi.fn>;
-  deleteWhere3: ReturnType<typeof vi.fn>;
-} {
-  const envExecuteTakeFirst = vi.fn().mockResolvedValue(opts.envRow ?? null);
-  const envWhere2 = vi.fn();
-  const envWhere2Obj: any = { executeTakeFirst: envExecuteTakeFirst };
-  envWhere2.mockReturnValue(envWhere2Obj);
-  const envWhere1 = vi.fn();
-  const envWhere1Obj: any = { where: envWhere2 };
-  envWhere1.mockReturnValue(envWhere1Obj);
-  const envSelectAll = vi.fn().mockReturnValue({ where: envWhere1 });
-
-  const varListExecute = vi.fn().mockResolvedValue(opts.listVars ?? []);
-  const varListWhere2 = vi.fn().mockReturnValue({ execute: varListExecute });
-  const varListWhere1 = vi.fn().mockReturnValue({ where: varListWhere2 });
-  const varListSelectAll = vi.fn().mockReturnValue({ where: varListWhere1 });
-
-  const insertExecute = vi.fn().mockResolvedValue(undefined);
-  const insertOnConflict = vi.fn().mockReturnValue({ execute: insertExecute });
-  const insertValues = vi.fn().mockReturnValue({ onConflict: insertOnConflict });
-
-  const deleteExecute = vi.fn().mockResolvedValue(undefined);
-  const deleteWhere3 = vi.fn().mockReturnValue({ execute: deleteExecute });
-  const deleteWhere2 = vi.fn().mockReturnValue({ where: deleteWhere3 });
-  const deleteWhere1 = vi.fn().mockReturnValue({ where: deleteWhere2 });
-
-  const db = {
-    selectFrom: vi.fn().mockImplementation((table: string) => {
-      if (table === 'contexts') return { selectAll: envSelectAll };
-      if (table === 'context_variables') return { selectAll: varListSelectAll };
-      return {};
-    }),
-    insertInto: vi.fn().mockImplementation((table: string) => {
-      if (table === 'context_variables') return { values: insertValues };
-      return {};
-    }),
-    deleteFrom: vi.fn().mockImplementation((table: string) => {
-      if (table === 'context_variables') return { where: deleteWhere1 };
-      return {};
-    }),
+}) {
+  const { db, mocks } = createMockDb({
+    selectFirstRow: opts.envRow ?? null,
+    selectRows: opts.listVars ?? [],
+  });
+  return {
+    db,
+    insertExecute: mocks.onConflictExecute,
+    deleteExecute: mocks.deleteExecute,
+    insertValues: mocks.insertValues,
+    deleteWhere: mocks.deleteWhere,
   };
-
-  return { db, insertExecute, deleteExecute, insertValues, deleteWhere3 };
 }
 
 function buildTestApp(deps: { db: any; rbac: RbacEnforcer }) {
@@ -204,13 +162,11 @@ describe('admin context variables CRUD', () => {
     });
   });
 
-  // A variable key is a single already-decoded Hono path param. The handlers
-  // must NOT decode it a second time — a second decode either throws a
-  // URIError (500) when the literal key carries a stray `%`, or silently
-  // collapses a `%NN`-looking key onto a DIFFERENT key (wrong-key write or
-  // delete). The `:key` path param has no charset validation (only the request
-  // body is schema-checked), so a variable literally keyed `100%done` is
-  // creatable and both failure modes are reachable.
+  // A variable key is an already-decoded Hono path param. A second decode
+  // throws a URIError (500) on a stray `%`, or collapses a `%NN`-looking key
+  // onto a DIFFERENT key (wrong-key write or delete). `:key` has no charset
+  // validation (only the body is schema-checked), so a key like `100%done` is
+  // creatable and both failures are reachable.
   describe('variable :key path param is decoded exactly once (no double-decode)', () => {
     it('PUT forwards a literal-% key verbatim (was a 500 under double-decode)', async () => {
       const { db, insertValues } = buildMockDb({ envRow: env });
@@ -233,7 +189,7 @@ describe('admin context variables CRUD', () => {
     });
 
     it('DELETE forwards a literal-% key verbatim', async () => {
-      const { db, deleteWhere3 } = buildMockDb({ envRow: env });
+      const { db, deleteWhere } = buildMockDb({ envRow: env });
       const app = buildTestApp({ db, rbac: new RbacEnforcer() });
 
       const res = await app.request(
@@ -242,7 +198,7 @@ describe('admin context variables CRUD', () => {
       );
 
       expect(res.status).toBe(200);
-      expect(deleteWhere3).toHaveBeenCalledWith('key', '=', '100%done');
+      expect(deleteWhere).toHaveBeenCalledWith('key', '=', '100%done');
     });
 
     it('PUT does not collapse a %NN-looking key onto a different key', async () => {
@@ -266,7 +222,7 @@ describe('admin context variables CRUD', () => {
     });
 
     it('DELETE does not collapse a %NN-looking key onto a different key', async () => {
-      const { db, deleteWhere3 } = buildMockDb({ envRow: env });
+      const { db, deleteWhere } = buildMockDb({ envRow: env });
       const app = buildTestApp({ db, rbac: new RbacEnforcer() });
 
       const res = await app.request(
@@ -275,8 +231,8 @@ describe('admin context variables CRUD', () => {
       );
 
       expect(res.status).toBe(200);
-      expect(deleteWhere3).toHaveBeenCalledWith('key', '=', 'a%20b');
-      expect(deleteWhere3).not.toHaveBeenCalledWith('key', '=', 'a b');
+      expect(deleteWhere).toHaveBeenCalledWith('key', '=', 'a%20b');
+      expect(deleteWhere).not.toHaveBeenCalledWith('key', '=', 'a b');
     });
   });
 });

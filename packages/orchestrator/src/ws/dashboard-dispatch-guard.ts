@@ -1,8 +1,7 @@
 /**
- * Guarantees every forwarded dashboard request produces exactly one response
- * frame keyed to its requestId. Wraps the per-type dispatch so a thrown handler
- * or an unhandled message type returns a fast structured error instead of a
- * silently dropped frame (which the Platform would surface as a 10s 504 at its
+ * Guarantees every forwarded dashboard request gets exactly one response frame
+ * keyed to its requestId: a thrown handler or an unhandled type returns a
+ * structured error instead of a dropped frame (a 10s 504 at the Platform's
  * forward window).
  */
 export interface DashboardDispatchGuardDeps {

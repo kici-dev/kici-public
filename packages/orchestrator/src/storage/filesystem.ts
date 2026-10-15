@@ -1,17 +1,13 @@
 /**
- * Filesystem-backed cache storage.
+ * Filesystem-backed `CacheStorage`, the counterpart of `S3CacheStorage`, for
+ * single-host deployments and test sandboxes. Production should still use S3.
  *
- * Mirrors the `CacheStorage` interface that `S3CacheStorage` provides, but
- * stores blobs as files under a configured base directory. Pre-signed URLs
- * are replaced by HMAC-signed `http://<orchUrl>/api/v1/cache/blob/...` URLs
- * — see `sign-url.ts` for the token mechanics and `app.ts` for the route.
+ * Pre-signed URLs become HMAC-signed `http://<orchUrl>/api/v1/cache/blob/...`
+ * URLs (token mechanics: `sign-url.ts`; route: `app.ts`).
  *
- * Intended for single-host deployments and test sandboxes where standing up
- * an S3-compatible service is overkill. Production should still use S3.
- *
- * Metadata is co-located as a sibling JSON file (`<key>.meta.json`) so the
- * data file is byte-identical to what the agent receives over HTTP. TTL is
- * enforced lazily on access — same model as the S3 backend.
+ * Metadata sits in a sibling `<key>.meta.json`, so the data file is
+ * byte-identical to what the agent receives over HTTP. TTL is enforced lazily
+ * on access, as in the S3 backend.
  */
 
 import { promises as fs } from 'node:fs';
@@ -53,9 +49,9 @@ export class FilesystemCacheStorage implements CacheStorage {
   // -- Path layout --
 
   /**
-   * Map a cache key to its on-disk path. Keys may contain `/`, which becomes a
-   * directory separator. Reject keys containing `..` segments or NUL bytes to
-   * prevent path traversal — the same defence the route layer enforces too.
+   * Map a cache key to its on-disk path (`/` becomes a directory separator).
+   * Rejects `..` segments and NUL bytes against path traversal, as the route
+   * layer also does.
    */
   private resolvePath(key: string): string {
     if (key.includes('\0') || key.split('/').some((seg) => seg === '..' || seg === ''))
@@ -186,19 +182,14 @@ export class FilesystemCacheStorage implements CacheStorage {
   }
 
   /**
-   * List cache keys under a prefix.
-   *
-   * The prefix is a **key prefix**, not necessarily a directory — `UserCache`'s
-   * `restoreKeys` fallback lists on `${prefix}${seg(restoreKey)}`, a partial
-   * object name. Two shapes, and both must work the way the S3 backend does:
+   * List cache keys under a **key prefix**, which need not be a directory:
+   * `UserCache`'s `restoreKeys` fallback lists on `${prefix}${seg(restoreKey)}`,
+   * a partial object name. Both shapes must behave as on S3:
    *
    * - trailing `/` — a directory. Walk it directly; this is the hot path.
-   * - no trailing `/` — a partial name. Walk the parent directory and filter by
-   *   the prefix, since the prefix itself may name a file (or nothing at all).
-   *
-   * Reading the prefix as a directory in the second case is what made the
-   * `restoreKeys` fallback silently never hit here (`ENOENT` → `[]`) or throw
-   * (`ENOTDIR`, when a real object carried that exact name).
+   * - no trailing `/` — a partial name. Walk the parent and filter by the
+   *   prefix, which may name a file or nothing at all. Reading it as a
+   *   directory made `restoreKeys` never hit (`ENOENT`) or throw (`ENOTDIR`).
    */
   async list(subPrefix: string): Promise<string[]> {
     const isDirPrefix = subPrefix.endsWith('/');
@@ -245,10 +236,9 @@ export class FilesystemCacheStorage implements CacheStorage {
   // -- Internal --
 
   /**
-   * Recursively collect data files under `dir`, returning each as a cache key
-   * relative to `basePath` paired with its mtime. Metadata sidecars
-   * (`*.meta.json`) and the atomic-write temp files (`*.tmp-*`) are skipped so
-   * `list()` only surfaces real cache objects.
+   * Recursively collect data files under `dir` as `basePath`-relative keys with
+   * their mtime, skipping `*.meta.json` sidecars and `*.tmp-*` atomic-write
+   * temp files so `list()` surfaces only real cache objects.
    */
   private async walkDataFiles(
     dir: string,
@@ -288,17 +278,14 @@ export class FilesystemCacheStorage implements CacheStorage {
 function isNotFoundFsError(err: unknown): boolean {
   if (typeof err !== 'object' || err === null) return false;
   const code = (err as { code?: string }).code;
-  // ENOTDIR counts as "not found": it means a path component we expected to be
-  // a directory is actually a file, which for a lookup is the same answer as
-  // the object not being there. Without it, listing a key prefix that collides
-  // with a real object name throws instead of reporting a miss.
+  // ENOTDIR counts as "not found": a path component is a file, not a directory.
+  // Without it, listing a key prefix that collides with a real object throws.
   return code === 'ENOENT' || code === 'ENOTDIR';
 }
 
 /**
- * Write a file atomically: write to a temp sibling, fsync, rename. Avoids
- * partial reads if the orchestrator crashes mid-write. The temp suffix is
- * randomised so concurrent writers don't collide on the same temp name.
+ * Write atomically (temp sibling, fsync, rename) so a crash mid-write leaves no
+ * partial file. The random temp suffix keeps concurrent writers apart.
  */
 async function writeFileAtomic(path: string, data: Buffer | string): Promise<void> {
   const tmp = `${path}.tmp-${randomBytes(6).toString('hex')}`;

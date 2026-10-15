@@ -45,7 +45,7 @@ import type {
 import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
 import { SCHEMA_VERSION, BREAKING_FLOOR, type WorkflowWithSource } from '../types.js';
 
-// Mock child_process to avoid git dependency in tests
+// No git dependency in tests.
 vi.mock('node:child_process', () => ({
   execSync: vi.fn(() => '/mock/git/root'),
 }));
@@ -595,9 +595,8 @@ describe('generator - content hash fields', () => {
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    // What matters here is that the generator stamps the engine's version, not
-    // what that number happens to be — the number itself is pinned once, in
-    // engine's own types.test.ts, so a bump does not churn every mirror.
+    // Asserts the generator stamps the engine's version; the number itself is
+    // pinned once, in engine's types.test.ts, so a bump does not churn mirrors.
     expect(lockFile.schemaVersion).toBe(SCHEMA_VERSION);
   });
 
@@ -970,7 +969,7 @@ describe('generator - hashFiles', () => {
 describe('generator - source locations', () => {
   it('propagates _sourceLocation to sourceLocation when present', () => {
     const s = step('build', async () => {});
-    // Inject a mock _sourceLocation (step() captures real ones, but we want deterministic tests)
+    // A fixed location: step() captures a real one, which is not deterministic.
     const sWithLoc = {
       ...s,
       _sourceLocation: {
@@ -995,7 +994,6 @@ describe('generator - source locations', () => {
 
   it('omits sourceLocation when _sourceLocation is undefined (backward compat)', () => {
     const s = step('build', async () => {});
-    // Override _sourceLocation to undefined to ensure backward compat
     const sNoLoc = { ...s, _sourceLocation: undefined };
     const j = job('build', { runsOn: 'linux', steps: [sNoLoc] });
     const w = workflow('ci', { jobs: [j] });
@@ -2736,10 +2734,9 @@ describe('generator - result-aware dynamicJob', () => {
   });
 
   it('leaves the key absent — not undefined — for a generator that declares none', () => {
-    // The emitted object shape is what the lock is hashed and diffed from, so
-    // an always-present `gitCredentials: undefined` would move every workflow's
-    // serialized entry. Assert on the serialized key set, which is what a hash
-    // and a diff actually see.
+    // The lock is hashed and diffed from the serialized shape, so an
+    // always-present `gitCredentials: undefined` would move every workflow's
+    // entry. Assert on the serialized key set, which is what a hash sees.
     const entryOf = (jobs: sdk.JobOrFactory[]) => {
       const lock = generateLockFile([makeWorkflowWithSource(workflow('ci', { jobs }))]);
       const found = lock.workflows[0].jobs.find((j) => j._type === 'dynamic');
@@ -2930,11 +2927,10 @@ describe('TextMatch serialization', () => {
       return { stored, matched: re?.test('release-12') ?? false };
     }
 
-    // `d` (ES2022 hasIndices) and `v` (ES2024 unicodeSets) are legal in a repo
-    // targeting ES2024. When the unwrapper's flag class stopped at `[gimsuy]`
-    // they failed to unwrap, the whole `/release-\d+/v` string became the
-    // pattern, and the lock stored a regex matching literal slashes — green at
-    // compile time, never matching at run time.
+    // `d` (ES2022 hasIndices) and `v` (ES2024 unicodeSets) are legal under
+    // ES2024. An unwrapper whose flag class stops at `[gimsuy]` leaves the whole
+    // `/release-\d+/v` string as the pattern: green at compile time, never
+    // matching at run time.
     it.each([
       ['d', /release-\d+/d],
       ['i', /release-\d+/i],

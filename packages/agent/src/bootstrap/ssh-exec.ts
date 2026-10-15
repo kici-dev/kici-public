@@ -1,30 +1,25 @@
 /**
- * Agent-side SSH helper for bootstrap bring-up.
+ * Agent-side SSH helper for bootstrap bring-up, with the same discipline as
+ * `infra/prod/hw/ssh.sh` and the deploy-prod `runOnBox` helper: the bring-up
+ * private key is piped into an **ephemeral ssh-agent** (`ssh-add -` reads
+ * stdin) that is torn down in a `finally`, so the key never lands on disk or in
+ * a long-lived process environment, and lives only for one `ssh` / `scp`
+ * invocation.
  *
- * Lifts the discipline from `infra/prod/hw/ssh.sh` + the deploy-prod
- * `runOnBox` helper into the agent: the bring-up private key is piped into an
- * **ephemeral ssh-agent** (`ssh-add -` reads it from stdin) and the agent is
- * torn down in a `finally`, so the key never lands on disk and never enters a
- * long-lived process environment. The agent only holds the key for the
- * lifetime of the one `ssh` / `scp` invocation.
- *
- * `sshExec` runs a remote command; `sshPush` ships local bytes to a remote
- * path (`ssh 'cat > path'`). Both accept a resolved private key string
- * (supplied by the caller — the orchestrator resolves the scoped secret and
- * hands the key down). `sshExec` supports `{ stdin, port, hostKeyMode }` so it
- * can also drive a pre-boot dropbear / initramfs prompt (a forced-command
- * endpoint such as `cryptroot-unlock` on port 2222, which accepts the unlock
- * input on stdin and uses a transient host key distinct from the OS sshd key).
+ * The caller supplies the private key (the orchestrator resolves the scoped
+ * secret). `sshExec` also drives a pre-boot dropbear / initramfs prompt: a
+ * forced-command endpoint such as `cryptroot-unlock` on port 2222, which reads
+ * the unlock input on stdin and uses a transient host key distinct from the OS
+ * sshd key.
  */
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { makeTempDir } from '@kici-dev/core/tmp';
 import type { HostReach } from './reach.js';
 
-/** Host-key verification mode for the SSH connection. */
 export type SshHostKeyMode = 'accept-new' | 'strict';
 
-/** Result of an SSH invocation: exit code is reported, never thrown away. */
+/** The exit code is reported, never thrown away. */
 export interface SshResult {
   exitCode: number;
   stdout: string;
@@ -34,20 +29,19 @@ export interface SshResult {
 export interface SshExecOpts {
   /** Piped to the remote command's stdin (e.g. a LUKS passphrase to cryptroot-unlock). */
   stdin?: string;
-  /** Override the default SSH port (22). E.g. 2222 for a dropbear initramfs prompt. */
+  /** Default 22; e.g. 2222 for a dropbear initramfs prompt. */
   port?: number;
   /**
-   * Host-key verification. Defaults to `accept-new` — the dropbear initramfs
-   * host key differs from the OS sshd key, so a pinned OS entry must not be
-   * reused. `strict` enforces a known_hosts match.
+   * Defaults to `accept-new`: the dropbear initramfs host key differs from the
+   * OS sshd key, so a pinned OS entry must not be reused. `strict` enforces a
+   * known_hosts match.
    */
   hostKeyMode?: SshHostKeyMode;
 }
 
 /**
- * Low-level process spawn boundary, injectable so unit tests can assert the
- * exact argv / env / stdin without running a real `ssh`. Mirrors the relevant
- * subset of `child_process.spawn`'s contract.
+ * Process spawn boundary (a subset of `child_process.spawn`), injectable so
+ * unit tests can assert the exact argv / env / stdin without a real `ssh`.
  */
 export interface SpawnFn {
   (
@@ -57,7 +51,6 @@ export interface SpawnFn {
   ): Promise<SshResult>;
 }
 
-/** Default spawn boundary backed by `node:child_process.spawn`. */
 export const defaultSpawn: SpawnFn = (command, args, opts) =>
   new Promise<SshResult>((resolve, reject) => {
     const child = spawn(command, args, {
@@ -75,19 +68,16 @@ export const defaultSpawn: SpawnFn = (command, args, opts) =>
     child.on('error', reject);
     child.on('close', (code) => resolve({ exitCode: code ?? -1, stdout, stderr }));
     if (opts.stdin !== undefined) {
-      // The remote can close its read end before we finish writing (a pre-boot
-      // unlock drops the session mid-boot; a connect-timeout exits ssh early),
-      // which emits EPIPE on child.stdin. An unhandled 'error' on the stdin
-      // stream would surface as an uncaught exception and crash the agent —
-      // swallow it here. The real outcome is the process exit code reported via
-      // 'close'; a genuine SSH failure still shows up there (non-zero exit /
-      // stderr), so nothing meaningful is lost by dropping the write error.
+      // The remote can close its read end mid-write (a pre-boot unlock drops the
+      // session; a connect-timeout exits ssh early), emitting EPIPE on
+      // child.stdin. Unhandled, it crashes the agent as an uncaught exception.
+      // Swallowing it loses nothing: a genuine SSH failure still shows in the
+      // 'close' exit code and stderr.
       child.stdin?.on('error', () => {});
       child.stdin?.end(opts.stdin);
     }
   });
 
-/** Deps for the SSH helper — the spawn boundary is injectable for tests. */
 export interface SshDeps {
   spawnFn?: SpawnFn;
 }
@@ -111,7 +101,6 @@ function baseSshOptions(hostKeyMode: SshHostKeyMode): string[] {
   ];
 }
 
-/** Resolve the `user@address` target + port from reach metadata. */
 function resolveTarget(reach: HostReach, portOverride?: number): { dest: string; port: number } {
   if (!reach.address) {
     throw new Error(`host ${reach.agentId} has no SSH reach address declared`);
@@ -123,12 +112,9 @@ function resolveTarget(reach: HostReach, portOverride?: number): { dest: string;
 
 /**
  * Run a command on the target over SSH using an ephemeral, in-memory key.
- *
- * The key is loaded into a per-call ssh-agent (never written to disk) and the
- * agent is killed in `finally`. The remote command's exit code / stdout /
- * stderr are returned verbatim — a non-zero exit is reported, not swallowed
- * (a pre-boot unlock legitimately drops the session, so the caller decides
- * what a "success" looks like).
+ * Exit code, stdout and stderr return verbatim and a non-zero exit does not
+ * throw: a pre-boot unlock legitimately drops the session, so the caller
+ * decides what success looks like.
  */
 export async function sshExec(
   reach: HostReach,
@@ -147,9 +133,8 @@ export async function sshExec(
 }
 
 /**
- * Ship local bytes to a remote path over SSH (`ssh 'cat > path'`), using the
- * same ephemeral-key discipline. Throws on a non-zero exit (a push must
- * succeed end-to-end, unlike a pre-boot unlock).
+ * Ship local text to a remote path over SSH (`ssh 'cat > path'`) with an
+ * ephemeral key. Throws on a non-zero exit: a push must succeed end-to-end.
  */
 export async function sshPush(
   reach: HostReach,
@@ -163,7 +148,7 @@ export async function sshPush(
   const hostKeyMode = opts.hostKeyMode ?? 'accept-new';
   const { dest, port } = resolveTarget(reach, opts.port);
   const result = await withEphemeralAgent(privateKey, spawnFn, async (env) => {
-    // `cat > path` consumes stdin; we shell-quote the path to avoid splitting.
+    // Shell-quote the path so the remote shell does not split it.
     const args = [
       ...baseSshOptions(hostKeyMode),
       '-p',
@@ -183,14 +168,10 @@ export async function sshPush(
 }
 
 /**
- * Ship a local FILE to a remote path over `scp` (a binary channel), using the
- * same ephemeral-key discipline as `sshExec`/`sshPush`.
- *
- * Unlike `sshPush` — which pipes a JS string through `ssh 'cat > path'` and so
- * corrupts binary payloads (a ~50 MB tarball) — `scp` streams the file's raw
- * bytes untouched. This is the ONLY sanctioned path for a binary payload
- * transfer; the string `cat >` path is for text (launcher scripts) only. Throws
- * on a non-zero exit (a payload push must succeed end-to-end).
+ * Ship a local FILE to a remote path over `scp` with an ephemeral key. The ONLY
+ * sanctioned path for a binary payload: `sshPush` pipes a JS string and
+ * corrupts binary data (a ~50 MB tarball), so it is for text (launcher
+ * scripts) only. Throws on a non-zero exit.
  */
 export async function sshPushFile(
   reach: HostReach,
@@ -204,9 +185,8 @@ export async function sshPushFile(
   const hostKeyMode = opts.hostKeyMode ?? 'accept-new';
   const { dest, port } = resolveTarget(reach, opts.port);
   const result = await withEphemeralAgent(privateKey, spawnFn, async (env) => {
-    // scp takes an uppercase -P for the port (ssh uses lowercase -p). The
-    // destination is `user@addr:remotePath`; the key comes from the ephemeral
-    // agent via SSH_AUTH_SOCK in env, never a temp key file.
+    // scp takes uppercase -P for the port (ssh uses -p). The key comes from the
+    // ephemeral agent via SSH_AUTH_SOCK, never a temp key file.
     const args = [
       ...baseSshOptions(hostKeyMode),
       '-P',
@@ -226,18 +206,15 @@ export async function sshPushFile(
 }
 
 /**
- * Start a per-call ephemeral ssh-agent, load the key via stdin (never a file),
- * run `body` with `SSH_AUTH_SOCK` in env, and kill the agent in `finally`.
+ * Run `body` against a per-call ssh-agent holding the key (loaded via stdin,
+ * never a file), killed in `finally`.
  *
- * The agent is bound to a socket inside a private `kici-bootstrap-ssh-*`
- * directory (`ssh-agent -a <dir>/agent.sock`) rather than the default
- * `/tmp/ssh-XXXX`. `ssh-agent` daemonizes into its own session, so it does NOT
- * die with this process — a SIGKILL of the agent (routine when an ephemeral
- * bring-up runner is torn down) skips the `finally` and orphans the daemon.
- * The namespaced socket path lets a host cleanup job reap such orphans
- * precisely: it can distinguish a KiCI bring-up agent from an operator's login
- * agent, which a bare `/tmp/ssh-XXXX` socket cannot. The private dir is removed
- * in an outer `finally` so the normal path leaves nothing behind.
+ * The socket lives in a private `kici-bootstrap-ssh-*` directory rather than
+ * the default `/tmp/ssh-XXXX`. `ssh-agent` daemonizes into its own session, so
+ * a SIGKILL of this process (routine when an ephemeral bring-up runner is torn
+ * down) skips the `finally` and orphans the daemon; the namespaced path lets a
+ * host cleanup job tell a KiCI bring-up agent from an operator's login agent
+ * and reap it. An outer `finally` removes the private dir.
  */
 async function withEphemeralAgent<T>(
   privateKey: string,
@@ -254,26 +231,24 @@ async function withEphemeralAgent<T>(
     }
     const pid = parseAgentPid(start.stdout);
     // SSH_ASKPASS=/bin/false makes a passphrase-protected key fail fast instead
-    // of hanging on a TTY prompt — same contract as ssh.sh. SSH_AUTH_SOCK is the
-    // socket we bound above, not whatever ssh-agent echoed.
+    // of hanging on a TTY prompt. SSH_AUTH_SOCK is the socket bound above, not
+    // whatever ssh-agent echoed.
     const agentEnv: NodeJS.ProcessEnv = {
       ...baseEnv,
       SSH_AUTH_SOCK: sock,
       SSH_ASKPASS: '/bin/false',
       DISPLAY: '',
     };
-    // Only ever carry the ephemeral agent's own PID. If parseAgentPid could not
-    // extract one, delete any SSH_AGENT_PID inherited from a parent/login agent
-    // so the `finally` teardown's `ssh-agent -k` can never signal the wrong
-    // agent (with no PID it no-ops; a host cleanup job can reap the orphaned
-    // ephemeral agent by its kici-bootstrap-ssh socket).
+    // Carry only the ephemeral agent's own PID. Without one, drop any inherited
+    // SSH_AGENT_PID so `ssh-agent -k` can never signal a login agent; it no-ops
+    // and the cleanup job reaps the orphan by its kici-bootstrap-ssh socket.
     if (pid) {
       agentEnv.SSH_AGENT_PID = pid;
     } else {
       delete agentEnv.SSH_AGENT_PID;
     }
     try {
-      // Key on stdin, ending with a newline (ssh-add expects a complete PEM).
+      // ssh-add expects a complete PEM, ending with a newline.
       const add = await spawnFn('ssh-add', ['-'], {
         env: agentEnv,
         stdin: privateKey.endsWith('\n') ? privateKey : `${privateKey}\n`,
@@ -284,8 +259,7 @@ async function withEphemeralAgent<T>(
       return await body(agentEnv);
     } finally {
       await spawnFn('ssh-agent', ['-k'], { env: agentEnv }).catch(() => {
-        // Best-effort teardown; if this process is SIGKILLed before it runs,
-        // a host cleanup job can reap the orphan by its kici-bootstrap-ssh socket.
+        // Best-effort; the host cleanup job reaps an orphan by its socket.
       });
     }
   } finally {
@@ -295,7 +269,7 @@ async function withEphemeralAgent<T>(
   }
 }
 
-/** Extract `SSH_AGENT_PID=<n>;` from `ssh-agent -s` output (best-effort). */
+/** `SSH_AGENT_PID=<n>;` from `ssh-agent -s` output, best-effort. */
 function parseAgentPid(out: string): string | undefined {
   return out.match(/SSH_AGENT_PID=([^;\n]+)/)?.[1];
 }

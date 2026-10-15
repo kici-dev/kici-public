@@ -1,25 +1,12 @@
 /**
- * Runtime backstop for the KICI_ env-var allowlist.
+ * Runtime backstop for the KICI_ env-var allowlist: every `process.env.NAME` /
+ * `process.env['NAME']` access under `SCAN_ROOTS` must pass
+ * `IS_ALLOWED_ENV_NAME` from `./allowlist.ts`.
  *
- * Walks the source tree under every `SCAN_ROOTS` directory and
- * matches every `process.env.NAME` and `process.env['NAME']` access
- * against `IS_ALLOWED_ENV_NAME(NAME)` from `./allowlist.ts`. Any
- * unmatched name fails the test with a clear error pointing at the file
- * and the offending name.
- *
- * Why a backstop? The compile-time enforcement is the inline
- * `no-restricted-syntax` rule in `eslint.config.js`. Two failure modes
- * the runtime walk catches that ESLint can miss:
- *
- *   - Template-literal indexing: `process.env[`FOO_${suffix}`]` produces
- *     a TemplateLiteral expression, which the static `Literal`-based
- *     selector cannot pattern-match at lint time.
- *   - Whatever future contributor decides to disable the lint rule
- *     file-wide. The backstop walks the tree regardless of disable
- *     comments.
- *
- * Shape: recursive directory walk, ignore node_modules / dist / *.test.ts,
- * collect violations, expect [] at the end.
+ * The inline `no-restricted-syntax` rule in `eslint.config.js` is the
+ * compile-time enforcement; this walk also catches what ESLint misses:
+ * template-literal indexing (`process.env[`FOO_${suffix}`]`, which the
+ * `Literal`-based selector cannot match) and files that disable the lint rule.
  */
 import { describe, it, expect } from 'vitest';
 import {
@@ -35,33 +22,23 @@ import { tmpdir } from 'node:os';
 import { join, resolve, relative } from 'node:path';
 import { IS_ALLOWED_ENV_NAME } from './allowlist.js';
 
-/** Repo root, three `..` up from `packages/shared/src/env/`. */
 const REPO_ROOT = resolve(import.meta.dirname, '../../../../');
 
 /**
- * Roots of the source tree that the backstop walks. Mirrors the
- * coverage area of the inline ESLint rule. We deliberately exclude
- * `docs-site/`, `infra/`, and `tools/` because they sit on the edges
- * of the project and currently contain a few legitimate non-KICI_ env
- * reads (Astro/Vite/etc.) that are scoped to their own subtrees. They
- * can be added in a later sweep.
+ * Mirrors the inline ESLint rule's coverage. `docs-site/`, `infra/` and
+ * `tools/` are excluded: they hold legitimate non-KICI_ env reads
+ * (Astro/Vite/etc.) scoped to their own subtrees.
  */
 const SCAN_ROOTS = ['packages', 'scripts', 'e2e'];
 
-/**
- * Files / directories the walker skips outright. `allowlist.ts` and
- * this test file are excluded because their JSDoc and test-fixture
- * blocks contain the literal pattern `process.env.NAME` for
- * documentation purposes (e.g. the example in this very paragraph).
- */
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', '.cache', 'coverage', '.git']);
 /**
- * Gitignored scratch trees a check materialises next to the sources it checks
- * (`.tmp-*` directories of rendered workflow templates — fixtures that read
- * arbitrary env names on purpose). They are not source, and a tree left
- * behind by a killed run must not fail an unrelated package's tests.
+ * Gitignored `.tmp-*` scratch trees of rendered workflow templates, which read
+ * arbitrary env names on purpose. One left behind by a killed run must not fail
+ * an unrelated package's tests.
  */
 const SCRATCH_DIR = /^\.tmp-/;
+/** `allowlist.ts` and this file contain `process.env.NAME` as documentation. */
 const SELF_FILES = new Set([
   resolve(import.meta.dirname, 'allowlist.ts'),
   resolve(import.meta.dirname, 'env-rule-allowlist.test.ts'),
@@ -71,12 +48,9 @@ const SELF_FILES = new Set([
 const SOURCE_EXTS = /\.(ts|tsx|mts|mjs|js|cjs)$/;
 
 /**
- * Test files are excluded from the walk for the same reason the inline
- * ESLint rule should exclude them: tests legitimately set/read arbitrary
- * env names to exercise sanitizer / expose / fixture code paths
- * (`process.env.RANDOM_VAR`, `process.env.WEBHOOK_SECRET`, etc.).
- * Forcing every fixture name into `MIGRATING_ENV_VARS` would defeat
- * the purpose of the allowlist.
+ * Test files are excluded: they read arbitrary env names to exercise
+ * sanitizer / expose / fixture paths, and listing each in `MIGRATING_ENV_VARS`
+ * would defeat the allowlist.
  */
 const TEST_FILE = /\.(test|spec|int\.test)\.(ts|tsx|mts|mjs|js|cjs)$/;
 
@@ -107,43 +81,23 @@ function walk(dir: string, out: string[] = []): string[] {
 }
 
 /**
- * Single regex that catches both forms in one pass:
- *   - `process.env.NAME`         — dot member access.
- *   - `process.env['NAME']`      — single-quoted computed access.
- *   - `process.env["NAME"]`      — double-quoted computed access.
- *
- * The capture group is the env-var name. `[A-Z_][A-Z0-9_]*` matches the
- * shouty SCREAMING_SNAKE convention; lowercase identifiers (npm_*,
- * UTF8 strings, etc.) won't match here, but the `npm_*` family is
- * already in the OS/SDK regex anyway and isn't accessed via this
- * pattern in our source tree.
+ * Matches `process.env.NAME`, `process.env['NAME']` and `process.env["NAME"]`.
+ * Only SCREAMING_SNAKE names match; lowercase `npm_*` is in the OS/SDK regex
+ * anyway and not read this way in the tree.
  */
 const ACCESS_RE = /process\.env(?:\.([A-Z_][A-Z0-9_]*)|\[['"]([A-Z_][A-Z0-9_]*)['"]\])/g;
 
 /**
- * Strip the contents of every backtick-bounded template literal before
- * scanning, while preserving line counts so violation line numbers stay
- * accurate. Template literals frequently embed workflow source code that
- * the host file emits to disk — those `process.env.NAME` occurrences
- * belong to the *generated* file, not to the host, so they must not
- * trigger the allowlist check here.
+ * Blank every template literal's body, keeping newlines so violation line
+ * numbers stay accurate. Template literals often embed workflow source the host
+ * file emits; their `process.env.NAME` belongs to the generated file.
  *
- * The replacement keeps each newline intact so that `upTo.split('\n').length`
- * elsewhere still reports the correct line. We approximate "template
- * literal" with `` ` … ` `` matching, treating `\\.` as an escape (so
- * `` \` `` does not close the literal). This is a deliberate string-level
- * approximation rather than full TS AST parsing — the latter would buy
- * us nothing because the only construct we need to ignore is the
- * literal contents of fixture-emitting backtick strings, and the regex
- * gets that right for every host file in the tree.
+ * A string-level approximation (`\\.` is an escape, so `` \` `` does not close
+ * the literal) rather than a TS AST parse, which would buy nothing: it handles
+ * every host file in the tree.
  */
 function stripTemplateLiteralContents(src: string): string {
   return src.replace(/`(?:\\.|[^\\`])*`/g, (match) => {
-    // Replace the literal body with whitespace so the regex below can't
-    // match `process.env.NAME` inside it. Preserve newlines so line
-    // numbers in error messages still point at the correct host-file
-    // line. The backticks themselves are kept too, just to keep the
-    // shape of the source visually similar.
     let out = '`';
     for (let i = 1; i < match.length - 1; i++) {
       out += match[i] === '\n' ? '\n' : ' ';
@@ -166,10 +120,6 @@ function scanFile(file: string): Violation[] {
   } catch {
     return [];
   }
-  // Strip template-literal contents first so that `process.env.NAME`
-  // occurrences embedded in workflow-source-code fixtures the host file
-  // emits to disk do not get attributed to the host file. Newlines inside
-  // the literal are preserved so violation line numbers stay accurate.
   const scrubbed = stripTemplateLiteralContents(src);
   const violations: Violation[] = [];
   // Reset per-file because the regex is `g`-flagged and shared.
@@ -179,7 +129,6 @@ function scanFile(file: string): Violation[] {
     const name = m[1] ?? m[2];
     if (!name) continue;
     if (IS_ALLOWED_ENV_NAME(name)) continue;
-    // Compute 1-indexed line number for the match start.
     const upTo = scrubbed.slice(0, m.index);
     const line = upTo.split('\n').length;
     violations.push({ file, name, line });

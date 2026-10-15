@@ -14,12 +14,10 @@ import { join } from 'node:path';
 export const KICI_TMP_PREFIX = 'kici-';
 
 /**
- * Base directory for KiCI-created temp allocations. Honors the `KICI_TMPDIR`
- * env var (creating it if it does not yet exist) so an operator can route
- * KiCI's temp footprint onto a volume with room; falls back to the OS temp dir
- * otherwise. This is the single resolution point for `KICI_TMPDIR` — the
- * `@kici-dev/shared` `kiciTmpBase` delegates here so there is exactly one env
- * read across the codebase.
+ * Base directory for KiCI temp allocations: `KICI_TMPDIR` (created if missing),
+ * so an operator can route KiCI's temp footprint onto a volume with room, else
+ * the OS temp dir. The codebase's only read of `KICI_TMPDIR`; the
+ * `@kici-dev/shared` `kiciTmpBase` delegates here.
  */
 export function kiciTmpBase(): string {
   const custom = process.env.KICI_TMPDIR;
@@ -73,7 +71,6 @@ export async function makeTempFile(
   opts: MakeTempOptions & { suffix?: string } = {},
 ): Promise<TempHandle> {
   assertValidLabel(label);
-  // Same resolution order as makeTempDir: explicit base > KICI_TMPDIR > tmpdir.
   const base = opts.base ?? kiciTmpBase();
   const holder = await mkdtemp(join(base, `${KICI_TMP_PREFIX}${label}-`));
   const filePath = join(holder, `${label}${opts.suffix ?? ''}`);

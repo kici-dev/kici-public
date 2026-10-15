@@ -216,7 +216,6 @@ export class RegistrationStore {
             .where('id', '=', row.id)
             .execute();
         } else {
-          // INSERT new workflow
           await trx
             .insertInto('workflow_registrations')
             .values({
@@ -275,9 +274,6 @@ export class RegistrationStore {
     return rows.map(parseRow);
   }
 
-  /**
-   * Get registrations for a specific routing key.
-   */
   async getByRoutingKey(routingKey: string): Promise<RegistrationRow[]> {
     const rows = await this.db
       .selectFrom('workflow_registrations')
@@ -288,9 +284,6 @@ export class RegistrationStore {
     return rows.map(parseRow);
   }
 
-  /**
-   * Get registrations for a specific routing key + repo pair.
-   */
   async getByRoutingKeyAndRepo(
     routingKey: string,
     repoIdentifier: string,
@@ -330,9 +323,6 @@ export class RegistrationStore {
     return BigInt(result.numDeletedRows) > 0n;
   }
 
-  /**
-   * Delete all registrations for a routing key + repo pair.
-   */
   async deleteByRoutingKeyAndRepo(routingKey: string, repoIdentifier: string): Promise<void> {
     await this.db
       .deleteFrom('workflow_registrations')
@@ -374,7 +364,6 @@ export class RegistrationStore {
 }
 
 /**
- * Parse a DB row into a typed RegistrationRow.
  * Handles JSON parsing of lock_entry.
  */
 function parseRow(row: WorkflowRegistration): RegistrationRow {

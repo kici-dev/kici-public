@@ -1,14 +1,12 @@
 /**
- * Tests for the agent and orchestrator stop commands' folder-anchored behavior:
- * refusal when no targeting flag and no CWD manifest, and --instance-dir
- * resolution flowing through to manager.stop with a ServiceConfig built
- * from the manifest.
+ * Folder-anchored agent and orchestrator stop: targeting refusal and the
+ * manifest-built ServiceConfig.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
+import { makeTempDir } from '@kici-dev/test-support/tmp';
 import { Command } from 'commander';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import type {
   DiscoveredInstance,
@@ -57,9 +55,8 @@ vi.mock('../../../service/index.js', async () => {
     resolveUserLevel: vi.fn().mockReturnValue(true),
     kiciConfigRoot: vi.fn(() => mockKiciRoot),
     createServiceManager: vi.fn(async (platform: ServicePlatform) => makeManager(platform)),
-    // Manager selection lives in the seam, so the real one runs here with the
-    // driver factory injected: every candidate platform gets its own double, and
-    // `op` records which one the command actually operated through.
+    // The real manager selection runs with the driver factory injected: each
+    // platform gets its own double, and `op` records which one the command used.
     resolveInstanceTarget: (args: Parameters<typeof actual.resolveInstanceTarget>[0]) =>
       actual.resolveInstanceTarget({ ...args, createManager: async (p) => makeManager(p) }),
   };
@@ -68,10 +65,6 @@ vi.mock('../../../service/index.js', async () => {
 import { registerServiceLifecycleVerbs, type ServiceComponent } from '../service-verbs.js';
 import { InstanceNotFoundError, writeIndex, writeManifest } from '../../../service/index.js';
 import type { InstanceManifest } from '../../../service/index.js';
-
-function mkTmp(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function makeManifest(
   component: ServiceComponent,
@@ -100,8 +93,8 @@ describe.each(['agent', 'orchestrator'] as const)('%s stop — folder-anchored',
   let consoleErrorSpy: MockInstance<typeof console.error>;
 
   beforeEach(() => {
-    tmpInstanceDir = mkTmp(`kici-${component}-stop-i-`);
-    tmpConfigRoot = mkTmp(`kici-${component}-stop-c-`);
+    tmpInstanceDir = makeTempDir(`kici-${component}-stop-i-`);
+    tmpConfigRoot = makeTempDir(`kici-${component}-stop-c-`);
 
     mockListResult = [];
     mockStop.mockClear();
@@ -127,7 +120,7 @@ describe.each(['agent', 'orchestrator'] as const)('%s stop — folder-anchored',
 
   it('refuses without --instance-dir/--name and no CWD manifest', async () => {
     const savedCwd = process.cwd();
-    const emptyCwd = mkTmp(`kici-${component}-stop-cwd-`);
+    const emptyCwd = makeTempDir(`kici-${component}-stop-cwd-`);
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
       throw new Error('process.exit called');
     }) as never);
@@ -158,12 +151,11 @@ describe.each(['agent', 'orchestrator'] as const)('%s stop — folder-anchored',
 
     try {
       await program.parseAsync(['node', component, 'stop', '--name', 'kici-absent']);
-      // Did NOT stop anything and did NOT exit non-zero.
       expect(mockStop).not.toHaveBeenCalled();
       expect(exitSpy).not.toHaveBeenCalled();
       const logs = consoleLogSpy.mock.calls.map((c) => c.join(' ')).join('\n');
       expect(logs).toContain('not installed');
-      // Sanity: the typed error the handler branches on is a real Error subclass.
+      // The typed error the handler branches on is a real Error subclass.
       expect(new InstanceNotFoundError(component, 'x', 'm')).toBeInstanceOf(Error);
     } finally {
       exitSpy.mockRestore();
@@ -209,8 +201,8 @@ describe.each(['agent', 'orchestrator'] as const)('%s stop — folder-anchored',
     expect([...new Set(operatedPlatforms)]).toEqual(['compose']);
   });
 
-  // breaks-if-wrong: the overwhelmingly common case must be unaffected — a
-  // systemd install on a systemd host still operates through the systemd driver.
+  // breaks-if-wrong: a systemd install on a systemd host still operates through
+  // the systemd driver.
   it('operates a systemd-manifest install through the systemd driver', async () => {
     writeManifest(
       tmpInstanceDir,

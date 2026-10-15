@@ -2,12 +2,10 @@
  * Describe a failed package-manager install subprocess so the job error
  * carries what the package manager reported.
  *
- * `execFile` rejects with an error whose message is `Command failed: <cmd>`
- * followed by the child's stderr. That message drops the exit code, the
- * signal, a timeout kill and everything the child wrote to stdout, and when
- * the child wrote nothing to stderr it is the command line alone. The job
- * error and the run log then hold no cause. {@link describeInstallFailure}
- * builds the message from the error's own fields instead.
+ * `execFile` rejects with `Command failed: <cmd>` plus the child's stderr,
+ * dropping the exit code, the signal, a timeout kill and all stdout; with empty
+ * stderr it is the command line alone, so the job error holds no cause.
+ * {@link describeInstallFailure} builds the message from the error's own fields.
  */
 
 import { readdir, readFile } from 'node:fs/promises';
@@ -15,9 +13,9 @@ import { join } from 'node:path';
 import { toErrorMessage } from '@kici-dev/shared';
 import { redactNpmOutput } from './npm-registry-config.js';
 
-/** The last lines of each output stream the description keeps. */
+/** Kept per output stream. */
 export const INSTALL_FAILURE_TAIL_LINES = 40;
-/** The most characters of each output stream the description keeps. */
+/** Kept per output stream. */
 export const INSTALL_FAILURE_TAIL_CHARS = 4000;
 
 /** The fields `execFile` sets on the error it rejects with. */
@@ -48,14 +46,11 @@ function streamSection(name: string, value: unknown, tokens: readonly string[]):
 }
 
 /**
- * Build the error message for a failed install subprocess.
- *
- * The message keeps the first line of the original error (`Command failed:
- * <cmd>`) and adds the exit code or signal, whether the timeout killed the
- * child, and the end of its stderr and stdout. Each registry token in
- * `tokens` is redacted from every part. An error that does not come from a
- * finished subprocess (no `stdout` / `stderr` fields) keeps its own message,
- * redacted.
+ * Keeps the original error's first line (`Command failed: <cmd>`) and adds the
+ * exit code or signal, whether the timeout killed the child, and the end of its
+ * stderr and stdout, with every registry token in `tokens` redacted. An error
+ * with no `stdout` / `stderr` fields (not a finished subprocess) keeps its own
+ * message, redacted.
  */
 export function describeInstallFailure(err: unknown, tokens: readonly string[]): string {
   const message = redactNpmOutput(toErrorMessage(err), tokens);
@@ -84,13 +79,13 @@ export function describeInstallFailure(err: unknown, tokens: readonly string[]):
 }
 
 /**
- * Attach the end of npm's newest debug log under `cacheDir` to a failed npm
- * install's error, so {@link describeInstallFailure} can report it.
+ * Attach npm's newest debug log under `cacheDir` to a failed npm install's
+ * error, for {@link describeInstallFailure}.
  *
- * npm writes a debug log for every run to `<cache>/_logs/`, and on failure it
- * holds the cause even when npm wrote nothing to stderr. The install runs with
- * a per-job cache directory that is removed afterwards, so the log must be
- * read before that cleanup. A log that cannot be read leaves the error as it is.
+ * npm writes a debug log per run to `<cache>/_logs/`, and it holds the cause
+ * even when stderr is empty. The per-job cache directory is removed after the
+ * install, so read the log before that cleanup. An unreadable log leaves the
+ * error unchanged.
  */
 export async function attachNpmDebugLog(err: unknown, cacheDir: string): Promise<void> {
   if (!err || typeof err !== 'object') return;

@@ -3,11 +3,7 @@ import { createStepSecrets } from './secrets.js';
 import type { StepSecretsFileHost, StepSecretsFileWiring } from './secrets.js';
 import { SecretNotFoundError } from './errors.js';
 
-/**
- * Build an in-memory host adapter for unit-testing `mountFile` / `exposeFile`
- * without touching the filesystem. Each `writeMountedFile` call appends an
- * entry to the returned `files` array and returns a synthetic path.
- */
+/** In-memory host adapter: `writeMountedFile` records to `files` and returns a synthetic path. */
 function makeMemoryHost(): {
   host: StepSecretsFileHost;
   files: Array<{ path: string; content: string; sources: string[]; mode: number; name?: string }>;

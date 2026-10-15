@@ -9,7 +9,6 @@ import { AccessDeniedError, AuthenticationError, ConnectionError } from './platf
 
 type Call = { url: string; init: RequestInit };
 
-/** Stub fetch with a queue of responses and record each call. */
 function stubFetch(...responses: Array<Response | Error>): Call[] {
   const calls: Call[] = [];
   vi.stubGlobal(

@@ -1,8 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ExecutionTracker, type ExecutionTrackerDeps } from './execution-tracker.js';
 
-// Mock Prometheus metrics to avoid pulling in the OTel registry from a peer
-// package during this isolated unit test.
+// Avoids pulling in the OTel registry from a peer package.
 vi.mock('../metrics/prometheus.js', () => ({
   executionsTotal: { add: vi.fn() },
   executionDurationSeconds: { record: vi.fn() },
@@ -10,14 +9,9 @@ vi.mock('../metrics/prometheus.js', () => ({
 }));
 
 /**
- * Tiny Kysely-shaped mock that only models the queries used by
- * `getReplayDataWithDb`: a single `selectFrom('execution_runs').select(...)
- * .where(...).where(...).orderBy(...).execute()` chain plus a
- * `selectFrom('execution_jobs').select(...).where(...).execute()` chain.
- *
- * The full mock in execution-tracker.test.ts is purpose-built for write-through
- * assertions and would need substantial extensions (orderBy + plain .execute
- * for selects) to cover this method — keeping the replay test isolated avoids
+ * Kysely-shaped mock of only the `getReplayDataWithDb` query chains (execution_runs with
+ * orderBy, execution_jobs). The execution-tracker.test.ts mock is built for write-through
+ * assertions and would need orderBy + plain select .execute — kept separate to avoid
  * polluting that fixture.
  */
 function createMockDb(opts: {
@@ -133,8 +127,8 @@ describe('ExecutionTracker.getReplayDataWithDb', () => {
 
     const tracker = new ExecutionTracker({ db });
 
-    // Stub getReplayData() to simulate an in-memory entry for the same runId
-    // (avoids needing a full DB-write-supporting mock to drive onExecutionStarted).
+    // Simulates an in-memory entry for the same runId without a DB-write mock for
+    // onExecutionStarted.
     vi.spyOn(tracker, 'getReplayData').mockReturnValue([
       {
         runId: 'run-shared',
@@ -180,9 +174,8 @@ describe('ExecutionTracker.getReplayDataWithDb', () => {
 });
 
 /**
- * The DB-backed half of the reconnect replay. After a restart the in-memory map
- * is empty, so a terminal cross-repository global run reaches the Platform only
- * through this branch — and its marker has to come off the row.
+ * DB-backed half of reconnect replay: after a restart the in-memory map is empty, so a terminal
+ * cross-repository global run reaches the Platform only here, with its marker read off the row.
  */
 describe('ExecutionTracker.getReplayDataWithDb cross-repo attribution', () => {
   const SOURCE_REPO = 'org/source-repo';

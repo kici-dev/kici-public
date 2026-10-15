@@ -3,15 +3,12 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Add `org_settings.dashboard_write_policy jsonb NOT NULL DEFAULT '{}'`.
  *
- * Stores the per-customer policy that decides which Platform-routed
- * dashboard.* write operations the orchestrator accepts. An empty
- * JSONB object means everything is enabled (permissive default). To
- * disable an operation, set its key to `false`, e.g.
- * `{"secrets.set": false, "variables.set": false}`. Unknown / missing
- * keys are treated as `true` by the resolver in
- * `@kici-dev/engine/protocol/dashboard-write-operations`.
+ * Per-customer policy for which Platform-routed dashboard.* write operations the orchestrator
+ * accepts. A key set to `false` disables that operation (e.g. `{"secrets.set": false}`);
+ * missing keys resolve to `true` in `@kici-dev/engine/protocol/dashboard-write-operations`, so
+ * `{}` enables everything.
  *
- * Idempotent: a re-run on a DB that already has the column is a no-op.
+ * Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colCheck = await sql<{ exists: boolean }>`

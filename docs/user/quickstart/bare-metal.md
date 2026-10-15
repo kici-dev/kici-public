@@ -175,9 +175,16 @@ Within ~5 seconds you should see:
 
 The bare-metal scaler launches an agent process on the same host whenever a job arrives and tears it down when the job finishes. No long-running agent service to manage — agents come and go per-job.
 
-Create a scaler config alongside the orchestrator env file:
+The scaler config needs the path of the agent binary, `binaryPath`. Get it from `kici-admin orchestrator status`. Its **Agent binary** line names the `kici-agent` that step 4 installed with the Node.js runtime the service runs:
+
+```
+Agent binary:  /usr/local/bin/kici-agent
+```
+
+`kici-admin orchestrator upgrade` installs each new agent at this path, so an agent at this path upgrades with the orchestrator. Create a scaler config alongside the orchestrator env file. The first command reads the path from the status output:
 
 ```bash
+AGENT_BIN=$(kici-admin orchestrator status | awk '/^Agent binary:/ {print $3}')
 cat > ~/.config/kici/scalers.yaml <<EOF
 version: 1
 globalMaxAgents: 4
@@ -188,11 +195,17 @@ scalers:
     maxAgents: 4
     labelSets:
       - labels: [linux, bare-metal]
-        binaryPath: $(command -v kici-agent)
+        binaryPath: ${AGENT_BIN}
 EOF
+cat ~/.config/kici/scalers.yaml
 ```
 
-`$(command -v kici-agent)` is evaluated by your shell when the heredoc is written, so the absolute path to the `kici-agent` binary installed in step 4 lands in the file. Inspect the result with `cat ~/.config/kici/scalers.yaml` — `binaryPath:` should point at something like `/usr/local/bin/kici-agent` (or whichever prefix your `npm install -g` uses).
+Make sure that `binaryPath:` is not empty. When the status output has no **Agent binary** line, the service does not run from an npm install of `kici-admin`. Then set `binaryPath` to `$(npm prefix -g)/bin/kici-agent`, from a shell that uses the same Node.js runtime as the service.
+
+Do not use the output of `command -v kici-agent` when a Node.js version manager (mise, nvm, asdf, Volta, fnm) manages your Node.js. It can print an alias or a shim:
+
+- **An alias**, such as mise's `~/.local/share/mise/installs/node/24/bin/kici-agent`, moves to another runtime when you install a new Node.js version. The new runtime has no `kici-agent`, and the orchestrator does not start. `readlink -f` turns an alias into a fixed path.
+- **A shim**, such as `~/.local/share/mise/shims/kici-agent`, runs the version manager, not the agent. `readlink -f` does not help: it prints the version manager's own executable. The orchestrator refuses a shim. To find the file behind a shim, run `mise which kici-agent`, `asdf which kici-agent` or `volta which kici-agent`.
 
 Point the orchestrator at the scaler config and restart it:
 
@@ -224,7 +237,8 @@ dual-scaler example and point `binaryPath` at your installed agent:
 ```bash
 curl -o ~/.config/kici/scalers.yaml \
   https://raw.githubusercontent.com/kici-dev/kici-public/main/examples/quickstart/bare-metal/scalers.dual.yaml
-sed -i "s#binaryPath:.*#binaryPath: $(command -v kici-agent)#" ~/.config/kici/scalers.yaml
+AGENT_BIN=$(kici-admin orchestrator status | awk '/^Agent binary:/ {print $3}')
+sed -i "s#binaryPath:.*#binaryPath: ${AGENT_BIN}#" ~/.config/kici/scalers.yaml
 kici-admin orchestrator restart
 ```
 
@@ -393,7 +407,9 @@ When a new KiCI version ships, one self-driving command does the whole upgrade:
 kici-admin orchestrator upgrade --version <latest> --yes
 ```
 
-It installs the correct global package under the unit's own pinned node runtime, restarts, and verifies the unit now launches the new version. Scaler-spawned agents pick up the new agent code on the next job — they respawn fresh from `$(command -v kici-agent)` every time. DB migrations run automatically on first start of the new version.
+It installs the correct global package under the unit's own pinned node runtime, restarts, and verifies the unit now launches the new version. DB migrations run automatically on first start of the new version.
+
+The install also puts the new `kici-agent` under the runtime of the service unit. Scaler-spawned agents start from the `binaryPath` in `scalers.yaml` for each job, so they run the new agent when `binaryPath` names that file. Before the upgrade installs anything, it checks each bare-metal `binaryPath`. It stops when a `binaryPath` is not an executable file or is a version-manager shim, and the service keeps running. It warns when a `binaryPath` goes through a version-manager alias, or runs an agent from another runtime. Each message names the path to use.
 
 :::caution[Don't re-run `install` to upgrade]
 `kici-admin orchestrator upgrade` is the whole upgrade — it installs and restarts for you. Re-running `kici-admin orchestrator install` against an already-installed service is **not** the upgrade path — it's for first-time setup. In the same deploy folder, it registers the service again, but it installs no new release. On a terminal, it also runs the setup wizard again, which writes a new env file, unless you pass `--no-wizard`. Against a same-named instance in another deploy folder, it stops with `an orchestrator instance "…" is already installed`. If you see that error, you wanted `kici-admin orchestrator upgrade` instead.
@@ -444,8 +460,10 @@ You should see `KICI_STORAGE_TYPE=s3`, `KICI_STORAGE_ENDPOINT=http://localhost:8
 
 **Push happens but no agent spawns.** Tail `kici-admin orchestrator logs` immediately after the push and look near the top for one of three failure modes:
 
-- `scaler config parse error`: the YAML in `~/.config/kici/scalers.yaml` didn't validate. Re-read the file (`cat ~/.config/kici/scalers.yaml`) — most often `binaryPath:` is empty because `$(command -v kici-agent)` evaluated to nothing at heredoc-write time, which means step 4's `npm install -g kici-admin` didn't put `kici-agent` on PATH. Re-run `command -v kici-agent` from your shell to confirm; if it's empty, re-install with `npm install -g kici-admin@latest` and regenerate the file.
+- `scaler config parse error`: the YAML in `~/.config/kici/scalers.yaml` didn't validate. Re-read the file (`cat ~/.config/kici/scalers.yaml`) — most often `binaryPath:` is empty because `AGENT_BIN` was empty when the shell wrote the heredoc. Run `kici-admin orchestrator status` and look for the **Agent binary** line. If it is missing or shows `(not installed)`, re-install with `npm install -g kici-admin@latest` under the service's Node.js runtime and regenerate the file.
 - `KICI_SCALER_CONFIG_PATH not set` (or the orchestrator boots without loading any scaler): the env-file line you appended in step 7 didn't take effect. The value MUST be an absolute path — systemd env files do NOT expand `~` or `$HOME`. Re-check with `grep '^KICI_SCALER_CONFIG_PATH=' ~/.config/kici/kici-orchestrator.env`; it should look like `KICI_SCALER_CONFIG_PATH=/home/<you>/.config/kici/scalers.yaml`. If it has `~` or `$HOME`, rewrite the line and `kici-admin orchestrator restart`.
 - `scaler spawn failed: ENOENT`: the orchestrator loaded the config but the `binaryPath:` doesn't exist (someone moved or uninstalled `kici-agent` between heredoc and now). Re-resolve and rewrite the file.
+
+**The orchestrator does not start, and the log shows `Required tools validation failed: '…/kici-agent' not executable`.** The bare-metal `binaryPath` names no executable file. The usual cause is a path through a Node.js version-manager alias, such as `~/.local/share/mise/installs/node/24/bin/kici-agent`: after you install a new Node.js version, the alias points at a runtime that has no `kici-agent`. The same failure names a `binaryPath` that `is a version-manager shim`: a shim runs the version manager, not the agent. When the orchestrator's own runtime has a `kici-agent`, the log adds a `Hint:` line with its path. `kici-admin orchestrator status` prints the same path as **Agent binary**. Set `binaryPath` to that path in `~/.config/kici/scalers.yaml`, then run `kici-admin orchestrator restart`.
 
 **Push happens but no run appears in the dashboard.** Either GitHub didn't deliver the webhook (check the App's "Recent deliveries" tab in GitHub's settings — look for 4xx responses), or the orchestrator received it but no workflow matched. Run `kici preview push` against your workflow file to confirm a `push` to your branch would trigger something.

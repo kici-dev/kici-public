@@ -4,17 +4,11 @@ import { relativeTime, renderTable, colorStatus, stripAnsi } from './render.js';
 /**
  * Re-import `render.js` with picocolors reporting a chosen colour support.
  *
- * `colorStatus` branches on `pc.isColorSupported`, which picocolors computes
- * ONCE at its own module load from the environment. Assigning
- * `process.env.NO_COLOR` inside a test body therefore changes nothing — the
- * decision was already made — so an assertion written that way only reports the
- * ambient environment of whoever ran it. Stubbing the env and re-importing does
- * not help either: picocolors resolves from `node_modules`, which vitest
- * externalises, so the cached instance survives `vi.resetModules()`.
- *
- * Substituting the module is what makes colour support an input rather than an
- * accident. Marking each stub so the colourised branch is recognisable also
- * keeps the "did it colourise?" assertion independent of any real ANSI codes.
+ * picocolors computes `isColorSupported` ONCE at load, so setting
+ * `process.env.NO_COLOR` in a test changes nothing. Re-importing does not help:
+ * vitest externalises `node_modules`, so the instance survives
+ * `vi.resetModules()`. Substituting the module makes colour support an input;
+ * marked stubs keep the assertion independent of real ANSI codes.
  */
 async function loadRenderWithColor(
   isColorSupported: boolean,
@@ -75,11 +69,8 @@ describe('render helpers', () => {
     expect(uncolored('failed')).toBe('failed');
   });
 
-  // Positive counterpart to the case above. On its own that assertion holds
-  // just as well for a `colorStatus` that never colourises anything, so the
-  // pair is what pins the stripping to colour support rather than to the
-  // function being inert. It is also the half that fails on a colour-capable
-  // runner when the branch is wrong, which is where this was caught.
+  // Positive counterpart: alone, the case above also passes for a `colorStatus`
+  // that never colourises, so the pair pins stripping to colour support.
   it('colorStatus colorizes when color IS supported', async () => {
     const { colorStatus: colored } = await loadRenderWithColor(true);
     expect(colored('failed')).toBe('<red>failed</red>');

@@ -12,10 +12,9 @@ declare const KICI_VERSION: string;
 const version = typeof KICI_VERSION !== 'undefined' ? KICI_VERSION : '0.0.1';
 
 /**
- * Top-level commands that were removed, mapped to their current equivalent.
- * Consulted when the CLI hits an unknown command so the user gets a precise
- * redirect instead of a bare "unknown command" dead end. The redirect text
- * lives here once; every consumer reads it from this map.
+ * Removed top-level commands mapped to their current equivalent. An unknown
+ * command gets this precise redirect instead of a bare "unknown command".
+ * Every consumer reads the redirect text from this map.
  */
 export const RETIRED_COMMANDS: Record<string, string> = {
   status:
@@ -38,9 +37,8 @@ export function retiredCommandHint(commandName: string | undefined): string | un
 }
 
 /**
- * Derive the command name a user attempted from the parsed operands, falling
- * back to the first non-option token in the raw argv. Used to look up a retired
- * command after commander rejects an unknown command.
+ * The command name a user attempted: the first parsed operand, else the first
+ * non-option token in the raw argv.
  */
 export function attemptedCommand(program: Command, argv: string[]): string | undefined {
   const firstOperand = program.args[0];
@@ -49,8 +47,8 @@ export function attemptedCommand(program: Command, argv: string[]): string | und
 }
 
 /**
- * Build the kici Commander program with every command registered. Exported so
- * the surface registry can walk the real command tree without parsing argv (no
+ * The kici Commander program with every command registered. Exported so the
+ * surface registry can walk the real command tree without parsing argv (no
  * action runs during a tree walk).
  */
 export function buildProgram(): Command {
@@ -58,28 +56,23 @@ export function buildProgram(): Command {
 
   program.name('kici').description('KiCI workflow compiler').version(version);
   // `kici run` is action-bearing AND has a `remote` subcommand whose options
-  // (`--env`, `--quiet`, `--kici-dir`, `--debug`) collide by name with the
-  // parent action's. Positional-options parsing stops the parent from swallowing
-  // an option that appears after the subcommand name, so `kici run remote --json`
-  // reaches the subcommand instead of the parent.
+  // (`--env`, `--quiet`, `--kici-dir`, `--debug`) collide with the parent's.
+  // Positional options route an option after the subcommand name to the
+  // subcommand, so `kici run remote --json` reaches `remote`.
   program.enablePositionalOptions();
 
-  // Print version header before every command, unless the invocation requested
-  // structured (`--json`) or quiet output — stdout must stay parseable then.
+  // No version header under `--json` or quiet output: stdout must stay parseable.
   program.hook('preAction', (_thisCommand, actionCommand) => {
     if (shouldSuppressBanner(actionCommand)) return;
     console.log(pc.gray(`kici v${version}`));
   });
 
-  // Configure custom error output
   program.configureOutput({
     outputError: (str, write) => {
       write(pc.red(str));
     },
   });
 
-  // Any unknown command or option ends with a near-match suggestion (when one
-  // exists) plus a pointer to the full command list.
   program.showSuggestionAfterError(true);
   program.showHelpAfterError('(run `kici --help` to see all commands)');
 
@@ -97,14 +90,12 @@ export function buildProgram(): Command {
     .action(async (options) => {
       const { compileCommand, watchCommand } = await import('./commands/index.js');
       if (options.watch) {
-        // Watch mode - runs indefinitely
+        // Runs indefinitely and handles its own exit.
         await watchCommand({
           kiciDir: options.kiciDir,
           verbose: options.verbose,
         });
-        // watchCommand handles its own exit
       } else {
-        // Single compilation
         const success = await compileCommand({
           kiciDir: options.kiciDir,
           check: options.check,
@@ -132,15 +123,12 @@ export function buildProgram(): Command {
   // --- kici run (local and remote subcommands) ---
 
   const runCommand = program.command('run').description('Execute workflows locally or remotely');
-  // Route options after the `remote` subcommand name to the subcommand (see the
-  // program-level note above) rather than the parent action.
+  // See the program-level enablePositionalOptions note.
   runCommand.enablePositionalOptions();
 
-  // `kici run [event]` is action-bearing: a routed run with this machine as the
-  // ephemeral agent, dispatched through the warm local dev plane. It coexists
-  // with the `run remote` subcommand below — Commander dispatches to `remote`
-  // when the first token matches, else runs this parent action. The retired
-  // `run local` subcommand redirects here via the action's retired-command guard.
+  // `kici run [event]`: a routed run with this machine as the ephemeral agent,
+  // through the warm local dev plane. Commander dispatches to `remote` when the
+  // first token matches, else runs this parent action.
   runCommand
     .argument('[event]', 'Event type for a routed local run (e.g. push, pr:open)')
     .option('--local', 'Route the run with this machine as the ephemeral agent', false)
@@ -167,8 +155,7 @@ export function buildProgram(): Command {
     .option('--quiet', 'Suppress the banner + streaming output', false)
     .option('--debug', 'Verbose internals', false)
     .action(async (event, options) => {
-      // `kici run local` reaches this parent action (event === 'local') now that
-      // the `local` subcommand is retired; redirect to the routed replacement.
+      // The retired `kici run local` lands here as event === 'local'.
       const retired = retiredCommandHint(event ? `run ${event}` : undefined);
       if (retired) {
         process.stderr.write(pc.red(`${retired}\n`));
@@ -181,8 +168,7 @@ export function buildProgram(): Command {
         offline: options.offline,
         connected: options.connected,
         inPlace: options.inPlace,
-        // `--trusted` or its alias `--no-sandbox` (Commander sets options.sandbox
-        // === false when `--no-sandbox` is passed) select the trusted profile.
+        // Commander sets options.sandbox === false for `--no-sandbox`.
         trusted: Boolean(options.trusted) || options.sandbox === false,
         env: options.env,
         payload: options.payload,
@@ -250,9 +236,8 @@ export function buildProgram(): Command {
       [] as string[],
     )
     .option(
-      // `--yes` is listed first so Commander derives the option property from
-      // the last long flag (`--approve-all` → `options.approveAll`); both flags
-      // remain accepted aliases.
+      // Commander names the property after the last long flag
+      // (`options.approveAll`); both flags are accepted.
       '--yes, --approve-all',
       'Auto-approve every approval gate this run holds on (run-scoped; eligibility still enforced)',
       false,
@@ -358,8 +343,7 @@ export function buildProgram(): Command {
     )
     .action(async (options) => {
       const { initCommand } = await import('./commands/index.js');
-      // commander turns `--no-agents-md` into options.agentsMd=false when the flag
-      // is passed (true by default). Translate to the InitOptions field shape.
+      // `--no-agents-md` sets options.agentsMd=false (true by default).
       const success = await initCommand({
         ...options,
         noAgentsMd: options.agentsMd === false,
@@ -956,9 +940,8 @@ Environment variables:
       process.exit(success ? 0 : 1);
     });
 
-  // `kici report` is action-bearing with two subcommands, the same shape as
-  // `kici run [event]` + `kici run remote`: the bare form produces a bundle,
-  // and list/withdraw manage what has already been sent.
+  // Action-bearing like `kici run`: the bare form produces a bundle, and
+  // list/withdraw manage what has already been sent.
   const reportCmd = program
     .command('report')
     .description('Gather a redacted diagnostic bundle to share when reporting an issue');
@@ -1122,11 +1105,9 @@ Environment variables:
 }
 
 /**
- * Handle a commander parse exit thrown under `exitOverride`. Help and version
- * requests exit cleanly; an unknown command is augmented with a retired-command
- * redirect when one applies (commander already wrote the generic error,
- * suggestion, and help pointer before throwing); every other parse error keeps
- * commander's own exit code and already-printed message.
+ * Help and version exit 0. An unknown command adds a retired-command redirect
+ * when one applies (commander already printed the error, suggestion and help
+ * pointer). Every other parse error keeps commander's exit code and message.
  */
 function handleCliParseExit(err: CommanderError, argv: string[], program: Command): void {
   if (err.code === 'commander.helpDisplayed' || err.code === 'commander.version') {
@@ -1156,17 +1137,12 @@ export function runCli(argv: string[] = process.argv): void {
 }
 
 /**
- * Decide whether this module is the process entry point, tolerating a
- * symlinked `argv[1]`. A `node_modules/.bin/kici` entry is a symlink, and when
- * it points at this compiled `cli.js` (the compiler package declares a `kici`
- * bin), `process.argv[1]` is the symlink path while `import.meta.url` is the
- * real file. A plain `resolve()` comparison sees two different paths and never
- * matches, silently skipping `runCli()` — so `kici compile` (and every other
- * subcommand) becomes a no-op when invoked through the bin symlink.
- * Dereference both sides with `realpathSync` so a symlinked invocation is
- * correctly recognised as the entry point. Falls back to a plain `resolve()`
- * comparison when `argv[1]` doesn't resolve to a real file (e.g. a virtual
- * entry point), preserving the previous behaviour for that edge case.
+ * Whether this module is the process entry point, tolerating a symlinked
+ * `argv[1]`. Through a `node_modules/.bin/kici` symlink, `argv[1]` is the
+ * symlink while `import.meta.url` is the real file, so a plain `resolve()`
+ * comparison never matches and every subcommand becomes a no-op. Both sides
+ * go through `realpathSync`; a plain `resolve()` comparison is the fallback
+ * when `argv[1]` is not a real file (e.g. a virtual entry point).
  */
 export function isMainEntryPoint(argv1: string | undefined, importMetaUrl: string): boolean {
   if (!argv1) return false;
@@ -1178,9 +1154,8 @@ export function isMainEntryPoint(argv1: string | undefined, importMetaUrl: strin
   }
 }
 
-// Only parse argv when this module is the process entry point. The published
-// bin shim imports `runCli` and calls it explicitly; importing the module
-// (e.g. the surface registry building the command tree) must NOT parse/exit.
+// The bin shim calls `runCli` explicitly; a plain import (e.g. the surface
+// registry building the command tree) must NOT parse or exit.
 if (isMainEntryPoint(process.argv[1], import.meta.url)) {
   runCli();
 }

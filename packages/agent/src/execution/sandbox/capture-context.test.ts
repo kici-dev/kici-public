@@ -16,7 +16,7 @@ describe('step capture context', () => {
         seen.push(currentCaptureStepIndex());
       }),
     ]);
-    // Each closure reports ITS OWN index even though both ran concurrently.
+    // Each concurrent closure reports ITS OWN index.
     expect(seen.sort()).toEqual([0, 1]);
   });
 

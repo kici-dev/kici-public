@@ -1,35 +1,28 @@
 /**
  * File-backed, cross-process resource ledger for named machine pools.
  *
- * Multiple orchestrators on the same host that reference the same `machinePool`
- * name share a JSON file under `KICI_MACHINE_LEDGER_DIR ?? /var/lib/kici/scaler-ledger`.
- * Each scaler reservation appends a row; releases delete the matching row;
- * and a periodic reaper prunes rows whose `(pid, bootId)` no longer exists.
+ * Orchestrators on one host that name the same `machinePool` share a JSON file
+ * under `KICI_MACHINE_LEDGER_DIR ?? /var/lib/kici/scaler-ledger`. A reservation
+ * appends a row, a release deletes it, and a periodic reaper prunes rows whose
+ * `(pid, bootId)` no longer exists.
  *
  * ## Concurrency
  *
- * Every read-modify-write goes through `withLock(poolName, fn)`, which uses
- * an atomic POSIX `mkdir` on a sibling lockdir as the cross-process mutex.
- * `mkdir` succeeds for exactly one caller when the directory does not exist,
- * so it works as a portable `flock` substitute without any native dependency.
- *
- * Neither `proper-lockfile` nor `fs-ext` is a dependency, so this uses the
- * `mkdir` lock instead. This avoids adding a native binding for the sake of
- * a single locking primitive.
+ * Every read-modify-write runs under `withLock`: an atomic POSIX `mkdir` on a
+ * sibling lockdir succeeds for exactly one caller, a portable `flock`
+ * substitute. `proper-lockfile` / `fs-ext` are rejected to avoid a native
+ * binding for one primitive.
  *
  * ## Crash safety
  *
- * Reservations carry `{ pid, bootId, instanceId, agentId, cpus, memBytes }`.
- * `bootId` is read once at orchestrator startup from
- * `/proc/sys/kernel/random/boot_id`; combined with `pid`, it lets the reaper
- * detect "this PID is dead AND was on a previous boot" reliably:
+ * `bootId` is read once at startup from `/proc/sys/kernel/random/boot_id`; with
+ * `pid` it lets the reaper tell a dead process:
  *
  * - Same boot: `process.kill(pid, 0)` answers liveness.
  * - Different boot: any pre-reboot row is unconditionally stale.
  *
- * If an orchestrator dies without releasing, the next reservation request
- * from any orchestrator on the host calls `reapStale()` first, so there's
- * no leak window beyond the next spawn attempt.
+ * Each reservation reaps first, so a crashed orchestrator's rows leak no longer
+ * than the next spawn attempt.
  */
 
 import { mkdir, readFile, writeFile, rename, rm, stat } from 'node:fs/promises';
@@ -52,50 +45,37 @@ export interface LedgerFile {
   reservations: ReservationRow[];
 }
 
-/** A single reservation row in the ledger. */
 export interface ReservationRow {
-  /** Orchestrator instance id (from `KICI_CLUSTER_INSTANCE_ID` or generated). */
+  /** From `KICI_CLUSTER_INSTANCE_ID`, or generated. */
   instanceId: string;
-  /** Process id that owns this reservation. */
   pid: number;
-  /** Linux boot id at the time the row was created. */
+  /** Linux boot id when the row was created. */
   bootId: string;
-  /** Agent id this reservation is associated with. */
   agentId: string;
-  /** Reserved cpus (cores). */
+  /** Cores. */
   cpus: number;
-  /** Reserved memory in bytes. */
   memBytes: number;
-  /** When the row was inserted (epoch ms). */
+  /** Epoch ms. */
   reservedAt: number;
 }
 
-/** Lock acquisition options. */
 interface LockOptions {
-  /** Maximum retries before bailing. Each retry waits a short jitter. */
   maxAttempts?: number;
   /** Initial backoff in ms; doubles per retry up to a cap. */
   initialBackoffMs?: number;
 }
 
 /**
- * Read the host's Linux boot id once at startup. Used together with `pid` so
- * the reaper can tell whether a stale row points to a dead process.
+ * Read the host's Linux boot id once at startup.
  *
- * Falls back to a synthesized id on non-Linux hosts (development machines).
- * On those hosts the cross-orchestrator coordination story still works —
- * the ledger just can't distinguish "same boot, dead pid" from "different
- * boot" because the host doesn't expose a boot id. `process.kill(pid, 0)`
- * still answers liveness for the same-host common case.
+ * Non-Linux dev hosts get a synthesized id, so the ledger cannot tell "same
+ * boot, dead pid" from "different boot" there and cross-process coordination is
+ * best-effort; `process.kill(pid, 0)` still answers same-host liveness.
  */
 function readBootId(): string {
   try {
     return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
   } catch {
-    // Synthesize a per-process boot id so darwin / non-Linux dev hosts still
-    // function. A genuine boot id can only come from /proc; without it any
-    // cross-process coordination on dev machines should be considered
-    // best-effort.
     return `synthetic-${process.pid}-${Date.now()}`;
   }
 }
@@ -122,7 +102,6 @@ async function resolveLedgerDir(explicit: string | undefined): Promise<string> {
   for (const dir of candidates) {
     try {
       await mkdir(dir, { recursive: true });
-      // Probe writability with a sentinel file we immediately remove.
       const sentinel = join(dir, `.write-probe-${process.pid}`);
       await writeFile(sentinel, 'probe', { encoding: 'utf8' });
       await rm(sentinel, { force: true });
@@ -135,22 +114,17 @@ async function resolveLedgerDir(explicit: string | undefined): Promise<string> {
 }
 
 /**
- * File-backed machine pool ledger.
- *
- * One instance is shared across all scaler entries that reference any pool
- * (the pool name is passed per-call). The ledger does not cache the JSON:
- * every operation goes through the lock, reads the file, applies the
- * mutation, and writes it back — keeping the wire format the only source
- * of truth across processes.
+ * One instance serves every pool (named per call). It never caches the JSON:
+ * every operation locks, reads, mutates and writes back, so the file is the
+ * only source of truth across processes.
  */
 export class MachineLedger {
   private readonly bootId = readBootId();
   private dirPath: string | null = null;
   private readonly explicitDir: string | undefined;
   private readonly instanceId: string;
-  /** Per-process knownCaps cache; the on-disk file's `cap` must match the caller's expectation. */
+  /** The on-disk file's `cap` must match. */
   private readonly expectedCaps = new Map<string, ResourceCap>();
-  /** Reaper interval handle. */
   private reaperTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: { explicitDir?: string; instanceId: string }) {
@@ -158,10 +132,7 @@ export class MachineLedger {
     this.instanceId = opts.instanceId;
   }
 
-  /**
-   * Lazy directory resolution so construction stays synchronous. Called from
-   * every operation; resolves once and caches.
-   */
+  /** Lazy, so construction stays synchronous; resolves once. */
   private async ensureDir(): Promise<string> {
     if (this.dirPath !== null) return this.dirPath;
     this.dirPath = await resolveLedgerDir(this.explicitDir);
@@ -174,17 +145,12 @@ export class MachineLedger {
     this.expectedCaps.set(name, cap);
   }
 
-  /**
-   * Path to the JSON file for `poolName`. Sibling lockdir is `<file>.lock`.
-   */
+  /** The pool's JSON file and its sibling lockdir. */
   private async pathFor(poolName: string): Promise<{ file: string; lock: string }> {
     const dir = await this.ensureDir();
     return { file: join(dir, `${poolName}.json`), lock: join(dir, `${poolName}.lock`) };
   }
 
-  /**
-   * Atomic mkdir-based lock. Held for the duration of `fn`.
-   */
   private async withLock<T>(
     poolName: string,
     fn: () => Promise<T>,
@@ -202,8 +168,6 @@ export class MachineLedger {
       } catch (err) {
         const e = err as NodeJS.ErrnoException;
         if (e.code !== 'EEXIST') throw err;
-        // Lock is taken — check if its holder is dead. If the lockdir is
-        // older than 30s with no live pid, force-release.
         await this.maybeReleaseStaleLock(lock);
         await delay(Math.min(backoff, 100));
         backoff = Math.min(backoff * 2, 100);
@@ -220,9 +184,8 @@ export class MachineLedger {
   }
 
   /**
-   * If the lock directory has been held for more than 30 seconds, assume the
-   * holder is dead and release it. Without this, an orchestrator that gets
-   * SIGKILL'd while holding the lock would leave it stuck forever.
+   * A lockdir older than 30 seconds is presumed dead and released; otherwise a
+   * holder SIGKILL'd mid-lock wedges the pool forever.
    */
   private async maybeReleaseStaleLock(lock: string): Promise<void> {
     try {
@@ -236,9 +199,7 @@ export class MachineLedger {
     }
   }
 
-  /**
-   * Read the ledger file (or initialize an empty one when missing).
-   */
+  /** A missing file reads as an empty ledger. */
   private async readLedger(poolName: string): Promise<LedgerFile> {
     const { file } = await this.pathFor(poolName);
     const expected = this.expectedCaps.get(poolName);
@@ -284,11 +245,8 @@ export class MachineLedger {
   }
 
   /**
-   * Try to add a reservation. Returns true if the cap allowed it (and the row
-   * was persisted), false if any cap would be exceeded after summing.
-   *
-   * Reaps stale rows from dead processes before checking the cap so an
-   * orphaned reservation doesn't permanently squat capacity.
+   * Persist a reservation and return true, or false when any cap would be
+   * exceeded. Dead rows are reaped first, so an orphan never squats capacity.
    */
   async tryReserve(
     poolName: string,
@@ -343,9 +301,7 @@ export class MachineLedger {
     });
   }
 
-  /**
-   * Release the reservation for `agentId`. Idempotent.
-   */
+  /** Idempotent. */
   async release(poolName: string, agentId: string): Promise<void> {
     await this.withLock(poolName, async () => {
       const ledger = await this.readLedger(poolName);
@@ -360,9 +316,7 @@ export class MachineLedger {
     });
   }
 
-  /**
-   * Reap stale (dead-process) rows for the given pool. Called periodically.
-   */
+  /** Reap dead-process rows; called periodically. */
   async reapStale(poolName: string): Promise<void> {
     await this.withLock(poolName, async () => {
       const ledger = await this.readLedger(poolName);
@@ -379,20 +333,14 @@ export class MachineLedger {
   }
 
   /**
-   * Mutates `ledger.reservations` in place to drop rows that point at dead
-   * processes. Live-pid heuristic:
-   * - Different bootId → unconditionally dead (host rebooted since).
-   * - Same bootId, OWN instance: probe via `process.kill(pid, 0)` (always
-   *   works inside this process's PID namespace).
-   * - Same bootId, OTHER instance: keep the row. We cannot safely
-   *   `process.kill(pid, 0)` against a peer orchestrator's PID — when the
-   *   two orchestrators share a host but live in different PID namespaces
-   *   (e.g. one runs natively and the other in a container), `kill` returns
-   *   ESRCH for any peer pid and the reservation would be falsely reaped,
-   *   silently breaking the cross-process cap. Peer cleanup happens via
-   *   `releaseAllForInstance()` on graceful shutdown; SIGKILL'd peers leave
-   *   their rows in place until the host reboots (which the bootId check
-   *   then reaps unconditionally).
+   * Drop, in place, rows that point at dead processes:
+   * - Different bootId: dead (host rebooted since).
+   * - Same bootId, OWN instance: probe with `process.kill(pid, 0)`, which works
+   *   inside this PID namespace.
+   * - Same bootId, OTHER instance: keep. A peer in another PID namespace (native
+   *   vs container) gets ESRCH for every pid, so probing would falsely reap and
+   *   silently break the cap. Peers release on graceful shutdown; a SIGKILL'd
+   *   peer's rows stay until the next reboot.
    */
   private dropDeadReservations(ledger: LedgerFile): void {
     ledger.reservations = ledger.reservations.filter((r) => {
@@ -418,10 +366,7 @@ export class MachineLedger {
     });
   }
 
-  /**
-   * Start the periodic reaper. Idempotent. The reaper iterates every
-   * registered pool every 30s.
-   */
+  /** Start the periodic reaper over every registered pool. Idempotent. */
   start(intervalMs = 30_000): void {
     if (this.reaperTimer !== null) return;
     this.reaperTimer = setInterval(() => {
@@ -433,7 +378,6 @@ export class MachineLedger {
     }
   }
 
-  /** Stop the periodic reaper. */
   stop(): void {
     if (this.reaperTimer !== null) {
       clearInterval(this.reaperTimer);
@@ -451,10 +395,7 @@ export class MachineLedger {
     }
   }
 
-  /**
-   * Best-effort: release every reservation owned by this instance across all
-   * registered pools. Called on graceful shutdown.
-   */
+  /** Best-effort release of this instance's rows in every pool, on graceful shutdown. */
   async releaseAllForInstance(): Promise<void> {
     for (const pool of this.expectedCaps.keys()) {
       try {

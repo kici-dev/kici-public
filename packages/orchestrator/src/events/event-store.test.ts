@@ -50,9 +50,6 @@ function makeDbRow(overrides: Partial<Record<string, unknown>> = {}): Record<str
   };
 }
 
-/**
- * Create a mock Kysely db for EventStore using the shared helper.
- */
 import { createMockDb as _createMockDb } from '../__test-helpers__/mock-db.js';
 
 function createMockDb(

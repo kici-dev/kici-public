@@ -61,10 +61,9 @@ describe('restageAgent', () => {
     const res = await restageAgent(REACH, KEY, opts(), { spawnFn });
     expect(res.restaged).toBe(true);
 
-    // Staged into the version-keyed dir.
     const stage = calls.find((c) => c.cmd.includes('sha256sum -c'));
     expect(stage?.cmd).toContain('kici-agent-2.0.0');
-    // Atomic folder-anchored swap to the target version.
+    // Atomic folder-anchored swap.
     const swap = calls.find((c) => c.cmd.includes('ln -sfn'));
     expect(swap?.cmd).toContain('kici-agent-2.0.0');
     expect(swap?.cmd).toContain('mv -T');
@@ -79,7 +78,6 @@ describe('restageAgent', () => {
     const { spawnFn, calls } = makeSpawn({ currentVersion: '2.0.0' });
     const res = await restageAgent(REACH, KEY, opts(), { spawnFn });
     expect(res.restaged).toBe(false);
-    // No stage, no swap, no restart.
     expect(calls.some((c) => c.cmd.includes('sha256sum -c'))).toBe(false);
     expect(calls.some((c) => c.cmd.includes('ln -sfn'))).toBe(false);
     expect(calls.some((c) => c.cmd.includes(RESTART.stop))).toBe(false);
@@ -90,7 +88,6 @@ describe('restageAgent', () => {
     await expect(restageAgent(REACH, KEY, opts(), { spawnFn })).rejects.toThrow(
       /extract|verify|failed/i,
     );
-    // The swap + restart never ran.
     expect(calls.some((c) => c.cmd.includes('ln -sfn'))).toBe(false);
     expect(calls.some((c) => c.cmd.includes(RESTART.stop))).toBe(false);
   });

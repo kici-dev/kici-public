@@ -197,11 +197,10 @@ describe('addIsolationRules placement', () => {
   }
 
   it('inserts every rule, so the block lands ahead of the tail baseline jump', async () => {
-    // The host baseline lives in its own chain reached by a jump appended as
-    // the forward chain's LAST rule. An appended per-VM rule would land after
-    // that jump and never be reached — which is how `denyAll` used to grant
-    // full egress: the baseline's unconditional internet accept terminated the
-    // chain first.
+    // The host baseline chain is reached by a jump appended as the forward
+    // chain's LAST rule, so an appended per-VM rule is never reached: the
+    // baseline's unconditional internet accept terminates first, and `denyAll`
+    // grants full egress.
     nftReturns('');
     await addIsolationRules('10.0.0.5', '10.0.0.1', { denyAll: true }, 'saddr');
 
@@ -214,9 +213,8 @@ describe('addIsolationRules placement', () => {
   });
 
   it('issues the inserts in reverse, so the chain reads gateway → allowlist → drops', async () => {
-    // Each `insert` prepends, so the LAST issued command ends up first in the
-    // chain. Reversing the build order is what makes the landed order match
-    // `buildIsolationRuleOps`.
+    // Each `insert` prepends, so the build order is issued reversed to land as
+    // `buildIsolationRuleOps` ordered it.
     nftReturns('');
     await addIsolationRules(
       '10.0.0.5',
@@ -430,11 +428,10 @@ describe('buildHostAccessRuleOps', () => {
   const CT = [...match, 'ct', 'state', 'established,related', 'accept'];
 
   it('leads with the conntrack exception so a host-initiated flow is not severed', () => {
-    // The chain is keyed on the sandbox as the SOURCE, so it also sees the
-    // reply leg of a connection the HOST opened. Measured on this host: with
-    // the terminal drop and no ct rule, a curl from the host into a container
-    // on the range timed out; adding this rule restored it while a sandbox
-    // connecting OUT to an unlisted host port stayed refused.
+    // The chain is keyed on the sandbox as SOURCE, so it also sees the reply
+    // leg of a host-opened connection. Measured: without the ct rule a host curl
+    // into a container timed out; with it, that works while a sandbox connecting
+    // OUT to an unlisted host port stays refused.
     expect(buildHostAccessRuleOps(match, [])[0]).toEqual(CT);
   });
 
@@ -555,9 +552,8 @@ describe('removeHostIsolationRules', () => {
 
 describe('readForwardChain', () => {
   it('reads a table with no forward chain as no rules rather than throwing', async () => {
-    // nft answers a missing table or chain with "No such file or directory".
-    // A caller checking whether its rule set is installed has to read that as
-    // NOT installed and go install it; a throw aborts the whole ensure path.
+    // nft answers a missing table or chain with "No such file or directory",
+    // which must read as NOT installed; a throw aborts the whole ensure path.
     nftFails('No such file or directory');
     await expect(readForwardChain({ table: 'kici_fc_e2e' })).resolves.toBeNull();
   });

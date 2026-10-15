@@ -1,23 +1,18 @@
 /**
  * Step-approval bridge — correlates a step-scoped `held_runs` row with the
- * agent that is blocking the step loop, so the resolution (approve / reject /
- * expire) can be relayed back to that agent as a `step.approval-resolved`
- * message.
+ * agent blocking its step loop, so the resolution is relayed back to that agent
+ * as `step.approval-resolved`.
  *
  * Flow:
- *   1. The agent sends `step.approval-request`; the WS handler calls
- *      `request()`, which creates a step-scoped hold (via `createStepHold`) and
- *      returns a promise that the handler awaits.
- *   2. A human approves (the dashboard / CLI `applyDecision` calls
- *      `onStepRelease` → `resolve(holdId, 'approved')`), or the hold is rejected
- *      (`resolve(holdId, 'rejected')`), or the stale detector expires it
- *      (`resolve(holdId, 'expired')`).
- *   3. The pending promise settles; the WS handler sends `step.approval-resolved`
- *      to the originating agent.
+ *   1. On `step.approval-request` the WS handler awaits `request()`, which
+ *      creates a step-scoped hold (via the hold store's `createHold`).
+ *   2. `applyDecision`'s `onStepRelease` calls `resolve(holdId, 'approved')`, a
+ *      reject calls `resolve(holdId, 'rejected')`, or the stale detector calls
+ *      `resolve(holdId, 'expired')`.
+ *   3. The handler sends `step.approval-resolved` to the originating agent.
  *
- * On agent disconnect the bridge rejects that agent's pending waits so the
- * handler's `ws.send` is skipped (the socket is gone) and the hold is left for
- * the stale detector / a manual decision.
+ * On agent disconnect its pending waits reject, so the handler skips `ws.send`
+ * and the hold is left for the stale detector / a manual decision.
  */
 import {
   HoldScope,
@@ -62,36 +57,28 @@ export interface StepApprovalRequest {
 export interface StepApprovalBridgeDeps {
   store: HeldRunStore;
   /**
-   * Resolve the orchestrator's tenant org id (same value the dashboard handler
-   * uses to read held_runs). A function because the org is resolved post-auth
-   * for sourceless orchestrators.
+   * The tenant org id the dashboard handler also reads held_runs with. A
+   * function because a sourceless orchestrator resolves its org post-auth.
    */
   resolveOrgId: () => string;
   /** Resolve the authoritative approval expiry (seconds) for an org. */
   resolveExpirySeconds: (orgId: string) => Promise<number>;
-  /**
-   * Access-log writer for the orchestrator audit stream. Optional -- if not
-   * set, the step-hold creation audit row (`held_run.request`) is skipped.
-   */
+  /** When unset, the `held_run.request` audit row is skipped. */
   accessLogWriter?: AccessLogWriter;
-  /** Routing key recorded on the audit row. Optional. */
+  /** Routing key recorded on the audit row. */
   routingKey?: string | null;
 }
 
 /**
- * Owns the step-scoped held_runs rows and the map from holdId → the waiting
- * agent's resolver. The only place that opens a step hold and the only place
- * that settles a step-scoped wait.
+ * Owns step-scoped held_runs rows and the holdId → waiting-agent resolver map:
+ * the only place that opens a step hold or settles a step-scoped wait.
  */
 export class StepApprovalBridge {
   private readonly pending = new Map<string, PendingStepApproval>();
 
   constructor(private readonly deps: StepApprovalBridgeDeps) {}
 
-  /**
-   * Create a step-scoped hold and return a promise that settles when the hold
-   * is approved / rejected / expired (via {@link resolve}).
-   */
+  /** Create a step-scoped hold; the promise settles via {@link resolve}. */
   async request(
     req: StepApprovalRequest,
   ): Promise<{ outcome: StepApprovalOutcome; reason?: string }> {
@@ -123,9 +110,8 @@ export class StepApprovalBridge {
       ...(req.payload !== undefined && { payload: req.payload }),
     });
 
-    // Audit the step-hold creation. The agent requested the hold while
-    // executing the step (no Keycloak user context), so the actor is the
-    // dispatcher system component.
+    // The agent requested the hold mid-step (no Keycloak user context), so the
+    // actor is the dispatcher system component.
     runDetached(
       logger,
       'Access log write',
@@ -155,9 +141,8 @@ export class StepApprovalBridge {
   }
 
   /**
-   * Settle a step-scoped wait. Called by the approve/reject applier
-   * (`onStepRelease`) and by the stale detector (`expired`). A no-op when no
-   * agent is waiting on the hold (e.g. the agent already disconnected).
+   * Called by the applier (`onStepRelease`) and the stale detector (`expired`).
+   * A no-op when no agent waits on the hold (e.g. it already disconnected).
    */
   resolve(holdId: string, outcome: StepApprovalOutcome, reason?: string): boolean {
     const entry = this.pending.get(holdId);
@@ -168,9 +153,8 @@ export class StepApprovalBridge {
   }
 
   /**
-   * Reject every pending wait for a disconnected agent. The held_runs rows are
-   * left as-is (the stale detector will expire them) — only the in-memory
-   * resolver is dropped so the handler's relayed `ws.send` is skipped.
+   * Reject a disconnected agent's pending waits so the handler skips `ws.send`.
+   * The held_runs rows stay for the stale detector to expire.
    */
   failAgent(agentId: string): void {
     for (const [holdId, entry] of this.pending) {

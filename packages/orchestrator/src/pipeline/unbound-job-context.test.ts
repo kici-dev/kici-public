@@ -40,11 +40,7 @@ function makeEnv(id: string, name: string): Context {
 
 const LOG = { runId: 'run-1', workflow: 'deploy', job: 'build' };
 
-/**
- * A resolver whose contexts resolve `secretsById[id]` and carry
- * `bindingsById[id]` bindings. `countContextBindings` is left off when
- * `bindingsById` is omitted.
- */
+/** Contexts resolve `secretsById[id]` with `bindingsById[id]` bindings; no `countContextBindings` without `bindingsById`. */
 function resolver(
   secretsById: Record<string, Record<string, string>>,
   bindingsById?: Record<string, number | Error>,

@@ -1,8 +1,4 @@
-/**
- * Follow an offline routed run against the local plane by polling the
- * orchestrator admin API (no SSE in independent mode). Streams step log lines as
- * they arrive and resolves when the run reaches a terminal state.
- */
+/** Follows a local-plane run by polling the admin API (independent mode has no SSE). */
 
 import { AdminApiClient } from '@kici-dev/orchestrator';
 import {
@@ -15,10 +11,8 @@ import {
 import { unwrapStoredLogLine } from '../remote/output/streaming.js';
 
 /**
- * Job states that mean the job did NOT succeed (failed / stale / cancelled /
- * dropped / unroutable). Read only by the anti-false-green guard below, so a
- * missing member lets a lagging `success` run header be reported verbatim even
- * though a job settled badly.
+ * Read only by the anti-false-green guard below: a missing member lets a lagging
+ * `success` run header be reported even though a job settled badly.
  */
 const FAILED_JOB_STATES: ReadonlySet<string> = new Set<string>([
   ExecutionJobStatus.enum.failed,
@@ -28,30 +22,23 @@ const FAILED_JOB_STATES: ReadonlySet<string> = new Set<string>([
   ExecutionJobStatus.enum.unroutable,
 ]);
 
-/** Job states in which no agent has claimed the job yet. */
 const UNCLAIMED_JOB_STATES: ReadonlySet<string> = new Set<string>([
   ExecutionJobStatus.enum.pending,
   ExecutionJobStatus.enum.queued,
 ]);
 
 /**
- * How often the acceptance check re-fetches jobs. Deliberately far coarser than
- * the poll interval: at 750 ms a two-minute window would cost ~160 extra admin
- * requests to answer a question that changes once.
+ * Far coarser than the poll interval: at 750 ms a two-minute window would cost
+ * ~160 extra admin requests for a question that changes once.
  */
 const ACCEPTANCE_CHECK_INTERVAL_MS = 5_000;
 
-/** Default window for an agent to claim the run before the follow gives up. */
 const DEFAULT_ACCEPTANCE_TIMEOUT_MS = 120_000;
 
 /**
- * Resolve the acceptance window, falling back to the default for any value that
- * is not a positive number of milliseconds.
- *
- * A malformed override must never reach the deadline arithmetic: `Number('')`
- * is `0` (every run fails instantly) and `Number('2 min')` is `NaN`, which makes
- * `now > deadline` permanently false and silently restores the 900 s hang this
- * window exists to prevent. Both failure modes are worse than ignoring a typo.
+ * Falls back to the default for anything but a positive ms count. `Number('')`
+ * is `0` (every run fails instantly) and `Number('2 min')` is `NaN` (`now >
+ * deadline` stays false, restoring the 900 s hang): both worse than ignoring a typo.
  */
 export function resolveAcceptanceTimeoutMs(
   explicitMs: number | undefined,
@@ -63,12 +50,11 @@ export function resolveAcceptanceTimeoutMs(
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ACCEPTANCE_TIMEOUT_MS;
 }
 
-/** A minimal admin-read client (AdminApiClient.get) — injectable for tests. */
+/** `AdminApiClient.get`, injectable for tests. */
 export interface RunFollowClient {
   get<T>(path: string): Promise<T>;
 }
 
-/** Terminal outcome of a followed run. */
 export interface RunOutcome {
   runId: string;
   status: string;
@@ -99,28 +85,22 @@ export interface FollowRunOptions {
   client?: RunFollowClient;
   pollIntervalMs?: number;
   /**
-   * Idle window: the max time with NO observed progress (no new log line, no run
-   * status change) before the follow gives up. Resets on every progress tick, so
-   * a legitimately long run (e.g. a full deploy, tens of minutes of image
-   * builds + host mutation) never times out while it is actively advancing —
-   * only a genuinely stalled run does. Default 15 min.
+   * Max time with no new log line and no run status change; resets on progress,
+   * so a long but active run never times out. Default 15 min.
    */
   idleTimeoutMs?: number;
-  /** Absolute cap regardless of progress (safety net against a runaway follow). Default 2 h. */
+  /** Absolute cap regardless of progress. Default 2 h. */
   maxTotalMs?: number;
   /**
-   * Max time for the FIRST job to leave `pending`/`queued` — that is, for some
-   * agent to claim the run. A plane whose scaler matches no label set, or whose
-   * agent cannot start, never gets past this, so it fails in seconds instead of
-   * consuming the whole idle window. Default 2 min; override with
-   * `KICI_LOCAL_ACCEPTANCE_TIMEOUT_MS`.
+   * Max time for an agent to claim the run (a job leaves `pending`/`queued`), so
+   * an unmatched label set or a failed agent start fails fast instead of using
+   * the idle window. Default 2 min; `KICI_LOCAL_ACCEPTANCE_TIMEOUT_MS` overrides.
    */
   acceptanceTimeoutMs?: number;
   /** Plane log path named in the acceptance-failure message. */
   hintLogPath?: string;
 }
 
-/** Poll a run to completion, streaming step logs. */
 export async function followRun(
   planeUrl: string,
   adminToken: string,
@@ -135,7 +115,7 @@ export async function followRun(
     opts.acceptanceTimeoutMs,
     process.env.KICI_LOCAL_ACCEPTANCE_TIMEOUT_MS,
   );
-  // Per-step log cursor (key `<jobId>:<stepIndex>` → next line offset string).
+  // `<jobId>:<stepIndex>` → next line offset.
   const cursors = new Map<string, string>();
   const stream = !opts.quiet && opts.onLine ? opts.onLine : undefined;
 
@@ -161,18 +141,12 @@ export async function followRun(
 
     const { run } = await client.get<RunHeaderResponse>(`/api/v1/admin/runs/${runId}`);
 
-    // Acceptance: some agent must claim a job. A run nothing can serve — no
-    // scaler label set matches its runsOn, or the agent failed to start — sits
-    // in queued until the orchestrator's own hour-long queue timeout, so
-    // without this it would consume the entire idle window instead.
-    // A run that already reached a terminal state is never blamed on acceptance:
-    // its outcome is known, so reporting "no agent picked up this run" for a run
-    // that was cancelled — or that finished — as the window elapsed would be the
-    // same misdiagnosis this window exists to remove.
+    // A run nothing can serve sits in queued until the orchestrator's hour-long
+    // queue timeout. A terminal run is never blamed on acceptance: its outcome
+    // is known, and blaming it would be the misdiagnosis this check removes.
     if (!accepted && !TERMINAL_RUN_STATES.has(run.status)) {
       if (run.status === ExecutionRunStatus.enum.held) {
-        // A held run is waiting for a reviewer, not for an agent — push the
-        // window out rather than blaming the plane for the wait.
+        // A held run waits for a reviewer, not an agent.
         acceptanceDeadline = now + acceptanceTimeoutMs;
       } else if (now - lastAcceptanceCheck >= ACCEPTANCE_CHECK_INTERVAL_MS) {
         lastAcceptanceCheck = now;
@@ -195,21 +169,17 @@ export async function followRun(
       lastStatus = run.status;
       progressed = true;
     }
-    // Streaming a new log line is progress — a long-but-active deploy resets the
-    // idle window on every batch of output, so only true silence trips it.
+    // A new log line is progress, so only true silence trips the idle window.
     if (stream) {
       const emitted = await drainLogs(client, runId, cursors, stream);
       if (emitted > 0) progressed = true;
     }
     if (progressed) lastProgressAt = now;
 
-    // The run header can report a terminal status while a later dispatch wave
-    // (e.g. after the `__build__` init job) is still in flight — reporting done
-    // there is a false green AND, for an isolated workdir, would let the caller
-    // clean up the clone the agent is about to fetch. Only conclude when the run
-    // header is terminal, every job row is terminal, and (for success) no job
-    // failed — so a run header lagging behind a just-failed job never reads as
-    // success.
+    // The header can read terminal while a later dispatch wave (e.g. after the
+    // `__build__` init job) is in flight: concluding there is a false green and
+    // lets the caller clean up an isolated clone the agent is about to fetch. A
+    // header lagging a just-failed job never reads as success.
     if (TERMINAL_RUN_STATES.has(run.status)) {
       const jobs = await fetchJobs(client, runId);
       const allTerminal = jobs.length > 0 && jobs.every((j) => TERMINAL_JOB_STATES.has(j.status));
@@ -223,7 +193,6 @@ export async function followRun(
   }
 }
 
-/** Fetch the run's jobs mapped to the summary shape. */
 async function fetchJobs(client: RunFollowClient, runId: string): Promise<RunOutcome['jobs']> {
   const { jobs } = await client.get<JobsResponse>(`/api/v1/admin/runs/${runId}/jobs`);
   return jobs.map((j) => ({
@@ -233,10 +202,7 @@ async function fetchJobs(client: RunFollowClient, runId: string): Promise<RunOut
   }));
 }
 
-/**
- * Stream any new step-log lines. Best-effort: a per-step fetch error never
- * aborts the follow (logs are observability, not the terminal signal).
- */
+/** Best-effort: a fetch error never aborts the follow; logs are not the terminal signal. */
 async function drainLogs(
   client: RunFollowClient,
   runId: string,
@@ -256,23 +222,19 @@ async function drainLogs(
       const key = `${job.jobId}:${step.stepIndex}`;
       try {
         let cursor = cursors.get(key);
-        // Drain the step until the server reports no further pages this tick.
         for (;;) {
           const qs = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
           const page = await client.get<StepLogsResponse>(
             `/api/v1/admin/runs/${runId}/jobs/${job.jobId}/steps/${step.stepIndex}/logs${qs}`,
           );
           for (const l of page.lines) {
-            // The admin route serves the store's JSON envelopes verbatim
-            // ({"ts","level","msg"}); the terminal gets the text, as
-            // `kici run remote` and `kici runs logs` do.
+            // The admin route serves stored JSON envelopes ({"ts","level","msg"})
+            // verbatim; print the text, as `kici run remote` and `kici runs logs` do.
             onLine(unwrapStoredLogLine(l.value));
             emitted++;
           }
-          // Persist the position even on the last page (nextCursor is null once
-          // drained): the cursor is a line offset, so advancing it to
-          // `totalLines` stops the next tick re-reading — and re-emitting — the
-          // already-streamed tail.
+          // On the last page nextCursor is null; advancing the line offset to
+          // `totalLines` stops the next tick re-emitting the streamed tail.
           cursor = page.nextCursor ?? String(page.totalLines);
           cursors.set(key, cursor);
           if (!page.nextCursor) break;

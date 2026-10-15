@@ -1,25 +1,14 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { format } from 'node:util';
 
-/**
- * Sink for captured console lines.
- *
- * The agent wires this to a per-job LogStreamer so captured lines become
- * log.chunk messages to the orchestrator and dashboard.
- */
+/** Sink for captured console lines; the agent wires it to a per-job LogStreamer (log.chunk). */
 export interface CaptureSink {
   addLine(line: string): void;
 }
 
 /**
- * AsyncLocalStorage holding the active CaptureSink.
- *
- * When a sink is active, the patched console.* methods route formatted lines
- * to the sink. When no sink is active, the patched methods fall through to
- * the original console methods.
- *
- * Nested runCaptured() shadows the outer sink for the duration of the inner
- * scope; ALS restores the outer sink when the inner scope exits.
+ * The active sink; with none, the patched console.* falls through to the originals.
+ * A nested runCaptured() shadows the outer sink until its scope exits.
  */
 const consoleCapture = new AsyncLocalStorage<CaptureSink>();
 
@@ -37,16 +26,9 @@ const originals: Record<ConsoleMethod, (...args: unknown[]) => void> = {
 let installed = false;
 
 /**
- * Install monkey-patches on console.log / error / warn / info / debug.
- *
- * Idempotent: subsequent calls are no-ops.
- *
- * Does NOT patch process.stdout.write or process.stderr.write. Winston's
- * Console transport writes through those streams directly, so patching them
- * at the agent level would leak agent-internal logger output into user step
- * streams whenever Winston fires on an async stack descended from a user
- * function. Winston bypasses console.*, so patching only console.* is
- * collision-free.
+ * Patch console.* (idempotent). Never process.stdout/stderr.write: Winston's Console
+ * transport writes there, so patching them would leak agent logger output into user
+ * step streams whenever Winston fires on an async stack descended from a user function.
  */
 export function installConsoleCapture(): void {
   if (installed) return;
@@ -68,11 +50,8 @@ export function installConsoleCapture(): void {
 }
 
 /**
- * Run `fn` with the given sink active. console.* calls inside `fn` and any
- * async descendants route to the sink until the returned promise resolves.
- *
- * If `installConsoleCapture()` has not been called, the sink is still tracked
- * in ALS but console.* calls are not intercepted.
+ * Route console.* from `fn` and its async descendants to `sink` until the promise
+ * resolves. Without `installConsoleCapture()`, the sink is tracked but nothing is intercepted.
  */
 export function runCaptured<T>(sink: CaptureSink, fn: () => T | Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {

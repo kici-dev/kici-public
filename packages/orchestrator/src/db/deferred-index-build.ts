@@ -18,10 +18,9 @@ export const DEFERRED_INDEX_LOCK_KEY = 543210002;
 /**
  * Drop a leftover invalid index before rebuilding it.
  *
- * An interrupted `CREATE INDEX CONCURRENTLY` leaves the index in place marked
- * invalid: it is not used by the planner, and `IF NOT EXISTS` sees it and
- * skips. Without this, the very first failed build would make the retry a
- * permanent no-op — the opposite of the "retries on the next boot" contract.
+ * An interrupted `CREATE INDEX CONCURRENTLY` leaves an invalid index that the
+ * planner ignores and `IF NOT EXISTS` skips, so without this the first failed
+ * build would turn the "retries on the next boot" contract into a no-op.
  */
 export async function dropIfInvalid(
   client: Pick<pg.Client, 'query'>,
@@ -48,13 +47,12 @@ export interface BuildDeferredIndexesResult {
 /**
  * Build every deferred index on one dedicated connection.
  *
- * The connection is taken straight from `pg` rather than from the serving
- * pool: `CREATE INDEX CONCURRENTLY` must run outside a transaction and must
- * not inherit a statement timeout, and a concurrent build on a large table
- * would otherwise hold a serving connection for its whole duration.
+ * The connection comes straight from `pg`, not the serving pool:
+ * `CREATE INDEX CONCURRENTLY` runs outside a transaction with no statement
+ * timeout, and a long build would otherwise hold a serving connection.
  *
- * The advisory lock is `pg_try_advisory_lock`, not the blocking form: when a
- * peer is already building, this instance has nothing to wait for.
+ * `pg_try_advisory_lock`, not the blocking form: when a peer is already
+ * building, this instance has nothing to wait for.
  */
 export async function buildDeferredIndexes(
   databaseUrl: string,

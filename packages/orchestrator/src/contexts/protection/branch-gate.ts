@@ -27,7 +27,6 @@ export const INTERNAL_TRIGGER_NO_BRANCH_DETAIL =
 
 /** Evaluate branch restrictions, trigger type filters, and repo patterns. */
 export function evaluateBranchGate(env: Context, ctx: JobDispatchContext): ProtectionGateResult {
-  // Check branch restrictions
   if (env.branchRestrictions.length > 0) {
     // An internally-triggered run with an EMPTY branch genuinely has none, so
     // no pattern can match it. Say that, instead of printing the empty value as
@@ -50,7 +49,6 @@ export function evaluateBranchGate(env: Context, ctx: JobDispatchContext): Prote
     }
   }
 
-  // Check trigger type filters
   if (env.triggerTypeFilters.length > 0) {
     const matches = env.triggerTypeFilters.some((filter) =>
       picomatch.isMatch(ctx.triggerType, filter),
@@ -63,7 +61,6 @@ export function evaluateBranchGate(env: Context, ctx: JobDispatchContext): Prote
     }
   }
 
-  // Check repo patterns
   if (env.repoPatterns.length > 0) {
     const matches = env.repoPatterns.some((pattern) => picomatch.isMatch(ctx.repository, pattern));
     if (!matches) {

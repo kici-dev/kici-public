@@ -14,7 +14,7 @@ import {
 } from '@kici-dev/engine';
 import type { HostRosterStore } from '../agent/host-roster.js';
 
-/** Store surface the inventory handlers need (kept narrow for testability). */
+/** Kept narrow for testability. */
 export interface InventoryApiDeps {
   rosterStore: Pick<HostRosterStore, 'queryInventory' | 'getInventory'>;
   /** Roster grace window (ms) — the same value runsOnAll's `findMatching` uses. */
@@ -24,9 +24,8 @@ export interface InventoryApiDeps {
 const getParamsSchema = z.object({ agentId: z.string().min(1) });
 
 /**
- * Build the `inventory.query` handler. Validates the optional label selector
- * (`include` OR-of-AND groups + `exclude`); an empty selector ⇒ all hosts.
- * Property filtering is done client-side in the workflow.
+ * Label selector: `include` OR-of-AND groups + `exclude`; an empty selector ⇒
+ * all hosts. The workflow filters properties client-side.
  */
 export function createInventoryQueryHandler(
   deps: InventoryApiDeps,
@@ -41,7 +40,7 @@ export function createInventoryQueryHandler(
   };
 }
 
-/** Build the `inventory.get` handler — single-host lookup, null when absent. */
+/** Single-host lookup, null when absent. */
 export function createInventoryGetHandler(
   deps: InventoryApiDeps,
 ): (agentId: string, params: Record<string, unknown>) => Promise<HostInventoryEntry | null> {

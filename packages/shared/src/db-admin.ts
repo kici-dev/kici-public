@@ -5,12 +5,10 @@ import { createPool } from './db.js';
 import { depCacheKeyOf } from './dep-cache-key.js';
 
 /**
- * Admin/DB-operations helpers shared between `kici-admin` (orchestrator DB)
- * and `kici-platform-admin` (Platform DB). Each CLI wraps these with its own
- * bundled migration provider and audit-log pattern.
- *
- * All destructive ops require the caller to pass a fully-formed database URL
- * — no parsing of environment variables here. The CLI layer handles that.
+ * DB-operation helpers shared by `kici-admin` (orchestrator DB) and
+ * `kici-platform-admin` (Platform DB); each CLI adds its own migration provider
+ * and audit log. Callers pass a full database URL: this module reads no
+ * environment variables.
  */
 
 export const MIGRATION_HASH_TABLE = '_migration_content_hash';
@@ -22,11 +20,9 @@ interface ParsedDatabaseUrl {
 }
 
 /**
- * Parse a libpq-style URL into (adminUrl, dbName, dbOwner).
- *
- * `adminUrl` connects to the `postgres` maintenance DB so callers can run
- * `CREATE DATABASE` / `DROP DATABASE` on `dbName`. `dbOwner` is the URL's
- * username, which becomes the new DB owner when we create it.
+ * `adminUrl` points at the `postgres` maintenance DB, so callers can
+ * `CREATE` / `DROP DATABASE` on `dbName`. `dbOwner` is the URL's username and
+ * owns a database this module creates.
  */
 export function parseDatabaseUrl(databaseUrl: string): ParsedDatabaseUrl {
   const url = new URL(databaseUrl);
@@ -42,9 +38,7 @@ export function parseDatabaseUrl(databaseUrl: string): ParsedDatabaseUrl {
   return { adminUrl: url.toString(), dbName, dbOwner };
 }
 
-/**
- * Redact the password from a libpq URL for safe logging.
- */
+/** Redacts the password for safe logging. */
 export function maskDatabaseUrl(databaseUrl: string): string {
   try {
     const url = new URL(databaseUrl);
@@ -75,60 +69,45 @@ async function withAdminPool<T>(adminUrl: string, fn: (pool: pg.Pool) => Promise
 }
 
 /**
- * Drop `dbName` (if it exists), then recreate it owned by `owner`. Terminates
- * existing backend connections so the DROP doesn't block.
+ * Drop `dbName` (if it exists), then recreate it owned by `owner`. `WITH (FORCE)`
+ * terminates the database's connections inside the DROP itself, so a client that
+ * reconnects at once (a starting Platform or orchestrator) cannot slip in between a
+ * separate terminate and the DROP.
  */
 export async function dropAndCreateDatabase(databaseUrl: string): Promise<void> {
   const { adminUrl, dbName, dbOwner } = parseDatabaseUrl(databaseUrl);
   assertValidIdentifier(dbName, 'database name');
   assertValidIdentifier(dbOwner, 'database owner');
   await withAdminPool(adminUrl, async (pool) => {
-    await pool.query(
-      'SELECT pg_terminate_backend(pid) FROM pg_stat_activity ' +
-        'WHERE datname = $1 AND pid <> pg_backend_pid()',
-      [dbName],
-    );
-    await pool.query(`DROP DATABASE IF EXISTS "${dbName}"`);
+    await pool.query(`DROP DATABASE IF EXISTS "${dbName}" WITH (FORCE)`);
     await pool.query(`CREATE DATABASE "${dbName}" OWNER "${dbOwner}"`);
   });
 }
 
 export interface EnsureDatabaseOpts {
   /**
-   * DB owner role. Defaults to the URL's username. Pass when the admin
-   * connection user is privileged (e.g. Patroni superuser) but the new
-   * database should be owned by a separate, non-privileged role — the
-   * cross-owner case for provisioning shared-cluster databases like
-   * Keycloak's on the Platform Patroni cluster.
+   * Defaults to the URL's username. Pass it when the admin user is privileged
+   * (e.g. Patroni superuser) but a separate non-privileged role must own the
+   * database, as for Keycloak's database on the Platform Patroni cluster.
    */
   owner?: string;
   /**
    * After creating (or finding) the database, run
-   * `REVOKE CONNECT ON DATABASE "<name>" FROM PUBLIC`. Recommended for
-   * shared Patroni clusters where multiple unrelated databases coexist
-   * (Platform + Keycloak today, more tomorrow) — the default `PUBLIC`
-   * CONNECT grant otherwise lets any role with LOGIN on the cluster
-   * reach the new database. Idempotent (REVOKE on an already-revoked
-   * grant is a no-op).
+   * `REVOKE CONNECT ON DATABASE "<name>" FROM PUBLIC`. Use it on shared
+   * clusters: the default `PUBLIC` CONNECT grant lets any role with LOGIN on
+   * the cluster reach the new database. Idempotent.
    */
   revokeConnectFromPublic?: boolean;
   /**
-   * After creating (or finding) the database — and after the optional
-   * `REVOKE CONNECT … FROM PUBLIC` — `GRANT CONNECT ON DATABASE "<name>"
-   * TO "<role>"` for each role here. Pairs with `revokeConnectFromPublic`
-   * to re-grant CONNECT to the specific non-PUBLIC roles that legitimately
-   * need it once the default PUBLIC grant is revoked. Idempotent (GRANT on
-   * an already-present grant is a no-op). Each name is validated as a SQL
-   * identifier before interpolation.
+   * After the optional revoke, `GRANT CONNECT ON DATABASE "<name>" TO "<role>"`
+   * for each role, re-granting the roles that need CONNECT once `PUBLIC`
+   * loses it. Idempotent. Each name is validated as a SQL identifier before
+   * interpolation.
    */
   grantConnectToRoles?: string[];
 }
 
-/**
- * CREATE DATABASE IF NOT EXISTS (idempotent). With no `opts`, the URL's
- * username is the owner. Pass `owner` to override and
- * `revokeConnectFromPublic` to lock down the default CONNECT grant.
- */
+/** CREATE DATABASE IF NOT EXISTS (idempotent); `opts` sets the owner and CONNECT grants. */
 export async function ensureDatabase(
   databaseUrl: string,
   opts: EnsureDatabaseOpts = {},
@@ -157,10 +136,7 @@ export async function ensureDatabase(
   });
 }
 
-/**
- * CREATE ROLE ... LOGIN [CREATEDB] (idempotent — updates password if role
- * already exists).
- */
+/** CREATE ROLE ... LOGIN [CREATEDB]; an existing role gets the new password. */
 export async function createDbRole(
   adminUrl: string,
   opts: { username: string; password: string; createDb?: boolean },
@@ -180,11 +156,9 @@ export async function createDbRole(
 }
 
 /**
- * Create a read-only role and grant SELECT on all tables in the public schema
- * (plus default privileges for tables created later).
- *
- * `databaseUrl` must connect as the DB owner (or superuser) since we need to
- * ALTER DEFAULT PRIVILEGES.
+ * Create a read-only role with SELECT on every public-schema table, including
+ * tables created later. `databaseUrl` must connect as the DB owner or a
+ * superuser, which ALTER DEFAULT PRIVILEGES needs.
  */
 export async function createReadOnlyDbUser(
   databaseUrl: string,
@@ -225,15 +199,11 @@ function bundleStableSource(fn: (...args: never[]) => unknown): string {
 }
 
 /**
- * Compute a stable content hash over all migrations the provider exposes.
- * Uses migration name + the string representation of `up`/`down` (via
- * `Function.toString()`), so brute-force rewrites of a migration body invalidate
- * the hash even when the filename stays the same.
+ * Hash every migration's name and `up`/`down` source (`Function.toString()`),
+ * so rewriting a migration body changes the hash even under the same filename.
  *
- * Works with any `MigrationProvider` — file-based or the orchestrator /
- * Platform bundled ones. The bundler renames clashing identifiers with a
- * `$<n>` suffix whose number depends on everything else in the bundle, so the
- * CLI and the server bundle give one migration different source text. The
+ * The bundler suffixes clashing identifiers with `$<n>`, numbered by the rest
+ * of the bundle, so the CLI and server bundles differ in source text. The
  * suffixes are removed before hashing: a database the orchestrator migrated
  * reads current to `db check-schema`, and the reverse.
  */
@@ -256,21 +226,13 @@ export async function computeMigrationsHash(provider: MigrationProvider): Promis
 }
 
 /**
- * Marker row key used by the bundled-provider hash (`computeMigrationsHash`).
- *
- * Kept distinct from the older file-based hash (which writes to the row keyed
- * `'kysely_migration'`) so the two algorithms can coexist in the same
- * `_migration_content_hash` table without clobbering each other.
- * `kici-admin db check-schema` / `kici-platform-admin db check-schema` read
- * this row; a caller of the file-based hash reads the other.
+ * Row key for the `computeMigrationsHash` hash. The file-based hash writes the
+ * `'kysely_migration'` row of the same table, so the distinct key keeps the two
+ * from clobbering each other. Both `db check-schema` commands read this row.
  */
 const PROVIDER_HASH_KEY = 'kysely_migration_provider';
 
-/**
- * Ensure the content-hash marker table exists, then upsert `hash` keyed by
- * `PROVIDER_HASH_KEY`. Paired with `readStoredMigrationContentHash` +
- * `isSchemaCurrent`.
- */
+/** Create the marker table if missing, then upsert `hash` under `PROVIDER_HASH_KEY`. */
 export async function storeMigrationContentHash(pool: pg.Pool, hash: string): Promise<void> {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ${MIGRATION_HASH_TABLE} (
@@ -285,10 +247,7 @@ export async function storeMigrationContentHash(pool: pg.Pool, hash: string): Pr
   );
 }
 
-/**
- * Read the provider-based content hash, or `null` if the marker table / row
- * doesn't exist.
- */
+/** Returns `null` when the marker table or row is missing. */
 export async function readStoredMigrationContentHash(pool: pg.Pool): Promise<string | null> {
   try {
     const result = await pool.query<{ hash: string }>(
@@ -308,10 +267,8 @@ export interface PurgeStaleExecutionResult {
 }
 
 /**
- * TRUNCATE dispatch_queue on the orchestrator DB (direct SQL). Used by the
- * `kici-admin queue clear --database-url ...` direct-DB fallback when the
- * orchestrator isn't reachable over HTTP (e.g. warm-start cleanup before the
- * service restarts).
+ * Backs `kici-admin queue clear --database-url`, the fallback when the
+ * orchestrator is not reachable over HTTP (e.g. cleanup before it restarts).
  */
 export async function clearDispatchQueueDirect(databaseUrl: string): Promise<void> {
   const pool = createPool(databaseUrl);
@@ -322,24 +279,17 @@ export async function clearDispatchQueueDirect(databaseUrl: string): Promise<voi
   }
 }
 
-/**
- * DELETE orphan execution_runs + execution_jobs for routing keys other than
- * `routingKey` (and rows with NULL routing_key). Returns row counts.
- */
+/** Delete runs and jobs whose routing key is NULL or not `routingKey`. */
 export async function purgeStaleExecutionDirect(
   databaseUrl: string,
   routingKey: string,
 ): Promise<PurgeStaleExecutionResult> {
   const pool = createPool(databaseUrl);
   try {
-    // Wipe stale concurrency_groups rows. Reasons to delete:
-    // 1. routing_key from a different deployment (mirrors execution_runs).
-    // 2. run_id refers to an execution_run we're about to delete (orphans).
-    // 3. (restart cleanup) any non-terminal status under THIS routing key
-    //    whose owning run is no longer 'running'/'pending'/'queued' — agents
-    //    from the previous orchestrator process are gone and the slot-release
-    //    path would otherwise pick the orphan first by created_at ASC.
-    // The table has no FK on run_id so we have to clean it explicitly.
+    // concurrency_groups has no FK on run_id, so it is cleaned explicitly: rows
+    // of another deployment, and rows whose run is not pending, running or
+    // cancelling. After a restart the previous process's agents are gone, and
+    // slot release (created_at ASC) would otherwise pick such an orphan first.
     const concurrencyGroupsResult = await pool.query(
       `DELETE FROM concurrency_groups
         WHERE routing_key != $1
@@ -390,14 +340,10 @@ export interface PurgeStaleSourcesResult {
  * deployment), and any `workflow_registrations` rows whose routing_key no
  * longer points at an existing source. An org's remote source
  * (`remote:<orgId>`, a `remote_sources` row) is a source the purge never
- * touches, so the registrations under it are kept. When `dryRun` is true,
- * only count the rows that would be deleted.
+ * touches, so the registrations under it are kept. `dryRun` only counts.
  *
- * Orphan registration cleanup is critical: generic_webhook_sources is wiped
- * wholesale, but workflow_registrations rows previously persisted under those
- * routing keys would otherwise survive and pollute the cross-source dispatch
- * fan-out on the next test run (causing clone attempts against long-dead
- * repo identifiers from earlier tests).
+ * Registrations under the wiped generic sources would otherwise survive and
+ * join the next run's cross-source dispatch fan-out, cloning long-dead repos.
  */
 export async function purgeStaleSourcesDirect(
   databaseUrl: string,
@@ -454,10 +400,8 @@ export async function purgeStaleSourcesDirect(
     );
     const sources = await pool.query(`DELETE FROM sources WHERE routing_key != $1`, [routingKey]);
     const generic = await pool.query(`DELETE FROM generic_webhook_sources`);
-    // Wipe registrations whose routing_key no longer resolves — generic rows
-    // are all gone above, real-provider rows survive in `sources` (if any),
-    // and an org's remote source lives in `remote_sources`, which the purge
-    // never touches.
+    // Delete registrations whose routing key resolves to no row in `sources` or
+    // `remote_sources` (the purge never touches the latter).
     // fails-when: a registration under a live remote source (`remote:<orgId>`) is deleted
     // breaks-if-wrong: a registration under no source at all must still be deleted
     const registrations = await pool.query(
@@ -479,10 +423,7 @@ export async function purgeStaleSourcesDirect(
   }
 }
 
-/**
- * Bulk-delete scoped_secrets. Scoped to one org when `orgId` is provided,
- * else all orgs. Returns the number of rows deleted.
- */
+/** Delete the scoped secrets of `orgId`, or of every org when it is omitted. */
 export async function purgeScopedSecretsDirect(
   databaseUrl: string,
   orgId?: string,
@@ -499,15 +440,10 @@ export async function purgeScopedSecretsDirect(
 }
 
 /**
- * Bulk-delete `contexts` (and their FK-dependent rows) for an org, or for
- * every org when `orgId` is omitted. `context_bindings` /
- * `context_variables` / `context_source_overrides` cascade
- * automatically (ON DELETE CASCADE). `held_runs` and `execution_runs` reference
- * `contexts(id)` with ON DELETE SET NULL, so deleting contexts alone
- * would leave orphaned `held_runs` rows carrying a null context reference;
- * this helper deletes the org's `held_runs` too so a reset gets a clean slate.
- * Runs in a transaction so both deletes commit atomically. Exposed via
- * `kici-admin context purge`.
+ * Backs `kici-admin context purge`: delete the contexts of `orgId`, or of every
+ * org when it is omitted. Bindings, variables and source overrides cascade.
+ * `held_runs` and `execution_runs` use ON DELETE SET NULL, so the org's
+ * `held_runs` are deleted too, in the same transaction, for a clean slate.
  */
 export async function purgeContextsDirect(
   databaseUrl: string,
@@ -537,16 +473,11 @@ export async function purgeContextsDirect(
 
 // ── context ops ────────────────────────────────────────────────────
 //
-// Direct-DB helpers backing `kici-admin context`. These abstract the
-// `ON CONFLICT (org_id, name) DO UPDATE` upsert pattern so no caller
-// open-codes it against `new pg.Pool`. Every helper owns its own pool (max=1)
-// and awaits `pool.end()` in finally — callers pass a database URL, not a pool.
+// Back `kici-admin context`, so no caller open-codes the
+// `ON CONFLICT (org_id, name) DO UPDATE` upsert. Each helper takes a database
+// URL and owns a max=1 pool it always ends.
 
-/**
- * Allowed policy field names for `setContextPolicyDirect`. Kept as an
- * explicit allowlist so the column-name interpolation in the UPDATE string
- * can never be driven by unsanitised caller input.
- */
+/** Allowlist, so caller input never drives the column names interpolated into the UPDATE. */
 const ENV_POLICY_COLUMNS = new Set<string>([
   'branch_restrictions',
   'repo_patterns',
@@ -617,17 +548,14 @@ export interface SeedContextResult {
 }
 
 /**
- * Upsert a context row keyed by (org_id, name). Returns the env id and
- * whether the row was newly inserted. `branchRestrictions` / `requiredReviewers`
- * are JSON-serialised server-side; pass them as plain arrays or objects. On
- * conflict only the supplied policy fields change (see
- * `suppliedPolicyAssignments`).
+ * Upsert a context by (org_id, name). Pass `branchRestrictions` /
+ * `requiredReviewers` as plain values; they are JSON-serialised here. On
+ * conflict only the supplied policy fields change.
  *
- * An omitted `holdExpirySeconds` is written as NULL rather than a literal
- * window: the column carries no DDL default, so "never set" and "cleared" both
- * land on NULL and resolve through the one `DEFAULT_HOLD_EXPIRY_SECONDS`
- * fallback on read. Writing a literal here would give this path a second,
- * longer default that no read-side code knows about.
+ * An omitted `holdExpirySeconds` is written as NULL: the column has no DDL
+ * default, so "never set" and "cleared" both resolve through the one
+ * `DEFAULT_HOLD_EXPIRY_SECONDS` read fallback. A literal here would be a
+ * second, longer default no reader knows about.
  */
 export async function seedContextDirect(
   databaseUrl: string,
@@ -684,15 +612,9 @@ export interface DeleteContextOpts {
 }
 
 /**
- * Delete a context keyed by (org_id, name). Returns whether a row was
- * removed. The `context_bindings`, `context_variables`, and
- * `context_source_overrides` children all carry
- * `FOREIGN KEY (context_id) REFERENCES contexts(id) ON DELETE CASCADE`,
- * so a single DELETE on `contexts` cascades to those children. The
- * `held_runs` FK uses `ON DELETE SET NULL`, so terminal held-run history
- * survives the delete with a null context reference. Pending held runs
- * still reference the context, so this helper pre-checks their count and
- * throws before issuing the DELETE — approve or reject them first.
+ * Delete a context by (org_id, name). Bindings, variables and source overrides
+ * cascade; terminal held runs survive with a null context (ON DELETE SET NULL).
+ * Throws while the context has pending held runs: approve or reject them first.
  */
 export async function deleteContextDirect(
   databaseUrl: string,
@@ -700,11 +622,8 @@ export async function deleteContextDirect(
 ): Promise<{ deleted: boolean }> {
   const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
   try {
-    // The `'pending'` literal mirrors HeldRunStatus.Pending
-    // (orchestrator contexts/held-runs.ts) — the source of truth for the
-    // value. @kici-dev/shared cannot import the orchestrator enum (dependency
-    // direction), so the string is embedded here like other status literals in
-    // this module.
+    // 'pending' mirrors HeldRunStatus.Pending (orchestrator contexts/held-runs.ts),
+    // which @kici-dev/shared cannot import (dependency direction).
     const pending = await pool.query<{ count: string }>(
       `SELECT count(*)::text AS count FROM held_runs hr
          JOIN contexts e ON e.id = hr.context_id
@@ -735,11 +654,7 @@ export interface SeedContextBindingOpts {
   hostPattern?: string;
 }
 
-/**
- * Upsert an `context_bindings` row connecting `contextName` to `scopePattern`
- * (scoped to `hostPattern`, default `'**'`). Throws if the context does
- * not exist.
- */
+/** Bind `contextName` to `scopePattern` (idempotent). Throws if the context is missing. */
 export async function seedContextBindingDirect(
   databaseUrl: string,
   opts: SeedContextBindingOpts,
@@ -781,10 +696,7 @@ export interface SetContextPolicyOpts {
   allowLocalExecution?: boolean;
 }
 
-/**
- * UPDATE only the policy fields that were explicitly provided. Columns that
- * were NOT in `opts` are left untouched. Throws if the context is missing.
- */
+/** Update only the policy fields present in `opts`. Throws if the context is missing. */
 export async function setContextPolicyDirect(
   databaseUrl: string,
   opts: SetContextPolicyOpts,
@@ -866,9 +778,7 @@ export interface ContextRow {
   updated_at: string;
 }
 
-/**
- * SELECT * FROM contexts WHERE org_id = $1, ordered by name.
- */
+/** An org's contexts, ordered by name. */
 export async function listContextsDirect(
   databaseUrl: string,
   opts: { orgId: string },
@@ -909,10 +819,7 @@ export interface ShowContextResult {
   bindings: ContextBindingRow[];
 }
 
-/**
- * Fetch a single context row joined with its variables and bindings.
- * Throws if the context does not exist.
- */
+/** A context with its variables and bindings. Throws if the context is missing. */
 export async function showContextDirect(
   databaseUrl: string,
   opts: { orgId: string; name: string },
@@ -968,10 +875,9 @@ export interface CreateContextTemplateOpts {
 }
 
 /**
- * The policy fields a template upsert writes. The template INSERT sets neither
- * `enabled` nor `repo_patterns`, so their `EXCLUDED` values are the insert
- * defaults: passing either through would reset an existing template's value
- * whenever a caller's object happened to carry the field.
+ * Omits `enabled` and `repo_patterns`: the template INSERT sets neither, so
+ * their `EXCLUDED` values are insert defaults that would reset an existing
+ * template whenever a caller's object carried the field.
  */
 function templatePolicyFields(opts: CreateContextTemplateOpts): UpsertPolicyFields {
   return {
@@ -984,14 +890,9 @@ function templatePolicyFields(opts: CreateContextTemplateOpts): UpsertPolicyFiel
 }
 
 /**
- * Create (or update) a context template + its seed variables in one
- * transaction. Templates are represented as contexts with `type='template'`
- * by convention. Returns `{ envId, variablesSet }`.
- *
- * An omitted `holdExpirySeconds` is written as NULL rather than a literal
- * window, for the same reason as `seedContextDirect`: the column has no DDL
- * default and every read resolves NULL through `DEFAULT_HOLD_EXPIRY_SECONDS`.
- * On conflict only the supplied policy fields change, as in `seedContextDirect`.
+ * Upsert a context template (a context with `type='template'` by convention)
+ * and its seed variables in one transaction. `holdExpirySeconds` and conflict
+ * handling behave as in `seedContextDirect`.
  */
 export async function createContextTemplateDirect(
   databaseUrl: string,
@@ -1059,10 +960,7 @@ export interface SetContextSecretOpts {
   encryptedValue: string;
 }
 
-/**
- * UPSERT a scoped_secrets row keyed by (org_id, scope=context, key).
- * Writes the value verbatim — the caller is responsible for encryption.
- */
+/** Upsert a context-scoped secret, written verbatim: the caller encrypts it. */
 export async function setContextSecretDirect(
   databaseUrl: string,
   opts: SetContextSecretOpts,
@@ -1107,24 +1005,22 @@ export interface DispatchQueueRow {
 
 export interface ListQueueOpts {
   status?: string;
-  /** Status NOT IN list (e.g., to find non-terminal rows). */
+  /** E.g. the terminal statuses, to find non-terminal rows. */
   statusNotIn?: readonly string[];
   jobNamePrefix?: string;
-  /** Exact job_name match (e.g., `__build__e2e-test`). */
+  /** Exact match (e.g. `__build__e2e-test`). */
   jobName?: string;
-  /** job_name NOT LIKE (e.g., `__build__%` to exclude build jobs). */
+  /** A LIKE pattern (e.g. `__build__%` excludes build jobs). */
   jobNameNotLike?: string;
   workflowName?: string;
-  /** ISO timestamp or Date; matches rows with created_at > this. */
+  /** Exclusive lower bound on created_at. */
   createdAfter?: string | Date;
   limit?: number;
 }
 
 /**
- * READ-ONLY: SELECT from `dispatch_queue` with optional status + job-name
- * filters and a bounded limit (defaults to 100). Includes source_tar_url,
- * deps_url, and job_config so a caller can inspect cache metadata
- * without a second round-trip.
+ * Read-only, newest first; the limit defaults to 100 and is clamped to 1–1000.
+ * Rows carry the cache metadata columns, so no second round-trip is needed.
  */
 export async function listQueueDirect(
   databaseUrl: string,
@@ -1194,10 +1090,7 @@ export async function listQueueDirect(
   }
 }
 
-/**
- * READ-ONLY: SELECT a single dispatch_queue row by id. Throws with a
- * clear message when no row matches.
- */
+/** Read-only. Throws when no row matches. */
 export async function showQueueEntryDirect(
   databaseUrl: string,
   opts: { id: string },
@@ -1262,10 +1155,7 @@ export interface ListExecutionRunsOpts {
   limit?: number;
 }
 
-/**
- * READ-ONLY: SELECT execution_runs with optional filters. Ordered by
- * created_at DESC, capped at a sensible limit.
- */
+/** Read-only, newest first; the limit defaults to 100 and is clamped to 1–1000. */
 export async function listExecutionRunsDirect(
   databaseUrl: string,
   opts: ListExecutionRunsOpts = {},
@@ -1309,13 +1199,10 @@ export async function listExecutionRunsDirect(
 }
 
 /**
- * One `check_run_tracking` row: the orchestrator's record of a check run it posted.
- *
- * Named `...DirectRow` rather than `CheckRunTrackingRow` because the
- * orchestrator's own `db/types.ts` already exports that name for the Kysely
- * `Selectable`, whose `check_run_id` is a `number`. Two same-named types with
- * different field types, both in scope inside the orchestrator package, is a
- * silent-comparison-bug waiting to happen.
+ * The orchestrator's record of a check run it posted. Not named
+ * `CheckRunTrackingRow`: the orchestrator's `db/types.ts` exports that name with
+ * a `number` `check_run_id`, and two same-named types with different field
+ * types in one package invite silent comparison bugs.
  */
 export interface CheckRunTrackingDirectRow {
   provider: string;
@@ -1324,25 +1211,18 @@ export interface CheckRunTrackingDirectRow {
   sha: string;
   check_name: string;
   /**
-   * The id the provider returned when the check run was CREATED. It is written
-   * once, at create time, when the check run is still `queued` — the later
-   * terminal update is a PATCH that writes nothing here. So a non-null value
-   * proves creation, NOT that the check run reached a conclusion.
+   * Written once, when the check run is created (still `queued`); the terminal
+   * PATCH writes nothing here. Non-null proves creation, not a conclusion. Null
+   * does not prove a failed create: the write is best-effort (cache-only on a
+   * DB error), so the check run can exist with no id recorded.
    *
-   * Null does not prove the create failed either: the write is best-effort and
-   * falls back to cache-only on a DB error, so the check run can exist at the
-   * provider with no id recorded here.
-   *
-   * Selected as `::text` because the column is BIGINT and node-postgres maps
-   * int8 to a string to avoid precision loss. The cast makes that explicit in
-   * the query rather than depending on driver defaults, so adding a global
-   * int8 type parser later cannot silently change this field's type.
+   * Selected as `::text` (the column is BIGINT) so a future global int8 type
+   * parser cannot silently change this field's type.
    */
   check_run_id: string | null;
   /**
-   * `'pending'` is stamped BEFORE the create call and `'completed'` after it
-   * returns an id. Nothing resets it when a create fails, so a row stuck on
-   * `'pending'` means the create never returned — still in flight or
+   * `'pending'` before the create call, `'completed'` once it returns an id.
+   * Nothing resets it on failure, so a row stuck on `'pending'` is in flight or
    * permanently failed, which this column alone cannot distinguish.
    */
   build_creation_state: string | null;
@@ -1353,12 +1233,9 @@ export interface CheckRunTrackingDirectRow {
    */
   in_progress_sent_at: Date | null;
   /**
-   * When the terminal (`completed`) update was accepted by the provider. This
-   * is the column that answers "did we complete it?" — `check_run_id` only
-   * answers "did we create it?".
-   *
-   * Best-effort like every write on this table, so null means "we have no
-   * record of sending it", not "it was never sent".
+   * When the provider accepted the terminal `completed` update: the "did we
+   * complete it?" column. Best-effort, so null means "no record of sending it",
+   * not "never sent".
    */
   terminal_sent_at: Date | null;
 }
@@ -1370,15 +1247,10 @@ export interface ListCheckRunTrackingOpts {
 }
 
 /**
- * READ-ONLY: SELECT check_run_tracking rows for a commit. One row per
- * `(provider, owner, repo, sha, check_name)`, ordered by check_name.
- *
- * Each column answers a different question. `check_run_id` is written once,
- * when the check run is created in the `queued` state, so it answers "did we
- * create it?". `terminal_sent_at` is stamped only after the provider accepts
- * the terminal `completed` PATCH, so it answers "did we complete it?". Every
- * write here is best-effort, so a null column is "no record", never proof of
- * failure — see the per-field notes for what each one does and does not prove.
+ * Read-only: a commit's rows, one per `(provider, owner, repo, sha, check_name)`,
+ * ordered by check_name. `check_run_id` answers "did we create it?",
+ * `terminal_sent_at` "did we complete it?"; a null is "no record", never proof
+ * of failure (see `CheckRunTrackingDirectRow`).
  */
 export async function listCheckRunTrackingDirect(
   databaseUrl: string,
@@ -1409,10 +1281,7 @@ export async function listCheckRunTrackingDirect(
   }
 }
 
-/**
- * READ-ONLY: fetch a single run by run_id AND its jobs. Throws if no run
- * matches the run_id. Jobs list may be empty for pending runs.
- */
+/** Read-only: a run and its jobs (empty for a pending run). Throws if no run matches. */
 export async function showExecutionRunDirect(
   databaseUrl: string,
   opts: { runId: string },
@@ -1466,7 +1335,7 @@ export interface ListRegistrationsOpts {
   customerId?: string;
   routingKey?: string;
   repoIdentifier?: string;
-  /** Include rows where this trigger type is in trigger_types[]. */
+  /** Matches rows whose trigger_types contains it. */
   triggerType?: string;
   limit?: number;
 }
@@ -1478,9 +1347,8 @@ export interface ListRegistrationsResult {
 }
 
 /**
- * READ-ONLY: list workflow_registrations with optional filters. Also returns
- * the latest registry_versions.version so callers can assert registry bumps
- * without a second round trip.
+ * Read-only, newest-updated first. Also returns the latest registry version,
+ * so callers can assert a registry bump without a second round trip.
  */
 export async function listRegistrationsDirect(
   databaseUrl: string,
@@ -1541,9 +1409,8 @@ export interface ShowRegistrationResult {
 }
 
 /**
- * READ-ONLY: show one workflow_registrations row by id, plus the latest
- * registry_versions row (the monotonic version bumped on every registration
- * insert/delete). Throws if the registration id is unknown.
+ * Read-only: one registration plus the latest registry version (bumped on every
+ * registration insert or delete). Throws if the id is unknown.
  */
 export async function showRegistrationDirect(
   databaseUrl: string,
@@ -1577,13 +1444,10 @@ export async function showRegistrationDirect(
 // ── workflow register-manual ───────────────────────────────────────────────
 
 /**
- * Registerable trigger types. Kept in sync with
- * packages/orchestrator/src/registration/extractor.ts — any trigger whose type
- * is in this set (or which pins `repos: [...]` patterns) produces a
- * workflow_registrations row on default-branch push extraction.
- *
- * Duplicated here intentionally so the helper has no runtime dependency on
- * the engine package.
+ * A trigger of one of these types, or one that pins `repos: [...]`, yields a
+ * registration on default-branch push extraction. Kept in sync with
+ * packages/orchestrator/src/registration/extractor.ts, duplicated so this
+ * helper has no runtime dependency on the engine package.
  */
 export const REGISTERABLE_TRIGGER_TYPES: ReadonlySet<string> = new Set([
   'push',
@@ -1630,15 +1494,10 @@ export interface RegisterWorkflowManualResult {
 }
 
 /**
- * Transactionally upsert `workflow_registrations` rows from a lock file and
- * bump `registry_versions.version`. Mirrors the orchestrator's
- * RegistrationStore.replaceAll() path but runs offline, straight against the
- * database, without going through an orchestrator.
- *
- * Writes one row per registerable workflow (UPSERT by
- * (routing_key, repo_identifier, workflow_name)), then bumps
- * `registry_versions` in the same transaction so orchestrator processes
- * watching that row refresh their in-memory index.
+ * The offline counterpart of the orchestrator's `RegistrationStore.replaceAll()`:
+ * upsert one row per registerable workflow, keyed by
+ * (routing_key, repo_identifier, workflow_name), and bump `registry_versions`
+ * in the same transaction so watching orchestrators refresh their index.
  */
 export async function registerWorkflowManualDirect(
   databaseUrl: string,
@@ -1672,10 +1531,9 @@ export async function registerWorkflowManualDirect(
     ),
   );
 
-  // Written on every row, like the lock entry it keys: a row never keeps the
-  // dependency-cache key of a lock file it no longer carries the entry of. The
-  // commit is written next to it as the commit the key describes; the
-  // orchestrator uses the key only while that still equals the row's commit.
+  // Written on every row with its lock entry, so a row never keeps another lock
+  // file's dependency-cache key. The orchestrator uses the key only while
+  // `dep_cache_key_sha` still equals the row's commit.
   const { lockfileHash, siblingsDigest } = depCacheKeyOf(lockFile);
   const depCacheKeySha = opts.commitSha ?? null;
 
@@ -1732,7 +1590,7 @@ export async function registerWorkflowManualDirect(
     return { workflowCount: registerable.length, registryVersion };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {
-      // ignore rollback errors — the original error wins
+      // The original error wins.
     });
     throw err;
   } finally {
@@ -1742,13 +1600,9 @@ export async function registerWorkflowManualDirect(
 }
 
 /**
- * DELETE all rows from `raft_state` so a freshly-started orchestrator
- * self-elects with a clean term. Used after swapping the running
- * orchestrator process (warm-mode deploys) — without this, the new
- * process loads a high term and takes 60+ seconds cycling through
- * failed election rounds. Returns the number of rows deleted.
- *
- * Safe for repeated calls — if the table is empty, returns 0.
+ * Clear `raft_state` so a freshly started orchestrator self-elects with a clean
+ * term. Used after a warm-mode process swap: otherwise the new process loads a
+ * high term and spends 60+ seconds in failed election rounds. Idempotent.
  */
 export async function resetRaftStateDirect(databaseUrl: string): Promise<{ rowsDeleted: number }> {
   const pool = createPool(databaseUrl);
@@ -1768,12 +1622,10 @@ export interface EmitKiciEventOpts {
 }
 
 /**
- * INSERT a row into `kici_events` and fire `pg_notify('kici_event_channel', <id>)`
- * so the orchestrator EventRouter picks it up immediately. Simulates what
- * `agent ctx.emit()` does from inside a step execution — but without needing
- * an actual running step. Returns the event id.
- *
- * The event always gets `chain_depth=0` and `expires_at=NOW() + 1h`.
+ * Emit an event as a step's `ctx.emit()` would, with no running step: insert
+ * it into `kici_events` and `pg_notify('kici_event_channel', <id>)` so the
+ * orchestrator EventRouter picks it up at once. The event always gets
+ * `chain_depth=0` and `expires_at=NOW() + 1h`.
  */
 export async function emitKiciEventDirect(
   databaseUrl: string,
@@ -1887,14 +1739,10 @@ export async function isSchemaCurrent(
 // ── Orchestrator DB direct helpers ──────────────────────────────────
 
 /**
- * Purge backends whose encrypted `config` column can no longer be decrypted
- * (e.g. KICI_SECRET_KEY was rotated while the database was kept).
- *
- * Only rows with a non-empty `config_encrypted` are affected — the default
- * `pg` backend is seeded by the initial migration with `config_encrypted = ''`
- * as a sentinel (loadAllStores() skips decryption for it), so it is never the
- * source of the decryption failure and must be preserved. Deleting it breaks
- * everything that relies on the default backend being registered.
+ * Purge backends whose encrypted config no longer decrypts (e.g. after
+ * KICI_SECRET_KEY rotated over a kept database). The default `pg` backend
+ * carries the `config_encrypted = ''` sentinel, which loadAllStores() never
+ * decrypts, so it is kept: everything relies on it being registered.
  */
 export async function purgeSecretBackendsDirect(databaseUrl: string): Promise<{ deleted: number }> {
   const pool = createPool(databaseUrl);
@@ -1908,11 +1756,7 @@ export async function purgeSecretBackendsDirect(databaseUrl: string): Promise<{ 
   }
 }
 
-/**
- * Delete peer_credentials rows whose instance_id does NOT match a pattern
- * (`keepInstanceIdPattern`, a SQL `LIKE` pattern), so stale peer credentials
- * are wiped while the matching peers stay intact.
- */
+/** Delete the peer credentials whose instance_id is NOT LIKE `keepInstanceIdPattern`. */
 export async function prunePeerCredentialsDirect(
   databaseUrl: string,
   opts: { keepInstanceIdPattern: string },
@@ -1930,21 +1774,13 @@ export async function prunePeerCredentialsDirect(
 
 // ── org_settings (global workflow policy) ────────────────────────────
 
-/**
- * One entry in any of the three repo-pattern lists stored on `org_settings`.
- * `routingKey` is the source-qualifier; when absent, the entry applies to
- * any source in the org.
- */
+/** An `org_settings` repo-pattern entry; without `routingKey` it applies to every source in the org. */
 export interface OrgSettingsRepoPatternEntry {
   routingKey?: string;
   pattern: string;
 }
 
-/**
- * Wait for an orchestrator `event_log` row keyed by `delivery_id`.
- * Returns the full row (callers read many columns) or null on
- * timeout.
- */
+/** An orchestrator `event_log` row, keyed by `delivery_id`. */
 export interface EventLogRow {
   org_id: string;
   delivery_id: string;

@@ -1,11 +1,8 @@
 /**
- * Implementations for `kici-admin cold-store` subcommands: the shared
- * cold-store admin ops (`createColdStoreAdminOps` in `@kici-dev/shared`),
- * bound to an `OrchestratorColdStore` built against the orchestrator
- * Postgres + S3.
- *
- * No per-invocation breadcrumb row is written: the Platform admin CLI's
- * `audit_log` breadcrumb has no `access_log` counterpart here.
+ * `kici-admin cold-store`: the shared `createColdStoreAdminOps` bound to an
+ * `OrchestratorColdStore` on the orchestrator Postgres + S3. No per-invocation
+ * breadcrumb row is written: the Platform admin CLI's `audit_log` breadcrumb
+ * has no `access_log` counterpart here.
  */
 import { ChunkLru, createColdStoreAdminOps, createLogger, createPool } from '@kici-dev/shared';
 import { createDb } from '../../db/client.js';

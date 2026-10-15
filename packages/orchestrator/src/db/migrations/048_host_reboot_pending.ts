@@ -1,19 +1,13 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `host_roster.reboot_pending_until timestamptz NULL` — the persisted
- * reboot-pending flag for workflow-level host restart.
+ * `host_roster.reboot_pending_until`: the persisted reboot-pending flag (NULL = none), set when
+ * a `restartHost()` step calls `host.requestReboot`, so it survives an orchestrator restart.
  *
- * Set when an agent's `restartHost()` step calls `host.requestReboot` (so it
- * survives an orchestrator restart during the host's reboot window). While the
- * value is in the future it (1) makes the agent's imminent disconnect an
- * expected reboot rather than a recovery-fail, (2) gates the pinned-drain off
- * so the post-restart job is not dispatched into the about-to-reboot box, and
- * (3) clears on the next reconnect (down-then-up), releasing the held job. NULL
- * = no reboot pending.
- *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so existing data is
- * preserved.
+ * While in the future it (1) makes the agent's disconnect an expected reboot, not a
+ * recovery-fail, (2) gates the pinned-drain off so the post-restart job does not dispatch to the
+ * rebooting box, and (3) clears on the next reconnect, releasing the held job.
+ * Idempotent and additive.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.host_roster

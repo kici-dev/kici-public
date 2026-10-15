@@ -1,21 +1,20 @@
 import { z } from 'zod';
 
 /**
- * Structured `error` codes the Platform dashboard API returns in a JSON body,
- * which the dashboard SPA special-cases when rendering. Shared so the emit
- * sites (Platform) and the match site (dashboard) never drift on the literal.
+ * Structured `error` codes in Platform dashboard API JSON bodies that the
+ * dashboard special-cases; shared so the Platform emit sites and the dashboard
+ * match site never drift.
  */
 export const DashboardApiErrorCode = z.enum([
   'orchestrator_not_found',
   'session_max_age_exceeded',
   /**
-   * The addressed run exists but falls outside the org's plan retention window
-   * (soft-deleted, or created before the retention cutoff). Returned with 404
-   * rather than 403 or 410 so the status alone reveals nothing. The Platform
-   * resolves the run through its org-scoped handle, so this code is only ever
-   * emitted for a run the caller's own org owns — a caller probing another
-   * org's ids gets the route's ordinary not-found. The distinct code is what
-   * lets the dashboard explain the retention window to the owning org.
+   * The run exists but is outside the org's plan retention window (soft-deleted,
+   * or created before the cutoff). Returned with 404, not 403 or 410, so the
+   * status alone reveals nothing. The Platform resolves runs through the
+   * org-scoped handle, so only the owning org ever sees this code; a caller
+   * probing another org's ids gets the ordinary not-found. The code lets the
+   * dashboard explain the retention window.
    */
   'run_outside_retention',
 ]);

@@ -1,17 +1,14 @@
 /**
- * GateDeadlineDetector: periodic DB scanner enforcing an invoke gate's own
- * job-level `timeout`.
+ * Periodic DB scanner enforcing an invoke gate's own job-level `timeout`.
  *
- * A gate runs no steps on an agent, so the agent-side job timeout can never fire
- * for it. Instead the orchestrator owns the gate deadline: this scanner finds
- * non-terminal `gate` jobs whose `timeout_ms` has elapsed since the gate began
- * summoning and fails each one. Failing the gate drives its downstream `needs`
- * cascade through the normal job-status path; the summoned source-repo runs are
- * the repos' own runs and are left untouched.
+ * A gate runs no steps on an agent, so the agent-side job timeout never fires for it;
+ * the orchestrator fails non-terminal `gate` jobs whose `timeout_ms` has elapsed since
+ * the gate began summoning. Failing drives the downstream `needs` cascade through the
+ * normal job-status path; the summoned source-repo runs are the repos' own and are left
+ * untouched.
  *
- * The gate's timeout clock is `ready_at` (when the needs scheduler released it to
- * summon), falling back to `created_at` for a root gate that never carried a
- * `ready_at`.
+ * The clock is `ready_at` (when the needs scheduler released the gate to summon),
+ * falling back to `created_at` for a root gate that never carried a `ready_at`.
  */
 
 import { sql, type Kysely } from 'kysely';
@@ -32,9 +29,9 @@ export const GATE_DEADLINE_RECENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export interface GateDeadlineDetectorDeps {
   db: Kysely<Database>;
-  /** Used to fail an overdue gate through the canonical job-status path. */
+  /** Fails an overdue gate through the canonical job-status path. */
   executionTracker: Pick<ExecutionTracker, 'onJobStatus'>;
-  /** How often to scan in ms (reuses the stale-detector interval). */
+  /** Scan interval in ms (reuses the stale-detector interval). */
   scanIntervalMs: number;
 }
 
@@ -50,7 +47,7 @@ export class GateDeadlineDetector {
     this.scanIntervalMs = deps.scanIntervalMs;
   }
 
-  /** Start the detector: an immediate crash-recovery scan, then periodic scans. */
+  /** An immediate crash-recovery scan, then periodic scans. */
   async start(): Promise<void> {
     await this.scan();
     this.interval = setInterval(() => {
@@ -67,7 +64,6 @@ export class GateDeadlineDetector {
     }
   }
 
-  /** Find non-terminal gates past their timeout and fail each one. */
   async scan(): Promise<void> {
     try {
       const overdue = await this.buildOverdueQuery().execute();
@@ -83,10 +79,9 @@ export class GateDeadlineDetector {
   }
 
   /**
-   * Build the SELECT for overdue gates. Extracted so a unit test can compile the
-   * exact predicate set (Kysely `.compile()`) without a live database. A gate is
-   * overdue when `coalesce(ready_at, created_at) + timeout_ms` is in the past;
-   * the recency bound keeps the scan off ancient history each tick.
+   * Extracted so a unit test can compile the exact predicate set (Kysely `.compile()`)
+   * without a live database. Overdue means `coalesce(ready_at, created_at) + timeout_ms`
+   * is in the past; the recency bound keeps each tick off ancient history.
    */
   private buildOverdueQuery() {
     const deadline = sql`coalesce(ready_at, created_at) + (timeout_ms * interval '1 millisecond')`;

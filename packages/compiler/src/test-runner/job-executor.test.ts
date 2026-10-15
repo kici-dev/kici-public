@@ -12,8 +12,7 @@ describe('job-executor', () => {
     changedFiles: [],
   };
 
-  // Tests don't run shell commands that depend on cwd; passing the current
-  // working directory keeps the historical behavior.
+  // No test runs a cwd-dependent shell command.
   const TEST_REPO_ROOT = process.cwd();
 
   describe('executeStep', () => {
@@ -59,7 +58,7 @@ describe('job-executor', () => {
         throw new Error('Step 1 failed');
       });
       const step2 = step('step-2', async () => {
-        // This should not execute
+        // Never runs.
       });
 
       const testJob = job('test-job', {
@@ -94,7 +93,6 @@ describe('job-executor', () => {
     });
 
     it('stores id-less step outputs under their assigned step-N names (no collision)', async () => {
-      // Two id-less steps with outputs in one job each get a distinct step-N key (no '' collision).
       const a = step({ run: async () => ({ v: 1 }), outputs: { v: z.number() } });
       const b = step({ run: async () => ({ v: 2 }), outputs: { v: z.number() } });
       const probe = step('probe', async () => ({
@@ -121,7 +119,6 @@ describe('job-executor', () => {
       const mktempStep = step('mk', async (ctx) => {
         const handle = await ctx.mktemp('loc');
         capturedPath = handle.path;
-        // The temp dir exists while the step runs.
         expect(fs.existsSync(handle.path)).toBe(true);
         return { path: handle.path };
       });
@@ -135,7 +132,7 @@ describe('job-executor', () => {
 
       expect(result.status).toBe('success');
       expect(capturedPath).toBeDefined();
-      // After the job ends the scope is drained — the dir is gone (ENOENT).
+      // The scope is drained when the job ends.
       expect(fs.existsSync(capturedPath!)).toBe(false);
     });
 
@@ -318,7 +315,6 @@ describe('job-executor', () => {
       expect(result.status).toBe('success');
       expect(result.jobs).toHaveLength(2);
 
-      // Both jobs should complete
       const job1Result = result.jobs.find((j) => j.name === 'job-1');
       const job2Result = result.jobs.find((j) => j.name === 'job-2');
       expect(job1Result?.status).toBe('success');
@@ -427,7 +423,7 @@ describe('job-executor', () => {
       });
 
       const checkStep = step('check', async () => {
-        // Access outputs via .result proxy (resolves against the shared outputs map)
+        // The .result proxy resolves against the shared outputs map.
         const ver = buildStep.result.version;
         return { checkedVersion: ver };
       });
@@ -498,7 +494,7 @@ describe('job-executor', () => {
 
       expect(result.status).toBe('success');
       expect(result.jobs).toHaveLength(2);
-      // Multi-step job: outputs nested under step names
+      // Multi-step job: outputs nested under step names.
       const deployStepOutputs = result.jobs[1].steps[0].outputs as any;
       expect(deployStepOutputs.deployed).toBe(true);
       expect(deployStepOutputs.setupData).toEqual({
@@ -534,7 +530,7 @@ describe('job-executor', () => {
 
       expect(result.status).toBe('success');
       expect(result.jobs).toHaveLength(2);
-      // Single-step job: outputs flattened (no step-name nesting)
+      // Single-step job: outputs flattened.
       const deployStepOutputs = result.jobs[1].steps[0].outputs as any;
       expect(deployStepOutputs.deployedEnv).toBe('staging');
       expect(deployStepOutputs.deployedVersion).toBe('3.0.0');
@@ -553,7 +549,6 @@ describe('job-executor', () => {
         needs: [setupJob],
         steps: [
           step('deploy', async () => {
-            // Access via .result proxy
             const env = setupJob.result.env;
             return { targetEnv: env };
           }),

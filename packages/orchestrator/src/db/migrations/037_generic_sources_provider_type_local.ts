@@ -5,21 +5,18 @@ import { type Kysely, sql } from 'kysely';
  * permits `'local'` instead of `'internal'`, and migrate any carried-over
  * `'internal'` rows to `'local'`.
  *
- * The local filesystem (`file://`) provider is `provider_type='local'`; the
- * value used to be `'internal'`. The original CHECK constraint
- * (`generic_webhook_sources_provider_type_check`) allowed only
- * `{'generic','internal'}`, so writing a `'local'` row fails. Universal-git
- * sources keep `provider_type='generic'` (discriminated by `git_config`), so
- * the new allowed set is `{'generic','local'}`.
+ * The local filesystem (`file://`) provider is `provider_type='local'`, which
+ * the original `generic_webhook_sources_provider_type_check`
+ * (`{'generic','internal'}`) rejects. Universal-git sources keep
+ * `provider_type='generic'` (discriminated by `git_config`), so the new allowed
+ * set is `{'generic','local'}`.
  *
  * Idempotent: the constraint is dropped IF EXISTS and recreated; the data
  * backfill is a plain UPDATE that is a no-op once no `'internal'` rows remain.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
-  // Drop the old constraint FIRST. The existing constraint only permits
-  // {'generic','internal'}, so any UPDATE touching a row (even one that already
-  // holds 'local' from an out-of-band write) would re-trigger the old check and
-  // fail. With the constraint gone, the backfill runs freely.
+  // Drop the old constraint FIRST: any UPDATE touching a row (even one already
+  // 'local' from an out-of-band write) would re-trigger it and fail.
   await sql`
     ALTER TABLE public.generic_webhook_sources
       DROP CONSTRAINT IF EXISTS generic_webhook_sources_provider_type_check

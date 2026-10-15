@@ -3,7 +3,7 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { up } from './061_execution_runs_environment_id.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -101,8 +101,7 @@ describeDb('migration 061_execution_runs_environment_id', () => {
   it('backfills environment_id for rows whose environment matches a unique fixed env', async () => {
     const e1 = await insertEnv('org_aaaaaaaa', 'production', 'fixed');
     await insertRun('11111111-1111-1111-1111-111111111111', 'production');
-    // The new column already exists (the beforeAll migration ran up() once on empty data),
-    // so up() now only re-runs the idempotent backfill over the seeded rows.
+    // The column exists already, so up() only re-runs the idempotent backfill.
     await up(db);
     expect(await envId('11111111-1111-1111-1111-111111111111')).toBe(e1);
   });

@@ -24,7 +24,7 @@ describe('localTrustRootCommand', () => {
   });
 
   it('writes a { issuer: kici-local, jwks } trust root from the published public JWK', async () => {
-    // Simulate the plane orchestrator having published its public JWK.
+    // As the plane orchestrator publishes it.
     const devDir = path.join(tmp, 'local', 'dev-identity');
     fs.mkdirSync(devDir, { recursive: true });
     const pubJwk = { kty: 'EC', crv: 'P-256', x: 'X', y: 'Y', alg: 'ES256', use: 'sig', kid: 'k1' };
@@ -36,7 +36,7 @@ describe('localTrustRootCommand', () => {
 
     const written = JSON.parse(fs.readFileSync(out, 'utf-8'));
     expect(written.issuer).toBe('kici-local');
-    // Never the prod issuer — kici-local can't masquerade.
+    // kici-local can never masquerade as the prod issuer.
     expect(written.issuer).not.toBe('https://api.kici.dev');
     expect(written.jwks.keys).toHaveLength(1);
     expect(written.jwks.keys[0].kid).toBe('k1');

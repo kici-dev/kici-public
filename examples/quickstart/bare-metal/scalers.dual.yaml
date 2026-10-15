@@ -39,6 +39,13 @@ scalers:
     maxAgents: 4
     labelSets:
       - labels: [linux, bare-metal]
-        # Absolute path to the kici-agent binary. `npm install -g kici-admin`
-        # puts it on PATH — resolve the path with: command -v kici-agent
+        # Absolute path to the kici-agent binary. Use the "Agent binary" path
+        # that `kici-admin orchestrator status` prints: the kici-agent installed
+        # with the orchestrator's Node.js runtime, which `kici-admin orchestrator
+        # upgrade` updates.
+        # Do not use a Node.js version-manager path from `command -v kici-agent`:
+        # an alias (mise's node/24) moves to a runtime with no kici-agent when
+        # you install a new Node.js version, and a shim (~/.local/share/mise/shims)
+        # runs the version manager, not the agent. `mise which kici-agent`
+        # prints the file behind a mise shim.
         binaryPath: /usr/local/bin/kici-agent

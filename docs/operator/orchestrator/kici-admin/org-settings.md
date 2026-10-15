@@ -269,13 +269,13 @@ Controls how held approval elements (workflow / job / step gates) behave for the
 
 ```bash
 kici-admin org-settings dashboard-writes show --org <id> [--category <name>] [--sensitivity <name>] [--format json|table]
-kici-admin org-settings dashboard-writes set --org <id> --op <name>=<true|false> [--op ...] [--category <name>] [--sensitivity <name>] [--enabled true|false] [--format json|table]
+kici-admin org-settings dashboard-writes set --org <id> --op <name>=<permissive|encrypted|disabled> [--op ...] [--category <name>] [--sensitivity <name>] [--enabled true|false] [--format json|table]
 kici-admin org-settings dashboard-writes reset --org <id> [--format json|table]
 ```
 
 Manages the per-orch dashboard write policy — the matrix of `dashboard.*` write operations the orchestrator will accept when proxied through Platform. Empty policy = all operations enabled (permissive default).
 
-- `show` prints the current policy. Filter to one category (`Secrets`, `Variables`, `Environments`, `Bindings`, `Held runs`, `DLQ`, `Registrations`, `Topology`) or one sensitivity bucket (`plaintext`, `authority`, `dispatch`).
+- `show` prints the current policy. Filter to one category (`Secrets`, `Variables`, `Contexts`, `Bindings`, `Held runs`, `DLQ`, `Attestations`, `Registrations`, `Topology`, `Fleet`) or one sensitivity bucket (`plaintext`, `authority`, `dispatch`).
 - `set` flips one or more operations. Pass `--op <name>=<permissive|encrypted|disabled>` (repeatable) for individual operations, or combine `--category` / `--sensitivity` with `--enabled <bool>` to flip every operation in the matching group at once. The CLI prints the planned change before applying.
 - `reset` returns every operation to the permissive default.
 - `--org <id>` selects the org row.

@@ -1,21 +1,15 @@
 /**
- * PAT-authenticated client for the Platform's dev-facing run-remote routes.
+ * PAT-authenticated `kici run remote` transport through the Platform, which
+ * relays each control request over the WS dashboard-proxy to the org's
+ * orchestrator, so the orchestrator's HTTP API need not be reachable from the
+ * developer machine. The other transport is `DirectRunClient` (`direct-client.ts`).
  *
- * One of the two transports `kici run remote` uses. It targets the Platform
- * (`config.platformEndpoint`), which relays each control request over the WS
- * dashboard-proxy to the org's orchestrator cluster, so the orchestrator's
- * own HTTP API need not be reachable from the developer machine. The other
- * transport, `DirectRunClient` (`direct-client.ts`), calls an orchestrator's
- * `/api/v1/test` routes itself.
- *
- * The overlay tarball does NOT flow through here: `initUpload` returns an
- * presigned URL the CLI PUTs to directly (data plane).
+ * The overlay tarball does NOT flow through here: `initUpload` returns a
+ * presigned URL the CLI PUTs to directly.
  */
 
 import { toErrorMessage } from '@kici-dev/core';
 import type { CheckMode, HostTargetSelector } from '@kici-dev/engine';
-
-// --- Error types ---
 
 export class AuthenticationError extends Error {
   constructor(message = 'Invalid or expired token. Run `kici login` to authenticate.') {
@@ -49,9 +43,8 @@ export class ConnectionError extends Error {
 }
 
 /**
- * Thrown when the org has more than one connected orchestrator cluster and the
- * developer did not pick one (no `--orchestrator` flag, no per-org default).
- * Carries the list of connected cluster names so the CLI can print the choice.
+ * Thrown when several orchestrator clusters are connected and neither
+ * `--orchestrator` nor a per-org default picks one; carries the cluster names.
  */
 export class AmbiguousClusterError extends Error {
   constructor(
@@ -70,8 +63,6 @@ export class NoClusterError extends Error {
     this.name = 'NoClusterError';
   }
 }
-
-// --- Request/response types ---
 
 export interface PlatformUploadInitInput {
   sha?: string;
@@ -99,9 +90,8 @@ export interface PlatformTriggerInput {
   workflowName?: string;
   uploadId?: string;
   /**
-   * Ephemeral X25519 public key the CLI used to encrypt the overlay tarball.
-   * The orchestrator pairs it with the upload's stored private key to decrypt
-   * the overlay. Distinct from `encryptedSecretsKey` (the optional secrets key).
+   * Ephemeral X25519 key that encrypted the overlay tarball; the orchestrator
+   * pairs it with the upload's stored private key. Distinct from `encryptedSecretsKey`.
    */
   cliPublicKey?: string;
   inlineLockFile?: string;
@@ -110,20 +100,18 @@ export interface PlatformTriggerInput {
   encryptedSecrets?: string;
   encryptedSecretsKey?: string;
   /**
-   * Run mode for the dispatched run (`apply` | `check` | `check-fail-on-drift`).
-   * The Platform relays it onto the dispatch event so the orchestrator runs the
-   * agent step loop in the requested mode. Omitted means `apply`.
+   * Relayed onto the dispatch event; the agent step loop runs in this mode.
+   * Omitted means `apply`.
    */
   checkMode?: CheckMode;
   /**
-   * Host narrowing from `kici run --target`. The Platform relays it verbatim to
-   * the orchestrator, which intersects each runsOnAll roster with it.
+   * `kici run --target`, relayed verbatim; the orchestrator intersects each
+   * runsOnAll roster with it.
    */
   target?: HostTargetSelector;
   /**
-   * Raw operator-supplied `kici run --input KEY=VALUE` pairs (not defaulted /
-   * coerced). The Platform relays them verbatim; the orchestrator validates,
-   * coerces, and applies defaults authoritatively against the lock descriptor.
+   * Raw `kici run --input KEY=VALUE` pairs, relayed verbatim; the orchestrator
+   * validates, coerces and defaults them authoritatively against the lock descriptor.
    */
   dispatchInputs?: Record<string, string>;
 }
@@ -163,17 +151,16 @@ export interface PlatformCancelResponse {
 }
 
 interface PlatformRunClientConfig {
-  /** Platform base URL, e.g. `https://api.kici.dev`. */
+  /** e.g. `https://api.kici.dev`. */
   platformEndpoint: string;
-  /** Personal access token (PAT) used as the bearer credential. */
+  /** PAT, sent as the bearer credential. */
   token: string;
 }
 
 /**
- * Append the cluster-targeting query params the Platform routes understand:
- * `?orchestrator=<cluster>` (explicit pick) and `?defaultCluster=<cluster>`
- * (the CLI's per-org default). Either may be omitted to let the Platform
- * sole-select or return a 422 with the cluster list.
+ * Cluster-targeting query: `orchestrator` (explicit pick) and `defaultCluster`
+ * (per-org default). With neither, the Platform sole-selects or returns a 422
+ * with the cluster list.
  */
 function clusterQuery(orchestrator?: string, defaultCluster?: string): string {
   const params = new URLSearchParams();
@@ -183,17 +170,14 @@ function clusterQuery(orchestrator?: string, defaultCluster?: string): string {
   return q ? `?${q}` : '';
 }
 
-/** Cluster targeting for a run-remote request. */
 export interface ClusterTarget {
-  /** Explicit `--orchestrator <name>` pick. */
+  /** `--orchestrator <name>`. */
   orchestrator?: string;
-  /** Per-org default cluster (`config.defaultClusters[orgId]`). */
+  /** `config.defaultClusters[orgId]`. */
   defaultCluster?: string;
 }
 
-/**
- * Client for the Platform's `/api/v1/orgs/:orgId/test/*` relay routes.
- */
+/** Client for the Platform's `/api/v1/orgs/:orgId/test/*` relay routes. */
 export class PlatformRunClient {
   private readonly baseUrl: string;
   private readonly token: string;
@@ -214,7 +198,7 @@ export class PlatformRunClient {
     return (await response.json()) as PlatformUploadInitResponse;
   }
 
-  /** POST /test/trigger — trigger a remote run. */
+  /** POST /test/trigger */
   async trigger(
     orgId: string,
     target: ClusterTarget,
@@ -252,7 +236,7 @@ export class PlatformRunClient {
     return (await response.json()) as PlatformRunLogsResponse;
   }
 
-  /** POST /test/runs/:runId/cancel — cancel a run. */
+  /** POST /test/runs/:runId/cancel */
   async cancel(
     orgId: string,
     runId: string,
@@ -264,11 +248,9 @@ export class PlatformRunClient {
   }
 
   /**
-   * Make a PAT-authenticated request to the Platform.
-   *
    * Classifies errors: 401 → AuthenticationError, 403 → AccessDeniedError,
    * 404 → NotFoundError, 422 ambiguous_cluster → AmbiguousClusterError,
-   * 422 no_cluster → NoClusterError. Network failures → ConnectionError.
+   * 422 no_cluster → NoClusterError, network failure → ConnectionError.
    */
   private async request(path: string, init: RequestInit): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
@@ -295,7 +277,7 @@ export class PlatformRunClient {
     }
 
     await this.throwForStatus(response);
-    // Unreachable — throwForStatus always throws on a non-OK response.
+    // Unreachable: throwForStatus always throws.
     return response;
   }
 
@@ -315,10 +297,8 @@ export class PlatformRunClient {
       if (body.error === 'no_cluster') {
         throw new NoClusterError(body.message);
       }
-      // A 422 from the trigger relay (status === 'rejected') carries the run
-      // body whose `reason` holds the fail-closed gate message (e.g. the
-      // context "does not allow test runs"). Surface that reason — it is
-      // the actionable text, not the generic HTTP status.
+      // A rejected trigger's `reason` holds the actionable fail-closed gate
+      // message (e.g. the context "does not allow test runs").
       throw new Error(body.reason ?? body.message ?? body.error ?? 'Request rejected (422)');
     }
 
@@ -354,14 +334,14 @@ export async function readJson(response: Response): Promise<Record<string, unkno
   }
 }
 
-/** Read the `error` field of a JSON body, falling back to text then a default. */
+/** Read a JSON body's `error`, then `message`, falling back to text then `fallback`. */
 export async function readError(response: Response, fallback: string): Promise<string> {
   try {
     const body = (await response.clone().json()) as { error?: string; message?: string };
     if (body.error) return body.error;
     if (body.message) return body.message;
   } catch {
-    // not JSON — try text below
+    // not JSON
   }
   try {
     const text = await response.text();

@@ -13,7 +13,7 @@ import { type Kysely, sql } from 'kysely';
  * Nullable and unbackfilled: null on every per-repository run, and on every row
  * written before these columns existed.
  *
- * Idempotent: guarded on each column's existence, so re-running is a no-op.
+ * Idempotent: guarded on each column's existence.
  */
 async function colExists(db: Kysely<unknown>, name: string): Promise<boolean> {
   const result = await sql<{ exists: boolean }>`

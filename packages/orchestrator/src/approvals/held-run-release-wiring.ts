@@ -1,21 +1,16 @@
 /**
- * The release wiring the local (`kici-admin`) held-run decision surface runs on.
+ * The release wiring of the local (`kici-admin`) held-run decision surface,
+ * composed by `createApp` for every mode. A factory rather than an inline
+ * literal so a test can assert its fields: the defect it guards is a MISSING
+ * field — a release that flips the `held_runs` row without dispatching looks
+ * like it works and does nothing.
  *
- * `createApp` composes this for every mode. It lives here rather than inline in
- * that composition root because the defect it guards against is a MISSING
- * field, not a wrong algorithm: a release path that flips the `held_runs` row
- * without dispatching looks like it works and does nothing. A factory can be
- * constructed by a test and its fields asserted; an object literal buried in
- * `createApp` cannot.
+ * `undefined` without a job-release callback, so no decision route is mounted
+ * rather than one whose approves are silent no-ops.
  *
- * It returns `undefined` when there is no job-release callback, so an app
- * assembled without one mounts no decision route at all rather than one whose
- * approves are silent no-ops.
- *
- * Every callback reads the LIVE processing-deps bag at call time rather than
- * capturing one: the provider registry is swapped whenever sources reload, and
- * a captured bag would resolve a check poster from a registry that no longer
- * serves the routing key.
+ * Callbacks read the LIVE processing-deps bag at call time: sources reloading
+ * swap the provider registry, and a captured bag would resolve a check poster
+ * from a registry that no longer serves the routing key.
  */
 import type { ReleaseSignal } from '../contexts/held-runs.js';
 import type { ProcessingDeps } from '../pipeline/processor.js';
@@ -36,12 +31,10 @@ export interface HeldRunReleaseInputs {
 }
 
 /**
- * The reason a workflow-scoped hold rejected through this surface records on the
- * run it cancels, when the operator supplied none.
- *
- * Scope-neutral on purpose: the install gate, the org trust policy's PR-wide
- * hold and an SDK workflow-level `requireApproval` all arrive here, so a
- * reason naming one of them would mislabel the other two.
+ * The reason recorded on the run when a workflow-scoped hold is rejected here
+ * with none supplied. Scope-neutral on purpose: the install gate, the org trust
+ * policy's PR-wide hold and an SDK workflow-level `requireApproval` all arrive
+ * here, so naming one would mislabel the others.
  */
 export const DEFAULT_LOCAL_REJECT_REASON = 'Workflow hold rejected by the orchestrator operator';
 
@@ -53,11 +46,9 @@ export function buildHeldRunRelease(
   return {
     onJobRelease,
     ...(onWorkflowRelease && { onWorkflowRelease }),
-    // Rejecting a workflow-scoped hold must cancel the run and drop the pending
-    // dispatch context, not merely flip the row: without it the run stays alive
-    // in `held` forever and the context that would have replayed it is
-    // stranded. Built from the live bag, exactly as the direct-ingress pipeline
-    // builds its own.
+    // A reject must cancel the run and drop the pending dispatch context, not
+    // merely flip the row, or the run stays `held` forever with its context
+    // stranded. Built from the live bag, as the direct-ingress pipeline does.
     onWorkflowReject: (hold, reason) => {
       const procDeps = buildProcessingDeps();
       return rejectWorkflow(hold, procDeps, procDeps.db, reason ?? DEFAULT_LOCAL_REJECT_REASON);

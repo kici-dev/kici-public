@@ -69,10 +69,8 @@ describe('formatPolicy', () => {
   });
 
   it('says no policy is stored when an older route sent no policy fields', () => {
-    // The shape a v0.5.0 INDEPENDENT orchestrator with no stored row returns:
-    // it resolved no policy at all, so it omitted the four fields. `(defaults)`
-    // would be wrong twice over there — nothing is stored, and no defaults are
-    // being applied either.
+    // A v0.5.0 INDEPENDENT orchestrator with no row resolves no policy and
+    // omits the fields: nothing is stored and no defaults apply.
     const out = formatPolicy(
       { customerId: 'org-1', source: null, platformManaged: false, updatedAt: null },
       'table',
@@ -82,8 +80,7 @@ describe('formatPolicy', () => {
   });
 
   it('labels an absent source as defaults when the fields did arrive', () => {
-    // A row-less orchestrator on this build DOES apply the fail-closed defaults
-    // and sends them, so `(defaults)` is the honest wording here.
+    // A row-less orchestrator on this build applies and sends the fail-closed defaults.
     const out = formatPolicy({ ...VIEW, source: null, platformManaged: false }, 'table');
     expect(out).toContain('none (defaults)');
     expect(out).not.toContain('no policy stored');
@@ -93,17 +90,15 @@ describe('formatPolicy', () => {
     const out = formatPolicy({ ...VIEW, forkPolicy: ForkPolicy.enum.ignore }, 'table');
     expect(out).toContain('drops fork pull requests before dispatch');
     expect(out).toContain('contributor sees nothing');
-    // Where to look for an individual drop, so the warning is actionable.
     expect(out).toContain('kici_orch_fork_events_ignored_total');
-    // `show`, not `list`: the list table has no error column, so an operator
-    // sent there would find every drop row and none of the reasons.
+    // `show`, not `list`: the list table has no error column, so no reasons.
     expect(out).toContain('kici-admin event-log show');
     expect(out).not.toContain('kici-admin event-log list');
   });
 
   it('does not warn under a policy that leaves the contributor something to see', () => {
-    // Non-vacuity for the three cases above: `hold` and `allow` both produce a
-    // run or a check, so a build that warned unconditionally would fail here.
+    // Non-vacuity: `hold` and `allow` produce a run or a check, so an
+    // unconditional warning fails here.
     for (const value of [ForkPolicy.enum.hold, ForkPolicy.enum.allow]) {
       const out = formatPolicy({ ...VIEW, forkPolicy: value }, 'table');
       expect(out, `forkPolicy ${value}`).not.toContain('drops fork pull requests');
@@ -118,9 +113,8 @@ describe('formatPolicy', () => {
     expect(platform).toContain('a default nobody chose');
     expect(platform).toContain('Settings > CI trust');
 
-    // An independent orchestrator cannot be set from the dashboard, and the
-    // route 409s on a Platform-attached one — so the remedy has to follow the
-    // mode rather than name one verb for both.
+    // The dashboard cannot set an independent orchestrator and the route 409s
+    // on a Platform-attached one, so the remedy follows the mode.
     const independent = formatPolicy(
       {
         ...VIEW,
@@ -240,15 +234,13 @@ describe('formatDirectory', () => {
     expect(out).toContain('No approval directory is stored');
     expect(out).toContain('the KiCI Platform (read-only here)');
     expect(out).toContain('/kici approve');
-    // A Platform-attached orchestrator waits for a push; there is nothing the
-    // operator can do here, so it must not be told to run the writer.
+    // A Platform-attached orchestrator waits for a push, so no writer is named.
     expect(out).toContain('control-plane handshake');
     expect(out).not.toContain('directory-set');
   });
 
   it('points an independent orchestrator at its own writer', () => {
-    // The two absences have different remedies. Telling an independent operator
-    // to wait for a push that will never come is the wording this replaced.
+    // An independent orchestrator never receives a push, so its remedy differs.
     const out = formatDirectory({ directory: null, platformManaged: false }, 'table');
     expect(out).toContain('nothing will ever be pushed here');
     expect(out).toContain('kici-admin trust-policy directory-set');
@@ -270,21 +262,16 @@ describe('formatDirectory', () => {
 });
 
 /**
- * The staleness surface: an age beside the stored timestamp, and a note whose
- * severity tracks whether a refresh can arrive at all.
- *
- * The disconnected case is the one the whole feature exists for and is covered
- * here only — reproducing it end-to-end would mean partitioning a live
- * Platform, so the end-to-end suite asserts only the connected rendering.
+ * An age beside the stored timestamp, and a note whose severity tracks whether
+ * a refresh can arrive. The disconnected case is covered here only: end to end
+ * it would need a partitioned live Platform, so the end-to-end suite asserts
+ * the connected one.
  */
 describe('formatDirectory staleness rendering', () => {
   /** Three days after DIRECTORY.updatedAt. */
   const NOW = Date.parse('2026-08-30T06:00:00.000Z');
 
-  /**
-   * Collapse the hard-wrapped note into one line, so an assertion on a phrase
-   * survives re-wrapping the prose it lives in.
-   */
+  /** One line, so a phrase assertion survives re-wrapping. */
   const flat = (out: string): string => out.replace(/\s+/g, ' ');
 
   it('renders the age beside the stored timestamp', () => {
@@ -303,8 +290,7 @@ describe('formatDirectory staleness rendering', () => {
   });
 
   it('clamps a directory written in the future rather than rendering a negative age', () => {
-    // The write timestamp is the orchestrator's clock and `now` is the CLI
-    // host's; a backwards skew must not render `-5s ago`.
+    // Orchestrator and CLI clocks differ; a backwards skew must not render `-5s ago`.
     const out = formatDirectory(
       { directory: DIRECTORY, platformManaged: true },
       'table',
@@ -334,8 +320,7 @@ describe('formatDirectory staleness rendering', () => {
     expect(out).toContain('Note:');
     expect(flat(out)).toContain("reaches this orchestrator on the Platform's next push");
     expect(out).toContain('kici_orch_trust_directory_age_seconds');
-    // A connected orchestrator is behind by one push, not indefinitely — the
-    // escalated wording must not fire here or it stops meaning anything.
+    // A connected orchestrator lags one push at most, so no escalation.
     expect(out).not.toContain('Warning:');
     expect(out).not.toContain('unbounded');
   });
@@ -349,22 +334,19 @@ describe('formatDirectory staleness rendering', () => {
     expect(out).toContain('Warning:');
     expect(flat(out)).toContain('the Platform connection is down, so no push can arrive');
     expect(flat(out)).toContain('That window is unbounded');
-    // The trade-off is deliberate; the operator must not read this as a bug to
-    // fix by expiring the cache.
+    // Deliberate: not a bug to fix by expiring the cache.
     expect(flat(out)).toContain('deliberately never expired');
   });
 
   it('does not escalate when the orchestrator reports no connection state', () => {
-    // An orchestrator predating `platformConnected` sends nothing. Absent means
-    // unknown, and reading unknown as down would cry outage on every read.
+    // An orchestrator without `platformConnected` sends nothing: unknown, not down.
     const out = formatDirectory({ directory: DIRECTORY, platformManaged: true }, 'table', NOW);
     expect(out).toContain('Note:');
     expect(out).not.toContain('Warning:');
   });
 
   it('says nothing at all on an independent orchestrator', () => {
-    // The operator reading this wrote the directory. There is no upstream for
-    // it to lag behind, so every wording above would be false.
+    // The reader wrote the directory; there is no upstream to lag behind.
     const out = formatDirectory(
       { directory: DIRECTORY, platformManaged: false, platformConnected: false },
       'table',
@@ -376,8 +358,7 @@ describe('formatDirectory staleness rendering', () => {
   });
 
   it('says nothing when no directory has ever been stored', () => {
-    // The absence wording already explains what to expect; a staleness note
-    // about a directory that does not exist would name an age nothing has.
+    // The absence wording covers it; a missing directory has no age.
     const out = formatDirectory(
       { directory: null, platformManaged: true, platformConnected: false },
       'table',
@@ -388,8 +369,7 @@ describe('formatDirectory staleness rendering', () => {
   });
 
   it('leaves JSON output untouched by the age and the note', () => {
-    // `--format json` is a script contract: the rendered age is a CLI-side
-    // computation and must not appear in the body the route returned.
+    // `--format json` is a script contract: the CLI-side age stays out of the route's body.
     const parsed = JSON.parse(
       formatDirectory(
         { directory: DIRECTORY, platformManaged: true, platformConnected: false },
@@ -402,12 +382,9 @@ describe('formatDirectory staleness rendering', () => {
 });
 
 /**
- * The registration seam.
- *
- * The formatters above can be perfect while the command that reaches them
- * sends the wrong path, drops a flag, or is never registered at all — and none
- * of the tests above would notice. These drive the real Commander action with a
- * stub client and assert the exact request it produced.
+ * The registration seam: the formatter tests miss a wrong path, a dropped flag
+ * or a missing registration, so these drive the real Commander action with a
+ * stub client and assert the exact request.
  */
 describe('registerTrustPolicyCommands', () => {
   afterEach(() => vi.restoreAllMocks());
@@ -504,8 +481,7 @@ describe('registerTrustPolicyCommands', () => {
     expect(patch).toHaveBeenCalledWith('/api/v1/admin/trust-policy/directory', {
       customerId: 'org-1',
       userId: 'user-7',
-      // Defaulted, not dropped — the link is per-provider and a missing one
-      // would store a link no comment can ever match.
+      // Defaulted: a link without a provider matches no comment.
       provider: 'github',
       providerUsername: 'carol',
       providerUserId: '7070',
@@ -514,8 +490,7 @@ describe('registerTrustPolicyCommands', () => {
   });
 
   it('directory-set requires the provider numeric id', async () => {
-    // Commander refuses a missing required option before any request is made,
-    // so an inert link cannot be created by omission.
+    // Commander refuses before any request, so omission cannot create an inert link.
     const { program, patch } = harness();
     const argv = SET_ARGV.filter(
       (a, i) => a !== '--provider-user-id' && SET_ARGV[i - 1] !== '--provider-user-id',
@@ -533,8 +508,7 @@ describe('registerTrustPolicyCommands', () => {
     await expect(program.parseAsync(argv)).rejects.toThrow('exit');
     expect(exit).toHaveBeenCalledWith(1);
     expect(patch).not.toHaveBeenCalled();
-    // The message names what IS accepted, so the operator does not have to go
-    // read the route schema.
+    // The message names what IS accepted.
     expect(vi.mocked(console.error).mock.calls.flat().join(' ')).toContain(
       CiTrustLevel.options.join(' | '),
     );
@@ -573,8 +547,7 @@ describe('registerTrustPolicyCommands', () => {
   });
 
   it('directory-set surfaces the route refusal verbatim and exits non-zero', async () => {
-    // The 409 wording is the server's, not the CLI's — reworded here it would
-    // drift from what the orchestrator actually decided.
+    // The 409 wording is the server's; rewording it here would drift.
     const message = 'The approval directory is managed by the KiCI Platform for this orchestrator.';
     const { program } = harness();
     const patch = vi.fn().mockRejectedValue(new Error(message));

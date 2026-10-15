@@ -1,6 +1,5 @@
-// Agent package — deployed application, not a library.
-// Internal modules are imported directly by server.ts.
-// Only re-export types/symbols needed by other packages.
+// Deployed application, not a library: server.ts imports internals directly, so
+// re-export only what other packages need.
 
 export { loadConfig, type AppConfig } from './config.js';
 export { installDeps, type InstallDepsOptions } from './execution/dep-installer.js';

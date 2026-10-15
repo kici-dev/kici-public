@@ -1,18 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createHmac } from 'node:crypto';
 import { verifyInboundWebhook, type VerifyInboundDeps } from './verify-inbound.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 // --- Test doubles --------------------------------------------------
-
-/** Build a fake Kysely chain that resolves the github source row lookup. */
-function fakeDb(sourceRow: { id: string } | null) {
-  return {
-    selectFrom: vi.fn().mockReturnThis(),
-    select: vi.fn().mockReturnThis(),
-    where: vi.fn().mockReturnThis(),
-    executeTakeFirst: vi.fn().mockResolvedValue(sourceRow ?? undefined),
-  } as unknown as VerifyInboundDeps['db'];
-}
 
 /** Build a PgSecretStore stub returning the provided secrets map by scope. */
 function fakeSecretStore(scopes: Record<string, Record<string, string>>) {
@@ -46,7 +37,7 @@ function githubSig(body: string, secret: string): string {
 describe('verifyInboundWebhook (dispatch)', () => {
   it('returns rejected_unknown_source for an unknown routing-key prefix', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: fakeGenericSourceManager(null),
     };
@@ -74,7 +65,7 @@ describe('verifyInboundWebhook (github)', () => {
   it('accepts a valid signature', async () => {
     const sig = githubSig(BODY, SECRET);
     const deps: VerifyInboundDeps = {
-      db: fakeDb({ id: SOURCE_ID }),
+      db: createMockDb({ selectFirstRow: { id: SOURCE_ID } }).db,
       secretStore: fakeSecretStore({ [SCOPE]: { webhookSecret: SECRET } }),
       genericSourceManager: fakeGenericSourceManager(null),
     };
@@ -92,7 +83,7 @@ describe('verifyInboundWebhook (github)', () => {
   it('falls back to the headers map when signatureHeader is null', async () => {
     const sig = githubSig(BODY, SECRET);
     const deps: VerifyInboundDeps = {
-      db: fakeDb({ id: SOURCE_ID }),
+      db: createMockDb({ selectFirstRow: { id: SOURCE_ID } }).db,
       secretStore: fakeSecretStore({ [SCOPE]: { webhookSecret: SECRET } }),
       genericSourceManager: fakeGenericSourceManager(null),
     };
@@ -110,7 +101,7 @@ describe('verifyInboundWebhook (github)', () => {
   it('rejects when the signature does not match', async () => {
     const wrong = githubSig(BODY, 'different-secret');
     const deps: VerifyInboundDeps = {
-      db: fakeDb({ id: SOURCE_ID }),
+      db: createMockDb({ selectFirstRow: { id: SOURCE_ID } }).db,
       secretStore: fakeSecretStore({ [SCOPE]: { webhookSecret: SECRET } }),
       genericSourceManager: fakeGenericSourceManager(null),
     };
@@ -128,7 +119,7 @@ describe('verifyInboundWebhook (github)', () => {
 
   it('rejects when the signature header is missing entirely', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb({ id: SOURCE_ID }),
+      db: createMockDb({ selectFirstRow: { id: SOURCE_ID } }).db,
       secretStore: fakeSecretStore({ [SCOPE]: { webhookSecret: SECRET } }),
       genericSourceManager: fakeGenericSourceManager(null),
     };
@@ -146,7 +137,7 @@ describe('verifyInboundWebhook (github)', () => {
 
   it('returns rejected_unknown_source when no source row exists', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: fakeGenericSourceManager(null),
     };
@@ -163,7 +154,7 @@ describe('verifyInboundWebhook (github)', () => {
 
   it('returns rejected_misconfigured when source has no stored secret', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb({ id: SOURCE_ID }),
+      db: createMockDb({ selectFirstRow: { id: SOURCE_ID } }).db,
       secretStore: fakeSecretStore({ [SCOPE]: {} }),
       genericSourceManager: fakeGenericSourceManager(null),
     };
@@ -184,7 +175,7 @@ describe('verifyInboundWebhook (github)', () => {
       getSecrets: vi.fn().mockRejectedValue(new Error('decryption key unavailable')),
     } as unknown as VerifyInboundDeps['secretStore'];
     const deps: VerifyInboundDeps = {
-      db: fakeDb({ id: SOURCE_ID }),
+      db: createMockDb({ selectFirstRow: { id: SOURCE_ID } }).db,
       secretStore: failingStore,
       genericSourceManager: fakeGenericSourceManager(null),
     };
@@ -219,7 +210,7 @@ describe('verifyInboundWebhook (generic, hmac_sha256)', () => {
   it('accepts a valid HMAC signature with default header', async () => {
     const sig = createHmac('sha256', SECRET).update(BODY, 'utf8').digest('hex');
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: gmRow('hmac_sha256', { secret: SECRET }),
     };
@@ -237,7 +228,7 @@ describe('verifyInboundWebhook (generic, hmac_sha256)', () => {
   it('rejects an HMAC signature mismatch', async () => {
     const wrong = createHmac('sha256', 'different').update(BODY).digest('hex');
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: gmRow('hmac_sha256', { secret: SECRET }),
     };
@@ -255,7 +246,7 @@ describe('verifyInboundWebhook (generic, hmac_sha256)', () => {
 
   it('returns rejected_misconfigured when verification_config is missing the secret', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: gmRow('hmac_sha256', {}),
     };
@@ -273,7 +264,7 @@ describe('verifyInboundWebhook (generic, hmac_sha256)', () => {
 
   it('returns rejected_misconfigured when verification_config is invalid JSON', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: fakeGenericSourceManager({
         routing_key: ROUTING,
@@ -294,7 +285,7 @@ describe('verifyInboundWebhook (generic, hmac_sha256)', () => {
 
   it('returns rejected_misconfigured (never throws) for an out-of-union verification_method', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: fakeGenericSourceManager({
         routing_key: ROUTING,
@@ -320,7 +311,7 @@ describe('verifyInboundWebhook (generic, hmac_sha256)', () => {
 
   it('returns rejected_unknown_source when no row exists', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: fakeGenericSourceManager(null),
     };
@@ -352,7 +343,7 @@ describe('verifyInboundWebhook (generic, bearer_token)', () => {
 
   it('accepts a matching Bearer token in Authorization header', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: gmRow({ token: TOKEN }),
     };
@@ -369,7 +360,7 @@ describe('verifyInboundWebhook (generic, bearer_token)', () => {
 
   it('rejects a wrong Bearer token', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: gmRow({ token: TOKEN }),
     };
@@ -399,7 +390,7 @@ describe('verifyInboundWebhook (generic, ip_allowlist)', () => {
 
   it('accepts an allowlisted client IP', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: gmRow(),
     };
@@ -416,7 +407,7 @@ describe('verifyInboundWebhook (generic, ip_allowlist)', () => {
 
   it('rejects an IP outside the allowlist', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: gmRow(),
     };
@@ -433,7 +424,7 @@ describe('verifyInboundWebhook (generic, ip_allowlist)', () => {
 
   it('rejects when no clientIp was forwarded', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: gmRow(),
     };
@@ -452,7 +443,7 @@ describe('verifyInboundWebhook (generic, ip_allowlist)', () => {
 describe('verifyInboundWebhook (generic, none)', () => {
   it('always accepts when verification_method=none', async () => {
     const deps: VerifyInboundDeps = {
-      db: fakeDb(null),
+      db: createMockDb().db,
       secretStore: fakeSecretStore({}),
       genericSourceManager: fakeGenericSourceManager({
         routing_key: 'generic:org-1:src-none',

@@ -94,7 +94,6 @@ describe('workflow()', () => {
       if (trigger._tag === 'PrTrigger') {
         expect(trigger).toHaveProperty('targetBranches');
       }
-      // Should be frozen (immutable)
       expect(Object.isFrozen(trigger)).toBe(true);
     });
   });
@@ -118,7 +117,6 @@ describe('workflow()', () => {
         rules: [myRule],
       });
 
-      // Rules should be stored directly, not transformed
       expect(ci.rules![0]).toBe(myRule);
       expect(ci.rules![0]._tag).toBe('Rule');
     });
@@ -240,7 +238,6 @@ describe('workflow()', () => {
     });
 
     it('creates workflow with dynamic job generator', () => {
-      // Note: DynamicJobFn uses destructured {$, ctx, log, env}
       const dynamicJobs: DynamicJobFn = async ({ $, ctx, log, env }) => [
         job('test-a', { runsOn: 'linux', steps: [checkoutStep], needs: ['build'] }),
         job('test-b', { runsOn: 'linux', steps: [checkoutStep], needs: ['build'] }),
@@ -290,8 +287,7 @@ describe('workflow()', () => {
         jobs: [buildJob, dynamicJobs],
       });
 
-      // Verify workflow stores the configuration
-      // Actual needs resolution happens at agent runtime
+      // Needs resolution happens at agent runtime.
       expect(w.jobs).toHaveLength(2);
     });
   });

@@ -1,26 +1,22 @@
-// SSH auth setup for `git clone` with a provider-supplied private key.
-//
-// Writes the private key (and optionally a pinned known_hosts file) to a
-// temporary directory with restrictive permissions, then composes the
-// `GIT_SSH_COMMAND` env var that `git clone` picks up. The caller MUST call
-// the returned `cleanup()` in a `finally` block to wipe the tempdir — the
-// key never touches persistent storage.
+// SSH auth for `git clone` with a provider-supplied private key: writes the key
+// (and a known_hosts file) to a restrictive tempdir and composes
+// `GIT_SSH_COMMAND`. The caller MUST call `cleanup()` in a `finally`, so the key
+// never reaches persistent storage.
 
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { makeTempDir } from '@kici-dev/core/tmp';
 
 export interface SshAuthSetup {
-  /** Value for the `GIT_SSH_COMMAND` env var. */
   gitSshCommand: string;
-  /** Absolute path of the tempdir — used by tests. Not safe to log. */
+  /** Used by tests. Not safe to log. */
   tempDir: string;
-  /** Removes the tempdir and its contents. Safe to call multiple times. */
+  /** Idempotent. */
   cleanup(): Promise<void>;
 }
 
 export interface SetupSshAuthOpts {
-  /** PEM-encoded private key. Must include trailing newline. */
+  /** PEM-encoded; a missing trailing newline is added. */
   privateKey: string;
   /** 'accept-new' (default) trusts first-seen host keys; 'pinned' requires `knownHosts`. */
   hostKeyPolicy?: 'accept-new' | 'pinned';
@@ -29,20 +25,11 @@ export interface SetupSshAuthOpts {
 }
 
 /**
- * Materialize an SSH private key (and optional pinned known_hosts) into a
- * tempdir and build the `GIT_SSH_COMMAND` that `git clone` needs.
+ * Permissions: key and known_hosts 0o600 (OpenSSH refuses a world-readable
+ * key), tempdir 0o700.
  *
- * Permissions:
- *   - private key mode 0o600 (required by OpenSSH — refuses to use world-
- *     readable keys).
- *   - known_hosts mode 0o600.
- *   - tempdir mode 0o700.
- *
- * SSH flags composed:
- *   - `-i <keyfile>` — identity file.
- *   - `-o IdentitiesOnly=yes` — don't try other keys from ssh-agent / ~/.ssh.
- *   - `-o BatchMode=yes` — never prompt for passwords / passphrases.
- *   - host-key checking flags based on `hostKeyPolicy`.
+ * SSH flags: `-i <keyfile>`; `IdentitiesOnly=yes` (no ssh-agent / ~/.ssh keys);
+ * `BatchMode=yes` (never prompt); host-key checking per `hostKeyPolicy`.
  */
 export async function setupSshAuth(opts: SetupSshAuthOpts): Promise<SshAuthSetup> {
   if (opts.hostKeyPolicy === 'pinned' && !opts.knownHosts) {
@@ -54,13 +41,10 @@ export async function setupSshAuth(opts: SetupSshAuthOpts): Promise<SshAuthSetup
   const pem = opts.privateKey.endsWith('\n') ? opts.privateKey : `${opts.privateKey}\n`;
   await writeFile(keyPath, pem, { mode: 0o600 });
 
-  // Always materialize a per-call known_hosts file — empty for accept-new
-  // (TOFU on the empty cache), populated for pinned. Without an explicit
-  // UserKnownHostsFile, ssh would fall back to the runtime user's
-  // ~/.ssh/known_hosts, where a stale entry for the same host:port (e.g.
-  // an earlier forge bound to that port) would block the clone because
-  // accept-new still rejects mismatches against cached keys. The per-call
-  // file is wiped by cleanup() so the agent never mutates global SSH state.
+  // Always a per-call known_hosts (empty for accept-new, populated for pinned).
+  // Otherwise ssh falls back to ~/.ssh/known_hosts, where a stale entry for the
+  // same host:port blocks the clone (accept-new still rejects mismatches), and
+  // the agent would mutate global SSH state.
   const knownHostsPath = join(tempDir, 'known_hosts');
   const knownHostsBody = opts.hostKeyPolicy === 'pinned' ? opts.knownHosts! : '';
   await writeFile(knownHostsPath, knownHostsBody, { mode: 0o600 });
@@ -92,11 +76,7 @@ export async function setupSshAuth(opts: SetupSshAuthOpts): Promise<SshAuthSetup
   };
 }
 
-/**
- * Quote a path for inclusion in `GIT_SSH_COMMAND`. We use single-quote
- * wrapping so backslashes and spaces survive git's shell-parse of the
- * command value.
- */
+/** Single-quote a path so backslashes and spaces survive git's shell-parse of `GIT_SSH_COMMAND`. */
 function escapeShellArg(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }

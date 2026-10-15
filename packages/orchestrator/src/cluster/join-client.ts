@@ -91,10 +91,9 @@ function sealedResponseOf(response: JoinResponse): SealedJoinResponse {
  * through.
  *
  * The `satisfies` clause makes a bundle storage field with no entry here a
- * compile error, so the projection cannot silently drop one — which is the
- * whole defect this artifact exists to avoid. The companion test pins the
- * other half: every field `sharedConfigSchema.storage` accepts, and every
- * variable named here, resolves in the startup env definition.
+ * compile error, so the projection cannot silently drop one. The companion test
+ * pins the other half: every field `sharedConfigSchema.storage` accepts, and
+ * every variable named here, resolves in the startup env definition.
  */
 export const STORAGE_ENV_VARS = {
   type: 'KICI_STORAGE_TYPE',
@@ -171,9 +170,7 @@ async function writeSecretFile(path: string, content: string): Promise<void> {
   await writeFileSecurely(path, content, SECRET_FILE_MODE);
 }
 
-/**
- * Write the env file the orchestrator boots from.
- */
+/** Write the env file the orchestrator boots from. */
 export async function writeEnvFile(path: string, bundle: ConfigBundle): Promise<void> {
   await writeSecretFile(path, buildEnvFile(bundle));
 }
@@ -234,15 +231,12 @@ export class JoinClient {
       throw new Error('--api-key is required for Platform relay mode');
     }
 
-    // Dynamic import ws for Node.js environments
     const { default: WebSocket } = await import('ws');
 
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url, {
-        // Cap the maximum decompressed frame size so a rogue or
-        // compromised Platform peer cannot OOM the joiner with a compression
-        // bomb during the join handshake. Without this, ws@8.x defaults
-        // to 100 MiB.
+        // Cap the decompressed frame size so a rogue or compromised Platform peer cannot OOM
+        // the joiner with a compression bomb during the join. ws@8.x defaults to 100 MiB.
         maxPayload: WS_MAX_PAYLOAD_BYTES,
         perMessageDeflate: {
           concurrencyLimit: 10,

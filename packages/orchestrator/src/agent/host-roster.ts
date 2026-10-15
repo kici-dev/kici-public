@@ -25,26 +25,20 @@ export type HostProperties = Record<string, string | number | boolean>;
 export const STAGED_AGENT_VERSION_KEY = 'kici:staged-agent-version';
 
 /**
- * Fold a hostname to its canonical form. Applied at every roster write AND at
- * every read that leaves the store, so one row's name can never be reported
- * folded and another's raw.
+ * Fold a hostname to its canonical form, at every roster write AND every read
+ * that leaves the store, so no row is reported folded while another is raw.
  *
- * Hostnames are case-insensitive by DNS convention, and the derived
- * `kici:host:<hostname>` label is already stored canonical — so an unfolded
- * `hostname` column disagreed in case with its own label. The label fold is
- * reused so the two can never drift apart. `agent_id` is deliberately NOT
- * folded: it is an opaque identifier, and matching it case-insensitively would
- * let a binding written for one agent reach another.
+ * Hostnames are case-insensitive (DNS), and the derived `kici:host:<hostname>`
+ * label is stored canonical, so the label fold is reused to keep the two in
+ * step. `agent_id` is deliberately NOT folded: it is opaque, and a
+ * case-insensitive match would let a binding for one agent reach another.
  *
- * The read side is load-bearing rather than belt-and-braces, because a write
- * fold alone never reaches every row: a `declareStatic`-only host has no agent
- * to re-register it, so its row keeps the case the operator typed for as long
- * as the host exists.
+ * The read fold is load-bearing: a `declareStatic`-only host has no agent to
+ * re-register it, so its row keeps the operator's case for as long as it exists.
  *
- * A hostname is also what `${host}` renders into a secret scope pattern, so a
- * binding on `prod/hosts/${host}` now resolves under the lowercase name — an
- * accepted breaking change, and one this delivers to every host at once rather
- * than to whichever rows happened to be rewritten.
+ * `${host}` in a secret scope pattern renders this name, so `prod/hosts/${host}`
+ * resolves under the lowercase name — an accepted breaking change, delivered to
+ * every host at once rather than to whichever rows happened to be rewritten.
  */
 function canonicalizeHostname(raw: string | null | undefined): string | null {
   return raw === null || raw === undefined ? null : canonicalizeLabel(raw);
@@ -64,11 +58,10 @@ export function isReservedHostKey(key: string): boolean {
 
 /**
  * Drop every reserved `kici:` key from an agent-reported host-property bag.
- * Agent-reported properties win the roster shallow-merge, and the staged-version
- * convergence gate and the restart commands the re-stage runs over SSH both
- * read `kici:` keys, so a registering agent must never set them. Reserved keys
- * come only from orchestrator code (`recordStagedVersion`) and a local
- * `kici-admin host declare`.
+ * Agent keys win the roster shallow-merge, and the staged-version convergence
+ * gate and the re-stage's SSH restart commands read `kici:` keys, so an agent
+ * must never set them. Reserved keys come only from `recordStagedVersion` and
+ * a local `kici-admin host declare`.
  */
 export function stripReservedProperties(props: HostProperties): HostProperties {
   const out: HostProperties = {};
@@ -147,10 +140,9 @@ export interface DeclareStaticInput {
 }
 
 /**
- * Pre-agent reach metadata for a declared host — how to SSH to it for bootstrap
- * bring-up before it has a KiCI agent. All fields nullable: a host with no reach
- * metadata cannot be bootstrapped. `sshKeySecret` is a scoped-secret ref
- * (`scope/key`) the orchestrator resolves server-side; the key never lives here.
+ * How to SSH to a declared host for bootstrap bring-up before it has an agent.
+ * A host with no reach metadata cannot be bootstrapped. `sshKeySecret` is a
+ * scoped-secret ref (`scope/key`) resolved server-side; the key never lives here.
  */
 export interface HostReach {
   agentId: string;
@@ -159,9 +151,9 @@ export interface HostReach {
   sshPort: number | null;
   sshKeySecret: string | null;
   /**
-   * When true, the box can reach the orchestrator's object storage — bring-up
-   * picks the `s3-direct` delivery mode (box pulls the payload via a presigned
-   * URL). NULL / false ⇒ the conservative `ssh-push` fallback.
+   * True ⇒ the box reaches the orchestrator's object storage, so bring-up uses
+   * `s3-direct` (the box pulls the payload via a presigned URL). NULL / false ⇒
+   * the conservative `ssh-push` fallback.
    */
   s3Reachable: boolean | null;
 }
@@ -184,19 +176,17 @@ export enum HostStatus {
 export type LifecycleClass = 'static' | 'ephemeral';
 
 /**
- * A roster host that matched a `runsOnAll` predicate, with its derived status.
- * The host-fanout resolver consumes this: `ready` hosts become pinned children;
- * `unreachable` static hosts are subject to the `onUnreachable` policy; `stale`
- * ephemeral hosts are skipped.
+ * A roster host that matched a `runsOnAll` predicate. In the host-fanout
+ * resolver, `ready` hosts become pinned children, `unreachable` static hosts
+ * get the `onUnreachable` policy, and `stale` ephemeral hosts are skipped.
  */
 export interface MatchedHost {
   agentId: string;
   /** Canonical hostname; falls back to the raw agentId when the row has none. */
   host: string;
   /**
-   * The row's labels, folded on read. A row written before labels were
-   * canonicalized still carries the case the operator typed, and this is the
-   * only place that case would otherwise reach a matcher.
+   * Folded on read: a row written before labels were canonicalized keeps the
+   * operator's case, and this is the only place it would otherwise reach a matcher.
    */
   labels: CanonicalLabel[];
   lifecycleClass: LifecycleClass;
@@ -214,10 +204,9 @@ export interface UpsertHostInput {
   tokenId: string | null;
   lifecycleClass: LifecycleClass;
   /**
-   * True when an auto-scaler backend spawned this agent, so `runsOnAll`
-   * fan-out skips it. Derived from the scaler manager's registration lookup,
-   * never from `lifecycleClass` (which is `ephemeral` for every agent when the
-   * auth mode is `none`). Omitted ⇒ false.
+   * True when an auto-scaler spawned this agent, so `runsOnAll` fan-out skips
+   * it. From the scaler manager's registration lookup, never `lifecycleClass`
+   * (`ephemeral` for every agent under auth mode `none`). Omitted ⇒ false.
    */
   scalerManaged?: boolean;
   labels: string[];
@@ -226,9 +215,8 @@ export interface UpsertHostInput {
   arch: string;
   instanceId: string;
   /**
-   * Agent-reported typed host-vars. Shallow-merged into any existing bag on
-   * conflict (agent-reported keys win; operator-declared keys the agent does
-   * not report are preserved). Omitted ⇒ no change to the stored bag on update,
+   * Shallow-merged into the existing bag on conflict: agent keys win, operator
+   * keys the agent does not report survive. Omitted ⇒ no change on update,
    * `{}` on insert.
    */
   properties?: HostProperties;
@@ -242,13 +230,11 @@ export interface HostStatusRow {
 }
 
 /**
- * The ONE status-derivation function — used by the store and the kici-admin
- * host CLI. `ready` requires the host to be genuinely live (connected to some
- * instance AND heartbeat fresh — the freshness check catches a crashed
- * instance that never cleared `connected_instance_id`). It never returns
- * `ready` for a not-currently-live host: a not-live `static` reads
- * `unreachable` (the declared-but-absent alarm), a not-live `ephemeral` reads
- * `stale` (scaled down, awaiting reap).
+ * The ONE status derivation, shared by the store and the kici-admin host CLI.
+ * `ready` needs a connected instance AND a fresh heartbeat (freshness catches a
+ * crashed instance that never cleared `connected_instance_id`). A not-live
+ * `static` reads `unreachable` (the declared-but-absent alarm); a not-live
+ * `ephemeral` reads `stale` (scaled down, awaiting reap).
  */
 export function deriveHostStatus(row: HostStatusRow, nowMs: number, graceMs: number): HostStatus {
   const ageMs = nowMs - new Date(row.last_seen).getTime();
@@ -258,9 +244,8 @@ export function deriveHostStatus(row: HostStatusRow, nowMs: number, graceMs: num
 }
 
 /**
- * Normalize a stored `host_properties` value into a typed host-vars bag. The pg
- * driver returns parsed JSON for a `jsonb` column, but accept a JSON string too
- * (defensive for non-pg paths / tests). Non-object / null reads back as `{}`.
+ * Normalize a stored `host_properties` value. pg returns parsed `jsonb`; a JSON
+ * string is accepted for non-pg paths and tests. Non-object / null reads `{}`.
  */
 export function parseHostProperties(value: unknown): HostProperties {
   const parsed = typeof value === 'string' ? safeJsonParse(value) : value;
@@ -273,12 +258,12 @@ export function parseHostProperties(value: unknown): HostProperties {
 /**
  * Durable, cluster-shared roster of every agent the cluster has ever enrolled.
  *
- * The in-memory `AgentRegistry` reconciles into this table on register
- * (`upsert`) / unregister (`markDisconnected`), with a coarse heartbeat
- * (`stampLastSeen`). All liveness writes are owner-guarded by `instanceId` so a
- * stale disconnect from an old instance can never clobber a row a different
- * instance now owns. The leader-only reaper deletes `ephemeral` rows past their
- * ttl via `reapEphemeralPastTtl`; `static` rows persist and read `unreachable`.
+ * The in-memory `AgentRegistry` reconciles into it on register (`upsert`),
+ * unregister (`markDisconnected`) and a coarse heartbeat (`stampLastSeen`).
+ * Liveness writes are owner-guarded by `instanceId`, so a stale disconnect from
+ * an old instance never clobbers a row another instance now owns. The
+ * leader-only reaper deletes `ephemeral` rows past ttl; `static` rows persist
+ * and read `unreachable`.
  */
 export class HostRosterStore {
   constructor(private readonly db: Kysely<Database>) {}
@@ -287,8 +272,7 @@ export class HostRosterStore {
   async upsert(input: UpsertHostInput): Promise<void> {
     const labelsJson = JSON.stringify(input.labels);
     const hostname = canonicalizeHostname(input.hostname);
-    // Strip the reserved `kici:` namespace from agent-reported properties. This
-    // is a security boundary: a compromised agent could otherwise forge
+    // Security boundary: without the strip, a compromised agent could forge
     // `kici:staged-agent-version` (evading the fleet-upgrade convergence) or
     // `kici:agent-restart-*` (a command the re-stage runs over SSH).
     const reportedJson = JSON.stringify(stripReservedProperties(input.properties ?? {}));
@@ -313,20 +297,18 @@ export class HostRosterStore {
         oc.column('agent_id').doUpdateSet({
           token_id: input.tokenId,
           lifecycle_class: input.lifecycleClass,
-          // Re-registration converges this like every other identity column: a
-          // host that stops (or starts) being scaler-spawned under the same
-          // agent id must not keep a stale fan-out eligibility.
+          // Converges on re-registration, so a host that stops (or starts) being
+          // scaler-spawned under the same agent id never keeps stale eligibility.
           scaler_managed: input.scalerManaged ?? false,
           labels: labelsJson,
           hostname,
           platform: input.platform,
           arch: input.arch,
           connected_instance_id: input.instanceId,
-          // An agent registration confirms the host. A row a dashboard declare
-          // created is replaced by what the agent reports; any other row keeps a
-          // shallow merge (agent keys win, operator keys it does not report
-          // survive). PostgreSQL evaluates every SET expression against the
-          // existing row, so this CASE reads the source before the update.
+          // Registration confirms the host: a dashboard-declared row is replaced
+          // by the agent's report; any other row shallow-merges (agent keys win).
+          // PostgreSQL evaluates every SET against the existing row, so this CASE
+          // reads the source before the update.
           host_properties: sql`CASE WHEN host_roster.identity_source = ${HostIdentitySource.platform}
             THEN ${reportedJson}::jsonb
             ELSE COALESCE(host_roster.host_properties, '{}'::jsonb) || ${reportedJson}::jsonb END`,
@@ -359,10 +341,9 @@ export class HostRosterStore {
   }
 
   /**
-   * Declare a static host. Under `operator` authority (a local `kici-admin`),
-   * it inserts or converges the row; under `platform` authority (a dashboard
-   * write, the default) it only creates a new, unconfirmed row. Returns
-   * `{ created: true }` when the declare inserted the row.
+   * Declare a static host. `operator` authority (a local `kici-admin`) inserts
+   * or converges the row; `platform` authority (a dashboard write, the default)
+   * only creates a new, unconfirmed row. `created` is true when it inserted.
    */
   async declareStatic(input: DeclareStaticInput): Promise<{ created: boolean }> {
     const authority = input.authority ?? HostWriteAuthority.platform;
@@ -415,14 +396,13 @@ export class HostRosterStore {
   /**
    * An operator declare. A re-declare converges the operator-owned columns
    * (labels, hostname, reach, host_properties) and preserves the agent-reported
-   * liveness and identity columns (connected_instance_id, last_seen, platform,
-   * arch, lifecycle_class, token_id, reboot_pending_until). Each operator field
-   * is preserve-on-omit, and properties shallow-merge — except on a row a
-   * dashboard declare created: there the operator's values replace labels,
-   * hostname and properties outright, so no Platform-chosen value survives the
-   * confirmation, and the row becomes `operator`. An `agent` row stays `agent`.
-   * PostgreSQL evaluates every SET expression against the existing row, so each
-   * CASE reads the source before this statement changes it.
+   * ones (connected_instance_id, last_seen, platform, arch, lifecycle_class,
+   * token_id, reboot_pending_until). Operator fields are preserve-on-omit and
+   * properties shallow-merge — except on a dashboard-declared row, where the
+   * operator's labels, hostname and properties replace it outright (no
+   * Platform-chosen value survives confirmation) and the row becomes
+   * `operator`. An `agent` row stays `agent`. PostgreSQL evaluates every SET
+   * against the existing row, so each CASE reads the source before the update.
    */
   private async declareAsOperator(input: DeclareStaticInput): Promise<{ created: boolean }> {
     // undefined ⇒ NULL ⇒ COALESCE preserves the existing column on update.
@@ -505,12 +485,11 @@ export class HostRosterStore {
   }
 
   /**
-   * Record the self-contained agent-payload version the orchestrator staged onto
-   * a host (bring-up or fleet re-stage). Stored in `host_properties` under a
-   * reserved key so the convergence gate can compare it against the target
-   * INDEPENDENTLY of the agent's own self-reported bundle version (two payloads
-   * can carry the same self-report but different staged keys). Shallow-merged, so
-   * it survives an agent re-register (the agent's reserved keys are stripped).
+   * Record the agent-payload version staged onto a host (bring-up or fleet
+   * re-stage), under a reserved key, so the convergence gate compares it to the
+   * target INDEPENDENTLY of the agent's self-reported version (two payloads can
+   * share a self-report but differ in staged key). Shallow-merged, so it survives
+   * an agent re-register (the agent's reserved keys are stripped).
    */
   async recordStagedVersion(agentId: string, version: string): Promise<void> {
     const patch = JSON.stringify({ [STAGED_AGENT_VERSION_KEY]: version });
@@ -548,14 +527,13 @@ export class HostRosterStore {
 
   /**
    * Resolve EVERY roster host matching a label predicate (OR-of-AND include
-   * groups, minus exclude labels), tagged with its derived status. Returns
-   * declared-but-absent static hosts (status `unreachable`) so a caller can
-   * apply `onUnreachable` — the live registry alone cannot name an
-   * expected-but-absent host.
+   * groups, minus exclude labels), with derived status. Declared-but-absent
+   * static hosts come back `unreachable` so a caller can apply `onUnreachable`;
+   * the live registry alone cannot name them.
    *
-   * This is the INVENTORY query: it includes auto-scaler-spawned hosts, whose
-   * `lifecycleClass` is what the SDK's `ctx.kici.inventory` exposes to tell
-   * them apart. `runsOnAll` fan-out uses {@link findFanoutTargets} instead.
+   * The INVENTORY query: it includes auto-scaler hosts, told apart by the
+   * `lifecycleClass` `ctx.kici.inventory` exposes. `runsOnAll` fan-out uses
+   * {@link findFanoutTargets} instead.
    */
   async findMatching(
     include: readonly (readonly LabelMatcher[])[],
@@ -566,17 +544,14 @@ export class HostRosterStore {
   }
 
   /**
-   * Resolve the `runsOnAll` fan-out target set: {@link findMatching}, minus
-   * every auto-scaler-spawned host.
+   * The `runsOnAll` fan-out targets: {@link findMatching} minus every
+   * auto-scaler host. Fan-out targets DECLARED fleet members: a scaler agent
+   * has a pool's fixed shape, so a child pinned to one runs at that shape — the
+   * defect the dispatcher's warm-pool suitability gate removes, on the path a
+   * pin deliberately leaves ungated.
    *
-   * Fan-out targets DECLARED fleet members. An auto-scaler agent is spawned to
-   * a pool's fixed shape, so a child pinned to one runs at that shape rather
-   * than its own — the same defect the dispatcher's warm-pool suitability gate
-   * removes, on the path a pin deliberately leaves ungated.
-   *
-   * Separate from `findMatching` on purpose: `findMatching` also backs the
-   * SDK's `inventory.query`, where a host the caller asked for must never go
-   * missing (a selector returning FEWER hosts than no selector at all).
+   * Separate on purpose: `findMatching` also backs `inventory.query`, where a
+   * selector must never return FEWER hosts than no selector at all.
    */
   async findFanoutTargets(
     include: readonly (readonly LabelMatcher[])[],
@@ -587,10 +562,8 @@ export class HostRosterStore {
   }
 
   /**
-   * Shared row loop behind {@link findMatching} and {@link findFanoutTargets}.
-   * `excludeScalerManaged` stays private to the store — each public method
-   * names its own semantics, so a call site cannot silently pick the wrong
-   * population by passing a bare boolean.
+   * Shared row loop. `excludeScalerManaged` stays private so a call site cannot
+   * pick the wrong population by passing a bare boolean.
    */
   private async matchRows(
     include: readonly (readonly LabelMatcher[])[],
@@ -598,8 +571,8 @@ export class HostRosterStore {
     graceMs: number,
     excludeScalerManaged: boolean,
   ): Promise<MatchedHost[]> {
-    // A row a dashboard declare created is an unconfirmed placeholder: it is
-    // never a fan-out or inventory target until its agent or an operator confirms it.
+    // A dashboard-declared row is an unconfirmed placeholder: never a target
+    // until its agent or an operator confirms it.
     const rows = await this.db
       .selectFrom('host_roster')
       .selectAll()
@@ -609,8 +582,7 @@ export class HostRosterStore {
     const out: MatchedHost[] = [];
     for (const row of rows) {
       if (excludeScalerManaged && row.scaler_managed) continue;
-      // Rows persisted before labels were canonicalized still carry the case
-      // the operator typed, so fold on read rather than migrating the table.
+      // Fold on read rather than migrating rows written before canonicalization.
       const labels = canonicalizeLabels(JSON.parse(row.labels) as string[]);
       const set = new Set(labels);
       if (exclude.some((e) => matcherSatisfiedBy(canonicalizeMatcher(e), set))) continue;
@@ -639,23 +611,17 @@ export class HostRosterStore {
   }
 
   /**
-   * Map a roster row to the canonical {@link HostInventoryEntry} — the queryable
-   * shape returned by the `inventory.query`/`inventory.get` RPC and typed on the
-   * SDK's `ctx.kici.inventory`. Status is derived the same way `findMatching`
-   * derives it (live + fresh ⇒ ready; declared-but-absent static ⇒ unreachable;
-   * ephemeral past ttl ⇒ stale).
+   * Map a roster row to the {@link HostInventoryEntry} the `inventory.query` /
+   * `inventory.get` RPC returns and `ctx.kici.inventory` types. Status derives
+   * as in `findMatching`.
    */
   toInventoryEntry(row: HostRosterRow, graceMs: number): HostInventoryEntry {
     return {
       agentId: row.agent_id,
-      // Folded for the same reason `matchRows` folds: a row written before the
-      // fold shipped must still answer a canonical `inventory.query` selector.
+      // Folded as in `matchRows`, so an old row answers a canonical selector.
       labels: canonicalizeLabels(JSON.parse(row.labels) as string[]),
       properties: parseHostProperties(row.host_properties),
-      // Folded for the same reason the labels above are: a declared-only host
-      // never re-registers, so its row keeps the case the operator typed
-      // forever, and `ctx.kici.inventory` must not report one host's name
-      // folded and its neighbour's raw.
+      // Read fold: see canonicalizeHostname.
       hostname: canonicalizeHostname(row.hostname),
       platform: row.platform,
       arch: row.arch,
@@ -666,10 +632,10 @@ export class HostRosterStore {
   }
 
   /**
-   * Query the roster as canonical {@link HostInventoryEntry} records. With a
-   * selector, reuses `findMatching`'s label filtering (server-side, glob/regex);
-   * property filtering is done client-side in the workflow. Omit the selector ⇒
-   * every host. Unconfirmed rows a dashboard declare created are omitted.
+   * Query the roster as {@link HostInventoryEntry} records. A selector reuses
+   * `findMatching`'s server-side label filtering (glob/regex); property
+   * filtering happens client-side in the workflow. No selector ⇒ every host.
+   * Unconfirmed dashboard-declared rows are omitted.
    */
   async queryInventory(
     selector: InventorySelector | undefined,
@@ -717,13 +683,11 @@ export class HostRosterStore {
   }
 
   /**
-   * Count `static` (declared) hosts whose derived status is `unreachable` —
-   * the "declared-but-absent" alarm population. Reuses the single-source
-   * {@link deriveHostStatus} so the count never diverges from what
-   * `kici-admin host list` shows. A not-currently-connected static host reads
-   * `unreachable` regardless of grace (only the connected-but-stale case
-   * depends on `graceMs`). An unconfirmed dashboard-created row never raises
-   * the alarm.
+   * Count `unreachable` static hosts — the declared-but-absent alarm. Uses
+   * {@link deriveHostStatus} so it matches `kici-admin host list`. A
+   * disconnected static host is `unreachable` regardless of grace; only the
+   * connected-but-stale case depends on `graceMs`. An unconfirmed
+   * dashboard-created row never raises the alarm.
    */
   async countStaticUnreachable(graceMs: number): Promise<number> {
     const rows = await this.db
@@ -769,9 +733,8 @@ export class HostRosterStore {
   }
 
   /**
-   * Mark a host as about-to-reboot until `until`. Set by the `host.requestReboot`
-   * API handler when an agent's `restartHost()` step runs. While the value is in
-   * the future, the host's disconnect is the expected reboot and its pinned
+   * Set by the `host.requestReboot` handler when an agent's `restartHost()` step
+   * runs. Until `until`, a disconnect is the expected reboot and the pinned
    * post-restart job is held.
    */
   async setRebootPending(agentId: string, until: Date): Promise<void> {

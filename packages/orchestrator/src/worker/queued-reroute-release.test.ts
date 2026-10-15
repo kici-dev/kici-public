@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { InMemoryJobQueue } from './in-memory-job-queue.js';
 import { InMemoryExecutionTracker } from './in-memory-execution-tracker.js';
 import { releaseQueuedRerouteJobs } from './queued-reroute-release.js';
+import { startRun } from '../__test-helpers__/tracker.js';
 
 const input = (jobId: string, runId = 'run-1') => ({
   jobId,
@@ -28,18 +29,13 @@ async function setup(jobIds: string[]) {
     await queue.enqueue(input(id));
     jobOwnership.set(id, 'wss://coord');
   }
-  await executionTracker.onExecutionStarted(
-    'run-1',
-    'ci',
-    'github',
-    '',
-    'main',
-    'abc',
-    'd-1',
-    {},
-    null,
-    jobIds.map((jobId) => ({ jobId, jobName: jobId })),
-  );
+  await startRun(executionTracker, {
+    repoIdentifier: '',
+    ref: 'main',
+    sha: 'abc',
+    deliveryId: 'd-1',
+    jobs: jobIds.map((jobId) => ({ jobId, jobName: jobId })),
+  });
   const dispatcher = {
     cancelQueuedJob: vi.fn(async (id: string, reason: string) => queue.markFailed(id, reason)),
   };

@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/shared",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Shared utilities for the KiCI CI/CD stack — logging, zx setup, crypto, telemetry, health and metrics routes. No business logic.",
   "keywords": [
     "ci",
@@ -108,7 +108,7 @@
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "build": "node ../../scripts/build-ts.mjs && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/shared --name @kici-dev/shared"
@@ -139,6 +139,7 @@
     "zx": "^8.8.5"
   },
   "devDependencies": {
+    "@kici-dev/test-support": "workspace:*",
     "@opentelemetry/sdk-trace-base": "^2.11.0",
     "@types/archiver": "^8.0.0",
     "@types/dockerode": "^4.0.1",

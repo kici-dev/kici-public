@@ -23,16 +23,10 @@ import type { ContextMetadata } from '../generators/secrets-dts.js';
 import { toErrorMessage } from '@kici-dev/core';
 
 /**
- * Error kinds meaning the Platform is genuinely unreachable or the CLI is not
- * configured to reach it — not authenticated, no active org, network down, or
- * orchestrator offline. For these, `kici types` falls back to the local secret
- * files, then to an empty stub, so the declaration file always exists
- * (typecheck degrades to "no known keys" rather than "module has no exported
- * member") instead of failing.
- *
- * An authenticated-but-rejected response (`unauthorized`, `forbidden`, …) is
- * deliberately excluded: that is a real credential/permission problem the user
- * must see, and writing a stub would mask it.
+ * The Platform is unreachable or unconfigured, so `kici types` falls back to the
+ * local secret files, then an empty stub. An authenticated-but-rejected response
+ * (`unauthorized`, `forbidden`, …) is deliberately excluded: a stub would mask a
+ * real credential problem the user must see.
  */
 const UNREACHABLE_ERROR_KINDS: readonly DashboardErrorKind[] = [
   'not_logged_in',
@@ -42,20 +36,14 @@ const UNREACHABLE_ERROR_KINDS: readonly DashboardErrorKind[] = [
 ];
 
 export interface TypesOptions {
-  /**
-   * Path to the `.kici` directory (defaults to `.kici`). Resolved through
-   * `resolveKiciDir`, the same resolver every other command uses, so a
-   * relative value is interpreted against the project rather than against
-   * whatever directory the CLI happened to be invoked from.
-   */
+  /** Defaults to `.kici`; resolved against the project, as every command does. */
   kiciDir?: string;
-  /** Suppress the success line on stdout (so machine-readable output stays pure). */
+  /** Suppresses the stdout success line, so machine-readable output stays pure. */
   quiet?: boolean;
-  /** `--orchestrator-url`: read key names from this orchestrator directly. */
+  /** Reads key names from this orchestrator directly. */
   orchestratorUrl?: string;
 }
 
-/** Key names from one source, or why that source could not supply them. */
 type SourceRead =
   | { kind: 'ok'; source: TypesSource; contexts: ContextMetadata[] }
   | { kind: 'unreachable'; reason: string }
@@ -69,7 +57,6 @@ async function readFileOrNull(p: string): Promise<string | null> {
   }
 }
 
-/** Read context key names straight from an orchestrator. */
 async function readFromOrchestrator(
   target: Extract<RunTarget, { kind: 'direct' }>,
 ): Promise<SourceRead> {
@@ -92,7 +79,6 @@ async function readFromOrchestrator(
   }
 }
 
-/** Read context key names through the Platform login. */
 async function readFromPlatform(config: GlobalConfig): Promise<SourceRead> {
   try {
     const client = DashboardClient.fromConfig(config);
@@ -111,13 +97,12 @@ async function readFromPlatform(config: GlobalConfig): Promise<SourceRead> {
   }
 }
 
-/** Key names from `.kici/.secrets` and `.kici/secrets.yaml` (never values). */
+/** Key names from `.kici/.secrets` and `.kici/secrets.yaml`, never values. */
 async function readFromLocalFiles(kiciDir: string): Promise<ContextMetadata[]> {
   const contexts = await loadLocalSecretContexts(kiciDir);
   return Object.entries(contexts).map(([name, values]) => ({ name, keys: Object.keys(values) }));
 }
 
-/** Read from the remote target (direct orchestrator, else the Platform login). */
 async function readRemote(config: GlobalConfig, options: TypesOptions): Promise<SourceRead | null> {
   const resolved = resolveRunTarget({
     flagUrl: options.orchestratorUrl,
@@ -135,26 +120,15 @@ async function readRemote(config: GlobalConfig, options: TypesOptions): Promise<
 }
 
 /**
- * Generate TypeScript declarations for context secrets.
- *
- * Reads context secret key names from a direct orchestrator target, else the
- * Platform login, else the local secret files, and writes
- * .kici/types/secrets.d.ts with module augmentation for KnownSecretKeys and
- * ContextSecrets. The header names the source. A key set read from an
- * orchestrator or the Platform is never replaced by local files or the
- * offline stub.
- *
- * @param options - Command options
- * @returns true on success, false on error
+ * Writes `.kici/types/secrets.d.ts` (augmenting KnownSecretKeys and
+ * ContextSecrets) from a direct orchestrator, else the Platform login, else the
+ * local secret files; the header names the source. A remote key set is never
+ * replaced by local files or the offline stub.
  */
 export async function typesCommand(options: TypesOptions = {}): Promise<boolean> {
-  // Resolve before joining. `path.join('.kici', 'types')` is cwd-relative, and
-  // `resolveKiciDir` accepts the cwd already being the `.kici` directory, so an
-  // unresolved join lands the declarations at `<project>/.kici/.kici/types/` —
-  // inside the tree `hashKiciSourceTree` walks and outside the `.kici/types/`
-  // prefix it excludes. That poisons the digest the compiler just recorded into
-  // the lock file, and every agent re-walking the tree then rejects the run as
-  // a stale lock.
+  // Resolve before joining: when the cwd is already `.kici`, a raw join lands at
+  // `.kici/.kici/types/`, inside the tree `hashKiciSourceTree` walks but outside
+  // its `.kici/types/` exclusion, so every agent rejects the run as a stale lock.
   const kiciDir = resolveKiciDir(options.kiciDir);
   const typesDir = path.join(kiciDir, 'types');
   const outputPath = path.join(typesDir, 'secrets.d.ts');
@@ -181,7 +155,7 @@ export async function typesCommand(options: TypesOptions = {}): Promise<boolean>
   }
 }
 
-/** Write a key set unless the existing file holds a remote one local files must not replace. */
+/** Skips the write when the existing file holds a remote key set local files must not replace. */
 async function writeTypes(
   outputPath: string,
   source: TypesSource,
@@ -215,13 +189,10 @@ async function writeTypes(
 }
 
 /**
- * No source supplied key names. Keep an existing declaration file untouched —
- * a transient offline `kici compile` / `kici types` must not clobber a
- * developer's populated types with an empty stub. Only when the file is
- * absent or itself a stub (a fresh clone / unauthenticated CI, where it is
- * gitignored) write a valid empty augmentation, so typecheck degrades to "no
- * known keys" rather than failing with "module has no exported member".
- * Either way, warn but do not fail the command.
+ * A transient offline run must not clobber populated types, so only an absent
+ * file or an existing stub (fresh clone, unauthenticated CI) gets the empty
+ * augmentation: typecheck then reports "no known keys", not "module has no
+ * exported member". Either way it warns and succeeds.
  */
 async function writeOfflineStub(outputPath: string, reason: string): Promise<boolean> {
   const existing = existingTypesSource(await readFileOrNull(outputPath));

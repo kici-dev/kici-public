@@ -184,9 +184,8 @@ describe('handleTestTrigger', () => {
   });
 
   it('does NOT resolve an overlay when cliPublicKey is absent (no-secrets run regression)', async () => {
-    // Regression for the no-secrets fullRepo run that produced an empty workDir:
-    // the overlay key must come from `cliPublicKey`, never `encryptedSecretsKey`.
-    // With only an uploadId (no cliPublicKey), no overlay is resolved.
+    // Guards the empty-workDir no-secrets fullRepo run: the overlay key comes
+    // from `cliPublicKey`, never `encryptedSecretsKey`.
     const initMeta = vi.fn().mockResolvedValue(undefined);
     const getUrl = vi.fn().mockResolvedValue('https://dl.example/tarball.enc');
     const { db } = makeDbMock({
@@ -213,9 +212,8 @@ describe('handleTestTrigger', () => {
         fixtureId: 'fix-3',
         event: { type: 'push', targetBranch: 'main', payload: {} },
         uploadId: 'up-2',
-        // No cliPublicKey → overlay cannot be resolved (and must not fall back
-        // to encryptedSecretsKey). For run-remote the CLI always sends
-        // cliPublicKey, so this guards the contract, not the happy path.
+        // No cliPublicKey. run-remote always sends one, so this guards the
+        // contract, not the happy path.
       },
       deps,
     );
@@ -446,10 +444,9 @@ describe('handleTestRunLogs', () => {
     const { db } = makeDbMock({
       runRow: { run_id: 'run-1', status: 'success', is_test_run: true },
     });
-    // The final log file ("marker") is not yet visible to list/read until the
-    // pending append is drained — the race that drops the last user-visible
-    // line. The logWriter.drain mock both proves drain() is awaited AND, when
-    // it resolves, makes the marker file appear in the storage snapshot.
+    // The final "marker" file is invisible until the pending append drains —
+    // the race that drops the last user-visible line. The drain mock makes the
+    // marker appear, so the result proves drain() was awaited.
     const visibleFiles: Record<string, string> = { ...FILES };
     const logStorage = {
       list: vi.fn(() => Promise.resolve(Object.keys(visibleFiles))),
@@ -458,7 +455,6 @@ describe('handleTestRunLogs', () => {
       ),
     };
     const drain = vi.fn(async () => {
-      // Simulate the pending append landing as part of the drain.
       visibleFiles['executions/run-1/job-test/step-1.log'] = 'marker:DYNENV_SECRET_OK';
     });
     const deps = { db, logStorage, logWriter: { drain } } as unknown as TestRelayHandlerDeps;
@@ -469,8 +465,7 @@ describe('handleTestRunLogs', () => {
     )) as { lines: string[]; nextCursor: number; done: boolean };
 
     expect(drain).toHaveBeenCalledWith('run-1');
-    // The marker line — written during the drain — is present, AND the response
-    // is only done once it has been included (no done:true without the line).
+    // No done:true without the marker line.
     expect(result.lines).toContain('marker:DYNENV_SECRET_OK');
     expect(result.done).toBe(true);
     expect(result.nextCursor).toBe(result.lines.length);
@@ -545,14 +540,11 @@ describe('handleTestCancel', () => {
 });
 
 /**
- * Attribution of a relayed test run.
- *
- * The Platform has always stamped `actor` on `test.relay.trigger` — the wire
- * schema requires it — but the handler dropped it on the floor: it wrote one
- * `access_log` row and passed nothing into the pipeline. So the orchestrator's
- * own `execution_runs.triggered_by` stayed NULL for every `kici run remote`
- * run, and the orchestrator dashboard, `kici runs show` and `kici-admin` all
- * reported no initiator for a run that plainly had one.
+ * Attribution of a relayed test run: the schema-required `actor` on
+ * `test.relay.trigger` must reach the pipeline, not only the `access_log` row.
+ * Otherwise `execution_runs.triggered_by` stays NULL for every
+ * `kici run remote` run, and the dashboard, `kici runs show` and `kici-admin`
+ * report no initiator.
  */
 describe('handleTestTrigger attribution', () => {
   // The pipeline mock is module-scoped and shared with the describe above, so
@@ -599,9 +591,8 @@ describe('handleTestTrigger attribution', () => {
   });
 
   it('threads an agent-kind actor through unflattened', async () => {
-    // Provenance travels as part of the actor, not pre-rendered: the pipeline
-    // is what decides how to split it across `triggered_by` and
-    // `triggered_by_agent_label`.
+    // The pipeline, not the handler, splits provenance across `triggered_by`
+    // and `triggered_by_agent_label`.
     vi.mocked(testPipeline.processTestTrigger).mockResolvedValue({
       runId: 'run-2',
       status: 'accepted',

@@ -1,11 +1,9 @@
 /**
- * Multi-context merge helpers shared across the orchestrator dispatch path.
+ * Multi-context merge helpers for the orchestrator dispatch path.
  *
- * A job may bind several contexts in order; their resolved
- * secrets/variables are folded last-wins (a later context's key overrides an
- * earlier one) and their protection gates combine all-must-pass. This module is
- * browser-safe (pure functions + a Zod enum, no Node built-ins) so it can be
- * exported from the engine context barrel.
+ * A job may bind several contexts in order; their resolved secrets/variables
+ * fold last-wins and their protection gates combine all-must-pass. Browser-safe
+ * (no Node built-ins), so the engine context barrel exports it.
  */
 import { z } from 'zod';
 
@@ -24,9 +22,8 @@ export const ContextGateRejectReason = z.enum([
 export type ContextGateRejectReason = z.infer<typeof ContextGateRejectReason>;
 
 /**
- * Fold an ordered list of per-context resolved maps into one. Later entries
- * override earlier keys (last-wins), matching the documented merge order for
- * `contexts: [...]`.
+ * Fold ordered per-context maps into one, last-wins, matching the documented
+ * merge order for `contexts: [...]`.
  */
 export function mergeOrderedMaps(
   maps: ReadonlyArray<Record<string, string>>,

@@ -1,8 +1,5 @@
 /**
- * Tests for admin run inspection routes.
- *
- * Verifies auth, RBAC, query parameter filtering, and response shapes
- * for:
+ * Auth, RBAC, query filtering and response shapes for the admin run routes:
  *   GET /api/v1/admin/runs                        — list + filters
  *   GET /api/v1/admin/runs/:runId                 — run header only
  *   GET /api/v1/admin/runs/:runId/jobs            — jobs (+ optional steps)
@@ -18,9 +15,8 @@ import type { Role } from '../secrets/rbac.js';
 import { encrypt, deriveKey } from '@kici-dev/shared';
 
 /**
- * Minimal mock for a Kysely query chain. Each call in the builder chain
- * returns the same proxy, and terminal executors are swappable via the
- * returned vi.fn() references so tests can stage per-call responses.
+ * Kysely chain mock: every builder call returns the same proxy, and the returned
+ * terminal-executor vi.fn()s let tests stage per-call responses.
  */
 function createMockDb() {
   const mockExecute = vi.fn().mockResolvedValue([]);
@@ -29,11 +25,9 @@ function createMockDb() {
 
   const whereCalls: Array<unknown[]> = [];
   /**
-   * The same predicates, tagged with the table the query read.
-   *
-   * `whereCalls` alone cannot say WHICH query carried a predicate, so a route
-   * that issues two queries against the same id proves nothing by its presence
-   * — dropping the predicate from one of them leaves the other's entry behind.
+   * The same predicates, tagged with the queried table. `whereCalls` alone
+   * cannot say WHICH query carried a predicate: with two queries on the same id,
+   * dropping it from one leaves the other's entry behind.
    */
   const whereCallsByTable: Array<{ table: string; args: unknown[] }> = [];
   /** Every table name passed to `selectFrom`, in call order. */
@@ -234,10 +228,9 @@ describe('admin run routes', () => {
     });
 
     it('accepts every run status on ?status, including held and cancelling', async () => {
-      // The route-level assertion, not just the constant: `?status=held` used
-      // to be rejected with 400 even though held runs exist, and a test that
-      // only probed the exported set would still pass with the validation loop
-      // deleted.
+      // Asserted at the route, not on the constant: a test probing only the
+      // exported set would still pass with the validation loop deleted, or with
+      // `?status=held` rejected by 400 although held runs exist.
       for (const status of ExecutionRunStatus.options) {
         const res = await request(app, `?status=${status}`, { token: validToken });
         expect(res.status, `?status=${status} should be accepted`).toBe(200);
@@ -394,10 +387,9 @@ describe('admin run routes', () => {
       expect(res.status).toBe(404);
     });
 
-    // `runs_on_labels` and `matrix_values` are JSONB, so the driver hands back a
-    // parsed array/object. Both fixtures below use that real shape: with a JSON
-    // string instead, the route could re-parse it and still look correct while
-    // returning null against a live database for every job.
+    // `runs_on_labels` and `matrix_values` are JSONB, so the driver returns a
+    // parsed value; the fixtures use that real shape. With a JSON string, a route
+    // that re-parses would look correct yet return null against a live database.
     it('passes JSONB columns through as the driver already parsed them', async () => {
       const now = new Date();
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
@@ -900,14 +892,13 @@ describe('admin run routes', () => {
   // ── step logs: the dispatch-queue fallback for eval rounds ──────
   //
   // A global eval round writes NO `execution_runs` row when it admits its
-  // candidates (the round is what decides whether a run exists at all), yet
-  // its `global-eval` step log is durably stored. `dispatch_queue` carries
-  // the same `run_id` plus the `routing_key` the scope guard needs, so the
-  // route resolves such ids there. The mock db ignores the table name, so
-  // each staged `executeTakeFirst` value is consumed in query order:
-  // execution_runs, then dispatch_queue, then the `execution_steps` lookup
-  // inside `readStepLogLines`. `selectFromCalls` records which tables were
-  // actually read.
+  // candidates (the round decides whether a run exists at all), yet its
+  // `global-eval` step log is durably stored. `dispatch_queue` carries the same
+  // `run_id` plus the `routing_key` the scope guard needs, so the route
+  // resolves such ids there. The mock ignores table names, so staged
+  // `executeTakeFirst` values are consumed in query order: execution_runs,
+  // dispatch_queue, then `execution_steps` inside `readStepLogLines`.
+  // `selectFromCalls` records which tables were read.
 
   describe('GET /runs/:runId/jobs/:jobId/steps/:stepIndex/logs — eval-round fallback', () => {
     /** Point `tokenManager.validate` at a routing-key-scoped token. */
@@ -939,16 +930,12 @@ describe('admin run routes', () => {
       const body = await res.json();
       expect(body.lines).toEqual([{ untrusted: true, value: '[global-filter] verdict=true' }]);
       expect(deps.mockDb.selectFromCalls).toContain('dispatch_queue');
-      // The fallback must be keyed on THIS run. Without the predicate the
-      // query returns an ARBITRARY queued row, whose routing key would then
-      // authorize the request — and every other assertion in this describe
-      // still passes, because the mock returns the staged row either way.
-      //
-      // Asserted against `whereCallsByTable`, not `whereCalls`: the
-      // `execution_runs` lookup and the `execution_steps` lookup inside
-      // `readStepLogLines` both carry the same `run_id` predicate, so a
-      // table-blind assertion would be satisfied by either of them and prove
-      // nothing about the fallback.
+      // The fallback must be keyed on THIS run: without the predicate an
+      // ARBITRARY queued row's routing key would authorize the request, and
+      // every other assertion here still passes (the mock returns the staged row).
+      // Asserted on `whereCallsByTable`, because the `execution_runs` and
+      // `execution_steps` lookups carry the same `run_id` predicate and would
+      // satisfy a table-blind assertion.
       expect(
         deps.mockDb.whereCallsByTable
           .filter((w) => w.table === 'dispatch_queue')

@@ -1,22 +1,20 @@
 /**
- * Invoke-gate executor.
- *
- * An invoke gate is a standard job whose only novel attribute is `invoke`: it
- * never dispatches steps to an agent. When the gate becomes ready the
+ * Invoke-gate executor. An invoke gate is a standard job whose only novel
+ * attribute is `invoke`: it never dispatches steps to an agent. When ready, the
  * orchestrator emits the gate's kici event at the source repo, matches the
  * repo's opt-in subscribers, dispatches each as a normal in-repo run, and
  * tracks each spawned run as a **proxy job** in the gate's own run.
  *
- * Correlation is a synchronous in-process match-and-dispatch — one orchestrator
- * serves one org, so the executor matches + dispatches through an injected
- * `summon` callback and gets the spawned run ids back directly. It ALSO persists
- * `summoned_by_run_id` / `summoned_by_proxy_job` on each spawned run so proxy
- * completion still resolves if the run finalizes on another HA instance.
+ * One orchestrator serves one org, so match-and-dispatch is synchronous and
+ * in-process through an injected `summon` callback that returns the spawned run
+ * ids. It ALSO persists `summoned_by_run_id` / `summoned_by_proxy_job` on each
+ * spawned run so proxy completion resolves if the run finalizes on another HA
+ * instance.
  *
- * The gate itself is the aggregating graph node: downstream `needs` edges point
- * at the gate, and its proxies are its fan-out children (`base_job_name` = the
- * gate name). A zero-subscriber emit fails the gate by default; `optional: true`
- * makes it a green skip.
+ * The gate is the aggregating graph node: downstream `needs` edges point at it,
+ * and its proxies are its fan-out children (`base_job_name` = the gate name). A
+ * zero-subscriber emit fails the gate by default; `optional: true` makes it a
+ * green skip.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -76,13 +74,11 @@ export function isInvokeGate(lockJob: Pick<LockJob, 'invoke'>): boolean {
 }
 
 /**
- * A summon that was REFUSED, as opposed to one that matched nothing.
- *
- * The two are not the same verdict and must never render the same. A gate
- * carrying `optional: true` treats zero summoned runs as a green skip, so a
- * refusal returned as `[]` would report success for work that was declined.
- * Throwing this makes the confusion unrepresentable: {@link runInvokeGate}
- * fails the gate job with the reason, whatever order its own checks run in.
+ * A summon that was REFUSED, as opposed to one that matched nothing. An
+ * `optional: true` gate treats zero summoned runs as a green skip, so a refusal
+ * returned as `[]` would report success for declined work. Throwing this makes
+ * the confusion unrepresentable: {@link runInvokeGate} fails the gate job with
+ * the reason, whatever order its own checks run in.
  */
 export class SummonRefusedError extends Error {
   constructor(reason: string) {
@@ -93,11 +89,9 @@ export class SummonRefusedError extends Error {
 
 /** One source-repo run summoned by an invoke gate. */
 export interface SummonedRun {
-  /** The spawned run's id. */
   runId: string;
   /** The source repo the run belongs to (`owner/repo`). */
   repo: string;
-  /** The subscribing workflow's name. */
   workflow: string;
 }
 
@@ -123,12 +117,9 @@ export interface InvokeGateDeps {
   /**
    * Match the source repo's subscribers to `event`, dispatch each as a normal
    * in-repo run, and return the spawned run ids. Implemented at the composition
-   * root, where it reuses the orchestrator's event match + trust-policy path.
-   *
-   * An empty array means the event matched no subscriber — a real outcome a
-   * gate may declare `optional`. A REFUSAL raises
-   * {@link SummonRefusedError} instead, so the two can never be read as the
-   * same thing.
+   * root, reusing the orchestrator's event match + trust-policy path. An empty
+   * array means no subscriber matched (a gate may declare that `optional`); a
+   * REFUSAL raises {@link SummonRefusedError} instead.
    */
   summon: (args: SummonArgs) => Promise<SummonedRun[]>;
   /** Max chain depth allowed for a summon (the circuit breaker's bound). */
@@ -173,10 +164,8 @@ export function aggregateGateStatus(proxyStatuses: readonly string[]): {
 }
 
 /**
- * The message a gate naming a reserved event fails with.
- *
- * Exported so the gate executor and its test state the same string, and so the
- * SDK-side error can be compared against it.
+ * The message a gate naming a reserved event fails with; exported so the
+ * executor, its test and the SDK-side error compare against one string.
  */
 export function reservedEventMessage(event: string, prefix: string): string {
   return (
@@ -191,12 +180,11 @@ export function zeroSubscriberMessage(sourceRepo: string, event: string): string
 }
 
 /**
- * The proxy job name for a summoned run — the gate name, a `repo:workflow`
- * variant, and the summoned run id. The run id makes the name **unique per run**:
+ * The proxy job name for a summoned run. The run id makes it **unique per run**:
  * two summoned runs with the same `repo`+`workflow` (duplicate registrations)
  * would otherwise share one `job_name`, so the mirror's `job_name` lookup would
- * resolve one proxy and leave the other hanging. The human-readable label for the
- * graph is carried separately in `variant_label` (`repo:workflow`).
+ * resolve one proxy and leave the other hanging. The graph label lives in
+ * `variant_label` (`repo:workflow`).
  */
 export function proxyJobName(gateJobName: string, run: SummonedRun): string {
   return `${gateJobName} (${run.repo}:${run.workflow}) [${run.runId}]`;
@@ -211,13 +199,12 @@ export function proxyJobName(gateJobName: string, run: SummonedRun): string {
 export async function runInvokeGate(deps: InvokeGateDeps, args: RunInvokeGateArgs): Promise<void> {
   const { runId, gateJobId, gateJobName, event, sourceRepo } = args;
 
-  // The gate's event name comes from the WORKFLOW (`invokeSource('...')`), and
-  // this path reaches the dispatcher without passing the `event.emit` guard —
-  // no agent message, no `kici_events` row. So the same reservation is enforced
-  // here, authoritatively: a gate naming `__schedule_fire` would otherwise
-  // summon a run the classifier could read as orchestrator-minted, and one
-  // naming `kici.scaler.scale-*` would forge a scaler event with an
-  // author-chosen payload. The SDK refuses it first; this is the backstop.
+  // The event name comes from the WORKFLOW (`invokeSource('...')`), and this path
+  // reaches the dispatcher without the `event.emit` guard (no agent message, no
+  // `kici_events` row), so the reservation is enforced here, authoritatively: a
+  // gate naming `__schedule_fire` would summon a run the classifier could read as
+  // orchestrator-minted, and one naming `kici.scaler.scale-*` would forge a scaler
+  // event with an author-chosen payload. The SDK refuses it first; this is the backstop.
   const reservedPrefix = reservedEventNamePrefix(event);
   if (reservedPrefix) {
     await deps.executionTracker.onJobStatus(
@@ -318,10 +305,9 @@ export interface ReleaseInvokeGateDeps {
 
 /**
  * Release a ready invoke gate: swap its synthetic needs-pending row for a real
- * `gate` job row, then run the gate executor. Reads the summoning run's source
- * repo and chain depth from `execution_runs` (the chain depth bounds recursion).
- * Shared by the needs-release path (`dispatchReadyJob`) and the root-gate
- * post-registration nudge, so both go through one code path.
+ * `gate` job row, then run the executor with the source repo and chain depth
+ * (which bounds recursion) read from `execution_runs`. Shared by the
+ * needs-release path (`dispatchReadyJob`) and the root-gate post-registration nudge.
  */
 export async function releaseInvokeGate(
   deps: ReleaseInvokeGateDeps,

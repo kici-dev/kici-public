@@ -1,9 +1,4 @@
-/**
- * Barrel export for the cluster coordination module.
- *
- * All cluster-related functionality is exported from this single entry point
- * for clean imports in server.ts and standalone.ts.
- */
+/** Barrel export for the cluster coordination module. */
 
 export { PeerRegistry } from './peer-registry.js';
 export type { PeerInfo, PeerAgentInfo, PeerRegistryOptions } from './peer-registry.js';

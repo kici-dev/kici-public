@@ -141,9 +141,9 @@ describe('resolveWhenToRunOn', () => {
     expect(set).not.toContain(ExecutionJobStatus.enum.success);
   });
   it('is exactly the terminal statuses classified as failures', () => {
-    // The expansion and the run roll-up must read one classification. This
-    // pins the expansion to `STATUS_FAILURE_CLASS` rather than to a literal
-    // list that a new failure status could silently miss.
+    // The expansion and the run roll-up must read one classification, so this
+    // pins the expansion to `STATUS_FAILURE_CLASS`, not a literal list a new
+    // failure status could silently miss.
     const expected = [...TERMINAL_JOB_STATES].filter(
       (s) =>
         STATUS_FAILURE_CLASS[s as keyof typeof STATUS_FAILURE_CLASS] ===
@@ -160,9 +160,8 @@ describe('resolveWhenToRunOn', () => {
     expect(resolveWhenToRunOn('always').sort()).toEqual([...TERMINAL_JOB_STATES].sort());
   });
   it('hands back a fresh array, so a caller cannot mutate the shared expansion', () => {
-    // Two edges compiled from the same keyword must not alias one array: a
-    // caller that sorts or pushes onto its result would otherwise reorder the
-    // keyword's expansion for every other edge in the lock file.
+    // Edges compiled from one keyword must not alias one array, or a caller
+    // that sorts or pushes onto its result changes every other edge's expansion.
     const first = resolveWhenToRunOn('on-failure');
     first.sort();
     first.push(ExecutionJobStatus.enum.cancelled);

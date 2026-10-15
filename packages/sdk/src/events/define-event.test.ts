@@ -73,7 +73,6 @@ describe('defineEvent()', () => {
       }),
     );
 
-    // Schema parse returns correctly typed data
     const result = event.schema.parse({ count: 1, label: 'test' });
     expect(result.count).toBe(1);
     expect(result.label).toBe('test');

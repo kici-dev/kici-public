@@ -15,38 +15,16 @@ import { WebhookIngestOutcome } from '../pipeline/process-webhook.js';
 
 const logger = createLogger({ prefix: 'orch:webhooks' });
 
-/**
- * Dependencies for generic webhook routes.
- */
 export interface GenericWebhookRoutesDeps {
-  /** Generic source manager for source lookup and validation */
   sourceManager: GenericSourceManager;
-  /** Processing callback -- connects to the trigger matching pipeline */
+  /** Hands the delivery to the trigger-matching pipeline. */
   onWebhook: (info: WebhookInfo) => Promise<WebhookIngestOutcome>;
 }
 
-/** In-memory sliding-window rate limiter for generic webhook sources */
+/** In-memory, per process. */
 const rateLimiter = new SlidingWindowRateLimiter(0);
 
-/**
- * Create generic webhook routes for non-GitHub webhook ingestion.
- *
- * Endpoint: POST /webhook/:orgId/generic/:sourceId
- *
- * Handler flow:
- * 1. Read raw body
- * 2. Look up source from GenericSourceManager
- * 3. Check payload size
- * 4. Rate limit check
- * 5. Verify signature using per-source verification config
- * 6. Extract idempotency key, check dedup
- * 7. Extract event type, check allowed events
- * 8. Normalize and process through pipeline
- * 9. Return response
- *
- * @param deps - Dependencies (source manager, dedup cache, processing callback)
- * @returns Hono app with generic webhook routes
- */
+/** Non-GitHub webhook ingestion: POST /webhook/:orgId/generic/:sourceId. */
 export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono {
   const app = new Hono();
   const normalizer = new GenericWebhookNormalizer(deps.sourceManager);
@@ -131,20 +109,16 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
           }
         }
 
-        // 8. Provider-type branching (gap closure).
+        // 8. Provider-type branching.
         //
-        // generic_webhook_sources.provider_type drives which normalizer the
-        // pipeline processor will resolve via getByRoutingKey(info.routingKey).
-        // For 'local' sources the normalize step parses the body as a
-        // github-shaped push/PR payload and tags info.provider='local'.
-        // For 'generic' sources the existing normalizeGenericRequest path
-        // runs. All other logic (dedup, rate limit, idempotency, logging,
-        // metrics) is SHARED between the two branches — only the lines below
-        // differ, everything before and after this block runs once.
+        // provider_type drives which normalizer the pipeline resolves via
+        // getByRoutingKey(info.routingKey): 'local' parses the body as a
+        // github-shaped push/PR payload tagged provider='local'; 'generic' runs
+        // normalizeGenericRequest. Everything else (dedup, rate limit,
+        // idempotency, logging, metrics) is SHARED and runs once.
         let info: WebhookInfo;
         let resolvedEvent: string;
         if (source.provider_type === 'local') {
-          // Local sources expect github-shaped JSON + x-event-type header.
           let parsedPayload: Record<string, unknown>;
           try {
             parsedPayload = JSON.parse(body) as Record<string, unknown>;
@@ -162,8 +136,7 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
             typeof parsedPayload.action === 'string' ? parsedPayload.action : null;
 
           // Scope deliveryId by routing key to prevent cross-source dedup
-          // collisions. SHARED with the generic branch below — same scoping
-          // rule applies regardless of which normalizer ran.
+          // collisions; the generic branch applies the same rule.
           const rawDeliveryId =
             idempotencyKey ?? headers['x-delivery-id'] ?? headers['x-request-id'] ?? randomUUID();
           const deliveryId = `${source.routing_key}:${rawDeliveryId}`;
@@ -178,7 +151,6 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
           };
           resolvedEvent = localEvent;
         } else {
-          // Existing generic path — untouched.
           const normalized = await normalizer.normalizeGenericRequest(
             source.routing_key,
             body,
@@ -188,10 +160,8 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
             return c.json({ rejected: true, reason: 'Normalization failed' }, 400);
           }
 
-          // 9. Check allowed events filter (generic-only — local sources
-          //    pass the event-type header through and any future allowed-event
-          //    filter for them would live in the orchestrator pipeline, not
-          //    this hot path).
+          // 9. Allowed-events filter, generic only: a filter for local sources
+          //    would belong in the pipeline, not this hot path.
           const allowedEvents = parseJsonArray(source.allowed_events);
           if (allowedEvents && allowedEvents.length > 0) {
             if (!allowedEvents.includes(normalized.event)) {
@@ -206,10 +176,8 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
             }
           }
 
-          // 10. Build WebhookInfo and process
-          // Scope deliveryId by routing key to prevent cross-source false-positive dedup.
-          // Without this, two different sources sharing the same idempotency key would
-          // collide in the global dedup_cache.
+          // 10. Build WebhookInfo. Scoping deliveryId by routing key stops two
+          // sources sharing an idempotency key from colliding in the global dedup_cache.
           const rawDeliveryId =
             idempotencyKey ?? normalizer.extractDeliveryId(headers) ?? randomUUID();
           const deliveryId = `${source.routing_key}:${rawDeliveryId}`;
@@ -225,22 +193,19 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
           resolvedEvent = normalized.event;
         }
 
-        // 11. Hand the delivery to ingest. This resolves once the delivery is
-        // DURABLY QUEUED, not once it has been matched and dispatched — a
-        // provider's delivery attempt times out in seconds while one matched
-        // workflow's build phase alone may take minutes, so a response that
-        // waited for the pipeline turned a slow build into a failed delivery.
+        // 11. Hand to ingest. Resolves once the delivery is DURABLY QUEUED, not
+        // matched and dispatched: a provider's delivery attempt times out in
+        // seconds while one build phase may take minutes, so waiting for the
+        // pipeline would turn a slow build into a failed delivery.
         //
-        // The pipeline still owns the atomic dedup claim (a single chokepoint
-        // shared by the relay, generic, and direct GitHub ingestion paths), so
-        // the route does no check-then-act of its own; the `duplicate` outcome
-        // below is ingest's advisory probe of an already-known delivery id, and
-        // a genuine cross-instance race is still arbitrated by that one claim.
+        // The pipeline owns the atomic dedup claim (one chokepoint for the
+        // relay, generic, and direct GitHub paths), so the route does no
+        // check-then-act; `duplicate` is ingest's advisory probe of a known
+        // delivery id, and a cross-instance race is arbitrated by that claim.
         const outcome = await deps.onWebhook(info);
 
-        // Shed (admission control saturated): 429 + Retry-After, and crucially do
-        // NOT mark the idempotency key — the caller must be able to redeliver the
-        // same webhook and have it processed, not deduped away as a lost delivery.
+        // Shed (admission control saturated): 429 + Retry-After, and do NOT mark
+        // the idempotency key, so a redelivery is processed, not deduped away.
         if (outcome === WebhookIngestOutcome.enum.shed) {
           c.header('Retry-After', '5');
           return c.json(
@@ -253,8 +218,7 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
           );
         }
 
-        // 12. Record idempotency marker for the source-specific dedup window
-        // (only meaningful for an actually-processed delivery).
+        // 12. Mark idempotency for the source's dedup window (processed deliveries only).
         if (idempotencyKey && outcome !== WebhookIngestOutcome.enum.duplicate) {
           await deps.sourceManager.markIdempotency(source.id, idempotencyKey);
         }
@@ -275,16 +239,14 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
           dedupHitsTotal.add(1);
           return c.json({ accepted: true, deliveryId: info.deliveryId, duplicate: true }, 200);
         }
-        // 202 = accepted and durably queued. It does NOT assert that any
-        // workflow matched or dispatched — those outcomes reach the event log,
-        // the run list, and the structured logs, never this response.
+        // 202 = durably queued, NOT matched or dispatched; those outcomes reach
+        // the event log, run list and structured logs, never this response.
         return c.json({ accepted: true, deliveryId: info.deliveryId }, 202);
       } catch (err) {
-        // Reachable for a failure BEFORE the delivery is queued (source lookup,
-        // verification, the durable write). A pipeline failure cannot land here
-        // any more — by then the response is sent — so it surfaces as a `failed`
-        // event-log row (written by `processWebhook`, under the delivery's
-        // resolved org) plus an `orch:ingest-accept` error line instead.
+        // Only failures BEFORE the delivery is queued (lookup, verification, the
+        // durable write). A pipeline failure happens after the response, as a
+        // `failed` event-log row (by `processWebhook`, under the resolved org)
+        // plus an `orch:ingest-accept` error line.
         logger.error('Generic webhook processing error', {
           orgId,
           sourceId,
@@ -299,9 +261,7 @@ export function createGenericWebhookRoutes(deps: GenericWebhookRoutesDeps): Hono
   return app;
 }
 
-/**
- * Parse verification config from DB storage format.
- */
+/** `api_key` maps to bearer_token; an invalid config returns null. */
 function parseVerificationConfig(
   method: string,
   configJson: string | Record<string, unknown>,
@@ -360,22 +320,19 @@ function parseVerificationConfig(
   }
 }
 
-/**
- * Extract idempotency key from headers or body path.
- */
+/** Configured header, then configured body path, then fallback headers. */
 function extractIdempotencyKey(
   headers: Record<string, string>,
   rawBody: string,
   headerName?: string | null,
   bodyPath?: string | null,
 ): string | null {
-  // Check configured header
   if (headerName) {
     const value = headers[headerName.toLowerCase()];
     if (value) return value;
   }
 
-  // Check configured body path (simple dot notation)
+  // Simple dot notation.
   if (bodyPath) {
     try {
       const parsed = JSON.parse(rawBody);
@@ -386,13 +343,9 @@ function extractIdempotencyKey(
     }
   }
 
-  // Fallback headers
   return headers['x-idempotency-key'] ?? headers['x-delivery-id'] ?? null;
 }
 
-/**
- * Parse a JSON array from a DB column value.
- */
 function parseJsonArray(value: string | string[] | null): string[] | null {
   if (value === null) return null;
   if (Array.isArray(value)) return value;

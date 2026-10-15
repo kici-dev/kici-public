@@ -86,10 +86,9 @@ describe('fleet admin routes', () => {
   });
 
   it('does not auth-gate paths outside /admin/fleet-* (no global * middleware)', async () => {
-    // This router is mounted at '/' on the orchestrator app. A '*' auth
-    // matcher would attach the Bearer gate to unrelated routes like /health
-    // and 401 them. With the path-scoped middleware, an unrelated path is a
-    // plain 404 (router has no handler) — NOT a 401 (auth intercepting it).
+    // The router mounts at '/', so a '*' auth matcher would 401 unrelated
+    // routes like /health. Path-scoped, an unrelated path is a plain 404 (no
+    // handler), NOT a 401.
     const app = makeApp();
     const res = await app.request('/health');
     expect(res.status).toBe(404);

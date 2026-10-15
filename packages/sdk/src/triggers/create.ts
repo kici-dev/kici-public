@@ -1,7 +1,4 @@
-/**
- * Create trigger helper - creates triggers for ref creation events (branches/tags).
- * Returns a frozen CreateTriggerConfig directly.
- */
+/** Trigger helper for ref creation events (branches and tags); returns a frozen config. */
 
 import type { BranchPattern, CreateConfigInput, CreateTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';

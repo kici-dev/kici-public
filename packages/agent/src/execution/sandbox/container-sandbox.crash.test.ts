@@ -1,17 +1,8 @@
+import '../../__test-helpers__/shared-mocks.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Duplex } from 'node:stream';
 import Docker from 'dockerode';
 import { ExecutionJobStatus } from '@kici-dev/engine';
-
-vi.mock('@kici-dev/shared', () => ({
-  createLogger: vi.fn(() => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  })),
-  toErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
-}));
 
 vi.mock('@kici-dev/shared/container-runtime', () => ({
   ensureRuntimeVolume: vi.fn(async () => 'kici-runtime-node-abc123'),

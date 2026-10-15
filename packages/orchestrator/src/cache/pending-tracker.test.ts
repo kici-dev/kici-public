@@ -4,15 +4,14 @@ import { PendingTracker } from './pending-tracker.js';
 import { PendingBuildTracker } from './pending-builds.js';
 import { PendingInitTracker, type InitResult } from './pending-inits.js';
 import { PendingDynamicTracker } from './pending-dynamics.js';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 function mockLockJob(name: string): LockJob {
-  return {
-    _type: 'static',
+  return staticJob({
     name,
     runsOn: 'linux',
-    needs: [],
     steps: [{ name: 'step-1', hasOutputs: false }],
-  };
+  });
 }
 
 interface TrackerCase<T> {

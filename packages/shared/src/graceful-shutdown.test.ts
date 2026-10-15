@@ -24,7 +24,7 @@ describe('setupGracefulShutdown', () => {
 
   beforeEach(() => {
     for (const key of Object.keys(signalListeners)) delete signalListeners[key];
-    // Capture process.on registrations without actually binding real signal handlers
+    // Capture process.on registrations without binding real signal handlers
     vi.spyOn(process, 'on').mockImplementation(((event: string, listener: () => void) => {
       (signalListeners[event] ??= []).push(listener);
       return process;

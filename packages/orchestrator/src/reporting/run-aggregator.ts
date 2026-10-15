@@ -1,16 +1,11 @@
 /**
- * Shared run-detail aggregator.
+ * Shared run-detail aggregator: DB rows → canonical nested run detail (jobs with nested
+ * steps, needs and outputs). The dashboard handler and the agent-facing structured
+ * run-result route share `buildRunDetailJobs` / `mapRunDetailStep`, so the row→jobs shape
+ * never diverges between the two read surfaces.
  *
- * One source of truth for "DB rows → canonical nested run detail (jobs with
- * nested steps + needs + outputs)". The dashboard handler and the agent-facing
- * structured run-result route both build on the same `buildRunDetailJobs` /
- * `mapRunDetailStep` mapping, so the row→jobs shape never diverges between the
- * two read surfaces.
- *
- * `aggregateRunDetail` is the warm-path convenience used by the agent route: it
- * runs the run-header + per-run batch queries and returns the canonical detail.
- * (Cold-store fallback stays a dashboard-handler concern — the agent read path
- * is warm-only in v1.)
+ * `aggregateRunDetail` is the agent route's warm path. Cold-store fallback stays a
+ * dashboard-handler concern — the agent read path is warm-only in v1.
  */
 import { setupStepsFirst } from './step-display-order.js';
 import type { Kysely } from 'kysely';
@@ -90,18 +85,13 @@ export interface RunDetailJobLookups {
 }
 
 /**
- * The routing reason as a reader should see it.
+ * The routing reason as a reader should see it: only while the job is `pending`/`queued`.
  *
- * `routing_reason` is only meaningful while the job is still waiting to be
- * routed, and more than twenty call sites move a job out of `pending`/`queued`
- * — dispatch, cancel, the run-level failure cascades, the stale detector.
- * Requiring every one of them to also null the column would be fragile in the
- * one direction that matters: the site somebody forgets renders a finished job
- * as "waiting for an agent".
- *
- * So the guard lives here, at the read boundary both projections share, where
- * it cannot be forgotten by a writer that does not know this column exists.
- * The stale bytes may linger in the row; they are never shown.
+ * More than twenty call sites move a job out of those statuses (dispatch, cancel, the
+ * run-level failure cascades, the stale detector). Making each also null the column is
+ * fragile: the site somebody forgets renders a finished job as "waiting for an agent". So
+ * the guard sits at the read boundary both projections share; stale bytes may linger in the
+ * row but are never shown.
  */
 export function visibleRoutingReason(status: string, routingReason: string | null): string | null {
   const stillWaiting =
@@ -233,12 +223,10 @@ export async function aggregateRunDetail(
     .executeTakeFirst();
   if (!run) return null;
 
-  // The four child-row reads are independent of one another once the run row
-  // gates existence, so they run in one concurrent wave instead of four serial
-  // round-trips. This keeps the structured read (relayed to the user-plane MCP
-  // under a fixed timeout budget) fast even when the orchestrator's Postgres
-  // pool is contended by a concurrent execution. The result assembly below is
-  // identical to a serial fetch.
+  // The child-row reads are independent once the run row gates existence, so they run in
+  // one concurrent wave, not serial round-trips. This keeps the structured read (relayed to
+  // the user-plane MCP under a fixed timeout budget) fast even when a concurrent execution
+  // contends the Postgres pool. The assembly below is identical to a serial fetch.
   const [jobs, steps, secretOutputRows, needsRows] = await Promise.all([
     db
       .selectFrom('execution_jobs')

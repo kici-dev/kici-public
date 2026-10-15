@@ -1,6 +1,6 @@
 /**
- * Trigger matching engine for evaluating workflow triggers against webhook events.
- * Single source of truth -- replaces duplicate logic in compiler and orchestrator.
+ * Trigger matching engine for evaluating workflow triggers against webhook
+ * events; the one implementation the compiler and the orchestrator share.
  */
 import { getCompiledRegex, getGlobMatcher, getRepoGlobMatcher } from './compiled-matchers.js';
 import { isDeferrableRange, resolveDiffRange } from './diff-range.js';
@@ -46,9 +46,7 @@ import {
 import { matchJsonPath, matchJsonPathNot } from './jsonpath-matcher.js';
 import { evaluateTextMatch } from './text-match.js';
 
-/**
- * Split a list of string patterns into include/exclude based on ! prefix.
- */
+/** Patterns split into include/exclude by their `!` prefix (stripped on exclude). */
 interface SplitPatterns<T> {
   include: T[];
   exclude: T[];
@@ -82,9 +80,6 @@ function splitBranchPatterns(
   return { include, exclude };
 }
 
-/**
- * Match a branch pattern against a branch name.
- */
 export function matchBranchPattern(pattern: LockBranchPattern, branch: string): boolean {
   if (pattern.type === 'glob') {
     return getGlobMatcher(pattern.pattern)(branch);
@@ -94,14 +89,11 @@ export function matchBranchPattern(pattern: LockBranchPattern, branch: string): 
 }
 
 /**
- * Match a repo pattern against a repository identifier.
- *
- * Same shape as {@link matchBranchPattern}, but glob patterns compile through
- * {@link getRepoGlobMatcher} so a dot-prefixed identifier (`.hidden/repo`) is
- * matched by `**`. Repo identifiers are org/name pairs, not paths, so there is
- * no dotfile convention to respect — and `repos: ['**']` means every repo.
- *
- * Regex patterns are unaffected: `dot` is a glob option with no regex analogue.
+ * Like {@link matchBranchPattern}, but globs compile through
+ * {@link getRepoGlobMatcher} so `**` matches a dot-prefixed identifier
+ * (`.hidden/repo`): repo identifiers are org/name pairs with no dotfile
+ * convention, and `repos: ['**']` means every repo. Regex patterns are
+ * unaffected (`dot` is glob-only).
  */
 function matchRepoPattern(pattern: LockBranchPattern, repo: string): boolean {
   if (pattern.type === 'glob') {
@@ -110,62 +102,51 @@ function matchRepoPattern(pattern: LockBranchPattern, repo: string): boolean {
   return getCompiledRegex(pattern.pattern, pattern.flags, 'branch/tag/repo pattern').test(repo);
 }
 
-/**
- * Match any of the branch patterns.
- * Returns true if patterns array is empty (no filter = match all).
- */
+/** An empty pattern list matches every branch. */
 function matchAnyBranch(patterns: readonly LockBranchPattern[], branch: string): boolean {
   if (patterns.length === 0) return true;
   return patterns.some((p) => matchBranchPattern(p, branch));
 }
 
 /**
- * Match path patterns against changed files.
- * Patterns prefixed with ! are exclusions. Remaining patterns are inclusions.
- * An all-negation array has implicit match-all semantics for non-excluded files.
+ * Match path patterns against changed files. `!`-prefixed patterns are
+ * exclusions; an all-negation array matches every non-excluded file.
  */
 export function matchPathPatterns(
   paths: readonly string[],
   changedFiles: string[],
   status?: ChangedFilesStatus,
 ): boolean {
-  // No path filters = match
   if (paths.length === 0) return true;
 
-  // Diff unavailable (a provider capability gap such as universal-git PR
-  // events, or upstream degradation): conservative match — running a workflow
-  // spuriously beats silently dropping a real one. This is NEVER inferred from
-  // an empty list; only an explicit `unavailable` status triggers it, so a
-  // genuine empty diff (`fetched` + []) still correctly no-matches below.
+  // Diff unavailable (a provider gap such as universal-git PR events, or
+  // upstream degradation): match conservatively, since a spurious run beats a
+  // silently dropped one. Only an explicit `unavailable` status triggers it, so a
+  // genuine empty diff (`fetched` + []) still no-matches below.
   if (status === 'unavailable') return true;
 
-  // If no changed files provided, can't filter by path
   if (changedFiles.length === 0) return false;
 
   const { include, exclude } = splitStringPatterns(paths);
 
-  // Filter out files matching exclusion patterns first
   let relevantFiles = changedFiles;
   if (exclude.length > 0) {
     relevantFiles = changedFiles.filter(
       (file) => !exclude.some((pattern) => getGlobMatcher(pattern)(file)),
     );
-    // If all files are excluded, no match
     if (relevantFiles.length === 0) return false;
   }
 
-  // If no include patterns (all-negation array), remaining files match implicitly
+  // An all-negation array matches the remaining files implicitly.
   if (include.length === 0) return true;
 
-  // Check include patterns against remaining files
   return relevantFiles.some((file) => include.some((pattern) => getGlobMatcher(pattern)(file)));
 }
 
 /**
- * Match repo patterns against a source repository identifier.
- * Patterns with ! prefix in the pattern string are exclusions.
- * An all-negation array has implicit match-all semantics for non-excluded repos.
- * Empty array = no filtering (matches all repos).
+ * Match repo patterns against a source repository identifier. `!`-prefixed
+ * patterns are exclusions; an all-negation array matches every non-excluded
+ * repo, and an empty array matches all repos.
  */
 export function matchRepoPatterns(
   repos: readonly LockBranchPattern[],
@@ -175,22 +156,17 @@ export function matchRepoPatterns(
 
   const { include, exclude } = splitBranchPatterns(repos);
 
-  // Check exclusions first
   if (exclude.length > 0) {
     if (exclude.some((p) => matchRepoPattern(p, sourceRepo))) return false;
   }
 
-  // If no include patterns (all-negation array), non-excluded repo matches implicitly
+  // An all-negation array matches a non-excluded repo implicitly.
   if (include.length === 0) return true;
 
   return include.some((p) => matchRepoPattern(p, sourceRepo));
 }
 
-/**
- * Evaluate repo pattern filter for a trigger against an event.
- * Returns true if matched (or no filter), false if filtered out.
- * Adds trace entries for debugging.
- */
+/** True when the repo filter matches or is absent; records a trace entry. */
 function evaluateRepoFilter(
   trigger: { repos?: readonly LockBranchPattern[] },
   event: SimulatedEvent,
@@ -217,12 +193,10 @@ function evaluateRepoFilter(
 }
 
 /**
- * Evaluate a trigger's `commitMessage` filter. Returns true when the trigger
- * declares none (the fast path).
- *
- * An event with no message is INDETERMINATE, not a clean exclusion: the filter
- * is fail-visible, mirroring the Tier-1 `requires` gate, so a workflow whose
- * declared gate was never evaluated does not run.
+ * Evaluate a trigger's `commitMessage` filter; true when the trigger declares
+ * none. An event with no message is INDETERMINATE, not a clean exclusion:
+ * like the Tier-1 `requires` gate, a workflow whose declared gate was never
+ * evaluated does not run.
  */
 function evaluateCommitMessageFilter(
   trigger: { readonly commitMessage?: LockTextMatch },
@@ -258,7 +232,6 @@ function evaluateCommitMessageFilter(
   return result.pass;
 }
 
-/** Set by a push/pr trigger whose `paths` check passed only because the diff was unavailable. */
 /** Trace value of a `paths` check that read an unavailable diff. */
 export const UnavailablePathsTrace = {
   /** A git range exists: the agent decides from its clone. */
@@ -271,13 +244,17 @@ export const UnavailablePathsTrace = {
 export const DEFERRED_PATHS_SUMMARY_SUFFIX = ' — paths decided on the agent';
 
 export interface TriggerMatchNotes {
+  /**
+   * Set by a push/pr trigger whose `paths` check passed only because the diff
+   * was unavailable while a git range exists.
+   */
   conservativePaths?: readonly string[];
 }
 
 /**
  * Evaluate a push/pr trigger's `paths` list and trace it. An `unavailable`
- * diff matches; when the event still has a git range, the match is recorded in
- * `notes` so the workflow's path decision moves to the agent's clone.
+ * diff matches; with a git range, `notes` records it so the agent's clone
+ * decides the paths.
  */
 function checkTriggerPaths(
   paths: readonly string[],
@@ -308,23 +285,18 @@ function checkTriggerPaths(
   return matches;
 }
 
-/**
- * Match a PR trigger against a simulated event.
- */
 function matchPrTrigger(
   trigger: LockPrTrigger,
   event: SimulatedEvent,
   traces: TraceEntry[],
   notes?: TriggerMatchNotes,
 ): boolean {
-  // Must be pull_request event
   if (event.type !== 'pull_request') {
     traces.push(createTraceEntry('event type', 'pull_request', event.type, false));
     return false;
   }
   traces.push(createTraceEntry('event type', 'pull_request', event.type, true));
 
-  // Check action
   if (trigger.events.length > 0) {
     const action = event.action ?? '';
     const actionMatches = trigger.events.includes(action);
@@ -332,7 +304,6 @@ function matchPrTrigger(
     if (!actionMatches) return false;
   }
 
-  // Check target branch
   if (trigger.targetBranches.length > 0) {
     const matches = matchAnyBranch(trigger.targetBranches, event.targetBranch);
     traces.push(
@@ -346,7 +317,6 @@ function matchPrTrigger(
     if (!matches) return false;
   }
 
-  // Check source branch
   if (trigger.sourceBranches.length > 0) {
     if (!event.sourceBranch) {
       traces.push(
@@ -372,35 +342,27 @@ function matchPrTrigger(
     if (!matches) return false;
   }
 
-  // Check paths
   if (!checkTriggerPaths(trigger.paths, event, traces, notes)) return false;
 
-  // Check commit message
   if (!evaluateCommitMessageFilter(trigger, event, traces)) return false;
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a push trigger against a simulated event.
- */
 function matchPushTrigger(
   trigger: LockPushTrigger,
   event: SimulatedEvent,
   traces: TraceEntry[],
   notes?: TriggerMatchNotes,
 ): boolean {
-  // Must be push event
   if (event.type !== 'push') {
     traces.push(createTraceEntry('event type', 'push', event.type, false));
     return false;
   }
   traces.push(createTraceEntry('event type', 'push', event.type, true));
 
-  // Check branch
   if (trigger.branches.length > 0) {
     const matches = matchAnyBranch(trigger.branches, event.targetBranch);
     traces.push(
@@ -414,22 +376,16 @@ function matchPushTrigger(
     if (!matches) return false;
   }
 
-  // Check paths
   if (!checkTriggerPaths(trigger.paths, event, traces, notes)) return false;
 
-  // Check commit message
   if (!evaluateCommitMessageFilter(trigger, event, traces)) return false;
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a tag trigger against a simulated event.
- * Tag name is expected in event.targetBranch (normalizer sets it there).
- */
+/** Tag name is expected in event.targetBranch (normalizer sets it there). */
 function matchTagTrigger(
   trigger: LockTagTrigger,
   event: SimulatedEvent,
@@ -441,7 +397,6 @@ function matchTagTrigger(
   }
   traces.push(createTraceEntry('event type', 'tag', event.type, true));
 
-  // Check tag name patterns against targetBranch (which holds the tag name)
   if (trigger.patterns.length > 0) {
     const matches = matchAnyBranch(trigger.patterns, event.targetBranch);
     traces.push(
@@ -455,19 +410,14 @@ function matchTagTrigger(
     if (!matches) return false;
   }
 
-  // Check commit message
   if (!evaluateCommitMessageFilter(trigger, event, traces)) return false;
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a comment trigger against a simulated event.
- * Supports action filter, source filter (issue vs PR), and bodyMatch (glob/regex).
- */
+/** Supports action filter, source filter (issue vs PR), and bodyMatch (glob/regex). */
 function matchCommentTrigger(
   trigger: LockCommentTrigger,
   event: SimulatedEvent,
@@ -479,7 +429,6 @@ function matchCommentTrigger(
   }
   traces.push(createTraceEntry('event type', 'comment', event.type, true));
 
-  // Check action filter
   if (trigger.actions.length > 0) {
     const action = event.action ?? '';
     const matches = trigger.actions.includes(action);
@@ -487,7 +436,6 @@ function matchCommentTrigger(
     if (!matches) return false;
   }
 
-  // Check source filter (issue vs PR)
   if (trigger.source) {
     const issue = event.payload.issue as Record<string, unknown> | undefined;
     const hasPullRequest = issue && 'pull_request' in issue;
@@ -498,14 +446,12 @@ function matchCommentTrigger(
       traces.push(createTraceEntry('source', 'issue', isFromPr ? 'pr' : 'issue', matches));
       if (!matches) return false;
     } else {
-      // source === 'pr'
       const matches = isFromPr;
       traces.push(createTraceEntry('source', 'pr', isFromPr ? 'pr' : 'issue', matches));
       if (!matches) return false;
     }
   }
 
-  // Check bodyMatch
   if (trigger.bodyMatch) {
     const comment = event.payload.comment as Record<string, unknown> | undefined;
     const body = (comment?.body as string) ?? '';
@@ -526,16 +472,12 @@ function matchCommentTrigger(
     }
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a review trigger against a simulated event.
- * Supports action and review state filters.
- */
+/** Supports action and review state filters. */
 function matchReviewTrigger(
   trigger: LockReviewTrigger,
   event: SimulatedEvent,
@@ -547,7 +489,6 @@ function matchReviewTrigger(
   }
   traces.push(createTraceEntry('event type', 'review', event.type, true));
 
-  // Check action filter
   if (trigger.actions.length > 0) {
     const action = event.action ?? '';
     const matches = trigger.actions.includes(action);
@@ -555,7 +496,6 @@ function matchReviewTrigger(
     if (!matches) return false;
   }
 
-  // Check state filter
   if (trigger.states.length > 0) {
     const review = event.payload.review as Record<string, unknown> | undefined;
     const state = (review?.state as string) ?? '';
@@ -564,16 +504,12 @@ function matchReviewTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a review comment trigger against a simulated event.
- * Supports action filter.
- */
+/** Supports action filter. */
 function matchReviewCommentTrigger(
   trigger: LockReviewCommentTrigger,
   event: SimulatedEvent,
@@ -585,7 +521,6 @@ function matchReviewCommentTrigger(
   }
   traces.push(createTraceEntry('event type', 'review_comment', event.type, true));
 
-  // Check action filter
   if (trigger.actions.length > 0) {
     const action = event.action ?? '';
     const matches = trigger.actions.includes(action);
@@ -593,16 +528,12 @@ function matchReviewCommentTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a release trigger against a simulated event.
- * Supports action filter (published, created, etc.).
- */
+/** Supports action filter (published, created, etc.). */
 function matchReleaseTrigger(
   trigger: LockReleaseTrigger,
   event: SimulatedEvent,
@@ -614,7 +545,6 @@ function matchReleaseTrigger(
   }
   traces.push(createTraceEntry('event type', 'release', event.type, true));
 
-  // Filter by actions if specified
   if (trigger.actions.length > 0) {
     const action = event.action ?? '';
     const matches = trigger.actions.includes(action);
@@ -622,16 +552,12 @@ function matchReleaseTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a dispatch trigger against a simulated event.
- * GitHub sends event_type as action for repository_dispatch.
- */
+/** GitHub sends event_type as action for repository_dispatch. */
 function matchDispatchTrigger(
   trigger: LockDispatchTrigger,
   event: SimulatedEvent,
@@ -643,7 +569,6 @@ function matchDispatchTrigger(
   }
   traces.push(createTraceEntry('event type', 'dispatch', event.type, true));
 
-  // Filter by types (matches against event.action)
   if (trigger.types.length > 0) {
     const action = event.action ?? '';
     const matches = trigger.types.includes(action);
@@ -651,16 +576,12 @@ function matchDispatchTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a create trigger against a simulated event.
- * Checks refType and ref pattern against payload fields.
- */
+/** Checks refType and ref pattern against payload fields. */
 function matchCreateTrigger(
   trigger: LockCreateTrigger,
   event: SimulatedEvent,
@@ -672,7 +593,6 @@ function matchCreateTrigger(
   }
   traces.push(createTraceEntry('event type', 'create', event.type, true));
 
-  // Check refType filter
   if (trigger.refTypes.length > 0) {
     const refType = event.payload.ref_type as string;
     const matches = trigger.refTypes.includes(refType as 'branch' | 'tag');
@@ -680,7 +600,6 @@ function matchCreateTrigger(
     if (!matches) return false;
   }
 
-  // Check ref patterns against payload.ref
   if (trigger.patterns.length > 0) {
     const ref = event.payload.ref as string;
     const matches = matchAnyBranch(trigger.patterns, ref);
@@ -695,16 +614,12 @@ function matchCreateTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a delete trigger against a simulated event.
- * Same structure as create trigger.
- */
+/** Same structure as create trigger. */
 function matchDeleteTrigger(
   trigger: LockDeleteTrigger,
   event: SimulatedEvent,
@@ -716,7 +631,6 @@ function matchDeleteTrigger(
   }
   traces.push(createTraceEntry('event type', 'delete', event.type, true));
 
-  // Check refType filter
   if (trigger.refTypes.length > 0) {
     const refType = event.payload.ref_type as string;
     const matches = trigger.refTypes.includes(refType as 'branch' | 'tag');
@@ -724,7 +638,6 @@ function matchDeleteTrigger(
     if (!matches) return false;
   }
 
-  // Check ref patterns against payload.ref
   if (trigger.patterns.length > 0) {
     const ref = event.payload.ref as string;
     const matches = matchAnyBranch(trigger.patterns, ref);
@@ -739,16 +652,12 @@ function matchDeleteTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a status trigger against a simulated event.
- * Checks context via glob matching and state filter.
- */
+/** Checks context via glob matching and state filter. */
 function matchStatusTrigger(
   trigger: LockStatusTrigger,
   event: SimulatedEvent,
@@ -760,7 +669,6 @@ function matchStatusTrigger(
   }
   traces.push(createTraceEntry('event type', 'status', event.type, true));
 
-  // Check context patterns via glob matching
   if (trigger.contexts.length > 0) {
     const context = (event.payload.context as string) ?? '';
     const matches = trigger.contexts.some((pattern) => getGlobMatcher(pattern)(context));
@@ -768,7 +676,6 @@ function matchStatusTrigger(
     if (!matches) return false;
   }
 
-  // Check state filter
   if (trigger.states.length > 0) {
     const state = (event.payload.state as string) ?? '';
     const matches = trigger.states.includes(state);
@@ -776,16 +683,12 @@ function matchStatusTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a workflow_run trigger against a simulated event.
- * Checks action, workflow name, and conclusion filters.
- */
+/** Checks action, workflow name, and conclusion filters. */
 function matchWorkflowRunTrigger(
   trigger: LockWorkflowRunTrigger,
   event: SimulatedEvent,
@@ -797,7 +700,6 @@ function matchWorkflowRunTrigger(
   }
   traces.push(createTraceEntry('event type', 'workflow_run', event.type, true));
 
-  // Check action filter
   if (trigger.actions.length > 0) {
     const action = event.action ?? '';
     const matches = trigger.actions.includes(action);
@@ -807,7 +709,6 @@ function matchWorkflowRunTrigger(
 
   const workflowRun = event.payload.workflow_run as Record<string, unknown> | undefined;
 
-  // Check workflow name filter
   if (trigger.workflows.length > 0) {
     const name = (workflowRun?.name as string) ?? '';
     const matches = trigger.workflows.includes(name);
@@ -815,7 +716,6 @@ function matchWorkflowRunTrigger(
     if (!matches) return false;
   }
 
-  // Check conclusion filter
   if (trigger.conclusions.length > 0) {
     const conclusion = (workflowRun?.conclusion as string) ?? '';
     const matches = trigger.conclusions.includes(conclusion);
@@ -823,16 +723,12 @@ function matchWorkflowRunTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a fork trigger against a simulated event.
- * Fork triggers match unconditionally (no filter fields).
- */
+/** Fork triggers filter only by repo. */
 function matchForkTrigger(
   trigger: LockForkTrigger,
   event: SimulatedEvent,
@@ -844,16 +740,12 @@ function matchForkTrigger(
   }
   traces.push(createTraceEntry('event type', 'fork', event.type, true));
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a star trigger against a simulated event.
- * Supports action filter (created, deleted).
- */
+/** Supports action filter (created, deleted). */
 function matchStarTrigger(
   trigger: LockStarTrigger,
   event: SimulatedEvent,
@@ -865,7 +757,6 @@ function matchStarTrigger(
   }
   traces.push(createTraceEntry('event type', 'star', event.type, true));
 
-  // Check action filter
   if (trigger.actions.length > 0) {
     const action = event.action ?? '';
     const matches = trigger.actions.includes(action);
@@ -873,16 +764,12 @@ function matchStarTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a watch trigger against a simulated event.
- * Supports action filter (started).
- */
+/** Supports action filter (started). */
 function matchWatchTrigger(
   trigger: LockWatchTrigger,
   event: SimulatedEvent,
@@ -894,7 +781,6 @@ function matchWatchTrigger(
   }
   traces.push(createTraceEntry('event type', 'watch', event.type, true));
 
-  // Check action filter
   if (trigger.actions.length > 0) {
     const action = event.action ?? '';
     const matches = trigger.actions.includes(action);
@@ -902,27 +788,21 @@ function matchWatchTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a generic webhook trigger against a simulated event.
- * Matches event type against the events array, then optionally filters by action.
- */
+/** Matches event type against the events array, then optionally filters by action. */
 function matchWebhookTrigger(
   trigger: LockWebhookTrigger,
   event: SimulatedEvent,
   traces: TraceEntry[],
 ): boolean {
-  // Check event type against trigger's events array
   const eventMatches = trigger.events.includes(event.type);
   traces.push(createTraceEntry('event type', trigger.events.join('|'), event.type, eventMatches));
   if (!eventMatches) return false;
 
-  // Check action filter
   if (trigger.actions.length > 0) {
     const action = event.action ?? '';
     const matches = trigger.actions.includes(action);
@@ -930,16 +810,12 @@ function matchWebhookTrigger(
     if (!matches) return false;
   }
 
-  // Check repo patterns
   if (!evaluateRepoFilter(trigger, event, traces)) return false;
 
   return true;
 }
 
-/**
- * Match a kici_event trigger against a simulated event.
- * Checks event name, optional JSONPath match/not, and source filter.
- */
+/** Checks event name, optional JSONPath match/not, and source filter. */
 function matchKiciEventTrigger(
   trigger: LockKiciEventTrigger,
   event: SimulatedEvent,
@@ -951,13 +827,11 @@ function matchKiciEventTrigger(
   }
   traces.push(createTraceEntry('event type', 'kici_event', event.type, true));
 
-  // Check event name from payload
   const eventName = (event.payload.eventName as string) ?? '';
   const nameMatches = eventName === trigger.eventName;
   traces.push(createTraceEntry('event name', trigger.eventName, eventName, nameMatches));
   if (!nameMatches) return false;
 
-  // Apply JSONPath match filter
   if (trigger.match && Object.keys(trigger.match).length > 0) {
     const eventPayload = (event.payload.payload as Record<string, unknown>) ?? {};
     const matches = matchJsonPath(eventPayload, trigger.match);
@@ -967,7 +841,6 @@ function matchKiciEventTrigger(
     if (!matches) return false;
   }
 
-  // Apply JSONPath not filter
   if (trigger.not && Object.keys(trigger.not).length > 0) {
     const eventPayload = (event.payload.payload as Record<string, unknown>) ?? {};
     const passes = matchJsonPathNot(eventPayload, trigger.not);
@@ -975,7 +848,6 @@ function matchKiciEventTrigger(
     if (!passes) return false;
   }
 
-  // Check source filter
   if (trigger.source) {
     const sourceRepo = (event.payload.sourceRepo as string) ?? '';
     const matches = sourceRepo === trigger.source;
@@ -986,10 +858,7 @@ function matchKiciEventTrigger(
   return true;
 }
 
-/**
- * Match a workflow_complete trigger against a simulated event.
- * Checks workflow name, status array, and source filter.
- */
+/** Checks workflow name, status array, and source filter. */
 function matchWorkflowCompleteTrigger(
   trigger: LockWorkflowCompleteTrigger,
   event: SimulatedEvent,
@@ -1001,7 +870,6 @@ function matchWorkflowCompleteTrigger(
   }
   traces.push(createTraceEntry('event type', 'workflow_complete', event.type, true));
 
-  // Check workflow name if specified
   if (trigger.name) {
     const workflowName = (event.payload.workflowName as string) ?? '';
     const matches = workflowName === trigger.name;
@@ -1009,7 +877,6 @@ function matchWorkflowCompleteTrigger(
     if (!matches) return false;
   }
 
-  // Check status filter
   if (trigger.status && trigger.status.length > 0) {
     const status = (event.payload.status as string) ?? '';
     const matches = trigger.status.includes(status);
@@ -1017,7 +884,6 @@ function matchWorkflowCompleteTrigger(
     if (!matches) return false;
   }
 
-  // Check source filter
   if (trigger.source) {
     const sourceRepo = (event.payload.sourceRepo as string) ?? '';
     const matches = sourceRepo === trigger.source;
@@ -1029,15 +895,12 @@ function matchWorkflowCompleteTrigger(
 }
 
 /**
- * Match a workflows_failed_batch trigger against a simulated event.
- *
- * The trigger participates in two phases:
- *  - A failed `workflow_complete` event is an accumulation input — it matches
- *    (respecting optional name/source filters) so the orchestrator buffers the
- *    run into the batch window instead of dispatching now.
- *  - A synthetic `workflows_failed_batch` event is the dispatch trigger — the
- *    orchestrator emits it once per window and it matches to dispatch the
- *    subscribing workflow a single time.
+ * A workflows_failed_batch trigger matches in two phases:
+ *  - A failed `workflow_complete` event (subject to the name/source filters) is
+ *    an accumulation input: the orchestrator buffers the run into the batch
+ *    window instead of dispatching now.
+ *  - A synthetic `workflows_failed_batch` event, emitted once per window,
+ *    dispatches the subscribing workflow a single time.
  */
 function matchWorkflowsFailedBatchTrigger(
   trigger: LockWorkflowsFailedBatchTrigger,
@@ -1058,7 +921,6 @@ function matchWorkflowsFailedBatchTrigger(
   }
   traces.push(createTraceEntry('event type', 'workflows_failed_batch', event.type, true));
 
-  // Check workflow name if specified
   if (trigger.name) {
     const workflowName = (event.payload.workflowName as string) ?? '';
     const matches = workflowName === trigger.name;
@@ -1066,7 +928,6 @@ function matchWorkflowsFailedBatchTrigger(
     if (!matches) return false;
   }
 
-  // Check source filter
   if (trigger.source) {
     const sourceRepo = (event.payload.sourceRepo as string) ?? '';
     const matches = sourceRepo === trigger.source;
@@ -1077,10 +938,7 @@ function matchWorkflowsFailedBatchTrigger(
   return true;
 }
 
-/**
- * Match a job_complete trigger against a simulated event.
- * Checks workflow name, job name, status array, and source filter.
- */
+/** Checks workflow name, job name, status array, and source filter. */
 function matchJobCompleteTrigger(
   trigger: LockJobCompleteTrigger,
   event: SimulatedEvent,
@@ -1092,7 +950,6 @@ function matchJobCompleteTrigger(
   }
   traces.push(createTraceEntry('event type', 'job_complete', event.type, true));
 
-  // Check workflow name if specified
   if (trigger.workflow) {
     const workflowName = (event.payload.workflowName as string) ?? '';
     const matches = workflowName === trigger.workflow;
@@ -1100,7 +957,6 @@ function matchJobCompleteTrigger(
     if (!matches) return false;
   }
 
-  // Check job name if specified
   if (trigger.job) {
     const jobName = (event.payload.jobName as string) ?? '';
     const matches = jobName === trigger.job;
@@ -1108,7 +964,6 @@ function matchJobCompleteTrigger(
     if (!matches) return false;
   }
 
-  // Check status filter
   if (trigger.status && trigger.status.length > 0) {
     const status = (event.payload.status as string) ?? '';
     const matches = trigger.status.includes(status);
@@ -1116,7 +971,6 @@ function matchJobCompleteTrigger(
     if (!matches) return false;
   }
 
-  // Check source filter
   if (trigger.source) {
     const sourceRepo = (event.payload.sourceRepo as string) ?? '';
     const matches = sourceRepo === trigger.source;
@@ -1127,10 +981,7 @@ function matchJobCompleteTrigger(
   return true;
 }
 
-/**
- * Match a generic_webhook trigger against a simulated event.
- * Checks source ID, optional events array, and JSONPath match/not.
- */
+/** Checks source ID, optional events array, and JSONPath match/not. */
 function matchGenericWebhookTrigger(
   trigger: LockGenericWebhookTrigger,
   event: SimulatedEvent,
@@ -1142,13 +993,12 @@ function matchGenericWebhookTrigger(
   }
   traces.push(createTraceEntry('event type', 'generic_webhook', event.type, true));
 
-  // Check source ID -- must match exactly
   const eventSource = (event.payload.source as string) ?? '';
   const sourceMatches = eventSource === trigger.source;
   traces.push(createTraceEntry('source', trigger.source, eventSource, sourceMatches));
   if (!sourceMatches) return false;
 
-  // Check events filter (optional -- if specified, event action must be in the list)
+  // Matched against payload.eventType, falling back to the event action.
   if (trigger.events && trigger.events.length > 0) {
     const eventType = (event.payload.eventType as string) ?? event.action ?? '';
     const matches = trigger.events.includes(eventType);
@@ -1158,7 +1008,6 @@ function matchGenericWebhookTrigger(
     if (!matches) return false;
   }
 
-  // Apply JSONPath match filter
   if (trigger.match && Object.keys(trigger.match).length > 0) {
     const matches = matchJsonPath(event.payload, trigger.match);
     traces.push(
@@ -1167,7 +1016,6 @@ function matchGenericWebhookTrigger(
     if (!matches) return false;
   }
 
-  // Apply JSONPath not filter
   if (trigger.not && Object.keys(trigger.not).length > 0) {
     const passes = matchJsonPathNot(event.payload, trigger.not);
     traces.push(createTraceEntry('jsonpath not', JSON.stringify(trigger.not), '(payload)', passes));
@@ -1177,10 +1025,7 @@ function matchGenericWebhookTrigger(
   return true;
 }
 
-/**
- * Match a schedule trigger against a simulated event.
- * Schedule triggers match when the event type is 'schedule' and the cron expression matches.
- */
+/** Schedule triggers match when the event type is 'schedule' and the cron expression matches. */
 function matchScheduleTrigger(
   trigger: LockScheduleTrigger,
   event: SimulatedEvent,
@@ -1192,7 +1037,6 @@ function matchScheduleTrigger(
   }
   traces.push(createTraceEntry('event type', 'schedule', event.type, true));
 
-  // Check cron expression from payload
   const cronExpression = (event.payload.cronExpression as string) ?? '';
   const matches = cronExpression === trigger.cronExpression;
   traces.push(createTraceEntry('cron expression', trigger.cronExpression, cronExpression, matches));
@@ -1202,9 +1046,8 @@ function matchScheduleTrigger(
 }
 
 /**
- * Match a lifecycle trigger against a simulated event.
- * Lifecycle triggers match when event type is 'lifecycle', the lifecycle event is in the trigger's
- * events array, and optionally the source repo matches.
+ * Lifecycle triggers match when event type is 'lifecycle', the lifecycle event
+ * is in the trigger's events array, and optionally the source repo matches.
  */
 function matchLifecycleTrigger(
   trigger: LockLifecycleTrigger,
@@ -1217,7 +1060,6 @@ function matchLifecycleTrigger(
   }
   traces.push(createTraceEntry('event type', 'lifecycle', event.type, true));
 
-  // Check lifecycle event type from payload
   const lifecycleEvent = (event.payload.lifecycleEvent as string) ?? '';
   const eventMatches = trigger.events.includes(lifecycleEvent);
   traces.push(
@@ -1225,7 +1067,6 @@ function matchLifecycleTrigger(
   );
   if (!eventMatches) return false;
 
-  // Check source filter (optional)
   if (trigger.sources && trigger.sources.length > 0) {
     const sourceRepo = (event.payload.sourceRepo as string) ?? '';
     const sourceMatches = trigger.sources.includes(sourceRepo);
@@ -1236,9 +1077,6 @@ function matchLifecycleTrigger(
   return true;
 }
 
-/**
- * Match a trigger against a simulated event.
- */
 export function matchTrigger(
   trigger: LockTrigger,
   event: SimulatedEvent,
@@ -1297,17 +1135,13 @@ export function matchTrigger(
   }
 }
 
-/**
- * Match all triggers for a workflow against an event.
- * Returns WorkflowDecision with full trace.
- */
+/** Match all of a workflow's triggers against an event, with the full trace. */
 export function matchWorkflowTriggers(
   workflow: LockWorkflow,
   event: SimulatedEvent,
 ): WorkflowDecision {
   const allTraces: TraceEntry[] = [];
 
-  // No triggers = never match
   if (workflow.triggers.length === 0) {
     return createWorkflowDecision(workflow.name, false, [], undefined, 'No triggers defined');
   }
@@ -1315,10 +1149,10 @@ export function matchWorkflowTriggers(
   let firstDeferred: { index: number; traces: TraceEntry[]; type: string } | undefined;
   const deferredPaths: string[][] = [];
 
-  // Try each trigger - the first outright match wins
+  // The first outright match wins.
   for (let i = 0; i < workflow.triggers.length; i++) {
     const trigger = workflow.triggers[i];
-    if (trigger == null) continue; // skip null triggers
+    if (trigger == null) continue;
     const triggerTraces: TraceEntry[] = [];
     const notes: TriggerMatchNotes = {};
 
@@ -1358,9 +1192,6 @@ export function matchWorkflowTriggers(
   return createWorkflowDecision(workflow.name, false, allTraces, undefined, 'No triggers matched');
 }
 
-/**
- * Match all workflows against an event.
- */
 export function matchAllWorkflows(
   workflows: readonly LockWorkflow[],
   event: SimulatedEvent,

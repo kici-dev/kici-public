@@ -1,17 +1,16 @@
 /**
  * The security hold of a pre-run global evaluation round.
  *
- * A global candidate that declares a `filter` or carries a `DynamicJobFn` needs
- * the evaluation round before any of its runs exist, and the round runs the
- * workflow repository's code on an agent that has the event's head checked out.
- * When the trust policy holds the event, that code must wait for the approval as
- * well. So instead of dispatching the round, the pass records ONE held run per
- * workflow repository — named like the round job it replaces — in the same
- * security queue, with the same hold row, as a held per-repository workflow.
+ * A candidate with a `filter` or a `DynamicJobFn` needs the round before its
+ * runs exist, and the round runs workflow-repository code on an agent with the
+ * event's head checked out, so a held event's round must wait for approval too.
+ * Instead of dispatching it, the pass records ONE held run per workflow
+ * repository, named like the round job, in the same security queue with the
+ * same hold row as a held per-repository workflow.
  *
- * Approving that hold re-evaluates the round from the stored webhook payload
- * (`releaseHeldGlobalEvalRound`); rejecting it cancels the run like any other
- * workflow-scoped security hold.
+ * Approval re-evaluates the round from the stored payload
+ * (`releaseHeldGlobalEvalRound`); rejection cancels it like any workflow-scoped
+ * security hold.
  */
 import { randomUUID } from 'node:crypto';
 import { createLogger } from '@kici-dev/shared';
@@ -33,9 +32,8 @@ export interface HoldGlobalEvalRoundsArgs {
   info: WebhookInfo;
   deps: ProcessingDeps;
   event: SimulatedEvent;
-  /** The candidates that needed the round. */
   candidates: readonly GlobalEvalCandidate[];
-  /** The source repository the event came from. */
+  /** The source repository. */
   repoIdentifier: string;
   /** The event's commit SHA. */
   ref: string;
@@ -66,12 +64,11 @@ function byWorkflowRepo(
 }
 
 /**
- * Hold the evaluation round of every workflow repository among `candidates`.
- * Returns the id of each held run, in workflow-repository order.
+ * Hold the round of every workflow repository among `candidates`; returns the
+ * held run ids in workflow-repository order.
  *
- * One run per workflow repository, not per registered SHA: the release
- * re-evaluates a whole workflow repository, so two rows for one repository would
- * dispatch its workflows twice.
+ * One run per workflow repository, not per SHA: the release re-evaluates the
+ * whole repository, so two rows would dispatch its workflows twice.
  */
 export async function holdGlobalEvalRounds(args: HoldGlobalEvalRoundsArgs): Promise<string[]> {
   const runIds: string[] = [];
@@ -91,8 +88,7 @@ async function holdOneRound(
   const runId = randomUUID();
   const reg = group[0].reg;
 
-  // The release re-evaluates the event from this payload, so it is stored
-  // before the hold that can release it exists.
+  // Stored before the hold exists, since the release re-evaluates from it.
   await storeWebhookPayload({ logStorage: deps.logStorage, runId, payload: info.payload });
 
   await deps.executionTracker?.recordRunHeld({
@@ -115,8 +111,7 @@ async function holdOneRound(
     triggerEvent: info.event,
     prNumber: event.prNumber ?? null,
     isGlobalEvalRound: true,
-    // The workflows this round covers, so its release can refuse to run the
-    // round without one of them.
+    // So the release can refuse to run the round without one of them.
     heldRoundWorkflows: group.map((candidate) => candidate.lockEntry.name),
   });
 

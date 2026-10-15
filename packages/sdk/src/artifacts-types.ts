@@ -1,9 +1,8 @@
 /**
- * Artifact name constraints: a filesystem/URL-safe token. The schema is hosted
- * in `@kici-dev/engine` because it is a trust-boundary contract the orchestrator
- * enforces on every inbound upload, not only an SDK-side call check. Re-exported
- * here unchanged, so the public SDK surface is stable and a name the SDK accepts
- * is exactly a name the orchestrator accepts.
+ * Artifact name constraints: a filesystem/URL-safe token. Hosted in
+ * `@kici-dev/engine` because the orchestrator enforces it on every inbound
+ * upload; re-exported unchanged, so a name the SDK accepts is exactly a name
+ * the orchestrator accepts.
  */
 export { ArtifactNameSchema, ARTIFACT_NAME_MAX_LENGTH } from '@kici-dev/engine';
 

@@ -3,24 +3,19 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Add `admin_tokens.subject TEXT`, nullable.
  *
- * `admin_tokens` had no field tying a token to a person: `label` is free text
- * and `role` says what the token may do, not who holds it. So the operational
- * advice in the two-layer RBAC guide — one token per engineer, match the
- * orchestrator role to the dashboard role, revoke both on departure — was not
- * merely unchecked, it was not expressible.
+ * `label` is free text and `role` says what a token may do, not who holds it,
+ * so the two-layer RBAC guide's advice (one token per engineer, match the
+ * orchestrator role to the dashboard role, revoke both on departure) needs a
+ * holder field to be expressible.
  *
- * `subject` records the intended holder as the operator states it: an OIDC
- * `sub` or an email. The orchestrator cannot verify it and never treats it as
- * an authorization input; it is the join key the Platform's RBAC drift report
+ * `subject` is the intended holder as the operator states it: an OIDC `sub`
+ * or an email. The orchestrator cannot verify it and never treats it as an
+ * authorization input; it is the join key the Platform's RBAC drift report
  * uses to compare a token against the org's dashboard membership.
  *
- * Nullable, no default, and deliberately NOT backfilled. NULL is the
- * `unlinked` finding the report exists to surface: every token minted before
- * this column existed genuinely has no recorded holder, and inventing one
- * would hide exactly the condition an operator needs to see.
- *
- * Idempotent: the add is guarded on existence and the drop uses IF EXISTS, so
- * a re-run is a no-op.
+ * Nullable, no default, deliberately NOT backfilled: NULL is the `unlinked`
+ * finding the report surfaces, and a token minted before this column has no
+ * recorded holder. Idempotent.
  */
 const COLUMN = 'subject';
 

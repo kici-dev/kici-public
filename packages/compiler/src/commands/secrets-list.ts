@@ -9,12 +9,8 @@ export interface SecretsListOptions {
 }
 
 /**
- * List test-available secret contexts through the Platform.
- *
- * Calls GET /api/v1/orgs/:orgId/contexts?includeSecrets=true (relayed to
- * the org's orchestrator), filters to contexts with
- * allowLocalExecution=true, and displays a table of names, key names, and
- * flags. Values are never exposed -- only key names.
+ * Lists contexts with allowLocalExecution through the Platform, which relays to
+ * the org's orchestrator. Only key names are shown, never values.
  */
 export async function secretsListCommand(_options: SecretsListOptions = {}): Promise<boolean> {
   try {
@@ -44,7 +40,6 @@ export async function secretsListCommand(_options: SecretsListOptions = {}): Pro
   }
 }
 
-/** Render the secret-context table to stdout. */
 function renderContextTable(contexts: ContextContext[]): void {
   console.log(pc.bold('\nTest-available secret contexts:\n'));
 

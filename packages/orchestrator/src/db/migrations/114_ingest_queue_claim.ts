@@ -3,21 +3,15 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Claim bookkeeping for the durable ingest queue.
  *
- * Two additive, nullable columns:
+ * - `ingest_overflow_buffer.claimed_at` — when a row moved `buffered` → `replaying`. A worker
+ *   that dies mid-pipeline strands its row in `replaying`, so the drain pass reclaims claims
+ *   older than the timeout below. It must be its own clock: `captured_at` orders the FIFO
+ *   drain, so an old row would read as instantly stale and be reclaimed from a live worker.
+ * - `cluster_settings.ingest_overflow_claim_timeout_ms` — that timeout; NULL → the configured
+ *   default. It must exceed the longest legitimate pipeline run (a build phase alone is capped
+ *   at `cacheBuildTimeoutMs`), or a reclaim re-runs in-flight work.
  *
- * - `ingest_overflow_buffer.claimed_at` — when a row moved `buffered` →
- *   `replaying`. A worker that dies mid-pipeline leaves its row in `replaying`
- *   with nothing to move it back, so the drain pass reclaims a row whose claim
- *   is older than the timeout below. The claim clock has to be its own column:
- *   `captured_at` orders the FIFO drain, so an old row picked up first would
- *   read as instantly stale and be reclaimed out from under a live worker.
- * - `cluster_settings.ingest_overflow_claim_timeout_ms` — how long a claim may
- *   stand before the drain pass reclaims it. NULL means the orchestrator's
- *   configured default applies. It must exceed the longest a single delivery's
- *   pipeline can legitimately run (a build phase alone is capped at
- *   `cacheBuildTimeoutMs`), or a reclaim would re-run work still in flight.
- *
- * Idempotent: each column is guarded on existence, so a re-run is a no-op.
+ * Idempotent: each column is guarded on existence.
  */
 async function columnExists(db: Kysely<unknown>, table: string, column: string): Promise<boolean> {
   const check = await sql<{ exists: boolean }>`

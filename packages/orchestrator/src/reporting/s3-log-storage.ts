@@ -1,9 +1,7 @@
 /**
- * S3-backed log storage.
- *
- * Stores execution logs in S3. Retention is bounded by the orchestrator cleanup
- * sweep, which bulk-deletes objects older than `KICI_STEP_LOG_TTL_DAYS` (default
- * 90; 0 disables the sweep for operators running their own bucket lifecycle).
+ * S3-backed log storage. Retention is bounded by the orchestrator cleanup sweep, which
+ * bulk-deletes objects older than `KICI_STEP_LOG_TTL_DAYS` (default 90; 0 disables the
+ * sweep for operators running their own bucket lifecycle).
  *
  * Two write verbs with different durability contracts:
  *
@@ -18,22 +16,19 @@
  *   once the buffer reaches segmentFlushBytes OR its oldest byte reaches
  *   segmentFlushMs. Each byte is written exactly once (no O(N^2) amplification)
  *   and the unique seal key means concurrent appends to the same step can never
- *   overwrite one another. Durability of the final tail is guaranteed by
- *   finalize(path) at run completion.
+ *   overwrite one another. finalize(path) at run completion makes the tail durable.
  *
- * - finalize() seals the remaining tail buffer for a step key.
- * - read() lists sealed segments (plus any single object written by
- *   append()) and streams them via the byte-offset cursor.
+ * - read() streams sealed segments (plus any single object from append()) via the
+ *   byte-offset cursor.
  * - exists()/list() are segment-aware: `exists` is true when a single object or
  *   any segment is present; `list` collapses segment keys to their logical step
  *   path.
  *
- * All appendStreaming/finalize operations for one step key run through a
- * sequential execution chain so the in-memory buffer and seq counter are the
- * authoritative single writer even when the caller fires appends without
- * awaiting.
+ * All appendStreaming/finalize operations for one step key run through a sequential
+ * execution chain, so the in-memory buffer and seq counter are the authoritative single
+ * writer even when the caller fires appends without awaiting.
  *
- * Uses AWS SDK v3 modular imports -- only loaded when S3 storage is configured.
+ * AWS SDK v3 modular imports -- only loaded when S3 storage is configured.
  */
 
 import {
@@ -111,15 +106,11 @@ export class S3LogStorage implements LogStorage {
   // -- Helpers --
 
   /**
-   * Build the full S3 object key from a log path.
-   *
-   * The assert is not traversal protection — S3 keys are opaque byte strings,
-   * so `..` is a literal segment and this concatenation cannot escape the
-   * prefix. It refuses to mint a malformed key at all: `list()` and
-   * `listWithMetadata()` rebuild storage-relative paths by slicing the prefix
-   * off, so a key carrying `..` or a leading `/` would be handed back to the
-   * caller as an odd relative path — and on a filesystem-backed peer that path
-   * reaches a resolve. Keep it; it is deliberate.
+   * The assert is not traversal protection — an S3 key is an opaque byte string, so `..`
+   * is literal and cannot escape the prefix. It refuses to mint a malformed key at all:
+   * `list()` and `listWithMetadata()` slice the prefix off to rebuild relative paths, so a
+   * key carrying `..` or a leading `/` would come back as an odd relative path, which on a
+   * filesystem-backed peer reaches a resolve. Keep it; it is deliberate.
    *
    * Removals do NOT go through here: see {@link S3LogStorage.deleteKey}.
    */
@@ -131,25 +122,23 @@ export class S3LogStorage implements LogStorage {
   /**
    * Object key for a removal, built without the minting assert.
    *
-   * `deleteMany` consumes this store's own `listWithMetadata()` output, which
-   * reports whatever keys the bucket actually holds — including a legacy
-   * malformed one written before `objectKey()` began refusing them. Routing a
-   * removal through the minting assert would throw while building the batch,
-   * so one such object would abort the whole retention sweep and leave every
-   * expired object in place forever. There is no protection to lose: an S3 key
-   * is an opaque byte string, so a `..` segment is literal and this
-   * concatenation addresses an object inside the prefix or nothing at all.
+   * `deleteMany` consumes `listWithMetadata()` output, which reports whatever keys the
+   * bucket holds — including a legacy malformed one written before `objectKey()` refused
+   * them. The assert would throw while building the batch, so one such object would abort
+   * the whole retention sweep and leave every expired object in place forever. No
+   * protection is lost: a `..` segment is literal, so this addresses an object inside the
+   * prefix or nothing at all.
    */
   private deleteKey(path: string): string {
     return `${this.prefix}${path}`;
   }
 
-  /** Segment object key for a given sequence number (zero-padded to 6 digits). */
+  /** Zero-padded to 6 digits. */
   private segKey(key: string, seq: number): string {
     return `${key}/seg-${String(seq).padStart(6, '0')}`;
   }
 
-  /** Check if an error is a "not found" error (NoSuchKey, NotFound, 404). */
+  /** NoSuchKey, NotFound, or 404. */
   private isNotFoundError(err: unknown): boolean {
     if (typeof err !== 'object' || err === null) return false;
     const name = (err as { name?: string }).name;
@@ -158,7 +147,7 @@ export class S3LogStorage implements LogStorage {
     return code === 404;
   }
 
-  /** Read the full content of an S3 object as a string. Returns null if not found. */
+  /** Null if not found. */
   private async getContent(key: string): Promise<string | null> {
     try {
       const response = await this.client.send(
@@ -179,10 +168,9 @@ export class S3LogStorage implements LogStorage {
   }
 
   /**
-   * Run `fn` after every previously-queued operation for `key` has settled, so
-   * all appendStreaming/finalize calls for one step key execute strictly in
-   * order. The chain swallows prior errors (they are surfaced to their own
-   * caller) so one failed op does not wedge the key.
+   * Runs `fn` after every queued operation for `key` has settled, so a step key's
+   * appendStreaming/finalize calls execute strictly in order. The chain swallows prior
+   * errors (surfaced to their own caller) so one failed op does not wedge the key.
    */
   private runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.locks.get(key) ?? Promise.resolve();
@@ -202,7 +190,6 @@ export class S3LogStorage implements LogStorage {
   async append(path: string, data: string): Promise<void> {
     const key = this.objectKey(path);
 
-    // Read existing content (if any) and append new data
     const existing = await this.getContent(key);
     const newContent = existing !== null ? existing + data : data;
 
@@ -218,10 +205,7 @@ export class S3LogStorage implements LogStorage {
 
   // -- Write path (high-frequency step logs: buffered append-only segments) --
 
-  /**
-   * Highest existing segment number under a key (for mid-run redeploy
-   * continuity), + 1. Returns 0 when no segments exist yet.
-   */
+  /** Highest existing segment number + 1 (mid-run redeploy continuity); 0 when none. */
   private async nextSeq(key: string): Promise<number> {
     let max = -1;
     let token: string | undefined;
@@ -288,9 +272,8 @@ export class S3LogStorage implements LogStorage {
     await this.runExclusive(key, async () => {
       const buf = this.buffers.get(key);
       if (buf) {
-        // On a transient seal failure the buffer is retained (runExclusive
-        // surfaces the throw to the caller) so a later seal/finalize retries
-        // the accumulated bytes rather than dropping them.
+        // On a transient seal failure the buffer is retained (the throw reaches the
+        // caller) so a later seal/finalize retries the bytes rather than dropping them.
         await this.seal(key, buf);
         this.buffers.delete(key);
       }
@@ -303,9 +286,8 @@ export class S3LogStorage implements LogStorage {
   // -- Read path --
 
   /**
-   * Single-object size (or null) + sealed segments in ascending seq order for a
-   * key. The single object is the content written by append() (single-shot
-   * writers).
+   * Size of the append()-written single object (or null) + sealed segments in ascending
+   * seq order.
    */
   private async layout(key: string): Promise<{ single: number | null; segs: Segment[] }> {
     let single: number | null = null;
@@ -344,10 +326,7 @@ export class S3LogStorage implements LogStorage {
     return Buffer.from(await resp.Body.transformToByteArray());
   }
 
-  /**
-   * Map a global byte cursor + limit onto per-object range reads across an
-   * ordered entry list. Returns the reads to perform and the total byte size.
-   */
+  /** Map a global byte cursor + limit onto per-object range reads over ordered entries. */
   private planReads(
     entries: Segment[],
     cursor: number,
@@ -428,8 +407,7 @@ export class S3LogStorage implements LogStorage {
 
       for (const obj of response.Contents ?? []) {
         if (!obj.Key) continue;
-        // Collapse a segment key to its logical step path; single-object keys
-        // already are logical paths and pass through unchanged.
+        // Collapse a segment key to its logical step path; single-object keys pass through.
         const logicalKey = obj.Key.replace(/\/seg-\d+$/, '');
         const relativePath = logicalKey.startsWith(this.prefix)
           ? logicalKey.slice(this.prefix.length)
@@ -459,8 +437,7 @@ export class S3LogStorage implements LogStorage {
 
       for (const obj of response.Contents ?? []) {
         if (!obj.Key || !obj.LastModified) continue;
-        // Physical object keys (segments and single objects) are kept
-        // as-is — the sweep deletes each one, so no seg-collapse here.
+        // Physical keys as-is — the sweep deletes each one, so no seg-collapse here.
         const relativePath = obj.Key.startsWith(this.prefix)
           ? obj.Key.slice(this.prefix.length)
           : obj.Key;
@@ -477,10 +454,9 @@ export class S3LogStorage implements LogStorage {
     let deleted = 0;
     for (let i = 0; i < paths.length; i += 1000) {
       const chunk = paths.slice(i, i + 1000);
-      // Quiet:true suppresses the per-key success list but STILL returns any
-      // per-key errors, so a partially-failed batch (e.g. one key access-
-      // denied) is not miscounted as fully deleted and the object is not
-      // silently reported as swept — count only what S3 actually removed.
+      // Quiet:true suppresses the per-key success list but STILL returns per-key errors,
+      // so a partially-failed batch (e.g. one key access-denied) is not counted as fully
+      // deleted — count only what S3 actually removed.
       const response = await this.client.send(
         new DeleteObjectsCommand({
           Bucket: this.bucket,

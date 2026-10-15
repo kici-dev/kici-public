@@ -33,7 +33,6 @@ function collectLines(stream: PassThrough): Record<string, unknown>[] {
   }) as unknown as Record<string, unknown>[];
 }
 
-/** Simple helper: parse output from a PassThrough into JSON lines */
 function parseOutput(stream: PassThrough): Record<string, unknown>[] {
   const data = (stream.read() as Buffer | null) ?? Buffer.alloc(0);
   return data

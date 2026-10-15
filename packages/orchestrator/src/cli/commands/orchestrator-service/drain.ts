@@ -1,17 +1,13 @@
 /**
- * `kici-admin orchestrator drain` / `resume` CLI verbs.
- *
- * Quiesce a coordinator before an upgrade: stop dispatching new jobs, let
- * in-flight jobs finish, report when quiesced. `--wait` polls status
- * client-side until `jobsRunning` reaches 0 or the timeout elapses; exit codes
- * are scriptable (0 quiesced/initiated, 2 wait timed out, 1 error).
+ * `kici-admin orchestrator drain` / `resume`: quiesce a coordinator before an
+ * upgrade. `--wait` polls until `jobsRunning` is 0 or the timeout elapses.
+ * Exit codes: 0 quiesced/initiated, 2 wait timed out, 1 error.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../../api-client.js';
 import { waitForQuiesce } from '../shared/upgrade-safety.js';
 
-// Re-exported so existing importers (and the tests that pin the poller's
-// semantics) keep one implementation between the CLI verb and the upgrade.
+// Re-exported so the CLI verb and the upgrade share one poller.
 export { waitForQuiesce };
 
 type Snapshot = { draining: boolean; jobsRunning: number };

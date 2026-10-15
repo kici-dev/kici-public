@@ -72,10 +72,8 @@ async function reloadOnce(deps: ScalerFileReloadDeps): Promise<ScalerFileReloadR
     return { outcome: ScalerReloadOutcome.enum.rejected, errors: result.errors };
   }
 
-  // The dashboard diagnostics snapshot renders its scaler list from the stored
-  // config, not from the manager, so leaving it at the boot-time value makes
-  // the panel hide a scaler the reload just added and keep showing one it
-  // removed.
+  // The dashboard diagnostics snapshot renders scalers from the stored config,
+  // not the manager; a stale boot-time value hides added and shows removed ones.
   deps.onApplied?.(config);
   logger.info('Scaler configuration reloaded successfully', { plan: result.plan });
   scalerConfigReloadsTotal.add(1, { result: 'success' });

@@ -1,6 +1,4 @@
-/**
- * Format an ISO timestamp as a relative time string (e.g. "2 minutes ago").
- */
+/** "2 minutes ago" from an ISO timestamp. */
 export function formatRelativeTime(isoDate: string): string {
   const ms = Date.now() - new Date(isoDate).getTime();
   if (ms < 0) return 'just now';

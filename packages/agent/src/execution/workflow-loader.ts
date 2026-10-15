@@ -1,10 +1,8 @@
 /**
- * Workflow module loading: transforms `.ts` workflow files on import via the
- * `@kici-dev/core/ts-loader-hook` oxc-transform ESM loader hook. Customer
- * workflow code is imported
- * directly from the cloned / extracted source tree — no intermediate bundle,
- * no Rolldown step at runtime. `@kici-dev/sdk` and host-repo deps resolve via
- * Node's normal ESM lookup against `.kici/node_modules/`.
+ * Imports `.ts` workflow files straight from the cloned / extracted source tree
+ * through the `@kici-dev/core/ts-loader-hook` oxc-transform loader hook — no
+ * bundle, no Rolldown step at runtime. `@kici-dev/sdk` and host-repo deps
+ * resolve by Node's ESM lookup against `.kici/node_modules/`.
  */
 
 import fsPromises from 'node:fs/promises';
@@ -25,11 +23,9 @@ import { isDynamicJobFn } from '@kici-dev/sdk';
 import { buildGeneratorContext, type GeneratorRepoPair } from './generator-context.js';
 
 /**
- * SDK output-map setters resolved from a specific `@kici-dev/sdk` instance.
- * The agent uses these to wire the workflow module's OWN SDK copy (a different
- * physical module than the agent's bundled SDK) to the same output maps the
- * step loop mutates, so within-job `.result` proxies — which read that copy's
- * module-global `_stepOutputsMap` — resolve at access time.
+ * Output-map setters of the workflow module's OWN SDK copy (not the agent's
+ * bundled SDK), wired to the maps the step loop mutates so within-job `.result`
+ * proxies — reading that copy's module-global `_stepOutputsMap` — resolve.
  */
 export interface SdkOutputSetters {
   setStepOutputsMap: (map: OutputsMap) => void;
@@ -38,23 +34,16 @@ export interface SdkOutputSetters {
 }
 
 /**
- * Resolve the `@kici-dev/sdk` instance the workflow module itself imports.
+ * Resolves the `@kici-dev/sdk` instance the workflow module itself imports.
  *
- * The workflow's `.result` proxies read the module-global step-outputs map of
- * whichever SDK copy the workflow file resolves — which is generally a
- * different physical module than the agent's bundled SDK (the workflow is
- * imported from the cloned source tree and resolves its deps against that
- * tree's `node_modules`). Resolving via `createRequire(workflowFilePath)` walks
- * `node_modules` from the workflow file exactly the way the workflow's own
- * `import '@kici-dev/sdk'` does — including any hoisted copy — so the returned
- * setters mutate the SAME module-global map object the proxies read. Node caches
- * ESM modules by resolved URL, so importing that path yields the workflow's live
- * singleton, not a fresh copy.
+ * `createRequire(workflowFilePath)` walks `node_modules` exactly as the
+ * workflow's own `import '@kici-dev/sdk'` does, hoisted copies included, and
+ * Node caches ESM by resolved URL, so the setters mutate the live map the
+ * proxies read.
  *
- * The setters live only on `@kici-dev/sdk/internal`. A tree whose SDK does not
- * publish that subpath cannot be wired to this agent, and the agent's own
- * bundled setters would mutate a map the workflow's proxies never read — so the
- * mismatch is refused here rather than surfacing later as an empty `.result`.
+ * The setters live only on `@kici-dev/sdk/internal`. Without that subpath the
+ * agent's bundled setters would mutate a map the proxies never read, so the
+ * mismatch is refused here rather than surfacing as an empty `.result`.
  */
 export async function resolveWorkflowSdkSetters(
   workflowFilePath: string,
@@ -90,10 +79,9 @@ export async function resolveWorkflowSdkSetters(
   };
 }
 
-// Build-time constants injected by the agent bundler (scripts/build-service.mjs).
-// The agent's baked SDK fingerprint is included in the lock-file drift error
-// so an operator can correlate against the host / orchestrator SDK fingerprint
-// without tailing the agent startup log.
+// Injected by the agent bundler (scripts/build-service.mjs). The lock-file drift
+// error carries this baked SDK fingerprint so an operator can compare it with
+// the host / orchestrator one without tailing the agent startup log.
 declare const KICI_SDK_VERSION: string;
 declare const KICI_SDK_BUNDLE_HASH: string;
 const AGENT_SDK_VERSION = typeof KICI_SDK_VERSION !== 'undefined' ? KICI_SDK_VERSION : 'unknown';
@@ -101,31 +89,23 @@ const AGENT_SDK_BUNDLE_HASH =
   typeof KICI_SDK_BUNDLE_HASH !== 'undefined' ? KICI_SDK_BUNDLE_HASH : 'unknown';
 
 /**
- * Compile schema version, re-exported from its single definition in
- * `@kici-dev/core/kici-source-digest`. The compiler mixes the same constant
- * into every `contentHash` it writes, so a second copy here is exactly how a
- * producer and its verifier drift apart.
+ * Re-exported, never copied: the compiler mixes this constant into every
+ * `contentHash`, so a second copy would let producer and verifier drift apart.
  */
 export { COMPILE_SCHEMA_VERSION } from '@kici-dev/core/kici-source-digest';
 
 /**
- * Register the ESM loader hook that transforms `.ts` / `.tsx` files on the fly
- * for subsequent dynamic `import()` calls. Idempotent at our level via the
- * `hookRegistered` flag; Node also tolerates repeated `register()` calls by
- * stacking layers, but we avoid the noise.
+ * Registers the `.ts` / `.tsx` loader hook once (Node would stack repeated
+ * `register()` calls as layers).
  *
- * Two registration branches:
- *
- * - **Container path** — when `KICI_TS_LOADER_HOOK_PATH` is set (only
- *   `ContainerSandbox` sets it, pointing at a pure-JS hook bundle mounted into
- *   the job container), register that on-disk hook by absolute `file://` URL.
- *   `module.register` resolves the specifier on disk in a worker thread, so a
- *   bare package specifier would need a `node_modules` tree next to the runner
- *   bundle — which does not exist in a bare customer container. An absolute
- *   `file://` URL sidesteps resolution entirely.
- * - **Fork / firecracker path** — when the env var is unset, register the
- *   `@kici-dev/core/ts-loader-hook` oxc-transform hook by bare specifier,
- *   resolved via the workspace `node_modules` those sandboxes bind read-only.
+ * - **Container** — `KICI_TS_LOADER_HOOK_PATH` (set only by `ContainerSandbox`)
+ *   names a pure-JS hook bundle mounted into the job container, registered by
+ *   absolute `file://` URL: `module.register` resolves a bare specifier on disk
+ *   in a worker thread, and a bare customer container has no `node_modules`
+ *   next to the runner bundle.
+ * - **Fork / firecracker** — the bare `@kici-dev/core/ts-loader-hook`
+ *   specifier, resolved from the workspace `node_modules` those sandboxes bind
+ *   read-only.
  */
 let hookRegistered = false;
 export function ensureLoaderHookRegistered(): void {
@@ -140,15 +120,10 @@ export function ensureLoaderHookRegistered(): void {
 }
 
 /**
- * Compute content hash for a workflow (same formula as `@kici-dev/compiler`
- * lockfile/hasher.ts). Used to verify the loaded source matches the lock
- * file's contentHash when `expectedContentHash` is provided.
- *
- * Line endings in `rawSource` (and inside `assetDigest`) are normalized to LF
- * before hashing. This matches the compiler-side normalization in
- * `@kici-dev/compiler` `lockfile/hasher.ts` so Windows agents — where Git's
- * `core.autocrlf=true` system default checks out text files with CRLF — agree
- * with lockfiles compiled on Linux (LF).
+ * The same formula as `@kici-dev/compiler` `lockfile/hasher.ts`, including its
+ * LF normalization of `rawSource` and `assetDigest`, so a Windows agent (Git's
+ * `core.autocrlf=true` default checks out CRLF) agrees with a lock compiled on
+ * Linux.
  */
 function computeContentHash(rawSource: string, assetDigest?: string): string {
   let input = `${COMPILE_SCHEMA_VERSION}:${normalizeLineEndings(rawSource)}`;
@@ -159,18 +134,14 @@ function computeContentHash(rawSource: string, assetDigest?: string): string {
 }
 
 /**
- * The compile schema version the lock file records for `sourceFile`, or null
- * when the tree carries no readable lock (a `file://` in-place run, a workflow
- * outside the `.kici/` convention, a hand-built fixture).
+ * The compile schema version the lock records for `sourceFile`, or null when
+ * the tree has no readable lock (a `file://` in-place run, a workflow outside
+ * `.kici/`, a hand-built fixture).
  *
- * The source tarball carries `.kici/kici.lock.json` — the digest excludes it,
- * but `source-packer.ts` packs it — so the agent can read the producing
- * compiler's schema version from the tree it already has, with no wire field
- * to plumb and no protocol change.
- *
- * A malformed or unreadable lock returns null rather than throwing: this is a
- * diagnostic gate in front of the real hash check, so it must never convert a
- * bad lock into a worse error than the hash comparison already gives.
+ * `source-packer.ts` packs `.kici/kici.lock.json` (the digest excludes it), so
+ * no wire field is needed. A malformed lock returns null, never throws: this
+ * diagnostic gate must not turn a bad lock into a worse error than the hash
+ * check gives.
  */
 async function readLockCompileSchemaVersion(
   kiciDir: string,
@@ -185,17 +156,15 @@ async function readLockCompileSchemaVersion(
   const workflows = (parsed as { workflows?: unknown })?.workflows;
   if (!Array.isArray(workflows)) return null;
 
-  // Match the entry by its recorded source file where possible. `sourceFile` is
-  // workDir-relative (`.kici/workflows/w.ts`) and so is `source.file`, but a
-  // lock written elsewhere can spell it differently — so fall back to any entry
-  // that names a version. Every workflow in one lock is compiled by one
-  // compiler, so the fallback cannot pick a different answer than the match.
+  // Both paths are workDir-relative, but a lock written elsewhere can spell
+  // `source.file` differently, so fall back to any entry naming a version: one
+  // compiler compiles every workflow in a lock, so the answer is the same.
   const normalize = (p: string): string => p.replaceAll('\\', '/').replace(/^\.\//, '');
   const target = normalize(sourceFile);
   const versionOf = (w: unknown): number | null => {
     const v = (w as { compileSchemaVersion?: unknown })?.compileSchemaVersion;
-    // 0 is the compiler's "no bundle, no hash" sentinel (generator.ts) — such a
-    // lock carries no contentHash to gate, so it is not a version claim.
+    // 0 is the compiler's "no bundle, no hash" sentinel (generator.ts), not a
+    // version claim.
     return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null;
   };
 
@@ -228,19 +197,13 @@ async function buildAssetDigestFromResolvedPaths(
 }
 
 /**
- * Load a workflow module by dynamic-importing its source file.
+ * Dynamic-imports the workflow's `.ts` file; transitive imports resolve against
+ * the workspace `node_modules/` as under any `tsx`-style runner.
  *
- * Registers the oxc-transform loader hook (idempotent), then dynamic-imports
- * the `.ts` file. Transitive imports resolve against the workspace's
- * `node_modules/` the same way any `tsx`-style runner would — so host-repo
- * helpers and `@kici-dev/sdk` Just Work.
- *
- * When `expectedContentHash` is provided, verifies the extracted `.kici/` tree
- * matches the hash in the lock file. It re-hashes the whole tree, not the entry
- * file alone, so an edit to an imported helper is caught — that was the gap
- * that let a warm cache restore a stale tarball and run the OLD helper green.
- * Drift produces a descriptive error that surfaces the baked agent SDK
- * fingerprint (useful when debugging "is the agent running a stale build?").
+ * With `expectedContentHash`, re-hashes the whole extracted `.kici/` tree, not
+ * just the entry file, so a warm cache restoring a stale tarball cannot run an
+ * old imported helper green. The drift error names the baked agent SDK
+ * fingerprint, to spot an agent running a stale build.
  */
 export async function loadWorkflowSource(
   workDir: string,
@@ -253,16 +216,13 @@ export async function loadWorkflowSource(
   const filePath = path.join(workDir, sourceFile);
 
   if (expectedContentHash) {
-    // The same walk the compiler ran, over the tree the agent actually has.
-    // Falls back to the entry file for a workflow outside a `.kici/` directory,
-    // mirroring the compiler's own fallback so the two agree in both shapes.
+    // The compiler's walk; outside a `.kici/` directory both fall back to the
+    // entry file.
     const kiciDir = findKiciDir(filePath);
 
-    // The producing compiler's schema version is mixed into `contentHash`, so a
-    // compiler and an agent on different versions can NEVER agree — the hash
-    // check below would report "workflow source changed" and tell the operator
-    // to run `kici compile`, which cannot fix a version mismatch. Read the
-    // version the lock records and name the real fault first.
+    // The schema version is mixed into `contentHash`, so mismatched versions
+    // never agree, and the hash error would wrongly advise `kici compile`.
+    // Name the real fault first.
     if (kiciDir) {
       const lockVersion = await readLockCompileSchemaVersion(kiciDir, sourceFile);
       if (lockVersion !== null && lockVersion !== COMPILE_SCHEMA_VERSION) {
@@ -287,11 +247,9 @@ export async function loadWorkflowSource(
     }
     const actualHash = computeContentHash(rawSource, assetDigest);
     if (actualHash !== expectedContentHash) {
-      // A symlink in the hashed tree is the one drift "run kici compile" cannot
-      // resolve: the digest covers the link string, so a link the tarball omits
-      // or extraction rewrites makes the compiling machine's hash unreachable
-      // here and every recompile reproduces it. Name the links when there are
-      // any, so the loop is diagnosable from the error alone.
+      // A symlink is the one drift recompiling cannot fix: the digest covers the
+      // link string, so a link the tarball omits or extraction rewrites makes
+      // the hash unreachable here on every recompile. Name the links.
       const symlinkNote = kiciDir
         ? hashedSymlinkDriftNote(await collectSourceSymlinks(kiciDir))
         : '';
@@ -313,9 +271,6 @@ export async function loadWorkflowSource(
   return { module: module as Record<string, unknown>, sdkSetters };
 }
 
-/**
- * Type guard for Workflow shape (discriminant: `_tag === 'Workflow'`).
- */
 function isWorkflow(value: unknown): value is Workflow {
   return (
     typeof value === 'object' &&
@@ -325,13 +280,7 @@ function isWorkflow(value: unknown): value is Workflow {
   );
 }
 
-/**
- * Extract a workflow by name from a module's exports.
- *
- * Searches:
- * 1. Default export (single Workflow or array of Workflows)
- * 2. Named exports
- */
+/** Searches the default export (one Workflow or an array), then named exports. */
 export function extractWorkflow(module: Record<string, unknown>, workflowName: string): Workflow {
   if (module.default) {
     const defaultExport = module.default;
@@ -357,9 +306,6 @@ export function extractWorkflow(module: Record<string, unknown>, workflowName: s
   throw new Error(`Workflow '${workflowName}' not found in module exports`);
 }
 
-/**
- * Extract a dynamic job function from a workflow by index.
- */
 export function extractDynamicJobFn(workflow: Workflow, index: number): DynamicJobFn {
   if (index < 0 || index >= workflow.jobs.length) {
     throw new Error(
@@ -375,9 +321,6 @@ export function extractDynamicJobFn(workflow: Workflow, index: number): DynamicJ
   return item;
 }
 
-/**
- * Extract steps from a static job within a workflow.
- */
 export function extractSteps(workflow: Workflow, jobName: string): readonly StepInput[] {
   for (const item of workflow.jobs) {
     if (!isDynamicJobFn(item) && (item as Job).name === jobName) {
@@ -389,18 +332,12 @@ export function extractSteps(workflow: Workflow, jobName: string): readonly Step
 }
 
 /**
- * Extract steps from a job generated by a DynamicJobFn.
+ * Re-evaluates the DynamicJobFn, because generated step functions are closures
+ * obtainable only by calling it again, and returns the named job's steps.
  *
- * Re-evaluates the DynamicJobFn to get the generated Job[] array, then finds
- * the job by name and returns its steps. This is necessary because
- * DynamicJobFn-generated jobs' step functions are closures that can only be
- * obtained by calling the DynamicJobFn again.
- *
- * The function must be deterministic: given the same event context, it should
- * return the same jobs with the same step functions. When `expectedJobNames`
- * is provided, the re-evaluated output is compared against the original eval.
- * A sibling mismatch logs a warning; a missing target job throws a clear
- * determinism error.
+ * The function must be deterministic for the same event context. Against
+ * `expectedJobNames`, a sibling mismatch logs a warning and a missing target
+ * job throws a determinism error.
  */
 export async function extractStepsFromDynamicJob(
   workflow: Workflow,
@@ -412,12 +349,10 @@ export async function extractStepsFromDynamicJob(
   expectedJobNames?: string[],
   /** Frozen upstream snapshot for a result-aware generator (rebuilds ctx.needs). */
   upstreamSnapshot?: import('@kici-dev/engine').UpstreamSnapshot,
-  /** Declared upstream needs that shape ctx.needs. */
   declaredNeeds?: readonly unknown[],
   /**
-   * The source / workflow repo pair for a global workflow. Must match what the
-   * first evaluation saw, or a generator that reads the source tree produces a
-   * different job list here and the determinism check below fails the job.
+   * A global workflow's repo pair; it must match the first evaluation's, or a
+   * generator reading the source tree fails the determinism check.
    */
   repos?: GeneratorRepoPair,
 ): Promise<{ steps: readonly StepInput[]; droppedJobs: string[] }> {
@@ -433,9 +368,8 @@ export async function extractStepsFromDynamicJob(
       (() => Promise.reject(new Error('Agent API not available during re-evaluation'))),
   );
 
-  // Rebuild ctx.needs from the frozen snapshot (never a live read), so re-eval
-  // sees the identical upstream data the original eval did — the same
-  // determinism guarantee ctx.event carries.
+  // From the frozen snapshot, never a live read, so re-eval sees the original
+  // upstream data (the guarantee ctx.event carries).
   const needs = upstreamSnapshot
     ? buildNeedsContext(
         upstreamSnapshot,
@@ -443,8 +377,8 @@ export async function extractStepsFromDynamicJob(
       )
     : undefined;
 
-  // Built through the shared builder so this re-evaluation and the first
-  // evaluation (job-runner.ts, or the global eval round) cannot drift apart.
+  // The shared builder keeps this and the first evaluation (job-runner.ts, or
+  // the global eval round) from drifting apart.
   const generatedJobs = await dynamicFn(
     buildGeneratorContext({
       workflowName: workflow.name,

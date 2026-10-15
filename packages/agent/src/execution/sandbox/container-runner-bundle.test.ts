@@ -5,13 +5,11 @@ import { dirname, join } from 'node:path';
 import { describe, it, expect } from 'vitest';
 
 // The container sandbox mounts this bundle as a single file into the customer
-// job container, so every static import it loads at startup must resolve inside
-// a bare Node image — i.e. be a `node:` built-in. `zx` + `@kici-dev/*` must be
-// inlined, not left as bare imports. This test guards that load-time contract
-// against a build-config regression that would silently ship a runner the job
-// container cannot load. (Dynamic `require()`s inside inlined deps are guarded
-// optional paths; running the bundle in a real job container needs a container
-// runtime, which this file does not start.)
+// job container, so every static import must resolve in a bare Node image — a
+// `node:` built-in; `zx` + `@kici-dev/*` must be inlined. Guards against a
+// build-config regression shipping a runner the container cannot load.
+// (Dynamic `require()`s inside inlined deps are guarded optional paths; a real
+// container run needs a container runtime, which this file does not start.)
 const bundlePath = join(
   dirname(fileURLToPath(import.meta.url)),
   '../../../dist/workflow-runner-bundle.js',
@@ -24,10 +22,8 @@ describe('workflow-runner bundle is self-contained', () => {
   it('every static top-level import is a node builtin (zx + @kici-dev/* inlined)', () => {
     expect(existsSync(bundlePath), 'run `pnpm build` in packages/agent first').toBe(true);
     const src = readFileSync(bundlePath, 'utf8');
-    // Rolldown emits every top-level import on its own line starting with
-    // `import`. Match line-anchored `import ... from '<spec>'` and bare
-    // side-effect `import '<spec>'` — this avoids matching `from '...'` that
-    // appears inside embedded string literals of inlined dependencies.
+    // Rolldown emits each top-level import on its own line; line-anchoring
+    // avoids matching `from '...'` inside inlined dependencies' string literals.
     const specifiers: string[] = [];
     for (const line of src.split('\n')) {
       const m =

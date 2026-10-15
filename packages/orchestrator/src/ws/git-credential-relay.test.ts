@@ -309,11 +309,10 @@ describe('git credential relay handler', () => {
 
     it('admits inline material the lock itself declared', async () => {
       // `docs/user/patterns/git-credentials.md` documents a `*Value` entry for a
-      // credential that only exists at run time, and the compiler writes it into
-      // the lock verbatim. Refusing every `*Value` would break that documented
-      // form the moment the declaration channel was turned on. It costs nothing:
-      // material the lock declares is already readable from the job's own
-      // checkout, and a forger would need it before they could send it.
+      // run-time-only credential, which the compiler writes into the lock
+      // verbatim, so refusing every `*Value` would break it. Admitting it costs
+      // nothing: lock-declared material is already readable from the job's own
+      // checkout, and a forger would need it before sending it.
       const runtimeRef = { kind: 'token', tokenValue: 'from-the-lock' } as const;
       const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
       await handlerWith(broker, jobFacts({ declaredCredentials: { default: { ...runtimeRef } } }))(

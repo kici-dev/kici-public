@@ -1,11 +1,7 @@
 /**
- * Env-file resolution + content for `kici-admin orchestrator install`.
- *
- * Three write paths — the interactive wizard, copying a supplied --env-file,
- * or writing an enumerated stub the operator fills in by hand — plus the
- * flag/TTY precedence that picks between them. Kept out of install.ts so the
- * command action stays small and the decision + stub content are unit-testable
- * without driving the whole install through Commander.
+ * Env file for `kici-admin orchestrator install`: wizard, copied --env-file, or
+ * a stub the operator fills in. Kept out of install.ts so the mode decision and
+ * stub content are unit-testable without Commander.
  */
 
 import fs from 'node:fs';
@@ -16,10 +12,8 @@ import { upsertEnvAssignment } from '../../service/env-assignment.js';
 import { ENV_FILE_MODE } from '../shared/env-file-mode.js';
 import type { OrchestratorSourceHint } from '../../wizard/orchestrator-wizard.js';
 
-/** Which config source the install writes the env file from. */
 export type InstallEnvMode = 'wizard' | 'env-file' | 'stub';
 
-/** Result of writing the install env file. */
 export interface WriteInstallEnvResult {
   /** Present only in wizard mode when the operator opted into a GitHub App source. */
   sourceHint?: OrchestratorSourceHint;
@@ -32,37 +26,28 @@ export const COMPOSE_QUICKSTART_URL = 'https://docs.kici.dev/user/quickstart/com
 export const GITHUB_INGRESS_URL = 'https://docs.kici.dev/operator/orchestrator/github-ingress/';
 
 /**
- * Operating mode a fresh install writes when the operator names none.
- *
- * `hybrid` is a superset of `platform`: the orchestrator accepts every
- * Platform-relayed webhook exactly as `platform` does, and additionally serves
- * its own ingress route, which verifies the HMAC signature before it acts on a
- * delivery. It requires no configuration beyond what `platform` requires, so an
- * orchestrator whose port nothing reaches behaves identically to a `platform`
- * one — while an operator who later exposes that port stops losing pushes to a
- * relay outage.
+ * Mode a fresh install writes when the operator names none. `hybrid` is
+ * `platform` plus its own HMAC-verified ingress route, with no extra
+ * configuration: with the port unreachable it behaves as `platform`, and
+ * exposing the port later stops losing pushes to a relay outage.
  */
 export const DEFAULT_INSTALL_MODE: OrchestratorMode = OrchestratorMode.enum.hybrid;
 
 export interface WizardModeInput {
   /** --wizard=true / --no-wizard=false / undefined when neither is passed. */
   wizard?: boolean;
-  /** --env-file value, if any. */
   envFile?: string;
   /** --dev (spins up a local Postgres and fills the DB URL). */
   dev?: boolean;
-  /** Whether stdout is attached to an interactive terminal. */
+  /** Whether stdout is an interactive terminal. */
   isTTY: boolean;
-  /** Whether the process runs under CI (non-interactive). */
   isCI: boolean;
 }
 
 /**
- * Pick the install env mode. Precedence: an explicit --env-file wins; then an
- * explicit --wizard / --no-wizard; --dev keeps the stub (it provisions the DB,
- * so the wizard's DB prompt would be redundant); otherwise the wizard is the
- * default only on a bare interactive terminal (mirrors `kici init`), and every
- * non-interactive/scripted install writes the stub.
+ * Precedence: --env-file, then --wizard / --no-wizard; --dev keeps the stub (it
+ * provisions the DB, so the wizard's DB prompt is redundant); else the wizard
+ * only on an interactive non-CI terminal (as `kici init`), the stub otherwise.
  */
 export function resolveWizardMode(input: WizardModeInput): InstallEnvMode {
   if (input.envFile) return 'env-file';
@@ -74,10 +59,8 @@ export function resolveWizardMode(input: WizardModeInput): InstallEnvMode {
 }
 
 /**
- * Build the stub env file: every required key with an inline explanation, a
- * generation command for the two secrets, and a pointer to the compose
- * quickstart. Fills KICI_DATABASE_URL from a --dev container URL when present,
- * and KICI_MODE from `--mode` when the operator named one.
+ * Every required key with an inline explanation. KICI_DATABASE_URL comes from
+ * a --dev container URL when present, KICI_MODE from `--mode`.
  */
 export function buildStubEnv(opts: { devDbUrl?: string; mode?: OrchestratorMode }): string {
   const dbUrl = opts.devDbUrl ?? 'postgresql://kici:password@localhost:5432/kici';
@@ -122,36 +105,29 @@ export function buildStubEnv(opts: { devDbUrl?: string; mode?: OrchestratorMode 
 export interface WriteInstallEnvArgs {
   mode: InstallEnvMode;
   envFilePath: string;
-  /** Source path for env-file mode. */
   envFileSource?: string;
-  /** Dev-provisioned DB URL, threaded into the stub / appended to an env file. */
+  /** Dev-provisioned DB URL, written into the stub or appended to an env file. */
   devDbUrl?: string;
   /**
-   * Operating mode from `--mode`. Written into the stub, and preselected in the
-   * wizard's mode prompt. Unset falls back to {@link DEFAULT_INSTALL_MODE}.
+   * From `--mode`: written into the stub and preselected in the wizard. Unset
+   * falls back to {@link DEFAULT_INSTALL_MODE}.
    */
   orchestratorMode?: OrchestratorMode;
   /**
-   * Whether the operator actually typed `--mode`, as opposed to Commander
-   * filling in {@link DEFAULT_INSTALL_MODE}.
-   *
-   * Only the env-file path needs the distinction. The file the operator hands
-   * in may already declare `KICI_MODE`, and the install bakes the service unit's
-   * entry point from that value — so a defaulted `hybrid` must never overwrite a
-   * joined cluster's `independent`, while a named `--mode` must.
+   * The operator typed `--mode` (Commander did not default it). The env-file
+   * path bakes the unit's entry point from its `KICI_MODE`, so a defaulted
+   * `hybrid` must never overwrite a joined cluster's `independent`, while a
+   * named `--mode` must.
    */
   modeExplicit?: boolean;
 }
 
 /**
- * Materialise the env file for the resolved mode.
- *
- * Every write path ends at {@link ENV_FILE_MODE}: the file carries the secrets
- * master key, so it must never be group- or world-readable. Each path that
- * creates or replaces the file stages it through a sibling temporary at that
- * mode, so the destination never exists more permissively even briefly. The
- * trailing chmod tightens the one path that only appends — a file that was
- * already there at looser permissions.
+ * Every path ends at {@link ENV_FILE_MODE}: the file holds the secrets master
+ * key, so it is never group- or world-readable. Creating or replacing stages
+ * through a sibling temporary at that mode, so the destination is never
+ * briefly looser; the trailing chmod tightens a pre-existing file the append
+ * path only extends.
  */
 export async function writeInstallEnvFile(
   args: WriteInstallEnvArgs,
@@ -188,11 +164,10 @@ async function materialiseInstallEnvFile(
     if (!fs.existsSync(source)) throw new Error(`env file not found: ${source}`);
     copyFileSecurelySync(source, envFilePath, ENV_FILE_MODE);
     console.log(`Copied env file to ${envFilePath}`);
-    // The unit's entry point is baked from KICI_MODE at install time, so a
-    // named --mode has to reach the copied file: setting it afterwards would
-    // leave an `independent` orchestrator pointed at the Platform-connected
-    // server, which refuses to boot. A defaulted --mode writes nothing, so a
-    // file that already names its mode keeps it.
+    // The unit's entry point is baked from KICI_MODE now, so a named --mode
+    // must reach the copied file: set later, an `independent` orchestrator
+    // would point at the Platform-connected server, which refuses to boot. A
+    // defaulted --mode writes nothing, so the file keeps its own mode.
     if (modeExplicit && orchestratorMode) {
       writeFileSecurelySync(
         envFilePath,
@@ -204,7 +179,6 @@ async function materialiseInstallEnvFile(
     return {};
   }
 
-  // stub mode
   if (!fs.existsSync(envFilePath)) {
     writeFileSecurelySync(
       envFilePath,

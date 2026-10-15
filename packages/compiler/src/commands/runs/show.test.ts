@@ -13,10 +13,9 @@ import * as clientMod from '../../remote/dashboard-client.js';
 import * as heldRunMod from '../held-run-client.js';
 import { HeldRunRequestError } from '../held-run-client.js';
 
-// The real module is kept (`importActual`) so `HeldRunRequestError` stays the
-// same class the command's `instanceof` check compares against — a re-declared
-// stub class would never match, and the permission-denied path would silently
-// test nothing.
+// `importActual` keeps `HeldRunRequestError` the class the command's `instanceof`
+// compares against; a stub class would never match, and the permission-denied
+// path would silently test nothing.
 vi.mock('../held-run-client.js', async () => {
   const actual =
     await vi.importActual<typeof import('../held-run-client.js')>('../held-run-client.js');
@@ -45,7 +44,6 @@ beforeEach(() => {
 
 afterEach(() => vi.restoreAllMocks());
 
-/** A minimal run summary the header renderer accepts. */
 function runSummary(status: string = ExecutionRunStatus.enum.success) {
   return {
     runId: 'r1',
@@ -58,7 +56,6 @@ function runSummary(status: string = ExecutionRunStatus.enum.success) {
   };
 }
 
-/** Stub the dashboard client with a fixed run + detail payload. */
 function stubClient(detail: unknown, status: string = ExecutionRunStatus.enum.success): void {
   vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
     getRun: async () => runSummary(status),
@@ -255,9 +252,8 @@ describe('runsShowCommand', () => {
   });
 
   it('says nothing when the caller may not read held runs', async () => {
-    // A caller with `runs:read` but not the held-runs permission will never
-    // have this data, so the note would print on every single invocation —
-    // including a plainly successful run with nothing held.
+    // A caller with `runs:read` but not the held-runs permission never has this
+    // data, so the note would print on every invocation, even with nothing held.
     stubClient({
       jobs: [
         {
@@ -294,8 +290,7 @@ describe('runsShowCommand', () => {
   });
 
   it('omits the unavailable field when the holds were read', async () => {
-    // The negative control: without it, a field that is always present would
-    // satisfy the assertion above.
+    // Negative control: an always-present field would satisfy the assertion above.
     stubClient({ jobs: [] });
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     await runsShowCommand('r1', { json: true });

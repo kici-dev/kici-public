@@ -1,21 +1,16 @@
 /**
- * Static resolution of the in-repo `workspace:` sibling closure `.kici` depends
- * on, and a digest over its source.
+ * Static resolution of the in-repo sibling closure `.kici` depends on, and a
+ * digest over its source.
  *
- * The deps tarball carries those sibling package directories **with their built
- * output** (`packKiciDeps`), while the pointer that names it is keyed on
- * `lockfileHash` — a hash of the package-manager lock file. Editing a sibling's
- * source moves no package-manager lock file, so a repo whose `.kici` depends on
- * an in-repo `workspace:` package restored that sibling's STALE build over the
- * fresh clone on every warm-cache run. `siblingsDigest` closes that: it enters
- * the dep pointer key, so a sibling edit is a pointer miss and the deps are
- * rebuilt.
+ * The deps tarball carries those siblings **with their built output**
+ * (`packKiciDeps`), but its pointer is keyed on `lockfileHash`, which a sibling
+ * source edit does not move: a warm-cache run would restore the sibling's STALE
+ * build over the fresh clone. `siblingsDigest` enters the pointer key, so a
+ * sibling edit is a pointer miss and the deps rebuild.
  *
- * Resolution is **static** — manifests and `git ls-files`, never an installed
- * `node_modules`. The agent's own `collectInRepoSiblings` walks an installed
- * tree, which cannot be used here: `kici compile` would then emit a different
- * lock file before and after an install, and a lock file whose contents depend
- * on whether you have installed is not hermetic.
+ * Resolution is **static** (manifests and `git ls-files`, never `node_modules`),
+ * unlike the agent's own `collectInRepoSiblings`: a lock file that differs
+ * before and after an install is not hermetic.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -24,7 +19,6 @@ import path from 'node:path';
 import { sha256 } from '@kici-dev/core';
 import { parse as parseYaml } from 'yaml';
 
-/** Dependency protocols that name a directory inside this repository. */
 const IN_REPO_PROTOCOLS = ['workspace:', 'file:', 'link:', 'portal:'];
 
 interface Manifest {
@@ -46,7 +40,6 @@ function readManifest(dir: string): Manifest | null {
   }
 }
 
-/** Every dependency specifier in a manifest, across all four dependency maps. */
 function allSpecifiers(m: Manifest): Array<[string, string]> {
   return Object.entries({
     ...m.dependencies,
@@ -57,10 +50,9 @@ function allSpecifiers(m: Manifest): Array<[string, string]> {
 }
 
 /**
- * The workspace globs declared at the repo root — `pnpm-workspace.yaml`'s
- * `packages:` first, then `package.json#workspaces` (npm / yarn / bun). Empty
- * when the repo declares no workspace, in which case a `workspace:` specifier
- * resolves to nothing and is skipped rather than guessed at.
+ * `pnpm-workspace.yaml`'s `packages:` first, then `package.json#workspaces`
+ * (npm / yarn / bun). Empty when no workspace is declared, so a `workspace:`
+ * specifier is skipped rather than guessed at.
  */
 export function readWorkspaceGlobs(gitRoot: string): string[] {
   const pnpmFile = path.join(gitRoot, 'pnpm-workspace.yaml');
@@ -80,9 +72,10 @@ export function readWorkspaceGlobs(gitRoot: string): string[] {
 }
 
 /**
- * Directories the workspace globs match, each carrying a manifest. Resolved with
- * `git ls-files` so the set is exactly what is tracked — the same authority the
- * digest itself uses, and one that needs no install.
+ * Package name → directory for every tracked `package.json` outside
+ * `node_modules`; empty when no workspace glob is declared. The globs gate the
+ * lookup but are not matched against each directory. `git ls-files` is the
+ * digest's own authority and needs no install.
  */
 function workspacePackageDirs(gitRoot: string, globs: string[]): Map<string, string> {
   const byName = new Map<string, string>();
@@ -109,9 +102,9 @@ function workspacePackageDirs(gitRoot: string, globs: string[]): Map<string, str
 }
 
 /**
- * Resolve one specifier to a repo-relative directory, or null when it does not
- * name one. `file:` / `link:` / `portal:` carry the path; `workspace:` carries a
- * version range, so the package NAME is resolved through the workspace globs.
+ * A repo-relative directory, or null. `file:` / `link:` / `portal:` carry the
+ * path; `workspace:` carries a version range, so the package NAME resolves
+ * through the workspace packages.
  */
 function resolveSpecifier(
   pkgName: string,
@@ -128,9 +121,8 @@ function resolveSpecifier(
     const target = spec.slice(proto.length);
     const abs = path.resolve(gitRoot, fromDir, target);
     const rel = path.relative(gitRoot, abs).replaceAll('\\', '/');
-    // A `file:` target outside the repo is not an in-repo sibling; it is also
-    // not something `git ls-files` can digest, so it is skipped rather than
-    // silently contributing nothing under a name that suggests it did.
+    // A target outside the repo is no sibling and `git ls-files` cannot digest
+    // it: skip it rather than let it contribute nothing under its name.
     if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
     return rel;
   }
@@ -138,12 +130,9 @@ function resolveSpecifier(
 }
 
 /**
- * Every in-repo sibling directory `.kici` depends on, transitively, as sorted
- * repo-relative POSIX paths.
- *
- * `.kici` itself is excluded: its own source is already covered by
- * `contentHash`, and including it here would make a `.kici` edit invalidate the
- * dep cache for no reason.
+ * The transitive in-repo siblings of `.kici`, as sorted repo-relative POSIX
+ * paths. `.kici` itself is excluded: `contentHash` covers it, and including it
+ * would make a `.kici` edit invalidate the dep cache.
  */
 export function collectInRepoSiblings(gitRoot: string, kiciDir = '.kici'): string[] {
   const kiciManifest = readManifest(path.join(gitRoot, kiciDir));
@@ -172,13 +161,9 @@ export function collectInRepoSiblings(gitRoot: string, kiciDir = '.kici'): strin
 }
 
 /**
- * SHA-256 over the git-tracked source of every resolved sibling directory, or
- * null when `.kici` depends on none.
- *
- * `git ls-files` is install-independent and is already the compiler's world (it
- * resolves `gitRoot` to generate the lock at all). Content is read as text and
- * `\0`-delimited against its path, exactly as the `.kici/` tree digest is, so a
- * rename cannot be disguised as a content edit.
+ * SHA-256 over the git-tracked source of every sibling, or null when there is
+ * none. Content is read as text and `\0`-delimited against its path, as the
+ * `.kici/` tree digest is, so a rename cannot pass as a content edit.
  */
 export function computeSiblingsDigest(gitRoot: string, kiciDir = '.kici'): string | null {
   const siblings = collectInRepoSiblings(gitRoot, kiciDir);
@@ -204,8 +189,7 @@ export function computeSiblingsDigest(gitRoot: string, kiciDir = '.kici'): strin
       try {
         content = readFileSync(path.join(gitRoot, rel), 'utf-8');
       } catch {
-        // Unreadable or deleted-but-tracked: contributes its path alone, which
-        // still moves the digest when the file comes or goes.
+        // Unreadable or deleted-but-tracked: its path alone still moves the digest.
       }
       parts.push(`${rel}\0${content.replaceAll('\r\n', '\n')}\0`);
     }

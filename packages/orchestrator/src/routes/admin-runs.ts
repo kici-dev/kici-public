@@ -1,22 +1,18 @@
 /**
- * Admin API routes for execution run inspection.
- *
- * Provides read-only endpoints for listing runs and inspecting per-run
- * sub-resources (jobs, ephemeral key status, secret outputs). All routes
- * are protected by Bearer token authentication and an RBAC permission
- * check (`run.read` for most, `secret.reveal` for the reveal variant of
- * `secret-outputs`).
+ * Read-only admin API for execution runs and their sub-resources. Every route
+ * requires a Bearer token and an RBAC permission: `run.read`, plus
+ * `secret.reveal` for the reveal variant of `secret-outputs`.
  *
  * Endpoints:
  *   GET /api/v1/admin/runs                        — list runs with filters
  *   GET /api/v1/admin/runs/:runId                 — run header fields only
  *   GET /api/v1/admin/runs/:runId/jobs            — jobs list (optional steps)
+ *   GET /api/v1/admin/runs/:runId/structured      — aggregated run detail
+ *   GET /api/v1/admin/runs/:runId/jobs/:jobId/steps/:stepIndex/logs — step logs
  *   GET /api/v1/admin/runs/:runId/ephemeral-key   — scrub status
  *   GET /api/v1/admin/runs/:runId/secret-outputs  — masked by default; ?reveal=true
  *
- * This is the server-side counterpart to `kici-admin runs`, which replaces
- * hand-rolled curl commands and dashboard clicks when verifying execution
- * state.
+ * Server side of `kici-admin runs`.
  */
 
 import { setupStepsFirst } from '../reporting/step-display-order.js';
@@ -43,18 +39,13 @@ import { type AdminEnv, createAdminApp } from './admin-env.js';
 const logger = createLogger({ prefix: 'admin-runs' });
 
 /**
- * Statuses accepted by the `?status=` filter.
- *
- * The full canonical union rather than just `ExecutionRunStatus.options`: only
- * run statuses can appear in `execution_runs.status`, but the job-only members
- * were accepted before and match no row, so keeping them avoids turning
- * an empty result into a rejected request.
+ * Statuses accepted by the `?status=` filter: the full canonical union, not
+ * just `ExecutionRunStatus.options`. Job-only members match no
+ * `execution_runs` row but stay accepted, so such a filter returns an empty
+ * result rather than a rejected request.
  */
 export const RUN_STATUSES: ReadonlySet<string> = new Set<string>(CANONICAL_STATUSES);
-/**
- * Parse an ISO-8601 timestamp; return null on invalid input so the caller
- * can turn it into a 400 with a clear message.
- */
+/** Parse an ISO-8601 timestamp; `ok: false` lets the caller return a clear 400. */
 function parseSince(raw: string | undefined): { ok: true; value: Date | null } | { ok: false } {
   if (raw === undefined) return { ok: true, value: null };
   const parsed = new Date(raw);
@@ -62,10 +53,7 @@ function parseSince(raw: string | undefined): { ok: true; value: Date | null } |
   return { ok: true, value: parsed };
 }
 
-/**
- * Parse the `?status=` query param. Accepts a single status or a
- * comma-separated list (e.g. `success,failed`). Duplicates are collapsed.
- */
+/** Parse `?status=`: one status or a comma-separated list, duplicates collapsed. */
 function parseStatus(raw: string | undefined): string[] | null {
   if (!raw) return null;
   const parts = raw
@@ -76,10 +64,7 @@ function parseStatus(raw: string | undefined): string[] | null {
   return Array.from(new Set(parts));
 }
 
-/**
- * Parse the `?count=` query param. Treat `true` / `1` as true; everything
- * else (including absence) as false.
- */
+/** Parse a boolean flag param: only `true` / `1` are true. */
 function parseCountFlag(raw: string | undefined): boolean {
   return raw === 'true' || raw === '1';
 }
@@ -91,26 +76,19 @@ export interface AdminRunRoutesDeps {
   /** Required to reveal secret-output plaintext via ?reveal=true. */
   auditLogger?: AuditLogger;
   /**
-   * The orchestrator master key, plus the previous generation during a
-   * rotation grace window. Required to reveal secret-output plaintext; a row
-   * still sealed under the old key reveals until `rotate-key` has swept the
-   * table.
+   * The master key, plus the previous generation during a rotation grace
+   * window. Required to reveal secret-output plaintext; a row still sealed
+   * under the old key reveals until `rotate-key` has swept the table.
    */
   masterKeys?: ResolvedMasterKeys | null;
   /**
-   * Log storage backend. Required only by the agent step-logs endpoint
-   * (`/runs/:runId/jobs/:jobId/steps/:stepIndex/logs`); when absent, that
-   * path 503s cleanly.
+   * Required only by the step-logs endpoint
+   * (`/runs/:runId/jobs/:jobId/steps/:stepIndex/logs`), which 503s without it.
    */
   logStorage?: LogStorage;
 }
 
-/**
- * Create admin API routes for execution run inspection.
- *
- * @param deps - Admin run route dependencies
- * @returns Hono app with run routes mounted at /api/v1/admin/runs
- */
+/** Run routes, mounted at /api/v1/admin/runs. */
 export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
 
@@ -150,12 +128,10 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
       }
     }
 
-    // Routing-key-scoped tokens see only runs whose `routing_key`
-    // matches their scope. Forced on both the list and count queries
-    // so the totals report the same window the caller sees.
+    // A routing-key-scoped token sees only runs with its `routing_key`, forced
+    // on both the list and count queries so the totals match what it sees.
     const tokenRoutingKey = c.get('routingKey');
 
-    // Build the count query once and share filters with the list query.
     let countQuery = deps.db
       .selectFrom('execution_runs')
       .select(deps.db.fn.countAll<number>().as('total'));
@@ -330,7 +306,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
     const runId = c.req.param('runId');
     const includeSteps = parseCountFlag(c.req.query('includeSteps'));
 
-    // Verify run exists so we can distinguish "run missing" from "no jobs yet".
+    // Tells "run missing" (404) apart from "no jobs yet".
     const runExists = await deps.db
       .selectFrom('execution_runs')
       .select(['run_id', 'routing_key'])
@@ -362,9 +338,8 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
       .orderBy('created_at', 'asc')
       .execute();
 
-    // Resolved dependency edges for the run, grouped by downstream job_name.
-    // Surfaced so operators (and the dashboard DAG view) see what each job
-    // depended on, with the per-edge run-on status-set.
+    // Dependency edges grouped by downstream job_name, with each edge's run-on
+    // status set, for operators and the dashboard DAG view.
     const needsRows = await deps.db
       .selectFrom('execution_job_needs')
       .select(['job_name', 'upstream_name', 'run_on'])
@@ -420,10 +395,9 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
             jobId: job.job_id,
             jobName: job.job_name,
             status: job.status,
-            // `matrix_values` and `runs_on_labels` are JSONB, so the driver
-            // already returns a parsed object/array. Passing one back through
-            // `JSON.parse` throws on the coerced string and yields null, which
-            // is what made every job report no routing labels.
+            // `matrix_values` and `runs_on_labels` are JSONB, already parsed by
+            // the driver; a `JSON.parse` here throws on the coerced string and
+            // yields null, so every job would report no routing labels.
             matrixValues: job.matrix_values ?? null,
             agentId: job.agent_id,
             startedAt: job.started_at?.toISOString() ?? null,
@@ -475,15 +449,13 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
       return c.json({ error: 'Log storage not configured on this orchestrator' }, 503);
     }
 
-    // A global eval round decides whether any run exists at all, so it writes
-    // NO `execution_runs` row on success (see `buildRoundJobInput` in
-    // pipeline/global-eval-round.ts) — yet its step logs are durably stored.
-    // `dispatch_queue` carries the same run_id plus the routing_key the scope
-    // guard needs, and its rows survive until terminal-status age pruning, so
-    // it is the correct second source. The 404 and the scope guard both keep
-    // their exact meaning; only the set of ids that resolve widens. The
-    // fallback query runs only when `execution_runs` misses, so an ordinary
-    // run still costs a single lookup.
+    // A global eval round writes NO `execution_runs` row on success (see
+    // `buildRoundJobInput` in pipeline/global-eval-round.ts), yet its step logs
+    // are stored. `dispatch_queue` carries the same run_id plus the routing_key
+    // the scope guard needs, and its rows survive until terminal-status age
+    // pruning, so it is the second source. The 404 and the scope guard keep
+    // their meaning; only the set of resolving ids widens. The fallback runs
+    // only on an `execution_runs` miss, so an ordinary run costs one lookup.
     const run = await deps.db
       .selectFrom('execution_runs')
       .select(['run_id', 'routing_key'])
@@ -497,9 +469,8 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
           .where('run_id', '=', runId)
           .executeTakeFirst();
     // Resolve the ROW, not the routing key: `execution_runs.routing_key` is
-    // nullable, and a found run with a null key must stay a scope decision
-    // (403 for a scoped token, allowed for an unscoped one) rather than
-    // collapsing into a 404.
+    // nullable, and a found run with a null key stays a scope decision (403
+    // for a scoped token, allowed for an unscoped one), never a 404.
     const scopeSource = run ?? queued;
     if (!scopeSource) {
       return c.json({ error: `Run ${runId} not found` }, 404);
@@ -600,7 +571,6 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
       );
     }
 
-    // Reveal path — unseal each row with the orchestrator master key.
     const masterKeys = deps.masterKeys!;
     const outputs: Array<{
       id: string;

@@ -1,16 +1,14 @@
 /**
  * The cluster-settings snapshot a coordinator serves to DB-less workers.
  *
- * A worker cannot read `cluster_settings`, so every knob it applies at spawn
- * reaches it through this snapshot, pulled over the peer channel whenever a
- * coordinator advertises a newer settings version. Each value is the stored
- * override, or the serving coordinator's configured default when the column
- * is NULL.
+ * Every knob a worker applies at spawn reaches it through this snapshot,
+ * pulled over the peer channel whenever a coordinator advertises a newer
+ * settings version. Each value is the stored override, or the serving
+ * coordinator's configured default when the column is NULL.
  */
 import type { WorkerClusterSettings } from '@kici-dev/engine';
 import type { ClusterSettingsReader } from './cluster-settings-reader.js';
 
-/** The configured defaults behind each snapshot field. */
 export interface WorkerClusterSettingDefaults {
   agentTokenTtlMs: number;
   firecrackerApiSocketWaitMs: number;
@@ -29,10 +27,9 @@ function numberOr(value: unknown, fallback: number): number {
 }
 
 /**
- * Resolve the worker snapshot and its version from ONE read of the row. A
- * worker stores the version with the values and pulls again only when a
- * coordinator advertises a higher version, so a version read separately from
- * the values could pair a newer version with older values for good.
+ * Resolve the snapshot and its version from ONE row read: a worker pulls again
+ * only on a higher advertised version, so a separately read version could pair
+ * a newer version with older values for good.
  */
 export async function resolveWorkerClusterSettingsSnapshot(
   reader: Pick<ClusterSettingsReader, 'getRow'>,

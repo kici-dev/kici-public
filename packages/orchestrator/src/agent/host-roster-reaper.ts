@@ -23,20 +23,18 @@ export interface HostRosterReaperOptions {
 }
 
 /**
- * Leader-only host-roster reaper.
- *
- * Modeled on `EventRetryScanner`: started/stopped via the Raft leadership
- * callbacks, a single timer cleared on `stop()`. Each leader tick it:
+ * Leader-only host-roster reaper, started/stopped via the Raft leadership
+ * callbacks like `EventRetryScanner`. Each leader tick it:
  *
  * - DELETEs `ephemeral` host_roster rows whose `last_seen` is older than the ttl
  *   (scaled-down autoscale agents — silent GC, no alarm); and
- * - counts `static` (declared) hosts whose derived status is `unreachable` and
- *   publishes that count to the `kici_orch_declared_hosts_unreachable` gauge, so
- *   a Mimir ruler alert can page an operator when a declared box goes dark.
+ * - publishes the count of `static` (declared) hosts whose derived status is
+ *   `unreachable` to the `kici_orch_declared_hosts_unreachable` gauge, so a
+ *   Mimir ruler alert can page an operator when a declared box goes dark.
  *
- * `static` unreachability is read-derived by `deriveHostStatus` (no write here),
- * so the reaper never deletes a static row. Followers never run the reaper, so
- * the gauge series exists only on the leader (the alert uses `max by ()`).
+ * `static` unreachability is read-derived by `deriveHostStatus`, so the reaper
+ * never deletes a static row. The gauge series exists only on the leader (the
+ * alert uses `max by ()`).
  */
 export class HostRosterReaper {
   private readonly store: HostRosterReaperOptions['store'];
@@ -84,8 +82,8 @@ export class HostRosterReaper {
     this.setUnreachableGauge(unreachable);
     if (unreachable > 0) logger.warn('Declared hosts unreachable', { count: unreachable });
 
-    // Clear any reboot-pending flag whose deadline has passed (host never
-    // returned). The held post-restart job then fails via the queue timeout.
+    // Clear expired reboot-pending flags (host never returned); the held
+    // post-restart job then fails via the queue timeout.
     await this.rebootSweep.scan();
   }
 }

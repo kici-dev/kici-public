@@ -3,15 +3,12 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './035_pending_workflow_contexts.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 035.
- *
- * Creates a throwaway database, applies migrations 001..035 via the
- * production provider, and asserts the pending_workflow_contexts table + its
- * columns exist, and that `down` drops it. Gated on
- * `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 035: in a throwaway database, 001..035 via
+ * the production provider create pending_workflow_contexts and `down` drops it.
+ * Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;

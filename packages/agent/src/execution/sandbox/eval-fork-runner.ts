@@ -1,14 +1,11 @@
 /**
- * Agent-side driver for the eval child.
+ * Agent-side driver for the eval child: forks `eval-runner.js` with a sanitized
+ * env, sends one `eval` request, streams log lines onto the job's synthetic
+ * step-0 log, and resolves with the serialized result.
  *
- * Forks `eval-runner.js` with a sanitized environment, sends one `eval`
- * request, streams the child's log lines onto the job's synthetic step-0 log,
- * and resolves with the evaluation's serialized result.
- *
- * The accepted inbound set is exactly `ready`, `log.line`, `eval.api.request`,
- * `eval.result` and `eval.error` — anything else from the child is ignored, so a
- * customer module that gains code execution in the child cannot reach the step
- * runner's privileged relays by naming one of their message types.
+ * Only `ready`, `log.line`, `eval.api.request`, `eval.result` and `eval.error`
+ * are accepted, so a customer module with code execution in the child cannot
+ * reach the step runner's privileged relays by naming their message types.
  */
 
 import { fork, type ChildProcess } from 'node:child_process';
@@ -19,48 +16,35 @@ import { buildSanitizedEnv } from './env-sanitizer.js';
 
 const logger = createLogger({ prefix: 'eval-fork-runner' });
 
-/** Wall-clock ceiling on the whole child lifetime, independent of the evaluation's own timeouts. */
+/** Ceiling on the whole child lifetime, independent of the evaluation's own timeouts. */
 const EVAL_CHILD_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 
 /**
- * How much of the child's stderr to keep for the die-without-reporting message.
- * A node module-resolution failure fits comfortably; the cap keeps a chatty
- * child from pushing an unbounded string into a job's error field.
+ * Stderr kept for the die-without-reporting message: fits a module-resolution
+ * failure, and stops a chatty child bloating a job's error field.
  */
 const EVAL_CHILD_STDERR_TAIL_BYTES = 4096;
 
 export interface RunEvalChildOptions {
   /** Absolute path to the compiled `eval-runner.js`. */
   evalRunnerPath: string;
-  /** The evaluation to perform. */
   request: EvalRequest;
-  /** Stream one captured line onto the job's log. */
   onLogLine: (line: string, stream?: LogStream) => void;
-  /**
-   * Relay a `ctx.kici` call to the orchestrator. Omitted means no API transport
-   * is wired, and every call rejects — the same fallback the in-process
-   * evaluation used.
-   */
+  /** Relays a `ctx.kici` call; when omitted, every call rejects. */
   onApiRequest?: (method: string, params: Record<string, unknown>) => Promise<unknown>;
-  /**
-   * Operator-set agent-launch property. Threaded through so a trusted fleet
-   * agent's declared passthrough env still reaches an evaluation.
-   */
+  /** Operator-set; lets a trusted fleet agent's declared passthrough env reach an evaluation. */
   trustedEnv?: boolean;
-  /** Cancels the evaluation; the child is killed and the promise rejects. */
+  /** Kills the child and rejects. */
   signal?: AbortSignal;
 }
 
 /**
- * Run one evaluation in a fresh child and resolve with its result.
- *
- * Rejects with the evaluation's own error text on `eval.error`, so the calling
- * handler reports exactly the message the in-process evaluation used to throw.
+ * Run one evaluation in a fresh child. On `eval.error`, rejects with the
+ * evaluation's own error text.
  */
 export function runEvalChild<T>(options: RunEvalChildOptions): Promise<T> {
-  // `{}` and never `process.env`: buildSanitizedEnv merges its first argument
-  // wholesale at its user-env layer, so passing process.env would re-add every
-  // variable the sanitizer just excluded — including the agent's own.
+  // `{}`, never `process.env`: buildSanitizedEnv merges its first argument
+  // wholesale, which would re-add every excluded variable, the agent's own included.
   const env = buildSanitizedEnv({}, { trustedEnv: options.trustedEnv });
 
   return new Promise<T>((resolve, reject) => {
@@ -75,7 +59,7 @@ export function runEvalChild<T>(options: RunEvalChildOptions): Promise<T> {
       try {
         child.send(msg);
       } catch {
-        // Channel closed — the child exited; the exit handler settles.
+        // Channel closed; the exit handler settles.
       }
     };
 
@@ -108,18 +92,14 @@ export function runEvalChild<T>(options: RunEvalChildOptions): Promise<T> {
     };
     options.signal?.addEventListener('abort', onAbort, { once: true });
 
-    // The child's own stdout/stderr are drained so the pipe buffer cannot fill
-    // and block it. Their content is NOT re-emitted on any normal path:
-    // customer console output arrives as `log.line`, and echoing the raw stream
-    // would publish a second, unfiltered copy to the agent's journal.
+    // Drain stdout/stderr so a full pipe cannot block the child. Neither is
+    // re-emitted: console output arrives as `log.line`, and an echo would put an
+    // unfiltered copy in the agent's journal.
     //
-    // stderr is additionally kept as a bounded tail, used ONLY when the child
-    // dies without reporting. That is the one path where the child never got as
-    // far as sending a message, so its stderr is the sole record of why — a
-    // missing `eval-runner.js` or an unresolvable import prints
-    // `ERR_MODULE_NOT_FOUND` there and nowhere else. Discarding it turned a
-    // Firecracker rootfs that shipped no eval runner into an unattributable
-    // "exited without a result (code=1)".
+    // A bounded stderr tail is used ONLY when the child dies without reporting,
+    // where it is the sole record (e.g. `ERR_MODULE_NOT_FOUND` for a missing
+    // `eval-runner.js`). Without it, a Firecracker rootfs lacking the eval runner
+    // showed only "exited without a result (code=1)".
     child.stdout?.resume();
     let stderrTail = '';
     child.stderr?.setEncoding('utf8');
@@ -151,9 +131,7 @@ export function runEvalChild<T>(options: RunEvalChildOptions): Promise<T> {
           finish(() => reject(new Error(msg.error)));
           return;
         default:
-          // Anything outside the eval union is not a message this child is
-          // allowed to send. Log it and drop it — a customer module with code
-          // execution in the child must not reach a handler by naming one.
+          // Not in the eval union: drop, so code in the child cannot reach a handler by naming one.
           logger.warn('Ignoring unexpected message from eval child', {
             type: (msg as { type?: string }).type,
           });
@@ -165,9 +143,7 @@ export function runEvalChild<T>(options: RunEvalChildOptions): Promise<T> {
     });
 
     child.on('exit', (code, signalName) => {
-      // A result or an error already settled the promise on every normal path;
-      // reaching here means the child died without reporting, so its stderr is
-      // the only diagnostic that exists.
+      // Every normal path already settled; the child died without reporting.
       const detail = stderrTail.trim();
       finish(() =>
         reject(

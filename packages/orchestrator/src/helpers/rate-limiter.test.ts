@@ -52,7 +52,6 @@ describe('SlidingWindowRateLimiter', () => {
 
     it('shrinks the map after keys go idle and a later check triggers the sweep', () => {
       const limiter = new SlidingWindowRateLimiter(5, 60_000);
-      // Touch 100 distinct keys within the window.
       for (let i = 0; i < 100; i++) {
         expect(limiter.check(`event-${i}`).allowed).toBe(true);
       }

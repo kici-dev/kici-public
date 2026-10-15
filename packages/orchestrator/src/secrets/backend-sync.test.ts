@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { BackendSyncManager } from './backend-sync.js';
 import type { BackendDescriptor, SecretStore } from '@kici-dev/engine';
 
-/** Minimal mock backend registry. */
 function createMockRegistry() {
   const backends: BackendDescriptor[] = [];
   return {

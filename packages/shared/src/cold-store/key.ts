@@ -1,49 +1,34 @@
 /**
  * Key helpers for S3 object layouts.
  *
- * `encodeKeySegment` escapes non-safe characters in a single path segment
- * so that values coming from user-controlled sources (delivery IDs,
- * routing keys, org IDs, partition values) can be embedded in an object
- * key without breaking the key structure.
- *
- * This function was originally defined in
- * packages/orchestrator/src/webhook/event-log.ts and is now shared with
- * the cold-store framework. The encoding algorithm MUST NOT change —
- * previously-written chunk and event-log keys depend on this mapping
- * remaining stable forever. A fixture test in key.test.ts locks the
- * behavior.
+ * `encodeKeySegment` lets user-controlled values (delivery IDs, routing keys,
+ * org IDs, partition values) sit in an object key without breaking its
+ * structure. Its encoding MUST NOT change: already-written chunk and event-log
+ * keys depend on the mapping staying stable forever, and a fixture test in
+ * key.test.ts locks it.
  */
 
 /**
  * Encode a single S3 path segment: anything outside `[A-Za-z0-9._:-]`
- * becomes `_<hex>` where `<hex>` is the lowercase UTF-16 code unit of
- * the replaced character (same as `ch.charCodeAt(0).toString(16)`).
+ * becomes `_<hex>`, the lowercase hex of the character's UTF-16 code unit.
  */
 export function encodeKeySegment(s: string): string {
   return s.replace(/[^A-Za-z0-9._:-]/g, (ch) => `_${ch.charCodeAt(0).toString(16)}`);
 }
 
-/**
- * DB identifier for cold-store chunk keys.
- */
+/** DB identifier for cold-store chunk keys. */
 export type DbKind = 'platform' | 'orchestrator';
 
-/**
- * Compose the prefix for a specific table's cold-store objects.
- *
- * Layout: `<prefix>/<db>/<table>`.
- */
+/** Prefix for a table's cold-store objects: `<prefix>/<db>/<table>`. */
 export function tablePrefix(args: { prefix: string; db: DbKind; table: string }): string {
   const stripped = args.prefix.replace(/\/+$/, '');
   return `${stripped}/${args.db}/${args.table}`;
 }
 
 /**
- * Compose the prefix for a specific tenant's day-partitioned objects.
- *
- * Layout: `<prefix>/<db>/<table>/<tenantId>/<YYYY>/<MM>/<DD>`.
- * `tenantId` is encoded via `encodeKeySegment`.
- * `partitionDate` must be `YYYY-MM-DD` (no other format is accepted).
+ * Prefix for a tenant's day-partitioned objects:
+ * `<prefix>/<db>/<table>/<tenantId>/<YYYY>/<MM>/<DD>`, with `tenantId` encoded.
+ * `partitionDate` must be `YYYY-MM-DD`.
  */
 export function tenantDayPrefix(args: {
   prefix: string;
@@ -61,23 +46,19 @@ export function tenantDayPrefix(args: {
 }
 
 /**
- * Allowed bucket-segment shape: lowercase letters, digits, the literal
- * `forever`, e.g. `30d` / `180d` / `1y` / `2y` / `forever`. Validated to
- * keep the S3 path safe (no `/`, no `.`, no path traversal).
+ * Bucket segment (`30d`, `1y`, `forever`, …): lowercase letters and digits
+ * only, which keeps the S3 path safe (no `/`, no `.`, no path traversal).
  */
 const BUCKET_SEGMENT_RE = /^[a-z0-9]+$/;
 
 /**
- * Compose a tenant-day prefix that includes the cold-bucket segment.
- * Layout:
+ * Tenant-day prefix plus the cold-bucket segment:
+ * `<prefix>/<db>/<table>/<tenantId>/<YYYY>/<MM>/<DD>/<bucket>`.
  *
- *   `<prefix>/<db>/<table>/<tenantId>/<YYYY>/<MM>/<DD>/<bucket>`
- *
- * V1-manifest chunks live at the day-prefix root and are
- * addressed via `tenantDayPrefix` directly — those single-chunk (v1) chunks are
- * treated as the `'forever'` bucket by `parseManifest` but DO NOT carry
- * a `forever` segment in their key (the chunk-purge sweep keys off the
- * manifest's `bucket` / `maxColdDays`, not the path).
+ * V1 chunks live at the day-prefix root (`tenantDayPrefix`). `parseManifest`
+ * treats them as the `'forever'` bucket, but their key carries no `forever`
+ * segment: the chunk-purge sweep keys off the manifest's `bucket` /
+ * `maxColdDays`, not the path.
  */
 export function tenantDayBucketPrefix(args: {
   prefix: string;
@@ -96,13 +77,12 @@ export function tenantDayBucketPrefix(args: {
 }
 
 /**
- * Compose a full object key for a cold-store chunk or its manifest.
+ * Full object key for a cold-store chunk or its manifest.
  *
- * - V1 (no `bucket` arg): `<tenant-day-prefix>/<chunkId>.<ext>` — original
- *   layout, preserved for read-back compatibility with V1 chunks.
- * - V2 (with `bucket`): `<tenant-day-prefix>/<bucket>/<chunkId>.<ext>` —
- *   the GC sweep can list a single bucket subprefix to find purge
- *   candidates without scanning the whole day.
+ * - V1 (no `bucket`): `<tenant-day-prefix>/<chunkId>.<ext>`, kept so V1
+ *   chunks read back.
+ * - V2 (with `bucket`): `<tenant-day-prefix>/<bucket>/<chunkId>.<ext>`, so
+ *   the GC sweep lists one bucket subprefix instead of scanning the whole day.
  */
 export function chunkObjectKey(args: {
   prefix: string;

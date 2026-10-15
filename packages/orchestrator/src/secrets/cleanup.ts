@@ -14,7 +14,6 @@ export interface SecretCleanupDeps {
   db: Kysely<Database>;
   /** Max age in hours before rows are considered orphaned. Default: 24 */
   maxAgeHours?: number;
-  /** Optional logger for cleanup messages */
   logger?: {
     info(msg: string, meta?: Record<string, unknown>): void;
     warn(msg: string, meta?: Record<string, unknown>): void;

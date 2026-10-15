@@ -4,9 +4,6 @@
 
 import { z } from 'zod';
 
-/**
- * Configuration for the event routing system.
- */
 export interface EventRouterConfig {
   /** Maximum allowed chain depth before circuit breaker trips (default: 10) */
   maxChainDepth: number;
@@ -45,9 +42,6 @@ export interface EventRouterConfig {
   debugFailFirstNAttemptsByEvent?: Record<string, number>;
 }
 
-/**
- * Reason an event landed in the DLQ.
- */
 export type DlqReason = 'exhausted_retries' | 'non_retryable';
 
 /** How the router resolved one event against the registered workflows. */
@@ -128,9 +122,6 @@ export function eventProcessingState(e: StoredEvent): EventProcessingState {
   return EventProcessingState.enum.pending;
 }
 
-/**
- * Default event router configuration.
- */
 export const DEFAULT_EVENT_ROUTER_CONFIG: EventRouterConfig = {
   maxChainDepth: 10,
   rateLimitPerWorkflowPerMinute: 100,

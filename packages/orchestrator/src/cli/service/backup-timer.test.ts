@@ -1,10 +1,4 @@
-/**
- * Tests for the scheduled database-backup timer.
- *
- * Rendering is asserted against the generated unit / plist text; install and
- * uninstall run against an in-memory {@link TimerIo} so no unit file is written
- * and no `systemctl` / `launchctl` process is spawned.
- */
+/** Scheduled backup timer; install and uninstall run against an in-memory {@link TimerIo}. */
 
 import { describe, it, expect, vi } from 'vitest';
 
@@ -175,8 +169,7 @@ describe('renderLaunchdBackupPlist', () => {
   });
 
   it('carries a PATH that can find pg_dump, whatever the env file held', () => {
-    // launchd starts a job with a minimal PATH, so without this the scheduled
-    // dump cannot find pg_dump on a Homebrew or Postgres.app install.
+    // launchd's minimal PATH lacks pg_dump on a Homebrew or Postgres.app install.
     const plist = renderLaunchdBackupPlist(makeConfig({ nodeBinPath: '/opt/node/bin/node' }), {});
     expect(plist).toContain('<key>PATH</key>');
     expect(plist).toContain(
@@ -314,8 +307,7 @@ describe('readEnvValue', () => {
       readEnvValue('KICI_SCALER_CONFIG_PATH="/etc/kici/s.yaml"\n', 'KICI_SCALER_CONFIG_PATH'),
     ).toBe('/etc/kici/s.yaml');
     // fails-when: the value trim is dropped — returns ' /etc/kici/s.yaml'. The
-    // space sits AFTER the `=`, so it survives the per-line trim that runs
-    // before the split; a space at end of line would pin nothing.
+    // space sits AFTER the `=`, so the per-line trim cannot remove it.
     expect(
       readEnvValue('KICI_SCALER_CONFIG_PATH= /etc/kici/s.yaml\n', 'KICI_SCALER_CONFIG_PATH'),
     ).toBe('/etc/kici/s.yaml');
@@ -336,8 +328,7 @@ describe('readEnvValue', () => {
   });
 
   it('breaks-if-wrong: a single occurrence still resolves, quotes and all', () => {
-    // The last-occurrence scan must not change the ordinary case, which is
-    // every real env file: one line per key.
+    // The ordinary case: one line per key.
     expect(readEnvValue('KICI_DATABASE_URL=postgres://one\n', 'KICI_DATABASE_URL')).toBe(
       'postgres://one',
     );

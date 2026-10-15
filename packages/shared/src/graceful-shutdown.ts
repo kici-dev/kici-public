@@ -17,21 +17,14 @@ async function exitAfterLogFlush(code: () => number): Promise<void> {
   process.exit(code());
 }
 
-/**
- * A single teardown step in the graceful shutdown sequence.
- */
 export interface ShutdownStep {
-  /** Human-readable name logged before/after execution. */
+  /** Logged before and after the step runs. */
   name: string;
-  /** Teardown function. Runs sequentially; errors are caught per-step. */
+  /** Steps run sequentially; a step's error is caught and logged, and the next step runs. */
   fn: () => Promise<void> | void;
 }
 
-/**
- * Logger interface accepted by {@link setupGracefulShutdown}.
- * Compatible with Winston and any logger that exposes `info`, `warn`, and `error`
- * with a structured-metadata second argument.
- */
+/** Satisfied by Winston, or any logger whose `info` / `warn` / `error` take structured metadata second. */
 export interface ShutdownLogger {
   info(msg: string, meta?: Record<string, unknown>): void;
   warn(msg: string, meta?: Record<string, unknown>): void;
@@ -39,65 +32,47 @@ export interface ShutdownLogger {
 }
 
 export interface GracefulShutdownOptions {
-  /** Logger used for all shutdown messages. */
   logger: ShutdownLogger;
-  /** Ordered list of teardown steps executed sequentially. */
   steps: ShutdownStep[];
-  /** Force-exit timeout in milliseconds (default: 30 000). */
+  /** Force-exit timeout in ms (default: 30 000). */
   timeoutMs?: number;
   /**
-   * Optional callback invoked when the force-exit timeout fires.
-   * If the callback returns `true`, the default `process.exit(1)` is
-   * suppressed — the callback is responsible for exiting the process.
-   * Use this for last-resort cleanup (e.g., killing child processes
-   * and deferring exit to let abort handlers run).
+   * Runs when the force-exit timeout fires, for last-resort cleanup (e.g.
+   * killing child processes). Returning `true` suppresses the default exit, and
+   * the callback must then exit the process itself.
    */
   onForceExit?: () => boolean | void;
-  /**
-   * If `true`, `uncaughtException` and `unhandledRejection` handlers
-   * are NOT registered. Useful when the caller manages those separately.
-   * Default: `false` (handlers are registered).
-   */
+  /** `true` skips registering the `uncaughtException` / `unhandledRejection` handlers (default `false`). */
   skipErrorHandlers?: boolean;
 }
 
-/**
- * Return value from {@link setupGracefulShutdown} so callers can
- * trigger shutdown programmatically (e.g., from SIGUSR1 drain handlers).
- */
+/** Lets callers trigger shutdown programmatically (e.g. from a SIGUSR1 drain handler). */
 export interface ShutdownHandle {
   /**
-   * Trigger shutdown with the given reason string. Pass a non-zero `code` for a
-   * deliberate-but-failed stop (e.g. a one-shot agent whose self-bootstrap claim
-   * was rejected) so the process exits non-zero; omit it for a clean stop.
+   * Pass a non-zero `code` for a deliberate-but-failed stop (e.g. a one-shot
+   * agent whose self-bootstrap claim was rejected); omit it for a clean stop.
    */
   shutdown(signal: string, code?: number): Promise<void>;
 }
 
 /**
- * Wire up SIGTERM / SIGINT (and optionally uncaughtException /
- * unhandledRejection) handlers that execute the provided teardown
- * steps sequentially, then exit.
+ * On SIGTERM / SIGINT (and, unless skipped, uncaughtException /
+ * unhandledRejection), run the steps sequentially, then exit.
  *
- * Exit codes: signal-triggered and programmatic shutdowns exit 0;
- * shutdowns triggered by uncaughtException / unhandledRejection exit 1 so
- * `Restart=on-failure`-style supervisor policies and exit-code alerting
- * see the fatal cause. Escalation is sticky — a fatal trigger arriving
- * while a clean shutdown is already in progress still raises the final
- * exit code to 1.
+ * Signal and programmatic shutdowns exit 0 unless the caller passes a code;
+ * the fatal triggers exit 1, so `Restart=on-failure` supervisors and exit-code
+ * alerting see the cause. Escalation is sticky: a fatal trigger during a clean
+ * shutdown still raises the final code to 1.
  *
- * Every exit this makes first waits (up to 2 s) for the rotated log files to
- * take the lines logged so far and then closes them, so after a completed
- * shutdown a file ends with the same line as stdout. On the forced path the
- * file stops at the lines logged when the timer fired, and an `onForceExit`
- * that exits by itself gets no flush.
+ * Every exit first waits (up to 2 s) for the rotated log files to take the
+ * lines logged so far, then closes them, so after a completed shutdown a file
+ * ends with the same line as stdout. On the forced path a file stops at the
+ * lines logged when the timer fired, and an `onForceExit` that exits by itself
+ * gets no flush.
  *
- * A force-exit timer ensures the process terminates even if a step hangs.
- * The force-exit honors the same sticky exit code as a clean completion: a
- * slow SIGTERM/SIGINT stop that merely overran the grace period still exits 0,
- * so systemd records an intentional stop rather than marking the unit `failed`
- * (which would break `systemctl restart` recovery). Only a fatal trigger
- * (uncaughtException / unhandledRejection) raises the force-exit code to 1.
+ * A force-exit timer ends a hung step. It uses the same sticky code, so a slow
+ * SIGTERM/SIGINT stop still exits 0: systemd marking the unit `failed` would
+ * break `systemctl restart` recovery.
  */
 export function setupGracefulShutdown(options: GracefulShutdownOptions): ShutdownHandle {
   const { logger, steps, timeoutMs = 30_000, onForceExit, skipErrorHandlers = false } = options;
@@ -106,9 +81,8 @@ export function setupGracefulShutdown(options: GracefulShutdownOptions): Shutdow
   let exitCode = 0;
 
   async function gracefulShutdown(signal: string, code = 0): Promise<void> {
-    // Sticky escalation: raised on EVERY trigger — including duplicates that
-    // are otherwise ignored — so a fatal error arriving mid-shutdown still
-    // turns the final exit non-zero.
+    // Raised on EVERY trigger, ignored duplicates included, so a fatal error
+    // mid-shutdown still makes the final exit non-zero.
     exitCode = Math.max(exitCode, code);
 
     if (isShuttingDown) {
@@ -125,10 +99,8 @@ export function setupGracefulShutdown(options: GracefulShutdownOptions): Shutdow
       });
       const handled = onForceExit?.();
       if (handled !== true) {
-        // Honor the sticky exitCode (0 for an intentional SIGTERM/SIGINT stop,
-        // 1 for a fatal trigger) rather than a blanket 1 — a slow-but-clean
-        // stop must not surface to systemd as exit-code FAILURE, which marks
-        // the unit `failed` and breaks `systemctl restart` recovery.
+        // The sticky code, not a blanket 1: a slow clean stop must not mark the
+        // systemd unit `failed`.
         void exitAfterLogFlush(() => exitCode);
       }
     }, timeoutMs);
@@ -160,11 +132,9 @@ export function setupGracefulShutdown(options: GracefulShutdownOptions): Shutdow
     }
   }
 
-  // Signal handlers
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-  // Uncaught error handlers (unless caller opts out)
   if (!skipErrorHandlers) {
     process.on('uncaughtException', (error) => {
       logger.error('Uncaught exception', {
@@ -183,8 +153,6 @@ export function setupGracefulShutdown(options: GracefulShutdownOptions): Shutdow
     });
   }
 
-  // The public handle is for intentional shutdowns (drain handlers, tests).
-  // The clean exit code (0) is the default; a caller may pass a non-zero code
-  // for a deliberate-but-failed stop.
+  // For intentional shutdowns (drain handlers, tests).
   return { shutdown: (signal: string, code = 0) => gracefulShutdown(signal, code) };
 }

@@ -725,9 +725,8 @@ describe('listInstances — an unavailable driver is not authoritative', () => {
     }
   });
 
-  // available() and list() are two separate calls, so the registry can go down
-  // in the gap. A driver that reports that as a throw must be dropped, not read
-  // as an empty scan — and must not take the whole lifecycle command with it.
+  // The registry can go down between available() and list(). A driver that
+  // then throws is dropped, neither read as an empty scan nor failing the command.
   //
   // fails-when: scanDrivers lets the rejection through. `listInstances` then
   // rejects and `kici-admin orchestrator status` dies resolving a name; drop
@@ -901,9 +900,8 @@ describe('resolveInstanceTarget — the manager comes from the install', () => {
   }
 
   // fails-when: the manager is built from detectPlatform() — pinned here to
-  // 'systemd', while the manifest under --instance-dir says 'compose'. The two
-  // sides cannot move together, so this reddens on exactly the manifest-vs-host
-  // axis.
+  // 'systemd', while the manifest under --instance-dir says 'compose', so this
+  // reddens on exactly the manifest-vs-host axis.
   it('a compose-manifest install on a systemd host selects the compose manager', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-r-'));
     try {

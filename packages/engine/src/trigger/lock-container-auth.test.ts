@@ -4,9 +4,8 @@ import type { LockJob } from './types.js';
 
 describe('lock schema container.auth', () => {
   it('landed after the additive container.auth bump', () => {
-    // The exact current version is pinned once, in types.test.ts. Re-pinning it
-    // per feature only churns every later bump; what this file cares about is
-    // that container.auth is inside the readable window.
+    // types.test.ts pins the exact version; re-pinning here would churn every
+    // bump. This only checks that container.auth is inside the readable window.
     expect(SCHEMA_VERSION).toBeGreaterThanOrEqual(38);
   });
 

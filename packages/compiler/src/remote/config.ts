@@ -2,23 +2,16 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
-/**
- * An orchestrator `kici run remote` talks to directly, saved by
- * `kici connect`: its base URL and the orchestrator admin token to present.
- */
+/** An orchestrator `kici run remote` calls directly, saved by `kici connect` with its admin token. */
 export interface DirectTarget {
   url: string;
   token: string;
 }
 
-/**
- * Global KiCI configuration stored in ~/.kici/config.
- * Contains authentication tokens and endpoint settings.
- */
+/** Global KiCI configuration (`<config dir>/config`). */
 export interface GlobalConfig {
   /** Orchestrator URL `kici verify-attestation` uses as its default trust root */
   endpoint?: string;
-  /** Platform relay URL */
   platformEndpoint?: string;
   /** OIDC issuer URL the PAT was minted against (provenance; from OAuth login) */
   oidcIssuer?: string;
@@ -30,28 +23,23 @@ export interface GlobalConfig {
   routingKey?: string;
   /** Personal access token (from OAuth login) */
   pat?: string;
-  /** PAT identifier (server-side ID) */
+  /** Server-side PAT id */
   patId?: string;
-  /** PAT expiry timestamp (ISO 8601) */
+  /** ISO 8601 */
   patExpiresAt?: string;
-  /** Active organization ID */
   activeOrgId?: string;
-  /** User email from OIDC token */
+  /** From the OIDC token */
   userEmail?: string;
   /**
-   * Per-org default orchestrator cluster for `kici run remote`, keyed by org id.
-   * Set by `kici orchestrators use <cluster>`; consulted when `--orchestrator`
-   * is omitted so a developer with one preferred cluster types no flag.
+   * Per-org default cluster for `kici run remote`, keyed by org id. Set by
+   * `kici orchestrators use <cluster>`; used when `--orchestrator` is omitted.
    */
   defaultClusters?: Record<string, string>;
   /** The orchestrator `kici run remote` and `kici types` call directly (`kici connect`). */
   direct?: DirectTarget;
 }
 
-/**
- * Strips unknown keys and validates known fields from a raw config object.
- * Returns a clean GlobalConfig with only recognized, valid fields.
- */
+/** Keep only recognized fields with valid values. */
 function sanitizeConfig(raw: unknown): GlobalConfig {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
     return {};
@@ -113,15 +101,7 @@ function sanitizeConfig(raw: unknown): GlobalConfig {
   return config;
 }
 
-/**
- * Returns the global KiCI config directory path.
- *
- * Resolution order:
- *   1. `KICI_CONFIG_DIR`, when set to a non-empty value.
- *   2. `~/.kici`.
- *
- * `env` is injectable so this module's own tests can exercise both branches.
- */
+/** A non-empty `KICI_CONFIG_DIR`, else `~/.kici`. `env` is injectable for tests. */
 export function getConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   if (env.KICI_CONFIG_DIR) {
     return env.KICI_CONFIG_DIR;
@@ -129,18 +109,11 @@ export function getConfigDir(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(os.homedir(), '.kici');
 }
 
-/**
- * Returns the path to the global config file (~/.kici/config).
- */
 export function getConfigPath(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(getConfigDir(env), 'config');
 }
 
-/**
- * Load the global KiCI config from ~/.kici/config.
- * Returns an empty object if the file does not exist.
- * Unknown keys are stripped; invalid values are ignored.
- */
+/** Empty when the file is missing; unknown keys and invalid values are dropped. */
 export async function loadGlobalConfig(): Promise<GlobalConfig> {
   const configPath = getConfigPath();
 
@@ -162,11 +135,7 @@ export async function loadGlobalConfig(): Promise<GlobalConfig> {
   }
 }
 
-/**
- * Save the global KiCI config to ~/.kici/config.
- * Creates the config directory if needed.
- * Sets file permissions to 0o600 (owner read/write only) since it contains tokens.
- */
+/** Mode 0o600, since the file holds tokens. */
 export async function saveGlobalConfig(config: GlobalConfig): Promise<void> {
   const configDir = getConfigDir();
   await fs.mkdir(configDir, { recursive: true });
@@ -177,15 +146,10 @@ export async function saveGlobalConfig(config: GlobalConfig): Promise<void> {
   await fs.writeFile(configPath, content, { mode: 0o600 });
 }
 
-/**
- * Merge partial config into the existing global config.
- * Loads existing config, merges with the partial, saves, and returns the merged result.
- * Undefined values in the partial are ignored (existing values preserved).
- */
+/** Merge, save and return the result; an undefined value in `partial` keeps the existing one. */
 export async function mergeGlobalConfig(partial: Partial<GlobalConfig>): Promise<GlobalConfig> {
   const existing = await loadGlobalConfig();
 
-  // Only merge defined values from partial
   const merged: GlobalConfig = { ...existing };
   if (partial.endpoint !== undefined) merged.endpoint = partial.endpoint;
   if (partial.platformEndpoint !== undefined) merged.platformEndpoint = partial.platformEndpoint;

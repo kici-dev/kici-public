@@ -1,16 +1,10 @@
 /**
- * Run-history retention diagnostic check.
+ * Run-history retention check: is anything removing rows from this database? An operator cannot
+ * otherwise ask, and with no deleter the only symptom is a disk filling months later.
  *
- * Answers the question an operator cannot otherwise ask: is anything at all
- * removing rows from this database? Retention used to be object-store-first,
- * so an install with no bucket configured — the default — aged nothing, and
- * the only symptom was a disk filling months later.
- *
- * WARN when every window is disabled AND the cold store is off AND
- * `execution_runs` has already grown past the threshold: that is the exact
- * state with no deleter and a table large enough for it to matter. Otherwise
- * PASS, naming the effective windows and, while the announce window runs, the
- * date the first deletion is due.
+ * WARN when every window is disabled AND the cold store is off AND `execution_runs` is past the
+ * threshold — no deleter, and a table large enough to matter. Otherwise PASS, naming the
+ * effective windows and, while the announce window runs, the date the first deletion is due.
  */
 import { sql } from 'kysely';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -44,7 +38,7 @@ function describe(w: RetentionWindows): string {
   );
 }
 
-/** What the verdict needs to know. Gathered by the check, decided here. */
+/** Gathered by the check, decided by `retentionVerdict`. */
 export interface RetentionVerdictInput {
   windows: RetentionWindows;
   coldStoreEnabled: boolean;
@@ -56,11 +50,8 @@ export interface RetentionVerdictInput {
 }
 
 /**
- * Decide the check's outcome from already-gathered facts.
- *
- * Split from the check so the branches are testable without standing up a
- * database — in particular the WARN branch, which needs a row count larger
- * than any fixture would seed.
+ * Split from the check so branches are testable without a database — notably WARN, which needs
+ * a row count larger than any fixture would seed.
  */
 export function retentionVerdict(
   input: RetentionVerdictInput,
@@ -126,8 +117,7 @@ export async function checkRunHistoryRetention(deps: DiagnosticDeps): Promise<Di
     );
     const coldStoreEnabled = readOrchestratorColdStoreConfig().enabled;
 
-    // The count is only meaningful in the no-deleter case, and it is the one
-    // query here that scans a large table — so it runs only then.
+    // Only meaningful with no deleter, and the one large-table scan here — so it runs only then.
     let rows = 0;
     if (allWindowsDisabled(windows) && !coldStoreEnabled) {
       const r = await sql<{ n: string }>`

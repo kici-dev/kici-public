@@ -1,9 +1,6 @@
 /**
- * Tests for the DB-backed job queue (PostgreSQL only).
- *
- * Unit tests use mockDb() to verify queue logic: depth checks,
- * SQL-based JSONB label matching, FIFO ordering, status transitions, and timeout expiry.
- * Integration tests would use @testcontainers/postgresql.
+ * DB-backed job queue (PostgreSQL only), against mockDb(): depth checks, SQL
+ * JSONB label matching, FIFO ordering, status transitions and timeout expiry.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { JobQueue, DispatchQueueStatus, type QueuedJobInput } from './job-queue.js';
@@ -53,10 +50,7 @@ function makeDbRow(overrides: Partial<Record<string, unknown>> = {}): Record<str
   };
 }
 
-/**
- * Create a mock Kysely db that supports the query chains used by JobQueue.
- * Wraps the shared mock-db helper with a backward-compatible `_mocks` property.
- */
+/** The shared mock-db helper plus a backward-compatible `_mocks` property. */
 import { createMockDb as _createMockDb } from '../__test-helpers__/mock-db.js';
 
 function createMockDb(
@@ -75,19 +69,15 @@ function createMockDb(
   const selectFirstRow = 'selectFirstRow' in options ? options.selectFirstRow : countResult;
   const { db, mocks } = _createMockDb({
     selectRows: options.selectRows ?? [],
-    // Route count queries through selectFirstRow since getDepth() uses
-    // selectFrom().select(fn.countAll()).where().executeTakeFirst()
-    // which goes through the select terminal chain.
+    // getDepth()'s count query ends in the select chain's executeTakeFirst().
     selectFirstRow,
     countResult,
-    // The pattern-free drain claims in ONE statement — an UPDATE whose
-    // sub-select picks the row — so the claimed row arrives via RETURNING,
-    // not via the select chain. `selectFirstRow: <row>` still means "the queue
-    // holds this claimable row", so mirror an EXPLICIT one here by default; a
-    // test that wants to model a LOST claim overrides `updatedRow` with
-    // undefined. The implicit countResult fallback is deliberately NOT
-    // mirrored — it is a sentinel for the depth chain, and feeding it to the
-    // claim would hand the drain a row-shaped object with no id.
+    // The pattern-free drain claims in ONE statement (an UPDATE whose
+    // sub-select picks the row), so the row arrives via RETURNING. An EXPLICIT
+    // `selectFirstRow` still means "the queue holds this claimable row", so it
+    // is mirrored by default; a LOST claim overrides `updatedRow` with
+    // undefined. The implicit countResult fallback is NOT mirrored: it is a
+    // depth-chain sentinel and would hand the drain a row with no id.
     updatedRow:
       'updatedRow' in options
         ? options.updatedRow
@@ -100,7 +90,6 @@ function createMockDb(
     insertReturning: 'insertReturning' in options ? options.insertReturning : { id: 'mock-id' },
   });
 
-  // Expose _mocks for backward-compatible assertions (tests reference db._mocks.values etc.)
   db._mocks = {
     execute: mocks.selectExecute,
     executeTakeFirst: mocks.updateExecuteTakeFirst,
@@ -241,7 +230,7 @@ describe('JobQueue', () => {
       const arg = valuesCall.mock.calls[0][0];
       expect(arg.expires_at).toBeDefined();
 
-      // expires_at should be ~10 minutes from now
+      // ~10 minutes from now.
       const expiresAt = new Date(arg.expires_at).getTime();
       expect(expiresAt).toBeGreaterThanOrEqual(before + 600_000);
       expect(expiresAt).toBeLessThanOrEqual(after + 600_000);
@@ -344,7 +333,7 @@ describe('JobQueue', () => {
         id: 'job-oldest',
         runs_on_labels: ['linux', 'docker'], // JSONB auto-parsed by driver
       });
-      // dequeueForLabels uses executeTakeFirst (LIMIT 1), not execute
+      // executeTakeFirst (LIMIT 1), not execute.
       const db = createMockDb({ selectFirstRow: row });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
@@ -396,21 +385,18 @@ describe('JobQueue', () => {
 
       await queue.dequeueForLabels(['linux']);
 
-      // Verify the locking clause is part of the query chain
       expect(db._mocks.selectForUpdate).toHaveBeenCalled();
       expect(db._mocks.selectSkipLocked).toHaveBeenCalled();
     });
 
     it('filters out expired pending jobs', async () => {
-      // Expired job should not be returned even if status is still 'pending'
-      // (cleanup hasn't run yet). The SQL WHERE clause includes
-      // (expires_at IS NULL OR expires_at >= now()) to prevent dispatching expired jobs.
+      // A still-'pending' expired job (cleanup not yet run) is never returned:
+      // the WHERE clause includes (expires_at IS NULL OR expires_at >= now()).
       const expiredRow = makeDbRow({
         id: 'job-expired',
         expires_at: '2020-01-01T00:00:00.000Z', // well in the past
       });
-      // Since the WHERE clause filters at DB level, the mock returns undefined
-      // (no matching rows) when the job is expired
+      // The DB filters it out, so the mock returns no row.
       const db = createMockDb({ selectFirstRow: undefined });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
@@ -460,9 +446,8 @@ describe('JobQueue', () => {
       // exclude, the pin predicate (pinned_agent_id IS NULL [OR = agent]), the
       // stopped-run guard, and the pattern-free guard (runs_on_patterns = '[]'
       // AND exclude_patterns = '[]') = 7. The `runs_on_labels @> :gate`
-      // containment must NOT be added when agentMandatoryLabels is empty (it
-      // would be a no-op against an empty JSONB array but leaving it off keeps
-      // the query cheap).
+      // containment must NOT be added when agentMandatoryLabels is empty: a
+      // no-op against an empty JSONB array, and leaving it off keeps the query cheap.
       expect(db._mocks.where).toHaveBeenCalledTimes(7);
     });
 
@@ -484,9 +469,8 @@ describe('JobQueue', () => {
     });
 
     it('returns null when the gate predicate filters out the only candidate', async () => {
-      // The DB filters at SQL level; from JS perspective the mock returns no row
-      // when the gate predicate excludes every candidate. The behavior we cover
-      // is: caller passes a gate, we still get null cleanly (no exception).
+      // The SQL gate excludes every candidate, so the mock returns no row; a
+      // gated caller still gets null cleanly, no exception.
       const db = createMockDb({ selectFirstRow: undefined });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
@@ -641,10 +625,10 @@ describe('JobQueue', () => {
       // web-09 does not match ^kici:host:box- → JS post-filter rejects it.
       const wrong = await queue.dequeueForLabels(['kici:host:web-09']);
       expect(wrong).toBeNull();
-      // The row was filtered out in JS, so no per-row conditional claim was
-      // attempted. `set` alone no longer distinguishes that — the fast path is
-      // itself an UPDATE now — so key on the by-id claim's own terminal, which
-      // the fast path (a `returningAll()` chain) never touches.
+      // Filtered out in JS, so no per-row conditional claim was attempted.
+      // `set` cannot show that (the fast path is itself an UPDATE), so key on
+      // the by-id claim's terminal, which the fast path's `returningAll()`
+      // chain never touches.
       expect(db._mocks.executeTakeFirst).not.toHaveBeenCalled();
     });
 
@@ -664,7 +648,7 @@ describe('JobQueue', () => {
       const blocked = await queue.dequeueForLabels(['role:web', 'kici:host:web-canary']);
       expect(blocked).toBeNull();
       // No per-row conditional claim — see the sibling test for why `set` is
-      // no longer the discriminator.
+      // not the discriminator.
       expect(db._mocks.executeTakeFirst).not.toHaveBeenCalled();
     });
 
@@ -731,8 +715,8 @@ describe('JobQueue', () => {
     });
 
     it('returns null when the gate predicate excludes the bound jobId', async () => {
-      // Simulates: bound jobId still pending, but its runsOn does not include
-      // the agent's gate label so the SQL filter rejects the row.
+      // The bound job is still pending, but its runsOn lacks the agent's gate
+      // label, so the SQL filter rejects the row.
       const db = createMockDb({ selectFirstRow: undefined });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
@@ -788,10 +772,9 @@ describe('JobQueue', () => {
 
       await queue.markDispatched('job-1', 'agent-7');
 
-      // `owner_instance_id` is what lets a cluster-wide sweep tell its own rows
-      // from a live sibling's; `dispatched_at` is what stops the stale detector
-      // measuring a job's queue wait as if it were a dispatch that went
-      // unacknowledged.
+      // `owner_instance_id` lets a cluster-wide sweep tell its own rows from a
+      // live sibling's; `dispatched_at` stops the stale detector measuring
+      // queue wait as an unacknowledged dispatch.
       expect(db._mocks.set).toHaveBeenCalledWith(
         expect.objectContaining({
           owner_instance_id: 'coord-a',
@@ -854,9 +837,9 @@ describe('JobQueue', () => {
 
       await queue.requeue('job-1');
 
-      // The job was routable at dispatch time, so a clock stamped before it is
-      // spent. Carrying it over would let the probe fail the requeued job on
-      // its very next tick with no fresh grace window.
+      // The job was routable at dispatch, so an earlier clock is spent; kept,
+      // it would let the probe fail the requeued job on its next tick with no
+      // fresh grace window.
       expect(db._mocks.set).toHaveBeenCalledWith(
         expect.objectContaining({ unroutable_since: null }),
       );
@@ -1374,11 +1357,10 @@ describe('JobQueue', () => {
       const db = createMockDb({ countResult: { count: 5 } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
-      // First call hits DB
       const depth1 = await queue.getDepth();
       expect(depth1).toBe(5);
 
-      // Second call within 1s returns cached value (no extra DB call)
+      // Within 1s: the cached value, no extra DB call.
       const depth2 = await queue.getDepth();
       expect(depth2).toBe(5);
     });
@@ -1387,12 +1369,10 @@ describe('JobQueue', () => {
       const db = createMockDb({ countResult: { count: 0 } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
-      // Warm the cache
       await queue.getDepth();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       expect((queue as any).depthCache).not.toBeNull();
 
-      // Enqueue should invalidate the cache
       await queue.enqueue(makeJobInput());
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       expect((queue as any).depthCache).toBeNull();
@@ -1510,10 +1490,9 @@ describe('JobQueue', () => {
     });
 
     it('collapses case-only variants into one byLabel series', async () => {
-      // A row an orchestrator wrote before migration 140 canonicalized the
-      // table keeps the author's case. Counting it verbatim would split one
-      // queue into a `Linux` series and a `linux` series, halving both the
-      // gauge and the depth warning that reads it.
+      // A row written before migration 140 canonicalized the table keeps the
+      // author's case; counted verbatim, it would split one queue into `Linux`
+      // and `linux` series, halving the gauge and the depth warning reading it.
       const db = createMockDb({
         selectRows: [
           makeDbRow({
@@ -1649,15 +1628,12 @@ describe('JobQueue', () => {
       });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
-      // Enqueue with requestId
       await queue.enqueue(makeJobInput({ requestId: 'test-trace-id' }));
 
-      // Verify request_id was passed to DB insert
       const valuesCall = db._mocks.values;
       const insertArg = valuesCall.mock.calls[0][0];
       expect(insertArg.request_id).toBe('test-trace-id');
 
-      // Dequeue returns it
       const result = await queue.dequeueForLabels(['linux', 'docker']);
       expect(result).not.toBeNull();
       expect(result!.requestId).toBe('test-trace-id');
@@ -1671,15 +1647,13 @@ describe('JobQueue', () => {
       });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 
-      // Enqueue without requestId
       await queue.enqueue(makeJobInput());
 
-      // Verify null was persisted
       const valuesCall = db._mocks.values;
       const insertArg = valuesCall.mock.calls[0][0];
       expect(insertArg.request_id).toBeNull();
 
-      // Dequeue returns undefined (null -> undefined mapping)
+      // null maps to undefined.
       const result = await queue.dequeueForLabels(['linux', 'docker']);
       expect(result).not.toBeNull();
       expect(result!.requestId).toBeUndefined();
@@ -1761,9 +1735,9 @@ describe('JobQueue', () => {
       expect(count).toBe(3);
       expect(db.updateTable).toHaveBeenCalledWith('dispatch_queue');
       expect(db._mocks.set).toHaveBeenCalledWith({ status: DispatchQueueStatus.Failed });
-      // Status whitelist must include Dispatched so that build-coordinator
-      // timeouts (which insertDispatched()'d the build job before the timer
-      // fired) actually cascade to the dispatch_queue row.
+      // Dispatched must be in the whitelist so a build-coordinator timeout
+      // (its build job was insertDispatched()'d before the timer fired)
+      // cascades to the dispatch_queue row.
       expect(db._mocks.updateWhere).toHaveBeenCalledWith('status', 'in', [
         DispatchQueueStatus.Pending,
         DispatchQueueStatus.Recovering,
@@ -1781,8 +1755,8 @@ describe('JobQueue', () => {
 
       expect(db.updateTable).toHaveBeenCalledWith('dispatch_queue');
       expect(db._mocks.set).toHaveBeenCalledWith({ status: DispatchQueueStatus.Completed });
-      // Status guard must be present so a late agent job.complete cannot
-      // flip a Failed/Expired row back to Completed.
+      // The status guard stops a late agent job.complete flipping a
+      // Failed/Expired row back to Completed.
       expect(db._mocks.updateWhere).toHaveBeenCalledWith('status', 'in', [
         DispatchQueueStatus.Dispatched,
         DispatchQueueStatus.Recovering,
@@ -1790,10 +1764,9 @@ describe('JobQueue', () => {
     });
 
     it('is a no-op when the row is already terminal (duplicate/replayed terminal frame)', async () => {
-      // Terminal job/step status now rides the agent's reconnect-replay buffer,
-      // so the orchestrator can legitimately receive the same terminal frame
-      // twice (once live, once replayed). The status guard makes the second
-      // markCompleted match zero rows — it must resolve, not throw.
+      // Terminal job/step status rides the agent's reconnect-replay buffer, so
+      // the same terminal frame can arrive twice (live, then replayed). The
+      // second markCompleted matches zero rows and must resolve, not throw.
       const db = createMockDb({ updateResult: { numUpdatedRows: 0n } });
       const queue = new JobQueue(db, { maxDepth: 100, defaultTimeoutMs: 600_000 });
 

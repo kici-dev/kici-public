@@ -56,8 +56,7 @@ describe('resolveSelection', () => {
     const map = resolveSelection(topology, ['worker-1']);
     // worker-1 matches itself wholesale...
     expect(map.get('worker-1')).toEqual({ all: true, agentIds: [], workerInstanceIds: [] });
-    // ...and coord-a records worker-1 in its workerInstanceIds so the root knows
-    // to traverse it.
+    // ...and coord-a lists worker-1 in workerInstanceIds so the root traverses it.
     expect(map.get('coord-a')).toEqual({
       all: false,
       agentIds: [],

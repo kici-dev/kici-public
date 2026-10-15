@@ -1,7 +1,4 @@
-/**
- * Tag trigger helper - creates triggers for tag push events.
- * Returns a frozen TagTriggerConfig directly.
- */
+/** Tag push trigger helper; returns a frozen TagTriggerConfig. */
 
 import type { BranchPattern, TagConfigInput, TagTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';

@@ -4,11 +4,10 @@
  * job's `.kici/` install on the agent host may contact.
  *
  * The host install runs outside the job network's egress filter, so every
- * origin it contacts must be one the operator chose. A workflow's
- * `registries:` block and a repository's `.kici/.npmrc` are chosen by the
- * repository, so they qualify only when their origin is on this list.
- * Matching is by exact origin (scheme, host and port after URL
- * normalization), never by what a name resolves to.
+ * origin it contacts must be operator-chosen: a workflow's `registries:` block
+ * and a repository's `.kici/.npmrc` qualify only when their origin is listed.
+ * Matching is by exact origin (scheme, host and port after URL normalization),
+ * never by what a name resolves to.
  */
 
 export type RegistryOriginParse = { ok: true; origin: string } | { ok: false; reason: string };
@@ -16,10 +15,7 @@ export type RegistryOriginParse = { ok: true; origin: string } | { ok: false; re
 export interface ParsedHostInstallRegistries {
   /** Normalized origins, in first-seen order, without duplicates. */
   origins: string[];
-  /**
-   * Entries that are not an http(s) origin, with the reason. Each entry has its
-   * credentials removed (`redactRegistryEntry`), since it goes into a startup error.
-   */
+  /** Refused entries with the reason, credentials removed (`redactRegistryEntry`) for the startup error. */
   invalid: { entry: string; reason: string }[];
 }
 
@@ -27,9 +23,8 @@ export interface ParsedHostInstallRegistries {
 const PLAIN_HOST = /^(?:[a-z0-9_-]+(?:\.[a-z0-9_-]+)*\.?|\[[0-9a-f:.]+\])$/;
 
 /**
- * Normalize one operator entry to its origin. The entry must be an http(s)
- * URL naming only an origin: no credentials, path, query or fragment, and a
- * host name that is a plain DNS name or IP address.
+ * The entry must be an http(s) URL naming only an origin: no credentials, path,
+ * query or fragment, and a plain DNS name or IP address as host.
  */
 export function parseRegistryOrigin(entry: string): RegistryOriginParse {
   let url: URL;
@@ -56,9 +51,8 @@ export function parseRegistryOrigin(entry: string): RegistryOriginParse {
 }
 
 /**
- * `entry` without anything that may be a credential, for an error message: the
- * userinfo before the host, and the text of a query or a fragment. The rest of
- * the entry is kept as written, so the operator can find it in the setting.
+ * Strips what may be a credential (userinfo, query and fragment text) for an
+ * error message; the rest stays as written so the operator can find it.
  */
 export function redactRegistryEntry(entry: string): string {
   return (
@@ -70,7 +64,7 @@ export function redactRegistryEntry(entry: string): string {
   );
 }
 
-/** Split the comma-separated setting, normalize each entry, and collect the refusals. */
+/** Comma-separated setting. */
 export function parseHostInstallRegistries(raw: string): ParsedHostInstallRegistries {
   const origins: string[] = [];
   const invalid: ParsedHostInstallRegistries['invalid'] = [];

@@ -1,23 +1,10 @@
-/**
- * kici logout command
- *
- * Revokes PAT server-side and clears local auth config.
- */
-
 import pc from 'picocolors';
 import { loadGlobalConfig, saveGlobalConfig, getConfigPath } from '../remote/config.js';
 import { planeStatus, detachPlane } from '../local-plane/plane-manager.js';
 
 /**
- * Logout from KiCI.
- *
- * 1. Revokes the PAT server-side (DELETE /api/v1/pats/:id)
- * 2. Clears auth fields from local config (preserves non-auth settings)
- *
- * If server revocation fails (network error), still clears local config
- * with a warning that the PAT will expire automatically.
- *
- * @returns true on completion (always succeeds from user's perspective)
+ * A failed server-side PAT revoke only warns (the PAT expires on its own); the
+ * login fields are cleared regardless, and the command always succeeds.
  */
 export async function logoutCommand(): Promise<boolean> {
   const config = await loadGlobalConfig();
@@ -27,7 +14,6 @@ export async function logoutCommand(): Promise<boolean> {
     return true;
   }
 
-  // Try to revoke PAT server-side
   if (config.patId && config.platformEndpoint) {
     try {
       const url = `${config.platformEndpoint}/api/v1/pats/${config.patId}`;
@@ -53,19 +39,18 @@ export async function logoutCommand(): Promise<boolean> {
     }
   }
 
-  // Detach the local dev plane if attached, so a logged-out user isn't left
-  // with a hybrid plane holding a now-orphaned orchestrator key. Best-effort:
-  // the revoke uses the still-present PAT; a failure is non-fatal.
+  // A hybrid plane would hold an orphaned orchestrator key. Best-effort, using
+  // the still-present PAT.
   try {
     if ((await planeStatus()).mode === 'hybrid') {
       await detachPlane({ pat: config.pat });
       console.log(pc.gray('Local dev plane detached (back to offline).'));
     }
   } catch {
-    // Non-fatal — logout proceeds regardless.
+    // Non-fatal.
   }
 
-  // Clear all auth fields from config, preserving connection settings
+  // Connection settings are preserved.
   const cleanConfig = { ...config };
   delete cleanConfig.pat;
   delete cleanConfig.patId;

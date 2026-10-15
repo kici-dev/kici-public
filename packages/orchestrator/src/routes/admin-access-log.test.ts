@@ -1,14 +1,12 @@
 /**
- * Tests for the admin access-log route.
- *
+ * Admin access-log routes:
  *   GET /api/v1/admin/access-log         — list with filters (q, action, ...)
  *   GET /api/v1/admin/access-log/:id     — single entry by id
  *
- * Mirrors the Bearer-token + RBAC plumbing shape of admin-event-dlq.test.ts:
- * the AccessLogWriter is stubbed with a vi.fn() so the test can assert the
- * exact filter argument forwarded into `accessLog.query()` — including the
- * `q` substring which the dashboard WS handler already forwards but which
- * the admin HTTP route + CLI omitted.
+ * Same Bearer-token + RBAC plumbing as admin-event-dlq.test.ts. The
+ * AccessLogWriter is a vi.fn(), so the test asserts the exact filter forwarded
+ * into `accessLog.query()` — including the `q` substring, which the admin
+ * HTTP route must forward as the dashboard WS handler does.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createAdminAccessLogRoutes, type AdminAccessLogRoutesDeps } from './admin-access-log.js';

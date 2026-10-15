@@ -3,34 +3,24 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Coordinator ownership for the job-dispatch plane.
  *
- * `dispatch_queue` records which **agent** a row went to (`agent_id`,
- * `ack_agent_id`, `recovery_agent_id`, `pinned_agent_id`) but never which
- * **coordinator** is watching it, so every cluster-wide sweep reads the whole
- * shared table and acts on rows a live sibling owns.
+ * `dispatch_queue` records which **agent** a row went to but not which **coordinator** watches
+ * it, so every cluster-wide sweep acted on rows a live sibling owns.
  *
- * - `dispatch_queue.owner_instance_id TEXT NULL` — the coordinator that
- *   dispatched the row. A NULL reads as "unknown owner", never as "not mine",
- *   which is the convention migration 119 established for the scaler plane.
- * - `dispatch_queue.dispatched_at TIMESTAMPTZ NULL` — when the row was actually
- *   handed to an agent, as distinct from `created_at`, which is when it was
- *   enqueued. The stale detector's "dispatch never acknowledged" heuristic reads
- *   this; a NULL falls back to `created_at`, so a row written before this column
- *   existed keeps exactly its previous behaviour.
- * - `cluster_instances` — the coordinator heartbeat. Liveness has to come from
- *   the DB rather than the peer registry because the peer registry is empty at
- *   exactly the moment startup recovery runs, and it needs no peer connectivity,
- *   so it works in non-Raft multi-coordinator and standalone deployments alike.
- *   It mirrors what `host_roster` already does for agents.
- * - `execution_runs.cancelling_at TIMESTAMPTZ NULL` — when the run entered
- *   `cancelling`. A cancel can be dropped in transit (a peer blip), leaving the
- *   run cancelling with its jobs still executing; the re-drive sweep needs to
- *   know how long that has been true, and no existing column says.
- * - A partial unique index on `concurrency_groups (routing_key, group_key,
- *   run_id) WHERE status = 'active'` — makes a re-acquire idempotent at the DB
- *   level now that the database, not a process map, arbitrates slots.
+ * - `dispatch_queue.owner_instance_id` — the dispatching coordinator. NULL reads as "unknown
+ *   owner", never "not mine" (the scaler-plane convention from migration 119).
+ * - `dispatch_queue.dispatched_at` — when the row was handed to an agent (`created_at` is
+ *   enqueue time); read by the stale detector's "dispatch never acknowledged" heuristic. NULL
+ *   falls back to `created_at`, so older rows keep their behaviour.
+ * - `cluster_instances` — the coordinator heartbeat, as `host_roster` is for agents. Liveness
+ *   comes from the DB because the peer registry is empty when startup recovery runs; it needs
+ *   no peer connectivity, so it works in non-Raft multi-coordinator and standalone deployments.
+ * - `execution_runs.cancelling_at` — when the run entered `cancelling`. A cancel dropped in
+ *   transit leaves jobs executing; the re-drive sweep needs to know for how long.
+ * - A partial unique index on `concurrency_groups (routing_key, group_key, run_id) WHERE
+ *   status = 'active'`, making a re-acquire idempotent now that the DB arbitrates slots.
  *
- * Both columns are nullable and backfill as NULL, so an in-flight queue survives
- * the upgrade. Idempotent: guarded on each object's existence.
+ * The new columns are nullable and backfill as NULL, so an in-flight queue survives the
+ * upgrade. Idempotent: guarded on each object's existence.
  */
 async function tableExists(db: Kysely<unknown>, name: string): Promise<boolean> {
   const result = await sql<{ exists: boolean }>`
@@ -69,9 +59,8 @@ export async function up(db: Kysely<unknown>): Promise<void> {
     }
   }
 
-  // Startup recovery scans `dispatched` rows by owner, so the index is partial
-  // on that status: terminal rows are the bulk of the table and are never read
-  // by an ownership predicate.
+  // Partial on `dispatched`: startup recovery scans those by owner, and terminal rows (the
+  // bulk) are never read by an ownership predicate.
   await sql`
     CREATE INDEX IF NOT EXISTS idx_dispatch_queue_owner_dispatched
       ON public.dispatch_queue (owner_instance_id)
@@ -107,22 +96,18 @@ export async function up(db: Kysely<unknown>): Promise<void> {
         last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `.execute(db);
-    // The liveness predicate reads "is any row for this instance fresher than
-    // now() - grace", so the heartbeat column carries the index.
+    // The liveness predicate is "heartbeat fresher than now() - grace".
     await sql`
       CREATE INDEX idx_cluster_instances_last_heartbeat_at
         ON public.cluster_instances (last_heartbeat_at)
     `.execute(db);
   }
 
-  // Collapse pre-existing duplicates before the unique index is built, or the
-  // build fails and takes the whole migration — and startup with it — down.
-  // Duplicates are the normal state of an upgraded database, not a corruption:
-  // the slot was recorded once per `concurrency.report`, and a report arrives
-  // per JOB, so any run with two jobs in one group left two `active` rows for
-  // the same (routing_key, group_key, run_id). The oldest row is the slot the
-  // run actually holds; the rest are records of the same acquisition, so they
-  // are marked `completed` rather than deleted.
+  // Collapse duplicates first, or the unique index build fails the migration and startup.
+  // Duplicates are normal on an upgraded database: a slot was recorded per `concurrency.report`,
+  // which arrives per JOB, so a run with several jobs in one group left several `active` rows.
+  // The oldest is the held slot; the rest record the same acquisition and become `completed`,
+  // not deleted.
   await sql`
     UPDATE public.concurrency_groups cg
        SET status = 'completed',

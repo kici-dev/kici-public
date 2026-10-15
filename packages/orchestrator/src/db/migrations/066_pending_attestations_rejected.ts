@@ -1,13 +1,10 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `rejected_at` to `pending_attestations`: the terminal-rejection marker for
- * a deferred attestation the Platform definitively cannot mint (run/job absent).
- * NULL while the row is still pending a later mint; set once, the row is skipped
- * by the retrier and drops out of the pending-attestations gauge. Re-armed via
- * `kici-admin attestations retry --include-rejected`.
- *
- * Idempotent: guarded on column existence.
+ * Add `pending_attestations.rejected_at`: marks a deferred attestation the Platform definitively
+ * cannot mint (run/job absent). Once set, the retrier skips the row and it leaves the
+ * pending-attestations gauge; `kici-admin attestations retry --include-rejected` re-arms it.
+ * Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const exists = await columnExists(db, 'pending_attestations', 'rejected_at');

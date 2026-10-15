@@ -1,8 +1,6 @@
 /** OS-specific pieces of a mise init expansion. */
 export interface MiseTemplate {
-  /** The `run` command. */
   run: string;
-  /** Shell to run it with. */
   shell: string;
   /** Cache `paths` for mise's data dir on this OS. */
   cachePaths: string[];
@@ -19,9 +17,8 @@ mise env -s bash | sed -n 's/^export //p' | sed '/^PATH=/d' \\
   | sed -E 's/^([A-Za-z_][A-Za-z0-9_]*)="(.*)"$/\\1=\\2/' >> "$KICI_ENV"
 echo "$HOME/.local/share/mise/shims" >> "$KICI_PATH"`;
 
-// The Windows install resolves the latest mise zip via windows-install.ts at
-// expand time and substitutes the URL into the <ASSET_URL> placeholder; see
-// expander.ts.
+// expander.ts resolves the latest mise zip (windows-install.ts) at expand time
+// and substitutes its URL for <ASSET_URL>.
 const PWSH_RUN = `$ErrorActionPreference = 'Stop'
 # mise writes informational output (\`mise trusted …\`, install progress) to
 # stderr even on success. Under \`$ErrorActionPreference = 'Stop'\` PowerShell
@@ -66,9 +63,8 @@ Invoke-Mise env -s pwsh | ForEach-Object {
 Invoke-Mise bin-paths | Add-Content -Path $env:KICI_PATH`;
 
 /**
- * Pick the mise template for a host platform (Node `process.platform` value).
- * The Windows `run` carries an `<ASSET_URL>` placeholder the expander replaces
- * with the resolved GitHub-release zip URL.
+ * `platform` is a Node `process.platform` value. The Windows `run` carries an
+ * `<ASSET_URL>` placeholder the expander replaces with the GitHub-release zip URL.
  */
 export function selectMiseTemplate(platform: NodeJS.Platform): MiseTemplate {
   if (platform === 'win32') {

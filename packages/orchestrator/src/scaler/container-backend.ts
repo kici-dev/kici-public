@@ -1,10 +1,7 @@
 /**
- * Container scaler backend implementation.
- *
- * Manages ephemeral agent containers using Docker or Podman via dockerode.
- * Supports auto-detection of container runtime socket.
- * Handles full container lifecycle: pull, create, start, stop, remove.
- * Supports container socket sharing, resource limits, and orphan cleanup.
+ * Container scaler backend: ephemeral agent containers on Docker or Podman via
+ * dockerode, with runtime-socket auto-detection, socket sharing, resource
+ * limits and orphan cleanup.
  */
 
 import { access, constants } from 'node:fs/promises';
@@ -63,9 +60,6 @@ const ISOLATED_NETWORK_SUBNET = '172.30.0.0/16';
 /** Gateway IP for the isolated agent network (host-side). */
 export const ISOLATED_NETWORK_GATEWAY = '172.30.0.1';
 
-/**
- * Result of runtime detection.
- */
 export interface DetectedRuntime {
   socketPath: string;
   runtime: 'docker' | 'podman';
@@ -85,7 +79,7 @@ export async function detectRuntime(
 ): Promise<DetectedRuntime | null> {
   const probes = [...PROBE_ORDER];
 
-  // Add rootless Podman socket path
+  // Rootless Podman.
   const xdgDir = process.env.XDG_RUNTIME_DIR;
   if (xdgDir) {
     probes.push({
@@ -94,7 +88,6 @@ export async function detectRuntime(
     });
   }
 
-  // If runtime hint is specific, filter probes to only that runtime
   const filtered =
     runtimeHint && runtimeHint !== 'auto'
       ? probes.filter((p) => p.runtime === runtimeHint)
@@ -171,9 +164,12 @@ export interface ContainerScalerBackendOptions {
   runtime?: 'docker' | 'podman' | 'auto';
   /** Default resource limits applied when label set has none */
   defaultResources?: ResourceRequest;
-  /** Extra host:IP mappings injected into spawned containers (e.g. ["registry.local:host-gateway"]) */
+  /** Extra host:IP mappings for spawned containers (e.g. ["registry.local:host-gateway"]). */
   extraHosts?: string[];
-  /** Disable nftables-based network isolation (default: true). Set to false when nft is unavailable (e.g. rootless containers without NET_ADMIN). */
+  /**
+   * Enables nftables-based network isolation (default: true). Set to false when nft is
+   * unavailable (e.g. rootless containers without NET_ADMIN).
+   */
   networkIsolation?: boolean;
   /**
    * Extra `hostAccess` entries the orchestrator itself directed agents at —
@@ -181,7 +177,7 @@ export interface ContainerScalerBackendOptions {
    * narrowing does not cut off a host-local object store.
    */
   hostServices?: string[];
-  /** Token store for creating ephemeral agent auth tokens. Optional -- when undefined, no token is injected. */
+  /** Token store for ephemeral agent auth tokens; when undefined, no token is injected. */
   tokenStore?: AgentTokenStore;
   /** TTL for ephemeral agent tokens in ms. Default: 1 hour. */
   tokenTtlMs?: number;
@@ -322,7 +318,6 @@ export class ContainerScalerBackend implements ScalerBackend {
 
     if (options.host) {
       this.docker = new Docker({ host: options.host });
-      // For remote connections, we don't have a local socket
       this.resolvedSocketPath = '';
       this.detectedRuntime = options.runtime === 'podman' ? 'podman' : 'docker';
     } else {
@@ -343,17 +338,14 @@ export class ContainerScalerBackend implements ScalerBackend {
     const networkId = await ensureIsolatedNetwork(this.docker);
     this.isolatedNetworkId = networkId;
 
-    // Inspect network to get the host bridge interface name.
     const networkInfo = await this.docker.getNetwork(networkId).inspect();
-    // Docker stores bridge name in Options['com.docker.network.bridge.name']
-    // Podman/netavark may use a different key or generate br-<id> pattern
+    // Podman/netavark may omit Docker's bridge-name option; fall back to br-<id>.
     const bridgeName =
       networkInfo.Options?.['com.docker.network.bridge.name'] ?? `br-${networkId.slice(0, 12)}`;
     this.isolatedBridgeIface = bridgeName;
 
     logger.info(`Isolated network bridge interface: ${bridgeName}`);
 
-    // Prepare nftables table (skip when network isolation is disabled).
     // Per-container rules are applied during spawn(), not here.
     if (this.networkIsolation) {
       await ensureKiciTable();
@@ -369,13 +361,10 @@ export class ContainerScalerBackend implements ScalerBackend {
   /**
    * Declare required tools for a container scaler entry.
    *
-   * For the auto-detect case (no explicit socketPath / remote host) the
-   * orchestrator must have a local container runtime — docker OR podman — on
-   * PATH, otherwise the scaler cannot spawn agent containers. Declaring it
-   * here lets the startup tool-validation gate fail fast with a clear error
-   * instead of the first job hanging. When a socketPath or remote host is
-   * configured the binary need not be on PATH (the runtime may be remote), so
-   * reachability is validated later in create().
+   * Auto-detect (no socketPath / remote host) needs docker OR podman on PATH;
+   * declaring it lets the startup tool-validation gate fail fast instead of the
+   * first job hanging. With a socketPath or remote host the runtime may be
+   * remote, so create() validates reachability instead.
    */
   static getRequiredTools(entry: ScalerEntry): ToolRequirement[] {
     if (entry.host || entry.socketPath) {
@@ -397,7 +386,7 @@ export class ContainerScalerBackend implements ScalerBackend {
    * Throws if no container runtime is found and no host is configured.
    */
   static async create(options: ContainerScalerBackendOptions): Promise<ContainerScalerBackend> {
-    // Validate nftables availability before any other setup (skip when networkIsolation is disabled)
+    // nftables is validated before any other setup.
     if (options.networkIsolation !== false) {
       await validateNftablesAvailability();
     }
@@ -405,16 +394,13 @@ export class ContainerScalerBackend implements ScalerBackend {
     let backend: ContainerScalerBackend;
 
     if (options.host) {
-      // Remote connection -- no socket detection needed
       const runtime = options.runtime === 'podman' ? 'podman' : 'docker';
       backend = new ContainerScalerBackend(options, '', runtime);
     } else if (options.socketPath) {
-      // Explicit socket path -- detect runtime type from path
       const runtime = containerRuntimeForSocketPath(options.socketPath);
       logger.info(`Using configured socket at ${options.socketPath}`, { runtime });
       backend = new ContainerScalerBackend(options, options.socketPath, runtime);
     } else {
-      // Auto-detect
       const detected = await detectRuntime(options.runtime);
       if (!detected) {
         throw new Error('No container runtime found. Install Docker or Podman, or configure host.');
@@ -424,7 +410,7 @@ export class ContainerScalerBackend implements ScalerBackend {
       backend = new ContainerScalerBackend(options, detected.socketPath, detected.runtime);
     }
 
-    // Create isolated network and apply nftables rules before any containers are spawned
+    // Before any container is spawned.
     if (options.networkIsolation !== false) {
       await backend.ensureIsolatedNetwork();
     } else {
@@ -535,12 +521,10 @@ export class ContainerScalerBackend implements ScalerBackend {
     const emit = (eventType: Parameters<ScalerEventCallback>[0]['eventType'], detail: string) => {
       onEvent?.({ agentId, eventType, detail, timestampMs: Date.now() });
     };
-    // A container created before an abort/failure; removed best-effort in the
-    // catch with a fresh (unsignalled) request so cleanup isn't cancelled by
-    // the same abort that triggered the failure path.
+    // Removed best-effort in the catch with a fresh (unsignalled) request, so
+    // the abort that triggered the failure cannot cancel the cleanup.
     let createdContainer: Docker.Container | undefined;
 
-    // Find matching label set config
     const normalizedTarget = normalizeLabelSet(labelSet);
     const matchedLabelSet = this._labelSets.find(
       (ls) => normalizeLabelSet(ls.labels) === normalizedTarget,
@@ -551,14 +535,12 @@ export class ContainerScalerBackend implements ScalerBackend {
       );
     }
 
-    // Check capacity
     if (this.getActiveCount() >= this.maxAgents) {
       throw new Error(
         `Container backend "${this.name}" at capacity (${this.maxAgents}/${this.maxAgents})`,
       );
     }
 
-    // Create ManagedAgent tracking
     const managed: ManagedAgent = {
       id: agentId,
       labelSet,
@@ -568,16 +550,14 @@ export class ContainerScalerBackend implements ScalerBackend {
     };
     this.agents.set(managed.id, managed);
 
-    // The agent inside the container registers over WS the moment `start`
-    // returns it to life, and can finish its job and disconnect while this
-    // method is still awaiting the runtime (a `start` or `logs` call takes
-    // 60–95 s under batch load). That disconnect runs `destroy`, which drops
-    // the tracking entry — so after every await past that point the spawn
-    // checks it still owns one, and unwinds through the catch when it does
-    // not: the container it created is removed, and the manager's
-    // failure branch releases the reservation. Resolving instead would hand
-    // the manager an agent that no longer exists and leave a log capture
-    // open on a removed container.
+    // The agent registers over WS once `start` runs it, and can finish its job
+    // and disconnect while this method still awaits the runtime (a `start` or
+    // `logs` call takes 60–95 s under batch load); that `destroy` drops the
+    // tracking entry. So after every later await the spawn checks it still owns
+    // the entry and otherwise unwinds through the catch: the container is
+    // removed and the manager's failure branch releases the reservation.
+    // Resolving would hand the manager a dead agent and leave a log capture open
+    // on a removed container.
     const assertStillTracked = (): void => {
       if (this.agents.get(managed.id) !== managed) {
         throw new Error(`Agent ${agentId} was torn down while its container was being provisioned`);
@@ -585,7 +565,6 @@ export class ContainerScalerBackend implements ScalerBackend {
     };
 
     try {
-      // Forward KICI_AGENT_ENV_ prefixed vars from orchestrator process.env
       const agentEnvForwarded: string[] = [];
       for (const [key, value] of Object.entries(process.env)) {
         if (key.startsWith(KICI_AGENT_ENV_PREFIX) && value !== undefined) {
@@ -600,18 +579,15 @@ export class ContainerScalerBackend implements ScalerBackend {
         spawnContext,
       );
 
-      // Build env array
       const env: string[] = [
         `KICI_ORCHESTRATOR_URL=${orchestratorUrl}`,
         `KICI_AGENT_ID=${agentId}`,
         `KICI_LABELS=${fullLabels.join(',')}`,
         `KICI_SCALER_MANAGED=1`,
         `KICI_EXECUTION_MODE=bare-metal`,
-        // Where the agent materializes the KiCI runtime from when it NESTS a
-        // job container. The pool's own agent image carries /opt/kici and is
-        // present on this host by construction, so it is the one image the
-        // agent can always reach. Unused by a per-job-image spawn, which runs
-        // the steps directly rather than nesting.
+        // Source of the KiCI runtime when the agent NESTS a job container: the
+        // pool's own agent image carries /opt/kici and is on this host by
+        // construction. Unused by a per-job-image spawn, which does not nest.
         `KICI_RUNTIME_IMAGE=${matchedLabelSet.image!}`,
         ...(agentToken ? [`KICI_AGENT_TOKEN=${agentToken}`] : []),
         ...(matchedLabelSet.backpressureMode
@@ -621,18 +597,14 @@ export class ContainerScalerBackend implements ScalerBackend {
         ...Object.entries(matchedLabelSet.env ?? {}).map(([k, v]) => `${k}=${v}`),
       ];
 
-      // Build binds array (user-defined volumes + optional container socket)
       const binds: string[] = [...(matchedLabelSet.volumes ?? [])];
       if (matchedLabelSet.containerSocket && this.resolvedSocketPath) {
         // Mount at native path (not remapped to /var/run/docker.sock)
         binds.push(`${this.resolvedSocketPath}:${this.resolvedSocketPath}`);
       }
 
-      // Resolve resource limits.
-      // 1. `effectiveLimits` from ScalerManager wins -- it already accounts for
-      //    job overrides, label-set, and scaler defaults.
-      // 2. Otherwise fall back to `matchedLabelSet.resources?.limits`.
-      // 3. Otherwise fall back to `this.defaultResources?.limits`.
+      // `effectiveLimits` from ScalerManager wins: it already folds in job
+      // overrides, label-set and scaler defaults.
       let resolvedLimits: EffectiveLimits;
 
       if (effectiveLimits && (effectiveLimits.cpus || effectiveLimits.memBytes)) {
@@ -646,22 +618,20 @@ export class ContainerScalerBackend implements ScalerBackend {
         };
       }
 
-      // Pull image based on pull policy. Default IfNotPresent: KiCI agent
-      // images are pinned + immutable, so re-pulling on every spawn only storms
-      // the registry/socket. A label set on a moving tag sets `Always`.
-      // A job that declared its own container image is spawned on THAT image,
-      // with the KiCI runtime injected so it needs neither Node nor git. Absent
-      // one, the pool's fixed agent image is used exactly as before — the agent
-      // image already carries the runtime, so nothing is injected into it.
+      // Default pull policy IfNotPresent: KiCI agent images are pinned and
+      // immutable, so re-pulling every spawn only storms the registry/socket; a
+      // label set on a moving tag sets `Always`. A job that declared its own
+      // image spawns on THAT image with the KiCI runtime injected (no Node or git
+      // needed). Otherwise the pool's agent image, which already carries the
+      // runtime, is used as is.
       const jobContainer = spawnContext?.container;
       const spawnImage = jobContainer?.image ?? matchedLabelSet.image!;
 
       await pullImageIfMissing({
         docker: this.docker,
         image: spawnImage,
-        // A per-job image is the customer's, not ours — it is not pinned and
-        // immutable the way an agent image is, so the label set's policy does
-        // not describe it.
+        // A customer's per-job image is not pinned and immutable like an agent
+        // image, so the label set's policy does not describe it.
         ...(!jobContainer && matchedLabelSet.imagePullPolicy
           ? { pullPolicy: matchedLabelSet.imagePullPolicy }
           : {}),
@@ -670,14 +640,12 @@ export class ContainerScalerBackend implements ScalerBackend {
         onProgress: (message) => emit(ScalerEventType.enum['scaler.provisioning'], message),
       });
 
-      // Inject the KiCI runtime for a per-job image. Materialized out of the
-      // agent image into a named volume, because a bind mount needs a HOST path
-      // and the orchestrator may itself be containerized.
+      // The runtime is materialized from the agent image into a named volume: a
+      // bind mount needs a HOST path, and the orchestrator may be containerized.
       let agentInit: string[] = [];
       if (jobContainer) {
-        // Tell the agent it IS the job's image. Without this it sees the job's
-        // `container:` field, decides it needs a container, and nests a second
-        // one from the same image — a runtime inside a runtime.
+        // The agent IS the job's image; without this it reads the job's
+        // `container:` field and nests a second container from the same image.
         env.push('KICI_JOB_IMAGE_AGENT=1');
 
         const runtimeVolume = await ensureRuntimeVolume({
@@ -692,16 +660,13 @@ export class ContainerScalerBackend implements ScalerBackend {
         agentInit = runtimeInitCommand(await agentImageLabels(this.docker, matchedLabelSet.image!));
       }
 
-      // Create container attached to the isolated network
       emit(ScalerEventType.enum['scaler.provisioning'], 'creating container');
       const normalizedLabelSetStr = normalizeLabelSet(labelSet);
       const container = await this.docker.createContainer({
         abortSignal: signal,
         Image: spawnImage,
-        // A per-job image declares its own CMD, so the agent has to be named
-        // explicitly or the container runs the customer's entrypoint and no
-        // agent ever registers. The pool's own agent image already starts the
-        // agent by default, so it keeps its CMD.
+        // A per-job image's own CMD would run the customer's entrypoint and no
+        // agent would register. The pool's agent image keeps its default CMD.
         ...(jobContainer ? { Cmd: injectedAgentCommand(agentInit) } : {}),
         Env: env,
         Labels: {
@@ -709,9 +674,8 @@ export class ContainerScalerBackend implements ScalerBackend {
           'kici-scaler-name': this.name,
           'kici-agent-id': agentId,
           'kici-labels': normalizedLabelSetStr,
-          // Bound-work identity, when this spawn serves a specific job: lets
-          // an operator (or a test) map a running container back to the
-          // job/run it was provisioned for via `podman ps --filter label=…`.
+          // Bound-work identity: maps a running container back to its job/run
+          // via `podman ps --filter label=…`.
           ...(spawnContext?.boundJobId && { 'kici-bound-job-id': spawnContext.boundJobId }),
           ...(spawnContext?.runId && { 'kici-run-id': spawnContext.runId }),
         },
@@ -730,24 +694,20 @@ export class ContainerScalerBackend implements ScalerBackend {
       });
 
       createdContainer = container;
-      // Record the container the moment it exists, not when the spawn
-      // completes: a `destroy` that lands in between must stop and remove
-      // THIS container, not the empty ref the entry was created with.
+      // Recorded the moment it exists: a `destroy` landing before the spawn
+      // completes must remove THIS container, not the entry's initial empty ref.
       managed.backendRef = container.id;
       this.containerToManaged.set(container.id, managed.id);
       assertStillTracked();
 
-      // Emit network event if network isolation is enabled
       if (this.networkIsolation) {
         emit(ScalerEventType.enum['scaler.network'], 'configuring network isolation');
       }
 
-      // Start container
       await container.start({ abortSignal: signal } as Docker.ContainerStartOptions);
       assertStillTracked();
       emit(ScalerEventType.enum['scaler.ready'], 'container started');
 
-      // Apply per-container nftables isolation rules based on container IP
       if (this.networkIsolation) {
         await this.applyIsolationRules({
           agentId,
@@ -760,7 +720,6 @@ export class ContainerScalerBackend implements ScalerBackend {
         assertStillTracked();
       }
 
-      // Create log capture from container stdout/stderr
       try {
         const capture = await createContainerLogCapture(this.docker, container.id);
         this.logCaptures.set(managed.id, capture);
@@ -772,17 +731,15 @@ export class ContainerScalerBackend implements ScalerBackend {
       }
       assertStillTracked();
 
-      // Update tracking
       managed.state = 'running';
 
       emit(ScalerEventType.enum['agent.connecting'], 'waiting for agent WS registration');
 
       return managed;
     } catch (err) {
-      // Emit failure event before cleanup, enriching with any captured
-      // container output so a "binary found but crashed on startup" failure
-      // carries its stderr along. The capture is closed here too: its stream
-      // follows a container this path is about to remove.
+      // The failure event carries any captured output, so a "binary found but
+      // crashed on startup" failure shows its stderr. The capture closes here:
+      // its stream follows a container this path removes.
       const capture = this.logCaptures.get(managed.id);
       const t = capture?.tail() ?? '';
       if (capture) {
@@ -794,7 +751,6 @@ export class ContainerScalerBackend implements ScalerBackend {
         ScalerEventType.enum['scaler.failed'],
         t ? `${base}\n--- captured output ---\n${t}` : base,
       );
-      // Clean up per-container nftables rules if applied
       const failedIp = this.containerIps.get(managed.id);
       if (failedIp) {
         try {
@@ -804,9 +760,7 @@ export class ContainerScalerBackend implements ScalerBackend {
         }
         this.containerIps.delete(managed.id);
       }
-      // A hung/aborted provision may have created a container before failing;
-      // remove it best-effort with a fresh (unsignalled) request so cleanup
-      // itself isn't cancelled by the same abort that triggered this path.
+      // Fresh (unsignalled) request: the abort that led here must not cancel it.
       if (createdContainer) {
         this.containerToManaged.delete(createdContainer.id);
         try {
@@ -815,9 +769,8 @@ export class ContainerScalerBackend implements ScalerBackend {
           // Best effort — container may not exist or already be gone.
         }
       }
-      // Clean up tracking on failure. Only this spawn's own entry: a destroy
-      // that already ran has dropped it, and nothing may have re-registered
-      // the id in between.
+      // Only this spawn's own entry: a destroy that already ran has dropped it,
+      // and the id may since have been re-registered.
       if (this.agents.get(managed.id) === managed) this.agents.delete(managed.id);
       throw err;
     }
@@ -846,49 +799,43 @@ export class ContainerScalerBackend implements ScalerBackend {
   }
 
   async destroy(managedId: string, _context?: ScalerDestroyContext): Promise<void> {
-    // _context (teardown reason) is only meaningful to the event backend; a
-    // container teardown is the same regardless of why it was requested.
+    // _context (teardown reason) matters only to the event backend.
     const managed = this.agents.get(managedId);
     if (!managed) return;
 
     managed.state = 'destroying';
 
-    // Capture container IP before clearing tracking maps
     const containerIp = this.containerIps.get(managedId);
     this.containerIps.delete(managedId);
 
-    // Remove from tracking maps IMMEDIATELY before any async operations.
-    // This ensures getActiveCount() reflects the reduced count right away,
-    // preventing state corruption where subsequent spawns see stale active counts
-    // (e.g., after lock-file-drift failure when destroy is called fire-and-forget).
+    // Untracked before any await, so getActiveCount() drops at once and later
+    // spawns never see a stale count (e.g. a fire-and-forget destroy after a
+    // lock-file-drift failure).
     this.containerToManaged.delete(managed.backendRef);
     this.agents.delete(managedId);
 
-    // Clean up per-container nftables rules (before container stop)
+    // Before the container stops.
     if (containerIp && this.networkIsolation) {
       try {
         await removeIsolationRules(containerIp);
       } catch {
-        // Best effort -- cleanup should not block destruction
+        // Best effort.
       }
     }
 
-    // Close log capture before stopping container
     const capture = this.logCaptures.get(managedId);
     if (capture) {
       capture.close();
       this.logCaptures.delete(managedId);
     }
 
-    // No container yet: the spawn is still waiting on `createContainer`, and
-    // its own unwind removes whatever that call returns (see `spawn`). An
-    // empty ref must never reach the runtime — dockerode turns it into
-    // `POST /containers//stop`, podman answers with a redirect, and
-    // docker-modem follows it to a request nothing listens to for errors: the
-    // `getaddrinfo ENOTFOUND containers` that killed the process.
+    // No container yet: the spawn's own unwind removes whatever `createContainer`
+    // returns. An empty ref must never reach the runtime — dockerode sends
+    // `POST /containers//stop`, podman redirects, and docker-modem follows it to
+    // an unhandled `getaddrinfo ENOTFOUND containers` that kills the process.
     if (!managed.backendRef) return;
 
-    // Container cleanup is best-effort -- internal state is already consistent
+    // Best effort: internal state is already consistent.
     try {
       const container = this.docker.getContainer(managed.backendRef);
 
@@ -908,15 +855,13 @@ export class ContainerScalerBackend implements ScalerBackend {
     }
   }
 
-  /**
-   * Get the LogCapture for a managed agent (used by ScalerManager for log forwarding).
-   */
+  /** Used by ScalerManager for log forwarding. */
   getLogCapture(managedId: string): LogCapture | undefined {
     return this.logCaptures.get(managedId);
   }
 
   async shutdownAll(): Promise<void> {
-    // Per-container nftables rules are cleaned up inside each destroy() call
+    // Each destroy() removes its own nftables rules.
     const ids = [...this.agents.keys()];
     await Promise.allSettled(ids.map((id) => this.destroy(id)));
   }
@@ -925,7 +870,6 @@ export class ContainerScalerBackend implements ScalerBackend {
     labelSets: LabelSetConfig[],
     opts?: { maxAgents?: number; entry?: ScalerEntry },
   ): ValidationResult {
-    // Validate: all container label sets must have an image
     const errors: string[] = [];
     labelSets.forEach((ls, i) => {
       if (!ls.image) {
@@ -947,14 +891,11 @@ export class ContainerScalerBackend implements ScalerBackend {
   /**
    * Clean up this scaler's orphaned containers and stale isolation rules.
    *
-   * Every filter below exists because the sweep used to list every
-   * `kici-managed=true` container on the host and force-remove it, running at
-   * orchestrator boot, at worker-peer start, on a live config reload that adds
-   * a scaler, and from `kici-admin scaler reap-orphans`. Two orchestrators
-   * sharing one docker host therefore killed each other's running agents on
-   * every boot, and adding a second container scaler removed the first one's
-   * agents mid-job — every in-flight job failing as "agent disconnected" on a
-   * healthy system.
+   * Runs at orchestrator boot, at worker-peer start, on a live config reload
+   * that adds a scaler, and from `kici-admin scaler reap-orphans`. Without the
+   * filters below, two orchestrators sharing one docker host kill each other's
+   * running agents on every boot, and adding a second container scaler removes
+   * the first one's agents mid-job ("agent disconnected" on a healthy system).
    *
    * A container is removed only when all of these hold:
    *  - it carries this scaler's own `kici-scaler-name`, so a backend can only
@@ -981,9 +922,8 @@ export class ContainerScalerBackend implements ScalerBackend {
       const running = info.State === 'running';
       return !(running && (!agentId || this.isRegistered(agentId)));
     });
-    // In parallel: each stop can take its full stop timeout, and longer when
-    // the runtime misses the container's exit, so one after another turned a
-    // handful of leftover agents into a minute-long start.
+    // In parallel: each stop can take its full timeout (longer when the runtime
+    // misses the exit), so a serial sweep makes a few leftovers a minute-long start.
     const removed = await Promise.all(orphans.map((info) => this.removeOrphan(info.Id)));
     let cleaned = removed.filter(Boolean).length;
 
@@ -997,7 +937,7 @@ export class ContainerScalerBackend implements ScalerBackend {
     try {
       await container.stop({ t: 5 });
     } catch {
-      // May already be stopped
+      // May already be stopped.
     }
     try {
       await container.remove({ force: true });
@@ -1011,11 +951,9 @@ export class ContainerScalerBackend implements ScalerBackend {
   /**
    * Remove containers this backend spawned for one agent id.
    *
-   * Implements the optional `ScalerBackend.reapUnowned` hook. It is what
-   * reclaims a container whose registration the orchestrator refused — the
-   * case `cleanupOrphans` used to cover by removing every `kici-managed`
-   * container on the host, which is exactly the breadth that killed other
-   * orchestrators' live agents.
+   * Implements the optional `ScalerBackend.reapUnowned` hook: it reclaims a
+   * container whose registration the orchestrator refused, so `cleanupOrphans`
+   * need not reap host-wide and kill other orchestrators' live agents.
    *
    * @returns true when a container was found and removed
    */
@@ -1075,20 +1013,15 @@ export class ContainerScalerBackend implements ScalerBackend {
    */
   private async reapUnownedIsolationRules(snapshotIps: Set<string>): Promise<number> {
     if (!this.networkIsolation) return 0;
-    // A rule is reaped only when NOTHING on this host holds its address. The
-    // runtime listing is what makes that true across backends: a second
-    // container scaler, the bare-metal backend's container mode, and another
-    // orchestrator on the same runtime all put their agents on the one
-    // `kici-agent-net`, so reaping every address this backend does not track
-    // would strip a neighbour's running agent of its RFC1918 and
+    // A rule is reaped only when NOTHING on this host holds its address; the
+    // runtime listing covers the neighbours. Reaping by this backend's tracking
+    // alone would strip a neighbour's running agent of its RFC1918 and
     // cloud-metadata drops — the silent fail-open this sweep exists to repair.
     const heldOnHost = await this.isolatedNetworkAddressesInUse();
     if (heldOnHost === null) return 0;
-    // Union the pre-removal snapshot with a fresh read: a spawn that landed
-    // while the container pass was awaiting docker holds rules this sweep would
-    // otherwise reap out from under it, and an IP the pass just released is
-    // cheap to skip and reclaim on the next sweep. Both directions of the race
-    // therefore resolve toward sparing.
+    // Union the pre-removal snapshot with a fresh read so both directions of the
+    // race spare: a spawn that landed during the container pass keeps its rules,
+    // and an IP the pass just released is reclaimed on the next sweep.
     const liveIps = new Set([...snapshotIps, ...this.containerIps.values(), ...heldOnHost]);
     let deleted = 0;
     for (const [identifier, handles] of await listIsolationRules()) {
@@ -1138,9 +1071,8 @@ export class ContainerScalerBackend implements ScalerBackend {
 /**
  * Whether an nft rule identifier is an address on the isolated agent network.
  *
- * The chain is shared with every other backend on the host, so the sweep has to
- * be able to tell its own addresses from theirs. The isolated network's subnet
- * is a fixed constant, which makes the test exact rather than heuristic.
+ * The chain is shared with every other backend on the host; the isolated
+ * network's fixed subnet makes this test exact rather than heuristic.
  */
 function isolatedNetworkAddress(identifier: string): boolean {
   const prefix = ISOLATED_NETWORK_SUBNET.split('.').slice(0, 2).join('.');

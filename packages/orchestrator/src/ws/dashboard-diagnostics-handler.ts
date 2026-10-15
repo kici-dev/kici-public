@@ -1,10 +1,8 @@
 /**
  * Handles dashboard.diagnostics requests from Platform.
  *
- * Reads the AgentRegistry for connected agent info, extracts orchestrator
- * metadata from config, and computes label gap information from the job queue.
- *
- * Returns a response matching dashboardDiagnosticsResponseSchema.
+ * Reads the AgentRegistry for connected agent info and extracts orchestrator
+ * metadata from config. `pendingLabelGaps` is always empty.
  */
 
 import {
@@ -32,27 +30,22 @@ import type { RaftNode } from '../cluster/raft.js';
 export interface DiagnosticsHandlerDeps {
   agentRegistry: AgentRegistry;
   config: AppConfig;
-  /** Orchestrator version string (e.g. "0.0.1"). */
+  /** e.g. "0.0.1". */
   version: string;
-  /** Unique scaler backend types (e.g. ["container", "firecracker"]). */
+  /** Unique backend types, e.g. ["container", "firecracker"]. */
   scalerBackends: string[];
-  /** Optional job queue for queued job count. */
   jobQueue?: {
     getDepth(): Promise<number>;
   };
-  /** Optional scaler manager for agent-to-scaler mapping. */
   scalerManager?: ScalerManager | null;
-  /** Optional scaler config for scaler details. */
   scalerConfig?: ScalerConfig | null;
-  /** Optional peer registry for cluster coordinator mode. */
+  /** Set in cluster coordinator mode. */
   peerRegistry?: PeerRegistry | null;
-  /** Optional Raft node for cluster election state. */
   raftNode?: RaftNode | null;
 }
 
 /**
- * Build a safe config subset for a scaler entry (no secrets like socketPath, uid, gid, etc).
- * Uses an explicit allowlist to prevent accidental secret leaks.
+ * An explicit allowlist, so secrets (socketPath, uid, gid, …) never leak.
  */
 export function buildSafeScalerConfig(entry: ScalerEntry): Record<string, unknown> {
   return {
@@ -101,10 +94,7 @@ function buildDiagnosticsAgent(
   };
 }
 
-/**
- * Build a diagnostics response for the given request.
- * When includeAgents is false (default), agents[] is empty and aggregate fields are populated.
- */
+/** When includeAgents is false (default), agents[] is empty; aggregates are always set. */
 export async function handleDiagnosticsRequest(
   deps: DiagnosticsHandlerDeps,
   requestId: string,
@@ -112,7 +102,6 @@ export async function handleDiagnosticsRequest(
 ): Promise<DashboardDiagnosticsResponse> {
   const { agentRegistry, config, version, scalerBackends } = deps;
 
-  // Get process identity (username + UID)
   let runningAsUser: string | null = null;
   let runningAsUid: number | null = null;
   try {
@@ -120,10 +109,9 @@ export async function handleDiagnosticsRequest(
     runningAsUser = info.username;
     runningAsUid = info.uid;
   } catch {
-    // userInfo() can throw in some environments (e.g., containers without /etc/passwd)
+    // userInfo() throws in e.g. containers without /etc/passwd
   }
 
-  // Build agents array + compute aggregates from registry
   const agents: DashboardDiagnosticsResponse['agents'] = [];
   let runningJobs = 0;
   let agentCount = 0;
@@ -141,17 +129,15 @@ export async function handleDiagnosticsRequest(
     }
   }
 
-  // Get queued job count
   let queuedJobs = 0;
   if (deps.jobQueue) {
     try {
       queuedJobs = await deps.jobQueue.getDepth();
     } catch {
-      // If queue query fails, report 0
+      // A failed queue query reports 0
     }
   }
 
-  // Build scalers array from scaler config + computed status (includes auto-injected platform labels)
   const scalerStatus = deps.scalerManager?.getStatus();
   const scalers =
     deps.scalerConfig?.scalers.map((entry) => {
@@ -161,18 +147,16 @@ export async function handleDiagnosticsRequest(
         type: entry.type,
         maxAgents: entry.maxAgents,
         activeAgents: backend?.activeCount ?? 0,
-        // Use computed label sets from getStatus() which include auto-injected OS/arch labels
+        // getStatus() label sets include the auto-injected OS/arch labels
         labelSets: backend?.labelSets ?? entry.labelSets.map((ls) => ls.labels),
         config: buildSafeScalerConfig(entry),
-        // Local-spawn backends (bare-metal, Firecracker, container on a local
-        // runtime socket) statically surface this orchestrator's hostname as
-        // their spawning host. Backends that provision elsewhere (remote
-        // container runtime, future cloud backends) carry no host.
+        // Local-spawn backends (bare-metal, Firecracker, local container socket)
+        // report this orchestrator's hostname; remote-provisioning ones carry none.
         ...(backend?.spawnsOnLocalHost ? { hosts: [hostname()] } : {}),
       };
     }) ?? undefined;
 
-  // Build peers array from PeerRegistry (coordinator only, connected workers only)
+  // Coordinator only; connected workers only
   const peers =
     deps.peerRegistry
       ?.getWorkerPeers()
@@ -193,7 +177,6 @@ export async function handleDiagnosticsRequest(
           scalerName: a.scalerName ?? null,
         })),
         scalerCapacity: peer.scalerCapacity,
-        // OS metadata from heartbeats
         hostname: peer.hostname,
         osRelease: peer.osRelease,
         totalMemoryMb: peer.totalMemoryMb,
@@ -205,7 +188,6 @@ export async function handleDiagnosticsRequest(
         runningAsUser: peer.runningAsUser,
         runningAsUid: peer.runningAsUid,
         version: peer.version,
-        // Raft election state from peer heartbeats
         raftTerm: peer.term,
         raftLeaderId: peer.leaderId,
         // dependencyHealth will be forwarded here once PeerInfo includes it
@@ -221,10 +203,8 @@ export async function handleDiagnosticsRequest(
       scalerBackends,
       runningJobs,
       queuedJobs,
-      // Label gaps: empty array for now. The job queue doesn't expose
-      // per-label queued job data yet. Can be enhanced when that API exists.
+      // Empty: the job queue does not expose per-label queued job data yet.
       pendingLabelGaps: [],
-      // Orchestrator identity and OS metadata
       instanceId: config.instanceId,
       hostname: hostname(),
       osRelease: release(),
@@ -237,11 +217,9 @@ export async function handleDiagnosticsRequest(
       uptimeSeconds: Math.round(uptime()),
       runningAsUser,
       runningAsUid,
-      // Raft election state
       raftRole: deps.raftNode?.getRole() ?? null,
       raftTerm: deps.raftNode?.getCurrentTerm() ?? null,
       raftLeaderId: deps.raftNode?.getLeaderId() ?? null,
-      // Agent aggregates (always populated regardless of includeAgents)
       agentCount,
       statefulAgentCount,
     },
@@ -251,10 +229,6 @@ export async function handleDiagnosticsRequest(
   };
 }
 
-/**
- * Build a per-scaler capacity response for the given request.
- * Reads ScalerManager status to get active/max counts per backend.
- */
 export function handleScalerCapacityRequest(
   scalerManager: ScalerManager | null,
   requestId: string,
@@ -273,7 +247,7 @@ export function handleScalerCapacityRequest(
     name: backend.name,
     activeAgents: backend.activeCount,
     maxAgents: backend.maxAgents,
-    // History snapshots not tracked yet -- return current value as single-point
+    // History is not tracked yet: the current value is the single point
     history: [backend.activeCount],
   }));
 
@@ -284,10 +258,7 @@ export function handleScalerCapacityRequest(
   };
 }
 
-/**
- * Build a per-scaler agents response for the given request.
- * When scalerName is null, returns agents not bound to any scaler (stateful agents).
- */
+/** A null scalerName returns agents bound to no scaler (stateful agents). */
 export function handleScalerAgentsRequest(
   deps: DiagnosticsHandlerDeps,
   requestId: string,

@@ -1,4 +1,4 @@
-/** kici runs logs — step logs for a run (replaces `kici status --logs`). */
+/** `kici runs logs`: step logs for a run. */
 import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
 import { JobKind, TERMINAL_RUN_STATES, type DashboardJobDetail, sleep } from '@kici-dev/engine';
@@ -15,25 +15,18 @@ export interface RunsLogsOptions {
 const POLL_INTERVAL_MS = 2000;
 
 /**
- * A job's workflow-level log: the setup narration (clone, dependency install,
+ * A job's workflow-level log: setup narration (clone, dependency install,
  * workflow module load) written before and between its steps.
  */
 const SETUP_STEP_INDEX = -1;
-/**
- * The label a job's setup log prints under, after the job name. A step name is
- * any string, so a step can be named `setup`; the parentheses keep that step's
- * heading apart from the setup log's.
- */
+/** The parentheses keep it apart from a step named `setup`. */
 const SETUP_HEADING = '(setup)';
-/** The prefix of the `--json` key a job's setup lines print under. */
 const SETUP_JSON_KEY_PREFIX = 'setup:';
 
 /**
- * The `--json` key of a job's setup lines: `setup:` and the job name, with `%`
- * and `/` percent-encoded. A step's key `<job>/<step>` always contains a `/`
- * and this key never does, so no step key can take it, whatever the job and
- * step are named. Encoding `%` keeps two job names apart when one of them
- * already reads like an encoded `/`.
+ * `setup:` plus the job name with `%` and `/` percent-encoded. A step key
+ * `<job>/<step>` always contains a `/` and this never does, so no step can take
+ * it. Encoding `%` keeps apart a job name that already reads like an encoded `/`.
  */
 function setupJsonKey(jobName: string): string {
   return SETUP_JSON_KEY_PREFIX + jobName.replaceAll('%', '%25').replaceAll('/', '%2F');
@@ -72,18 +65,15 @@ function selectJobs(jobs: DashboardJobDetail[], jobFilter?: string): DashboardJo
   return jobFilter ? jobs.filter((j) => j.jobName === jobFilter) : jobs;
 }
 
-/**
- * A job's setup log: its lines, and whether the orchestrator stored one at all
- * (`recorded`, absent when the orchestrator does not report it).
- */
 interface SetupLog {
   lines: string[];
+  /** Whether the orchestrator stored one; absent when it does not report it. */
   recorded?: boolean;
 }
 
 /**
- * A job's setup log. An orchestrator that serves no setup log answers the
- * request with an error; that reads as "no setup lines", never as a failure.
+ * An orchestrator that serves no setup log answers with an error; that reads as
+ * "no setup lines", never as a failure.
  */
 async function fetchSetupLog(
   client: DashboardClient,
@@ -99,19 +89,18 @@ async function fetchSetupLog(
 }
 
 /**
- * Whether the job started on an agent, and so could have written a setup log.
- * A job that never started (queued, skipped, cancelled first) or that runs on
- * no agent (an invoke gate, a summoned-run proxy) has none to report on.
+ * Only a job that started on an agent can have written a setup log: not one
+ * never started (queued, skipped, cancelled first) or run on no agent (an
+ * invoke gate, a summoned-run proxy).
  */
 function ranOnAnAgent(job: DashboardJobDetail): boolean {
   return job.startedAt !== null && (job.jobKind ?? JobKind.enum.standard) === JobKind.enum.standard;
 }
 
 /**
- * The note printed under a job's setup heading when its setup log has no lines:
- * none was recorded, or the stored log is empty. `null` when there are lines,
- * when the job never ran on an agent, or when the orchestrator does not report
- * which case applies.
+ * Says whether an empty setup log was never recorded or is stored empty. `null`
+ * when there are lines, the job never ran on an agent, or the orchestrator does
+ * not report which case applies.
  */
 function emptySetupLogNote(job: DashboardJobDetail, setup: SetupLog): string | null {
   if (setup.lines.length > 0 || setup.recorded === undefined) return null;
@@ -169,7 +158,7 @@ async function collectAllLogs(
   return out;
 }
 
-/** Print the lines of `key` not printed yet, with a heading before the first. */
+/** Prints the lines of `key` not printed yet, with a heading before the first. */
 function printNewLines(
   printed: Record<string, number>,
   key: string,

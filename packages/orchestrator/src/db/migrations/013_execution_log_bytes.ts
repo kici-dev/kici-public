@@ -1,21 +1,13 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `log_bytes BIGINT NOT NULL DEFAULT 0` columns to `execution_runs` and
- * `execution_jobs` so the orchestrator can persist the per-job and per-run
- * raw log byte totals reported by agents on terminal `step.status`.
+ * Per-run and per-job raw log byte totals, reported by agents on terminal `step.status`.
  *
- * Used by the operator-side `kici_org_log_bytes` capacity-planning gauge on
- * the Platform (Platform mirrors these columns via WS replication and runs
- * the aggregation query — same DB-derived pattern as
- * `kici_org_executions_count` and `kici_org_agent_minutes`).
+ * The Platform mirrors these columns via WS replication for its `kici_org_log_bytes` gauge
+ * (the DB-derived pattern of `kici_org_executions_count` and `kici_org_agent_minutes`).
  *
- * Default 0 keeps existing rows valid without a backfill: pre-existing runs
- * predate this column and report as zero log-bytes, which is the correct
- * operator-visibility value (we never had the agent telemetry to compute a
- * real total for them).
- *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`).
+ * Default 0 needs no backfill: older runs never had the agent telemetry, so zero is correct.
+ * Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`

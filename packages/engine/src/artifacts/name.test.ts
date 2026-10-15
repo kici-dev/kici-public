@@ -35,16 +35,16 @@ describe('ArtifactNameSchema', () => {
   });
 
   it('rejects names that would collide on one storage key after sanitization', () => {
-    // `a/b` and `a_b` are distinct names but both sanitize to the same storage
-    // segment; rejecting the non-conforming one keeps the mapping injective.
+    // `a/b` and `a_b` sanitize to one storage segment; rejecting the
+    // non-conforming one keeps the mapping injective.
     expect(ArtifactNameSchema.safeParse('a/b').success).toBe(false);
     expect(ArtifactNameSchema.safeParse('a_b').success).toBe(true);
   });
 
   it('rejects an all-dots name', () => {
-    // `.` / `..` are path-canonicalized away before reaching the backend, so a
-    // storage segment escapes them — which would collide with the literal
-    // escaped name (`.` and `_.` both address `_.`).
+    // Path canonicalization drops `.` / `..` before the backend, so the storage
+    // segment escapes them, which collides with the literal escaped name
+    // (`.` and `_.` both address `_.`).
     expect(ArtifactNameSchema.safeParse('.').success).toBe(false);
     expect(ArtifactNameSchema.safeParse('..').success).toBe(false);
     expect(ArtifactNameSchema.safeParse('...').success).toBe(false);
@@ -94,9 +94,8 @@ describe('artifactInvalidNameError', () => {
   });
 
   it('composes with checkArtifactName into the full customer-visible detail', () => {
-    // This is the exact string both the orchestrator and the agent sandbox must
-    // produce for the same input. If either tier stops matching it, the drift
-    // this definition removed has come back.
+    // The orchestrator and the agent sandbox must both produce exactly this
+    // string for the same input.
     const detail = checkArtifactName('a/b');
     expect(detail).not.toBeNull();
     expect(artifactInvalidNameError(detail!)).toBe(

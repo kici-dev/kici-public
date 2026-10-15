@@ -1,17 +1,13 @@
 /**
- * One answer to "is a local dev plane running", shared by up, down, and status.
- *
- * Ownership is decided by pid identity — the process actually holding the port
- * versus the pid the stamp names — not by whether a stamp file exists. That is
- * what keeps the three commands consistent: a plane nobody stamped is foreign to
- * all of them, rather than invisible to two and adoptable by the third.
- *
- * Every external effect arrives through `PlaneProbes`, so the policy here is
- * exercised without a subprocess or a socket.
+ * One answer to "is a local dev plane running", shared by up, down and status.
+ * Ownership is pid identity (the port holder versus the stamp's pid), not stamp
+ * existence, so a plane nobody stamped is foreign to all three commands rather
+ * than invisible to two and adoptable by the third. Every external effect goes
+ * through `PlaneProbes`, so the policy is testable without a subprocess or socket.
  */
 import { isPortFree, findPortHolderPid, terminatePid, waitForPortFree } from './port-holder.js';
 
-/** The stamp fields classification needs. Structural, to avoid an import cycle with plane-manager. */
+/** Structural, to avoid an import cycle with plane-manager. */
 export interface StampIdentity {
   orchestratorPid: number;
   port: number;
@@ -48,11 +44,10 @@ export interface ReclaimResult {
 }
 
 /**
- * Cap on each loopback probe. The holder these probes exist to diagnose is
- * frequently wedged, and a socket that accepts a connection but never answers
- * would otherwise hang the CLI for the HTTP client's own multi-minute default —
- * turning `kici local status` into the hang it is meant to explain. A holder
- * that cannot answer loopback within this window is treated as not answering.
+ * Cap on each loopback probe. The holder is often wedged, and a socket that
+ * accepts but never answers would hang `kici local status` for the HTTP
+ * client's multi-minute default. Past this window the holder counts as not
+ * answering.
  */
 const PROBE_TIMEOUT_MS = 2_000;
 
@@ -92,9 +87,8 @@ const defaultProbes: PlaneProbes = {
 };
 
 /**
- * Whether a `/health` body came from a KiCI orchestrator. The build-fingerprint
- * fields are the discriminator: an `ok` status alone is far too common to
- * justify signalling the process that produced it.
+ * The build-fingerprint fields are the discriminator: an `ok` status alone is
+ * far too common to justify signalling the process that produced it.
  */
 export function isKiciOrchestratorHealth(body: unknown): body is KiciHealth {
   if (typeof body !== 'object' || body === null) return false;
@@ -107,7 +101,6 @@ export function isKiciOrchestratorHealth(body: unknown): body is KiciHealth {
   );
 }
 
-/** The state label a classification reports to the operator. */
 export function planeStateOf(c: PlaneClassification): PlaneState {
   switch (c.kind) {
     case 'free':
@@ -123,16 +116,13 @@ export function planeStateOf(c: PlaneClassification): PlaneState {
   }
 }
 
-/** The holder pid a classification carries, when it has one. */
 export function classificationPid(c: PlaneClassification): number | null {
   return 'pid' in c ? c.pid : null;
 }
 
 /**
- * Decide what, if anything, is holding the plane port and whether it is ours.
- *
  * `stamp` is the on-disk record of the plane this config dir booted; a null
- * stamp means nothing here booted the holder, so any live holder is foreign.
+ * stamp makes any live holder foreign.
  */
 export async function classifyPlane(
   port: number,
@@ -143,16 +133,11 @@ export async function classifyPlane(
   if (await p.isPortFree(port)) return { kind: 'free' };
 
   const holderPid = await p.findPortHolderPid(port);
-  // When discovery cannot name the holder, fall back to the stamp: the port is
-  // occupied and a stamped plane whose pid is still alive is the only candidate
-  // we know of. When discovery does name one, pid identity is authoritative.
-  //
-  // The fallback assumes the stamped pid was not recycled onto an unrelated
-  // process while some third party took the port — the one case where a stop
-  // would signal a pid that is not the holder. It needs both `ss` and `lsof` to
-  // be missing or failing, which is why identity is not re-derived from
-  // `/health` here: that would trade a rare miss for reporting every plane whose
-  // orchestrator is too wedged to answer as foreign.
+  // A named holder makes pid identity authoritative. An unnamed one falls back
+  // to a live stamped pid, the only known candidate. That fallback misfires only
+  // if the stamped pid was recycled while a third party took the port AND both
+  // `ss` and `lsof` fail; re-deriving identity from `/health` would instead
+  // report every plane too wedged to answer as foreign.
   const ours =
     holderPid !== null
       ? stamp !== null && holderPid === stamp.orchestratorPid
@@ -172,8 +157,8 @@ export async function classifyPlane(
 }
 
 /**
- * Free the plane port, if it is ours or another KiCI plane orchestrator. A
- * holder that does not identify as one is reported and left strictly alone.
+ * Frees the port when the holder is ours or another KiCI plane orchestrator;
+ * any other holder is reported and left strictly alone.
  */
 export async function reclaimPlanePort(
   port: number,

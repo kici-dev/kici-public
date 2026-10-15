@@ -8,8 +8,8 @@ import { singleLinkTarCaches } from '@kici-dev/core/tar-single-link';
 import { sha256 } from '@kici-dev/shared';
 
 /**
- * Pack `entries` (relative to `cwd`) into an in-memory gzip tarball and return
- * it with its SHA-256.
+ * Pack `entries` (relative to `cwd`) into an in-memory gzip tarball, with its
+ * SHA-256.
  *
  * - `portable` strips the system-specific metadata (uid/gid/uname/gname, dev,
  *   ino, nlink, atime/ctime). It keeps each entry's mtime, so two packs of the

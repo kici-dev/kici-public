@@ -1,8 +1,4 @@
-/**
- * Event type mapping system for webhook events.
- * Supports all 22 trigger types defined in the SDK:
- * 15 GitHub event types + 7 internal/generic types.
- */
+/** Maps CLI event args to every SDK trigger type, GitHub and internal/generic. */
 
 import type { LockTrigger } from '../types.js';
 
@@ -30,15 +26,11 @@ export type EventType =
   | { type: 'schedule'; cronExpression?: string; timezone?: string }
   | { type: 'lifecycle'; lifecycleEvent: string };
 
-/**
- * Parse CLI event argument to EventType.
- * Supports all trigger types and common action shortcuts.
- */
+/** Accepts every trigger type plus common action shortcuts. */
 export function parseEventArg(arg: string): EventType {
   const normalized = arg.toLowerCase().trim();
 
   switch (normalized) {
-    // --- PR events ---
     case 'pr:open':
     case 'pr:opened':
       return { type: 'pull_request', action: 'opened' };
@@ -52,15 +44,13 @@ export function parseEventArg(arg: string): EventType {
     case 'pr:reopened':
       return { type: 'pull_request', action: 'reopened' };
 
-    // --- Push ---
     case 'push':
       return { type: 'push' };
 
-    // --- Tag ---
     case 'tag':
       return { type: 'tag' };
 
-    // --- Comment (issue_comment) ---
+    // GitHub issue_comment
     case 'comment':
     case 'comment:created':
       return { type: 'comment', action: 'created' };
@@ -69,7 +59,7 @@ export function parseEventArg(arg: string): EventType {
     case 'comment:deleted':
       return { type: 'comment', action: 'deleted' };
 
-    // --- Review (pull_request_review) ---
+    // GitHub pull_request_review
     case 'review':
     case 'review:submitted':
       return { type: 'review', action: 'submitted' };
@@ -78,7 +68,7 @@ export function parseEventArg(arg: string): EventType {
     case 'review:dismissed':
       return { type: 'review', action: 'dismissed' };
 
-    // --- Review comment (pull_request_review_comment) ---
+    // GitHub pull_request_review_comment
     case 'review_comment':
     case 'review_comment:created':
       return { type: 'review_comment', action: 'created' };
@@ -87,7 +77,6 @@ export function parseEventArg(arg: string): EventType {
     case 'review_comment:deleted':
       return { type: 'review_comment', action: 'deleted' };
 
-    // --- Release ---
     case 'release':
     case 'release:published':
       return { type: 'release', action: 'published' };
@@ -104,11 +93,10 @@ export function parseEventArg(arg: string): EventType {
     case 'release:released':
       return { type: 'release', action: 'released' };
 
-    // --- Dispatch (repository_dispatch) ---
+    // GitHub repository_dispatch
     case 'dispatch':
       return { type: 'dispatch' };
 
-    // --- Create ---
     case 'create':
       return { type: 'create' };
     case 'create:branch':
@@ -116,7 +104,6 @@ export function parseEventArg(arg: string): EventType {
     case 'create:tag':
       return { type: 'create', refType: 'tag' };
 
-    // --- Delete ---
     case 'delete':
       return { type: 'delete' };
     case 'delete:branch':
@@ -124,11 +111,9 @@ export function parseEventArg(arg: string): EventType {
     case 'delete:tag':
       return { type: 'delete', refType: 'tag' };
 
-    // --- Status ---
     case 'status':
       return { type: 'status' };
 
-    // --- Workflow run ---
     case 'workflow_run':
     case 'workflow_run:completed':
       return { type: 'workflow_run', action: 'completed' };
@@ -137,27 +122,22 @@ export function parseEventArg(arg: string): EventType {
     case 'workflow_run:in_progress':
       return { type: 'workflow_run', action: 'in_progress' };
 
-    // --- Fork ---
     case 'fork':
       return { type: 'fork' };
 
-    // --- Star ---
     case 'star':
     case 'star:created':
       return { type: 'star', action: 'created' };
     case 'star:deleted':
       return { type: 'star', action: 'deleted' };
 
-    // --- Watch ---
     case 'watch':
     case 'watch:started':
       return { type: 'watch', action: 'started' };
 
-    // --- KiCI internal event ---
     case 'kici_event':
       return { type: 'kici_event', eventName: 'test-event' };
 
-    // --- Workflow complete ---
     case 'workflow_complete':
       return { type: 'workflow_complete', workflowName: 'test', status: 'success' };
     case 'workflow_complete:success':
@@ -167,11 +147,10 @@ export function parseEventArg(arg: string): EventType {
     case 'workflow_complete:cancelled':
       return { type: 'workflow_complete', workflowName: 'test', status: 'cancelled' };
 
-    // --- Workflows failed batch (synthetic internal event) ---
+    // Synthetic internal event
     case 'workflows_failed_batch':
       return { type: 'workflows_failed_batch' };
 
-    // --- Job complete ---
     case 'job_complete':
       return {
         type: 'job_complete',
@@ -180,20 +159,16 @@ export function parseEventArg(arg: string): EventType {
         status: 'success',
       };
 
-    // --- Generic webhook ---
     case 'generic_webhook':
       return { type: 'generic_webhook' };
 
-    // --- Schedule ---
     case 'schedule':
       return { type: 'schedule' };
 
-    // --- Lifecycle ---
     case 'lifecycle':
       return { type: 'lifecycle', lifecycleEvent: 'workflow_complete' };
 
     default: {
-      // Handle dynamic patterns with colon-separated parameters
       if (normalized.startsWith('kici_event:')) {
         const eventName = normalized.slice('kici_event:'.length);
         return { type: 'kici_event', eventName };
@@ -210,7 +185,7 @@ export function parseEventArg(arg: string): EventType {
         const source = normalized.slice('generic_webhook:'.length);
         return { type: 'generic_webhook', source };
       }
-      // webhook: is a shorthand alias for generic_webhook:
+      // Shorthand alias for generic_webhook:
       if (normalized.startsWith('webhook:')) {
         const source = normalized.slice('webhook:'.length);
         return { type: 'generic_webhook', source };
@@ -220,7 +195,7 @@ export function parseEventArg(arg: string): EventType {
         return { type: 'lifecycle', lifecycleEvent };
       }
       if (normalized.startsWith('schedule:')) {
-        // schedule:<cron> is not typical but allow specifying a cron expression
+        // Atypical, but allows a cron expression.
         const cronExpression = normalized.slice('schedule:'.length);
         return { type: 'schedule', cronExpression };
       }
@@ -249,11 +224,7 @@ function assertNever(x: never): never {
   throw new Error(`Unhandled trigger type: ${JSON.stringify(x)}`);
 }
 
-/**
- * Derive an event-arg string from a `LockTrigger` that `parseEventArg` can accept.
- * Inverse of `parseEventArg` for picker-driven flows: pick a trigger, feed the
- * derived event arg back through the standard pipeline.
- */
+/** Inverse of `parseEventArg`, so a picked trigger feeds back through the standard pipeline. */
 export function triggerToEventArg(trigger: LockTrigger): string {
   switch (trigger._type) {
     case 'pr': {
@@ -348,10 +319,7 @@ function patternSummary(patterns: readonly { pattern: string }[], max = 3): stri
   );
 }
 
-/**
- * One-line label for a `LockTrigger`, suitable for interactive picker rows.
- * Keeps output compact and human-readable.
- */
+/** One-line picker-row label. */
 export function triggerSummary(trigger: LockTrigger): string {
   switch (trigger._type) {
     case 'pr': {

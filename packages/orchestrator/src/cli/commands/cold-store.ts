@@ -1,10 +1,7 @@
 /**
- * Cold-store commands for kici-admin (orchestrator side).
- *
- * Every subcommand builds an `OrchestratorColdStore` against the
- * orchestrator Postgres + S3 and delegates to the helpers in
- * `cold-store-impl.ts`. Mirrors
- * `kici-platform-admin cold-store …` on the Platform side.
+ * Cold-store commands for kici-admin, mirroring `kici-platform-admin
+ * cold-store …`. Each builds an `OrchestratorColdStore` and delegates to
+ * `cold-store-impl.ts`.
  *
  *   cold-store archive-now <table>       Run one cycle for a single adapter
  *   cold-store dry-run-archive <table>   Show what would be archived
@@ -17,10 +14,9 @@
  *   cold-store purge-now                 Purge expired chunks (dry-run default)
  *   cold-store peek-chunk <chunkId>      Stream the first N rows of a chunk
  *
- * The CLI talks **directly** to the orchestrator Postgres (and the same
- * S3 bucket the running process uses). It does not go through the
- * orchestrator HTTP admin API — every operation here is a break-glass
- * inspection of bytes that don't belong to the running process.
+ * Talks **directly** to the orchestrator Postgres and the running process's S3
+ * bucket, never the admin API: every operation is a break-glass inspection of
+ * bytes the running process does not own.
  */
 
 import type { Command } from 'commander';
@@ -31,11 +27,7 @@ interface CommonOpts {
   databaseUrl?: string;
 }
 
-/**
- * @param _getClient unused — cold-store commands talk to the DB + S3
- *   directly. Retained for signature consistency with other command
- *   group registrations.
- */
+/** @param _getClient unused; kept for a signature consistent with other command groups. */
 export function registerColdStoreCommands(
   program: Command,
   _getClient: () => AdminApiClient,

@@ -1,10 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { gitClone } from './git-clone.js';
 
-// Track execFileSync calls
 let execFileSyncCalls: Array<{ cmd: string; args: string[]; opts: Record<string, unknown> }> = [];
 
-// Default rev-parse result
 let revParseStdout = 'abc123def456789';
 
 vi.mock('node:child_process', () => ({
@@ -19,12 +17,10 @@ function defaultExecFileSync(cmd: unknown, args: unknown[], opts: unknown) {
     opts: (opts ?? {}) as Record<string, unknown>,
   });
 
-  // If this is a rev-parse call, return the mock SHA
   if (argsArr.some((a) => a === 'rev-parse')) {
     return revParseStdout + '\n';
   }
 
-  // For clone/fetch/checkout, return empty buffer
   return Buffer.from('');
 }
 
@@ -47,7 +43,6 @@ describe('gitClone', () => {
       workDir: '/tmp/work',
     });
 
-    // First call: git clone
     const cloneCall = execFileSyncCalls[0];
     expect(cloneCall.cmd).toBe('git');
     expect(cloneCall.args).toContain('clone');
@@ -69,11 +64,9 @@ describe('gitClone', () => {
     });
 
     const cloneCall = execFileSyncCalls[0];
-    // Token should be in http.extraHeader as Basic auth
     expect(cloneCall.args).toContain('-c');
     const basicB64 = Buffer.from('x-access-token:ghs_secret123').toString('base64');
     expect(cloneCall.args).toContain(`http.extraHeader=Authorization: Basic ${basicB64}`);
-    // URL should NOT contain the token
     const urlArg = cloneCall.args.find((a) => a.includes('github.com'));
     expect(urlArg).toBe('https://github.com/org/repo.git');
     expect(urlArg).not.toContain('ghs_secret123');
@@ -104,7 +97,6 @@ describe('gitClone', () => {
       }),
     ).resolves.toBeUndefined();
 
-    // Second call should be rev-parse HEAD in the work directory
     const revParseCall = execFileSyncCalls[1];
     expect(revParseCall.cmd).toBe('git');
     expect(revParseCall.args).toContain('-C');
@@ -114,8 +106,7 @@ describe('gitClone', () => {
   });
 
   it('throws on SHA mismatch after fetch+checkout fallback fails', async () => {
-    // Both rev-parse calls return a non-matching SHA, triggering fetch+checkout
-    // fallback which also fails the re-verify
+    // Every rev-parse mismatches, so the fetch+checkout fallback fails the re-verify too.
     revParseStdout = 'deadbeef12345';
 
     await expect(
@@ -272,11 +263,9 @@ describe('gitClone', () => {
       workDir: '/tmp/work',
     });
 
-    // All 5 calls (clone, rev-parse, fetch, checkout, rev-parse) should have
-    // GIT_CONFIG_GLOBAL pointing at the temp gitconfig file that carries the
-    // `[safe] directory = *` bypass. The temp config approach is required
-    // because the spawned `upload-pack` subprocess for file:// clones does
-    // NOT honour `GIT_CONFIG_KEY_*` env vars or `-c safe.directory` flags.
+    // Every call carries GIT_CONFIG_GLOBAL at the temp gitconfig with the
+    // `[safe] directory = *` bypass: the `upload-pack` subprocess of a file://
+    // clone does NOT honour `GIT_CONFIG_KEY_*` env vars or `-c safe.directory`.
     expect(execFileSyncCalls).toHaveLength(5);
     for (let i = 0; i < execFileSyncCalls.length; i++) {
       const env = execFileSyncCalls[i].opts.env as Record<string, string> | undefined;
@@ -298,7 +287,7 @@ describe('gitClone', () => {
 
     const cloneCall = execFileSyncCalls[0];
     expect(cloneCall.args).not.toContain('--branch');
-    // Should return early without rev-parse since sha is empty
+    // Empty sha: no rev-parse.
     expect(execFileSyncCalls).toHaveLength(1);
   });
 
@@ -339,9 +328,8 @@ describe('gitClone', () => {
     expect(env!.GIT_SSH_COMMAND).toMatch(/^ssh /);
     expect(env!.GIT_SSH_COMMAND).toContain('IdentitiesOnly=yes');
     expect(env!.GIT_SSH_COMMAND).toContain('StrictHostKeyChecking=accept-new');
-    // Per-call known_hosts MUST be wired even for accept-new — otherwise
-    // ssh falls back to the runtime user's ~/.ssh/known_hosts and a stale
-    // entry there for the same host:port can block the clone.
+    // Per-call known_hosts even for accept-new: otherwise ssh falls back to the
+    // runtime user's ~/.ssh/known_hosts, where a stale entry can block the clone.
     expect(env!.GIT_SSH_COMMAND).toContain('UserKnownHostsFile=');
   });
 

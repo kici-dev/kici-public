@@ -1,7 +1,6 @@
 /**
- * Tests for the check that a Windows service launch runs a release that reads
- * KICI_ENV_FILE. Real files in a temporary folder: the check reads the bundle
- * beside a KiCI package launcher and the entry of an npm install.
+ * Real files in a temporary folder: the check reads the bundle beside a KiCI
+ * package launcher and the entry of an npm install.
  */
 
 import fs from 'node:fs';

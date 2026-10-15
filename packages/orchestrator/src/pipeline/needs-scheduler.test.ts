@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import { ExecutionJobStatus, TERMINAL_JOB_STATES, materializeFanout } from '@kici-dev/engine';
@@ -12,6 +12,7 @@ import {
   getFailurePropagationTargets,
   checkAllUpstreamsSatisfied,
 } from './needs-scheduler.js';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 /** Build a non-fanned MaterializedJob from a minimal lock-job spec for scheduler tests. */
 function mat(spec: { name: string; needs?: LockJob['needs']; dependsOnGroups?: string[] }): {
@@ -32,15 +33,8 @@ function mat(spec: { name: string; needs?: LockJob['needs']; dependsOnGroups?: s
   };
 }
 
-/** Build a pending MockJobRow for the scheduler mock DB. */
-function jobRow(name: string): {
-  run_id: string;
-  job_name: string;
-  status: string;
-  needs_satisfied: boolean;
-  ready_at: Date | null;
-  group_name: string | null;
-} {
+/** A pending scheduler row for job `name` of `RUN_ID`, upstreams not yet satisfied. */
+function jobRow(name: string, overrides: Partial<MockJobRow> = {}): MockJobRow {
   return {
     run_id: RUN_ID,
     job_name: name,
@@ -48,6 +42,7 @@ function jobRow(name: string): {
     needs_satisfied: false,
     ready_at: null,
     group_name: null,
+    ...overrides,
   };
 }
 
@@ -89,11 +84,9 @@ const RUN_ON_SUCCESS = JSON.stringify([ExecutionJobStatus.enum.success]);
 const RUN_ON_ALWAYS = JSON.stringify([...TERMINAL_JOB_STATES]);
 
 function createMockDb(jobRows: MockJobRow[], edgeRows: MockEdgeRow[]) {
-  // Track state mutably so tests can observe updates
   const jobs = [...jobRows];
   const edges = [...edgeRows];
 
-  // Build a chainable query builder mock
   function createSelectChain(rows: Record<string, unknown>[]) {
     const chain: Record<string, unknown> = {};
     let filteredRows = [...rows];
@@ -193,7 +186,6 @@ function createMockDb(jobRows: MockJobRow[], edgeRows: MockEdgeRow[]) {
     }),
     insertInto: vi.fn().mockImplementation(() => createInsertChain()),
     updateTable: vi.fn().mockImplementation(() => createUpdateChain()),
-    // Expose internal state for assertions
     _jobs: jobs,
     _edges: edges,
   };
@@ -206,43 +198,14 @@ const RUN_ID = '11111111-1111-1111-1111-111111111111';
 describe('needs-scheduler', () => {
   describe('evaluateDownstreams', () => {
     it('returns empty array when completed job has no downstreams', async () => {
-      const db = createMockDb(
-        [
-          {
-            run_id: RUN_ID,
-            job_name: 'lint',
-            status: 'success',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-        ],
-        [],
-      );
+      const db = createMockDb([jobRow('lint', { status: 'success', needs_satisfied: true })], []);
       const result = await evaluateDownstreams(db, RUN_ID, 'lint', ExecutionJobStatus.enum.success);
       expect(result).toEqual([]);
     });
 
     it('returns downstream job when all upstreams are terminal success', async () => {
       const db = createMockDb(
-        [
-          {
-            run_id: RUN_ID,
-            job_name: 'lint',
-            status: 'success',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-        ],
+        [jobRow('lint', { status: 'success', needs_satisfied: true }), jobRow('deploy')],
         [{ run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', run_on: RUN_ON_SUCCESS }],
       );
       const result = await evaluateDownstreams(db, RUN_ID, 'lint', ExecutionJobStatus.enum.success);
@@ -250,36 +213,14 @@ describe('needs-scheduler', () => {
     });
 
     it('dispatches a fan-in job once when several upstreams finish concurrently', async () => {
-      // Two upstreams of the same job reach terminal at nearly the same moment.
-      // Each terminal runs its own evaluateDownstreams, and both observe every
-      // upstream satisfied — only the one that wins the needs_satisfied claim
-      // may dispatch, or the job executes twice.
+      // Two upstreams reach terminal at nearly the same moment, and both
+      // evaluateDownstreams calls see every upstream satisfied: only the
+      // needs_satisfied claim winner may dispatch, or the job executes twice.
       const db = createMockDb(
         [
-          {
-            run_id: RUN_ID,
-            job_name: 'lint',
-            status: 'success',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'test',
-            status: 'success',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
+          jobRow('lint', { status: 'success', needs_satisfied: true }),
+          jobRow('test', { status: 'success', needs_satisfied: true }),
+          jobRow('deploy'),
         ],
         [
           { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', run_on: RUN_ON_SUCCESS },
@@ -299,30 +240,9 @@ describe('needs-scheduler', () => {
     it('does NOT return downstream when another upstream is still pending', async () => {
       const db = createMockDb(
         [
-          {
-            run_id: RUN_ID,
-            job_name: 'lint',
-            status: 'success',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'test',
-            status: 'running',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
+          jobRow('lint', { status: 'success', needs_satisfied: true }),
+          jobRow('test', { status: 'running', needs_satisfied: true }),
+          jobRow('deploy'),
         ],
         [
           { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', run_on: RUN_ON_SUCCESS },
@@ -335,24 +255,7 @@ describe('needs-scheduler', () => {
 
     it('skips downstream when upstream failed and run_on is success-only', async () => {
       const db = createMockDb(
-        [
-          {
-            run_id: RUN_ID,
-            job_name: 'test',
-            status: 'failed',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-        ],
+        [jobRow('test', { status: 'failed', needs_satisfied: true }), jobRow('deploy')],
         [{ run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', run_on: RUN_ON_SUCCESS }],
       );
       const result = await evaluateDownstreams(db, RUN_ID, 'test', ExecutionJobStatus.enum.failed);
@@ -363,24 +266,7 @@ describe('needs-scheduler', () => {
 
     it('dispatches downstream when upstream failed and run_on includes failed', async () => {
       const db = createMockDb(
-        [
-          {
-            run_id: RUN_ID,
-            job_name: 'test',
-            status: 'failed',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'notify',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-        ],
+        [jobRow('test', { status: 'failed', needs_satisfied: true }), jobRow('notify')],
         [{ run_id: RUN_ID, job_name: 'notify', upstream_name: 'test', run_on: RUN_ON_ALWAYS }],
       );
       const result = await evaluateDownstreams(db, RUN_ID, 'test', ExecutionJobStatus.enum.failed);
@@ -394,7 +280,7 @@ describe('needs-scheduler', () => {
       ]);
       const db = createMockDb(
         [
-          { ...jobRow('gather'), status: ExecutionJobStatus.enum.skipped, needs_satisfied: true },
+          jobRow('gather', { status: ExecutionJobStatus.enum.skipped, needs_satisfied: true }),
           jobRow('report'),
         ],
         [{ run_id: RUN_ID, job_name: 'report', upstream_name: 'gather', run_on: onSkip }],
@@ -411,7 +297,7 @@ describe('needs-scheduler', () => {
     it('skips downstream when upstream skipped and run_on is success-only', async () => {
       const db = createMockDb(
         [
-          { ...jobRow('gather'), status: ExecutionJobStatus.enum.skipped, needs_satisfied: true },
+          jobRow('gather', { status: ExecutionJobStatus.enum.skipped, needs_satisfied: true }),
           jobRow('report'),
         ],
         [{ run_id: RUN_ID, job_name: 'report', upstream_name: 'gather', run_on: RUN_ON_SUCCESS }],
@@ -430,7 +316,7 @@ describe('needs-scheduler', () => {
       const skippedOnly = JSON.stringify([ExecutionJobStatus.enum.skipped]);
       const db = createMockDb(
         [
-          { ...jobRow('probe'), status: ExecutionJobStatus.enum.failed, needs_satisfied: true },
+          jobRow('probe', { status: ExecutionJobStatus.enum.failed, needs_satisfied: true }),
           jobRow('handler'),
         ],
         [{ run_id: RUN_ID, job_name: 'handler', upstream_name: 'probe', run_on: skippedOnly }],
@@ -445,30 +331,9 @@ describe('needs-scheduler', () => {
     it('inserts concrete name-to-name edges when group resolves to N members', async () => {
       const db = createMockDb(
         [
-          {
-            run_id: RUN_ID,
-            job_name: 'shard-1',
-            status: 'pending',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: 'tests',
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'shard-2',
-            status: 'pending',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: 'tests',
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
+          jobRow('shard-1', { needs_satisfied: true, group_name: 'tests' }),
+          jobRow('shard-2', { needs_satisfied: true, group_name: 'tests' }),
+          jobRow('deploy'),
         ],
         [],
       );
@@ -479,26 +344,13 @@ describe('needs-scheduler', () => {
         ['shard-1', 'shard-2'],
         [{ jobName: 'deploy', runOn: [ExecutionJobStatus.enum.success] }],
       );
-      // Should have inserted 2 edges: deploy -> shard-1, deploy -> shard-2
       const deployEdges = db._edges.filter((e) => e.job_name === 'deploy');
       expect(deployEdges).toHaveLength(2);
       expect(deployEdges.map((e) => e.upstream_name).sort()).toEqual(['shard-1', 'shard-2']);
     });
 
     it('with empty group (0 members) sets needs_satisfied=true for dependent downstreams', async () => {
-      const db = createMockDb(
-        [
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-        ],
-        [],
-      );
+      const db = createMockDb([jobRow('deploy')], []);
       await resolveGroupEdges(
         db,
         RUN_ID,
@@ -506,37 +358,15 @@ describe('needs-scheduler', () => {
         [],
         [{ jobName: 'deploy', runOn: [ExecutionJobStatus.enum.success] }],
       );
-      // No edges should be inserted
       expect(db._edges).toHaveLength(0);
     });
 
     it('correctly propagates runOn from dependent static jobs to each edge row', async () => {
       const db = createMockDb(
         [
-          {
-            run_id: RUN_ID,
-            job_name: 'shard-1',
-            status: 'pending',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: 'tests',
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'notify',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
+          jobRow('shard-1', { needs_satisfied: true, group_name: 'tests' }),
+          jobRow('deploy'),
+          jobRow('notify'),
         ],
         [],
       );
@@ -559,35 +389,7 @@ describe('needs-scheduler', () => {
 
   describe('insertEdgesForRun', () => {
     it('creates edge rows from lock file needs array', async () => {
-      const db = createMockDb(
-        [
-          {
-            run_id: RUN_ID,
-            job_name: 'lint',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'test',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-        ],
-        [],
-      );
+      const db = createMockDb([jobRow('lint'), jobRow('test'), jobRow('deploy')], []);
       const { jobs, expansionMap } = combine(
         mat({ name: 'lint' }),
         mat({ name: 'test', needs: ['lint'] }),
@@ -599,27 +401,7 @@ describe('needs-scheduler', () => {
     });
 
     it('correctly handles NeedsEntry objects (extracts name and runOn)', async () => {
-      const db = createMockDb(
-        [
-          {
-            run_id: RUN_ID,
-            job_name: 'test',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'notify',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-        ],
-        [],
-      );
+      const db = createMockDb([jobRow('test'), jobRow('notify')], []);
       const { jobs, expansionMap } = combine(
         mat({ name: 'test' }),
         mat({ name: 'notify', needs: [{ name: 'test', runOn: [...TERMINAL_JOB_STATES] as any }] }),
@@ -631,33 +413,13 @@ describe('needs-scheduler', () => {
     });
 
     it('marks root jobs (no needs) as needs_satisfied=true', async () => {
-      const db = createMockDb(
-        [
-          {
-            run_id: RUN_ID,
-            job_name: 'lint',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-        ],
-        [],
-      );
+      const db = createMockDb([jobRow('lint'), jobRow('deploy')], []);
       const { jobs, expansionMap } = combine(
         mat({ name: 'lint' }),
         mat({ name: 'deploy', needs: ['lint'] }),
       );
       await insertEdgesForRun(db, RUN_ID, jobs, expansionMap);
-      // lint is a root job, should be marked as satisfied
+      // A root job is satisfied.
       const lintJob = db._jobs.find((j) => j.job_name === 'lint');
       expect(lintJob?.needs_satisfied).toBe(true);
     });
@@ -666,14 +428,12 @@ describe('needs-scheduler', () => {
       const db = createMockDb([jobRow('test (a)'), jobRow('test (b)'), jobRow('deploy')], []);
       // Upstream `test` fans into two children; downstream `deploy` needs `test`.
       const upstream = materializeFanout([
-        {
-          _type: 'static',
+        staticJob({
           name: 'test',
           runsOn: 'ubuntu',
-          needs: [],
           steps: [],
           matrix: { _type: 'static', values: ['a', 'b'] },
-        } as LockJob,
+        }),
       ]);
       const downstream = mat({ name: 'deploy', needs: ['test'] });
       const jobs = [...upstream.jobs, ...downstream.jobs];
@@ -690,14 +450,12 @@ describe('needs-scheduler', () => {
       const db = createMockDb([jobRow('lint'), jobRow('build (a)'), jobRow('build (b)')], []);
       const upstream = mat({ name: 'lint' });
       const downstream = materializeFanout([
-        {
-          _type: 'static',
-          name: 'build',
+        staticJob({
           runsOn: 'ubuntu',
           needs: ['lint'],
           steps: [],
           matrix: { _type: 'static', values: ['a', 'b'] },
-        } as LockJob,
+        }),
       ]);
       const jobs = [...upstream.jobs, ...downstream.jobs];
       const expansionMap = new Map<string, readonly string[]>([
@@ -713,14 +471,12 @@ describe('needs-scheduler', () => {
     it('copies the runOn set onto every expanded matrix edge', async () => {
       const db = createMockDb([jobRow('test (a)'), jobRow('test (b)'), jobRow('notify')], []);
       const upstream = materializeFanout([
-        {
-          _type: 'static',
+        staticJob({
           name: 'test',
           runsOn: 'ubuntu',
-          needs: [],
           steps: [],
           matrix: { _type: 'static', values: ['a', 'b'] },
-        } as LockJob,
+        }),
       ]);
       const downstream = mat({
         name: 'notify',
@@ -742,30 +498,9 @@ describe('needs-scheduler', () => {
     it('correctly evaluates a job with mixed upstream statuses', async () => {
       const db = createMockDb(
         [
-          {
-            run_id: RUN_ID,
-            job_name: 'lint',
-            status: 'success',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'test',
-            status: 'failed',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
+          jobRow('lint', { status: 'success', needs_satisfied: true }),
+          jobRow('test', { status: 'failed', needs_satisfied: true }),
+          jobRow('deploy'),
         ],
         [
           { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', run_on: RUN_ON_SUCCESS },
@@ -782,24 +517,7 @@ describe('needs-scheduler', () => {
   describe('checkSchedulerInvariant', () => {
     it('detects stuck job with all-terminal upstreams and needs_satisfied=false', async () => {
       const db = createMockDb(
-        [
-          {
-            run_id: RUN_ID,
-            job_name: 'lint',
-            status: 'success',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-        ],
+        [jobRow('lint', { status: 'success', needs_satisfied: true }), jobRow('deploy')],
         [{ run_id: RUN_ID, job_name: 'deploy', upstream_name: 'lint', run_on: RUN_ON_SUCCESS }],
       );
       const stuck = await checkSchedulerInvariant(db, RUN_ID);
@@ -811,30 +529,9 @@ describe('needs-scheduler', () => {
     it('finds transitive downstreams that should be skipped', async () => {
       const db = createMockDb(
         [
-          {
-            run_id: RUN_ID,
-            job_name: 'test',
-            status: 'failed',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'deploy',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'notify',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
+          jobRow('test', { status: 'failed', needs_satisfied: true }),
+          jobRow('deploy'),
+          jobRow('notify'),
         ],
         [
           { run_id: RUN_ID, job_name: 'deploy', upstream_name: 'test', run_on: RUN_ON_SUCCESS },
@@ -848,30 +545,9 @@ describe('needs-scheduler', () => {
     it('stops propagation at run_on edges that admit the status', async () => {
       const db = createMockDb(
         [
-          {
-            run_id: RUN_ID,
-            job_name: 'test',
-            status: 'failed',
-            needs_satisfied: true,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'notify',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
-          {
-            run_id: RUN_ID,
-            job_name: 'cleanup',
-            status: 'pending',
-            needs_satisfied: false,
-            ready_at: null,
-            group_name: null,
-          },
+          jobRow('test', { status: 'failed', needs_satisfied: true }),
+          jobRow('notify'),
+          jobRow('cleanup'),
         ],
         [
           { run_id: RUN_ID, job_name: 'notify', upstream_name: 'test', run_on: RUN_ON_ALWAYS },

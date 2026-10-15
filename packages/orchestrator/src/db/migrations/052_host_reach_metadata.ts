@@ -1,19 +1,16 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add pre-agent reach metadata to the host roster so a declared host (no agent
- * yet) can be reached over SSH for bootstrap bring-up:
+ * Add SSH reach metadata so a declared host with no agent yet can be bootstrapped:
  *
- * - `host_roster.address text NULL` — IP / hostname to SSH to.
- * - `host_roster.ssh_user text NULL` — SSH login user (defaults to `root` at use site).
- * - `host_roster.ssh_port int NULL` — SSH port (defaults to 22 at use site).
- * - `host_roster.ssh_key_secret text NULL` — scoped-secret ref (`scope/key`)
- *   holding the bring-up private key. The orchestrator resolves it server-side;
- *   the key never lives in the roster.
+ * - `host_roster.address` — IP / hostname.
+ * - `host_roster.ssh_user` — login user (`root` at the use site when NULL).
+ * - `host_roster.ssh_port` — port (22 at the use site when NULL).
+ * - `host_roster.ssh_key_secret` — scoped-secret ref (`scope/key`) to the bring-up private key,
+ *   resolved server-side; the key never lives in the roster.
  *
- * All nullable: a host with no reach metadata simply cannot be bootstrapped and
- * behaves exactly as before. Idempotent (`ADD COLUMN IF NOT EXISTS`); additive,
- * so existing data is preserved.
+ * All nullable: a host without them cannot be bootstrapped and is otherwise unaffected.
+ * Idempotent and additive.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.host_roster

@@ -1,19 +1,15 @@
 import { z } from 'zod';
 
 /**
- * agent.api method name for the provenance ID-token request.
- *
- * Single source of truth: both the orchestrator's mint-handler registration
- * and the SDK `ctx.kici.oidc.token()` wrapper import this constant, so the
- * wire method name lives in exactly one place.
+ * agent.api method name for the provenance ID-token request, imported by both
+ * the orchestrator's mint-handler registration and the SDK `ctx.kici.oidc.token()`.
  */
 export const OIDC_TOKEN_REQUEST_METHOD = 'oidc.token.request';
 
 /**
- * Params an agent sends with an OIDC_TOKEN_REQUEST_METHOD call. The agent
- * supplies only the job it is running plus the requested token audience; the
- * orchestrator binds the mint to the job the agent actually owns and derives
- * every identity claim server-side, so the agent never asserts a repo/ref.
+ * The agent sends only its job and the audience; the orchestrator binds the
+ * mint to the job the agent owns and derives every identity claim server-side,
+ * so the agent never asserts a repo/ref.
  */
 export const oidcTokenRequestParamsSchema = z.object({
   jobId: z.string().min(1),
@@ -30,11 +26,9 @@ export const oidcMintedTokenSchema = z.object({
 export type OidcMintedToken = z.infer<typeof oidcMintedTokenSchema>;
 
 /**
- * Result the orchestrator returns to the agent: either the minted short-lived
- * JWT, or — when the mint failed transiently (`unavailable`/`failed`, never
- * `rejected`) — a `deferred` signal so the agent freezes the statement and
- * reports it for later fulfilment. A permanent `rejected` is thrown, never
- * returned, so it is not part of this union.
+ * The minted short-lived JWT, or `deferred` when the mint failed transiently,
+ * so the agent freezes the statement and reports it for later fulfilment. A
+ * permanent `rejected` is thrown, never returned.
  */
 export const oidcTokenResultSchema = z.union([
   oidcMintedTokenSchema,

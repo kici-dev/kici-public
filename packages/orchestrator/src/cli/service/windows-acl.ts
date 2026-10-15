@@ -1,21 +1,16 @@
 /**
- * Restricting a Windows service's env file to the service account and to
- * Administrators.
+ * Restrict a Windows service's env file to LocalSystem and Administrators.
  *
- * Node maps a file mode onto Windows by toggling the read-only attribute and
- * changes no ACL, so ENV_FILE_MODE protects nothing there. The instance folder
- * under C:\ProgramData\kici\ inherits read access for BUILTIN\Users from
- * C:\ProgramData. Its ACL is replaced with full control for LocalSystem (the
- * account the shawl service runs as) and Administrators, inherited by
- * everything created in it: the env file, the temporary file a secure write
- * stages it through, and the service logs are unreadable to other accounts
- * from the moment they exist.
+ * On Windows a Node file mode only toggles the read-only attribute, so
+ * ENV_FILE_MODE protects nothing, and the instance folder under
+ * C:\ProgramData\kici\ inherits BUILTIN\Users read. The folder ACL becomes
+ * inherited full control for LocalSystem (the shawl service account) and
+ * Administrators, so the env file, a secure write's temp file and the logs are
+ * private from the moment they exist.
  *
- * Every call passes `/L` and none recurses, so icacls acts on the folder and on
- * the env file themselves and never on what a link there points at. A
- * recursive `/reset` or `/setowner` descends into the target of a junction or
- * of a symbolic link, even with `/L`, and rewrites the ACL of the files there.
- * The new folder ACL still reaches every entry that inherits from the folder.
+ * Every call passes `/L` and none recurses: a recursive `/reset` or
+ * `/setowner` follows a junction or symlink even with `/L` and rewrites the
+ * ACLs at its target. The folder ACL still reaches every inheriting entry.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -32,9 +27,8 @@ export const ADMINISTRATORS_SID = 'S-1-5-32-544';
 export type IcaclsRunner = (args: string[]) => void;
 
 /**
- * The icacls in the Windows system folder, which also holds the cmd.exe that
- * COMSPEC names. A bare `icacls` would also be looked up in the current
- * folder, and the install runs elevated.
+ * The icacls beside COMSPEC's cmd.exe: a bare `icacls` is also looked up in
+ * the current folder, and the install runs elevated.
  */
 function icaclsPath(): string {
   const comspec = process.env.COMSPEC;
@@ -50,9 +44,8 @@ const runIcacls: IcaclsRunner = (args) => {
 };
 
 /**
- * The icacls arguments that remove every inherited ACE from `dir` and grant
- * full control, inherited by files and folders, to LocalSystem and
- * Administrators. SIDs rather than names, so a localized Windows resolves them.
+ * Drop every inherited ACE from `dir` and grant inherited full control to
+ * LocalSystem and Administrators, by SID so a localized Windows resolves them.
  */
 export function restrictDirArgs(dir: string): string[] {
   return [
@@ -72,9 +65,8 @@ export function resetFileArgs(file: string): string[] {
 }
 
 /**
- * Restrict the folder that holds `envFilePath`, then reset an existing env
- * file to inherit only from it, which also drops any explicit ACE on the file.
- * Run it before the first secret is written into the folder.
+ * Restrict the env file's folder, then reset an existing env file to inherit
+ * only from it (dropping any explicit ACE). Run before the first secret is written.
  */
 export function restrictEnvFileAccess(
   envFilePath: string,

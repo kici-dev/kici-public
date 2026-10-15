@@ -1,12 +1,10 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `execution_runs.failure_class` — the reason a terminal run failed
- * (`RunFailureClass`: never_started / timed_out / dead_orchestrator /
- * step_failure / cancelled). Derived at run completion from the terminal job
- * statuses (the status column alone can't carry it — timed_out and step_failure
- * both collapse to `failed`). Plain text, value-constrained by the enum in code,
- * like `status`. NULL for success / not-yet-terminal runs. Nullable, no backfill,
+ * `execution_runs.failure_class` (`RunFailureClass`: never_started / timed_out /
+ * dead_orchestrator / step_failure / cancelled), derived at completion from the terminal
+ * job statuses: `status` collapses timed_out and step_failure into `failed`. Plain text,
+ * constrained by the enum in code. NULL for success / non-terminal runs. No backfill,
  * idempotent.
  */
 async function colExists(db: Kysely<unknown>, table: string, name: string): Promise<boolean> {

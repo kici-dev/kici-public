@@ -1,8 +1,6 @@
 /**
- * Static migration provider for bundled builds.
- *
- * Rolldown doesn't support dynamic `import()` of migration files at runtime,
- * so we statically import all migrations and provide them to Kysely's Migrator.
+ * Static migration provider for bundled builds: Rolldown cannot dynamic-`import()` migration
+ * files at runtime, so every migration is imported statically for Kysely's Migrator.
  */
 import type { Migration, MigrationProvider } from 'kysely/migration';
 import * as m001 from './migrations/001_initial.js';
@@ -163,6 +161,7 @@ import * as m155 from './migrations/155_org_settings_reroute_spawn_retry.js';
 import * as m156 from './migrations/156_kici_events_match_outcome.js';
 import * as m157 from './migrations/157_host_roster_identity_source.js';
 import * as m158 from './migrations/158_normalize_legacy_values.js';
+import * as m159 from './migrations/159_org_id_widen_to_source_width.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -326,6 +325,7 @@ export function createMigrationProvider(): MigrationProvider {
         '156_kici_events_match_outcome': m156,
         '157_host_roster_identity_source': m157,
         '158_normalize_legacy_values': m158,
+        '159_org_id_widen_to_source_width': m159,
       };
     },
   };

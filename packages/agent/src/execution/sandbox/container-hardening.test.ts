@@ -45,10 +45,10 @@ describe('buildContainerHardening', () => {
 
     it('mounts a private tmpfs at /tmp with explicit exec,nosuid,nodev options', () => {
       const { hostConfig } = buildContainerHardening(baseOpts());
-      // Options are explicit (not empty) so docker and podman agree: docker
-      // defaults an empty-option tmpfs to noexec, which breaks jobs that exec
-      // from /tmp (npm/pnpm install scripts). `exec` matches the podman/bwrap
-      // posture; nosuid,nodev keep the hardening.
+      // Explicit options so docker and podman agree: docker defaults an
+      // empty-option tmpfs to noexec, breaking jobs that exec from /tmp
+      // (npm/pnpm install scripts). `exec` matches podman/bwrap; nosuid,nodev
+      // keep the hardening.
       expect(hostConfig.Tmpfs).toEqual({ '/tmp': 'rw,exec,nosuid,nodev' });
     });
 

@@ -3,15 +3,11 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Cluster-global wait for a Firecracker VM's API socket after the jailer starts.
  *
- * One additive, nullable column. NULL means the orchestrator's configured
- * default applies (`KICI_FIRECRACKER_API_SOCKET_WAIT_MS`). It is read per spawn:
- * a coordinator reads it from this table, and a DB-less worker receives it in
- * the cluster-settings snapshot it pulls from the leader.
+ * NULL → the configured default (`KICI_FIRECRACKER_API_SOCKET_WAIT_MS`). Read per spawn: from
+ * this table on a coordinator, from the leader's cluster-settings snapshot on a DB-less worker.
  *
- * BIGINT rather than INTEGER: the value is in milliseconds, the same type every
- * other millisecond knob on this table uses.
- *
- * Idempotent: the column is guarded on existence, so a re-run is a no-op.
+ * BIGINT milliseconds, like every other millisecond knob on this table.
+ * Idempotent: guarded on column existence.
  */
 async function columnExists(db: Kysely<unknown>, table: string, column: string): Promise<boolean> {
   const check = await sql<{ exists: boolean }>`

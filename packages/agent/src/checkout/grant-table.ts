@@ -1,16 +1,15 @@
 /**
  * Live write grants for this job.
  *
- * `withWrite` adds a grant before running its callback and revokes it in a
- * `finally`; the TTL is a backstop so a step that crashes cannot leave one
- * standing. The credential helper consults this table to decide whether to ask
- * the broker for a read-only or an elevated credential.
+ * `withWrite` adds a grant before its callback and revokes it in a `finally`;
+ * the TTL is a backstop so a crashed step cannot leave one standing. The
+ * credential helper consults this table to choose a read-only or an elevated
+ * credential from the broker.
  *
- * Scope note, stated because the name could mislead: a grant is scoped to a
- * REPOSITORY and a TIME WINDOW — not to a step. The agent forks one process per
- * job and `parallel()` runs its children inside that process, so a concurrent
- * sibling step can push to the same repository while a grant is live. It cannot
- * reach a different repository.
+ * A grant is scoped to a REPOSITORY and a TIME WINDOW, not to a step. The agent
+ * forks one process per job and `parallel()` runs its children inside it, so a
+ * concurrent sibling step can push to the same repository while a grant is
+ * live, but never to a different one.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -19,7 +18,7 @@ export interface WriteGrant {
   /** `owner/repo`, however git spelled it. */
   repoPath: string;
   permissions: Readonly<Record<string, string>>;
-  /** Epoch millis after which the grant is dead regardless of revocation. */
+  /** Epoch millis; the grant is dead after it, revoked or not. */
   expiresAt: number;
 }
 
@@ -56,7 +55,7 @@ export class GrantTable {
     return null;
   }
 
-  /** Live grant count, after reaping expired entries. Test and diagnostics use. */
+  /** Reaps expired entries first. For tests and diagnostics. */
   size(now: number = Date.now()): number {
     for (const [id, grant] of this.grants) {
       if (grant.expiresAt <= now) this.grants.delete(id);

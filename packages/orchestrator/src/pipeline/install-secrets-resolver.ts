@@ -7,31 +7,26 @@
  * `<context>:<secret-name>` syntax. The resolver:
  *
  *   1. Parses every qualified ref and groups by context name.
- *   2. Runs the install gate (`install-gate.ts`): every referenced context's
- *      protection rules (branch / trust / concurrency / reviewer / wait-timer)
- *      are evaluated before it decides. Any `reject` fails the whole workflow
- *      dispatch with a clear reason; otherwise any hold returns ONE structured
- *      `hold` decision, aggregated across the contexts, so the caller can
- *      pause the workflow dispatch as a workflow-scoped held run and resume it
- *      when the gate clears. The hold records which contexts held and which
- *      passed. On the resume path the caller sets `skipProtectionGate` and
- *      hands back that record: the contexts that held are covered by the
- *      approval, every other context is gated again, and a context that now
- *      matches a different row is refused.
+ *   2. Runs the install gate (`install-gate.ts`) over every referenced
+ *      context's protection rules. Any `reject` fails the whole workflow
+ *      dispatch; otherwise any hold returns ONE aggregated `hold` decision,
+ *      recording which contexts held and which passed, so the caller can park a
+ *      workflow-scoped held run. On resume the caller sets
+ *      `skipProtectionGate` and hands back that record: held contexts are
+ *      covered by the approval, every other context is gated again, and a
+ *      context that now matches a different row is refused.
  *   3. Resolves secrets per context via `secretResolver.resolveForContext`
- *      against the row step 2 gated (which writes its own audit log lines),
- *      so a context whose name is a glob pattern delivers its own bindings.
- *   4. Validates each registry URL scheme: HTTPS always allowed; `http://`
- *      allowed only for loopback / `*.local` hosts OR when the org operator
- *      has flipped `org_settings.allow_http_npm_registries=true`.
+ *      (which writes its own audit lines) against the row step 2 gated, so a
+ *      glob-pattern context delivers its own bindings.
+ *   4. Validates each registry URL scheme: HTTPS always; `http://` only for
+ *      loopback / `*.local` hosts or when
+ *      `org_settings.allow_http_npm_registries=true`.
  *   5. Strips the resolved auth entirely when the contributor-trust tier is
- *      not `trusted` (defense in depth: even if a misconfigured context
- *      lets an unknown contributor through the protection-pipeline trust
- *      gate, this strip ensures fork PRs never see registry tokens — the
- *      install fails naturally because the deps are unreachable).
+ *      not `trusted`: defense in depth, so fork PRs never see registry tokens
+ *      even through a misconfigured context; the install then fails on
+ *      unreachable deps.
  *
- * Pure helper: no imports of the dispatch giant. Tested in isolation in
- * `install-secrets-resolver.test.ts`.
+ * Pure helper: no imports of the dispatch giant.
  */
 
 import { HoldType } from '@kici-dev/engine';
@@ -99,16 +94,14 @@ export interface ResolveInstallSecretsArgs {
   secretResolver: SecretResolverApi | undefined;
   protectionContext: JobDispatchContext;
   /**
-   * Resume path: the dispatch continues past a released install-gate hold. The
-   * gate runs only for the contexts `releasedHold` does not cover. The
-   * untrusted-contributor strip still runs first.
+   * Resume path past a released install-gate hold: the gate runs only for
+   * contexts `releasedHold` does not cover. The untrusted strip still runs first.
    */
   skipProtectionGate?: boolean;
   /**
-   * Resume path: what the released hold recorded (`hold` decision's
-   * `record`). Its held contexts are covered by the approval; every recorded
-   * context must still match the same row. Read as stored JSON: absent or
-   * malformed, it covers no context.
+   * Resume path: the released hold's `record`. Its held contexts are covered by
+   * the approval; every recorded context must still match the same row. Absent
+   * or malformed stored JSON covers no context.
    */
   releasedHold?: InstallGateRecord;
 }
@@ -157,20 +150,13 @@ export function parseQualifiedSecretRef(
   return { envName, secretName };
 }
 
-/**
- * Hosts that count as loopback / link-local for the http:// exemption:
- *   - `localhost`
- *   - any IPv4 in 127.0.0.0/8
- *   - the IPv6 loopback `::1` (URL.hostname returns this with brackets)
- *   - any `*.local` mDNS hostname
- */
+/** Hosts exempt from the https requirement: `localhost`, 127.0.0.0/8, `::1`, `*.local`. */
 function isLoopbackOrLocalHost(host: string): boolean {
   const lower = host.toLowerCase();
-  // URL.hostname keeps IPv6 literals bracketed, e.g. "[::1]". Strip before compare.
+  // URL.hostname keeps IPv6 literals bracketed, e.g. "[::1]".
   const unbracketed = lower.startsWith('[') && lower.endsWith(']') ? lower.slice(1, -1) : lower;
   if (unbracketed === 'localhost' || unbracketed === '::1') return true;
   if (unbracketed.endsWith('.local')) return true;
-  // 127.0.0.0/8 — first octet must be 127 and the rest must be valid IPv4.
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(unbracketed);
   if (!m) return false;
   const [, a, b, c, d] = m;
@@ -259,11 +245,8 @@ function collectSecretRefs(
 }
 
 /**
- * The held-run `hold_type` for a gate outcome — the gate's own `holdType` when
- * it set one, otherwise the `HoldType` member its action implies. Column and
- * gate share one vocabulary, so nothing is translated here.
- *
- * Exported for tests.
+ * The held-run `hold_type`: the gate's own `holdType`, else the `HoldType` its
+ * action implies. Column and gate share one vocabulary. Exported for tests.
  */
 export function resolveHoldType(
   action: 'hold' | 'wait' | 'queue',
@@ -276,9 +259,8 @@ export function resolveHoldType(
 }
 
 /**
- * Match every referenced context name once — exact name first, then a glob
- * context whose pattern matches — so the protection gate and the secret
- * resolution below both act on the same row. A name with no match maps to null.
+ * Match every referenced context name once (exact, then glob) so the gate and
+ * the secret resolution act on the same row. No match maps to null.
  */
 async function matchInstallContexts(
   envNames: Iterable<string>,
@@ -292,10 +274,6 @@ async function matchInstallContexts(
   return matched;
 }
 
-/**
- * The hold decision for a gate outcome that held: the aggregated verdict, the
- * context that names the hold, and the record of which contexts held.
- */
 function holdDecision(
   gate: Extract<InstallGateOutcome, { kind: 'hold' }>,
 ): Extract<ResolveInstallSecretsResult, { decision: 'hold' }> {
@@ -332,8 +310,7 @@ export async function resolveInstallSecrets(
     };
   }
 
-  // Strip first when the contributor is untrusted: the install will fail
-  // naturally on missing private deps, no token bytes leave the orchestrator.
+  // Strip first for an untrusted contributor: no token bytes leave the orchestrator.
   if (isUntrustedTier(args.trustResolution?.tier)) {
     installSecretsContributorStrippedTotal.add(1, {
       trust_tier: args.trustResolution?.tier ?? 'unknown',
@@ -353,8 +330,7 @@ export async function resolveInstallSecrets(
     return { decision: 'reject', reason: collected.reason };
   }
 
-  // Validate registry URL schemes BEFORE any secret resolution to avoid
-  // burning a secret-resolver audit row on a request that will be rejected.
+  // Before secret resolution, so a rejected request burns no audit row.
   if (registries) {
     for (let i = 0; i < registries.length; i++) {
       const v = validateRegistryUrlScheme(registries[i].url, args.allowHttpNpmRegistries);
@@ -402,8 +378,6 @@ export async function resolveInstallSecrets(
     return { decision: 'reject', reason: gate.reason };
   }
 
-  // Resolve once per unique env, then look up the bare secret names from
-  // each result. Missing secret => reject with a clear message.
   const perEnv = new Map<string, Record<string, string>>();
   for (const envName of collected.envs.keys()) {
     const envRow = matched.get(envName);

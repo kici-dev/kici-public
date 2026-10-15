@@ -3,7 +3,7 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './125_org_trust_directory.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
  * Real-Postgres test for migration 125: asserts `public.org_trust_directory`
@@ -55,10 +55,8 @@ describeDb('migration 125_org_trust_directory', () => {
     await adminPool.end();
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    // The harness RETURNS (rather than throws) when the target migration is not
-    // registered in `migration-provider.ts`, so an unchecked call leaves the
-    // table absent and every assertion below fails with a confusing
-    // "column should exist" instead of naming the real cause.
+    // The harness RETURNS (not throws) an unregistered target's error; unchecked, every
+    // assertion below fails with a confusing "column should exist".
     const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 120_000);

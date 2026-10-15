@@ -1,18 +1,15 @@
 /**
  * Hold window applied when a context carries no explicit hold expiry.
  *
- * `contexts.hold_expiry_seconds` is nullable, and a cleared column means "no
- * explicit expiry" rather than "expire instantly" — without this fallback a
- * cleared value would reach `evaluateReviewerGate` as `null`, whose
- * `null * 1000` puts `holdUntil` at the current instant, so every reviewer hold
- * would be created already overdue and swept to `expired` on the next stale
- * scan, cancelling the job the hold was meant to gate.
+ * `contexts.hold_expiry_seconds` is nullable and has no DDL default; NULL
+ * (never set, or cleared) means "no explicit expiry", not "expire instantly".
+ * Without this fallback `evaluateReviewerGate` would compute `null * 1000`,
+ * put `holdUntil` at the current instant, and the next stale scan would sweep
+ * every reviewer hold to `expired`, cancelling the job it gates.
  *
- * It lives here, beside `DEFAULT_CONCURRENCY_STRATEGY`, because the same three
- * modules resolve both: the orchestrator's context store, its protection
- * aggregate, and the dispatch path. The column carries no DDL default, so a
- * context created without a hold expiry and one whose expiry was cleared both
- * land on NULL and resolve through this single constant.
+ * Lives beside `DEFAULT_CONCURRENCY_STRATEGY` because the same modules resolve
+ * both: the orchestrator's context store, its protection aggregate, and the
+ * dispatch path.
  *
  * Plain number, no `node:*` import — safe for the browser-facing engine barrel.
  */

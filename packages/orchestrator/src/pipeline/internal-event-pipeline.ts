@@ -1,12 +1,8 @@
 /**
- * Adapter that dispatches an internally-triggered workflow through the SHARED
- * pipeline (`dispatchMatchedWorkflow`) instead of a bespoke path.
- *
- * The bespoke path it replaces resolved no bound contexts, so no context vars,
- * no scoped secrets and none of the context's protection rules reached an
- * internally-triggered job; it also dropped every non-static job on the floor.
- * Routing through the one pipeline is what keeps a fourth such gap from
- * appearing.
+ * Dispatches an internally-triggered workflow through the SHARED pipeline
+ * (`dispatchMatchedWorkflow`), never a bespoke path: a bespoke path resolves no
+ * bound contexts (no context vars, scoped secrets or protection rules) and drops
+ * every non-static job.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -38,22 +34,19 @@ import type { ProviderBundle } from '../provider-registry.js';
 const logger = createLogger({ prefix: 'internal-event-pipeline' });
 
 /**
- * The LIFECYCLE event names the orchestrator emits to itself. They are
- * `__`-prefixed so they can never collide with a user `kiciEvent()` name, and
- * each one maps onto a canonical trigger-event type (`__schedule_fire` is the
- * one that is not a plain de-prefixing).
+ * The LIFECYCLE event names the orchestrator emits to itself. The `__` prefix
+ * keeps them from colliding with a user `kiciEvent()` name; each maps onto a
+ * canonical trigger-event type (`__schedule_fire` is not a plain de-prefixing).
  *
- * NOT the whole set of orchestrator-minted events — the scaler manager mints two
- * more under the other reserved prefix. NOT the trusted set either: two of these
- * four are caused by a run and inherit its tier — `ORCHESTRATOR_MINTED_TRUSTED_EVENT_NAMES`
- * is what the trust classification reads.
+ * NOT every orchestrator-minted event (the scaler manager mints two more under
+ * the other reserved prefix), and NOT the trusted set: two of these four are
+ * caused by a run and inherit its tier — trust classification reads
+ * `ORCHESTRATOR_MINTED_TRUSTED_EVENT_NAMES`.
  *
- * Enumerated so this module compares against a checked value rather than a bare
- * literal. It is NOT yet the single source: `cron/cron-scheduler.ts`,
- * `events/event-emitter.ts` and `events/event-router.ts` still spell the same
- * names inline, and converging them is a sweep this module's blast radius does
- * not cover. The names are a protocol between those emitters, the router and
- * this adapter, so a typo in any one of them silently stops matching.
+ * NOT yet the single source: `cron/cron-scheduler.ts`, `events/event-emitter.ts`
+ * and `events/event-router.ts` still spell the names inline. The names are a
+ * protocol between those emitters, the router and this adapter, so a typo in
+ * any one of them silently stops matching.
  */
 export const InternalSystemEventName = z.enum([
   '__schedule_fire',
@@ -62,23 +55,17 @@ export const InternalSystemEventName = z.enum([
   '__job_complete',
 ]);
 
-/** Zod view over the canonical trigger-event types, so no type is respelled. */
 const TriggerEventType = z.enum(TRIGGER_EVENT_TYPES);
 
-/** The prefix that marks an orchestrator-internal (system) event name. */
 const INTERNAL_EVENT_PREFIX = '__';
 
-/**
- * The provider stamped on an internal event that carries no routing key of its
- * own. Mirrors the bespoke path's `ctx.providerType ?? 'internal'` fallback.
- */
+/** The provider stamped on an internal event that carries no routing key of its own. */
 const INTERNAL_PROVIDER = 'internal';
 
 /**
- * Context for dispatching one internally-triggered workflow.
- *
- * Declared here rather than in `orchestrator-core.ts` because the adapter is
- * the consumer that defines the shape; the composition root imports it.
+ * Context for dispatching one internally-triggered workflow. Declared here, not
+ * in `orchestrator-core.ts`: the adapter defines the shape and the composition
+ * root imports it.
  */
 export interface InternalEventDispatchContext {
   event: {
@@ -92,49 +79,44 @@ export interface InternalEventDispatchContext {
   providerType: 'github' | undefined;
   /**
    * Provider bundle for the acting repository, resolved by the composition root
-   * from the live registry.
+   * from the live registry; it also carries the clone-token provider and the
+   * check-status poster.
    *
    * Required, not derived here: every dispatch site builds its clone URL as
    * `bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? ''`, and nothing
-   * downstream resolves a bundle from `deps.providerRegistry`. Passing
-   * `undefined` therefore dispatches every job with an empty repo URL AND
-   * classifies the run as a local-working-tree dispatch (the source-pack build
-   * and the source-cache probe both gate on `!!ctx.bundle`), so no source
-   * tarball is produced and the agent falls through to cloning `''`. It also
-   * carries the clone-token provider and the check-status poster.
+   * downstream resolves a bundle from `deps.providerRegistry`. `undefined`
+   * dispatches every job with an empty repo URL AND classifies the run as a
+   * local-working-tree dispatch (the source-pack build and the source-cache
+   * probe both gate on `!!ctx.bundle`), so no source tarball is produced and the
+   * agent clones `''`.
    *
-   * Legitimately `undefined` when the event carries no routing key, or when the
-   * registry has no bundle for it — the same state the pre-pipeline path
-   * rendered as an empty repo URL.
+   * Legitimately `undefined` when the event carries no routing key, or the
+   * registry has no bundle for it.
    */
   bundle: ProviderBundle | undefined;
   cronCommitSha: string;
   /**
-   * The default branch of the registration this event dispatches, or `null`
-   * when it was never captured.
+   * The registration's default branch, or `null` when never captured.
    *
    * A `__schedule_fire` run executes the default branch's lock file, so that
-   * branch IS the run's branch — which is what a context's branch restrictions
-   * evaluate. `null` presents no branch and the gate then rejects with its
-   * named-cause verdict; nothing substitutes a value, because a branch nobody
-   * proved is worse than an honest refusal.
+   * branch IS the run's branch for a context's branch restrictions. `null`
+   * presents no branch and the gate rejects with its named-cause verdict;
+   * nothing substitutes a value, because a branch nobody proved is worse than an
+   * honest refusal.
    */
   registrationDefaultBranch: string | null;
   /**
-   * The run that summoned this one through an invoke gate, when there is one.
-   *
-   * Set ONLY by the invoke-gate summon path, whose event id is synthesized and
-   * therefore matches no `kici_events` row. Stating the emitting run directly
-   * is what lets a summoned run inherit its summoner's trust tier — the same
-   * inheritance every other user `kiciEvent()` subscriber gets — instead of
-   * always falling back to isolated on a lookup that cannot succeed.
+   * The run that summoned this one through an invoke gate. Set ONLY by the
+   * invoke-gate summon path, whose synthesized event id matches no
+   * `kici_events` row; naming the emitting run directly lets the summoned run
+   * inherit its summoner's trust tier instead of falling back to isolated on a
+   * lookup that cannot succeed.
    */
   summonedByRunId?: string;
   /**
-   * Chain depth to stamp on the started run. A webhook-triggered run leaves this
-   * unset (0); a run summoned by an invoke gate carries its summoner's depth + 1
-   * so the chain-depth circuit breaker bounds recursion when it fires its own
-   * gate.
+   * Chain depth to stamp on the started run: unset (0) for a webhook-triggered
+   * run, the summoner's depth + 1 for an invoke-gate summon, so the chain-depth
+   * circuit breaker bounds recursion.
    */
   chainDepth?: number;
 }
@@ -166,8 +148,6 @@ export function deriveInternalEventIdentity(eventName: string): {
     const stripped = eventName.slice(INTERNAL_EVENT_PREFIX.length);
     return { jobConfigType: stripped, triggerEvent: stripped };
   }
-  // A user `kiciEvent()`: workflows observe the literal `kici_event` as the
-  // event type, while the run carries the actual event name.
   return { jobConfigType: TriggerEventType.enum.kici_event, triggerEvent: eventName };
 }
 
@@ -189,17 +169,14 @@ function isFailureLifecycleDispatch(workflow: LockWorkflow, decision: WorkflowDe
 }
 
 /**
- * Resolve the defaults-only `dispatchInputs` an internally-triggered run
- * carries, so steps and rules read `ctx.dispatchInputs` for a scheduled run
- * exactly as they do for a manual "fire now".
+ * Resolve the defaults-only `dispatchInputs` of an internally-triggered run, so
+ * `ctx.dispatchInputs` reads the same as for a manual "fire now".
  *
- * A schedule fire carries no operator input, so the values come entirely from
- * the trigger's declared defaults. A workflow may declare several `schedule()`
- * triggers, and the fired event names the cron + timezone that actually
- * elapsed, so that trigger's inputs win; an internal event with no cron of its
- * own (`__workflow_complete`, `__job_complete`, a user `kiciEvent()`) falls
- * back to the first declared schedule. A workflow with no schedule trigger
- * resolves nothing and the field is omitted.
+ * Values come from the trigger's declared defaults. Among several `schedule()`
+ * triggers, the one matching the fired cron + timezone wins; an event with no
+ * cron of its own (`__workflow_complete`, `__job_complete`, a user
+ * `kiciEvent()`) uses the first declared schedule. No schedule trigger → the
+ * field is omitted.
  */
 function resolveInternalDispatchInputs(
   workflow: LockWorkflow,
@@ -219,24 +196,18 @@ function resolveInternalDispatchInputs(
   return resolveScheduleInputs(trigger?.inputs);
 }
 
-/**
- * The audit reason stamped on an orchestrator-minted run's trust resolution.
- */
 const ORCHESTRATOR_MINTED_TRUST_REASON =
   'Orchestrator-minted internal event -- no external influence (trusted ref)';
 
 /**
- * The contributor an internal event names when none can be inherited. An
- * orchestrator-minted event has no sender at all, which is the same empty
- * string a default-branch push with no resolvable sender already records.
+ * The contributor when none can be inherited: the same empty string a
+ * default-branch push with no resolvable sender records.
  */
 const NO_CONTRIBUTOR = '';
 
 /**
- * Build the trust resolution an internally-triggered run carries.
- *
- * ONE builder for every internal branch — minted, inherited-trusted,
- * inherited-unknown — so the audit fields cannot disagree by branch.
+ * ONE builder for every internal branch (minted, inherited-trusted,
+ * inherited-unknown), so the audit fields cannot disagree by branch.
  */
 function makeInternalTrustResolution(
   tier: TrustTier,
@@ -251,40 +222,30 @@ function makeInternalTrustResolution(
  * both reserved namespaces: `__schedule_fire`, and the scaler manager's two
  * `kici.scaler.*` events.
  *
- * The test for membership is the same for all three, and it is a property of
- * the event rather than of its prefix: the orchestrator itself is the sole
- * emitter, the payload carries no external influence, the emit path refuses the
- * name from a workflow step, AND no run causes the event — so there is no
- * emitter whose privilege the subscriber could be inheriting instead. A
- * `kici.scaler.scale-up` is minted by `ScalerManager` from its own state
- * exactly as a `__schedule_fire` is minted by the cron scheduler from its own —
- * nothing a contributor controls reaches either one.
+ * Membership is a property of the event, not its prefix: the orchestrator is
+ * the sole emitter (each from its own state), the payload carries no external
+ * influence, the emit path refuses the name from a workflow step, AND no run
+ * causes the event — so there is no emitter whose privilege the subscriber
+ * could inherit instead.
  *
- * That last clause is what excludes the three remaining lifecycle events.
- * `__workflow_complete` and `__job_complete` are each caused by ONE run and
- * carry its id as the event's `source_run_id`, so they inherit that run's tier
- * like any other subscriber; `__workflows_failed_batch` is caused by MANY runs
- * and resolves the most restrictive tier across them
- * ({@link resolveFailedBatchTrustResolution}). Minting an event is not, on its
- * own, evidence that nothing external shaped the run that triggered it: an
- * untrusted fork-PR run completing would otherwise hand its
- * `__workflow_complete` subscriber the shared cache scope and the Dockerfile
- * builds the emitter itself was denied.
+ * That last clause excludes the other lifecycle events. `__workflow_complete`
+ * and `__job_complete` are each caused by ONE run (their `source_run_id`) and
+ * inherit its tier; `__workflows_failed_batch` is caused by MANY runs and
+ * resolves the most restrictive tier across them
+ * ({@link resolveFailedBatchTrustResolution}). Minting an event is not evidence
+ * that nothing external shaped the run that caused it: an untrusted fork-PR
+ * run's `__workflow_complete` subscriber would otherwise get the shared cache
+ * scope and the Dockerfile builds the emitter was denied.
  *
- * Enumerated rather than prefix-matched, both times. An unrecognized name in
- * either namespace is not something this orchestrator emitted, so it takes the
- * strict path.
- *
- * That enumeration is load-bearing beyond tidiness, because the `__` namespace
- * already holds a name with a CALLER-CONTROLLED suffix: the generic-webhook
- * idempotency marker `__dedup:<idempotencyKey>` (`webhook/generic-sources.ts`).
- * It is written straight into `kici_events` and never travels the emit path, so
- * the emit-time reservation does not see it — the enumeration is the only thing
- * that keeps it out of the trusted set. It reaches the router on a catch-up
- * scan, and subscribing to a reserved name is allowed (only emitting one is
- * refused), so a workflow CAN subscribe to it. Today that costs nothing: the
- * name is not enumerated, so such a run is classified isolated, which is the
- * correct strict verdict for a value a webhook sender chose.
+ * Enumerated, never prefix-matched: an unrecognized name in either namespace
+ * was not emitted by this orchestrator, so it takes the strict path. This is
+ * load-bearing: the `__` namespace already holds a CALLER-CONTROLLED name, the
+ * generic-webhook idempotency marker `__dedup:<idempotencyKey>`
+ * (`webhook/generic-sources.ts`). It is written straight into `kici_events`,
+ * bypassing the emit-time reservation, reaches the router on a catch-up scan,
+ * and a workflow CAN subscribe to it (only emitting a reserved name is
+ * refused). Being unenumerated, such a run is classified isolated — the correct
+ * strict verdict for a value a webhook sender chose.
  *
  * ANY future addition to `InternalSystemEventName` must be checked against it:
  * a member of the form `__dedup:…`, or a prefix match that admitted one, would
@@ -296,23 +257,20 @@ const ORCHESTRATOR_MINTED_TRUSTED_EVENT_NAMES: ReadonlySet<string> = new Set<str
 ]);
 
 /**
- * True for the events the orchestrator mints for itself with no causing run
- * ({@link ORCHESTRATOR_MINTED_TRUSTED_EVENT_NAMES}).
+ * True for {@link ORCHESTRATOR_MINTED_TRUSTED_EVENT_NAMES}.
  *
- * The premise that a user step cannot produce one of these names is ENFORCED,
- * not assumed: `reservedEventNamePrefix` refuses BOTH the `__` and the `kici.`
- * namespace at the emit path, in the SDK client-side and in the orchestrator's
- * `event.emit` handler authoritatively. Without that guard an untrusted fork-PR
- * job could emit `__schedule_fire` — or `kici.scaler.scale-up` — and be
- * classified trusted by this very function.
+ * That a user step cannot produce one of these names is ENFORCED:
+ * `reservedEventNamePrefix` refuses BOTH the `__` and the `kici.` namespace at
+ * the emit path, in the SDK client-side and authoritatively in the
+ * orchestrator's `event.emit` handler. Without it an untrusted fork-PR job
+ * could emit `__schedule_fire` or `kici.scaler.scale-up` and be classified
+ * trusted here.
  *
- * A scaler event is emitted with no `sourceRunId`, so without this it fell to
- * emitter inheritance, found no emitting run, and resolved to no tier at all —
- * which isolates the run's caches and makes `resolveWorkflowDockerfileBuilds`
- * deny a `container: { dockerfile }` job unless the org opted in. A
- * provisioning or teardown workflow that builds its own image is the scaler's
- * own headline use case, so that outcome contradicted both the documented rule
- * and the feature.
+ * A scaler event carries no `sourceRunId`, so emitter inheritance would resolve
+ * no tier — isolating the run's caches and making
+ * `resolveWorkflowDockerfileBuilds` deny a `container: { dockerfile }` job
+ * unless the org opted in, which breaks the scaler's headline use case (a
+ * provisioning or teardown workflow building its own image).
  */
 function isOrchestratorMintedTrustedEvent(eventName: string): boolean {
   return ORCHESTRATOR_MINTED_TRUSTED_EVENT_NAMES.has(eventName);
@@ -322,14 +280,11 @@ function isOrchestratorMintedTrustedEvent(eventName: string): boolean {
 const COMMIT_SHA_REF = /^[0-9a-f]{40}$/;
 
 /**
- * Read a run's `ref` as a BRANCH, or the empty string when it is not one.
+ * Read a run's `ref` as a BRANCH, or `''` when it is not one.
  *
- * A run row's `ref` is a branch for every webhook-triggered run, but a run
- * started before this branch-provenance path existed recorded the cron commit
- * sha there instead. Presenting a sha to a context's branch restrictions is the
- * exact confusion this whole path removes — an operator cannot add a commit sha
- * to a restriction list and would not want to — so a sha-shaped ref resolves to
- * no branch and the gate rejects with its named cause.
+ * Older run rows can hold the cron commit sha in `ref`. An operator cannot list
+ * a commit sha in a branch restriction, so a sha-shaped ref resolves to no
+ * branch and the gate rejects with its named cause.
  */
 function branchFromRef(ref: string | null | undefined): string {
   if (!ref || COMMIT_SHA_REF.test(ref)) return '';
@@ -337,30 +292,26 @@ function branchFromRef(ref: string | null | undefined): string {
 }
 
 /**
- * What a run INHERITS from the run that emitted its event: the trust tier, and
- * the branch. One lookup produces both, so the two facts can never disagree
- * about which run they were read from.
+ * What a run INHERITS from the run that emitted its event. One lookup produces
+ * both fields, so they never disagree about which run they were read from.
  */
 interface EmitterInheritance {
   trustResolution: TrustResolution | undefined;
-  /** The emitting run's branch, or `''` when there is none to inherit. */
+  /** `''` when there is none to inherit. */
   branch: string;
 }
 
-/** Nothing to inherit — the strict direction for every failure path. */
+/** The strict direction for every failure path. */
 const NO_INHERITANCE: EmitterInheritance = { trustResolution: undefined, branch: '' };
 
 /**
  * Read a persisted `trust_tier` back as the tier the emitting run carried.
  *
- * SQL NULL is a run that never had a tier (a feature-branch push, a run that
- * predates trust resolution) and stays unresolved. A NON-null value the schema
- * does not recognize is a tier the run DID carry, spelled in a vocabulary this
- * orchestrator no longer reads — a row written before the tier set narrowed
- * holds `known`, which meant "not trusted". Reading that as unresolved would be
- * a fail-open: `isUntrustedTier(undefined)` passes the trust gate, so a
- * subscriber of a once-untrusted run would inherit MORE privilege than the run
- * had. So it reads as `unknown`, the strict tier.
+ * SQL NULL (a feature-branch push, a run that predates trust resolution) stays
+ * unresolved. A NON-null value the schema does not recognize (an older row's
+ * `known`, meaning "not trusted") reads as `unknown`, the strict tier: reading
+ * it as unresolved fails open, because `isUntrustedTier(undefined)` passes the
+ * trust gate and the subscriber would inherit MORE privilege than the run had.
  */
 function inheritedTier(stored: unknown): TrustTier | undefined {
   if (stored === null || stored === undefined) return undefined;
@@ -371,16 +322,15 @@ function inheritedTier(stored: unknown): TrustTier | undefined {
 /**
  * Read a run's persisted trust tier and branch, and inherit both.
  *
- * EVERY failure is the strict direction — no db, a run row that no longer
- * exists, an absent tier, or a query that throws all resolve to no tier (which
- * `deriveCacheRefScope` maps to the isolated scope) and no branch (which the
- * context branch gate rejects); a tier the schema does not recognize resolves
- * to `unknown` (`inheritedTier`). A lookup failure never fails the dispatch: an
- * internally triggered run that silently never fires is worse than one that
- * runs with the narrower privilege.
+ * EVERY failure is the strict direction: no db, a missing run row, an absent
+ * tier, or a throwing query resolve to no tier (`deriveCacheRefScope` → the
+ * isolated scope) and no branch (rejected by the context branch gate); an
+ * unrecognized tier resolves to `unknown` (`inheritedTier`). A lookup failure
+ * never fails the dispatch: a run that silently never fires is worse than one
+ * with the narrower privilege.
  *
- * The tier and the branch resolve independently: a run row with no tier still
- * yields its branch, because the two answer different questions.
+ * Tier and branch resolve independently: a row with no tier still yields its
+ * branch.
  */
 async function inheritRunResolution(
   runId: string,
@@ -414,17 +364,15 @@ async function inheritRunResolution(
 }
 
 /**
- * Resolve the trust tier a user `kiciEvent()` subscriber INHERITS from the run
- * that emitted the event, via the event's own `source_run_id`.
+ * Resolve the tier a user `kiciEvent()` subscriber INHERITS from the emitting
+ * run, via the event's `source_run_id`.
  *
- * Inheritance rather than blanket trust, because `emit` is not trust-gated and
- * an untrusted ref still executes — the security gate (`securityDecision`) and
- * the privilege level (`trustResolution.tier`) are separate mechanisms. So an
- * untrusted-but-running job can emit a custom event, and trusting its
- * subscribers would hand them privileges their emitter was explicitly denied.
+ * Inheritance, not blanket trust: `emit` is not trust-gated and an untrusted
+ * ref still executes (the security gate `securityDecision` and the privilege
+ * level `trustResolution.tier` are separate), so trusting its subscribers would
+ * hand them privileges their emitter was denied.
  *
- * A missing event row or a null `source_run_id` is the strict direction, same
- * as every failure inside the run lookup it delegates to.
+ * A missing event row or a null `source_run_id` takes the strict direction.
  */
 async function inheritEmitterResolution(
   eventId: string,
@@ -453,24 +401,16 @@ async function inheritEmitterResolution(
 }
 
 /**
- * How restrictive each trust tier is, ascending — so "the most restrictive of
- * several" is the greatest rank.
+ * How restrictive each trust tier is, ascending: "the most restrictive of
+ * several" is the greatest rank. Only `trusted` is privileged
+ * (`isUntrustedTier` is `tier !== 'trusted'`; `deriveCacheRefScope` gives the
+ * shared scope to `trusted` alone).
  *
- * Only `trusted` is actually privileged: `isUntrustedTier` is `tier !==
- * 'trusted'` and `deriveCacheRefScope` gives the shared scope to `trusted`
- * alone.
- *
- * A `Record<TrustTier, number>` and NOT an ordered array, because the mapped
- * type is what makes the exhaustiveness real: a tier added to `TrustTierSchema`
- * fails to compile here until it is ranked. An array typed `readonly
- * TrustTier[]` carries no such obligation — it would compile unchanged, an
- * `indexOf` of the new tier would return `-1`, and `-1` beats every real rank
- * downward, so the new tier would sort as LESS restrictive than `trusted` and a
- * batch carrying one would resolve `trusted`. The fail-open direction is
- * exactly the one this classifier must not have, so the safety is delegated to
- * the compiler rather than to a comment asking the next editor to remember.
- * `trustTierRanksCoverEverySchemaTier` re-asserts it at runtime for the same
- * reason the emit reservation is checked in two places.
+ * A `Record<TrustTier, number>`, NOT an ordered array: the mapped type makes a
+ * tier added to `TrustTierSchema` fail to compile until ranked. With an array,
+ * `indexOf` of an unranked tier returns `-1`, sorting it LESS restrictive than
+ * `trusted`, so a batch carrying one would resolve `trusted` — fail-open.
+ * `trustTierRanksCoverEverySchemaTier` re-asserts it at runtime.
  */
 const TRUST_TIER_RANK: Record<TrustTier, number> = {
   [TrustTierSchema.enum.trusted]: 0,
@@ -478,13 +418,9 @@ const TRUST_TIER_RANK: Record<TrustTier, number> = {
 };
 
 /**
- * True when every tier the schema admits carries a rank.
- *
- * The `Record<TrustTier, number>` above already fails the build on an unranked
- * tier, so this can only ever be false if the two drift through a cast. It is
- * exported so a test asserts it against the live `TrustTierSchema.options`
- * rather than against a transcription of it — the check has to read the schema
- * to be worth having.
+ * True when every tier the schema admits carries a rank. Only false if the two
+ * drift through a cast; exported so a test asserts it against the live
+ * `TrustTierSchema.options`, not a transcription of it.
  */
 export function trustTierRanksCoverEverySchemaTier(): boolean {
   return TrustTierSchema.options.every((tier) => typeof TRUST_TIER_RANK[tier] === 'number');
@@ -492,10 +428,8 @@ export function trustTierRanksCoverEverySchemaTier(): boolean {
 
 /**
  * The `__workflows_failed_batch` payload fields the trust classification reads.
- *
- * `total` is REQUIRED even though only the comparison against `runs.length`
- * uses it: without it there is no way to tell an uncapped batch from a capped
- * one, and "cannot tell" takes the strict path like every other failure here.
+ * `total` is REQUIRED: without it a capped batch is indistinguishable from an
+ * uncapped one, and "cannot tell" takes the strict path.
  */
 const FailedBatchTrustPayload = z.object({
   total: z.number(),
@@ -505,25 +439,18 @@ const FailedBatchTrustPayload = z.object({
 /**
  * Resolve the tier a `__workflows_failed_batch` subscriber runs with.
  *
- * The batch event carries NO `sourceRunId` — it is one synthetic event per
- * swept accumulation window, caused by every failed run in that window at once
- * — so there is no single emitter to inherit from. It resolves the MOST
- * RESTRICTIVE tier across the runs it names: a batch is only as trusted as its
- * least trusted member, so a notifier fired by a window that included one
- * fork-PR failure does not run with the privileges of the maintainer pushes
- * beside it.
+ * The batch is one synthetic event per swept accumulation window, with NO
+ * `sourceRunId`, so it resolves the MOST RESTRICTIVE tier across the runs it
+ * names: a notifier fired by a window with one fork-PR failure does not get the
+ * privileges of the maintainer pushes beside it.
  *
- * EVERY failure is the strict direction, as everywhere else in this classifier:
- * no db, a payload that does not parse, an empty run list, or ANY member whose
- * tier cannot be read all resolve to `undefined` (isolated). One unreadable
- * member is not narrowed away to a minimum over the rest — a minimum over a
- * subset is not a minimum.
+ * EVERY failure is the strict direction: no db, an unparseable payload, an
+ * empty run list, or ANY member whose tier cannot be read resolve to
+ * `undefined` (isolated) — a minimum over a subset is not a minimum.
  *
- * A CAPPED batch is refused without computing at all. The retry scanner carries
- * `runs.slice(0, BATCH_MAX_RUNS)` while `total` stays the true count, so on a
- * capped window `runs` is a truncated SAMPLE and the runs omitted from it are
- * exactly the ones whose tiers are unknown here. A sample that happens to be
- * entirely trusted is the case that would otherwise fail open.
+ * A CAPPED batch is refused outright: the retry scanner carries
+ * `runs.slice(0, BATCH_MAX_RUNS)` while `total` stays the true count, so the
+ * omitted runs' tiers are unknown and an all-trusted sample would fail open.
  */
 async function resolveFailedBatchTrustResolution(
   payload: Record<string, unknown>,
@@ -536,11 +463,9 @@ async function resolveFailedBatchTrustResolution(
   if (runs.length === 0) return undefined;
   if (total > runs.length) return undefined;
 
-  // Serial by design at today's cap: an uncapped batch carries at most
-  // `BATCH_MAX_RUNS` (200) runs, and only an UNCAPPED one reaches this loop at
-  // all. If that cap rises, replace the loop with a single
-  // `where('run_id', 'in', runIds)` and fold the rows in memory — the rule is
-  // unchanged either way, but N awaited round-trips per swept window is not.
+  // Serial is fine while only an uncapped batch (at most `BATCH_MAX_RUNS`, 200)
+  // reaches here; if the cap rises, use one `where('run_id', 'in', runIds)` and
+  // fold the rows in memory.
   let mostRestrictive: TrustTier = TrustTierSchema.enum.trusted;
   for (const run of runs) {
     const { trustResolution } = await inheritRunResolution(run.runId, deps);
@@ -550,10 +475,8 @@ async function resolveFailedBatchTrustResolution(
     }
   }
 
-  // No contributor: the batch answers to as many contributors as it carries
-  // runs, and naming one of them would read as a fact about the whole batch.
-  // The webhook path's own no-resolvable-sender case records the same empty
-  // string.
+  // No contributor: naming one of the batch's many would read as a fact about
+  // the whole batch.
   return makeInternalTrustResolution(
     mostRestrictive,
     NO_CONTRIBUTOR,
@@ -562,43 +485,31 @@ async function resolveFailedBatchTrustResolution(
 }
 
 /**
- * Classify an internally-triggered run: the trust tier it runs at, and the
- * branch it inherits from the run that emitted its event.
+ * Classify an internally-triggered run: its trust tier, and the branch it
+ * inherits from the emitting run. ONE resolution, so both are read from the
+ * SAME run. The branch is `''` where there is no single emitting run: a minted
+ * event (a `__schedule_fire` presents the registration's default branch at the
+ * dispatch site instead) and a failure batch.
  *
- * Both come from ONE resolution because both are facts about the SAME emitting
- * run — resolving them separately would let them disagree about which run they
- * read. The branch is `''` wherever there is no single emitting run to inherit
- * from: an orchestrator-minted event (a `__schedule_fire` presents the
- * registration's default branch instead, at the dispatch site) and a failure
- * batch (which many runs cause, on as many branches).
+ * Ordered SUMMON FIRST, deliberately:
  *
- * The branches are ordered SUMMON FIRST, deliberately:
- *
- * 1. An invoke-gate summon states its emitting run DIRECTLY
- *    (`summonedByRunId`), so it inherits without the `kici_events` hop — its
- *    event id is synthesized and matches no persisted row, so the lookup could
- *    only ever fail, a wrong verdict (isolated for a trusted summoner) reported
- *    as a recurring production error. It is checked FIRST because its event
- *    name comes from the workflow author (`invokeSource('...')`), and a
- *    summoned run must never be able to claim minted-trust by naming a minted
- *    event. Inheritance is what the summon path gets, always. The reservation
- *    is refused upstream too (`runInvokeGate`), so this ordering is the second
- *    of two independent stops rather than the only one.
+ * 1. An invoke-gate summon names its emitting run DIRECTLY
+ *    (`summonedByRunId`); its synthesized event id matches no `kici_events`
+ *    row, so that lookup could only fail (isolated for a trusted summoner, as a
+ *    recurring production error). It goes FIRST because its event name comes
+ *    from the workflow author (`invokeSource('...')`), and a summoned run must
+ *    never claim minted-trust by naming a minted event. `runInvokeGate` also
+ *    refuses the reservation, so this ordering is the second of two stops.
  * 2. An orchestrator-minted event with NO CAUSING RUN (`__schedule_fire`, the
- *    two `kici.scaler.*` events) is trusted: it carries no external influence,
- *    which is the same reasoning that already justifies its
- *    `securityDecision: { action: 'pass' }`. That premise holds only because
- *    the whole `__` namespace is refused at every path a workflow can reach.
- * 3. `__workflows_failed_batch` is minted too, but MANY runs cause it and it
- *    carries no `sourceRunId`, so it resolves the most restrictive tier across
- *    the runs it names.
- * 4. Everything else inherits its emitter's tier via the event's
- *    `source_run_id` — a user `kiciEvent()`, and the two lifecycle events a
- *    single run causes (`__workflow_complete`, `__job_complete`), which set
- *    that field to the completing run. Being orchestrator-minted says nothing
- *    about the run that CAUSED the event, so classifying those two by name
- *    instead let an untrusted run's completion hand its subscriber the
- *    privileges the run itself was denied.
+ *    two `kici.scaler.*` events) is trusted: no external influence, the same
+ *    reasoning as its `securityDecision: { action: 'pass' }`. That holds only
+ *    because the whole `__` namespace is refused at every path a workflow can
+ *    reach.
+ * 3. `__workflows_failed_batch`: the most restrictive tier across its runs.
+ * 4. Everything else inherits via the event's `source_run_id` — a user
+ *    `kiciEvent()`, and `__workflow_complete` / `__job_complete`, which set it
+ *    to the completing run. Classifying those two by name would hand an
+ *    untrusted run's subscriber the privileges the run was denied.
  */
 async function resolveInternalInheritance(
   ctx: InternalEventDispatchContext,
@@ -626,8 +537,8 @@ async function resolveInternalInheritance(
 
 /**
  * Dispatch one matched workflow for an internal event through the shared
- * pipeline. Returns the spawned-run summary the bespoke path returned, or
- * `null` when the decision names a workflow the lock file does not carry.
+ * pipeline. Returns `null` when the decision names a workflow the lock file
+ * does not carry.
  */
 export async function dispatchInternalEventViaPipeline(
   decision: WorkflowDecision,
@@ -642,27 +553,20 @@ export async function dispatchInternalEventViaPipeline(
   const runId = randomUUID();
   const payload = ctx.event.payload ?? {};
 
-  // The branch this run presents to a context's branch restrictions.
-  //
-  // A `__schedule_fire` run executes the registration's default-branch lock
-  // file, so that branch IS its branch. Every other internal trigger inherits
-  // the branch of the run that emitted its event.
-  //
-  // `''` when neither is known — a registration that predates the
-  // `default_branch` column, an emitting run that no longer exists, a ref that
-  // is a commit sha rather than a branch. The branch gate reads the empty value
-  // and rejects with its named-cause verdict. Nothing substitutes a branch:
-  // presenting one the run never proved would let a restricted context accept a
-  // run from anywhere.
+  // The branch presented to a context's branch restrictions: the registration's
+  // default branch for a `__schedule_fire`, else the emitting run's branch.
+  // `''` when unknown (no `default_branch` captured, a vanished emitting run, a
+  // sha-shaped ref); the gate rejects it with its named cause. Nothing
+  // substitutes a branch: an unproven one would let a restricted context accept
+  // a run from anywhere.
   const { trustResolution, branch: inheritedBranch } = await resolveInternalInheritance(ctx, deps);
   const presentedBranch =
     ctx.event.eventName === InternalSystemEventName.enum.__schedule_fire
       ? (ctx.registrationDefaultBranch ?? '')
       : inheritedBranch;
 
-  // The shape the TRIGGER MATCHER needs: `SimulatedEvent` requires
-  // `targetBranch`, and the run row's branch is read off it. It never reaches
-  // user code — `eventEnvelope` below is what does.
+  // For the TRIGGER MATCHER and the run row's branch; never reaches user code
+  // (`eventEnvelope` does).
   const simulatedEvent: SimulatedEvent = {
     type: jobConfigType,
     payload,
@@ -670,18 +574,13 @@ export async function dispatchInternalEventViaPipeline(
     changedFiles: [],
   };
 
-  // The shape USER CODE observes, stated verbatim so nothing is fabricated.
-  // This envelope becomes `RuleContext.event` on the agent and the `event` half
-  // of `buildConcurrencyGroupContext`, where every field is read as fact.
-  //
-  // `targetBranch` stays OMITTED here even now that `presentedBranch` often
-  // holds a real branch: setting it would re-key the documented
-  // `ctx.event.targetBranch ?? 'default'` concurrency group of every existing
-  // internal workflow, silently splitting one group into per-branch ones. The
-  // branch is provenance the orchestrator evaluates (the trigger matcher and
-  // the context branch gate), not a field user code asked for. `changedFiles`
-  // is omitted for the same reason it always was: an internal event has none.
-  // Both are optional on `EventBase`, so user code reads an honest `undefined`.
+  // What USER CODE observes (`RuleContext.event` on the agent, the `event` half
+  // of `buildConcurrencyGroupContext`), where every field is read as fact.
+  // `targetBranch` stays OMITTED: setting it would re-key the documented
+  // `ctx.event.targetBranch ?? 'default'` concurrency group of every internal
+  // workflow into per-branch groups; the branch is provenance only the
+  // orchestrator evaluates. `changedFiles` is omitted because an internal event
+  // has none. Both are optional on `EventBase`, so user code reads `undefined`.
   const eventEnvelope: Record<string, unknown> = { type: jobConfigType, payload };
 
   const info: WebhookInfo = {
@@ -689,12 +588,10 @@ export async function dispatchInternalEventViaPipeline(
     deliveryId: ctx.event.id,
     event: jobConfigType,
     action: null,
-    // `internal` is not a member of `ProviderType`, and the cast is deliberate:
-    // it is the value the run row already carries for an internal event, and it
-    // travels as a passthrough label — nothing branches on it, it only has to
-    // keep saying what it has always said. Widening the union to admit it would
-    // make every exhaustive switch over real providers accept a value none of
-    // them can serve.
+    // Deliberate cast: `internal` is not a `ProviderType`, only a passthrough
+    // label the run row carries (nothing branches on it). Widening the union
+    // would make every exhaustive switch over real providers accept a value
+    // none of them can serve.
     provider: (ctx.providerType ?? INTERNAL_PROVIDER) as ProviderType,
     payload,
   };
@@ -706,58 +603,42 @@ export async function dispatchInternalEventViaPipeline(
   const dispatchCtx: WorkflowDispatchContext = {
     info,
     deps,
-    // Resolved by the composition root from the live registry. Without it every
-    // job dispatches with an empty repo URL and the run is classified as a
-    // local-working-tree dispatch, so the workflow source can never be
-    // materialized.
+    // See `InternalEventDispatchContext.bundle`.
     bundle: ctx.bundle,
     payload,
     repoIdentifier: ctx.repoIdentifier,
-    // An internal event dispatches the acting repository's own lock file, so
-    // the defining repository is the same one.
+    // An internal event dispatches the acting repository's own lock file.
     workflowRepoIdentifier: ctx.repoIdentifier,
-    // The registration's provider context. It is what `onExecutionStarted`
-    // persists as `execution_runs.provider_context`, what the run's
-    // `installationId` is extracted from for every status forward, and what the
-    // check-run reporter authenticates with — so a blank object silently
-    // un-authenticates the whole run, it does not merely omit a label.
+    // Persisted as `execution_runs.provider_context`, the source of the run's
+    // `installationId` for every status forward, and the check-run reporter's
+    // credentials — a blank object silently un-authenticates the whole run.
     credentials: ctx.providerContext,
     event: simulatedEvent,
     eventWithFiles: simulatedEvent,
-    // `ref` is the COMMIT, not the branch — every dispatch site writes it as
-    // the run row's `sha` and derives the row's branch from
-    // `event.targetBranch` instead. A cron fire carries the commit sha it
-    // resolved; every other internal event has none, and nothing substitutes
-    // one.
+    // `ref` is the COMMIT (the run row's `sha`; the branch comes from
+    // `event.targetBranch`). Only a cron fire carries one; nothing substitutes
+    // it.
     ref: ctx.cronCommitSha || '',
     fullLockFile: lockFile,
     resolvedOrgId,
     workflow,
     decision,
     runId,
-    // Minted with no causing run => trusted; every other internal event
-    // inherits the tier of the run (or runs) that caused it; every failure
-    // degrades to `undefined` (isolated).
-    // `undefined` here is NOT neutral — `deriveCacheRefScope` maps it to the
-    // isolated user-cache scope, which `resolveWorkflowDockerfileBuilds` then
-    // denies unless the org opted in, so leaving it unset denied the
-    // cron-fired image builds of every org that has not opted in.
+    // `undefined` is NOT neutral: `deriveCacheRefScope` maps it to the isolated
+    // scope, and `resolveWorkflowDockerfileBuilds` then denies image builds
+    // unless the org opted in.
     trustResolution,
     lockFileSource: undefined,
     localWorkingTree: false,
     crossSource: false,
     triggeredBy: null,
     triggeredByAgentLabel: null,
-    // An internal event has no pull-request provenance for the org trust policy
-    // to evaluate — no external contributor, no fork, no base-vs-head diff. The
-    // centralized evaluator short-circuits to `pass` on a non-PR event, so
-    // stating it is the same verdict rather than a bypass. Same reasoning as
-    // the CLI remote-run path (`test-pipeline.ts`).
+    // No pull-request provenance for the org trust policy to evaluate; the
+    // centralized evaluator returns `pass` on a non-PR event, so this is the
+    // same verdict, not a bypass (as in `test-pipeline.ts`).
     securityDecision: { action: 'pass' },
-    // Every dispatch through this adapter is orchestrator-triggered. The
-    // context branch gate reads this to tell a genuinely branchless run (empty
-    // `event.targetBranch`) apart from a run whose branch does not
-    // match, so it can name the real cause instead of quoting an empty value.
+    // Lets the context branch gate tell a branchless run (empty
+    // `event.targetBranch`) from a branch mismatch and name the real cause.
     internallyTriggered: true,
     triggerEventOverride: triggerEvent,
     eventEnvelopeOverride: eventEnvelope,
@@ -769,8 +650,7 @@ export async function dispatchInternalEventViaPipeline(
   const result = await dispatchMatchedWorkflow(dispatchCtx);
 
   // A run whose jobs are all deferred (dynamic matrix / deferred init) has
-  // dispatched nothing YET and still runs — treating it as a failure is the
-  // bug the old path had in mirror image.
+  // dispatched nothing YET and still runs; it is not a failure.
   if (result.dispatchedJobCount === 0 && (result.deferredJobCount ?? 0) === 0 && !result.held) {
     logger.warn('Internal event run dispatched no jobs', {
       runId,

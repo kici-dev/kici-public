@@ -1,6 +1,4 @@
 /**
- * Workflows-failed-batch trigger helper.
- *
  * Accumulates failed workflow completions over a time window and fires the
  * subscribing global workflow once per window with the batched run list, so a
  * mass incident notifies a single time instead of once per failed run.

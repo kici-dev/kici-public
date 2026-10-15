@@ -1,15 +1,14 @@
 /**
  * External-actor agent re-stage + restart (fleet auto-upgrade apply).
  *
- * Runs in the OPS agent (the one holding `kici:capability:ssh-transport`) —
- * never on the target host itself, so there is NO self-update-handoff: an
- * external actor swaps the bytes and restarts the target's agent, which
- * reconnects on its OWN persistent token (this function never mints or handles
- * a token). The install is folder-anchored (mirroring the versioned-upgrade
- * layout): the target version is staged into `<installDir>/kici-agent-<version>`
- * and an atomic symlink swap makes it current, so a stage failure aborts BEFORE
- * the swap and never leaves a half-upgraded install. Idempotent — a box already
- * on the target version is a no-op.
+ * Runs in the OPS agent (the one holding `kici:capability:ssh-transport`), never
+ * on the target host, so there is NO self-update handoff: it swaps the bytes and
+ * restarts the target's agent, which reconnects on its OWN persistent token
+ * (this module never mints or handles a token). The install is folder-anchored,
+ * mirroring the versioned-upgrade layout: the target version is staged into
+ * `<installDir>/kici-agent-<version>` and an atomic symlink swap makes it
+ * current, so a stage failure aborts BEFORE the swap and never leaves a
+ * half-upgraded install. A box already on the target version is a no-op.
  */
 import path from 'node:path';
 import type { AgentPlatform } from '@kici-dev/shared';
@@ -20,15 +19,15 @@ import { stageAgentPayload, type DeliveryMode } from './stage-agent-payload.js';
 import type { AgentPayloadSource } from './payload-source.js';
 import { shQuote } from '@kici-dev/core';
 
-/** Default folder-anchored install base for a permanent fleet agent. */
+/** Install base for a permanent fleet agent. */
 const DEFAULT_INSTALL_DIR = '/opt/kici-agent';
 
 /**
- * How to drain + restart the target's agent after the swap. The ops agent runs
- * `stop` (a graceful drain — SIGTERM + grace) then `start`. For a systemd unit
- * this is `systemctl --user restart <svc>`; for a bare-process fixture it is a
- * kill + relaunch of the install's own launcher (the box's persistent token
- * lives in its env, so no reconnect material is threaded here).
+ * Drain + restart of the target's agent after the swap: `stop` (a graceful
+ * drain, SIGTERM + grace) then `start`. For a systemd unit this is
+ * `systemctl --user restart <svc>`; for a bare-process fixture, a kill +
+ * relaunch of the install's own launcher (the box's persistent token lives in
+ * its env, so no reconnect material is threaded here).
  */
 export interface RestartSpec {
   stop: string;
@@ -38,31 +37,28 @@ export interface RestartSpec {
 export interface RestageOpts {
   /** Target platform; probed over SSH when omitted. */
   platform?: AgentPlatform;
-  /** Target version to converge the host onto (the orchestrator's version). */
+  /** The orchestrator's version. */
   version: string;
-  /** How the payload reaches the box (ssh-push | s3-direct). */
   delivery: DeliveryMode;
-  /** Folder-anchored install base (default `/opt/kici-agent`). */
+  /** Default `/opt/kici-agent`. */
   installDir?: string;
-  /** Drain + restart commands run after the atomic swap. */
   restart: RestartSpec;
 }
 
 export interface RestageDeps extends SshDeps {
-  /** Payload source for the `ssh-push` delivery path (unused for `s3-direct`). */
+  /** For `ssh-push` delivery; unused for `s3-direct`. */
   payloadSource?: AgentPayloadSource;
   /** Ops-agent-side file-hash boundary, injectable for tests. */
   hashLocalFile?: (filePath: string) => Promise<string>;
 }
 
-/** The versioned payload directory for a version under the install base. */
 function versionDir(installDir: string, version: string): string {
   return path.posix.join(installDir, `kici-agent-${version}`);
 }
 
 /**
- * Read the version the `kici-agent` symlink currently points at, or null when
- * no install is present. The symlink target is `kici-agent-<version>`.
+ * The version the `kici-agent` symlink points at (its target is
+ * `kici-agent-<version>`); null with no install.
  */
 async function readCurrentVersion(
   reach: HostReach,
@@ -84,9 +80,8 @@ async function readCurrentVersion(
 }
 
 /**
- * Atomically point `<installDir>/kici-agent` at the target version directory.
  * `ln -sfn` onto a temp name + `mv -T` is a single rename, so a reader never
- * sees a missing symlink. The target is stored relative so the tree is movable.
+ * sees a missing symlink. The target is relative so the tree is movable.
  */
 async function swapInstall(
   reach: HostReach,
@@ -109,7 +104,6 @@ async function swapInstall(
   }
 }
 
-/** Run the drain (stop) then the restart (start) over SSH. */
 async function drainAndRestart(
   reach: HostReach,
   privateKey: string,
@@ -131,9 +125,9 @@ async function drainAndRestart(
 }
 
 /**
- * Re-stage the target version onto `reach` and restart its agent. Returns
- * `{ restaged: false }` when the host is already on the target version (no
- * stage, no swap, no restart), `{ restaged: true }` when this call swapped it.
+ * Re-stage the target version onto `reach` and restart its agent.
+ * `{ restaged: false }` means the host was already on it (no stage, swap or
+ * restart).
  */
 export async function restageAgent(
   reach: HostReach,
@@ -143,15 +137,13 @@ export async function restageAgent(
 ): Promise<{ restaged: boolean }> {
   const installDir = opts.installDir ?? DEFAULT_INSTALL_DIR;
 
-  // Idempotent: a box already on the target version needs no re-stage.
   const current = await readCurrentVersion(reach, privateKey, installDir, deps);
   if (current === opts.version) return { restaged: false };
 
   const platform = opts.platform ?? (await probeTargetPlatform(reach, privateKey, deps));
 
-  // Stage (verify + extract) into the version-keyed dir. stageAgentPayload
-  // throws on any verify/extract failure, so the swap below is only reached on
-  // a fully-verified stage — never a half-upgrade.
+  // stageAgentPayload throws on any verify/extract failure, so the swap is
+  // reached only after a fully-verified stage.
   await stageAgentPayload(
     reach,
     privateKey,

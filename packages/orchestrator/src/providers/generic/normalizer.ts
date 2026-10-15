@@ -128,7 +128,6 @@ export class GenericWebhookNormalizer implements WebhookNormalizer {
    * 5. Returns normalized WebhookData
    *
    * @param routingKey - The routing key for this source (from URL path)
-   * @param rawBody - Raw request body string
    * @param headers - Request headers (lowercase keys)
    * @returns Normalized data or null if source not found/disabled
    */
@@ -142,16 +141,13 @@ export class GenericWebhookNormalizer implements WebhookNormalizer {
     headers: Record<string, string>;
     routingKey: string;
   } | null> {
-    // Look up source config
     const source = await this.sourceManager.getByRoutingKey(routingKey);
     if (!source) {
       return null;
     }
 
-    // Parse body
     const payload = parseBody(rawBody, headers['content-type']);
 
-    // Extract event type
     const event = extractEventType(
       headers,
       payload,
@@ -159,7 +155,6 @@ export class GenericWebhookNormalizer implements WebhookNormalizer {
       source.event_type_path,
     );
 
-    // Filter headers
     const stripHeaders = parseStripHeaders(source.strip_headers);
     const filteredHeaders = filterHeaders(headers, stripHeaders);
 

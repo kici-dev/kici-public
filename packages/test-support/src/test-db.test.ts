@@ -1,16 +1,19 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { type Kysely, sql } from 'kysely';
+import type { MigrationProvider } from 'kysely/migration';
 import pg from 'pg';
-import { TestDbBackendsRemainError, terminateTestDbBackends } from './test-db.js';
+import {
+  TestDbBackendsRemainError,
+  describeWithTestDb,
+  terminateTestDbBackends,
+  testDbAdminUrl,
+  useTestDb,
+  withDatabase,
+} from './test-db.js';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
 const TEST_DB = `kici_test_db_helper_${process.pid}_${Date.now()}`;
-
-function withDatabase(url: string, dbName: string): string {
-  const parsed = new URL(url);
-  parsed.pathname = `/${dbName}`;
-  return parsed.toString();
-}
 
 async function backendCount(admin: pg.Pool): Promise<number> {
   const { rows } = await admin.query<{ n: number }>(
@@ -119,5 +122,106 @@ describe('terminateTestDbBackends — after the terminate', () => {
     await terminateTestDbBackends(pool, 'db');
     // breaks-if-wrong: a database already empty must return after one count, with no terminate
     expect(calls).toEqual(['count:0']);
+  });
+});
+
+interface WidgetDb {
+  widgets: { id: number; name: string };
+}
+
+const widgetMigrations: MigrationProvider = {
+  async getMigrations() {
+    return {
+      '001_widgets': {
+        async up(db: Kysely<unknown>) {
+          await db.schema
+            .createTable('widgets')
+            .addColumn('id', 'integer')
+            .addColumn('name', 'text')
+            .execute();
+        },
+      },
+    };
+  },
+};
+
+describe('withDatabase', () => {
+  it('swaps only the database path of a connection URL', () => {
+    expect(withDatabase('postgres://u:p@h:5432/postgres?sslmode=disable', 'kici_x')).toBe(
+      'postgres://u:p@h:5432/kici_x?sslmode=disable',
+    );
+  });
+});
+
+describe('testDbAdminUrl', () => {
+  it('reads the gate env var', () => {
+    expect(testDbAdminUrl()).toBe(process.env.KICI_TEST_ADMIN_DATABASE_URL);
+  });
+});
+
+describeWithTestDb<WidgetDb>(
+  'describeWithTestDb',
+  { prefix: 'kici_tsupport', provider: widgetMigrations, poolMax: 3 },
+  (getDb) => {
+    it('hands the suite a migrated, isolated database', async () => {
+      const { db, name } = getDb();
+      expect(name).toMatch(/^kici_tsupport_\d+_\d+$/);
+      await db.insertInto('widgets').values({ id: 1, name: 'a' }).execute();
+      expect(await db.selectFrom('widgets').selectAll().execute()).toEqual([{ id: 1, name: 'a' }]);
+    });
+
+    it('connects to the database it names, not the admin database', async () => {
+      const { db, name, url, pool } = getDb();
+      const { rows } = await sql<{ d: string }>`select current_database() as d`.execute(db);
+      expect(rows[0].d).toBe(name);
+      expect(new URL(url).pathname).toBe(`/${name}`);
+      // fails-when: poolMax is not passed through to the suite pool
+      expect(pool.options.max).toBe(3);
+    });
+  },
+);
+
+describeDb('useTestDb teardown', () => {
+  let name: string | undefined;
+
+  describe('a suite with its own database', () => {
+    const getDb = useTestDb<unknown>({ prefix: 'kici_tsupport_drop' });
+    it('creates a bare database when no provider is given', async () => {
+      name = getDb().name;
+      const { rows } = await sql<{ n: number }>`
+        select count(*)::int as n from information_schema.tables where table_schema = 'public'
+      `.execute(getDb().db);
+      expect(rows[0].n).toBe(0);
+    });
+  });
+
+  let poolOnly: pg.Pool | undefined;
+
+  describe('a suite that queries only the pool', () => {
+    const getDb = useTestDb<unknown>({ prefix: 'kici_tsupport_pool' });
+    it('leaves Kysely unused', async () => {
+      poolOnly = getDb().pool;
+      const { rows } = await poolOnly.query<{ one: number }>('SELECT 1 AS one');
+      expect(rows[0].one).toBe(1);
+    });
+  });
+
+  // Parent hooks run after the nested suites' afterAll, so the drop has happened.
+  afterAll(async () => {
+    // fails-when: teardown relies on Kysely destroy() alone, which never ends a
+    // pool Kysely did not connect through; the terminate then kills its idle client
+    expect(poolOnly?.ended).toBe(true);
+    const admin = new pg.Pool({ connectionString: ADMIN_URL, max: 1 });
+    try {
+      const { rows } = await admin.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM pg_database WHERE datname = $1',
+        [name],
+      );
+      // fails-when: the harness afterAll leaves the throwaway database behind
+      expect(name).toBeDefined();
+      expect(rows[0].n).toBe(0);
+    } finally {
+      await admin.end();
+    }
   });
 });

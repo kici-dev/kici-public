@@ -1,22 +1,17 @@
 /**
  * Registry of dashboard write operations governed by the per-orch
- * dashboard-write policy.
+ * dashboard-write policy. Subpath export
+ * `@kici-dev/engine/protocol/dashboard-write-operations`; browser-safe (no node
+ * built-ins), so the dashboard SPA imports it directly.
  *
- * Subpath export: consumers import from
- * `@kici-dev/engine/protocol/dashboard-write-operations`. The file is pure
- * Zod + plain TypeScript with no node built-ins, so it remains
- * browser-safe and is also imported directly by the dashboard SPA for
- * capability rendering.
- *
- * Three audiences read this registry:
+ * Readers:
  *   - Orchestrator: enforces the policy per operation in dashboard.* handlers.
  *   - Platform: gates HTTP routes that proxy to the orch.
  *   - Dashboard: renders per-control state (enabled / disabled / loading).
  *
- * Adding a new operation: append an entry to `DashboardWriteOperation`
- * (the Zod enum) and `DASHBOARD_WRITE_OPERATIONS` (the descriptor array).
- * The runtime build-time tests on the orchestrator and Platform sides
- * fail until at least one gate handler references the new operation.
+ * A new operation goes in both `DashboardWriteOperation` and
+ * `DASHBOARD_WRITE_OPERATIONS`; the orchestrator and Platform tests fail until
+ * at least one gate handler references it.
  */
 import { z } from 'zod';
 
@@ -111,16 +106,14 @@ export const DashboardWriteSensitivity = z.enum(['plaintext', 'authority', 'disp
 export type DashboardWriteSensitivity = z.infer<typeof DashboardWriteSensitivity>;
 
 /**
- * Descriptor for one dashboard write operation. The fields that don't
- * affect enforcement (label, cliEquivalent) are read by the dashboard
- * SPA to render policy-aware UI and by the docs generator.
+ * Descriptor for one dashboard write operation. The non-enforcement fields
+ * (label, cliEquivalent) feed the dashboard SPA's policy-aware UI and the docs
+ * generator.
  */
 export interface DashboardWriteOperationDescriptor {
-  /** The operation enum value used by enforcement helpers. */
   readonly name: DashboardWriteOperation;
   /** The wire message type the operation maps to (dashboard.* on Platform→Orch). */
   readonly wireMessageType: string;
-  /** Grouping for UI rendering. */
   readonly category: DashboardWriteCategory;
   /** Human-facing label for tooltips and the Security policy page. */
   readonly label: string;
@@ -359,19 +352,13 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
 
 /**
  * The operations whose `cliEquivalent` answers only on an **independent**
- * orchestrator.
- *
- * `kici-admin held-run approve` and `reject` refuse with a 409 wherever a
- * Platform is attached, because the Platform's own held-run trust gate is the
- * authority on who may answer a hold there. Every other operation's CLI
- * equivalent works in any mode.
- *
- * That makes these two the only operations a Platform-attached orchestrator
- * cannot move to the CLI layer: disabling one leaves no surface that can answer
- * a context or reviewer hold, so the orchestrator refuses the write. This list
- * is what the orchestrator's policy module and the `dashboard-writes` CLI
- * render both read, so the refusal and the warning can never name different
- * operations.
+ * orchestrator. `kici-admin held-run approve` / `reject` refuse with a 409
+ * wherever a Platform is attached, because the Platform's held-run trust gate
+ * decides who may answer a hold there; every other CLI equivalent works in any
+ * mode. A Platform-attached orchestrator therefore refuses to disable these,
+ * since nothing else could answer a context or reviewer hold. The
+ * orchestrator's policy module and the `dashboard-writes` CLI render both read
+ * this list, so the refusal and the warning always name the same operations.
  */
 export const CLI_INDEPENDENT_ONLY_OPERATIONS: readonly DashboardWriteOperation[] = Object.freeze([
   'held_runs.approve',
@@ -415,16 +402,14 @@ export function getDashboardWriteOperationsBySensitivity(
 /**
  * Per-operation dashboard-write posture.
  *
- *   - `permissive` — the write is accepted and its plaintext value transits
- *     the hosted Platform process (today's default; the absent-key default).
+ *   - `permissive` (the default, also for an absent key) — the write is
+ *     accepted and its plaintext value transits the hosted Platform process.
  *   - `encrypted` — the write is accepted but the value is sealed in the
  *     browser to the orchestrator's published X25519 key, so the Platform
  *     relays only opaque ciphertext. Valid ONLY for `plaintext`-sensitivity
- *     operations (`secrets.set`, `variables.set`) — an operation with no
- *     plaintext payload has nothing to seal.
+ *     operations (`secrets.set`, `variables.set`): nothing else has a
+ *     plaintext payload to seal.
  *   - `disabled` — the write is refused; the operator must use the CLI.
- *
- * Absent from the sparse map ⇒ `permissive`.
  */
 export const DashboardWritePolicyState = z.enum(['permissive', 'encrypted', 'disabled']);
 export type DashboardWritePolicyState = z.infer<typeof DashboardWritePolicyState>;
@@ -439,14 +424,11 @@ export type DashboardWritePolicyMap = Partial<
 >;
 
 /**
- * Validates a sparse policy map. Every value is a
- * {@link DashboardWritePolicyState}; `encrypted` is rejected for any operation
- * whose sensitivity is not `plaintext` (nothing to seal without a plaintext
- * payload; the signing half that would cover authority/dispatch ops is a
- * separate feature). Use this where the value is required but may be empty
- * (e.g. the JSONB column on the orch). For optional fields on outer schemas,
- * embed `dashboardWritePolicyMap` directly with `.optional()` so omission stays
- * as `undefined` rather than being coerced to `{}`.
+ * Validates a sparse policy map, rejecting `encrypted` for any operation whose
+ * sensitivity is not `plaintext` (authority/dispatch ops would need signing,
+ * a separate feature). Use it where the value is required but may be empty
+ * (e.g. the orch JSONB column); an optional outer field embeds it with
+ * `.optional()` so omission stays `undefined` rather than `{}`.
  */
 export const dashboardWritePolicyMap = z
   .partialRecord(DashboardWriteOperation, DashboardWritePolicyState)
@@ -466,10 +448,7 @@ export const dashboardWritePolicyMap = z
 
 export const dashboardWritePolicyMapSchema = dashboardWritePolicyMap.default({});
 
-/**
- * Resolve the effective posture of an operation given a (possibly sparse)
- * policy map. Treats `undefined` as the permissive default.
- */
+/** Effective posture of an operation; an absent entry is `permissive`. */
 export function resolvePolicyState(
   policy: DashboardWritePolicyMap | null | undefined,
   op: DashboardWriteOperation,
@@ -477,11 +456,7 @@ export function resolvePolicyState(
   return policy?.[op] ?? 'permissive';
 }
 
-/**
- * Resolve the effective enabled state of an operation. `true` unless the
- * posture is `disabled`. Convenience for the many read-only "may this write
- * proceed at all?" call sites.
- */
+/** `true` unless the operation's posture is `disabled`. */
 export function isDashboardWriteOperationEnabled(
   policy: DashboardWritePolicyMap | null | undefined,
   op: DashboardWriteOperation,
@@ -498,11 +473,9 @@ export function isEncryptedState(
 }
 
 /**
- * Expand a (possibly sparse) policy map into the full effective enabled
- * boolean for all 27 operations. Operations the policy doesn't mention come
- * back as `true` (permissive). Retained for existing consumers that only need
- * the enabled/disabled bit; {@link resolveFullPolicyStateView} exposes the
- * richer tri-state.
+ * Expand a sparse policy map into the enabled boolean for every operation;
+ * unmentioned operations are `true`. {@link resolveFullPolicyStateView} gives
+ * the tri-state.
  */
 export function resolveFullPolicyView(
   policy: DashboardWritePolicyMap | null | undefined,
@@ -515,11 +488,9 @@ export function resolveFullPolicyView(
 }
 
 /**
- * Expand a (possibly sparse) policy map into the full tri-state posture for
- * all 27 operations. Used by the orch HTTP admin response, the WS
- * `orch.capabilities` broadcast, and the dashboard's policy page so consumers
- * see the full picture (including which plaintext ops are `encrypted`), not the
- * sparse storage shape.
+ * Expand a sparse policy map into the tri-state posture for every operation,
+ * for the orch HTTP admin response, the WS `orch.capabilities` broadcast and
+ * the dashboard policy page.
  */
 export function resolveFullPolicyStateView(
   policy: DashboardWritePolicyMap | null | undefined,

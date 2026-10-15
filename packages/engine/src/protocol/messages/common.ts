@@ -4,16 +4,14 @@ import { z } from 'zod';
  * Maximum decompressed WebSocket frame size accepted by every KiCI WS endpoint
  * (Platform, orchestrator, agent — both server-side and client-side).
  *
- * Bounds per-frame memory allocation against `permessage-deflate`
- * compression-bomb DoS. Without this cap, `ws@8.x` defaults to 100 MiB,
- * which an unauthenticated attacker can exhaust on the Platform's
- * `/ws` endpoint pre-auth via a single crafted compressed frame.
+ * Bounds per-frame memory against `permessage-deflate` compression bombs:
+ * `ws@8.x` defaults to 100 MiB, which an unauthenticated attacker can exhaust
+ * on the Platform's `/ws` endpoint pre-auth with one crafted compressed frame.
  *
  * 25 MiB matches `WEBHOOK_RELAY_MAX_BODY_BYTES` (and GitHub's own webhook
- * payload cap). The chunked webhook-relay protocol breaks bodies into ~85 KiB
- * frames anyway, so this leaves orders-of-magnitude headroom for every other
- * legitimate WS frame in the system (log.chunk, state.replay, dashboard
- * proxy responses, etc.).
+ * payload cap). The webhook relay chunks bodies into ~85 KiB frames, so this
+ * leaves orders-of-magnitude headroom for every other legitimate frame
+ * (log.chunk, state.replay, dashboard proxy responses, etc.).
  *
  * MUST be passed as `maxPayload` on every `new WebSocket(...)` constructor and
  * on every `WebSocketServer` `options` object across the three packages.
@@ -41,14 +39,11 @@ export const ackSchema = z.object({
 /**
  * Negative acknowledgment - message received but could not be processed.
  *
- * Doubles as the version-skew diagnosability signal: when a peer receives a
- * protocol message type it does not understand, it replies with a NACK naming
- * the unsupported `receivedType` instead of silently dropping the frame (which
- * otherwise surfaces only as a downstream proxy timeout). `messageId` correlates
- * the NACK to a request/response frame when the offending frame carried one; a
- * fire-and-forget control frame omits it and `receivedType` is the diagnostic
- * anchor. Both are optional so an uncorrelatable skew frame still yields a valid
- * NACK.
+ * Doubles as the version-skew signal: a peer that receives a message type it
+ * does not understand replies with a NACK naming the `receivedType`, instead of
+ * dropping the frame (which surfaces only as a downstream proxy timeout).
+ * Both fields are optional, so a fire-and-forget frame with no `messageId`
+ * still yields a valid NACK.
  */
 export const nackSchema = z.object({
   type: z.literal('nack'),
@@ -75,24 +70,20 @@ export const NACK_EXEMPT_MESSAGE_TYPES: ReadonlySet<string> = new Set([
 
 /**
  * Build an unsupported-message NACK for a frame that failed every schema in a
- * direction's recognition chain (version skew: the peer sent a type this build
- * does not understand).
+ * direction's recognition chain (version skew).
  *
- * Returns `null` — meaning "do not NACK, stay drop-and-warn" — when:
- * - `raw` is not an object carrying a non-empty string `type` (genuinely
- *   malformed garbage, not a recognizable-but-unsupported message); OR
- * - the `type` is in `NACK_EXEMPT_MESSAGE_TYPES` (loop guard + streaming); OR
- * - the `type` is in `knownTypes` — a KNOWN message type that failed the
- *   direction's recognition chain is malformed (e.g. an oversized field past
- *   its length bound), not version skew. The caller must close the connection,
- *   never keep it alive with a NACK; only a genuinely-unknown type is a skew
- *   signal.
+ * Returns `null` (do not NACK, stay drop-and-warn) when:
+ * - `raw` is not an object with a non-empty string `type` (malformed garbage); OR
+ * - the `type` is in `NACK_EXEMPT_MESSAGE_TYPES`; OR
+ * - the `type` is in `knownTypes`: a KNOWN type that failed the chain is
+ *   malformed (e.g. a field past its length bound), not version skew. The
+ *   caller must close the connection, never keep it alive with a NACK.
  *
  * `side` names the local peer emitting the NACK (the behind party) for the
  * operator-facing upgrade hint, matching the lock-window "upgrade the
- * orchestrator/Platform" wording. `knownTypes` is the set of message types this
- * build recognizes for the given direction (derived from the schema
- * discriminators by the caller).
+ * orchestrator/Platform" wording. `knownTypes` is the set of types this build
+ * recognizes for the direction, derived by the caller from the schema
+ * discriminators.
  */
 export function buildUnsupportedMessageNack(
   raw: unknown,
@@ -122,6 +113,5 @@ export const errorSchema = z.object({
   message: z.string(),
 });
 
-/** Inferred types from schemas. */
 export type Heartbeat = z.infer<typeof heartbeatSchema>;
 export type Ack = z.infer<typeof ackSchema>;

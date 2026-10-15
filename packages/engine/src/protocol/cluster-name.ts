@@ -1,19 +1,16 @@
 /**
  * Cluster name format for orchestrator identity.
  *
- * Subpath export: consumers import from
- * `@kici-dev/engine/protocol/cluster-name`. Pure Zod + plain TypeScript
- * with no node built-ins; browser-safe.
+ * Subpath export (`@kici-dev/engine/protocol/cluster-name`); browser-safe.
  *
  * Three audiences validate against the same regex:
  *   - Orchestrator: boot resolver + `kici-admin cluster-name set`.
  *   - Platform: `source.register` defense-in-depth on wire payload.
  *   - Dashboard: client-side input validation on future rename UI.
  *
- * DNS-label-ish: lowercase letters, digits, hyphens; starts with a
- * letter; max 63 chars. Matches RFC 1035 label rules narrowed to
- * lowercase, which keeps cluster names safe for URLs without encoding
- * and for filesystem / log identifiers.
+ * RFC 1035 label rules narrowed to lowercase (letters, digits, hyphens;
+ * starts with a letter; max 63 chars), so cluster names are safe in URLs
+ * without encoding and in filesystem / log identifiers.
  */
 import { z } from 'zod';
 
@@ -34,14 +31,13 @@ export const clusterNameSchema = z
 export type ClusterName = z.infer<typeof clusterNameSchema>;
 
 /**
- * Generate a random auto-name in the `cluster-<6hex>` form used when an
- * operator has not supplied a name. The 6-hex suffix gives ~16M values
- * per org; same-org collisions are caught by the Platform's UNIQUE
- * constraint and the orch retries with a fresh suffix.
+ * Generate a random `cluster-<6hex>` auto-name for an operator who supplied
+ * none. The suffix gives ~16M values per org; the Platform's UNIQUE
+ * constraint catches a same-org collision and the orchestrator retries with
+ * a fresh suffix.
  *
- * Accepts an injected `randomBytes` to keep the function testable and
- * to allow the orchestrator caller to use `node:crypto.randomBytes`
- * without pulling a node built-in into this browser-safe module.
+ * `randomBytes` is injected so the function is testable and the orchestrator can pass
+ * `node:crypto.randomBytes` without a Node built-in in this browser-safe module.
  */
 export function generateClusterName(randomBytes: (size: number) => Uint8Array): ClusterName {
   const bytes = randomBytes(3);

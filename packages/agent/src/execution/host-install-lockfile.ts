@@ -3,24 +3,21 @@
  * when the agent's npm is too old to refuse non-registry sources by flag.
  *
  * npm before 11.15.0 has `--allow-git` but no `--allow-remote`, `--allow-file`
- * or `--allow-directory`. A registry package can declare its own dependency on
- * an `https://…/x.tgz` URL, and npm fetches that URL from the agent host,
- * outside the job network's egress filter, the moment it resolves the edge. So
- * with such an npm the host install runs `npm ci`, which installs what the
- * lockfile pins and never rewrites it.
+ * or `--allow-directory`. A registry package can depend on an
+ * `https://…/x.tgz` URL, which npm fetches from the agent host, outside the job
+ * network's egress filter, as soon as it resolves the edge. So with such an npm
+ * the host install runs `npm ci`, which installs what the lockfile pins and
+ * never rewrites it.
  *
- * `npm ci` alone is not enough. Before it compares its result with the
- * lockfile, npm resolves every dependency edge the lockfile leaves open, and
- * resolving an edge fetches its target: a lockfile that omits a package, or
- * records a URL dependency with no locked package for it, makes npm download
- * that URL before it refuses the out-of-sync lockfile. And npm fetches a locked
- * package that has no `resolved` URL from whatever its `version` names: a
+ * `npm ci` alone is not enough. It resolves, and so fetches, every edge the
+ * lockfile leaves open (an omitted package, a URL dependency with no locked
+ * package) before it refuses the out-of-sync lockfile. And it fetches a locked
+ * package with no `resolved` URL from whatever its `version` names: a
  * `http:host:port/x.tgz` URL, a directory or a tarball on the agent host. So the
- * host install runs only when npm's own lockfile reader finds no open edge, and
- * every locked package carries a semver version and a `resolved` tarball on an
- * allowed registry. A package inside a dependency's own tarball
- * (`bundleDependencies`) has no `resolved` of its own and needs only the
- * version.
+ * host install runs only when npm's own lockfile reader finds no open edge and
+ * every locked package has a semver version and a `resolved` tarball on an
+ * allowed registry. A `bundleDependencies` package has no `resolved` of its own
+ * and needs only the version.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -49,7 +46,7 @@ export interface LockEdge {
   spec: string;
   /** The locked package the edge resolves to, or `null` when none. */
   to: unknown;
-  /** Whether the locked package satisfies the edge's spec. */
+  /** The locked package satisfies the edge's spec. */
   valid: boolean;
 }
 
@@ -75,9 +72,9 @@ export interface LockTree {
 
 /** The lockfile reader and version parser of the npm that runs the install. */
 export interface NpmLockReader {
-  /** Loads the virtual tree of the project in a directory from its lockfile. */
+  /** Loads the project's virtual tree from its lockfile. */
   loadTree: (projectDir: string) => Promise<LockTree>;
-  /** Whether a string is a valid semver version, by npm's own `semver`. */
+  /** Validity by npm's own `semver`. */
   isVersion: (version: string) => boolean;
 }
 

@@ -1,10 +1,8 @@
-// The Linux capability set (capabilities(7)), stored in the bare uppercase
-// Docker-API form (no CAP_ prefix — the HostConfig.CapAdd wire form). Single
-// source of truth for the SDK validator, the compiler, and the dispatch
-// resolver. Pure data — safe for the browser-safe engine barrel.
+// The Linux capability set (capabilities(7)) in the bare uppercase Docker
+// HostConfig.CapAdd form (no CAP_ prefix), for the SDK validator, the compiler
+// and the dispatch resolver. Pure data, so browser-safe.
 //
-// Runs CAP_CHOWN=0 through CAP_CHECKPOINT_RESTORE=40 (41 capabilities), the
-// full modern set as of Linux 5.9+ (CHECKPOINT_RESTORE was the last addition).
+// CAP_CHOWN=0 through CAP_CHECKPOINT_RESTORE=40, the last addition (Linux 5.9+).
 export const KNOWN_LINUX_CAPABILITIES: ReadonlySet<string> = new Set([
   'CHOWN',
   'DAC_OVERRIDE',

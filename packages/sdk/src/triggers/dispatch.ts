@@ -1,8 +1,3 @@
-/**
- * Dispatch trigger helper - creates triggers for repository_dispatch events.
- * Returns a frozen DispatchTriggerConfig directly.
- */
-
 import type {
   BranchPattern,
   DispatchConfigInput,
@@ -12,7 +7,7 @@ import type {
 import { toBranchPattern, asArray } from './types.js';
 
 /**
- * Create a repository dispatch trigger configuration.
+ * Create a frozen repository_dispatch trigger configuration.
  *
  * @example
  * // Match any dispatch event

@@ -16,10 +16,9 @@ export function agentPackageKey(version: string, platform: AgentPlatform): strin
 }
 
 /**
- * Parse an `agent-packages/<version>/kici-agent-<platform>.tar.gz` key back into
- * its version + platform, or null when the key is not a payload tarball (e.g. a
- * `.sha256` sidecar or an unrelated key). Used to discover the fleet's platform
- * set from the store on upgrade.
+ * Parse a payload key back into its version and platform; null for any other key
+ * (a `.sha256` sidecar, an unrelated key). Discovers the fleet's platform set
+ * from the store on upgrade.
  */
 export function parseAgentPackageKey(
   key: string,

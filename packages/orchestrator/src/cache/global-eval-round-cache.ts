@@ -3,16 +3,14 @@
  *
  * **This cache only helps webhook redelivery and same-input re-deliveries.** Its
  * key pins the source commit and a digest of the whole round input, and every
- * real push carries a new source SHA — so a developer pushing twice gets two
- * rounds, by design. Read it as a duplicate-delivery guard, never as a
- * steady-state optimization: sizing it up buys nothing, and a hit rate near zero
- * on a healthy cluster is the expected shape, not a defect.
+ * real push carries a new source SHA, so two pushes get two rounds by design. It
+ * is a duplicate-delivery guard, not a steady-state optimization: sizing it up
+ * buys nothing, and a hit rate near zero on a healthy cluster is expected.
  *
- * There is deliberately no TTL. A round verdict is a pure function of its
- * inputs, and {@link globalEvalRoundCacheKey} covers all of them, so an entry
- * cannot go stale within its own key — the same content-addressable argument the
- * lock-file and content caches make for their SHA-keyed entries, without their
- * branch-name escape hatch.
+ * Deliberately no TTL: a round verdict is a pure function of its inputs, and
+ * {@link globalEvalRoundCacheKey} covers all of them, so an entry cannot go stale
+ * within its key — the content-addressable argument of the lock-file and content
+ * caches, without their branch-name escape hatch.
  */
 
 import { createHash } from 'node:crypto';
@@ -29,32 +27,28 @@ const KEY_SEPARATOR = '\u0000';
 /**
  * Key one round over **every input its verdict depends on**.
  *
- * The three SHAs are not enough, and the gap is a wrong-answer bug rather than a
- * missed-hit one. `createFilterContext` and `buildGeneratorContext` both receive
- * the whole event, so a filter can branch on `event.type`, `targetBranch`,
- * `changedFiles`, or anything in the raw payload. A push to `main` at commit X
- * and a pull-request synchronize whose head is commit X share all three SHAs and
- * genuinely deserve different verdicts: their events differ, and their
- * changed-file sets are computed over different ranges. Two branches pointing at
- * one commit collide the same way. `workflowRoutingKey` is in the key for the
- * reason `groupCandidates` keeps it in the group key — it selects the provider
+ * The SHAs alone would give wrong answers, not just missed hits.
+ * `createFilterContext` and `buildGeneratorContext` both receive the whole event,
+ * so a filter can branch on `event.type`, `targetBranch`, `changedFiles`, or
+ * anything in the raw payload. A push to `main` at commit X and a pull-request
+ * synchronize whose head is X share every SHA yet deserve different verdicts
+ * (different events, changed files computed over different ranges); two branches
+ * at one commit collide the same way. `workflowRoutingKey` is in the key for the
+ * reason `groupCandidates` keeps it in the group key: it selects the provider
  * bundle that mints the clone credentials.
  *
- * `sourceRepoIdentifier` is its own component, placed next to `sourceSha` so the
- * source repo and its commit stay adjacent. Every event already carries its
- * source repo, so the event digest covers it too — but keying it explicitly
- * makes that coverage structural rather than incidental: an event shape that
+ * `sourceRepoIdentifier` sits next to `sourceSha`. The event digest covers it
+ * too, but keying it explicitly makes that structural: an event shape that
  * stopped carrying the source repo could otherwise collide two repos' rounds.
  *
- * The candidate list and the event are folded in as a SHA-256 digest of their
- * JSON, so the key stays a bounded string no matter how large a payload is. Both
- * are rebuilt by the same code from the same delivery, so a genuine redelivery
- * reproduces the digest; anything else is a miss, which costs a round rather
- * than a wrong verdict.
+ * The candidate list and the event enter as a SHA-256 digest of their JSON, so
+ * the key stays bounded. The same code rebuilds both from the same delivery, so a
+ * genuine redelivery reproduces the digest; anything else is a miss, which costs
+ * a round rather than a wrong verdict.
  *
- * Returns `null` when the inputs cannot be serialized. A round that cannot be
- * keyed is not cached — never keyed on a partial input, which is how a
- * cache starts answering questions it was not asked.
+ * Returns `null` when the inputs cannot be serialized: a round is never keyed on
+ * a partial input, which is how a cache starts answering questions it was not
+ * asked.
  */
 export function globalEvalRoundCacheKey(args: {
   workflowRepoIdentifier: string;
@@ -91,18 +85,16 @@ export function globalEvalRoundCacheKey(args: {
  * An agent-side budget breach reports `success` with the affected candidates
  * marked indeterminate — the whole round on a round-budget breach, one workflow
  * on a candidate-budget breach. Caching either turns one slow round into a
- * permanently replayed failure for the whole key: a webhook redelivery, which
- * is exactly when an operator is retrying, would be served the stored failure
- * instead of running again, and the round's own retry sits behind this cache
- * read so a stored breach short-circuits that too.
+ * permanently replayed failure for the key: a webhook redelivery (exactly when an
+ * operator retries) would be served the stored failure, and the round's own retry
+ * sits behind this cache read, so it short-circuits too.
  *
- * Requiring EVERY candidate to be decided costs almost no hit rate — an
- * indeterminate verdict is the exceptional path — and buys a guarantee that is
- * easy to state: nothing a redelivery replays was ever undecided.
+ * Requiring EVERY candidate decided costs almost no hit rate (indeterminate is the
+ * exceptional path) and guarantees nothing a redelivery replays was undecided.
  *
- * An empty candidate list is not cacheable either. For a non-empty group it
- * means every candidate is about to be recorded as "no verdict", which is the
- * same failure by another route.
+ * An empty candidate list is not cacheable either: for a non-empty group every
+ * candidate is about to be recorded as "no verdict", the same failure by another
+ * route.
  */
 export function isCacheableRoundResult(result: GlobalEvalRoundResult): boolean {
   const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
@@ -129,7 +121,7 @@ export class GlobalEvalRoundCache {
     this.cache.set(key, value);
   }
 
-  /** Hit/miss counters for metrics and debugging. */
+  /** For metrics and debugging. */
   stats(): { hits: number; misses: number; size: number } {
     return { hits: this.hits, misses: this.misses, size: this.cache.size };
   }

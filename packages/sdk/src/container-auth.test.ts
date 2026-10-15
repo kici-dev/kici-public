@@ -19,8 +19,8 @@ describe('ContainerConfig.auth', () => {
   });
 
   it('accepts a runtime-derived token via the *Value half', () => {
-    // A token fetched during the run has no secret-store entry to name, so the
-    // `*Value` half of the Sourced pair carries the material itself.
+    // A token fetched during the run has no secret-store entry, so the `*Value`
+    // half carries the material itself.
     const j = job('build', {
       container: { image: 'reg:5000/acme/ci:1.2', auth: { tokenValue: 'fetched-at-runtime' } },
       runsOn: ['kici:os:linux'],

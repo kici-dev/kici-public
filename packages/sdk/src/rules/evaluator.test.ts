@@ -64,8 +64,7 @@ describe('evaluateRules — evaluationError (throw vs clean false)', () => {
 
   it('the exact repro — reading an undefined event field throws a TypeError → evaluationError', async () => {
     // rule('main only', ctx => ctx.event.ref.endsWith('main')) on an event with
-    // no ref: reading .endsWith on undefined throws a TypeError. This is the
-    // finding's canonical repro — a crashed gate must NOT be a clean false.
+    // no ref throws a TypeError; a crashed gate must NOT be a clean false.
     const noRefCtx = createRuleContext({ event: { type: 'push' }, changedFilesStatus: 'fetched' });
     const result = await evaluateRules(
       [rule('main only', (c) => (c.event as { ref?: string }).ref!.endsWith('main'))],

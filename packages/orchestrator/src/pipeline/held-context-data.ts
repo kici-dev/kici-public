@@ -112,11 +112,9 @@ interface LogFields {
 
 /**
  * Resolve the merged variables and secrets of `entries`, then the container
- * registry credentials, writing each onto `into` as soon as it resolves. A
- * context that has no scope binding is named in a warning log line.
- *
- * Writing progressively keeps what already resolved when a later step throws,
- * which is what the dispatch path's catch relies on.
+ * registry credentials, writing each onto `into` as soon as it resolves, so the
+ * dispatch path's catch keeps what resolved before a later step throws. A
+ * context with no scope binding is named in a warning log line.
  */
 export async function resolveContextJobData(args: {
   deps: ContextDataDeps;
@@ -165,19 +163,16 @@ async function resolveRegistryAuthInto(args: {
   const resolver = deps.secretResolver;
   const contextStore = deps.contextStore;
   if (!resolver || !contextStore) return;
-  // Private-registry credentials for the job's container image. Resolved HERE,
-  // orchestrator-side: the lock carries `<context>:<secret-name>` references and
-  // the agent never resolves a secret itself. The reference names its own
-  // context, so it goes through the job secret gate — which runs that context's
-  // protection rules — rather than a direct lookup. The same rule
-  // `gitCredentials` follows.
+  // Resolved orchestrator-side: the lock carries `<context>:<secret-name>`
+  // references and the agent never resolves a secret. The reference names its
+  // own context, so it goes through the job secret gate (that context's
+  // protection rules), as `gitCredentials` does, not a direct lookup.
   //
-  // Stripped when the contributor is untrusted, exactly as install secrets are
-  // stripped: the pull fails naturally on the first private image and no token
-  // bytes leave the orchestrator. The refs come from the base-branch lock for a
-  // fork pull request, so there is no forgery here — the exposure is that the
-  // resolved `{username, password}` lands in `jobConfig`, which the job's own
-  // process reads.
+  // Stripped for an untrusted contributor, as install secrets are: the pull
+  // fails on the first private image and no token bytes leave the orchestrator.
+  // A fork PR's refs come from the base-branch lock, so the risk is not forgery
+  // but the resolved `{username, password}` landing in `jobConfig`, which the
+  // job's own process reads.
   const { container, dispatchCtx, trustTier, admittedContextIds } = registryAuth;
   if (isUntrustedTier(trustTier)) {
     containerRegistryAuthContributorStrippedTotal.add(1, { trust_tier: trustTier ?? 'unknown' });
@@ -188,10 +183,9 @@ async function resolveRegistryAuthInto(args: {
     return;
   }
   // The AUTH resolver, not the spawn resolver: a job that builds its image has
-  // no spawn (the image does not exist yet) but still needs credentials for the
-  // Dockerfile's own `FROM` base.
-  // A failure raised by the store or the resolver itself, as opposed to a
-  // refusal this job earned; only this kind throws under `omit`.
+  // no spawn yet but still needs credentials for the Dockerfile's `FROM` base.
+  // `lookupFailure`: a store or resolver failure, not a refusal this job earned;
+  // only this kind throws under `omit`.
   let lookupFailure: unknown;
   try {
     into.containerRegistryAuth = await resolveContainerRegistryAuth(container, {
@@ -279,9 +273,8 @@ export function withoutContextData(
  * The job's own contexts are not re-gated: it passed their rules, or its hold
  * was released. Throws when the record is malformed, the stores are
  * unavailable, a bound context is gone or replaced, or a lookup fails, so the
- * caller fails the job rather than dispatching it without the secrets it was
- * bound to. A registry-auth refusal leaves the job without registry
- * credentials, as dispatch does.
+ * caller fails the job rather than dispatching it without its bound secrets.
+ * A registry-auth refusal only drops registry credentials, as dispatch does.
  */
 export async function resolveReleasedJobInput(args: {
   jobInput: QueuedJobInput;

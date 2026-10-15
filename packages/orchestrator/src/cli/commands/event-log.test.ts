@@ -1,15 +1,12 @@
 /**
- * Tests for `kici-admin event-log` CLI subcommands.
- *
- * Covers flag forwarding to the admin API client (including the --action
- * filter). The HTTP round trip needs a live orchestrator; this file covers
- * argument parsing and flag forwarding.
+ * Argument parsing and flag forwarding to the admin API client (including the
+ * --action filter). The HTTP round trip needs a live orchestrator.
  */
 
 import { describe, expect, it } from 'vitest';
-import { Command } from 'commander';
 import { registerEventLogCommands } from './event-log.js';
 import type { AdminApiClient } from '../api-client.js';
+import { runCli } from '../../__test-helpers__/cli.js';
 
 interface CommandResult {
   stdout: string;
@@ -18,45 +15,7 @@ interface CommandResult {
 }
 
 async function runCommand(args: string[], client: Partial<AdminApiClient>): Promise<CommandResult> {
-  const program = new Command();
-  program.exitOverride();
-  registerEventLogCommands(program, () => client as AdminApiClient);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: unknown[]) => logs.push(a.join(' '));
-  console.error = (...a: unknown[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as never;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err) {
-    const message = (err as { message?: string } | null)?.message ?? '';
-    if (!message.startsWith('EXIT:')) {
-      const code = (err as { code?: string } | null)?.code;
-      if (!code?.startsWith('commander.')) {
-        console.log = origLog;
-        console.error = origError;
-        process.exit = origExit;
-        throw err;
-      }
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
+  return runCli((p) => registerEventLogCommands(p, () => client as AdminApiClient), args);
 }
 
 describe('kici-admin event-log list --action', () => {

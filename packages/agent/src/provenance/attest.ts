@@ -35,18 +35,14 @@ export interface DeferredAttestationReport {
 export interface AttestDeps {
   /** Relay: returns a minted KiCI ID token or a transient `deferred` signal. */
   getIdToken: (opts: { audience: string }) => Promise<OidcTokenResult>;
-  /** Upload the serialized bundle; returns the storage key it was written to. */
+  /** Returns the storage key the bundle was written to. */
   persist: (bundle: KiciBundle, subjectDigest: string) => Promise<string>;
-  /**
-   * Report a frozen, DSSE-signed statement for later minting (the transient
-   * mint-failure path). Required only when the relay may defer; the live path
-   * never calls it.
-   */
+  /** Transient mint-failure path only; required only when the relay may defer. */
   reportDeferred?: (report: DeferredAttestationReport) => Promise<void>;
   /** Agent-local job facts used to freeze a statement when the mint defers. */
   localContext?: LocalBuildContext;
   builderVersions: { 'kici-agent': string; 'kici-orchestrator': string };
-  /** Injectable clock for deterministic tests; defaults to wall time. */
+  /** Injectable for tests; defaults to wall time. */
   now?: () => string;
 }
 
@@ -55,7 +51,6 @@ export interface AttestInput {
   audience?: string;
 }
 
-/** A minted-and-uploaded attestation, or a deferred one captured for later. */
 export type AttestResult =
   | { storageKey: string; bundle: KiciBundle; subjectDigest: string }
   | { deferred: true; statementHash: string; subjectDigest: string };
@@ -65,21 +60,19 @@ export async function attestProvenance(
   input: AttestInput,
 ): Promise<AttestResult> {
   const audience = input.audience ?? KICI_PROVENANCE_AUDIENCE;
-  // Validate the subject digest up front so a malformed subject fails before we
-  // mint an identity token and sign anything.
+  // Validates the subject before minting or signing anything.
   const subjectDigest = subjectDigestString(input.subject);
   const tokenResult = await deps.getIdToken({ audience });
 
-  // Transient mint failure: freeze + DSSE-sign the statement from agent-local
-  // facts now, report it, and let the job stay green. The identity token is
-  // minted later and bound to this statement by its hash.
+  // Transient mint failure: the job stays green; the identity token is minted
+  // later and bound to the frozen statement by its hash.
   if ('deferred' in tokenResult) {
     return deferAttestation(deps, input, subjectDigest, audience);
   }
   const { token } = tokenResult;
 
-  // The token came from the trusted relay this same process just called; the
-  // consumer (verifier) is what validates it against the JWKS. We only decode.
+  // From the trusted relay this process just called; the verifier validates it
+  // against the JWKS, so only decode here.
   const claims = decodeJwt(token) as unknown as ProvenanceTokenClaims;
 
   const now = (deps.now ?? (() => new Date().toISOString()))();
@@ -107,9 +100,8 @@ export async function attestProvenance(
 }
 
 /**
- * Freeze + DSSE-sign the provenance statement from agent-local job facts and
- * report it for later minting. The step does NOT throw — the job completes
- * green and the attestation surfaces as `deferred`.
+ * Freezes + DSSE-signs the statement from agent-local facts for later minting.
+ * The job completes green and the attestation surfaces as `deferred`.
  */
 async function deferAttestation(
   deps: AttestDeps,
@@ -146,13 +138,11 @@ async function deferAttestation(
 }
 
 /**
- * Pick the primary digest (`sha256` preferred) as the storage-key discriminator.
- * Throws when the subject carries no digest: an empty digest set would otherwise
- * yield an `undefined` storage-key segment (`provenance/<run>/<job>/undefined.kici.json`)
- * and an unverifiable statement, since in-toto requires every subject to carry
- * at least one digest. The SDK `ProvenanceSubjectInput` type allows an empty
- * digest map (both `sha256` and `sha512` are optional), so this is the runtime
- * boundary that upholds the engine `digestSetSchema` invariant.
+ * The primary digest (`sha256` preferred), the storage-key discriminator. The
+ * SDK `ProvenanceSubjectInput` allows an empty digest map, so this runtime
+ * boundary upholds the engine `digestSetSchema` invariant: an empty set would
+ * give an `undefined.kici.json` storage key and an in-toto statement no
+ * verifier accepts.
  */
 export function subjectDigestString(subject: ProvenanceSubject): string {
   const digest = subject.digest.sha256 ?? Object.values(subject.digest)[0];

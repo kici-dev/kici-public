@@ -1,12 +1,15 @@
 /**
- * Filesystem-backed log storage.
+ * Filesystem-backed log storage: append-only JSONL files with cursor-based pagination.
+ * Lifecycle is operator-managed (the retention sweep runs on the S3 backend only).
  *
- * Stores execution logs as files on disk. Lifecycle is operator-managed (the
- * cleanup retention sweep runs on the S3 backend only). Supports append-only
- * writes (JSONL accumulation) and cursor-based pagination.
+ * Layout: {basePath}/executions/{runId}/job-{name}/step-{index}.log
  *
- * File layout:
- *   {basePath}/executions/{runId}/job-{name}/step-{index}.log
+ * A logical key maps to the same relative path on disk, `/` separating directories. On a
+ * Windows host, each character Windows refuses in a file name (`"`, `*`, `:`, `<`, `>`, `?`,
+ * `|`, `\` and the control characters 1-31) is stored as the private-use character
+ * U+F000 + its code, the mapping Cygwin uses for the same set. Every name Windows accepts maps
+ * to itself, so the mapping moves no file a Windows host could already write, and `list()`
+ * decodes the names back to logical keys.
  */
 
 import { appendFile, mkdir, readFile, readdir, stat, unlink } from 'node:fs/promises';
@@ -16,41 +19,60 @@ import type { LogReadOptions, LogReadResult, LogStorage } from './log-storage.js
 
 interface FilesystemLogStorageOptions {
   basePath: string;
+  /** Host platform; `win32` turns on the file-name mapping. Defaults to `process.platform`. */
+  platform?: NodeJS.Platform;
+}
+
+/** Characters a Windows file name cannot hold. NUL never reaches here: `assertSafeLogPath` refuses it. */
+const WIN32_RESERVED_CHAR_RE = /["*:<>?|\\\u0001-\u001f]/g;
+/** The private-use characters `WIN32_RESERVED_CHAR_RE` maps onto. */
+const WIN32_MAPPED_CHAR_RE = /[\uf001-\uf01f\uf022\uf02a\uf03a\uf03c\uf03e\uf03f\uf05c\uf07c]/g;
+const WIN32_PRIVATE_USE_OFFSET = 0xf000;
+
+/** Logical name segment → Windows-safe file name. */
+function encodeWin32Segment(segment: string): string {
+  return segment.replace(WIN32_RESERVED_CHAR_RE, (ch) =>
+    String.fromCharCode(WIN32_PRIVATE_USE_OFFSET + ch.charCodeAt(0)),
+  );
+}
+
+/** Windows file name → logical name segment. */
+function decodeWin32Segment(name: string): string {
+  return name.replace(WIN32_MAPPED_CHAR_RE, (ch) =>
+    String.fromCharCode(ch.charCodeAt(0) - WIN32_PRIVATE_USE_OFFSET),
+  );
 }
 
 export class FilesystemLogStorage implements LogStorage {
   private readonly basePath: string;
+  private readonly mapWin32Names: boolean;
 
   constructor(options: FilesystemLogStorageOptions) {
     this.basePath = resolve(options.basePath);
+    this.mapWin32Names = (options.platform ?? process.platform) === 'win32';
   }
 
   // -- Paths --
 
   /**
-   * Resolve a logical log path to an absolute filesystem path, refusing
-   * anything that would address a file outside the storage root.
+   * Resolve a logical log path to an absolute path, refusing anything outside the storage root.
    *
-   * Two checks, deliberately both. `assertSafeLogPath` is the effective gate on
-   * POSIX: once a path is relative and carries no `..` segment, `resolve()`
-   * cannot produce anything outside the root, so the comparison below is
-   * unreachable there. It is kept as a second, independent statement of the
-   * same invariant — it is what catches a resolver with extra escape hatches
-   * (win32 resolves a drive-relative `C:foo` against that drive's own cwd, not
-   * against the root), and it means relaxing the logical check cannot silently
-   * reopen an escape.
+   * Two checks, deliberately. `assertSafeLogPath` is the effective gate on POSIX (a relative
+   * path with no `..` cannot resolve outside the root), so the comparison below is unreachable
+   * there. It stays as an independent statement of the invariant: it catches resolvers with
+   * extra escape hatches (win32 resolves drive-relative `C:foo` against that drive's cwd, a form
+   * the Windows name mapping already turns into a plain name), and relaxing the logical check
+   * cannot silently reopen an escape.
    *
-   * Both checks are lexical — neither resolves symlinks. A symlink planted
-   * inside the log root still redirects a logically-clean path outside it;
-   * containing that would need a `realpath` on every call, and the log root is
-   * the orchestrator user's own directory.
+   * Both are lexical — neither resolves symlinks. A symlink planted inside the log root still
+   * redirects a clean path outside it; containing that needs a `realpath` per call, and the log
+   * root is the orchestrator user's own directory.
    *
-   * Every verb on this class funnels through here, so a new caller is
-   * contained on arrival.
+   * Every verb funnels through here, so a new caller is contained on arrival.
    */
   private fullPath(path: string): string {
     assertSafeLogPath(path);
-    const full = resolve(this.basePath, path);
+    const full = resolve(this.basePath, this.toDiskPath(path));
     // The equality arm lets an empty / `.` prefix address the root itself.
     if (full !== this.basePath && !full.startsWith(this.basePath + sep)) {
       throw new Error(`log path escapes the storage root: ${path}`);
@@ -58,18 +80,31 @@ export class FilesystemLogStorage implements LogStorage {
     return full;
   }
 
+  /**
+   * Logical key → relative on-disk path. Identity off Windows. On Windows a key that already
+   * holds one of the mapped private-use characters is refused: `list()` would decode it to a
+   * different key, so writing it would break the round trip.
+   */
+  private toDiskPath(path: string): string {
+    if (!this.mapWin32Names) return path;
+    if (path.search(WIN32_MAPPED_CHAR_RE) !== -1) {
+      throw new Error(`log path holds a character reserved for Windows file-name mapping: ${path}`);
+    }
+    return path.split('/').map(encodeWin32Segment).join('/');
+  }
+
+  /** Path relative to the base path, as the host separates it → logical `/`-separated key. */
+  private toLogicalKey(relativePath: string): string {
+    const segments = relativePath.split(sep);
+    return (this.mapWin32Names ? segments.map(decodeWin32Segment) : segments).join('/');
+  }
+
   // -- Helpers --
 
-  /**
-   * Ensure the directory for a given file path exists.
-   */
   private async ensureDir(filePath: string): Promise<void> {
     await mkdir(dirname(filePath), { recursive: true });
   }
 
-  /**
-   * Check if a file exists on disk.
-   */
   private async fileExists(filePath: string): Promise<boolean> {
     try {
       await stat(filePath);
@@ -80,9 +115,7 @@ export class FilesystemLogStorage implements LogStorage {
     }
   }
 
-  /**
-   * Get the size of a file in bytes. Returns 0 if the file doesn't exist.
-   */
+  /** Bytes; 0 if the file doesn't exist. */
   private async fileSize(filePath: string): Promise<number> {
     try {
       const s = await stat(filePath);
@@ -93,10 +126,7 @@ export class FilesystemLogStorage implements LogStorage {
     }
   }
 
-  /**
-   * Recursively list all files under a directory, returning paths relative
-   * to the base path.
-   */
+  /** Recursive; logical keys relative to the base path. */
   private async listRecursive(dirPath: string): Promise<string[]> {
     const results: string[] = [];
 
@@ -108,7 +138,7 @@ export class FilesystemLogStorage implements LogStorage {
           const nested = await this.listRecursive(entryPath);
           results.push(...nested);
         } else {
-          results.push(relative(this.basePath, entryPath));
+          results.push(this.toLogicalKey(relative(this.basePath, entryPath)));
         }
       }
     } catch (err: unknown) {
@@ -128,8 +158,7 @@ export class FilesystemLogStorage implements LogStorage {
   }
 
   async appendStreaming(path: string, data: string): Promise<void> {
-    // appendFile is already atomic + durable, so a step log needs no buffering
-    // on the filesystem backend.
+    // appendFile is already atomic + durable, so no buffering here.
     await this.append(path, data);
   }
 

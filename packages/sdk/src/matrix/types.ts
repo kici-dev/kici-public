@@ -1,9 +1,8 @@
 import type { $ as Shell } from 'zx';
 import type { Logger } from '../context.js';
 
-// Pure matrix value types live in @kici-dev/engine (so the orchestrator can
-// expand matrices without depending on the SDK). Re-export them here so SDK
-// consumers keep importing the same names.
+// Pure matrix value types live in @kici-dev/engine so the orchestrator can
+// expand matrices without the SDK; re-exported here for SDK consumers.
 export type {
   StaticMatrixArray,
   StaticMatrixObject,

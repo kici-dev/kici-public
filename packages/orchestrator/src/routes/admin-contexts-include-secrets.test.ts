@@ -4,15 +4,14 @@ import { createAdminContextRoutes } from './admin-contexts.js';
 import { RbacEnforcer } from '../secrets/rbac.js';
 
 /**
- * Build a hand-rolled chained Kysely-style mock that supports the two
- * shapes used by the GET /contexts handler:
+ * Chained Kysely-style mock for the GET /contexts handler's query shapes:
  *
  *   1. envStore.list(orgId)  →  selectFrom('contexts').selectAll().where().orderBy().execute()
- *   2. The new include-secrets join →
+ *   2. The include-secrets join →
  *      selectFrom('context_bindings as eb').innerJoin('scoped_secrets as ss', ...)
  *        .select(...).where().where().where().distinct().execute()
  *
- * The two shapes diverge at the first call after selectFrom (`selectAll` vs `innerJoin`).
+ * They diverge at the first call after selectFrom (`selectAll` vs `innerJoin`).
  */
 function buildMockDb(opts: {
   envRows: unknown[];
@@ -54,10 +53,8 @@ function buildMockDb(opts: {
 }
 
 /**
- * Build a parent Hono app that injects the `role` + `userId` context vars
- * (normally set by the admin auth middleware in admin.ts) and mounts the
- * context routes underneath. This lets us hit the routes directly
- * without standing up the full auth stack.
+ * Parent app injecting `role` + `userId` (normally set by the admin auth
+ * middleware in admin.ts), so the routes run without the full auth stack.
  */
 function buildTestApp(deps: { db: any; rbac: RbacEnforcer }) {
   const inner = createAdminContextRoutes(deps);

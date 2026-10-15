@@ -15,8 +15,8 @@ describe('parseVersionBase', () => {
     expect(parseVersionBase('0.5.0.1')).toBeNull();
     expect(parseVersionBase('v0.5.0')).toBeNull();
     expect(parseVersionBase('latest')).toBeNull();
-    // `Number('')` is 0 and `Number(' 1')` is 1, so a digits-only test — not a
-    // `Number.isNaN` test on the raw part — is what rejects these.
+    // `Number('')` is 0 and `Number(' 1')` is 1, so only a digits-only test (not
+    // `Number.isNaN` on the raw part) rejects these.
     expect(parseVersionBase('0..0')).toBeNull();
     expect(parseVersionBase('0. 5.0')).toBeNull();
   });
@@ -38,8 +38,8 @@ describe('agentVersionAtLeast', () => {
 
   it('accepts a prerelease of the minimum', () => {
     // The suffixes in play are build counters, not release candidates: strict
-    // semver would order `0.5.0-9159` below `0.5.0` and read every agent on a
-    // prerelease build as too old for a feature it in fact carries.
+    // semver would order `0.5.0-9159` below `0.5.0` and read every prerelease-build
+    // agent as too old for a feature it carries.
     expect(agentVersionAtLeast('0.5.0-9159', '0.5.0')).toBe(true);
   });
 

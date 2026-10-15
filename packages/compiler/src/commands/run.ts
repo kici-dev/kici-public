@@ -53,11 +53,8 @@ import { confirm as inquirerConfirm } from '@inquirer/prompts';
 import type { RemoteRunOptions, RemoteRunResult } from './preview.js';
 
 /**
- * True when the Platform run-status snapshot reports a terminal run status.
- *
- * Resolves through the engine's canonical vocabulary rather than matching a
- * hand-written literal set, so a newly-added terminal status never leaves
- * `kici run` polling a finished run forever.
+ * Resolves through the engine's canonical vocabulary, not a hand-written literal
+ * set, so a newly-added terminal status never leaves `kici run` polling forever.
  */
 function isTerminalRunStatus(status: string): boolean {
   const canonical = toCanonicalStatus(status.toLowerCase());
@@ -65,10 +62,8 @@ function isTerminalRunStatus(status: string): boolean {
 }
 
 /**
- * Compile `--target` selector strings into a {@link HostTargetSelector}. Each
- * string becomes one AND value (its own include set); repeated values
- * AND-combine. Returns undefined when no `--target` is given. Throws when
- * `--target-allow-empty` is set without at least one `--target`.
+ * Each `--target` string becomes its own include set; repeated values AND-combine.
+ * Throws when `--target-allow-empty` is set without a `--target`.
  */
 export function buildTargetSelector(
   targets: string[] | undefined,
@@ -87,11 +82,9 @@ export function buildTargetSelector(
 }
 
 /**
- * Look up the dispatch-trigger `inputs` descriptor for a workflow from a parsed
- * inline lock file. When `workflowName` is given, only that workflow's dispatch
- * triggers are considered; otherwise descriptors across all workflows are merged
- * (best-effort fast-fail — the orchestrator re-validates against the matched
- * workflow authoritatively). Returns undefined when no dispatch inputs declared.
+ * Without `workflowName`, merges the dispatch `inputs` descriptors of every
+ * workflow: a best-effort fast-fail, since the orchestrator re-validates against
+ * the matched workflow authoritatively.
  */
 export function lookupDispatchInputsDescriptor(
   inlineLockFile: string | undefined,
@@ -119,10 +112,8 @@ export function lookupDispatchInputsDescriptor(
 }
 
 /**
- * Validate raw `--input KEY=VALUE` pairs against the (optional) lock descriptor
- * and return the raw operator pairs verbatim. The CLI fast-fails on malformed /
- * invalid input for UX, but forwards the **raw** strings — the orchestrator is
- * authoritative and applies coercion + defaults exactly once.
+ * Fast-fails on invalid `--input` pairs but returns the **raw** strings: the
+ * orchestrator is authoritative and applies coercion and defaults exactly once.
  */
 export function buildDispatchInputs(
   pairs: string[],
@@ -132,36 +123,25 @@ export function buildDispatchInputs(
   const raw = parseInputPairs(pairs);
   if (descriptor) {
     const r = coerceDispatchInputs(raw, descriptor);
-    if ('error' in r) throw r.error; // fast-fail UX; orchestrator re-validates authoritatively
+    if ('error' in r) throw r.error;
   }
   return raw;
 }
 
-/** Interval between status/log polls while a run is active. */
 const POLL_INTERVAL_MS = 750;
 
 /**
- * How long a freshly triggered run may still read as missing before a 404 is
- * reported as a real error.
- *
- * The trigger call answers with the run id as soon as the orchestrator has
- * created the run, while the Platform's view of that run arrives over the
- * relay a moment later. The first poll therefore fires while the run is not
- * yet readable and legitimately 404s. Within this budget — and only until the
- * first successful read — a 404 means "not visible yet" and the poll retries;
- * after it, or once the run has been read at least once, a 404 is surfaced as
- * a genuinely missing run.
+ * The trigger answers once the orchestrator creates the run, but the Platform's
+ * view arrives over the relay later, so the first poll can legitimately 404.
+ * Within this budget, and only until the first successful read, a 404 retries;
+ * after that it is a genuinely missing run.
  */
 const RUN_VISIBILITY_GRACE_MS = 30_000;
 
 /**
- * Run `fn` with everything written to `process.stdout` redirected to
- * `process.stderr`, then restore the original writer. Compiling a repo
- * evaluates every user workflow / fixture module, and a `console.log` at a
- * module's top level writes straight to stdout. On a machine-readable
- * (`--json`) run that stdout MUST carry only the final JSON result, so the
- * compile phases run inside this guard — workflow log output belongs on
- * stderr regardless.
+ * Compiling evaluates every user workflow and fixture module, and a top-level
+ * `console.log` writes straight to stdout. A `--json` stdout MUST carry only the
+ * final JSON result, so compile phases run with stdout redirected to stderr.
  */
 export async function withStdoutOnStderr<T>(fn: () => Promise<T>): Promise<T> {
   const realWrite = process.stdout.write.bind(process.stdout);
@@ -174,16 +154,13 @@ export async function withStdoutOnStderr<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Recompile `.kici/workflows` → `kici.lock.json` before a remote run. The
- * orchestrator matches triggers and dispatches against the inline lock, so a
- * stale lock would route an edited or newly-added workflow incorrectly. Returns
- * false on a compile/validation error so the caller can abort before any upload
- * or dispatch.
+ * The orchestrator matches triggers against the inline lock, so a stale lock
+ * would route an edited or new workflow incorrectly. Returns false on a compile
+ * error so the caller aborts before any upload or dispatch.
  */
 async function compileBeforeRemoteRun(options: RemoteRunOptions): Promise<boolean> {
-  // Keep stdout pure for machine-readable runs: --json (and --quiet) must not
-  // carry the compile / auto-types success lines — nor any user workflow's
-  // module-top-level console.log — before the JSON result.
+  // --json and --quiet stdout carries neither compile success lines nor user
+  // module-top-level console.log output.
   const pureStdout = Boolean(options.json || options.quiet);
   const compile = () =>
     compileCommand({
@@ -191,8 +168,7 @@ async function compileBeforeRemoteRun(options: RemoteRunOptions): Promise<boolea
       check: false,
       verbose: options.debug ?? false,
       quiet: pureStdout,
-      // The types refresh reads the orchestrator this run goes to, so a
-      // direct run never reaches a saved Platform login.
+      // So the types refresh of a direct run never reaches a saved Platform login.
       orchestratorUrl: options.orchestratorUrl,
     });
   return pureStdout ? withStdoutOnStderr(compile) : compile();
@@ -211,19 +187,16 @@ export async function runRemoteCommand(
   }
 
   try {
-    // Fail fast on an invalid --target / --target-allow-empty combination (and
-    // an unsafe regex / invalid glob) before any compile or dispatch work.
+    // Fail fast on an invalid selector (or unsafe regex / invalid glob) before
+    // any compile or dispatch work.
     buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
 
-    // --workflow without a fixture: direct workflow run (bypass triggers)
     if (options.workflow && !fixture && !options.all) {
       return await runDirectWorkflow(options.workflow, options);
     }
 
-    // Resolve .kici directory
     const kiciDir = resolveKiciDir(options.kiciDir);
 
-    // --history: show recent run history
     if (options.history) {
       const history = new RunHistory();
       await history.load();
@@ -232,18 +205,13 @@ export async function runRemoteCommand(
       return true;
     }
 
-    // Compile fixtures. In machine-readable mode, isolate any module-top-level
-    // console.log a fixture emits when evaluated so it cannot corrupt the JSON
-    // result that stdout must carry alone.
     const testsDir = path.join(kiciDir, 'tests');
     const fixtures = options.json
       ? await withStdoutOnStderr(() => compileFixtures(testsDir))
       : await compileFixtures(testsDir);
 
-    // Determine which fixtures to run
     let selected: CompiledFixture[];
     if (options.pick) {
-      // No fixtures at all: fall through to the help/empty message.
       if (fixtures.length === 0) {
         return listFixtures(fixtures);
       }
@@ -257,7 +225,6 @@ export async function runRemoteCommand(
         throw err;
       }
     } else if (!fixture && !options.all) {
-      // No fixture arg and no --all: list available fixtures
       return listFixtures(fixtures);
     } else if (options.all) {
       selected = fixtures;
@@ -271,7 +238,6 @@ export async function runRemoteCommand(
       return false;
     }
 
-    // Run selected fixtures remotely
     return await runFixturesRemotely(selected, options);
   } catch (error) {
     const message = toErrorMessage(error);
@@ -285,11 +251,6 @@ export async function runRemoteCommand(
   }
 }
 
-// --- Remote execution functions ---
-
-/**
- * List available fixtures as a table.
- */
 function listFixtures(fixtures: CompiledFixture[]): boolean {
   if (fixtures.length === 0) {
     logger.info(pc.yellow('No fixtures found.'));
@@ -304,7 +265,6 @@ function listFixtures(fixtures: CompiledFixture[]): boolean {
 
   logger.info(pc.bold('\nAvailable fixtures:\n'));
 
-  // Table header
   const idWidth = Math.max(12, ...fixtures.map((f) => f.id.length)) + 2;
   const header = `  ${pc.bold('ID'.padEnd(idWidth))} ${pc.bold('Source'.padEnd(40))} ${pc.bold('Event type')}`;
   logger.info(header);
@@ -327,7 +287,6 @@ function warnStderr(message: string): void {
   process.stderr.write(`${pc.yellow(message)}\n`);
 }
 
-/** Warn about run flags that are accepted but have no effect. */
 function warnDeprecatedRunFlags(options: RemoteRunOptions): void {
   if (options.routingKey) {
     warnStderr(
@@ -336,7 +295,6 @@ function warnDeprecatedRunFlags(options: RemoteRunOptions): void {
   }
 }
 
-/** Warn that the Platform-only targeting flags do not apply to a direct run. */
 function warnIgnoredForDirect(options: RemoteRunOptions): void {
   const flags = [options.org && '--org', options.orchestrator && '--orchestrator'].filter(Boolean);
   warnStderr(
@@ -345,11 +303,8 @@ function warnIgnoredForDirect(options: RemoteRunOptions): void {
 }
 
 /**
- * Resolve where this run goes and return the transport that reaches it.
- *
- * The target comes from `resolveRunTarget` (flag, environment, saved direct
- * target, Platform login). A direct target is verified with `whoami` first, so
- * a token that cannot start runs stops here, before anything is uploaded.
+ * A direct target is verified with `whoami` first, so a token that cannot start
+ * runs stops here, before anything is uploaded.
  */
 async function resolveRunContext(
   config: GlobalConfig,
@@ -377,11 +332,9 @@ async function resolveRunContext(
 }
 
 /**
- * Resolve the authenticated Platform client and the run target (org + cluster).
- *
- * Org resolution: `--org` → `config.activeOrgId` → error.
- * Cluster resolution: `--orchestrator` → `config.defaultClusters[orgId]` →
- * omit and let the Platform sole-select (or return a 422 the CLI surfaces).
+ * Org: `--org` → `config.activeOrgId` → error. Cluster: `--orchestrator` →
+ * `config.defaultClusters[orgId]` → omitted, so the Platform sole-selects (or
+ * returns a 422 the CLI surfaces).
  */
 function resolvePlatformTransport(
   config: GlobalConfig,
@@ -420,9 +373,6 @@ function resolvePlatformTransport(
   });
 }
 
-/**
- * Run fixtures remotely, through the Platform or straight to an orchestrator.
- */
 async function runFixturesRemotely(
   fixtures: CompiledFixture[],
   options: RemoteRunOptions,
@@ -433,7 +383,7 @@ async function runFixturesRemotely(
   const ctx = await resolveRunContext(config, options);
   if (!ctx) return false;
 
-  // --json implies --quiet (only structured JSON goes to stdout)
+  // --json implies --quiet: only structured JSON goes to stdout.
   if (options.json) {
     options.quiet = true;
   }
@@ -482,9 +432,6 @@ async function runFixturesRemotely(
   return renderResults(results, options);
 }
 
-/**
- * Render the aggregated fixture results in the requested format.
- */
 async function renderResults(
   results: RemoteRunResult[],
   options: RemoteRunOptions,
@@ -522,12 +469,10 @@ async function renderResults(
 }
 
 /**
- * Prepare the overlay tarball + routing metadata for a run.
- *
- * The overlay always carries the full local working tree (the run executes the
- * developer's local code, never a clone). The compiled lock is inlined so the
- * orchestrator can match triggers under the `remote:<orgId>` anchor without a
- * webhook provider to fetch it from a git host.
+ * The overlay always carries the full local working tree, and the compiled lock
+ * is inlined: the orchestrator never clones for a relayed run, and the
+ * `remote:<orgId>` anchor has no webhook provider to fetch the lock or a base
+ * tree from a git host.
  */
 async function prepareOverlay(options: RemoteRunOptions): Promise<{
   tarballPath: string;
@@ -544,34 +489,23 @@ async function prepareOverlay(options: RemoteRunOptions): Promise<{
     logger.info(pc.gray('Creating overlay tarball...'));
   }
 
-  // `kici run remote` always uploads the full local working tree as a
-  // self-contained overlay — the orchestrator runs the developer's local code,
-  // not a clone of a committed revision. The orchestrator never clones for a
-  // relayed run (the `remote:<orgId>` anchor has no webhook provider / clone
-  // URL), so a diff-only overlay against a remote HEAD would leave the agent
-  // with no base tree. `fullWorkingTree: true` forces the complete selection
-  // regardless of whether the repo has a git remote.
+  // A diff-only overlay against a remote HEAD would leave the agent with no base
+  // tree, so the complete selection is forced whether or not a git remote exists.
   const { tarballPath, summary, hasRemote, warnings } = await createOverlayTarball(repoRoot, {
     fullWorkingTree: true,
   });
-  // Warnings name paths the remote workspace will not contain (submodules,
-  // dangling symlinks). They go to stderr so --json keeps stdout parseable and
-  // still shows them.
+  // Warnings name paths the remote workspace lacks (submodules, dangling
+  // symlinks); stderr keeps a --json stdout parseable.
   for (const warning of warnings) process.stderr.write(`${pc.yellow(`⚠ ${warning}`)}\n`);
 
   if (!options.quiet) {
-    // Guarded by !quiet so `--json` (which sets quiet) keeps stdout pure JSON.
-    // The overlay includes the `.git` directory, so the remote workspace is the
-    // developer's working tree exactly — steps that shell out to git work.
     logger.info(
       pc.gray('Running your local working tree (overlay includes .git, so git steps work)'),
     );
   }
 
-  // Remote runs always carry the compiled lock inline, on either transport:
-  // the run lands under the `remote:<orgId>` anchor, which resolves the org but has
-  // no webhook provider to fetch the lock from a git host. The dev's local
-  // compiled lock is the authority for a test run of their working tree.
+  // On either transport; the local compiled lock is the authority for a test
+  // run of the working tree.
   const inlineLockFile = await readFile(path.join(kiciDir, 'kici.lock.json'), 'utf-8');
 
   if (!options.quiet) {
@@ -589,10 +523,7 @@ async function prepareOverlay(options: RemoteRunOptions): Promise<{
   return { tarballPath, summary, hasRemote, inlineLockFile, kiciDir, repoRoot };
 }
 
-/**
- * Init the upload (control plane) and PUT the encrypted tarball directly to the
- * object store (data plane). Returns the upload id + the encryption keys.
- */
+/** Inits the upload (control plane), then PUTs the encrypted tarball straight to the object store (data plane). */
 async function initAndUpload(
   ctx: RunRemoteTransport,
   overlay: Awaited<ReturnType<typeof prepareOverlay>>,
@@ -625,9 +556,6 @@ async function initAndUpload(
   };
 }
 
-/**
- * Run a single fixture remotely over the resolved transport.
- */
 async function runSingleFixture(
   fixture: CompiledFixture,
   ctx: RunRemoteTransport,
@@ -647,10 +575,9 @@ async function runSingleFixture(
     const overlay = await prepareOverlay(options);
     const uploaded = await initAndUpload(ctx, overlay, options);
 
-    // Build the simulated event from fixture. The run executes the local
-    // working tree. Stamp the real origin `owner/repo` + provider when the tree
-    // has a recognized git remote, else a synthetic `local/<repo>` identity so
-    // the dashboard never builds a broken external link.
+    // Stamp the real origin `owner/repo` and provider when the tree has a
+    // recognized git remote, else a synthetic `local/<repo>` identity, so the
+    // dashboard never builds a broken external link.
     const event = buildEventFromFixture(opts);
     {
       const identity = buildLocalRepoIdentity(overlay.repoRoot);
@@ -677,8 +604,7 @@ async function runSingleFixture(
       fixtureId: fixture.id,
       event,
       uploadId: uploaded.uploadId,
-      // The key that encrypted the overlay tarball — required for the
-      // orchestrator to decrypt + apply the overlay (independent of secrets).
+      // Overlay-tarball key, required to decrypt the overlay (independent of secrets).
       cliPublicKey: uploaded.cliPublicKey,
       secrets: opts.secrets,
       ...(encrypted && {
@@ -687,8 +613,7 @@ async function runSingleFixture(
       }),
       workflowName: opts.workflowName,
       inlineLockFile: overlay.inlineLockFile,
-      // Always fullRepo: the overlay carries the complete local working tree;
-      // the orchestrator never clones for a relayed run.
+      // The overlay carries the complete working tree; a relayed run never clones.
       fullRepo: true,
       ...(options.checkMode && { checkMode: options.checkMode }),
       ...(() => {
@@ -732,7 +657,6 @@ async function runSingleFixture(
       endpoint: ctx.endpoint,
     });
 
-    // --no-wait: print runId and return immediately
     if (options.wait === false) {
       return { fixtureId: fixture.id, runId: triggerResult.runId, status: 'accepted' };
     }
@@ -752,7 +676,6 @@ async function runSingleFixture(
   }
 }
 
-/** Map a run-path error to a CLI message + a result. */
 function handleRunError(
   fixtureId: string,
   error: unknown,
@@ -789,11 +712,8 @@ function handleRunError(
 }
 
 /**
- * Poll the transport for run completion, streaming log lines as they arrive.
- *
- * Advances a monotonic line-offset cursor: each `runLogs(cursor)`
- * returns the next chunk + `nextCursor`; the run is done only when the status
- * is terminal and the log stream has drained.
+ * Advances a monotonic line-offset log cursor; the run is done only when the
+ * status is terminal and the log stream has drained.
  */
 async function pollRunToCompletion(
   ctx: RunRemoteTransport,
@@ -806,8 +726,8 @@ async function pollRunToCompletion(
   const tailLines: string[] = [];
   const MAX_TAIL = 50;
 
-  // Ctrl-C cancels the run. The poll loop stops, and the command returns only
-  // once the cancel request has settled; a second Ctrl-C exits at once.
+  // Ctrl-C cancels the run and returns once the cancel settles; a second Ctrl-C
+  // exits at once.
   let cancelRequest: Promise<void> | null = null;
   const cancelHandler = () => {
     if (!cancelRequest) {
@@ -823,12 +743,9 @@ async function pollRunToCompletion(
 
   try {
     let lastStatus: PlatformRunStatusResponse | null = null;
-    // Holds observed so far (so we prompt / notify once per hold), and whether
-    // this transport has said it cannot list holds for this run.
     const holdState: HoldWatchState = { seen: new Set<string>(), unavailable: false };
 
-    // Flipped by the first successful read. Until then a 404 is treated as
-    // "the Platform has not seen this run yet" (see RUN_VISIBILITY_GRACE_MS).
+    // See RUN_VISIBILITY_GRACE_MS.
     let runSeen = false;
 
     while (!cancelRequest) {
@@ -863,10 +780,6 @@ async function pollRunToCompletion(
         return finishRun(fixtureId, runId, lastStatus, startTime, tailLines, options);
       }
 
-      // Surface any approval holds for this run every non-terminal tick. Quiet /
-      // --json runs are handled inside watchRunHolds: it routes hold text to
-      // stderr (keeping stdout pure JSON) and forces the non-interactive path so
-      // --approve-all auto-approves instead of the run hanging on a gate.
       if (!terminal) {
         await watchRunHolds(runId, holdState, ctx, options);
       }
@@ -890,16 +803,12 @@ async function pollRunToCompletion(
   }
 }
 
-/** How long Ctrl-C waits for the orchestrator to answer a cancel request. */
 const CANCEL_REQUEST_TIMEOUT_MS = 15_000;
 
-/** Exit code of a second Ctrl-C: 128 + SIGINT, the shell convention. */
+/** 128 + SIGINT, the shell convention. */
 const SIGINT_EXIT_CODE = 130;
 
-/**
- * Ask the orchestrator to cancel `runId` and report the outcome. Never throws:
- * a failed or unanswered request is reported, and the command still ends.
- */
+/** Never throws: a failed or unanswered cancel is reported, and the command still ends. */
 export async function requestRunCancel(
   ctx: Pick<RunRemoteTransport, 'cancel'>,
   runId: string,
@@ -939,19 +848,17 @@ export async function requestRunCancel(
   }
 }
 
-/** Hold bookkeeping carried across poll ticks. */
 export interface HoldWatchState {
-  /** Hold ids already shown (prompted or notified once each). */
+  /** Hold ids already prompted or notified, once each. */
   seen: Set<string>;
   /** Set once the transport says it cannot list holds; listing then stops. */
   unavailable: boolean;
 }
 
 /**
- * Fetch this run's pending holds and surface them to the operator, through the
- * transport's hold access. A transport that cannot list holds here says so
- * once (`HoldsUnavailableError`) and is not asked again. Any other failure is
- * swallowed: hold-visibility is best-effort and must never abort the run watch.
+ * A transport that cannot list holds says so once (`HoldsUnavailableError`) and
+ * is not asked again. Any other failure is swallowed: hold visibility is
+ * best-effort and must never abort the run watch.
  */
 export async function watchRunHolds(
   runId: string,
@@ -961,9 +868,8 @@ export async function watchRunHolds(
 ): Promise<void> {
   if (state.unavailable) return;
   const quiet = Boolean(options.quiet);
-  // Quiet / --json: never block on a stdin prompt (would hang the machine-
-  // readable run) — force the notify path — and never write hold text to
-  // stdout (the pure-JSON channel) — route it to stderr.
+  // Quiet / --json: never block on a stdin prompt (it would hang the run, and
+  // --approve-all auto-approves instead), and write hold text to stderr.
   const output = quiet
     ? (line: string) => void process.stderr.write(line + '\n')
     : (line: string) => logger.info(line);
@@ -989,11 +895,9 @@ export async function watchRunHolds(
       state.unavailable = true;
       output(pc.yellow(`[kici] ${err.message}`));
     }
-    // Best-effort: never let a hold-poll error abort the run watch.
   }
 }
 
-/** Build the final result + render the summary table for a completed run. */
 function finishRun(
   fixtureId: string,
   runId: string,
@@ -1028,7 +932,6 @@ function finishRun(
   return { fixtureId, runId, status: finalStatus, durationMs, jobs };
 }
 
-/** Map a Platform run-status snapshot to the CLI's job summary shape. */
 function jobsFromStatus(
   status: PlatformRunStatusResponse | null,
 ): Array<{ name: string; status: string; durationMs?: number }> {
@@ -1036,15 +939,12 @@ function jobsFromStatus(
   return status.jobs.map((j) => ({
     name: j.jobName,
     status: j.status,
-    // The summary table prints `-` for an unknown duration; a relay that does
-    // not report one leaves it that way.
+    // An unreported duration prints as `-` in the summary table.
     ...(typeof j.durationMs === 'number' && { durationMs: j.durationMs }),
   }));
 }
 
-/**
- * Build a SimulatedEvent-compatible object from fixture options.
- */
+/** Returns a SimulatedEvent-compatible object. */
 function buildEventFromFixture(opts: import('@kici-dev/sdk').FixtureOptions): {
   type: string;
   action?: string;
@@ -1078,10 +978,7 @@ function buildEventFromFixture(opts: import('@kici-dev/sdk').FixtureOptions): {
   };
 }
 
-/**
- * Run a specific workflow directly (bypass trigger matching), over the
- * resolved transport.
- */
+/** Runs a workflow directly, bypassing trigger matching. */
 async function runDirectWorkflow(
   workflowName: string,
   options: RemoteRunOptions,
@@ -1110,10 +1007,7 @@ async function runDirectWorkflow(
     const overlay = await prepareOverlay(options);
     const uploaded = await initAndUpload(ctx, overlay, options);
 
-    // The run executes the local working tree. Stamp the real origin
-    // `owner/repo` + provider when the tree has a recognized git remote, else a
-    // synthetic `local/<repo>` identity so the dashboard never builds a broken
-    // external link.
+    // Real origin identity, else synthetic `local/<repo>` (see runSingleFixture).
     const identity = buildLocalRepoIdentity(overlay.repoRoot);
     const payload: Record<string, unknown> = {
       repository: { full_name: identity.repoIdentifier, provider: identity.provider },
@@ -1130,7 +1024,6 @@ async function runDirectWorkflow(
       fixtureId,
       event: { type: 'manual', targetBranch: 'main', payload },
       uploadId: uploaded.uploadId,
-      // Overlay-tarball key — required for overlay decryption (independent of secrets).
       cliPublicKey: uploaded.cliPublicKey,
       ...(encrypted && {
         encryptedSecrets: encrypted.encryptedSecrets,
@@ -1138,7 +1031,6 @@ async function runDirectWorkflow(
       }),
       workflowName,
       inlineLockFile: overlay.inlineLockFile,
-      // Always fullRepo: the overlay carries the complete local working tree.
       fullRepo: true,
       ...(options.checkMode && { checkMode: options.checkMode }),
       ...(() => {
@@ -1168,9 +1060,6 @@ async function runDirectWorkflow(
   }
 }
 
-/**
- * Display remote run results as a summary table.
- */
 function displayRemoteResults(results: RemoteRunResult[]): void {
   logger.info(pc.bold('\n--- Results ---\n'));
 

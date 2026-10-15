@@ -1,10 +1,7 @@
 /**
- * `kici-admin firecracker` command group.
- *
- * Local host-networking ops for the orchestrator's Firecracker scaler:
- * provision/verify/teardown the per-coordinator bridge + nft table, with
- * --persist for reboot survival. These run directly on the host (privileged
- * `ip`/`nft`/`systemctl`) and do NOT use the admin HTTP client.
+ * `kici-admin firecracker`: provisions, verifies and tears down the Firecracker
+ * scaler's per-coordinator bridge and nft table (--persist survives reboots).
+ * Runs on the host with privileged `ip`/`nft`/`systemctl`, NOT the admin HTTP client.
  */
 import type { Command } from 'commander';
 import { registerProvision } from './provision.js';

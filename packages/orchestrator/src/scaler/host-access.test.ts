@@ -11,7 +11,6 @@ describe('resolveAgentHostAccess default', () => {
   const base = { orchestratorUrl: 'http://192.168.1.40:10143', gateway: '172.30.0.1' };
 
   it('grants the orchestrator port and DNS on the gateway, and nothing else', () => {
-    // The whole-host grant this replaces was every port on every host address.
     expect(resolveAgentHostAccess({ policy: undefined, ...base })).toEqual([
       '172.30.0.1:53',
       '*:10143',

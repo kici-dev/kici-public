@@ -40,10 +40,9 @@ describe('coldDaysToBucket', () => {
   });
 
   it('throws on undefined / NaN / non-positive input (catches engine map gaps loudly)', () => {
-    // Production regression: the engine retention helper returned undefined
-    // for an unknown action string and the framework silently produced a
-    // `"undefinedd"` bucket prefix that wedged the cold_store_chunks index
-    // INSERT and the read-through.
+    // Production regression: an unknown action string yielded undefined and a
+    // `"undefinedd"` bucket prefix that wedged the cold_store_chunks INSERT and
+    // the read-through.
     expect(() => coldDaysToBucket(undefined as never)).toThrow(/invalid retention value/);
     expect(() => coldDaysToBucket(Number.NaN as never)).toThrow(/invalid retention value/);
     expect(() => coldDaysToBucket(0 as never)).toThrow(/invalid retention value/);

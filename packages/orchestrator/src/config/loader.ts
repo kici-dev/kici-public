@@ -34,7 +34,6 @@ export const SENSITIVE_FIELD_PATHS = [
  * Load and validate the local orchestrator YAML configuration.
  *
  * @param configPath - Explicit path to the config file (highest precedence)
- * @returns Validated LocalConfig
  * @throws Error if explicit path doesn't exist, or if validation fails
  */
 export async function loadLocalConfig(configPath?: string): Promise<LocalConfig> {
@@ -49,7 +48,7 @@ export async function loadLocalConfig(configPath?: string): Promise<LocalConfig>
     if (!isExplicit && isNodeError(err) && err.code === 'ENOENT') {
       return { database: { url: '' } } as unknown as LocalConfig;
     }
-    // If explicit path was given, throw with clear error
+    // An explicit path, or any read error other than ENOENT, throws with a clear error
     throw new Error(`Failed to read config file at ${resolvedPath}: ${toErrorMessage(err)}`);
   }
 

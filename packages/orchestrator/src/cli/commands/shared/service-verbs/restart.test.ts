@@ -1,14 +1,7 @@
-/**
- * Tests for the agent and orchestrator restart commands' folder-anchored behavior:
- * refusal when no targeting flag and no CWD manifest, and --instance-dir
- * resolution flowing through to manager.restart with a ServiceConfig built
- * from the manifest.
- */
-
 import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
+import { makeTempDir } from '@kici-dev/test-support/tmp';
 import { Command } from 'commander';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import type {
   DiscoveredInstance,
@@ -27,7 +20,6 @@ let mockKiciRoot = '';
 /** Platforms whose driver the command operated through — discovery `list` calls excluded. */
 const operatedPlatforms: string[] = [];
 
-/** Wrap a driver operation so it records which platform's driver ran it. */
 function op<A extends unknown[], R>(platform: string, fn: (...a: A) => R): (...a: A) => R {
   return (...args: A) => {
     operatedPlatforms.push(platform);
@@ -61,9 +53,8 @@ vi.mock('../../../service/index.js', async () => {
     resolveUserLevel: vi.fn().mockReturnValue(true),
     kiciConfigRoot: vi.fn(() => mockKiciRoot),
     createServiceManager: vi.fn(async (platform: ServicePlatform) => makeManager(platform)),
-    // Manager selection lives in the seam, so the real one runs here with the
-    // driver factory injected: every candidate platform gets its own double, and
-    // `op` records which one the command actually operated through.
+    // The real seam runs with an injected driver factory: one double per
+    // platform, and `op` records which one the command operated through.
     resolveInstanceTarget: (args: Parameters<typeof actual.resolveInstanceTarget>[0]) =>
       actual.resolveInstanceTarget({ ...args, createManager: async (p) => makeManager(p) }),
   };
@@ -72,10 +63,6 @@ vi.mock('../../../service/index.js', async () => {
 import { registerServiceLifecycleVerbs, type ServiceComponent } from '../service-verbs.js';
 import { writeIndex, writeManifest } from '../../../service/index.js';
 import type { InstanceManifest } from '../../../service/index.js';
-
-function mkTmp(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function makeManifest(
   component: ServiceComponent,
@@ -104,8 +91,8 @@ describe.each(['agent', 'orchestrator'] as const)('%s restart — folder-anchore
   let consoleErrorSpy: MockInstance<typeof console.error>;
 
   beforeEach(() => {
-    tmpInstanceDir = mkTmp(`kici-${component}-rs-i-`);
-    tmpConfigRoot = mkTmp(`kici-${component}-rs-c-`);
+    tmpInstanceDir = makeTempDir(`kici-${component}-rs-i-`);
+    tmpConfigRoot = makeTempDir(`kici-${component}-rs-c-`);
 
     mockListResult = [];
     mockIsInstalled = true;
@@ -133,7 +120,7 @@ describe.each(['agent', 'orchestrator'] as const)('%s restart — folder-anchore
 
   it('refuses without --instance-dir/--name and no CWD manifest', async () => {
     const savedCwd = process.cwd();
-    const emptyCwd = mkTmp(`kici-${component}-rs-cwd-`);
+    const emptyCwd = makeTempDir(`kici-${component}-rs-cwd-`);
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
       throw new Error('process.exit called');
     }) as never);

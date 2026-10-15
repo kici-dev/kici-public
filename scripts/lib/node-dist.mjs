@@ -101,10 +101,8 @@ export function isNodeDistComplete(dir, platform) {
 }
 
 /**
- * Extract a platform's members from a Node.js archive into a new directory
- * under `workDir`, and return that directory.
- *
- * Windows zips are read with Info-ZIP `unzip`; its absence is a named error.
+ * Extract a platform's members into a new directory under `workDir` and
+ * return it. Windows zips are read with Info-ZIP `unzip`; its absence is a named error.
  *
  * @param {object} opts
  * @param {string} opts.archivePath the downloaded archive
@@ -157,13 +155,11 @@ export function extractNodeDist({ archivePath, version, platform, workDir, env =
 }
 
 /**
- * Move an extracted tree into place as the cache directory.
- *
- * The tree is renamed in first, so a complete cache is never moved aside: the
- * rename fails only when a directory is already there. A complete one came
- * from a concurrent run, which is kept while this tree is dropped. An
- * incomplete one was left by an older packaging run (a bare `node` binary, no
- * npm, or no LICENSE); it is moved aside and the rename is tried again.
+ * Move an extracted tree into place as the cache directory. The rename comes
+ * first, so a complete cache is never moved aside: an existing complete one
+ * (from a concurrent run) is kept and this tree dropped; an incomplete one
+ * (from an older run: a bare `node` binary, no npm, or no LICENSE) is moved
+ * aside and the rename retried.
  */
 export function publishNodeDist(tree, cacheDir, platform) {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -238,8 +234,7 @@ export async function ensureNodeDist({
   }
   log(`  [node] SHA-256 verified: ${actualHash.slice(0, 16)}...`);
 
-  // The work directory sits beside the cache directory, so publishing it is a
-  // rename within one filesystem.
+  // Beside the cache directory, so publishing is a same-filesystem rename.
   mkdirSync(cacheBase, { recursive: true });
   const workDir = mkdtempSync(path.join(cacheBase, `.extract-${platform.os}-${platform.arch}-`));
   try {

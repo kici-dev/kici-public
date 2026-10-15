@@ -17,11 +17,9 @@ const logger = createLogger({ prefix: 'orch:github-webhook' });
 /** GitHub caps webhook payloads at 25MB — cluster-wide fallback default. */
 const MAX_GITHUB_PAYLOAD_BYTES = 25 * 1024 * 1024;
 
-/** Dependencies for the direct GitHub webhook ingress route. */
 export interface GithubWebhookRoutesDeps {
   /** Local source lookup (by UUID). */
   sourceStore: SourceStore;
-  /** Inbound verification deps (db + secret store + generic source manager). */
   verifyDeps: VerifyInboundDeps;
   /** Pipeline entry — owns the atomic dedup claim + dispatch. */
   onWebhook: (info: WebhookInfo) => Promise<WebhookIngestOutcome>;
@@ -32,9 +30,8 @@ export interface GithubWebhookRoutesDeps {
 }
 
 /**
- * Whether the orchestrator serves the direct GitHub ingress route for a given
- * operating mode. Hybrid, independent, and observed modes serve their own
- * ingress; platform mode is relay-only (no local GitHub source to serve).
+ * Hybrid, independent and observed modes serve their own GitHub ingress;
+ * platform mode is relay-only (no local GitHub source to serve).
  */
 export function shouldServeGithubIngress(mode: OrchestratorMode): boolean {
   return OWN_INGRESS_MODES.includes(mode);
@@ -51,8 +48,8 @@ type IngressRoute = 'source' | 'org';
 const UNKNOWN_SOURCE: SourceResolution = { rejection: { status: 404, reason: 'Unknown source' } };
 
 /**
- * Read the App installation-target headers GitHub sets on an App-level
- * delivery. `null` when neither header is present: a classic repository hook.
+ * The App installation-target headers GitHub sets on an App-level delivery;
+ * `null` when neither is present (a classic repository hook).
  */
 function readAppTarget(c: Context): { appId: number } | { invalid: string } | null {
   const targetType = c.req.header('x-github-hook-installation-target-type');
@@ -111,10 +108,7 @@ function resolveByAppId(deps: GithubWebhookRoutesDeps): SourceResolver {
   };
 }
 
-/**
- * The delivery handler both routes share: resolve the source, verify the
- * signature locally, parse, and hand the delivery to ingest.
- */
+/** The delivery handler both routes share. */
 function createDeliveryHandler(
   deps: GithubWebhookRoutesDeps,
   resolve: SourceResolver,
@@ -123,10 +117,10 @@ function createDeliveryHandler(
   return async (c: Context) => {
     const orgId = c.req.param('orgId') ?? '';
     try {
-      // 1. Raw body bytes (verbatim — required for HMAC).
+      // Raw body bytes, verbatim: required for HMAC.
       const body = Buffer.from(await c.req.arrayBuffer());
 
-      // 2. Resolve the local GitHub source (the resolver owns the App headers).
+      // The resolver owns the App headers.
       const resolution = await resolve(c);
       if ('rejection' in resolution) {
         return c.json(
@@ -136,14 +130,12 @@ function createDeliveryHandler(
       }
       const { source } = resolution;
 
-      // 3. Delivery + event metadata.
       const deliveryId = c.req.header('x-github-delivery');
       const event = c.req.header('x-github-event');
       if (!deliveryId || !event) {
         return c.json({ rejected: true, reason: 'Missing required GitHub headers' }, 400);
       }
 
-      // 4. Collect lowercased headers + signature for verification.
       const headers: Record<string, string> = {};
       c.req.raw.headers.forEach((value, key) => {
         headers[key.toLowerCase()] = value;
@@ -159,7 +151,7 @@ function createDeliveryHandler(
       const clientIp =
         headers['x-forwarded-for']?.split(',')[0]?.trim() ?? headers['x-real-ip'] ?? null;
 
-      // 5. Verify the signature locally (rotation-aware GitHub path).
+      // Rotation-aware local GitHub signature path.
       const outcome = await verifyInboundWebhook(deps.verifyDeps, {
         routingKey: source.routing_key,
         body,
@@ -179,9 +171,9 @@ function createDeliveryHandler(
         return c.json({ rejected: true, reason: outcome.reason ?? 'Source misconfigured' }, 422);
       }
 
-      // 6. Parse payload + build WebhookInfo. The deliveryId is the raw
-      // X-GitHub-Delivery (NOT scoped by routing key or route) so a delivery
-      // arriving by the relay and by either direct route dedups to the same claim.
+      // deliveryId is the raw X-GitHub-Delivery (NOT scoped by routing key or
+      // route) so a delivery arriving by the relay and by either direct route
+      // dedups to the same claim.
       let payload: Record<string, unknown>;
       try {
         payload = JSON.parse(body.toString('utf8')) as Record<string, unknown>;
@@ -199,11 +191,10 @@ function createDeliveryHandler(
         payload,
       };
 
-      // 7. Hand the delivery to ingest. Resolves once the delivery is DURABLY
-      // QUEUED, not once it has been matched and dispatched: GitHub abandons a
-      // delivery after 10 seconds, while one matched workflow's build phase
-      // alone may legitimately take minutes. The pipeline still owns the
-      // atomic dedup claim.
+      // Resolves once the delivery is DURABLY QUEUED, not once matched and
+      // dispatched: GitHub abandons a delivery after 10 seconds, while one
+      // workflow's build phase may take minutes. The pipeline owns the atomic
+      // dedup claim.
       const ingest = await deps.onWebhook(info);
       webhooksReceivedTotal.add(1, { source: 'github-direct', event });
       logger.info('Direct GitHub webhook accepted', {
@@ -226,14 +217,13 @@ function createDeliveryHandler(
           429,
         );
       }
-      // 202 = accepted and durably queued; it asserts nothing about matching
-      // or dispatch. Those outcomes reach the event log and the run list.
+      // 202 = durably queued; matching and dispatch outcomes reach the event
+      // log and the run list.
       return c.json({ accepted: true, deliveryId }, 202);
     } catch (err) {
-      // Reachable only for a failure BEFORE the delivery is queued. A pipeline
-      // failure surfaces as a `failed` event-log row (written by
-      // `processWebhook`, under the delivery's resolved org) plus an
-      // `orch:ingest-accept` error line, not as a 500 here.
+      // Only for a failure BEFORE the delivery is queued. A pipeline failure
+      // surfaces as a `failed` event-log row (written by `processWebhook` under
+      // the delivery's resolved org) plus an `orch:ingest-accept` error line.
       logger.error('Direct GitHub webhook processing error', {
         orgId,
         route,
@@ -265,10 +255,10 @@ function createDeliveryHandler(
 export function createGithubWebhookRoutes(deps: GithubWebhookRoutesDeps): Hono {
   const app = new Hono();
 
-  // Per-request body cap: a live cluster override wins over the config
-  // default; Hono's bodyLimit rejects an over-Content-Length request and aborts
-  // a chunked body with 413 the moment it passes the cap, so a hostile chunked
-  // request can never buffer an unbounded body into memory.
+  // Per-request body cap; a live cluster override wins over the config default.
+  // bodyLimit rejects an over-Content-Length request and aborts a chunked body
+  // with 413 as it passes the cap, so a hostile chunked request can never
+  // buffer an unbounded body into memory.
   const payloadCap: MiddlewareHandler = async (c, next) => {
     const maxSize =
       (await deps.clusterSettings?.getNumber(

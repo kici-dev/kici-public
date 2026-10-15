@@ -1,24 +1,16 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Generalize `held_runs` from an environment-only hold into the unified
- * "held element" model that backs per-element approvals, and add the
- * `held_run_approvals` table that records each approver's decision.
- *
- * New `held_runs` columns (all idempotent, column-exists guarded):
- * - `hold_scope text NOT NULL DEFAULT 'job'` — 'workflow' | 'job' | 'step'
- *   (engine `HoldScope`). Existing rows held a single job, so they default to
- *   'job'.
- * - `step_index integer` — nullable; set only for step-scoped holds.
- * - `trigger_source text NOT NULL DEFAULT 'environment'` — 'environment' |
- *   'explicit' (engine `TriggerSource`). Existing holds came from environment
- *   protection, so they default to 'environment'.
- * - `approval_requirement jsonb` — the normalized `ApprovalRequirement`
- *   (clauses + expiresAt + reason) the hold must satisfy. Nullable for legacy
- *   rows that predate the approval model.
- *
- * New `held_run_approvals` table: one row per approver decision, FK to
- * `held_runs.id` (uuid) with ON DELETE CASCADE.
+ * Generalize `held_runs` from an environment-only hold into the "held element" model behind
+ * per-element approvals, and add `held_run_approvals` (one row per approver decision,
+ * ON DELETE CASCADE). Columns are added idempotently, column-exists guarded:
+ * - `hold_scope` — 'workflow' | 'job' | 'step' (engine `HoldScope`); existing rows held a
+ *   single job, so they default to 'job'.
+ * - `step_index` — set only for step-scoped holds.
+ * - `trigger_source` — 'environment' | 'explicit' (engine `TriggerSource`); existing holds came
+ *   from environment protection, so they default to 'environment'.
+ * - `approval_requirement` — the normalized `ApprovalRequirement` (clauses + expiresAt +
+ *   reason); NULL on rows that predate the approval model.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colExists = async (column: string): Promise<boolean> => {

@@ -1,11 +1,7 @@
 /**
- * Debug bundle CLI command for kici-admin.
- *
- * Creates a sanitized diagnostic ZIP bundle by calling multiple admin API
- * endpoints and assembling the results client-side. The bundle contains
- * config, diagnostics, system info, and cluster state for troubleshooting.
- *
- * Usage: kici-admin debug-bundle [--output <path>]
+ * `kici-admin debug-bundle [--output <path>]`: a sanitized diagnostic ZIP
+ * (config, diagnostics, system info, cluster state) assembled client-side from
+ * several admin API endpoints.
  */
 
 import * as fs from 'node:fs';
@@ -27,9 +23,6 @@ interface DebugBundleOptions {
   fleetTimeout: number;
 }
 
-/**
- * Register the debug-bundle command on the CLI program.
- */
 export function registerDebugBundleCommand(
   program: Command,
   getClient: () => AdminApiClient,
@@ -38,9 +31,8 @@ export function registerDebugBundleCommand(
     .command('debug-bundle')
     .description('Generate a diagnostic debug bundle ZIP for troubleshooting')
     .addOption(
-      // The literal default is a fresh timestamped filename; pair it with a
-      // stable defaultValueDescription so --help and the generated CLI docs
-      // stay deterministic (the runtime default value is unchanged).
+      // The default is a timestamped filename; a stable defaultValueDescription
+      // keeps --help and the generated CLI docs deterministic.
       new Option('-o, --output <path>', 'Output ZIP file path').default(
         `kici-debug-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.zip`,
         'kici-debug-<timestamp>.zip',
@@ -80,7 +72,6 @@ export function registerDebugBundleCommand(
 
         console.log('Collecting diagnostic data...');
 
-        // Gather data from admin API endpoints in parallel
         const [diagnoseResult, configResult, systemInfo, clusterHealth, metrics] =
           await Promise.allSettled([
             client.diagnose(),
@@ -90,7 +81,6 @@ export function registerDebugBundleCommand(
             safeRequest(() => client.getText('/metrics')),
           ]);
 
-        // Create the ZIP bundle
         const output = fs.createWriteStream(outputPath);
         const archive = new ZipArchive({ zlib: { level: 6 } });
 
@@ -101,7 +91,6 @@ export function registerDebugBundleCommand(
 
         archive.pipe(output);
 
-        // Manifest
         const manifest = {
           version: '1.0',
           generated_at: new Date().toISOString(),
@@ -111,43 +100,37 @@ export function registerDebugBundleCommand(
         };
         archive.append(JSON.stringify(manifest, null, 2), { name: 'manifest.json' });
 
-        // Diagnostics
         if (diagnoseResult.status === 'fulfilled') {
           archive.append(JSON.stringify(diagnoseResult.value, null, 2), {
             name: 'diagnostics/results.json',
           });
         }
 
-        // Config (already redacted server-side by config export)
+        // Config export redacts server-side.
         if (configResult.status === 'fulfilled' && configResult.value) {
           archive.append(JSON.stringify(configResult.value, null, 2), {
             name: 'config/config.json',
           });
         }
 
-        // System info
         if (systemInfo.status === 'fulfilled' && systemInfo.value) {
           archive.append(JSON.stringify(systemInfo.value, null, 2), {
             name: 'system/info.json',
           });
         }
 
-        // Cluster health
         if (clusterHealth.status === 'fulfilled' && clusterHealth.value) {
           archive.append(JSON.stringify(clusterHealth.value, null, 2), {
             name: 'cluster/health.json',
           });
         }
 
-        // Metrics
         if (metrics.status === 'fulfilled' && metrics.value) {
           archive.append(String(metrics.value), { name: 'system/metrics.txt' });
         }
 
-        // Logs — include rotated *.log files from the orchestrator's KICI_LOG_DIR
-        // (same directory used by the shared Winston rotated-file transport).
-        // Runs locally: the CLI is executed on the same host as the service,
-        // so the files on disk are the ones we want to ship to support.
+        // Rotated *.log files from KICI_LOG_DIR (the shared Winston rotated-file
+        // transport's directory), read locally: the CLI runs on the service's host.
         const logDir = opts.logDir ?? process.env.KICI_LOG_DIR;
         if (logDir && fs.existsSync(logDir)) {
           await addLogsToArchive(archive, logDir, opts.logWindow);
@@ -165,9 +148,7 @@ export function registerDebugBundleCommand(
     );
 }
 
-/**
- * Wrap an async call to return null on failure instead of throwing.
- */
+/** Null on failure instead of a throw. */
 async function safeRequest<T>(fn: () => Promise<T>): Promise<T | null> {
   try {
     return await fn();
@@ -181,7 +162,6 @@ async function safeRequest<T>(fn: () => Promise<T>): Promise<T | null> {
  * cluster into one nested ZIP via the orchestrator's server-side fan-out.
  */
 async function runFleetBundle(client: AdminApiClient, opts: DebugBundleOptions): Promise<void> {
-  // --list: enumerate the topology and exit, no collection.
   if (opts.list) {
     const topology = await client.getFleetTopology();
     if (opts.json) {
@@ -204,9 +184,8 @@ async function runFleetBundle(client: AdminApiClient, opts: DebugBundleOptions):
 }
 
 /**
- * Resolve the `--pick` selectors: a bare `--pick` on a TTY opens an interactive
- * checkbox over the enumerated topology; a value is split on commas; no flag
- * means "everything".
+ * A bare `--pick` on a TTY opens an interactive checkbox over the topology; a
+ * value splits on commas; no flag means everything.
  */
 async function resolveFleetSelectors(
   client: AdminApiClient,
@@ -219,7 +198,6 @@ async function resolveFleetSelectors(
       .map((s) => s.trim())
       .filter(Boolean);
   }
-  // Bare --pick: interactive picker on a TTY.
   if (!process.stdout.isTTY) {
     throw new Error('--pick with no value requires a TTY; pass comma-separated selectors instead');
   }

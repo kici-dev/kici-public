@@ -9,7 +9,7 @@ import {
   JOB_CACHE_OWNER,
 } from './cache-phase.js';
 
-/** Build a CachePhaseDeps with a spy sendIpc and a monotonic step-index allocator. */
+/** CachePhaseDeps with a spy sendIpc and a monotonic step-index allocator. */
 function buildDeps(cache: CacheApi, startIndex = 100) {
   const sent: RunnerToAgentMessage[] = [];
   let idx = startIndex;

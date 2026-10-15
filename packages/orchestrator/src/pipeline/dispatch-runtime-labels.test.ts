@@ -1,8 +1,7 @@
 /**
- * The runtime facts a job's own shape demands of the host that runs it, which
- * live in `dispatch-matched-workflow.ts` beside the selector partitioning they
- * feed. A file of their own because that suite carries heavy dispatch
- * scaffolding and this is a pure function over a lock job's `container`.
+ * The runtime facts a job's shape demands of its host (in
+ * `dispatch-matched-workflow.ts`): a pure function over a lock job's `container`,
+ * tested apart from that suite's heavy dispatch scaffolding.
  */
 import { describe, it, expect } from 'vitest';
 import { CONTAINER_BUILD_RUNTIME_LABEL } from '@kici-dev/engine';
@@ -19,8 +18,7 @@ describe('requiredRuntimeLabelsFor', () => {
   });
 
   it('adds NOTHING for a job that names a finalized image', () => {
-    // Adding an implicit requirement to jobs that already work is how container
-    // jobs were stranded once before — they had been running fine, and a gate
+    // An implicit requirement on working jobs once stranded container jobs: a gate
     // the orchestrator could not evaluate made them match nothing.
     expect(requiredRuntimeLabelsFor('python:3.12')).toEqual([]);
     expect(requiredRuntimeLabelsFor({ image: 'python:3.12' })).toEqual([]);
@@ -33,10 +31,9 @@ describe('requiredRuntimeLabelsFor', () => {
 
 describe('runsOnSelectorsForLockJob', () => {
   it('carries the authored labels through UNCHANGED, even for a dockerfile job', () => {
-    // The requirement is applied when matching registered agents, not here:
-    // these selectors are also what the scaler consult sees, and a backend is
-    // chosen by exact label-set containment. A label no pool declares would
-    // strand the job `queued-no-backend` rather than spawn anything.
+    // Applied when matching registered agents, not here: the scaler consult sees
+    // these selectors and picks a backend by exact label-set containment, so a label
+    // no pool declares would strand the job `queued-no-backend`.
     const sel = runsOnSelectorsForLockJob({
       runsOn: [{ kind: 'exact', value: 'linux' }],
     });

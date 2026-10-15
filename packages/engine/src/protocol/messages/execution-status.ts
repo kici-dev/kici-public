@@ -3,15 +3,13 @@ import { z } from 'zod';
 // --- Field-size bounds (flood hardening) ---
 //
 // A customer-controlled orchestrator can stream fabricated execution/job/replay
-// messages into the Platform. Bare `z.string()` / unbounded arrays let a single
-// message carry megabytes of attacker-chosen text and amplify into the browser
-// fan-out + DB writes. These ceilings bound the per-message blast radius,
-// mirroring the conventions in `platform-orchestrator.ts` (ids `.max(128)`,
-// repo identifier `.max(256)`, free text `.max(2000)`, label arrays `.max(30)`).
+// messages; unbounded fields would let one message carry megabytes into the
+// browser fan-out and DB writes. These ceilings bound the per-message blast
+// radius, following `platform-orchestrator.ts` conventions.
 
 /** Max length for ids and short identifier fields (runId, jobId, sha, ref, …). */
 export const STATUS_ID_MAX = 128;
-/** Max length for the repo identifier (`owner/repo` can be long). */
+/** Max length for the repo identifier (`owner/repo`). */
 export const REPO_IDENTIFIER_MAX = 256;
 /** Max length for free-text fields (commit message, failure/error reason). */
 export const STATUS_FREE_TEXT_MAX = 2000;
@@ -24,19 +22,16 @@ export const RUNS_ON_LABELS_MAX = 30;
 /** Max number of bound context names on a job. */
 export const CONTEXTS_MAX = 30;
 
-// --- Execution status enums (single source of truth via Zod z.enum) ---
-// Access values: ExecutionRunStatus.enum.pending, ExecutionJobStatus.enum.success, etc.
-// Access type: ExecutionRunStatus (inferred string literal union)
+// --- Execution status enums (single source of truth) ---
 
 /**
  * Status values for execution runs (execution_runs table).
  *
- * `held` = the run is paused at the workflow install gate (a `registries:` /
- * `installEnv:` protection rule returned hold/wait/queue). It is alive and
- * resumable — NOT terminal — so it is deliberately absent from
- * `TERMINAL_RUN_STATES`. On release (reviewer approve, wait-timer expiry,
- * concurrency slot free) the run resumes into job dispatch; on reject it
- * transitions to `cancelled`.
+ * `held` = paused at the workflow install gate (a `registries:` / `installEnv:`
+ * protection rule returned hold/wait/queue). It is resumable, NOT terminal, so
+ * it is absent from `TERMINAL_RUN_STATES`. On release (reviewer approve,
+ * wait-timer expiry, concurrency slot free) the run resumes into job dispatch;
+ * on reject it becomes `cancelled`.
  */
 export const ExecutionRunStatus = z.enum([
   'pending',
@@ -52,11 +47,10 @@ export type ExecutionRunStatus = z.infer<typeof ExecutionRunStatus>;
 /**
  * Status values for execution jobs (execution_jobs table + job.status protocol messages).
  *
- * `unroutable` = the job's `runsOn` matched no agent for the whole queue
- * window, so it never ran. Distinct from `failed` (a failed job ran and has
- * logs to read; an unroutable one has a fleet/label problem to fix), from
- * `skipped` (a condition deliberately excluded it) and from `timed_out_stale`
- * (capacity existed but never freed up).
+ * `unroutable` = `runsOn` matched no agent for the whole queue window, so the
+ * job never ran: a fleet/label problem, unlike `failed` (ran, has logs),
+ * `skipped` (a condition excluded it) or `timed_out_stale` (capacity existed
+ * but never freed up).
  */
 export const ExecutionJobStatus = z.enum([
   'pending',
@@ -75,22 +69,18 @@ export const ExecutionJobStatus = z.enum([
 export type ExecutionJobStatus = z.infer<typeof ExecutionJobStatus>;
 
 /**
- * Job kind on the wire. `standard` runs steps on an agent; `gate` is an invoke
- * gate that summons source-repo runs instead of running steps; `proxy` mirrors
- * one summoned run's lifecycle. The orchestrator's DB `JobKind` enum mirrors
- * these members.
+ * Job kind on the wire (mirrored by the orchestrator's DB `JobKind`): `standard`
+ * runs steps on an agent; `gate` is an invoke gate that summons source-repo
+ * runs instead; `proxy` mirrors one summoned run's lifecycle.
  */
 export const JobKind = z.enum(['standard', 'gate', 'proxy']);
 export type JobKind = z.infer<typeof JobKind>;
 
 /**
- * The status values a notification subscription may target at the given level.
- *
- * A run-level subscription matches against an `ExecutionRunStatus`; a job-level
- * subscription matches against an `ExecutionJobStatus` (which carries job-only
- * terminal states like `timed_out_stale` / `drift_dropped` / `skipped`). Both
- * the Platform validation and the dashboard editor derive their allowed set
- * from this single helper so server validation and UI options cannot diverge.
+ * The status values a notification subscription may target at a level:
+ * `ExecutionRunStatus` for runs, `ExecutionJobStatus` (with job-only states
+ * like `timed_out_stale` / `drift_dropped` / `skipped`) for jobs. Platform
+ * validation and the dashboard editor both derive from it, so they cannot diverge.
  */
 export function statusOptionsForLevel(level: 'run' | 'job'): readonly string[] {
   return level === 'job' ? ExecutionJobStatus.options : ExecutionRunStatus.options;
@@ -125,9 +115,8 @@ export const StepConcurrencyKind = z.enum(['sequential', 'parallel-child', 'para
 export type StepConcurrencyKind = z.infer<typeof StepConcurrencyKind>;
 
 /**
- * Distinct reasons a run/job ended because a configured wall-clock timeout
- * was exceeded. Surfaced in the failure/cancel reason so the dashboard can
- * label "timed out" instead of a generic failure.
+ * Why a run/job exceeded a configured wall-clock timeout, surfaced in the
+ * failure/cancel reason so the dashboard can label "timed out".
  *
  *  - `job_timeout`      — a job exceeded its `timeout` (total job wall-clock,
  *                         agent-enforced in the forked workflow-runner).
@@ -135,16 +124,15 @@ export type StepConcurrencyKind = z.infer<typeof StepConcurrencyKind>;
  *                         wall-clock, orchestrator-enforced run deadline).
  *
  * Step-level timeouts are reported inline in the step error message and do
- * NOT use this enum (they predate it and stay as-is).
+ * NOT use this enum.
  */
 export const TimeoutReason = z.enum(['job_timeout', 'workflow_timeout']);
 export type TimeoutReason = z.infer<typeof TimeoutReason>;
 
 /**
- * Categories of init failure — i.e. failures that prevent a run from ever
- * executing a step. Set at the detection site (orchestrator or agent) and
- * persisted alongside the run/job row so the dashboard can render an
- * explanatory banner even when the orchestrator is offline.
+ * Categories of init failure (a run that never executes a step). Set at the
+ * detection site (orchestrator or agent) and persisted on the run/job row, so
+ * the dashboard can explain it even while the orchestrator is offline.
  *
  * Scope is carried separately on `initFailureSchema.scope`:
  *  - `run`-scoped categories fail the whole run before any job runs
@@ -178,10 +166,10 @@ export type InitFailureCategory = z.infer<typeof InitFailureCategory>;
  *  - step_failure      — a job actually ran and failed.
  *  - cancelled         — the run was cancelled.
  *
- * Derived at run completion from the terminal job statuses, because
- * `timed_out`/`step_failure` both collapse to run-status `failed` — the status
- * alone can't carry it. `never_started` is stamped by the init-failure paths and
- * `dead_orchestrator` is stamped Platform-side by the dead-orchestrator detector.
+ * Derived at run completion from terminal job statuses, since `timed_out` and
+ * `step_failure` both collapse to run-status `failed`. The init-failure paths
+ * stamp `never_started`; the Platform's dead-orchestrator detector stamps
+ * `dead_orchestrator`.
  */
 export const RunFailureClass = z.enum([
   'never_started',
@@ -193,10 +181,9 @@ export const RunFailureClass = z.enum([
 export type RunFailureClass = z.infer<typeof RunFailureClass>;
 
 /**
- * `step_type` values for the user-facing cache pseudo-steps that appear in the
- * run timeline. Mirrors the `hook:*` pseudo-step `step_type` convention: each
- * declarative job/step cache restore or save surfaces as one pseudo-step so the
- * dashboard can render it inline alongside the real steps.
+ * `step_type` values for cache pseudo-steps in the run timeline. Like `hook:*`,
+ * each declarative cache restore or save is one pseudo-step the dashboard
+ * renders inline with the real steps.
  */
 export const CacheStepType = z.enum(['cache:restore', 'cache:save']);
 export type CacheStepType = z.infer<typeof CacheStepType>;
@@ -204,18 +191,15 @@ export type CacheStepType = z.infer<typeof CacheStepType>;
 /**
  * `step_type` values for pseudo-steps that run BEFORE a job's real steps.
  *
- * A run's step timeline is ordered by `step_index`, and every pseudo-step index
- * sits ABOVE the real steps (the wire schema requires a non-negative index, and
- * the in-sandbox allocators claim a high block). That is fine for the cache
- * pseudo-steps, which mostly bracket the work — but a job's image build runs
- * strictly first, and rendering it last reads as though it happened last.
+ * The timeline orders by `step_index`, and every pseudo-step index sits ABOVE
+ * the real steps (the wire requires a non-negative index; in-sandbox allocators
+ * claim a high block). A job's image build runs strictly first, so readers sort
+ * these types ahead of everything, by TYPE rather than index.
  *
- * A reader therefore sorts these types ahead of everything else, by TYPE rather
- * than by index. Keeping the ordering rule here — rather than as a negative
- * index — is deliberate: `step.status` rejects a negative index outright, so an
- * agent that sent one to an older orchestrator would have its connection closed
- * mid-job, and two consumers (the check-run reporter's array write, the
- * dashboard's `stepIndex >= 0` log gate) treat a negative index as absent.
+ * Not a negative index: `step.status` rejects one outright (an older
+ * orchestrator would close the agent's connection mid-job), and the check-run
+ * reporter's array write and the dashboard's `stepIndex >= 0` log gate treat a
+ * negative index as absent.
  */
 export const SetupStepType = z.enum(['container:build']);
 export type SetupStepType = z.infer<typeof SetupStepType>;
@@ -230,8 +214,7 @@ export const CacheRunEventType = z.enum(['cache.restore', 'cache.save']);
 export type CacheRunEventType = z.infer<typeof CacheRunEventType>;
 
 /**
- * Outcome recorded on a cache pseudo-step (drives the pseudo-step status + the
- * `run.event` metadata).
+ * Outcome of a cache pseudo-step; drives its status and the `run.event` metadata.
  *
  *  - `hit`     — restore found an entry (exact key or restoreKeys prefix).
  *  - `miss`    — restore found nothing.
@@ -243,11 +226,9 @@ export const CacheOutcome = z.enum(['hit', 'miss', 'saved', 'skipped', 'error'])
 export type CacheOutcome = z.infer<typeof CacheOutcome>;
 
 /**
- * Failure reason the Platform records on a run it fails because that run's
- * orchestrator disconnected and did not reconnect within the stale threshold.
- * Written by the Platform stale-detector into `execution_runs.failure_reason`
- * and matched by the dashboard to render the "stale / offline" run badge. A
- * shared constant so the writer (Platform) and reader (dashboard) never drift.
+ * `execution_runs.failure_reason` the Platform stale-detector writes when a
+ * run's orchestrator disconnected and did not reconnect within the stale
+ * threshold; the dashboard matches it for the "stale / offline" badge.
  */
 export const DEAD_ORCH_FAILURE_REASON = 'Orchestrator disconnected and did not recover';
 
@@ -283,13 +264,10 @@ export const TERMINAL_JOB_STATES: ReadonlySet<string> = new Set<ExecutionJobStat
 /**
  * The type-level counterpart of `TERMINAL_JOB_STATES`.
  *
- * Written as `Exclude<>` of the non-terminal statuses, never `Extract<>` of the
- * terminal ones. That direction is load-bearing: `Extract<ExecutionJobStatus,
- * 'success' | …>` does not widen when a value is added to the enum, so an
- * exhaustive switch over it keeps compiling and its `never` default arm is
- * inert. `Exclude<>` does widen, so a new status becomes a compile error at
- * every switch that claims to be total over the terminal set — which is the
- * only reason to write such a switch.
+ * `Exclude<>` of the non-terminal statuses, never `Extract<>` of the terminal
+ * ones: `Extract<>` does not widen when the enum gains a value, leaving an
+ * exhaustive switch's `never` arm inert. `Exclude<>` widens, so a new status is
+ * a compile error at every switch claiming to be total over the terminal set.
  */
 export type TerminalJobStatus = Exclude<
   ExecutionJobStatus,
@@ -320,29 +298,23 @@ export const executionStatusSchema = z.object({
   workflowName: z.string().max(STATUS_ID_MAX),
   status: ExecutionRunStatus,
   /**
-   * Routing key of the run's own source. Absent for a run the orchestrator
-   * recorded no routing key for (the Platform then falls back to the WS
-   * connection's first routing key). Lets the Platform mirror attribute each
-   * run to its real source even when one orchestrator serves multiple sources.
+   * Routing key of the run's own source, so the Platform mirror attributes runs
+   * correctly when one orchestrator serves several sources. Absent → the
+   * Platform falls back to the WS connection's first routing key.
    */
   routingKey: z.string().max(STATUS_ID_MAX).optional(),
   repoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
   /**
-   * The repository that DEFINES the workflow, when that is not
-   * `repoIdentifier` — a global workflow authored in one repository and
-   * dispatched against another. Absent for every per-repository run, where the
-   * two are the same repository, so "present" is a precise marker for a
-   * cross-repository global run.
+   * The repository that DEFINES the workflow, when not `repoIdentifier` (a
+   * global workflow dispatched against another repository). Absent for every
+   * per-repository run, so presence marks a cross-repository global run.
    */
   workflowRepoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
   /**
-   * True when this run records a global evaluation round rather than a
-   * workflow.
-   *
-   * The Platform mirrors it so its own re-run refusal can admit a round: a
-   * round is definitionally cross-repository, and re-running one re-evaluates
-   * the original event instead of resolving a workflow out of the acted-on
-   * repository's lock file. Absent means an ordinary run.
+   * True when this run records a global evaluation round rather than a workflow.
+   * The Platform mirrors it so its re-run refusal admits a round: a round is
+   * cross-repository by definition, and re-running it re-evaluates the original
+   * event instead of resolving a workflow from the acted-on repository's lock file.
    */
   isGlobalEvalRound: z.boolean().optional(),
   /**
@@ -367,19 +339,18 @@ export const executionStatusSchema = z.object({
   timestamp: z.number(),
   /** Parent run ID for re-run lineage (null/undefined for original runs). */
   parentRunId: z.string().max(STATUS_ID_MAX).nullable().optional(),
-  /** Root ancestor run ID for re-run lineage (null/undefined for original runs). Always points to the first run in the chain. */
+  /** First run in the re-run chain (null/undefined for original runs). */
   originalRunId: z.string().max(STATUS_ID_MAX).nullable().optional(),
   /** User identity that triggered this re-run (null/undefined for webhook-triggered). */
   triggeredBy: z.string().max(STATUS_ID_MAX).nullable().optional(),
   /** Agent provenance label when the run was triggered through an agent credential. */
   triggeredByAgentLabel: z.string().max(STATUS_ID_MAX).nullable().optional(),
   /**
-   * Triggering-actor identity captured from the provider event (the pusher / PR
-   * author), distinct from `triggeredBy` (the KiCI re-run user). Provider
-   * identities only — never tenant attribution (the wire-schema invariant: no
-   * `orgId` here). Powers the dashboard "triggered by @x" and actor-scope
-   * notifications. `triggerActorUsername` uses the wider repo-identifier bound
-   * because provider logins can be long display names.
+   * The provider event's actor (pusher / PR author), not `triggeredBy` (the KiCI
+   * re-run user). Provider identities only, never tenant attribution (no `orgId`
+   * on the wire). Powers "triggered by @x" and actor-scope notifications.
+   * `triggerActorUsername` takes the wider repo-identifier bound because
+   * provider logins can be long display names.
    */
   triggerActorProvider: z.string().max(STATUS_ID_MAX).nullable().optional(),
   triggerActorUsername: z.string().max(REPO_IDENTIFIER_MAX).nullable().optional(),
@@ -387,26 +358,24 @@ export const executionStatusSchema = z.object({
   /** Human-readable reason why the run failed (only present for failed runs). */
   failureReason: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
   /**
-   * Total raw log bytes accumulated across all jobs of this run, summed by the
-   * orchestrator from per-step `logBytesStreamed` values reported by the agent.
-   * Only set on terminal run states. Powers the operator-side
-   * `kici_org_log_bytes` capacity-planning gauge on the Platform.
+   * Raw log bytes across all jobs, summed by the orchestrator from the agent's
+   * per-step `logBytesStreamed`. Set only on terminal states; feeds the
+   * Platform's `kici_org_log_bytes` capacity-planning gauge.
    */
   logBytes: z.number().int().nonnegative().optional(),
   /**
-   * Structured init-failure signal. Set by the orchestrator when the run
-   * never executed a single step. Persisted in execution_runs.init_failure
-   * on both orchestrator and Platform sides. Only present when status === 'failed'.
+   * Set when the run never executed a step; persisted in
+   * execution_runs.init_failure on both sides. Only present when status === 'failed'.
    */
   initFailure: initFailureSchema.optional(),
   /** Why a terminal run failed (only present for failed/cancelled runs). */
   failureClass: RunFailureClass.optional(),
   /**
-   * The run's status generation. It starts at 0 and the orchestrator raises it
-   * each time the run leaves a terminal status (a run failed before a job it had
-   * already dispatched reported in, and then continues). The Platform keeps a
-   * terminal status against a non-terminal frame unless the frame's generation
-   * is newer, so a frame that arrives late cannot move a finished run back.
+   * The run's status generation: starts at 0, and the orchestrator raises it each
+   * time the run leaves a terminal status (it failed before an already-dispatched
+   * job reported in, then continues). The Platform keeps a terminal status
+   * against a non-terminal frame unless the frame's generation is newer, so a
+   * late frame cannot move a finished run back.
    */
   statusEpoch: statusEpochSchema,
 });
@@ -423,7 +392,7 @@ export const stepStatusForwardSchema = z.object({
   state: ExecutionStepStatus,
   timestamp: z.number(),
   data: z.record(z.string().max(STATUS_ID_MAX), z.unknown()).optional(),
-  /** Secret key names accessed by this step. Forwarded from agent for dashboard display. */
+  /** Secret key names this step accessed, for dashboard display. */
   secretsAccessed: z.array(z.string().max(STATUS_ID_MAX)).max(RUNS_ON_LABELS_MAX).optional(),
   /** Step concurrency role; absent means an ordinary sequential step. */
   concurrencyKind: StepConcurrencyKind.optional(),
@@ -451,32 +420,22 @@ export const jobStatusForwardSchema = z.object({
   /** Ordered bound context names for this job (multi-context jobs). */
   contexts: z.array(z.string().max(STATUS_ID_MAX)).max(CONTEXTS_MAX).optional(),
   /**
-   * Total raw log bytes accumulated across all steps of this job, summed by
-   * the orchestrator from per-step `logBytesStreamed` values reported by the
-   * agent. Only set on terminal job states. Powers the operator-side
-   * `kici_org_log_bytes` capacity-planning gauge on the Platform.
+   * Raw log bytes across this job's steps, set only on terminal job states; same
+   * derivation and use as the run-level `logBytes`.
    */
   logBytes: z.number().int().nonnegative().optional(),
   timestamp: z.number(),
   /** Structured init-failure signal — set for synthetic rejected-* / init-failed-* jobs. */
   initFailure: initFailureSchema.optional(),
-  /**
-   * Job kind. Absent means an ordinary `standard` job. `gate`/`proxy` mark an
-   * invoke gate and its per-run proxy children.
-   */
+  /** Absent means `standard`; `gate`/`proxy` mark an invoke gate and its per-run proxy children. */
   jobKind: JobKind.optional(),
   /** For a `proxy` job, the summoned run it mirrors. Additive/optional. */
   summonedRunId: z.string().max(STATUS_ID_MAX).optional(),
 });
 
-/** State replay sent on orchestrator reconnection -- full snapshot of active runs and jobs. */
 /**
- * A single run's full mirror-projection shape, as carried in `state.replay`.
- *
- * Carried by the orchestrator-reconnect `state.replay` push and consumed by the
- * Platform's shared `upsertRunMirror` mirror-projection helper. Extracting it as
- * a named schema keeps a single source of truth for any future reconciliation
- * path that projects the same per-run shape.
+ * A single run's full mirror-projection shape in `state.replay`, consumed by the
+ * Platform's shared `upsertRunMirror` helper.
  */
 export const stateReplayRunSchema = z.object({
   runId: z.string().max(STATUS_ID_MAX),
@@ -485,9 +444,7 @@ export const stateReplayRunSchema = z.object({
   routingKey: z.string().max(STATUS_ID_MAX).optional(),
   repoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
   /**
-   * The repository that DEFINES the workflow, when that is not
-   * `repoIdentifier`. Same meaning and same absent-for-per-repository-runs
-   * contract as on `execution.status`; carried here so a run that reaches the
+   * Same contract as on `execution.status`; carried so a run that reaches the
    * Platform only through the reconnect replay keeps its attribution.
    */
   workflowRepoIdentifier: z.string().max(REPO_IDENTIFIER_MAX).optional(),
@@ -528,6 +485,7 @@ export const stateReplayRunSchema = z.object({
 });
 export type StateReplayRun = z.infer<typeof stateReplayRunSchema>;
 
+/** State replay sent on orchestrator reconnection: a full snapshot of active runs and jobs. */
 export const stateReplaySchema = z.object({
   type: z.literal('state.replay'),
   messageId: z.string().max(STATUS_ID_MAX),

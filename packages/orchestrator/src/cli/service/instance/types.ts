@@ -1,32 +1,23 @@
 /**
- * Instance types — the shared shape of a folder-anchored service instance,
- * its on-disk manifest, the reconciled cache index, and the per-driver
- * discovery result.
- *
- * A KiCI service instance is identified by (component, name, instanceDir).
- * The deploy folder holds the manifest; the index at <kiciRoot>/instances.json
- * is a reconciled cache of all installed instances on the host.
+ * A service instance is identified by (component, name, instanceDir). The
+ * deploy folder holds the manifest; `<kiciRoot>/instances.json` is a
+ * reconciled cache of the host's installed instances.
  */
 
 import type { ServicePlatform } from '../types.js';
 
-/** The two KiCI components managed by `kici-admin` service commands. */
 export type Component = 'orchestrator' | 'agent';
 
-/** Enumerable list — used for iteration and discovery. */
 export const COMPONENTS: readonly Component[] = ['orchestrator', 'agent'] as const;
 
-/** Narrow an arbitrary string to a Component. */
 export function isComponent(value: string): value is Component {
   return value === 'orchestrator' || value === 'agent';
 }
 
 /**
- * The manifest written by `install` into the deploy folder
- * (`./.kici-orchestrator.json` or `./.kici-agent.json`).
- *
- * Holds everything `resolveInstance` needs to reconstruct a ServiceConfig
- * without re-deriving paths.
+ * The `./.kici-<component>.json` that `install` writes into the deploy folder:
+ * everything `resolveInstance` needs to rebuild a ServiceConfig without
+ * re-deriving paths.
  */
 export interface InstanceManifest {
   component: Component;
@@ -40,18 +31,11 @@ export interface InstanceManifest {
   createdAt: string;
   kiciVersion: string;
   /**
-   * Installed version → the last applied migration at the moment that version
-   * was running.
-   *
-   * A rollback flips a symlink, and the previous release's static migration
-   * provider does not carry the newer migrations' names — so Kysely refuses to
-   * start against a ledger that records them, and the documented recovery
-   * produces a second outage. This map is what lets the switch check whether
-   * the database is ahead of the version it is about to activate.
-   *
-   * Merged, never replaced, at every version change. Absent on every instance
-   * installed before this field existed, which the guard treats as "unknown"
-   * and warns about rather than refusing.
+   * Installed version → the last migration applied while it ran. A version
+   * switch checks it to refuse activating a version the database is ahead of
+   * (see `schemaGuardVerdict`). Merged, never replaced, at every version
+   * change; absent on older installs, which the guard warns about rather than
+   * refuses.
    */
   migrationHeads?: Record<string, string>;
 }
@@ -65,13 +49,12 @@ export interface IndexEntry {
   instanceDir: string;
 }
 
-/** CLI options that influence target resolution. */
 export interface ResolveOptions {
   instanceDir?: string;
   name?: string;
 }
 
-/** Fully-resolved target — what `resolveInstance` returns. */
+/** What `resolveInstance` returns. */
 export interface ResolvedInstance {
   manifest: InstanceManifest;
   manifestPath: string;

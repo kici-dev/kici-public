@@ -1,18 +1,12 @@
 /**
- * Predicate + projection evaluation for the shared `createMockDb` harness.
+ * Predicate + projection evaluation for the `createMockDb` harnesses.
  *
- * Kept BYTE-IDENTICAL in the orchestrator and the Platform, which each carry a
- * copy. Each package owns an
- * independent `createMockDb` builder and neither package may import the other, so
- * the evaluator is duplicated rather than shared. A drift test fails the moment
- * the copies diverge.
- *
- * `createMockDb` used to return its configured rows verbatim, whatever the
- * query asked for: a `.where(...)` or a `.select([...])` was recorded on a spy
- * and then discarded. A test therefore observed only the rows it had itself
- * configured, so dropping a filter or a projected column from the code under
- * test changed nothing the test could see. This module is the evaluator that
- * closes that: the mock now *applies* the query it was handed.
+ * The orchestrator and the Platform each own an independent `createMockDb`
+ * builder, typed by their own options, and both apply the query they are handed
+ * through this evaluator. Without it, a `.where(...)` or a `.select([...])`
+ * would only be recorded on a spy, so a test would observe the rows it had
+ * itself configured, and dropping a filter or a projected column from the code
+ * under test would change nothing the test could see.
  *
  * Scope, stated precisely because the guarantee is partial by construction:
  *

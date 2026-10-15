@@ -45,8 +45,7 @@ describe('step()', () => {
       },
     });
 
-    // This is a type-level test - if it compiles, it passes
-    // Runtime check that outputs schema is preserved (Zod v4 API)
+    // Type-level test (it passes if it compiles), plus a runtime check that the outputs schema survives.
     expect(build.outputs?.version.def.type).toBe('string');
     expect(build.outputs?.count.def.type).toBe('number');
   });
@@ -128,7 +127,6 @@ describe('step()', () => {
       executed = true;
     });
 
-    // Create a minimal mock context for testing
     const mockContext = {
       $: {} as any,
       log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
@@ -323,8 +321,7 @@ describe('step()', () => {
   describe('Step<TResult> inference', () => {
     it('infers void return type for simple function form', () => {
       const s = step('test', async () => {});
-      // Type test: Step<void> -- the run function returns Promise<void>
-      // If this compiles, the inference is correct
+      // Type test: Step<void>; compiling proves the inference.
       expect(s._tag).toBe('Step');
     });
 
@@ -335,7 +332,6 @@ describe('step()', () => {
         },
       });
       // Type test: Step<{ version: string; count: number }>
-      // Verify at runtime that run returns the expected value
       expect(s._tag).toBe('Step');
       expect(typeof s.run).toBe('function');
     });

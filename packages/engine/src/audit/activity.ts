@@ -9,18 +9,16 @@
  * (origin, requestId, outcome) are nullable so audit_log rows stay
  * shape-compatible without padding.
  *
- * Browser-safe: only Zod imports + base64 helpers via globalThis.btoa/atob
- * (available in Node 18+ and all evergreen browsers). No Node built-ins.
+ * Browser-safe: Zod plus globalThis.btoa/atob (Node 18+ and evergreen
+ * browsers); no Node built-ins.
  */
 import { z } from 'zod';
 import { ActorType } from '../protocol/messages/actor.js';
 import { AccessLogOutcome, AccessLogSource } from '../protocol/messages/access-log.js';
 
 /**
- * Source discriminator on a unified Activity row.
- * NOT to be confused with `AccessLogSource` (platform_proxy / admin_http / agent /
- * admin_cli) — that field is renamed to `origin` on the unified row to
- * avoid the collision.
+ * Source discriminator on a unified Activity row. Not `AccessLogSource`,
+ * which the unified row carries as `origin`.
  */
 export const ActivityRowSource = z.enum(['audit_log', 'access_log']);
 export type ActivityRowSource = z.infer<typeof ActivityRowSource>;
@@ -69,9 +67,8 @@ export const activityRowSchema = z.object({
   /** access_log only — request correlation ID. */
   requestId: z.string().nullable().optional(),
   /**
-   * access_log only — origin of the entry (the AccessLogSource values:
-   * platform_proxy / admin_http / admin_cli / agent). Renamed from `source` on
-   * the access_log row schema so the unified row's `source` field is
+   * access_log only — the access_log row's `source` (platform_proxy /
+   * admin_http / admin_cli / agent), renamed so the unified `source` is
    * unambiguously the audit_log vs. access_log discriminator.
    */
   origin: AccessLogSource.nullable().optional(),
@@ -79,9 +76,8 @@ export const activityRowSchema = z.object({
 export type ActivityRow = z.infer<typeof activityRowSchema>;
 
 /**
- * Unified filter schema accepted by GET /orgs/:customerId/activity.
- * Captures every filter the existing CLI commands expose, plus the new
- * search features (runId sugar, full-text q).
+ * Unified filter schema accepted by GET /orgs/:customerId/activity: every
+ * filter the CLI commands expose, plus runId sugar and full-text `q`.
  */
 export const activityFilterSchema = z.object({
   source: ActivityFilterSource.default('all'),
@@ -105,10 +101,9 @@ export const activityFilterSchema = z.object({
   agentLabel: z.string().max(255).optional(),
   /**
    * When true, return only agent-attributed rows (access_log `agent_label IS NOT NULL`).
-   * Arrives as a query string (`?agentOnly=false`), so parse it with `z.stringbool()`
-   * — NOT `z.coerce.boolean()`, whose `z.coerce.boolean('false') === true` is a
-   * confirmed footgun. The `z.boolean()` arm keeps a native boolean acceptable for
-   * programmatic callers (mirrors how `limit` tolerates both a number and a string).
+   * Parsed with `z.stringbool()`, not `z.coerce.boolean()`, because
+   * `z.coerce.boolean('false') === true`. The `z.boolean()` arm accepts a native
+   * boolean from programmatic callers, as `limit` accepts a number or a string.
    */
   agentOnly: z.union([z.boolean(), z.stringbool()]).optional(),
   /** ISO timestamp lower bound (inclusive). */
@@ -122,11 +117,9 @@ export const activityFilterSchema = z.object({
 export type ActivityFilter = z.infer<typeof activityFilterSchema>;
 
 /**
- * Internal cursor shape — preserves both halves of the federated
- * pagination state. `null` for either half means that source is exhausted
- * and should not be re-queried on the next page.
- *
- * Encoded as base64url(JSON) to keep it opaque-looking and URL-safe.
+ * Internal cursor holding both halves of the federated pagination state. A
+ * `null` half means that source is exhausted and is not re-queried. Encoded
+ * as base64url(JSON) so it stays opaque and URL-safe.
  */
 export const activityCursorSchema = z.object({
   audit: z
@@ -143,7 +136,7 @@ export const activityCursorSchema = z.object({
 });
 export type ActivityCursor = z.infer<typeof activityCursorSchema>;
 
-// --- base64url helpers (browser-safe; Node 18+ + evergreen browsers expose btoa/atob) ---
+// --- base64url helpers ---
 
 function base64UrlEncode(s: string): string {
   // btoa requires Latin-1; cursor JSON is ASCII so this is safe.
@@ -156,18 +149,14 @@ function base64UrlDecode(s: string): string {
   return atob(padded);
 }
 
-/**
- * Encode a cursor for the federated /activity endpoint. Returns a
- * URL-safe opaque string suitable for the `cursor` query param.
- */
+/** Encodes a cursor as a URL-safe opaque string for the /activity `cursor` query param. */
 export function encodeActivityCursor(cursor: ActivityCursor): string {
   return base64UrlEncode(JSON.stringify(cursor));
 }
 
 /**
- * Decode an opaque cursor string. Returns `null` when the input is
- * malformed (corrupted base64, invalid JSON, or schema mismatch). Callers
- * should treat null as "start from page zero" rather than 500ing.
+ * Returns `null` for a malformed cursor (bad base64, invalid JSON, or schema
+ * mismatch); callers treat null as "start from page zero" rather than 500ing.
  */
 export function decodeActivityCursor(cursor: string): ActivityCursor | null {
   try {
@@ -180,10 +169,8 @@ export function decodeActivityCursor(cursor: string): ActivityCursor | null {
 }
 
 /**
- * Apply the runId sugar: when `runId` is set on the filter, it is mapped
- * to (targetType='run', targetId=runId) for both halves of the
- * federation. Returns a new filter with runId resolved into the explicit
- * target fields; existing target* fields take precedence if both are set.
+ * Resolves `runId` into targetType='run' + targetId=runId for both halves of
+ * the federation; explicit target* fields take precedence.
  */
 export function resolveRunIdSugar(filter: ActivityFilter): ActivityFilter {
   if (!filter.runId) return filter;

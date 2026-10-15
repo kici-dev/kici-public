@@ -1,22 +1,19 @@
 import { z } from 'zod';
 
-// --- Inbound webhook delivery log enums (single source of truth via Zod z.enum) ---
-// Access values: EventLogStatus.enum.processed, PayloadOmittedReason.enum.size_exceeded.
-// These enums back the orchestrator `event_log` table, the dashboard list/detail
-// projections, and the kici-admin `event-log` CLI. They are NOT used for the
-// Platform-side `event_log` (which uses a separate, narrower 'pending' default
-// status — Platform owns the routing-status string).
+// --- Inbound webhook delivery log enums ---
+// They back the orchestrator `event_log` table, the dashboard list/detail
+// projections and the kici-admin `event-log` CLI, not the Platform-side
+// `event_log`, whose narrower 'pending'-default routing status Platform owns.
 
 /**
  * Outcome of webhook processing on the orchestrator.
  *
- * - `received` — row written before processing started (e.g. oversized payload
- *   path that records the row but defers further work to the standard pipeline).
+ * - `received` — row written before processing started (e.g. the oversized
+ *   payload path, which defers further work to the standard pipeline).
  * - `shed` — the ingest admission controller refused the delivery under load
- *   before it reached the pipeline. `error_message` names the shed reason. The
- *   row is a breadcrumb written at shed time so a shed delivery is telling
- *   apart from one that never arrived; a later successful overflow replay
- *   upgrades the same row to its real outcome.
+ *   before the pipeline; `error_message` names the reason. The row tells a
+ *   shed delivery apart from one that never arrived, and a later successful
+ *   overflow replay upgrades it to its real outcome.
  * - `processed` — webhook was processed and at least one workflow was
  *   evaluated. `matched_count` carries how many actually matched.
  * - `duplicate` — dedup cache rejected the delivery.
@@ -42,13 +39,12 @@ export type EventLogStatus = z.infer<typeof EventLogStatus>;
 /**
  * Reason the payload was NOT stored to object storage.
  *
- * - `size_exceeded` — body exceeded the configured `eventLog.maxPayloadBytes`
- *   soft cap. The DB row is still written (with the hash + actual size) so the
- *   delivery is visible in the dashboard; the body itself can be retrieved
- *   from `KICI_WEBHOOK_PAYLOAD_DIR` or raw logs by hash if needed.
+ * - `size_exceeded` — body exceeded the `eventLog.maxPayloadBytes` soft cap.
+ *   The DB row (hash + actual size) is still written, so the delivery shows in
+ *   the dashboard; the body is retrievable by hash from
+ *   `KICI_WEBHOOK_PAYLOAD_DIR` or raw logs.
  * - `storage_failed` — upload to LogStorage threw. The DB row is still
- *   written so the operator can investigate; the failure is logged at error
- *   level by the writer.
+ *   written, and the writer logs the failure at error level.
  */
 export const PayloadOmittedReason = z.enum(['size_exceeded', 'storage_failed']);
 export type PayloadOmittedReason = z.infer<typeof PayloadOmittedReason>;

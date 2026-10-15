@@ -1,7 +1,4 @@
-/**
- * Errors a scaler backend's `spawn()` throws to tell the manager how to treat
- * the failure.
- */
+/** Errors a scaler backend's `spawn()` throws to tell the manager how to treat the failure. */
 
 /**
  * A spawn the host refused outright. Retrying cannot succeed until an operator

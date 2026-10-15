@@ -1,9 +1,8 @@
 /**
- * Build a SLSA v1.0 in-toto provenance statement from the server-truth identity
- * token claims plus the caller-supplied subject. The build context comes
- * entirely from the JWT claims (minted server-side by the orchestrator,
- * unforgeable), so the
- * statement's identity equals the token's identity by construction.
+ * SLSA v1.0 in-toto provenance statements. The live builder takes its build
+ * context entirely from the identity token's JWT claims (minted server-side by
+ * the orchestrator, unforgeable), so the statement's identity equals the
+ * token's by construction.
  */
 import {
   IN_TOTO_STATEMENT_TYPE,
@@ -48,11 +47,10 @@ export interface BuildStatementInput {
 }
 
 /**
- * Agent-local job context used to freeze a provenance statement for a deferred
- * attestation. When the orchestrator's mint defers there is no identity token
- * to read claims from, so the statement is built from facts the agent
- * already holds about the job it just ran. Only the identity token is deferred;
- * these attested facts are sealed (DSSE-signed) at build time.
+ * Agent-local job context for freezing a deferred attestation's statement: with
+ * the mint deferred there is no identity token, so the statement uses facts the
+ * agent holds about the job it ran. Only the token is deferred; these facts are
+ * sealed (DSSE-signed) at build time.
  */
 export interface LocalBuildContext {
   repository: string;
@@ -60,8 +58,8 @@ export interface LocalBuildContext {
   sha: string | null;
   /**
    * The token's `workflow_ref` claim (`<name>@<sha>`) when the orchestrator
-   * supplied one. NOT a global workflow's clone ref — those are never equal,
-   * and comparing them is what a cross-check would have failed on.
+   * supplied one. NOT a global workflow's clone ref: the two are never equal,
+   * so a cross-check comparing them fails.
    */
   workflowRef: string;
   runId: string;
@@ -75,22 +73,19 @@ export interface LocalBuildContext {
   /**
    * The orchestrator instance id, for the `builder.id`. Absent when the
    * orchestrator sent no provenance context, which yields the honest
-   * `/orchestrator/unknown` the local guess has always produced.
+   * `/orchestrator/unknown`.
    */
   orchestratorId?: string;
 }
 
 /**
- * Build a frozen SLSA v1.0 provenance statement from agent-local job context,
- * for a deferred attestation (no minted identity token yet). Marks
- * `attestationOrigin: 'deferred'` in the internal parameters. The caller
- * DSSE-signs the returned statement immediately and computes its statement hash
- * — one of the two bindings the later OIDC mint commits to.
- *
- * Emits the same fields `buildProvenanceStatement` emits, so a statement frozen
- * from an orchestrator-supplied context is field-for-field what a live mint
- * would have produced. That is what lets the orchestrator cross-check the
- * statement against its own run row before signing anything that commits to it.
+ * Frozen statement for a deferred attestation (no minted token yet), marked
+ * `attestationOrigin: 'deferred'`. The caller DSSE-signs it immediately and
+ * computes its statement hash, one of the two bindings the later OIDC mint
+ * commits to. Emits the same fields as `buildProvenanceStatement`, so a
+ * statement frozen from an orchestrator-supplied context matches a live mint
+ * field for field, which lets the orchestrator cross-check it against its run
+ * row before signing anything that commits to it.
  */
 export function buildLocalProvenanceStatement(input: {
   context: LocalBuildContext;
@@ -137,10 +132,7 @@ export function buildLocalProvenanceStatement(input: {
   };
 }
 
-/**
- * Build a KiCI SLSA v1.0 provenance statement (validates against
- * `kiciProvenanceStatementSchema`).
- */
+/** Validates against `kiciProvenanceStatementSchema`. */
 export function buildProvenanceStatement(input: BuildStatementInput): KiciProvenanceStatement {
   const c = input.tokenClaims;
   return {

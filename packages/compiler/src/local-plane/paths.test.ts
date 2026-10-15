@@ -22,13 +22,10 @@ describe('local-plane paths', () => {
   });
 
   it('resolves a symlinked local dir to its durable target', () => {
-    // A caller can run against a throwaway config dir that only symlinks
-    // `local` at the real plane, so it carries no credentials while still
-    // reusing the warm plane. Postgres is started with a data directory under
-    // whatever planeRoot() returns and keeps it OPEN — so if it returned the
-    // ephemeral path, the caller removing its temp dir would PANIC the running
-    // Postgres ("could not open file .../pgdata/global/pg_control") and shut
-    // the whole plane down under every later phase.
+    // A throwaway config dir may symlink `local` at the real plane to reuse it
+    // without credentials. Postgres keeps its data dir under planeRoot() OPEN, so
+    // an ephemeral path would PANIC it ("could not open file
+    // .../pgdata/global/pg_control") once the caller removes its temp dir.
     const durable = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-plane-real-'));
     const durableLocal = path.join(durable, 'local');
     fs.mkdirSync(durableLocal);
@@ -39,7 +36,6 @@ describe('local-plane paths', () => {
     process.env.KICI_CONFIG_DIR = ephemeral;
     try {
       expect(planeRoot()).toBe(fs.realpathSync(durableLocal));
-      // And the data directory Postgres is handed follows it.
       expect(planePaths().pgData).toBe(path.join(fs.realpathSync(durableLocal), 'pgdata'));
     } finally {
       fs.rmSync(ephemeral, { recursive: true, force: true });

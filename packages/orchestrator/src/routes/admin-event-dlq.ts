@@ -1,9 +1,7 @@
 /**
- * Admin API routes for the event DLQ (dead-letter queue).
- *
- * Exposes the orchestrator-side DLQ — events that exhausted their dispatch
- * retry budget — over Bearer-auth HTTP so operators can list, manually retry,
- * or discard rows from the kici-admin CLI / dashboard.
+ * Admin API for the event dead-letter queue (events that exhausted their
+ * dispatch retry budget), over Bearer-auth HTTP for the kici-admin CLI /
+ * dashboard.
  *
  *   GET    /api/v1/admin/event-dlq        — list DLQ events (limit + cursor)
  *   GET    /api/v1/admin/event-dlq/count  — number of DLQ events (for badge)
@@ -120,16 +118,13 @@ export function createAdminEventDlqRoutes(deps: AdminEventDlqRoutesDeps): Hono<A
         return c.json({ error: 'DLQ event not found' }, 404);
       }
 
-      // Re-publish so a healthy node picks it up immediately rather than
-      // waiting for the leader-only retry scanner's next tick. We deliberately
-      // issue the notify outside any transaction — the row update above has
-      // already committed, so the notify is safe to fire-and-forget.
+      // Deliberately outside any transaction: the row update has already
+      // committed, so the notify is safe to fire-and-forget.
       try {
         await sql`SELECT pg_notify('kici_event_channel', ${id})`.execute(deps.eventStore.getDb());
       } catch (err) {
-        // Notify failure is non-fatal: the retry scanner will pick it up on
-        // its next tick. Log so operators see why the row didn't dispatch
-        // sooner, but don't fail the API call.
+        // Non-fatal: the retry scanner picks it up on its next tick. Logged so
+        // operators see why the row did not dispatch sooner.
         logger.warn('pg_notify failed after DLQ retry; scanner will catch up', {
           eventId: id,
           error: toErrorMessage(err),

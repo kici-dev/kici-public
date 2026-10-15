@@ -46,12 +46,11 @@ export class TrustStore {
     targetRoutingKey: string,
     eventName: string,
   ): Promise<boolean> {
-    // Same-repo events are always trusted
+    // Events whose source and target routing keys match are always trusted
     if (sourceRoutingKey === targetRoutingKey) {
       return true;
     }
 
-    // Query cross_repo_trust for an enabled matching row
     const row = await this.db
       .selectFrom('cross_repo_trust')
       .select(['allowed_events'])
@@ -94,7 +93,6 @@ export class TrustStore {
       return false;
     }
 
-    // Check if eventName matches any allowed glob pattern
     return patterns.some((pattern) => picomatch.isMatch(eventName, String(pattern)));
   }
 
@@ -171,9 +169,6 @@ export class TrustStore {
     };
   }
 
-  /**
-   * Remove a trust relationship by ID.
-   */
   async removeTrust(id: string): Promise<void> {
     await this.db.deleteFrom('cross_repo_trust').where('id', '=', id).execute();
   }

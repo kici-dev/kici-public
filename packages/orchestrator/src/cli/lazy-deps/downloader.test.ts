@@ -1,17 +1,9 @@
-/**
- * Tests for the lazy dependency downloader.
- *
- * Mocks filesystem and crypto operations to test download, verify,
- * extract, and cache-hit scenarios without actual network calls.
- */
+/** Lazy dependency downloader tests, with the filesystem mocked and no network. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { LazyDep } from './registry.js';
-
-// We test the pure logic functions without actual HTTP/archive operations
-// by mocking the filesystem layer.
 
 vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -90,7 +82,6 @@ describe('lazy-deps', () => {
 
   describe('cache', () => {
     it('getCacheBasePath returns a path', async () => {
-      // Need to mock os for this
       const { getCacheBasePath } = await import('./cache.js');
       const p = getCacheBasePath();
       expect(typeof p).toBe('string');
@@ -131,18 +122,17 @@ describe('lazy-deps', () => {
       mockedExistsSync.mockReturnValue(false);
 
       const { ensureDep } = await import('./downloader.js');
-      // Will throw because we can't actually download, but should attempt mkdir first
+      // Throws without network, but mkdir must run first.
       try {
         await ensureDep(testDep, testCacheDir);
       } catch {
-        // Expected - no actual HTTP available
+        // Expected: no network.
       }
       expect(mockedMkdirSync).toHaveBeenCalled();
     });
 
     it('verifyIntegrity rejects on SHA-256 mismatch', async () => {
       const { verifyIntegrity } = await import('./downloader.js');
-      // Create a buffer with known content
       const content = Buffer.from('test content');
       const wrongHash = 'wrong-hash-value';
       expect(() => verifyIntegrity(content, wrongHash)).toThrow('SHA-256 integrity check failed');
@@ -151,7 +141,6 @@ describe('lazy-deps', () => {
     it('verifyIntegrity passes with correct hash', async () => {
       const { verifyIntegrity } = await import('./downloader.js');
       const content = Buffer.from('test content');
-      // Pre-computed SHA-256 of "test content"
       const crypto = await import('node:crypto');
       const correctHash = crypto.createHash('sha256').update(content).digest('hex');
       expect(() => verifyIntegrity(content, correctHash)).not.toThrow();

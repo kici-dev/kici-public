@@ -3,13 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './071_batch_accumulation.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 071. Creates a throwaway database, applies
- * migrations 001..071, and asserts the batch-accumulation tables + their columns
- * exist, the open-once unique index is present, and the item→window cascade
- * fires. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 071: the batch-accumulation tables and columns, the open-once
+ * unique index, and the item→window cascade. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;

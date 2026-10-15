@@ -1,15 +1,6 @@
 /**
- * Dashboard handler for the orchestrator.
- *
- * Responds to dashboard.* and run.* WS messages from Platform by querying the local
- * execution_jobs and execution_steps tables and reading logs from LogStorage.
- *
- * Supported messages:
- * - dashboard.run.detail: returns jobs with nested steps for a run
- * - dashboard.step.logs: returns log lines for a specific step
- * - dashboard.payload: returns the original webhook payload for a run
- * - run.rerun.request: re-runs a completed workflow run
- * - run.cancel.request: cancels a running workflow run
+ * Answers the Platform's dashboard.* and run.* WS messages from the local
+ * execution tables and LogStorage.
  */
 import { setupStepsFirst } from '../reporting/step-display-order.js';
 import { HeldRunCancelRefusedError } from '../cancel/cancel-run.js';
@@ -115,62 +106,48 @@ interface DashboardHandlerDeps {
   logStorage: LogStorage;
   /**
    * The orchestrator's own provenance issuer (`KICI_ORCHESTRATOR_PROVENANCE_ISSUER`)
-   * when it owns signing. Surfaced on attestations-list responses so the Platform
-   * returns it as `trustedIssuer` — the dashboard / CLI verify against the
-   * orchestrator that signed the bundles.
+   * when it owns signing. The Platform returns it as `trustedIssuer`, so the
+   * dashboard / CLI verify against the orchestrator that signed the bundles.
    */
   provenanceSigningIssuer?: string | null;
   /**
-   * Object-storage backend for provenance bundles. The attestations handler
-   * reads each stored bundle by `storage_key` and inlines it into the response
-   * so the dashboard verifies it client-side without a second fetch. Optional —
-   * when absent (e.g. orchestrators without provenance configured) the handler
-   * replies with an `error` and an empty list. Reuses the cache storage backend
-   * (the same one attestation bundles are written to).
+   * The cache storage backend attestation bundles are written to. The handler
+   * inlines each bundle (by `storage_key`) so the dashboard verifies it
+   * client-side without a second fetch. Absent (no provenance configured) ⇒ an
+   * `error` reply with an empty list.
    */
   provenanceStorage?: CacheStorage | null;
   /**
-   * User-facing artifacts layer. Backs `dashboard.artifacts.list` — lists a
-   * run's named artifacts and mints a presigned GET per entry. Optional — when
-   * absent (orchestrator without a DB / cache storage) the handler replies with
-   * an `error` and an empty list.
+   * Backs `dashboard.artifacts.list` (a presigned GET per artifact). Absent (no
+   * DB / cache storage) ⇒ an `error` reply with an empty list.
    */
   artifactStore?: ArtifactStore | null;
   /**
    * Drain the deferred-attestation outbox on demand (mints in this process,
-   * which owns the Platform WS). Backs `dashboard.attestation.retry`. Optional —
-   * absent on orchestrators without the retrier wired.
+   * which owns the Platform WS). Backs `dashboard.attestation.retry`.
    */
   retryAttestations?: (opts: {
     runId?: string;
   }) => Promise<{ minted: number; stillPending: number }>;
-  /** Send a response message back to Platform over the WS connection. */
   send: (msg: unknown) => void;
-  /** This orchestrator's instance ID, included in job detail responses. */
+  /** Included in job detail responses. */
   orchestratorId?: string;
-  /** Access log writer — records one row per read / mutation with actor attribution. */
+  /** Records one row per read / mutation with actor attribution. */
   accessLog?: AccessLogWriter;
   /** Org ID for access_log rows (null when the orchestrator isn't org-scoped). */
   orgId?: string | null;
   /** Routing key for access_log rows (null when not run-scoped). */
   routingKey?: string | null;
   /**
-   * Long-lived cold-store handle for read fallback. When set, run /
-   * job / step lookups fall through to S3 if the row has aged out of
-   * PG. `null` means the orchestrator is running without cold-store
-   * configured — handler then serves PG rows only.
+   * Run / job / step lookups fall through to this S3 cold store once a row ages
+   * out of PG; `null` serves PG rows only.
    */
   coldStore?: ColdStore | null;
   /**
-   * Callback for handling re-run requests.
-   * Returns { newRunId } on success or throws on failure.
-   *
-   * `routingKey` is forwarded from the Platform (read from
-   * Platform's denormalized `execution_runs.routing_key`) so the
-   * orchestrator can probe its cold-store under the right tenant
-   * prefix when the run row is missing from PG. Optional for back-
-   * compat with mixed deploys; absent means the orchestrator falls
-   * back to the legacy "no PG row → throw" path.
+   * Throws on failure. `routingKey` comes from the Platform's denormalized
+   * `execution_runs.routing_key`, so the cold-store probe uses the right tenant
+   * prefix when the run row is missing from PG. It is optional for mixed-deploy
+   * back-compat; absent ⇒ the legacy "no PG row → throw" path.
    */
   onRerun: (
     runId: string,
@@ -185,24 +162,16 @@ interface DashboardHandlerDeps {
     requestId: string,
     routingKey?: string,
   ) => Promise<{ newRunId: string }>;
-  /**
-   * Callback for handling cancel requests.
-   * Returns { cancelledJobs } on success or throws on failure.
-   * The force flag indicates whether to force-cancel (SIGKILL, skip hooks).
-   */
+  /** Throws on failure. `force` force-cancels (SIGKILL, skip hooks). */
   onCancel: (
     runId: string,
     cancelledBy: string | null,
     cancelledByAgentLabel: string | null,
     force?: boolean,
     // `alreadyTerminal` is optional so a caller that cannot distinguish the case
-    // (and every existing test double) still satisfies the type; it is forwarded
-    // verbatim when present.
+    // (and every test double) satisfies the type; it is forwarded when present.
   ) => Promise<{ cancelledJobs: number; alreadyTerminal?: boolean }>;
-  /**
-   * Callback for handling manual schedule trigger requests.
-   * Returns { newRunId } on success or throws on failure.
-   */
+  /** Throws on failure. */
   onManualSchedule: (
     registrationId: string,
     triggeredBy: string | null,
@@ -215,17 +184,15 @@ interface DashboardHandlerDeps {
     requestId: string,
   ) => Promise<{ newRunId: string }>;
   /**
-   * Event store for the per-org DLQ surface. Optional — when absent the
-   * `handleEventDlq*` methods reply with a structured `error` so the
-   * dashboard renders an empty-state without crashing. In real
-   * deployments the store is wired by `bootstrapOrchestrator`.
+   * Backs the per-org DLQ surface (wired by `bootstrapOrchestrator`). Absent ⇒
+   * `handleEventDlq*` replies with a structured `error`, which the dashboard
+   * renders as an empty state.
    */
   eventStore?: EventStore | null;
   /**
    * **Test-only fault injection**, supplied only by the build-time test double:
-   * `handleRerunRequest` awaits this hook before invoking `onRerun`, so an HA
-   * test can force a slow first coordinator and trigger a relay failover.
-   * Undefined (the shipped default) means no delay.
+   * awaited before `onRerun` so an HA test can slow the first coordinator into
+   * a relay failover. The shipped default is undefined (no delay).
    */
   beforeRerun?: () => Promise<void>;
 }
@@ -276,14 +243,14 @@ export class DashboardHandler {
   }
 
   /**
-   * Update the bound orgId + routingKey. Called from server.ts after resolving
-   * the single tenant org from the `sources` / `generic_webhook_sources` table.
+   * Called from server.ts after resolving the single tenant org from the
+   * `sources`, `generic_webhook_sources` or `remote_sources` table.
    *
-   * NOTE: this binding is the **fallback** access_log scope. Run-targeted
-   * handlers resolve the run-owning org per-request via `resolveOrgForRun`;
-   * the bound pair is consulted only when the per-target lookup yields no
-   * result (e.g. cold-archived run, deleted source). On a multi-tenant
-   * orchestrator the bound pair is non-deterministic (server.ts:937-955
+   * The binding is only the **fallback** access_log scope: run-targeted
+   * handlers resolve the run-owning org per request via `resolveOrgForRun`
+   * and use the bound pair only when that yields nothing (e.g. cold-archived
+   * run, deleted source). On a multi-tenant
+   * orchestrator the bound pair is non-deterministic (server.ts `onAuthenticated`
    * picks the first row from a `LIMIT 1` query with no `ORDER BY`), so it
    * MUST NOT be the source of truth for `access_log.org_id`.
    */
@@ -293,15 +260,10 @@ export class DashboardHandler {
   }
 
   /**
-   * Resolve the run-owning org from `execution_runs.routing_key` plus a
-   * sources/generic_webhook_sources lookup on that routing key. Returns
-   * `null` when the run row is missing (e.g. cold-archived) so the caller
-   * can fall back to the handler-bound context.
-   *
-   * Returns `{ orgId, routingKey }` where either field can be null:
-   * - `routingKey` is non-null whenever the PG run row was found, even if
-   *   the source row has since been deleted (best-effort attribution).
-   * - `orgId` is null only when the routing key has no matching source row.
+   * Null when the run row is missing (e.g. cold-archived), so the caller falls
+   * back to the bound context. Otherwise `routingKey` is set even when the
+   * source row was deleted (best-effort attribution), and `orgId` is null only
+   * when no source row matches the routing key.
    */
   private async resolveOrgForRun(
     runId: string,
@@ -316,11 +278,8 @@ export class DashboardHandler {
   }
 
   /**
-   * Resolve the org owning a routing key by consulting both source tables
-   * (GitHub-app `sources` first, then `generic_webhook_sources`). Used
-   * directly for `handleRerunRequest` (which gets a `routingKey` hint from
-   * Platform's denormalized copy) and indirectly via
-   * `resolveOrgForRun`.
+   * GitHub-app `sources` first, then `generic_webhook_sources`. Also used
+   * directly by `handleRerunRequest` with the Platform's `routingKey` hint.
    */
   private async resolveOrgForRoutingKey(
     routingKey: string,
@@ -340,16 +299,12 @@ export class DashboardHandler {
       .executeTakeFirst();
     if (genSrc?.customer_id) return { orgId: genSrc.customer_id, routingKey };
 
-    // Routing key found but no source row matches (deleted source) —
-    // best-effort attribution: keep the routing key, leave orgId null so
-    // `contextOrFallback` can substitute the bound orgId.
+    // Deleted source: keep the routing key and leave orgId null for
+    // `contextOrFallback` to fill from the bound context.
     return { orgId: null, routingKey };
   }
 
-  /**
-   * Resolve the org from a `workflow_registrations` row. Returns null when
-   * the registration is missing (caller falls back to bound context).
-   */
+  /** Null when the registration is missing (caller falls back to bound context). */
   private async resolveOrgForRegistration(
     registrationId: string,
   ): Promise<{ orgId: string | null; routingKey: string | null } | null> {
@@ -363,10 +318,8 @@ export class DashboardHandler {
   }
 
   /**
-   * Apply a per-target resolution result, falling back to the handler-bound
-   * orgId / routingKey when the resolution is null or its individual fields
-   * are null. This is the merge point that makes the bound context a
-   * fallback rather than the source of truth.
+   * The merge point that makes the bound context a per-field fallback for a
+   * per-target resolution, never the source of truth.
    */
   private contextOrFallback(resolved: { orgId: string | null; routingKey: string | null } | null): {
     orgId: string | null;
@@ -382,10 +335,9 @@ export class DashboardHandler {
   }
 
   /**
-   * Defense-in-depth dashboard-write policy gate for the DLQ handlers.
-   * Returns true when allowed; false (with a `denied` access_log row and
-   * an `operation_disabled` envelope on the wire) when the orch policy
-   * has the operation switched off.
+   * Defense-in-depth policy gate for the DLQ handlers: false when the policy
+   * disables the op, after recording a `denied` row and sending the
+   * `operation_disabled` envelope.
    */
   private async enforcePolicy(
     msg: { actor: ActorPrincipal; requestId: string; orgId: string },
@@ -416,17 +368,12 @@ export class DashboardHandler {
     }
   }
 
-  /**
-   * Handle a dashboard.run.detail request.
-   * Queries execution_jobs and execution_steps for the given runId,
-   * builds a nested job/step tree, and sends the response.
-   */
+  /** dashboard.run.detail: the run's nested job/step tree. */
   async handleRunDetail(msg: DashboardRunDetailRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
     try {
-      // Query trust context + run-scoped init_failure from execution_runs
-      // (trust context is populated for PR-triggered runs; init_failure is
-      // populated for runs that never executed a step).
+      // Trust context is set for PR-triggered runs; init_failure for runs that
+      // never executed a step.
       let runRow:
         | {
             trust_tier: string | null;
@@ -447,7 +394,6 @@ export class DashboardHandler {
         .where('run_id', '=', msg.runId)
         .executeTakeFirst();
 
-      // Query all jobs for this run
       let jobs = await this.db
         .selectFrom('execution_jobs')
         .select([
@@ -477,7 +423,6 @@ export class DashboardHandler {
         .orderBy('created_at', 'asc')
         .execute();
 
-      // Query all steps for this run in one query (more efficient than per-job)
       let steps = await this.db
         .selectFrom('execution_steps')
         .select([
@@ -502,12 +447,9 @@ export class DashboardHandler {
         .orderBy('step_index', 'asc')
         .execute();
 
-      // Cold-store fallback. If PG has 0 jobs, the run was
-      // archived (jobs + steps moved to S3 in the same archive cycle).
-      // Pull the chunk rows back to populate the response so the
-      // dashboard run-detail page works for any run the orchestrator
-      // has ever owned. Run-row trust context is best-effort —
-      // archived runs may have had null values anyway.
+      // 0 PG jobs ⇒ archived (jobs + steps move to S3 in one archive cycle), so
+      // run detail works for any run this orchestrator ever owned. Run-row trust
+      // context is best-effort: archived runs may have had nulls anyway.
       if (jobs.length === 0 && this.coldStore && this.routingKey) {
         const cold = await this.fetchArchivedRunDetail(this.routingKey, msg.runId);
         if (cold.run && !runRow) runRow = cold.run;
@@ -515,14 +457,13 @@ export class DashboardHandler {
         if (cold.steps.length > 0) steps = cold.steps as typeof steps;
       }
 
-      // Query secret output key names per job (values are NOT sent to dashboard)
+      // Secret output key names only: values are NOT sent to the dashboard.
       const secretOutputRows = await this.db
         .selectFrom('run_secret_outputs')
         .select(['job_id', 'output_key'])
         .where('run_id', '=', msg.runId)
         .execute();
 
-      // Group secret output keys by job_id
       const secretKeysByJob = new Map<string, string[]>();
       for (const row of secretOutputRows) {
         let keys = secretKeysByJob.get(row.job_id);
@@ -533,7 +474,6 @@ export class DashboardHandler {
         keys.push(row.output_key);
       }
 
-      // Group steps by job_id
       const stepsByJob = new Map<string, typeof steps>();
       for (const step of steps) {
         let jobSteps = stepsByJob.get(step.job_id);
@@ -544,9 +484,8 @@ export class DashboardHandler {
         jobSteps.push(step);
       }
 
-      // Query dependency edges for the whole run in one batch (keyed by
-      // downstream job_name). These are the resolved edges the needs-scheduler
-      // enforced — dynamic-group edges are already concrete job-name edges here.
+      // The resolved edges the needs-scheduler enforced: dynamic-group edges are
+      // already concrete job-name edges here.
       const needsRows = await this.db
         .selectFrom('execution_job_needs')
         .select(['job_name', 'upstream_name', 'run_on'])
@@ -554,14 +493,12 @@ export class DashboardHandler {
         .execute();
       const needsByJob = groupNeedsByJobName(needsRows);
 
-      // Build response
       const responseJobs = buildRunDetailJobs(jobs, {
         stepsByJob,
         secretKeysByJob,
         needsByJob,
       });
 
-      // Build trust context if available (PR-triggered runs)
       const trustContext =
         runRow?.trust_tier || runRow?.lock_file_source || runRow?.contributor_username
           ? {
@@ -571,9 +508,8 @@ export class DashboardHandler {
             }
           : undefined;
 
-      // Run-scoped init failure — set when the run never executed a step
-      // (e.g. lock-file fetch failed, build coordination failed). The
-      // dashboard renders a banner explaining the reason.
+      // E.g. lock-file fetch or build coordination failed; the dashboard
+      // renders a banner with the reason.
       const runInitFailure = (runRow?.init_failure as InitFailure | null) ?? undefined;
 
       // Validate outgoing response against engine schema (double validation)
@@ -647,20 +583,17 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.run.structured request — the user-plane equivalent of
-   * the orchestrator-admin `/runs/:id/structured` endpoint. Reuses the
-   * aggregator + provenance mapper so the result is byte-identical to the admin
-   * surface; emits an `access_log` `run.structured.read` row (carrying the
-   * agent label when the actor came through an agent PAT).
+   * dashboard.run.structured: the user-plane twin of the orchestrator-admin
+   * `/runs/:id/structured` endpoint, byte-identical because it reuses the
+   * aggregator + provenance mapper. The `run.structured.read` access-log row
+   * carries the agent label when the actor came through an agent PAT.
    */
   async handleRunStructured(msg: DashboardRunStructuredRequest): Promise<void> {
     const start = Date.now();
-    // Resolve the run-owning org concurrently with the aggregate: the org
-    // context is only needed for the access-log row, not the response payload,
-    // so it need not precede the read. Combined with the concurrent child-row
-    // reads inside aggregateRunDetail, this keeps the structured read within
-    // the fixed relay-timeout budget even when the Postgres pool is contended
-    // by a concurrent execution.
+    // The org context only feeds the access-log row, so resolve it concurrently
+    // with the aggregate. With aggregateRunDetail's concurrent child-row reads,
+    // this keeps the read within the fixed relay-timeout budget even when a
+    // concurrent execution contends the Postgres pool.
     const resolvedPromise = this.resolveOrgForRun(msg.runId);
     try {
       const [detail, resolved] = await Promise.all([
@@ -689,8 +622,7 @@ export class DashboardHandler {
         result,
       });
     } catch (err) {
-      // The access-log row still needs org context; the org-resolve may have
-      // succeeded even if the aggregate failed.
+      // The org-resolve may have succeeded even though the aggregate failed.
       const ctx = this.contextOrFallback(await resolvedPromise.catch(() => null));
       logger.error('Error handling dashboard.run.structured', {
         runId: msg.runId,
@@ -716,13 +648,11 @@ export class DashboardHandler {
   }
 
   /**
-   * Resolve every routing key owned by an org by unioning both source
-   * tables. The orchestrator is single-org but multi-routing-key: one org
-   * owns one GitHub-app source plus N generic sources, each with its own
-   * `routing_key`. `execution_runs` has no `org_id` column — org ownership
-   * is expressed purely through `routing_key → sources.customer_id` /
-   * `generic_webhook_sources.customer_id`, so scoping a run query to an org
-   * means scoping it to the union of that org's routing keys.
+   * The orchestrator is single-org but multi-routing-key: one org owns one
+   * GitHub-app source plus N generic sources. `execution_runs` has no `org_id`;
+   * ownership is only `routing_key → sources.customer_id` /
+   * `generic_webhook_sources.customer_id`, so an org-scoped run query scopes to
+   * the union of the org's routing keys.
    *
    * Predicates mirror the org-context resolver in `server.ts` and
    * `resolveOrgForRoutingKey` above:
@@ -752,12 +682,9 @@ export class DashboardHandler {
   }
 
   /**
-   * Resolve a per-routing-key source identity map for a set of routing keys,
-   * unioning both source tables. Uses the identical name/subtype/provider
-   * derivation as `handleSourcesList` so a run summary's `source` block
-   * matches what the sources page shows for the same routing key. Routing
-   * keys with no live source row are absent from the map (the caller
-   * falls back to the run's own provider).
+   * Same name/subtype/provider derivation as `handleSourcesList`, so a run
+   * summary's `source` block matches the sources page. Keys with no live source
+   * row are absent (the caller falls back to the run's own provider).
    */
   private async resolveSourceIdentities(
     routingKeys: string[],
@@ -797,12 +724,9 @@ export class DashboardHandler {
   }
 
   /**
-   * Look up the page's jobs in one query to derive per-run `jobCount` plus the
-   * compile-job markers (`hadCompileJob` / `compileJobId`). The compile job is
-   * the synthetic `__build__*` job KiCI inserts for the compile phase — the
-   * same definition the Platform run-list route uses
-   * (`job_name LIKE '__build__%'`). Returns a per-run aggregate keyed by
-   * `run_id`; runs with no job rows are absent (the caller omits the fields).
+   * Per-run `jobCount` plus compile-job markers (`hadCompileJob` /
+   * `compileJobId`) for one page, in one query. Runs with no job rows are
+   * absent (the caller omits the fields).
    */
   private async resolveRunJobAggregates(
     runIds: string[],
@@ -826,9 +750,8 @@ export class DashboardHandler {
         map.set(j.run_id, agg);
       }
       agg.jobCount += 1;
-      // The synthetic compile job (`__build__*`) is the build phase; surface
-      // its id so the page can render the compile-step link, matching the
-      // Platform run-list route's `job_name LIKE '__build__%'` definition.
+      // The synthetic `__build__*` compile job, as the Platform run-list route
+      // defines it (`job_name LIKE '__build__%'`); its id backs the compile-step link.
       if (j.job_name.startsWith('__build__') && !agg.compileJobId) {
         agg.compileJobId = j.job_id;
       }
@@ -847,23 +770,15 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.runs.list request.
+   * dashboard.runs.list: a page of run summaries scoped to ALL routing keys of
+   * the bound org. The bound `this.routingKey` is just ONE of them (picked
+   * non-deterministically at startup), so filtering on it alone would drop runs
+   * under a sibling key. Attribution uses the bound `orgId` / `routingKey`
+   * directly, like the org-scoped event-log / access-log handlers.
    *
-   * Returns a page of run summaries from `execution_runs`, scoped to ALL
-   * routing keys owned by this orchestrator's bound org (`this.orgId`). The
-   * orchestrator is single-org but multi-routing-key, and the bound
-   * `this.routingKey` is just ONE of the org's keys (resolved
-   * non-deterministically at startup), so filtering on it alone would drop
-   * runs that arrived under a sibling routing key. We resolve the org's full
-   * routing-key set from `sources` + `generic_webhook_sources` and filter on
-   * the union. Attribution still uses the handler-bound `orgId` /
-   * `routingKey` directly — the same inline-ctx pattern as the org-scoped
-   * event-log / access-log handlers.
-   *
-   * Used by the operator console (`support-read` break-glass) and the
-   * dashboard's run-list view. The access_log row carries the wire actor
-   * (including the platform_operator reason) so the customer can audit any
-   * operator read.
+   * Serves the operator console (`support-read` break-glass) and the run-list
+   * view. The access_log row carries the wire actor (including the
+   * platform_operator reason) so the customer can audit any operator read.
    */
   async handleRunsList(msg: DashboardRunsListRequest): Promise<DashboardRunsListResponse> {
     const ctx = { orgId: this.orgId, routingKey: this.routingKey };
@@ -887,9 +802,7 @@ export class DashboardHandler {
         };
       }
 
-      // Scope by the union of the org's routing keys. An empty set means the
-      // org owns no (live) sources — return an empty page rather than running
-      // an unbounded query.
+      // No live sources ⇒ an empty page, never an unbounded query.
       const routingKeys = await this.resolveOrgRoutingKeys(this.orgId);
       if (routingKeys.length === 0) {
         this.access.recordIn(
@@ -957,9 +870,7 @@ export class DashboardHandler {
       const hasMore = rows.length > limit;
       const pageRows = hasMore ? rows.slice(0, limit) : rows;
 
-      // Enrichment lookups for the page: per-run job aggregates (jobCount +
-      // compile-job markers) and per-routing-key source identities. Skipped
-      // when the page is empty so no needless query is issued.
+      // Enrichment lookups are skipped for an empty page.
       const pageRunIds = pageRows.map((r) => r.run_id);
       const pageRoutingKeys = [
         ...new Set(pageRows.map((r) => r.routing_key).filter((k): k is string => !!k)),
@@ -1023,25 +934,15 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.runs.filters request.
+   * dashboard.runs.filters: the distinct filter-option values for the customer
+   * runs page, with `handleRunsList`'s scoping and attribution. Values come
+   * in-memory from one column projection over `execution_runs`; `sources`
+   * reuses `resolveSourceIdentities` to match the sources page.
    *
-   * Returns the distinct filter-option values the customer runs page renders
-   * in its filter controls — statuses / workflows / branches / repositories /
-   * triggerTypes / sources — scoped to ALL routing keys owned by this
-   * orchestrator's bound org (same scoping as `handleRunsList`). Distinct
-   * values are derived in-memory from a single column projection over
-   * `execution_runs`; `sources` reuses `resolveSourceIdentities` so the list
-   * matches what the sources page shows for the same routing key.
-   *
-   * `triggerTypes` is populated from `execution_runs.provider` — the
-   * orchestrator has no dedicated trigger-event column, so `provider`
-   * (`github` / `generic` / `local`) is the closest available
-   * discriminator the customer filter can offer.
-   *
-   * Attribution uses the handler-bound `orgId` / `routingKey` directly — the
-   * same inline-ctx pattern as `handleRunsList`. The access_log row carries
-   * the wire actor (including the platform_operator reason) so the customer
-   * can audit any operator read.
+   * `triggerTypes` comes from `execution_runs.provider` (`github` / `generic` /
+   * `local`): with no trigger-event column, it is the closest discriminator.
+   * The access_log row carries the wire actor (including the platform_operator
+   * reason) so the customer can audit any operator read.
    */
   async handleRunsFilters(msg: DashboardRunsFiltersRequest): Promise<DashboardRunsFiltersResponse> {
     const ctx = { orgId: this.orgId, routingKey: this.routingKey };
@@ -1069,9 +970,7 @@ export class DashboardHandler {
         return emptyResponse;
       }
 
-      // Scope by the union of the org's routing keys. An empty set means the
-      // org owns no (live) sources — return empty options rather than running
-      // an unbounded query.
+      // No live sources ⇒ empty options, never an unbounded query.
       const routingKeys = await this.resolveOrgRoutingKeys(this.orgId);
       if (routingKeys.length === 0) {
         this.access.recordIn(
@@ -1145,18 +1044,12 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.sources.list request.
-   *
-   * Returns the org's webhook source summaries by unioning both source
-   * tables (GitHub-app `sources` + live `generic_webhook_sources`), scoped
-   * to this orchestrator's bound org (`this.orgId`). Source counts are tiny
-   * so the page is returned unpaginated (`msg.limit` is ignored). Secret-
-   * bearing columns (`config`, `git_config`, `verification_config`) are
-   * never projected — `git_config` is read only to derive the subtype.
-   *
-   * Attribution uses the handler-bound `orgId` / `routingKey` directly —
-   * the same inline-ctx pattern as `handleRunsList`. The access_log row
-   * carries the wire actor so the customer can audit any operator read.
+   * dashboard.sources.list: the bound org's GitHub-app `sources` plus live
+   * `generic_webhook_sources`, unpaginated because counts are tiny (`msg.limit`
+   * is ignored). Secret-bearing columns (`config`, `git_config`,
+   * `verification_config`) are never returned; `git_config` is read only to
+   * derive the subtype. Attribution follows `handleRunsList`; the access_log
+   * row carries the wire actor so the customer can audit any operator read.
    */
   async handleSourcesList(msg: DashboardSourcesListRequest): Promise<DashboardSourcesListResponse> {
     const ctx = { orgId: this.orgId, routingKey: this.routingKey };
@@ -1240,23 +1133,16 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.admin-tokens.list request.
+   * dashboard.admin-tokens.list: the live admin-token inventory for the
+   * Platform's RBAC drift report. `admin_tokens` is orchestrator-wide (one org
+   * per orchestrator), so there is no `orgId` filter; the bound context
+   * attributes the row. Revoked or expired tokens are not findings, so they
+   * are left out as noise.
    *
-   * Returns the orchestrator's live admin-token inventory for the Platform's
-   * RBAC drift report. `admin_tokens` is orchestrator-wide — an orchestrator
-   * serves exactly one org — so the projection is not filtered by `orgId`; the
-   * handler-bound `orgId` / `routingKey` attribute the access_log row, the same
-   * inline-ctx pattern `handleSourcesList` uses.
-   *
-   * Only live tokens are returned: a revoked or already-expired token is not a
-   * finding, so reporting one would be noise the operator learns to ignore.
-   *
-   * `token_hash` is never selected. The report has no use for it, and a hash is
-   * a credential verifier — relaying one would put an offline-crackable value
-   * on the dashboard plane.
-   *
-   * Reading who holds admin tokens is itself privileged, so every read writes
-   * an access_log row carrying the wire actor.
+   * `token_hash` is never selected: a hash is a credential verifier, and
+   * relaying one would put an offline-crackable value on the dashboard plane.
+   * Reading who holds admin tokens is privileged, so every read writes an
+   * access_log row carrying the wire actor.
    */
   async handleAdminTokensList(
     msg: DashboardAdminTokensListRequest,
@@ -1324,10 +1210,7 @@ export class DashboardHandler {
     }
   }
 
-  /**
-   * Handle a dashboard.step.logs request.
-   * Looks up the step's log_path and reads content from LogStorage.
-   */
+  /** dashboard.step.logs: reads the step's log_path from LogStorage. */
   async handleStepLogs(msg: DashboardStepLogsRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
     try {
@@ -1394,7 +1277,6 @@ export class DashboardHandler {
         return;
       }
 
-      // Read the log file
       const result = await this.logStorage.read(step.log_path);
       const allLines = result.data.split('\n').filter(Boolean);
       const totalLines = allLines.length;
@@ -1483,14 +1365,10 @@ export class DashboardHandler {
     }
   }
 
-  /**
-   * Read the attestation rows for a run, joined to `execution_jobs` for the
-   * job name. Ordered oldest-first so the dashboard table is stable.
-   */
+  /** Oldest-first so the dashboard table is stable. */
   private async resolveAttestationsForRun(runId: string) {
-    // `attestations.run_id` / `job_id` are TEXT, while
-    // `execution_jobs.run_id` / `job_id` are `uuid`. Postgres won't compare
-    // `uuid = text` implicitly, so cast the uuid side to text in the join.
+    // `attestations` ids are TEXT and `execution_jobs` ids are `uuid`; Postgres
+    // won't compare `uuid = text` implicitly, so the uuid side is cast to text.
     return this.db
       .selectFrom('attestations')
       .innerJoin('execution_jobs', (join) =>
@@ -1519,11 +1397,9 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.attestations.list request: list the run's provenance
-   * attestations, inlining each stored bundle from object storage so the
-   * dashboard verifies it client-side. Mirrors `handleStepLogs` (per-run org
-   * resolution + `access.recordIn` + `send`). Rows whose bundle can't be read are
-   * skipped (best-effort) rather than failing the whole list.
+   * dashboard.attestations.list: the run's attestations with each bundle
+   * inlined for client-side verification. A row whose bundle can't be read is
+   * skipped rather than failing the whole list.
    */
   async handleAttestationsList(msg: DashboardAttestationsListRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
@@ -1610,10 +1486,8 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.artifacts.list request: list the run's named artifacts
-   * with a presigned GET per entry. Mirrors `handleAttestationsList` (per-run
-   * org resolution + `access.recordIn` + `send`). Org is resolved server-side from
-   * the run row, never the wire, so the listing cannot cross tenants.
+   * dashboard.artifacts.list: a presigned GET per named artifact. The org comes
+   * from the run row, never the wire, so the listing cannot cross tenants.
    */
   async handleArtifactsList(msg: DashboardArtifactsListRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
@@ -1696,11 +1570,7 @@ export class DashboardHandler {
     }
   }
 
-  /**
-   * Fetch + parse one attestation bundle from object storage. Returns the full
-   * detail item, or null when the bundle is missing or not valid JSON (logged).
-   * Shared by `handleAttestationsList` (per-run) and `handleAttestationGet`.
-   */
+  /** Null (logged) when the bundle is missing or not valid JSON. */
   private async inlineBundle(row: {
     id: string;
     jobId: string;
@@ -1752,11 +1622,7 @@ export class DashboardHandler {
     };
   }
 
-  /**
-   * Org-wide attestations query: one page of metadata-only summaries (no bundle
-   * fetch) plus the total matching count. Filters/pagination/sort applied via
-   * the shared filter builder.
-   */
+  /** One page of metadata-only summaries (no bundle fetch) plus the total count. */
   private async resolveAttestationsListAll(
     filters: DashboardAttestationsListAllRequest['filters'],
     page: number,
@@ -1809,9 +1675,9 @@ export class DashboardHandler {
         : SourceOrigin.enum.triggered,
     }));
 
-    // Surface deferred attestations still awaiting a mint, on page 1 only.
-    // These have no bundle yet; they render with a `pending` badge + a retry
-    // action. No status/name filter is applied (a pending row has no verdict).
+    // Deferred attestations awaiting a mint show on page 1 only, with a `pending`
+    // badge + retry action. No status/name filter applies: a pending row has
+    // no bundle and no verdict.
     const pendingSummaries =
       page <= 1 && !filters.status ? await this.resolvePendingAttestationSummaries() : [];
 
@@ -1822,7 +1688,6 @@ export class DashboardHandler {
     };
   }
 
-  /** Map the deferred-attestation outbox into pending list summaries (page 1). */
   private async resolvePendingAttestationSummaries(): Promise<AttestationListSummary[]> {
     const rows = await basePendingAttestationsQuery(this.db)
       .select([
@@ -1866,11 +1731,7 @@ export class DashboardHandler {
     }));
   }
 
-  /**
-   * Handle a dashboard.attestations.list.all request: org-wide, paginated,
-   * filtered list of attestation summaries (metadata only). Access-logged
-   * against the `attestation` target.
-   */
+  /** Org-wide, metadata only; access-logged against the `attestation` target. */
   async handleAttestationsListAll(msg: DashboardAttestationsListAllRequest): Promise<void> {
     const ctx = this.contextOrFallback(null);
     const target = { type: 'attestation' as const, id: 'list' };
@@ -1947,9 +1808,8 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.attestation.retry request: drain the deferred-attestation
-   * outbox (optionally scoped to one run) and reply with the mint counts. The
-   * mint happens in this orchestrator process, which owns the Platform WS.
+   * Drains the deferred-attestation outbox (optionally one run's) in this
+   * process, which owns the Platform WS.
    */
   async handleAttestationRetry(msg: DashboardAttestationRetryRequest): Promise<void> {
     const ctx = this.contextOrFallback(null);
@@ -2009,9 +1869,8 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.attestation.get request: a single attestation by id with
-   * its bundle inlined for the detail page. Resolves the run-owning org for the
-   * access-log row, then logs against the `attestation` target.
+   * One attestation with its bundle inlined, logged against the `attestation`
+   * target under the run-owning org.
    */
   async handleAttestationGet(msg: DashboardAttestationGetRequest): Promise<void> {
     const target = { type: 'attestation' as const, id: msg.attestationId };
@@ -2048,8 +1907,7 @@ export class DashboardHandler {
       if (row) ctx = this.contextOrFallback(await this.resolveOrgForRun(row.runId));
 
       const inlined = row ? await this.inlineBundle(row) : null;
-      // Augment the detail item with the owning run id + stored verdict so the
-      // detail page can render the "view run" link and the recorded badge.
+      // Backs the detail page's "view run" link and recorded badge.
       const attestation =
         inlined && row
           ? {
@@ -2121,10 +1979,6 @@ export class DashboardHandler {
     }
   }
 
-  /**
-   * Handle a dashboard.payload request.
-   * Reads the webhook payload from log storage for the given runId.
-   */
   async handlePayload(msg: DashboardPayloadRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
     const payloadPath = webhookPayloadPath(msg.runId);
@@ -2140,11 +1994,9 @@ export class DashboardHandler {
       const result = await this.logStorage.read(payloadPath);
 
       if (!result.data) {
-        // INFO (not warn): a missing payload on this orch is expected when
-        // Platform routes a dashboard.payload request to an orch that did
-        // not ingest the webhook (e.g. fresh pool member, HA reroute). The
-        // caller is responsible for retrying on a different orch or treating
-        // this as 404.
+        // INFO, not warn: expected when the request reaches an orch that did not
+        // ingest the webhook (fresh pool member, HA reroute). The caller retries
+        // on another orch or treats it as 404.
         logger.info('Dashboard payload not found', {
           requestId: msg.requestId,
           runId: msg.runId,
@@ -2243,32 +2095,29 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.orch.logs request.
-   * Reads orchestration + provisioning log files from LogStorage for the given run/job.
-   * Provisioning logs are returned with phase "provisioning" so the dashboard can
-   * render them in a separate collapsible section.
+   * Provisioning logs carry phase "provisioning" so the dashboard renders them
+   * in a separate collapsible section.
    */
   async handleOrchLogs(msg: DashboardOrchLogsRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
     try {
       const basePath = `executions/${msg.runId}/jobs/${msg.jobId}`;
 
-      // Read orchestration logs
       let orchLines: string[] = [];
       try {
         const orchResult = await this.logStorage.read(`${basePath}/orchestration.jsonl`);
         orchLines = orchResult.data.split('\n').filter(Boolean);
       } catch {
-        // Orchestration logs may not exist yet
+        // May not exist yet.
       }
 
-      // Read provisioning logs (stored by emitScalerEvent in execution-tracker)
+      // Written by emitScalerEvent in execution-tracker.
       let provLines: string[] = [];
       try {
         const provResult = await this.logStorage.read(`${basePath}/provisioning.jsonl`);
         provLines = provResult.data.split('\n').filter(Boolean);
       } catch {
-        // Provisioning logs may not exist (non-scaler runs)
+        // Absent for non-scaler runs.
       }
 
       const allLines = [...orchLines, ...provLines];
@@ -2308,14 +2157,9 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a run.rerun.request.
-   * Delegates to the onRerun callback which invokes handleRerun from the rerun module.
-   *
-   * Resolution: prefer `msg.routingKey` (denormalization hint from
-   * Platform — `execution_runs.routing_key` mirror). The hint is the ONLY
-   * org context we have when the run row has been cold-archived out of PG,
-   * so consult sources/generic_webhook_sources directly. If the hint is
-   * absent, fall back to `resolveOrgForRun` against the warm PG row.
+   * Org resolution prefers the Platform's `msg.routingKey` hint: it is the ONLY
+   * org context once the run row is cold-archived out of PG. Without it,
+   * `resolveOrgForRun` reads the warm PG row.
    */
   async handleRerunRequest(msg: RunRerunRequest): Promise<void> {
     let resolved: { orgId: string | null; routingKey: string | null } | null = null;
@@ -2327,10 +2171,7 @@ export class DashboardHandler {
     const ctx = this.contextOrFallback(resolved);
 
     try {
-      // Test-only: the build-time test double injects `beforeRerun` to slow the
-      // first coordinator so an HA test can force a relay failover and exercise
-      // the requestId idempotency claim. The shipped orchestrator leaves it
-      // undefined, so no delay is applied.
+      // Test-only (see `beforeRerun`): exercises the requestId idempotency claim.
       if (this.beforeRerun) await this.beforeRerun();
       const result = await this.onRerun(
         msg.runId,
@@ -2368,11 +2209,9 @@ export class DashboardHandler {
         'error',
         toErrorMessage(err),
       );
-      // Surface a stable code for archived-run rerun attempts so
-      // the Platform proxy can map to HTTP 410 instead of a generic 400.
-      // We detect by structural shape (`code === 'runArchivedNotRerunnable'`)
-      // rather than `instanceof` so the orchestrator package doesn't have
-      // to import from `pipeline/rerun.ts` at the type level.
+      // A stable code lets the Platform proxy answer HTTP 410, not a generic 400.
+      // Detected by shape, not `instanceof`, to avoid a type-level import of
+      // `pipeline/rerun.ts`.
       const errorCode =
         err &&
         typeof err === 'object' &&
@@ -2389,10 +2228,6 @@ export class DashboardHandler {
     }
   }
 
-  /**
-   * Handle a run.cancel.request.
-   * Delegates to the onCancel callback which sends job.cancel to agents.
-   */
   async handleCancelRequest(msg: RunCancelRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRun(msg.runId));
     try {
@@ -2455,19 +2290,13 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.event-log.list request.
-   *
-   * Returns a paginated page of inbound webhook delivery rows owned by this
-   * orchestrator (`event_log` table) for the given org. Pagination uses an
-   * opaque cursor (received_at + id) so concurrent inserts don't shift pages.
-   *
-   * Filters: routingKey, event, status, fromTimestamp/toTimestamp,
-   * deliveryId substring. All optional.
+   * Inbound webhook deliveries (`event_log`) for the org. The opaque
+   * (received_at + id) cursor keeps concurrent inserts from shifting pages.
+   * Every filter is optional; deliveryId matches a substring.
    */
   async handleEventLogList(msg: DashboardEventLogListRequest): Promise<void> {
-    // The schema already carries `orgId` on the wire — that's the source of
-    // truth for attribution. routingKey is an optional filter; default to
-    // the bound routing key only when no filter was supplied.
+    // The wire `orgId` is the source of truth for attribution. The bound routing
+    // key applies only when no routingKey filter was supplied.
     const ctx = { orgId: msg.orgId, routingKey: msg.routingKey ?? this.routingKey };
     try {
       const limit = Math.min(Math.max(msg.limit ?? 50, 1), 200);
@@ -2579,11 +2408,9 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.event-log.activity request — windowed aggregate counts
-   * for the org (matched vs unmatched vs lockfile-missing), the
-   * orchestrator-only facts the Platform relay cannot compute (it only sees
-   * "delivered", not whether a trigger matched). Powers the Runs-page misconfig
-   * strip + the `kici runs` hint. Aggregate counts only — no payloads, no repo
+   * Windowed matched / unmatched / lockfile-missing counts: facts the Platform
+   * relay cannot compute (it only sees "delivered"). Powers the Runs-page
+   * misconfig strip + the `kici runs` hint. Counts only — no payloads, no repo
    * identifiers — so the Platform route serves them to all org members.
    */
   async handleEventLogActivity(msg: DashboardEventLogActivityRequest): Promise<void> {
@@ -2657,19 +2484,12 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.access-log.list request.
-   *
-   * Returns a paginated page of access_log rows for the given org. Used by
-   * the dashboard "Data access" tab to show who read what (and when).
-   *
-   * Every filter is optional; the orchestrator scopes on orgId then applies
-   * each supplied filter independently. Records its own access_log row
-   * under action='access_log.list.read' so there's a meta-audit of who
-   * looked at the audit log.
+   * Backs the dashboard "Data access" tab. Scopes on orgId, then applies each
+   * optional filter independently. Its own `access_log.list.read` row is a
+   * meta-audit of who looked at the audit log.
    */
   async handleAccessLogList(msg: DashboardAccessLogListRequest): Promise<void> {
-    // `msg.orgId` is the source of truth for attribution; routingKey is
-    // informational only on this handler so we keep the bound value.
+    // `msg.orgId` attributes; routingKey is informational, so the bound value stays.
     const ctx = { orgId: msg.orgId, routingKey: this.routingKey };
     if (!this.accessLog) {
       this.send({
@@ -2739,20 +2559,15 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.event-log.detail request.
-   *
-   * Returns the metadata row only — the webhook body bytes stream over a
-   * separate chunked-WS path (`handleEventLogPayloadStream` below) so
-   * Platform never holds the full body in memory and the dashboard can
-   * render progress as bytes arrive. When `payload_omitted=true` the row's
-   * `payloadOmitted`/`payloadOmittedReason` fields tell the dashboard to
-   * skip issuing a stream request.
+   * Metadata only: the body streams over `handleEventLogPayloadStream`, so the
+   * Platform never holds it in memory and the dashboard shows progress. With
+   * `payload_omitted=true`, `payloadOmitted`/`payloadOmittedReason` tell the
+   * dashboard to skip the stream request.
    */
   async handleEventLogDetail(msg: DashboardEventLogDetailRequest): Promise<void> {
     const ctx = { orgId: msg.orgId, routingKey: msg.routingKey ?? this.routingKey };
     try {
-      // Hot lookup first; on miss falls back to cold-store
-      // (scoped by `routingKey` hint from Platform when available).
+      // On a hot miss, the cold store (scoped by the Platform's `routingKey` hint).
       const row = await loadEventLogByDeliveryId({
         db: this.db,
         coldStore: this.coldStore ?? undefined,
@@ -2818,22 +2633,16 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.event-log.payload.stream request.
+   * Gunzips the body and emits it as base64 `dashboard.event-log.payload.chunk`
+   * messages of 64 KiB decompressed bytes; the first carries `totalBytes`, the
+   * last `isLast=true`.
    *
-   * Reads the gzipped body from LogStorage, decompresses it, slices the
-   * decompressed bytes into 64 KiB chunks, base64-encodes each, and emits a
-   * sequence of `dashboard.event-log.payload.chunk` messages. The first
-   * chunk carries `totalBytes`; the last chunk carries `isLast=true`.
+   * One `event_log.payload.read` audit row is written at stream start:
+   * `allowed` when the body begins streaming, `not_found` / `denied` for an
+   * empty/error stream. Per-chunk rows would add volume, not attribution.
    *
-   * The single audit row (`event_log.payload.read`) is written at the start
-   * of the stream — outcome `allowed` when the row exists and the body
-   * begins streaming, `not_found` / `denied` when the request resolves to
-   * an empty/error stream. Per-chunk audits would inflate the access-log
-   * volume without adding attribution detail.
-   *
-   * Pacing: a `setImmediate` yield between sends keeps the WS connection
-   * from saturating. For the 5 MB cap this means
-   * ~80 yields per stream — negligible.
+   * A `setImmediate` yield between sends keeps the WS from saturating: ~80
+   * yields for the 5 MB cap.
    */
   async handleEventLogPayloadStream(msg: DashboardEventLogPayloadStreamRequest): Promise<void> {
     const ctx = { orgId: msg.orgId, routingKey: msg.routingKey ?? this.routingKey };
@@ -2906,11 +2715,9 @@ export class DashboardHandler {
 
     let decompressed: Buffer;
     try {
-      // LogStorage.read() returns the binary content as a string (FS
-      // backend reads as UTF-8; S3 backend treats body as bytes). The
-      // writer used .append() with a binary-encoded gzip buffer, so we
-      // round-trip through Buffer and gunzip — same shape as the legacy
-      // detail handler used to do.
+      // LogStorage.read() returns a string (FS reads UTF-8, S3 treats the body as
+      // bytes) and the writer appended a binary-encoded gzip buffer, so
+      // round-trip through Buffer before gunzip.
       const result = await this.logStorage.read(row.payload_key);
       const buf = Buffer.from(result.data, 'binary');
       decompressed = gunzipSync(buf);
@@ -2944,9 +2751,7 @@ export class DashboardHandler {
 
     const totalBytes = decompressed.byteLength;
     if (totalBytes === 0) {
-      // Empty body is still a valid (if unusual) decompression — emit a
-      // single terminal chunk with no error so the dashboard can render
-      // an empty body view.
+      // An empty body is valid: one terminal chunk, no error.
       this.send({
         type: 'dashboard.event-log.payload.chunk',
         requestId: msg.requestId,
@@ -2974,23 +2779,16 @@ export class DashboardHandler {
         ...(seq === 0 && { totalBytes }),
       });
       if (!isLast) {
-        // Yield the event loop between chunks so we don't saturate the
-        // single WS connection. Mirrors the agent-side log.chunk pacing.
+        // Mirrors the agent-side log.chunk pacing.
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
     }
   }
 
   /**
-   * Handle a dashboard.event-dlq.list request.
-   *
-   * Returns a paginated page of DLQ rows (events whose dispatch attempts
-   * exhausted the retry budget). The page is keyed off `dlq_at DESC` and
-   * paginates with a single `before` ISO cursor.
-   *
-   * Records one `event_dlq.list.read` access_log entry using the user
-   * actor on the wire — mirrors the HTTP admin route's audit shape but
-   * with the calling user's identity instead of the bearer-token role.
+   * DLQ rows (dispatch retries exhausted), `dlq_at DESC` with one `before` ISO
+   * cursor. The `event_dlq.list.read` row mirrors the HTTP admin route's audit
+   * shape, with the wire user's identity instead of the bearer-token role.
    */
   async handleEventDlqList(msg: DashboardEventDlqListRequest): Promise<void> {
     const ctx = { orgId: msg.orgId, routingKey: this.routingKey };
@@ -3070,11 +2868,8 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.event-dlq.count request.
-   *
-   * Returns the DLQ depth for the sidebar badge. Polled ~30s by the
-   * dashboard. No access_log row — the count surface is intentionally
-   * un-audited (it's a frequent badge poll, not a triage action).
+   * DLQ depth for the sidebar badge, polled every ~30s. Deliberately
+   * un-audited: a frequent badge poll is not a triage action.
    */
   async handleEventDlqCount(msg: DashboardEventDlqCountRequest): Promise<void> {
     try {
@@ -3106,12 +2901,9 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.event-dlq.retry request.
-   *
-   * Clears the DLQ flag on the row and issues a `pg_notify` so a healthy
-   * node picks the event up immediately rather than waiting for the
-   * leader-only retry scanner's next tick. Notify failure is non-fatal —
-   * the scanner will catch up.
+   * Clears the DLQ flag and `pg_notify`s so a healthy node picks the event up
+   * without waiting for the leader-only retry scanner. A notify failure is
+   * non-fatal: the scanner catches up.
    */
   async handleEventDlqRetry(msg: DashboardEventDlqRetryRequest): Promise<void> {
     const ctx = { orgId: msg.orgId, routingKey: this.routingKey };
@@ -3214,10 +3006,8 @@ export class DashboardHandler {
   }
 
   /**
-   * Handle a dashboard.event-dlq.discard request.
-   *
-   * Permanently deletes the DLQ row. No retry, no archive — used when the
-   * payload is corrupt or the routing target has been removed.
+   * Permanently deletes the DLQ row (no retry, no archive), for a corrupt
+   * payload or a removed routing target.
    */
   async handleEventDlqDiscard(msg: DashboardEventDlqDiscardRequest): Promise<void> {
     const ctx = { orgId: msg.orgId, routingKey: this.routingKey };
@@ -3308,10 +3098,6 @@ export class DashboardHandler {
     }
   }
 
-  /**
-   * Handle a run.manual_schedule.request.
-   * Delegates to the onManualSchedule callback which invokes handleManualSchedule.
-   */
   async handleManualScheduleRequest(msg: ManualScheduleRequest): Promise<void> {
     const ctx = this.contextOrFallback(await this.resolveOrgForRegistration(msg.registrationId));
     try {
@@ -3359,11 +3145,9 @@ export class DashboardHandler {
   }
 
   /**
-   * Cold-store fallback: fetch the run + its jobs + its steps
-   * from S3 when the PG copy has been archived. Bounded scan: stops at
-   * the warm cutoff (older entries don't exist in cold-store yet by
-   * construction). Each row is filtered by `run_id` because chunks
-   * span multiple runs.
+   * Fetch an archived run + jobs + steps from S3. The scan stops at the warm
+   * cutoff (cold-store holds nothing past it by construction), and rows are
+   * filtered by `run_id` because chunks span runs.
    */
   private async fetchArchivedRunDetail(
     routingKey: string,
@@ -3463,10 +3247,8 @@ export class DashboardHandler {
     if (!this.coldStore) return out;
     const epoch = new Date(0);
 
-    // No explicit upper bound: the store resolves each table's own warm
-    // cutoff. These three tables are tuned independently via
-    // KICI_COLD_STORE_<TABLE>_WARM_TTL_DAYS, so each read is bounded by
-    // that table's own value rather than by one shared cutoff.
+    // No explicit upper bound: each table's warm cutoff is tuned independently
+    // via KICI_COLD_STORE_<TABLE>_WARM_TTL_DAYS and resolved by the store.
     const fetchByRun = async (table: 'execution_runs' | 'execution_jobs' | 'execution_steps') => {
       const rows: Record<string, unknown>[] = [];
       try {
@@ -3562,9 +3344,6 @@ function coerceToDate(v: unknown): Date | null {
   return null;
 }
 
-// ── event_log helpers ──────────────────────────────────────────────
-
-/** Map a DB row to the WS list-item shape. */
 function rowToListItem(r: {
   delivery_id: string;
   routing_key: string;
@@ -3629,12 +3408,9 @@ interface RunSummaryRow {
 }
 
 /**
- * Map one `execution_runs` page row plus its enrichment lookups into the
- * customer run-summary shape (`DashboardRunSummary`). Every optional field is
- * omitted when the orchestrator can't supply it, so the reused customer runs
- * page degrades cleanly to '—'.
- *
- * Deliberately omitted because the orchestrator has no source for them:
+ * An optional field the orchestrator can't supply is omitted, so the reused
+ * customer runs page degrades cleanly to '—'. Deliberately omitted, for lack
+ * of a source:
  * - `commitMessage` — no commit-message column on `execution_runs`.
  * - `triggerEvent` — no trigger-event column (the run's `provider` is NOT the
  *   trigger event, so it must not be substituted).

@@ -31,11 +31,7 @@ export function parseInputPairs(pairs: string[]): Record<string, string> {
   return out;
 }
 
-/**
- * Coerce + validate raw operator pairs against the descriptor map, applying
- * defaults. Strict: unknown keys are errors. Returns typed values or a
- * structured `DispatchInputError`.
- */
+/** Coerce and validate raw pairs against the map, applying defaults. Unknown keys are errors. */
 export function coerceDispatchInputs(
   raw: Record<string, string>,
   map: InputsDescriptorMap,
@@ -43,8 +39,7 @@ export function coerceDispatchInputs(
   const parsed = buildZodObjectFromMap(map).safeParse(raw);
   if (parsed.success) return { values: parsed.data };
   const issues: DispatchInputIssue[] = parsed.error.issues.flatMap((i) => {
-    // `unrecognized_keys` carries the offending key(s) on `keys`, not on `path`
-    // (its `path` is the empty root) — surface one issue per unknown key.
+    // `unrecognized_keys` carries the keys on `keys`; its `path` is the empty root.
     if (i.code === 'unrecognized_keys' && Array.isArray((i as { keys?: unknown }).keys)) {
       return (i as { keys: string[] }).keys.map((k) => ({
         key: k,

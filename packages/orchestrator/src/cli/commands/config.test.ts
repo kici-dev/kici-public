@@ -1,11 +1,8 @@
 /**
- * `kici-admin config set` warns for a path nothing reads back.
- *
- * The shared config store is written by `/admin/config` and read by
- * `buildConfigBundle` alone. Startup parses the environment, and the reloader
- * is constructed with no shared store, so a `config set` on any other path is
- * stored, versioned, and never applied — which the CLI used to report as a
- * plain success.
+ * `kici-admin config set` warns for a path nothing reads back. Only
+ * `buildConfigBundle` reads the shared config store (startup parses the
+ * environment; the reloader has no shared store), so any other path is stored,
+ * versioned and never applied.
  */
 
 import { Command } from 'commander';
@@ -20,13 +17,10 @@ import {
 
 describe('sharedConfigSetWarning', () => {
   // fails-when: a path no orchestrator reads back is set and the command says
-  //   nothing. `cacheTtlDays` is the exact sequence the operator docs used to
-  //   prescribe — `config set cacheTtlDays 7` then `config reload` — which
-  //   returns success and changes nothing.
-  // `secrets.keyFile` and `secrets.bootstrapAdminToken` are the two the bare
-  // `secrets` prefix used to silence. Both are declared by sharedConfigSchema
-  // and neither reaches buildConfigBundle, which reads `shared.secrets?.key`
-  // and nothing else beneath `secrets`.
+  //   nothing; `config set cacheTtlDays 7` then `config reload` returns
+  //   success and changes nothing.
+  // `secrets.keyFile` and `secrets.bootstrapAdminToken` are in sharedConfigSchema,
+  // but buildConfigBundle reads only `shared.secrets?.key` beneath `secrets`.
   it.each([
     'cacheTtlDays',
     'queue.maxDepth',
@@ -42,10 +36,9 @@ describe('sharedConfigSetWarning', () => {
     expect(warning).toContain('org-settings');
   });
 
-  // breaks-if-wrong: a warning on every path trains the operator to ignore the
-  //   channel. These are the paths `buildConfigBundle` genuinely reads out of
-  //   the shared document and hands to a joining orchestrator, so setting one
-  //   does change what a new peer boots with.
+  // breaks-if-wrong: a warning on every path trains the operator to ignore it.
+  //   `buildConfigBundle` hands these paths to a joining orchestrator, so
+  //   setting one changes what a new peer boots with.
   it.each(['storage', 'storage.bucket', 'storage.forcePathStyle', 'secrets.key'])(
     'stays silent for `%s`',
     (path) => {
@@ -53,8 +46,7 @@ describe('sharedConfigSetWarning', () => {
     },
   );
 
-  // Pinned against the schema rather than a hand-written list, so a sibling
-  // added to `secrets` later is covered without editing this file.
+  // Pinned against the schema, so a new `secrets` sibling is covered automatically.
   // fails-when: `secrets` returns to the consumed list, silencing every
   //   sibling under it.
   // breaks-if-wrong: `secrets.key` is the one the join bundle carries, so it
@@ -90,9 +82,8 @@ describe('kici-admin config set', () => {
 
     const stdout = vi.spyOn(console, 'log').mockImplementation(() => {});
     const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
-    // The action's catch calls process.exit(1). Unstubbed, an unexpected throw
-    // tears the vitest worker down instead of failing the test, so the run
-    // reports an infrastructure error rather than the assertion that broke.
+    // The action's catch calls process.exit(1); unstubbed, it kills the vitest
+    // worker and hides the failing assertion.
     const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
       throw new Error(`process.exit(${code ?? 0})`);
     }) as never);
@@ -123,24 +114,22 @@ describe('kici-admin config set', () => {
     expect(stderr).toBe('');
   });
 
-  // The command, not the helper: `secrets.keyFile` is one of the two paths the
-  // bare `secrets` prefix used to silence, and it is as inert as cacheTtlDays.
+  // The command, not the helper: `secrets.keyFile` is as inert as cacheTtlDays.
   it('emits the warning for a `secrets` sibling the bundle does not carry', async () => {
     const { stderr } = await runSet('secrets.keyFile', '"/etc/kici/key"');
     expect(stderr).toContain('secrets.keyFile');
     expect(stderr).toContain('cluster-settings');
   });
 
-  // fails-when: `process.exit` is left unstubbed. The action's catch calls it,
-  //   so a failing write ends the vitest worker — the run then reports an
-  //   infrastructure error and no assertion in this file is attributed.
+  // fails-when: `process.exit` is left unstubbed: a failing write ends the
+  //   vitest worker and no assertion in this file is attributed.
   it('a failing write reaches the exit path rather than ending the worker', async () => {
     await expect(runSet('cacheTtlDays', '7', new Error('boom'))).rejects.toThrow('process.exit(1)');
   });
 
-  // breaks-if-wrong: warning is additive. The write still happens, the exit
-  //   code stays 0, and stdout still carries only the API result — refusing
-  //   here would be a compat break needing a deprecation ledger row.
+  // breaks-if-wrong: the warning is additive: the write happens, the exit code
+  //   stays 0 and stdout carries only the API result. Refusing would be a
+  //   compat break needing a deprecation ledger row.
   it('still writes the value and leaves stdout unchanged', async () => {
     const { configSet, stdout } = await runSet('cacheTtlDays', '7');
     expect(configSet).toHaveBeenCalledWith('cacheTtlDays', 7, undefined);

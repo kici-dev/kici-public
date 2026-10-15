@@ -1,10 +1,8 @@
 /**
- * Version and environment context for an issue report.
- *
- * A report without version context costs a support round-trip before anyone can
- * even reproduce the problem, so this is collected first and never fails: the
- * client-side half always resolves, and the component versions are folded in
- * only when the authenticated probe actually reached the Platform.
+ * Version and environment context for an issue report. A report without it
+ * costs a support round-trip, so it never fails: the client-side half always
+ * resolves, and component versions are added only when the authenticated probe
+ * reached the Platform.
  */
 
 import { PROTOCOL_VERSION } from '@kici-dev/engine';
@@ -19,10 +17,9 @@ export interface OrchestratorIdentity {
   mode: string | null;
   connected: boolean;
   /**
-   * Where this orchestrator's config files live on its host. Recorded so a
-   * support bundle names the files whoever reads it should ask for. Paths
-   * only — the bundle never carries their contents. Each is null when the
-   * orchestrator did not report it.
+   * Where the orchestrator's config files live on its host, so the bundle
+   * reader knows which files to ask for. Paths only, never contents; null when
+   * not reported.
    */
   configPaths: {
     envFile: string | null;
@@ -36,7 +33,6 @@ export interface ReportIdentity {
   nodeVersion: string;
   platform: string;
   arch: string;
-  /** The wire protocol this CLI speaks. */
   protocolVersion: number;
   /**
    * Every orchestrator the probe saw, not just the first: a report about a
@@ -44,10 +40,8 @@ export interface ReportIdentity {
    */
   orchestrators: OrchestratorIdentity[];
   /**
-   * The newest KiCI version the Platform knows about, when it told us. This is
-   * an upgrade hint, NOT the Platform's own version — the diagnostics response
-   * carries no such field, and inventing one would put a fabricated value in a
-   * bundle a human will read as fact.
+   * The newest KiCI version the Platform knows about: an upgrade hint, NOT the
+   * Platform's own version, which the diagnostics response does not carry.
    */
   latestKnownVersion?: string;
   /** Why component versions are missing, when the probe could not run. */
@@ -55,12 +49,8 @@ export interface ReportIdentity {
 }
 
 /**
- * Build the identity block.
- *
- * `probe` is the same `ProbeOutcome` `kici doctor` already performs — one
- * authenticated infrastructure read — passed in rather than re-fetched so a
- * report never issues a second round trip for data the caller may already
- * hold, and so every path is testable without network.
+ * `probe` is the `kici doctor` `ProbeOutcome`, passed in rather than
+ * re-fetched: no second round trip, and every path is testable without network.
  */
 export function collectIdentity(probe: ProbeOutcome | null): ReportIdentity {
   const identity: ReportIdentity = {
@@ -73,7 +63,7 @@ export function collectIdentity(probe: ProbeOutcome | null): ReportIdentity {
   };
 
   if (probe === null) {
-    // Not logged in, or no active org — a local-only bundle is still useful.
+    // Not logged in, or no active org: a local-only bundle is still useful.
     identity.probeError = 'not authenticated; component versions unavailable';
     return identity;
   }
@@ -84,9 +74,7 @@ export function collectIdentity(probe: ProbeOutcome | null): ReportIdentity {
   }
 
   identity.orchestrators = probe.infra.orchestrators.map((o) => ({
-    // The wire schema makes clusterName optional; a connection that never
-    // named itself is still worth reporting, so it is labelled rather than
-    // dropped from the list.
+    // clusterName is optional on the wire; an unnamed connection is labelled, not dropped.
     clusterName: o.clusterName ?? '(unnamed)',
     version: o.version ?? null,
     mode: o.mode ?? null,

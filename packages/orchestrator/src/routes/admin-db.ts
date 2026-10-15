@@ -1,12 +1,7 @@
 /**
- * Admin API routes for database migration management.
- *
- * Provides endpoints to run pending migrations and check migration status
- * through the admin API. Uses advisory locking for concurrency safety
- * across multiple orchestrator instances.
- *
- * All routes are mounted under /api/v1/admin/db and protected by
- * the admin auth middleware in admin.ts.
+ * Admin routes to run pending migrations and check migration status, under
+ * /api/v1/admin/db behind the admin auth middleware in admin.ts. Advisory
+ * locking keeps concurrent orchestrator instances safe.
  */
 import { Hono } from 'hono';
 import type { Kysely } from 'kysely';
@@ -21,16 +16,15 @@ interface DbRouteDeps {
   db: Kysely<any>;
   pool: pg.Pool;
   /**
-   * Connection string for the timeout-free pool that schema work runs on.
-   * Absent in unit tests, which fall back to the shared pool.
+   * Connection string for the timeout-free pool schema work runs on; absent in
+   * unit tests, which fall back to the shared pool.
    */
   databaseUrl?: string;
 }
 
 /**
- * Run `fn` against a pool whose connections carry no statement timeout, so a
- * long backfill is not cancelled mid-migration. Falls back to the shared pool
- * when no connection string was threaded through.
+ * Run `fn` on a pool with no statement timeout, so a long backfill is not
+ * cancelled mid-migration; the shared pool when no connection string is given.
  */
 async function onMigrationPool<T>(
   deps: DbRouteDeps,
@@ -43,8 +37,7 @@ async function onMigrationPool<T>(
 export function createDbRoutes(deps: DbRouteDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
 
-  // DB migrations are orchestrator-wide; routing-key tokens have no
-  // legitimate use here.
+  // Migrations are orchestrator-wide; routing-key tokens have no use here.
   app.use('/db/*', requireUnscoped);
 
   app.post('/db/migrate', async (c) => {
@@ -63,11 +56,10 @@ export function createDbRoutes(deps: DbRouteDeps): Hono<AdminEnv> {
 
   // POST /api/v1/admin/db/migrate/to -- migrate to a named migration.
   //
-  // Runs on the CURRENT binary, whose static provider is the only one that
-  // carries the newer migrations' down() functions. That is why a rollback has
-  // to call this BEFORE the version pointer moves: once the old binary is
-  // running, the migrations the ledger records no longer exist in its provider
-  // and Kysely refuses to start at all.
+  // Runs on the CURRENT binary, the only one whose provider carries the newer
+  // migrations' down() functions — so a rollback calls this BEFORE the version
+  // pointer moves. On the old binary the ledger names migrations its provider
+  // lacks, and Kysely refuses to start at all.
   app.post('/db/migrate/to', async (c) => {
     let body: { name?: unknown };
     try {

@@ -1,20 +1,11 @@
 /**
- * Label-set matching and overlap detection for the scaler module.
- *
- * Label sets are normalized (sorted, deduplicated, lowercased) for
- * deterministic comparison.
- *
- * findBackendForLabels uses subset matching: a job requiring ['macos']
- * matches a scaler with ['macos', 'darwin', 'bare-metal']. This is
- * consistent with peer routing (findPeersWithCapacity) and allows
- * workflows to target broad labels like 'macos' without listing every
- * label the scaler defines.
+ * Scaler label-set matching and overlap detection. Subset matching lets a
+ * workflow target a broad label like 'macos' without listing every label the
+ * scaler defines.
  */
 
 /**
- * Normalize a label set for comparison.
- * Sorts alphabetically, deduplicates, and lowercases all labels.
- * Produces a deterministic string key for comparison.
+ * A label set as a deterministic comparison key: lowercased, deduplicated, sorted.
  *
  * @example
  * normalizeLabelSet(['Docker', 'linux', 'linux']) // => "docker,linux"
@@ -25,28 +16,23 @@ export function normalizeLabelSet(labels: string[]): string {
 }
 
 /**
- * Check if two label sets are exactly equal after normalization.
- * Subsets do NOT match -- ["linux"] does not match ["linux", "docker"].
+ * Exact equality after normalization; a subset does NOT match.
  */
 export function labelSetsMatch(a: string[], b: string[]): boolean {
   return normalizeLabelSet(a) === normalizeLabelSet(b);
 }
 
 /**
- * Detect overlapping label sets across different scalers.
- * Returns all pairs of scalers that share the same normalized label set.
- *
- * Intra-scaler duplicates are allowed (same scaler, duplicate label sets).
- * Only cross-scaler overlaps are flagged.
- *
- * Used at startup to reject configs with ambiguous routing.
+ * Every pair of scalers sharing a normalized label set. A duplicate within one
+ * scaler is allowed. Startup rejects a config with an overlap: its routing is
+ * ambiguous.
  */
 export function detectLabelSetOverlaps(
   scalers: Array<{ name: string; labelSets: Array<{ labels: string[] }> }>,
 ): Array<{ labels: string; scaler1: string; scaler2: string }> {
   const overlaps: Array<{ labels: string; scaler1: string; scaler2: string }> = [];
 
-  // Map: normalized label set -> first scaler name that owns it
+  // normalized label set -> the first scaler that owns it
   const seen = new Map<string, string>();
 
   for (const scaler of scalers) {
@@ -70,12 +56,10 @@ export function detectLabelSetOverlaps(
 }
 
 /**
- * The taint gate for one of a scaler's label sets, read from the index-aligned
- * `labelSetMandatoryLabels`. A scaler that declares no gate at all leaves every
- * label set ungated. `null` when the array is present but its length does not
- * match `labelSets` — a mismatched array carries no trustworthy alignment, so
- * indexing into it would apply one label set's gate to another, and the safe
- * reading is that no label set of that scaler is routable.
+ * The taint gate for one label set, from the index-aligned
+ * `labelSetMandatoryLabels`; no array means ungated. `null` when the array's
+ * length differs from `labelSets`: indexing a misaligned array would apply one
+ * set's gate to another, so no label set of that scaler is routable.
  */
 function gateForLabelSet(
   scaler: {
@@ -91,20 +75,13 @@ function gateForLabelSet(
 }
 
 /**
- * Find which scaler backend handles a given set of labels.
- * Returns the scaler name and label-set index, or null if no match.
+ * The scaler and label-set index that handle a job's labels, or null.
  *
- * Uses subset matching: job labels must be a subset of the scaler's label set.
- * ['macos'] matches ['macos', 'darwin', 'bare-metal']. This is consistent
- * with peer routing (findPeersWithCapacity) which uses the same semantics.
- *
- * In addition, every label in the gate for the matched label set must be
- * present in the job's `runsOn`. This is the Kubernetes-taint-style opt-in
- * gate: a label set gated on `['gpu']` only accepts jobs that explicitly
- * include `gpu` in `runsOn`.
- *
- * When multiple backends match, the one with the smallest label set wins
- * (most specific match).
+ * Subset matching: ['macos'] matches ['macos', 'darwin', 'bare-metal'], the same
+ * semantics as peer routing (findPeersWithCapacity). Every label in the
+ * matched set's gate must also be in `runsOn` (a Kubernetes-taint-style
+ * opt-in: a set gated on `['gpu']` accepts only jobs naming `gpu`). Among
+ * several matches the smallest label set wins.
  */
 export function findBackendForLabels(
   labels: string[],
@@ -134,10 +111,8 @@ export function findBackendForLabels(
 
   for (const scaler of scalers) {
     for (let i = 0; i < scaler.labelSets.length; i++) {
-      // Per-label-set gate: every label in this set's gate must be present in
-      // the job's targetLabels. Checked inside the loop, because a scaler
-      // mixing platforms gates each of its label sets differently — hoisting
-      // this to the scaler level tests the union and rejects every set.
+      // Per set, not per scaler: a scaler mixing platforms gates each set
+      // differently, and a scaler-level check tests the union and rejects every set.
       const mandatory = gateForLabelSet(scaler, i);
       if (mandatory === null) continue;
       if (mandatory.length > 0) {
@@ -147,7 +122,6 @@ export function findBackendForLabels(
 
       const scalerLabels = new Set(scaler.labelSets[i].labels.map((l) => l.toLowerCase()));
 
-      // Check: every required label exists in the scaler's label set
       let allMatch = true;
       for (const label of targetLabels) {
         if (!scalerLabels.has(label)) {
@@ -157,7 +131,6 @@ export function findBackendForLabels(
       }
 
       if (allMatch) {
-        // Check exclusion labels: skip backends whose label set contains any excluded label
         if (excludeLabels.length > 0) {
           const hasExcluded = excludeLabels.some((e) => scalerLabels.has(e.toLowerCase()));
           if (hasExcluded) continue;

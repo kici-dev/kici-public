@@ -1,20 +1,18 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the triggering-actor columns to `execution_runs`:
+ * Triggering-actor columns on `execution_runs`:
  *
- *  - `trigger_actor_provider` — the origin provider of the actor identity
- *    (`github` today; provider-generic so GitLab/Bitbucket extend later).
- *  - `trigger_actor_username` — the provider login of the person who triggered
- *    the run (e.g. the GitHub pusher / PR author).
- *  - `trigger_actor_user_id` — the immutable provider user id (mirrors
+ *  - `trigger_actor_provider` — origin provider of the identity (`github`;
+ *    provider-generic).
+ *  - `trigger_actor_username` — provider login of who triggered the run (e.g.
+ *    the GitHub pusher / PR author).
+ *  - `trigger_actor_user_id` — immutable provider user id (mirrors
  *    `identity_links.provider_user_id`), preferred over the mutable username
  *    when resolving the actor to a KiCI user.
  *
  * Captured for ALL event types (push/tag/PR/comment), unlike the PR-only
- * `contributor_username`. Independently useful for a dashboard "triggered by
- * @x" and audit, beyond actor notifications. All nullable, no backfill,
- * idempotent.
+ * `contributor_username`. All nullable, no backfill, idempotent.
  */
 async function colExists(db: Kysely<unknown>, table: string, name: string): Promise<boolean> {
   const result = await sql<{ exists: boolean }>`

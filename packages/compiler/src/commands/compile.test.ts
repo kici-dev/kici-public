@@ -33,8 +33,7 @@ describe('kici compile: dep-reinstall gate', () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  // Mark `.kici/kici.lock.json`'s `lockfileHash` stale so the dep-change branch
-  // would fire.
+  // A stale `lockfileHash` makes the dep-change branch fire.
   async function staleDepsHash(): Promise<void> {
     const lockPath = path.join(tempDir, '.kici', 'kici.lock.json');
     const lock = JSON.parse(await fs.readFile(lockPath, 'utf-8'));
@@ -43,9 +42,8 @@ describe('kici compile: dep-reinstall gate', () => {
   }
 
   it('skips reinstall when `.kici/package.json` is absent (workspace-managed deps)', async () => {
-    // Setup: scaffold a `.kici/` with workflows + lock file, then remove the
-    // `package.json` to simulate a workspace member whose deps live at the
-    // repo root (a monorepo whose `.kici/` is a workspace member).
+    // No `.kici/package.json`: a monorepo whose `.kici/` is a workspace member
+    // with deps at the repo root.
     expect(await initCommand({ skipInstall: true })).toBe(true);
     expect(await compileCommand({ check: false, verbose: false })).toBe(true);
     await fs.rm(path.join(tempDir, '.kici', 'package.json'));
@@ -86,7 +84,6 @@ describe('kici compile: dynamic-value functions', () => {
 
   it('compiles a function context to a dynamic marker (no inline expression, no purity warning)', async () => {
     expect(await initCommand({ skipInstall: true })).toBe(true);
-    // Replace the scaffolded workflow with one whose context is a function.
     const workflowsDir = path.join(tempDir, '.kici', 'workflows');
     for (const f of await fs.readdir(workflowsDir)) {
       await fs.rm(path.join(workflowsDir, f));
@@ -113,15 +110,15 @@ describe('kici compile: dynamic-value functions', () => {
     const ok = await compileCommand({ check: false, verbose: false });
     expect(ok).toBe(true);
 
-    // The function context is serialized as a dynamic marker, never an inline
-    // expression — the agent init round resolves it.
+    // A function context is a dynamic marker, never an inline expression; the
+    // agent init round resolves it.
     const lockPath = path.join(tempDir, '.kici', 'kici.lock.json');
     const lockJson = await fs.readFile(lockPath, 'utf-8');
     expect(lockJson).not.toContain('_type": "inline"');
     const lock = JSON.parse(lockJson);
     expect(lock.workflows[0].jobs[0].contexts).toEqual([{ value: '', dynamic: true }]);
 
-    // No purity / init-job warning is emitted (the notion no longer exists).
+    // No purity / init-job warning.
     const warnLines = warnSpy.mock.calls.map((c) => String(c[0])).join('\n');
     expect(warnLines).not.toContain('is not pure');
     expect(warnLines).not.toContain('~5-10s');

@@ -92,9 +92,6 @@ function mockMetrics(): DispatchMetrics {
   };
 }
 
-/**
- * Create a mock JobQueue with controllable behavior.
- */
 function mockQueue(
   options: {
     depth?: number;
@@ -115,7 +112,6 @@ function mockQueue(
   } = options;
   let dequeueIndex = 0;
 
-  // Track dispatched job IDs to auto-populate getJobById if no explicit map
   const dispatchedJobIds: string[] = [];
 
   return {
@@ -148,13 +144,11 @@ function mockQueue(
     getDepth: vi.fn().mockResolvedValue(depth),
     getPendingJobs: vi.fn().mockResolvedValue(dequeueJobs),
     listPending: vi.fn().mockImplementation(async (limit: number) => pendingJobs.slice(0, limit)),
-    // Recovery methods
     markRecovering: vi.fn().mockResolvedValue(undefined),
     markFailedIfRecovering: vi.fn().mockResolvedValue(true),
     markDispatchedIfRecovering: vi.fn().mockResolvedValue(true),
     getJobById: vi.fn().mockImplementation(async (jobId: string) => {
       if (jobLookups?.has(jobId)) return jobLookups.get(jobId)!;
-      // Default: return a minimal result with the jobId and run-1
       return { id: jobId, runId: 'run-1', status: 'dispatched' };
     }),
     getJobsByStatus: vi.fn().mockResolvedValue([]),
@@ -163,7 +157,6 @@ function mockQueue(
     getRecoveringJobs: vi.fn().mockResolvedValue([]),
     sweepExpiredRecoveries: vi.fn().mockResolvedValue([]),
     hasAgentOwnedJob: vi.fn().mockResolvedValue(false),
-    // Dispatch-ack methods
     requeue: vi.fn().mockResolvedValue(1),
     requeueIfAwaitingAck: vi.fn().mockResolvedValue(1),
     getFullJobById: vi.fn().mockResolvedValue(null),
@@ -222,7 +215,6 @@ describe('Dispatcher', () => {
         expect(result.jobId).toBeDefined();
       }
 
-      // onDispatch should be called with the agent ID and a job object
       expect(onDispatch).toHaveBeenCalledTimes(1);
       expect(onDispatch).toHaveBeenCalledWith(
         'agent-1',
@@ -234,10 +226,8 @@ describe('Dispatcher', () => {
         }),
       );
 
-      // Agent active jobs should be incremented
       expect(registry.get('agent-1')!.activeJobs).toBe(1);
 
-      // Metrics
       expect(metrics.incJobsDispatched).toHaveBeenCalledWith('dispatched');
     });
 
@@ -248,9 +238,8 @@ describe('Dispatcher', () => {
 
       await dispatcher.dispatch(makeJobInput());
 
-      // The row is inserted already-dispatched, so it never reaches
-      // markDispatched — the owner has to be written by the insert itself or a
-      // cold coordinator can never resolve ownership of this job.
+      // Inserted already-dispatched, so it never reaches markDispatched: the insert
+      // must write the owner or a cold coordinator can never resolve ownership.
       expect(queue.insertDispatched).toHaveBeenCalledWith(expect.anything(), 'agent-1');
       expect(queue.markDispatched).not.toHaveBeenCalled();
     });
@@ -413,7 +402,6 @@ describe('Dispatcher', () => {
     });
 
     it('queues when no available agent', async () => {
-      // No agents registered
       const queue = mockQueue();
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
 
@@ -495,9 +483,7 @@ describe('Dispatcher', () => {
     it('picks an idle agent when one busy and one idle (multiple agents)', async () => {
       registry.register('agent-busy', mockWs(), ['linux']);
       registry.register('agent-idle', mockWs(), ['linux']);
-      // Make agent-busy have a job
       registry.incrementActiveJobs('agent-busy');
-      // agent-idle has 0 jobs
 
       const queue = mockQueue();
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
@@ -524,7 +510,7 @@ describe('Dispatcher', () => {
 
       await dispatcher.onAgentAvailable('agent-1');
 
-      // Single-job model: only one job dispatched
+      // Single-job model.
       expect(onDispatch).toHaveBeenCalledTimes(1);
       expect(onDispatch).toHaveBeenCalledWith('agent-1', expect.objectContaining({ id: 'job-1' }));
 
@@ -543,7 +529,6 @@ describe('Dispatcher', () => {
 
       await dispatcher.onAgentAvailable('agent-1');
 
-      // Agent at capacity -- no dispatch
       expect(onDispatch).not.toHaveBeenCalled();
     });
 
@@ -551,7 +536,6 @@ describe('Dispatcher', () => {
       const jobs = [makeQueuedJob({ id: 'job-2', runsOnLabels: ['linux'] })];
       const queue = mockQueue({ dequeueJobs: jobs });
 
-      // Register agent with maxConcurrency=2
       registry.register('agent-1', mockWs(), ['linux'], 'linux', 'x64', undefined, 2);
       registry.incrementActiveJobs('agent-1'); // 1 active, capacity for 1 more
 
@@ -559,7 +543,6 @@ describe('Dispatcher', () => {
 
       await dispatcher.onAgentAvailable('agent-1');
 
-      // Agent has capacity -- should dequeue and dispatch
       expect(onDispatch).toHaveBeenCalledTimes(1);
       expect(onDispatch).toHaveBeenCalledWith('agent-1', expect.objectContaining({ id: 'job-2' }));
       expect(registry.get('agent-1')!.activeJobs).toBe(2);
@@ -592,24 +575,19 @@ describe('Dispatcher', () => {
       registry.register('agent-1', mockWs(), ['linux']);
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
 
-      // Dispatch one job to the agent (single-job model)
       await dispatcher.dispatch(makeJobInput({ runId: 'run-1' }));
       expect(onDispatch).toHaveBeenCalledTimes(1);
 
-      // Disconnect the agent
       const failedJobIds = await dispatcher.onAgentDisconnect('agent-1');
 
-      // No immediately failed jobs -- recovery timers started instead
+      // Recovery timers start instead of failing jobs immediately.
       expect(failedJobIds).toEqual([]);
       expect(queue.markFailed).not.toHaveBeenCalled();
 
-      // Job should be marked as recovering in DB
       expect(queue.markRecovering).toHaveBeenCalledTimes(1);
 
-      // Agent should be unregistered from registry
       expect(registry.get('agent-1')).toBeUndefined();
 
-      // Clean up timers
       dispatcher.stopRecoveryTimers();
     });
 
@@ -629,7 +607,6 @@ describe('Dispatcher', () => {
       const queue = mockQueue();
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
 
-      // Should not throw
       await dispatcher.onAgentDisconnect('nonexistent');
 
       expect(queue.markFailed).not.toHaveBeenCalled();
@@ -649,9 +626,8 @@ describe('Dispatcher', () => {
     }
 
     it('onAgentDisconnect completes a started in-flight job as success when reboot-pending', async () => {
-      // Realistic order: the restart job dispatches + starts on a non-pending
-      // agent, then the step sets the reboot-pending flag, then the box reboots
-      // (disconnect). So the flag is added AFTER dispatch+start.
+      // Realistic order: the restart job dispatches + starts, then the step sets the
+      // reboot-pending flag, then the box reboots (disconnect).
       const pending = new Set<string>();
       const rosterStore = rebootStore(pending);
       const queue = mockQueue();
@@ -696,8 +672,8 @@ describe('Dispatcher', () => {
       registry.register('agent-1', mockWs(), ['linux']);
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch, rosterStore });
 
-      // A pinned post-restart job arriving via the direct-dispatch path (needs
-      // satisfied) must be held, not dispatched into the about-to-reboot box.
+      // A pinned post-restart job on the direct-dispatch path (needs satisfied) is
+      // held, not dispatched into the about-to-reboot box.
       const result = await dispatcher.dispatch(
         makeJobInput({ runId: 'run-1', pinnedAgentId: 'agent-1' }),
       );
@@ -709,8 +685,7 @@ describe('Dispatcher', () => {
 
     it('dispatch() queues a label-routed job (does not dispatch) when the only matching agent is reboot-pending', async () => {
       // A `runsOn: 'kici:host:<id>'` post-restart job is label-routed (no
-      // pinnedAgentId); when its only matching host is reboot-pending it must be
-      // held, not sent into the about-to-reboot box.
+      // pinnedAgentId); when its only matching host is reboot-pending it is held.
       const pending = new Set<string>(['host-1']);
       const rosterStore = rebootStore(pending);
       const queue = mockQueue();
@@ -796,12 +771,10 @@ describe('Dispatcher', () => {
       registry.register('agent-1', mockWs(), ['linux']);
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
 
-      // Dispatch a job
       const result = await dispatcher.dispatch(makeJobInput());
       expect(result.status).toBe('dispatched');
       expect(registry.get('agent-1')!.activeJobs).toBe(1);
 
-      // Complete the job
       const jobId = (result as { status: 'dispatched'; jobId: string }).jobId;
       dispatcher.onJobComplete('agent-1', jobId);
 
@@ -912,10 +885,9 @@ describe('Dispatcher', () => {
 
   describe('redrivePendingToConnectedAgents (pending safety-net)', () => {
     it('does NOT re-drive a held label-routed post-restart job onto a reboot-pending host', async () => {
-      // The safety-net re-drive must apply the same reboot-pending gate as
-      // dispatch() / drainForAgent: a job held because its only matching host is
-      // reboot-pending must stay pending, not be re-driven into the about-to-die
-      // box. Without the gate this path defeats the workflow host-restart hold.
+      // The safety-net re-drive applies the same reboot-pending gate as dispatch() /
+      // drainForAgent, or it re-drives a held job into the about-to-die box and
+      // defeats the workflow host-restart hold.
       const rosterStore = {
         isRebootPending: vi.fn(async (agentId: string) => agentId === 'restart-box'),
         clearRebootPending: vi.fn(),
@@ -974,8 +946,8 @@ describe('Dispatcher', () => {
 
     it('recovers a requeued job the one-shot redispatch missed while the agent was transiently at capacity', async () => {
       registry.register('healthy', mockWs(), ['linux']);
-      // Simulate the healthy agent's in-flight registration drain holding its
-      // single eagerly-claimed slot at the instant the ack deadline fires.
+      // The healthy agent's in-flight registration drain holds its single
+      // eagerly-claimed slot at the instant the ack deadline fires.
       registry.incrementActiveJobs('healthy');
 
       const job = makeQueuedJob({ id: 'orphan-1', runsOnLabels: ['linux'], status: 'pending' });
@@ -989,9 +961,9 @@ describe('Dispatcher', () => {
         .mockResolvedValue([]);
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
 
-      // Ack sweep requeues + one-shot redispatch — but the only matching agent
-      // is transiently at capacity, so the job is left pending with no
-      // re-trigger: an orphan that only the redrive below can recover.
+      // The ack sweep requeues + redispatches once, but the only matching agent is
+      // at capacity, so the job is left pending with no re-trigger: an orphan only
+      // the redrive below recovers.
       await dispatcher.sweepExpiredAckDeadlines();
       expect(onDispatch).not.toHaveBeenCalled();
 
@@ -1050,12 +1022,9 @@ describe('Dispatcher', () => {
     });
 
     it('delivers a pinned job to its pinned agent when that agent is connected and idle', async () => {
-      // The pinned agent is deliberately registered with a label the job does
-      // NOT require, so `findAvailable(['linux'])` returns nothing and the ONLY
-      // route to delivery is the pin branch of `selectConnectedTargetForPending`.
-      // A mutation that broke pinned delivery (the branch returning null, or
-      // falling through to the label matcher) would leave the job undelivered
-      // and trip this assertion.
+      // The pinned agent's label is one the job does NOT require, so
+      // `findAvailable(['linux'])` returns nothing and the ONLY route to delivery is
+      // the pin branch of `selectConnectedTargetForPending`.
       registry.register('pinned-host', mockWs(), ['windows']);
       const job = makeQueuedJob({
         id: 'pinned-1',
@@ -1090,13 +1059,10 @@ describe('Dispatcher', () => {
     });
 
     it('does not consult the scaler even when a connected agent exists but cannot take the job', async () => {
-      // A scaler hook is wired AND a connected agent exists, but that agent
-      // cannot take the job (its labels do not match), so the sweep finds no
-      // target — the realistic "no connected agent can take the job" case, not
-      // the degenerate empty-fleet one. Spawning fresh capacity is
-      // retryPendingScaleRequests' job, not this connected-agent sweep's, so a
-      // future edit that added a scaler fallback on the no-target branch would
-      // call onNoMatchingAgent here and trip this assertion.
+      // A connected agent exists but its labels do not match, so the sweep finds no
+      // target (not the degenerate empty-fleet case). Spawning capacity is
+      // retryPendingScaleRequests' job, so a scaler fallback on the no-target branch
+      // would call onNoMatchingAgent and trip this assertion.
       const onNoMatchingAgent = vi
         .fn()
         .mockResolvedValue({ action: 'spawning', backendType: 'docker' });
@@ -1121,7 +1087,7 @@ describe('Dispatcher', () => {
 
   describe('drain gate', () => {
     it('dispatch enqueues Pending and skips the agent + scaler while draining', async () => {
-      // A free matching agent is present — proves we do NOT use it while draining.
+      // A free matching agent is present, so only the drain gate holds the job.
       registry.register('agent-1', mockWs(), ['linux']);
       const queue = mockQueue();
       const onNoMatchingAgent = vi.fn();
@@ -1179,8 +1145,8 @@ describe('Dispatcher', () => {
     });
 
     it('queues a pinned job (with the pin) instead of dispatching while draining', async () => {
-      // The pinned agent is present, free, and matches — proves the drain gate,
-      // not agent unavailability, holds the job.
+      // The pinned agent is present, free, and matches, so only the drain gate
+      // holds the job.
       registry.register('a1', mockWs(), ['role:web']);
       const queue = mockQueue();
       const dispatcher = new Dispatcher({
@@ -1232,11 +1198,7 @@ describe('Dispatcher', () => {
       shapeFits: vi.fn().mockReturnValue(verdict),
     });
 
-    /**
-     * One label-matching warm agent whose shape check answers `verdict`. The
-     * question every case here asks is whether the job reaches that agent or
-     * falls through to the scaler.
-     */
+    /** One label-matching warm agent whose shape check answers `verdict`. */
     function withOneAgent(verdict: boolean, queue = mockQueue(), agentLabels = ['linux']) {
       registry.register('warm-1', mockWs(), agentLabels);
       const onNoMatchingAgent = vi
@@ -1319,11 +1281,10 @@ describe('Dispatcher', () => {
       expect((await dispatcher.dispatch(makeJobInput({ jobId: 'other-1' }))).status).toBe('queued');
     });
 
-    // The typed `resources` field is a convenience mirror the caller may omit:
-    // the webhook dispatch path and the worker's reroute handler both build
-    // their input with the declaration in `jobConfig` alone. Reading only the
-    // mirror reported a job that declares nothing, so the gate admitted a warm
-    // agent of the pool's size to a job that asked for another.
+    // The typed `resources` field is a mirror the caller may omit: the webhook
+    // dispatch path and the worker's reroute handler put the declaration in
+    // `jobConfig` alone. Reading only the mirror would admit a warm agent of the
+    // pool's size to a job that asked for another.
     it('reads the declared shape from jobConfig when the typed mirror is absent', async () => {
       const { dispatcher, shapeFits } = withOneAgent(true);
       const resources = { requests: { cpus: 8, memory: '16g' } };
@@ -1340,8 +1301,8 @@ describe('Dispatcher', () => {
         makeJobInput({ jobConfig: { resources: { requests: { cpus: 8 } } } }),
       );
 
-      // The 5th argument is the shape the spawn is sized from. Read as absent,
-      // the scaler starts the job's own agent at the label-set default.
+      // The 5th argument sizes the spawn; read as absent, the scaler starts the
+      // job's agent at the label-set default.
       expect(onNoMatchingAgent.mock.calls[0][4]).toEqual({ requests: { cpus: 8 } });
     });
 
@@ -1363,9 +1324,9 @@ describe('Dispatcher', () => {
     });
 
     it('treats a dockerfile job as needing a runtime a build CLI does not provide', async () => {
-      // A dockerfile job additionally requires the build-capable runtime label,
-      // and it runs the pool's agent image nesting a container it builds — so
-      // it needs a runtime socket too, and brings no image a spawn could start.
+      // A dockerfile job also requires the build-capable runtime label and a runtime
+      // socket (it nests the container it builds in the pool's agent image), and
+      // brings no image a spawn could start.
       const { dispatcher, onNoMatchingAgent } = withOneAgent(true, mockQueue(), [
         'linux',
         'kici:runtime:container-build',
@@ -1456,8 +1417,8 @@ describe('Dispatcher', () => {
 
       await dispatcher.onAgentAvailable('warm-1');
 
-      // The predicate reaches the claim itself: a row rejected after being
-      // claimed would be stranded Dispatched and would burn a dispatch attempt.
+      // The predicate reaches the claim itself: a row rejected after its claim would
+      // be stranded Dispatched and burn a dispatch attempt.
       const canServe = (queue.dequeueForLabels as ReturnType<typeof vi.fn>).mock.calls[0][3] as (
         job: QueuedJob,
       ) => boolean;
@@ -1507,11 +1468,10 @@ describe('Dispatcher', () => {
       const result = await dispatcher.dispatch(makeJobInput());
 
       expect(result.status).toBe('queued');
-      // The dispatcher enqueues first (so it has a stable jobId for the
-      // scaler to bind), then calls onNoMatchingAgent with that queue jobId
-      // plus the run id. The jobId powers the eager-dispatch fix for the
-      // scaler-managed agent idle-shutdown race; the runId lets a spawn that
-      // fails before WS registration be attributed back to its run.
+      // The dispatcher enqueues first (a stable jobId for the scaler to bind), then
+      // calls onNoMatchingAgent with that jobId plus the run id. The jobId powers
+      // eager dispatch against the scaler-managed agent idle-shutdown race; the runId
+      // attributes a spawn that fails before WS registration back to its run.
       const queuedJobId = (result as { status: 'queued'; jobId: string }).jobId;
       expect(onNoMatchingAgent).toHaveBeenCalledWith(
         ['linux'],
@@ -1609,7 +1569,6 @@ describe('Dispatcher', () => {
     });
 
     it('queues job when onNoMatchingAgent returns no-backend but a busy agent has matching labels', async () => {
-      // Register an agent with matching labels but at full capacity
       registry.register('agent-busy', mockWs(), ['linux'], 1);
       registry.incrementActiveJobs('agent-busy');
 
@@ -1670,7 +1629,6 @@ describe('Dispatcher', () => {
 
     it('falls through to enqueue when onNoMatchingAgent is not configured', async () => {
       const queue = mockQueue();
-      // No onNoMatchingAgent provided -- backward compatible
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
 
       const result = await dispatcher.dispatch(makeJobInput());
@@ -1783,10 +1741,9 @@ describe('Dispatcher', () => {
         unknown,
         { image: string; authconfig?: unknown } | undefined,
       ];
-      // Labels are passed through untouched: the scaler picks a pool by exact
-      // label-set containment, so a runtime label no pool declares would strand
-      // the job. Runtime is judged on registered agents instead (see
-      // container-routing.ts).
+      // Labels pass through untouched: the scaler picks a pool by exact label-set
+      // containment, so a runtime label no pool declares would strand the job.
+      // Runtime is judged on registered agents instead (see container-routing.ts).
       expect(labels).toEqual(['linux']);
       // Assembled from what dispatch already resolved — never re-resolved here.
       expect(containerSpawn?.image).toBe('reg.internal:5000/acme/ci:1.2');
@@ -2096,7 +2053,7 @@ describe('Dispatcher', () => {
 
       dispatcher.onJobComplete('agent-1', jobId);
 
-      // Still in grace window
+      // Still in the grace window.
       expect(dispatcher.isJobOwnedByAgent('agent-1', jobId)).toBe(true);
     });
 
@@ -2111,7 +2068,7 @@ describe('Dispatcher', () => {
 
       dispatcher.onJobComplete('agent-1', jobId);
 
-      // Advance past grace window (30s)
+      // Past the 30s grace window.
       vi.advanceTimersByTime(31_000);
 
       expect(dispatcher.isJobOwnedByAgent('agent-1', jobId)).toBe(false);
@@ -2153,11 +2110,9 @@ describe('Dispatcher', () => {
       dispatcher.onJobComplete('agent-1', jobId);
       dispatcher.startGraceCleanup();
 
-      // Still in grace window at 29s
       vi.advanceTimersByTime(29_000);
       expect(dispatcher.isJobOwnedByAgent('agent-1', jobId)).toBe(true);
 
-      // Advance past grace window and let cleanup run
       vi.advanceTimersByTime(2_000);
       expect(dispatcher.isJobOwnedByAgent('agent-1', jobId)).toBe(false);
 
@@ -2176,7 +2131,7 @@ describe('Dispatcher', () => {
       dispatcher.onJobComplete('agent-1', jobId);
       expect(dispatcher.isJobOwnedByAgent('agent-1', jobId)).toBe(true);
 
-      // Re-register agent since onJobComplete unregistered it via registry
+      // onJobComplete unregistered the agent.
       registry.register('agent-1', mockWs(), ['linux']);
       await dispatcher.onAgentDisconnect('agent-1');
 
@@ -2198,16 +2153,14 @@ describe('Dispatcher', () => {
       const result = await dispatcher.dispatch(makeJobInput());
       const jobId = (result as { status: 'dispatched'; jobId: string }).jobId;
 
-      // Disconnect starts recovery (now also persists deadline + agentId
-      // so a replacement coord can resume the sweep).
+      // Disconnect starts recovery and persists deadline + agentId so a replacement
+      // coord can resume the sweep.
       await dispatcher.onAgentDisconnect('agent-1');
       expect(queue.markRecovering).toHaveBeenCalledWith(jobId, expect.any(Date), 'agent-1');
 
-      // Claim recovery before timer fires
       const claimed = dispatcher.claimRecovery(jobId, 'agent-1');
       expect(claimed).toBe(true);
 
-      // Advance past grace period -- timer should NOT fire
       vi.advanceTimersByTime(200_000);
       await vi.runAllTimersAsync();
       expect(queue.markFailedIfRecovering).not.toHaveBeenCalled();
@@ -2244,8 +2197,8 @@ describe('Dispatcher', () => {
       const queue = mockQueue();
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
 
-      // A row dispatched before the owner column existed: the sweep falls back
-      // to the placeholder, so no real agent id can claim it.
+      // A row dispatched before the owner column existed: the sweep uses the
+      // placeholder, so no real agent id can claim it.
       await dispatcher.startRecoveryTimer('job-42', 'unknown', 'run-42');
 
       expect(dispatcher.claimRecovery('job-42', 'agent-1')).toBe(false);
@@ -2276,7 +2229,6 @@ describe('Dispatcher', () => {
 
       await dispatcher.onAgentDisconnect('agent-1');
 
-      // Wrong agent trying to claim
       const claimed = dispatcher.claimRecovery(jobId, 'agent-2');
       expect(claimed).toBe(false);
 
@@ -2301,7 +2253,7 @@ describe('Dispatcher', () => {
 
       await dispatcher.onAgentDisconnect('agent-1');
 
-      // Advance past default grace period (2x 60s = 120s)
+      // Default grace period: 2x 60s.
       await vi.advanceTimersByTimeAsync(120_000);
 
       expect(queue.markFailedIfRecovering).toHaveBeenCalledWith(
@@ -2343,18 +2295,15 @@ describe('Dispatcher', () => {
       registry.register('agent-1', mockWs(), ['linux']);
       const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
 
-      // Dispatch 1 job (single-job model)
       const result1 = await dispatcher.dispatch(makeJobInput({ runId: 'run-1' }));
       const jobId1 = (result1 as { status: 'dispatched'; jobId: string }).jobId;
 
-      // Disconnect starts recovery
       await dispatcher.onAgentDisconnect('agent-1');
 
       const recovering = dispatcher.getRecoveringJobsForAgent('agent-1');
       expect(recovering).toHaveLength(1);
       expect(recovering).toContain(jobId1);
 
-      // Different agent has no recovering jobs
       expect(dispatcher.getRecoveringJobsForAgent('agent-2')).toEqual([]);
 
       dispatcher.stopRecoveryTimers();
@@ -2370,9 +2319,7 @@ describe('Dispatcher', () => {
 
       await dispatcher.onAgentDisconnect('agent-1');
 
-      // Job is recovering -- still owned by agent-1
       expect(dispatcher.isJobOwnedByAgent('agent-1', jobId)).toBe(true);
-      // Not owned by different agent
       expect(dispatcher.isJobOwnedByAgent('agent-2', jobId)).toBe(false);
 
       dispatcher.stopRecoveryTimers();
@@ -2397,11 +2344,10 @@ describe('Dispatcher', () => {
 
       await dispatcher.onAgentDisconnect('agent-1');
 
-      // At 59,999ms -- job should still be recovering
       await vi.advanceTimersByTimeAsync(59_999);
       expect(queue.markFailedIfRecovering).not.toHaveBeenCalled();
 
-      // At 60,000ms (2x 30s) -- timer fires
+      // 2x 30s.
       await vi.advanceTimersByTimeAsync(1);
       expect(queue.markFailedIfRecovering).toHaveBeenCalledWith(
         jobId,
@@ -2431,7 +2377,6 @@ describe('Dispatcher', () => {
       expect(info!.agentId).toBe('agent-1');
       expect(info!.disconnectedAt).toBeGreaterThan(0);
 
-      // Unknown job returns null
       expect(dispatcher.getRecoveryInfo('unknown-job')).toBeNull();
 
       dispatcher.stopRecoveryTimers();
@@ -2440,7 +2385,6 @@ describe('Dispatcher', () => {
     it('recovery timer catches DB errors instead of crashing (unhandled rejection)', async () => {
       vi.useFakeTimers();
       const queue = mockQueue();
-      // Make markFailedIfRecovering throw a DB error
       (queue.markFailedIfRecovering as ReturnType<typeof vi.fn>).mockRejectedValue(
         new Error('connection refused'),
       );
@@ -2457,10 +2401,9 @@ describe('Dispatcher', () => {
 
       await dispatcher.onAgentDisconnect('agent-1');
 
-      // Advance past grace period -- timer fires, DB call fails, should NOT throw
       await vi.advanceTimersByTimeAsync(120_000);
 
-      // markFailedIfRecovering was called (and failed), but no unhandled rejection
+      // Called and failed, with no unhandled rejection.
       expect(queue.markFailedIfRecovering).toHaveBeenCalledWith(jobId, expect.any(String));
     });
 
@@ -2480,10 +2423,8 @@ describe('Dispatcher', () => {
       await dispatcher.dispatch(makeJobInput());
       await dispatcher.onAgentDisconnect('agent-1');
 
-      // Stop all timers
       dispatcher.stopRecoveryTimers();
 
-      // Advance past grace period -- timer should NOT fire
       await vi.advanceTimersByTimeAsync(200_000);
       expect(queue.markFailedIfRecovering).not.toHaveBeenCalled();
       expect(onJobFailedPermanently).not.toHaveBeenCalled();
@@ -2506,7 +2447,6 @@ describe('Dispatcher', () => {
 
       await dispatcher.startRecoveryTimer('job-42', 'agent-1', 'run-42');
 
-      // markRecovering is now called with the persisted deadline + agentId
       expect(queue.markRecovering).toHaveBeenCalledWith(
         'job-42',
         expect.any(Date),
@@ -2514,10 +2454,9 @@ describe('Dispatcher', () => {
       );
       expect(onRecoveryStarted).toHaveBeenCalledWith('agent-1', 'job-42');
 
-      // Job should be owned by agent
       expect(dispatcher.isJobOwnedByAgent('agent-1', 'job-42')).toBe(true);
 
-      // Advance past grace period (2x 10s = 20s)
+      // 2x 10s.
       await vi.advanceTimersByTimeAsync(20_000);
 
       expect(queue.markFailedIfRecovering).toHaveBeenCalledWith(
@@ -2541,8 +2480,8 @@ describe('Dispatcher', () => {
       let dequeues = 0;
       const queue = {
         ...mockQueue(),
-        // Async gap widens the check-then-claim window: both racers reach
-        // the dequeue before either would have incremented under the old code.
+        // The async gap widens the check-then-claim window, so both racers reach the
+        // dequeue before either increments.
         dequeueForLabels: vi.fn(async () => {
           dequeues++;
           await new Promise((r) => setTimeout(r, 10));
@@ -2592,7 +2531,7 @@ describe('Dispatcher', () => {
       const onDispatch = vi.fn();
       const dispatcher = new Dispatcher({ registry, queue, metrics: mockMetrics(), onDispatch });
 
-      // Simulate the phantom dispatch: job-1 tracked to the rejecting agent.
+      // The phantom dispatch: job-1 tracked to the rejecting agent.
       registry.incrementActiveJobs('zzz-rejecter');
       dispatcher.restoreJobForAgent('zzz-rejecter', 'job-1');
 
@@ -2600,7 +2539,6 @@ describe('Dispatcher', () => {
 
       expect(requeue).toHaveBeenCalledWith('job-1', { countAttempt: false });
       expect(registry.get('zzz-rejecter')?.activeJobs).toBe(0);
-      // Redispatched to the idle agent via dispatchBoundJob:
       expect(onDispatch).toHaveBeenCalledWith(
         'idle-agent',
         expect.objectContaining({ id: 'job-1' }),
@@ -3049,9 +2987,8 @@ describe('Dispatcher', () => {
       const { registry, queue } = setupScalerAgent({
         requeue,
         markRecovering,
-        // The dispatch path that tracks a job WITHOUT marking it started:
-        // dispatchBoundJob with a stubbed dequeueById models a dispatch that
-        // never produced a `job.status: running`.
+        // dispatchBoundJob with a stubbed dequeueById tracks a job WITHOUT marking it
+        // started: no `job.status: running` ever arrives.
         dequeueById: vi.fn(async () => makeQueuedJob({ id: 'job-1' })),
         markDispatched: vi.fn(async () => {}),
         getJobById: vi.fn(async () => ({ id: 'job-1', runId: 'run-1', status: 'dispatched' })),
@@ -3160,8 +3097,8 @@ describe('Dispatcher', () => {
 
       await vi.advanceTimersByTimeAsync(5_001);
 
-      // The requeue is the guarded one: it proves the ack never landed and
-      // flips the row in the same statement, so an acked job is never requeued.
+      // The guarded requeue proves the ack never landed and flips the row in one
+      // statement, so an acked job is never requeued.
       expect(queue.requeueIfAwaitingAck).toHaveBeenCalledWith(jobId, 'a1');
       expect(queue.requeue).not.toHaveBeenCalled();
       expect(onAckTimeout).toHaveBeenCalledWith('a1', jobId, 'run-1');
@@ -3200,9 +3137,8 @@ describe('Dispatcher', () => {
     });
 
     it('an ack that beats the deadline arming is honored (no spurious requeue)', async () => {
-      // getAckTimeoutMs blocks on a gate, so the agent's ack can arrive between
-      // the dispatch send and the pending-ack entry being armed — the real
-      // race the earlyAcks map closes.
+      // getAckTimeoutMs blocks on a gate, so the ack can arrive between the dispatch
+      // send and the pending-ack entry being armed — the race the earlyAcks map closes.
       registry.register('a1', mockWs(), ['linux']);
       const queue = mockQueue();
       const onAckTimeout = vi.fn();
@@ -3379,8 +3315,8 @@ describe('Dispatcher', () => {
         makeQueuedJob({ id: jobId, status: 'pending' }),
       );
 
-      // Simulate the lost dispatch: no ack, no running, then the agent (the
-      // only one) disconnects. Triage must requeue and consult the scaler.
+      // The lost dispatch: no ack, no running, then the only agent disconnects.
+      // Triage must requeue and consult the scaler.
       await dispatcher.onAgentDisconnect('a1');
 
       expect(queue.requeue).toHaveBeenCalledWith(jobId, { countAttempt: true });
@@ -3494,10 +3430,9 @@ describe('Dispatcher', () => {
     });
 
     it('a late ack timer whose ack already landed leaves the running job alone', async () => {
-      // The DB is the arbiter: the guarded requeue reports that the row is no
-      // longer awaiting this agent's ack, which is how a coordinator learns the
-      // ack reached a sibling. Requeueing here would hand an executing job to a
-      // second agent, and unregistering would tear down a healthy one.
+      // The DB is the arbiter: the guarded requeue reports the row no longer awaits
+      // this agent's ack, i.e. the ack reached a sibling. Requeueing would hand an
+      // executing job to a second agent; unregistering would tear down a healthy one.
       vi.useFakeTimers();
       registry.register('a1', mockWs(), ['linux']);
       const queue = mockQueue();
@@ -3550,10 +3485,9 @@ describe('Dispatcher', () => {
 
   describe('recovery expiry', () => {
     it('does not fail a job that was reclaimed before the recovery timer fired', async () => {
-      // `markFailedIfRecovering` is conditional, so the DB row is safe — but
-      // `onJobFailedPermanently` fails `execution_jobs` and cancels the job's
-      // steps unconditionally. Gating on the DB's verdict is what stops a
-      // reclaimed, running job from being failed out from under its agent.
+      // `markFailedIfRecovering` is conditional, but `onJobFailedPermanently` fails
+      // `execution_jobs` and cancels steps unconditionally, so gating on the DB's
+      // verdict keeps a reclaimed, running job from being failed under its agent.
       vi.useFakeTimers();
       const queue = mockQueue();
       (queue.markFailedIfRecovering as ReturnType<typeof vi.fn>).mockResolvedValue(false);
@@ -3770,9 +3704,8 @@ describe('containerSpawnFor', () => {
   });
 
   it('offers NO spawn for a job that builds its image from a dockerfile', () => {
-    // This is what routes a dockerfile job to the nesting topology: the image
-    // does not exist until an agent has cloned and built it, so the scaler must
-    // not try to boot an agent from it.
+    // This routes a dockerfile job to the nesting topology: the image does not
+    // exist until an agent builds it, so the scaler must not boot an agent from it.
     expect(containerSpawnFor({ container: { dockerfile: '.kici/ci.Dockerfile' } })).toBeUndefined();
   });
 

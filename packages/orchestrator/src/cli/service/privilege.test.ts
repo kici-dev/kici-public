@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock platform-detect to control isRoot() in tests.
+// Controls isRoot().
 vi.mock('./platform-detect.js', () => ({
   isRoot: vi.fn(() => false),
 }));

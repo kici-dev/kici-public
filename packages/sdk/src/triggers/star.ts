@@ -1,13 +1,8 @@
-/**
- * Star trigger helper - creates triggers for star events.
- * Returns a frozen StarTriggerConfig directly.
- */
-
 import type { BranchPattern, StarConfigInput, StarTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';
 
 /**
- * Create a star trigger configuration.
+ * Create a frozen star trigger configuration.
  *
  * @example
  * // Match any star event

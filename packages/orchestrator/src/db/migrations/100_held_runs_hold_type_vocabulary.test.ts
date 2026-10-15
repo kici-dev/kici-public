@@ -4,7 +4,7 @@ import pg from 'pg';
 import { HoldType } from '@kici-dev/engine';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './100_held_runs_hold_type_vocabulary.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
  * Real-Postgres test for migration 100: asserts the legacy `approval` /
@@ -88,8 +88,7 @@ describeDb('migration 100_held_runs_hold_type_vocabulary', () => {
   });
 
   it('leaves an unknown hold type untouched', async () => {
-    // A newer orchestrator's hold type must survive an older reader's
-    // migration run rather than being coerced onto a known member.
+    // A newer orchestrator's hold type survives an older reader's migration run, uncoerced.
     await insertHeldRun('some_future_type');
 
     await up(db);
@@ -98,8 +97,7 @@ describeDb('migration 100_held_runs_hold_type_vocabulary', () => {
   });
 
   it('is idempotent', async () => {
-    // Deploys re-run migrations; a second up() must be a no-op, not a further
-    // rewrite.
+    // Deploys re-run migrations; a second up() must be a no-op.
     await insertHeldRun('approval');
 
     await up(db);

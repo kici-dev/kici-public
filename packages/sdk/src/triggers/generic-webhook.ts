@@ -1,12 +1,7 @@
-/**
- * Generic webhook trigger helper - creates triggers for non-GitHub webhook sources.
- * Returns a frozen GenericWebhookTriggerConfig directly.
- */
-
 import type { GenericWebhookConfigInput, GenericWebhookTriggerConfig } from './types.js';
 
 /**
- * Create a generic webhook trigger configuration.
+ * Create a frozen trigger for a non-GitHub webhook source. Throws on an empty `source`.
  *
  * @example
  * // Match any event from a source

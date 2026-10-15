@@ -2,11 +2,11 @@ import { describe, it, expectTypeOf } from 'vitest';
 import type { LockJob } from './types.js';
 
 /**
- * The lock-file dynamic fields no longer admit the schema-v11 inline
- * expression `{ _type: 'inline', expression }`. That object is itself a
- * `Record<string, string>`, so the `env` axis is pinned by type identity rather
- * than by an assignment the compiler would accept either way; the two string
- * fields refuse the object outright.
+ * The lock-file dynamic fields do not admit the schema-v11 inline expression
+ * `{ _type: 'inline', expression }`. That object is itself a
+ * `Record<string, string>`, so `env` is pinned by type identity, not by an
+ * assignment the compiler would accept either way; the string fields refuse the
+ * object outright.
  */
 describe('LockJob dynamic fields', () => {
   // fails-when: `concurrencyGroup` regains `| LockInlineValue`

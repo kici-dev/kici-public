@@ -1,13 +1,9 @@
 /**
- * Agent-process interception of the bootstrap bring-up API methods.
- *
- * `ctx.kici.bootstrap.ensureInitRunner` / `preBootSend` are relayed from the
- * workflow sandbox as `agent.api.request` IPC. The agent process intercepts
- * those two methods HERE (rather than relaying them straight to the
- * orchestrator) so the SSH transport — and the bring-up key / bootstrap token
- * the orchestrator hands back — stay in the agent process, never reaching user
- * workflow code. Every other method falls through to the orchestrator relay
- * unchanged.
+ * The agent process intercepts the bootstrap bring-up methods
+ * (`ensureInitRunner`, `preBootSend`, `restageAgent`), which arrive from the
+ * sandbox as `agent.api.request` IPC, so the SSH transport and the bring-up
+ * key / bootstrap token the orchestrator returns never reach workflow code.
+ * Every other method passes through to the orchestrator relay unchanged.
  */
 import {
   ensureInitRunner,
@@ -22,10 +18,8 @@ const PRE_BOOT_SEND = 'kici.preBootSend';
 const RESTAGE_AGENT = 'kici.restageAgent';
 
 /**
- * Wrap the orchestrator API transport so the two bootstrap methods are handled
- * in-process (SSH transport here; privileged resolve relayed to the
- * orchestrator). `relay` is the raw orchestrator transport (the WS
- * `sendApiRequest`).
+ * Handle the bootstrap methods in-process (SSH here; the privileged resolve
+ * still goes to the orchestrator). `relay` is the raw WS `sendApiRequest`.
  */
 export function withBootstrapInterception(
   relay: ApiTransport,

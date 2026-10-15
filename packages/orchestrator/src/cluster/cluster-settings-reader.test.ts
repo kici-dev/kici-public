@@ -4,51 +4,30 @@ import {
   ClusterSettingsReader,
   clampCacheMaxEntries,
 } from './cluster-settings-reader.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 /**
  * A db whose select throws while `shouldFail()` holds and returns `row`
- * otherwise, so a test can move a reader across a failure boundary in either
- * direction. `onSelect` fires per query that actually reached the db, which is
- * how a test asserts the negative cache suppressed the rest.
+ * otherwise. `mocks.selectExecuteTakeFirst` records each query that reached
+ * the db, so a test can assert the negative cache suppressed the rest.
  */
-function flakyDb(opts: {
-  shouldFail: () => boolean;
-  row?: Record<string, unknown>;
-  onSelect?: () => void;
-}) {
-  return {
-    selectFrom: () => ({
-      selectAll: () => ({
-        where: () => ({
-          executeTakeFirst: async () => {
-            opts.onSelect?.();
-            if (opts.shouldFail()) throw new Error('db down');
-            return opts.row;
-          },
-        }),
-      }),
-    }),
-  } as never;
+function flakyDb(opts: { shouldFail: () => boolean; row?: Record<string, unknown> }) {
+  const mock = createMockDb({ selectFirstRow: opts.row });
+  mock.mocks.selectExecuteTakeFirst.mockImplementation(async () => {
+    if (opts.shouldFail()) throw new Error('db down');
+    return opts.row;
+  });
+  return mock;
 }
 
-/** A db whose select always throws. */
 function failingDb() {
-  return flakyDb({ shouldFail: () => true });
+  const { db, mocks } = createMockDb();
+  mocks.selectExecuteTakeFirst.mockRejectedValue(new Error('db down'));
+  return db;
 }
 
-function fakeDb(row: Record<string, unknown> | undefined, onSelect?: () => void) {
-  return {
-    selectFrom: () => ({
-      selectAll: () => ({
-        where: () => ({
-          executeTakeFirst: async () => {
-            onSelect?.();
-            return row;
-          },
-        }),
-      }),
-    }),
-  } as never;
+function fakeDb(row: Record<string, unknown> | undefined) {
+  return createMockDb({ selectFirstRow: row }).db;
 }
 
 describe('ClusterSettingsReader', () => {
@@ -79,8 +58,7 @@ describe('ClusterSettingsReader', () => {
   });
 
   it('reads each cache knob override in place of the config default', async () => {
-    // All six are BIGINT, so pg hands them back as strings — the coercion is
-    // part of what these cases pin.
+    // BIGINT columns come back from pg as strings; these cases pin the coercion.
     const r = new ClusterSettingsReader(
       fakeDb({
         lockfile_cache_max: '900',
@@ -170,43 +148,26 @@ describe('ClusterSettingsReader', () => {
   });
 
   it('reads the row once per TTL window across multiple getNumber calls', async () => {
-    let selects = 0;
-    const r = new ClusterSettingsReader(
-      fakeDb({ queue_max_depth: 5, event_router_event_ttl_seconds: 7 }, () => {
-        selects++;
-      }),
-      10_000,
-    );
+    const { db, mocks } = createMockDb({
+      selectFirstRow: { queue_max_depth: 5, event_router_event_ttl_seconds: 7 },
+    });
+    const r = new ClusterSettingsReader(db, 10_000);
     await r.getNumber('queue_max_depth', 1);
     await r.getNumber('event_router_event_ttl_seconds', 1);
-    expect(selects).toBe(1);
+    expect(mocks.selectExecuteTakeFirst.mock.calls.length).toBe(1);
   });
 
   it('re-reads after the TTL window expires', async () => {
-    let selects = 0;
-    const r = new ClusterSettingsReader(
-      fakeDb({ queue_max_depth: 5 }, () => {
-        selects++;
-      }),
-      0, // TTL 0 → every read is a fresh load
-    );
+    const { db, mocks } = createMockDb({ selectFirstRow: { queue_max_depth: 5 } });
+    const r = new ClusterSettingsReader(db, 0); // TTL 0 → every read is a fresh load
     await r.getNumber('queue_max_depth', 1);
     await r.getNumber('queue_max_depth', 1);
-    expect(selects).toBe(2);
+    expect(mocks.selectExecuteTakeFirst.mock.calls.length).toBe(2);
   });
 
   it('degrades to fallback when the select throws', async () => {
-    const db = {
-      selectFrom: () => ({
-        selectAll: () => ({
-          where: () => ({
-            executeTakeFirst: async () => {
-              throw new Error('db down');
-            },
-          }),
-        }),
-      }),
-    } as never;
+    const { db, mocks } = createMockDb();
+    mocks.selectExecuteTakeFirst.mockRejectedValue(new Error('db down'));
     expect(await new ClusterSettingsReader(db, 10_000).getNumber('queue_max_depth', 1000)).toBe(
       1000,
     );
@@ -214,10 +175,8 @@ describe('ClusterSettingsReader', () => {
 
   it('getCachedVersion returns 0 before any load and the cached version after', async () => {
     const r = new ClusterSettingsReader(fakeDb({ queue_max_depth: 5, version: 7 }), 10_000);
-    // Cold reader: nothing loaded yet, and a DB-less/uninitialized cache is 0.
-    // (With a db present, the accessor kicks a background refresh but still
-    // returns the last-loaded value synchronously — 0 until the first load.)
-    // Warm the cache via a normal read, then the version is visible.
+    // With a db present, the accessor kicks a background refresh but returns
+    // the last-loaded value synchronously (0 until the first load).
     await r.getNumber('queue_max_depth', 1);
     expect(r.getCachedVersion()).toBe(7);
   });
@@ -237,7 +196,7 @@ describe('ClusterSettingsReader', () => {
   });
 
   it('keeps swallowing a read failure on the fallback-taking readers', async () => {
-    // getNumber and getString are the 16 knobs that WANT the degrade-to-default
+    // getNumber and getString serve the knobs that WANT the degrade-to-default
     // behaviour; tryGetString is purely additive and must not change them.
     const r = new ClusterSettingsReader(failingDb(), 10_000);
     expect(await r.getNumber('queue_max_depth', 1000)).toBe(1000);
@@ -255,10 +214,9 @@ describe('clampCacheMaxEntries', () => {
   });
 
   it('clamps a stored value above the ceiling', () => {
-    // The load-bearing case: this value can already be in the database, set
-    // before the route's `.max()` existed. Write-side validation cannot reach
-    // it, so the read site is the only thing standing between it and a
-    // constructor that throws during boot.
+    // Load-bearing: a value stored before the route's `.max()` existed is out
+    // of write-side validation's reach, so only the read site stops the
+    // constructor throwing during boot.
     expect(clampCacheMaxEntries(5_000_000_000, 500)).toBe(CACHE_MAX_ENTRIES_CEILING);
     expect(clampCacheMaxEntries(CACHE_MAX_ENTRIES_CEILING + 1, 500)).toBe(
       CACHE_MAX_ENTRIES_CEILING,
@@ -266,27 +224,22 @@ describe('clampCacheMaxEntries', () => {
   });
 
   it('falls back to the configured default for a value that is not a usable count', () => {
-    // Not clamped to 1 on purpose — a 1-entry cache thrashes silently, which is
-    // harder to diagnose than ignoring the garbage value outright.
+    // Not clamped to 1 on purpose: a 1-entry cache thrashes silently.
     for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(clampCacheMaxEntries(bad, 500)).toBe(500);
     }
   });
 
   it('clamps the fallback itself when it exceeds the ceiling', () => {
-    // A stored garbage value (0 / negative / NaN) triggers the fallback path.
-    // If the configured default is above the ceiling, the fallback must still
-    // be bounded — otherwise the LRU constructor gets an unclamped max and can
-    // throw during boot, the exact failure this clamp exists to prevent.
+    // A garbage stored value takes the fallback path; an above-ceiling default
+    // must still be bounded, or the LRU constructor can throw during boot.
     for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(clampCacheMaxEntries(bad, CACHE_MAX_ENTRIES_CEILING + 1)).toBe(
         CACHE_MAX_ENTRIES_CEILING,
       );
     }
-    // A fallback at or below the ceiling is returned unchanged.
     expect(clampCacheMaxEntries(0, 500)).toBe(500);
-    // A fractional fallback is floored, matching the stored-value path — the LRU
-    // constructor rejects a non-integer max, so neither branch may hand it one.
+    // The LRU constructor rejects a non-integer max, so the fallback is floored too.
     expect(clampCacheMaxEntries(0, 500.9)).toBe(500);
   });
 
@@ -308,8 +261,8 @@ describe('ClusterSettingsReader.tryGetString', () => {
   });
 
   it('reports a genuine unset (missing row, null column, empty string) as readable-null', async () => {
-    // A successful query that found nothing is the truth, not an unknown: a
-    // fresh cluster and a real opt-out both land here, and both must propagate.
+    // A successful empty query is the truth: a fresh cluster and a real
+    // opt-out both land here, and both must propagate.
     for (const row of [
       undefined,
       { dashboard_verified_issuer: null },
@@ -323,8 +276,7 @@ describe('ClusterSettingsReader.tryGetString', () => {
   });
 
   it('reports readable-null for a DB-less reader', async () => {
-    // With no cluster_settings to read at all, "unset" is the truth — reporting
-    // unreadable would make a holding caller hold forever.
+    // With no db, unset is the truth; unreadable would make a holding caller hold forever.
     const r = new ClusterSettingsReader(undefined, 10_000);
     expect(await r.tryGetString('dashboard_verified_issuer')).toEqual({ ok: true, value: null });
   });
@@ -335,31 +287,26 @@ describe('ClusterSettingsReader.tryGetString', () => {
   });
 
   it('keeps reporting unreadable for the whole negative-cache window', async () => {
-    // The load-bearing case. loadRow negative-caches for the TTL, so reads 2..N
-    // never reach the db. An implementation that raises `{ ok: false }` only
-    // from the catch answers "unset" for those reads and the downgrade still
-    // fires, one tick later — this test is what fails such a fix.
-    let selects = 0;
+    // Load-bearing: reads 2..N of the negative-cache TTL never reach the db, so
+    // raising `{ ok: false }` only from the catch would answer "unset" for them
+    // and the downgrade would fire one tick later.
     let fail = true;
-    const db = flakyDb({
+    const { db, mocks } = flakyDb({
       shouldFail: () => fail,
       row: { dashboard_verified_issuer: 'https://orch.example.com' },
-      onSelect: () => selects++,
     });
     const r = new ClusterSettingsReader(db, 10_000);
     expect(await r.tryGetString('dashboard_verified_issuer')).toEqual({ ok: false });
-    // The db has recovered, but the negative-cache window has not elapsed, so
-    // these reads are served from the failed entry and must stay honest.
+    // The db recovered inside the window: reads serve the failed entry.
     fail = false;
     expect(await r.tryGetString('dashboard_verified_issuer')).toEqual({ ok: false });
     expect(await r.tryGetString('dashboard_verified_issuer')).toEqual({ ok: false });
-    // And it did not hammer the sick db to say so.
-    expect(selects).toBe(1);
+    expect(mocks.selectExecuteTakeFirst.mock.calls.length).toBe(1);
   });
 
   it('recovers once the negative-cache window elapses', async () => {
     let fail = true;
-    const db = flakyDb({
+    const { db } = flakyDb({
       shouldFail: () => fail,
       row: { dashboard_verified_issuer: 'https://orch.example.com' },
     });
@@ -373,13 +320,11 @@ describe('ClusterSettingsReader.tryGetString', () => {
   });
 
   it('reports unreadable once a healthy read is followed by a failure', async () => {
-    // The production sequence, which every other unreadable case here skips:
-    // the reader has already served the configured issuer, and only then does
-    // the db go sick. Answering `{ ok: true, value: null }` at that point is
-    // exactly the downgrade this variant exists to prevent, so the transition
-    // — not just a cold-cache failure — is what needs pinning.
+    // The production sequence: the reader has served the issuer, then the db
+    // goes sick. `{ ok: true, value: null }` here is the downgrade this variant
+    // prevents, so the transition, not only a cold-cache failure, is pinned.
     let fail = false;
-    const db = flakyDb({
+    const { db } = flakyDb({
       shouldFail: () => fail,
       row: { dashboard_verified_issuer: 'https://orch.example.com' },
     });
@@ -419,19 +364,16 @@ describe('ClusterSettingsReader.tryGetBoolean', () => {
     expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: false });
   });
 
-  // The negative cache serves reads 2..N of a TTL window without touching the
-  // DB. Deriving "unreadable" from the catch alone would report those reads as
-  // a genuine unset -- which for a security gate means the config default
-  // instead of a deny.
+  // Negative-cached reads must stay unreadable: reporting them as unset would
+  // give a security gate the config default instead of a deny.
   it('keeps reporting unreadable for cached reads inside the TTL window', async () => {
     const r = new ClusterSettingsReader(failingDb(), 10_000);
     expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: false });
     expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: false });
   });
 
-  // No db at all is a real orchestrator shape (a DB-less worker), and unset IS
-  // the truth there -- calling it unreadable would make a fail-closed caller
-  // deny forever.
+  // A DB-less worker is real, and unset is the truth there; unreadable would
+  // make a fail-closed caller deny forever.
   it('reports "no database configured" as a genuine unset', async () => {
     const r = new ClusterSettingsReader(undefined, 10_000);
     expect(await r.tryGetBoolean('global_workflows_enabled')).toEqual({ ok: true, value: null });

@@ -549,8 +549,7 @@ describe('sourceRegistrationSchema', () => {
         },
       ],
     };
-    // Zod strips unknown keys by default, so this should still parse
-    // but webhookSecret will not be present in the output
+    // Zod strips unknown keys, so this parses without webhookSecret.
     const parsed = sourceRegistrationSchema.parse(msg);
     expect((parsed.sources[0] as Record<string, unknown>).webhookSecret).toBeUndefined();
   });
@@ -844,17 +843,13 @@ describe('peerUpdateSchema', () => {
 
 describe('platformToOrchestratorMessageSchema', () => {
   it('rejects single-frame webhook.relay (security invariant)', () => {
-    // The legacy single-frame `webhook.relay` schema is intentionally
-    // excluded from the wire union: it carries an attacker-controlled
-    // `payload` and pre-existed the chunked relay's on-orch HMAC
-    // verification, so accepting it on the wire would let a compromised
-    // Platform fabricate webhook deliveries that bypass the only
-    // trust boundary against a malicious Platform (the orchestrator-side
-    // `verifyInboundWebhook` invoked from `onVerifyInbound` on the chunked
-    // path). See the docblock on `webhookRelaySchema` and migration
-    // 012_drop_webhook_secret_columns.ts for the design rationale. The
-    // chunked path `webhook.relay.start` + `webhook.relay.chunk` is the
-    // sole legitimate route from Platform to `onWebhookRelay`.
+    // Single-frame `webhook.relay` is excluded from the wire union: its
+    // attacker-controlled `payload` bypasses the orchestrator-side
+    // `verifyInboundWebhook` (run from `onVerifyInbound` on the chunked path),
+    // the only trust boundary against a malicious Platform. The chunked
+    // `webhook.relay.start` + `webhook.relay.chunk` is the sole route to
+    // `onWebhookRelay`. Rationale: the `webhookRelaySchema` docblock and
+    // migration 012_drop_webhook_secret_columns.ts.
     const forged = {
       type: 'webhook.relay',
       messageId: 'msg-200',
@@ -960,12 +955,9 @@ describe('platformToOrchestratorMessageSchema', () => {
   });
 
   it('accepts every dashboardPlatformToOrchSchema member (no union drift)', () => {
-    // The orchestrator parses ALL inbound Platform frames against
-    // platformToOrchestratorMessageSchema; the Platform routes dashboard
-    // requests from the dashboardPlatformToOrchSchema set. Any dashboard
-    // request type missing from the wire union is silently dropped on the
-    // orchestrator and surfaces as a proxy timeout. Compare discriminator
-    // literals so a new dashboard message cannot drift out of the wire union.
+    // The orchestrator parses every inbound Platform frame against
+    // platformToOrchestratorMessageSchema, so a dashboardPlatformToOrchSchema
+    // type missing from it is silently dropped and surfaces as a proxy timeout.
     const literalsOf = (schema: z.ZodDiscriminatedUnion): string[] =>
       (schema.options as z.ZodObject<z.ZodRawShape>[]).map((opt) =>
         String((opt.shape.type as z.ZodLiteral<string>).value),
@@ -1140,34 +1132,25 @@ describe('cacheStatsSchema', () => {
 // ---------------------------------------------------------------------------
 // Platform → orchestrator authentication invariant
 //
-// The threat model is "rogue Platform impersonator". The TLS handshake is the
-// sole Platform-identity check at the connection layer; there is no
-// protocol-layer second-line defense — every Platform→orch wire frame is
-// trusted implicitly once the WS handshake completes. The matching tripwire
-// test in packages/orchestrator/src/ws/platform-client.test.ts pins the
-// absence of CA pinning / checkServerIdentity / pinned-roots agent on the
-// WS constructor.
+// Threat model: a rogue Platform impersonator. The TLS handshake is the sole
+// Platform-identity check; every Platform→orch frame is trusted once the WS
+// handshake completes. packages/orchestrator/src/ws/platform-client.test.ts
+// pins the connection-layer half (no CA pinning / checkServerIdentity /
+// pinned-roots agent on the WS constructor).
 //
-// THIS test is the codified pin for the *protocol-layer* half of the same
-// invariant: if a future PR adds a per-frame Platform-identity field
-// (`platformSignature`, `platformAttestation`, `signedBy`, `mac`, `hmac`)
-// to ANY Platform→orch schema, this test fires and forces a deliberate
-// re-evaluation. Either we now have a second-line defense (write the
-// verification-path test that exercises it), or the field is dead weight
-// (don't ship it).
+// This test pins the protocol-layer half: a per-frame Platform-identity field
+// on ANY Platform→orch schema fires it and forces a re-evaluation — either a
+// real second-line defense (with its own verification-path test) or dead
+// weight (don't ship it).
 // ---------------------------------------------------------------------------
 
 describe('Platform→orch authentication — no protocol-layer second-line defense (security invariant)', () => {
-  // Field names that would imply a per-frame Platform-identity claim. If any
-  // of these appear at the top level of a Platform→orch wire schema, the
-  // assumption that "TLS handshake is the only Platform-identity check"
-  // stops being true — the new field's verification path needs its own
-  // tests, and the Platform-identity invariant needs to be re-evaluated.
+  // Top-level field names that would imply a per-frame Platform-identity
+  // claim.
   //
-  // NOT included: `signatureHeaderName` / `signatureHeader` — those are
-  // GitHub's HMAC header being transparently FORWARDED inside webhook.relay
-  // so the orchestrator can verify the inbound webhook against its locally-
-  // stored secret. They are NOT a Platform-identity attestation.
+  // NOT included: `signatureHeaderName` / `signatureHeader` — GitHub's HMAC
+  // header FORWARDED inside webhook.relay so the orchestrator verifies the
+  // webhook against its own secret, not a Platform-identity attestation.
   const FORBIDDEN_PLATFORM_IDENTITY_KEYS = [
     'platformSignature',
     'platformAttestation',
@@ -1177,15 +1160,12 @@ describe('Platform→orch authentication — no protocol-layer second-line defen
   ] as const;
 
   /**
-   * Walk a schema (single z.object OR z.discriminatedUnion of z.objects)
-   * and return every member's top-level shape keys, paired with the
-   * member's `type` literal so a failure points at the offending message
-   * type rather than just "somewhere in the union".
+   * Every member's top-level shape keys, paired with its `type` literal so a
+   * failure names the offending message type.
    */
   function collectMemberShapes(
     schema: z.ZodTypeAny,
   ): Array<{ typeLiteral: string; keys: string[] }> {
-    // Discriminated union — walk the .options
     if (schema instanceof z.ZodDiscriminatedUnion) {
       const opts = schema.options as z.ZodObject<z.ZodRawShape>[];
       return opts.map((opt) => {
@@ -1198,7 +1178,6 @@ describe('Platform→orch authentication — no protocol-layer second-line defen
         return { typeLiteral, keys: Object.keys(shape) };
       });
     }
-    // Single z.object (e.g. logPullPlatformToOrchSchema, joinRequestSchema)
     if (schema instanceof z.ZodObject) {
       const shape = (schema as z.ZodObject<z.ZodRawShape>).shape;
       const typeField = shape.type as z.ZodLiteral<string> | undefined;
@@ -1211,14 +1190,11 @@ describe('Platform→orch authentication — no protocol-layer second-line defen
     );
   }
 
-  // The four Platform→orch schemas the orchestrator's handleMessage actually
-  // dispatches against (packages/orchestrator/src/ws/platform-client.ts:612-632):
-  //   1. platformToOrchestratorMessageSchema (primary union)
-  //   2. logPullPlatformToOrchSchema (log pull fallthrough)
-  //   3. joinRequestSchema (join.request relayed via Platform)
-  // Plus dashboardPlatformToOrchSchema, which is the dashboard-routed subset
-  // that overlaps with #1 — included here for completeness so a future split
-  // doesn't silently bypass this test.
+  // The schemas the orchestrator's handleMessage
+  // (packages/orchestrator/src/ws/platform-client.ts) dispatches against —
+  // the primary union, the log-pull fallthrough, and join.request relayed via
+  // the Platform — plus the dashboard-routed subset of the primary union, so a
+  // future split cannot bypass this test.
   const PLATFORM_TO_ORCH_SCHEMAS: Array<{ name: string; schema: z.ZodTypeAny }> = [
     { name: 'platformToOrchestratorMessageSchema', schema: platformToOrchestratorMessageSchema },
     { name: 'logPullPlatformToOrchSchema', schema: logPullPlatformToOrchSchema },
@@ -1229,8 +1205,7 @@ describe('Platform→orch authentication — no protocol-layer second-line defen
   for (const { name, schema } of PLATFORM_TO_ORCH_SCHEMAS) {
     it(`${name}: no member carries a per-frame Platform-identity field`, () => {
       const members = collectMemberShapes(schema);
-      // Sanity: we should have walked something. A schema that returns zero
-      // members is itself a regression (the test would silently pass).
+      // Zero members would make this test pass silently.
       expect(members.length).toBeGreaterThan(0);
 
       const offenders: Array<{
@@ -1245,8 +1220,6 @@ describe('Platform→orch authentication — no protocol-layer second-line defen
         }
       }
 
-      // Failure message names the offending message type + field so the
-      // re-evaluation can start from the exact regression point.
       expect(
         offenders,
         `Platform→orch schema added Platform-identity field(s); the no-second-line-defense invariant must be re-evaluated. Offenders: ${JSON.stringify(offenders)}`,
@@ -1255,9 +1228,6 @@ describe('Platform→orch authentication — no protocol-layer second-line defen
   }
 
   it('positive control: a forbidden key on a synthetic union member is detected', () => {
-    // Self-test that the introspection helper would actually catch a
-    // regression. Build a fake discriminated union with a deliberate
-    // `platformSignature` field and confirm collectMemberShapes surfaces it.
     const tainted = z.discriminatedUnion('type', [
       z.object({ type: z.literal('legit'), messageId: z.string() }),
       z.object({
@@ -1286,8 +1256,8 @@ describe('recognized-type sets', () => {
   });
 
   it('ORCH_TO_PLATFORM_RECOGNIZED_TYPES covers the ingestion types (drift guard)', () => {
-    // If a future union edit drops one of these members, the NACK classifier
-    // would start treating a known-but-invalid frame as version skew again.
+    // Dropping one of these makes the NACK classifier treat a known-but-invalid
+    // frame as version skew.
     expect(ORCH_TO_PLATFORM_RECOGNIZED_TYPES.has('execution.status')).toBe(true);
     expect(ORCH_TO_PLATFORM_RECOGNIZED_TYPES.has('step.status.forward')).toBe(true);
     expect(ORCH_TO_PLATFORM_RECOGNIZED_TYPES.has('job.status.forward')).toBe(true);

@@ -36,7 +36,6 @@ import type { WebhookInfo } from './handler.js';
 
 const logger = createLogger({ prefix: 'event-log' });
 
-/** Configuration for the writer. */
 export interface EventLogWriterOptions {
   /**
    * Cluster-wide fallback soft cap in bytes for payload upload (default 5 MB),
@@ -60,7 +59,6 @@ export interface EventLogOutcome {
   orgId: string;
   /** Where the delivery arrived. */
   source: EventLogSource;
-  /** Outcome status. */
   status: EventLogStatus;
   /** Workflows matched by trigger evaluation (default 0). */
   matchedCount?: number;
@@ -170,7 +168,6 @@ export class EventLogWriter {
         this.opts.maxPayloadBytes,
       )) ?? this.opts.maxPayloadBytes;
 
-    // Decide payload-storage path
     let payloadKey: string | null = null;
     let payloadOmitted = false;
     let payloadOmittedReason: PayloadOmittedReason | null = null;

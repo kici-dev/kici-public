@@ -1,24 +1,16 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Squashed initial migration -- creates the complete Orchestrator database schema.
+ * Squashed initial migration: the complete Orchestrator baseline schema, replacing the original
+ * migrations 001..027 (squashed pre-release, with no production data to preserve).
  *
- * This file replaces all prior orchestrator migrations (original 001..027) with
- * a single baseline that reproduces the current live schema. The project is
- * pre-release, so there is no production data to preserve across squashes.
+ * It creates the tables (dispatch queue, execution runs/jobs/steps, agents, sources, secrets,
+ * environments, registrations, …), the `notify_sources_change` / `notify_source_secrets_change`
+ * plpgsql functions and their LISTEN/NOTIFY triggers on `sources` / `scoped_secrets`, the
+ * `config_versions_version_seq` sequence and column default, and every key, index and FK.
  *
- * Includes:
- *   - 36 tables covering dispatch queue, execution state (runs/jobs/steps),
- *     agents, sources, secrets, environments, registrations, etc.
- *   - 2 plpgsql functions (notify_sources_change, notify_source_secrets_change)
- *     and their triggers on `sources` / `scoped_secrets` for LISTEN/NOTIFY wiring.
- *   - 1 sequence (config_versions_version_seq) + its column default.
- *   - All primary keys, uniques, indexes, and foreign-key constraints.
- *
- * The DDL order mirrors what pg_dump emits: tables → functions → sequence →
- * sequence-owned-by → default → constraints → indexes → triggers → FK
- * constraints. FK constraints come last so every referenced table is already
- * in place when the FK is added.
+ * DDL follows pg_dump order: tables → functions → sequence → owned-by → default → constraints →
+ * indexes → triggers → FK constraints, so every referenced table exists before its FK.
  */
 
 const DDL_STATEMENTS: readonly string[] = [
@@ -716,10 +708,7 @@ export async function up(db: Kysely<any>): Promise<void> {
   `.execute(db);
 }
 
-/**
- * Rollback drops everything created above. Uses CASCADE on table drops to cut
- * through the FK graph without relying on exact topological order.
- */
+/** Drops everything `up` created; CASCADE cuts the FK graph without a topological order. */
 export async function down(db: Kysely<any>): Promise<void> {
   // Drop triggers first (they reference functions).
   const triggers: Array<[string, string]> = [

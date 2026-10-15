@@ -52,7 +52,6 @@ export class VariableStore {
       .execute();
   }
 
-  /** Delete an org-level variable. */
   async deleteVar(orgId: string, contextId: string, key: string): Promise<void> {
     await this.db
       .deleteFrom('context_variables')
@@ -117,7 +116,6 @@ export class VariableStore {
       .execute();
   }
 
-  /** Delete a source override. */
   async deleteSourceOverride(
     orgId: string,
     contextId: string,
@@ -152,7 +150,6 @@ export class VariableStore {
   ): Promise<Record<string, string>> {
     const orgVars = await this.listVars(orgId, contextId);
 
-    // Build base from org vars
     const result: Record<string, string> = {};
     const lockedKeys = new Set<string>();
 
@@ -163,7 +160,6 @@ export class VariableStore {
       }
     }
 
-    // Merge source overrides if routing key provided
     if (routingKey) {
       const overrides = await this.listSourceOverrides(orgId, contextId, routingKey);
       for (const o of overrides) {

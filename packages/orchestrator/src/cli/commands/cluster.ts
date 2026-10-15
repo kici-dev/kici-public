@@ -1,17 +1,9 @@
 /**
- * Cluster recovery commands for kici-admin.
- *
- * Subcommand namespace: `kici-admin cluster reconcile-identity`.
- *
- * Reconciles the orchestrator's cluster identity between the DB
- * (`cluster_meta.cluster_id`) and the durable S3 sentinel
- * (`<prefix>/.kici-cluster-id`) when they diverge and the orchestrator refuses
- * to start with a "Cluster identity mismatch" error.
- *
- * DB + S3 direct (NOT the orchestrator HTTP admin API), so it works while the
- * orchestrator process is crash-looping — which is exactly when it is needed.
- * Default direction restores the DB FROM the durable sentinel (the
- * cross-restart / peer anchor); --adopt-db reverses it.
+ * `kici-admin cluster reconcile-identity`: reconcile `cluster_meta.cluster_id`
+ * with the durable S3 sentinel (`<prefix>/.kici-cluster-id`) after a "Cluster
+ * identity mismatch" refusal. DB + S3 direct, so it works while the
+ * orchestrator crash-loops. By default the DB is restored from the sentinel
+ * (the cross-restart / peer anchor); --adopt-db reverses it.
  */
 import { createInterface } from 'node:readline';
 import type { Command } from 'commander';

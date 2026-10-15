@@ -7,12 +7,9 @@ import type { JobExecutionOptions } from './types.js';
 import type { RunnerToAgentMessage, AgentToRunnerMessage } from './ipc-protocol.js';
 import { DepRestoreOutcome, type DepRestoreReport } from '../dep-restore-report.js';
 
-// We test createForkRunner via a controlled mock of child_process.fork
-// The fork-runner uses fork/spawn internally, so we mock at the module level.
+// fork-runner uses fork/spawn internally, so child_process is mocked at module level.
 
-/**
- * Create a mock ChildProcess that supports IPC message passing.
- */
+/** A mock ChildProcess that supports IPC message passing. */
 function createMockChild(): ChildProcess &
   EventEmitter & {
     sentMessages: AgentToRunnerMessage[];
@@ -62,9 +59,6 @@ function createMockChild(): ChildProcess &
   return child;
 }
 
-/**
- * Create minimal mock JobExecutionOptions.
- */
 function createMockExecOptions(overrides: Partial<JobExecutionOptions> = {}): JobExecutionOptions {
   const abortController = new AbortController();
   return {
@@ -95,7 +89,6 @@ describe('fork-runner cancel state machine', () => {
 
   beforeEach(async () => {
     mockChild = createMockChild();
-    // Mock child_process.fork to return our mock
     mockFork = vi.fn().mockReturnValue(mockChild);
     vi.doMock('node:child_process', () => ({
       fork: mockFork,
@@ -147,21 +140,17 @@ describe('fork-runner cancel state machine', () => {
     const execOpts = createMockExecOptions();
     const handle = mod.createForkRunner({ runnerPath: '/test/runner.js', env: {} }, execOpts);
 
-    // Simulate ready + execute flow
     mockChild.simulateIpc({ type: 'ready' });
 
-    // Cancel gracefully
     handle.cancel(false);
 
-    // Should have sent IPC abort with force: false
     const abortMsg = mockChild.sentMessages.find((m) => m.type === 'abort') as any;
     expect(abortMsg).toBeDefined();
     expect(abortMsg.force).toBe(false);
 
-    // Should have sent SIGTERM
     expect(mockChild.kill).toHaveBeenCalledWith('SIGTERM');
 
-    // Clean up - simulate job.complete from workflow-runner
+    // job.complete from workflow-runner.
     mockChild.simulateIpc({
       type: 'job.complete',
       status: 'failed',
@@ -177,23 +166,19 @@ describe('fork-runner cancel state machine', () => {
 
     mockChild.simulateIpc({ type: 'ready' });
 
-    // First cancel (graceful)
     handle.cancel(false);
     mockChild.kill.mockClear();
     mockChild.sentMessages.length = 0;
 
-    // Second cancel (force) while in cancelling state
+    // Force, while cancelling.
     handle.cancel(true);
 
-    // Should have sent IPC abort with force: true
     const forceAbortMsg = mockChild.sentMessages.find((m) => m.type === 'abort') as any;
     expect(forceAbortMsg).toBeDefined();
     expect(forceAbortMsg.force).toBe(true);
 
-    // Should have sent SIGKILL
     expect(mockChild.kill).toHaveBeenCalledWith('SIGKILL');
 
-    // Force cancel resolves immediately (doesn't wait for IPC)
     mockChild.simulateExit(null, 'SIGKILL');
     const result = await handle.result;
     expect(result.status).toBe('cancelled');
@@ -206,18 +191,14 @@ describe('fork-runner cancel state machine', () => {
 
     mockChild.simulateIpc({ type: 'ready' });
 
-    // Force cancel directly from running state
     handle.cancel(true);
 
-    // Should send force abort IPC
     const abortMsg = mockChild.sentMessages.find((m) => m.type === 'abort') as any;
     expect(abortMsg).toBeDefined();
     expect(abortMsg.force).toBe(true);
 
-    // Should SIGKILL immediately
     expect(mockChild.kill).toHaveBeenCalledWith('SIGKILL');
 
-    // Force cancel resolves immediately
     mockChild.simulateExit(null, 'SIGKILL');
     const result = await handle.result;
     expect(result.status).toBe('cancelled');
@@ -232,14 +213,11 @@ describe('fork-runner cancel state machine', () => {
 
     handle.cancel(false);
 
-    // Verify IPC message
     const abortMsg = mockChild.sentMessages.find((m) => m.type === 'abort') as any;
     expect(abortMsg).toEqual({ type: 'abort', force: false });
 
-    // Verify signal
     expect(mockChild.kill).toHaveBeenCalledWith('SIGTERM');
 
-    // Clean up
     mockChild.simulateIpc({ type: 'job.complete', status: 'failed', stepResults: [] });
     await handle.result;
   });
@@ -270,20 +248,16 @@ describe('fork-runner cancel state machine', () => {
 
     mockChild.simulateIpc({ type: 'ready' });
 
-    // Graceful cancel with 5s grace period
+    // 5s grace period.
     handle.cancel(false, 5000);
 
-    // Should have sent SIGTERM
     expect(mockChild.kill).toHaveBeenCalledWith('SIGTERM');
     mockChild.kill.mockClear();
 
-    // Advance past grace period
     vi.advanceTimersByTime(5100);
 
-    // Should have escalated to SIGKILL
     expect(mockChild.kill).toHaveBeenCalledWith('SIGKILL');
 
-    // Clean up
     mockChild.simulateExit(null, 'SIGKILL');
     const result = await handle.result;
     expect(result.status).toBe('cancelled');
@@ -313,11 +287,11 @@ describe('fork-runner cancel state machine', () => {
     expect(mockChild.kill).toHaveBeenCalledWith('SIGTERM');
     mockChild.kill.mockClear();
 
-    // Should not escalate at 10s (right at boundary)
+    // Not before 10s.
     vi.advanceTimersByTime(9900);
     expect(mockChild.kill).not.toHaveBeenCalled();
 
-    // Should escalate at 10s
+    // At 10s.
     vi.advanceTimersByTime(200);
     expect(mockChild.kill).toHaveBeenCalledWith('SIGKILL');
 
@@ -334,16 +308,13 @@ describe('fork-runner cancel state machine', () => {
 
     mockChild.simulateIpc({ type: 'ready' });
 
-    // Graceful cancel
     handle.cancel(false);
 
-    // Result should NOT be resolved yet
     let resolved = false;
     handle.result.then(() => {
       resolved = true;
     });
 
-    // Give microtask queue time to process
     await new Promise((r) => setTimeout(r, 10));
     expect(resolved).toBe(false);
 
@@ -366,13 +337,11 @@ describe('fork-runner cancel state machine', () => {
 
     mockChild.simulateIpc({ type: 'ready' });
 
-    // Force cancel
     handle.cancel(true);
 
     // Simulate process exit (SIGKILL triggers exit)
     mockChild.simulateExit(null, 'SIGKILL');
 
-    // Should resolve immediately with cancelled status
     const result = await handle.result;
     expect(result.status).toBe('cancelled');
   });
@@ -385,7 +354,6 @@ describe('fork-runner cancel state machine', () => {
 
     mockChild.simulateIpc({ type: 'ready' });
 
-    // Cancel gracefully
     handle.cancel(false);
 
     // Workflow-runner sends hook step.start during cancel path
@@ -396,10 +364,8 @@ describe('fork-runner cancel state machine', () => {
       step_type: 'hook:onCancel',
     });
 
-    // Should forward to onStepStatus
     expect(onStepStatus).toHaveBeenCalledWith(2, 'onCancel', 'running');
 
-    // Complete
     mockChild.simulateIpc({ type: 'job.complete', status: 'failed', stepResults: [] });
     await handle.result;
   });
@@ -407,9 +373,6 @@ describe('fork-runner cancel state machine', () => {
 
 // --- buildRequest tests for global workflow fields ---
 
-/**
- * Create a minimal valid JobDispatch for buildRequest testing.
- */
 function makeDispatch(overrides: Partial<JobDispatch> = {}): JobDispatch {
   return {
     type: 'job.dispatch',
@@ -553,12 +516,11 @@ describe('buildRequest - global workflow fields', () => {
     });
     const request = buildRequest(dispatch, '/workspace');
 
-    // Source repo info still in standard fields
+    // Source repo in the standard fields, workflow repo in the new ones.
     expect(request.repoUrl).toBe('https://github.com/org/source-repo.git');
     expect(request.ref).toBe('feature-branch');
     expect(request.sha).toBe('src-sha-123');
 
-    // Workflow repo info in new fields
     expect(request.workflowRepoUrl).toBe('https://github.com/org/workflow-repo.git');
     expect(request.workflowRef).toBe('main');
     expect(request.workflowSha).toBe('wf-sha-456');
@@ -611,10 +573,9 @@ describe('fork-runner completion-hooks-done relay', () => {
 
   it('surfaces detached + a reap() that SIGTERMs the child process group', async () => {
     const mod = await import('./fork-runner.js');
-    // Spy at the syscall boundary — killProcessGroup calls process.kill(-pid).
-    // Throw ESRCH so killProcessGroup returns 0 and reapGroup early-returns
-    // WITHOUT scheduling the grace timer + SIGKILL — a real deferred timer
-    // firing process.kill after the spy is restored would be a cross-test flake.
+    // Spy at the syscall boundary (killProcessGroup calls process.kill(-pid)).
+    // ESRCH makes reapGroup return before scheduling the grace timer + SIGKILL;
+    // a real timer firing after the spy is restored would leak into other tests.
     const esrch = Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => {
       throw esrch;
@@ -738,21 +699,18 @@ describe('buildRequest - job timeout', () => {
 
 // --- buildBwrapArgs tests ---
 //
-// The splice logic that adds `/lib64` when it exists on the host once
-// regressed: an off-by-one caused bwrap to receive
-// `--ro-bind /lib --ro-bind /lib64 /lib64 /lib`, which bwrap parsed as
-// "mount /lib at --ro-bind, then exec the command /lib64", crashing with
-// `bwrap: execvp /lib64: No such file or directory`. These tests lock in
-// the correct argument layout on both x86_64 (/lib64 present) and arm64
-// (/lib64 absent) so the regression can't return silently.
+// An off-by-one in the `/lib64` splice yields
+// `--ro-bind /lib --ro-bind /lib64 /lib64 /lib`, which bwrap parses as "mount
+// /lib at --ro-bind, then exec /lib64" (`bwrap: execvp /lib64: No such file or
+// directory`). These tests pin the layout on x86_64 (/lib64 present) and arm64
+// (/lib64 absent).
 
 describe('buildBwrapArgs', () => {
   let mockExistsSync: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
-    // Reset modules so the next dynamic import of fork-runner.js picks up
-    // the fresh `node:fs` mock instead of reusing a cached copy from an
-    // earlier describe block.
+    // So the next import of fork-runner.js picks up the fresh `node:fs` mock,
+    // not a copy cached by an earlier describe block.
     vi.resetModules();
     mockExistsSync = vi.fn();
     vi.doMock('node:fs', () => ({
@@ -767,10 +725,8 @@ describe('buildBwrapArgs', () => {
   });
 
   /**
-   * Walk the arg list and assert that every `--ro-bind` / `--bind` flag is
-   * immediately followed by two non-flag tokens (source + destination).
-   * This is the invariant bwrap requires — if it's violated the process
-   * crashes with `execvp`-style errors.
+   * Assert every `--ro-bind` / `--bind` flag is followed by two non-flag tokens
+   * (source + destination); bwrap otherwise crashes with `execvp`-style errors.
    */
   function assertBindInvariant(args: string[]): void {
     for (let i = 0; i < args.length; i++) {
@@ -793,27 +749,21 @@ describe('buildBwrapArgs', () => {
 
     const args = buildBwrapArgs('/tmp/workdir', '/usr/bin/node', true);
 
-    // Invariant: every bind flag is followed by valid src+dest tokens.
     assertBindInvariant(args);
 
-    // /lib and /lib64 are both bound, in the right order, with correct
-    // source/destination pairing. This is the exact layout that broke
-    // before the splice fix.
+    // Both bound, in order, with correct source/destination pairing.
     const joined = args.join(' ');
     expect(joined).toContain('--ro-bind /lib /lib --ro-bind /lib64 /lib64');
 
-    // The regression signature must NOT be present — before the fix the
-    // args contained `--ro-bind /lib --ro-bind /lib64 /lib64 /lib` which
-    // caused bwrap to interpret `/lib64` as the exec command.
+    // The off-by-one signature.
     expect(joined).not.toContain('--ro-bind /lib --ro-bind /lib64 /lib64 /lib');
 
-    // Namespace isolation flags must be present.
     expect(args).toContain('--unshare-pid');
     expect(args).toContain('--unshare-ipc');
     expect(args).toContain('--unshare-net');
     expect(args).toContain('--die-with-parent');
 
-    // Workspace bind is writable and chdir'd.
+    // Writable workspace bind, chdir'd.
     expect(joined).toContain('--bind /tmp/workdir /workspace');
     expect(joined).toContain('--chdir /workspace');
   });
@@ -827,7 +777,6 @@ describe('buildBwrapArgs', () => {
     assertBindInvariant(args);
     expect(args).not.toContain('/lib64');
 
-    // /lib is still present and correctly formed.
     const joined = args.join(' ');
     expect(joined).toContain('--ro-bind /lib /lib');
     expect(joined).toContain('--ro-bind /bin /bin');
@@ -842,11 +791,10 @@ describe('buildBwrapArgs', () => {
     assertBindInvariant(args);
 
     const joined = args.join(' ');
-    // /etc/hosts must be exposed read-only: bwrap auto-creates /etc with only the
-    // explicitly-bound files, so without it a host-net sandbox cannot resolve names
-    // that live only in /etc/hosts (e.g. registry.local -> 127.0.0.1). Absent the
-    // bind, glibc's nsswitch falls through to mDNS/DNS and resolves the name to a
-    // DIFFERENT host, so `npm install` hits the wrong registry and the run fails.
+    // bwrap creates /etc with only the bound files. Without a read-only
+    // /etc/hosts, a name that lives only there (e.g. registry.local ->
+    // 127.0.0.1) falls through to mDNS/DNS and resolves to a different host, so
+    // `npm install` hits the wrong registry.
     expect(joined).toContain('--ro-bind /etc/hosts /etc/hosts');
     // nsswitch drives the files->dns lookup order; bind it when present so the
     // sandbox honours the host's `files`-first resolution.
@@ -877,10 +825,9 @@ describe('buildBwrapArgs', () => {
   });
 
   it('adds a ro-bind for the node install ROOT when node lives outside /usr and /bin', async () => {
-    // Distributions like nvm/mise/asdf colocate `npm` under
-    // $NODE_ROOT/lib/node_modules. Without binding the entire root, the
-    // workflow runner's `npm install` step crashes with `Cannot find module
-    // .../lib/node_modules/npm/bin/npm-cli.js`. Regression guard.
+    // nvm/mise/asdf colocate `npm` under $NODE_ROOT/lib/node_modules; without
+    // the whole root bound, `npm install` fails with `Cannot find module
+    // .../lib/node_modules/npm/bin/npm-cli.js`.
     mockExistsSync.mockReturnValue(false);
     const { buildBwrapArgs } = await import('./fork-runner.js');
 
@@ -895,8 +842,7 @@ describe('buildBwrapArgs', () => {
     expect(joined).toContain(
       '--ro-bind /home/user/.local/share/mise/installs/node/24.0.0 /home/user/.local/share/mise/installs/node/24.0.0',
     );
-    // We should NOT also bind the bin/ subdir separately — that would be
-    // a redundant nested mount.
+    // No redundant nested bin/ mount.
     expect(
       args.filter(
         (a, i) =>
@@ -913,8 +859,8 @@ describe('buildBwrapArgs', () => {
     const args = buildBwrapArgs('/tmp/workdir', '/usr/bin/node', true);
 
     assertBindInvariant(args);
-    // /usr is already mounted ro-bind; we must not double-mount its bin dir
-    // or its parent (which IS /usr — caught by the startsWith('/usr') guard).
+    // /usr is already ro-bound; neither its bin dir nor its parent (/usr
+    // itself, caught by the startsWith('/usr') guard) is mounted again.
     const usrBinBindCount = args.filter(
       (a, i) => a === '/usr/bin' && args[i - 1] === '--ro-bind',
     ).length;
@@ -925,10 +871,8 @@ describe('buildBwrapArgs', () => {
   });
 
   it('binds the runner directory in single-tree (production) installs', async () => {
-    // No pnpm-workspace.yaml found walking up — production tarball case.
-    // Without this bind, bwrap'd Node crashes with `Cannot find module
-    // '/home/.../workflow-runner.js'` because the host install path is not
-    // mapped into the sandbox.
+    // Production tarball: no pnpm-workspace.yaml walking up. Without this bind
+    // bwrap'd Node fails with `Cannot find module '/home/.../workflow-runner.js'`.
     mockExistsSync.mockReturnValue(false);
     const { buildBwrapArgs } = await import('./fork-runner.js');
 
@@ -963,9 +907,8 @@ describe('buildBwrapArgs', () => {
   });
 
   it('does not double-bind when runner is colocated with the node install', async () => {
-    // Single-binary distribution where the node install root contains both
-    // bin/node and dist/workflow-runner.js. nodeInstallRoot = /opt/kici, and
-    // runnerDir = /opt/kici/dist is covered by it — no second bind.
+    // Single-binary distribution: nodeInstallRoot /opt/kici holds bin/node and
+    // covers runnerDir /opt/kici/dist, so there is no second bind.
     mockExistsSync.mockReturnValue(false);
     const { buildBwrapArgs } = await import('./fork-runner.js');
 
@@ -998,10 +941,9 @@ describe('buildBwrapArgs', () => {
   });
 
   it('binds the pnpm workspace root when one is found walking up from runnerPath', async () => {
-    // pnpm symlinks point to sibling packages outside of node_modules. The
-    // only way to make those resolve inside the sandbox is to bind the
-    // entire workspace root. Without this the runner crashes with
-    // `Cannot find package '@kici-dev/shared'`. Regression guard.
+    // pnpm symlinks point at siblings outside node_modules, so only binding the
+    // whole workspace root resolves them (else `Cannot find package
+    // '@kici-dev/shared'`).
     mockExistsSync.mockImplementation(
       (p: string) => p === '/home/u/devel/repo/pnpm-workspace.yaml',
     );
@@ -1070,10 +1012,9 @@ describe('buildBwrapArgs', () => {
   });
 
   it('appends extraReadOnlyBinds (e.g. file:// clone source dirs)', async () => {
-    // The internal provider can use `file:///path/to/repo` as the clone
-    // URL. That repo lives outside the workspace root, so without
-    // mounting it into the sandbox the workflow runner's git clone fails
-    // with `does not appear to be a git repository`. Regression guard.
+    // The internal provider may clone `file:///path/to/repo`, outside the
+    // workspace root; unmounted, the clone fails with `does not appear to be a
+    // git repository`.
     mockExistsSync.mockImplementation((p: string) => p === '/srv/test-repos/myrepo');
     const { buildBwrapArgs } = await import('./fork-runner.js');
 
@@ -1129,10 +1070,9 @@ describe('buildBwrapArgs', () => {
 
 // --- fileCloneSourceBinds tests ---
 //
-// The clone-source derivation is shared by the bare-metal (bwrap) and container
-// backends: only a local `file://` source needs its dir bound into the sandbox
-// so the in-sandbox `git clone` can read it. https/ssh remotes and malformed
-// URLs must yield no bind (the clone surfaces the real error itself).
+// Shared by the bare-metal (bwrap) and container backends: only a local
+// `file://` source needs a bind. https/ssh remotes and malformed URLs yield
+// none (the clone surfaces the real error itself).
 describe('fileCloneSourceBinds', () => {
   it('returns the source dir for a file:// URL', async () => {
     const { fileCloneSourceBinds } = await import('./fork-runner.js');

@@ -1,10 +1,6 @@
 /**
- * Shared error handler for admin route files.
- *
- * Handles common error types: RBAC permission denied, secret-scope not found
- * (→ 404), secret-scope rename onto an occupied scope (→ 409), Zod validation,
- * PostgreSQL unique constraint violations, PostgreSQL
- * invalid-text-representation (malformed typed input → 400), and generic errors.
+ * Shared error handler for admin route files. Client-side errors map to 4xx and
+ * are never logged at error level; anything else is a logged 500.
  */
 import { z } from 'zod';
 import { PermissionDeniedError } from '../secrets/rbac.js';
@@ -19,27 +15,24 @@ export function handleAdminError(
   if (err instanceof PermissionDeniedError) {
     return c.json({ error: err.message }, 403);
   }
-  // A rename/lookup against a scope that doesn't exist is a clean client-side
-  // not-found, not a server fault → 404 (and never logged at error level).
   if (err instanceof SecretScopeNotFoundError) {
     return c.json({ error: err.message }, 404);
   }
-  // Renaming onto an occupied scope would merge two scopes — a conflict the
-  // client can resolve by choosing a free name → 409, never a server fault.
+  // Renaming onto an occupied scope would merge two scopes; the client picks a
+  // free name.
   if (err instanceof SecretScopeExistsError) {
     return c.json({ error: err.message }, 409);
   }
   if (err instanceof z.ZodError) {
     return c.json({ error: 'Validation error', details: err.issues }, 400);
   }
-  // PostgreSQL unique constraint violation → 409 Conflict
+  // PostgreSQL unique constraint violation.
   if (err instanceof Error && 'code' in err && (err as { code: string }).code === '23505') {
     return c.json({ error: 'Conflict: resource already exists' }, 409);
   }
   // PostgreSQL invalid text representation (e.g. a malformed UUID/integer path
-  // param or body value) → 400 Bad Request. The client sent a value the column
-  // type cannot parse; this is bad input, not a server fault, so it must not be
-  // logged at error level (would pollute error dashboards/alerts).
+  // param or body value): bad input, so not logged at error level, which would
+  // pollute error dashboards/alerts.
   if (err instanceof Error && 'code' in err && (err as { code: string }).code === '22P02') {
     return c.json({ error: 'Invalid request: malformed value for a typed field' }, 400);
   }

@@ -8,10 +8,8 @@
  * for jobs with dynamic fields, and deferred dynamic-job-fn dispatch for
  * `_type:'dynamic'` lock entries.
  *
- * Splits the historic 2438-line `dispatchMatchedWorkflow` into typed phase
- * helpers so each piece can be reasoned about independently. The main
- * exported function is a narrative orchestrator that threads the typed
- * results through the pipeline.
+ * The exported `dispatchMatchedWorkflow` threads typed phase-helper results
+ * through the pipeline.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -155,11 +153,7 @@ const logger = createLogger({ prefix: 'pipeline' });
 /** Success-only run-on set: the default for a bare-string or unset needs edge. */
 const SUCCESS_ONLY_RUN_ON_JSON = JSON.stringify([ExecutionJobStatus.enum.success]);
 
-/**
- * Serialize a lock needs object-form entry's `runOn` status-set to the JSON
- * column value stored on an execution_job_needs edge. Falls back to the
- * success-only default when the entry carries no runOn.
- */
+/** The `execution_job_needs.run_on` JSON for a needs entry; success-only when it has no runOn. */
 function needsRunOnJson(entry: { runOn?: ExecutionJobStatus[] }): string {
   return entry.runOn && entry.runOn.length > 0
     ? JSON.stringify(entry.runOn)
@@ -178,14 +172,12 @@ export function deriveCacheRefScope(trust: TrustResolution | undefined): CacheRe
 }
 
 /**
- * Pre-resolve a clone token from the dispatch bundle's cloneTokenProvider for
- * the cluster-reroute path. Workers have no provider credentials of their own,
- * so without this token an agent on a peer attempts an unauthenticated HTTPS
- * clone of the source repo and fails on private repos with
- * "could not read Username for 'https://github.com'". Returns undefined when
- * the bundle has no cloneTokenProvider, when the provider returns no token,
- * or when minting throws — failure is non-fatal because the local-dispatch
- * path mints a token of its own at job.dispatch time.
+ * Pre-resolve a clone token for the cluster-reroute path. Workers have no
+ * provider credentials, so without it a peer's agent clones unauthenticated
+ * and fails on private repos ("could not read Username for
+ * 'https://github.com'"). Undefined when no provider, no token, or minting
+ * throws — non-fatal, because local dispatch mints its own token at
+ * job.dispatch time.
  */
 async function mintCloneTokenForReroute(args: {
   bundle?: ProviderBundle;
@@ -211,10 +203,9 @@ async function mintCloneTokenForReroute(args: {
 }
 
 /**
- * The clone tokens a job routed to a cluster peer carries: the source
- * repository's, and for a global workflow the workflow repository's too,
- * minted by its own bundle with its own credentials. Returned as the
- * RunContext fields to spread; a token that could not be minted is absent.
+ * Clone tokens for a job routed to a cluster peer: the source repository's,
+ * plus for a global workflow the workflow repository's, minted by its own
+ * bundle and credentials. A token that could not be minted is absent.
  */
 async function mintRerouteCloneTokens(
   ctx: WorkflowDispatchContext,
@@ -247,44 +238,31 @@ async function mintRerouteCloneTokens(
 // ---------------------------------------------------------------------------
 
 /**
- * Context for dispatching a single matched workflow.
- *
- * Captures every per-workflow closure dependency so the dispatch body is
- * callable from BOTH the same-source path AND the cross-source delegation
- * shell. `crossSource` is the discriminator the helper uses to override the
- * dispatch `deliveryId` so fan-out targets land on their composite dedup
- * slot (`${inbound.deliveryId}:${reg.id}`) instead of the inbound delivery
- * id.
+ * Context for dispatching a single matched workflow, from both the same-source
+ * path and the cross-source delegation shell. `crossSource` overrides the
+ * dispatch `deliveryId` so fan-out targets land on their composite dedup slot
+ * (`${inbound.deliveryId}:${reg.id}`).
  */
 export interface WorkflowDispatchContext {
   info: WebhookInfo;
   deps: ProcessingDeps;
   /**
-   * Provider bundle for the matched source. Undefined for local-repo test runs
-   * (`kici run` against an inline lock file with no remote provider): in that
-   * mode there is no clone-url builder / check-status poster / clone-token
-   * provider, and `repoUrl` falls back to `''` (the agent treats a missing url
-   * as a local/`fullRepo` clone). The webhook adapter always passes a defined
-   * bundle, so its dispatch behavior is unchanged.
+   * Undefined only for local-repo test runs (`kici run` with an inline lock
+   * file and no remote provider): no clone-url builder, check poster or
+   * clone-token provider, and `repoUrl` is `''`, which the agent treats as a
+   * local/`fullRepo` clone. The webhook adapter always passes one.
    */
   bundle?: ProviderBundle;
   payload: unknown;
   repoIdentifier: string;
   /**
-   * The repository that defines the workflow. Equals `repoIdentifier` unless
-   * `global` is set.
-   *
-   * REQUIRED, for the same reason `securityDecision` is: a dispatch path that
-   * does not state it must not compile. Left optional, a new caller omits it
-   * silently and every row it records claims the workflow lives in the
-   * repository the run acted on — a null marker is read as that fact, not as
+   * The repository that defines the workflow; equals `repoIdentifier` unless
+   * `global` is set. REQUIRED so a dispatch path that omits it does not
+   * compile: a null marker is read as "the repository the run acted on", not
    * "unknown" (`registration/registration-run-match.ts`).
    */
   workflowRepoIdentifier: string;
-  /**
-   * Set when the workflow is defined in another repository; `repoIdentifier`
-   * is then the event's source repository.
-   */
+  /** Set when another repository defines the workflow; `repoIdentifier` is then the event's source. */
   global?: GlobalDispatchIdentity;
   credentials: Record<string, unknown>;
   event: SimulatedEvent;
@@ -299,24 +277,19 @@ export interface WorkflowDispatchContext {
   };
   resolvedOrgId: string;
   /**
-   * The NAMES of the jobs this dispatch pass has admitted against a context
-   * concurrency limit, keyed by {@link concurrencyAdmissionKey}.
+   * NAMES of the jobs this pass admitted against a context concurrency limit,
+   * keyed by {@link concurrencyAdmissionKey}. The DB count cannot see a job
+   * just admitted, so without it every fan-out child is admitted against one
+   * slot.
    *
-   * The database count cannot see a job this pass has only just admitted, so
-   * without this tally every child of a fan-out is evaluated against that one
-   * blind value and all N are admitted against a single slot.
+   * Names, not a counter, so the two terms stay DISJOINT: the count query
+   * excludes exactly these names ({@link countOccupyingJobs}). A counter summed
+   * with a count that already sees the row double-counts a sibling on the
+   * deferred-init path and spuriously holds a job.
    *
-   * Names rather than a counter, because the two terms have to be DISJOINT: the
-   * count query excludes exactly the names held here (see
-   * {@link countOccupyingJobs}), so a job whose row has already landed
-   * contributes its tally entry and nothing else. A counter cannot express that
-   * exclusion, and summing it with a count that already sees the row is how the
-   * deferred-init path double-counts a sibling and spuriously holds a job.
-   *
-   * Created lazily on first use and dropped with the ctx. It is per-pass state,
-   * never persisted and never shared between passes; two actors arriving in the
-   * same millisecond still race between the count and the insert, which is
-   * accepted — this is a throughput control, not an isolation boundary.
+   * Lazy, per-pass, never persisted or shared. Two actors in the same
+   * millisecond still race between count and insert — accepted, as this is a
+   * throughput control, not an isolation boundary.
    */
   concurrencyAdmissions?: Map<string, Set<string>>;
   workflow: LockWorkflow;
@@ -327,117 +300,83 @@ export interface WorkflowDispatchContext {
   /** True when this run executes an uploaded local working tree (CLI remote run). */
   localWorkingTree: boolean;
   /**
-   * Identity that initiated this run, for `execution_runs.triggered_by`.
-   *
-   * Set by the CLI remote-run path, which knows its caller: the Platform relays
-   * the developer's actor on `test.relay.trigger` and the test pipeline renders
-   * it here. Undefined on the webhook path, where the initiator is a provider
-   * account rather than a KiCI principal — that attribution is carried by
-   * `triggerActorUsername` / `triggerActorUserId` instead.
+   * `execution_runs.triggered_by`. Set by the CLI remote-run path from the
+   * actor the Platform relays on `test.relay.trigger`. Undefined on the webhook
+   * path, whose provider-account initiator is in `triggerActorUsername` /
+   * `triggerActorUserId`.
    */
   triggeredBy?: string | null;
   /** Agent provenance label when the run was initiated through an agent credential. */
   triggeredByAgentLabel?: string | null;
   /**
-   * Re-run lineage for `execution_runs.parent_run_id` / `original_run_id`: the
-   * run this one re-runs and the root of its re-run chain. Set by the re-run of
-   * an organization-wide run; absent for every first run.
+   * `execution_runs.parent_run_id` / `original_run_id`. Set by the re-run of an
+   * organization-wide run; absent for every first run.
    */
   rerunLineage?: RerunLineage;
   /**
-   * The trigger event the run's OIDC subject derives from, when it is not the
-   * run's own `triggerEvent`. A re-run records `rerun` as its trigger event,
-   * which carries no pull-request dimension, so it states the original run's
-   * event here to keep the subject a re-run of a fork pull request presents.
+   * The trigger event the OIDC subject derives from, when not the run's own.
+   * A re-run records `rerun`, which has no pull-request dimension, so it
+   * states the original event here to keep a fork pull request's subject.
    */
   subjectTriggerEvent?: string;
   /** True only when invoked from the cross-source dispatch shell. */
   crossSource: boolean;
   /**
-   * Trigger-event string for the run's `triggerEvent`, stated explicitly rather
-   * than derived from `event.type`.
-   *
-   * The internal-event adapter needs this because a user `kiciEvent()` renders
-   * two different values: `jobConfig.event.type` is the literal `kici_event`,
-   * while the run carries the raw event name. `event.type` carries the former,
-   * so the latter has to be stated.
-   *
-   * Absent ⇒ the value derived from the event, unchanged for the webhook,
-   * CLI-remote-run and resume callers.
+   * The run's `triggerEvent`, stated instead of derived from `event.type`. A
+   * user `kiciEvent()` has `event.type` = `kici_event` while the run carries
+   * the raw event name. Absent ⇒ derived from the event.
    */
   triggerEventOverride?: string;
   /**
-   * The exact `jobConfig.event` envelope to ship, stated explicitly instead of
-   * spreading the `SimulatedEvent` this dispatch matched against.
-   *
-   * Same reason as `triggerEventOverride`: the matcher's event shape and the
-   * shape user code observes are not the same object. `SimulatedEvent` requires
-   * `targetBranch` and carries `changedFiles`; the envelope omits both. An
-   * internally triggered run genuinely has no changed files, and its branch is
-   * provenance the orchestrator evaluates (the trigger matcher and the context
-   * branch gate) rather than a field user code asked for — the envelope becomes
-   * `RuleContext.event` on the agent and the `event` half of
-   * `buildConcurrencyGroupContext`, so publishing the branch would silently
-   * re-key the documented `ctx.event.targetBranch ?? 'default'` concurrency
-   * group of every existing internal workflow.
-   *
-   * Absent ⇒ the envelope derived from the event, unchanged for the webhook,
-   * CLI-remote-run and resume callers.
+   * The exact `jobConfig.event` envelope, instead of spreading the matched
+   * `SimulatedEvent`. The envelope omits `targetBranch` and `changedFiles`: an
+   * internal run has no changed files, and its branch is provenance for the
+   * trigger matcher and context branch gate. The envelope becomes
+   * `RuleContext.event` and the `event` half of `buildConcurrencyGroupContext`,
+   * so publishing the branch would silently re-key the documented
+   * `ctx.event.targetBranch ?? 'default'` group of every internal workflow.
+   * Absent ⇒ derived from the event.
    */
   eventEnvelopeOverride?: Record<string, unknown>;
   /**
-   * Chain depth to stamp on the started run. A run summoned by an invoke gate
-   * carries its summoner's depth + 1, which is what bounds the chain-depth
-   * circuit breaker. Absent ⇒ 0, the column default (a webhook-triggered run
-   * starts a chain).
+   * Chain depth to stamp: an invoke-gate summon carries its summoner's depth +
+   * 1, which bounds the chain-depth circuit breaker. Absent ⇒ 0.
    *
-   * Threading this is load-bearing: the breaker fails OPEN if the value is
-   * lost, so an unbounded summon recursion would go undetected. It is stamped
-   * as soon as the run row exists, because `releaseInvokeGate` reads the column
-   * back at gate-release time — which happens inside this same dispatch.
+   * Load-bearing: the breaker fails OPEN if this is lost. Stamped as soon as
+   * the run row exists, because `releaseInvokeGate` reads it back inside this
+   * same dispatch.
    */
   chainDepth?: number;
   /**
    * Marks a run dispatched by a failure-lifecycle trigger, so its own
    * completion is excluded from batch accumulation and a broken notifier
-   * cannot re-trigger itself (`EventRouter.isFailureLifecycleRun`).
-   *
-   * Persisted as a field INSIDE the `trigger_decision` JSON blob, merged onto
-   * the decision summary rather than replacing it.
+   * cannot re-trigger itself (`EventRouter.isFailureLifecycleRun`). Persisted
+   * as a field merged INTO the `trigger_decision` JSON blob.
    */
   dispatchedByFailureLifecycle?: boolean;
   /**
-   * Marks a run the orchestrator triggered itself — a schedule fire, a
-   * workflow/job completion, a failure batch, a user `kiciEvent()`, or an
-   * invoke-gate summon — as opposed to one a provider webhook triggered.
+   * Marks a run the orchestrator triggered itself (schedule fire, workflow/job
+   * completion, failure batch, user `kiciEvent()`, invoke-gate summon). Absent
+   * ⇒ webhook-triggered.
    *
-   * Read by the context branch gate, and by nothing else. Such a run usually
-   * carries a real branch in `event.targetBranch` — a schedule fire presents
-   * its registration's default branch, every other internal trigger inherits
-   * the branch of the run that emitted its event — and the gate matches it like
-   * any other run's. The flag singles out the runs whose `targetBranch` is
-   * EMPTY: a failure batch or a scaler event (many runs behind it, or none), a
-   * registration whose default branch has never been captured, an emitting run
-   * that is gone. The gate rejects those naming that cause, instead of quoting
-   * an empty value as though it were a branch name. It does NOT weaken the
-   * gate — a run with no branch cannot satisfy a restriction, `*` included.
-   *
-   * Absent ⇒ webhook-triggered, unchanged for the webhook, CLI-remote-run and
-   * resume callers.
+   * Read only by the context branch gate. Such a run usually has a real
+   * `targetBranch` (a schedule's registration default branch, or the emitting
+   * run's branch) and is matched normally. The flag lets the gate name the
+   * cause when `targetBranch` is EMPTY (failure batch, scaler event, uncaptured
+   * default branch, emitting run gone) instead of quoting an empty branch. It
+   * does NOT weaken the gate: a run with no branch satisfies no restriction,
+   * `*` included.
    */
   internallyTriggered?: boolean;
   /**
-   * Outcome of the org trust-policy gate for this PR event. `pass` dispatches
-   * normally; `hold` parks the run in the security queue; `reject` fails it
-   * before any job starts. Computed once per PR event in the webhook pipeline
-   * and threaded down; the dispatch gate acts on it directly, see
-   * `holdRunForSecurityPolicy` / `rejectRunForSecurityPolicy`.
+   * Org trust-policy gate outcome for this PR event: `pass` dispatches, `hold`
+   * parks the run in the security queue, `reject` fails it before any job
+   * starts (`holdRunForSecurityPolicy` / `rejectRunForSecurityPolicy`).
+   * Computed once per PR event in the webhook pipeline.
    *
-   * REQUIRED: a dispatch path that does not state a decision must not compile.
-   * This field was optional once and the gate read `if (!decision) return
-   * null`, so forgetting to thread it meant the run passed the security gate —
-   * fail-open by omission inside a fail-closed control. A `pass` is stated
-   * explicitly.
+   * REQUIRED so a path that omits it does not compile: an optional field read
+   * as `if (!decision) return null` passes the gate on omission — fail-open
+   * inside a fail-closed control. A `pass` is stated explicitly.
    */
   securityDecision: TrustPolicyOutcome;
   /**
@@ -458,101 +397,74 @@ export interface WorkflowDispatchContext {
    */
   runRegisteredBeforeDispatch?: boolean;
   /**
-   * Set once `setupDispatchContext` has posted this dispatch's queued
-   * `kici/<workflow>` check and one `kici/<workflow>/job/<name>` per static job.
-   *
-   * Those checks go up BEFORE anything decides whether the run will start, so
-   * every exit after setup owes them a conclusion. The named early exits each
-   * complete their own; a THROW does not, and nothing else can — the workflow
-   * check keys off a run whose jobs never registered, and the stale sweep only
-   * touches check runs already `in_progress`. Left alone they stay `queued`
-   * forever, which on a pull request is a check that never finishes and a
-   * branch-protection blocker.
+   * Set once `setupDispatchContext` posted the queued `kici/<workflow>` check
+   * and one `kici/<workflow>/job/<name>` per static job. They go up BEFORE the
+   * start decision, so every exit owes them a conclusion. Named early exits
+   * complete their own; a THROW does not, and nothing else can (the stale
+   * sweep only touches `in_progress` checks), so they stay `queued` forever —
+   * a branch-protection blocker on a pull request.
    */
   pendingChecksPosted?: boolean;
   /** Composite dedup key `${info.deliveryId}:${reg.id}` (cross-source only). */
   crossSourceDeliveryId?: string;
   /**
-   * Routing key to use for dispatched QueuedJobInput + log / tracker rows.
-   * Same-source: equal to `info.routingKey`. Cross-source: equal to
-   * `reg.routingKey` (the registration's owning source, NOT the inbound
-   * generic routing key).
+   * Routing key for dispatched jobs and log / tracker rows: `info.routingKey`
+   * same-source; `reg.routingKey` cross-source (the registration's owning
+   * source, NOT the inbound generic key).
    */
   effectiveRoutingKey?: string;
   /**
-   * Provider identifier to use for dispatched QueuedJobInput + tracker rows.
-   * Same-source: equal to `info.provider`. Cross-source: equal to
-   * `regBundle.normalizer.provider` (the registration's provider type,
-   * e.g. 'github').
+   * Provider for dispatched jobs and tracker rows: `info.provider`
+   * same-source; `regBundle.normalizer.provider` cross-source.
    */
   effectiveProvider?: string;
   /**
-   * Extra jobConfig fields merged into every dispatched QueuedJobInput by
-   * this helper. Cross-source callers use this to inject provenance fields
-   * (`crossSource: true`, `inboundRoutingKey`, `inboundEventName`,
-   * `workflowRepoUrl`, `workflowRef`, `workflowSha`,
-   * `workflowRepoIdentifier`) that downstream agents / dashboards need for
-   * correct clone + logging.
+   * jobConfig fields merged into every dispatched job. Cross-source callers
+   * inject provenance (`crossSource: true`, `inboundRoutingKey`,
+   * `inboundEventName`, `workflowRepoUrl`, `workflowRef`, `workflowSha`,
+   * `workflowRepoIdentifier`) that agents and dashboards need to clone and log.
    */
   extraJobConfig?: Record<string, unknown>;
   /**
-   * Test-run provenance. Present only for `kici run` / test-trigger dispatches.
-   * When set, `recordRunStart` stamps `is_test_run = true` and
-   * `fixture_id = testRun.fixtureId` on the `execution_runs` row. Undefined for
-   * webhook runs (the stamp block is skipped).
+   * Set only for `kici run` / test-trigger dispatches: `recordRunStart` stamps
+   * `is_test_run = true` and `fixture_id` on the `execution_runs` row.
    */
   testRun?: { fixtureId: string };
   /**
-   * Run-wide flat secrets layered onto EVERY dispatched job's `jobConfig.secrets`
-   * (env-declaring or not). Used by the test path to deliver `kici run --secret`
-   * / `--env` CLI flat secrets, which must reach a job regardless of whether it
-   * declares an `context:`. Merged UNDER the per-job env-resolved secrets so
-   * the CLI value wins on a key collision (matching the prior B1-env -> A-CLI
-   * precedence). Undefined for webhook runs.
+   * `kici run --secret` / `--env` flat secrets, layered onto EVERY job's
+   * `jobConfig.secrets` whether or not it declares a `context:`. The CLI value
+   * wins on a key collision with per-job context secrets. Undefined for webhook
+   * runs.
    */
   runWideFlatSecrets?: Record<string, string>;
   /**
-   * Runtime host narrowing from `kici run --target` (Ansible `--limit`). Applied
-   * as a post-filter over each runsOnAll job's matched roster: effective hosts =
-   * runsOnAll ∩ target. Narrow-only. Undefined for webhook runs (no narrowing).
+   * `kici run --target` (Ansible `--limit`): narrow-only post-filter, effective
+   * hosts = runsOnAll ∩ target. Undefined for webhook runs.
    */
   target?: HostTargetSelector;
   /**
-   * Resolved (coerced + defaulted + validated) workflow-dispatch inputs from
-   * `kici run --input`. Carried onto every dispatched job's request so the agent
-   * exposes them as `ctx.dispatchInputs`. Undefined for webhook runs.
+   * Resolved (coerced, defaulted, validated) `kici run --input` values, exposed
+   * to every job as `ctx.dispatchInputs`. Undefined for webhook runs.
    */
   dispatchInputs?: Record<string, unknown>;
   /**
-   * What the workflow install gate recorded when it held this dispatch: the
-   * contexts that held, which the hold's approval covers, and the ones it
-   * admitted. Stored with the held dispatch and read by its release, which
-   * gates every context the approval did not cover. Unset on any other
-   * dispatch.
+   * Set only on an install-gate-held dispatch: the contexts that held (covered
+   * by the hold's approval) and the ones admitted. Its release gates every
+   * context the approval did not cover.
    */
   installGateRecord?: InstallGateRecord;
 }
 
 /**
- * The trigger-event string every recording site in this file stamps on the run.
+ * The trigger event every recording site stamps on the run. One helper keeps a
+ * new recording path from ignoring `ctx.triggerEventOverride`, which wins when
+ * non-blank; otherwise derived from the event.
  *
- * `ctx.triggerEventOverride` wins verbatim when stated; otherwise the value is
- * derived from the simulated event exactly as the webhook / CLI-remote-run /
- * resume callers have always derived it. Routing every site through one helper
- * is what keeps a new recording path from silently ignoring the override.
- *
- * "Stated" means a non-blank string. A `??` alone would let `''` (or a
- * whitespace-only string) through as a value, and a blank trigger event is not
- * a trigger event: it reaches the dashboard and the Platform forward as the
- * run's only answer to "what fired this?", where it renders as nothing at all
- * rather than as the derived value the caller clearly meant to keep.
- *
- * The guard is only ever load-bearing when the DERIVED value is non-blank — a
- * caller that states a blank override over a real `event.type`. It does NOT
- * rescue a dispatch whose event type is itself blank (a bare `__` name
- * de-prefixes both to `''`, so the fallback returns `''` too); that input is
- * unemittable, since the emit path refuses the whole `__` namespace and the
- * orchestrator mints only enumerated names.
+ * Non-blank, not `??`: a blank trigger event renders as nothing on the
+ * dashboard and Platform forward instead of the derived value. This does NOT
+ * rescue a blank `event.type` (a bare `__` name de-prefixes to `''`); that is
+ * unemittable, since emit refuses the `__` namespace and the orchestrator
+ * mints only enumerated names.
  */
 function dispatchTriggerEvent(ctx: WorkflowDispatchContext): string {
   const override = ctx.triggerEventOverride;
@@ -561,14 +473,9 @@ function dispatchTriggerEvent(ctx: WorkflowDispatchContext): string {
 }
 
 /**
- * The `trigger_decision` blob for a run this dispatch records.
- *
- * `dispatchedByFailureLifecycle` is MERGED onto the decision summary, never
- * substituted for it: the summary's own fields are what the dashboard and the
- * registration matcher read back, and `EventRouter.isFailureLifecycleRun`
- * only needs its own key to be present alongside them. The key is omitted
- * entirely when the dispatch is not a failure-lifecycle one, so a plain run's
- * blob is byte-identical to what it was before this field existed.
+ * The `trigger_decision` blob. `dispatchedByFailureLifecycle` is MERGED onto
+ * the summary, never substituted: the dashboard and registration matcher read
+ * the summary's fields. The key is omitted on a plain run.
  */
 function dispatchTriggerDecision(
   ctx: WorkflowDispatchContext,
@@ -581,16 +488,11 @@ function dispatchTriggerDecision(
 }
 
 /**
- * Stamp the inherited chain depth on the run row this dispatch just recorded.
- *
- * Called immediately after each site that inserts the row, NOT at the end of
- * dispatch: `releaseInvokeGate` reads `execution_runs.chain_depth` back when it
- * releases a root gate, which happens inside this same call. A depth written
- * afterwards would leave the circuit breaker reading 0 for a summoned run and
- * failing open on an unbounded summon recursion.
- *
- * A run that starts its own chain writes nothing at all — the column defaults
- * to 0, so the webhook path keeps its exact previous write set.
+ * Stamp the inherited chain depth right after each row insert, NOT at the end
+ * of dispatch: `releaseInvokeGate` reads `execution_runs.chain_depth` inside
+ * this same call, and a later write leaves the breaker reading 0 — failing
+ * open on unbounded summon recursion. A chain-starting run writes nothing (the
+ * column defaults to 0).
  */
 async function stampChainDepth(ctx: WorkflowDispatchContext): Promise<void> {
   if (!ctx.chainDepth || ctx.chainDepth <= 0) return;
@@ -615,12 +517,7 @@ function runEventContextFor(
   };
 }
 
-/**
- * Register the run with the execution tracker, then stamp its chain depth.
- *
- * Every registration site passes the same context-derived arguments and differs
- * only in the jobs it registers and the secret contexts it declares.
- */
+/** Register the run with the execution tracker, then stamp its chain depth. */
 async function startTrackedRun(
   tracker: NonNullable<ProcessingDeps['executionTracker']>,
   ctx: WorkflowDispatchContext,
@@ -656,41 +553,30 @@ async function startTrackedRun(
     ctx.triggeredByAgentLabel,
     event.prNumber ?? null,
     workflowRepoProvenance(ctx),
-    // Where the code came from, which `event.targetBranch` above deliberately
-    // does not say.
+    // Where the code came from, which `event.targetBranch` deliberately omits.
     runEventContextFor(ctx, event),
   );
   await stampChainDepth(ctx);
 }
 
 /**
- * The internal-trigger fields every PRE-dispatch recording site has to carry:
- * `chainDepth`, `dispatchedByFailureLifecycle` and `rerunLineage`. The sites are
- * the install-gate hold, the trust-policy hold, the trust-policy reject, the
- * init-failure skip, and the build that failed before tracking started. Each
- * writes its `execution_runs` row and returns, so there is no later dispatch
- * step to stamp them.
+ * Internal-trigger fields every PRE-dispatch recording site carries (install-
+ * gate hold, trust-policy hold and reject, init-failure skip, build failed
+ * before tracking). Each writes its `execution_runs` row and returns, so no
+ * later step stamps them.
  *
- * `chainDepth` is the load-bearing one, and only on the two HOLDS: a hold is
- * RESUMABLE, so released, the run goes on to fire its own invoke gate, and
- * `releaseInvokeGate` reads `execution_runs.chain_depth` back to bound the
- * recursion. A row inserted without it carries the column's `0` default, which
- * does not read as "unknown" — it reads as "this run starts a chain", so the
- * circuit breaker fails OPEN. That was harmless only while no summoned run
- * could reach these sites; routing internal events through this dispatch makes
- * it reachable. The three terminal sites are stamped for the record rather
- * than for a reader: their row is the run's only trace, and one saying `0`
- * claims to have started the chain it actually died inside.
+ * `chainDepth` is load-bearing on the two HOLDS: a released hold fires its own
+ * invoke gate, and `releaseInvokeGate` reads `chain_depth` to bound recursion.
+ * The `0` default reads as "starts a chain", so the breaker fails OPEN. The
+ * terminal sites stamp it for the record: their row is the run's only trace.
  *
- * `dispatchedByFailureLifecycle` rides along for the same lifetime reason: a
- * HELD run resumes onto its own row and completes, and that completion is what
- * a `workflows_failed_batch` accumulator would otherwise fold back into the
- * very batch that spawned it. The terminal sites record it for consistency —
- * none of them emits a completion event today.
+ * `dispatchedByFailureLifecycle`: a HELD run resumes and completes on its own
+ * row, and a `workflows_failed_batch` accumulator would fold that completion
+ * back into the batch that spawned it. Terminal sites record it for
+ * consistency; none emits a completion event.
  *
- * A stated `chainDepth` is passed on verbatim, `0` included; the tracker is
- * where `0` normalizes away (see `inheritedChainDepth`), so that decision lives
- * in one place instead of being re-made at every layer.
+ * A stated `chainDepth` passes verbatim, `0` included; the tracker normalizes
+ * `0` away (`inheritedChainDepth`).
  */
 function preDispatchRunProvenance(ctx: WorkflowDispatchContext): {
   chainDepth?: number;
@@ -705,19 +591,16 @@ function preDispatchRunProvenance(ctx: WorkflowDispatchContext): {
 }
 
 /**
- * The minimal slice of a dispatch context the needs catch-up + ready-recompute
- * helpers read. Both the per-repository `WorkflowDispatchContext` and the
- * global-workflow dispatch path (which builds its own inputs and never
- * constructs a full `WorkflowDispatchContext`) can drive the needs scheduler
- * through this narrow shape.
+ * The slice the needs catch-up and ready-recompute helpers read, so the
+ * global-workflow path (which never builds a full `WorkflowDispatchContext`)
+ * can drive the needs scheduler too.
  */
 export type NeedsSchedulingContext = Pick<WorkflowDispatchContext, 'deps' | 'runId'>;
 
 /**
- * Build the dispatch-envelope event, carrying the orchestrator's already-fetched
- * changed-files list + status from `eventWithFiles` as a fast-path (the agent
- * recomputes from the clone when status !== 'fetched', so this only forfeits the
- * optimization when a path is missed — correctness comes from the agent).
+ * The dispatch-envelope event, carrying the already-fetched changed files as a
+ * fast path. The agent recomputes from the clone when status !== 'fetched', so
+ * correctness comes from the agent.
  */
 export function envelopeEvent(
   baseEvent: SimulatedEvent,
@@ -731,39 +614,30 @@ export function envelopeEvent(
 }
 
 export interface DispatchMatchedWorkflowResult {
-  /** Number of jobs successfully dispatched (non-rejected). */
+  /** Non-rejected jobs dispatched. */
   dispatchedJobCount: number;
-  /** Execution job ids of every dispatched/tracked job (root, gated, synthetic). */
+  /** Every dispatched/tracked job id (root, gated, synthetic). */
   dispatchedJobIds: string[];
   /**
-   * Jobs whose dispatch is deferred to the agent init round (a dynamic context
-   * or a deferred-init job) and therefore not yet in `dispatchedJobIds`. These
-   * still run — they are dispatched asynchronously by `startDeferredPhases` —
-   * so a caller must not treat a run with pending deferred work as "nothing
-   * dispatched". Absent/0 on the early-return paths.
+   * Jobs deferred to the agent init round, not yet in `dispatchedJobIds`. They
+   * still run (`startDeferredPhases`), so a run with deferred work is not
+   * "nothing dispatched". Absent/0 on early returns.
    */
   deferredJobCount?: number;
-  /** True when the workflow install gate paused the dispatch (held run). */
+  /** True when the workflow install gate held the run. */
   held?: boolean;
   /**
-   * User-visible warnings aggregated from dispatched jobs — today, one per job
-   * whose bound test-run context(s) were unavailable and skipped. Surfaced
-   * on the accepted trigger response so the CLI can print them.
+   * One warning per job whose bound test-run contexts were skipped, surfaced
+   * on the trigger response for the CLI to print.
    */
   envWarnings?: string[];
 }
 
 /** Options controlling a (re-)dispatch of a matched workflow. */
 export interface DispatchMatchedWorkflowOptions {
-  /**
-   * Resume path: skip the workflow install protection gate (already satisfied)
-   * so secrets resolve directly and the dispatch flows into job dispatch.
-   */
+  /** Resume path: the install protection gate is already satisfied. */
   skipInstallProtectionGate?: boolean;
-  /**
-   * The run id whose `held` execution_runs row should be reused (flipped to
-   * pending) instead of inserting a fresh row.
-   */
+  /** Run id whose `held` row is flipped to pending instead of inserting a new one. */
   reuseRunId?: string;
 }
 
@@ -774,20 +648,18 @@ export interface DispatchMatchedWorkflowOptions {
 type DispatchFn = (input: QueuedJobInput) => ReturnType<Dispatcher['dispatch']>;
 
 interface DispatchSetup {
-  /** Wrapped dispatcher that injects ctx.extraJobConfig into every dispatch. */
+  /** Injects ctx.extraJobConfig into every dispatch. */
   dispatcher: { dispatch: DispatchFn };
-  /** WebhookInfo overlaid with effective routing key + provider. */
+  /** Overlaid with the effective routing key and provider. */
   info: WebhookInfo;
   /** Composite delivery id on cross-source, otherwise info.deliveryId. */
   effectiveDeliveryId: string;
   workflowConcurrency: { cancelInProgress?: boolean; max?: number } | undefined;
   workflowTimeoutMs: number | undefined;
   /**
-   * Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`),
-   * carried on `ctx.extraJobConfig` by the test-trigger / `kici run --check`
-   * path. Persisted onto the `execution_runs` row so `computeRunStatus` can
-   * fail a `check-fail-on-drift` run that detected drift. Undefined for the
-   * default apply-mode webhook path.
+   * Idempotent-step mode (`apply` | `check` | `check-fail-on-drift`) from the
+   * `kici run --check` path; persisted so `computeRunStatus` fails a
+   * `check-fail-on-drift` run with drift. Undefined for apply-mode webhooks.
    */
   checkMode: string | undefined;
 }
@@ -804,9 +676,9 @@ interface BuildPrepResult {
   dynamicEntries: ReadonlyArray<Extract<LockWorkflow['jobs'][number], { _type: 'dynamic' }>>;
   staticJobs: readonly LockJob[];
   /**
-   * Static jobs expanded into dispatchable children (matrix fan-out). Non-matrix
-   * jobs pass through 1:1. Every dispatch phase iterates this list, keying by
-   * `expandedName`. Dynamic-matrix jobs are flagged `pendingDynamicMatrix`.
+   * Static jobs after matrix fan-out (non-matrix 1:1), keyed by
+   * `expandedName` in every phase. Dynamic-matrix jobs carry
+   * `pendingDynamicMatrix`.
    */
   materializedJobs: readonly MaterializedJob[];
   /** baseName -> expanded child names; drives needs-edge expansion. */
@@ -819,12 +691,11 @@ interface BuildPrepResult {
   buildJobName: string | undefined;
   buildJobLabels: string[] | undefined;
   buildJobTrackedEarly: boolean;
-  /** True when the build failed but dynamic entries can still proceed. */
+  /** The build failed but dynamic entries can still proceed. */
   buildFailed: boolean;
   /**
-   * True when the helper has fully short-circuited the dispatch (build failed
-   * and no dynamic entries to fall back on, or build job rejected). Caller
-   * MUST early-return with `dispatchedJobCount: 0`.
+   * Dispatch short-circuited (build failed with no dynamic entries, or build
+   * job rejected). Caller MUST return `dispatchedJobCount: 0`.
    */
   abort: boolean;
 }
@@ -832,9 +703,9 @@ interface BuildPrepResult {
 interface SecretBundle {
   declaredContexts: readonly string[];
   runPublicKeyBase64: string | undefined;
-  /** Resolved private npm registries (token bytes already filled in). Undefined = none. */
+  /** Private npm registries with tokens filled in. */
   npmRegistries: NpmRegistrySpec[] | undefined;
-  /** Bare-name resolved secrets to project as install env vars. Undefined = none. */
+  /** Bare-name secrets projected as install env vars. */
   installEnvSecrets: Record<string, string> | undefined;
 }
 
@@ -843,9 +714,8 @@ interface JobEnvData {
   /** Configured env id matched for the first declared context name. */
   contextId?: string;
   /**
-   * Ordered bound-context names persisted on the job row (`(dynamic)`
-   * placeholder for elements unresolved at dispatch; overwritten with the
-   * agent-resolved list for dynamic contexts). Empty/undefined = no binding.
+   * Ordered bound-context names for the job row; `(dynamic)` marks an element
+   * the agent resolves later, which then overwrites the list.
    */
   contextNames?: string[];
   contextVars?: Record<string, string>;
@@ -853,31 +723,28 @@ interface JobEnvData {
   jobSecrets?: Record<string, string>;
   jobNamespacedSecrets?: Record<string, Record<string, string>>;
   /**
-   * Registry credentials for this job's container image, resolved from the
-   * secret NAMES the lock carries. Lifted to a top-level dispatch field (and
-   * stripped from jobConfig) before the message reaches the agent.
+   * Container registry credentials resolved from the lock's secret NAMES;
+   * lifted to a top-level dispatch field (stripped from jobConfig) before the
+   * agent sees it.
    */
   containerRegistryAuth?: { username: string; password: string; serveraddress: string };
   held?: boolean;
   /**
-   * Set when the job's bound contexts admitted its reject rules: what a later
-   * dispatch resolves the context data from when the job is stored as a
-   * pending dispatch context (held, waiting on upstream jobs, or outside its
-   * wave window) instead of dispatching now. Carries no secret value.
+   * Set when the bound contexts admitted the job's reject rules: what a later
+   * dispatch resolves context data from when the job is stored pending (held,
+   * awaiting upstream, outside its wave). Carries no secret value.
    */
   contextResolution?: DeferredContextResolution;
   /**
-   * Pending approval hold for this job, set when a context policy or
-   * explicit lock `approval` requires human sign-off. The dispatch loop turns
-   * this into a `held_runs` row + a stored pending job context so `release()`
-   * can re-dispatch after approval.
+   * Set when a context policy or lock `approval` needs sign-off; the dispatch
+   * loop turns it into a `held_runs` row plus a stored pending job context so
+   * `release()` can re-dispatch.
    */
   approvalHold?: PendingApprovalHold;
   /**
-   * A non-reviewer hold (security / wait-timer / concurrency-queue) decided by a
-   * context's protection rules. Carried rather than written on the spot so
-   * `holdJobForApproval` can create the row and the job's resume path in ONE
-   * transaction — the reviewer branch uses `approvalHold` for the same purpose.
+   * A non-reviewer hold (security / wait-timer / concurrency-queue) from
+   * protection rules. Carried, not written on the spot, so
+   * `holdJobForApproval` creates the row and resume path in ONE transaction.
    */
   nonApprovalHold?: CreateHeldRunData;
   rejected?: boolean;
@@ -885,11 +752,7 @@ interface JobEnvData {
   pendingInit?: boolean;
   /** Bound contexts skipped on a test/local run because they disallow local execution. */
   skippedEnvs?: string[];
-  /**
-   * User-visible warning set whenever any bound context was unavailable for
-   * a test run (non-test or unconfigured) and skipped — surfaced on the CLI run
-   * output and the dashboard run view.
-   */
+  /** Warning naming test-run contexts skipped as non-test or unconfigured; shown in CLI and dashboard. */
   envWarning?: string;
 }
 
@@ -915,22 +778,17 @@ interface JobEnvEvalResult {
 }
 
 /**
- * Synthetic job-id prefix every needs-gate site stamps on a job it holds back.
- * The release path (`dispatchReadyJob` → `findSyntheticJobId` → `addJobsToRun`)
- * keys on it, so it is load-bearing rather than cosmetic — which is what makes
- * it a sound way to recover the gated set without threading a parallel list
- * through both the single-orchestrator and cluster dispatch paths.
- *
- * Re-exported from `db/synthetic-job-ids.ts`, which owns it so the concurrency
- * sweep in `contexts/` can exclude these rows without importing this module.
+ * Synthetic job-id prefix every needs-gate site stamps on a held-back job. The
+ * release path (`dispatchReadyJob` → `findSyntheticJobId` → `addJobsToRun`)
+ * keys on it, so it soundly recovers the gated set without threading a parallel
+ * list through both the single-orch and cluster paths. Owned by `db/synthetic-job-ids.ts` so the `contexts/`
+ * concurrency sweep need not import this module.
  */
 export { NEEDS_PENDING_JOB_ID_PREFIX };
 
 /**
- * Fallback reason for a context protection-rule rejection whose evaluator
- * returned no reason of its own. The real reason names the offending context
- * and rule; this only covers the degenerate case, and is shared so the setter
- * and the run-facing record can never carry different words for it.
+ * Reason for a protection-rule rejection whose evaluator gave none; shared so
+ * the setter and run-facing record use the same words.
  */
 const DEFAULT_CONTEXT_REJECT_REASON = 'Rejected by protection rules';
 
@@ -948,11 +806,10 @@ interface DispatchedJob {
   waveMaxParallel?: number;
   /** The base's failFast policy, stamped on every child of a bounded wave. */
   waveFailFast?: boolean;
-  /** Ordered bound-context names persisted on the job row (multi-env jobs). */
+  /** Ordered bound-context names (multi-env jobs). */
   contexts?: string[];
   /** Bound contexts skipped on a test run (non-test / unconfigured). */
   skippedContexts?: string[];
-  /** User-visible warning naming the skipped test-run contexts. */
   envWarning?: string;
   /** `gate` marks an invoke-gate row (runs the gate executor, never an agent). */
   jobKind?: JobKind;
@@ -967,9 +824,8 @@ interface RejectedJob {
   /** Explicit init-failure category override; inferred from reason when absent. */
   category?: InitFailureCategory;
   /**
-   * Terminal status to record for this job. Defaults to `failed`. A zeroed
-   * `runsOnAll` that intentionally narrowed to no hosts is recorded as `skipped`
-   * (no init-failure) so its downstreams' `when` sets govern propagation.
+   * Default `failed`. A `runsOnAll` deliberately narrowed to no hosts records
+   * `skipped` (no init-failure) so downstream `when` sets govern propagation.
    */
   terminalStatus?: ExecutionJobStatus;
 }
@@ -981,10 +837,8 @@ type BuildJobConfigFn = (mat: MaterializedJob) => Record<string, unknown>;
 // ---------------------------------------------------------------------------
 
 /**
- * Build the wrapped dispatcher, overlay info with effective routing/provider,
- * persist the webhook payload, fire source-location callbacks, and post the
- * pending check-run check. Pure side-effects + a typed result bag for
- * downstream phases.
+ * Wrap the dispatcher, overlay effective routing/provider, persist the payload,
+ * fire source-location callbacks, and post the pending checks.
  */
 async function setupDispatchContext(ctx: WorkflowDispatchContext): Promise<DispatchSetup> {
   const { deps, repoIdentifier, credentials, ref, runId, workflow, crossSource } = ctx;
@@ -1021,8 +875,6 @@ async function setupDispatchContext(ctx: WorkflowDispatchContext): Promise<Dispa
 
   const workflowTimeoutMs = workflow.timeout;
 
-  // The test-trigger / `kici run --check` path stamps the run mode onto
-  // ctx.extraJobConfig.checkMode; surface it so onExecutionStarted persists it.
   const rawCheckMode = ctx.extraJobConfig?.checkMode;
   const checkMode = typeof rawCheckMode === 'string' ? rawCheckMode : undefined;
 
@@ -1052,14 +904,12 @@ async function setupDispatchContext(ctx: WorkflowDispatchContext): Promise<Dispa
       jobNames,
       installationId: (credentials as { installationId?: number }).installationId,
       routingKey: info.routingKey,
-      // Explicit runId/requestId so the reporter can build details_url
-      // even if a later async hop drops the ALS frame.
+      // Explicit so details_url survives a later async hop dropping the ALS frame.
       runId,
       requestId: getRequestContext().requestId,
     });
-    // Only after the post resolved: the flag says the checks are ON the commit,
-    // so a failed post must not make the catch fabricate a conclusion for a
-    // check run that was never created.
+    // Only after the post resolved, so a failed post never makes the catch
+    // conclude a check run that was never created.
     ctx.pendingChecksPosted = true;
   }
 
@@ -1078,9 +928,8 @@ async function setupDispatchContext(ctx: WorkflowDispatchContext): Promise<Dispa
 // ---------------------------------------------------------------------------
 
 /**
- * Choose the execution platform for this workflow. The first job's runsOn
- * label set determines which agents are candidates; the first matching agent
- * picks platform/arch. Falls back to linux/x64 when no agents are registered.
+ * Platform/arch of the first agent matching the first job's runsOn; linux/x64
+ * when none.
  */
 function chooseTargetPlatform(
   workflow: LockWorkflow,
@@ -1089,9 +938,7 @@ function chooseTargetPlatform(
   let targetPlatform = 'linux';
   let targetArch = 'x64';
   if (!agentRegistry) return { targetPlatform, targetArch };
-  // Only exact labels can pick a representative agent; regex patterns can't be
-  // turned into a concrete label to probe. An empty exact set falls back to
-  // 'default' so a glob-only first job still probes for any agent.
+  // Only exact labels can be probed; a glob-only first job probes 'default'.
   const firstJob = workflow.jobs.filter(isLockStaticJob)[0];
   const firstExact = partitionMatchers(firstJob?.runsOn ?? []).exact;
   const representativeLabels: string[] =
@@ -1105,10 +952,9 @@ function chooseTargetPlatform(
 }
 
 /**
- * Whether the repository the workflow source comes from can be built into a
- * cached source pack. A cross-source dispatch always clones and installs. A
- * global run builds from its workflow repository, which needs the registration's
- * commit: without one there is no commit to pack, so it installs agent-side.
+ * Whether the workflow source repo can be packed into the cache. Cross-source
+ * always clones and installs; a global run needs the registration's commit,
+ * else it installs agent-side.
  */
 function buildableWorkflowRepo(ctx: WorkflowDispatchContext): boolean {
   // fails-when: a global run with workflowSha null or '' reaches the cache probe or the build
@@ -1116,11 +962,7 @@ function buildableWorkflowRepo(ctx: WorkflowDispatchContext): boolean {
   return !ctx.crossSource && (!ctx.global || !!ctx.global.workflowSha);
 }
 
-/**
- * Probe source + dep caches and forward stats to Platform.
- * A dispatch whose workflow repository is not buildable always clones and
- * installs, so caches are bypassed.
- */
+/** Probe source + dep caches and forward stats to Platform; bypassed when not buildable. */
 async function probeCaches(
   ctx: WorkflowDispatchContext,
   setup: DispatchSetup,
@@ -1133,10 +975,8 @@ async function probeCaches(
   const buildable = buildableWorkflowRepo(ctx);
   let sourceHit = false;
   let depHit = false;
-  // Local-repo runs (no bundle) carry their source as a working-tree overlay,
-  // and `file://` in-place runs (`localWorkingTree`) run the operator's real
-  // tree directly — neither is a cacheable provider build, so skip the source/dep
-  // cache probe entirely (a stale cached tarball must never shadow the tree).
+  // Local-repo runs (working-tree overlay) and `file://` in-place runs are not
+  // cacheable builds: a stale cached tarball must never shadow the tree.
   if (!ctx.bundle || ctx.localWorkingTree) {
     return { sourceHit, depHit };
   }
@@ -1172,22 +1012,13 @@ async function probeCaches(
 }
 
 /**
- * Whether this dispatch must run a `__build__` job before its real jobs.
+ * Whether a `__build__` job must run first. Either cache missing is a reason:
+ * source (keyed on contentHash) and deps (keyed on lockfile hash) miss
+ * independently, and a dependency bump leaves source warm and deps cold.
+ * Gating on the source miss alone never uploads the dep tarball, so agents
+ * with no registry route (cloud one-shot, air-gapped) cannot run at all.
  *
- * Either cache missing is a reason to build. The two are keyed on different
- * things — the source cache on the workflow source's contentHash, the dep cache
- * on the lockfile hash — so they miss independently, and a dependency bump is
- * exactly the case that leaves the source warm and the deps cold. Gating only on
- * the source miss made that state permanent: no build job ran, so nothing ever
- * uploaded the dep tarball, so every agent fell back to installing from the
- * registry on every job — and an agent with no route to that registry (a
- * cloud-hosted one-shot agent, an air-gapped runner) could not run the job at
- * all. The `__build__` job already carries `buildSourceNeeded` /
- * `buildDepsNeeded` separately and the agent already honors both, so a
- * deps-only build was implemented and unreachable.
- *
- * A hash is required alongside its miss: with no hash there is no cache key to
- * write, so building would produce an artifact nothing could ever look up.
+ * A miss counts only with its hash: no hash means no cache key to write.
  */
 export function buildIsNeeded(args: {
   /** False when there is nothing to cache into (no bundle, no coordinator, …). */
@@ -1203,10 +1034,7 @@ export function buildIsNeeded(args: {
   return sourceMissing || depsMissing;
 }
 
-/**
- * Build the QueuedJobInput for a __build__ job. Same-shape helper used by the
- * build-job dispatch flow inside `runBuildJob`.
- */
+/** The QueuedJobInput for a __build__ job. */
 function buildBuildJobInput(args: {
   ctx: WorkflowDispatchContext;
   setup: DispatchSetup;
@@ -1236,16 +1064,14 @@ function buildBuildJobInput(args: {
       source: { file: workflow.source?.file ?? fullLockFile.source.file },
       contentHash: args.contentHash || undefined,
       lockfileHash: args.lockfileHash || undefined,
-      // Part of the dep POINTER key, so the build job must echo it back on
-      // upload — a publish keyed differently from the probe writes a pointer
-      // nothing will ever read.
+      // Part of the dep POINTER key: a publish keyed unlike the probe writes a
+      // pointer nothing reads.
       ...(fullLockFile.siblingsDigest && { siblingsDigest: fullLockFile.siblingsDigest }),
       workflowName: workflow.name,
       buildSourceNeeded: !args.sourceHit && !!args.contentHash,
       buildDepsNeeded: !args.depHit && !!args.lockfileHash,
-      // The build job is the one that UPLOADS the source tarball, so its
-      // dispatch ref must carry the org: the upload handler resolves the
-      // storage prefix from that server-side record, never from the wire.
+      // The build job UPLOADS the tarball; the upload handler resolves the
+      // storage prefix from this server-side org, never from the wire.
       cacheOrgId: ctx.resolvedOrgId,
       ...(workflow.resolvedHashFiles?.length && {
         resolvedHashFiles: workflow.resolvedHashFiles,
@@ -1258,10 +1084,9 @@ function buildBuildJobInput(args: {
 }
 
 /**
- * The repository a `__build__` job clones to pack the workflow source. A global
- * run packs the workflow repository at its registered commit, with that
- * repository's credentials and source; every other run packs the event's own
- * repository at the event commit.
+ * What a `__build__` job clones: a global run's workflow repository at its
+ * registered commit with its own credentials, else the event's repository at
+ * the event commit.
  */
 function buildCloneTarget(
   ctx: WorkflowDispatchContext,
@@ -1297,13 +1122,11 @@ function buildCloneTarget(
 }
 
 /**
- * Build the QueuedJobInput for a synthetic `__bringup__` job: the orchestrator
- * dispatches one per declared-but-un-agented `includeUninitialized` child to an
- * agent holding `kici:capability:ssh-transport`, which runs the agent-side
- * `ensureInitRunner(targetAgentId)` over SSH. The init-runner then connects
- * under `targetAgentId`, and the child's pinned-hold (already queued with that
- * pin) drains its bootstrap steps onto it. The bring-up job clones nothing and
- * runs no sandbox (`bringupOnly`).
+ * A synthetic `__bringup__` job, one per un-agented `includeUninitialized`
+ * child, sent to a `kici:capability:ssh-transport` agent that runs
+ * `ensureInitRunner(targetAgentId)` over SSH. The init-runner connects under
+ * `targetAgentId` and the child's pinned hold drains onto it. Clones nothing,
+ * no sandbox (`bringupOnly`).
  */
 export function buildBringupJobInput(args: {
   ctx: WorkflowDispatchContext;
@@ -1334,11 +1157,9 @@ export function buildBringupJobInput(args: {
 }
 
 /**
- * Dispatch the synthetic `__bringup__` job for one un-agented fan-out child. The
- * bring-up runs on an ssh-transport ops agent; if none is connected, the
- * bring-up job queues with its label pin and the held target child times out via
- * the normal queue path. Best-effort: a bring-up dispatch failure is logged, not
- * thrown — the held child surfaces the timeout if no init-runner ever connects.
+ * Best-effort `__bringup__` dispatch for one un-agented child: with no
+ * ssh-transport agent it queues, and the held child times out via the normal
+ * queue path. A failure is logged, not thrown.
  */
 async function dispatchBringupForChild(args: {
   ctx: WorkflowDispatchContext;
@@ -1366,9 +1187,8 @@ async function dispatchBringupForChild(args: {
 }
 
 /**
- * Run the build job and track its result. Returns the build job metadata or
- * sentinel values when the build fails. Mutates execution-tracker rows so
- * downstream phases can attach execution_jobs to a real run.
+ * Run and track the build job. Registers the run with the tracker so later
+ * phases attach execution_jobs to a real run.
  */
 async function runBuildJob(args: {
   ctx: WorkflowDispatchContext;
@@ -1379,11 +1199,7 @@ async function runBuildJob(args: {
   targetArch: string;
   sourceHit: boolean;
   depHit: boolean;
-  /**
-   * True when the workflow has jobs that are dispatched only after the build
-   * finishes. Drives the pending-jobs token that keeps the run from being
-   * finalized the moment the build job goes terminal.
-   */
+  /** Jobs dispatch after the build; takes the token that stops finalizing on build terminal. */
   hasPostBuildJobs: boolean;
 }): Promise<{
   buildJobId: string | undefined;
@@ -1392,11 +1208,9 @@ async function runBuildJob(args: {
   buildJobTrackedEarly: boolean;
   rejected: boolean;
   /**
-   * Set when `ensureBuild` rejects (typically a build-coordinator timeout).
-   * Returned instead of thrown so the caller still sees `buildJobId` if the
-   * inner closure managed to insert the build job's dispatch_queue row
-   * before the timer fired — without that, the caller has no way to mark
-   * the orphaned `dispatched` row as `failed`.
+   * Set when `ensureBuild` rejects (typically a timeout). Returned, not thrown,
+   * so the caller still sees a `buildJobId` inserted before the timer fired and
+   * can fail the orphaned `dispatched` row.
    */
   error: unknown;
 }> {
@@ -1456,28 +1270,20 @@ async function runBuildJob(args: {
         await startTrackedRun(deps.executionTracker, ctx, setup, [
           { jobId: buildJobId, jobName: buildJobName, runsOnLabels: buildJobLabels },
         ]);
-        // The run is registered here rather than by `startRunBeforeDispatch`,
-        // which returns early for a build-tracked run — so this is the site that
-        // owes the row its trust context. Without it the row carried none at all
-        // across the whole build plus static-dispatch window, which is longer
-        // than the window the other site closes.
+        // `startRunBeforeDispatch` returns early for a build-tracked run, so
+        // this site owes the row its trust context across the build window.
         await stampTrustContextBeforeDispatch(ctx);
         buildJobTrackedEarly = true;
-        // The run is now registered with the build job ALONE, and this closure
-        // awaits the build before any other job is dispatched. Without a token
-        // the build going terminal satisfies isRunComplete, so the run is
-        // finalized mid-build — posting the provider check status and
-        // forwarding a terminal run status to the Platform before a single real
-        // job has run. Taken here rather than after the build so it is in place
-        // before the build can report terminal; released by
-        // dispatchMatchedWorkflow's finally.
+        // The run holds the build job ALONE: without a token the build going
+        // terminal satisfies isRunComplete and finalizes the run mid-build
+        // (check status posted, terminal status forwarded). Taken before the
+        // build can report terminal; released by dispatchMatchedWorkflow's
+        // finally.
         //
-        // The token guards only this process. The dispatch queue is
-        // cluster-wide, so the build may be claimed by an agent connected to a
-        // sibling coordinator, which rehydrates the run from the row and sees
-        // the build alone; the token's durable form (the run row's
-        // registration-window column) is what makes that sibling defer, and
-        // the build wait below must not start before it has landed.
+        // The token guards only this process. A sibling coordinator whose
+        // agent claims the build rehydrates from the row; the durable
+        // registration-window column makes it defer, so the build wait must
+        // not start before that has landed.
         if (args.hasPostBuildJobs && deps.executionTracker.holdRunForPendingJobs(runId)) {
           args.ctx.dispatchWindowTokenHeld = true;
           await deps.executionTracker.registrationWindowSettled(runId);
@@ -1495,20 +1301,16 @@ async function runBuildJob(args: {
       }
     });
   } catch (err) {
-    // ensureBuild rejected (typically build-coordinator timeout). Don't
-    // re-throw — the closure may have already populated `buildJobId` /
-    // `buildJobTrackedEarly` synchronously before the timer fired, and
-    // the caller needs that state to drive `recordBuildFailure`. The
-    // caller routes on `error` instead of relying on the throw.
+    // Not re-thrown: the closure may already have set `buildJobId` /
+    // `buildJobTrackedEarly`, which `recordBuildFailure` needs.
     error = err;
   }
   return { buildJobId, buildJobName, buildJobLabels, buildJobTrackedEarly, rejected, error };
 }
 
 /**
- * Mark a build failure end-to-end: record the failed check status, fail the
- * execution_runs row, and (optionally) bootstrap a minimal failed run when
- * the build threw before onExecutionStarted ran.
+ * Record a build failure: failed check status, failed run row, and a minimal
+ * failed run when the build threw before onExecutionStarted.
  */
 async function recordBuildFailure(args: {
   ctx: WorkflowDispatchContext;
@@ -1516,11 +1318,9 @@ async function recordBuildFailure(args: {
   buildJobTrackedEarly: boolean;
   err: unknown;
   /**
-   * Build job's dispatch_queue id when the inner closure managed to insert
-   * the row before `ensureBuild` rejected. Used to mark the orphaned
-   * `Dispatched` row as `Failed` directly: the run-level cascade in
-   * `executionTracker.onBuildFailed` only fires when `buildJobTrackedEarly`
-   * is true, but the dispatch_queue row exists regardless.
+   * The build's dispatch_queue id if inserted before `ensureBuild` rejected.
+   * Failed directly, because `onBuildFailed`'s cascade fires only when
+   * `buildJobTrackedEarly`, yet the row exists regardless.
    */
   buildJobId?: string | undefined;
 }): Promise<void> {
@@ -1577,13 +1377,9 @@ async function recordBuildFailure(args: {
       });
     }
   }
-  // Mark the build job's dispatch_queue row as failed even when the
-  // run-level cascade can't reach it (`buildJobTrackedEarly` is false
-  // because the build-coordinator timeout fired before the closure's
-  // `onExecutionStarted` await returned). Without this, the row
-  // stays in `Dispatched` indefinitely until the agent eventually
-  // sends `job.complete` — and a caller polling for
-  // `failed`/`expired` would never observe a terminal state.
+  // Fail the dispatch_queue row even when the run-level cascade cannot reach
+  // it (timeout before `onExecutionStarted` returned); otherwise it stays
+  // `Dispatched` until `job.complete` and pollers never see a terminal state.
   if (buildJobId) {
     try {
       await deps.dispatcher.cancelQueuedJob(buildJobId, `Build failed: ${toErrorMessage(err)}`);
@@ -1598,13 +1394,9 @@ async function recordBuildFailure(args: {
 }
 
 /**
- * The cache-artifact fields every dispatch payload carries: where the source and
- * dependency tarballs are, and the digests an agent verifies them against.
- *
- * One builder rather than five hand-repeated literals, so a new field cannot be
- * threaded to some dispatch paths and forgotten on others — which is how
- * `sourceTarDigest` would have reached the coordinator route and not the local
- * fallback beside it.
+ * Cache-artifact fields every dispatch payload carries: tarball URLs and the
+ * digests an agent verifies. One builder so a new field reaches every
+ * dispatch path, not just some.
  */
 function cacheArtifactFields(buildPrep: BuildPrepResult): {
   sourceTarUrl: string | undefined;
@@ -1620,10 +1412,7 @@ function cacheArtifactFields(buildPrep: BuildPrepResult): {
   };
 }
 
-/**
- * Mark a build success: post the success check status and read final URLs
- * from the cache for downstream dispatch.
- */
+/** Post the build success check and read the final cache URLs. */
 async function readPostBuildCacheUrls(args: {
   ctx: WorkflowDispatchContext;
   setup: DispatchSetup;
@@ -1679,23 +1468,10 @@ async function readPostBuildCacheUrls(args: {
 }
 
 /**
- * Phase B orchestrator: probe caches, dispatch the build job (if needed),
- * and surface enough state for downstream phases to skip / continue
- * appropriately.
- */
-/**
- * Materialize each static job's matrix into dispatchable children. A job whose
- * matrix is invalid (zero combinations / over the cap) is dropped from the
- * dispatch list and recorded as a `matrix_expansion` matrix failure so the run's
- * other jobs still proceed. Dynamic-matrix jobs pass through with a
- * `pendingDynamicMatrix` marker for the eval flow.
- */
-/**
- * Resolve a `runsOnAll` lock job against the declared host roster and partition
- * the matched hosts into the target set per the `onUnreachable` policy (R2):
- * `ready` hosts always run; unreachable durable (`static`) hosts hold / fail /
- * skip; stale ephemeral hosts are always skipped. Throws {@link FanoutError}
- * when the run can't proceed (fail policy with an absent host, or zero targets).
+ * Resolve a `runsOnAll` job against the host roster and apply `onUnreachable`:
+ * `ready` hosts run; unreachable `static` hosts hold / fail / skip; stale
+ * ephemeral hosts are skipped. Throws {@link FanoutError} when the run cannot
+ * proceed (fail policy with an absent host, or zero targets).
  */
 export async function resolveHostFanoutTargets(
   lockJob: LockJob,
@@ -1707,24 +1483,19 @@ export async function resolveHostFanoutTargets(
   }
   const predicate = lockJob.runsOnAll!;
   const onUnreachable = lockJob.onUnreachable ?? 'hold';
-  // `includeUninitialized` widens the fan-out to declared-but-un-agented hosts:
-  // each unreachable static host becomes a bring-up target (its child is held
-  // until a temporary init-runner connects under the same agentId) rather than
-  // being subject to the `onUnreachable` policy. A live host runs on its own
-  // agent. Default (absent) ⇒ today's `onUnreachable` semantics, no bring-up.
+  // `includeUninitialized`: each unreachable static host becomes a bring-up
+  // target (child held until an init-runner connects under its agentId)
+  // instead of following `onUnreachable`.
   const includeUninitialized = lockJob.includeUninitialized === true;
-  // `findFanoutTargets`, not `findMatching`: fan-out covers declared fleet
-  // members, so an auto-scaler-spawned agent is never a target. Pinning a child
-  // to one would run it at the pool's fixed shape instead of its own.
+  // `findFanoutTargets`, not `findMatching`: a scaler-spawned agent is never a
+  // target, since pinning to one runs the child at the pool's fixed shape.
   const matched = await deps.hostRosterStore.findFanoutTargets(
     predicate.include,
     predicate.exclude,
     deps.rosterGraceMs ?? 300_000,
   );
 
-  // `--target` narrows the runsOnAll-matched roster as a post-filter (never
-  // widens). `matched` is kept intact for the non-target zero-host heuristic
-  // below; only `candidates` is narrowed.
+  // `--target` only narrows; `matched` stays intact for the zero-host heuristic.
   const candidates = target
     ? matched.filter((h) => hostSatisfiesTarget(new Set(h.labels), target))
     : matched;
@@ -1764,9 +1535,8 @@ export async function resolveHostFanoutTargets(
 
   if (targets.length === 0) {
     if (targetNarrowedToZero) {
-      // The roster matched hosts but `--target` removed every one. `allowEmpty`
-      // chooses the synthetic job's terminal state: skipped (downstream `when`
-      // governs) vs failed (fail-loud).
+      // `--target` removed every matched host; `allowEmpty` picks skipped
+      // (downstream `when` governs) over failed.
       throw new FanoutError(
         lockJob.name,
         `--target left job '${lockJob.name}' with zero hosts`,
@@ -1803,22 +1573,17 @@ interface JobRoutingSelectors {
   excludeLabels: string[];
   excludePatterns: LabelMatcher[];
   /**
-   * The `runsOn` exact values exactly as the lock file spells them, before the
-   * canonical fold `partitionMatchers` applies.
-   *
-   * Only {@link resolveRosterAgentPin} reads this. A bare agent id in `runsOn`
-   * is the documented inventory fan-out pattern (`runsOn: [h.agentId]`), and an
-   * agent id is not a label: `host_roster.agent_id` is case-sensitive, so the
-   * folded form misses every host whose id carries a capital.
+   * `runsOn` exact values as spelled, before `partitionMatchers` folds them.
+   * For {@link resolveRosterAgentPin} only: `host_roster.agent_id` is
+   * case-sensitive, so the folded form misses ids with a capital.
    */
   runsOnExactRaw: string[];
 }
 
 /**
- * Partition a lock job's runsOn / excludeLabels matchers into exact labels (SQL
- * `@>` prefilter + registry index) and regex patterns (JS post-filter). A
- * `runsOnAll` host-fanout job has no `runsOn`; its pinned children carry no
- * routing (the pin targets the resolved agent directly).
+ * Partition runsOn / excludeLabels into exact labels (SQL `@>` prefilter +
+ * registry index) and regex patterns (JS post-filter). A `runsOnAll` job has
+ * no `runsOn`; its children route by pin.
  */
 export function runsOnSelectorsForLockJob(lockJob: {
   runsOn?: readonly LabelMatcher[];
@@ -1831,8 +1596,7 @@ export function runsOnSelectorsForLockJob(lockJob: {
     runsOnPatterns: include.regex,
     excludeLabels: exclude.exact,
     excludePatterns: exclude.regex,
-    // Read off the same array `partitionMatchers` just validated, so an invalid
-    // matcher has already thrown by the time this runs.
+    // `partitionMatchers` already validated (and thrown on) this array.
     runsOnExactRaw: (lockJob.runsOn ?? [])
       .filter((m) => m.kind === 'exact')
       .map((m) => (m as { kind: 'exact'; value: string }).value),
@@ -1840,25 +1604,17 @@ export function runsOnSelectorsForLockJob(lockJob: {
 }
 
 /**
- * Runtime facts a job's own shape demands of the host that runs it.
+ * Runtime labels a job's shape demands of its host. Only a
+ * `container.dockerfile` job gets one: building needs a `docker` / `podman`
+ * CLI, which the agent self-reports as `kici:runtime:container-build`.
  *
- * Only a `container.dockerfile` job gets one. Building shells out to a
- * `docker` / `podman` CLI, so a host without one cannot run the job at all, and
- * the agent self-reports `kici:runtime:container-build` when it has one.
+ * A finalized `image` job deliberately gets NOTHING: an implicit requirement
+ * on working jobs strands them. An agent too old to report the label cannot
+ * build anyway.
  *
- * A job that names a finalized `image` deliberately gets NOTHING added. Adding
- * an implicit requirement to jobs that already work is how container jobs were
- * stranded once before: they had been running fine, and a routing gate the
- * orchestrator could not actually evaluate made them match nothing. A dockerfile
- * job is new, so requiring the fact strands no existing workflow — and an agent
- * old enough not to report the fact is an agent that cannot build anyway.
- *
- * Applied when matching REGISTERED agents (the dispatcher), and deliberately
- * NOT when consulting the scaler. A scaler backend is chosen by exact label-set
- * containment, so a required label the operator never wrote in a pool's label
- * set matches no backend at all — the job would be stranded `queued-no-backend`
- * rather than spawned. The pool's hosts are the operator's to describe; what an
- * agent can actually do is known only once it registers and says so.
+ * Applied to REGISTERED agents only, NOT the scaler: backends match by exact
+ * label-set containment, so a label absent from the pool's set strands the job
+ * `queued-no-backend`. What an agent can do is known once it registers.
  */
 export function requiredRuntimeLabelsFor(container: unknown): string[] {
   if (!container || typeof container !== 'object') return [];
@@ -1869,21 +1625,14 @@ export function requiredRuntimeLabelsFor(container: unknown): string[] {
 }
 
 /**
- * Resolve a generated job's single bare-`agentId` `runsOn` into a host pin.
+ * Resolve the documented inventory pattern `runsOn: [h.agentId]` into a host
+ * pin. A bare agentId is no advertised label, so label routing leaves it
+ * `queued-no-backend`. When the single exact label names a roster host, pin it
+ * (plus its coordinator for reroute), as `runsOnAll` children pin. Any other
+ * shape returns null and keeps label routing.
  *
- * The documented inventory fan-out pattern is `runsOn: [h.agentId]`. A bare
- * agentId is not a label any agent advertises, so the normal label path leaves
- * the job `queued-no-backend`. When the single exact label names a known roster
- * host, resolve it to a `pinnedAgentId` dispatch (+ the host's coordinator for
- * cross-cluster reroute) — exact parity with how `runsOnAll` children pin. Any
- * other shape (multi-label, a regex pattern, a non-roster label, or no roster
- * store) returns null and the caller keeps normal label routing.
- *
- * `runsOnExact` takes the values the lock file spells, NOT the canonical labels
- * every other routing path uses: this looks the value up as an agent id, and
- * agent ids are case-sensitive. Handing it folded labels strands every host
- * whose id carries a capital on the normal label path, where a bare agent id
- * matches nothing.
+ * `runsOnExact` takes the lock's spelling, NOT folded labels: agent ids are
+ * case-sensitive.
  */
 export async function resolveRosterAgentPin(args: {
   runsOnExact: string[];
@@ -1895,17 +1644,14 @@ export async function resolveRosterAgentPin(args: {
   if (runsOnExact.length !== 1 || runsOnPatterns.length > 0) return null;
   const candidate = runsOnExact[0];
   const row = await hostRosterStore.get(candidate);
-  // An unconfirmed row a dashboard declare created is not an inventory host, so
-  // it never turns a label into a pin.
+  // An unconfirmed dashboard-declared row is not an inventory host.
   if (!row || row.identity_source === HostIdentitySource.platform) return null;
   return { pinnedAgentId: candidate, connectedInstanceId: row.connected_instance_id ?? null };
 }
 
 /**
- * The generic fan-out tracking fields persisted on `execution_jobs` for a
- * materialized child: `baseJobName` + `variantKind` + `variantLabel`. Serves
- * matrix (label = combination suffix) and host (label = hostname) uniformly so
- * the dashboard groups on real columns instead of string-parsing the name.
+ * Fan-out tracking columns for a child (label = matrix combination suffix or
+ * hostname), so the dashboard groups on columns, not parsed names.
  */
 function variantTrackingFields(mat: MaterializedJob): {
   baseJobName?: string;
@@ -1927,19 +1673,13 @@ function variantTrackingFields(mat: MaterializedJob): {
 }
 
 /**
- * The `gitCredentials` declaration persisted on `execution_jobs` for a job.
+ * The persisted `gitCredentials` declaration: server truth the credential
+ * relay authorizes a wire `ref` against on every git network operation.
  *
- * This is the server truth the credential relay authorizes against: a
- * workflow-supplied `ref` on the wire must match one of these entries. The relay
- * is called on every git network operation, so it reads a persisted column
- * rather than re-fetching or re-parsing a lock file.
- *
- * Copied verbatim, because the relay compares a request against it byte for
- * byte. A `<name>Secret` field is a secret NAME in qualified `<context>:<key>`
- * form; its `<name>Value` sibling is material for a credential with no store
- * entry to name, which the SDK accepts and the compiler copies through. Do not
- * filter or normalize either here — a value that differs from the lock's is a
- * declaration no request can ever match.
+ * Copied verbatim; the relay compares byte for byte. `<name>Secret` is a
+ * qualified `<context>:<key>` NAME; `<name>Value` is literal material for a
+ * credential with no store entry. Never filter or normalize: a differing
+ * value matches no request.
  */
 function gitCredentialFields(lockJob: LockJob): {
   gitCredentials?: Readonly<Record<string, Readonly<Record<string, string>>>>;
@@ -1956,17 +1696,11 @@ export interface WavePlan {
 }
 
 /**
- * Compute the rolling-wave plan for a materialized job set.
- *
- * For each base job declaring `maxParallel` whose fan-out produced more than one
- * child, children are ordered deterministically by `fanoutIndex` (the
- * agentId / variant-label rank assigned at materialization; falling back to
- * `expandedName` for children with no index) and every child at index `>=
- * maxParallel` is held (`wave_gated=true`). The first `maxParallel` dispatch
- * immediately; held children release one-per-terminal via the wave-scheduler.
- * Every child of a bounded-wave base — held or not — gets a `policy` entry so
- * the wave-scheduler can read the width/failFast at terminal time. A non-fan-out
- * job (single child) or one without `maxParallel` contributes nothing.
+ * Rolling-wave plan. For a `maxParallel` base with more than one child,
+ * children sort by `fanoutIndex` (else `expandedName`) and index `>=
+ * maxParallel` is held (`wave_gated=true`); held children release
+ * one-per-terminal via the wave-scheduler. Every child of a bounded base gets
+ * a `policy` entry for the scheduler to read at terminal time.
  */
 export function computeWavePlan(materializedJobs: readonly MaterializedJob[]): WavePlan {
   const byBase = new Map<string, MaterializedJob[]>();
@@ -1981,8 +1715,6 @@ export function computeWavePlan(materializedJobs: readonly MaterializedJob[]): W
     const maxParallel = children[0]?.lockJob.maxParallel;
     if (maxParallel === undefined || children.length <= 1) continue;
     const failFast = children[0]?.lockJob.failFast ?? false;
-    // Order by the deterministic fan-out index so wave-release order == child
-    // index; fall back to expandedName for children without an index.
     const ordered = [...children].sort((a, b) =>
       a.fanoutIndex !== undefined && b.fanoutIndex !== undefined
         ? a.fanoutIndex - b.fanoutIndex
@@ -1996,6 +1728,11 @@ export function computeWavePlan(materializedJobs: readonly MaterializedJob[]): W
   return { held, policy };
 }
 
+/**
+ * Materialize each static job's fan-out. An invalid fan-out (zero combinations,
+ * over the cap) is recorded as a failure so the run's other jobs proceed.
+ * Dynamic-matrix jobs pass through marked `pendingDynamicMatrix`.
+ */
 export async function materializeStaticJobsSafe(
   staticJobs: readonly LockJob[],
   deps: ProcessingDeps,
@@ -2032,9 +1769,8 @@ export async function materializeStaticJobsSafe(
           reason: err.message,
           ...(narrowed && { terminalStatus: ExecutionJobStatus.enum.skipped }),
         });
-        // Map the zeroed base to its synthetic terminal job (its own name) so
-        // insertEdgesForRun creates a real edge for downstreams. The synthetic
-        // row's status (skipped vs failed) then governs propagation via `when`.
+        // Map the zeroed base to its synthetic terminal job so downstreams get a
+        // real edge; its skipped/failed status governs `when` propagation.
         expansionMap.set(lockJob.name, [lockJob.name]);
         continue;
       }
@@ -2044,6 +1780,7 @@ export async function materializeStaticJobsSafe(
   return { materializedJobs, expansionMap, matrixFailures };
 }
 
+/** Phase B orchestrator: probe caches, run the build job when needed, report what later phases need. */
 async function prepareCacheAndBuild(
   ctx: WorkflowDispatchContext,
   setup: DispatchSetup,
@@ -2076,33 +1813,17 @@ async function prepareCacheAndBuild(
   let buildJobTrackedEarly = false;
   let buildFailed = false;
 
-  // A build job fetches + caches the workflow source from the provider bundle.
-  // A local-repo run (no bundle — `kici run` against an inline lock with the
-  // working tree carried as an overlay) has no remote source to build, so it
-  // skips the build and dispatches its static jobs directly. The webhook path
-  // always has a bundle, so its build behavior is unchanged.
-  //
-  // A local `file://` IN-PLACE run (`localWorkingTree`) likewise skips the
-  // source-pack build: the agent runs the operator's real tree directly (under
-  // its KICI_IN_PLACE profile — no clone, no source-restore), so packing a
-  // source tarball is both wasteful and wrong (it would carry a dist-less clone).
+  // No build for a local-repo run (no bundle; working-tree overlay, nothing
+  // remote to build) or a `file://` IN-PLACE run: the agent runs the real tree
+  // under KICI_IN_PLACE (no clone, no source-restore), and a packed tarball
+  // would carry a dist-less clone.
   const cacheInfraAvailable =
     buildableWorkflowRepo(ctx) &&
     !localWorkingTree &&
     !!ctx.bundle &&
     deps.buildCoordinator &&
     (deps.sourceCache || deps.depCache);
-  // Either cache missing is a reason to build. The two are keyed on different
-  // things — the source cache on the workflow source's contentHash, the dep
-  // cache on the lockfile hash — so they miss independently, and a dependency
-  // bump is exactly the case that leaves the source warm and the deps cold.
-  // Gating only on the source miss made that state permanent: no build job ran,
-  // so nothing ever uploaded the dep tarball, so every agent fell back to
-  // installing from the registry on every job — and an agent with no route to
-  // that registry (a cloud-hosted one-shot agent, an air-gapped runner) could
-  // not run the job at all. The build job already carries `buildSourceNeeded` /
-  // `buildDepsNeeded` separately and the agent already honors both, so a
-  // deps-only build was implemented and unreachable.
+  // Either cache missing builds; see `buildIsNeeded`.
   const buildNeeded = buildIsNeeded({
     cacheInfraAvailable: Boolean(cacheInfraAvailable),
     sourceHit,
@@ -2275,10 +1996,9 @@ async function resolveWorkflowSecretsAndKey(
   ctx: WorkflowDispatchContext,
 ): Promise<SecretBundle | { skipDispatch: true; reason: string }> {
   const { deps, workflow, runId } = ctx;
-  // Workflow-level contexts are not resolved here: every job binds them ahead of
-  // its own, and each job resolves them only after their protection gates admit
-  // it (see effectiveContextRefs). A workflow that names contexts still needs
-  // the secrets subsystem, so its absence fails the dispatch up front.
+  // Workflow-level contexts bind ahead of each job's own and resolve per job,
+  // after its gates admit it (effectiveContextRefs); here only a missing
+  // secrets subsystem fails fast.
   const declaredContexts = workflow.contexts ?? [];
   // fails-when: a workflow names contexts and KICI_SECRET_KEY is unset — dispatch is refused
   // breaks-if-wrong: a workflow with no workflow-level contexts must dispatch without a resolver
@@ -2327,17 +2047,6 @@ async function resolveWorkflowSecretsAndKey(
 // Phase C2 — workflow-level install auth (private npm registries + installEnv)
 // ---------------------------------------------------------------------------
 
-/**
- * Resolve the workflow's `registries:` and `installEnv:` declarations into
- * per-dispatch fields. Fires per-context protection rules, looks up
- * each `<env>:<secret>` reference via the secret resolver, validates registry
- * URL schemes, and applies the contributor-trust strip.
- *
- * Returns a `skipDispatch` sentinel when the helper rejects the dispatch
- * (malformed ref, missing env, missing secret, gate non-pass, bad URL
- * scheme). On accept, mutates `secrets.npmRegistries` /
- * `secrets.installEnvSecrets` so downstream phases pick them up.
- */
 /** A workflow install gate that paused dispatch — surfaced to the caller. */
 interface InstallGateHold {
   action: 'hold' | 'wait' | 'queue';
@@ -2350,6 +2059,13 @@ interface InstallGateHold {
   record: InstallGateRecord;
 }
 
+/**
+ * Resolve `registries:` and `installEnv:`: fire per-context protection rules,
+ * look up each `<env>:<secret>`, validate registry URL schemes, apply the
+ * contributor-trust strip. Rejects (malformed ref, missing env or secret, gate
+ * non-pass, bad scheme) return `skipDispatch`; on accept, mutates
+ * `secrets.npmRegistries` / `secrets.installEnvSecrets`.
+ */
 async function resolveWorkflowInstallSecrets(
   ctx: WorkflowDispatchContext,
   secrets: SecretBundle,
@@ -2387,8 +2103,7 @@ async function resolveWorkflowInstallSecrets(
     triggerType: event.type,
     repository: policyRepo(ctx),
     runId,
-    // Workflow-level install has no per-job id; surface a deterministic
-    // synthetic id so audit logs make the workflow scope visible.
+    // Deterministic synthetic id so audit logs show the workflow scope.
     jobId: installGateJobId(workflow.name),
     internallyTriggered: ctx.internallyTriggered === true,
   };
@@ -2503,18 +2218,15 @@ function buildDeferredInitJob(args: {
   const initJobName = `__init__${workflow.name}__${mat.expandedName}`;
   const jobConfig: Record<string, unknown> = {
     initOnly: true,
-    // The init job resolves dynamic fields against the BASE job definition in
-    // source; for a dynamic matrix the base name is what findJobByName needs.
+    // Dynamic fields resolve against the BASE job (what findJobByName needs).
     targetJobName: mat.baseName,
-    // A non-global workflow's `filter` gets no eval round of its own — the
-    // init job evaluates it before this job's dynamic fields, and a `false`
-    // verdict suppresses the dispatch. Omitted (never `false`) when the
-    // workflow declares none, matching how the lock file records it.
+    // A non-global `filter` is evaluated here before the dynamic fields; a
+    // `false` verdict suppresses dispatch. Omitted (never `false`) when absent,
+    // as the lock file records it.
     ...(workflow.hasFilter === true && { hasFilter: true }),
-    // Paths the orchestrator could only match conservatively; the init job
-    // decides them from its clone before anything else, and a no-match
-    // suppresses the dispatch. Omitted when none, so an older agent sees no
-    // change.
+    // Paths matched only conservatively; the init job decides them from its
+    // clone, and a no-match suppresses dispatch. Omitted when none, so an
+    // older agent sees no change.
     ...(deferredPathsOf(ctx) && { deferredPaths: deferredPathsOf(ctx) }),
     workflowName: workflow.name,
     source: workflow.source?.file ?? fullLockFile.source.file,
@@ -2528,8 +2240,7 @@ function buildDeferredInitJob(args: {
     ...(workflow.resolvedHashFiles?.length && {
       resolvedHashFiles: workflow.resolvedHashFiles,
     }),
-    // A global workflow's init job checks out the workflow repository and the
-    // source repository, as its other jobs do.
+    // A global init job checks out both repositories, like its other jobs.
     ...globalJobConfigFor(ctx),
   };
   const initJobInput: QueuedJobInput = {
@@ -2560,10 +2271,7 @@ function buildDeferredInitJob(args: {
   return { mat, initJobInput };
 }
 
-/**
- * Read the org's configured approval-hold expiry (seconds), falling back to the
- * cluster default of 24h when the org row or column is absent.
- */
+/** The org's approval-hold expiry in seconds; 24h when unset. */
 async function resolveApprovalExpiry(ctx: WorkflowDispatchContext): Promise<number> {
   const { deps, resolvedOrgId } = ctx;
   const fallback = 86400;
@@ -2581,13 +2289,9 @@ async function resolveApprovalExpiry(ctx: WorkflowDispatchContext): Promise<numb
 }
 
 /**
- * Union the explicit lock approval clauses with the context reviewer
- * clauses into a single AND list (deduped). Every set must be satisfied.
- *
- * `workflowApproval` is the workflow-level `requireApproval`, which the caller
- * passes only for a root job — the only kind `applyStaticApprovalHolds` ever
- * holds under a workflow-scoped requirement. It has no default: the parameter
- * is required so a future call site cannot silently drop the source.
+ * Deduped AND list of context reviewer, lock, and workflow approval clauses.
+ * `workflowApproval` is passed only for a root job (the only kind held under a
+ * workflow-scoped requirement); required so no call site silently drops it.
  */
 function unionApprovalClauses(
   lockApproval: LockApproval | undefined,
@@ -2630,10 +2334,9 @@ function buildExplicitJobHold(
 }
 
 /**
- * Build a workflow-scoped hold from the lock workflow's `approval` block. The
- * gate holds the workflow's root jobs (those with no `needs`) before any job
- * dispatches; downstream jobs are gated by their `needs` edges. Each held root
- * job carries this same requirement and re-dispatches on approval.
+ * Workflow-scoped hold from the lock `approval` block, carried by every root
+ * job (no `needs`); downstream jobs wait on their `needs` edges. Each held root
+ * re-dispatches on approval.
  */
 function buildExplicitWorkflowHold(
   approval: LockApproval,
@@ -2654,10 +2357,9 @@ function buildExplicitWorkflowHold(
 }
 
 /**
- * Scan a lock workflow's always-mode approval timeouts (workflow-level +
- * each static job) for a non-positive / non-finite `timeoutSeconds`. Returns the
- * first offender or null. Step-scope approvals ride the validated
- * `step.approval-request` wire schema and are not checked here.
+ * First workflow- or job-level approval with an invalid `timeoutSeconds`, or
+ * null. Step-scope approvals are validated by the `step.approval-request`
+ * wire schema instead.
  */
 export function findInvalidApprovalTimeout(
   workflow: LockWorkflow,
@@ -2676,11 +2378,9 @@ export function findInvalidApprovalTimeout(
 }
 
 /**
- * Build the per-host secret-resolution context for a materialized child. A
- * `runsOnAll` host child carries its identity on `mat.agent` (preferred) or
- * `mat.pinnedAgentId`/`mat.host`; a non-host child (matrix/static) has none, so
- * resolution stays fleet-wide (`'**'`-only). Returns `undefined` when there are
- * no host facts to scope by.
+ * Per-host secret-resolution facts for a host child (`mat.agent` preferred,
+ * else `pinnedAgentId`/`host`). Undefined for a non-host child, whose
+ * resolution stays fleet-wide (`'**'`-only).
  */
 export function hostCtxFromMat(mat: MaterializedJob): HostFacts | undefined {
   if (mat.agent) {
@@ -2693,13 +2393,8 @@ export function hostCtxFromMat(mat: MaterializedJob): HostFacts | undefined {
 }
 
 /**
- * Apply per-job context data: protection rules, hold creation, context
- * variables, and per-job secret resolution. Mutates `jobEnvData` in place.
- */
-/**
- * User-facing warning naming bound contexts that cannot participate in a
- * test run — non-test (`allowLocalExecution=false`) or unconfigured — plus which
- * test-allowed contexts (if any) the job runs with instead.
+ * Warning naming bound contexts unavailable to a test run (non-test or
+ * unconfigured) and the contexts the job runs with instead.
  */
 function formatTestRunUnavailableEnvWarning(unavailable: string[], remaining: string[]): string {
   const names = unavailable.map((n) => `'${n}'`).join(', ');
@@ -2710,22 +2405,17 @@ function formatTestRunUnavailableEnvWarning(unavailable: string[], remaining: st
 }
 
 /**
- * Mint the two approval holds that are decided by the LOCK FILE alone — the
- * job's own `requireApproval` and the workflow-level one on a root job.
+ * Mint the approval holds the LOCK FILE alone decides: the job's
+ * `requireApproval`, and the workflow's on a root job.
  *
- * Kept separate from {@link applyContextRulesAndSecrets} because these two need
- * nothing an agent must compute: they are statically knowable at dispatch, for
- * every job, including one whose dynamic fields defer to an init round. That is
- * the whole point of the split — the dynamic-field deferral sits above the
- * per-job evaluation block, and when these holds lived inside that block a job
- * pairing `requireApproval` with `dynamicEnv` / a dynamic context /
- * `dynamicConcurrencyGroup` / a dynamic matrix dispatched with no gate at all.
+ * Separate from {@link applyContextRulesAndSecrets} because they are knowable
+ * at dispatch for every job, including one whose dynamic fields defer to an
+ * init round; inside the per-job block (below the deferral) a job pairing
+ * `requireApproval` with any dynamic field dispatched ungated.
  *
- * Both guards on `!jobEnvData.approvalHold`, so a context-driven hold minted
- * earlier wins: it unions the job's own approval clauses AND — on a root job —
- * the workflow's into itself (`unionApprovalClauses`), making it the strictly
- * stronger requirement. Ordering is therefore load-bearing on the static path —
- * call this AFTER the context rules, never before.
+ * Both guard on `!jobEnvData.approvalHold`, so an earlier context hold wins: it
+ * unions the job's and (on a root) the workflow's clauses, so it is strictly
+ * stronger. Call this AFTER the context rules, never before.
  */
 async function applyStaticApprovalHolds(args: {
   ctx: WorkflowDispatchContext;
@@ -2734,11 +2424,8 @@ async function applyStaticApprovalHolds(args: {
 }): Promise<void> {
   const { ctx, lockJob, jobEnvData } = args;
   const { deps } = ctx;
-  // Explicit SDK requireApproval on a job with no context-driven hold:
-  // hold the job with trigger_source='explicit'.
-  // An approval this orchestrator cannot enforce must be loud. Without a
-  // heldRunStore the job dispatches ungated, which is the same outcome the
-  // dynamicJob path already reports as an error rather than dropping silently.
+  // An approval this orchestrator cannot enforce (no heldRunStore) must be
+  // loud: the job dispatches ungated, logged as an error like the dynamicJob path.
   if (lockJob.approval && !jobEnvData.approvalHold && !jobEnvData.rejected && !deps.heldRunStore) {
     logger.error('Job requires approval but no held-run store is configured — running it UNGATED', {
       runId: ctx.runId,
@@ -2753,10 +2440,7 @@ async function applyStaticApprovalHolds(args: {
       await resolveApprovalExpiry(ctx),
     );
   }
-  // Workflow-level requireApproval holds the run before any job dispatches:
-  // every root job (no `needs`) is held under one workflow-scoped requirement.
-  // Downstream jobs are gated by their `needs` edges, so holding the roots
-  // holds the whole run.
+  // Holding every root (no `needs`) holds the whole run via `needs` edges.
   const isRootJob = !lockJob.needs || lockJob.needs.length === 0;
   if (
     ctx.workflow.approval &&
@@ -2774,17 +2458,11 @@ async function applyStaticApprovalHolds(args: {
 }
 
 /**
- * Resolve which of a job's bound contexts actually participate in this
- * dispatch, and record the run's context identity on `jobEnvData`.
- *
- * Returns `null` when none participates — every bound name was unconfigured,
- * or a test run skipped them all. The caller then dispatches with the job's own
- * env only: a bound `context:` never rejects on absence.
- *
- * Split out of {@link applyContextRulesAndSecrets} for length only; the
- * sequence is unchanged. The returned entries keep `env` optional because
- * `evaluateMultiContextGates` takes that shape — the caller narrows once, after
- * the reject gates have run.
+ * The bound contexts that participate in this dispatch; records the run's
+ * context identity on `jobEnvData`. Null when none does (all unconfigured or
+ * test-skipped): the job dispatches with its own env, since a bound `context:`
+ * never rejects on absence. `env` stays optional for
+ * `evaluateMultiContextGates`; the caller narrows after the reject gates.
  */
 async function resolveParticipatingContexts(args: {
   ctx: WorkflowDispatchContext;
@@ -2796,26 +2474,20 @@ async function resolveParticipatingContexts(args: {
   const { deps, runId, workflow, resolvedOrgId } = ctx;
   if (!deps.contextStore) return null;
 
-  // Match each bound context by name (in order).
   let matched: Array<{ name: string; env: EngineContext | undefined }> = [];
   for (const name of contextNames) {
     const cfg = await deps.contextStore.matchContext(resolvedOrgId, name);
     matched.push({ name, env: cfg ? toContext(cfg) : undefined });
   }
 
-  // The run's context column / concurrency grouping uses the first declared
-  // bound name, even if some bound contexts have no configured record.
+  // The context column and concurrency grouping use the first declared name,
+  // configured or not.
   jobEnvData.contextName = contextNames[0];
-  // Record the id of the configured env matched for the first declared name —
-  // tied to the same name written into the run's `context` column. Captured
-  // before the missing/test-skip filtering below, which only governs
-  // protection rules / secrets, not history identity.
+  // Captured before the missing/test-skip filtering, which governs only
+  // protection rules and secrets, not history identity.
   jobEnvData.contextId = matched[0]?.env?.id;
 
-  // Lenient missing-context handling: a bound name with no configured record
-  // does not contribute protection rules / vars (the established
-  // single-context behavior). Proactive rejection of a provably-missing
-  // context is the deferred registration-time satisfiability check.
+  // Lenient: an unconfigured bound name contributes no rules or vars.
   const missing = matched.filter((m) => !m.env).map((m) => m.name);
   if (missing.length > 0) {
     logger.warn('bound context(s) not configured; skipping', {
@@ -2827,13 +2499,10 @@ async function resolveParticipatingContexts(args: {
     matched = matched.filter((m) => m.env);
   }
 
-  // Skip-on-test (allow-and-warn): a test/local run never rejects on a bound
-  // context. Bound contexts that cannot participate in a test run —
-  // non-test (`allowLocalExecution === false`) or unconfigured (missing above) —
-  // are dropped (their vars/secrets and gates do not participate) and named in a
-  // single user-visible warning. The fixture `secrets:` gate stays fail-closed;
-  // a bound `context:` only warns. If every bound env is unavailable, the
-  // job runs with no context vars.
+  // A test/local run never rejects on a bound context: non-test
+  // (`allowLocalExecution === false`) or unconfigured ones are dropped (vars,
+  // secrets and gates) and named in one warning. The fixture `secrets:` gate
+  // stays fail-closed.
   if (ctx.testRun) {
     const skipped = matched.filter((m) => m.env && m.env.allowLocalExecution === false);
     if (skipped.length > 0) {
@@ -2856,33 +2525,22 @@ async function resolveParticipatingContexts(args: {
     if (matched.length === 0) return null; // dispatch with no env vars — never reject
   }
 
-  // No configured context participates (all missing and/or test-skipped):
-  // dispatch with the job's own env only, no context-scoped vars/secrets.
   if (matched.length === 0) return null;
 
   return matched;
 }
 
 /**
- * Key for the in-pass admission tally.
- *
- * The org id is part of the key so the tally inherits the cross-tenant scoping
- * the running-count query already enforces on `execution_runs.customer_id`: a
- * context name shared across tenants must not leak concurrency between them.
- * One dispatch pass carries a single `resolvedOrgId`, so the org component is a
- * standing invariant rather than a live discriminator — it is here so a future
- * pass dispatching for more than one org cannot silently merge two orgs'
- * tallies. `JSON.stringify` over the pair is used rather than string
- * concatenation so no separator character can make two different pairs collide.
+ * In-pass admission tally key. The org id mirrors the count query's
+ * `customer_id` scoping so a shared context name never leaks concurrency
+ * across tenants — a standing invariant, since one pass has one org.
+ * `JSON.stringify`, not concatenation, so no separator makes pairs collide.
  */
 export function concurrencyAdmissionKey(orgId: string, concurrencyGroup: string): string {
   return JSON.stringify([orgId, concurrencyGroup]);
 }
 
-/**
- * The names this dispatch pass has admitted under one tally key, created on
- * first use.
- */
+/** Names admitted under one tally key, created on first use. */
 function admittedJobNames(ctx: WorkflowDispatchContext, admissionKey: string): Set<string> {
   ctx.concurrencyAdmissions ??= new Map();
   let names = ctx.concurrencyAdmissions.get(admissionKey);
@@ -2894,15 +2552,9 @@ function admittedJobNames(ctx: WorkflowDispatchContext, admissionKey: string): S
 }
 
 /**
- * Give back a slot an admitted job will never use.
- *
- * The one caller is the dynamic-matrix fan-out: the placeholder is gated before
- * the agent resolves the combinations, and it is then replaced by its children
- * rather than dispatched, so its reservation has to be released before they are
- * gated or a fan-out of N children would consume N+1 slots.
- *
- * Keyed by job NAME, so releasing the placeholder cannot give back a slot a
- * sibling reserved in between — which a bare counter decrement could.
+ * Give back a slot an admitted job will never use: a dynamic-matrix
+ * placeholder, gated before its children replace it, or N children take N+1
+ * slots. Keyed by NAME so it never releases a sibling's reservation.
  */
 function releaseAdmission(
   ctx: WorkflowDispatchContext,
@@ -2914,16 +2566,14 @@ function releaseAdmission(
 
 /** The gate-time facts a matrix fan-out replays once per child. */
 interface ContextGateInputs {
-  /** The aggregated effective context every bound context contributed to. */
+  /** Aggregated effective context of every bound context. */
   env: EngineContext;
   dispatchCtx: JobDispatchContext;
   effectiveConcurrencyGroup: string;
   trustTier: TrustTier | undefined;
   /**
-   * The materialized job's expanded name — what `execution_jobs.job_name`
-   * carries for the row this job eventually writes, and therefore the identity
-   * the admission tally reserves under and the count query excludes on. A
-   * matrix fan-out replays the gate per child, so each child supplies its own.
+   * Expanded name = the row's `execution_jobs.job_name`, so the identity the
+   * tally reserves and the count query excludes. Per child in a fan-out.
    */
   jobName: string;
 }
@@ -2937,26 +2587,15 @@ interface ContextGateHandle extends ContextGateInputs {
 }
 
 /**
- * Evaluate one job's admission against its bound contexts' protection rules and
- * record the verdict on `jobEnvData`.
+ * Evaluate one job against its contexts' protection rules; record the verdict
+ * on `jobEnvData`. Separate so a dynamic-matrix fan-out re-gates per child
+ * without re-resolving scoped secrets and emitting N audit lines.
  *
- * Extracted from {@link applyContextRulesAndSecrets} so a dynamic-matrix
- * fan-out can re-evaluate it per child WITHOUT re-running the whole routine —
- * re-running it would re-resolve the context's scoped secrets once per child
- * and emit N identical audit lines for one logical admission. It is also what
- * keeps that function under the 200-line ESLint ceiling.
- *
- * The count fed to the concurrency gate is the DB count PLUS the siblings
- * already admitted in this dispatch pass — but only for a job that actually
- * dispatches in this pass (`dispatchesThisPass`). The DB count cannot see what
- * this pass has just admitted, so without the second term every child of a
- * fan-out is evaluated against the same blind value.
- *
- * The two terms are disjoint BY CONSTRUCTION, not by timing: the query is
- * handed the tally's own names to exclude, so every excluded name contributes
- * exactly its tally entry, this job contributes nothing to either term, and
- * every other name contributes only its rows. Nothing can land in both terms,
- * whatever order the pass reaches its jobs in.
+ * The concurrency count is the DB count PLUS siblings admitted this pass, the
+ * latter only when `dispatchesThisPass`. The terms are disjoint BY
+ * CONSTRUCTION, not timing: the query excludes the tally's names, so each
+ * contributes only its tally entry, this job contributes to neither, and
+ * others only their rows — whatever order the pass reaches its jobs.
  */
 async function applyContextProtectionGates(args: {
   ctx: WorkflowDispatchContext;
@@ -2964,19 +2603,14 @@ async function applyContextProtectionGates(args: {
   gate: ContextGateInputs;
   jobEnvData: JobEnvData;
   /**
-   * Whether this job reaches an agent during THIS dispatch pass, which is what
-   * decides if it takes part in the in-pass admission tally.
+   * Whether this job reaches an agent THIS pass, so joins the tally. Default
+   * `true`.
    *
-   * A needs-gated job does not: the dispatch loop stores its pending context and
-   * registers it under a `needs-pending-` id, and the needs scheduler dispatches
-   * it later. Letting it reserve a slot is not merely conservative — a job the
-   * concurrency gate queues takes the hold path, which is evaluated BEFORE the
-   * needs branch, so the job never reaches the needs scheduler at all and the
-   * queued-hold release path dispatches it with no upstream check. It would then
-   * run beside a still-pending upstream, or after a FAILED one.
-   *
-   * Defaults to `true`: every other call site gates a job it is about to
-   * dispatch.
+   * A needs-gated job (stored under a `needs-pending-` id for the needs
+   * scheduler) does not. If it reserved a slot and got queued, the hold path —
+   * evaluated BEFORE the needs branch — would bypass the needs scheduler, and
+   * the queued-hold release would dispatch it with no upstream check, beside a
+   * pending or after a FAILED upstream.
    */
   dispatchesThisPass?: boolean;
 }): Promise<ContextGateHandle> {
@@ -2985,39 +2619,30 @@ async function applyContextProtectionGates(args: {
   const { deps, runId, workflow, resolvedOrgId } = ctx;
   const { env, dispatchCtx, effectiveConcurrencyGroup, trustTier, jobName } = gate;
 
-  // RESERVE this job's slot in one synchronous turn, before any await below.
-  // Both the count and `evaluateProtectionRules` are async, so two dynamic-
-  // matrix flow-backs resuming inside those awaits would otherwise both read
-  // the same pre-reservation state and both be admitted against one slot. A
-  // non-pass verdict releases the reservation immediately after.
+  // RESERVE synchronously, before any await: two dynamic-matrix flow-backs
+  // resuming inside the awaits would otherwise both be admitted against one
+  // slot. A non-pass verdict releases it.
   const admissionKey = concurrencyAdmissionKey(resolvedOrgId, effectiveConcurrencyGroup);
   const admitted = admittedJobNames(ctx, admissionKey);
   if (dispatchesThisPass) admitted.add(jobName);
 
-  // One snapshot of the tally, plus this job itself, drives BOTH terms below.
-  // This job is excluded from both — the gate asks how many slots OTHERS hold —
-  // so a job whose own row already exists (its init round, a retry) does not
-  // gate itself out.
+  // One tally snapshot plus this job drives BOTH terms. This job is excluded
+  // from both (the gate counts OTHERS' slots), so a job whose row exists (init
+  // round, retry) does not gate itself out.
   const excludeJobNames = new Set(admitted);
   excludeJobNames.add(jobName);
-  // The SHARED definition of an occupied slot — the same one the ready re-gate
-  // and the release sweep read. A job occupies its slot from the moment it is
-  // dispatched, not from the moment its agent reports `running`: counting only
-  // `running` left every dispatched job invisible here for the whole
-  // agent-provisioning window, so a burst of arrivals inside that window was
-  // admitted in full against one slot.
+  // The SHARED occupied-slot definition (also the ready re-gate and release
+  // sweep): occupied from dispatch, not `running`, or a burst inside the
+  // agent-provisioning window is admitted against one slot.
   const occupiedElsewhere = deps.db
     ? await countOccupyingJobs(deps.db, resolvedOrgId, effectiveConcurrencyGroup, {
         runId,
         jobNames: [...excludeJobNames],
       })
     : 0;
-  // Sized from the SAME set the query excluded, not from a fresh read of the
-  // tally. A sibling that reserves while that query is in flight is outside the
-  // exclusion, so counting it here as well would count it twice the moment its
-  // row lands — the exact double-count this arithmetic exists to prevent. One
-  // snapshot feeds both terms, so nothing can appear in both. A job that does
-  // not dispatch from this pass is evaluated against the count alone.
+  // Sized from the SAME set the query excluded, not a fresh tally read: a
+  // sibling reserving mid-query is outside the exclusion and would count twice
+  // once its row lands. A job not dispatching this pass uses the count alone.
   const occupiedBySiblings = dispatchesThisPass ? excludeJobNames.size - 1 : 0;
 
   const gateResult = await evaluateProtectionRules(
@@ -3028,15 +2653,13 @@ async function applyContextProtectionGates(args: {
     trustTier,
   );
   if (dispatchesThisPass && gateResult.action !== 'pass') {
-    // Not dispatching, so it holds no slot. Deleting this job's own name cannot
-    // touch a sibling's reservation, however many landed in between.
+    // Holds no slot; deleting its own name never touches a sibling's.
     admitted.delete(jobName);
   }
   const handle: ContextGateHandle = {
     ...gate,
     admissionKey,
-    // A job that took no part in the tally holds no slot, so a later
-    // `releaseAdmission` on its handle must not give one back.
+    // Outside the tally means no slot for `releaseAdmission` to give back.
     admitted: dispatchesThisPass && gateResult.action === 'pass',
   };
 
@@ -3061,15 +2684,11 @@ async function applyContextProtectionGates(args: {
     const isApprovalHold =
       gateResult.action === 'hold' &&
       (gateResult.holdType ?? HoldType.enum.reviewer) === HoldType.enum.reviewer;
-    // An approval hold (reviewer gate) defers hold creation to the dispatch
-    // loop so the resume path can store the job's dispatch context. Security /
-    // wait / queue holds are created immediately.
+    // A reviewer hold is created by the dispatch loop, which also stores the
+    // resume context.
     if (deps.heldRunStore && isApprovalHold) {
-      // This hold REPLACES whatever `applyStaticApprovalHolds` would have
-      // minted (both its branches are guarded on `!approvalHold`), so it must
-      // carry every source that would otherwise have gated the job. The
-      // workflow-level gate holds root jobs only — downstream jobs are gated by
-      // their `needs` edges — so a non-root job's clause set stays untouched.
+      // REPLACES what `applyStaticApprovalHolds` would mint, so it carries
+      // every source; the workflow clause applies to root jobs only.
       const isRoot = !lockJob.needs || lockJob.needs.length === 0;
       const explicit = unionApprovalClauses(
         lockJob.approval,
@@ -3088,9 +2707,8 @@ async function applyContextProtectionGates(args: {
         },
       };
     } else if (deps.heldRunStore) {
-      // Carried, not written here: `holdJobForApproval` writes it together with
-      // the job's pending dispatch context so a hold can never exist without a
-      // resume path.
+      // Carried: `holdJobForApproval` writes it with the pending context, so no
+      // hold exists without a resume path.
       jobEnvData.nonApprovalHold = {
         runId,
         jobId: dispatchCtx.jobId,
@@ -3110,50 +2728,34 @@ async function applyContextProtectionGates(args: {
       holdType: gateResult.holdType,
       reason: gateResult.reason,
     });
-    // The pending `KiCI Security` check of a security-typed hold is NOT posted
-    // here. Nothing has written a `held_runs` row yet, and every route that
-    // settles that check reaches it through one — so a post here that the row
-    // write never followed (no store, no database, a rolled-back transaction)
-    // would strand a pending check that nothing can ever terminalize. It is
-    // posted by `holdJobForApproval`, after the row and the resume context land
-    // in one transaction.
+    // A security hold's pending `KiCI Security` check is NOT posted here: every
+    // route that settles it goes through a `held_runs` row, so a post without
+    // the row (no store, rolled back) strands it. `holdJobForApproval` posts it
+    // after the row and resume context commit.
   }
   return handle;
 }
 
 /**
- * Resolve a job's bound contexts, run their protection gates, and — when the
- * job is admitted — resolve the contexts' variables and scoped secrets onto its
- * `jobEnvData`.
- *
- * Returns the {@link ContextGateHandle} a dynamic-matrix fan-out re-gates each
- * child with, or `undefined` when no gate ran (no context store, no
- * participating context, or a hard multi-context rejection).
+ * Resolve bound contexts, run their gates, and on admission resolve their
+ * variables and scoped secrets onto `jobEnvData`. Returns the handle a
+ * dynamic-matrix fan-out re-gates children with; undefined when no gate ran.
  */
 async function applyContextRulesAndSecrets(args: {
   ctx: WorkflowDispatchContext;
   lockJob: LockJob;
   /**
-   * The materialized job's expanded name — what `held_runs.job_id` carries for
-   * a hold this function creates. `lockJob.name` must NOT be used: every child
-   * of a matrix job shares it, so sibling holds would be indistinguishable.
+   * `held_runs.job_id` for a hold created here; NOT `lockJob.name`, which
+   * matrix siblings share.
    */
   expandedName: string;
   contextNames: readonly string[];
   concurrencyGroup: string | undefined;
   jobEnvData: JobEnvData;
   hostCtx?: HostFacts;
-  /**
-   * Whether this job reaches an agent during THIS dispatch pass. Forwarded to
-   * {@link applyContextProtectionGates}, which documents why a needs-gated job
-   * must stay out of the in-pass admission tally. Defaults to `true`.
-   */
+  /** See {@link applyContextProtectionGates}. Default `true`. */
   dispatchesThisPass?: boolean;
-  /**
-   * Whether to resolve the job's container registry credentials. A generated
-   * job's config carries no container, so it passes `false` rather than
-   * resolving credentials nothing reads. Defaults to `true`.
-   */
+  /** Default `true`; a generated job (no container) passes `false`. */
   resolveRegistryAuth?: boolean;
 }): Promise<ContextGateHandle | undefined> {
   const { ctx, lockJob, expandedName, contextNames, concurrencyGroup, jobEnvData, hostCtx } = args;
@@ -3171,10 +2773,8 @@ async function applyContextRulesAndSecrets(args: {
   if (!participating) return undefined;
   const matched = participating;
 
-  // Every reader of `held_runs.job_id` resolves it as the job name: the
-  // dashboard approval queue, `kici approve --job`, and the MCP approve/reject
-  // tools. Store the expanded name so those surfaces can name and target the
-  // held job.
+  // Readers of `held_runs.job_id` (dashboard queue, `kici approve --job`, MCP
+  // approve/reject) resolve it as the job name.
   const jobId = expandedName;
   const dispatchCtx: JobDispatchContext = {
     branch: policyBranch(ctx),
@@ -3185,9 +2785,8 @@ async function applyContextRulesAndSecrets(args: {
     internallyTriggered: ctx.internallyTriggered === true,
   };
 
-  // All-must-pass hard reject gates (enabled/branch/trigger/repo) across every
-  // configured bound context. When any rejects, the run is rejected with a
-  // reason naming the offending context and rule.
+  // All-must-pass reject gates (enabled/branch/trigger/repo); the reason names
+  // the offending context and rule.
   const rejections = evaluateMultiContextGates(matched, dispatchCtx);
   if (rejections.length > 0) {
     jobEnvData.rejected = true;
@@ -3201,9 +2800,8 @@ async function applyContextRulesAndSecrets(args: {
     return undefined;
   }
 
-  // Every remaining bound context is configured and passed the reject gates.
   const present = matched.map((m) => ({ name: m.name, env: m.env as EngineContext }));
-  // The configured primary context drives the merged-data resolution below.
+  // The configured primary context drives merged-data resolution.
   jobEnvData.contextName = present[0].name;
   const eff = aggregateProtectionParams(present.map((p) => p.env));
   const env = buildEffectiveContext(present[0].env, eff);
@@ -3235,10 +2833,9 @@ async function applyContextRulesAndSecrets(args: {
       : undefined;
 
   if (jobEnvData.rejected) return gateHandle;
-  // Recorded for every admitted job, not only a held one: a job the static
-  // approval gate holds next, or one that waits on upstream jobs, is stored as a
-  // pending dispatch context without its context data and resolves it from this
-  // record when it is dispatched.
+  // Recorded for every admitted job: one the static approval gate holds next,
+  // or one awaiting upstream, is stored without context data and resolves it
+  // from this record at dispatch.
   jobEnvData.contextResolution = {
     contexts: present.map((p) => ({ name: p.name, id: p.env.id })),
     orgId: resolvedOrgId,
@@ -3269,15 +2866,13 @@ async function applyContextRulesAndSecrets(args: {
       });
     }
   }
-  // A held job resolves nothing now: the release path resolves the same data
-  // from the record above once the hold is released.
+  // A held job's release path resolves the data from the record above.
   return gateHandle;
 }
 
 /**
- * Phase D — evaluate static jobs' context data, queue deferred-init jobs
- * for jobs with dynamic fields, and pick the first `runContextName` for
- * the run.
+ * Phase D — evaluate static jobs' context data, queue deferred-init jobs for
+ * dynamic fields, and pick the run's `runContextName`.
  */
 export async function evaluateJobContexts(args: {
   ctx: WorkflowDispatchContext;
@@ -3298,33 +2893,25 @@ export async function evaluateJobContexts(args: {
       workflow,
       lockJob,
     );
-    // Ordered display list persisted on the job row (placeholder for unresolved
-    // dynamic elements; the deferred-init flow-back overwrites it once resolved).
     const displayEnvNames = buildJobContextDisplayNames(workflow, lockJob);
     if (displayEnvNames.length > 0) jobEnvData.contextNames = displayEnvNames;
-    // A dynamic field cannot be evaluated here AT ALL — its value is only known
-    // once the agent has run the workflow module — so the whole per-job block
-    // below is skipped and the init result drives it instead.
+    // A dynamic field is known only once the agent runs the workflow module, so
+    // the init result drives the per-job block instead.
     const needsInit =
       envNeedsInit ||
       lockJob.dynamicEnv === true ||
       lockJob.dynamicConcurrencyGroup === true ||
-      // A dynamic matrix is resolved by the same agent-eval init flow: the agent
-      // runs the matrix fn, returns the combinations, and the init-result path
-      // re-materializes N children at dispatch.
+      // The agent runs the matrix fn; the init-result path re-materializes N children.
       mat.pendingDynamicMatrix === true;
 
     if (needsInit && deps.pendingInits) {
-      // Approval is decided by the lock file, not by the init round — but it is
-      // minted in the FLOW-BACK, not here. Setting `held` before the round would
-      // make `applyContextRulesAndSecrets` skip its own final block (guarded on
-      // `!held`), so the job's context vars, secrets and registry auth would
-      // never resolve and the stored input the release path dispatches would be
-      // missing them. The documented ordering — context rules first, static
-      // holds after — has to hold on this path too.
+      // Approval is minted in the FLOW-BACK, not here: `held` set now would make
+      // `applyContextRulesAndSecrets` skip its `!held` block, so context vars,
+      // secrets and registry auth never resolve into the stored release input.
+      // Context rules first, static holds after, holds on this path too.
       //
-      // Nothing between here and the flow-back reads `held`: the dispatch loop
-      // and the peer filter both exclude a `pendingInit` job first.
+      // Nothing before the flow-back reads `held`: the dispatch loop and peer
+      // filter exclude a `pendingInit` job first.
       jobEnvData.pendingInit = true;
       deferredInitJobs.push(buildDeferredInitJob({ ctx, setup, buildPrep, mat }));
       jobContextData.set(mat.expandedName, jobEnvData);
@@ -3339,8 +2926,7 @@ export async function evaluateJobContexts(args: {
 
     if (jobEnv) jobEnvData.jobEnv = jobEnv;
     if (contextNames.length > 0) {
-      // Run the matcher first so jobEnvData.contextId is populated, then
-      // capture the run-level name + id from the first env-bearing job.
+      // Populates jobEnvData.contextId; the first env-bearing job names the run.
       await applyContextRulesAndSecrets({
         ctx,
         lockJob,
@@ -3349,9 +2935,7 @@ export async function evaluateJobContexts(args: {
         concurrencyGroup,
         jobEnvData,
         hostCtx: hostCtxFromMat(mat),
-        // A needs-gated job does not dispatch from this pass — the loop below
-        // stores its pending context and the needs scheduler dispatches it
-        // later — so it takes no in-pass slot.
+        // A needs-gated job dispatches later via the needs scheduler: no slot.
         dispatchesThisPass: isRootJob(lockJob),
       });
       if (!runContextName) {
@@ -3360,21 +2944,15 @@ export async function evaluateJobContexts(args: {
       }
     }
     await applyStaticApprovalHolds({ ctx, lockJob, jobEnvData });
-    // A workflow-level `filter` defers only the DISPATCH — never the evaluation
-    // above. Everything a job gets without a filter (its bound contexts, their
-    // vars and scoped secrets, the context rules that can reject it, and its
-    // approval hold) it still gets with one; the init job just decides whether
-    // the dispatch happens. Reusing the dynamic-field `continue` here is what
-    // made declaring a filter silently drop all of it.
+    // A workflow `filter` defers only the DISPATCH, never the evaluation above
+    // (contexts, vars, secrets, reject rules, approval hold); the dynamic-field
+    // `continue` would silently drop all of that.
     //
-    // A rejected or held job needs no verdict: it is not dispatching from here
-    // either way, and giving it an init job would let the flow-back dispatch it
-    // past the very hold that stopped it. The consequence is that a held job's
-    // filter is never evaluated — approval, not the filter, is its gate.
+    // A rejected or held job gets no init job: the flow-back would dispatch it
+    // past its hold. A held job's filter is never evaluated; approval gates it.
     //
-    // Deferred paths are the second verdict the init job returns: a workflow
-    // that matched only because the changed files were unavailable learns from
-    // the agent's clone whether its `paths` actually match.
+    // Deferred paths are the init job's second verdict: a match made without
+    // changed files learns from the clone whether its `paths` match.
     if (
       (workflow.hasFilter === true || deferredPathsOf(ctx) !== undefined) &&
       deps.pendingInits &&
@@ -3394,12 +2972,10 @@ export async function evaluateJobContexts(args: {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve every static job's `sandbox:` escape-hatch request against the org
- * allow-list. Deny is loud + total: the first non-allow-listed request returns
- * `{ denied }` (the caller fails the whole run) — a disallowed capability is
- * never silently stripped and run. Jobs with no request, or a non-escalating
- * one, contribute no grant. The agent applies only the returned grants and never
- * reads the allow-list.
+ * Resolve every `sandbox:` request against the org allow-list. Deny is loud and
+ * total: the first disallowed request returns `{ denied }` and the run fails —
+ * never silently stripped. A non-escalating request adds no grant. The agent
+ * applies only these grants and never reads the allow-list.
  */
 function resolveWorkflowSandboxGrants(
   workflow: LockWorkflow,
@@ -3417,12 +2993,7 @@ function resolveWorkflowSandboxGrants(
   return { grants };
 }
 
-/**
- * Read the org's Dockerfile-build opt-in, defaulting to DENY.
- *
- * Deny on a read failure, not allow: an unreadable setting must not widen what
- * an untrusted ref may do.
- */
+/** The org's Dockerfile-build opt-in; DENY on a read failure, so it never widens. */
 async function readAllowUntrustedDockerfileBuilds(ctx: WorkflowDispatchContext): Promise<boolean> {
   if (!ctx.deps.db) return false;
   try {
@@ -3442,24 +3013,15 @@ async function readAllowUntrustedDockerfileBuilds(ctx: WorkflowDispatchContext):
 }
 
 /**
- * Refuse a Dockerfile build on an untrusted ref, unless the org opted in.
+ * Refuse a Dockerfile build on an untrusted ref unless the org opted in. The
+ * build runs arbitrary `RUN` commands on the host daemon, OUTSIDE the hardened
+ * posture (`docker build` cannot be capability-restricted). Untrusted = fork
+ * PR, unresolved contributor, or internal run without a trusted emitter (the
+ * user-cache write-scope classification) — including a `kiciEvent()`
+ * subscriber that inherited an `unknown` tier or nothing at all.
  *
- * A job may build its container image from a Dockerfile in the repository. That
- * build runs arbitrary `RUN` commands on the agent host's daemon, OUTSIDE the
- * hardened posture the job's own steps get — `docker build` cannot be
- * capability-restricted the way a container run can. So an untrusted ref (a fork
- * PR, an unresolved contributor, or an internally-triggered run without a
- * trusted emitter — the same classification the user-cache write scope uses)
- * reaches it only where the operator said so.
- *
- * "Without a trusted emitter" covers both halves of the internal case: a
- * `kiciEvent()` subscriber that inherited an `unknown` tier, and one
- * that inherited nothing at all (no emitting run, no persisted tier, a lookup
- * that failed) — the strict fallback, which is not an "untrusted emitter".
- *
- * Enforced here, at dispatch, and nowhere else: the agent applies only what
- * dispatch authorized, exactly as it does for the sandbox capability grant. Deny
- * is loud and total — the build never starts.
+ * Enforced only here, at dispatch; the agent applies what dispatch authorized,
+ * as for sandbox grants. Deny is loud and total.
  */
 export function resolveWorkflowDockerfileBuilds(
   workflow: LockWorkflow,
@@ -3500,41 +3062,26 @@ function makeBuildJobConfig(args: {
   npmRegistries: NpmRegistrySpec[] | undefined;
   installEnvSecrets: Record<string, string> | undefined;
   event: SimulatedEvent;
-  /**
-   * Verbatim `jobConfig.event` envelope, when the caller states one. See
-   * `WorkflowDispatchContext.eventEnvelopeOverride`.
-   */
+  /** See `WorkflowDispatchContext.eventEnvelopeOverride`. */
   eventEnvelopeOverride: Record<string, unknown> | undefined;
-  /** Org id that owns the run — namespaces the user-facing cache. */
+  /** Namespaces the user-facing cache. */
   cacheOrgId: string;
-  /** Repo identifier (e.g. "owner/repo") — second user-cache namespacing level. */
+  /** Second user-cache namespacing level ("owner/repo"). */
   cacheRepoId: string;
-  /** User-cache write scope for this dispatch (trusted => shared, else isolated). */
+  /** Trusted => shared, else isolated. */
   cacheRefScope: CacheRefScope;
   /**
-   * True for test runs (`kici run`), which ship the workflow body as a
-   * working-tree overlay that may differ from the committed lock. Omitting
-   * `contentHash` tells the agent to skip the lock-vs-source hash check so the
-   * overlaid (uncommitted) source is accepted.
+   * True for `kici run`, whose overlay may differ from the committed lock; no
+   * `contentHash` makes the agent skip the lock-vs-source check.
    */
   omitContentHash: boolean;
-  /**
-   * Run-wide flat secrets layered onto every job's secrets, UNDER the per-job
-   * env-resolved set so the run-wide value wins on collision (the test path's
-   * CLI `--secret` / `--env` flat secrets). Undefined for webhook runs.
-   */
+  /** See `WorkflowDispatchContext.runWideFlatSecrets`; the run-wide value wins. */
   runWideFlatSecrets: Record<string, string> | undefined;
-  /**
-   * Resolved (coerced + defaulted) workflow-dispatch inputs from `kici run
-   * --input`, stamped onto every job's config so the agent exposes them as
-   * `ctx.dispatchInputs`. Undefined for webhook runs.
-   */
+  /** See `WorkflowDispatchContext.dispatchInputs`. */
   dispatchInputs: Record<string, unknown> | undefined;
   /**
-   * Dispatch-resolved per-job sandbox escape-hatch grants, keyed by lock-job
-   * name. Populated only for jobs whose `sandbox:` request the orchestrator
-   * authorized against the org allow-list (a denied request fails the run before
-   * this builder runs). Absent key ⇒ no grant ⇒ default hardened posture.
+   * Allow-listed sandbox grants by lock-job name (a denied request already
+   * failed the run). Absent ⇒ default hardened posture.
    */
   resolvedSandboxGrants: ReadonlyMap<string, ResolvedSandboxGrant>;
 }): BuildJobConfigFn {
@@ -3561,15 +3108,13 @@ function makeBuildJobConfig(args: {
     return {
       source: workflow.source ?? fullLockFile.source,
       workflowName: workflow.name,
-      // The expanded child name is the job identity for reporting + log labels;
-      // the agent exposes the BASE name on ctx.job.name (via baseJobName) and the
-      // combination only via ctx.matrix.
+      // Expanded name for reporting and log labels; the agent exposes the BASE
+      // name as ctx.job.name and the combination only via ctx.matrix.
       name: mat.expandedName,
       baseJobName: mat.baseName,
       ...(mat.variantValues && { matrixValues: mat.variantValues }),
-      // Operator dispatch inputs (run-scoped, identical for every job).
       ...(dispatchInputs && { dispatchInputs }),
-      // Host fan-out: expose the per-host identity as ctx.host / ctx.agent.
+      // Exposed as ctx.host / ctx.agent.
       ...(mat.host && { host: mat.host }),
       ...(mat.agent && {
         agent: {
@@ -3579,28 +3124,22 @@ function makeBuildJobConfig(args: {
           ...(mat.agent.arch && { arch: mat.agent.arch }),
         },
       }),
-      // Fan-out position: expose the deterministic ordinal as ctx.fanout.
+      // Deterministic ordinal, exposed as ctx.fanout.
       ...fanoutEnvelopeFields(mat),
-      // Single-agent selection policy (read by the dispatcher at selection time;
-      // the agent ignores it). Defaults to deterministic when the lock omits it.
+      // Read by the dispatcher at selection; the agent ignores it. Default
+      // deterministic.
       ...(lockJob.runsOnPick && { runsOnPick: lockJob.runsOnPick }),
       steps: lockJob.steps,
       needs: lockJob.needs,
       rules: lockJob.rules,
-      // The job's container image selects the container execution backend on the
-      // agent (determineExecutionMode gives jobConfig.container top priority), so
-      // it must survive dispatch or a container:-field job silently runs bare-metal.
+      // Selects the agent's container backend (top priority in
+      // determineExecutionMode); dropped, the job silently runs bare-metal.
       ...(lockJob.container && { container: lockJob.container }),
-      // The job's named git credentials, as declared in the lock. Values are
-      // secret NAMES; the agent resolves nothing itself — it names one by key
-      // and the orchestrator's credential relay checks it against the same
-      // declaration it persisted on `execution_jobs.git_credentials`. Without
-      // this the agent's map is always empty, so `credential: 'x'` throws and
-      // `default` silently falls back to the source credential.
+      // Secret NAMES; the agent names one by key and the credential relay checks
+      // it against `execution_jobs.git_credentials`. Without it `credential: 'x'`
+      // throws and `default` silently falls back to the source credential.
       ...(lockJob.gitCredentials && { gitCredentials: lockJob.gitCredentials }),
-      // The dispatch-resolved sandbox escape-hatch grant (allow-listed here, the
-      // single enforcement point). The agent applies only this resolved grant and
-      // never reads the allow-list. Absent ⇒ default hardened posture.
+      // Absent ⇒ default hardened posture.
       ...(resolvedSandboxGrants.get(lockJob.name) && {
         sandboxGrant: resolvedSandboxGrants.get(lockJob.name),
       }),
@@ -3612,17 +3151,14 @@ function makeBuildJobConfig(args: {
       ...(npmRegistries && npmRegistries.length > 0 && { npmRegistries }),
       ...(installEnvSecrets && Object.keys(installEnvSecrets).length > 0 && { installEnvSecrets }),
       ...(envData?.contextName && { context: envData.contextName }),
-      // Run-wide CLI flat secrets win a key collision with the context secrets,
-      // and reach a job with no context too.
+      // Run-wide CLI secrets win a collision and reach context-less jobs too.
       ...contextDataConfigFields(envData, runWideFlatSecrets),
       ...(envData?.jobEnv && { jobEnv: envData.jobEnv }),
       ...(lockJob.resources && { resources: lockJob.resources }),
-      // Job-level wall-clock timeout (ms). The agent reads jobConfig.timeout in
-      // buildRequest → request.jobTimeoutMs to arm the job deadline.
+      // Wall-clock ms; the agent arms the deadline via request.jobTimeoutMs.
       ...(lockJob.timeout !== undefined && { timeout: lockJob.timeout }),
-      // User-facing cache namespacing — carried through the dispatch so the
-      // agent-WS handler can resolve the org/repo/scope of a cache request
-      // from the tracked dispatch (never from the agent's wire message).
+      // The agent-WS handler resolves a cache request's org/repo/scope from the
+      // tracked dispatch, never from the agent's wire message.
       ...(cacheOrgId && { cacheOrgId }),
       ...(cacheRepoId && { cacheRepoId }),
       cacheRefScope,
@@ -3636,10 +3172,7 @@ function makeBuildJobConfig(args: {
 // Phase E+F+G — static job dispatch
 // ---------------------------------------------------------------------------
 
-/**
- * Build the QueuedJobInput for an execution job (used by both cluster and
- * single-orch paths).
- */
+/** The QueuedJobInput for an execution job (cluster and single-orch paths). */
 function buildExecutionJobInput(args: {
   ctx: WorkflowDispatchContext;
   setup: DispatchSetup;
@@ -3659,12 +3192,9 @@ function buildExecutionJobInput(args: {
     runsOnPatterns: selectors.runsOnPatterns,
     excludeLabels: selectors.excludeLabels,
     excludePatterns: selectors.excludePatterns,
-    // Bake ctx.extraJobConfig into the job's config so a needs-gated / wave-held
-    // child carries it too: gated children are stored as a pending context and
-    // re-dispatched later by the needs scheduler through the base dispatcher,
-    // which does NOT re-apply the dispatcher wrapper's extraJobConfig merge.
-    // Without this, a test run's overlay/`fullRepo` provenance would be lost on
-    // the downstream and the agent would try to clone an empty repoUrl.
+    // Baked in because gated children re-dispatch through the base dispatcher,
+    // which skips the wrapper's extraJobConfig merge; else a test run's
+    // overlay/`fullRepo` provenance is lost and the agent clones an empty repoUrl.
     jobConfig: { ...buildJobConfig(mat), ...globalJobConfigFor(ctx), ...ctx.extraJobConfig },
     repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
     ref: event.sourceBranch ?? event.targetBranch,
@@ -3676,8 +3206,7 @@ function buildExecutionJobInput(args: {
     ...cacheArtifactFields(buildPrep),
     requestId: getRequestContext().requestId,
     ...(lockJob.resources && { resources: lockJob.resources }),
-    // Host fan-out: pin this child to its resolved agent (+ the cross-cluster
-    // reroute hint). The dispatcher routes it only to that agent.
+    // Host fan-out pin (plus the cross-cluster reroute hint).
     ...(mat.pinnedAgentId && { pinnedAgentId: mat.pinnedAgentId }),
     ...(mat.connectedInstanceId !== undefined && {
       connectedInstanceId: mat.connectedInstanceId,
@@ -3686,50 +3215,6 @@ function buildExecutionJobInput(args: {
 }
 
 /**
- * Post the pending `KiCI Security` status, and record on every hold that gates
- * this commit's check that the commit now carries it.
- *
- * The record is what a settle reads to decide whether a hold has a check to
- * terminalize. Deriving that from the row's shape instead answers what the code
- * INTENDED, and `postCheckStatus` CREATES the named run when it finds none — so
- * a post the provider refused left a shape saying "posted" and a settle that
- * put a completed `KiCI Security` run on a commit which never had one.
- *
- * `heldRunIds` is plural because the commit carries ONE check run: a job held on
- * two independent requirements has both of them gating it, and marking only the
- * one whose summary was rendered would let the first to end resolve a check the
- * other is still gating.
- *
- * Awaited, where the post used to be fire-and-forget: the record can only be
- * written once the provider has accepted, and a record racing the settle is a
- * record the settle may not see. A failed post is still swallowed — the dispatch
- * loop is never blocked by a provider error — but the round-trip is now
- * serial and inside the per-job loop, so N held jobs cost N of them.
- *
- * On success and then a failed record the commit keeps a pending check the
- * settle will decline to close. That is the residue the fire-and-forget post
- * could already leave, now narrowed to whatever can fail between the accepted
- * post and ONE statement. The record is therefore retried
- * {@link PENDING_CHECK_MARK_ATTEMPTS} times before it is given up on, which
- * closes the half of that window the doc above names as reachable without a
- * process dying — a lost connection, a statement timeout, a deadlock. What is
- * left is a process death inside the retry window, and nothing in reach closes
- * that: a sweeper would have to ask the provider whether the check exists, and
- * `CheckStatusPoster` has no read method. Adding one means a new method on a
- * compat-protected engine interface, every implementation and every hand-built
- * bundle, to recover a window measured in milliseconds — against a recovery
- * that already exists, since pushing a new commit re-posts. A sweeper without
- * that read could only guess, and a wrong guess FABRICATES a check, which is
- * the worse direction either way: a fabricated failing check on a pull request
- * is worse than a stuck one.
- *
- * The record is one statement over every id, never one per id. A partial mark
- * would leave an unmarked hold uncounted by the contention query, so the first
- * hold to end would terminalize the shared check while the other still gates
- * the job — a fabricated PASSING check, the worse direction, and reachable
- * without any process dying. See `markPendingCheckPosted`.
- */
-/**
  * How many times {@link postPendingHoldCheck} tries to record an accepted post
  * on the hold rows before giving up and leaving the check unclosable.
  */
@@ -3737,6 +3222,32 @@ export const PENDING_CHECK_MARK_ATTEMPTS = 3;
 /** Backoff between mark attempts, multiplied by the attempt number. */
 const PENDING_CHECK_MARK_RETRY_BASE_MS = 25;
 
+/**
+ * Post the pending `KiCI Security` status, then record on every hold gating
+ * this commit's check that the commit carries it.
+ *
+ * A settle reads the record, not the row's shape, to decide whether there is a
+ * check to terminalize: `postCheckStatus` CREATES a missing run, so a shape
+ * saying "posted" after a refused post put a completed check on a commit that
+ * never had one.
+ *
+ * `heldRunIds` is plural because the commit carries ONE check run: with two
+ * requirements gating a job, marking one lets the first to end resolve a check
+ * the other still gates. Marked in one statement, never per id — a partial
+ * mark lets the contention query miss a hold and fabricate a PASSING check
+ * (`markPendingCheckPosted`).
+ *
+ * Awaited so the record lands before a settle can race it; a failed post is
+ * swallowed so the dispatch loop never blocks, at one serial round-trip per
+ * held job.
+ *
+ * A failed record after a successful post leaves a pending check no settle
+ * closes; retried {@link PENDING_CHECK_MARK_ATTEMPTS} times to cover a lost
+ * connection, statement timeout or deadlock. A process death mid-retry stays
+ * open: a sweeper would need a read on `CheckStatusPoster`, a compat-protected
+ * engine interface, to recover milliseconds that a new commit already
+ * recovers — and guessing FABRICATES checks, worse than a stuck one.
+ */
 export async function postPendingHoldCheck(args: {
   poster: NonNullable<NonNullable<WorkflowDispatchContext['bundle']>['checkStatusPoster']>;
   store: NonNullable<ProcessingDeps['heldRunStore']>;
@@ -3775,8 +3286,7 @@ export async function postPendingHoldCheck(args: {
         holdIds: args.heldRunIds,
         attempt,
         attempts: PENDING_CHECK_MARK_ATTEMPTS,
-        // Names the consequence: a give-up leaves a pending check on the commit
-        // that no settle will close, recoverable only by a new commit.
+        // A give-up leaves a pending check only a new commit recovers.
         outcome: lastAttempt ? 'giving up — the pending check will not be closed' : 'retrying',
         error: toErrorMessage(err),
       });
@@ -3789,11 +3299,8 @@ export async function postPendingHoldCheck(args: {
 }
 
 /**
- * Hold a job awaiting approval: create the `held_runs` row (with the resolved
- * `ApprovalRequirement`) and persist the job's dispatch context so `release()`
- * can re-dispatch it through `dispatchReadyJob` after approval. A job with no
- * `approvalHold` (security / wait / queue holds, whose row was created eagerly)
- * just logs and stays held.
+ * Hold a job: create the `held_runs` row and persist its dispatch context so
+ * `release()` re-dispatches it through `dispatchReadyJob`.
  */
 async function holdJobForApproval(args: {
   ctx: WorkflowDispatchContext;
@@ -3816,9 +3323,8 @@ async function holdJobForApproval(args: {
     placeholder: {
       jobName: mat.expandedName,
       ...(mat.variantValues && { matrixValues: mat.variantValues }),
-      // A held matrix / host child keeps its variant identity. Without these the
-      // row carries a null `base_job_name`, which the rolling-wave scheduler keys
-      // on — so the wave would never fire for a child that was held.
+      // The rolling-wave scheduler keys on `base_job_name`; null, a held
+      // child's wave never fires.
       ...variantTrackingFields(mat),
       ...gitCredentialFields(mat.lockJob),
       runsOnLabels: selectors.runsOnLabels,
@@ -3828,17 +3334,14 @@ async function holdJobForApproval(args: {
 }
 
 /**
- * Store a job as a pending dispatch context, to be dispatched later by
- * `dispatchReadyJob`.
- *
- * A job bound to a context is stored WITHOUT its context data and WITH the
- * record its later dispatch resolves that data from, so no context secret is
- * kept at rest while the job waits. A job with no record stores its input as
- * built: it carries no context data, only the run-wide secrets.
+ * Store a job as a pending dispatch context for `dispatchReadyJob`. A bound job
+ * is stored WITHOUT context data, WITH the record to resolve it from, so no
+ * context secret rests while it waits. Without a record the input is stored as
+ * built (run-wide secrets only).
  */
 async function storeDeferredJobContext(args: {
   ctx: WorkflowDispatchContext;
-  /** The executor to write through: the dispatch's own db, or a transaction. */
+  /** The dispatch's own db, or a transaction. */
   db: Parameters<typeof storePendingJobContext>[0];
   jobName: string;
   jobInput: QueuedJobInput;
@@ -3858,22 +3361,20 @@ async function storeDeferredJobContext(args: {
 }
 
 /**
- * Write a held job's `held_runs` row(s) and its pending dispatch context in one
- * transaction, audit each row, register its `needs-pending-` placeholder, and
- * post the pending commit check. Shared by lock-defined jobs
- * ({@link holdJobForApproval}) and the jobs a dynamic generator produces
- * ({@link holdGeneratedJobs}), which build their dispatch input differently but
- * resume through the same `dispatchReadyJob` path.
+ * Write a held job's `held_runs` row(s) and pending context in one transaction,
+ * audit each row, register its `needs-pending-` placeholder, and post the
+ * pending check. Shared by {@link holdJobForApproval} and
+ * {@link holdGeneratedJobs}; both resume through `dispatchReadyJob`.
  */
 async function persistJobHold(args: {
   ctx: WorkflowDispatchContext;
-  /** The expanded job name — `held_runs.job_id` and the pending-context key. */
+  /** Expanded name: `held_runs.job_id` and the pending-context key. */
   jobName: string;
   envData: JobEnvData;
   runsOnLabels: string[];
   /** Built only once the hold is known to persist. */
   buildJobInput: () => QueuedJobInput;
-  /** The run row registered while the job waits; its id is minted here. */
+  /** Registered while the job waits; its id is minted here. */
   placeholder: Omit<DispatchedJob, 'jobId'>;
   dispatchedJobs: DispatchedJob[];
 }): Promise<void> {
@@ -3881,13 +3382,9 @@ async function persistJobHold(args: {
   const { deps, workflow, runId } = ctx;
   const hold = envData.approvalHold;
   const nonApproval = envData.nonApprovalHold;
-  // `approvalHold` no longer gates whether a resume path is persisted — it only
-  // selects which store method writes the row. A hold with no resume path is
-  // what let a wait-timer / concurrency / trust gate drop its job: the job was
-  // registered nowhere, so `isRunComplete` (which iterates only registered jobs)
-  // could pass without it whenever a sibling job dispatched, and a single-job
-  // run instead took the `dispatchedJobs.length === 0` init-failure branch and
-  // failed with a misleading "no jobs were dispatched".
+  // Every hold kind persists a resume path; `approvalHold` only picks the store
+  // method. A hold registered nowhere lets `isRunComplete` pass without the job,
+  // or fails a single-job run with a misleading "no jobs were dispatched".
   if ((!hold && !nonApproval) || !deps.heldRunStore || !deps.db) {
     logger.info('Job held by protection rules (not persisted — no hold data or no store)', {
       runId,
@@ -3899,24 +3396,17 @@ async function persistJobHold(args: {
 
   const jobInput = args.buildJobInput();
 
-  // The held_runs row keys the resume by (run_id, job_id) where job_id is the
-  // expanded job *name* — release() consumes the pending context by the same name.
+  // Keyed (run_id, job_id = expanded name); release() consumes the pending
+  // context by the same name.
   //
-  // The rows and the pending context are written TOGETHER. Serially, every order
-  // has an unacceptable failure: row-first can leave a hold nothing can resume,
-  // and context-first can leave a registered job nothing can release (a
-  // permanently stuck run). A rollback leaves the job as if the hold had never
-  // been attempted.
+  // Rows and context are written TOGETHER: row-first can leave a hold nothing
+  // resumes, context-first a job nothing releases. A rollback leaves the job
+  // as if never held.
   //
-  // BOTH rows when the job carries both, because they are two independent
-  // requirements and a job gated by two must satisfy both to run. The gate that
-  // enforces that is `dispatchReadyJob`'s `hasPendingHold`, which refuses while
-  // ANY pending row names this (run_id, job_id) — so releasing one leaves the
-  // other still gating, and the resume only proceeds once neither is pending.
-  // Writing only the reviewer row did not merely lose a record: the trust gate
-  // was then unenforced, and the reviewer hold releases on `contexts:write`
-  // plus clause eligibility where the trust hold required `ci_trust:write` —
-  // a lower permission releasing a job the security gate held.
+  // BOTH rows when both exist: `dispatchReadyJob`'s `hasPendingHold` refuses
+  // while ANY pending row names this job. With only the reviewer row, the trust
+  // gate is unenforced — `contexts:write` plus clause eligibility would release
+  // a job that needs `ci_trust:write`.
   const heldRows = await deps.db.transaction().execute(async (trx) => {
     const rows: { row: HeldRun; scope: string; triggerSource: string; holdType?: string }[] = [];
     if (hold) {
@@ -3932,9 +3422,8 @@ async function persistJobHold(args: {
             contextId: hold.contextId,
             queueType: hold.queueType,
           },
-          // The transaction, explicitly: the store's own connection is not
-          // enrolled in it, so an insert left on the default executor commits
-          // whatever the context write beside it does.
+          // Explicit: the store's own connection is not enrolled in the
+          // transaction, so it would commit regardless of the context write.
           trx,
         ),
         scope: hold.scope,
@@ -3960,11 +3449,8 @@ async function persistJobHold(args: {
     });
     return rows;
   });
-  // Audit each hold creation. The orchestrator's dispatch subsystem creates the
-  // hold automatically in response to a webhook (no Keycloak user context), so
-  // the actor is the dispatcher system component. One entry per row: a hold an
-  // operator can be asked to approve, with no audit trail saying it was raised,
-  // is a gap regardless of what else was raised alongside it.
+  // One audit entry per row, actor the dispatcher system component (no user
+  // context on a webhook): every approvable hold needs a trail of being raised.
   for (const written of heldRows) {
     runDetached(
       logger,
@@ -3990,10 +3476,8 @@ async function persistJobHold(args: {
       { runId, heldRunId: written.row.id },
     );
   }
-  // Register a synthetic placeholder so the run is not considered complete
-  // while the job awaits approval. Uses the same `needs-pending-` prefix as the
-  // needs scheduler so release() can resume through dispatchReadyJob, which
-  // swaps this placeholder for the real dispatched job id.
+  // Placeholder keeps the run incomplete; the `needs-pending-` prefix lets
+  // dispatchReadyJob swap it for the real job id on release.
   const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${jobName}-${randomUUID()}`;
   dispatchedJobs.push({ jobId: syntheticId, ...placeholder });
 
@@ -4008,34 +3492,20 @@ async function persistJobHold(args: {
       : { holdType: nonApproval?.holdType, reason: nonApproval?.reason }),
   });
 
-  // The ids that own the one `KiCI Security` check posted below. Every row this
-  // job wrote, not just the one whose summary is rendered: the commit carries a
-  // SINGLE check run, so a job holding on two requirements has both of them
-  // gating that one check. Marking only the rendered row would let the first
-  // hold to end terminalize the check — `success`, on an approve — while the
-  // other still gates the job, which is the "branch protection goes green over
-  // held work" hazard the contention query exists to prevent.
+  // EVERY row owns the one `KiCI Security` check: marking only the rendered
+  // row lets the first hold to end turn it `success` while the other still
+  // gates the job — branch protection green over held work.
   const heldRunIds = heldRows.map((written) => written.row.id);
 
-  // Surface the pending approval on the provider's commit check, naming the
-  // clauses an approver must satisfy. Step-level holds run inside the agent, so
-  // this stays at job granularity. A failed check post is logged and swallowed:
-  // it must not block the dispatch loop.
-  // Reviewer holds only: the check description names the clauses an approver
-  // must satisfy, and a wait-timer / concurrency / trust hold has none. Posting
-  // "awaiting approval" for one would tell a reader to go approve something no
-  // approval releases.
+  // Reviewer holds only, at job granularity (step holds run in the agent): the
+  // description names the clauses to satisfy, and other holds have none, so
+  // "awaiting approval" would point at an approval that releases nothing.
   if (hold && ctx.bundle?.checkStatusPoster) {
-    // A reviewer hold resumes: its pending dispatch context was written above,
-    // in the same transaction as the `held_runs` row, so approval re-dispatches
-    // the job under this run's own trust resolution. The note names what that
-    // resumed job will not have.
+    // Approval re-dispatches under this run's own trust resolution; the note
+    // names what that resumed job will not have.
     const postureNote = buildReducedPrivilegeNote(ctx.trustResolution?.tier, ctx.lockFileSource);
-    // The second gate, when there is one. Both holds were written above and both
-    // must be released, but the commit carries one check run — so a description
-    // naming only the approval clauses leaves the approver approving, nothing
-    // running, and the text unchanged. It has to say what else is outstanding
-    // and who clears it.
+    // Name the second gate too: the one check run must say what else is
+    // outstanding and who clears it, or approving changes nothing visible.
     const alsoSecurity =
       nonApproval?.holdType === HoldType.enum.security
         ? `\n\n${SECURITY_HOLD_ALSO_GATES_NOTE}`
@@ -4058,30 +3528,17 @@ async function persistJobHold(args: {
     });
   }
 
-  // The per-env context gate's own security hold posts here rather than at the
-  // gate, for the same reason the reviewer post above does: every route that
-  // terminalizes a `KiCI Security` check reaches it through the `held_runs`
-  // row, so a pending post the row write never followed is a check nothing can
-  // ever settle — a permanent branch-protection blocker on the commit. Posting
-  // after the transaction costs the contributor the transaction's own duration
-  // before the check appears, and buys back the case where it would never go
-  // away.
+  // The context gate's security hold posts here, after the transaction, for the
+  // same reason: a pending post with no `held_runs` row is a check nothing
+  // settles — a permanent branch-protection blocker.
   //
-  // `else if`, because the two are not exclusive: a job pairing `requireApproval`
-  // with a security-typed context gate carries BOTH `approvalHold` and
-  // `nonApprovalHold` — the gate mints one, and `applyStaticApprovalHolds` runs
-  // after it and mints the other on a `!approvalHold` guard alone. Both holds
-  // are written and both gate the job, but the commit has ONE `KiCI Security`
-  // check run, so two posts wrote the same run back to back and which summary a
-  // contributor read was a race. The reviewer copy is rendered because it names
-  // concrete clauses a human can act on; both rows own the check either way,
-  // through `heldRunIds` above.
+  // `else if`: a job pairing `requireApproval` with a security context gate
+  // carries BOTH holds, but there is ONE check run, so two posts raced for the
+  // summary. The reviewer copy wins (actionable clauses); both rows own the
+  // check via `heldRunIds`.
   else if (nonApproval?.holdType === HoldType.enum.security && ctx.bundle?.checkStatusPoster) {
-    // The reduced-privilege note belongs here: the transaction above wrote this
-    // hold's pending dispatch context under the job's expanded name, and
-    // `/kici approve` re-dispatches it through `dispatchReadyJob` under the same
-    // unresolved-or-untrusted tier — so the run really does execute with the
-    // reductions the note names.
+    // `/kici approve` re-dispatches under the same unresolved-or-untrusted
+    // tier, so the run really has the reductions the note names.
     const postureNote = buildReducedPrivilegeNote(ctx.trustResolution?.tier, ctx.lockFileSource);
     const holdSummary =
       buildSecurityHoldSummary(
@@ -4203,15 +3660,13 @@ async function clusterRouteRootJobs(args: {
   } = args;
   const { deps, workflow, repoIdentifier, credentials, event, ref, runId, bundle } = ctx;
 
-  // expandedName -> combination values, so the route-result pushes (keyed only by
-  // jobName) can re-attach matrixValues to the dispatched job rows.
+  // Route results are keyed only by jobName; re-attach matrixValues by it.
   const matrixByName = new Map<string, Record<string, unknown>>();
   for (const mj of rootDispatchableJobs) {
     if (mj.variantValues) matrixByName.set(mj.expandedName, mj.variantValues);
   }
-  // Same re-attachment for the lock's git-credential declaration, which the
-  // credential relay authorizes against. A routed job that lost it would have
-  // every workflow-supplied ref refused as undeclared.
+  // Likewise git credentials: without them the relay refuses every
+  // workflow-supplied ref as undeclared.
   const gitCredsByName = new Map<
     string,
     Readonly<Record<string, Readonly<Record<string, string>>>>
@@ -4219,7 +3674,6 @@ async function clusterRouteRootJobs(args: {
   for (const mj of rootDispatchableJobs) {
     if (mj.lockJob.gitCredentials) gitCredsByName.set(mj.expandedName, mj.lockJob.gitCredentials);
   }
-  /** The tracked-row git-credential fields for a routed job, by expanded name. */
   const gitCredsFor = (
     jobName: string,
   ): { gitCredentials?: Readonly<Record<string, Readonly<Record<string, string>>>> } => {
@@ -4261,12 +3715,10 @@ async function clusterRouteRootJobs(args: {
       runsOnLabels: [sel.runsOnLabels],
       runsOnPatterns: sel.runsOnPatterns,
       excludePatterns: sel.excludePatterns,
-      // The coordinator persists a routed job through the BASE dispatcher, on
-      // this instance or on a peer, so the dispatcher wrapper's extraJobConfig
-      // merge never runs for it. Bake the provenance in here, as the
-      // needs-gated path does: without it a relayed test run reaches the agent
-      // with no fullRepo / tarballUrl / isTestRun, and the agent clones an
-      // empty repoUrl instead of unpacking the overlay.
+      // The coordinator uses the BASE dispatcher (here or on a peer), skipping
+      // the wrapper's extraJobConfig merge; baked in (as the needs-gated path
+      // does), or a relayed test run lacks fullRepo / tarballUrl / isTestRun and
+      // clones an empty repoUrl.
       jobConfig: { ...buildJobConfig(mj), ...globalJobConfigFor(ctx), ...ctx.extraJobConfig },
       repoUrl: bundle?.repoUrlBuilder?.buildCloneUrl(repoIdentifier) ?? '',
       ref: event.sourceBranch ?? event.targetBranch,
@@ -4331,9 +3783,8 @@ async function clusterRouteRootJobs(args: {
         });
         rejectedJobs.push({ jobId: syntheticId, jobName: jtr.jobName, reason: result.reason });
       } else {
-        // Tracked like `queued` — see the sibling comment in
-        // `dispatchSingleOrchPath`: an untracked queued job is invisible to
-        // `isRunComplete` and lets the run finish green without it.
+        // Tracked like `queued`: untracked, `isRunComplete` finishes the run
+        // green without it.
         if (result.status === 'queued-no-backend') {
           logger.warn('Job has no matching backend (cluster fallback, tracked)', {
             runId,
@@ -4367,11 +3818,9 @@ async function clusterRouteRootJobs(args: {
       runsOnLabels: flatLabels,
     });
   }
-  // Rerouted jobs MUST also feed dispatchedJobs so the downstream
-  // onExecutionStarted call writes execution_runs + execution_jobs rows
-  // for them. Otherwise the run row never exists on this coord and
-  // onPeerJobProgress's recoverRunFromDb returns null for every progress
-  // update from the worker, leaving the run permanently in `running`.
+  // Rerouted jobs MUST feed dispatchedJobs so onExecutionStarted writes their
+  // rows; otherwise recoverRunFromDb returns null for every peer progress
+  // update and the run stays `running` forever.
   for (const rerouted of routeResult.reroutedJobs) {
     const jtr = jobsToRoute.find((j) => j.jobName === rerouted.jobName);
     const flatLabels = jtr?.runsOnLabels?.[0] ?? [];
@@ -4400,19 +3849,17 @@ async function clusterRouteRootJobs(args: {
 }
 
 /**
- * Register an invoke gate as a pending (needs-gated) job: store its invoke
- * parameters on the pending job context and push a synthetic needs-pending row
- * tagged `job_kind='gate'`. The gate never reaches an agent — it is released
- * through `dispatchReadyJob` (whose gate branch runs the summon executor). A root
- * gate is nudged by `invokeRootGates` after registration; a needs-gated one is
- * released by the scheduler when its upstreams complete.
+ * Register an invoke gate as a pending job: its invoke parameters go on the
+ * pending context and a synthetic needs-pending row is tagged
+ * `job_kind='gate'`. It never reaches an agent; `dispatchReadyJob`'s gate
+ * branch runs the summon. Root gates are nudged by `invokeRootGates`,
+ * needs-gated ones by the scheduler.
  */
 async function registerPendingInvokeGate(args: {
   ctx: WorkflowDispatchContext;
   mat: MaterializedJob;
   jobInput: QueuedJobInput;
   invokeParams: InvokeGateParams;
-  /** The gate job's context resolution record, when it binds a context. */
   resolution: DeferredContextResolution | undefined;
   dispatchedJobs: DispatchedJob[];
 }): Promise<void> {
@@ -4446,10 +3893,9 @@ async function registerPendingInvokeGate(args: {
 }
 
 /**
- * Release every root (no-needs) invoke gate once the run, its jobs, and its needs
- * edges are all registered. A root gate has no upstream to fire the scheduler, so
- * it is nudged through the same `dispatchReadyJob` release path a needs-gated gate
- * uses when its upstreams complete. Needs-gated gates are left for the scheduler.
+ * Release every root invoke gate once the run, jobs and needs edges are
+ * registered: with no upstream to fire the scheduler, it is nudged through
+ * `dispatchReadyJob` directly.
  */
 async function invokeRootGates(args: {
   ctx: WorkflowDispatchContext;
@@ -4492,12 +3938,10 @@ async function invokeRootGates(args: {
 }
 
 /**
- * Register a generated (dynamic) invoke gate. Generated jobs are dispatched after
- * the run is already registered, so a gate is added as a synthetic needs-pending
- * `gate` row plus its pending invoke context; when `release` is true (a root
- * generated gate) it is immediately released through `dispatchReadyJob`, while a
- * needs-gated generated gate waits for the scheduler (its cross-domain needs
- * edges are inserted by the caller).
+ * Register a generated invoke gate on an already-registered run: a synthetic
+ * needs-pending `gate` row plus its pending context. `release` (a root gate)
+ * releases it now; otherwise it waits for the scheduler (the caller inserts
+ * its needs edges).
  */
 async function registerGeneratedInvokeGate(args: {
   ctx: WorkflowDispatchContext;
@@ -4505,7 +3949,6 @@ async function registerGeneratedInvokeGate(args: {
   matrixValues?: Record<string, unknown>;
   jobInput: QueuedJobInput;
   invokeParams: InvokeGateParams;
-  /** The generated gate's context resolution record, when it binds a context. */
   resolution: DeferredContextResolution | undefined;
   release: boolean;
 }): Promise<void> {
@@ -4554,34 +3997,16 @@ async function registerGeneratedInvokeGate(args: {
 }
 
 /**
- * Record every job a context protection rule rejected as a synthetic
- * `rejected-*` job on the run, carrying the rule's own reason.
+ * Record each context-rule rejection as a synthetic `rejected-*` job carrying
+ * the rule's reason, as a dispatcher rejection is recorded. A skipped job
+ * leaves no row: an all-gated run then fails as a misleading `no_agent`, and a
+ * partial rejection leaves downstream `needs` edges on a job that never
+ * terminalizes. Recorded, the dashboard and `kici runs show` name the context
+ * and rule, and downstream `when` sets get a terminal upstream.
  *
- * **Why the job cannot just be skipped.** A rejection used to end at a
- * `logger.info` and a `continue`: the job never entered `rejectedJobs`, so no
- * row, no init-failure signal and no reason reached the run, and the reason
- * survived only in the orchestrator's log. Two things followed, both of them
- * wrong for a reader of the run. A run whose every job was gated fell through
- * to the all-rejected guard as `no_agent` / 'No jobs were dispatched for this
- * run' — telling the reader no agent was available for a run that had agents
- * and was deliberately gated. And a partial rejection recorded nothing at all,
- * leaving a downstream `needs` edge pointing at a job that never terminalizes.
- *
- * Recording it as a synthetic `rejected-*` job is the same shape a dispatcher
- * rejection already takes, and `context_rules` is a job-scoped init-failure
- * category by definition — so the run carries the reason per gated job, the
- * dashboard and `kici runs show` can name the context and rule, and the
- * downstream `when` sets get a terminal upstream to evaluate.
- *
- * Called once for both dispatch paths (the cluster branch filters rejected jobs
- * out of routing, the single-orchestrator loop `continue`s past them), so a
- * rejection is recorded exactly once regardless of which path runs.
- *
- * A `pendingInit` job is deliberately skipped: its context is only named once
- * the agent's init round returns, so its verdict is not final here and the
- * flow-back records it instead ({@link recordContextRuleRejectionAfterInit}).
- * That split is what keeps the record exactly-once — a job cannot be recorded
- * by both, whichever order the two rejection sites are reached in.
+ * Called once for both dispatch paths, so exactly once. A `pendingInit` job is
+ * skipped: its verdict is final only after the init round, and
+ * {@link recordContextRuleRejectionAfterInit} records it — never both.
  */
 function recordContextRuleRejections(args: {
   ctx: WorkflowDispatchContext;
@@ -4620,31 +4045,18 @@ function recordContextRuleRejections(args: {
 }
 
 /**
- * The deferred-init sibling of {@link recordContextRuleRejections}: record a
- * job the context rules rejected during the agent's init round.
+ * Deferred-init sibling of {@link recordContextRuleRejections}. A dynamic
+ * `context: (e) => …` is named only after the agent runs the module, so its
+ * gates run in the flow-back, after the run row exists; the reason goes
+ * straight to the tracker, like the `init-failed-*` row in the catch block.
  *
- * A dynamically-bound context (`context: (e) => …`) is only named once the
- * agent has run the workflow module, so its gates are evaluated in the
- * flow-back — long after the static collector ran, and long after the run row
- * was written. The reason therefore has no array to land in and is recorded
- * directly on the tracker, the same way the sibling `init-failed-*` row in this
- * file's catch block is.
+ * Without it the run finishes GREEN: `__init__` is a tracked job reported
+ * `success`, so `isRunComplete` holds and `releasePendingJobsHold` finalizes
+ * it. The no-jobs guard (`deferredInitJobs.length === 0`) never fires here.
  *
- * Without this record the run finished GREEN. `__init__` is itself a tracked
- * execution job — the agent reports it `running` then `success`, and the
- * orchestrator forwards every agent job status to the tracker with no init-job
- * filter — so a run whose only real job was gated here still held one terminal
- * job, `isRunComplete` was satisfied, and the last `releasePendingJobsHold`
- * finalized it successfully. That is the same silent-green outcome the static
- * path used to produce, except that this path did not even reach the no-jobs
- * guard: that guard requires `deferredInitJobs.length === 0`, which a deferred
- * job contradicts by definition, so it produced no failed job and not even the
- * misleading `no_agent`.
- *
- * Registration must therefore complete BEFORE the LAST pending-jobs token is
- * dropped, which is why both calls `await` inside the spawned task's own `try`
- * — the release runs in a `.finally()` on that promise. A row added after the
- * run finalized would attach a non-terminal job to a completed run.
+ * Must complete BEFORE the LAST pending-jobs token drops (callers `await`
+ * inside the task's `try`; release is in `.finally()`), or a non-terminal job
+ * attaches to a completed run.
  */
 async function recordContextRuleRejectionAfterInit(args: {
   ctx: WorkflowDispatchContext;
@@ -4709,7 +4121,6 @@ async function dispatchSingleOrchPath(args: {
     args;
   const { deps, workflow, runId } = ctx;
   const wavePlan = computeWavePlan(buildPrep.materializedJobs);
-  /** The wave-policy fields persisted on a bounded-wave child's execution_jobs row. */
   const wavePolicyFields = (name: string): { waveMaxParallel?: number; waveFailFast?: boolean } => {
     const p = wavePlan.policy.get(name);
     return p ? { waveMaxParallel: p.maxParallel, waveFailFast: p.failFast } : {};
@@ -4718,21 +4129,12 @@ async function dispatchSingleOrchPath(args: {
     const lockJob = mat.lockJob;
     const matrixValues = mat.variantValues;
     const envData = jobContextData.get(mat.expandedName);
-    // A rejected job never dispatches. A non-`pendingInit` rejection was already
-    // recorded by `recordContextRuleRejections`, which runs once for both
-    // dispatch paths; a `pendingInit` one is recorded by the flow-back
-    // (`recordContextRuleRejectionAfterInit`) instead, because its context is
-    // only named by the init round. Either way this branch only has to skip the
-    // dispatch.
+    // Rejections are already recorded (`recordContextRuleRejections` or the
+    // flow-back); only skip the dispatch.
     if (envData?.rejected) continue;
-    // `pendingInit` is checked BEFORE `held`, and the order is load-bearing.
-    // A job can now be both: its approval is known from the lock file, but its
-    // dynamic values are not. Holding it here would call `buildExecutionJobInput`
-    // on unresolved values and store THAT as the pending dispatch context — so
-    // the release path would dispatch a job whose dynamic env, contexts,
-    // concurrency group or matrix were never resolved. The flow-back owns the
-    // hold for such a job (`holdExecutionAfterInit`), because only it has the
-    // resolved values to store.
+    // `pendingInit` BEFORE `held`, load-bearing: a job can be both, and holding
+    // it here would store input built from unresolved dynamic values. The
+    // flow-back owns its hold (`holdExecutionAfterInit`).
     if (envData?.pendingInit) continue;
     if (envData?.held) {
       await holdJobForApproval({
@@ -4759,9 +4161,7 @@ async function dispatchSingleOrchPath(args: {
       selectors,
     });
 
-    // An invoke gate never reaches an agent: register it as a pending gate
-    // (root gates are nudged post-registration by invokeRootGates; needs-gated
-    // gates are released by the scheduler). Applies to both root and non-root.
+    // An invoke gate, root or not, registers as a pending gate.
     const invokeParams = invokeParamsFromLockJob(lockJob);
     if (invokeParams) {
       await registerPendingInvokeGate({
@@ -4801,11 +4201,9 @@ async function dispatchSingleOrchPath(args: {
       continue;
     }
 
-    // Rolling-wave gate: a fan-out child beyond the maxParallel sliding window
-    // is held (not enqueued) until the wave-scheduler releases it on a sibling
-    // terminal. Reuses the same pending-context + synthetic-id pattern as the
-    // needs gate; the wave_gated=true flag (persisted via onExecutionStarted)
-    // keeps the dispatch loop from picking it up and is cleared on release.
+    // Rolling wave: a child beyond the maxParallel window is held (not
+    // enqueued) until a sibling terminal releases it. wave_gated=true keeps the
+    // dispatch loop off it and is cleared on release.
     if (wavePlan.held.has(mat.expandedName)) {
       await storeDeferredJobContext({
         ctx,
@@ -4815,10 +4213,8 @@ async function dispatchSingleOrchPath(args: {
         runsOnLabels,
         resolution: envData?.contextResolution,
       });
-      // Use the SAME `needs-pending-` synthetic-id prefix as the needs gate: the
-      // release path (dispatchReadyJob → findSyntheticJobId → addJobsToRun) only
-      // cleans up rows with that prefix, so a divergent prefix would leave a
-      // duplicate pending row that the wave-scheduler miscounts as in-flight.
+      // SAME prefix as the needs gate: release only cleans up that prefix, and a
+      // leftover duplicate row is miscounted as in-flight.
       const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${mat.expandedName}-${randomUUID()}`;
       dispatchedJobs.push({
         jobId: syntheticId,
@@ -4839,11 +4235,8 @@ async function dispatchSingleOrchPath(args: {
       continue;
     }
 
-    // Fresh-box convergence: an `includeUninitialized` child pinned to a
-    // declared-but-un-agented host gets a synthetic `__bringup__` job dispatched
-    // to an ssh-transport ops agent FIRST. That brings up a temporary init-runner
-    // (it enrolls under `mat.pinnedAgentId`), and the child below — queued with
-    // the same pin by `dispatchPinned` — drains onto it via `onAgentAvailable`.
+    // Bring-up FIRST: the init-runner enrolls under `mat.pinnedAgentId`, and the
+    // pinned child below drains onto it via `onAgentAvailable`.
     if (mat.needsBringup && mat.pinnedAgentId) {
       await dispatchBringupForChild({ ctx, setup, mat });
     }
@@ -4862,12 +4255,10 @@ async function dispatchSingleOrchPath(args: {
       });
       rejectedJobs.push({ jobId: syntheticId, jobName: mat.expandedName, reason: result.reason });
     } else {
-      // `queued-no-backend` is tracked exactly like `queued`. The job IS in the
-      // dispatch queue under `result.jobId`, so leaving it untracked made a run
-      // whose `runsOn` matched no agent finish GREEN: `isRunComplete` iterates
-      // the REGISTERED jobs, and an unregistered one is invisible to it. Tracked,
-      // it holds the run open until an agent appears (scale-from-zero still
-      // works) or the queue window expires and terminalizes it `unroutable`.
+      // `queued-no-backend` is tracked like `queued`: it IS queued, and
+      // `isRunComplete` sees only REGISTERED jobs. Tracked, it holds the run
+      // open until an agent appears (scale-from-zero) or the queue window
+      // terminalizes it `unroutable`.
       if (result.status === 'queued-no-backend') {
         logger.warn('Job has no matching backend (tracked, awaiting capacity)', {
           runId,
@@ -4900,9 +4291,8 @@ async function dispatchSingleOrchPath(args: {
 }
 
 /**
- * Phase E+F+G orchestrator — pick cluster vs single-orch path. Returns the
- * dispatched + rejected job lists (the build job, if any, is appended to
- * `dispatchedJobs` upstream).
+ * Phase E+F+G — pick the cluster or single-orch path, filling the dispatched
+ * and rejected lists (the build job is appended upstream).
  */
 async function dispatchStaticJobs(args: {
   ctx: WorkflowDispatchContext;
@@ -4930,11 +4320,8 @@ async function dispatchStaticJobs(args: {
       const envData = jobContextData.get(mj.expandedName);
       return !envData?.rejected && !envData?.held && !envData?.pendingInit;
     });
-    // A held job is excluded from routing above and nothing else in this branch
-    // would touch it — so under a coordinator it used to vanish outright: no
-    // `held_runs` row, no pending context, no placeholder, and a run that could
-    // report success without it. The single-orchestrator path holds these in its
-    // dispatch loop; this is the same call for the cluster path.
+    // Held jobs are excluded from routing, so hold them here (as the single-orch
+    // loop does), or they vanish and the run can succeed without them.
     for (const mat of buildPrep.materializedJobs) {
       const envData = jobContextData.get(mat.expandedName);
       if (!envData?.held || envData.rejected || envData.pendingInit) continue;
@@ -4948,9 +4335,8 @@ async function dispatchStaticJobs(args: {
         dispatchedJobs,
       });
     }
-    // Invoke gates never route to a peer — the gate summons + tracks proxies on
-    // the ingesting orchestrator. Register them locally as pending gates; root
-    // gates are released by invokeRootGates after registration.
+    // Invoke gates never route to a peer: the ingesting orchestrator summons and
+    // tracks proxies.
     for (const mat of dispatchableJobs.filter((mj) => isInvokeGate(mj.lockJob))) {
       const invokeParams = invokeParamsFromLockJob(mat.lockJob);
       if (!invokeParams) continue;
@@ -5012,40 +4398,23 @@ async function dispatchStaticJobs(args: {
 // ---------------------------------------------------------------------------
 
 /**
- * Register the run BEFORE the first job is handed to an agent, and hold it open
- * for the whole dispatch window.
+ * Register the run BEFORE the first job reaches an agent, and hold it open for
+ * the dispatch window.
  *
- * **The race this closes.** Root jobs are dispatched to agents inside the
- * dispatch loop, and the run's own `execution_runs` row is written afterwards,
- * by `recordRunStart`. An agent that reports a job terminal in that window
- * misses in `ExecutionTracker`'s memory, `recoverRunFromDb` finds no row, and
- * the status update is **discarded** — `Run not found in DB, skipping job
- * status update`. The upstream never becomes terminal, so no downstream is ever
- * released and the run hangs with nothing logged as wrong. The `execution_jobs`
- * foreign-key violation logged at error level is the same race a few
- * microseconds later, once the row insert is attempted against a run that does
- * not exist yet.
+ * **The race.** If `recordRunStart` wrote the row after the loop, a job
+ * terminal on arrival (rejected dispatch, init failure, capability mismatch)
+ * finds no row in `recoverRunFromDb`; the update is **discarded** (`Run not
+ * found in DB, skipping job status update`), no downstream releases, and the
+ * run hangs silently. The `execution_jobs` FK violation is the same race.
+ * The source-pack build path already starts early; this generalizes it.
  *
- * The window is single-digit milliseconds, and entirely reachable in production
- * by any job that terminates on arrival: a rejected dispatch, an init failure, a
- * capability mismatch. It was invisible for as long as the direct-ingress
- * webhook route answered only after the whole pipeline had run, because no
- * caller could learn a job had been dispatched until every row was committed.
+ * **The token is not optional:** without it the first terminal job satisfies
+ * `isRunComplete` mid-dispatch and the run is finalized (status, check,
+ * Platform forward). Released by `dispatchMatchedWorkflow`'s `finally` once
+ * `recordRunStart` registered every job.
  *
- * A workflow with a source-pack build never hits it: `prepareCacheAndBuild`
- * registers the run with the build job alone before dispatching anything else.
- * This is that same early start, generalized to every workflow.
- *
- * **The token is not optional.** Starting the run early is not sufficient on its
- * own: without a pending-jobs token, the first job to go terminal satisfies
- * `isRunComplete` while jobs 2..N are still being dispatched, and the run is
- * finalized mid-flight — a terminal run status written, the provider check
- * posted, and the status forwarded to the Platform before the rest of the run
- * has done anything. The token is released by `dispatchMatchedWorkflow`'s
- * `finally`, once `recordRunStart` has registered every dispatched job.
- *
- * Returns true when this call registered the run, which is what tells
- * `recordRunStart` to take its `addJobsToRun` branch.
+ * True when this call registered the run, sending `recordRunStart` down its
+ * `addJobsToRun` branch.
  */
 async function startRunBeforeDispatch(args: {
   ctx: WorkflowDispatchContext;
@@ -5057,17 +4426,13 @@ async function startRunBeforeDispatch(args: {
   const { deps, workflow, runId } = ctx;
   const tracker = deps.executionTracker;
   if (!tracker) return false;
-  // The source-pack build path already registered the run with the build job
-  // alone and took its own token over the same window.
+  // The build path already registered the run and took its own token.
   if (buildPrep.buildJobTrackedEarly) return false;
-  // Nothing will be handed to an agent, so there is no window to close — and a
-  // row inserted here would hold zero jobs forever. `isRunComplete` ends
-  // `run.jobs.size > 0` and no sweeper reaps such a row (the stale-run detector
-  // scans from `execution_jobs` / `dispatch_queue`, orphan recovery needs
-  // `running`, cold-store archival needs a terminal status), so it would sit
-  // `pending` while the deadline detector re-fired against it every tick. The
-  // all-deferred workflows that land here keep their own bootstrap,
-  // `ensureExecutionRunForDeferred`.
+  // Nothing reaches an agent, and a zero-job row never completes
+  // (`run.jobs.size > 0`) and no sweeper reaps it (stale-run detector scans
+  // jobs/queue, orphan recovery needs `running`, archival needs terminal) — it
+  // sits `pending` while the deadline detector re-fires. All-deferred workflows
+  // use `ensureExecutionRunForDeferred`.
   if (buildPrep.buildFailed || buildPrep.materializedJobs.length === 0) return false;
 
   await startTrackedRun(tracker, ctx, setup, [], { declaredContexts });
@@ -5085,15 +4450,10 @@ async function startRunBeforeDispatch(args: {
 }
 
 /**
- * The three `execution_runs` columns that carry a run's resolved trust context.
- *
- * One definition, used by both writers below, so the pre-dispatch stamp and the
- * post-dispatch rewrite cannot drift into recording different things.
- *
- * `lockFileSource` is absent for every dispatch that selects no lock-file branch
- * — an internal event, a CLI test run — so the column is omitted rather than
- * written. Omitting is what the driver already does with an `undefined` value;
- * spelling it out here keeps the statement independent of that behavior.
+ * The `execution_runs` trust-context columns, one definition for both writers
+ * so they cannot drift. `lock_file_source` is omitted explicitly when no
+ * lock-file branch was selected (internal event, CLI test run), independent of
+ * the driver's `undefined` handling.
  */
 function trustContextColumns(
   trustResolution: NonNullable<WorkflowDispatchContext['trustResolution']>,
@@ -5107,42 +4467,25 @@ function trustContextColumns(
 }
 
 /**
- * Record the run's resolved trust context BEFORE any job reaches an agent.
+ * Record the trust context BEFORE any job reaches an agent. `recordRunStart`
+ * writes it only after the loop, fire-and-forget, so the row would carry none
+ * for that window — permanently if the write fails.
  *
- * `recordRunStart` writes these columns too, but it runs AFTER the dispatch loop
- * and its write is fire-and-forget (`.execute().catch(log)`). So between the run
- * row landing above and that write completing, the row describes a run that has
- * started with no trust context — and keeps describing it that way permanently
- * if that write fails, since its `.catch` only logs.
+ * The git credential relay reads a NULL `trust_tier` LENIENTLY
+ * (`security/trust-tier.ts`), serving a fork pull request its declared
+ * credentials. A NULL `lock_file_source` reads as "no reduced-privilege
+ * posture" (`buildReducedPrivilegeNote`, dashboard security panel, stale-run
+ * detector), so an untrusted tier with no lock source — a state a fork pull
+ * request must never show — appears if the tier lands alone.
  *
- * That matters because the git credential relay reads `trust_tier` to decide
- * whether a run may use its declared credentials, and a NULL reads LENIENTLY
- * (`security/trust-tier.ts`) — so a fork pull request would be served its
- * declared credentials for the whole window.
- *
- * `lock_file_source` reads the same way one step out. It is the column recording
- * that a fork's own workflow definitions were NOT the ones evaluated, and every
- * reader of the row renders a NULL as "no reduced-privilege posture" rather than
- * as "unknown": `buildReducedPrivilegeNote` drops its base-branch clause, the
- * dashboard's security panel shows no lock source, and the stale-run detector
- * carries none onto the job it re-reports. Writing the tier alone therefore
- * closed one lenient NULL by opening a window on another, and a run inside that
- * window reports a resolved untrusted tier with no lock source — the one state a
- * fork pull request must never be observed in.
- *
- * So all three columns go in ONE statement: no reader can see a partial trust
- * context, and the in-memory mirror rides along so a job completing inside the
- * window names the same posture the row does.
- *
- * Awaited, so the context is durable before an agent can ask. `recordRunStart`
- * rewrites the same values afterwards, which is a no-op.
+ * So all columns go in ONE statement, with the in-memory mirror, and awaited
+ * so they are durable before an agent asks. `recordRunStart`'s rewrite is a
+ * no-op.
  */
 async function stampTrustContextBeforeDispatch(ctx: WorkflowDispatchContext): Promise<void> {
   const { deps, runId, trustResolution, lockFileSource } = ctx;
   if (!trustResolution) return;
-  // Guarded on its own, like the mirror in `recordRunStart`: a tracker that does
-  // not implement the method loses only the note, and must not cost the row its
-  // write.
+  // Guarded alone: a tracker lacking the method loses only the note, not the row.
   try {
     deps.executionTracker?.setRunTrustContext(runId, trustResolution.tier, lockFileSource);
   } catch (err) {
@@ -5159,9 +4502,8 @@ async function stampTrustContextBeforeDispatch(ctx: WorkflowDispatchContext): Pr
       .where('run_id', '=', runId)
       .execute();
   } catch (err) {
-    // Do NOT abort the dispatch: a run that cannot record its trust context
-    // still has to run. Every reader stays lenient, exactly as it does for a run
-    // whose trust never resolved, and `recordRunStart` retries the write.
+    // Do NOT abort: readers stay lenient as for unresolved trust, and
+    // `recordRunStart` retries the write.
     logger.error('Failed to stamp the trust context before dispatch', {
       runId,
       error: toErrorMessage(err),
@@ -5178,10 +4520,8 @@ async function recordRunStart(args: {
   runContextId: string | undefined;
   dispatchedJobs: DispatchedJob[];
   /**
-   * True when the run row was already inserted before the dispatch loop — by
-   * `startRunBeforeDispatch`, or by the source-pack build path registering the
-   * build job alone. The run then only needs its jobs added, never a second
-   * `onExecutionStarted` (which would reset the in-memory job map).
+   * The row was inserted before the loop (early start or build path): only add
+   * jobs, never a second `onExecutionStarted`, which resets the job map.
    */
   runTrackedEarly: boolean;
 }): Promise<void> {
@@ -5197,15 +4537,10 @@ async function recordRunStart(args: {
   } = args;
   const { deps, runId } = ctx;
   if (!deps.executionTracker) return;
-  // Without an early start there is no row yet, so a run that dispatched
-  // nothing gets none here — the all-rejected / deferred paths below record it
-  // instead. With an early start the row already exists, so the per-run context
-  // and trust updates still have something to write to.
+  // No row and nothing dispatched: the all-rejected / deferred paths record it.
   if (!runTrackedEarly && dispatchedJobs.length === 0) return;
   if (runTrackedEarly) {
-    // The build job was registered on its own by the build path, so it is
-    // already in the run's job map; a general early start registered no jobs at
-    // all and every dispatched job is new.
+    // The build path already registered the build job; skip it.
     const executionJobs =
       buildPrep.buildJobTrackedEarly && buildPrep.buildJobId
         ? dispatchedJobs.filter((j) => j.jobId !== buildPrep.buildJobId)
@@ -5224,13 +4559,9 @@ async function recordRunStart(args: {
 }
 
 /**
- * The per-run column writes that follow a run's registration: its secret
- * context, trust context, test-run stamp and local-working-tree mark. Every one
- * is best-effort and never aborts the dispatch.
- *
- * Shared by `recordRunStart` and the deferred bootstrap, because a run with no
- * static job is registered only by the bootstrap, after `recordRunStart` has
- * already returned for want of a row.
+ * Best-effort per-run column writes after registration (context, trust,
+ * test-run, local working tree); none aborts dispatch. Shared with the
+ * deferred bootstrap, which alone registers a run with no static job.
  */
 function stampRunStartColumns(
   ctx: WorkflowDispatchContext,
@@ -5253,19 +4584,12 @@ function stampRunStartColumns(
       });
   }
   if (trustResolution) {
-    // The same two values the row below records, mirrored onto the in-memory
-    // run so a job's completion check can name the reduced-privilege posture.
-    // Stamped from here rather than passed to `onExecutionStarted`, because
-    // trust resolves on its own path. `stampTrustContextBeforeDispatch` already
-    // wrote both the mirror and the row as soon as the run was registered; this
-    // is the idempotent rewrite that also covers a run registered by neither
-    // early site.
+    // In-memory mirror so a completion check can name the reduced-privilege
+    // posture; trust resolves on its own path, hence not via
+    // `onExecutionStarted`. Idempotent after `stampTrustContextBeforeDispatch`,
+    // and covers runs registered by neither early site.
     //
-    // Guarded like the `.catch()` on each sibling write below, and for the same
-    // reason: every post-start write here is best-effort, and none of them may
-    // abort `recordRunStart` — the remaining ones (the trust columns, the
-    // test-run stamp) would be silently skipped. A tracker that does not
-    // implement the method loses only the note.
+    // Guarded so a throw cannot skip the remaining best-effort writes.
     try {
       deps.executionTracker?.setRunTrustContext(runId, trustResolution.tier, lockFileSource);
     } catch (err) {
@@ -5323,34 +4647,15 @@ function categorizeRejectReason(reason: string): InitFailureCategory {
 }
 
 /**
- * Open the needs gate for any job whose upstreams already reached terminal
- * before this run's edges existed.
+ * Open the needs gate for jobs whose upstreams went terminal before the edges
+ * existed. Edges are written after the loop; a root job terminal on arrival
+ * drives `evaluateDownstreams` against zero edges, and the event-driven
+ * scheduler never re-fires, so the downstream stays `pending` forever.
  *
- * **The race this closes.** Root jobs are dispatched to agents inside the
- * dispatch loop, but `execution_job_needs` is only written afterwards, here. An
- * agent that reports a root job terminal in that window drives
- * `evaluateDownstreams`, which reads zero edges, returns an empty result, and
- * the gate never fires again — the downstream stays `pending` forever and the
- * run hangs with no error anywhere. Nothing re-evaluates on its own: the
- * scheduler is purely event-driven off job completion, and that event has
- * already been consumed.
- *
- * The window is small (single-digit milliseconds) but entirely reachable: a job
- * that fails immediately on arrival — a rejected dispatch, an init failure, a
- * capability mismatch — reports terminal in about the time one DB write takes.
- * It was invisible for as long as the webhook route answered only after the
- * whole pipeline had run, because the caller could not learn a job had been
- * dispatched until every edge was already committed.
- *
- * Recomputing here is the same guard the deferred result-aware eval registration
- * already applies for its own edges, and it is safe to run unconditionally: the
- * claim inside `recomputeNeedsSatisfied` is a conditional UPDATE, so a job the
- * normal completion path already claimed is skipped rather than dispatched
- * twice.
- *
- * Wave-held jobs share the synthetic-id prefix but are gated by the rolling-wave
- * scheduler, not by needs, so they are excluded — opening their gate here would
- * bypass the `maxParallel` window.
+ * The same guard the deferred result-aware eval registration applies for its own
+ * edges. Safe unconditionally: `recomputeNeedsSatisfied` claims with a conditional
+ * UPDATE, so an already-claimed job is not dispatched twice. Wave-held jobs
+ * share the prefix but are excluded, or the `maxParallel` window is bypassed.
  */
 export async function catchUpNeedsGatedJobs(args: {
   ctx: NeedsSchedulingContext;
@@ -5364,13 +4669,9 @@ export async function catchUpNeedsGatedJobs(args: {
     .map((j) => j.jobName);
   if (gatedNames.length === 0) return;
 
-  // Only a job whose gate is already expressible may be recomputed. A job
-  // gated on a dynamic group has NO row here yet — `insertEdgesForRun` cannot
-  // name members that the eval job has not generated, so `resolveGroupEdges`
-  // writes those edges later. `checkAllUpstreamsSatisfied` reads "no edges" as
-  // "no needs, dispatch now", so handing it such a job releases a downstream
-  // before its group has run at all — which is the opposite of the stall this
-  // catch-up exists to fix.
+  // Only jobs with edges: a dynamic-group job gets its edges later
+  // (`resolveGroupEdges`), and `checkAllUpstreamsSatisfied` reads "no edges" as
+  // "dispatch now", releasing it before its group ran.
   const edged = await db
     .selectFrom('execution_job_needs')
     .select('job_name')
@@ -5406,8 +4707,7 @@ async function insertEdgesAndMarkRejected(args: {
     const now = Date.now();
     for (const { jobId, jobName, reason, category, terminalStatus } of rejectedJobs) {
       const status = terminalStatus ?? ExecutionJobStatus.enum.failed;
-      // A skipped synthetic job (intentionally narrowed-to-empty fan-out) carries
-      // no init-failure; a failed one does.
+      // A skipped (narrowed-to-empty) job carries no init-failure.
       const extra =
         status === ExecutionJobStatus.enum.skipped
           ? { error: reason }
@@ -5439,18 +4739,13 @@ async function insertEdgesAndMarkRejected(args: {
 // ---------------------------------------------------------------------------
 
 /**
- * After init finishes, resolve the new context and update jobEnvData with
- * the resolved context + vars + secrets.
- *
- * Returns the {@link ContextGateHandle} the delegated
- * `applyContextRulesAndSecrets` produced, so a dynamic-matrix fan-out can
- * re-gate each resolved child against the same effective context without
- * re-resolving its scoped secrets.
+ * After init, apply the resolved contexts, vars and secrets to jobEnvData.
+ * Returns the gate handle for re-gating dynamic-matrix children.
  */
 async function applyInitResultContext(args: {
   ctx: WorkflowDispatchContext;
   lockJob: LockJob;
-  /** The materialized job's expanded name — `held_runs.job_id` for any hold. */
+  /** `held_runs.job_id` for any hold. */
   expandedName: string;
   initResult:
     | { contextNames?: string[]; env?: Record<string, string>; concurrencyGroup?: string }
@@ -5463,48 +4758,29 @@ async function applyInitResultContext(args: {
   const { deps } = ctx;
   let gate: ContextGateHandle | undefined;
   const anyDynamic = (lockJob.contexts ?? []).some((e) => e.dynamic);
-  // Which names to apply. When the job binds a DYNAMIC context the agent
-  // resolves the whole ordered list and reports it. When every binding is
-  // STATIC the agent reports nothing — `init-runner` only fills `contextNames`
-  // under `flags.dynamicContext` — but the orchestrator has had those names all
-  // along, in the lock file.
-  //
-  // Falling back to them is what stops a static context being ignored merely
-  // because some OTHER field on the job is dynamic. Without it such a job ran
-  // with no `enabled` check, no branch restriction, no minimum-trust check, no
-  // concurrency limit, no required reviewers, no wait timer — and none of the
-  // context's vars or secrets.
-  //
-  // The agent resolves only the job's own list, so the workflow-level names
-  // are placed before it here, exactly as the static path places them.
+  // A DYNAMIC binding: the agent reports the ordered list. All STATIC: the
+  // agent reports nothing (`init-runner` fills `contextNames` only under
+  // `flags.dynamicContext`), so use the lock's names — else a static context
+  // is ignored, with all its gates, vars and secrets, just because another
+  // field is dynamic. Workflow-level names go first, as on the static path.
   const resolvedNames = anyDynamic
     ? resolveJobContextNames(ctx.workflow, {
         contexts: (initResult?.contextNames ?? []).map((value) => ({ value, dynamic: false })),
       }).names
     : resolveJobContextNames(ctx.workflow, lockJob).names;
   if (resolvedNames.length > 0 && deps.contextStore) {
-    // Overwrite the dispatch-time placeholder list with the agent-resolved one.
-    // `applyContextRulesAndSecrets` does not maintain this list, and
-    // `dispatchExecutionAfterInit` persists it on the job row.
+    // Replaces the placeholder list; `dispatchExecutionAfterInit` persists it.
     jobEnvData.contextNames = [...resolvedNames];
-    // Delegate to the SAME function the synchronous path uses, rather than
-    // re-implementing a subset of it. This path previously matched the contexts
-    // and resolved their secrets itself while re-applying exactly one gate (the
-    // test-run `allowLocalExecution` fail-safe) — so a job whose contexts
-    // resolve at init time was never checked against `enabled`, branch
-    // restrictions, minimum trust, the concurrency limit, required reviewers or
-    // a wait timer. Those gates are not optional for a dynamically-bound
-    // context; they are evaluable only once the name is known, which is
-    // here.
+    // The SAME function as the synchronous path, so every gate (`enabled`,
+    // branch, minimum trust, concurrency, reviewers, wait timer) applies once
+    // the name is known — never a re-implemented subset.
     gate = await applyContextRulesAndSecrets({
       ctx,
       lockJob,
       expandedName,
       contextNames: resolvedNames,
-      // The agent resolves a `dynamicConcurrencyGroup` and reports it here. It
-      // used to be dropped on the floor — the parameter type did not even name
-      // it — so such a job was gated under the CONTEXT name instead of its own
-      // group, silently sharing a limit with everything else bound to it.
+      // The agent-resolved `dynamicConcurrencyGroup`; without it the job gates
+      // under the CONTEXT name, sharing a limit with everything bound to it.
       concurrencyGroup: initResult?.concurrencyGroup ?? concurrencyGroup,
       jobEnvData,
       hostCtx,
@@ -5527,40 +4803,25 @@ export enum InitDispatchSuppression {
 }
 
 /**
- * Decide whether an arrived init result may dispatch its job.
+ * Whether an arrived init result may dispatch its job.
  *
- * `Paths` is checked first: a workflow whose deferred `paths` did not match
- * never triggered, whatever its filter says. Only an explicit `false`
- * suppresses — an agent that predates deferred paths reports no verdict, and
- * that absence dispatches.
+ * `Paths` first: unmatched deferred `paths` never triggered, whatever the
+ * filter says. Only an explicit `false` suppresses; an older agent's missing
+ * verdict dispatches.
  *
- * `Filter` requires the workflow to actually declare a filter as well as the
- * agent to have reported `false`: a buggy or rogue agent must not be able to
- * suppress a filter-less workflow by inventing the field, and an agent that
- * predates the filter reports no verdict at all — reading that absence as
- * "suppress" would silently stop every dispatch it handles.
+ * `Filter` needs both a declared filter and a reported `false`: a rogue agent
+ * cannot suppress a filter-less workflow, and an older agent's missing verdict
+ * must not stop every dispatch.
  *
- * `Gated` covers a job that is already rejected or held. Its two halves now have
- * very different reachability, and saying so is the point of this paragraph:
+ * `Gated`: **rejected** is load-bearing — the flow-back's
+ * `suppression === Gated && jobEnvData.rejected` branch stops it. **held** is
+ * NOT consumed here: a held job gets its init round (only it resolves dynamic
+ * values) and the flow-back routes it to `holdExecutionAfterInit`. The no-
+ * dispatch guarantee for a held job lives at the call site's `held` branch,
+ * `dispatchReadyJob`'s pending-hold check, and the cluster path's
+ * `holdJobForApproval`.
  *
- * - **rejected** is live and load-bearing. The flow-back consumes it (that is
- *   the `suppression === Gated && jobEnvData.rejected` branch) to stop a job its
- *   context rules rejected from dispatching.
- * - **held** is NOT consumed here any more. A held job deliberately DOES get an
- *   init job — nothing else can resolve a dynamic value, so suppressing the
- *   round would make the job undispatchable rather than merely gated. The
- *   flow-back handles it after resolution instead, routing it to
- *   `holdExecutionAfterInit` so the hold and its resolved dispatch context are
- *   stored together.
- *
- * So do not read this as a guarantee that a held job cannot dispatch: that
- * guarantee lives at the call site's `jobEnvData.held` branch, and — for the
- * needs-scheduler and cluster paths, which reach a job by other routes — in
- * `dispatchReadyJob`'s pending-hold check and the cluster path's own
- * `holdJobForApproval` call.
- *
- * Exported for its own test: inline, the second branch could not be exercised at
- * all, and an untestable security check is one nobody can prove still works.
+ * Exported so the security check is testable.
  */
 export function initDispatchSuppression(
   workflow: Pick<LockWorkflow, 'hasFilter'>,
@@ -5576,23 +4837,14 @@ export function initDispatchSuppression(
 }
 
 /**
- * After init resolution, HOLD the job for approval instead of dispatching it.
+ * After init, HOLD the job instead of dispatching it: sibling of
+ * {@link dispatchExecutionAfterInit} for a lock-file approval on a job with
+ * dynamic fields (the dispatch loop skips it, see its `pendingInit` guard).
  *
- * The sibling of {@link dispatchExecutionAfterInit} for a job whose approval
- * was decided from the lock file (`applyStaticApprovalHolds`) while its dynamic
- * fields still needed an init round. The dispatch loop deliberately skips such
- * a job — see the `pendingInit` guard there — because holding it at dispatch
- * time would have stored an input built from unresolved values.
- *
- * Both halves of the hold happen here, in this order:
- *   1. `holdJobForApproval` creates the `held_runs` row, audits it, and stores
- *      the pending dispatch context built from the NOW-RESOLVED `jobEnvData`.
- *   2. The synthetic placeholder it produced is registered on the run, so the
- *      run is not considered complete while the job awaits approval.
- *
- * Step 2 is why this cannot call `holdJobForApproval` inline: the
- * dispatch loop registers its placeholders in one `addJobsToRun` after the
- * loop, and this path runs long after that call has already happened.
+ *   1. `holdJobForApproval` writes the row, audits it, and stores the context
+ *      built from the NOW-RESOLVED `jobEnvData`.
+ *   2. The placeholder is registered here, because the loop's single
+ *      `addJobsToRun` has long since run.
  */
 async function holdExecutionAfterInit(args: {
   ctx: WorkflowDispatchContext;
@@ -5615,10 +4867,8 @@ async function holdExecutionAfterInit(args: {
     dispatchedJobs: heldJobs,
   });
   if (heldJobs.length > 0 && deps.executionTracker) {
-    // NOT swallowed: this placeholder is the only thing keeping the run open
-    // while the approval is pending. If it never lands, the run can complete
-    // while the hold sits pending forever — so let the error propagate to the
-    // flow-back's catch, which records an init-failure the operator can see.
+    // NOT swallowed: the placeholder alone keeps the run open, so the error
+    // propagates to the flow-back's catch, which records a visible init-failure.
     try {
       await deps.executionTracker.addJobsToRun(runId, heldJobs);
     } catch (err) {
@@ -5638,30 +4888,23 @@ async function holdExecutionAfterInit(args: {
   });
 }
 
-/**
- * After init resolution, dispatch the actual execution job — through the
- * coordinator if peers are connected, else direct dispatch.
- */
+/** After init, dispatch the execution job: via the coordinator with peers, else direct. */
 async function dispatchExecutionAfterInit(args: {
   ctx: WorkflowDispatchContext;
   setup: DispatchSetup;
   buildPrep: BuildPrepResult;
   buildJobConfig: BuildJobConfigFn;
   mat: MaterializedJob;
-  /** Agent-resolved ordered bound-context names, persisted on the real job row. */
+  /** Agent-resolved ordered bound-context names. */
   contexts?: string[];
-  /** Test-run warning for context(s) skipped as unavailable — persisted for the dashboard. */
   envWarning?: string;
-  /** Names of the contexts skipped for the test run. */
   skippedContexts?: string[];
 }): Promise<void> {
   const { ctx, setup, buildPrep, buildJobConfig, mat, contexts, envWarning, skippedContexts } =
     args;
   const lockJob = mat.lockJob;
-  // The per-job fields every `addJobsToRun` below persists on the real job row.
-  // `gitCredentials` rides here rather than at each call site because the relay
-  // fails a request closed when the column is empty: a route that dropped it
-  // would refuse every declared credential on a deferred-init job.
+  // Fields every `addJobsToRun` below persists. `gitCredentials` is here so no
+  // route drops it: the relay fails closed on an empty column.
   const trackedFields = {
     ...(contexts?.length ? { contexts } : {}),
     ...(envWarning ? { envWarning } : {}),
@@ -5794,10 +5037,8 @@ async function dispatchExecutionAfterInit(args: {
 }
 
 /**
- * After the agent eval resolves a dynamic matrix to N combinations, materialize
- * the children and dispatch one execution job per combination — the dynamic-
- * matrix equivalent of the static-matrix dispatch path. Needs edges for the
- * children are inserted from the freshly-built expansion map.
+ * Materialize an agent-resolved dynamic matrix and dispatch one job per
+ * combination, then insert the children's needs edges.
  */
 async function dispatchResolvedDynamicMatrix(args: {
   ctx: WorkflowDispatchContext;
@@ -5807,10 +5048,7 @@ async function dispatchResolvedDynamicMatrix(args: {
   mat: MaterializedJob;
   combos: Array<Record<string, string | undefined>>;
   jobContextData: Map<string, JobEnvData>;
-  /**
-   * The base job's gate handle, from `applyInitResultContext`. Undefined when
-   * the job binds no context, in which case there is nothing to re-gate.
-   */
+  /** The base job's gate handle; undefined when it binds no context. */
   gate: ContextGateHandle | undefined;
 }): Promise<void> {
   const { ctx, setup, buildPrep, buildJobConfig, mat, combos, jobContextData, gate } = args;
@@ -5820,10 +5058,8 @@ async function dispatchResolvedDynamicMatrix(args: {
   try {
     result = materializeResolvedMatrix(mat.lockJob, combos);
   } catch (err) {
-    // The placeholder is never dispatched on any exit from here, so its
-    // reserved slot goes back before every one of them. Releasing only on the
-    // success path leaked a slot for the rest of the pass whenever a matrix
-    // failed to expand, which under-admits every later job in the same group.
+    // The placeholder never dispatches, on any exit: release its slot here too,
+    // or later jobs in the group are under-admitted.
     if (gate?.admitted) releaseAdmission(ctx, gate.admissionKey, gate.jobName);
     if (err instanceof FanoutError && deps.executionTracker) {
       const jobId = `matrix-failed-${randomUUID()}`;
@@ -5846,22 +5082,17 @@ async function dispatchResolvedDynamicMatrix(args: {
     throw err;
   }
 
-  // Each child inherits the base job's resolved env data (env/secrets resolved
-  // during init), keyed by its expanded name so makeBuildJobConfig finds it.
+  // Children inherit the base's resolved env data, keyed by expanded name for
+  // makeBuildJobConfig.
   const baseEnvData = jobContextData.get(mat.expandedName) ?? {};
-  // The placeholder never dispatches — the children replace it — so give back
-  // the in-pass slot its own gate reserved. Without this a fan-out of N
-  // children would consume N+1 slots.
+  // Children replace the placeholder: release its slot, or N children take N+1.
   if (gate?.admitted) releaseAdmission(ctx, gate.admissionKey, gate.jobName);
   for (const child of result.jobs) {
     const childEnvData: JobEnvData = { ...baseEnvData };
     jobContextData.set(child.expandedName, childEnvData);
-    // Gate each child on its own — the same shape a STATIC matrix produces,
-    // where `evaluateJobContexts` iterates the already expanded jobs and gates
-    // each one. Gating only the placeholder admitted all N combinations against
-    // a single checked slot. Skipped when the base already rejected or held:
-    // that verdict fans out to every child unchanged, and re-running the gate
-    // would spend a slot on a job that is not dispatching.
+    // Gate each child, as a STATIC matrix does; gating only the placeholder
+    // admits all N against one slot. A base reject/hold fans out unchanged, so
+    // no slot is spent re-gating.
     if (gate && !childEnvData.rejected && !childEnvData.held) {
       await applyContextProtectionGates({
         ctx,
@@ -5874,22 +5105,14 @@ async function dispatchResolvedDynamicMatrix(args: {
         jobEnvData: childEnvData,
       });
     }
-    // Defensive rather than reachable today: the base's own gate rejects before
-    // the fan-out is reached (`startDeferredInitDispatch` returns on
-    // `jobEnvData.rejected`), and the remaining reject gates are deterministic
-    // over the same effective context. Recorded rather than dropped, because a
-    // child that silently neither dispatched nor held would leave the run
-    // waiting on a job nothing ever reports.
+    // Defensive: the base's gate rejects before fan-out and the reject gates
+    // are deterministic. Recorded so the run never waits on a silent child.
     if (childEnvData.rejected) {
       await recordContextRuleRejectionAfterInit({ ctx, mat: child, jobEnvData: childEnvData });
       continue;
     }
-    // A held base job holds every child, one hold each — the same shape a
-    // STATIC matrix produces, where `evaluateJobContexts` iterates the already
-    // expanded jobs and mints a hold per child. Holding only the placeholder
-    // would resume a single un-expanded job instead of the N combinations.
-    // `holdJobForApproval` keys `held_runs.job_id` on the expanded name, so the
-    // children's holds stay distinguishable.
+    // A held base holds each child (keyed on expanded name), as a STATIC matrix
+    // does; holding the placeholder would resume one un-expanded job.
     if (childEnvData.held) {
       await holdExecutionAfterInit({
         ctx,
@@ -5911,8 +5134,7 @@ async function dispatchResolvedDynamicMatrix(args: {
     });
   }
 
-  // Insert needs edges for the resolved children so downstream jobs that need
-  // this base name wait for all of them.
+  // Downstreams needing the base name wait for every child.
   if (deps.db) {
     try {
       await insertEdgesForRun(deps.db, runId, result.jobs, result.expansionMap);
@@ -5943,10 +5165,8 @@ function startDeferredInitDispatch(args: {
   const { executionTracker } = deps;
   for (const { mat, initJobInput } of deferredInitJobs) {
     const lockJob = mat.lockJob;
-    // Each init job registers its execution jobs from a task that outlives this
-    // call, so it holds its own token. Taken synchronously here — before
-    // dispatchMatchedWorkflow's finally drops the build-window token — so the
-    // run is never momentarily un-held between the two.
+    // The task outlives this call, so it holds its own token, taken
+    // synchronously before the finally drops the window token — never un-held.
     const held = executionTracker?.holdRunForPendingJobs(runId) ?? false;
     const spawned = (async () => {
       try {
@@ -5960,10 +5180,8 @@ function startDeferredInitDispatch(args: {
         if (dispatchResult.status === 'rejected' || dispatchResult.status === 'duplicate') {
           throw new Error(`Init job dispatch rejected: ${dispatchResult.status}`);
         }
-        // `queued-no-backend` is tracked exactly like `queued`, as at every
-        // other dispatch site: the init job IS in the dispatch queue under
-        // `dispatchResult.jobId` and runs once an agent appears, so failing the
-        // run here left it dead while its init job later ran on a fresh agent.
+        // Tracked like `queued`: the init job IS queued and runs once an agent
+        // appears, so failing the run here would orphan it.
         if (dispatchResult.status === 'queued-no-backend') {
           logger.warn('Init job has no matching backend (tracked, awaiting capacity)', {
             runId,
@@ -5994,19 +5212,11 @@ function startDeferredInitDispatch(args: {
           jobContextData.set(mat.expandedName, jobEnvData);
           return;
         }
-        // A REJECTED job stops here: it is not dispatching, and nothing needs
-        // its resolved values. A HELD one does not — its approval was decided
-        // from the lock file before this round ran, and the release path
-        // dispatches the STORED pending context verbatim, so the values must be
-        // resolved and stored now or the job resumes unresolved.
+        // A REJECTED job stops here. A HELD one continues: release dispatches
+        // the STORED context verbatim, so values must resolve and store now.
         if (suppression === InitDispatchSuppression.Gated && jobEnvData.rejected) {
-          // Defensive rather than reachable today: a job is deferred either
-          // before its context rules run (a dynamic field) or only when it is
-          // not already rejected (the workflow-filter deferral), so nothing
-          // sets `rejected` between the deferral and this check. It records the
-          // rejection anyway, because the static collector skips every
-          // `pendingInit` job — leaving this branch silent would recreate the
-          // very gap the flow-back recorder exists to close.
+          // Defensive (nothing sets `rejected` between deferral and here), but
+          // recorded: the static collector skips `pendingInit` jobs.
           await recordContextRuleRejectionAfterInit({ ctx, mat, jobEnvData });
           jobContextData.set(mat.expandedName, jobEnvData);
           return;
@@ -6022,11 +5232,8 @@ function startDeferredInitDispatch(args: {
             ? { concurrencyGroup: lockJob.concurrencyGroup }
             : {}),
         });
-        // A context-unavailable warning is decided here, after the agent init
-        // round — long after the blocking `kici run remote` test run received
-        // its accept response. Surface it on the run's log stream (the same
-        // channel the init job's own lines take) so the CLI prints it, matching
-        // the synchronous path's accept-response warning.
+        // Decided after `kici run remote` got its accept response, so the
+        // warning goes on the run's log stream for the CLI to print.
         if (jobEnvData.envWarning && deps.logWriter) {
           await deps.logWriter.appendChunk(
             runId,
@@ -6036,28 +5243,18 @@ function startDeferredInitDispatch(args: {
             Date.now(),
           );
         }
-        // Now that the context rules have run (and resolved this job's vars and
-        // secrets), mint the holds the lock file decides. Same order as the
-        // synchronous path, so a context-driven hold still wins — it unions the
-        // job's own clauses, and on a root job the workflow's, into itself, and
-        // is the stronger requirement.
+        // Static holds AFTER context rules, as on the synchronous path.
         await applyStaticApprovalHolds({ ctx, lockJob, jobEnvData });
         jobContextData.set(mat.expandedName, jobEnvData);
-        // Re-checked AFTER resolution, not only before it: a dynamically-bound
-        // context's gates are evaluable only once the init round has named it,
-        // so `applyInitResultContext` is what sets `rejected` on this path. The
-        // pre-resolution check above cannot see it.
+        // Re-checked AFTER resolution: `applyInitResultContext` sets `rejected`
+        // for a dynamically-bound context.
         if (jobEnvData.rejected) {
           await recordContextRuleRejectionAfterInit({ ctx, mat, jobEnvData });
           return;
         }
-        // The matrix branch is checked BEFORE the single-job hold: a held
-        // dynamic-matrix job must fan its hold out across the children the
-        // round just resolved, not sit on the un-expanded placeholder, so the
-        // hold decision is made per child inside `dispatchResolvedDynamicMatrix`.
+        // Matrix BEFORE the single-job hold: a held dynamic matrix holds per
+        // child inside `dispatchResolvedDynamicMatrix`.
         if (mat.pendingDynamicMatrix && initResult.matrixValues) {
-          // The agent resolved the dynamic matrix to N combinations — materialize
-          // them and dispatch one child per combination, just like a static matrix.
           await dispatchResolvedDynamicMatrix({
             ctx,
             setup,
@@ -6069,11 +5266,8 @@ function startDeferredInitDispatch(args: {
             gate: contextGate,
           });
         } else if (jobEnvData.held) {
-          // Approval, not the init round, is this job's gate. The hold row and
-          // the pending dispatch context are created together HERE so the
-          // stored input carries the values this round just resolved —
-          // `storePendingJobContext` upserts, so a context written earlier is
-          // overwritten rather than duplicated.
+          // Hold and context are created HERE so the stored input carries the
+          // resolved values; `storePendingJobContext` upserts.
           await holdExecutionAfterInit({ ctx, setup, buildPrep, buildJobConfig, mat, jobEnvData });
         } else {
           await dispatchExecutionAfterInit({
@@ -6122,10 +5316,9 @@ function startDeferredInitDispatch(args: {
         }
       }
     })();
-    // Released via `.finally()` on the spawned promise rather than a
-    // try/finally inside it: the body returns early on several paths above its
-    // own try, and running after its catch is what lets the synthetic
-    // `init-failed-*` row land while the token is still held.
+    // Released in `.finally()` on the promise, not a try/finally inside it (the
+    // body returns early on several paths above its own try); after its catch,
+    // so the `init-failed-*` row lands while the token is still held.
     if (!held) {
       logger.warn('Deferred init job dispatched without a pending-jobs token', {
         runId,
@@ -6157,44 +5350,35 @@ function startDeferredInitDispatch(args: {
 
 export interface GeneratedJobConfig {
   /**
-   * The generated lock job with its `name` and `needs` rewritten to expanded
-   * matrix-child names (identical to the base job for non-matrix generated
-   * jobs). Downstream dispatch / needs-edge / tracking code keys on this name.
+   * `name` and `needs` rewritten to expanded matrix-child names; dispatch,
+   * needs edges and tracking key on this name.
    */
   genJob: LockJob;
   genJobConfig: Record<string, unknown>;
   runsOnLabels: string[];
-  /** Regex matchers the agent's labels must satisfy (JS post-filter). */
+  /** JS post-filter. */
   runsOnPatterns: LabelMatcher[];
-  /** Exact labels the dispatched agent must NOT have. */
   excludeLabels: string[];
-  /** Regex matchers that disqualify an agent (JS post-filter). */
+  /** JS post-filter. */
   excludePatterns: LabelMatcher[];
-  /** Host-fanout pin: when runsOn resolved to a roster host, route only to it. */
+  /** Set when runsOn resolved to a roster host. */
   pinnedAgentId?: string;
-  /** The host's current coordinator (cross-cluster reroute hint); null = not connected. */
+  /** Cross-cluster reroute hint; null = not connected. */
   connectedInstanceId?: string | null;
-  /** The matrix combination for this child; absent for non-matrix generated jobs. */
   matrixValues?: Record<string, unknown>;
   /**
-   * The `gitCredentials` map the generator's LOCK entry declared, inherited by
-   * this child. Persisted to `execution_jobs.git_credentials` at every dispatch
-   * site below, which is what the credential relay authorizes a request against.
+   * Inherited from the generator's LOCK entry; persisted to
+   * `execution_jobs.git_credentials` at every dispatch site for the relay.
    */
   gitCredentials?: Readonly<Record<string, Readonly<Record<string, string>>>>;
-  /**
-   * What a later dispatch resolves the job's context data from, when the job
-   * binds a context. A generated job stored as a pending dispatch context
-   * carries no context data at rest.
-   */
+  /** Context-data source for a later dispatch; no context data rests in storage. */
   contextResolution?: DeferredContextResolution;
 }
 
 /**
- * Split generated configs into pinned (host-pin dispatch) and unpinned (normal
- * label routing). A pinned config always rides the dispatcher pin path because
- * the coordinator's `JobToRoute` shape carries no pin field — routing it via the
- * coordinator would silently drop the pin.
+ * Split generated configs into pinned and unpinned. Pinned always use the
+ * dispatcher pin path: `JobToRoute` has no pin field, so the coordinator would
+ * silently drop it.
  */
 export function partitionGeneratedConfigsByPin(configs: readonly GeneratedJobConfig[]): {
   pinnedConfigs: GeneratedJobConfig[];
@@ -6214,13 +5398,13 @@ async function dispatchEvalJob(args: {
   setup: DispatchSetup;
   buildPrep: BuildPrepResult;
   dynamicEntry: BuildPrepResult['dynamicEntries'][number];
-  /** Frozen upstream snapshot for a result-aware generator (absent for event-only). */
+  /** Result-aware generators only. */
   upstreamSnapshot?: UpstreamSnapshot;
 }): Promise<{
   evalJobId: string;
   evalJobLabels: string[];
   evalJobName: string;
-  /** Synthetic deferred-eval row to swap for the real eval id (result-aware only). */
+  /** Result-aware only: the synthetic row to swap for the real eval id. */
   replaceSyntheticId: string | undefined;
   runsOnLabels: string[];
 }> {
@@ -6240,27 +5424,21 @@ async function dispatchEvalJob(args: {
     source: dynamicEntry.source,
     event,
     timeoutMs: 120_000,
-    // The workflow's `filter` gates the generator as well as the static jobs'
-    // init round — the agent runs it first and generates nothing on a `false`
-    // verdict. Without this a generator-only workflow would keep the filter
-    // inert, and a mixed one would half-dispatch. Omitted (never `false`) when
-    // the workflow declares none, matching how the lock file records it.
+    // `filter` gates the generator too (nothing generated on `false`), or a
+    // mixed workflow half-dispatches. Omitted (never `false`) when absent.
     ...(workflow.hasFilter === true && { hasFilter: true }),
-    // Deferred paths gate the generator the same way, and ahead of the filter.
+    // Deferred paths gate it the same way, ahead of the filter.
     ...(deferredPathsOf(ctx) && { deferredPaths: deferredPathsOf(ctx) }),
     ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
     ...(workflow.resolvedHashFiles?.length && {
       resolvedHashFiles: workflow.resolvedHashFiles,
     }),
-    // Result-aware generators carry their declared needs + the frozen upstream
-    // snapshot so the agent can build ctx.needs at eval time.
+    // For the agent to build ctx.needs at eval time.
     ...(upstreamSnapshot && {
       resultAware: true,
       declaredNeeds: dynamicEntry.needs ?? [],
       upstreamSnapshot,
     }),
-    // A global workflow's generator evaluation checks out the workflow
-    // repository and the source repository, as its other jobs do.
     ...globalJobConfigFor(ctx),
   };
   const evalJobInput: QueuedJobInput = {
@@ -6288,11 +5466,9 @@ async function dispatchEvalJob(args: {
     depsUrl: buildPrep.depsUrl,
     depsHash: buildPrep.depsHash,
   };
-  // For a result-aware (deferred) eval, registerDeferredEvalJob inserted a
-  // synthetic pending row under the same job name; look it up BEFORE dispatch so
-  // the swap that follows carries no further await between the WS dispatch and
-  // the caller's pendingDynamics.track() registration (a late await there races
-  // a fast eval-complete reply and drops the resolve).
+  // Look up registerDeferredEvalJob's synthetic row BEFORE dispatch: an await
+  // between dispatch and the caller's pendingDynamics.track() races a fast
+  // eval-complete reply and drops the resolve.
   const replaceSyntheticId =
     upstreamSnapshot && deps.executionTracker
       ? await deps.executionTracker.findDynamicEvalSyntheticId(runId, evalJobName)
@@ -6312,9 +5488,9 @@ async function dispatchEvalJob(args: {
 }
 
 /**
- * Records a dropped generated-job matrix as a `matrix_expansion` init failure so
+ * Record a dropped generated-job matrix as a `matrix_expansion` init failure so
  * the run's dashboard surfaces it, mirroring the static / top-level dynamic-matrix
- * paths. A no-op when the run has no execution tracker.
+ * paths.
  */
 async function recordGeneratedMatrixFailure(
   deps: WorkflowDispatchContext['deps'],
@@ -6349,49 +5525,43 @@ interface ResolveGeneratedJobConfigsArgs {
   installEnvSecrets: Record<string, string> | undefined;
   generatedJobs: LockJob[];
   dynamicEntry: BuildPrepResult['dynamicEntries'][number];
-  /** Frozen upstream snapshot threaded into each generated job's dynamicSource for re-eval. */
+  /** Threaded into each job's dynamicSource for re-eval. */
   upstreamSnapshot?: UpstreamSnapshot;
 }
 
-/** A generated job its contexts' protection gates held, with the hold they decided. */
+/** A generated job its contexts' gates held. */
 export interface HeldGeneratedJob {
   config: GeneratedJobConfig;
   envData: JobEnvData;
 }
 
 /**
- * The generated jobs split by their context gate verdict. A job the gates
- * rejected, or whose resolution threw, appears in neither list: it is recorded
- * on the run as failed.
+ * Generated jobs by gate verdict. Rejected or thrown jobs are in neither list;
+ * they are recorded on the run as failed.
  */
 export interface GeneratedJobResolution {
-  /** Jobs cleared to dispatch, carrying their resolved context data. */
+  /** Carrying their resolved context data. */
   dispatchable: GeneratedJobConfig[];
-  /** Jobs to hold; their context secrets are not resolved. */
+  /** Context secrets not resolved. */
   held: HeldGeneratedJob[];
 }
 
 /**
- * Run a generated job's bound contexts through the SAME gates a lock-defined
- * job passes — {@link applyContextRulesAndSecrets} — and return the verdict.
- *
- * The job arrives on the agent's dynamic-eval reply, so its `contexts` list is
- * job-code output. Binding a context must therefore cost what it costs a static
- * job: the repository / branch / trigger / enabled rules, then the reviewer,
- * wait-timer, minimum-trust and concurrency gates, and only after both the
- * context's variables and secrets.
+ * Gate a generated job's contexts through the SAME
+ * {@link applyContextRulesAndSecrets} as a lock job. Its `contexts` is
+ * job-code output, so binding one must cost the full set of rules and gates
+ * before any vars or secrets resolve.
  */
 async function gateGeneratedJobContexts(args: {
   ctx: WorkflowDispatchContext;
-  /** The workflow the generating dynamic entry belongs to. */
   workflow: Pick<LockWorkflow, 'contexts'>;
   mat: MaterializedJob;
 }): Promise<JobEnvData> {
   const { ctx, workflow, mat } = args;
   const genJob = mat.lockJob;
   const jobEnvData: JobEnvData = {};
-  // The workflow-level contexts bind a generated job too. A dynamic element is
-  // not resolved for a generated job, so only the static names are gated.
+  // Workflow-level contexts bind too; dynamic elements are not resolved here,
+  // so only static names are gated.
   const contextNames = resolveJobContextNames(workflow, genJob).names;
   if (contextNames.length === 0) return jobEnvData;
   await applyContextRulesAndSecrets({
@@ -6405,8 +5575,7 @@ async function gateGeneratedJobContexts(args: {
         : genJob.concurrencyGroup,
     jobEnvData,
     hostCtx: hostCtxFromMat(mat),
-    // A needs-gated generated job is stored and dispatched later by the needs
-    // scheduler, so it takes no in-pass slot — the same split static jobs use.
+    // Needs-gated: dispatched later by the scheduler, no in-pass slot.
     dispatchesThisPass: isRootJob(genJob),
     resolveRegistryAuth: false,
   });
@@ -6426,11 +5595,8 @@ async function buildGeneratedJobConfig(args: {
   const { installEnvSecrets, dynamicEntry, upstreamSnapshot } = base;
   const { deps, event } = ctx;
   const genJob = mat.lockJob;
-  // A generated job has no lock entry of its own, so it inherits the ceiling its
-  // GENERATOR was granted in the lock file. Read from `dynamicEntry` and never
-  // from `genJob`: `generatedJobs` arrives on the agent's dynamic-eval reply as
-  // unvalidated JSON, so a map read from there would let job code declare its
-  // own authorization — the hole the server-side credential record closes.
+  // Inherit the GENERATOR's lock ceiling, never `genJob`'s: that is unvalidated
+  // agent JSON, and reading it lets job code grant its own authorization.
   const inheritedGitCredentials = dynamicEntry.gitCredentials;
   // Run-wide CLI flat secrets win on collision + reach env-less dynamic jobs.
   const genSecrets: Record<string, string> = {
@@ -6450,9 +5616,8 @@ async function buildGeneratedJobConfig(args: {
     name: envelope.name,
     steps: genJob.steps,
     needs: expandedNeeds,
-    // Raw matrix/include/exclude are consumed at dispatch time, not shipped:
-    // the child instead carries baseJobName + matrixValues (exposed to the
-    // agent as ctx.job.name + ctx.matrix).
+    // Raw matrix is consumed here; the child carries baseJobName + matrixValues
+    // (ctx.job.name + ctx.matrix).
     ...(envelope.matrixValues && {
       baseJobName: envelope.baseJobName,
       matrixValues: envelope.matrixValues,
@@ -6474,8 +5639,7 @@ async function buildGeneratedJobConfig(args: {
       index: dynamicEntry.source.index,
       event,
       expectedJobNames,
-      // Result-aware generators re-eval against the same frozen snapshot the
-      // eval saw, plus the declared needs that shape ctx.needs.
+      // Re-eval sees the same frozen snapshot and declared needs.
       ...(upstreamSnapshot && {
         upstreamSnapshot,
         declaredNeeds: dynamicEntry.needs ?? [],
@@ -6492,8 +5656,7 @@ async function buildGeneratedJobConfig(args: {
   return {
     genJob: { ...genJob, name: envelope.name, needs: expandedNeeds },
     genJobConfig,
-    // A pin targets the agent directly — clear routing labels (parity with
-    // runsOnAll children, which carry no routing). A miss keeps normal routing.
+    // A pin clears routing labels, like runsOnAll children.
     runsOnLabels: pin ? [] : genSel.runsOnLabels,
     runsOnPatterns: pin ? [] : genSel.runsOnPatterns,
     excludeLabels: genSel.excludeLabels,
@@ -6509,11 +5672,8 @@ async function buildGeneratedJobConfig(args: {
 }
 
 /**
- * Gate each generated job on its bound contexts and build the job configs.
- *
- * A job the context rules reject is recorded on the run as failed and returned
- * in neither list. A job whose resolution throws is recorded on the run as
- * failed too, and dropped from both lists.
+ * Gate each generated job and build its config. Rejected or thrown jobs are
+ * recorded on the run as failed and returned in neither list.
  */
 export async function resolveGeneratedJobConfigs(
   args: ResolveGeneratedJobConfigsArgs,
@@ -6523,15 +5683,9 @@ export async function resolveGeneratedJobConfigs(
   const dispatchable: GeneratedJobConfig[] = [];
   const held: HeldGeneratedJob[] = [];
 
-  // Materialize each generated job's matrix into N children at dispatch time —
-  // the agent's dynamic serializer already resolved any dynamic matrix fn into a
-  // static LockMatrix, so a generated job with a matrix fans out here exactly
-  // like a lock-level static-matrix job. Non-matrix generated jobs pass through
-  // 1:1. The expansion map rewrites needs edges across the generated set, and
-  // the agent's expected-jobs tracking sees the expanded child names.
-  // Each generated job whose matrix fails to materialize is recorded as a
-  // matrix_expansion init failure and dropped, so one bad matrix does not poison
-  // the rest of the generated set. The loop handles multiple bad matrices.
+  // The agent already resolved dynamic matrix fns to static matrices, so fan
+  // out here like a lock static matrix; the expansion map rewrites needs. A
+  // failing matrix is recorded and dropped so it cannot poison the rest.
   let fanout;
   const remaining = [...generatedJobs];
   for (;;) {
@@ -6552,10 +5706,8 @@ export async function resolveGeneratedJobConfigs(
       if (remaining.length === before) throw err; // safety: avoid an infinite loop
     }
   }
-  // The agent re-evaluates the DynamicJobFn and compares its output against
-  // these names for determinism. The factory produces BASE job names (matrix
-  // expansion is an orchestrator dispatch concern), so expectedJobNames carries
-  // base names, de-duplicated across a fanned job's children.
+  // The agent's re-eval determinism check compares BASE names (the factory
+  // never expands matrices), de-duplicated across children.
   const expectedJobNames = [...new Set(fanout.jobs.map((m) => m.baseName))];
 
   const expandNeeds = (needs: LockJob['needs']): LockJob['needs'] => {
@@ -6608,9 +5760,9 @@ export async function resolveGeneratedJobConfigs(
 
 /** The step of resolving one generated job that a per-job failure came from. */
 enum GeneratedJobStep {
-  /** `gateGeneratedJobContexts`: matching its contexts, their gates and secrets. */
+  /** `gateGeneratedJobContexts`. */
   ContextGate = 'context-gate',
-  /** `buildGeneratedJobConfig`: its job config, including the global checkout fields. */
+  /** `buildGeneratedJobConfig`, including the global checkout fields. */
   JobConfig = 'job-config',
 }
 
@@ -6636,20 +5788,13 @@ const DROPPED_GENERATED_JOB_FAILURES: Record<
 };
 
 /**
- * Drop a generated job whose resolution threw: log the step that failed, give
- * back any in-pass concurrency slot its context gate reserved, and record the
- * job on the run as failed.
+ * Drop a generated job whose resolution threw: log the step, release its
+ * in-pass slot by name (the gate may have thrown after reserving, leaving no
+ * handle), and record it failed.
  *
- * The job never dispatches, so a sibling gated after it must not count it as
- * occupying a slot. The release goes by name because the gate may have thrown
- * after it reserved, leaving no gate handle to release through.
- *
- * The record gives the run a terminal row under the job's name. Without it a
- * job that `needs` the dropped one waits forever (the needs gate reads a
- * missing upstream as not yet terminal), and a run with no such dependent
- * finishes green without the job. It is awaited before the caller inserts the
- * needs edges and recomputes the gates, so that recompute already reads the
- * failed upstream and skips its dependents.
+ * The terminal row stops dependents waiting forever on a missing upstream and
+ * a dependent-free run finishing green without it. Awaited before the caller
+ * inserts edges and recomputes, so the recompute skips its dependents.
  */
 async function dropGeneratedJob(args: {
   ctx: WorkflowDispatchContext;
@@ -6713,9 +5858,8 @@ async function recordDroppedGeneratedJob(args: {
 }
 
 /**
- * A job's exact runs-on labels, or none when its matchers are invalid. A
- * generated job's `runsOn` is job-code output, and an invalid matcher may be
- * the very reason the job is being dropped.
+ * Exact runs-on labels, or none when the job-code matchers are invalid —
+ * possibly why the job is being dropped.
  */
 function runsOnLabelsOrNone(lockJob: LockJob): string[] {
   // fails-when: a job dropped for an invalid matcher throws here again, so it is never recorded
@@ -6813,9 +5957,7 @@ async function gateAndStoreNonRootGeneratedJobs(args: {
   for (const config of gatedGeneratedConfigs) {
     const { genJob, runsOnLabels, matrixValues, gitCredentials } = config;
     const gatedJobInput = buildGeneratedJobInput({ ctx, setup, buildPrep, config });
-    // A generated invoke gate never reaches an agent: register it as a pending
-    // gate (its cross-domain needs edges were inserted above) and let the
-    // scheduler release it when its upstreams complete.
+    // A generated invoke gate registers as pending; the scheduler releases it.
     const gateInvokeParams = invokeParamsFromLockJob(genJob);
     if (gateInvokeParams) {
       await registerGeneratedInvokeGate({
@@ -6859,17 +6001,11 @@ async function gateAndStoreNonRootGeneratedJobs(args: {
 }
 
 /**
- * Hold the generated jobs their contexts' protection gates held, through the
- * same `held_runs` row + pending dispatch context a lock-defined job's hold
- * writes ({@link persistJobHold}), so approval resumes each one through
- * `dispatchReadyJob`.
- *
- * A needs-gated held job also gets its needs edges: the resume path's needs
- * gate reads them, so an approval cannot run the job ahead of its upstreams.
- * The placeholders are registered on the run in one call after the holds, the
- * same shape {@link holdExecutionAfterInit} uses, and a failure to register
- * them propagates — a hold with no placeholder would let the run complete
- * while the job waits.
+ * Hold gate-held generated jobs via {@link persistJobHold}, so approval
+ * resumes each through `dispatchReadyJob`. Needs-gated ones get their edges so
+ * approval cannot outrun upstreams. Placeholders register in one call
+ * afterwards and a failure propagates: without one the run completes while
+ * the job waits.
  */
 async function holdGeneratedJobs(args: {
   ctx: WorkflowDispatchContext;
@@ -6923,8 +6059,7 @@ async function directDispatchGeneratedJobs(args: {
         ...(pinnedAgentId && { pinnedAgentId }),
         ...(connectedInstanceId !== undefined && { connectedInstanceId }),
       };
-      // A root generated invoke gate never reaches an agent: register it as a
-      // gate and release it immediately (the run is already tracked).
+      // A root generated gate is released now; the run is already tracked.
       const gateInvokeParams = invokeParamsFromLockJob(genJob);
       if (gateInvokeParams) {
         await registerGeneratedInvokeGate({
@@ -6975,9 +6110,7 @@ async function routeRootGeneratedJobs(args: {
   const { deps, workflow, repoIdentifier, credentials, event, ref, runId, bundle } = ctx;
   if (rootGeneratedConfigs.length === 0) return;
 
-  // Invoke gates never route to a peer — the gate summons + tracks proxies on
-  // the ingesting orchestrator. Dispatch them locally (directDispatch registers
-  // and releases each gate), then partition the rest for cluster routing.
+  // Invoke gates stay on the ingesting orchestrator.
   const gateConfigs = rootGeneratedConfigs.filter((c) => isInvokeGate(c.genJob));
   if (gateConfigs.length > 0) {
     await directDispatchGeneratedJobs({ ctx, setup, buildPrep, configs: gateConfigs });
@@ -6987,11 +6120,8 @@ async function routeRootGeneratedJobs(args: {
 
   const { pinnedConfigs, unpinnedConfigs } = partitionGeneratedConfigsByPin(nonGateConfigs);
 
-  // Pinned generated jobs always go through the dispatcher pin path: JobToRoute
-  // (the coordinator label-routing shape) carries no pin field, so routing a
-  // pinned job through it would lose the pin. The dispatcher's dispatchPinned
-  // handles local dispatch / queue-with-pin and the cross-cluster reroute the
-  // same way runsOnAll children are dispatched.
+  // Pinned jobs use dispatchPinned (see `partitionGeneratedConfigsByPin`), which
+  // handles local, queue-with-pin and cross-cluster reroute like runsOnAll.
   if (pinnedConfigs.length > 0) {
     await directDispatchGeneratedJobs({ ctx, setup, buildPrep, configs: pinnedConfigs });
   }
@@ -7215,10 +6345,7 @@ async function insertGeneratedNeedsEdges(
   }
 }
 
-/**
- * Eval-time topological sort across the fully-resolved graph. Marks all cycle
- * participants as failed and signals abort upstream.
- */
+/** Topologically sort the resolved graph; fail every cycle participant and signal abort. */
 async function detectAndFailCycles(args: {
   ctx: WorkflowDispatchContext;
 }): Promise<{ cycle: boolean }> {
@@ -7302,14 +6429,9 @@ async function recomputeAndDispatchReady(args: {
 }
 
 /**
- * Recompute the needs gate for `jobNames` and act on whatever became ready:
- * open the gate for a satisfied job, terminalize a job an upstream's status
- * excluded.
- *
- * `recomputeNeedsSatisfied` claims each job with a conditional
- * `needs_satisfied = false → true` UPDATE, so a job a concurrent
- * `evaluateDownstreams` already claimed is not returned here and cannot be
- * dispatched twice.
+ * Recompute the needs gate for `jobNames`: open satisfied jobs, terminalize
+ * excluded ones. The conditional `needs_satisfied = false → true` claim means
+ * a job a concurrent `evaluateDownstreams` claimed is never dispatched twice.
  */
 export async function recomputeAndApplyReady(
   ctx: NeedsSchedulingContext,
@@ -7342,11 +6464,7 @@ export async function recomputeAndApplyReady(
   }
 }
 
-/**
- * Split a result-aware generator's declared needs into static/named upstream job
- * names and dynamic-group names. Reuses the same normalized lock edge shapes the
- * static-job `needs` serializer produces.
- */
+/** Split a result-aware generator's declared needs into job names and group names. */
 function splitDeclaredNeeds(needs: BuildPrepResult['dynamicEntries'][number]['needs']): {
   jobNames: string[];
   groupNames: string[];
@@ -7366,11 +6484,9 @@ function splitDeclaredNeeds(needs: BuildPrepResult['dynamicEntries'][number]['ne
 }
 
 /**
- * Register a result-aware generator's eval job as a deferred, needs-gated DAG
- * job: insert a synthetic pending execution_jobs row plus its execution_job_needs
- * edges, so the existing scheduler gates the eval exactly like any other job.
- * Group needs expand to their member job names (members already carry group_name
- * from setGroupNameAndResolveEdges on the group's own eval completion).
+ * Register a result-aware eval as a needs-gated job (synthetic pending row plus
+ * edges) so the scheduler gates it like any job. Group needs expand to members,
+ * which carry group_name from setGroupNameAndResolveEdges.
  */
 async function registerDeferredEvalJob(args: {
   ctx: WorkflowDispatchContext;
@@ -7382,7 +6498,6 @@ async function registerDeferredEvalJob(args: {
   if (!deps.db) return;
   const { jobNames, groupNames } = splitDeclaredNeeds(dynamicEntry.needs);
 
-  // Expand group needs to concrete member job names recorded for this run.
   const groupMembers: string[] = [];
   for (const groupName of groupNames) {
     const members = await deps.db
@@ -7408,8 +6523,8 @@ async function registerDeferredEvalJob(args: {
     }
   }
 
-  // Synthetic pending eval-job row so the scheduler can gate + the run-complete
-  // check waits on it. Replaced by the real eval job id when the gate opens.
+  // Gated by the scheduler and awaited by run-complete; replaced by the real
+  // eval id when the gate opens.
   const syntheticId = `dynamic-eval-pending-${evalJobName}-${randomUUID()}`;
   if (deps.executionTracker) {
     await deps.executionTracker.addJobsToRun(runId, [
@@ -7440,21 +6555,15 @@ async function registerDeferredEvalJob(args: {
     upstreams: upstreamNames,
   });
 
-  // Race guard: an upstream may already be terminal (evaluateDownstreams ran for
-  // it before our edges existed), so the gate would never fire from a future
-  // completion. Recompute now; if already satisfied, fire the ready callback so
-  // the gate opens. recomputeNeedsSatisfied returns 'skip' too — for an upstream
-  // whose terminal status is not in the eval edge's run_on set, surface it as a
-  // skipped eval below.
+  // Race guard: an upstream may have gone terminal before these edges existed,
+  // so no future completion fires the gate. Recompute now.
   const results = await recomputeNeedsSatisfied(deps.db, runId, [evalJobName]);
   for (const result of results) {
     if (result.action === 'dispatch' && deps.executionTracker?.onJobReadyCallback) {
       await deps.executionTracker.onJobReadyCallback(runId, evalJobName);
     } else if (result.action === 'skip') {
-      // An upstream's terminal status is not in the eval edge's run_on set: the
-      // generator produces nothing. Open the gate anyway so the awaiting task
-      // proceeds with an empty snapshot (the generator decides what an
-      // empty/failed upstream means via a wider `when` set).
+      // Upstream status outside run_on: open the gate anyway so the task
+      // proceeds with an empty snapshot (a wider `when` set decides meaning).
       if (deps.executionTracker?.onJobReadyCallback) {
         await deps.executionTracker.onJobReadyCallback(runId, evalJobName);
       }
@@ -7462,19 +6571,14 @@ async function registerDeferredEvalJob(args: {
   }
 }
 
-// `gatherInvokeResults` now lives in `orchestrator-core.ts` alongside its
-// sibling upstream-outputs helpers (`mergeUpstreamOutputs`,
-// `buildUpstreamOutputsByBase`, `parseOutputsCell`), so the standard-job
-// dispatch path can reuse it without a reverse import cycle. Re-exported here
-// for the existing consumers/tests that import it from this module.
+// Lives in `orchestrator-core.ts` (no reverse import cycle); re-exported for
+// consumers that import it from here.
 export { gatherInvokeResults };
 
 /**
- * Gather the frozen upstream snapshot for a result-aware eval: each declared
- * job/group-member's stored outputs (the same plain outputs map that backs
- * jobRef.result), plus group → ordered member names, plus per-gate invoke
- * results. Captured once, at eval dispatch, and replayed unchanged on
- * agent-side re-eval.
+ * Frozen upstream snapshot for a result-aware eval: stored outputs (as backing
+ * jobRef.result), group → ordered members, and invoke results. Captured once at
+ * eval dispatch and replayed unchanged on agent re-eval.
  */
 async function gatherUpstreamSnapshot(args: {
   ctx: WorkflowDispatchContext;
@@ -7486,9 +6590,8 @@ async function gatherUpstreamSnapshot(args: {
   if (!deps.db) return snapshot;
   const { jobNames, groupNames } = splitDeclaredNeeds(dynamicEntry.needs);
 
-  // An upstream single-job need that names an invoke gate resolves to its per-run
-  // results (one entry per proxy child), exposed downstream as
-  // `ctx.needs['<gate>'].result`. Populate it before the plain jobs/groups read.
+  // A need naming an invoke gate resolves to one result per proxy child
+  // (`ctx.needs['<gate>'].result`).
   const invokeResults = await gatherInvokeResults(deps.db, runId, jobNames);
   if (Object.keys(invokeResults).length > 0) snapshot.invokeResults = invokeResults;
 
@@ -7517,9 +6620,7 @@ async function gatherUpstreamSnapshot(args: {
       .where('job_name', 'in', allJobNames)
       .execute();
     for (const row of rows) {
-      // outputs is a JSONB column — Kysely returns it already-parsed (object),
-      // though a string is tolerated too (parseOutputsCell handles both). A
-      // null/empty/unparseable cell yields no outputs for that upstream.
+      // JSONB, parsed or string; an empty or unparseable cell yields no outputs.
       const parsed = parseOutputsCell(row.outputs);
       if (parsed) snapshot.jobs[row.job_name] = parsed;
       if (row.status && snapshot.statuses) {
@@ -7542,14 +6643,12 @@ async function processDynamicEntry(args: {
   if (!deps.pendingDynamics) return;
   const evalJobName = `__dynamic__${workflow.name}__${dynamicEntry.source.index}`;
   try {
-    // Result-aware generators defer their eval until declared upstreams complete.
-    // Register the eval as a needs-gated DAG job and wait for the scheduler to
-    // open its gate, then snapshot the now-terminal upstreams' outputs.
+    // Result-aware: wait for the scheduler to open the eval's gate, then
+    // snapshot the terminal upstreams.
     let upstreamSnapshot: UpstreamSnapshot | undefined;
     if (dynamicEntry.resultAware) {
-      // Register the gate promise BEFORE registering edges so the race guard in
-      // registerDeferredEvalJob (which may fire onJobReadyCallback synchronously
-      // when an upstream is already terminal) finds a gate to open.
+      // Gate promise BEFORE edges: the race guard may fire onJobReadyCallback
+      // synchronously.
       const gateOpened = trackEvalGate(runId, evalJobName);
       await registerDeferredEvalJob({ ctx, evalJobName, dynamicEntry });
       await gateOpened;
@@ -7569,12 +6668,9 @@ async function processDynamicEntry(args: {
       dynamicEntry,
       upstreamSnapshot,
     });
-    // Register the completion tracker BEFORE any further await so a fast
-    // eval-complete reply can't resolve before we're listening.
+    // Track BEFORE any further await, or a fast eval-complete reply is missed.
     const generatedJobsPromise = deps.pendingDynamics.track(evalJobId);
-    // Record the eval job in the tracker. For a result-aware (deferred) eval,
-    // replaceSyntheticId swaps the synthetic pending row registerDeferredEvalJob
-    // inserted; for an event-only eval there is no synthetic row to replace.
+    // replaceSyntheticId is set only for a result-aware eval.
     if (deps.executionTracker) {
       await deps.executionTracker.addJobsToRun(
         runId,
@@ -7672,16 +6768,12 @@ function startDeferredDynamicDispatch(args: {
   if (buildPrep.dynamicEntries.length === 0 || !deps.pendingDynamics) return;
   const { executionTracker } = deps;
   for (const dynamicEntry of buildPrep.dynamicEntries) {
-    // Each entry registers its jobs from a task that outlives this call, so it
-    // holds its own token. Taken synchronously here — before
-    // dispatchMatchedWorkflow's finally drops the build-window token — so the
-    // run is never momentarily un-held between the two.
+    // Own token, taken synchronously (see `startDeferredInitDispatch`).
     const held = executionTracker?.holdRunForPendingJobs(ctx.runId) ?? false;
     const spawned = processDynamicEntry({ ctx, setup, buildPrep, secrets, dynamicEntry });
-    // Released via `.finally()` on the spawned promise rather than a
-    // try/finally inside processDynamicEntry: it returns early above its own
-    // try, and running after its catch is what lets the synthetic
-    // `dynamic-eval-failed-*` row land while the token is still held.
+    // `.finally()` on the promise, not a try/finally inside processDynamicEntry
+    // (it returns early above its own try); after the catch, so
+    // `dynamic-eval-failed-*` lands while held.
     if (!held) {
       logger.warn('Dynamic entry dispatched without a pending-jobs token', {
         runId: ctx.runId,
@@ -7708,11 +6800,8 @@ function startDeferredDynamicDispatch(args: {
 }
 
 /**
- * When ALL jobs are deferred (no static dispatched, no init dispatched yet),
- * we must create the execution_runs row BEFORE dispatching deferred-init or
- * deferred-dynamic jobs. Otherwise a fast init/dyn completion triggers
- * onJobStatus → execution_jobs INSERT against a non-existent run (FK
- * violation).
+ * When ALL jobs are deferred, create the run row BEFORE dispatching them, or a
+ * fast completion inserts execution_jobs against a missing run (FK violation).
  */
 async function ensureExecutionRunForDeferred(args: {
   ctx: WorkflowDispatchContext;
@@ -7721,9 +6810,8 @@ async function ensureExecutionRunForDeferred(args: {
   dispatchedJobs: DispatchedJob[];
   deferredInitCount: number;
   reason: 'init' | 'dynamic';
-  /** True when the run row already exists (see `recordRunStart`). */
+  /** See `recordRunStart`. */
   runTrackedEarly: boolean;
-  /** The run-level secret context the evaluation resolved, for `stampRunStartColumns`. */
   runContextName: string | undefined;
   runContextId: string | undefined;
 }): Promise<void> {
@@ -7737,8 +6825,7 @@ async function ensureExecutionRunForDeferred(args: {
     runTrackedEarly,
   } = args;
   const { deps } = ctx;
-  // A second `onExecutionStarted` would reset the in-memory job map, so the row
-  // is only bootstrapped here when nothing has registered the run yet.
+  // Only when unregistered: a second `onExecutionStarted` resets the job map.
   if (!deps.executionTracker || runTrackedEarly) return;
   if (dispatchedJobs.length !== 0) return;
   if (reason === 'dynamic' && deferredInitCount > 0) return;
@@ -7747,25 +6834,16 @@ async function ensureExecutionRunForDeferred(args: {
 }
 
 /**
- * Complete the check runs `setupDispatchContext` posted, for a dispatch that
- * ends without any job.
+ * Complete the posted check runs for a dispatch that ends with no job. The
+ * exit rows (`recordInitFailureRun`, `onBuildFailed`) fire only
+ * `onExecutionStatusChange`, never `onExecutionComplete` (the one wired to
+ * `updateWorkflowStatus`), so the checks would stay `queued` and block branch
+ * protection.
  *
- * Every early exit below that phase inherits the same defect: the queued
- * `kici/<workflow>` and per-job checks are already on the commit, and the row
- * each exit writes (`recordInitFailureRun`, `onBuildFailed`) fires
- * `onExecutionStatusChange` only — never `onExecutionComplete`, which is the
- * one callback wired to `updateWorkflowStatus`. Left alone the checks stay
- * `queued` forever and block branch protection.
- *
- * The names come from `ctx` + `setup`, matching the `setPendingAwait` call in
- * `setupDispatchContext` field for field. Never throws: a provider error must
- * not turn a recorded failure into a dispatch error.
- *
- * `setup` is optional so the top-level catch can call this with `ctx` alone. A
- * throw can land before `dispatchMatchedWorkflowInner` returns its `setup` to
- * anyone, but the two fields read off it — the effective provider and routing
- * key — are `setupDispatchContext`'s own overlay of values `ctx` already
- * carries, so the fallback reproduces them rather than approximating them.
+ * Names match `setupDispatchContext`'s `setPendingAwait` field for field.
+ * Never throws: a provider error must not turn a recorded failure into a
+ * dispatch error. `setup` is optional for the top-level catch; the `ctx`
+ * fallback reproduces its provider and routing-key overlay exactly.
  */
 async function completeChecksForUndispatchedRun(args: {
   ctx: WorkflowDispatchContext;
@@ -7786,7 +6864,6 @@ async function completeChecksForUndispatchedRun(args: {
       repo,
       sha: ref,
       workflowName: workflow.name,
-      // The same name `setupDispatchContext` posted the checks under.
       ...(ctx.global && { workflowRepoIdentifier: ctx.global.workflowRepoIdentifier }),
       jobNames: workflow.jobs.filter(isLockStaticJob).map((j) => j.name),
       installationId: (credentials as { installationId?: number }).installationId,
@@ -7803,16 +6880,9 @@ async function completeChecksForUndispatchedRun(args: {
 }
 
 /**
- * Persist a failed `execution_runs` row for a pre-dispatch early-exit so the
- * dashboard's Runs view surfaces secret_resolution / install_secrets /
- * context_rules rejections instead of leaving the run with zero trace, and
- * complete the check runs that exit strands.
- *
- * Called from every early-exit site in `dispatchMatchedWorkflow` that ends the
- * dispatch with an init failure — the approval-misconfig gate, workflow
- * secrets, install secrets, both sandbox denials, and the no-jobs guard. The
- * helper is a no-op when no `executionTracker` is wired into deps (test /
- * minimal deployments).
+ * Persist a failed run row for a pre-dispatch init-failure exit, so the Runs
+ * view shows it instead of no trace, and complete the stranded checks. The row
+ * is skipped without an `executionTracker`.
  */
 async function recordInitFailureFromSkip(args: {
   ctx: WorkflowDispatchContext;
@@ -7829,11 +6899,10 @@ async function recordInitFailureFromSkip(args: {
     provider: setup.info.provider,
     repoIdentifier,
     workflowRepoIdentifier,
-    // The run row's `ref` is the branch the run PRESENTS — the same value
-    // `onExecutionStarted` writes on the ordinary path, and the one the context
-    // branch gate evaluates. Not `sourceBranch`: a job's checkout ref is the PR
-    // head branch, which a fork contributor names freely, and this row is read
-    // back as a branch claim by the internal-event branch inheritance.
+    // The branch the run PRESENTS (as `onExecutionStarted` writes, and the
+    // context branch gate evaluates), not `sourceBranch`: a fork names its PR
+    // head freely, and internal-event branch inheritance reads this row as a
+    // branch claim.
     ref: event.targetBranch,
     sha: ref,
     deliveryId: setup.effectiveDeliveryId,
@@ -7849,10 +6918,7 @@ async function recordInitFailureFromSkip(args: {
     ...preDispatchRunProvenance(ctx),
   });
 
-  // The run is terminal and no job will ever run, so the queued checks have to
-  // be closed here. Outside the tracker guard above: the check runs come from a
-  // different dependency, so a deployment without a tracker can still have them
-  // on the commit.
+  // Not tracker-guarded: checks come from another dependency.
   await completeChecksForUndispatchedRun({
     ctx,
     setup,
@@ -7862,11 +6928,9 @@ async function recordInitFailureFromSkip(args: {
 }
 
 /**
- * Fail the run loud when the lock file's always-mode approval config carries an
- * invalid `timeoutSeconds` (non-positive / non-finite). Runs before any job
- * dispatches so an invalid value can never reach the hold builders (no past
- * `expires_at`, no `new Date(Infinity)` crash). Returns true when it recorded an
- * `approval_misconfig` init-failure (the caller must then short-circuit).
+ * Fail the run on an invalid approval `timeoutSeconds` before any dispatch, so
+ * it never reaches the hold builders (past `expires_at`, `new Date(Infinity)`).
+ * True when it recorded `approval_misconfig`; the caller must short-circuit.
  */
 async function recordApprovalMisconfigIfInvalid(
   ctx: WorkflowDispatchContext,
@@ -7885,10 +6949,9 @@ async function recordApprovalMisconfigIfInvalid(
 }
 
 /**
- * Pause the workflow dispatch at the install gate: write a `held` execution_runs
- * row (reused on resume), create the workflow-scoped held_runs row, and persist
- * the pending workflow context so the release path can rebuild + resume the
- * dispatch. No jobs are queued.
+ * Pause at the install gate: a `held` run row (reused on resume), the
+ * workflow-scoped held_runs row, and the pending workflow context the release
+ * rebuilds from. No jobs are queued.
  */
 async function holdWorkflowForInstallGate(args: {
   ctx: WorkflowDispatchContext;
@@ -7907,11 +6970,7 @@ async function holdWorkflowForInstallGate(args: {
       provider: setup.info.provider,
       repoIdentifier,
       workflowRepoIdentifier,
-      // The run row's `ref` is the branch the run PRESENTS — the same value
-      // `onExecutionStarted` writes on the ordinary path, and the one the context
-      // branch gate evaluates. Not `sourceBranch`: a job's checkout ref is the PR
-      // head branch, which a fork contributor names freely, and this row is read
-      // back as a branch claim by the internal-event branch inheritance.
+      // The presented branch, never `sourceBranch` (see `recordInitFailureFromSkip`).
       ref: event.targetBranch,
       sha: ref,
       deliveryId: setup.effectiveDeliveryId,
@@ -7940,8 +6999,7 @@ async function holdWorkflowForInstallGate(args: {
     });
   }
 
-  // The record goes with the stored dispatch: its release reads it back to know
-  // which contexts the approval covers.
+  // The release reads the record to know which contexts the approval covers.
   await storePendingWorkflowContext(
     deps.db,
     toSerializableInputs({ ...ctx, installGateRecord: hold.record }),
@@ -7949,12 +7007,8 @@ async function holdWorkflowForInstallGate(args: {
 }
 
 /**
- * How long the security hold raised by `decision` stays approvable.
- *
- * The window rides on the decision itself, from the same policy read that
- * produced the verdict — no second DB read, so no TOCTOU and no divergence
- * between deciding and sizing. A decision carrying no window falls back to the
- * documented default.
+ * How long the hold stays approvable. The window rides on the decision from
+ * the same policy read (no second read, no TOCTOU); default when absent.
  */
 function securityHoldExpiryMs(decision: Extract<TrustPolicyOutcome, { action: 'hold' }>): number {
   const seconds = decision.approvalExpirySeconds ?? DEFAULT_APPROVAL_EXPIRY_SECONDS;
@@ -7988,21 +7042,17 @@ export function buildSecurityHoldData(
 }
 
 /**
- * Hold a run in the security queue because the org trust policy said so. The
- * reason travels from the policy gate, so one helper covers every arm.
+ * Hold a run in the security queue per the org trust policy; the reason comes
+ * from the gate, so one helper covers every arm.
  *
- * Mirrors the install-gate hold, including its resume context: the hold fires
- * before any job is materialized, so there is no job to re-dispatch and the
- * whole workflow dispatch is stored and replayed instead. `/kici approve`
- * releases the workflow-scoped hold through `resumeWorkflow`, which re-runs this
- * dispatch with `reuseRunId` set — so `applyTrustPolicyGate` short-circuits and
- * the run continues into the gates it never reached, still carrying the
- * `trustResolution` this dispatch resolved. `/kici reject` cancels the run and
- * drops the context; stale-detector expiry fails it.
+ * Like the install-gate hold, no job exists yet, so the whole dispatch is
+ * stored and replayed: `/kici approve` → `resumeWorkflow` re-runs it with
+ * `reuseRunId`, `applyTrustPolicyGate` short-circuits, and the run continues
+ * with this dispatch's `trustResolution`. `/kici reject` cancels and drops the
+ * context; stale-detector expiry fails it.
  *
- * The held `execution_runs` row carries the PR number so the PR-scoped
- * `/kici approve|reject` comment path (which joins on `pr_number`) can attribute
- * and release the hold — a NULL would leave it fail-closed unreachable.
+ * The row carries the PR number: the `/kici approve|reject` comment path joins
+ * on `pr_number`, and a NULL leaves the hold fail-closed unreachable.
  */
 async function holdRunForSecurityPolicy(args: {
   ctx: WorkflowDispatchContext;
@@ -8029,11 +7079,7 @@ async function holdRunForSecurityPolicy(args: {
       provider: setup.info.provider,
       repoIdentifier,
       workflowRepoIdentifier,
-      // The run row's `ref` is the branch the run PRESENTS — the same value
-      // `onExecutionStarted` writes on the ordinary path, and the one the context
-      // branch gate evaluates. Not `sourceBranch`: a job's checkout ref is the PR
-      // head branch, which a fork contributor names freely, and this row is read
-      // back as a branch claim by the internal-event branch inheritance.
+      // The presented branch, never `sourceBranch` (see `recordInitFailureFromSkip`).
       ref: event.targetBranch,
       sha: ref,
       deliveryId: setup.effectiveDeliveryId,
@@ -8052,38 +7098,27 @@ async function holdRunForSecurityPolicy(args: {
   let heldRow: HeldRun | undefined;
   if (deps.heldRunStore) {
     const holdData = buildSecurityHoldData(runId, decision);
-    // The row and the context it resumes from are written TOGETHER, the same
-    // pairing `holdJobForApproval` makes and for the same reason: the context
-    // is the only thing that can replay this dispatch, so a row that outlived a
-    // failed context write would be a hold nothing can release. That run then
-    // reaches `failRunResumeLost`, which by its own comment cannot complete the
-    // queued `kici/…` checks — so the commit keeps them forever too.
+    // Row and context TOGETHER, as in `holdJobForApproval`: a row without its
+    // context is unreleasable and reaches `failRunResumeLost`, which cannot
+    // complete the queued `kici/…` checks.
     //
-    // Inside the store guard, not around it: the hold row is the only thing
-    // that can release this context, so a store-less orchestrator writing one
-    // would leave a context nothing can ever reference or clean up.
+    // Inside the store guard: without a row, nothing could reference or clean
+    // up the context.
     const writeHoldAndContext = async (exec?: Transaction<Database>): Promise<HeldRun> => {
       const row = await deps.heldRunStore!.create(ctx.resolvedOrgId, holdData, exec);
       await storePendingWorkflowContext(exec ?? deps.db, toSerializableInputs(ctx));
       return row;
     };
-    // A local test run (`kici run`) has no database at all: the context lives
-    // only in memory, so there is nothing to make atomic and nothing to enrol.
+    // A local `kici run` has no database; the context is in memory only.
     heldRow = deps.db
       ? await deps.db.transaction().execute(writeHoldAndContext)
       : await writeHoldAndContext();
   }
 
-  // Gated on the store as well as the poster, and for the same reason the row
-  // write is: every route that terminalizes a `KiCI Security` check reaches it
-  // through the `held_runs` row this branch writes. A post with no row behind it
-  // is a pending check nothing can ever settle.
+  // Store-gated too: a post with no `held_runs` row is a check nothing settles.
   if (deps.heldRunStore && heldRow && ctx.bundle?.checkStatusPoster) {
-    // The reduced-privilege note belongs here: this hold stores a resume context
-    // above, so `/kici approve` replays this dispatch and the run really does
-    // execute under the posture the note names. The replay reuses this run id,
-    // which short-circuits the trust gate rather than re-resolving trust, so the
-    // tier the note is built from is the tier the resumed run carries.
+    // The replay reuses this run id and skips re-resolving trust, so the note's
+    // tier is the resumed run's tier.
     const postureNote = buildReducedPrivilegeNote(trustResolution?.tier, ctx.lockFileSource);
     const holdSummary =
       buildSecurityHoldSummary(
@@ -8112,50 +7147,32 @@ function ignoredDispatchResult(): DispatchMatchedWorkflowResult {
 }
 
 /**
- * Answer an `ignore` verdict before the dispatch does anything observable.
- *
- * `ignore` withholds every artifact the event would otherwise leave behind, and
- * setup is already observable: it creates the queued check runs on the commit,
- * and no path from here completes them, so a check left queued sits on the pull
- * request as a branch-protection blocker. Deciding first is what makes the
- * withholding real.
- *
- * The other verdicts are decided after setup by `applyTrustPolicyGate`, because
- * a hold and a rejection both record a run row and post a check that need the
- * setup bag — and because deciding them earlier would change when the
- * approval-misconfig check runs relative to the policy.
- *
- * Returns the terminal dispatch result on `ignore`, or `null` to continue.
+ * Answer `ignore` before setup, which posts queued checks nothing would
+ * complete (a branch-protection blocker). Other verdicts wait for
+ * `applyTrustPolicyGate` after setup: they need the setup bag, and deciding
+ * earlier would reorder the approval-misconfig check. Null to continue.
  */
 function declineIgnoredDispatch(
   ctx: WorkflowDispatchContext,
   opts: DispatchMatchedWorkflowOptions,
 ): DispatchMatchedWorkflowResult | null {
-  // The same resume guard the gate applies: a re-entry re-dispatches a run
-  // whose hold was already released, so the verdict must not act a second time.
+  // A resume re-entry must not act on the verdict twice.
   if (opts.reuseRunId) return null;
   if (ctx.securityDecision.action !== 'ignore') return null;
   return ignoredDispatchResult();
 }
 
 /**
- * PR-wide trust-policy gate: the org policy decides whether a non-trusted
- * contributor's PR runs, is held for approval, or is rejected outright.
- *
- * Runs before any job dispatch and short-circuits the context gate, so a PR
- * that trips both never produces two competing holds. Skipped on a resume
- * re-entry (a released hold re-running this dispatch).
- *
- * Returns the terminal dispatch result when the gate acted, or `null` to let
- * dispatch continue.
+ * PR-wide trust-policy gate: run, hold, or reject a non-trusted contributor's
+ * PR. Runs before any dispatch and short-circuits the context gate, so no two
+ * competing holds. Skipped on resume. Null to continue.
  */
 async function applyTrustPolicyGate(
   ctx: WorkflowDispatchContext,
   setup: DispatchSetup,
   opts: { reuseRunId?: string | false },
 ): Promise<DispatchMatchedWorkflowResult | null> {
-  // A resume re-entry re-dispatches a run whose hold was already released, so
-  // the gate must not act a second time.
+  // A resume re-entry must not act twice.
   if (opts.reuseRunId) return null;
 
   const decision = ctx.securityDecision;
@@ -8163,11 +7180,8 @@ async function applyTrustPolicyGate(
     case 'pass':
       return null;
     case 'ignore':
-      // Redundant with `declineIgnoredDispatch`, which answers this verdict
-      // before setup can post a check run — kept so the switch stays total over
-      // the outcome union. Without the arm an `ignore` reaching here would fall
-      // to `default` and be rejected, writing exactly the visible failed run
-      // the verdict exists to withhold.
+      // Redundant with `declineIgnoredDispatch`, but keeps the switch total:
+      // `default` would reject, writing the visible failed run `ignore` withholds.
       return ignoredDispatchResult();
     case 'hold':
       await holdRunForSecurityPolicy({ ctx, setup, decision });
@@ -8176,18 +7190,10 @@ async function applyTrustPolicyGate(
       await rejectRunForSecurityPolicy({ ctx, setup, decision });
       return { dispatchedJobCount: 0, dispatchedJobIds: [] };
     default: {
-      // An action this build does not recognise denies. Falling through would
-      // dispatch untrusted code.
-      //
-      // No producer reaches this arm today. Every `securityDecision` comes from
-      // `evaluateTrustPolicy`, which returns only `pass` / `hold` / `ignore` —
-      // an unrecognised `forkPolicy` value hits ITS default and becomes a
-      // `hold`, so a newer Platform writing an unknown value into the plain-TEXT
-      // policy column is absorbed there rather than arriving here. This arm is
-      // the fail-closed answer held ready for a producer that returns an action
-      // the switch above does not name, one step stricter than the evaluator's
-      // own "a verdict I do not understand holds" stance because by here the run
-      // is about to start.
+      // An unrecognised action denies; falling through dispatches untrusted
+      // code. Unreachable today: `evaluateTrustPolicy` returns only `pass` /
+      // `hold` / `ignore` and turns an unknown `forkPolicy` into `hold`. Stricter
+      // than the evaluator's hold because the run is about to start.
       const unrecognised = decision as { action: string; reason?: TrustPolicyHoldReason };
       await rejectRunForSecurityPolicy({
         ctx,
@@ -8204,18 +7210,13 @@ async function applyTrustPolicyGate(
 }
 
 /**
- * Fail a run before any job starts because the org trust policy rejected it.
+ * Fail a run the trust policy rejected, before any job starts: a run-scoped
+ * init failure (visible in the run list and audit trail), a failure via the
+ * hold path's check poster (so hold→reject updates the check in place), and
+ * completion of the queued checks.
  *
- * Uses the run-scoped init-failure path so the rejection is visible in the run
- * list and the audit trail rather than vanishing, and posts the failure through
- * the same check poster the hold path uses so a policy tightened from hold to
- * reject updates that check in place. It also completes the queued check runs
- * `setupDispatchContext` posted, which nothing else on this path would.
- *
- * Both call sites are in `applyTrustPolicyGate`, and neither is reachable
- * through today's producers — see the `default` arm there for why. The function
- * is the terminal shape a `reject` verdict would take, kept whole so an action
- * that does arrive is denied completely rather than half-recorded.
+ * Unreachable through today's producers (see `applyTrustPolicyGate`'s
+ * `default` arm); kept whole so a verdict that arrives is denied completely.
  */
 async function rejectRunForSecurityPolicy(args: {
   ctx: WorkflowDispatchContext;
@@ -8248,11 +7249,10 @@ async function rejectRunForSecurityPolicy(args: {
     provider: setup.info.provider,
     repoIdentifier,
     workflowRepoIdentifier,
-    // The run row's `ref` is the branch the run PRESENTS — the same value
-    // `onExecutionStarted` writes on the ordinary path, and the one the context
-    // branch gate evaluates. Not `sourceBranch`: a job's checkout ref is the PR
-    // head branch, which a fork contributor names freely, and this row is read
-    // back as a branch claim by the internal-event branch inheritance.
+    // The branch the run PRESENTS (as `onExecutionStarted` writes, and the
+    // context branch gate evaluates), not `sourceBranch`: a fork names its PR
+    // head freely, and internal-event branch inheritance reads this row as a
+    // branch claim.
     ref: event.targetBranch,
     sha: ref,
     deliveryId: setup.effectiveDeliveryId,
@@ -8287,15 +7287,9 @@ async function rejectRunForSecurityPolicy(args: {
       });
     });
 
-  // `setupDispatchContext` already posted the queued `kici/<workflow>` and
-  // per-job checks, and this rejection dispatches nothing — so nothing else
-  // ever completes them. The security check above is a different check run
-  // (`KiCI Security`), so posting it leaves these untouched.
-  //
-  // Same summary on both. Branch protection usually requires
-  // `kici/<workflow>`, so that check is often the only one a contributor reads
-  // — and the half that matters is the last line, which says the run cannot be
-  // approved and names what an org owner has to change.
+  // `KiCI Security` is a separate check, so the queued ones need completing.
+  // Same summary: `kici/<workflow>` is often the only check a contributor
+  // reads, and its last line names what an org owner must change.
   await completeChecksForUndispatchedRun({
     ctx,
     setup,
@@ -8305,13 +7299,9 @@ async function rejectRunForSecurityPolicy(args: {
 }
 
 /**
- * Phases I + J — hand the deferred work off to its fire-and-forget tasks.
- *
- * A workflow whose jobs are ALL deferred dispatched nothing in the static loop,
- * so nothing has registered the run yet; `ensureExecutionRunForDeferred`
- * bootstraps the row first so the first `onJobStatus` from an init / dynamic
- * agent has a parent run to attach to. Each task then takes its own
- * pending-jobs token, since its jobs are registered after this call returns.
+ * Phases I + J — hand deferred work to fire-and-forget tasks. An all-deferred
+ * workflow gets its row from `ensureExecutionRunForDeferred` first; each task
+ * takes its own pending-jobs token.
  */
 async function startDeferredPhases(args: {
   ctx: WorkflowDispatchContext;
@@ -8379,11 +7369,7 @@ async function startDeferredPhases(args: {
 // ---------------------------------------------------------------------------
 
 /**
- * Dispatch a single matched workflow.
- *
- * Narrative orchestrator: each phase is a typed helper that returns a typed
- * result the next phase consumes. The function reads top-to-bottom as the
- * pipeline:
+ * Dispatch a single matched workflow, phase by phase:
  *   A. setup → wrapped dispatcher + overlaid info
  *   B. cache + build → buildPrep with cache URLs and build-job state
  *   C. workflow secrets + ephemeral key → secret bundle
@@ -8397,24 +7383,16 @@ export async function dispatchMatchedWorkflow(
   ctx: WorkflowDispatchContext,
   opts: DispatchMatchedWorkflowOptions = {},
 ): Promise<DispatchMatchedWorkflowResult> {
-  // Belt-and-braces against a stale flag arriving on a reused context: this
-  // call has not taken a token yet, so it owes no release, and it has not
-  // registered a run yet, so it owes no terminalization.
+  // Reset stale flags from a reused context: this call owes nothing yet.
   ctx.dispatchWindowTokenHeld = false;
   ctx.runRegisteredBeforeDispatch = false;
   ctx.pendingChecksPosted = false;
   try {
     return await dispatchMatchedWorkflowInner(ctx, opts);
   } catch (err) {
-    // The run row exists but may hold zero jobs — a throw on the first dispatch,
-    // or one from the registration itself. Nothing reaps that row: the
-    // stale-run detector scans from `execution_jobs` / `dispatch_queue`, orphan
-    // recovery needs `status = 'running'`, cold-store archival needs a terminal
-    // status, and cancel cannot terminalize it either (completion requires at
-    // least one job). It would sit `pending` forever, uncancellable, while the
-    // deadline detector re-fired against it every tick. `failRun` writes the
-    // terminal row and evicts the in-memory run without needing a job to hang
-    // it off.
+    // The row may hold zero jobs, which nothing reaps or cancels (see
+    // `startRunBeforeDispatch`); `failRun` terminalizes and evicts it without
+    // needing a job.
     if (ctx.runRegisteredBeforeDispatch) {
       try {
         await ctx.deps.executionTracker?.failRun(
@@ -8429,26 +7407,14 @@ export async function dispatchMatchedWorkflow(
         });
       }
     }
-    // The queued checks `setupDispatchContext` posted are on the commit and no
-    // job will ever conclude them. The named early exits each complete their
-    // own; a throw reaches none of those, and `failRun` above writes the run row
-    // without touching a check run — so this is the only place a thrown dispatch
-    // can close them.
+    // The only place a thrown dispatch closes the queued checks: early exits
+    // complete their own, `failRun` touches none. Keyed on the flag, not the
+    // throw site (a rolled-back hold transaction is one case of many). `setup`
+    // may not exist, hence the `ctx` fallback.
     //
-    // Enumerated by the shape rather than by the throw site: every exit after
-    // the checks are posted owes them a conclusion, so the flag is the
-    // condition. The hold transaction rolling back is one such throw; it is not
-    // a special case, and closing only that one would leave the rest.
-    //
-    // `setup` is unavailable here — the throw may have escaped before the inner
-    // function had one — which is why the helper falls back to `ctx` for the two
-    // fields it reads off it.
-    //
-    // Unconditional once the checks are up, including on a throw that escaped
-    // after a resumable hold landed: answering that hold re-enters
-    // `dispatchMatchedWorkflow`, whose `setupDispatchContext` posts the queued
-    // checks again, so the resume's pending post lands after this conclusion and
-    // wins. A permanently `queued` check has no such recovery.
+    // Unconditional, even after a resumable hold landed: the resume re-posts
+    // the queued checks after this conclusion and wins, whereas a permanently
+    // `queued` check never recovers.
     if (ctx.pendingChecksPosted) {
       await completeChecksForUndispatchedRun({
         ctx,
@@ -8456,27 +7422,16 @@ export async function dispatchMatchedWorkflow(
         summary: `The workflow could not be dispatched, so no job started. ${toErrorMessage(err)}`,
       });
     }
-    // Still propagated: an infrastructure fault must fail the delivery rather
-    // than be swallowed.
+    // Propagated: an infrastructure fault must fail the delivery.
     throw err;
   } finally {
-    // The build-window token (taken before the build job can go terminal) must
-    // never outlive this call. A `finally` covers every early return and every
-    // throw — a token left behind would wedge the run in `running` until the
-    // stale detector reaps it.
+    // The window token must never outlive this call (a leak wedges the run
+    // `running` until the stale detector). It covers jobs registered before
+    // return (`recordRunStart`, `needs-pending-*` / `rejected-*` rows); deferred
+    // init/dynamic tasks hold their own, taken before this drops.
     //
-    // This token covers the paths that register the run's post-build jobs
-    // before returning: `recordRunStart` for the static set, and the synthetic
-    // `needs-pending-*` / `rejected-*` rows for gated and rejected jobs. Jobs
-    // whose registration outlives dispatch hold their own token instead:
-    // `startDeferredInitDispatch` and `startDeferredDynamicDispatch` each take
-    // one synchronously — before this `finally` drops its own — and release it
-    // when their fire-and-forget task settles.
-    //
-    // Releasing can finalize the run (DB writes + Platform forwarding), so it
-    // can throw. Swallow-and-log: a throw from a `finally` replaces whatever
-    // dispatch was about to return or raise, turning a completed dispatch into
-    // a dispatch error and hiding the original build failure.
+    // Releasing can finalize the run and throw: swallow-and-log, since a throw
+    // from `finally` replaces the result and hides the original failure.
     if (ctx.dispatchWindowTokenHeld) {
       ctx.dispatchWindowTokenHeld = false;
       try {
@@ -8492,10 +7447,9 @@ export async function dispatchMatchedWorkflow(
 }
 
 /**
- * Resume path: flip the reused held run row off `held` so the resumed dispatch
- * can proceed into job dispatch; `recordRunStart` later reuses the row. The
- * flip is guarded on `held`, so it is also the claim: a re-fired release signal
- * that loses it must not dispatch the run again. Returns whether to continue.
+ * Resume path: flip the reused row off `held` (`recordRunStart` reuses it).
+ * Guarded on `held`, so it is the claim: a re-fired release that loses it must
+ * not dispatch again. Returns whether to continue.
  */
 async function claimResumedRun(
   ctx: WorkflowDispatchContext,
@@ -8530,10 +7484,8 @@ async function dispatchMatchedWorkflowInner(
 
   const buildPrep = await prepareCacheAndBuild(ctx, setup);
   if (buildPrep.abort) {
-    // The build either failed or was rejected, and this workflow has no dynamic
-    // entries to recover through — so no job will ever run. `onBuildFailed`
-    // wrote the terminal run row but reaches no check run, and the build's own
-    // `kici/<workflow>/setup` check is not one of these.
+    // No job will run. `onBuildFailed` reaches no check run, and the build's
+    // `kici/<workflow>/setup` check is a different one.
     await completeChecksForUndispatchedRun({
       ctx,
       setup,
@@ -8583,16 +7535,13 @@ async function dispatchMatchedWorkflowInner(
 
   const evalResult = await evaluateJobContexts({ ctx, setup, buildPrep });
 
-  // Resolve the per-job sandbox escape-hatch requests against the org allow-list
-  // (the single enforcement point). A denied request fails the whole run loudly
-  // before any job is queued; an absent reader defaults to deny-all (safe).
+  // The single sandbox enforcement point: a denied request fails the whole run
+  // loudly before any job is queued; no reader means deny-all.
   const sandboxAllowList: SandboxAllowList = ctx.deps.sandboxAllowListReader
     ? await ctx.deps.sandboxAllowListReader.read(ctx.resolvedOrgId)
     : { capabilities: [], allowHostNetwork: false };
-  // Same enforcement point, same loud-and-total shape: a Dockerfile build is an
-  // escape from the job sandbox, so an untrusted ref is refused here rather than
-  // anywhere the agent could be asked to judge it. `sandbox_denied` is the
-  // category because that is exactly what this is.
+  // A Dockerfile build escapes the sandbox, so an untrusted ref's build is
+  // refused here too, never left to the agent; hence `sandbox_denied`.
   const dockerfileResolution = resolveWorkflowDockerfileBuilds(ctx.workflow, {
     scope: deriveCacheRefScope(ctx.trustResolution),
     allowUntrusted: await readAllowUntrustedDockerfileBuilds(ctx),
@@ -8609,9 +7558,7 @@ async function dispatchMatchedWorkflowInner(
 
   const sandboxResolution = resolveWorkflowSandboxGrants(ctx.workflow, sandboxAllowList);
   if ('denied' in sandboxResolution) {
-    // Record a queryable failed run (this deny is BEFORE recordRunStart, so a
-    // plain failRun would leave no trace) so the author sees the denial + reason
-    // in the dashboard and the runs API — deny is loud, not silent.
+    // Before recordRunStart, so a plain failRun would leave no trace.
     await recordInitFailureFromSkip({
       ctx,
       setup,
@@ -8649,10 +7596,7 @@ async function dispatchMatchedWorkflowInner(
     });
   }
 
-  // Register the run BEFORE the first job reaches an agent, so a job that
-  // reports terminal on arrival has a run to attach to. See
-  // `startRunBeforeDispatch` for the race, and why the token it takes is not
-  // optional.
+  // Register the run BEFORE any job reaches an agent (`startRunBeforeDispatch`).
   const runTrackedEarly =
     buildPrep.buildJobTrackedEarly ||
     (await startRunBeforeDispatch({
@@ -8671,11 +7615,8 @@ async function dispatchMatchedWorkflowInner(
     dispatchedJobs,
     rejectedJobs,
   });
-  // Jobs whose fan-out could not be materialized (cap / zero-combination /
-  // unreachable hosts) get a synthetic terminal row so the run is not considered
-  // complete-with-no-jobs and downstreams keep a real needs edge. A genuine
-  // failure is recorded as failed with the matrix_expansion category; a
-  // narrowed-to-empty runsOnAll is recorded as skipped (its terminalStatus).
+  // Unmaterialized fan-outs get a synthetic terminal row so downstreams keep a
+  // real edge: failed as matrix_expansion, or skipped when narrowed to empty.
   for (const failure of buildPrep.matrixFailures) {
     dispatchedJobs.push({ jobId: failure.jobId, jobName: failure.jobName });
     rejectedJobs.push(
@@ -8684,10 +7625,8 @@ async function dispatchMatchedWorkflowInner(
         : { ...failure, category: InitFailureCategory.enum.matrix_expansion },
     );
   }
-  // Stamp each dispatched job with its ordered bound-context list so the
-  // job row persists it for the dashboard (keyed by expanded job name). Test-run
-  // skipped contexts + their warning ride along the same map and are also
-  // aggregated for the accepted trigger response (the CLI surface).
+  // Context lists and test-run warnings onto job rows; warnings are also
+  // aggregated for the trigger response.
   const envWarnings: string[] = [];
   for (const dj of dispatchedJobs) {
     const ed = evalResult.jobContextData.get(dj.jobName);
@@ -8715,27 +7654,16 @@ async function dispatchMatchedWorkflowInner(
     rejectedJobs,
   });
 
-  // Release root invoke gates now that the run, its jobs, and its needs edges
-  // all exist. A root gate has no upstream to fire the scheduler, so it is
-  // nudged through the same release path; needs-gated gates wait for their
-  // upstreams. Runs before the deferred phases so a gate's proxies are in flight
-  // by the time downstream jobs are evaluated.
+  // Before the deferred phases, so gate proxies are in flight when downstream
+  // jobs are evaluated.
   await invokeRootGates({ ctx, buildPrep });
 
-  // No-jobs guard: nothing registered a job AND there is no deferred recovery
-  // path (no deferred-init jobs, no dynamic entries). Without a row the run is
-  // either invisible (no early start, hence no row at all) or stuck `pending`
-  // forever (an early-started row with zero jobs, which `isRunComplete` can
-  // never satisfy and no sweeper reaps). Write a failed run row so the
-  // dashboard surfaces it either way — `recordInitFailureRun` overwrites a
-  // non-terminal row rather than conflicting with one.
+  // No-jobs guard: no job and no deferred recovery leaves the run invisible or
+  // stuck `pending` with zero jobs. Write a failed row
+  // (`recordInitFailureRun` overwrites a non-terminal one).
   //
-  // A job a context rule rejected does not reach this guard: it registers its
-  // own synthetic `rejected-*` row carrying a job-scoped `context_rules` init
-  // failure and the rule's reason, so the reader sees which context gated it
-  // rather than a run-wide "no agent". The `rejectedJobs` branch below is the
-  // fail-safe for a future rejection recorded without a job row, and it takes
-  // the recorded category rather than assuming one.
+  // Context-rule rejections have their own `rejected-*` rows; the
+  // `rejectedJobs` branch is a fail-safe that keeps the recorded category.
   if (
     dispatchedJobs.length === 0 &&
     evalResult.deferredInitJobs.length === 0 &&

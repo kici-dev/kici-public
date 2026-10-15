@@ -241,7 +241,7 @@ describe('kici verify-attestation', () => {
   });
 
   it('defaults --trust-root to the CONFIGURED ORCHESTRATOR when one is set', async () => {
-    // breaks-if-wrong: the orchestrator default must survive the fallback removal.
+    // breaks-if-wrong: the configured orchestrator must still be the default.
     mockLoadConfig.mockResolvedValue({ endpoint: 'https://orch.example' });
     mockVerify.mockResolvedValue({
       verified: true,

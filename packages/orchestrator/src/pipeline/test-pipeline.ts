@@ -2,12 +2,12 @@
  * Test-trigger adapter for CLI-initiated runs (`kici run`).
  *
  * Resolves the lock file, matched decisions, and fixture-specific concerns
- * (inline-vs-provider lock, decision selection, fixture-payload storage, the
+ * (inline-vs-provider lock, fixture-payload storage, the
  * `allow_local_execution` context gate, CLI-secret overlay, in-memory
  * test-run marking), then dispatches each matched workflow through the SAME
- * shared core as webhooks (`dispatchMatchedWorkflow`). The test path is a thin
- * adapter — needs-DAG scheduling, `expansionMap` fan-out edges, `runsOnAll`
- * host fan-out, and deferred init/dynamic dispatch all come from the core.
+ * core as webhooks (`dispatchMatchedWorkflow`), which supplies needs-DAG
+ * scheduling, `expansionMap` fan-out edges, `runsOnAll` host fan-out, and
+ * deferred init/dynamic dispatch.
  *
  * Differences from a webhook run:
  * - the synthetic event is injected directly (no provider normalization/dedup);
@@ -45,13 +45,8 @@ import { webhookPayloadPath } from './webhook-payload-store.js';
 
 const logger = createLogger({ prefix: 'test-pipeline' });
 
-/**
- * Input for a test trigger request.
- */
 export interface TestTriggerInput {
-  /** Unique fixture identifier from the CLI. */
   fixtureId: string;
-  /** The simulated event to inject into the pipeline. */
   event: {
     type: string;
     action?: string;
@@ -62,15 +57,15 @@ export interface TestTriggerInput {
   };
   /** Routing key for provider lookup and lock file fetch. */
   routingKey: string;
-  /** Reference to uploaded tarball (optional). */
+  /** Uploaded tarball reference. */
   uploadId?: string;
-  /** Fixture secret context mappings (optional). */
+  /** Fixture secret context mappings `{ contextName: envName }`. */
   secrets?: Record<string, string>;
   /** Base64 X25519+AES-GCM blob of the developer's local secrets ({flat, contexts}). */
   encryptedSecrets?: string;
   /** Base64 ephemeral CLI public key that encrypted `encryptedSecrets`. */
   encryptedSecretsKey?: string;
-  /** Direct workflow run -- bypass triggers (optional). */
+  /** Direct workflow run, bypassing triggers. */
   workflowName?: string;
   /** Resolved overlay metadata for tarball download + decryption. */
   resolvedOverlay?: {
@@ -78,18 +73,13 @@ export interface TestTriggerInput {
     cliPublicKey: string;
     orchestratorPrivateKey: string;
   };
-  /** Request trace ID from the HTTP request. */
+  /** Trace ID of the HTTP request. */
   requestId: string;
   /**
-   * The principal that initiated this run: the one the Platform relays on
+   * The initiating principal: the one the Platform relays on
    * `test.relay.trigger`, or the admin token's service account on the direct
-   * test-run routes.
-   *
-   * Required rather than optional: the relay handler and the direct test-run
-   * routes are the production callers and both always pass an actor, and an
-   * optional field would let a future caller silently drop attribution, which
-   * leaves `execution_runs.triggered_by` NULL while the column claims to hold
-   * the initiator.
+   * test-run routes. Required so no caller can silently leave
+   * `execution_runs.triggered_by` NULL.
    */
   actor: ActorPrincipal;
   /** JSON-stringified lock file content for local repos with no remote. */
@@ -97,40 +87,27 @@ export interface TestTriggerInput {
   /** When true, repo has no remote -- skip provider lookup, skip clone. */
   fullRepo?: boolean;
   /**
-   * Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`).
-   * Threaded onto each dispatched job's config and persisted on the run.
-   * Omitted means `apply`.
+   * Run mode for idempotent steps, set on each job's config and persisted on
+   * the run. Omitted means `apply`.
    */
   checkMode?: CheckMode;
-  /**
-   * Runtime host narrowing from `kici run --target`. Threaded onto the dispatch
-   * context, where it post-filters each runsOnAll job's matched roster.
-   */
+  /** `kici run --target`: post-filters each runsOnAll job's matched roster. */
   target?: HostTargetSelector;
   /**
-   * Raw operator-supplied `kici run --input KEY=VALUE` pairs (not coerced /
-   * defaulted). Validated + coerced + defaulted here against the matched
-   * workflow's lock dispatch descriptor before dispatch.
+   * Raw `kici run --input KEY=VALUE` pairs, validated, coerced and defaulted
+   * here against the matched workflow's lock dispatch descriptor.
    */
   dispatchInputs?: Record<string, string>;
 }
 
-/**
- * Result of processing a test trigger.
- */
 interface TestTriggerResult {
-  /** Unique run identifier. */
   runId: string;
-  /** Whether the test trigger was accepted or rejected. */
   status: 'accepted' | 'rejected';
-  /** Reason for rejection (if rejected). */
   reason?: string;
-  /** Dispatched job IDs. */
   jobIds: string[];
   /**
-   * User-visible warnings on an accepted run — today, one per job whose bound
-   * test-run context(s) were unavailable (non-test or unconfigured) and
-   * skipped. Printed by the CLI on acceptance.
+   * Warnings the CLI prints on acceptance: one per job whose bound test-run
+   * contexts were unavailable (non-test or unconfigured) and skipped.
    */
   warnings?: string[];
 }
@@ -172,7 +149,6 @@ async function resolveLockFileForTest(
   runId: string,
 ): Promise<ResolvedLockFile | { rejected: string }> {
   if (input.inlineLockFile) {
-    // Local repo -- use inline lock file directly, skip provider fetch
     let fullLockFile: FullLockFile;
     try {
       fullLockFile = JSON.parse(input.inlineLockFile) as FullLockFile;
@@ -188,16 +164,14 @@ async function resolveLockFileForTest(
     return { fullLockFile, bundle: undefined, repoIdentifier, provider };
   }
 
-  // Remote repo -- existing provider-based lock file fetch
   const bundle = deps.providerRegistry.getByRoutingKey(input.routingKey);
   if (!bundle?.lockFileFetcher) {
     return { rejected: `No provider found for routing key: ${input.routingKey}` };
   }
 
-  // Extract repo identifier from event payload (same as webhook pipeline).
-  // For internal provider, full_name is '.' which resolves to repoBasePath.
-  // For GitHub provider, full_name is 'owner/repo' used for API calls.
-  // Falls back to routing key if payload doesn't include repository info.
+  // As in the webhook pipeline: the internal provider's full_name '.' resolves
+  // to repoBasePath, GitHub's 'owner/repo' feeds API calls, and a payload with
+  // no repository falls back to the routing key.
   const repository = input.event.payload?.repository as
     { full_name?: string; owner?: { login?: string }; name?: string } | undefined;
   const repoIdentifier =
@@ -227,7 +201,6 @@ function selectMatchedDecisions(
   let decisions: WorkflowDecision[];
 
   if (input.workflowName) {
-    // Direct workflow execution -- bypass trigger matching
     const workflow = fullLockFile.workflows.find(
       (w: LockWorkflow) => w.name === input.workflowName,
     );
@@ -249,9 +222,8 @@ function selectMatchedDecisions(
 }
 
 /**
- * Persist the test fixture payload to object storage so the payload viewer
- * can resolve it the same way it does for real webhook runs. Failures are
- * logged but do not abort the run.
+ * Persist the fixture payload where the payload viewer reads webhook payloads.
+ * A failure is logged and does not abort the run.
  */
 async function storeFixturePayload(
   input: TestTriggerInput,
@@ -271,9 +243,8 @@ async function storeFixturePayload(
 }
 
 /**
- * Decrypt the CLI-uploaded local secrets blob ({flat, contexts}). Returns
- * empty maps when the run carries no encrypted secrets. Secret values are
- * never logged.
+ * Decrypt the CLI-uploaded secrets blob; empty maps when there is none. Secret
+ * values are never logged.
  */
 function decryptCliSecrets(input: TestTriggerInput): {
   flat: Record<string, string>;
@@ -290,17 +261,15 @@ function decryptCliSecrets(input: TestTriggerInput): {
 }
 
 /**
- * Resolve the fixture's `secrets` context mapping `{ contextName: envName }`
- * into namespaced secrets, fail-closed on non-test-allowed contexts, then
- * overlay the CLI-uploaded contexts (CLI wins per-context). Keyed by the
- * fixture context name (e.g. `db`), not the env name — the run carries these
- * verbatim on every dispatched job via `extraJobConfig.namespacedSecrets`.
+ * Resolve the fixture's `secrets` mapping into namespaced secrets, failing
+ * closed on contexts that do not allow test runs, then overlay the CLI-uploaded
+ * contexts (CLI wins per context). Keyed by the fixture context name (e.g.
+ * `db`), not the env name; every job gets them via `extraJobConfig.namespacedSecrets`.
  *
- * Each `envName` is matched the way a job's declared context is — exact name
- * first, then a glob context whose pattern matches — and the matched row both
- * decides the test-run gate and supplies the bindings the secrets resolve
- * through. Without a context store nothing is resolved, and a warning names the
- * mappings that were skipped; every orchestrator that serves test runs wires one.
+ * Each `envName` matches like a job's declared context (exact name, then glob),
+ * and the matched row both gates the test run and supplies the secret bindings.
+ * Without a context store nothing resolves and a warning names the skipped
+ * mappings; every orchestrator that serves test runs wires one.
  */
 async function resolveFixtureNamespacedSecrets(
   input: TestTriggerInput,
@@ -383,9 +352,8 @@ interface TestDispatchShared {
 }
 
 /**
- * Merge the dispatch-trigger `inputs` descriptors declared by the matched
- * workflows. Multiple workflows declaring the same key are last-write-wins
- * (the operator's `--input` is validated against the union).
+ * Merge the matched workflows' dispatch-trigger `inputs` descriptors, last
+ * write wins per key; the operator's `--input` is validated against the union.
  */
 function mergeMatchedDispatchDescriptors(
   fullLockFile: FullLockFile,
@@ -406,9 +374,8 @@ function mergeMatchedDispatchDescriptors(
 }
 
 /**
- * Validate + coerce + default the operator's raw `--input` pairs against the
- * matched workflows' dispatch descriptors. Returns the resolved values, or a
- * `{ rejected }` reason on validation failure (no dispatch).
+ * Validate, coerce and default the raw `--input` pairs against the matched
+ * workflows' dispatch descriptors; a failure rejects with no dispatch.
  */
 function resolveDispatchInputs(
   input: TestTriggerInput,
@@ -416,8 +383,7 @@ function resolveDispatchInputs(
   matchedDecisions: WorkflowDecision[],
 ): { values?: Record<string, unknown> } | { rejected: string } {
   const descriptor = mergeMatchedDispatchDescriptors(fullLockFile, matchedDecisions);
-  // No declared inputs anywhere: only reject if the operator nonetheless passed
-  // some (a typo against a workflow that declares none).
+  // No declared inputs: reject only if the operator passed some anyway.
   if (!descriptor) {
     if (input.dispatchInputs && Object.keys(input.dispatchInputs).length > 0) {
       return {
@@ -464,17 +430,14 @@ function buildTestDispatchContext(
     lockFileSource: undefined,
     localWorkingTree: shared.input.inlineLockFile != null,
     crossSource: false,
-    // `stringifyActor` + `agentLabelOf` is the same pair the dashboard re-run
-    // path uses for these two columns. Two renderings of one identity is how
-    // they drift, so this reuses that one rather than minting another.
+    // The same pair the dashboard re-run path uses for these columns, so one
+    // identity never gets two drifting renderings.
     triggeredBy: stringifyActor(shared.input.actor),
     triggeredByAgentLabel: agentLabelOf(shared.input.actor),
-    // `kici run` is operator-initiated against a synthetic event, so there is
-    // no pull-request provenance for the org trust policy to evaluate: no
-    // external contributor, no fork, no base-vs-head workflow diff. The
-    // centralized evaluator returns `pass` for exactly this shape (it
-    // short-circuits on a non-PR event), so stating it here is the same
-    // verdict, not a bypass.
+    // `kici run` is operator-initiated against a synthetic event, with no PR
+    // provenance (contributor, fork, base-vs-head diff) to evaluate. The
+    // central evaluator short-circuits a non-PR event to `pass`, so this is
+    // the same verdict, not a bypass.
     securityDecision: { action: 'pass' },
     extraJobConfig: shared.extraJobConfig,
     testRun: { fixtureId: shared.input.fixtureId },
@@ -487,11 +450,8 @@ function buildTestDispatchContext(
 }
 
 /**
- * Process a test trigger through the shared dispatch core.
- *
- * Resolves the lock file + matched decisions + fixture concerns, then builds a
- * `WorkflowDispatchContext` per matched workflow and calls
- * `dispatchMatchedWorkflow` — the same core the webhook path uses.
+ * Process a test trigger through the shared dispatch core: one
+ * `WorkflowDispatchContext` per matched workflow, into `dispatchMatchedWorkflow`.
  */
 export async function processTestTrigger(
   input: TestTriggerInput,
@@ -529,16 +489,13 @@ export async function processTestTrigger(
   }
   const matchedDecisions = matchResult;
 
-  // Resolve the tenant the SAME way the webhook pipeline does
-  // (sources -> generic_webhook_sources -> '__default__'). A wrong org id would
-  // resolve another tenant's contexts/secrets, so this MUST match the real
-  // path. Resolved ONCE here and shared by the context gate, the fixture
-  // namespaced-secret resolution, and the dispatch core.
+  // Resolve the tenant exactly as the webhook pipeline does (sources ->
+  // generic_webhook_sources -> '__default__'): a wrong org id would resolve
+  // another tenant's contexts and secrets. Resolved ONCE and shared by the
+  // context gate, the fixture secret resolution, and the dispatch core.
   const resolvedOrgId = deps.db ? await resolveOrgId(deps.db, input.routingKey) : '__default__';
 
-  // Authoritative dispatch-input validation: coerce + default + validate the
-  // operator's raw --input pairs against the matched workflows' lock descriptor.
-  // Rejected at the relay — no agent dispatched.
+  // The authoritative --input validation; a rejection dispatches no agent.
   const dispatchInputsResult = resolveDispatchInputs(input, fullLockFile, matchedDecisions);
   if ('rejected' in dispatchInputsResult) {
     return { runId, status: 'rejected', reason: dispatchInputsResult.rejected, jobIds: [] };
@@ -551,16 +508,15 @@ export async function processTestTrigger(
 
   await storeFixturePayload(input, deps, runId);
 
-  // CLI-secret overlay: the core resolves per-job env secrets through this
-  // decorator, so CLI flat secrets win over orchestrator env secrets.
+  // The core resolves per-job env secrets through this decorator, so CLI flat
+  // secrets win over orchestrator env secrets.
   const cliSecrets = decryptCliSecrets(input);
   const testDeps: ProcessingDeps = deps.secretResolver
     ? { ...deps, secretResolver: new DecoratingSecretResolver(deps.secretResolver, cliSecrets) }
     : deps;
 
-  // Mark the run in-memory BEFORE dispatch so the live-log observer broadcasts
-  // to the waiting CLI (independent of the async is_test_run column write the
-  // core performs from the testRun meta).
+  // Mark BEFORE dispatch so the live-log observer broadcasts to the waiting CLI,
+  // without waiting for the core's async is_test_run column write.
   deps.executionTracker?.markTestRun(runId);
 
   // Inline (local working tree) runs carry the real origin provider on the
@@ -586,8 +542,8 @@ export async function processTestTrigger(
     resolvedOrgId,
     info,
     extraJobConfig: buildExtraJobConfig(input, namespacedResult.namespaced),
-    // CLI `--secret` / `--env` flat secrets reach EVERY job (env-declaring or
-    // not), winning over a job's env-resolved secret on a key collision.
+    // Reach EVERY job, env-declaring or not, and win a key collision with a
+    // job's env-resolved secret.
     runWideFlatSecrets: cliSecrets.flat,
     ...(dispatchInputsResult.values && { dispatchInputs: dispatchInputsResult.values }),
   };
@@ -607,10 +563,9 @@ export async function processTestTrigger(
     if (result.envWarnings?.length) warnings.push(...result.envWarnings);
   }
 
-  // A workflow whose only jobs have a dynamic context (or a deferred-init job)
-  // dispatches nothing synchronously — those jobs are dispatched by the agent
-  // init round — so `jobIds` is empty even though real work is queued. Only
-  // reject when there is neither a dispatched job nor pending deferred work.
+  // Jobs with a dynamic context, or a deferred init, dispatch from the agent
+  // init round, so `jobIds` can be empty with work queued. Reject only when
+  // there is neither a dispatched job nor deferred work.
   if (jobIds.length === 0 && deferredJobCount === 0) {
     return {
       runId,

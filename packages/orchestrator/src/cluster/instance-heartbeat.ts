@@ -9,26 +9,22 @@ const logger = createLogger({ prefix: 'instance-heartbeat' });
 export const DEFAULT_INSTANCE_HEARTBEAT_MS = 10_000;
 
 /**
- * How many missed ticks a coordinator gets before it reads as dead. Six ticks
- * (60 s at the default interval) is wide enough that a GC pause, a slow DB or a
- * brief network stall does not evict a healthy coordinator — the cost of a
- * false "dead" verdict is another coordinator recovering jobs it is watching.
+ * Missed ticks before a coordinator reads as dead. Six (60 s at the default
+ * interval) survives a GC pause, slow DB or brief network stall; a false "dead"
+ * verdict makes another coordinator recover jobs this one is watching.
  */
 export const HEARTBEAT_MISSES_BEFORE_DEAD = 6;
 
 /**
- * The dispatcher's recovery grace period at the default config: twice
- * `agentMaxReconnectDelayMs` (60 s). Used as the fallback floor when a caller
- * has no configured grace period to hand in.
+ * The dispatcher's default recovery grace: twice `agentMaxReconnectDelayMs` (60 s).
+ * The fallback floor when a caller has no configured grace period.
  */
 export const DEFAULT_RECOVERY_GRACE_MS = 120_000;
 
 /**
- * The window inside which a `cluster_instances` row counts as live.
- *
- * Deliberately the larger of the recovery grace period and six heartbeat ticks:
- * the ownership predicate must never call a coordinator dead sooner than the
- * recovery machinery would have given it to reconnect.
+ * Window inside which a `cluster_instances` row counts as live: the larger of the
+ * recovery grace and six ticks, so the ownership predicate never calls a
+ * coordinator dead sooner than recovery would have let it reconnect.
  */
 export function instanceLivenessGraceMs(
   gracePeriodMs: number,
@@ -71,18 +67,15 @@ export interface InstanceHeartbeatOptions {
 /**
  * Writes this coordinator's liveness into `cluster_instances` on a fixed tick.
  *
- * Every ownership predicate in the dispatch plane asks "is the coordinator that
- * owns this row still alive?", and the answer has to come from the database.
- * The in-memory peer registry cannot answer it: it is empty at exactly the
- * moment startup recovery runs, because a freshly booted process has not
- * handshaken with any peer yet, so it reads every live sibling as dead — which
- * is the boot-time bug the predicate exists to fix. Raft membership is worse:
- * a partitioned coordinator self-elects and reads the other half as gone.
+ * Dispatch-plane ownership predicates ("is this row's owner alive?") must read the
+ * DB. The in-memory peer registry is empty when startup recovery runs (no peer
+ * handshakes yet), so it reads every live sibling as dead — the boot-time bug the
+ * predicate exists to fix. Raft membership is worse: a partitioned coordinator
+ * self-elects and reads the other half as gone.
  *
- * A DB heartbeat needs no peer connectivity, so it behaves the same in a
- * Raft cluster, a plain multi-coordinator deployment and a standalone one.
- * `host_roster` already derives agent liveness this way; this is the same
- * mechanism pointed at coordinators.
+ * A DB heartbeat needs no peer connectivity, so it behaves the same in Raft,
+ * plain multi-coordinator and standalone deployments — the mechanism
+ * `host_roster` uses for agent liveness.
  */
 export class InstanceHeartbeat {
   private readonly db: Kysely<Database>;
@@ -101,11 +94,9 @@ export class InstanceHeartbeat {
   }
 
   /**
-   * Write one heartbeat immediately, then every `intervalMs`.
-   *
-   * The immediate write matters: startup recovery runs moments after boot and
-   * reads this table, so a coordinator that had not yet written a row would be
-   * invisible to its own siblings' predicates.
+   * Write one heartbeat immediately, then every `intervalMs`. The immediate write
+   * matters: startup recovery reads this table moments after boot, and a
+   * coordinator with no row yet is invisible to its siblings' predicates.
    */
   async start(): Promise<void> {
     await this.beat({ processStart: true });
@@ -129,9 +120,8 @@ export class InstanceHeartbeat {
   }
 
   /**
-   * Remove this instance's row on a clean shutdown, so a coordinator that
-   * stopped on purpose is dead to its siblings immediately rather than after
-   * the grace window. Best-effort: a crash leaves the row to expire.
+   * Delete this row on clean shutdown so siblings see it dead immediately, not
+   * after the grace window. Best-effort: a crash leaves the row to expire.
    */
   async retire(): Promise<void> {
     this.stop();
@@ -150,11 +140,8 @@ export class InstanceHeartbeat {
 
   /**
    * One heartbeat write. Best-effort: a failed tick is retried on the next.
-   *
-   * `processStart` is set for the write `start()` makes, and is the only one
-   * that rewrites `started_at` — the column records when THIS process came up,
-   * so a restart under the same instance id must move it while an ordinary tick
-   * must not.
+   * Only `start()`'s write (`processStart`) rewrites `started_at`, which records
+   * when THIS process came up: a restart under the same id moves it, a tick does not.
    */
   async beat(opts: { processStart?: boolean } = {}): Promise<void> {
     const now = new Date();
@@ -188,12 +175,9 @@ export class InstanceHeartbeat {
 }
 
 /**
- * Which of the given coordinator instance ids are alive right now.
- *
- * Reads `cluster_instances` directly rather than the peer registry, for the
- * reason the class above documents: the peer registry is empty during boot and
- * blind under a partition, and a wrong "dead" verdict here means acting on a
- * row a working coordinator owns.
+ * Which of the given coordinator ids are alive now. Reads `cluster_instances`, not
+ * the peer registry (empty at boot, blind under a partition — see the class above):
+ * a wrong "dead" verdict means acting on a row a working coordinator owns.
  */
 export async function liveInstanceIds(
   db: Kysely<Database>,

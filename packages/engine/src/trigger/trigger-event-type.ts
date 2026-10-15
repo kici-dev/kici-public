@@ -1,10 +1,9 @@
 /**
  * Canonical trigger event types with human-readable metadata.
  *
- * These correspond to SimulatedEvent.type values produced by normalizers,
- * plus 'rerun' for re-run events. Adding a new event type here forces
- * compile-time failures in any exhaustive Record<TriggerEventType, ...>
- * (e.g., the dashboard icon map).
+ * The SimulatedEvent.type values normalizers produce, plus 'rerun'. A new event
+ * type here fails compilation of every exhaustive
+ * Record<TriggerEventType, ...> (e.g. the dashboard icon map) until it is added.
  */
 
 export const TRIGGER_EVENT_TYPES = [

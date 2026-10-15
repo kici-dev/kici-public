@@ -3,12 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './135_cluster_settings_retention_days.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 135: asserts the four retention-window
- * columns and the announce stamp exist on `cluster_settings` as nullable
- * columns after migrations 001..135, and that up/down are idempotent. Gated on
+ * Real-Postgres test for migration 135: the retention-window columns and the announce stamp are
+ * nullable on `cluster_settings`, and up/down are idempotent. Gated on
  * `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;

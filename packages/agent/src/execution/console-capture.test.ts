@@ -47,10 +47,8 @@ describe('console-capture', () => {
   });
 
   it('falls through to the real console when no sink is active', () => {
-    // With no active ALS sink, console.log should not throw and no sink should
-    // be tracked. We can't reliably spy on process.stdout.write under vitest
-    // (Node's console may bypass it in some runtimes), so we just assert the
-    // ALS state rather than the final fd write.
+    // Asserts the ALS state, not the fd write: Node's console may bypass a
+    // process.stdout.write spy under vitest in some runtimes.
     expect(_getActiveSinkForTests()).toBeUndefined();
     expect(() => console.log('no sink — fallthrough path')).not.toThrow();
     expect(_getActiveSinkForTests()).toBeUndefined();

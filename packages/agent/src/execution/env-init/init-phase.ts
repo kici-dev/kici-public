@@ -4,13 +4,13 @@ import { ExecutionStepStatus, LogStream, TimeoutReason } from '@kici-dev/engine'
 import { toErrorMessage } from '@kici-dev/shared';
 import type { RunnerToAgentMessage } from '../sandbox/ipc-protocol.js';
 
-/** Default init timeout when a spec sets none: 10 minutes. */
+/** Used when a spec sets no timeout: 10 minutes. */
 const DEFAULT_INIT_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
- * Marker thrown when an init command exceeds its wall-clock budget. Carries the
- * distinct P3 timeout reason so the phase result + job.complete report a timeout
- * rather than a generic failure.
+ * Thrown when an init command exceeds its wall-clock budget. Its distinct
+ * timeout reason makes the phase result and job.complete report a timeout, not
+ * a generic failure.
  */
 class InitTimeoutError extends Error {
   readonly reason = TimeoutReason.enum.job_timeout;
@@ -21,10 +21,9 @@ class InitTimeoutError extends Error {
 }
 
 /**
- * Cache engine port (P2). Init reuses the same imperative cache API bound to
- * `ctx.cache` (and used by the declarative job/step cache phase) — restore the
- * spec's paths before the command, save them after on an exact-key miss. The
- * shape mirrors `@kici-dev/sdk`'s `CacheApi` (`restore`/`save`).
+ * The imperative cache API bound to `ctx.cache` and used by the declarative
+ * job/step cache phase; mirrors `@kici-dev/sdk`'s `CacheApi`. Init restores the
+ * spec's paths before the command and saves them after on an exact-key miss.
  */
 export interface InitCachePort {
   restore(spec: CacheSpec): Promise<{ hit: boolean; matchedKey?: string }>;
@@ -32,53 +31,52 @@ export interface InitCachePort {
 }
 
 /**
- * Env-handoff port (P1). Mirrors the KICI_ENV / KICI_PATH file contract that
- * steps use: before the command the agent allocates fresh KICI_ENV / KICI_PATH
- * files and points the shell env at them (`beginCapture`); after a successful
- * command it reads + parses those files into an EnvDelta and applies it through
- * `applyEnvDelta` (operator-secret guard + PATH-prepend order), then truncates
- * the files (`applyDelta`). P1 owns the file lifecycle and the parse; the init
- * phase only sequences the two calls around the command.
+ * Env-handoff port: the KICI_ENV / KICI_PATH file contract steps use. The port
+ * owns the file lifecycle and the parse; the init phase only sequences the two
+ * calls around the command.
  */
 export interface InitEnvPort {
   /** Allocate fresh KICI_ENV/KICI_PATH files for this init; the shell's env points at them. */
   beginCapture(): Promise<void>;
-  /** Read+parse the files, apply via applyEnvDelta (operator-secret guard + masking), then truncate. */
+  /**
+   * Parse the files into an EnvDelta, apply it via `applyEnvDelta`
+   * (operator-secret guard, masking, PATH-prepend order), then truncate them.
+   */
   applyDelta(): Promise<void>;
 }
 
 export interface RunInitPhaseOptions {
-  /** Init specs to run, in order. Empty / undefined => no-op (ok:true). */
+  /** Run in order. Empty or undefined is a no-op (ok:true). */
   specs: GenericInitConfig[];
   /**
-   * Returns the sandbox shell to run the i-th init command with.
-   * The workflow-runner builds a fresh zx$ shell (cwd=clone root, env=process.env,
-   * log->IPC) per init so each spec's `env` overlay + KICI_ENV/KICI_PATH files apply.
+   * The workflow-runner builds a fresh zx$ shell per init (cwd=clone root,
+   * env=process.env, log->IPC) so each spec's `env` overlay and KICI_ENV/KICI_PATH
+   * files apply.
    */
   shellFor: (spec: GenericInitConfig, index: number) => typeof Shell;
-  /** Masked IPC sender (same as the step loop's maskedSend). */
+  /** The step loop's masked sender. */
   sendIpc: (msg: RunnerToAgentMessage) => void;
   /** stepIndex for init:0; subsequent specs use base+1, base+2, … (after user steps + hook indices). */
   stepIndexBase: number;
-  /** Cache engine (P2). When a spec sets `cache`, restore before / save-on-miss after. */
+  /** Used when a spec sets `cache`: restore before, save on a miss after. */
   cache?: InitCachePort;
-  /** Env-handoff port (P1). When set, capture before each init and apply the delta after success. */
+  /** When set, capture before each init and apply the delta after success. */
   env?: InitEnvPort;
 }
 
 export interface RunInitPhaseResult {
   ok: boolean;
-  /** Index of the init spec that failed (when ok=false). */
+  /** Set when ok=false. */
   failedInitIndex?: number;
-  /** Failure message (when ok=false). */
+  /** Set when ok=false. */
   error?: string;
-  /** True when the failure was a wall-clock timeout (init exceeded `timeout`). */
+  /** The init exceeded its `timeout`. */
   timedOut?: boolean;
-  /** Distinct P3 timeout reason (`job_timeout`) when `timedOut` is true. */
+  /** `job_timeout` when `timedOut` is true. */
   reason?: TimeoutReason;
 }
 
-/** Run all init specs in order; stop + fail at the first non-zero / timeout. */
+/** Stops and fails at the first non-zero exit or timeout. */
 export async function runInitPhase(opts: RunInitPhaseOptions): Promise<RunInitPhaseResult> {
   if (!opts.specs || opts.specs.length === 0) return { ok: true };
   for (let i = 0; i < opts.specs.length; i++) {
@@ -99,10 +97,8 @@ export async function runInitPhase(opts: RunInitPhaseOptions): Promise<RunInitPh
 }
 
 /**
- * Run a promise against a wall-clock budget. Aborts via an AbortController on
- * breach (mirroring the step loop) and rejects with an {@link InitTimeoutError}
- * carrying the distinct P3 timeout reason. Resolves with the command's value
- * when it finishes first.
+ * Rejects with an {@link InitTimeoutError} when `run` outlasts `timeoutMs`. The
+ * AbortController only drives that rejection; it does not reach the command.
  */
 function withInitTimeout<T>(run: Promise<T>, timeoutMs: number): Promise<T> {
   const ac = new AbortController();
@@ -175,33 +171,23 @@ async function runOneInit(
   const start = Date.now();
   const shell = spec.shell ?? 'bash';
   try {
-    // Restore the cache before the command (P2 reuse: same CacheApi the
-    // declarative job/step cache uses). Remember whether the exact key hit so
-    // we skip a redundant save afterward.
+    // An exact-key hit skips the save afterward.
     let cacheHit = false;
     if (spec.cache && opts.cache) {
       cacheHit = await restoreInitCache(spec.cache, opts.cache, stepIndex, opts.sendIpc);
     }
-    // Allocate fresh KICI_ENV/KICI_PATH files and point the shell env at them so
-    // the command can export env + PATH additions to subsequent steps (P1).
-    // The shell reads live process.env at spawn, so KICI_ENV/KICI_PATH must be
-    // set before the command runs or it sees them as unbound (set -u); setting
-    // them here, before opts.shellFor, keeps that ordering explicit.
+    // Before opts.shellFor: the shell reads live process.env at spawn, so an
+    // unset KICI_ENV/KICI_PATH is unbound under `set -u`.
     await opts.env?.beginCapture();
     const $ = opts.shellFor(spec, index);
-    // Run the user's command through the job's sandbox shell. The shell's cwd is
-    // the clone root and its env carries job env + secrets + KICI_ENV/KICI_PATH.
-    // Enforce the per-spec wall-clock budget (falling back to the default): on
-    // breach the command is aborted and the init fails with the distinct
-    // job_timeout reason, before any subsequent step runs.
+    // The shell's env carries job env, secrets and KICI_ENV/KICI_PATH. On a
+    // timeout the init fails with job_timeout before any later step runs.
     const timeoutMs = spec.timeout ?? DEFAULT_INIT_TIMEOUT_MS;
     await withInitTimeout($`${shell} -c ${spec.run}`, timeoutMs);
-    // Save the cache after a successful command, but only on a key miss.
     if (spec.cache && opts.cache && !cacheHit) {
       await saveInitCache(spec.cache, opts.cache, stepIndex, opts.sendIpc);
     }
-    // Apply the captured KICI_ENV/KICI_PATH delta after the command succeeds and
-    // after the cache save, so this init's env + PATH reach later inits + steps.
+    // After the cache save, so this init's env and PATH reach later inits and steps.
     await opts.env?.applyDelta();
     opts.sendIpc({
       type: 'step.complete',

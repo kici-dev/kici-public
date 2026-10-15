@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
-// Mock os.homedir to isolate tests from real home directory
 vi.mock('node:os', async () => {
   const actual = await vi.importActual<typeof import('node:os')>('node:os');
   return {
@@ -15,7 +14,6 @@ vi.mock('node:os', async () => {
   };
 });
 
-// Mock global fetch
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
@@ -23,7 +21,7 @@ import { hashKiciSourceTree } from '@kici-dev/core/kici-source-digest';
 
 import { typesCommand } from './types.js';
 
-/** Build a Response-like object DashboardClient understands (reads res.text()). */
+/** DashboardClient reads `res.text()`. */
 function jsonOk(body: unknown) {
   const text = JSON.stringify(body);
   return { ok: true, status: 200, text: async () => text, json: async () => JSON.parse(text) };
@@ -37,10 +35,8 @@ describe('kici types', () => {
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-types-test-'));
     vi.mocked(os.homedir).mockReturnValue(tempDir);
-    // The homedir mock alone does not isolate this suite: getConfigDir()
-    // refuses the ambient config under the KiCI test-isolation marker before
-    // it consults homedir(). Name the same directory the mock produces
-    // explicitly.
+    // getConfigDir() refuses the ambient config under the test-isolation marker
+    // before consulting homedir(), so the mock alone does not isolate the suite.
     process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
     consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -143,26 +139,22 @@ describe('kici types', () => {
       const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const result = await typesCommand({ kiciDir, quiet: true });
       expect(result).toBe(true);
-      // The "Types generated" line is a direct stdout write — under quiet it
-      // must not fire so a machine-readable caller keeps stdout pure.
       expect(logSpy).not.toHaveBeenCalled();
       logSpy.mockRestore();
     });
   });
 
-  /** Read the generated declaration file for a given .kici dir. */
   async function readStub(kiciDir: string): Promise<string> {
     return fs.readFile(path.join(kiciDir, 'types', 'secrets.d.ts'), 'utf-8');
   }
 
   describe('offline stub when the Platform is unreachable', () => {
     it('writes an empty stub and succeeds when not authenticated', async () => {
-      // No config file at all — DashboardClient.fromConfig throws not_logged_in.
+      // No config file, so DashboardClient.fromConfig throws not_logged_in.
       const kiciDir = path.join(tempDir, 'project', '.kici');
       const result = await typesCommand({ kiciDir });
 
-      // Does NOT fail: the file must exist so an unauthenticated fresh clone
-      // typechecks against "no known keys" rather than "no exported member".
+      // An unauthenticated fresh clone typechecks against "no known keys".
       expect(result).toBe(true);
       const content = await readStub(kiciDir);
       expect(content).toContain("declare module '@kici-dev/sdk'");
@@ -181,7 +173,7 @@ describe('kici types', () => {
       const result = await typesCommand({ kiciDir });
 
       expect(result).toBe(true);
-      // No org means no fetch is attempted (the client refuses before the wire).
+      // The client refuses before the wire.
       expect(mockFetch).not.toHaveBeenCalled();
       const content = await readStub(kiciDir);
       expect(content).toContain(
@@ -193,8 +185,7 @@ describe('kici types', () => {
       await writeConfig(platformConfig);
       mockFetch.mockRejectedValue(new Error('connect ECONNREFUSED'));
 
-      // A developer's real, populated declaration file generated on a prior
-      // authenticated run.
+      // Populated by a prior authenticated run.
       const kiciDir = path.join(tempDir, 'project', '.kici');
       await fs.mkdir(path.join(kiciDir, 'types'), { recursive: true });
       const populated =
@@ -203,8 +194,7 @@ describe('kici types', () => {
 
       const result = await typesCommand({ kiciDir });
 
-      // The command still succeeds, but the good file is preserved verbatim —
-      // a Platform blip must not downgrade type-checking to "any key accepted".
+      // A Platform blip must not downgrade type-checking to "any key accepted".
       expect(result).toBe(true);
       expect(await readStub(kiciDir)).toBe(populated);
       const errors = consoleErrorSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
@@ -240,8 +230,7 @@ describe('kici types', () => {
       const kiciDir = path.join(tempDir, 'project', '.kici');
       const result = await typesCommand({ kiciDir });
 
-      // A forbidden response is a real permission problem the user must see —
-      // masking it behind a stub would hide the misconfiguration.
+      // A real permission problem the user must see, not masked behind a stub.
       expect(result).toBe(false);
       const errors = consoleErrorSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
       expect(errors).toContain('contexts.read');
@@ -344,14 +333,10 @@ describe('kici types', () => {
 
   describe('digest invariance (the drift-gate seam)', () => {
     /**
-     * The lock file's `contentHash` is a digest over the whole `.kici/` tree,
-     * recorded by the compiler and re-derived by the agent before it runs a
-     * job. So every file `kici compile` writes into that tree has to be one
-     * the digest excludes, from every working directory the CLI accepts.
-     *
-     * Asserting the digest rather than a file list is deliberate: it is the
-     * property the gate depends on, and it keeps holding when the compiler
-     * starts writing some file this test never heard of.
+     * The agent re-derives the `.kici/` tree's `contentHash` before a job, so
+     * every file `kici compile` writes there must be excluded, from every
+     * accepted working directory. Asserting the digest, not a file list, keeps
+     * holding when the compiler writes a file this test never heard of.
      */
     async function digestAfterTypes(opts: {
       kiciDir: string;
@@ -397,9 +382,8 @@ describe('kici types', () => {
     });
 
     it('leaves the tree digest unchanged when run from inside .kici/', async () => {
-      // `resolveKiciDir` accepts this invocation, so the declarations must not
-      // land at `.kici/.kici/types/` — a path inside the hashed tree that the
-      // `.kici/types/` exclusion cannot match.
+      // Must not land at `.kici/.kici/types/`, which the `.kici/types/` exclusion
+      // cannot match.
       const project = path.join(tempDir, 'project');
       const kiciDir = path.join(project, '.kici');
       await fs.mkdir(kiciDir, { recursive: true });

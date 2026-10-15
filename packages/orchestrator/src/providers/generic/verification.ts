@@ -11,10 +11,8 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { verifySignature } from '@kici-dev/engine/webhook/signature';
 
-/** Supported verification methods */
 export type VerificationMethod = 'hmac_sha256' | 'bearer_token' | 'ip_allowlist' | 'none';
 
-/** HMAC-SHA256 verification config */
 export interface HmacVerificationConfig {
   method: 'hmac_sha256';
   secret: string;
@@ -22,7 +20,6 @@ export interface HmacVerificationConfig {
   headerName?: string;
 }
 
-/** Bearer token verification config */
 export interface BearerVerificationConfig {
   method: 'bearer_token';
   token: string;
@@ -30,18 +27,15 @@ export interface BearerVerificationConfig {
   headerName?: string;
 }
 
-/** IP allowlist verification config */
 export interface IpAllowlistVerificationConfig {
   method: 'ip_allowlist';
   allowlist: string[];
 }
 
-/** No verification config */
 export interface NoneVerificationConfig {
   method: 'none';
 }
 
-/** Discriminated union of all verification configs */
 export type VerificationConfig =
   | HmacVerificationConfig
   | BearerVerificationConfig
@@ -51,9 +45,7 @@ export type VerificationConfig =
 /**
  * Verify a generic webhook request.
  *
- * @param body - Raw request body as string
  * @param headers - Request headers (lowercase keys)
- * @param config - Verification configuration for this source
  * @param clientIp - Client IP address (required for ip_allowlist method)
  * @returns true if verification passes
  */
@@ -140,7 +132,6 @@ function verifyBearer(headers: Record<string, string>, config: BearerVerificatio
     return false;
   }
 
-  // Strip "Bearer " prefix if present
   const token = headerValue.startsWith('Bearer ') ? headerValue.slice(7) : headerValue;
 
   // Constant-time comparison

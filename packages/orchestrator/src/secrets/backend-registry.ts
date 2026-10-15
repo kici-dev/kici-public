@@ -274,9 +274,6 @@ export class BackendRegistry {
     return stores;
   }
 
-  /**
-   * Create a SecretStore for a given backend type and config.
-   */
   createStoreForBackend(
     backendType: BackendType,
     config: Record<string, unknown>,
@@ -306,9 +303,6 @@ export class BackendRegistry {
     }
   }
 
-  /**
-   * Update health status for a backend.
-   */
   async updateHealthStatus(
     name: string,
     status: BackendHealthStatus,
@@ -325,9 +319,6 @@ export class BackendRegistry {
       .execute();
   }
 
-  /**
-   * Update sync status for a backend.
-   */
   async updateSyncStatus(name: string, scopeCount: number, error?: string): Promise<void> {
     await this.db
       .updateTable('secret_backends')

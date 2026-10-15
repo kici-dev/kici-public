@@ -1,9 +1,6 @@
 /**
- * Shared fork-based execution logic used by BareMetalSandbox and FirecrackerSandbox.
- *
- * Both backends use child_process.fork() (or spawn via bwrap) with Node.js IPC
- * channel for communication. This module extracts the common fork + IPC dispatch
- * logic to avoid duplication.
+ * Fork + IPC dispatch shared by BareMetalSandbox and FirecrackerSandbox, which
+ * both run the runner via child_process.fork() (or spawn via bwrap) over a Node IPC channel.
  */
 
 import { execFileSync, fork, spawn, type ChildProcess } from 'node:child_process';
@@ -33,11 +30,9 @@ import { toErrorMessage } from '@kici-dev/shared';
 import type { CloneJobReposRequest } from '../../checkout/clone-job-repos.js';
 
 /**
- * Best-effort SIGKILL/SIGTERM of an entire process group led by `pid`.
- * `process.kill(-pid, signal)` targets the group whose leader is `pid` (the
- * child was spawned `detached`, so its pid is its group id). Returns 1 when the
- * group was signalled, 0 when it was already gone (ESRCH) or the pid is invalid.
- * We cannot cheaply count members, so the caller treats a non-zero return as
+ * Best-effort signal of the process group led by `pid` (a `detached` child's
+ * pid is its group id). Returns 1 when signalled, 0 when the group is gone
+ * (ESRCH) or the pid is invalid; members are not counted, so non-zero means
  * "reap attempted".
  */
 export function killProcessGroup(pid: number | undefined, signal: NodeJS.Signals): number {
@@ -46,16 +41,15 @@ export function killProcessGroup(pid: number | undefined, signal: NodeJS.Signals
     process.kill(-pid, signal);
     return 1;
   } catch {
-    // ESRCH = group already gone; any other error is treated as "nothing
-    // signalled" — the caller only distinguishes reaped-something from not.
+    // ESRCH or any other error counts as "nothing signalled".
     return 0;
   }
 }
 
 /**
- * SIGTERM the job's process group, wait a short grace, then SIGKILL. No-op
- * (returns 0) when the child was not spawned detached or has no pid. Returns the
- * count of reap attempts that signalled a live group (0, 1, or 2).
+ * SIGTERM the job's process group, wait a grace, then SIGKILL. Returns the
+ * count of attempts that signalled a live group (0, 1, or 2); 0 when the child
+ * is not detached or has no pid.
  */
 export async function reapGroup(
   pid: number | undefined,
@@ -64,126 +58,85 @@ export async function reapGroup(
   sleepMs = 2000,
 ): Promise<number> {
   if (!detached || pid === undefined) return 0;
-  // A 0 from the SIGTERM attempt is ESRCH — the whole group is already gone (if
-  // any member, including a backgrounded daemon, were alive the group signal
-  // would succeed and return 1). Nothing left to escalate, so skip the grace
-  // wait rather than pay it on every job whose tree exited cleanly.
+  // A 0 from SIGTERM means the whole group is gone (any live member, daemons
+  // included, makes the signal succeed), so skip the grace wait.
   const termed = killFn(pid, 'SIGTERM');
   if (termed === 0) return 0;
   await new Promise((r) => setTimeout(r, sleepMs));
   return termed + killFn(pid, 'SIGKILL');
 }
 
-/** Options for creating a fork-based runner. */
 interface ForkRunnerOptions {
   /** Absolute path to the compiled workflow-runner.js. */
   runnerPath: string;
   /** Pre-sanitized base environment (system + user vars). */
   env: Record<string, string>;
-  /** If true, wrap execution in bubblewrap for namespace isolation. */
   useBwrap?: boolean;
-  /** Working directory for the child process. */
   workDir?: string;
   /**
-   * If true, enable network isolation via bwrap --unshare-net.
-   * Creates a network namespace with only loopback -- no external connectivity.
-   * Intentionally strict: bare-metal is for trusted environments only.
-   * Only effective when useBwrap is also true.
+   * bwrap `--unshare-net`: loopback only. Deliberately strict, since bare-metal
+   * is for trusted environments only. Needs useBwrap.
    */
   networkIsolation?: boolean;
   /**
-   * Extra absolute host paths to bind read-only into the bwrap sandbox.
-   * Used by the bare-metal sandbox to expose `file://` clone source dirs
-   * (the internal provider's local repositories) to the workflow runner so its
-   * `git clone` step can read from them. Ignored when useBwrap=false.
+   * Absolute host paths bound read-only into bwrap, e.g. `file://` clone source
+   * dirs the runner's `git clone` reads. Ignored without useBwrap.
    */
   extraReadOnlyBinds?: string[];
-  /**
-   * Agent-level maximum grace period in milliseconds.
-   * The effective grace period is Math.min(jobGracePeriod, maxGracePeriodMs).
-   * Defaults to 30_000 (30 seconds).
-   */
+  /** Agent cap on the grace period, ms; effective grace is min(job, this). Default 30_000. */
   maxGracePeriodMs?: number;
-  /**
-   * Run the child as a dedicated user (uid, `uid:gid`, or a user name) instead
-   * of the agent's own. Opt-in; unset keeps today's same-uid behaviour.
-   */
+  /** Opt-in dedicated user (uid, `uid:gid`, or name); unset runs as the agent's uid. */
   runnerUser?: string;
   /**
-   * Spawn the runner child `detached` so it leads its own process group. Set by
-   * the bare-metal backend when orphan cleanup is on and bwrap is off, so the
-   * between-jobs phase can reap a backgrounded daemon that reparented to init.
-   * Ignored under bwrap (its PID namespace already contains the tree).
+   * Spawn the child `detached` as its own process-group leader, so the
+   * between-jobs phase can reap a daemon reparented to init. Set by bare-metal
+   * with orphan cleanup on and bwrap off; ignored under bwrap, whose PID
+   * namespace already contains the tree.
    */
   detachProcessGroup?: boolean;
-  /**
-   * Between-jobs out-of-band cleanup re-run: the runner reuses the preserved
-   * workdir and runs only the job's declared cleanup / onFailure hooks.
-   */
+  /** Out-of-band re-run in the preserved workdir of only the declared cleanup / onFailure hooks. */
   cleanupOnly?: boolean;
 }
 
 /**
- * Fork-runner cancel state machine.
- *
- * Prevents race conditions between force-cancel and hook completion:
- * - running: normal execution
- * - cancelling: graceful cancel in progress (SIGTERM sent, hooks may be running)
- * - force_killing: force cancel (SIGKILL sent, no hooks)
+ * Cancel state machine; prevents races between force-cancel and hook completion.
+ * - cancelling: SIGTERM sent, hooks may be running
+ * - force_killing: SIGKILL sent, no hooks
  */
 type ForkState = 'running' | 'cancelling' | 'force_killing';
 
-/** State of a running fork-based child process. */
 export interface ForkRunnerHandle {
-  /** The child process instance. */
   child: ChildProcess;
-  /** Promise that resolves when the job completes. */
   result: Promise<JobExecutionResult>;
-  /** Abort the running job (SIGTERM -> SIGKILL). Legacy method -- prefer cancel(). */
+  /** SIGTERM -> SIGKILL. Legacy; prefer cancel(). */
   abort: () => Promise<void>;
-  /** Kill the child process if still running. */
   kill: () => void;
   /**
-   * Cancel the running job with two-level support.
-   *
-   * @param force If false: graceful cancel (SIGTERM, grace period, then SIGKILL).
-   *              If true: force cancel (SIGKILL immediately, skip hooks).
-   * @param gracePeriodMs Grace period in ms before escalating to SIGKILL (graceful only).
-   *                      Capped by the agent's maxGracePeriodMs.
+   * @param force false: SIGTERM, grace period, then SIGKILL. true: SIGKILL now, skip hooks.
+   * @param gracePeriodMs Graceful only; capped by the agent's maxGracePeriodMs.
    */
   cancel: (force: boolean, gracePeriodMs?: number) => void;
-  /**
-   * Whether this runner leads its own detached process group (bare-metal,
-   * non-bwrap, orphan cleanup on). Drives whether `reap()` does anything.
-   */
+  /** Leads its own process group (bare-metal, non-bwrap, orphan cleanup on); gates `reap()`. */
   detached: boolean;
   /**
-   * True once the runner emitted `completion-hooks-done` (its onSuccess /
-   * onFailure / cleanup hooks ran). Stays false when the child exits before
-   * signalling, which is the between-jobs phase's cue to re-run declared
-   * cleanup out-of-band.
+   * Set by `completion-hooks-done`. False when the child exits before it, which
+   * cues the between-jobs phase to re-run declared cleanup out-of-band.
    */
   completionHooksRan: boolean;
   /**
-   * True once the runner reported (via `hooks-declared`) that the job declares
-   * an `onFailure` / `cleanup` hook. Recorded early so it survives a later hard
-   * kill; gates whether the out-of-band cleanup re-run is attempted.
+   * Set by `hooks-declared` when the job has an `onFailure` / `cleanup` hook.
+   * Recorded early so it survives a hard kill; gates the out-of-band re-run.
    */
   declaresCleanup: boolean;
-  /**
-   * SIGTERM → grace → SIGKILL the runner's process group, reaping any daemon it
-   * backgrounded. No-op (resolves 0) when the runner is not detached; returns
-   * the number of reap attempts that signalled a live group.
-   */
+  /** {@link reapGroup} over the runner's process group, reaping any daemon it backgrounded. */
   reap: () => Promise<number>;
 }
 
 /**
- * The clone-relevant slice of a dispatch, read from where the orchestrator puts
- * each field: the source repo and its credentials on the dispatch envelope, the
- * workflow repo and the checkout switches in `jobConfig`. Both the runner's
- * request and the agent's host-side checkout are built from this one reader, so
- * the two clones cannot read different fields.
+ * The clone-relevant slice of a dispatch: source repo and credentials from the
+ * envelope, workflow repo and checkout switches from `jobConfig`. The runner's
+ * request and the agent's host-side checkout both use this one reader, so the
+ * two clones cannot read different fields.
  */
 export function buildCloneRequest(
   dispatch: JobDispatch,
@@ -205,11 +158,7 @@ export function buildCloneRequest(
   };
 }
 
-/**
- * Build a JobExecutionRequest from a JobDispatch.
- *
- * Maps orchestrator dispatch fields to the subset needed by the workflow runner.
- */
+/** Map a JobDispatch to the subset the workflow runner needs. */
 export function buildRequest(
   dispatch: JobDispatch,
   workDir: string,
@@ -234,9 +183,8 @@ export function buildRequest(
     depsHash: dispatch.depsHash,
 
     workflowName: (jobConfig.workflowName as string) ?? '',
-    // The orchestrator names the dispatch envelope by the expanded child name
-    // (jobConfig.name) for reporting, but the job is defined once under its base
-    // name in source — use baseJobName for findJob/extractSteps + ctx.job.name.
+    // jobConfig.name is the expanded child name used for reporting; the source
+    // defines the job under baseJobName, which findJob/extractSteps + ctx.job.name need.
     jobName: (jobConfig.baseJobName as string | undefined) ?? (jobConfig.name as string) ?? '',
     runsOn: (jobConfig.runsOn as string) ?? '',
     matrixValues: jobConfig.matrixValues as Record<string, unknown> | undefined,
@@ -268,16 +216,14 @@ export function buildRequest(
     orchestratorPrivateKey: jobConfig.orchestratorPrivateKey as string | undefined,
 
     runPublicKey: dispatch.runPublicKey,
-    // The orchestrator's own view of the build, for a deferred attestation's
-    // frozen statement. Read from the dispatch, never from job config: the
-    // whole point is that it is server truth the job cannot influence.
+    // Server truth for a deferred attestation's frozen statement: read from the
+    // dispatch, never job config, so the job cannot influence it.
     provenanceContext: dispatch.provenanceContext,
 
     context: jobConfig.context as string | undefined,
     contextVars: jobConfig.contextVars as Record<string, string> | undefined,
     jobEnv: jobConfig.jobEnv as Record<string, string> | undefined,
 
-    // Global workflow fields
     isGlobalWorkflow: jobConfig.isGlobalWorkflow as boolean | undefined,
     workflowRepoIdentifier: jobConfig.workflowRepoIdentifier as string | undefined,
 
@@ -286,16 +232,16 @@ export function buildRequest(
     concurrencyWaitTimeoutMs: dispatch.concurrencyWaitTimeoutMs,
     branch: dispatch.ref,
 
-    // Plain outputs from upstream jobs for ctx.jobOutputs()
+    // For ctx.jobOutputs().
     upstreamJobOutputs: dispatch.upstreamJobOutputs as
       Record<string, Record<string, unknown>> | undefined,
 
-    // Terminal statuses + declared needs that shape ctx.needs for steps.
+    // Shape ctx.needs for steps.
     upstreamJobStatuses: dispatch.upstreamJobStatuses as
       Record<string, import('@kici-dev/engine').ExecutionJobStatus> | undefined,
     jobNeeds: jobConfig.needs as readonly unknown[] | undefined,
 
-    // Per-invoke-gate results for a standard downstream job's ctx.needs['<gate>'].result.
+    // For a downstream job's ctx.needs['<gate>'].result.
     upstreamInvokeResults: dispatch.upstreamInvokeResults as
       Record<string, import('@kici-dev/engine').InvokeResult[]> | undefined,
 
@@ -304,27 +250,19 @@ export function buildRequest(
     installEnvSecrets: dispatch.installEnvSecrets,
     jobIdShort: dispatch.jobId.slice(0, 8),
 
-    // DynamicJobFn source (for re-evaluating the function to extract step functions)
+    // Re-evaluated to extract a DynamicJobFn's step functions.
     dynamicSource: jobConfig.dynamicSource as
       { index: number; event: Record<string, unknown>; expectedJobNames?: string[] } | undefined,
   };
 }
 
 /**
- * Build bubblewrap (bwrap) arguments for namespace isolation.
+ * bwrap args: read-only system dirs and Node install, writable workspace,
+ * private /dev /proc /tmp, PID + IPC namespaces, die-with-parent, new-session.
  *
- * Creates a sandboxed filesystem view with:
- * - Read-only bind mounts for system directories (/usr, /lib, /bin, etc.)
- * - Read-only bind mount for Node.js binary
- * - Writable bind mount for the workspace directory
- * - Private /dev, /proc, /tmp
- * - PID and IPC namespace isolation
- * - Die-with-parent and new-session for process lifecycle safety
- *
- * When networkIsolation is true, --unshare-net creates a separate network namespace
- * with only loopback (no external connectivity). This is intentionally strict:
- * bare-metal mode is for trusted environments only, and full network isolation
- * is simpler and more secure than selective blocking.
+ * networkIsolation adds --unshare-net (loopback only). Full isolation is
+ * deliberate: bare-metal is for trusted environments only, and it is simpler
+ * and more secure than selective blocking.
  */
 export function buildBwrapArgs(
   workDir: string,
@@ -369,56 +307,33 @@ export function buildBwrapArgs(
     '--new-session',
   ];
 
-  // Full network isolation: creates a separate network namespace with only loopback.
-  // No external connectivity -- bare-metal is for trusted environments only.
   if (networkIsolation) {
     args.push('--unshare-net');
   }
 
-  // /lib64 may not exist on all systems (arm64 typically doesn't have it).
-  // On x86_64 Debian/Ubuntu it is usually a symlink to /usr/lib64. When
-  // present we add an extra bind mount for it so the workflow runner can
-  // find its 64-bit loader (ld-linux-x86-64.so.2) and shared libraries.
+  // /lib64 (absent on most arm64) holds the x86_64 loader (ld-linux-x86-64.so.2).
   if (existsSync('/lib64')) {
-    // Insert AFTER the /lib bind mount triple (--ro-bind /lib /lib).
-    // libIdx points at the source arg ('/lib'), so we advance by 2 to land
-    // past the target arg. Inserting at libIdx+1 would corrupt the arg list
-    // (bwrap would then receive `--ro-bind /lib --ro-bind /lib64 /lib64 /lib`
-    // and interpret the stray '/lib64' as the exec command, crashing with
-    // `bwrap: execvp /lib64: No such file or directory`).
+    // libIdx is the '/lib' source arg; +2 lands past the target. At +1, bwrap
+    // reads the stray '/lib64' as the exec command (`execvp /lib64: No such file`).
     const libIdx = args.indexOf('/lib', args.indexOf('--ro-bind') + 1);
     if (libIdx !== -1) {
       args.splice(libIdx + 2, 0, '--ro-bind', '/lib64', '/lib64');
     }
   }
 
-  // Bind the host's name-resolution files read-only so sandboxed workflows can
-  // resolve hostnames the same way the host does. bwrap auto-creates /etc with
-  // ONLY the explicitly-bound files, so without these an /etc/hosts-only name
-  // (e.g. registry.local -> 127.0.0.1, used by `npm install` in
-  // KICI_SANDBOX_NETWORK=host mode) is invisible to glibc's `files` source and
-  // the name silently resolves via mDNS/DNS to a different host — pointing the
-  // install at the wrong registry and failing the run. /etc/nsswitch.conf pins
-  // the files-first lookup order. Each is guarded because a minimal host may
-  // lack nsswitch.
+  // bwrap's /etc holds ONLY explicitly bound files, so without these an
+  // /etc/hosts-only name (e.g. registry.local for `npm install` under
+  // KICI_SANDBOX_NETWORK=host) silently resolves via mDNS/DNS to another host.
+  // nsswitch.conf pins files-first order; each is guarded since a minimal host may lack it.
   for (const nssFile of ['/etc/hosts', '/etc/nsswitch.conf']) {
     if (existsSync(nssFile)) {
       args.push('--ro-bind', nssFile, nssFile);
     }
   }
 
-  // Bind-mount the Node.js install ROOT read-only (may be outside /usr/bin,
-  // e.g., nvm/mise/asdf). We bind the parent of the binary's directory rather
-  // than just the binary's directory because Node distributions co-locate
-  // npm and other tooling under siblings of `bin/`:
-  //
-  //   $NODE_ROOT/bin/node            ← process.execPath
-  //   $NODE_ROOT/lib/node_modules/npm/bin/npm-cli.js
-  //   $NODE_ROOT/share/...
-  //
-  // Without binding the whole root, `npm install` (used by the workflow
-  // runner during `installDeps`) crashes with
-  // `Cannot find module '$NODE_ROOT/lib/node_modules/npm/bin/npm-cli.js'`.
+  // Bind the Node install ROOT (nvm/mise/asdf may live outside /usr), not just
+  // bin/: npm lives at $NODE_ROOT/lib/node_modules/npm, and `installDeps` fails
+  // with `Cannot find module '.../npm-cli.js'` without it.
   const nodeDir = dirname(nodeExecPath);
   const nodeInstallRoot = dirname(nodeDir);
   if (
@@ -429,40 +344,20 @@ export function buildBwrapArgs(
   ) {
     args.push('--ro-bind', nodeInstallRoot, nodeInstallRoot);
   } else if (!nodeDir.startsWith('/usr') && !nodeDir.startsWith('/bin')) {
-    // Edge case: binary lives directly at `/bin/node` or `/usr/bin/node`
-    // (handled by the /usr or /bin ro-binds above) — fall back to binding
-    // just the binary's parent dir.
+    // The root is `/` or under /usr or /bin: bind just the binary's dir.
     args.push('--ro-bind', nodeDir, nodeDir);
   }
 
-  // Bind-mount the workflow-runner.js so it (and its dependencies) is
-  // reachable from inside the sandbox under its real absolute path.
-  //
-  // Two cases:
-  //
-  // 1. **pnpm workspace install (a source checkout).** runnerPath lives somewhere
-  //    like /repo/packages/agent/dist/workflow-runner.js, and pnpm's
-  //    symlinked node_modules point at sibling packages
-  //    (e.g. /repo/packages/shared). We must bind the entire workspace
-  //    root (the directory containing pnpm-workspace.yaml) so all symlink
-  //    targets resolve. Binding only the runner dir or its node_modules
-  //    is not enough — symlinks resolve into unbound territory and Node
-  //    crashes with `Cannot find package '@kici-dev/shared'`.
-  //
-  // 2. **Single-tree install (production tarball or bundled binary).**
-  //    No pnpm-workspace.yaml is found walking up from runnerPath. Fall
-  //    back to binding runnerDir plus every node_modules in its parent
-  //    chain — this catches both the bundled-in-place case and a flat
-  //    `node_modules` next to dist/.
-  //
-  // Without this the bwrap'd Node process crashes immediately with
-  // `Cannot find module '/.../workflow-runner.js'` or
-  // `Cannot find package '...'`.
+  // Make workflow-runner.js and its deps reachable at their real paths.
+  // - pnpm workspace (source checkout): bind the whole workspace root, since
+  //   symlinked node_modules point at sibling packages; binding only the runner
+  //   dir fails with `Cannot find package '@kici-dev/shared'`.
+  // - Single tree (tarball or bundled binary, no pnpm-workspace.yaml): bind
+  //   runnerDir plus every node_modules up its parent chain.
   const boundDirs = new Set<string>();
   if (runnerPath) {
     const runnerDir = dirname(runnerPath);
 
-    // Find the pnpm workspace root by walking up from runnerDir.
     let workspaceRoot: string | undefined;
     let cursor: string = runnerDir;
     while (cursor && cursor !== '/' && cursor !== dirname(cursor)) {
@@ -479,13 +374,10 @@ export function buildBwrapArgs(
       !workspaceRoot.startsWith('/bin') &&
       !workspaceRoot.startsWith('/workspace')
     ) {
-      // Single bind covers all packages and their symlinked deps.
       args.push('--ro-bind', workspaceRoot, workspaceRoot);
       boundDirs.add(workspaceRoot);
     } else {
-      // Production / single-tree install fallback.
-      // Skip the runner bind if it's already covered by the node install root
-      // (single-binary distributions where node and the runner ship together).
+      // Skip the runner bind when the node install root covers it (single-binary distributions).
       const alreadyCoveredByNode =
         runnerDir === nodeDir ||
         runnerDir === nodeInstallRoot ||
@@ -500,7 +392,6 @@ export function buildBwrapArgs(
         args.push('--ro-bind', runnerDir, runnerDir);
         boundDirs.add(runnerDir);
       }
-      // Walk up from runnerDir to '/' and bind every node_modules we find.
       cursor = runnerDir;
       while (cursor && cursor !== '/' && cursor !== dirname(cursor)) {
         const candidate = `${cursor}/node_modules`;
@@ -519,10 +410,7 @@ export function buildBwrapArgs(
     }
   }
 
-  // Caller-supplied read-only binds (e.g. file:// clone source paths). The
-  // workflow runner clones the repo from inside the sandbox, so any local
-  // file:// URL must have its source dir mounted or `git clone` will fail
-  // with `does not appear to be a git repository`.
+  // Caller binds, e.g. file:// clone sources (see fileCloneSourceBinds).
   for (const extra of extraReadOnlyBinds) {
     if (
       !extra ||
@@ -542,46 +430,36 @@ export function buildBwrapArgs(
 }
 
 /**
- * Derive the read-only bind path(s) for a `file://` clone source. The workflow
- * runner clones the repo from inside the sandbox, so a local `file://` URL's
- * source directory must be exposed read-only or `git clone` fails with
- * `does not appear to be a git repository`. Returns `[]` for non-`file://`
- * remotes (https/ssh need no host bind) and for a malformed `file://` URL (the
- * clone then surfaces the real error rather than being masked here).
+ * Read-only bind path(s) for a `file://` clone source: the runner clones inside
+ * the sandbox, so without the bind `git clone` fails with `does not appear to be
+ * a git repository`. Returns `[]` for non-`file://` remotes and for a malformed
+ * `file://` URL (the clone then surfaces the real error).
  *
- * Shared by both sandboxes that clone a local source: the bare-metal (bwrap)
- * backend threads the result into `buildBwrapArgs`'s `extraReadOnlyBinds`, and
- * the container backend binds each `<dir>:<dir>:ro` into the job container —
- * the same clone-source affordance across both isolation models.
+ * Bare-metal feeds it to `buildBwrapArgs`'s `extraReadOnlyBinds`; the container
+ * backend binds each as `<dir>:<dir>:ro`.
  */
 export function fileCloneSourceBinds(repoUrl: string | undefined): string[] {
   if (typeof repoUrl !== 'string' || !repoUrl.startsWith('file://')) return [];
   try {
     const url = new URL(repoUrl);
-    // Reject an empty or root-only path (a malformed `file://` with no repo
-    // path): binding `/` would expose the entire host root into the sandbox.
+    // Binding `/` would expose the entire host root.
     return url.pathname && url.pathname !== '/' ? [url.pathname] : [];
   } catch {
     return [];
   }
 }
 
-/** A resolved POSIX identity for the runner child. */
 export interface RunnerIdentity {
   uid: number;
   gid: number;
 }
 
 /**
- * Resolve a `KICI_RUNNER_USER` spec to numeric ids.
+ * Resolve a `KICI_RUNNER_USER` spec (`uid`, `uid:gid`, or a name, via `id`) to
+ * numeric ids; a missing gid takes the user's primary group.
  *
- * Accepts `uid`, `uid:gid`, or a user name. A name is resolved through `id`,
- * which is present on every POSIX host the bare-metal backend supports; a uid
- * with no gid takes that user's primary group.
- *
- * Throws on an unresolvable spec rather than silently falling back to the
- * agent's own uid — the operator set this to get a boundary, so quietly not
- * having one is the worst outcome.
+ * Throws rather than falling back to the agent's uid: the operator asked for a
+ * boundary, and silently lacking one is the worst outcome.
  */
 export function resolveRunnerUser(spec: string | undefined): RunnerIdentity | undefined {
   if (!spec) return undefined;
@@ -613,11 +491,8 @@ export function resolveRunnerUser(spec: string | undefined): RunnerIdentity | un
 }
 
 /**
- * Hand the job workdir to the runner user before the child starts.
- *
- * Without this the child cannot write its own workspace. A failure is fatal:
- * the operator asked for a dedicated uid, and running one that cannot write is
- * a broken job wearing the clothes of a boundary.
+ * Chown the job workdir to the runner user so the child can write it. Failure
+ * is fatal: a dedicated uid that cannot write is a broken job posing as a boundary.
  */
 function chownWorkDirToRunner(workDir: string, identity: RunnerIdentity): void {
   if (!workDir) return;
@@ -632,10 +507,9 @@ function chownWorkDirToRunner(workDir: string, identity: RunnerIdentity): void {
 }
 
 /**
- * Spawn the workflow-runner child process. Returns the child handle and a
- * boolean indicating whether the spawn produced a usable PID. On Windows
- * services (shawl) fork() can fail silently when IPC pipes cannot be set up;
- * the caller treats `pidAssigned=false` as an immediate failure.
+ * Spawn the runner child. Under Windows services (shawl) fork() can fail
+ * silently when IPC pipes cannot be set up; the caller treats
+ * `pidAssigned=false` as an immediate failure.
  */
 function spawnRunnerChild(
   options: ForkRunnerOptions,
@@ -649,9 +523,8 @@ function spawnRunnerChild(
     extraReadOnlyBinds = [],
   } = options;
 
-  // Opt-in dedicated uid. Applied to both branches: bwrap gives the child its
-  // own namespaces but not its own user, so without this the child still shares
-  // the agent's uid and can reach the agent process outside the namespace.
+  // Applied under bwrap too: its namespaces do not change the uid, so the child
+  // could still reach the agent process outside the namespace.
   const identity = resolveRunnerUser(options.runnerUser);
   if (identity) chownWorkDirToRunner(effectiveWorkDir, identity);
   const identityOpts = identity ? { uid: identity.uid, gid: identity.gid } : {};
@@ -685,31 +558,26 @@ function spawnRunnerChild(
 }
 
 /**
- * True when the operator asked for the child's raw stdio on the agent's own
- * stderr (`KICI_RUNNER_DEBUG_STDIO=true`).
+ * `KICI_RUNNER_DEBUG_STDIO=true` echoes the child's raw stdio to the agent's stderr.
  *
- * Off by default. The agent's stderr is not a run log: for a scaler-spawned
- * agent the orchestrator's LogForwarder copies it into journald and Loki, where
- * it is readable without the `runs:read` check that guards the run log and with
- * no per-org scoping. The child's masked `log.line` stream is the log; echoing
- * the same bytes to stderr would publish the unmasked copy beside it.
+ * Off by default: for a scaler-spawned agent, the orchestrator's LogForwarder
+ * copies agent stderr into journald and Loki, readable without the `runs:read`
+ * check and with no per-org scoping, so the echo would publish an unmasked copy
+ * of the masked `log.line` stream.
  *
- * Read per call rather than cached so a test can flip it between cases.
+ * Read per call, not cached, so a test can flip it between cases.
  */
 function debugStdioEnabled(): boolean {
   return process.env.KICI_RUNNER_DEBUG_STDIO === 'true';
 }
 
-/** Drain the child's stdout (preventing pipe-buffer deadlock) and capture
- *  the last N stderr lines for crash diagnostics. The returned array is
- *  mutated in place by the stderr listener. */
+/** Drain stdout (a full pipe blocks the child) and keep the last stderr lines
+ *  for crash diagnostics in the returned array, which the listener mutates in place. */
 function setupChildStdioCapture(child: ChildProcess): string[] {
   const stderrLines: string[] = [];
   const MAX_STDERR_LINES = 20;
 
   if (child.stdout) {
-    // Drain only — the chunk is discarded unless debug stdio is on. Without a
-    // reader the pipe buffer fills and the child blocks on write.
     child.stdout.on('data', (chunk: Buffer) => {
       if (debugStdioEnabled()) {
         process.stderr.write(`[workflow-runner:stdout] ${chunk.toString().trimEnd()}\n`);
@@ -725,8 +593,7 @@ function setupChildStdioCapture(child: ChildProcess): string[] {
       stderrBuffer = lines.pop() ?? '';
       for (const line of lines) {
         if (!line.trim()) continue;
-        // The ring buffer feeds the crash tail, which is masked before it is
-        // emitted; only the echo below is gated.
+        // The crash tail is masked before emission; only the echo is gated.
         stderrLines.push(line);
         if (stderrLines.length > MAX_STDERR_LINES) stderrLines.shift();
         if (debugStdioEnabled()) {
@@ -739,8 +606,7 @@ function setupChildStdioCapture(child: ChildProcess): string[] {
   return stderrLines;
 }
 
-/** Send-helper that swallows EPIPE / closed-channel errors. Called from
- *  every IPC relay path because the channel may close before we respond. */
+/** Swallows EPIPE / closed-channel errors: the channel may close before a relay responds. */
 function safeSendToChild(child: ChildProcess, msg: AgentToRunnerMessage): void {
   try {
     child.send(msg);
@@ -749,10 +615,8 @@ function safeSendToChild(child: ChildProcess, msg: AgentToRunnerMessage): void {
   }
 }
 
-/** Closure-captured state shared by the IPC message handler, exit handler,
- *  and error handler. Mutating fields (`forkState`, `jobCompleted`,
- *  `cancelTimers`) live on the object so helpers can update them in place
- *  while the outer closure still observes the current value. */
+/** State shared by the message, exit and error handlers. Mutable fields live
+ *  on the object so helpers update them in place and the closure sees the current value. */
 interface ForkRunnerCtx {
   child: ChildProcess;
   execOptions: JobExecutionOptions;
@@ -769,14 +633,11 @@ interface ForkRunnerCtx {
   };
   stderrLines: string[];
   /**
-   * Agent-side masker over the same job's secrets. The child masks its own IPC
-   * messages, but the crash tail is assembled here from the child's raw stderr,
-   * on the agent side of the fork where the child's masker cannot reach.
+   * Masks the crash tail, which is built here from the child's raw stderr where
+   * the child's own masker cannot reach.
    */
   masker: LogMasker;
-  /** When true, the `ready` handler tells the runner to run cleanup-only. */
   cleanupOnly: boolean;
-  /** Writes the runner's setup-time dep-restore report to the agent log. */
   depRestoreRelay: DepRestoreReportRelay;
 }
 
@@ -785,8 +646,7 @@ function clearAllCancelTimers(ctx: ForkRunnerCtx): void {
   ctx.cancelTimers.length = 0;
 }
 
-/** Relay `event.emit` to the orchestrator via the supplied callback and
- *  send the response (or an error response) back into the sandbox runner. */
+/** Relay `event.emit` and send the response (or an error response) back to the runner. */
 function relayEventEmit(msg: EventEmitRequest, ctx: ForkRunnerCtx): void {
   ctx.execOptions.onEventEmit(msg).then(
     (response) => safeSendToChild(ctx.child, response),
@@ -799,8 +659,7 @@ function relayEventEmit(msg: EventEmitRequest, ctx: ForkRunnerCtx): void {
   );
 }
 
-/** Relay `concurrency.report` and pipe the orchestrator ack (or a synthetic
- *  cancel ack on relay failure) back into the sandbox runner. */
+/** Relay `concurrency.report`; a relay failure answers with a synthetic cancel ack. */
 function relayConcurrencyReport(msg: ConcurrencyReportMessage, ctx: ForkRunnerCtx): void {
   ctx.execOptions.onConcurrencyReport(msg).then(
     (ack) => safeSendToChild(ctx.child, ack),
@@ -813,9 +672,7 @@ function relayConcurrencyReport(msg: ConcurrencyReportMessage, ctx: ForkRunnerCt
   );
 }
 
-/** Relay `agent.api.request` and pipe the orchestrator response (or an error
- *  response, or a "not configured" response when the agent didn't provide
- *  the callback) back into the sandbox runner. */
+/** Relay `agent.api.request`; errors and a missing callback answer with an error response. */
 function relayAgentApiRequest(msg: AgentApiRequestIpc, ctx: ForkRunnerCtx): void {
   if (!ctx.execOptions.onApiRequest) {
     safeSendToChild(ctx.child, {
@@ -841,9 +698,7 @@ function relayAgentApiRequest(msg: AgentApiRequestIpc, ctx: ForkRunnerCtx): void
   );
 }
 
-/** Relay `cache.request` and pipe the orchestrator response (or an error
- *  response, or a "not configured" response when the agent didn't provide
- *  the callback) back into the sandbox runner. */
+/** Relay `cache.request`; errors and a missing callback answer with an error response. */
 function relayCacheRequest(msg: CacheRequestIpc, ctx: ForkRunnerCtx): void {
   if (!ctx.execOptions.onCacheRequest) {
     safeSendToChild(ctx.child, {
@@ -864,9 +719,8 @@ function relayCacheRequest(msg: CacheRequestIpc, ctx: ForkRunnerCtx): void {
   );
 }
 
-/** Relay `git.grant.request` to the agent's grant table and pipe the response
- *  (or an error response, or a "not configured" response when the callback
- *  isn't wired) back into the sandbox runner. */
+/** Relay `git.grant.request` to the agent's grant table; errors and a missing
+ *  callback answer with an error response. */
 function relayGitGrantRequest(msg: GitGrantRequestIpc, ctx: ForkRunnerCtx): void {
   if (!ctx.execOptions.onGitGrantRequest) {
     safeSendToChild(ctx.child, {
@@ -886,9 +740,7 @@ function relayGitGrantRequest(msg: GitGrantRequestIpc, ctx: ForkRunnerCtx): void
       }),
   );
 }
-/** Relay `provenance.request` and pipe the orchestrator response (or an error
- *  response, or a "not configured" response when the callback isn't wired) back
- *  into the sandbox runner. */
+/** Relay `provenance.request`; errors and a missing callback answer with an error response. */
 function relayProvenanceRequest(msg: ProvenanceRequestIpc, ctx: ForkRunnerCtx): void {
   if (!ctx.execOptions.onProvenanceRequest) {
     safeSendToChild(ctx.child, {
@@ -909,9 +761,7 @@ function relayProvenanceRequest(msg: ProvenanceRequestIpc, ctx: ForkRunnerCtx): 
   );
 }
 
-/** Relay `artifacts.request` and pipe the orchestrator response (or an error
- *  response, or a "not configured" response when the callback isn't wired) back
- *  into the sandbox runner. */
+/** Relay `artifacts.request`; errors and a missing callback answer with an error response. */
 function relayArtifactRequest(msg: ArtifactRequestIpc, ctx: ForkRunnerCtx): void {
   if (!ctx.execOptions.onArtifactRequest) {
     safeSendToChild(ctx.child, {
@@ -932,9 +782,7 @@ function relayArtifactRequest(msg: ArtifactRequestIpc, ctx: ForkRunnerCtx): void
   );
 }
 
-/** Relay `approval.request` and pipe the orchestrator's resolution (or a
- *  fail-closed reject when the callback isn't wired or the relay throws) back
- *  into the sandbox runner. */
+/** Relay `approval.request`; a missing callback or a relay error fails closed with a reject. */
 function relayApprovalRequest(msg: StepApprovalRequestIpc, ctx: ForkRunnerCtx): void {
   if (!ctx.execOptions.onApprovalRequest) {
     safeSendToChild(ctx.child, {
@@ -955,9 +803,8 @@ function relayApprovalRequest(msg: StepApprovalRequestIpc, ctx: ForkRunnerCtx): 
   );
 }
 
-/** Resolve the result promise for `job.complete` IPC messages. Encrypts
- *  secret outputs (when a runPublicKey is available) and overrides status to
- *  `cancelled` if a cancel was already in flight. */
+/** Resolve on `job.complete`: encrypt secret outputs when a runPublicKey exists,
+ *  and report `cancelled` if a cancel was already in flight. */
 function handleJobComplete(
   msg: Extract<RunnerToAgentMessage, { type: 'job.complete' }>,
   dispatch: JobDispatch,
@@ -993,17 +840,14 @@ function handleJobComplete(
   clearAllCancelTimers(ctx);
 }
 
-/** Dispatch one IPC message from the runner. Centralises the message switch
- *  so the createForkRunner body stays small. */
+/** Dispatch one IPC message from the runner. */
 function relayChildIpcMessage(
   msg: RunnerToAgentMessage,
   dispatch: JobDispatch,
   ctx: ForkRunnerCtx,
 ): void {
-  // The line content is job output. It reaches the run log through onLogLine
-  // below; repeating it on the agent's stderr publishes a second copy to the
-  // orchestrator's journal, so it is behind the same debug gate as the raw
-  // stdio drain.
+  // Line content is job output bound for the run log; echoing it to stderr
+  // would copy it into the orchestrator's journal, so it shares the debug gate.
   const logDetail =
     msg.type === 'log.line'
       ? debugStdioEnabled()
@@ -1113,8 +957,8 @@ function relayChildIpcMessage(
   }
 }
 
-/** Resolve the result promise when the child exits without sending
- *  `job.complete` — i.e. a crash, a forced kill, or an unexpected exit. */
+/** Resolve when the child exits without `job.complete`: a crash, a forced kill,
+ *  or an unexpected exit. */
 function handleChildExitWithoutCompletion(
   code: number | null,
   signal: NodeJS.Signals | null,
@@ -1127,9 +971,7 @@ function handleChildExitWithoutCompletion(
 
   const isCancelled =
     ctx.state.forkState === 'cancelling' || ctx.state.forkState === 'force_killing';
-  // The child's stderr is raw: whatever it wrote before dying never passed the
-  // child's own masker. Mask it here, before it reaches the run log and the
-  // job's persisted error.
+  // Raw stderr never passed the child's masker; mask before the run log and persisted error.
   const stderrLines = ctx.stderrLines.map((line) => ctx.masker.mask(line));
   const crashMsg = isCancelled
     ? 'Job cancelled'
@@ -1155,9 +997,7 @@ function handleChildExitWithoutCompletion(
   clearAllCancelTimers(ctx);
 }
 
-/** Build the cancel function (state machine: running → cancelling →
- *  force_killing). The caller is responsible for surfacing it to the
- *  ForkRunnerHandle via the closure. */
+/** Cancel function over the running → cancelling → force_killing state machine. */
 function buildCancelFn(
   child: ChildProcess,
   ctx: ForkRunnerCtx,
@@ -1173,8 +1013,7 @@ function buildCancelFn(
     } catch {
       // Process may already be dead
     }
-    // Kill the whole group too, so a cancelled job's backgrounded daemons die
-    // immediately; the between-jobs reap() is idempotent over this.
+    // Kill the group so backgrounded daemons die now; the later reap() is idempotent.
     if (detached) killProcessGroup(child.pid, 'SIGKILL');
     clearAllCancelTimers(ctx);
   };
@@ -1211,31 +1050,22 @@ function buildCancelFn(
 }
 
 /**
- * Spawn the workflow runner as a child process with IPC channel.
- *
- * In non-bwrap mode: uses child_process.fork() which sets up a native IPC channel.
- * In bwrap mode: uses child_process.spawn('bwrap', ...) with stdio IPC fd.
+ * Spawn the workflow runner with an IPC channel: fork() natively, or
+ * spawn('bwrap', ...) with a stdio IPC fd under bwrap.
  */
 export function createForkRunner(
   options: ForkRunnerOptions,
   execOptions: JobExecutionOptions,
 ): ForkRunnerHandle {
   const sanitizedEnv = buildSanitizedEnv(options.env);
-  // bwrap mounts a fresh `--tmpfs /tmp`, so any host TMPDIR pointing at a
-  // subdirectory of /tmp (e.g. TMPDIR=/tmp/<uid> under systemd PrivateTmp, a
-  // CI runner, or a shared multi-user box) does not exist inside the sandbox.
-  // os.tmpdir() would then return a non-existent path and every
-  // mkdtemp(join(tmpdir(), ...)) call (git config, dep install, secret mounts)
-  // fails ENOENT, failing the job before any step runs. The tmpfs root is
-  // always present, so pin TMPDIR to it for the sandboxed child.
+  // bwrap's fresh `--tmpfs /tmp` lacks any host TMPDIR subdirectory (e.g.
+  // /tmp/<uid> under PrivateTmp), so every mkdtemp(tmpdir()) would fail ENOENT
+  // before any step runs. The tmpfs root always exists.
   if (options.useBwrap) {
     sanitizedEnv.TMPDIR = '/tmp';
   }
-  // buildSanitizedEnv excludes every KICI_* host variable, so the child cannot
-  // see this one unless it is put back deliberately. Both halves of the debug
-  // echo are gated on it — the child's own fork-mode stdout passthrough and the
-  // agent-side drain below — so without this the flag would enable only half of
-  // what it documents.
+  // buildSanitizedEnv strips KICI_*; restore this flag so it gates the child's
+  // fork-mode stdout passthrough as well as the agent-side drain.
   if (debugStdioEnabled()) {
     sanitizedEnv.KICI_RUNNER_DEBUG_STDIO = 'true';
   }
@@ -1271,9 +1101,7 @@ export function createForkRunner(
   const defaultGracePeriodMs = 30_000;
   const agentMaxGracePeriodMs = options.maxGracePeriodMs ?? defaultGracePeriodMs;
 
-  // cancelTimers + state are hoisted so the kill() handle on the returned
-  // ForkRunnerHandle can clear timers synchronously without waiting for the
-  // child's exit handler to fire.
+  // Hoisted so kill() can clear timers synchronously, before the exit handler fires.
   const cancelTimers: NodeJS.Timeout[] = [];
   const detached = options.detachProcessGroup === true;
   const sharedState: {
@@ -1288,8 +1116,7 @@ export function createForkRunner(
     declaresCleanup: false,
   };
 
-  // cancelFn is assigned synchronously inside the result Promise so the handle
-  // returned at the bottom of the function captures it via closure.
+  // Assigned synchronously inside the result Promise executor.
   let cancelFn: (force: boolean, gracePeriodMs?: number) => void = () => {};
 
   const result = new Promise<JobExecutionResult>((resolve) => {
@@ -1333,7 +1160,7 @@ export function createForkRunner(
     });
   });
 
-  // Legacy abort signal handler -- delegates to graceful cancel
+  // Legacy abort signal: graceful cancel.
   const onAbort = () => cancelFn(false);
   execOptions.signal.addEventListener('abort', onAbort, { once: true });
   child.on('exit', () => execOptions.signal.removeEventListener('abort', onAbort));

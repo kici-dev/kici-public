@@ -5,11 +5,9 @@ import os from 'node:os';
 import { RunHistory, formatStatus, statusLabelWidth, type HistoryEntry } from './history.js';
 import { CANONICAL_STATUSES, ExecutionRunStatus } from '@kici-dev/engine';
 
-/** Strip ANSI escape codes from a string for test assertions */
 // eslint-disable-next-line no-control-regex
 const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');
 
-/** Create a test entry with sensible defaults */
 function makeEntry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
   return {
     runId: overrides.runId ?? `run-${Math.random().toString(36).slice(2, 8)}`,
@@ -41,7 +39,6 @@ describe('RunHistory', () => {
 
       await history.addEntry(entry);
 
-      // Verify file was created
       const content = await fs.readFile(path.join(tempDir, 'runs.json'), 'utf-8');
       const parsed = JSON.parse(content) as HistoryEntry[];
       expect(parsed).toHaveLength(1);
@@ -61,7 +58,6 @@ describe('RunHistory', () => {
     it('caps at 200 entries', async () => {
       const history = new RunHistory(tempDir);
 
-      // Add 205 entries
       for (let i = 0; i < 205; i++) {
         await history.addEntry(makeEntry({ runId: `run-${String(i).padStart(3, '0')}` }));
       }
@@ -70,7 +66,7 @@ describe('RunHistory', () => {
       const entries = history.getEntries();
       expect(entries).toHaveLength(200);
 
-      // Oldest entries (0-4) should be removed, entry 5 should be first (oldest)
+      // Entries 0-4 are evicted; entry 5 is the oldest kept.
       const oldestEntry = entries[entries.length - 1]; // getEntries returns most recent first
       expect(oldestEntry.runId).toBe('run-005');
     });
@@ -99,7 +95,6 @@ describe('RunHistory', () => {
       const history = new RunHistory(tempDir);
       await history.addEntry(makeEntry({ runId: 'run-exists' }));
 
-      // Should not throw
       await history.updateEntry('run-missing', { status: 'failed' });
 
       await history.load();
@@ -207,14 +202,12 @@ describe('RunHistory', () => {
 
       const table = history.formatTable(entries);
 
-      // Verify header
       expect(table).toContain('Run ID');
       expect(table).toContain('Fixture');
       expect(table).toContain('Status');
       expect(table).toContain('Duration');
       expect(table).toContain('Started');
 
-      // Verify content (strip ANSI color codes for assertions)
       const stripped = stripAnsi(table);
       expect(stripped).toContain('abc123');
       expect(stripped).toContain('push-main');
@@ -246,10 +239,9 @@ describe('RunHistory', () => {
       const history = new RunHistory(tempDir);
       await history.addEntry(makeEntry({ runId: 'cached' }));
 
-      // First explicit load
       await history.load();
 
-      // Remove the file -- cached entries should still be accessible
+      // Cached entries must survive the file's removal.
       await fs.rm(path.join(tempDir, 'runs.json'));
 
       const entries = history.getEntries();
@@ -284,8 +276,7 @@ describe('formatStatus', () => {
 
 describe('statusLabelWidth', () => {
   it('measures the plain label, not the colour-wrapped cell', () => {
-    // The table pads by this width. Measuring the rendered cell would count the
-    // ANSI escape bytes and collapse the column whenever colour is enabled.
+    // The rendered cell counts ANSI bytes, collapsing the column when colour is on.
     for (const status of CANONICAL_STATUSES) {
       expect(statusLabelWidth(status)).toBeLessThanOrEqual(stripAnsi(formatStatus(status)).length);
       expect(statusLabelWidth(status)).toBe(stripAnsi(formatStatus(status)).length);

@@ -1,9 +1,4 @@
-/**
- * kici workflows list command
- *
- * Lists permanently registered workflows by querying the Platform API.
- * Supports table output (default), JSON output, and stale filtering.
- */
+/** `kici workflows list`: permanently registered workflows, from the Platform API. */
 
 import pc from 'picocolors';
 import { formatRelativeTime } from '../format.js';
@@ -15,40 +10,24 @@ import {
 import { toErrorMessage } from '@kici-dev/core';
 import { parseDuration } from '@kici-dev/engine';
 
-/** Options for the workflows list command. */
 export interface WorkflowsListOptions {
-  /** Output as JSON */
   json?: boolean;
-  /** Filter stale registrations (e.g., "30d", "7d", "24h") */
+  /** Stale-registration threshold, e.g. "30d", "24h". */
   stale?: string;
-  /** Filter by trigger type */
   triggerType?: string;
-  /** Filter by repository */
   repo?: string;
 }
 
-/** API response shape (the Platform registrations-list payload). */
 type RegistrationsResponse = RegistrationsListResult;
 
-/**
- * List permanently registered workflows.
- *
- * Queries the Platform API for registrations, optionally filtering by trigger type,
- * repository, or staleness. Displays results as a table or JSON.
- *
- * @param options - Command options
- * @returns true on success, false on error
- */
 export async function workflowsListCommand(options: WorkflowsListOptions = {}): Promise<boolean> {
   try {
     const client = await DashboardClient.load();
 
-    // Build query params
     const filters: { triggerType?: string; repoIdentifier?: string } = {};
     if (options.triggerType) filters.triggerType = options.triggerType;
     if (options.repo) filters.repoIdentifier = options.repo;
 
-    // Fetch registrations through the Platform
     let data: RegistrationsResponse;
     try {
       data = await client.listRegistrations(filters);
@@ -68,7 +47,7 @@ export async function workflowsListCommand(options: WorkflowsListOptions = {}): 
 
     let registrations = data.registrations;
 
-    // Apply stale filtering
+    // A never-triggered registration counts as stale.
     if (options.stale) {
       const staleMs = parseDuration(options.stale);
       if (staleMs === null) {
@@ -85,22 +64,18 @@ export async function workflowsListCommand(options: WorkflowsListOptions = {}): 
       });
     }
 
-    // JSON output mode
     if (options.json) {
       console.log(JSON.stringify(registrations, null, 2));
       return true;
     }
 
-    // Empty result
     if (registrations.length === 0) {
       console.log(pc.yellow('No registered workflows found.'));
       return true;
     }
 
-    // Table output
     const termWidth = process.stdout.columns || 100;
 
-    // Calculate column widths
     const headers = ['WORKFLOW', 'REPO', 'TRIGGERS', 'LAST TRIGGERED'];
     const rows = registrations.map((r) => [
       r.workflowName,
@@ -114,11 +89,10 @@ export async function workflowsListCommand(options: WorkflowsListOptions = {}): 
       return Math.max(h.length, maxData);
     });
 
-    // Truncate columns to fit terminal width
     const totalGaps = (headers.length - 1) * 3; // 3 chars between columns
     const totalWidth = colWidths.reduce((a, b) => a + b, 0) + totalGaps;
     if (totalWidth > termWidth) {
-      // Shrink the widest columns first
+      // Shrink the widest column first, never below its header.
       let excess = totalWidth - termWidth;
       while (excess > 0) {
         const maxIdx = colWidths.indexOf(Math.max(...colWidths));
@@ -129,25 +103,21 @@ export async function workflowsListCommand(options: WorkflowsListOptions = {}): 
       }
     }
 
-    // Print header
     const headerLine = headers.map((h, i) => h.padEnd(colWidths[i])).join('   ');
     console.log(pc.bold(headerLine));
 
-    // Print rows
     for (const row of rows) {
       const cells = row.map((cell, i) => {
         const maxW = colWidths[i];
         const truncated = cell.length > maxW ? cell.slice(0, maxW - 1) + '\u2026' : cell;
         const padded = truncated.padEnd(maxW);
 
-        // Color "Never" values dim
         if (cell === 'Never') return pc.dim(padded);
         return padded;
       });
       console.log(cells.join('   '));
     }
 
-    // Registry info
     console.log('');
     console.log(
       pc.gray(

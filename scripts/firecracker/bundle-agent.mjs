@@ -35,12 +35,11 @@ await build({
   external: [
     'cpu-features',
     'dockerode',
-    // `oxc-transform` has a native N-API binding and can't be bundled. It's
-    // pulled in by `@kici-dev/core/ts-loader-hook`, which the workflow-runner
-    // registers at startup so imports of `.kici/workflows/*.ts` go through the
-    // oxc-based TS transform. Leaving `@kici-dev/core` bundled in-bundle
-    // would still route the runtime `module.register()` call to this external
-    // package path at `/opt/kici/node_modules/oxc-transform/`.
+    // `oxc-transform` has a native N-API binding and cannot be bundled.
+    // `@kici-dev/core/ts-loader-hook` pulls it in; the workflow-runner registers
+    // that hook at startup so `.kici/workflows/*.ts` imports go through the oxc
+    // TS transform. Even with `@kici-dev/core` in-bundle, the runtime
+    // `module.register()` call routes to the external `/opt/kici/node_modules/oxc-transform/`.
     'oxc-transform',
     '@kici-dev/core/ts-loader-hook',
   ],
@@ -64,12 +63,7 @@ await build({
   external: [
     'cpu-features',
     'dockerode',
-    // `oxc-transform` has a native N-API binding and can't be bundled. It's
-    // pulled in by `@kici-dev/core/ts-loader-hook`, which the workflow-runner
-    // registers at startup so imports of `.kici/workflows/*.ts` go through the
-    // oxc-based TS transform. Leaving `@kici-dev/core` bundled in-bundle
-    // would still route the runtime `module.register()` call to this external
-    // package path at `/opt/kici/node_modules/oxc-transform/`.
+    // Same externals, for the same reason, as the agent bundle above.
     'oxc-transform',
     '@kici-dev/core/ts-loader-hook',
   ],
@@ -83,16 +77,13 @@ await build({
 });
 console.log('Bundled workflow-runner.js');
 
-// Bundle the eval runner (forked as a child process by the agent for every
-// `__init__` / `__dynamic__` / `__build__` job and every global eval round).
-// It lands as a SIBLING of agent.js because `resolveEvalRunnerPath()` probes
-// `join(dirname(agent entry), 'eval-runner.js')` first, and in the Firecracker
-// rootfs the agent entry is `/opt/kici/agent.js`.
-//
-// Without it a Firecracker-hosted evaluation forks a path that does not exist:
-// node starts, fails to load the module, and exits 1 with its diagnostic on a
-// stderr the parent discards — surfacing as the opaque "Evaluation child exited
-// without a result (code=1, signal=null)".
+// The eval runner, forked by the agent for every `__init__` / `__dynamic__` /
+// `__build__` job and every global eval round, lands as a SIBLING of agent.js:
+// `resolveEvalRunnerPath()` probes `join(dirname(agent entry), 'eval-runner.js')`
+// first, and the rootfs agent entry is `/opt/kici/agent.js`. Without it a
+// Firecracker evaluation forks a missing path, and node exits 1 with its
+// diagnostic on a stderr the parent discards, surfacing as the opaque
+// "Evaluation child exited without a result (code=1, signal=null)".
 await build({
   input: path.join(monorepoRoot, 'packages/agent/src/execution/sandbox/eval-runner.ts'),
   platform: 'node',

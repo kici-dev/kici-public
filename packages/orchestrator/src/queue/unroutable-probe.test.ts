@@ -10,9 +10,8 @@ import {
 
 describe('DEFAULT_UNROUTABLE_GRACE_MS', () => {
   it('mirrors the config default so a 0 startup value derives a sane cadence', () => {
-    // Only used to pick the tick interval when the env default is 0. If the
-    // config default moves and this does not, a re-enabled probe ticks at the
-    // wrong cadence — cheap to assert, easy to forget.
+    // Picks the tick interval when the env default is 0: if the config default
+    // moves and this does not, a re-enabled probe ticks at the wrong cadence.
     expect(DEFAULT_UNROUTABLE_GRACE_MS).toBe(120_000);
     expect(probeTickIntervalMs(DEFAULT_UNROUTABLE_GRACE_MS)).toBe(30_000);
   });
@@ -77,11 +76,10 @@ function makeDeps(
 
 describe('unroutable probe', () => {
   it('acts on the LIVE grace, so a cluster setting can re-enable a 0 startup default', async () => {
-    // The tick is registered unconditionally precisely so this works: an
-    // orchestrator booted with KICI_UNROUTABLE_GRACE_MS=0 must still fast-fail
-    // once an operator sets `unroutable_grace_ms`, without a restart. Gating
-    // registration on the startup default made that impossible while the docs
-    // promised the cluster value takes effect within a cache window.
+    // The tick is registered unconditionally so an orchestrator booted with
+    // KICI_UNROUTABLE_GRACE_MS=0 still fast-fails once an operator sets
+    // `unroutable_grace_ms`, without a restart, within a cache window as the
+    // docs promise. Gating registration on the startup default breaks that.
     const { deps, queue, terminalize } = makeDeps({
       candidates: [{ ...candidate, unroutableSince: new Date(Date.now() - 200_000) }],
       graceMs: 120_000, // what the cluster setting now returns, not the 0 default
@@ -145,9 +143,9 @@ describe('unroutable probe', () => {
       graceMs: 120_000,
     });
     await createUnroutableProbeHandler(deps)();
-    // The claim is what takes the row out of `Pending`. Without it the job
-    // stays dispatchable to a later-connecting agent AND is re-listed (and
-    // re-terminalized, and re-counted) on every tick until the queue timeout.
+    // The claim takes the row out of `Pending`. Without it the job stays
+    // dispatchable to a later agent AND is re-listed, re-terminalized and
+    // re-counted every tick until the queue timeout.
     expect(queue.claimUnroutable).toHaveBeenCalledWith('q-1');
     expect(terminalize).toHaveBeenCalledTimes(1);
     expect(onFastFailed).toHaveBeenCalledTimes(1);
@@ -169,8 +167,8 @@ describe('unroutable probe', () => {
   });
 
   it('never terminalizes a job with a recorded provisioning error', async () => {
-    // The scaler attempted a spawn, so the labels routed — this is a capacity
-    // problem the queue timeout owns, not a fleet/label problem.
+    // The scaler attempted a spawn, so the labels routed: a capacity problem
+    // the queue timeout owns.
     const { deps, terminalize, setRoutingReason } = makeDeps({
       candidates: [
         {

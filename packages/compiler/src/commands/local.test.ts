@@ -41,9 +41,8 @@ describe('kici local commands', () => {
   beforeEach(() => {
     spy = vi.spyOn(console, 'log').mockImplementation(() => {});
     errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-    // vi.spyOn returns the SAME spy when console.log is already spied, so the
-    // recorded calls carry over between tests unless they are cleared here.
-    // Without this, a `not.toContain` assertion reads earlier tests' output.
+    // vi.spyOn returns the SAME spy when console.log is already spied, so
+    // without a clear a `not.toContain` reads earlier tests' output.
     spy.mockClear();
     errSpy.mockClear();
     loadGlobalConfig.mockReset();
@@ -115,9 +114,8 @@ describe('kici local commands', () => {
 
     const { localStatusCommand } = await import('./local.js');
     expect(await localStatusCommand({ json: true })).toBe(true);
-    // The documented contract: every key is present, and everything the plane
-    // cannot supply is an explicit null rather than a missing key — which is
-    // what lets a consumer read `.pid // empty` instead of probing for absence.
+    // Contract: every key is present, with an explicit null for what the plane
+    // cannot supply, so a consumer reads `.pid // empty` without probing.
     expect(JSON.parse(String(spy.mock.calls[0][0]))).toEqual({
       state: 'stopped',
       running: false,
@@ -132,9 +130,7 @@ describe('kici local commands', () => {
 
   it('localStatusCommand --json nulls stampVersion for a non-ready plane', async () => {
     const { planeStatus } = await import('../local-plane/plane-manager.js');
-    // planeStatus() populates stampVersion only on its `ours-ready` branch, so
-    // the documented "stampVersion is populated only for ready" holds for
-    // unready and both foreign states.
+    // planeStatus() sets stampVersion only on its `ours-ready` branch.
     vi.mocked(planeStatus).mockResolvedValueOnce({
       running: false,
       state: 'foreign-kici',
@@ -268,8 +264,7 @@ describe('kici local commands', () => {
     expect(text).toContain('no stamp in this config dir');
     // `kici local down` DOES reclaim a KiCI holder, so status points at it.
     expect(text).toContain('kici local down');
-    // Readiness is never probed for a plane this config dir did not stamp, so
-    // status must not report it as measured-unready.
+    // An unstamped plane is never readiness-probed, so it is not "NOT ready".
     expect(text).not.toContain('NOT ready');
     expect(text).not.toContain('Local dev plane is not running.');
   });
@@ -289,9 +284,8 @@ describe('kici local commands', () => {
     const text = spy.mock.calls.flat().join(' ');
     expect(text).toContain('not a KiCI plane orchestrator');
     expect(text).toContain('5555');
-    // `kici local down` deliberately refuses to signal a foreign holder, so
-    // status must not send the operator to it, and must not call the holder a
-    // running local dev plane.
+    // `kici local down` refuses to signal a foreign holder, so status must not
+    // point at it or call the holder a running local dev plane.
     expect(text).not.toContain('kici local down');
     expect(text).not.toContain('Local dev plane is running');
   });

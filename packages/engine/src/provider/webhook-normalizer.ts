@@ -1,9 +1,6 @@
 /**
- * WebhookNormalizer interface.
- *
- * Translates provider-specific webhook HTTP requests into KiCI's universal
- * SimulatedEvent format. Each provider implements this to handle its own
- * header conventions, signature schemes, and payload structures.
+ * Translates a provider's webhook HTTP requests (its header conventions,
+ * signature scheme and payload structure) into KiCI's universal SimulatedEvent.
  */
 
 import type { SimulatedEvent } from '../trigger/types.js';
@@ -13,10 +10,8 @@ export interface WebhookNormalizer {
   readonly provider: ProviderType;
 
   /**
-   * Extract a routing key from webhook headers/payload.
-   *
-   * The routing key uniquely identifies a webhook source within KiCI.
-   * Format: "{provider}:{provider-specific-id}"
+   * Extract the routing key that uniquely identifies a webhook source within
+   * KiCI. Format: "{provider}:{provider-specific-id}"
    *
    * Examples:
    * - GitHub: "github:12345" from X-GitHub-Hook-Installation-Target-ID header
@@ -36,9 +31,7 @@ export interface WebhookNormalizer {
   extractDeliveryId(headers: Record<string, string>): string | null;
 
   /**
-   * Extract the event type from headers.
-   *
-   * Returns the provider-specific event type string (not yet normalized).
+   * Extract the provider-specific event type (not yet normalized) from headers.
    *
    * Examples:
    * - GitHub: X-GitHub-Event header ("push", "pull_request")
@@ -48,39 +41,31 @@ export interface WebhookNormalizer {
   extractEventType(headers: Record<string, string>): string | null;
 
   /**
-   * Verify webhook signature or token.
-   *
-   * Each provider has its own verification scheme:
+   * Verify the webhook signature or token. Each provider has its own scheme:
    * - GitHub: HMAC-SHA256 with X-Hub-Signature-256 header
    * - GitLab: Plain token comparison with X-Gitlab-Token header
    * - Bitbucket: HMAC-SHA256 with X-Hub-Signature header
    *
-   * @param body - Raw request body as string
+   * @param body - Raw request body
    * @param headers - Request headers (lowercase keys)
    * @param secret - Webhook secret/token configured for this source
-   * @returns true if signature/token is valid
    */
   verifySignature(body: string, headers: Record<string, string>, secret: string): boolean;
 
   /**
-   * Normalize a provider-specific webhook into a SimulatedEvent.
-   *
-   * Maps provider event types to universal 'pull_request' | 'push' types.
-   * Returns null if the event type is not relevant for trigger matching
-   * (e.g., GitHub "star" events, GitLab "Pipeline Hook" events).
+   * Normalize a provider-specific webhook into a SimulatedEvent, mapping
+   * provider event types to universal 'pull_request' | 'push' types. Returns
+   * null if the event type is not relevant for trigger matching (e.g., GitHub
+   * "star" events, GitLab "Pipeline Hook" events).
    *
    * @param eventType - Provider-specific event type (from extractEventType)
    * @param action - Event action/sub-type, if applicable (e.g., "opened" for PRs)
-   * @param payload - Raw webhook payload
-   * @returns Normalized SimulatedEvent, or null if not matchable
    */
   normalizeEvent(eventType: string, action: string | null, payload: unknown): SimulatedEvent | null;
 
   /**
-   * Extract the repository identifier from a webhook payload.
-   *
-   * Returns a string in "owner/repo" format, or null if the payload
-   * does not contain repository information (e.g., generic webhooks).
+   * Extract the repository identifier in "owner/repo" format, or null if the
+   * payload has no repository information (e.g., generic webhooks).
    *
    * Examples:
    * - GitHub: "octocat/Hello-World" from payload.repository.full_name
@@ -90,10 +75,8 @@ export interface WebhookNormalizer {
   extractRepoIdentifier(payload: unknown): string | null;
 
   /**
-   * Extract the commit SHA or ref for lock file fetching from a webhook payload.
-   *
-   * Returns a commit SHA, branch name, or 'HEAD' as a fallback.
-   * Each provider maps event types to the appropriate payload field.
+   * Extract the ref for lock file fetching: a commit SHA, branch name, or
+   * 'HEAD' as a fallback, from the payload field matching the event type.
    *
    * Examples:
    * - GitHub push: payload.after
@@ -101,15 +84,12 @@ export interface WebhookNormalizer {
    * - Generic: 'HEAD' (no ref concept)
    *
    * @param eventType - Provider-specific event type (from extractEventType)
-   * @param payload - Raw webhook payload
    */
   extractRef(eventType: string, payload: unknown): string;
 
   /**
-   * Extract provider-specific credentials from a webhook payload.
-   *
-   * Returns an object with provider-specific credential fields needed
-   * for downstream operations (clone tokens, API calls, etc.).
+   * Extract the provider-specific credential fields downstream operations
+   * (clone tokens, API calls, etc.) need.
    *
    * Examples:
    * - GitHub: { installationId: 12345 } from payload.installation.id
@@ -118,14 +98,10 @@ export interface WebhookNormalizer {
   extractCredentials(payload: unknown): Record<string, unknown>;
 
   /**
-   * Extract the repository's default branch from the webhook payload.
-   *
-   * Optional. When implemented, the orchestrator uses this hook to decide
-   * whether a push event targets the default branch (required for workflow
-   * registration extraction). When omitted, the orchestrator falls back to
-   * the hardcoded `payload.repository.default_branch` shape.
-   *
-   * Returns null when the field is missing or cannot be resolved.
+   * Extract the repository's default branch, or null when missing or
+   * unresolvable. The orchestrator uses it to decide whether a push targets the
+   * default branch (required for workflow registration extraction); when
+   * omitted, it falls back to `payload.repository.default_branch`.
    */
   extractDefaultBranch?(payload: unknown): string | null;
 }

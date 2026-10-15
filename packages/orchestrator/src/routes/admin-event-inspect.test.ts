@@ -1,6 +1,5 @@
 /**
- * Tests for the internal-event inspection routes.
- *
+ * Internal-event inspection routes:
  *   GET /api/v1/admin/events      — list, newest first, with filters
  *   GET /api/v1/admin/events/:id  — one event, its redacted payload and runs
  */

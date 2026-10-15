@@ -33,7 +33,6 @@ describe('MetricsReporter', () => {
     vi.restoreAllMocks();
   });
 
-  /** Build a mock exporter that returns OTel CollectionResult. */
   function createMockExporter(
     metrics: Array<{
       name: string;
@@ -161,11 +160,9 @@ describe('MetricsReporter', () => {
 
     reporter.start();
 
-    // Advance past 30s
     await vi.advanceTimersByTimeAsync(30_000);
     expect(sent.length).toBe(1);
 
-    // Advance another 30s
     await vi.advanceTimersByTimeAsync(30_000);
     expect(sent.length).toBe(2);
 

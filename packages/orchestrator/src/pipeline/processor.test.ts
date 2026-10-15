@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock @kici-dev/shared to intercept logger calls for the
-// multi-provider fallback log-level elevation tests.
+// Intercepts logger calls for the multi-provider fallback log-level tests.
 const { mockPipelineLogger } = vi.hoisted(() => {
   const mockPipelineLogger = {
     debug: vi.fn(),
@@ -60,6 +59,8 @@ import { createMockDb } from '../__test-helpers__/mock-db.js';
 import { resolveDispatchCloneAuth } from '../git/dispatch-git-auth.js';
 import { makeGateTracker } from './dispatch-matched-workflow.test-helpers.js';
 import { HeldRunStatus } from '../contexts/held-runs.js';
+import { lockFileFixture, lockWorkflow, staticJob } from '../__test-helpers__/lock-fixtures.js';
+import { mockExecutionTracker } from '../__test-helpers__/tracker.js';
 
 // -- Mock helpers --
 
@@ -68,8 +69,7 @@ function createMockDedup(options: { exists?: boolean } = {}) {
   return {
     exists: vi.fn().mockResolvedValue(alreadySeen),
     mark: vi.fn().mockResolvedValue(undefined),
-    // The pipeline dedups via the atomic claim: it wins (true) for a fresh
-    // delivery and loses (false) when the delivery already exists (duplicate).
+    // The atomic dedup claim loses (false) for an already-seen delivery.
     claim: vi.fn().mockResolvedValue(!alreadySeen),
     cleanup: vi.fn().mockResolvedValue(0),
   };
@@ -125,10 +125,8 @@ function createMockProviderBundle(): ProviderBundle {
             targetBranch: pr?.base?.ref ?? 'main',
             sourceBranch: pr?.head?.ref,
             baseBranch: pr?.base?.ref ?? 'main',
-            // The real normalizer computes this as `head !== base` and always
-            // emits a boolean, so it is `false` for a payload naming neither.
-            // The mock has to match, or an assertion about the head context
-            // reads a shape production never produces.
+            // The real normalizer always emits a boolean (`head !== base`), so a
+            // payload naming neither gets `false`; the mock must match.
             isForkPR: false,
             payload: p,
             provider: 'github' as const,
@@ -245,50 +243,25 @@ function basePushInfo(overrides: Partial<WebhookInfo> = {}): WebhookInfo {
 }
 
 function matchingLockFile() {
-  return {
-    schemaVersion: 1,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
-    contentHash: 'test-hash',
+  return lockFileFixture({
     workflows: [
-      {
-        name: 'CI',
-        triggers: [
-          {
-            _type: 'pr',
-            events: ['opened', 'synchronize'],
-            targetBranches: [],
-            sourceBranches: [],
-            paths: [],
-          },
-        ],
+      lockWorkflow({
         jobs: [
-          {
-            _type: 'static',
-            name: 'build',
-            runsOn: [{ kind: 'exact', value: 'linux' }],
-            needs: [],
-            steps: [{ name: 'Build', hasOutputs: false }],
-          },
-          {
-            _type: 'static',
+          staticJob(),
+          staticJob({
             name: 'test',
-            runsOn: [{ kind: 'exact', value: 'linux' }],
-            needs: [],
             steps: [{ name: 'Test', hasOutputs: false }],
-          },
+          }),
         ],
-      },
+      }),
     ],
-  };
+  });
 }
 
 function noMatchLockFile() {
-  return {
-    schemaVersion: 1,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
-    contentHash: 'test-hash',
+  return lockFileFixture({
     workflows: [
-      {
+      lockWorkflow({
         name: 'Deploy',
         triggers: [
           {
@@ -298,17 +271,14 @@ function noMatchLockFile() {
           },
         ],
         jobs: [
-          {
-            _type: 'static',
+          staticJob({
             name: 'deploy',
-            runsOn: [{ kind: 'exact', value: 'linux' }],
-            needs: [],
             steps: [{ name: 'Deploy', hasOutputs: false }],
-          },
+          }),
         ],
-      },
+      }),
     ],
-  };
+  });
 }
 
 function createMockCheckRunReporter() {
@@ -356,7 +326,7 @@ describe('processWebhook', () => {
     // 2 static jobs dispatched
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(2);
 
-    // Verify job input shape has provider and providerContext (not installationId)
+    // The job input carries provider and providerContext, not installationId.
     const firstCall = (deps.dispatcher.dispatch as any).mock.calls[0][0];
     expect(firstCall.workflowName).toBe('CI');
     expect(firstCall.jobName).toBe('build');
@@ -364,10 +334,8 @@ describe('processWebhook', () => {
     expect(firstCall.deliveryId).toBe('delivery-123');
     expect(firstCall.provider).toBe('github');
     expect(firstCall.providerContext).toEqual({ installationId: 42 });
-    // Verify repoUrl is built via repoUrlBuilder
     expect(firstCall.repoUrl).toBe('https://github.com/myorg/myrepo.git');
-    // Verify the normalized event envelope is passed through for agent-side
-    // rule evaluation (raw provider payload nested at event.payload).
+    // Agent-side rules read the normalized envelope (raw payload at event.payload).
     expect(firstCall.jobConfig.event).toBeDefined();
     expect(typeof firstCall.jobConfig.event).toBe('object');
     expect((firstCall.jobConfig.event as { payload?: unknown }).payload).toBeDefined();
@@ -385,35 +353,30 @@ describe('processWebhook', () => {
 
   it('expands a static matrix job into N dispatches each carrying matrixValues', async () => {
     const deps = createDeps({
-      lockFileCache: createMockLockFileCache({
-        schemaVersion: 1,
-        source: { file: '.kici/workflows/ci.ts', export: '#default' },
-        contentHash: 'test-hash',
-        workflows: [
-          {
-            name: 'CI',
-            triggers: [
-              {
-                _type: 'pr',
-                events: ['opened'],
-                targetBranches: [],
-                sourceBranches: [],
-                paths: [],
-              },
-            ],
-            jobs: [
-              {
-                _type: 'static',
-                name: 'test',
-                runsOn: [{ kind: 'exact', value: 'linux' }],
-                needs: [],
-                steps: [{ name: 'Test', hasOutputs: false }],
-                matrix: { _type: 'static', values: { variant: ['a', 'b'] } },
-              },
-            ],
-          },
-        ],
-      }) as any,
+      lockFileCache: createMockLockFileCache(
+        lockFileFixture({
+          workflows: [
+            lockWorkflow({
+              triggers: [
+                {
+                  _type: 'pr',
+                  events: ['opened'],
+                  targetBranches: [],
+                  sourceBranches: [],
+                  paths: [],
+                },
+              ],
+              jobs: [
+                staticJob({
+                  name: 'test',
+                  steps: [{ name: 'Test', hasOutputs: false }],
+                  matrix: { _type: 'static', values: { variant: ['a', 'b'] } },
+                }),
+              ],
+            }),
+          ],
+        }),
+      ) as any,
     });
     await processWebhook(basePrInfo(), deps);
 
@@ -451,35 +414,30 @@ describe('processWebhook', () => {
         holdRunForPendingJobs: vi.fn(() => true),
         releasePendingJobsHold: vi.fn(),
       } as any,
-      lockFileCache: createMockLockFileCache({
-        schemaVersion: 1,
-        source: { file: '.kici/workflows/ci.ts', export: '#default' },
-        contentHash: 'test-hash',
-        workflows: [
-          {
-            name: 'CI',
-            triggers: [
-              {
-                _type: 'pr',
-                events: ['opened'],
-                targetBranches: [],
-                sourceBranches: [],
-                paths: [],
-              },
-            ],
-            jobs: [
-              {
-                _type: 'static',
-                name: 'test',
-                runsOn: [{ kind: 'exact', value: 'linux' }],
-                needs: [],
-                steps: [{ name: 'Test', hasOutputs: false }],
-                matrix: { _type: 'static', values: ['a', 'b'] },
-              },
-            ],
-          },
-        ],
-      }) as any,
+      lockFileCache: createMockLockFileCache(
+        lockFileFixture({
+          workflows: [
+            lockWorkflow({
+              triggers: [
+                {
+                  _type: 'pr',
+                  events: ['opened'],
+                  targetBranches: [],
+                  sourceBranches: [],
+                  paths: [],
+                },
+              ],
+              jobs: [
+                staticJob({
+                  name: 'test',
+                  steps: [{ name: 'Test', hasOutputs: false }],
+                  matrix: { _type: 'static', values: ['a', 'b'] },
+                }),
+              ],
+            }),
+          ],
+        }),
+      ) as any,
     });
     await processWebhook(basePrInfo(), deps);
 
@@ -500,19 +458,9 @@ describe('processWebhook', () => {
         schemaVersion: 1,
         source: { file: '.kici/workflows/ci.ts', export: '#default' },
         workflows: [
-          {
-            name: 'CI',
+          lockWorkflow({
             triggers: [{ _type: 'push', branches: [], paths: [] }],
-            jobs: [
-              {
-                _type: 'static',
-                name: 'build',
-                runsOn: [{ kind: 'exact', value: 'linux' }],
-                needs: [],
-                steps: [{ name: 'Build', hasOutputs: false }],
-              },
-            ],
-          },
+          }),
         ],
       }) as any,
     });
@@ -617,17 +565,14 @@ describe('processWebhook', () => {
     const deps = createDeps({ platformClient: undefined });
     await processWebhook(basePrInfo(), deps);
 
-    // Jobs still dispatched
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(2);
   });
 
   it('handles push events correctly', async () => {
-    const pushLockFile = {
-      schemaVersion: 1,
+    const pushLockFile = lockFileFixture({
       source: { file: '.kici/workflows/deploy.ts', export: '#default' },
-      contentHash: 'test-hash',
       workflows: [
-        {
+        lockWorkflow({
           name: 'Deploy',
           triggers: [
             {
@@ -637,17 +582,14 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'deploy',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Deploy', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(pushLockFile) as any,
@@ -664,13 +606,9 @@ describe('processWebhook', () => {
   });
 
   it('skips dynamic jobs (only dispatches static jobs)', async () => {
-    const lockFileWithDynamic = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    const lockFileWithDynamic = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           triggers: [
             {
               _type: 'pr',
@@ -681,21 +619,15 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
-              name: 'build',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
-              steps: [{ name: 'Build', hasOutputs: false }],
-            },
+            staticJob(),
             {
               _type: 'dynamic',
               source: { file: '.kici/workflows/ci.ts', index: 1 },
             },
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFileWithDynamic) as any,
@@ -709,12 +641,11 @@ describe('processWebhook', () => {
   });
 
   it('dispatches dynamic eval job for dynamic-only workflow (no static jobs)', async () => {
-    const dynamicOnlyLockFile = {
-      schemaVersion: 1,
+    const dynamicOnlyLockFile = lockFileFixture({
       source: { file: '.kici/workflows/infra.ts', export: '#default' },
       contentHash: 'dynamic-only-hash',
       workflows: [
-        {
+        lockWorkflow({
           name: 'dynamic-only-infra',
           triggers: [
             {
@@ -729,9 +660,9 @@ describe('processWebhook', () => {
               source: { file: '.kici/workflows/infra.ts', index: 0 },
             },
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const mockPendingDynamics = {
       track: vi.fn().mockReturnValue(new Promise(() => {})), // never resolves (fire-and-forget)
@@ -750,7 +681,7 @@ describe('processWebhook', () => {
     // Give fire-and-forget async task a tick to dispatch
     await new Promise((r) => setTimeout(r, 50));
 
-    // Verify eval job was dispatched (dynamic-only workflow produces 1 dispatch)
+    // A dynamic-only workflow dispatches only its eval job.
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(1);
     const dispatchCall = (deps.dispatcher.dispatch as any).mock.calls[0][0];
     expect(dispatchCall.jobName).toBe('__dynamic__dynamic-only-infra__0');
@@ -761,32 +692,25 @@ describe('processWebhook', () => {
   });
 
   it('resolves a dynamic matrix via the init flow into N child dispatches', async () => {
-    const matrixLockFile = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    const matrixLockFile = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           triggers: [
             { _type: 'pr', events: ['opened'], targetBranches: [], sourceBranches: [], paths: [] },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'test',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Test', hasOutputs: false }],
               matrix: {
                 _type: 'dynamic',
                 source: { file: '.kici/workflows/ci.ts', jobName: 'test' },
               },
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const mockPendingInits = {
       track: vi.fn().mockResolvedValue({
@@ -801,7 +725,7 @@ describe('processWebhook', () => {
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(matrixLockFile) as any,
       pendingInits: mockPendingInits as any,
-      executionTracker: makeDynamicTrackerMock() as any,
+      executionTracker: mockExecutionTracker() as any,
       db: createMockDb().db as any,
     });
     await processWebhook(basePrInfo(), deps);
@@ -823,38 +747,21 @@ describe('processWebhook', () => {
   });
 
   function dynamicOnlyLockFileFixture() {
-    return {
-      schemaVersion: 1,
+    return lockFileFixture({
       source: { file: '.kici/workflows/infra.ts', export: '#default' },
       contentHash: 'dynamic-only-hash',
       workflows: [
-        {
+        lockWorkflow({
           name: 'dynamic-only-infra',
           triggers: [{ _type: 'push', branches: [{ type: 'glob', pattern: 'main' }], paths: [] }],
           jobs: [{ _type: 'dynamic', source: { file: '.kici/workflows/infra.ts', index: 0 } }],
-        },
+        }),
       ],
-    };
-  }
-
-  function makeDynamicTrackerMock() {
-    return {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn().mockResolvedValue(undefined),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
-    };
+    });
   }
 
   it('records matrix_expansion when the dynamic eval reject carries it', async () => {
-    const mockTracker = makeDynamicTrackerMock();
+    const mockTracker = mockExecutionTracker();
     const mockPendingDynamics = {
       track: vi.fn().mockRejectedValue(
         new AgentJobFailedError('boom', {
@@ -894,7 +801,7 @@ describe('processWebhook', () => {
   });
 
   it('falls back to dynamic_eval when the dynamic eval reject carries no category', async () => {
-    const mockTracker = makeDynamicTrackerMock();
+    const mockTracker = mockExecutionTracker();
     const mockPendingDynamics = {
       track: vi.fn().mockRejectedValue(new AgentJobFailedError('boom')),
       resolve: vi.fn(),
@@ -922,38 +829,31 @@ describe('processWebhook', () => {
   });
 
   function genMatrixLockFileFixture(contentHash: string) {
-    return {
-      schemaVersion: 1,
+    return lockFileFixture({
       source: { file: '.kici/workflows/infra.ts', export: '#default' },
       contentHash,
       workflows: [
-        {
+        lockWorkflow({
           name: 'gen-matrix-infra',
           triggers: [{ _type: 'push', branches: [{ type: 'glob', pattern: 'main' }], paths: [] }],
           jobs: [{ _type: 'dynamic', source: { file: '.kici/workflows/infra.ts', index: 0 } }],
-        },
+        }),
       ],
-    };
+    });
   }
 
   it('fans out a generated job with a static matrix into N child dispatches', async () => {
     // The agent's eval resolves to generated LockJob[]; one carries a static matrix.
     const generatedJobs = [
-      {
-        _type: 'static',
+      staticJob({
         name: 'gen-matrix',
-        runsOn: [{ kind: 'exact', value: 'linux' }],
-        needs: [],
         steps: [{ name: 'run', hasOutputs: false }],
         matrix: { _type: 'static', values: { variant: ['a', 'b'] } },
-      },
-      {
-        _type: 'static',
+      }),
+      staticJob({
         name: 'gen-plain',
-        runsOn: [{ kind: 'exact', value: 'linux' }],
-        needs: [],
         steps: [{ name: 'run', hasOutputs: false }],
-      },
+      }),
     ];
 
     const mockPendingDynamics = {
@@ -963,7 +863,7 @@ describe('processWebhook', () => {
       has: vi.fn().mockReturnValue(false),
       cleanup: vi.fn(),
     };
-    const mockTracker = makeDynamicTrackerMock();
+    const mockTracker = mockExecutionTracker();
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(genMatrixLockFileFixture('gen-matrix-hash')) as any,
@@ -1006,21 +906,15 @@ describe('processWebhook', () => {
     // One generated job's matrix resolves to > MAX_FANOUT_JOBS (256) combinations.
     const overCap = Array.from({ length: 300 }, (_, i) => `v${i}`);
     const generatedJobs = [
-      {
-        _type: 'static',
+      staticJob({
         name: 'gen-bad',
-        runsOn: [{ kind: 'exact', value: 'linux' }],
-        needs: [],
         steps: [{ name: 'run', hasOutputs: false }],
         matrix: { _type: 'static', values: { variant: overCap } },
-      },
-      {
-        _type: 'static',
+      }),
+      staticJob({
         name: 'gen-good',
-        runsOn: [{ kind: 'exact', value: 'linux' }],
-        needs: [],
         steps: [{ name: 'run', hasOutputs: false }],
-      },
+      }),
     ];
 
     const mockPendingDynamics = {
@@ -1030,7 +924,7 @@ describe('processWebhook', () => {
       has: vi.fn().mockReturnValue(false),
       cleanup: vi.fn(),
     };
-    const mockTracker = makeDynamicTrackerMock();
+    const mockTracker = mockExecutionTracker();
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(genMatrixLockFileFixture('gen-fail-hash')) as any,
@@ -1064,7 +958,7 @@ describe('processWebhook', () => {
     const deps = createDeps();
     await processWebhook(basePrInfo(), deps);
 
-    // Single atomic claim replaces the historic exists()-then-mark().
+    // One atomic claim, never exists()-then-mark().
     expect(deps.dedup.claim).toHaveBeenCalledWith('delivery-123');
   });
 
@@ -1074,7 +968,6 @@ describe('processWebhook', () => {
     const deps = createDeps({ providerRegistry: registry });
     await processWebhook(basePrInfo(), deps);
 
-    // Verify lockFileCache.get was called with the provider's fetcher
     expect(deps.lockFileCache.get).toHaveBeenCalledWith(
       bundle.lockFileFetcher,
       'myorg/myrepo',
@@ -1086,14 +979,10 @@ describe('processWebhook', () => {
   it('uses changedFilesFetcher from provider bundle when triggers have path patterns', async () => {
     const bundle = createMockProviderBundle();
     const registry = createMockProviderRegistry(bundle);
-    // Lock file with path patterns triggers the changedFilesFetcher call
-    const lockWithPaths = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    // Path patterns trigger the changedFilesFetcher call.
+    const lockWithPaths = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           triggers: [
             {
               _type: 'pr',
@@ -1103,18 +992,9 @@ describe('processWebhook', () => {
               paths: ['src/**'],
             },
           ],
-          jobs: [
-            {
-              _type: 'static',
-              name: 'build',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
-              steps: [{ name: 'Build', hasOutputs: false }],
-            },
-          ],
-        },
+        }),
       ],
-    };
+    });
     const deps = createDeps({
       providerRegistry: registry,
       lockFileCache: createMockLockFileCache(lockWithPaths) as any,
@@ -1147,13 +1027,9 @@ describe('processWebhook', () => {
       status: 'unavailable',
     });
     const registry = createMockProviderRegistry(bundle);
-    const lockWithPaths = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    const lockWithPaths = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           triggers: [
             {
               _type: 'pr',
@@ -1163,18 +1039,9 @@ describe('processWebhook', () => {
               paths: ['src/**'],
             },
           ],
-          jobs: [
-            {
-              _type: 'static',
-              name: 'build',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
-              steps: [{ name: 'Build', hasOutputs: false }],
-            },
-          ],
-        },
+        }),
       ],
-    };
+    });
     const mockEventLog = { record: vi.fn().mockResolvedValue(undefined) };
     const deps = createDeps({
       providerRegistry: registry,
@@ -1186,8 +1053,7 @@ describe('processWebhook', () => {
 
     // Conservative match: the path-filtered workflow ran despite an empty diff.
     expect(deps.dispatcher.dispatch).toHaveBeenCalled();
-    // The processed event-log row carries the degraded annotation (not a silent
-    // processed / matched 0).
+    // The event-log row carries the degraded annotation, not a silent matched 0.
     expect(mockEventLog.record).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
@@ -1200,26 +1066,14 @@ describe('processWebhook', () => {
 
   describe('changed files resolution', () => {
     function pushPathsLockFile() {
-      return {
-        schemaVersion: 1,
-        source: { file: '.kici/workflows/ci.ts', export: '#default' },
-        contentHash: 'test-hash',
+      return lockFileFixture({
         workflows: [
-          {
+          lockWorkflow({
             name: 'Paths',
             triggers: [{ _type: 'push', branches: [], paths: ['src/**'] }],
-            jobs: [
-              {
-                _type: 'static',
-                name: 'build',
-                runsOn: [{ kind: 'exact', value: 'linux' }],
-                needs: [],
-                steps: [{ name: 'Build', hasOutputs: false }],
-              },
-            ],
-          },
+          }),
         ],
-      };
+      });
     }
 
     /** The `paths` check value the forwarded decision trace carries. */
@@ -1373,7 +1227,7 @@ describe('processWebhook', () => {
     });
     await processWebhook(basePrInfo(), deps);
 
-    // setPendingAwait should appear before any dispatch calls
+    // setPendingAwait precedes every dispatch.
     const pendingIndex = callOrder.indexOf('setPendingAwait');
     const firstDispatchIndex = callOrder.indexOf('dispatch');
     expect(pendingIndex).toBeLessThan(firstDispatchIndex);
@@ -1391,21 +1245,17 @@ describe('processWebhook', () => {
   });
 
   it('does not call checkRunReporter when not provided', async () => {
-    // Default deps have no checkRunReporter -- should work without it
     const deps = createDeps();
     await processWebhook(basePrInfo(), deps);
 
-    // No error thrown -- pipeline works without checkRunReporter
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(2);
   });
 
   it('calls checkRunReporter.setPending() with correct push event data', async () => {
-    const pushLockFile = {
-      schemaVersion: 1,
+    const pushLockFile = lockFileFixture({
       source: { file: '.kici/workflows/deploy.ts', export: '#default' },
-      contentHash: 'test-hash',
       workflows: [
-        {
+        lockWorkflow({
           name: 'Deploy',
           triggers: [
             {
@@ -1415,17 +1265,14 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'deploy',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Deploy', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const mockReporter = createMockCheckRunReporter();
     const deps = createDeps({
@@ -1448,24 +1295,14 @@ describe('processWebhook', () => {
     });
   });
 
-  // -- Execution tracker integration tests (regression for C-1: executionTracker was omitted) --
+  // -- Execution tracker integration tests --
 
   it('calls executionTracker.onExecutionStarted() when provided', async () => {
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn(),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-    };
+    const mockTracker = mockExecutionTracker();
     const deps = createDeps({ executionTracker: mockTracker as any });
     await processWebhook(basePrInfo(), deps);
 
-    // 2 static jobs dispatched, so onExecutionStarted should be called once per workflow
+    // onExecutionStarted runs once per workflow, not per job.
     expect(mockTracker.onExecutionStarted).toHaveBeenCalledTimes(1);
     expect(mockTracker.onExecutionStarted).toHaveBeenCalledWith(
       expect.any(String), // runId
@@ -1477,8 +1314,7 @@ describe('processWebhook', () => {
       'delivery-123', // deliveryId
       { installationId: 42 }, // credentials
       expect.any(Object), // decision summary
-      // The run is registered before the dispatch loop, so it starts with no
-      // jobs; they arrive through `addJobsToRun` once every dispatch returned.
+      // Registered before the dispatch loop; jobs arrive via `addJobsToRun`.
       [], // dispatchedJobs
       'github:12345', // routingKey
       undefined, // dispatchedContexts (no contexts declared)
@@ -1496,11 +1332,9 @@ describe('processWebhook', () => {
       undefined, // triggeredByAgentLabel (webhook-triggered, not agent)
       null, // prNumber (no PR number in the test fixture)
       undefined, // workflowRepo (per-repository dispatch)
-      // Pull-request head context. The fixture is a `pull_request` whose
-      // payload carries no head or base repository, so the fork question
-      // genuinely has no answer and `isFork` stays null — which every claim
-      // renders `'unresolved'`, so a policy pinning it fails CLOSED. It is
-      // never guessed as `false`, which would fail open.
+      // The payload names no head or base repository, so `isFork` stays null
+      // (claim `'unresolved'`, a pinning policy fails CLOSED), never a guessed
+      // `false`, which would fail open.
       { headRef: 'feature/auth', headRepository: null, isFork: null },
     );
     expect(mockTracker.addJobsToRun).toHaveBeenCalledTimes(1);
@@ -1514,23 +1348,12 @@ describe('processWebhook', () => {
 
   it('passes workflow concurrency config to executionTracker', async () => {
     const lockFile = matchingLockFile();
-    // Add concurrency config to the workflow
     (lockFile.workflows[0] as any).concurrency = {
       hasGroup: true,
       cancelInProgress: false,
       max: 3,
     };
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn(),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-    };
+    const mockTracker = mockExecutionTracker();
     const deps = createDeps({
       executionTracker: mockTracker as any,
       lockFileCache: createMockLockFileCache(lockFile) as any,
@@ -1539,10 +1362,9 @@ describe('processWebhook', () => {
 
     expect(mockTracker.onExecutionStarted).toHaveBeenCalledTimes(1);
     const call = mockTracker.onExecutionStarted.mock.calls[0];
-    // Index from the FRONT of the (long) onExecutionStarted signature so this
-    // assertion survives new trailing optional args (e.g. localWorkingTree).
-    // See execution-tracker.ts onExecutionStarted(): concurrency is arg 17,
-    // workflowTimeoutMs 18, checkMode 19.
+    // Indexed from the FRONT so new trailing optional args do not shift it:
+    // concurrency is arg 17, workflowTimeoutMs 18, checkMode 19 (see
+    // execution-tracker.ts onExecutionStarted()).
     const CONCURRENCY_ARG = 17;
     expect(call[CONCURRENCY_ARG]).toEqual({ cancelInProgress: false, max: 3 });
     expect(call[CONCURRENCY_ARG + 1]).toBeUndefined(); // workflowTimeoutMs
@@ -1550,22 +1372,16 @@ describe('processWebhook', () => {
   });
 
   it('does not call executionTracker when not provided', async () => {
-    // Default deps have no executionTracker -- should work without it
     const deps = createDeps({ executionTracker: undefined });
     await processWebhook(basePrInfo(), deps);
 
-    // No error thrown -- pipeline works without executionTracker
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(2);
   });
 
   it('only includes static job names in setPending (skips dynamic)', async () => {
-    const lockFileWithDynamic = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    const lockFileWithDynamic = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           triggers: [
             {
               _type: 'pr',
@@ -1576,21 +1392,15 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
-              name: 'build',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
-              steps: [{ name: 'Build', hasOutputs: false }],
-            },
+            staticJob(),
             {
               _type: 'dynamic',
               source: { file: '.kici/workflows/ci.ts', index: 1 },
             },
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const mockReporter = createMockCheckRunReporter();
     const deps = createDeps({
@@ -1656,9 +1466,8 @@ describe('processWebhook', () => {
     // agentRegistry should be queried with representative labels
     expect(mockAgentRegistry.findAvailable).toHaveBeenCalledWith(['linux']);
 
-    // Source cache is platform-agnostic (no platform/arch params) but org-scoped:
-    // `contentHash` alone is a property of a `.kici/` tree, so two repos built
-    // from the same template would otherwise share one object.
+    // Source cache is platform-agnostic but org-scoped: `contentHash` alone would
+    // let two repos built from the same template share one object.
     expect(mockSourceCache.has).toHaveBeenCalledWith('__default__', 'test-hash');
     expect(mockSourceCache.getUrlAndDigest).toHaveBeenCalledWith('__default__', 'test-hash');
 
@@ -1727,7 +1536,6 @@ describe('processWebhook', () => {
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
       sourceCache: mockSourceCache as any,
-      // No agentRegistry
     });
     await processWebhook(basePrInfo(), deps);
 
@@ -1771,10 +1579,8 @@ describe('processWebhook', () => {
     });
     await processWebhook(basePrInfo(), deps);
 
-    // buildCoordinator.ensureBuild should have been called
     expect(mockBuildCoordinator.ensureBuild).toHaveBeenCalledTimes(1);
 
-    // dispatcher should have dispatched the build job
     const dispatchCalls = (deps.dispatcher.dispatch as any).mock.calls;
     const buildCall = dispatchCalls.find(
       (c: any[]) => c[0].jobName && c[0].jobName.startsWith('__build__'),
@@ -1806,16 +1612,13 @@ describe('processWebhook', () => {
     const deps = createDeps({ coordinator: mockCoordinator as any });
     await processWebhook(basePrInfo(), deps);
 
-    // Coordinator should be called instead of direct dispatcher
     expect(mockCoordinator.routeJobs).toHaveBeenCalledTimes(1);
 
-    // routeJobs should receive RunContext and jobs
     const [runCtx, jobs] = mockCoordinator.routeJobs.mock.calls[0];
     expect(runCtx.workflowName).toBe('CI');
     expect(runCtx.repoIdentifier).toBe('myorg/myrepo');
     expect(jobs).toHaveLength(2); // 'build' and 'test' from matching lock file
 
-    // Direct dispatcher should NOT be called (coordinator handles dispatch)
     expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
   });
 
@@ -1828,19 +1631,15 @@ describe('processWebhook', () => {
     const deps = createDeps({ coordinator: mockCoordinator as any });
     await processWebhook(basePrInfo(), deps);
 
-    // Coordinator.routeJobs should NOT be called
     expect(mockCoordinator.routeJobs).not.toHaveBeenCalled();
 
-    // Direct dispatch should be used instead
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(2);
   });
 
   it('works unchanged when coordinator is not provided (backward compat)', async () => {
-    // Default deps have no coordinator -- existing behavior
     const deps = createDeps({ coordinator: undefined });
     await processWebhook(basePrInfo(), deps);
 
-    // Direct dispatch as usual
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(2);
   });
 
@@ -1857,17 +1656,7 @@ describe('processWebhook', () => {
       }),
     };
 
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn(),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-    };
+    const mockTracker = mockExecutionTracker();
 
     const deps = createDeps({
       coordinator: mockCoordinator as any,
@@ -1875,7 +1664,6 @@ describe('processWebhook', () => {
     });
     await processWebhook(basePrInfo(), deps);
 
-    // Execution tracker should be called with locally dispatched jobs
     expect(mockTracker.onExecutionStarted).toHaveBeenCalledTimes(1);
     // Jobs are registered after the dispatch loop, via `addJobsToRun`.
     const dispatchedJobs = mockTracker.addJobsToRun.mock.calls[0][1];
@@ -1899,13 +1687,9 @@ describe('processWebhook', () => {
 
     // Workflow-level contexts are gated per job, which needs a context store;
     // with none wired, no job may be handed the context's secrets.
-    const lockFile = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    const lockFile = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           contexts: ['production'],
           triggers: [
             {
@@ -1917,17 +1701,14 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'deploy',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Deploy', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
@@ -1945,26 +1726,11 @@ describe('processWebhook', () => {
   it('records an init-failure run when a workflow names contexts and secrets are not configured', async () => {
     // fails-when: a workflow naming contexts dispatches with no secrets subsystem
     const mockDispatcher = createMockDispatcher();
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn(),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
-    };
+    const mockTracker = mockExecutionTracker();
 
-    const lockFile = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    const lockFile = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           contexts: ['production'],
           triggers: [
             {
@@ -1976,17 +1742,14 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'deploy',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Deploy', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
@@ -2012,18 +1775,7 @@ describe('processWebhook', () => {
   });
 
   it('records a lock_resolution init-failure run when the inbound lock is corrupt', async () => {
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn(),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
-    };
+    const mockTracker = mockExecutionTracker();
     const mockEventLog = { record: vi.fn().mockResolvedValue(undefined) };
     const corruptCache = {
       get: vi.fn().mockRejectedValue(new LockFileParseError('myorg/myrepo', 'main', 'bad json')),
@@ -2051,7 +1803,6 @@ describe('processWebhook', () => {
       category: InitFailureCategory.enum.lock_resolution,
     });
     expect(call.initFailure.message.length).toBeGreaterThan(0);
-    // An event_log row is recorded with lockfile_corrupt.
     expect(mockEventLog.record).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
@@ -2060,18 +1811,7 @@ describe('processWebhook', () => {
   });
 
   it('does NOT record a run for a plain absent lock file (miss path unchanged)', async () => {
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn(),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
-    };
+    const mockTracker = mockExecutionTracker();
     const mockEventLog = { record: vi.fn().mockResolvedValue(undefined) };
 
     const deps = createDeps({
@@ -2092,11 +1832,9 @@ describe('processWebhook', () => {
   });
 
   /**
-   * The delivery is acknowledged before the pipeline runs, so nothing a
-   * post-acknowledgement failure decides can reach the sender. The event-log row
-   * is the per-delivery record of it, and the dashboard's failed-delivery count
-   * reads exactly `event_log.status = 'failed'` — with no writer that count is
-   * structurally always zero.
+   * The delivery is acknowledged before the pipeline runs, so a later failure
+   * reaches only the event-log row; the dashboard's failed-delivery count reads
+   * exactly `event_log.status = 'failed'`.
    */
   it('records a failed event-log row when the pipeline throws', async () => {
     const mockEventLog = { record: vi.fn().mockResolvedValue(undefined) };
@@ -2124,8 +1862,7 @@ describe('processWebhook', () => {
   });
 
   it('still rethrows when the failed-row write itself fails', async () => {
-    // The row is best-effort; the propagation is not. Swallowing here would
-    // mark the delivery processed and lose it.
+    // The row is best-effort; the propagation is not, or the delivery is lost.
     const mockEventLog = { record: vi.fn().mockRejectedValue(new Error('event_log down')) };
     const explodingCache = {
       get: vi.fn().mockRejectedValue(new Error('lock store unreachable')),
@@ -2140,8 +1877,7 @@ describe('processWebhook', () => {
   });
 
   it('records no failed row when the pipeline completes', async () => {
-    // The negative control: the status is written by a throw, not by every
-    // delivery, so an unconditional writer would pass the assertion above.
+    // Negative control: only a throw writes the status.
     const mockEventLog = { record: vi.fn().mockResolvedValue(undefined) };
     const deps = createDeps({ eventLog: mockEventLog as any });
 
@@ -2154,29 +1890,13 @@ describe('processWebhook', () => {
 
   it('records init-failure run when install-secrets rejects', async () => {
     const mockDispatcher = createMockDispatcher();
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn(),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
-    };
+    const mockTracker = mockExecutionTracker();
 
-    // Lock file declares an installEnv reference whose `<env>:<secret>` form is
-    // malformed — install-secrets resolver rejects with a parse error, exercising
-    // the install_secrets early-exit.
-    const lockFile = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    // A malformed `<env>:<secret>` installEnv reference fails to parse,
+    // exercising the install_secrets early-exit.
+    const lockFile = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           installEnv: ['malformed-no-colon-reference'],
           triggers: [
             {
@@ -2188,17 +1908,14 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'deploy',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Deploy', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
@@ -2220,31 +1937,15 @@ describe('processWebhook', () => {
   it('tags synthetic rejected-* jobs with context_rules init_failure', async () => {
     const rejectReason = 'Rejected by protection rules';
     const mockDispatcher = createMockDispatcher();
-    // Override dispatch to return a rejection result for the dispatched job.
     mockDispatcher.dispatch = vi.fn().mockResolvedValue({
       status: 'rejected',
       reason: rejectReason,
     });
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn().mockResolvedValue(undefined),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
-    };
+    const mockTracker = mockExecutionTracker();
 
-    const lockFile = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    const lockFile = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           triggers: [
             {
               _type: 'pr',
@@ -2255,17 +1956,14 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'deploy',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Deploy', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
@@ -2275,12 +1973,10 @@ describe('processWebhook', () => {
 
     await processWebhook(basePrInfo(), deps);
 
-    // Dispatcher should be called for the rejected job.
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
 
-    // The synthetic rejected-* job should be marked failed with the structured
-    // init_failure carrying scope=job, category=context_rules, the reject
-    // reason as message, and the job name.
+    // The synthetic rejected-* job fails with init_failure scope=job,
+    // category=context_rules, the reject reason and the job name.
     expect(mockTracker.onJobStatus).toHaveBeenCalled();
     const rejectedCall = mockTracker.onJobStatus.mock.calls.find(
       (args: unknown[]) =>
@@ -2304,31 +2000,15 @@ describe('processWebhook', () => {
   it('tags no-agent-available rejections with no_agent category', async () => {
     const rejectReason = 'No agent for label kici:os:linux available';
     const mockDispatcher = createMockDispatcher();
-    // Override dispatch to return a no-agent rejection result.
     mockDispatcher.dispatch = vi.fn().mockResolvedValue({
       status: 'rejected',
       reason: rejectReason,
     });
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn().mockResolvedValue(undefined),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
-    };
+    const mockTracker = mockExecutionTracker();
 
-    const lockFile = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    const lockFile = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           triggers: [
             {
               _type: 'pr',
@@ -2339,17 +2019,14 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'deploy',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Deploy', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
@@ -2361,9 +2038,7 @@ describe('processWebhook', () => {
 
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
 
-    // The synthetic rejected-* job should be marked failed with the structured
-    // init_failure carrying category=no_agent because the reason string matches
-    // the no-agent regex.
+    // category=no_agent, because the reason string matches the no-agent regex.
     expect(mockTracker.onJobStatus).toHaveBeenCalled();
     const rejectedCall = mockTracker.onJobStatus.mock.calls.find(
       (args: unknown[]) =>
@@ -2384,11 +2059,9 @@ describe('processWebhook', () => {
   });
 
   it('tags build-job dispatch rejections with build_coordination init_failure', async () => {
-    // Cache-miss path forces the orchestrator to dispatch a synthetic
-    // __build__<workflow> job. Reject that dispatch so the synthetic-rejected
-    // path inside runBuildJob calls failRun with the build_coordination
-    // init_failure (recorded against the synthetic execution_runs row that was
-    // just inserted by onExecutionStarted).
+    // A cache miss dispatches a synthetic __build__<workflow> job; rejecting it
+    // makes runBuildJob call failRun with a build_coordination init_failure on
+    // the run row onExecutionStarted just inserted.
     const buildRejectReason = 'Builder backend unavailable';
     const mockSourceCache = {
       has: vi.fn().mockResolvedValue(false),
@@ -2412,15 +2085,7 @@ describe('processWebhook', () => {
       return { status: 'dispatched', agentId: 'agent-1', jobId: 'j1' };
     });
     const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn().mockResolvedValue(undefined),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
+      ...mockExecutionTracker(),
       failRun: vi.fn().mockResolvedValue(undefined),
       onBuildFailed: vi.fn().mockResolvedValue(undefined),
       onBuildFailedBeforeTracking: vi.fn().mockResolvedValue(undefined),
@@ -2443,9 +2108,7 @@ describe('processWebhook', () => {
 
     await processWebhook(basePrInfo(), deps);
 
-    // The synthetic-rejected build job path should call failRun with a structured
-    // build_coordination init_failure so the dashboard banner can explain why
-    // the run was killed before any work happened.
+    // The init_failure lets the dashboard banner explain the run's early death.
     expect(mockTracker.failRun).toHaveBeenCalledTimes(1);
     const [, reason, initFailure] = mockTracker.failRun.mock.calls[0] as unknown[];
     expect(reason).toContain(buildRejectReason);
@@ -2465,10 +2128,8 @@ describe('processWebhook', () => {
   const ON_BUILD_FAILED_INIT_FAILURE_ARG = 12;
 
   it('tags build-coordinator failures (pre-tracking) with build_coordination init_failure', async () => {
-    // Build-coordinator timeout path: ensureBuild throws BEFORE its inner closure
-    // gets to call onExecutionStarted, so buildJobTrackedEarly stays false and
-    // recordBuildFailure routes the failure through onBuildFailedBeforeTracking,
-    // which must also carry the structured build_coordination init_failure.
+    // ensureBuild throws BEFORE onExecutionStarted, so recordBuildFailure routes
+    // through onBuildFailedBeforeTracking, which must carry the init_failure too.
     const coordinatorError = new Error('Build coordinator timed out after 30s');
     const mockSourceCache = {
       has: vi.fn().mockResolvedValue(false),
@@ -2487,15 +2148,7 @@ describe('processWebhook', () => {
     };
     const mockAgentRegistry = createMockAgentRegistry([{ platform: 'linux', arch: 'x64' }]);
     const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn().mockResolvedValue(undefined),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
+      ...mockExecutionTracker(),
       failRun: vi.fn().mockResolvedValue(undefined),
       onBuildFailed: vi.fn().mockResolvedValue(undefined),
       onBuildFailedBeforeTracking: vi.fn().mockResolvedValue(undefined),
@@ -2517,10 +2170,8 @@ describe('processWebhook', () => {
 
     await processWebhook(basePrInfo(), deps);
 
-    // recordBuildFailure routes through onBuildFailedBeforeTracking because no
-    // run row was tracked early. Indexed rather than read off the end: the
-    // trailing `provenance` arg sits after init_failure, so `length - 1` would
-    // silently start asserting against the wrong argument.
+    // Indexed, not read off the end: the trailing `provenance` arg follows
+    // init_failure, so `length - 1` would assert against the wrong argument.
     expect(mockTracker.onBuildFailedBeforeTracking).toHaveBeenCalledTimes(1);
     const call = mockTracker.onBuildFailedBeforeTracking.mock.calls[0] as unknown[];
     const initFailureArg = call[ON_BUILD_FAILED_INIT_FAILURE_ARG];
@@ -2534,12 +2185,10 @@ describe('processWebhook', () => {
   // -- Registration extraction tests --
 
   it('extracts and stores registrations on push to default branch', async () => {
-    const pushLockFile = {
-      schemaVersion: 1,
+    const pushLockFile = lockFileFixture({
       source: { file: '.kici/workflows/events.ts', export: '#default' },
-      contentHash: 'test-hash',
       workflows: [
-        {
+        lockWorkflow({
           name: 'OnDeploy',
           triggers: [
             {
@@ -2548,16 +2197,13 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'notify',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Notify', hasOutputs: false }],
-            },
+            }),
           ],
-        },
-        {
+        }),
+        lockWorkflow({
           name: 'Deploy',
           triggers: [
             {
@@ -2567,17 +2213,14 @@ describe('processWebhook', () => {
             },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'deploy',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Deploy', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const mockRegistrationStore = {
       replaceAll: vi.fn().mockResolvedValue(undefined),
@@ -2616,9 +2259,8 @@ describe('processWebhook', () => {
     });
     await processWebhook(pushInfo, deps);
 
-    // Registration store should be called with BOTH workflows: the kici_event
-    // one and the push-triggered one. made git triggers registerable
-    // so cross-source dispatch can resolve them by (customer_id, repo).
+    // BOTH workflows register, the kici_event one and the push-triggered one:
+    // cross-source dispatch resolves git triggers by (customer_id, repo).
     expect(mockRegistrationStore.replaceAll).toHaveBeenCalledTimes(1);
     expect(mockRegistrationStore.replaceAll).toHaveBeenCalledWith(
       'myorg/myrepo',
@@ -2638,26 +2280,21 @@ describe('processWebhook', () => {
   });
 
   it('skips registration extraction on push to non-default branch', async () => {
-    const pushLockFile = {
-      schemaVersion: 1,
+    const pushLockFile = lockFileFixture({
       source: { file: '.kici/workflows/events.ts', export: '#default' },
-      contentHash: 'test-hash',
       workflows: [
-        {
+        lockWorkflow({
           name: 'OnDeploy',
           triggers: [{ _type: 'kici_event', eventName: 'deploy-complete' }],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'notify',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Notify', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const mockRegistrationStore = {
       replaceAll: vi.fn(),
@@ -2691,7 +2328,6 @@ describe('processWebhook', () => {
     });
     await processWebhook(pushInfo, deps);
 
-    // Registration store should NOT be called for non-default branch
     expect(mockRegistrationStore.replaceAll).not.toHaveBeenCalled();
     expect(mockRegistrationStore.bumpVersion).not.toHaveBeenCalled();
   });
@@ -2718,26 +2354,21 @@ describe('processWebhook', () => {
   });
 
   it('skips registration for local provider (file:// sources)', async () => {
-    const pushLockFile = {
-      schemaVersion: 1,
+    const pushLockFile = lockFileFixture({
       source: { file: '.kici/workflows/events.ts', export: '#default' },
-      contentHash: 'test-hash',
       workflows: [
-        {
+        lockWorkflow({
           name: 'OnDeploy',
           triggers: [{ _type: 'kici_event', eventName: 'deploy-complete' }],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'notify',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Notify', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const mockRegistrationStore = {
       replaceAll: vi.fn(),
@@ -2773,33 +2404,28 @@ describe('processWebhook', () => {
     });
     await processWebhook(pushInfo, deps);
 
-    // Internal sources must NOT re-register workflows — the real provider
-    // source owns the registration set. See processor.ts comment at 5.1.
+    // Internal sources must NOT re-register workflows: the real provider
+    // source owns the registration set.
     expect(mockRegistrationStore.replaceAll).not.toHaveBeenCalled();
     expect(mockRegistrationStore.bumpVersion).not.toHaveBeenCalled();
   });
 
   it('emits registration.updated event after registration extraction', async () => {
-    const pushLockFile = {
-      schemaVersion: 1,
+    const pushLockFile = lockFileFixture({
       source: { file: '.kici/workflows/events.ts', export: '#default' },
-      contentHash: 'test-hash',
       workflows: [
-        {
+        lockWorkflow({
           name: 'OnDeploy',
           triggers: [{ _type: 'kici_event', eventName: 'deploy-complete' }],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'notify',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Notify', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
 
     const mockRegistrationStore = {
       replaceAll: vi.fn().mockResolvedValue(undefined),
@@ -2868,7 +2494,6 @@ describe('processWebhook', () => {
     });
     await processWebhook(basePrInfo(), deps);
 
-    // Should have inserted into run_ephemeral_keys
     expect(mockDb.insertInto).toHaveBeenCalledWith('run_ephemeral_keys');
     expect(insertValues).toHaveLength(1);
     expect(insertValues[0]).toEqual(
@@ -2879,12 +2504,10 @@ describe('processWebhook', () => {
       }),
     );
 
-    // Public key should be base64 encoded
     const pubKey = insertValues[0].public_key as string;
     expect(() => Buffer.from(pubKey, 'base64')).not.toThrow();
     expect(Buffer.from(pubKey, 'base64').length).toBeGreaterThan(0);
 
-    // Encrypted private key should be base64 encoded
     const encKey = insertValues[0].encrypted_private_key as string;
     expect(() => Buffer.from(encKey, 'base64')).not.toThrow();
   });
@@ -2908,7 +2531,6 @@ describe('processWebhook', () => {
     });
     await processWebhook(basePrInfo(), deps);
 
-    // Verify both dispatch calls include runPublicKey in jobConfig
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(2);
     for (let i = 0; i < 2; i++) {
       const jobInput = mockDispatcher.dispatch.mock.calls[i][0];
@@ -2916,7 +2538,6 @@ describe('processWebhook', () => {
       expect(typeof jobInput.jobConfig.runPublicKey).toBe('string');
     }
 
-    // runPublicKey should match what was stored in DB
     const storedPubKey = insertValues[0].public_key;
     const dispatchedPubKey = mockDispatcher.dispatch.mock.calls[0][0].jobConfig.runPublicKey;
     expect(dispatchedPubKey).toBe(storedPubKey);
@@ -2951,10 +2572,9 @@ describe('processWebhook', () => {
       dispatcher: mockDispatcher as any,
     });
 
-    // Should not throw -- gracefully handles key generation failure
     await processWebhook(basePrInfo(), deps);
 
-    // Jobs should still be dispatched (without runPublicKey)
+    // A key generation failure still dispatches, without runPublicKey.
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(2);
     const jobInput = mockDispatcher.dispatch.mock.calls[0][0];
     expect(jobInput.jobConfig.runPublicKey).toBeUndefined();
@@ -2985,7 +2605,6 @@ describe('processWebhook', () => {
     });
     await processWebhook(basePrInfo(), deps);
 
-    // routeJobs should have been called with jobs containing runPublicKey
     expect(mockCoordinator.routeJobs).toHaveBeenCalledTimes(1);
     const jobs = mockCoordinator.routeJobs.mock.calls[0][1];
     expect(jobs.length).toBeGreaterThan(0);
@@ -2997,13 +2616,9 @@ describe('processWebhook', () => {
   it('skips a workflow naming contexts with no secrets subsystem when executionTracker is not provided', async () => {
     const mockDispatcher = createMockDispatcher();
 
-    const lockFile = {
-      schemaVersion: 1,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
+    const lockFile = lockFileFixture({
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           contexts: ['staging'],
           triggers: [
             {
@@ -3014,18 +2629,9 @@ describe('processWebhook', () => {
               paths: [],
             },
           ],
-          jobs: [
-            {
-              _type: 'static',
-              name: 'build',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
-              steps: [{ name: 'Build', hasOutputs: false }],
-            },
-          ],
-        },
+        }),
       ],
-    };
+    });
 
     const deps = createDeps({
       lockFileCache: createMockLockFileCache(lockFile) as any,
@@ -3033,7 +2639,6 @@ describe('processWebhook', () => {
       dispatcher: mockDispatcher as any,
     });
 
-    // Should not throw -- gracefully handles missing tracker
     await processWebhook(basePrInfo(), deps);
 
     // Dispatcher should NOT be called (workflow skipped)
@@ -3046,10 +2651,8 @@ describe('processWebhook', () => {
 // ─────────────────────────────────────────────────────────────────────
 
 /**
- * Build a provider bundle that mimics the real GenericWebhookNormalizer:
- *   - normalizeEvent returns event.type='generic_webhook' with the user
- *     event name in event.action (THIS is what the synthetic event works around)
- *   - extractRepoIdentifier returns null (generic webhooks have no repo)
+ * Mimics the real GenericWebhookNormalizer: event.type='generic_webhook' with
+ * the user event name in event.action, and no repo identifier.
  */
 function createGenericProviderBundle(): ProviderBundle {
   return {
@@ -3062,11 +2665,9 @@ function createGenericProviderBundle(): ProviderBundle {
       normalizeEvent: vi
         .fn()
         .mockImplementation((eventType: string, _action: string | null, payload: unknown) => ({
-          // CRITICAL: type is the literal 'generic_webhook' — the matcher would
-          // never accept this against a user-defined webhook trigger. The
-          // cross-source branch in processWebhook MUST construct a synthetic
-          // event with type=eventType (the user event name) before calling
-          // matchAllWorkflows.
+          // The matcher never accepts 'generic_webhook' against a user-defined
+          // webhook trigger, so the cross-source branch MUST build a synthetic
+          // event with type=<user event name> before matchAllWorkflows.
           type: 'generic_webhook' as const,
           action: eventType !== 'default' ? eventType : undefined,
           targetBranch: '__generic__',
@@ -3080,10 +2681,7 @@ function createGenericProviderBundle(): ProviderBundle {
   };
 }
 
-/**
- * Build a provider bundle for a "registered source" (e.g. github:42) that the
- * cross-source dispatch path will resolve via providerRegistry.getByRoutingKey.
- */
+/** A registered-source bundle (e.g. github:42) cross-source dispatch resolves by routing key. */
 function createRegisteredBundle(token: string | null = 'token-from-reg-bundle'): ProviderBundle {
   return {
     normalizer: {
@@ -3109,10 +2707,7 @@ function createRegisteredBundle(token: string | null = 'token-from-reg-bundle'):
   };
 }
 
-/**
- * Build a webhook-trigger registration row consumable by RegistrationIndex
- * mocks. Mirrors RegisteredWorkflow shape from registration-index.ts.
- */
+/** A webhook-trigger `RegisteredWorkflow` row for RegistrationIndex mocks. */
 function makeWebhookRegistration(opts: {
   id: string;
   customerId: string;
@@ -3121,19 +2716,14 @@ function makeWebhookRegistration(opts: {
   workflowName: string;
   events: string[];
   disabled?: boolean;
-  /** Optional override for the registration's lockEntry jobs array. Defaults
-   * to a single static `do-thing` job (CS-1..CS-9 shape). Use this to inject
-   * dynamic-fn entries or mixed static+dynamic-fn workflows for CS-10/CS-11/CS-12. */
+  /** The lockEntry jobs; defaults to a single static `do-thing` job. */
   jobs?: unknown[];
 }) {
   const defaultJobs = [
-    {
-      _type: 'static' as const,
+    staticJob({
       name: 'do-thing',
-      runsOn: [{ kind: 'exact', value: 'linux' }],
-      needs: [],
       steps: [{ name: 'Run', hasOutputs: false }],
-    },
+    }),
   ];
   return {
     id: opts.id,
@@ -3184,22 +2774,17 @@ describe('processWebhook — cross-source webhook dispatch', () => {
   function makeCrossSourceDeps(opts: {
     registrations: ReturnType<typeof makeWebhookRegistration>[];
     registeredBundle?: ProviderBundle;
-    /** Mock db for resolveOrgId; if absent, falls back to '__default__' */
+    /** Absent: resolveOrgId falls back to '__default__'. */
     db?: unknown;
-    /** Optional pending-dynamics tracker mock (CS-10, CS-11). */
     pendingDynamics?: unknown;
-    /** Optional pending-inits tracker mock (CS-12). */
     pendingInits?: unknown;
-    /** Optional execution tracker mock (dynamic-eval init-failure cases). */
     executionTracker?: unknown;
   }): ProcessingDeps {
     const genericBundle = createGenericProviderBundle();
     const registeredBundle = opts.registeredBundle ?? createRegisteredBundle();
 
     const registry = new ProviderRegistry();
-    // Register the inbound generic source by exact routing key
     registry.registerByRoutingKey('generic:acmeOrg00001:src-generic', genericBundle);
-    // Register the cross-source target bundle by exact routing key
     registry.registerByRoutingKey('github:42', registeredBundle);
 
     const mockRegistrationStore = {
@@ -3233,7 +2818,6 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     });
   }
 
-  // CS-1 (happy path): single matched registration in same org
   it('CS-1: dispatches single matched cross-source registration', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-1',
@@ -3257,13 +2841,11 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     expect(call.providerContext).toEqual({ installationId: 7 });
     // repoUrl built from the REGISTRATION's repo via the registered bundle
     expect(call.repoUrl).toBe('https://github.com/orgA/repo1.git');
-    // jobConfig carries the cross-source provenance fields
     expect(call.jobConfig.crossSource).toBe(true);
     expect(call.jobConfig.inboundEventName).toBe('foo');
     expect(call.jobConfig.inboundRoutingKey).toBe('generic:acmeOrg00001:src-generic');
   });
 
-  // CS-2: fan-out N>1 with distinct composite dedup keys
   it('CS-2: fans out to N>1 cross-source registrations with distinct dedup keys', async () => {
     const regs = [
       makeWebhookRegistration({
@@ -3311,10 +2893,6 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     expect(markCalls).toContain('generic:acmeOrg00001:src-generic:delivery-1:reg-C');
   });
 
-  // CS-3 (regression — CRITICAL): synthetic SimulatedEvent has
-  // type=inboundEventName, NOT 'generic_webhook'. If the synthetic event
-  // construction is ever removed, matchWebhookTrigger will reject every
-  // cross-source registration and this test will fail loudly.
   it('CS-3: synthetic event has type=inboundEventName, not generic_webhook', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-pitfall1',
@@ -3326,19 +2904,14 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     });
 
     const deps = makeCrossSourceDeps({ registrations: [reg] });
-    // The matcher (matchAllWorkflows) is invoked inside processWebhook with a
-    // synthetic event. We assert downstream behavior: if the synthetic event
-    // had type='generic_webhook', the matcher would reject it
-    // because the registration's webhook trigger lists events=['foo'], and
-    // dispatcher.dispatch would NEVER be called. The fact that dispatch IS
-    // called proves the synthetic event was built with type='foo'.
+    // The registration's trigger lists events=['foo'], so a 'generic_webhook'
+    // synthetic event would never dispatch: dispatch proves type='foo'.
     await processWebhook(baseGenericInfo(), deps);
 
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(1);
 
-    // Sanity: confirm the inbound generic webhook would have been normalized
-    // to event.type='generic_webhook' (the raw normalizer output that would
-    // be REJECTED by matchWebhookTrigger if not corrected).
+    // Sanity: the raw normalizer output is 'generic_webhook', which the
+    // matcher rejects.
     const genericBundle = (deps.providerRegistry as ProviderRegistry).getByRoutingKey(
       'generic:acmeOrg00001:src-generic',
     )!;
@@ -3349,8 +2922,6 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     expect(rawNormalized?.action).toBe('foo');
   });
 
-  // CS-4: bundle resolved from REGISTRATION's routing key,
-  // never from the inbound generic source.
   it('CS-4: resolves provider bundle from registration routing key, not inbound', async () => {
     const registeredBundle = createRegisteredBundle();
     const reg = makeWebhookRegistration({
@@ -3367,28 +2938,21 @@ describe('processWebhook — cross-source webhook dispatch', () => {
       registeredBundle,
     });
 
-    // Spy on getByRoutingKey to capture exactly which routing keys are
-    // queried during cross-source dispatch.
     const registry = deps.providerRegistry as ProviderRegistry;
     const getByRoutingKeySpy = vi.spyOn(registry, 'getByRoutingKey');
 
     await processWebhook(baseGenericInfo(), deps);
 
-    // The cross-source branch must call getByRoutingKey with the
-    // REGISTRATION's routing key — not the inbound generic source's key.
     const queriedKeys = getByRoutingKeySpy.mock.calls.map((c) => c[0]);
     expect(queriedKeys).toContain('github:42');
-    // The inbound key is queried once at the top of processWebhook to get
-    // the inbound bundle, but the cross-source dispatch loop must query
-    // 'github:42' separately. Assert clone token was issued via the
-    // registered bundle (proves the right bundle was selected).
+    // The inbound key is queried once for the inbound bundle; the clone token
+    // proves the dispatch loop selected the registered bundle.
     expect(registeredBundle.cloneTokenProvider!.createCloneToken).toHaveBeenCalledWith(
       'orgA/repo1',
       reg.providerContext,
     );
   });
 
-  // CS-5: clone-token failure fails fast — no fallback dispatch.
   it('CS-5: clone token failure fails fast — no dispatch, errors counter incremented', async () => {
     const failingBundle = createRegisteredBundle();
     (failingBundle.cloneTokenProvider!.createCloneToken as any).mockRejectedValueOnce(
@@ -3411,14 +2975,10 @@ describe('processWebhook — cross-source webhook dispatch', () => {
 
     await processWebhook(baseGenericInfo(), deps);
 
-    // dispatcher.dispatch must NOT be called for this registration
     expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
   });
 
-  // CS-6 (cross-org isolation): orgB registrations are not
-  // returned for an inbound webhook resolving to orgA. We exercise this at
-  // the processor level by mocking getByOrgAndEvent so it ONLY returns orgA
-  // entries when called with orgA — and asserting the call shape.
+  // getByOrgAndEvent returns orgA entries ONLY for orgA; the call shape is asserted.
   it('CS-6: cross-org isolation — only orgA registrations are dispatched', async () => {
     const orgARegs = [
       makeWebhookRegistration({
@@ -3444,20 +3004,16 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     const deps = makeCrossSourceDeps({ registrations: [...orgARegs, ...orgBRegs] });
     await processWebhook(baseGenericInfo(), deps);
 
-    // Only the orgA registration should have been dispatched
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(1);
     const call = (deps.dispatcher.dispatch as any).mock.calls[0][0];
     expect(call.workflowName).toBe('orgA-wf');
 
-    // The mock getByOrgAndEvent must have been called with the resolved org
-    // ('__default__' since no db), NOT with 'orgB'.
+    // Called with the resolved org ('__default__' with no db), NOT 'orgB'.
     const idx = deps.registrationIndex as any;
     expect(idx.getByOrgAndEvent).toHaveBeenCalledWith('__default__', 'foo');
     expect(idx.getByOrgAndEvent).not.toHaveBeenCalledWith('orgB', 'foo');
   });
 
-  // CS-7 (the github→github path is byte-identical, never enters
-  // the cross-source branch).
   it('CS-7: inbound github webhook does NOT enter cross-source branch', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-untouched',
@@ -3486,15 +3042,11 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     });
     await processWebhook(basePrInfo(), deps);
 
-    // Same-source PR matched -> 2 static jobs from CI workflow dispatched
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(2);
 
-    // Cross-source path NOT entered: getByOrgAndEvent must never be called
     expect(mockRegistrationIndex.getByOrgAndEvent).not.toHaveBeenCalled();
   });
 
-  // CS-8: dedup replay — second delivery of the same inbound webhook is
-  // suppressed at the cross-source level via the composite dedup key.
   it('CS-8: dedup replay suppresses second delivery via composite key', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-replay',
@@ -3510,20 +3062,17 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     await processWebhook(baseGenericInfo(), deps1);
     expect(deps1.dispatcher.dispatch).toHaveBeenCalledTimes(1);
 
-    // Second delivery: the composite key was already claimed (row persisted
-    // between deliveries), so its atomic claim loses; the inbound delivery is a
-    // fresh id and still wins so the pipeline proceeds to the cross-source step.
+    // Second delivery: the persisted composite key's claim loses; the inbound
+    // id is fresh and wins, so the pipeline reaches the cross-source step.
     const deps2 = makeCrossSourceDeps({ registrations: [reg] });
     (deps2.dedup.claim as any).mockImplementation(async (key: string) => {
       return key !== 'generic:acmeOrg00001:src-generic:delivery-1:reg-replay';
     });
     await processWebhook(baseGenericInfo(), deps2);
-    // dispatcher must NOT be called the second time
     expect(deps2.dispatcher.dispatch).not.toHaveBeenCalled();
   });
 
-  // CS-9: fanout histogram is recorded once per inbound delivery with the
-  // event name label and the actual fan-out count.
+  // Recorded once per inbound delivery.
   it('CS-9: records crossSourceFanoutSize histogram with fan-out count and event label', async () => {
     const regs = [
       makeWebhookRegistration({
@@ -3564,13 +3113,9 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     recordSpy.mockRestore();
   });
 
-  // CS-10 — a dynamic-fn workflow delivered cross-source MUST queue a
-  // `__dynamic__` eval job: the generator is the only thing that knows which
-  // jobs the workflow has, so a delivery that dispatched nothing would be a
-  // workflow that silently never runs.
-  //
-  // The org-global path reaches the same guarantee by a different route — the
-  // Tier-2 eval round, covered in `process-webhook-globals-eval-round.test.ts`.
+  // Only the generator knows the workflow's jobs, so dispatching nothing would
+  // silently never run it. The org-global path gets the same guarantee from the
+  // eval round (`process-webhook-globals-eval-round.test.ts`).
   it('CS-10: dynamic-fn workflow cross-source delivered queues __dynamic__ eval job', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-cs10',
@@ -3613,25 +3158,16 @@ describe('processWebhook — cross-source webhook dispatch', () => {
       file: '.kici/workflows/foo.ts',
       index: 0,
     });
-    // Composite dedup key (cross-source override)
     expect(call.deliveryId).toBe('generic:acmeOrg00001:src-generic:delivery-1:reg-cs10');
-    // Registration's routing key, not inbound generic
     expect(call.routingKey).toBe('github:42');
-    // Repo URL built via the registered bundle's repoUrlBuilder
     expect(call.repoUrl).toBe('https://github.com/orgA/repo-dyn.git');
-    // CS-10b regression guard: the dispatched
-    // ref MUST be the empty string (so the agent's gitClone falls through to
-    // the default-branch clone path) and sha MUST be the registration's
-    // commitSha (so post-clone SHA verification fetch-deepens to the right
-    // commit). The pre-fix code leaked the synthetic '__generic__' placeholder
-    // as the dispatched ref, which produced `git clone --branch __generic__`
-    // and an invariably failing remote branch lookup against github.com.
+    // ref MUST be '' (gitClone takes the default-branch path) and sha the
+    // registration's commitSha (SHA verification deepens to it). A leaked
+    // '__generic__' placeholder ref runs `git clone --branch __generic__`.
     expect(call.ref).toBe('');
     expect(call.sha).toBe('reg-sha-1');
   });
 
-  // CS-11 — mixed static + dynamic-fn workflow cross-source delivery
-  // dispatches BOTH the static job and the dynamic eval job.
   it('CS-11: mixed static+dynamic-fn workflow dispatches both job kinds', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-cs11',
@@ -3641,13 +3177,10 @@ describe('processWebhook — cross-source webhook dispatch', () => {
       workflowName: 'mixed-wf',
       events: ['foo'],
       jobs: [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'do-thing',
-          runsOn: [{ kind: 'exact', value: 'linux' }],
-          needs: [],
           steps: [{ name: 'Run', hasOutputs: false }],
-        },
+        }),
         {
           _type: 'dynamic' as const,
           source: { file: '.kici/workflows/foo.ts', index: 1 },
@@ -3680,22 +3213,17 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     expect(jobNames).toContain('do-thing');
     expect(jobNames.some((n) => n.startsWith('__dynamic__'))).toBe(true);
 
-    // BOTH dispatched jobs share the same composite deliveryId
     const dedupKeys = new Set(calls.map((c) => c.deliveryId));
     expect(dedupKeys.size).toBe(1);
     expect([...dedupKeys][0]).toBe('generic:acmeOrg00001:src-generic:delivery-1:reg-cs11');
 
-    // BOTH dispatched jobs share the same runId (per-decision runId).
+    // One runId per decision.
     const runIds = new Set(calls.map((c) => c.runId));
     expect(runIds.size).toBe(1);
   });
 
-  // CS-12 — a static job with dynamic context fields reached via
-  // cross-source delivery queues an __init__ deferred-init job.
-  // Regression guard: deferred init dispatch (two-phase init model)
-  // must work through the delegated path. A static-only loop would never
-  // reach the deferred-init builder, so it would never fire on cross-source
-  // delivery.
+  // Deferred init must work through the delegated path: a static-only loop
+  // never reaches the deferred-init builder.
   it('CS-12: static job with dynamic context queues __init__ job', async () => {
     const reg = makeWebhookRegistration({
       id: 'reg-cs12',
@@ -3705,16 +3233,12 @@ describe('processWebhook — cross-source webhook dispatch', () => {
       workflowName: 'init-wf',
       events: ['foo'],
       jobs: [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'needs-init',
-          runsOn: [{ kind: 'exact', value: 'linux' }],
-          needs: [],
           steps: [{ name: 'Run', hasOutputs: false }],
-          // A dynamic context element triggers needsInit
-          // (the agent resolves it via an init job).
+          // Triggers needsInit: the agent resolves it in an init job.
           contexts: [{ value: '', dynamic: true }],
-        },
+        }),
       ],
     });
 
@@ -3735,7 +3259,6 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     // Give the fire-and-forget deferred init dispatch IIFE a tick to run.
     await new Promise((r) => setTimeout(r, 50));
 
-    // At least one dispatch should be an __init__ job.
     const calls = (deps.dispatcher.dispatch as any).mock.calls.map(
       (c: unknown[]) =>
         c[0] as {
@@ -3752,9 +3275,7 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     expect(initCall!.repoUrl).toBe('https://github.com/orgA/repo-init.git');
   });
 
-  // CS-13 — multi-registration fan-out preserves one delegated dispatch per
-  // matched registration with distinct composite dedup keys and distinct runIds.
-  // Re-asserts CS-2 invariant on the delegated path.
+  // The CS-2 invariant, on the delegated path.
   it('CS-13: multi-registration fan-out has distinct runIds and composite dedup keys (reg-A/reg-B/reg-C)', async () => {
     const regs = [
       makeWebhookRegistration({
@@ -3803,33 +3324,18 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     expect(markCalls).toContain('generic:acmeOrg00001:src-generic:delivery-1:reg-B');
     expect(markCalls).toContain('generic:acmeOrg00001:src-generic:delivery-1:reg-C');
 
-    // Distinct runIds (one per matched decision per registration)
     const runIds = new Set(calls.map((c) => c.runId));
     expect(runIds.size).toBe(3);
   });
 
-  // CS-14 — credentials and clone token come from the registration's bundle,
-  // not the inbound generic bundle. regression guard, strengthened on
-  // the delegated path. Reinforces CS-4 by asserting the
-  // registered bundle's token AND installationId propagate into the
-  // dispatched QueuedJobInput.providerContext (CS-4 only asserted bundle
-  // resolution, not credential propagation through the helper).
   // CS-15 — cross-source dispatch to a universal-git-authored workflow.
   //
-  // A universal-git-authored workflow is just a cross-source target whose
-  // routing key is `generic:<orgId>:<sourceId>` and whose provider bundle
-  // is a `UniversalGit*` implementation (normalizer.provider === 'generic',
-  // full cloneTokenProvider + repoUrlBuilder). The cross-source dispatch
-  // branch already uses `providerRegistry.getByRoutingKey(reg.routingKey)`
-  // (processor.ts:3495), so it resolves the universal-git bundle with no
-  // code change — this test is the runtime verification of that path.
-  //
-  // The inbound webhook is a plain `generic:*` source (required to enter
-  // the cross-source branch per the `info.provider === 'generic'` guard).
-  // The target registration lives on a distinct `generic:*` routing key
-  // whose bundle is a universal-git bundle — so this exercises the
-  // provider='generic' inbound → provider='generic' target flow with
-  // a universal-git provider bundle as the authority for clone + URL.
+  // Its routing key is `generic:<orgId>:<sourceId>` and its bundle a
+  // `UniversalGit*` one (provider 'generic', full cloneTokenProvider +
+  // repoUrlBuilder), resolved by `getByRoutingKey(reg.routingKey)`. The
+  // inbound is a plain `generic:*` source (the cross-source branch requires
+  // `info.provider === 'generic'`); the universal-git bundle on a distinct
+  // `generic:*` key is the authority for clone + URL.
   it('CS-15: cross-source dispatch to universal-git-authored global workflow', async () => {
     const universalGitBundle: ProviderBundle = {
       normalizer: {
@@ -3857,9 +3363,6 @@ describe('processWebhook — cross-source webhook dispatch', () => {
       },
     };
 
-    // Registration points at a universal-git routing key; the helper will
-    // call providerRegistry.getByRoutingKey(reg.routingKey) and get back
-    // the universal-git bundle above.
     const ugRoutingKey = 'generic:acmeOrg00001:forgejo-wf-source';
     const reg = makeWebhookRegistration({
       id: 'reg-cs15',
@@ -3891,11 +3394,9 @@ describe('processWebhook — cross-source webhook dispatch', () => {
 
     await processWebhook(baseGenericInfo(), deps);
 
-    // Dispatched exactly once through the universal-git bundle.
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(1);
     const call = (deps.dispatcher.dispatch as any).mock.calls[0][0];
 
-    // Registration's routingKey + provider propagate to the queued job.
     expect(call.routingKey).toBe(ugRoutingKey);
     expect(call.provider).toBe('generic');
 
@@ -3965,16 +3466,13 @@ describe('processWebhook — cross-source webhook dispatch', () => {
       reg.providerContext,
     );
 
-    // The inbound generic bundle has NO cloneTokenProvider in this test —
-    // asserting the registered one was used is sufficient to prove no
-    // fallback to the inbound bundle.
+    // With no inbound cloneTokenProvider, no fallback to the inbound bundle is possible.
     const genericBundle = (deps.providerRegistry as ProviderRegistry).getByRoutingKey(
       'generic:acmeOrg00001:src-generic',
     )!;
     expect(genericBundle.cloneTokenProvider).toBeUndefined();
 
-    // The dispatched job carries the registration's installationId, and the
-    // token appears nowhere a store persists: not on the queued job input
+    // The token appears nowhere a store persists: not on the queued job input
     // (dispatch_queue / pending_job_contexts), not on a run-row write.
     expect(deps.dispatcher.dispatch).toHaveBeenCalledTimes(1);
     const call = (deps.dispatcher.dispatch as any).mock.calls[0][0];
@@ -4239,10 +3737,7 @@ describe('processWebhook — cross-source webhook dispatch', () => {
     ).toEqual(['no-paths', 'src-only']);
   });
 
-  /**
-   * An inbound universal-git-style source: provider `generic`, a normalizer that
-   * reads a repository, and a lock-file fetcher of its own.
-   */
+  /** An inbound universal-git-style source: provider `generic`, own repo and lock file. */
   function createRepoReadingGenericBundle(): ProviderBundle {
     const bundle = createGenericProviderBundle();
     (bundle.normalizer.normalizeEvent as ReturnType<typeof vi.fn>).mockImplementation(
@@ -4268,26 +3763,21 @@ describe('processWebhook — cross-source webhook dispatch', () => {
   }
 
   function ownPushLockFile() {
-    return {
-      schemaVersion: 1,
+    return lockFileFixture({
       source: { file: '.kici/workflows/own.ts', export: '#default' },
       contentHash: 'own-hash',
       workflows: [
-        {
+        lockWorkflow({
           name: 'own-push',
           triggers: [{ _type: 'push', branches: [], paths: [] }],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'own-build',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
-              steps: [{ name: 'Build', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
   }
 
   function repoReadingDeps(opts: {
@@ -4413,14 +3903,11 @@ describe('processWebhook — cross-source webhook dispatch', () => {
 
 describe('processWebhook — context integration', () => {
   function envLockFile(jobOverrides: Record<string, unknown> = {}) {
-    return {
+    return lockFileFixture({
       schemaVersion: 9,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
       lockfileHash: 'lockfile-hash',
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           contentHash: 'wf-hash',
           compileSchemaVersion: 6,
           triggers: [
@@ -4442,9 +3929,9 @@ describe('processWebhook — context integration', () => {
               ...jobOverrides,
             },
           ],
-        },
+        }),
       ],
-    };
+    });
   }
 
   function createMockContextStore(matchResult: Record<string, unknown> | null = null) {
@@ -4499,9 +3986,7 @@ describe('processWebhook — context integration', () => {
 
     await processWebhook(basePrInfo(), deps);
 
-    // Job dispatched normally
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
-    // Context store NOT called (no context declared)
     expect(mockEnvStore.matchContext).not.toHaveBeenCalled();
   });
 
@@ -4519,9 +4004,8 @@ describe('processWebhook — context integration', () => {
     await processWebhook(basePrInfo(), deps);
 
     expect(mockEnvStore.matchContext).toHaveBeenCalledWith('__default__', 'production');
-    // A bound context with no configured record contributes no protection
-    // rules / vars but does not block dispatch — the job still runs, with the
-    // declared name recorded as the run context.
+    // A bound context with no record adds no rules or vars and does not block
+    // dispatch; the declared name is recorded as the run context.
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
     const jobConfig = mockDispatcher.dispatch.mock.calls[0][0].jobConfig;
     expect(jobConfig.context).toBe('production');
@@ -4530,7 +4014,7 @@ describe('processWebhook — context integration', () => {
   it('evaluates protection rules and rejects job when context rejects', async () => {
     const lockFile = envLockFile({ contexts: [{ value: 'production', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
-    // Return a disabled context -> always rejected
+    // A disabled context always rejects.
     const mockEnvStore = createMockContextStore({
       id: 'env-1',
       org_id: '__default__',
@@ -4561,24 +4045,12 @@ describe('processWebhook — context integration', () => {
 
     await processWebhook(basePrInfo(), deps);
 
-    // Job should NOT be dispatched (rejected by protection rules)
     expect(mockDispatcher.dispatch).not.toHaveBeenCalled();
   });
 
   /** Tracker double shaped like the one the dispatcher-rejection tests use. */
   function createRejectionTracker() {
-    return {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn().mockResolvedValue(undefined),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
-    };
+    return mockExecutionTracker();
   }
 
   /** A context row that rejects every job bound to it (disabled context). */
@@ -4606,10 +4078,7 @@ describe('processWebhook — context integration', () => {
     };
   }
 
-  /**
-   * The `rejected-*` row a context-rule rejection records, or undefined when
-   * the rejection left no trace on the run at all.
-   */
+  /** The `rejected-*` row a context-rule rejection records, if any. */
   function findContextRejectionRow(onJobStatus: ReturnType<typeof vi.fn>) {
     return onJobStatus.mock.calls.find(
       (args: unknown[]) =>
@@ -4618,10 +4087,8 @@ describe('processWebhook — context integration', () => {
   }
 
   it('records a context-rule rejection on the run with the rule reason', async () => {
-    // A rejection used to end at a log line and a `continue`: no row, no
-    // reason, and — with every job gated — an all-rejected guard that called
-    // it `no_agent` / 'No jobs were dispatched for this run', telling the
-    // reader no agent was available for a run that was deliberately gated.
+    // A rejection leaves a row with its reason; with every job gated, the run
+    // must not read as `no_agent` / 'No jobs were dispatched for this run'.
     const lockFile = envLockFile({ contexts: [{ value: 'production', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
     const mockTracker = createRejectionTracker();
@@ -4647,38 +4114,28 @@ describe('processWebhook — context integration', () => {
         jobName: 'deploy',
       },
     });
-    // The reason names the offending context and the rule that rejected it,
-    // rather than a generic string.
+    // The reason names the offending context and the rejecting rule.
     const message = (data as { initFailure: { message: string } }).initFailure.message;
     expect(message).toContain('production');
     expect(message).toContain('disabled');
     expect((data as { error: string }).error).toBe(message);
-    // No run-scoped `no_agent` failure: agents were never the problem. Without
-    // the rejection on the run, this records `no_agent` with
-    // 'No jobs were dispatched for this run'.
+    // No run-scoped `no_agent` failure: agents were never the problem.
     expect(mockTracker.recordInitFailureRun).not.toHaveBeenCalled();
   });
 
   it('records a partial context-rule rejection while the ungated job dispatches', async () => {
-    // The partial case wrote nothing at all: the gated job vanished from the
-    // run, so a reader saw a run that silently skipped it.
+    // Partial case: the gated job must not silently vanish from the run.
     const lockFile = envLockFile();
     lockFile.workflows[0].jobs = [
-      {
-        _type: 'static',
+      staticJob({
         name: 'deploy',
-        runsOn: [{ kind: 'exact', value: 'linux' }],
-        needs: [],
         steps: [{ name: 'Deploy', hasOutputs: false }],
         contexts: [{ value: 'production', dynamic: false }],
-      } as (typeof lockFile.workflows)[0]['jobs'][0],
-      {
-        _type: 'static',
+      }) as (typeof lockFile.workflows)[0]['jobs'][0],
+      staticJob({
         name: 'lint',
-        runsOn: [{ kind: 'exact', value: 'linux' }],
-        needs: [],
         steps: [{ name: 'Lint', hasOutputs: false }],
-      } as (typeof lockFile.workflows)[0]['jobs'][0],
+      }) as (typeof lockFile.workflows)[0]['jobs'][0],
     ];
     const mockDispatcher = createMockDispatcher();
     const mockTracker = createRejectionTracker();
@@ -4711,7 +4168,6 @@ describe('processWebhook — context integration', () => {
     const lockFile = envLockFile({ contexts: [{ value: 'staging', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
     const mockHeldRunStore = createMockHeldRunStore();
-    // Context with required reviewers -> hold action
     const mockEnvStore = createMockContextStore({
       id: 'env-2',
       org_id: '__default__',
@@ -4734,8 +4190,6 @@ describe('processWebhook — context integration', () => {
       created_by: null,
     });
 
-    // A bundle with a check-status poster so we can assert the pending check
-    // names the approval clauses.
     const mockCheckStatusPoster = { postCheckStatus: vi.fn().mockResolvedValue(undefined) };
     const bundle = createMockProviderBundle();
     (bundle as any).checkStatusPoster = mockCheckStatusPoster;
@@ -4754,9 +4208,7 @@ describe('processWebhook — context integration', () => {
 
     await processWebhook(basePrInfo(), deps);
 
-    // Job should NOT be dispatched (held for approval)
     expect(mockDispatcher.dispatch).not.toHaveBeenCalled();
-    // A generalized approval hold should be created (reviewer gate → env trigger)
     expect(mockHeldRunStore.createHold).toHaveBeenCalledTimes(1);
     expect(mockHeldRunStore.createHold.mock.calls[0][0]).toBe('__default__');
     expect(mockHeldRunStore.createHold.mock.calls[0][1]).toMatchObject({
@@ -4790,16 +4242,13 @@ describe('processWebhook — context integration', () => {
   });
 
   it('install gate held: pauses workflow dispatch as a workflow-scoped held run', async () => {
-    // Workflow-level registries: referencing a reviewer-gated env → the install
-    // gate holds, pausing the WHOLE workflow dispatch (no jobs queued).
-    const lockFile = {
+    // Registries referencing a reviewer-gated env make the install gate hold
+    // the WHOLE workflow dispatch.
+    const lockFile = lockFileFixture({
       schemaVersion: 9,
-      source: { file: '.kici/workflows/ci.ts', export: '#default' },
-      contentHash: 'test-hash',
       lockfileHash: 'lockfile-hash',
       workflows: [
-        {
-          name: 'CI',
+        lockWorkflow({
           contentHash: 'wf-hash',
           compileSchemaVersion: 6,
           registries: [{ url: 'https://npm.example.com/', tokenSecret: 'prod:NPM_TOKEN' }],
@@ -4807,17 +4256,14 @@ describe('processWebhook — context integration', () => {
             { _type: 'pr', events: ['opened'], targetBranches: [], sourceBranches: [], paths: [] },
           ],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'deploy',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'Deploy', hasOutputs: false }],
-            },
+            }),
           ],
-        },
+        }),
       ],
-    };
+    });
     const mockDispatcher = createMockDispatcher();
     const mockHeldRunStore = createMockHeldRunStore();
     const mockEnvStore = createMockContextStore({
@@ -4845,16 +4291,7 @@ describe('processWebhook — context integration', () => {
       resolveForContext: vi.fn().mockResolvedValue({ NPM_TOKEN: 'tok' }),
     };
     const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn().mockResolvedValue(undefined),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
+      ...mockExecutionTracker(),
       recordRunHeld: vi.fn().mockResolvedValue(undefined),
     };
 
@@ -4891,7 +4328,6 @@ describe('processWebhook — context integration', () => {
     const mockDispatcher = createMockDispatcher();
     const envVars = { DB_HOST: 'localhost', API_KEY: 'test-key' };
     const mockVariableStore = createMockVariableStore(envVars);
-    // Enabled context with no protection rules
     const mockEnvStore = createMockContextStore({
       id: 'env-3',
       org_id: '__default__',
@@ -4927,7 +4363,6 @@ describe('processWebhook — context integration', () => {
     const jobConfig = mockDispatcher.dispatch.mock.calls[0][0].jobConfig;
     expect(jobConfig.contextVars).toEqual(envVars);
     expect(jobConfig.context).toBe('dev');
-    // Variable store called with correct args
     expect(mockVariableStore.getResolvedVars).toHaveBeenCalledWith(
       '__default__',
       'env-3',
@@ -4964,16 +4399,14 @@ describe('processWebhook — context integration', () => {
 
     await processWebhook(basePrInfo(), deps);
 
-    // Job dispatched normally (dynamic env deferred to agent)
+    // A dynamic env is deferred to the agent.
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
-    // Context store NOT called (dynamic)
     expect(mockEnvStore.matchContext).not.toHaveBeenCalled();
   });
 
   it('dispatches job with pass result from protection rules', async () => {
     const lockFile = envLockFile({ contexts: [{ value: 'staging', dynamic: false }] });
     const mockDispatcher = createMockDispatcher();
-    // Enabled context with no restrictive rules -> pass
     const mockEnvStore = createMockContextStore({
       id: 'env-4',
       org_id: '__default__',
@@ -5004,7 +4437,6 @@ describe('processWebhook — context integration', () => {
 
     await processWebhook(basePrInfo(), deps);
 
-    // Job dispatched normally (protection rules passed)
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
   });
 });
@@ -5016,8 +4448,7 @@ describe('anyTriggerHasPathPatterns', () => {
 
   it('returns false for workflows with no path patterns', () => {
     const workflows = [
-      {
-        name: 'CI',
+      lockWorkflow({
         contentHash: 'h1',
         compileSchemaVersion: 1,
         triggers: [
@@ -5030,15 +4461,14 @@ describe('anyTriggerHasPathPatterns', () => {
           },
         ],
         jobs: [],
-      },
+      }),
     ];
     expect(anyTriggerHasPathPatterns(workflows)).toBe(false);
   });
 
   it('returns true for workflows with paths filter', () => {
     const workflows = [
-      {
-        name: 'CI',
+      lockWorkflow({
         contentHash: 'h1',
         compileSchemaVersion: 1,
         triggers: [
@@ -5051,20 +4481,19 @@ describe('anyTriggerHasPathPatterns', () => {
           },
         ],
         jobs: [],
-      },
+      }),
     ];
     expect(anyTriggerHasPathPatterns(workflows)).toBe(true);
   });
 
   it('returns true for workflows with !-prefixed exclusion paths', () => {
     const workflows = [
-      {
-        name: 'CI',
+      lockWorkflow({
         contentHash: 'h1',
         compileSchemaVersion: 1,
         triggers: [{ _type: 'push' as const, branches: [], paths: ['!docs/**'] }],
         jobs: [],
-      },
+      }),
     ];
     expect(anyTriggerHasPathPatterns(workflows)).toBe(true);
   });
@@ -5087,8 +4516,7 @@ describe('anyTriggerHasPathPatterns', () => {
 
   it('returns true when at least one trigger across multiple workflows has paths', () => {
     const workflows = [
-      {
-        name: 'CI',
+      lockWorkflow({
         contentHash: 'h1',
         compileSchemaVersion: 1,
         triggers: [
@@ -5101,7 +4529,7 @@ describe('anyTriggerHasPathPatterns', () => {
           },
         ],
         jobs: [],
-      },
+      }),
       {
         name: 'Lint',
         contentHash: 'h2',
@@ -5176,10 +4604,9 @@ describe('issue_comment /kici approve hold selection', () => {
   }
 
   it('scopes hold selection to the comment repo and PR number', async () => {
-    // A `/kici` command must never reach a hold from another PR — or another
-    // repo — in the same org. Each selected hold is then terminalized on the
-    // commit ITS OWN run acted on, so there is no repo-wide "latest hold's sha"
-    // lookup any more: this scoping is the whole of the selection contract.
+    // A `/kici` command must never reach a hold from another PR or repo in the
+    // same org. Each hold is terminalized on the commit ITS OWN run acted on, so
+    // this scoping is the whole selection contract.
     const mockHeldRunStore = {
       create: vi.fn().mockResolvedValue(undefined),
       listByQueueType: vi.fn().mockResolvedValue([]),
@@ -5238,12 +4665,9 @@ describe('issue_comment /kici approve hold selection', () => {
 // -- Init job dispatch tests --
 
 function dynamicContextLockFile() {
-  return {
-    schemaVersion: 1,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
-    contentHash: 'test-hash',
+  return lockFileFixture({
     workflows: [
-      {
+      lockWorkflow({
         name: 'Deploy',
         triggers: [
           {
@@ -5253,27 +4677,21 @@ function dynamicContextLockFile() {
           },
         ],
         jobs: [
-          {
-            _type: 'static',
+          staticJob({
             name: 'deploy-job',
-            runsOn: [{ kind: 'exact', value: 'linux' }],
-            needs: [],
             contexts: [{ value: '', dynamic: true }],
             steps: [{ name: 'Deploy', hasOutputs: false }],
-          },
+          }),
         ],
-      },
+      }),
     ],
-  };
+  });
 }
 
 function dynamicEnvOnlyLockFile() {
-  return {
-    schemaVersion: 1,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
-    contentHash: 'test-hash',
+  return lockFileFixture({
     workflows: [
-      {
+      lockWorkflow({
         name: 'Deploy',
         triggers: [
           {
@@ -5283,28 +4701,22 @@ function dynamicEnvOnlyLockFile() {
           },
         ],
         jobs: [
-          {
-            _type: 'static',
+          staticJob({
             name: 'deploy-job',
-            runsOn: [{ kind: 'exact', value: 'linux' }],
-            needs: [],
             dynamicEnv: true,
             contexts: [{ value: 'production', dynamic: false }],
             steps: [{ name: 'Deploy', hasOutputs: false }],
-          },
+          }),
         ],
-      },
+      }),
     ],
-  };
+  });
 }
 
 function multipleDynamicJobsLockFile() {
-  return {
-    schemaVersion: 1,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
-    contentHash: 'test-hash',
+  return lockFileFixture({
     workflows: [
-      {
+      lockWorkflow({
         name: 'Deploy',
         triggers: [
           {
@@ -5314,26 +4726,20 @@ function multipleDynamicJobsLockFile() {
           },
         ],
         jobs: [
-          {
-            _type: 'static',
+          staticJob({
             name: 'deploy-staging',
-            runsOn: [{ kind: 'exact', value: 'linux' }],
-            needs: [],
             contexts: [{ value: '', dynamic: true }],
             steps: [{ name: 'Deploy staging', hasOutputs: false }],
-          },
-          {
-            _type: 'static',
+          }),
+          staticJob({
             name: 'deploy-prod',
-            runsOn: [{ kind: 'exact', value: 'linux' }],
-            needs: [],
             dynamicConcurrencyGroup: true,
             steps: [{ name: 'Deploy prod', hasOutputs: false }],
-          },
+          }),
         ],
-      },
+      }),
     ],
-  };
+  });
 }
 
 function createMockPendingInits() {
@@ -5352,9 +4758,8 @@ describe('init job dispatch (dynamic fields)', () => {
     vi.restoreAllMocks();
   });
 
-  // Helper: wait for deferred init dispatches to complete (they run as fire-and-forget microtasks)
+  // Deferred init dispatches run as fire-and-forget microtasks.
   async function waitForDeferredInits(): Promise<void> {
-    // Flush microtask queue multiple times to allow chained async operations to complete
     for (let i = 0; i < 10; i++) {
       await new Promise((r) => setImmediate(r));
     }
@@ -5370,13 +4775,10 @@ describe('init job dispatch (dynamic fields)', () => {
     });
 
     await processWebhook(basePushInfo(), deps);
-    // processWebhook returns immediately; init dispatch is deferred
     await waitForDeferredInits();
 
-    // Should dispatch init job + execution job = 2 calls
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(2);
 
-    // First call should be the init job (deferred but fires immediately after processWebhook)
     const initCall = mockDispatcher.dispatch.mock.calls[0][0];
     expect(initCall.jobName).toBe('__init__Deploy__deploy-job');
     expect(initCall.runsOnLabels).toEqual([
@@ -5405,7 +4807,6 @@ describe('init job dispatch (dynamic fields)', () => {
     await processWebhook(basePushInfo(), deps);
     await waitForDeferredInits();
 
-    // Init + execution = 2 dispatches
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(2);
     expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
   });
@@ -5424,20 +4825,19 @@ describe('init job dispatch (dynamic fields)', () => {
     await processWebhook(basePushInfo(), deps);
     await waitForDeferredInits();
 
-    // Init job dispatched for dynamic env
     const initCall = mockDispatcher.dispatch.mock.calls[0][0];
     expect(initCall.jobConfig.initOnly).toBe(true);
     expect(initCall.jobConfig.dynamicEnv).toBe(true);
     expect(initCall.jobConfig.dynamicContext).toBe(false);
 
-    // Execution job dispatched after init (static context 'production' should be preserved)
+    // The static context 'production' survives into the execution job.
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(2);
   });
 
   it('skips context resolution when init returns undefined contextName', async () => {
     const mockDispatcher = createMockDispatcher();
     const mockPendingInits = createMockPendingInits();
-    // Init returns no contextName --: proceed without context resolution
+    // An init with no contextName skips context resolution.
     mockPendingInits.track.mockResolvedValue({});
 
     const deps = createDeps({
@@ -5449,15 +4849,13 @@ describe('init job dispatch (dynamic fields)', () => {
     await processWebhook(basePushInfo(), deps);
     await waitForDeferredInits();
 
-    // Init + execution = 2 dispatches
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(2);
     expect(mockPendingInits.track).toHaveBeenCalledTimes(1);
   });
 
   it('tracks a queued-no-backend init job like a queued one instead of failing the run', async () => {
     // fails-when: the deferred init path throws on `queued-no-backend` — the run
-    // fails in milliseconds while the init job sits in the dispatch queue and
-    // later runs on a fresh agent for a run that is already dead. Every other
+    // fails while the queued init job later runs for a dead run. Every other
     // dispatch site (build, regular, scheduler) treats the status like `queued`.
     const mockDispatcher = createMockDispatcher();
     mockDispatcher.dispatch
@@ -5474,8 +4872,7 @@ describe('init job dispatch (dynamic fields)', () => {
     await processWebhook(basePushInfo(), deps);
     await waitForDeferredInits();
 
-    // The init result is awaited under the queued job's id, then the execution
-    // job is dispatched — the same shape as a plain `queued` init.
+    // Same shape as a plain `queued` init.
     expect(mockPendingInits.track).toHaveBeenCalledWith('init-queued-1');
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(2);
   });
@@ -5516,8 +4913,7 @@ describe('init job dispatch (dynamic fields)', () => {
     await processWebhook(basePushInfo(), deps);
     await waitForDeferredInits();
 
-    // Init job dispatched but execution job should NOT be dispatched (failed init)
-    // Init dispatch + no execution dispatch = 1 call only
+    // A failed init dispatches no execution job.
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
   });
 
@@ -5527,19 +4923,7 @@ describe('init job dispatch (dynamic fields)', () => {
     const mockPendingInits = createMockPendingInits();
     mockPendingInits.track.mockRejectedValue(new Error(initErrorMessage));
 
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn().mockResolvedValue(undefined),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
-    };
+    const mockTracker = mockExecutionTracker();
 
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
@@ -5551,17 +4935,14 @@ describe('init job dispatch (dynamic fields)', () => {
     await processWebhook(basePushInfo(), deps);
     await waitForDeferredInits();
 
-    // The synthetic init-failed-* job is registered against the run so the
-    // status update has a job row to attach to.
+    // The synthetic init-failed-* job gives the status update a row to attach to.
     const addJobsCall = mockTracker.addJobsToRun.mock.calls.find((args: unknown[]) => {
       const jobs = args[1] as Array<{ jobId: string }>;
       return Array.isArray(jobs) && jobs.some((j) => j.jobId === 'init-failed-deploy-job');
     });
     expect(addJobsCall).toBeDefined();
 
-    // The synthetic job is marked failed with the structured init_failure
-    // carrying scope=job, category=dynamic_eval, the init error as message,
-    // and the parent job name.
+    // init_failure: scope=job, category=dynamic_eval, the init error, the parent job.
     const failedCall = mockTracker.onJobStatus.mock.calls.find(
       (args: unknown[]) => args[1] === 'init-failed-deploy-job',
     );
@@ -5590,19 +4971,7 @@ describe('init job dispatch (dynamic fields)', () => {
       }),
     );
 
-    const mockTracker = {
-      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      holdRunForPendingJobs: vi.fn(() => true),
-      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-      addJobsToRun: vi.fn().mockResolvedValue(undefined),
-      onJobStatus: vi.fn().mockResolvedValue(undefined),
-      onStepStatus: vi.fn(),
-      updateJobHeartbeat: vi.fn(),
-      getExecutionContext: vi.fn(),
-      getJobName: vi.fn(),
-      recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
-    };
+    const mockTracker = mockExecutionTracker();
 
     const deps = createDeps({
       dispatcher: mockDispatcher as any,
@@ -5641,11 +5010,9 @@ describe('init job dispatch (dynamic fields)', () => {
     await processWebhook(basePushInfo(), deps);
     await waitForDeferredInits();
 
-    // 2 init jobs + 2 execution jobs = 4 dispatches
     expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(4);
     expect(mockPendingInits.track).toHaveBeenCalledTimes(2);
 
-    // Verify init jobs have different names
     const initCalls = mockDispatcher.dispatch.mock.calls.filter(
       (call: any) => call[0].jobConfig?.initOnly,
     );
@@ -5680,8 +5047,7 @@ describe('PendingJobContext DB persistence', () => {
     const insertedRows: Array<Record<string, unknown>> = [];
     const deletedFilters: Array<{ table: string; filters: Array<[string, string]> }> = [];
     let selectRows: Array<Record<string, unknown>> = [];
-    // Rows the DELETE ... RETURNING fallback should surface when
-    // consumePendingJobContext runs on a peer whose in-memory Map is empty.
+    // What the DELETE ... RETURNING fallback surfaces on a peer with an empty Map.
     const pendingDbRows = new Map<string, Record<string, unknown>>();
 
     const mockExecute = vi.fn().mockResolvedValue(undefined);
@@ -5788,7 +5154,6 @@ describe('PendingJobContext DB persistence', () => {
   it('storePendingJobContext works without DB (in-memory only)', async () => {
     await storePendingJobContext(undefined, 'run-123', 'job-a', sampleCtx);
 
-    // Verify it's in the map by consuming it
     const result = await consumePendingJobContext(undefined, 'run-123', 'job-a');
     expect(result).toEqual(sampleCtx);
   });
@@ -5796,10 +5161,8 @@ describe('PendingJobContext DB persistence', () => {
   it('consumePendingJobContext deletes the row from DB and returns the context', async () => {
     const mockDb = createMockDbForPendingContexts();
 
-    // Store first
     await storePendingJobContext(mockDb as any, 'run-123', 'job-a', sampleCtx);
 
-    // Consume
     const result = await consumePendingJobContext(mockDb as any, 'run-123', 'job-a');
 
     expect(result).toEqual(sampleCtx);
@@ -5817,10 +5180,7 @@ describe('PendingJobContext DB persistence', () => {
     const result = await consumePendingJobContext(mockDb as any, 'run-999', 'nonexistent');
 
     expect(result).toBeUndefined();
-    // With the cluster fallback, a memory miss now triggers a single
-    // DELETE ... RETURNING against the shared DB. With nothing stored,
-    // the returning mock yields no rows and the function still returns
-    // undefined without throwing.
+    // A memory miss triggers one DELETE ... RETURNING against the shared DB.
     expect(mockDb.deleteFrom).toHaveBeenCalledWith('pending_job_contexts');
     expect(mockDb._deletedFilters).toHaveLength(1);
     expect(mockDb._deletedFilters[0].filters).toEqual([
@@ -5830,11 +5190,9 @@ describe('PendingJobContext DB persistence', () => {
   });
 
   it('consumePendingJobContext falls back to DB when another peer stored the context', async () => {
-    // Cluster scenario: peer A ingested the webhook and wrote the pending
-    // context to the shared DB (+ its own in-memory Map). Peer B ran the
-    // rerouted upstream job, so its needs-scheduler is what fires
-    // onJobReady — but peer B's Map is empty. We simulate this by seeding
-    // the DB-side store and leaving the in-memory Map untouched.
+    // Peer A wrote the pending context to the shared DB; peer B ran the
+    // rerouted upstream, so its needs-scheduler fires onJobReady with an empty
+    // Map. Only the DB side is seeded.
     const mockDb = createMockDbForPendingContexts();
     mockDb._seedPendingRow('cluster-run', 'downstream', {
       job_input: sampleJobInput,
@@ -5857,26 +5215,22 @@ describe('PendingJobContext DB persistence', () => {
   it('cleanupPendingJobContexts deletes all rows for a given run_id from DB', async () => {
     const mockDb = createMockDbForPendingContexts();
 
-    // Store two contexts for the same run
     await storePendingJobContext(mockDb as any, 'run-123', 'job-a', sampleCtx);
     await storePendingJobContext(mockDb as any, 'run-123', 'job-b', {
       ...sampleCtx,
       jobInput: { ...sampleJobInput, jobName: 'job-b' },
     });
 
-    // Also store one for a different run (should not be deleted)
     await storePendingJobContext(mockDb as any, 'run-456', 'job-x', sampleCtx);
 
     await cleanupPendingJobContexts(mockDb as any, 'run-123');
 
-    // DB delete should be called for run-123
     expect(mockDb.deleteFrom).toHaveBeenCalledWith('pending_job_contexts');
     const deleteForCleanup = mockDb._deletedFilters.find(
       (d) => d.filters.length === 1 && d.filters[0][1] === 'run-123',
     );
     expect(deleteForCleanup).toBeDefined();
 
-    // In-memory: run-123 contexts should be gone, run-456 should remain
     const remainingCtx = await consumePendingJobContext(undefined, 'run-456', 'job-x');
     expect(remainingCtx).toEqual(sampleCtx);
 
@@ -5923,7 +5277,6 @@ describe('PendingJobContext DB persistence', () => {
 
     await restorePendingJobContexts(mockDb as any);
 
-    // Consume without DB (just from in-memory map)
     const result = await consumePendingJobContext(undefined, 'run-restored', 'job-r');
     expect(result).toBeDefined();
     expect(result!.jobInput).toEqual(sampleJobInput);
@@ -5935,25 +5288,19 @@ describe('PendingJobContext DB persistence', () => {
 // Multi-provider lock-file fallback
 // ─────────────────────────────────────────────────────────────────────
 //
-// These tests cover the cross-provider lock-file resolution helper
-// `resolveLockFileWithFallback()`. The helper lets a
-// webhook whose inbound provider bundle cannot resolve a repo's lock
-// file fall back to the lock-file fetchers of OTHER provider bundles
-// registered against the SAME customer's registrations for the SAME
-// repo. Tenant isolation is structural (see
-// `registrationIndex.getByOrgAndRepo(customerId, repo)`), the inbound
-// routing key is excluded from the fallback set, and the fallback is
-// deduped by routingKey.
+// `resolveLockFileWithFallback()`: when the inbound bundle cannot resolve a
+// repo's lock file, it falls back to the fetchers of OTHER bundles registered
+// for the SAME customer and repo. Tenant isolation is structural
+// (`registrationIndex.getByOrgAndRepo(customerId, repo)`), the inbound routing
+// key is excluded, and the fallback is deduped by routingKey.
 describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
   });
 
   /**
-   * Build a push-shaped webhook coming through the internal ingress, the
-   * shape a failover-dispatch push arrives in. The
-   * LocalWebhookNormalizer extracts repo.full_name and strips
-   * refs/heads/ to produce a push SimulatedEvent.
+   * A push through the internal ingress, the shape a failover-dispatch push
+   * arrives in. LocalWebhookNormalizer takes repo.full_name and strips refs/heads/.
    */
   function internalPushInfo(
     overrides: Partial<WebhookInfo> = {},
@@ -5979,11 +5326,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     };
   }
 
-  /**
-   * Mock bundle whose normalizer mimics the real LocalWebhookNormalizer:
-   * type:'push', repo from repository.full_name, ref from payload.ref,
-   * credentials={}.
-   */
+  /** Mimics LocalWebhookNormalizer: 'push', repository.full_name, payload.ref, no credentials. */
   function createMockInternalBundle(lockFileResult: unknown = null): ProviderBundle {
     return {
       normalizer: {
@@ -6025,10 +5368,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     };
   }
 
-  /**
-   * Mock bundle modelling the github provider. Its lockFileFetcher is
-   * the fallback target — it requires installationId in credentials.
-   */
+  /** A github bundle: the fallback target, whose fetcher requires installationId. */
   function createMockGithubBundle(lockFileResult: unknown = null): ProviderBundle {
     const bundle: ProviderBundle = {
       normalizer: {
@@ -6055,10 +5395,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     return bundle;
   }
 
-  /**
-   * Lock file that matches a push trigger on master for
-   * example-org/test-repo (mimics hello-firecracker).
-   */
+  /** Matches a push to master of example-org/test-repo. */
   function helloFirecrackerLockFile() {
     return {
       // A freshly-compiled current lock carries the engine's SCHEMA_VERSION and a
@@ -6072,13 +5409,10 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
           name: 'hello-firecracker',
           triggers: [{ _type: 'push' as const, branches: [], paths: [] }],
           jobs: [
-            {
-              _type: 'static' as const,
+            staticJob({
               name: 'say-hello',
-              runsOn: [{ kind: 'exact', value: 'linux' }],
-              needs: [],
               steps: [{ name: 'echo', hasOutputs: false }],
-            },
+            }),
           ],
         },
       ],
@@ -6117,12 +5451,9 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
   }
 
   /**
-   * A real LockFileCache instance (not a mock) — the fallback resolver
-   * passes the fallback bundle's fetcher through the cache. Using a
-   * real cache proves the cache key is provider-agnostic (a cached hit
-   * from a prior webhook would short-circuit the fetcher call), but
-   * here we construct a fresh empty cache per test so fetcher calls
-   * are observable.
+   * A real LockFileCache, which the fallback resolver passes the fallback
+   * fetcher through, which proves the cache key is provider-agnostic; fresh per
+   * test so fetcher calls stay observable.
    */
   async function makeFreshLockFileCache() {
     const { LockFileCache } = await import('../lockfile-cache.js');
@@ -6134,7 +5465,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     githubBundle?: ProviderBundle;
     githubRoutingKey?: string;
     registrations: ReturnType<typeof makeRepoRegistration>[];
-    /** resolved org id — defaults to 'custA' (non-__default__) */
+    /** Defaults to 'custA'. */
     customerId?: string;
     /** Supplied only by tests that assert what the run row records. */
     executionTracker?: ProcessingDeps['executionTracker'];
@@ -6170,9 +5501,8 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
           }),
         }),
       }),
-      // `recordRunStart` stamps the trust context onto the tracked run with a
-      // fire-and-forget UPDATE. Only reached once an executionTracker is wired
-      // in, so the tests that omit one never touch this branch.
+      // `recordRunStart`'s fire-and-forget trust-context UPDATE; reached only
+      // with an executionTracker wired in.
       updateTable: vi.fn().mockReturnValue({
         set: vi.fn().mockReturnValue({
           where: vi.fn().mockReturnValue({
@@ -6191,7 +5521,6 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     });
   }
 
-  // Test 1 — success-first, no fallback fired.
   it('Test 1: inbound fetcher succeeds → no fallback consulted', async () => {
     const inbound = createMockInternalBundle(helloFirecrackerLockFile());
     const githubBundle = createMockGithubBundle(helloFirecrackerLockFile());
@@ -6211,15 +5540,11 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     await processWebhook(internalPushInfo(), deps);
 
-    // Inbound fetcher called exactly once (via lockFileCache).
     expect((inbound.lockFileFetcher!.fetchLockFile as any).mock.calls.length).toBe(1);
-    // Fallback fetcher NEVER called because inbound succeeded.
     expect((githubBundle.lockFileFetcher!.fetchLockFile as any).mock.calls.length).toBe(0);
-    // Dispatch happened (trigger matched).
     expect((deps.dispatcher.dispatch as any).mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 
-  // Test 2 — fallback success (core case).
   it('Test 2: inbound fetcher returns null → fallback resolves via github bundle', async () => {
     const inbound = createMockInternalBundle(null);
     const githubBundle = createMockGithubBundle(helloFirecrackerLockFile());
@@ -6240,9 +5565,8 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     await processWebhook(internalPushInfo(), deps);
 
-    // Inbound fetcher called first.
     expect((inbound.lockFileFetcher!.fetchLockFile as any).mock.calls.length).toBe(1);
-    // Fallback fetcher called next with REGISTRATION'S providerContext.
+    // The fallback fetcher gets the REGISTRATION'S providerContext.
     const githubCalls = (githubBundle.lockFileFetcher!.fetchLockFile as any).mock.calls;
     expect(githubCalls.length).toBe(1);
     const [repoId, ref, creds] = githubCalls[0];
@@ -6250,7 +5574,6 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     expect(ref).toBe('bbb');
     expect(creds).toEqual({ installationId: 12345 });
 
-    // Trigger matched → dispatch fired.
     expect((deps.dispatcher.dispatch as any).mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 
@@ -6261,19 +5584,16 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
    * bundle up by `routing_key` and hands it `provider_context` as the
    * credentials, then re-fetches the lock file with that pair.
    *
-   * A cross-provider lock-file fallback is the one delivery shape where the
-   * dispatch source is not the inbound one, so it is the only shape that can
-   * split the pair. `fetchLockFileWithFallbackPhase` swaps all three of
-   * `dispatchBundle` / `dispatchCredentials` / `resolvedFallbackRoutingKey`
-   * together, and `setupDispatchContext` overlays `info.routingKey` with the
-   * fallback key before `onExecutionStarted` writes the row — so both halves
-   * come from the fallback registration.
+   * A cross-provider lock-file fallback is the only delivery shape whose
+   * dispatch source is not the inbound one, so the only one that can split the
+   * pair. `fetchLockFileWithFallbackPhase` swaps `dispatchBundle` /
+   * `dispatchCredentials` / `resolvedFallbackRoutingKey` together, and
+   * `setupDispatchContext` overlays `info.routingKey` before `onExecutionStarted`
+   * writes the row.
    *
-   * If that ever silently drifted so the row recorded the INBOUND key beside
-   * the fallback credentials, a re-run would authenticate as the wrong
-   * installation and read the wrong tree — either failing outright or
-   * re-running against a lock file that is not the one the original run used.
-   * Nothing else asserts the pairing, so this is the pin.
+   * A row with the INBOUND key beside fallback credentials makes a re-run
+   * authenticate as the wrong installation and read the wrong tree. Nothing
+   * else asserts the pairing.
    */
   it('records the dispatch routing key with the credentials it came from', async () => {
     const inbound = createMockInternalBundle(null);
@@ -6309,9 +5629,7 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     expect(onExecutionStarted).toHaveBeenCalledTimes(1);
     const startCall = onExecutionStarted.mock.calls[0];
-    // Asserted as ONE pair: a row is correct only if BOTH halves name the
-    // fallback registration. Either half alone can look right while the row
-    // as a whole is unusable for a re-run.
+    // ONE pair: either half alone can look right while the row is unusable.
     expect({
       // `onExecutionStarted` is positional: arg 7 is providerContext,
       // arg 10 is routingKey.
@@ -6323,7 +5641,6 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     });
   });
 
-  // Test 3 — fallback exhaustion (multiple fetchers, none resolve).
   it('Test 3: all fallbacks exhausted → existing no-lock-file path runs, no crash', async () => {
     const inbound = createMockInternalBundle(null);
     const githubBundle1 = createMockGithubBundle(null);
@@ -6377,27 +5694,21 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     await processWebhook(internalPushInfo(), deps);
 
-    // Both fallback fetchers called.
     expect((githubBundle1.lockFileFetcher!.fetchLockFile as any).mock.calls.length).toBe(1);
     expect((githubBundle2.lockFileFetcher!.fetchLockFile as any).mock.calls.length).toBe(1);
-    // No dispatch (no lock file resolved, no global workflows).
     expect((deps.dispatcher.dispatch as any).mock.calls.length).toBe(0);
   });
 
-  // Test 4 — strict tenant boundary (security).
   it('Test 4: strict tenant boundary — customer B registration is NEVER consulted for customer A webhook', async () => {
     const inbound = createMockInternalBundle(null);
-    // Customer B's github bundle exists in the registry with the
-    // same repoIdentifier registered under it — but it MUST NOT be
-    // reachable from a customer A webhook.
+    // Customer B registered the same repo; a customer A webhook MUST NOT reach it.
     const customerBGithub = createMockGithubBundle(helloFirecrackerLockFile());
 
     const registry = new ProviderRegistry();
     registry.registerByRoutingKey('generic:acmeOrg00001:src-generic', inbound);
     registry.registerByRoutingKey('github:99', customerBGithub);
 
-    // registrationIndex returns NO same-customer registrations for custA.
-    // Cross-customer registrations would only surface under getByOrgAndRepo('custB', ...)
+    // No custA registrations; custB's surface only under getByOrgAndRepo('custB', ...).
     const getByOrgAndRepoSpy = vi.fn().mockImplementation((cid: string, _repo: string) => {
       if (cid === 'custA') return [];
       if (cid === 'custB')
@@ -6444,19 +5755,14 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     await processWebhook(internalPushInfo(), deps);
 
-    // Only custA was looked up.
     expect(getByOrgAndRepoSpy).toHaveBeenCalledWith('custA', 'example-org/test-repo');
     expect(getByOrgAndRepoSpy).not.toHaveBeenCalledWith('custB', 'example-org/test-repo');
-    // Customer B's fetcher NEVER called — strict tenant boundary.
     expect((customerBGithub.lockFileFetcher!.fetchLockFile as any).mock.calls.length).toBe(0);
-    // The fallback never consulted github:99 via providerRegistry.
     const queriedKeys = getByRoutingKeySpy.mock.calls.map((c) => c[0]);
     expect(queriedKeys).not.toContain('github:99');
-    // No dispatch happened.
     expect((deps.dispatcher.dispatch as any).mock.calls.length).toBe(0);
   });
 
-  // Test 5 — dedupe by routingKey.
   it('Test 5: two registrations with the same routingKey → fallback fetcher called ONCE', async () => {
     const inbound = createMockInternalBundle(null);
     const githubBundle = createMockGithubBundle(helloFirecrackerLockFile());
@@ -6482,22 +5788,16 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     await processWebhook(internalPushInfo(), deps);
 
-    // Fallback fetcher called exactly ONCE despite two registrations
-    // sharing the same routingKey.
     expect((githubBundle.lockFileFetcher!.fetchLockFile as any).mock.calls.length).toBe(1);
   });
 
-  // Fallback no-same-customer log fires at INFO level.
   it('fallback no-same-customer registrations log fires at info level with full context', async () => {
-    // Reset logger spies so earlier tests don't pollute assertions.
     mockPipelineLogger.info.mockClear();
     mockPipelineLogger.debug.mockClear();
 
     const inbound = createMockInternalBundle(null);
 
-    // No github bundle registered — so no fallback fetchers at all.
-    // But registrationIndex returns [] for this customerId + repo,
-    // triggering the "no same-customer registrations" miss path.
+    // No same-customer registrations: the miss path.
     const deps = await makeFallbackDeps({
       inboundBundle: inbound,
       registrations: [], // no registrations → getByOrgAndRepo returns []
@@ -6505,7 +5805,6 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     await processWebhook(internalPushInfo(), deps);
 
-    // The elevated INFO log fires with the expected message and context.
     const infoLogCalls = mockPipelineLogger.info.mock.calls.filter(
       (call: unknown[]) =>
         typeof call[0] === 'string' &&
@@ -6521,7 +5820,6 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     });
     expect(logContext.deliveryId).toBeDefined();
 
-    // The message is NOT at debug level (proves the elevation worked).
     const debugLogCalls = mockPipelineLogger.debug.mock.calls.filter(
       (call: unknown[]) =>
         typeof call[0] === 'string' &&
@@ -6530,12 +5828,9 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
     expect(debugLogCalls.length).toBe(0);
   });
 
-  // Test 7 — inbound routingKey excluded from fallback set.
   it('Test 7: inbound routingKey excluded from fallback — no self-recursion', async () => {
-    // Inbound is now github:42 (not internal). Its fetcher returns
-    // null (simulated transient failure). getByOrgAndRepo returns a
-    // registration with the SAME routingKey — it must be filtered
-    // out so the same fetcher is not invoked twice.
+    // The github:42 inbound fetcher returns null, and a registration shares
+    // its routingKey: it must be filtered out, not fetched twice.
     const inbound = createMockGithubBundle(null);
 
     const registry = new ProviderRegistry();
@@ -6619,19 +5914,14 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     await processWebhook(pushInfo, deps);
 
-    // Inbound fetcher called exactly ONCE total — dedupe prevents
-    // second call via fallback path.
     expect((inbound.lockFileFetcher!.fetchLockFile as any).mock.calls.length).toBe(1);
   });
 
   // Cross-provider dispatch — fallback bundle propagation
   // ─────────────────────────────────────────────────────────────────────
-  // These tests verify that when resolveLockFileWithFallback returns
-  // resolvedVia='fallback', the dispatch site swaps to the winning bundle's
-  // repoUrlBuilder and credentials (Layer 4 of the cross-provider pipeline
-  // binding fix).
+  // On resolvedVia='fallback', the dispatch site swaps to the winning bundle's
+  // repoUrlBuilder and credentials.
 
-  // Test A (regression): inbound fetcher succeeds → dispatch uses inbound bundle's repoUrlBuilder.
   it('Test A-08: inbound fetcher succeeds → dispatch uses inbound bundle repoUrl', async () => {
     const inbound = createMockInternalBundle(helloFirecrackerLockFile());
     const githubBundle = createMockGithubBundle(helloFirecrackerLockFile());
@@ -6651,16 +5941,13 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     await processWebhook(internalPushInfo(), deps);
 
-    // Dispatch happened with the INBOUND bundle's repoUrl (file://).
     const dispatchCalls = (deps.dispatcher.dispatch as any).mock.calls;
     expect(dispatchCalls.length).toBeGreaterThanOrEqual(1);
     const firstJobInput = dispatchCalls[0][0];
     expect(firstJobInput.repoUrl).toBe('file:///tmp/internal-repos/example-org/test-repo');
-    // providerContext should be the inbound credentials ({}).
     expect(firstJobInput.providerContext).toEqual({});
   });
 
-  // Test B (core fix): fallback fires → dispatch uses winning bundle's repoUrlBuilder + credentials.
   it('Test B-08: fallback fires → dispatch uses winning bundle repoUrl + credentials', async () => {
     const inbound = createMockInternalBundle(null);
     const githubBundle = createMockGithubBundle(helloFirecrackerLockFile());
@@ -6681,19 +5968,15 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     await processWebhook(internalPushInfo(), deps);
 
-    // Dispatch happened with the GITHUB bundle's repoUrl (https://).
     const dispatchCalls = (deps.dispatcher.dispatch as any).mock.calls;
     expect(dispatchCalls.length).toBeGreaterThanOrEqual(1);
     const firstJobInput = dispatchCalls[0][0];
     expect(firstJobInput.repoUrl).toBe('https://github.com/example-org/test-repo.git');
-    // providerContext should be the registration's providerContext, NOT the inbound's {}.
     expect(firstJobInput.providerContext).toEqual({ installationId: 12345 });
   });
 
-  // Test C: fallback fires but winning bundle has no repoUrlBuilder → repoUrl is empty string.
   it('Test C-08: fallback bundle has no repoUrlBuilder → repoUrl is empty string', async () => {
     const inbound = createMockInternalBundle(null);
-    // Create a github bundle with lockFileFetcher but NO repoUrlBuilder.
     const githubBundleNoUrl: ProviderBundle = {
       normalizer: {
         provider: 'github' as const,
@@ -6710,7 +5993,6 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
         provider: 'github' as const,
         fetchLockFile: vi.fn().mockResolvedValue(helloFirecrackerLockFile()),
       },
-      // No repoUrlBuilder!
     };
 
     const reg = makeRepoRegistration({
@@ -6729,11 +6011,9 @@ describe('processWebhook — multi-provider lock-file fallback (28.6.2-06)', () 
 
     await processWebhook(internalPushInfo(), deps);
 
-    // Dispatch happened — trigger matched.
     const dispatchCalls = (deps.dispatcher.dispatch as any).mock.calls;
     expect(dispatchCalls.length).toBeGreaterThanOrEqual(1);
     const firstJobInput = dispatchCalls[0][0];
-    // repoUrl is empty string because the fallback bundle has no repoUrlBuilder.
     expect(firstJobInput.repoUrl).toBe('');
   });
 });
@@ -6800,12 +6080,11 @@ describe('resolveLockFileWithFallback — corrupt lock handling', () => {
   });
 
   it('lets a valid fallback win over a corrupt inbound', async () => {
-    const validLock = {
-      schemaVersion: 1,
+    const validLock = lockFileFixture({
       source: { file: 'x', export: '#default' },
       contentHash: 'h',
       workflows: [],
-    };
+    });
     // Inbound throws corrupt; the fallback routing key's fetcher resolves a valid lock.
     const lockFileCache = {
       get: vi
@@ -6865,16 +6144,15 @@ describe('result-aware eval gate', () => {
     clearEvalGatesForRun('run-eg-3');
     expect(isEvalGatePending('run-eg-3', '__dynamic__ci__0')).toBe(false);
     expect(isEvalGatePending('run-eg-4', '__dynamic__ci__0')).toBe(true);
-    // cleanup
     clearEvalGatesForRun('run-eg-4');
   });
 });
 
 describe('dispatchReadyJob — a pending hold is not dispatchable', () => {
-  // The needs scheduler claims a downstream on `needs_satisfied` alone and calls
-  // dispatchReadyJob, which had no held_runs check at all. So
-  // `job('deploy', { needs: ['build'], approval: true })` reached an agent the
-  // moment `build` succeeded, while its hold row still said `pending`.
+  // The needs scheduler claims a downstream on `needs_satisfied` alone, so
+  // dispatchReadyJob must check held_runs: otherwise
+  // `job('deploy', { needs: ['build'], approval: true })` reaches an agent when
+  // `build` succeeds, while its hold row still says `pending`.
   //
   // Every release path flips the row to `released` BEFORE dispatching, so this
   // gate cannot block a legitimate resume — the control below is that case.
@@ -6890,14 +6168,10 @@ describe('dispatchReadyJob — a pending hold is not dispatchable', () => {
         where: function (this: unknown) {
           return this;
         },
-        // The real query filters on `status = pending`, so it yields a row
-        // only for a pending hold — the stub mirrors that rather than echoing
-        // whatever status it was given.
+        // Mirrors the real `status = pending` filter.
         executeTakeFirst: async () =>
           holdStatus === 'pending' ? { status: holdStatus } : undefined,
-        // The needs gate reads `execution_job_needs` with `execute`. No rows =
-        // no needs edges, which reads as dispatchable — the ordinary job these
-        // hold-gate cases model.
+        // The needs gate's `execution_job_needs` read: no edges, dispatchable.
         execute: async () => [],
       }),
       deleteFrom: () => ({
@@ -6939,17 +6213,14 @@ describe('dispatchReadyJob — a pending hold is not dispatchable', () => {
   });
 
   it('keeps refusing while a SECOND hold on the same job is still pending', async () => {
-    // A job carrying an SDK `requireApproval` AND a security-typed context gate
-    // gets TWO `held_runs` rows on one (run_id, job_id), because two independent
-    // requirements gate it and it may only run once both are satisfied. This
-    // gate is the whole mechanism for that: the query filters on
-    // `status = 'pending'` and takes the first match, so releasing one row still
-    // yields the other and the job stays held. The stub models exactly that.
+    // An SDK `requireApproval` plus a security-typed context gate give TWO
+    // `held_runs` rows on one (run_id, job_id), and the job runs only once both
+    // are satisfied. The query filters on `status = 'pending'` and takes the
+    // first match, so releasing one row still yields the other.
     //
-    // The stub records its `where` clauses, because the filter is the load-
-    // bearing part: without `status = 'pending'` the query would take whichever
-    // of the two rows Postgres returned first, and a released row would read as
-    // "nothing is holding this job" while the other still gated it.
+    // The stub records its `where` clauses: without the status filter the query
+    // would take whichever row Postgres returned first, and a released row would
+    // read as "nothing is holding this job".
     const rows = [{ status: 'released' }, { status: 'pending' }];
     const wheres: unknown[][] = [];
     const twoHoldDb = {
@@ -7005,8 +6276,7 @@ describe('dispatchReadyJob — a pending hold is not dispatchable', () => {
   });
 
   it('dispatches once the hold is released', async () => {
-    // The positive control. Identical setup, differing only in hold status —
-    // so a gate that refused everything would fail here.
+    // Positive control: only the hold status differs.
     await storePendingJobContext(undefined, 'run-rel', 'deploy', {
       jobInput: { runId: 'run-rel', jobName: 'deploy', jobConfig: {} } as never,
       runsOnLabels: ['default'],
@@ -7050,10 +6320,9 @@ describe('dispatchReadyJob — a pending hold is not dispatchable', () => {
   });
 
   /**
-   * The gate is the enforcement point for "both requirements answered" on a job
-   * carrying two holds, so answering `false` on a read error dispatched a job
-   * with neither hold released. It now refuses, and retries first so a single
-   * blip does not park the job.
+   * The gate enforces "both requirements answered" on a two-hold job, so a read
+   * error must refuse, never dispatch; it retries first so a single blip does
+   * not park the job.
    */
   describe('a hold read that fails', () => {
     function throwingDb(failures: number, calls: { n: number }) {
@@ -7070,8 +6339,7 @@ describe('dispatchReadyJob — a pending hold is not dispatchable', () => {
             if (calls.n <= failures) throw new Error('connection terminated');
             return undefined; // no hold — the job would dispatch if we got here
           },
-          // Only the hold read fails here; the needs gate reads cleanly and
-          // reports no edges, so this case isolates the hold retry ladder.
+          // The needs gate reads cleanly, isolating the hold retry ladder.
           execute: async () => [],
         }),
         deleteFrom: () => ({
@@ -7112,9 +6380,8 @@ describe('dispatchReadyJob — a pending hold is not dispatchable', () => {
     });
 
     it('dispatches when a transient failure clears within the retries', async () => {
-      // Two failures then a success, pinned as a literal rather than derived
-      // from PENDING_HOLD_READ_ATTEMPTS: a count expressed in terms of the
-      // constant moves with it, so shrinking the budget to 1 would still pass.
+      // Two failures then a success, as a literal: a count derived from
+      // PENDING_HOLD_READ_ATTEMPTS would still pass with a budget of 1.
       const calls = { n: 0 };
       await storePendingJobContext(undefined, 'run-db-blip', 'deploy', {
         jobInput: { runId: 'run-db-blip', jobName: 'deploy', jobConfig: {} } as never,
@@ -7138,8 +6405,7 @@ describe('dispatchReadyJob — a pending hold is not dispatchable', () => {
     });
 
     it('budgets enough attempts to ride out a blip', () => {
-      // The refusal is only a cheap trade because a single transient error does
-      // not park the job. One attempt would make every blip a park.
+      // One attempt would make every transient blip a park.
       expect(PENDING_HOLD_READ_ATTEMPTS).toBeGreaterThanOrEqual(3);
     });
 
@@ -7265,8 +6531,7 @@ describe('capDecisionSummaries', () => {
     const capped = capDecisionSummaries(summaries);
 
     expect(Buffer.byteLength(JSON.stringify(capped))).toBeLessThanOrEqual(DECISION_TRACE_MAX_BYTES);
-    // Positive control: it kept something and said what it dropped, rather than
-    // silently emitting an empty array.
+    // Positive control: not silently an empty array.
     expect(capped.length).toBeGreaterThan(1);
     const marker = capped.at(-1)!;
     expect(marker.traceTruncated).toBe(true);

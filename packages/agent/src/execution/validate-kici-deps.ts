@@ -1,36 +1,17 @@
 /**
- * Pre-install validation for `.kici/` dependency specifiers.
- *
- * The agent clones a single source repository and installs its `.kici/`
- * dependencies with the repo's package manager. Local-protocol specifiers —
- * `workspace:`, `file:`, `link:`, `portal:` — resolve a dependency against
- * another package on the same filesystem rather than a registry. Whether they
- * are resolvable depends on the manager and the layout:
- *
- * - npm has no `workspace:` protocol and cannot resolve any of these from a
- *   registry, so they are rejected up front with an actionable message
- *   instead of the raw `EUNSUPPORTEDPROTOCOL` npm would emit.
- * - pnpm resolves `workspace:` against the repo's pnpm workspace (the agent
- *   clones the whole repo, so an in-repo sibling is present), and resolves
- *   `file:`/`link:`/`portal:` against a path — allowed when that path stays
- *   inside the cloned repo, rejected when it escapes the clone.
- * - yarn classic (v1) has no `workspace:` protocol and no `portal:` — it links
- *   in-repo siblings by version range, not by a local specifier — so both are
- *   rejected with guidance; `file:`/`link:` are allowed when the path stays
- *   inside the clone, rejected when it escapes.
- * - yarn berry (v2+) resolves `workspace:` against the repo-root package.json
- *   `workspaces` field and `portal:`/`file:`/`link:` against inside-repo paths,
- *   so those are allowed when present/inside the clone and rejected otherwise.
- *
- * This module performs that classification so unresolvable specifiers fail
- * fast with guidance rather than a cryptic install error.
+ * Pre-install validation for `.kici/` dependency specifiers. The agent clones
+ * one repository, so a local-protocol specifier (`workspace:`, `file:`,
+ * `link:`, `portal:`) resolves only against that clone. Unresolvable ones fail
+ * fast with guidance instead of a cryptic install error (npm's raw
+ * `EUNSUPPORTEDPROTOCOL`, for one). Per-manager rules are in
+ * `findUnresolvableDeps`.
  */
 
 import { access, readFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { PackageManager, YarnFlavor } from '@kici-dev/shared/package-manager';
 
-/** Local-protocol specifier prefixes that resolve against the filesystem. */
+/** Specifier prefixes that resolve against the filesystem. */
 export enum LocalDepProtocol {
   Workspace = 'workspace:',
   File = 'file:',
@@ -45,7 +26,6 @@ const LOCAL_PROTOCOLS: readonly LocalDepProtocol[] = [
   LocalDepProtocol.Portal,
 ];
 
-/** A dependency whose specifier uses a local (filesystem) protocol. */
 export interface LocalProtocolDep {
   name: string;
   spec: string;
@@ -65,9 +45,8 @@ interface PackageJsonShape {
 }
 
 /**
- * Scan a parsed `.kici/package.json` for dependency specifiers that use a
- * local protocol (`workspace:`/`file:`/`link:`/`portal:`). Returns one entry
- * per dependency, in field order. Returns an empty array when there are none.
+ * Scan a parsed `.kici/package.json` for local-protocol dependency specifiers.
+ * Returns one entry per dependency, in field order.
  */
 export function findLocalProtocolDeps(pkg: PackageJsonShape): LocalProtocolDep[] {
   const found: LocalProtocolDep[] = [];
@@ -99,10 +78,10 @@ async function readKiciPackageJson(kiciDir: string): Promise<PackageJsonShape | 
 }
 
 /**
- * Whether `.kici/package.json` declares any local-protocol dependency. Used to
- * decide whether the agent must build the in-repo workspace dependency closure
- * after a pnpm install (so a `workspace:` sibling's build output exists before
- * the workflow that imports it loads).
+ * Whether `.kici/package.json` declares any local-protocol dependency. When it
+ * does, the agent builds the in-repo workspace dependency closure after a pnpm
+ * install, so a `workspace:` sibling's build output exists before the workflow
+ * that imports it loads.
  */
 export async function kiciHasLocalProtocolDeps(kiciDir: string): Promise<boolean> {
   const pkg = await readKiciPackageJson(kiciDir);
@@ -143,7 +122,7 @@ function resolveLocalPath(kiciDir: string, dep: LocalProtocolDep): string {
   return isAbsolute(rawPath) ? resolve(rawPath) : resolve(kiciDir, rawPath);
 }
 
-/** Whether `target` is `repoRoot` itself or a path inside it. */
+/** `repoRoot` itself counts as inside. */
 function isInsideRepo(repoRoot: string, target: string): boolean {
   const rel = relative(repoRoot, target);
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
@@ -161,15 +140,14 @@ async function findUnresolvableDeps(
   yarnFlavor: YarnFlavor,
 ): Promise<LocalProtocolDep[]> {
   if (packageManager === PackageManager.Npm) {
-    // npm has no workspace protocol and cannot resolve any of these from a
-    // registry — every local-protocol dep is unresolvable.
+    // npm has no workspace protocol and cannot resolve any of these from a registry.
     return [...deps];
   }
 
   if (packageManager === PackageManager.Yarn && yarnFlavor === YarnFlavor.Berry) {
     // berry (node-modules linker) resolves `workspace:` against the root
-    // package.json `workspaces` field and `portal:` against a path; `file:`/
-    // `link:`/`portal:` are allowed only when they stay inside the clone.
+    // package.json `workspaces` field; `file:`/`link:`/`portal:` must stay
+    // inside the clone.
     const hasWorkspaces = await rootHasWorkspaces(repoRoot);
     const unresolvable: LocalProtocolDep[] = [];
     for (const dep of deps) {
@@ -183,9 +161,8 @@ async function findUnresolvableDeps(
   }
 
   if (packageManager === PackageManager.Yarn) {
-    // yarn classic (v1) has no `workspace:` protocol and no `portal:`; it links
-    // siblings by version range, not by a local specifier. `file:`/`link:`
-    // resolve to a path — allowed only when it stays inside the clone.
+    // yarn classic (v1) has no `workspace:` or `portal:`; it links siblings by
+    // version range. `file:`/`link:` must stay inside the clone.
     const unresolvable: LocalProtocolDep[] = [];
     for (const dep of deps) {
       if (dep.protocol === LocalDepProtocol.Workspace || dep.protocol === LocalDepProtocol.Portal) {
@@ -201,20 +178,18 @@ async function findUnresolvableDeps(
   const unresolvable: LocalProtocolDep[] = [];
   for (const dep of deps) {
     if (dep.protocol === LocalDepProtocol.Workspace) {
-      // pnpm resolves `workspace:` against the repo's pnpm workspace. Without a
-      // pnpm-workspace.yaml there is no workspace to resolve against; with one,
-      // pnpm itself reports a clear error if the named sibling is absent.
+      // With a pnpm-workspace.yaml, pnpm itself reports a clear error when the
+      // named sibling is absent (the whole repo is cloned, so siblings exist).
       if (!hasWorkspaceFile) unresolvable.push(dep);
       continue;
     }
-    // file:/link:/portal: resolve to a path; allowed only when it stays inside
-    // the cloned repo (the agent has nothing outside it).
+    // The agent has nothing outside the clone.
     if (!isInsideRepo(repoRoot, resolveLocalPath(kiciDir, dep))) unresolvable.push(dep);
   }
   return unresolvable;
 }
 
-/** Build the actionable error for unresolvable local-protocol dependencies. */
+/** The actionable error for unresolvable local-protocol dependencies. */
 export function formatUnresolvableDepError(
   offenders: readonly LocalProtocolDep[],
   packageManager: PackageManager,

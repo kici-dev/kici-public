@@ -189,9 +189,8 @@ describe('createArtifactsApi.upload', () => {
   });
 
   it('never surfaces raw validation-issue JSON to the workflow author', async () => {
-    // The regression guard. A raw `ArtifactNameSchema.parse` here would throw a
-    // message that serializes the validation issues as JSON; asserting the
-    // absence of that shape is what stops a refactor from reintroducing it.
+    // A raw `ArtifactNameSchema.parse` here would throw a message serializing
+    // the validation issues as JSON; this guards against reintroducing it.
     const api = createArtifactsApi('/tmp', stubTransport({}));
     await expect(api.upload('a/b', ['out'])).rejects.toThrow(
       expect.objectContaining({ message: expect.not.stringContaining('"code"') }),
@@ -199,9 +198,8 @@ describe('createArtifactsApi.upload', () => {
   });
 
   it('rejects the name before touching the transport', async () => {
-    // A bad name must never reach beginUpload — the sandbox check exists to fail
-    // fast, and a transport call would also make the error come back from the
-    // orchestrator path instead.
+    // A bad name never reaches beginUpload: the sandbox check fails fast, and a
+    // transport call would return the error from the orchestrator path instead.
     const beginUpload = vi.fn(async (): Promise<ArtifactBeginUploadResult> => {
       throw new Error('beginUpload must not be reached for a non-conforming name');
     });

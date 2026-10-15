@@ -190,8 +190,8 @@ describe('case-insensitive label matching', () => {
     expect(regex[0]?.kind === 'regex' && regex[0].flags).toContain('i');
   });
 
-  // The security boundary: matcherMatches is what matchHostPattern uses to
-  // compare agent IDs and hostnames, and must stay case-sensitive.
+  // The security boundary: matchHostPattern compares agent IDs exactly through
+  // matcherMatches, so it must stay case-sensitive.
   it('leaves matcherMatches case-sensitive so host patterns do not widen', () => {
     expect(matcherMatches({ kind: 'exact', value: 'Prod-01' }, 'prod-01')).toBe(false);
     expect(matcherMatches({ kind: 'regex', source: '^prod-', flags: '' }, 'PROD-01')).toBe(false);

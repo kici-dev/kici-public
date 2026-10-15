@@ -1,12 +1,11 @@
 /**
  * Org global-workflow dispatch honours the event's trust-policy verdict.
  *
- * The trust policy is a property of the EVENT, so it applies to the
- * organization's global workflows exactly as it applies to the pull request's
- * own: with `forkPolicy: 'hold'` a fork PR must not execute a global workflow
- * against its head SHA with ORG credentials. Each global run is held in the
- * security queue next to the pull request's own runs, and carries the security
- * check a held run posts.
+ * The trust policy is a property of the EVENT, so it applies to the org's
+ * global workflows as to the pull request's own: with `forkPolicy: 'hold'` a
+ * fork PR must not execute a global workflow against its head SHA with ORG
+ * credentials. Each global run is held in the security queue next to the pull
+ * request's own runs, and carries the security check a held run posts.
  *
  * Two paths, tested independently because they have diverged before:
  *
@@ -30,6 +29,7 @@ import {
 import { SecurityHoldReason } from '../contexts/held-runs.js';
 import { ROUND_JOB_PREFIX } from './global-eval-round.js';
 import { webhookPayloadPath } from './webhook-payload-store.js';
+import { lockFileFixture, lockWorkflow, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 const ORG = '__default__';
 const SOURCE_REPO = 'acme/app';
@@ -68,15 +68,13 @@ function makeGlobalRegistration(
         { _type: 'pr', events: ['opened'], targetBranches: [], sourceBranches: [], paths: [] },
       ],
       jobs: over.jobs ?? [
-        {
-          _type: 'static',
+        staticJob({
           name: 'scan',
           // Label matchers are objects, not bare strings — `partitionMatchers`
           // rejects a raw string as a stale lock file.
           runsOn: [{ kind: 'exact', value: 'default' }],
-          needs: [],
           steps: [{ name: 'scan', hasOutputs: false }],
-        },
+        }),
       ],
     },
   };
@@ -165,8 +163,7 @@ function makeDeps(
             },
       ),
     },
-    // Present so the skip branches actually write their row: `recordSkipEventLog`
-    // returns early without it, and the drop's row is the only trace it leaves.
+    // `recordSkipEventLog` returns early without it, and the drop's row is its only trace.
     eventLog: { record: recordEventLog },
     registrationIndex: {
       refreshIfNeeded: vi.fn(async () => undefined),
@@ -190,28 +187,26 @@ function makeDeps(
       create: createHold,
       markPendingCheckPosted: vi.fn().mockResolvedValue(undefined),
     },
-    // With a lock file present the flow reaches Phase J
+    // With a lock file the flow reaches Phase J
     // (`dispatchGlobalWorkflowsForOtherRepos`) instead of Phase F. The
-    // same-source lock deliberately declares only a `push` workflow, which
-    // cannot match this pull_request event — so any dispatch observed in that
-    // case came from the ORG GLOBAL path, which is the guard under test.
+    // same-source lock declares only a `push` workflow, so any dispatch of this
+    // pull_request event comes from the ORG GLOBAL path under test.
     lockFileCache: {
       get: vi.fn(async () =>
         over.withLockFile
-          ? {
+          ? lockFileFixture({
               schemaVersion: 9,
-              source: { file: '.kici/workflows/ci.ts', export: '#default' },
               contentHash: 'srchash',
               workflows: [
-                {
+                lockWorkflow({
                   name: 'src-push-only',
                   contentHash: 'shash',
                   compileSchemaVersion: 1,
                   triggers: [{ _type: 'push', branches: [], paths: [] }],
                   jobs: [],
-                },
+                }),
               ],
-            }
+            })
           : null,
       ),
     },
@@ -238,8 +233,7 @@ const HOLD_ALL: TrustPolicy = {
 
 describe('global-workflow dispatch honours the event trust decision', () => {
   it('reaches the policy on the no-lock-file path, which used to return first', async () => {
-    // The blocker's direct regression test. Before the fix, Phase F returned
-    // before `evaluateSecurityPolicy` ran, so the store was never even read.
+    // Phase F must not return before `evaluateSecurityPolicy` reads the store.
     const { deps, dispatch } = makeDeps({ ...HOLD_ALL, forkPolicy: 'hold' });
 
     await processWebhook(makeInfo(), deps);
@@ -271,9 +265,7 @@ describe('global-workflow dispatch honours the event trust decision', () => {
   });
 
   it('still dispatches global workflows when the policy passes', async () => {
-    // The non-vacuity control: with the fork explicitly allowed the SAME
-    // fixture dispatches, so the assertions above are about the policy
-    // and not about a harness that never dispatches anything.
+    // Non-vacuity control: with the fork allowed the SAME fixture dispatches.
     const { deps, dispatch } = makeDeps({ ...HOLD_ALL, forkPolicy: 'allow' });
 
     await processWebhook(makeInfo(), deps);
@@ -283,8 +275,8 @@ describe('global-workflow dispatch honours the event trust decision', () => {
 
   // ── Phase J — the OTHER global-dispatch path, guarded independently ────────
   // `dispatchGlobalWorkflowsForOtherRepos` runs when a lock file DOES resolve.
-  // It failed for a different reason than Phase F — it received the decision's
-  // siblings but never the decision — so it needs its own falsifiable coverage.
+  // It can fail differently from Phase F (receiving the decision's siblings but
+  // never the decision), so it needs its own falsifiable coverage.
 
   it('holds the cross-repo global run when the policy holds (lock-file path)', async () => {
     // fails-when: the lock-file path dispatches or drops a held global run
@@ -342,9 +334,8 @@ describe('global-workflow dispatch honours the event trust decision', () => {
   });
 
   it('still dispatches cross-repo global workflows when the policy passes (lock-file path)', async () => {
-    // Non-vacuity control for the case above: the same fixture with forks
-    // allowed does dispatch, and the only workflow that can match this event is
-    // the org global one (the source lock declares a push-only workflow).
+    // Non-vacuity control: with forks allowed the same fixture dispatches, and
+    // only the org global workflow can match (the source lock is push-only).
     const { deps, dispatch } = makeDeps(
       { ...HOLD_ALL, forkPolicy: 'allow' },
       { withLockFile: true },
@@ -379,11 +370,9 @@ describe('global-workflow dispatch honours the event trust decision', () => {
   });
 
   it('posts NO check at all when the fork policy ignores the event', async () => {
-    // The point of `ignore`: the event leaves no trace a contributor can see.
-    // A held global run and its pending check would be exactly such a trace, so
-    // this is the one non-passing verdict that must post nothing — the case
-    // above proves the same fixture does post under `hold`, so this is not
-    // vacuous.
+    // Under `ignore` the event leaves no trace a contributor can see, so it is
+    // the one non-passing verdict that posts nothing; the case above proves the
+    // same fixture posts under `hold`.
     const { deps, dispatch, postCheckStatus, recordRunHeld } = makeDeps({
       ...HOLD_ALL,
       forkPolicy: 'ignore',
@@ -397,10 +386,9 @@ describe('global-workflow dispatch honours the event trust decision', () => {
   });
 
   it('records WHY the ignored event was dropped, and where the policy came from', async () => {
-    // The event-log row is the only surface that can explain this drop: there
-    // is no run, no check, and nothing on the pull request. A bare `received`
-    // row reads identically to an unknown-provider or unknown-event skip, which
-    // is what left a maintainer with a fork PR and no explanation anywhere.
+    // The event-log row is the only surface that can explain this drop (no run,
+    // no check, nothing on the PR); a bare `received` row reads identically to
+    // an unknown-provider or unknown-event skip.
     const stored = makeDeps({ ...HOLD_ALL, forkPolicy: 'ignore' });
     const unconfigured = makeDeps({ ...HOLD_ALL, forkPolicy: 'ignore' }, { unconfigured: true });
 
@@ -416,25 +404,22 @@ describe('global-workflow dispatch honours the event trust decision', () => {
     expect(storedMessage).toContain('forkPolicy=ignore');
     expect(storedMessage).toContain('visible to the contributor');
 
-    // An org that never chose `ignore` needs a different next step from one
-    // that did, and the two produce the SAME verdict — so the row has to carry
-    // the difference or nothing can.
+    // Both produce the SAME verdict but need different next steps, so only the
+    // row can carry the difference.
     expect(unconfiguredMessage).not.toBe(storedMessage);
     expect(unconfiguredMessage).toContain('no stored trust policy');
 
-    // Non-vacuity: the identical fixture writes NO message on a verdict that
-    // leaves other traces behind, so a build that stamped the same text on
-    // every skip would fail here.
+    // Non-vacuity: a verdict that leaves other traces writes NO message, so
+    // stamping the same text on every skip fails here.
     const held = makeDeps({ ...HOLD_ALL, forkPolicy: 'hold' });
     await processWebhook(makeInfo(), held.deps);
     expect(messageOf(held.recordEventLog)).toBe('');
   });
 
   it('drops the ignored event before it reads a lock file', async () => {
-    // The drop has to precede the lock-file fetch: every run row, check status,
-    // and clone token in this pipeline is created at or after it. Driven with
-    // `withLockFile: true` so the cache read is the observable proxy for that
-    // fetch — the same fixture reads it on every other verdict.
+    // The drop must precede the lock-file fetch: every run row, check status and
+    // clone token is created at or after it. The cache read under
+    // `withLockFile: true` is the observable proxy for that fetch.
     const ignored = makeDeps({ ...HOLD_ALL, forkPolicy: 'ignore' }, { withLockFile: true });
     const held = makeDeps({ ...HOLD_ALL, forkPolicy: 'hold' }, { withLockFile: true });
     const lockRead = (d: typeof ignored.deps) =>
@@ -445,11 +430,9 @@ describe('global-workflow dispatch honours the event trust decision', () => {
 
     expect(outcome).toBe('skipped');
     expect(lockRead(ignored.deps)).not.toHaveBeenCalled();
-    // Non-vacuity: the identical fixture DOES read the lock file when the
-    // verdict is one that lets the event continue.
+    // Non-vacuity: a verdict that lets the event continue DOES read it.
     expect(lockRead(held.deps)).toHaveBeenCalled();
-    // …and the policy really was consulted, so the drop is a decision and not a
-    // fixture that never got started.
+    // …and the policy was consulted, so the drop is a decision.
     expect(
       (ignored.deps as unknown as { trustPolicyStore: { get: ReturnType<typeof vi.fn> } })
         .trustPolicyStore.get,
@@ -526,7 +509,7 @@ describe('the pre-run evaluation round of a held event', () => {
       // fails-when: the hold records no covered set, so a release cannot tell a dropped workflow
       heldRoundWorkflows: [FILTERED],
     });
-    // The immediate candidate of the same event is held by the pipeline, as before.
+    // The pipeline holds the same event's immediate candidate too.
     expect(held.map((row) => row.workflowName).sort()).toEqual(['org-guard', ROUND_NAME].sort());
     // One security-queue row per held run, of the shape the release route expects.
     expect(h.createHold).toHaveBeenCalledTimes(2);

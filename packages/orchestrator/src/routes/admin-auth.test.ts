@@ -24,8 +24,7 @@ function appWith(deps: Parameters<typeof createBearerAuthMiddleware>[0]) {
 }
 
 describe('createBearerAuthMiddleware -- credential shapes stay 401', () => {
-  // Missing, malformed and unknown credentials. Every shape below must return
-  // 401 (never 500, never 503).
+  // Missing, malformed and unknown credentials: always 401, never 500 or 503.
   const cases: Array<{ name: string; header?: string; body: string }> = [
     { name: 'header absent', header: undefined, body: AUTH_ERROR.missing },
     { name: 'Bearer with empty token', header: 'Bearer ', body: AUTH_ERROR.missing },

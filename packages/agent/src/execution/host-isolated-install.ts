@@ -1,26 +1,23 @@
 /**
- * Run a container job's `.kici/` install on the agent host without letting the
- * repository reach the install's configuration, environment or tooling.
+ * Runs a container job's `.kici/` install on the agent host, out of reach of the
+ * repository's configuration, environment and tooling.
  *
- * The install never runs in the checkout. `.kici/package.json` and its
- * lockfile are copied (without following symlinks) into a fresh staging
- * directory next to a freshly written `.npmrc`. That file is serialized from
- * the allowlisted pairs the eligibility check parsed with npm's own parser:
- * registries and registry auth from the repository, plus TLS trust and proxies
- * from the operator's own config only. No line of either source file is
- * copied, so `node-options`, `git`, `script-shell` and every other key outside
- * the allowlist cannot reach the package manager. The repository's pnpmfiles,
- * workspace files and `package.json` scripts are never in reach either.
+ * `.kici/package.json` and its lockfile are copied (symlinks not followed) into
+ * a fresh staging directory, beside an `.npmrc` serialized from the allowlisted
+ * pairs npm's own parser read: registries and registry auth from the
+ * repository, TLS trust and proxies from the operator's config only. No source
+ * line is copied, so `node-options`, `git`, `script-shell` and every other
+ * non-allowlisted key never reach the package manager, nor do the repository's
+ * pnpmfiles, workspace files or `package.json` scripts.
  *
- * The package manager is the agent's own: the npm installed with the Node
- * running the agent, or else a distribution or PATH npm at 11.10.0 or later,
- * or the pinned pnpm bundle, each started with that Node
- * directly — never a corepack shim, which would follow the repository's
- * `packageManager` field. Both run with scripts disabled and git dependencies
- * refused. npm 11.15.0 and later runs `npm install` and refuses URL, file and
- * directory sources by flag; an older npm has no such flags, so it runs
+ * The package manager is the agent's own — the npm installed with the agent's
+ * Node, else a distribution or PATH npm >= 11.10.0, or the pinned pnpm bundle —
+ * started with that Node directly, never a corepack shim (which follows the
+ * repository's `packageManager` field). Scripts are disabled and git
+ * dependencies refused. npm >= 11.15.0 runs `npm install` and refuses URL, file
+ * and directory sources by flag; an older npm lacks those flags and runs
  * `npm ci` against a lockfile `host-install-lockfile.ts` verified pins every
- * package. The resulting `node_modules` is moved into `.kici/`.
+ * package. The `node_modules` is then moved into `.kici/`.
  */
 
 import { execFile } from 'node:child_process';
@@ -51,7 +48,6 @@ export const PINNED_PNPM_VERSION = '11.3.0';
 /** First npm with `--allow-remote` / `--allow-file` / `--allow-directory` (11.15.0). */
 const NPM_ALLOW_SOURCES_MIN: readonly number[] = [11, 15, 0];
 
-/** The npm command the host install runs. */
 export enum NpmInstallCommand {
   /** npm 11.15.0 and later: refuses every non-registry source by flag. */
   Install = 'install',
@@ -65,12 +61,10 @@ export enum NpmInstallCommand {
 const INSTALL_TIMEOUT_MS = 600_000;
 const INSTALL_MAX_BUFFER = 128 * 1024 * 1024;
 
-/** A package manager the host install may run: a Node script and its version. */
 export interface HostInstallTool {
   packageManager: HostInstallPlan['packageManager'];
-  /** The Node binary that runs the script. */
   nodeExe: string;
-  /** The package manager's own CLI entry point (npm-cli.js / pnpm.cjs). */
+  /** The package manager's CLI entry point (npm-cli.js / pnpm.cjs). */
   script: string;
   version: string;
 }
@@ -87,7 +81,6 @@ async function readPackageVersion(pkgJson: string, name: string): Promise<string
   }
 }
 
-/** The command an npm of `version` runs the host install with. */
 export function npmInstallCommand(version: string): NpmInstallCommand {
   return versionAtLeast(version, NPM_ALLOW_SOURCES_MIN)
     ? NpmInstallCommand.Install
@@ -95,10 +88,9 @@ export function npmInstallCommand(version: string): NpmInstallCommand {
 }
 
 /**
- * The npm the host install runs: the one {@link lookupHostNpm} finds, so it is
- * always the npm whose parser read the `.npmrc` files, at 11.10.0 or later,
- * started with the Node running the agent. A version-manager shim on PATH is
- * never used: it may pick its own npm.
+ * The npm {@link lookupHostNpm} finds — the one whose parser read the `.npmrc`
+ * files — at >= 11.10.0, started with the agent's Node. Never a PATH
+ * version-manager shim, which may pick its own npm.
  */
 export async function resolveHostNpm(
   env: HostNpmLookupEnv = hostNpmLookupEnv(),
@@ -144,11 +136,10 @@ export interface HostNpmrc {
 }
 
 /**
- * Build the install's only `.npmrc`: the allowlisted operator and repository
- * pairs, serialized by npm's own encoder, then the agent-managed registry
- * block (npm reads the last value of a key). An install secret reaches the
- * install only under a name a kept registry-auth value references as
- * `${NAME}`, and never under a name npm, pnpm or Node reads.
+ * The install's only `.npmrc`: allowlisted operator and repository pairs (npm's
+ * own encoder), then the agent registry block, since npm reads a key's last
+ * value. An install secret passes only under a name a kept registry-auth value
+ * references as `${NAME}`, never a name npm, pnpm or Node reads.
  */
 export function buildHostNpmrc(args: {
   npmrc: HostInstallPlan['npmrc'];
@@ -172,10 +163,10 @@ export function buildHostNpmrc(args: {
 }
 
 /**
- * The install's whole environment. Only locale, timezone, temp and `PATH` come
- * from the agent; `HOME` and the XDG dirs point into the staging directory so
- * no user-level npm or pnpm config is read. `NODE_OPTIONS`, `npm_config_*` and
- * `pnpm_config_*` never pass, whatever the agent's own environment holds.
+ * The install's whole environment. Only locale, timezone, temp, `SystemRoot`
+ * and `PATH` come from the agent; `HOME` and the XDG dirs point into the
+ * staging directory so no user-level npm or pnpm config is read.
+ * `NODE_OPTIONS`, `npm_config_*` and `pnpm_config_*` never pass.
  */
 export function buildHostInstallEnv(args: {
   baseEnv: NodeJS.ProcessEnv;
@@ -277,13 +268,12 @@ export interface RunHostInstallArgs {
   registries: readonly NpmRegistrySpec[];
   installEnvSecrets: Record<string, string>;
   jobIdShort: string;
-  /** The agent's sanitized environment; only locale, temp and PATH are read. */
+  /** The agent's sanitized environment; see {@link buildHostInstallEnv} for what is read. */
   baseEnv: NodeJS.ProcessEnv;
   /** Kills the package manager when the job is cancelled. */
   signal?: AbortSignal;
 }
 
-/** Stage, install and move `node_modules` into `.kici/`. */
 export async function runHostIsolatedInstall(args: RunHostInstallArgs): Promise<void> {
   const stage = await makeTempDir('host-install');
   try {

@@ -1,9 +1,6 @@
 /**
- * Local run history manager.
- *
- * Persists test run history in ~/.kici/history/runs.json so developers
- * can review past runs (kici run remote --history) and inspect specific runs
- * (kici status <run-id>).
+ * Local run history in ~/.kici/history/runs.json, read by
+ * `kici run remote --history` and `kici runs show <run-id>`.
  */
 
 import fs from 'node:fs/promises';
@@ -20,45 +17,32 @@ import {
   type CanonicalStatus,
 } from '@kici-dev/engine';
 
-/** Maximum number of entries to keep in history */
 const MAX_ENTRIES = 200;
 
-/** A single run history entry */
 export interface HistoryEntry {
-  /** Unique run identifier */
   runId: string;
-  /** Fixture that was run */
   fixtureId: string;
-  /** Current status of the run */
   status: CanonicalStatus;
-  /** ISO timestamp when the run started */
+  /** ISO timestamp */
   startedAt: string;
-  /** ISO timestamp when the run completed (if finished) */
+  /** ISO timestamp, once finished */
   completedAt?: string;
-  /** Total duration in milliseconds (if finished) */
+  /** Milliseconds, once finished */
   durationMs?: number;
-  /** Orchestrator endpoint used */
+  /** Orchestrator endpoint */
   endpoint: string;
-  /** Job-level status breakdown */
   jobs?: Array<{ name: string; status: string; durationMs?: number }>;
 }
 
-/** Filter criteria for querying history entries */
 interface HistoryFilter {
-  /** Exact status match */
+  /** Exact match */
   status?: string;
-  /** Fixture glob pattern (via picomatch) */
+  /** picomatch glob */
   fixture?: string;
-  /** Maximum number of entries to return */
   limit?: number;
 }
 
-/**
- * Manages local run history stored in ~/.kici/history/runs.json.
- *
- * Entries are capped at 200 (oldest removed first when exceeded).
- * The history file is created lazily on first write.
- */
+/** Capped at MAX_ENTRIES, oldest dropped first; the file is created on first write. */
 export class RunHistory {
   private readonly historyDir: string;
   private readonly historyFile: string;
@@ -69,16 +53,11 @@ export class RunHistory {
     this.historyFile = path.join(this.historyDir, 'runs.json');
   }
 
-  /**
-   * Add a new entry to the history.
-   * Creates the history file and directory if they don't exist.
-   * Caps history at MAX_ENTRIES by removing the oldest entries.
-   */
   async addEntry(entry: HistoryEntry): Promise<void> {
     const entries = await this.load();
     entries.push(entry);
 
-    // Cap at MAX_ENTRIES (remove oldest -- which are at the front)
+    // Oldest entries are at the front.
     while (entries.length > MAX_ENTRIES) {
       entries.shift();
     }
@@ -86,32 +65,23 @@ export class RunHistory {
     await this.save(entries);
   }
 
-  /**
-   * Update an existing entry by runId.
-   * Merges the provided updates into the existing entry.
-   * No-op if the runId is not found.
-   */
+  /** Merges `updates` into the entry; a no-op for an unknown runId. */
   async updateEntry(runId: string, updates: Partial<HistoryEntry>): Promise<void> {
     const entries = await this.load();
     const index = entries.findIndex((e) => e.runId === runId);
 
     if (index === -1) {
-      return; // Not found -- silently skip
+      return;
     }
 
     entries[index] = { ...entries[index], ...updates };
     await this.save(entries);
   }
 
-  /**
-   * Get entries with optional filtering.
-   * Returns entries in most-recent-first order.
-   */
+  /** Most recent first. Reads the cache: call load() first. */
   getEntries(filter?: HistoryFilter): HistoryEntry[] {
-    // Use cached entries (load must be called first for async reads)
     const entries = this.entries ? [...this.entries] : [];
 
-    // Reverse to get most recent first
     entries.reverse();
 
     let filtered = entries;
@@ -132,32 +102,21 @@ export class RunHistory {
     return filtered;
   }
 
-  /**
-   * Get a single entry by runId.
-   */
   getEntry(runId: string): HistoryEntry | undefined {
     if (!this.entries) return undefined;
     return this.entries.find((e) => e.runId === runId);
   }
 
-  /**
-   * Format entries as a table string for terminal display.
-   *
-   * Columns: Run ID | Fixture | Status | Duration | Started
-   * Status is color-coded, Started uses relative time.
-   */
   formatTable(entries: HistoryEntry[]): string {
     if (entries.length === 0) {
       return pc.gray('No run history found.');
     }
 
-    // Calculate column widths
     const idWidth = Math.max(10, ...entries.map((e) => e.runId.length)) + 2;
     const fixtureWidth = Math.max(10, ...entries.map((e) => e.fixtureId.length)) + 2;
 
     const lines: string[] = [];
 
-    // Header
     lines.push(
       `${'Run ID'.padEnd(idWidth)}${'Fixture'.padEnd(fixtureWidth)}${'Status'.padEnd(12)}${'Duration'.padEnd(12)}Started`,
     );
@@ -168,9 +127,8 @@ export class RunHistory {
     for (const entry of entries) {
       const id = entry.runId.padEnd(idWidth);
       const fixture = entry.fixtureId.padEnd(fixtureWidth);
-      // Pad by the plain label's width, not the rendered cell's: with colour
-      // enabled the ANSI escapes alone exceed the column width, so padding the
-      // coloured string is a no-op and the column collapses.
+      // Pad by the plain label's width: the ANSI escapes alone exceed the
+      // column width, so padding the coloured string collapses the column.
       const statusPad = Math.max(0, 12 - statusLabelWidth(entry.status));
       const status = formatStatus(entry.status) + ' '.repeat(statusPad);
       const duration = entry.durationMs
@@ -184,9 +142,7 @@ export class RunHistory {
     return lines.join('\n');
   }
 
-  /**
-   * Load entries from disk. Caches in memory for subsequent reads.
-   */
+  /** Caches in memory for subsequent reads. */
   async load(): Promise<HistoryEntry[]> {
     if (this.entries !== null) {
       return this.entries;
@@ -209,9 +165,6 @@ export class RunHistory {
     }
   }
 
-  /**
-   * Write entries to disk.
-   */
   private async save(entries: HistoryEntry[]): Promise<void> {
     await fs.mkdir(this.historyDir, { recursive: true });
     await fs.writeFile(this.historyFile, JSON.stringify(entries, null, 2) + '\n');
@@ -222,14 +175,9 @@ export class RunHistory {
 type StatusDisplay = { label: string; color: (text: string) => string };
 
 /**
- * Short label and colour for every canonical status in the run-history table.
- *
- * Exhaustive by type, so a new engine status breaks this file's typecheck
- * rather than making the history table print the literal string `undefined`.
- *
- * `label` and `color` are stored separately so the table's column width can be
- * measured on the plain label: padding a colour-wrapped string measures the
- * ANSI escape bytes too, which silently collapses the column.
+ * Exhaustive by type, so a new engine status breaks the typecheck rather than
+ * printing `undefined`. `label` is kept apart from `color` so column width is
+ * measured on the plain label, not the ANSI escape bytes.
  */
 const STATUS_DISPLAY: Readonly<Record<CanonicalStatus, StatusDisplay>> = Object.freeze({
   [ExecutionRunStatus.enum.success]: { label: 'pass', color: pc.green },
@@ -253,10 +201,7 @@ export function statusLabelWidth(status: string): number {
   return canonical === undefined ? status.length : STATUS_DISPLAY[canonical].label.length;
 }
 
-/**
- * Format a run status with its colour and short label. A status this CLI does
- * not recognise — a history file written by a newer version — renders verbatim.
- */
+/** A status this CLI does not recognise (written by a newer version) renders verbatim. */
 export function formatStatus(status: string): string {
   const canonical = toCanonicalStatus(status.toLowerCase());
   if (canonical === undefined) return pc.gray(status);

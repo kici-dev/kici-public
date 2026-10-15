@@ -1,13 +1,8 @@
 /**
- * Instance index — a reconciled CACHE of all installed instances on the host.
- *
- * Lives at <kiciRoot>/instances.json, where kiciRoot is the name-agnostic
- * config root (~/.config/kici/ for user-level, /etc/kici/ for system). The
- * index is convenience: discovery is authoritative against the init system
- * (see resolve.ts#listInstances which reconciles this file against scans).
- *
- * Corrupt index → warn and treat as empty; the next install/uninstall
- * rewrites it cleanly.
+ * `<kiciRoot>/instances.json`: a reconciled CACHE of the host's installed
+ * instances. Discovery against the init system is authoritative
+ * (resolve.ts#listInstances reconciles this file against scans). A corrupt
+ * index warns and reads as empty; the next install/uninstall rewrites it.
  */
 
 import fs from 'node:fs';
@@ -16,12 +11,11 @@ import type { Component, IndexEntry } from './types.js';
 
 const FILE = 'instances.json';
 
-/** Resolve <kiciRoot>/instances.json. */
 export function indexPath(kiciRoot: string): string {
   return path.join(kiciRoot, FILE);
 }
 
-/** Read the index. Missing or corrupt → []. */
+/** Missing or corrupt → []. */
 export function readIndex(kiciRoot: string): IndexEntry[] {
   const file = indexPath(kiciRoot);
   if (!fs.existsSync(file)) return [];
@@ -40,16 +34,15 @@ export function readIndex(kiciRoot: string): IndexEntry[] {
   }
 }
 
-/** Overwrite the index. */
 export function writeIndex(kiciRoot: string, entries: IndexEntry[]): void {
   fs.mkdirSync(kiciRoot, { recursive: true });
   fs.writeFileSync(indexPath(kiciRoot), JSON.stringify(entries, null, 2) + '\n', 'utf-8');
 }
 
 /**
- * Append an entry. Idempotent for an exact (component,name,instanceDir) match.
- * Throws on a (component,name) collision with a different instanceDir — the
- * caller must use a different name or pass --force to overwrite.
+ * Idempotent for an exact (component,name,instanceDir) match. Throws on a
+ * (component,name) collision at another instanceDir: the caller picks another
+ * name or passes --force.
  */
 export function appendIndexEntry(kiciRoot: string, entry: IndexEntry): void {
   const current = readIndex(kiciRoot);
@@ -63,7 +56,7 @@ export function appendIndexEntry(kiciRoot: string, entry: IndexEntry): void {
   writeIndex(kiciRoot, [...current, entry]);
 }
 
-/** Remove the matching entry (no-op when absent). */
+/** No-op when absent. */
 export function removeIndexEntry(
   kiciRoot: string,
   key: { component: Component; name: string },

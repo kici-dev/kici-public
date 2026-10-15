@@ -1,9 +1,7 @@
 /**
- * Derive a coarse, trusted run-failure classification from existing signals.
- *
- * Pure derivation — no heuristics, no flaky/regression detection (that's a
- * deferred phase). KiCI computes this from data it already records, so the
- * resulting category is a trusted field on the agent run-result.
+ * A coarse run-failure classification, derived purely from data KiCI already records —
+ * no heuristics, no flaky/regression detection — so the category is a trusted field on
+ * the agent run-result.
  */
 import { AgentFailureCategory, ExecutionRunStatus } from '@kici-dev/engine';
 
@@ -26,7 +24,7 @@ export interface FailureSignals {
 /** Init-failure categories that mean "infrastructure", not "the workflow failed". */
 const INFRA_INIT_CATEGORIES = new Set<string>(['no_agent']);
 
-/** Run statuses that represent a terminal failure (vs success / in-flight). */
+/** Terminal-failure run statuses (vs success / in-flight). */
 const TERMINAL_FAIL_STATUSES = new Set<string>([
   ExecutionRunStatus.enum.failed,
   ExecutionRunStatus.enum.cancelled,

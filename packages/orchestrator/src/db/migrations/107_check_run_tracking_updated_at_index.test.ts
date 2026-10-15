@@ -5,16 +5,14 @@ import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './107_check_run_tracking_updated_at_index.js';
 import type { Database } from '../types.js';
 import { CheckRunTrackingStore } from '../../reporting/check-run-tracking-store.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 107. Creates a throwaway database, applies
- * migrations 001..107, and asserts `idx_check_run_tracking_updated_at` exists
- * after up() and is gone after down() (then recreated idempotently). A second
- * block runs `CheckRunTrackingStore.pruneStale` against real Postgres: the
- * mock-DB unit tests assert which builder methods were called, so only this
- * one proves the `make_interval(days => $1)` predicate actually executes and
- * deletes exactly the stale rows. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 107: `idx_check_run_tracking_updated_at` exists after up(),
+ * is gone after down(), and recreates idempotently. It also runs
+ * `CheckRunTrackingStore.pruneStale` for real: the mock-DB unit tests only see builder calls, so
+ * only this proves `make_interval(days => $1)` executes and deletes exactly the stale rows.
+ * Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -43,9 +41,8 @@ describeDb('migration 107_check_run_tracking_updated_at_index', () => {
   };
 
   /**
-   * Insert a row with an explicit `updated_at`. `run_id` is left NULL on
-   * purpose for one of them: a row born at check-run create with no run
-   * attribution is precisely the shape the sweep has to be able to reclaim.
+   * Insert a row with an explicit `updated_at`. One row keeps `run_id` NULL: a row born at
+   * check-run create with no run attribution is exactly what the sweep must reclaim.
    */
   const insertRow = async (
     checkName: string,

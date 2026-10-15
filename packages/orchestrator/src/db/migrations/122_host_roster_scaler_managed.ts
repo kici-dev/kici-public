@@ -1,25 +1,18 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `host_roster.scaler_managed boolean NOT NULL DEFAULT false`.
+ * Add `host_roster.scaler_managed`: whether a scaler backend spawned the agent.
  *
- * `runsOnAll` fans a job out across the declared fleet. Every registering agent
- * upserts a roster row, auto-scaler-spawned ones included, so a pre-spawned
- * warm agent was a valid fan-out target — and a child pinned to it runs at the
- * pool's fixed shape rather than its own. This column records the one fact that
- * separates the two populations: whether a scaler backend spawned the agent.
+ * `runsOnAll` fans a job out across the declared fleet, and every registering agent upserts a
+ * roster row, so a pre-spawned warm agent was a fan-out target and a child pinned to it ran at
+ * the pool's fixed shape rather than its own.
  *
- * It is written from the scaler manager's registration lookup (a spawn record
- * exists for the agent id), NOT from `lifecycle_class`. `lifecycle_class`
- * snapshots the auth TOKEN's type and is `ephemeral` for every agent when the
- * auth mode is `none`, so it cannot distinguish a fleet host from a scaler
- * agent in that mode.
+ * Written from the scaler manager's registration lookup (a spawn record exists for the agent
+ * id), NOT from `lifecycle_class`, which snapshots the auth TOKEN's type and is `ephemeral` for
+ * every agent in auth mode `none`.
  *
- * DEFAULT false is load-bearing: a row written before this migration must read
- * as not-scaler-managed so an existing fleet host stays a fan-out target
- * immediately, without waiting to re-register.
- *
- * Idempotent: a re-run on a DB that already has the column is a no-op.
+ * DEFAULT false is load-bearing: a pre-existing row reads as not-scaler-managed, so an existing
+ * fleet host stays a fan-out target without re-registering. Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colCheck = await sql<{ exists: boolean }>`

@@ -2,25 +2,22 @@
  * `.kici/.kiciignore` — the declared list of paths the source digest excludes.
  *
  * The digest names a workflow's identity, so *which files it covers* is part of
- * that identity's definition. Before this file that definition was three
- * hard-coded constants, and it was wrong: the agent rewrites
- * `.kici/package-lock.json` (`npm install`, deliberately not `npm ci`, so a
- * resolved URL baked into the lock file cannot point at the wrong registry) and
- * `.kici/.npmrc` (a managed auth block, applied for one install and restored
- * after) inside the very tree whose digest it must reproduce. Neither was
- * excluded, so the drift gate rejected runs whose source had not changed.
- *
- * Making the set declarative rather than hard-coded is what lets a customer
- * whose own tooling writes into `.kici/` fix the same class of problem without
- * a release.
+ * that identity's definition. The agent rewrites `.kici/package-lock.json`
+ * (`npm install`, deliberately not `npm ci`, so a resolved URL baked into the
+ * lock file cannot point at the wrong registry) and `.kici/.npmrc` (a managed
+ * auth block, applied for one install and restored after) inside the very tree
+ * whose digest it must reproduce; unexcluded, they make the drift gate reject
+ * runs whose source did not change. A declarative set, not hard-coded
+ * constants, lets a customer whose own tooling writes into `.kici/` fix the
+ * same class of problem without a release.
  *
  * ## Not to be confused with the repo-root `.kiciignore`
  *
- * A repo **root** `.kiciignore` already exists and is unrelated: it selects
- * which working-tree files a `kici run --remote` overlay uploads
- * (`compiler/src/remote/uploader.ts`, glob-matched, relative to the repo root).
- * This one lives at `.kici/.kiciignore`, is matched relative to `.kici/`, and
- * affects only the digest. The two files never read each other.
+ * The repo **root** `.kiciignore` is unrelated: it selects which working-tree
+ * files a `kici run --remote` overlay uploads (`compiler/src/remote/uploader.ts`,
+ * glob-matched, relative to the repo root). This one lives at
+ * `.kici/.kiciignore`, is matched relative to `.kici/`, and affects only the
+ * digest. The two files never read each other.
  *
  * ## Semantics
  *
@@ -40,15 +37,14 @@
  * - A path under an ignored directory is ignored.
  *
  * One deliberate deviation from gitignore: a **symlink to a directory counts as
- * a directory**, so `node_modules/` covers a symlinked `node_modules`. `git`
- * treats a symlink as a file and would not. The purpose of the entry is
- * "exclude the dependency tree, whatever shape it takes on disk" — and treating
- * the link as a file hashed a `symlink:<target>` member into the identity that
- * the agent's own tree, where the dependency install writes a real directory,
- * structurally could not hold. The resolution happens in `collectSourcePaths`,
- * which stats a link to classify it and never follows one to read what is
- * behind it; the matcher below is unchanged and merely receives a truthful
- * `isDir`.
+ * a directory**, so `node_modules/` covers a symlinked `node_modules` (`git`
+ * treats a symlink as a file). The entry means "exclude the dependency tree,
+ * whatever shape it takes on disk"; treating the link as a file would hash a
+ * `symlink:<target>` member into the identity that the agent's own tree, where
+ * the dependency install writes a real directory, structurally cannot hold.
+ * `collectSourcePaths` resolves this: it stats a link to classify it and never
+ * follows one to read what is behind it, so the matcher below just receives a
+ * truthful `isDir`.
  */
 
 /**
@@ -73,9 +69,8 @@ export const KICI_DIGEST_DEFAULT_EXCLUSIONS: readonly string[] = [
  *
  * The compiler writes the computed digest INTO `.kici/kici.lock.json`, so a
  * digest covering that file would be an input to itself and no fixed point
- * would exist. This is arithmetic, not policy — there is no configuration under
- * which hashing it could work, so honoring a `.kiciignore` that omits it would
- * only produce a gate that rejects every run.
+ * would exist. No configuration can make hashing it work, so honoring a
+ * `.kiciignore` that omits it would only produce a gate that rejects every run.
  *
  * The lock file's own integrity comes from elsewhere: the orchestrator fetches
  * it at the commit SHA, so provenance vouches for it, never `contentHash`.

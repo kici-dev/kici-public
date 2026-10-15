@@ -1,13 +1,8 @@
-/**
- * Review trigger helper - creates triggers for pull request review events.
- * Returns a frozen ReviewTriggerConfig directly.
- */
-
 import type { BranchPattern, ReviewConfigInput, ReviewTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';
 
 /**
- * Create a pull request review trigger configuration.
+ * Create a frozen pull request review trigger configuration.
  *
  * @example
  * // Match any review event

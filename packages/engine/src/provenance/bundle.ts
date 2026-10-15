@@ -5,7 +5,7 @@
  * for the Fulcio certificate and no transparency log: it carries the DSSE
  * envelope over the in-toto statement, the ephemeral public key that signed it,
  * and the identity JWT that anchors the statement's build context to a
- * KiCI-minted identity (verified offline against the Platform JWKS).
+ * KiCI-minted identity (verified offline against the issuing orchestrator's JWKS).
  *
  * Pure schema + constants, browser-safe — the agent producer and the verifier
  * both import it. Exported at `@kici-dev/engine/provenance/bundle`.
@@ -50,7 +50,7 @@ export const kiciBundleSchema = z.object({
   verificationMaterial: z.object({
     /** JWK of the ephemeral ES256 key that signed the DSSE envelope. */
     publicKey: z.record(z.string(), z.unknown()),
-    /** The KiCI ID token (verified against the Platform JWKS). */
+    /** The KiCI ID token (verified against the issuing orchestrator's JWKS). */
     identityToken: z.string(),
   }),
 });

@@ -1,22 +1,14 @@
 /**
- * Platform attach helpers for the local dev plane. Pure HTTP/URL helpers with no
- * plane side-effects: derive the orchestrator WS relay URL from the CLI's HTTPS
- * API base, mint/revoke an org-scoped orchestrator key via the Platform API
- * using the logged-in personal access token, and probe Platform reachability.
- *
- * The minted key (prefix `kici_ok_`) is what the plane presents on WS auth when
- * it boots hybrid. It is org-scoped and created under the calling user's own
- * `api_keys:write` permission — attach never mints anything the user could not
+ * Platform attach helpers for the local dev plane, with no plane side effects.
+ * The minted `kici_ok_` key is what the plane presents on WS auth when it boots
+ * hybrid. It is org-scoped and created under the user's own `api_keys:write`
+ * permission via their PAT, so attach never mints anything the user could not
  * mint from the dashboard.
  */
 
 import { toErrorMessage } from '@kici-dev/core';
 
-/**
- * Derive the orchestrator WS relay URL from the CLI's HTTPS Platform API base.
- * `https://…` → `wss://…`, `http://…` → `ws://…`, then ensure a single trailing
- * `/ws` path segment (idempotent when the base already ends in `/ws`).
- */
+/** http(s) → ws(s), with exactly one trailing `/ws` segment (idempotent). */
 export function derivePlatformWsUrl(apiBase: string): string {
   let url: URL;
   try {
@@ -28,7 +20,6 @@ export function derivePlatformWsUrl(apiBase: string): string {
   else if (url.protocol === 'http:') url.protocol = 'ws:';
   else throw new Error(`Platform API base must be http(s): ${apiBase}`);
 
-  // Normalize the path to end in exactly one `/ws` segment.
   const trimmed = url.pathname.replace(/\/+$/, '');
   url.pathname = trimmed.endsWith('/ws') ? trimmed : `${trimmed}/ws`;
   url.search = '';
@@ -37,17 +28,13 @@ export function derivePlatformWsUrl(apiBase: string): string {
 }
 
 export interface MintedOrchestratorKey {
-  /** Raw orchestrator key (kici_ok_…) — present once. NEVER log this. */
+  /** Raw key, present once. NEVER log this. */
   key: string;
-  /** Platform api_keys id (for later revoke). */
+  /** Platform api_keys id, for revoke. */
   keyId: string;
   keyPrefix: string;
 }
 
-/**
- * Mint an org-scoped orchestrator key via the Platform HTTP API using the PAT.
- * `POST ${apiBase}/api/v1/orgs/${orgId}/orchestrator-keys`.
- */
 export async function mintOrchestratorKey(args: {
   apiBase: string;
   pat: string;
@@ -89,10 +76,8 @@ export async function mintOrchestratorKey(args: {
 }
 
 /**
- * Best-effort revoke of a previously-minted orchestrator key on detach.
- * `DELETE ${apiBase}/api/v1/orgs/${orgId}/orchestrator-keys/${keyId}`. Never
- * throws — a failed revoke (offline, expired PAT) is non-fatal; the key is
- * org-scoped and the local plane stops presenting it regardless.
+ * Never throws: a failed revoke on detach (offline, expired PAT) is non-fatal,
+ * since the local plane stops presenting the key regardless.
  */
 export async function revokeOrchestratorKey(args: {
   apiBase: string;
@@ -113,9 +98,8 @@ export async function revokeOrchestratorKey(args: {
 }
 
 /**
- * Bounded reachability probe against the Platform API base. Returns true when
- * the base responds (any HTTP status — a reachable Platform, even a 401/404 on
- * `/health`, proves the network path). A timeout / network error is false.
+ * True on any HTTP response, even a 401/404 on `/health`: it proves the
+ * network path. A timeout or network error is false.
  */
 export async function probePlatformReachable(apiBase: string, timeoutMs = 4000): Promise<boolean> {
   const controller = new AbortController();
@@ -123,7 +107,6 @@ export async function probePlatformReachable(apiBase: string, timeoutMs = 4000):
   try {
     const url = `${apiBase.replace(/\/+$/, '')}/health`;
     const res = await fetch(url, { signal: controller.signal });
-    // Any HTTP response (even 4xx) means the Platform is reachable.
     return res.status > 0;
   } catch {
     return false;
@@ -132,7 +115,7 @@ export async function probePlatformReachable(apiBase: string, timeoutMs = 4000):
   }
 }
 
-/** A short, non-sensitive label for the minted key name (the machine host). */
+/** Non-sensitive label for the minted key name. */
 function orgHostLabel(): string {
   return process.env.HOSTNAME || 'kici-local';
 }

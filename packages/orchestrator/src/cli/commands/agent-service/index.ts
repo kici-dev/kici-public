@@ -1,14 +1,8 @@
 /**
- * Agent service command group registration.
- *
- * Adds install, uninstall, start, stop, restart, status, logs, and upgrade
- * subcommands to the existing `agent` command group for managing the agent
- * as a system service.
- *
- * These commands manage local services directly and do NOT use AdminApiClient.
- * They coexist with the existing agent token management commands (register, list, revoke).
- *
- * Must be called AFTER registerAgentCommands() so the `agent` command already exists.
+ * Adds install, uninstall, start, stop, restart, status, logs and upgrade
+ * to the `agent` group beside its token commands (register, list,
+ * revoke). They manage local services directly and do NOT use AdminApiClient.
+ * Must run AFTER registerAgentCommands(), which creates the group.
  */
 
 import type { Command } from 'commander';

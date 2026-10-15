@@ -1,10 +1,8 @@
 /**
- * ScalerManager: central coordinator for all scaler backends.
- *
- * Sits between the orchestrator's Dispatcher and individual scaler backends.
- * Receives "no agent available" signals, routes to the correct backend,
- * enforces global limits, tracks spawning agents to prevent over-provisioning,
- * and manages the agent lifecycle from spawn to destroy.
+ * ScalerManager: coordinator between the Dispatcher and the scaler backends.
+ * Routes "no agent available" signals to a backend, enforces global limits,
+ * tracks spawning agents against over-provisioning, and owns the agent
+ * lifecycle from spawn to destroy.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -71,17 +69,15 @@ import { ScalerFailureTracker } from './failure-tracker.js';
 
 /**
  * How long a graceful shutdown waits for the scaler backends to stop their
- * agents. It is the first window inside the coordinator's 30 s shutdown limit,
- * and every later step (the HTTP stop grace, the database drain) still has to
- * fit after it.
+ * agents: the first window inside the coordinator's 30 s shutdown limit, so the
+ * later steps (HTTP stop grace, database drain) still fit after it.
  *
- * A container stop normally takes at most its own 10 s stop timeout, but the
- * container runtime can take far longer: a Docker daemon that misses a
- * container's exit waits out the stop timeout and then another 10 s for its
- * kill, and one such container held the whole step for 29.7 s. Past this
- * window the orchestrator logs each backend still stopping and continues. The
- * runtime finishes the stop on its own, and the next start's orphan cleanup
- * removes any agent container that is still there.
+ * A container stop normally takes at most its own 10 s stop timeout, but a
+ * Docker daemon that misses a container's exit waits out that timeout plus
+ * another 10 s for its kill; one such container held the step for 29.7 s. Past
+ * this window the orchestrator logs each backend still stopping and continues:
+ * the runtime finishes the stop, and the next start's orphan cleanup removes
+ * any agent container left behind.
  */
 export const SCALER_SHUTDOWN_GRACE_MS = 15_000;
 import type { BackendFailureSummary } from './failure-tracker.js';
@@ -143,11 +139,10 @@ function spawnFailureFields(err: unknown): Record<string, unknown> {
 const SCALER_AGENT_ID_PREFIX = 'scaler-';
 
 /**
- * Raised when a registering agent presents a scaler-minted id that the
- * orchestrator cannot back with a spawn record — either because the lookup
- * could not be completed (`cause` set) or because no record exists at all
- * (`cause` omitted). The WS handler answers it by refusing the registration, so
- * the agent reconnects rather than registering with no `mandatoryLabels` gate.
+ * Raised when a registering agent presents a scaler-minted id with no spawn
+ * record behind it: the lookup failed (`cause` set) or no record exists
+ * (`cause` omitted). The WS handler refuses the registration, so the agent
+ * reconnects rather than registering with no `mandatoryLabels` gate.
  */
 export class ScalerAdoptionLookupError extends Error {
   constructor(
@@ -178,11 +173,10 @@ const DEFAULT_STALE_SPAWN_PRUNE_MS = 300_000;
 const RETIREMENT_SWEEP_INTERVAL_MS = 30_000;
 
 /**
- * Classify a cluster-cap-lock failure for the metric.
- *
- * A wait budget that expired is a healthy database under contention; anything
- * else is a database the cap check could not use at all. Both refuse the
- * spawn, so only the label tells an operator which lever to reach for.
+ * Classify a cluster-cap-lock failure for the metric. An expired wait budget is
+ * a healthy database under contention; anything else is a database the cap
+ * check could not use. Both refuse the spawn, so only the label tells an
+ * operator which lever to reach for.
  */
 function capLockFailureReason(err: unknown): ScalerCapLockFailureReason {
   const code = (err as { code?: unknown } | null | undefined)?.code;
@@ -192,17 +186,14 @@ function capLockFailureReason(err: unknown): ScalerCapLockFailureReason {
 }
 
 /**
- * Counting semaphore that throttles the number of concurrent async operations.
- *
- * Used to bound how many `backend.spawn` provisioning operations (image pull +
+ * Counting semaphore bounding how many `backend.spawn` operations (image pull +
  * container create + start) run at once per backend, so a burst of in-cap jobs
  * cannot storm the container socket / registry.
  *
- * Slots are handed directly to the next waiter on release (rather than bumping a
+ * Release hands the slot directly to the next waiter (rather than bumping a
  * counter the woken task re-decrements), so a task arriving in the microtask gap
- * between a release and a woken waiter cannot jump the queue and transiently
- * exceed the cap. The slot is always released in `run`'s `finally`, so a failed
- * or throwing operation never leaks a slot and wedges the queue.
+ * cannot jump the queue and transiently exceed the cap. `run` releases in
+ * `finally`, so a throwing operation never leaks a slot and wedges the queue.
  */
 export class SpawnSemaphore {
   private available: number;
@@ -217,7 +208,6 @@ export class SpawnSemaphore {
       this.available -= 1;
       return;
     }
-    // No slot free: queue and wait for release() to hand one over directly.
     await new Promise<void>((resolve) => this.waiters.push(resolve));
   }
 
@@ -242,13 +232,7 @@ export class SpawnSemaphore {
 }
 
 /**
- * Resolved per-job resource amounts (cpus + bytes) for both `requests` and
- * `limits`. The scaler manager produces this from the job's declared resources
- * combined with the scaler's `defaults.resources`, applying the request<->limit
- * mirroring rule. Caps aggregate `requests`; backends use `limits`.
- */
-/**
- * Resolve the orchestrator WebSocket URL a scaler-spawned agent should dial.
+ * Resolve the orchestrator WebSocket URL a scaler-spawned agent dials.
  *
  * 1. Per-scaler `orchestratorUrl` (scalers.yaml) wins — required for container
  *    agents (host.docker.internal / LAN IP) and Firecracker VMs (bridge gateway
@@ -269,12 +253,17 @@ export function resolveScalerOrchestratorUrl(
   return `ws://127.0.0.1:${port ?? ORCHESTRATOR_DEFAULT_PORT}/ws`;
 }
 
+/**
+ * Resolved per-job `requests` and `limits` (cpus + bytes): the job's declared
+ * resources over the scaler's `defaults.resources`, with request<->limit
+ * mirroring applied. Caps aggregate `requests`; backends use `limits`.
+ */
 export interface ResolvedResources {
   requests: { cpus: number; memBytes: number };
   limits: { cpus: number; memBytes: number };
 }
 
-/** Per-scaler / per-orchestrator running totals (cpus + bytes). Always reflects sums of `requests`. */
+/** Per-scaler / per-orchestrator running totals of `requests` (cpus + bytes). */
 interface UsageCounter {
   cpus: number;
   memBytes: number;
@@ -285,22 +274,18 @@ interface ReservationEntry {
   scalerName: string;
   requests: { cpus: number; memBytes: number };
   /**
-   * The limits the agent was actually started at — what the kernel enforces on
-   * it, and therefore the other half of the shape a job has to match to be
-   * served by a pre-spawned one. Not persisted, so it is absent on a
-   * reservation `recoverState` rehydrated after a restart;
-   * {@link ScalerManager.agentView}'s shape check treats that as "cannot tell"
+   * The limits the agent was started at — what the kernel enforces, so the
+   * other half of the shape a job must match to use a pre-spawned agent. Not
+   * persisted, so absent on a reservation `recoverState` rehydrated;
+   * {@link ScalerManager.agentView}'s shape check reads that as "cannot tell"
    * on the limits dimension alone rather than refusing.
    */
   limits?: { cpus: number; memBytes: number };
 }
 
 /**
- * Apply the request<->limit mirroring rule: if only one side is set, copy it
- * to the other; if neither is set, return undefined; if both are set, leave them.
- *
- * Returns a fully nested `{ requests, limits }` shape, or undefined if the
- * input doesn't declare anything.
+ * Apply the request<->limit mirroring rule: a lone side is copied to the other,
+ * both sides are kept, and neither side returns undefined.
  */
 function mirrorRequestsLimits(resources: ResourceRequest | undefined): ResourceRequest | undefined {
   if (!resources) return undefined;
@@ -316,18 +301,16 @@ function mirrorRequestsLimits(resources: ResourceRequest | undefined): ResourceR
  * Turn resolved limits into the `effectiveLimits` argument `ScalerBackend.spawn`
  * takes, or `undefined` when neither dimension resolved to anything.
  *
- * A zero means "undeclared", so it is dropped rather than passed on: a backend
- * reads a present-but-zero field as a real limit on that dimension, and only an
- * absent one falls back to its own label-set or default limits.
+ * A zero means "undeclared", so it is dropped: a backend reads a present-but-zero
+ * field as a real limit, and only an absent one falls back to its own label-set
+ * or default limits.
  *
- * Both spawn paths use this. A warm agent's shape is fixed when it starts and
- * nothing reads a job's `resources` afterwards, so a pre-spawn that resolved a
- * shape has to carry it to the backend exactly as a job-bound spawn does —
- * otherwise the manager reserves (and later matches jobs against) a shape the
- * compute was never started at. It matters most on an event backend, whose
- * `scaler.scale-up` payload builds its `resources` hint from this and from
- * nothing else, so an omitted argument leaves the customer's provisioning
- * workflow to pick its own instance size.
+ * Both spawn paths use this. A warm agent's shape is fixed at start, so a
+ * pre-spawn must carry its resolved shape to the backend exactly as a job-bound
+ * spawn does, or the manager reserves (and matches jobs against) a shape the
+ * compute never started at. An event backend's `scaler.scale-up` payload builds
+ * its `resources` hint from this alone, so an omitted argument leaves the
+ * customer's provisioning workflow to pick its own instance size.
  */
 function spawnLimitsFor(limits: { cpus: number; memBytes: number }): EffectiveLimits | undefined {
   if (limits.cpus <= 0 && limits.memBytes <= 0) return undefined;
@@ -365,9 +348,7 @@ export function buildScalerUsageRows(
   return rows;
 }
 
-/**
- * Status summary for metrics and health endpoints.
- */
+/** Status summary for metrics and health endpoints. */
 export interface ScalerStatus {
   globalMaxAgents: number;
   globalActiveCount: number;
@@ -466,9 +447,7 @@ interface PeriodicSweeping {
   startPeriodicOrphanSweep(): void;
 }
 
-/**
- * Internal tracking for agents being spawned but not yet registered.
- */
+/** An agent being spawned but not yet registered. */
 interface SpawningEntry {
   labelSet: string[];
   backendName: string;
@@ -610,25 +589,18 @@ interface ProvisionFailureState {
   /** Epoch ms before which a further spawn request for this scaler is deferred. */
   deferUntilMs: number;
   /**
-   * Agent ids already counted, so two observers of the SAME dead provision
-   * count it once.
-   *
-   * Two independent paths see it: the local stale-spawn prune, which every
-   * coordinator runs over its own spawns, and the leader-gated reaper. On the
-   * leader both fire for one provision, and without this the backoff would
-   * double per failure there and nowhere else.
-   *
-   * Cleared with the rest of the state on a successful registration, and capped
-   * so a multi-day outage cannot grow it without bound.
+   * Agent ids already counted, so two observers of the SAME dead provision count
+   * it once: the local stale-spawn prune (every coordinator, over its own spawns)
+   * and the leader-gated reaper both fire on the leader, which would otherwise
+   * double the backoff there alone. Cleared on a successful registration, and
+   * capped so a multi-day outage cannot grow it without bound.
    */
   countedAgents: Set<string>;
 }
 
 /**
- * Ceiling on {@link ProvisionFailureState.countedAgents}.
- *
- * The set exists only to dedupe two observers of the same provision, which
- * observe within minutes of each other, so anything older is dead weight. A
+ * Ceiling on {@link ProvisionFailureState.countedAgents}. The two observers it
+ * dedupes fire within minutes of each other, so older ids are dead weight; a
  * long outage would otherwise add one id per attempt for as long as it lasts.
  */
 const MAX_COUNTED_FAILED_AGENTS = 64;
@@ -644,16 +616,13 @@ export interface ScalerManagerDeps {
   config: ScalerConfig;
   backends: Array<{ name: string; backend: ScalerBackend }>;
   /**
-   * Read-only view of the agent registry, for the warm pool's deficit
-   * calculation. Structural on purpose — the scaler must not depend on the
-   * agent layer's concrete class.
+   * Read-only agent-registry view for the warm pool's deficit. Structural on
+   * purpose: the scaler must not depend on the agent layer's concrete class.
    *
-   * Both hosts pass one, and a host that skips it does not get an inert warm
-   * pool: the readiness count falls back to 0, so a configured pool never sees
-   * the agents it started and keeps filling until `warmCapacityRemaining`
-   * clamps it at `maxAgents` — starving the job-bound spawns that share the
-   * cap. Optional only because the unit tests drive the spawn path without a
-   * registry.
+   * Both hosts pass one. Without it the readiness count falls back to 0, so a
+   * configured pool never sees its own agents and fills until
+   * `warmCapacityRemaining` clamps it at `maxAgents`, starving the job-bound
+   * spawns that share the cap. Optional only for unit tests.
    */
   agentRegistry?: {
     findAvailable(
@@ -674,10 +643,7 @@ export interface ScalerManagerDeps {
   instanceId: string;
   /** Callback for relaying scaler events with runId/jobId context. */
   onScalerEvent?: (runId: string, jobId: string, event: ScalerEvent) => void;
-  /**
-   * Optional DB-backed state store. Tests omit it; production wires it
-   * up via the orchestrator-core bootstrap.
-   */
+  /** DB-backed state store, wired by the orchestrator-core bootstrap; tests omit it. */
   stateStore?: ScalerStateStore;
   /**
    * Late-bound reserved-event emitter, resolved per call because the event
@@ -692,10 +658,9 @@ export interface ScalerManagerDeps {
    */
   claimStore?: ClaimStore;
   /**
-   * Optional machine-ledger options. When `machinePools` are configured,
-   * the manager initializes a `MachineLedger` keyed off this directory and
-   * the orchestrator's instance id; reservations sum across orchestrators
-   * on the same host.
+   * Machine-ledger options. With `machinePools` configured, the manager builds a
+   * `MachineLedger` keyed off this directory and the instance id; reservations
+   * sum across orchestrators on the same host.
    */
   machineLedger?: {
     /** Override the on-disk ledger directory. Falls back to `KICI_MACHINE_LEDGER_DIR`. */
@@ -713,11 +678,10 @@ export interface ScalerManagerDeps {
    */
   spawnTimeoutMs: number;
   /**
-   * Optional per-org resolver for the spawn deadline: given the job's org
-   * (jobConfig.cacheOrgId, undefined for warm-pool spawns), returns the
-   * effective timeout, falling back to the cluster default internally. Wired
-   * in orchestrator-core (has DB); omitted by the worker + unit tests → the
-   * cluster default spawnTimeoutMs is used.
+   * Per-org spawn-deadline resolver, keyed by the job's org
+   * (jobConfig.cacheOrgId, undefined for warm-pool spawns); falls back to the
+   * cluster default internally. Wired in orchestrator-core (has DB); the worker
+   * and unit tests omit it and use spawnTimeoutMs.
    */
   resolveSpawnTimeoutMs?: (orgId: string | undefined) => Promise<number>;
   /**
@@ -737,15 +701,15 @@ export interface ScalerManagerDeps {
    */
   readJobStatuses?: (jobs: readonly BoundJobRef[]) => Promise<ReadonlyMap<string, string>>;
   /**
-   * Constructs a backend for a scaler added by a config reload. Supplied by
-   * both hosts from the shared backend factory, so a reload can only build
-   * what startup already exercises. When omitted (unit tests), a reload that
-   * adds a scaler is rejected rather than silently ignored.
+   * Builds a backend for a scaler a config reload adds. Both hosts supply it
+   * from the shared backend factory, so a reload builds only what startup
+   * exercises. When omitted (unit tests), a reload that adds a scaler is
+   * rejected rather than silently ignored.
    *
-   * `config` is the config being reloaded, not the boot-time one. The factory
-   * reads `defaults.resources` and the whole `firecracker` network block off
-   * it, so an added scaler built from a stale config would allocate IPs from
-   * the old CIDR and attach TAPs to the old bridge — silently unreachable.
+   * `config` is the reloaded config, not the boot-time one: the factory reads
+   * `defaults.resources` and the `firecracker` network block off it, and a
+   * stale one would allocate IPs from the old CIDR and attach TAPs to the old
+   * bridge, silently unreachable.
    */
   createBackend?: (entry: ScalerEntry, config: ScalerConfig) => Promise<ScalerBackend | null>;
 }
@@ -768,17 +732,16 @@ export class ScalerManager {
   private readonly failureTracker = new ScalerFailureTracker();
   /**
    * Consecutive provisioning failures per scaler NAME, and the deferral they
-   * earned: an event scaler's external provision that never registered an
-   * agent, or a local launch that produced no agent (refused outright, or the
-   * agent stopped before it registered).
+   * earned: an event provision that never registered an agent, or a local
+   * launch that produced none (refused, or the agent stopped before
+   * registering).
    *
-   * Keyed by name rather than by backend type so one failing scaler never
-   * defers spawns for an unrelated one — two event scalers routinely drive two
-   * different providers, and an outage at one says nothing about the other.
+   * Keyed by name, not backend type, so one failing scaler never defers an
+   * unrelated one: two event scalers often drive two different providers.
    *
-   * In-memory and leader-local, like `ScalerFailureTracker`: the state resets on
-   * restart, which is the conservative direction (a fresh coordinator retries
-   * once immediately rather than inheriting a deferral it never observed).
+   * In-memory and leader-local, like `ScalerFailureTracker`: a restart resets
+   * it, the conservative direction (a fresh coordinator retries once at once
+   * rather than inheriting a deferral it never observed).
    */
   private readonly provisionFailures = new Map<string, ProvisionFailureState>();
   private readonly resolveProvisionBackoff: () => Promise<ProvisionBackoffSettings>;
@@ -851,78 +814,53 @@ export class ScalerManager {
    */
   private readonly scalerProvisioningTargets = new Map<string, string[] | undefined>();
 
-  /**
-   * Tracks agents being spawned but not yet registered via WS.
-   * Keyed by pre-generated agentId.
-   */
+  /** Agents spawned but not yet registered via WS, keyed by pre-generated agentId. */
   private readonly spawningAgents = new Map<string, SpawningEntry>();
 
-  /**
-   * Maps registered agentId to backendName for lifecycle events.
-   */
+  /** Registered agentId → backendName, for lifecycle events. */
   private readonly managedAgentIndex = new Map<string, string>();
 
   /**
-   * Agents this instance pre-spawned to wait for work, rather than for a
-   * specific queued job. The agent registry tracks readiness (`activeJobs`,
-   * `registeredAt`) and has never tracked provenance — it cannot derive this,
-   * and the spawning entry that carries it is deleted at registration.
-   *
-   * This is not a second copy of the pool's readiness. It is provenance, which
-   * nothing else knows, and only the reaper reads it: it may destroy an agent
-   * the pool itself created, never one that registered for a bound job whose
-   * dispatch has not yet arrived.
+   * Agents this instance pre-spawned to wait for work rather than for a queued
+   * job. This is provenance, not readiness: the agent registry cannot derive it,
+   * and the spawning entry that carries it is deleted at registration. Only the
+   * reaper reads it, so it destroys agents the pool created, never one that
+   * registered for a bound job whose dispatch has not arrived.
    */
   private readonly warmAgents = new Set<string>();
 
   /**
-   * Registered agents this instance started for a specific queued job, keyed
-   * by agent id. The spawning entry that carries the binding is deleted at
-   * registration, so this is where {@link agentView} reads it: the agent always
-   * runs its own job, and an agent started inside a job's image runs nothing
-   * else.
+   * Registered agents this instance started for a queued job, keyed by agent
+   * id. The spawning entry is deleted at registration, so {@link agentView}
+   * reads the binding here: the agent always runs its own job, and one started
+   * inside a job's image runs nothing else.
    */
   private readonly boundAgents = new Map<string, AgentBinding>();
   /** Jobs a `requestScale` call is provisioning right now, before its spawning entry exists. */
   private readonly jobsBeingProvisioned = new Set<string>();
 
   /**
-   * Warm agents whose destroy is issued but has not settled yet.
-   *
-   * An agent leaves `warmAgents` only once its destroy resolves, so until then
-   * `listIdle` keeps returning it and the next reap pass — 30 seconds later,
-   * or a reload that lowers the target — selects the very same agent again. A
-   * backend whose teardown outlives a tick would be handed a second destroy for
-   * an agent it is already destroying, and every extra pass would count another
-   * `kici_orch_scaler_warm_pool_reaped_total`. One entry per agent, cleared
-   * when the destroy settles either way.
+   * Warm agents whose destroy is issued but not settled. Until it resolves the
+   * agent stays in `warmAgents` and `listIdle`, so the next reap pass (30 s
+   * later, or a reload lowering the target) would hand the backend a second
+   * destroy and count another `kici_orch_scaler_warm_pool_reaped_total`.
+   * Cleared when the destroy settles either way.
    */
   private readonly warmDestroying = new Set<string>();
 
   /** Agents this instance adopted from another instance's spawn record. */
   private readonly adoptedAgents = new Map<string, AdoptedSpec>();
 
-  /**
-   * Active log forwarders for scaler-managed agents (container/bare-metal).
-   * Keyed by agentId. Each forwarder consumes a LogCapture stream.
-   */
+  /** Log forwarders for scaler-managed agents (container/bare-metal), keyed by agentId. */
   private readonly logForwarders = new Map<string, AgentLogForwarder>();
 
-  /**
-   * Correlation map: agentId -> { runId, jobId }.
-   * Populated by correlateAgentToJob() after job dispatch to a scaler-managed agent.
-   */
+  /** agentId → { runId, jobId }, set by correlateAgentToJob() after dispatch. */
   private readonly agentJobCorrelation = new Map<string, { runId: string; jobId: string }>();
 
-  /**
-   * Buffer for scaler events emitted before job correlation is established.
-   * Keyed by agentId. Flushed when correlateAgentToJob() is called.
-   */
+  /** Events emitted before job correlation, by agentId; flushed by correlateAgentToJob(). */
   private readonly eventBuffer = new Map<string, ScalerEvent[]>();
 
-  /**
-   * External callback for relaying correlated scaler events (e.g. to execution tracker).
-   */
+  /** Relays correlated scaler events (e.g. to the execution tracker). */
   private readonly onScalerEvent?: (runId: string, jobId: string, event: ScalerEvent) => void;
 
   /** Coordinator drain predicate; when true, requestScale() no-ops (no fresh
@@ -930,13 +868,11 @@ export class ScalerManager {
   private readonly isDraining: () => boolean;
 
   /**
-   * Optional callback fired (debounced) whenever scaler capacity frees — an
-   * ephemeral agent released its reservation on disconnect, a spawn failed, or a
-   * managed agent completed its job. Wired by the composition roots to the
-   * dispatcher's capacity-freed re-drive so jobs that got an `at-capacity`
-   * verdict get re-offered to the scaler the moment a slot opens, instead of
-   * sitting pending until they time out. Assigned after construction because it
-   * references the dispatcher, which is built after the manager.
+   * Fired (debounced) when scaler capacity frees: a reservation released on
+   * disconnect, a failed spawn, or a managed agent finishing its job. Wired to
+   * the dispatcher's capacity-freed re-drive, so `at-capacity` jobs are
+   * re-offered the moment a slot opens instead of pending until timeout.
+   * Assigned after construction: the dispatcher is built after the manager.
    */
   onCapacityFreed?: () => void;
 
@@ -955,11 +891,10 @@ export class ScalerManager {
   private readonly warmPoolCallbacks: WarmPoolCallbacks;
 
   /**
-   * Optional DB-backed state store. When wired (production path), every
-   * mutation to `spawningAgents` / `agentJobCorrelation` / `reservations`
-   * is write-through-cached to Postgres so a coord crash mid-spawn no
-   * longer orphans agents, strands reservations, or loses correlation.
-   * Unit tests can omit the store and operate from in-memory Maps only.
+   * DB-backed state store. When wired (production), every mutation to
+   * `spawningAgents` / `agentJobCorrelation` / `reservations` writes through
+   * to Postgres, so a coordinator crash mid-spawn does not orphan agents,
+   * strand reservations or lose correlation. Unit tests omit it.
    */
   private readonly stateStore?: ScalerStateStore;
 
@@ -1001,7 +936,6 @@ export class ScalerManager {
     this.agentRegistry = deps.agentRegistry;
     this.machineLedgerOptions = deps.machineLedger;
 
-    // Initialize the file-backed cross-process ledger when any pools are configured.
     if (deps.config.machinePools && deps.config.machinePools.length > 0) {
       if (!deps.machineLedger?.instanceId) {
         throw new Error(
@@ -1020,7 +954,6 @@ export class ScalerManager {
       this.machineLedger = null;
     }
 
-    // Index per-scaler orchestratorUrl overrides and roles
     for (const entry of deps.config.scalers) {
       this.appliedEntries.set(entry.name, stableJson(entry));
       this.scalerUrls.set(entry.name, entry.orchestratorUrl);
@@ -1035,12 +968,10 @@ export class ScalerManager {
       this.scalerPlatform.set(entry.name, entry.platform);
     }
 
-    // Index backends by name
     for (const { name, backend } of deps.backends) {
       this.backends.set(name, backend);
     }
 
-    // Initialize warm pool with callbacks
     this.warmPoolCallbacks = {
       onSpawnRequest: (labelSet: string[], backendName: string) =>
         this.spawnWarmAgent(labelSet, backendName),
@@ -1048,25 +979,21 @@ export class ScalerManager {
         const backend = this.backends.get(backendName);
         if (!backend) return;
 
-        // The agent stays in `warmAgents` — and therefore in `listIdle` — until
-        // this destroy settles, so a teardown slower than one 30s tick is asked
-        // for again on the next pass. Dropping the repeat keeps a backend from
-        // being handed a second destroy for an agent it is already destroying,
-        // and keeps the reaped counter at one per agent instead of one per tick.
+        // The agent stays in `listIdle` until this destroy settles, so a teardown
+        // slower than one 30s tick is asked for again; drop the repeat (see
+        // `warmDestroying`).
         if (this.warmDestroying.has(managedId)) return;
         this.warmDestroying.add(managedId);
 
-        // Condemn the agent BEFORE the destroy is issued. The registry entry
-        // survives until the agent's WebSocket actually closes, so throughout a
-        // container `stop({ t: 5 })` or a Firecracker `SendCtrlAltDel` plus its
-        // grace, `findAvailable` kept returning it — a webhook arriving in that
-        // window was dispatched onto an agent already exiting, and the job
-        // failed as a spurious infrastructure error on a healthy system.
+        // Condemn the agent BEFORE the destroy. The registry entry survives until
+        // the WebSocket closes, so through a container `stop({ t: 5 })` or a
+        // Firecracker `SendCtrlAltDel` plus grace, `findAvailable` would return
+        // it and a webhook in that window would land on an exiting agent as a
+        // spurious infrastructure error.
         //
         // The returned count closes the other direction: `listIdle` read
-        // `activeJobs` a tick earlier, and a job may have been claimed since.
-        // Re-reading it under the mark is what makes the check-then-destroy
-        // sequence safe — no job can be claimed after the mark.
+        // `activeJobs` a tick earlier. Re-reading it under the mark makes
+        // check-then-destroy safe, since no job can be claimed after the mark.
         const activeAtMark = this.agentRegistry?.markDraining(managedId);
         if (activeAtMark !== undefined && activeAtMark > 0) {
           logger.info(
@@ -1081,12 +1008,10 @@ export class ScalerManager {
         incWarmPoolReaped(backendName);
         try {
           await backend.destroy(managedId);
-          // Same rule as the disconnect path: the durable row goes only once
-          // the teardown resolved. A warm-pool spawn persists a row, and an
-          // event row survives both spawn and registration, so without this
-          // every idle-reaped agent would leave a permanent row behind — one
-          // that `recoverState` rehydrates on each restart and the stale-spawn
-          // prune deliberately spares. A rejected destroy keeps the row.
+          // As on the disconnect path, the durable row goes only once the
+          // teardown resolved; otherwise every idle-reaped agent leaves a row
+          // `recoverState` rehydrates on each restart and the stale-spawn prune
+          // spares. A rejected destroy keeps the row.
           this.deleteSpawningAgentFromStore(managedId);
         } catch (err) {
           logger.error(`Warm pool destroy failed for ${managedId}: ${err}`);
@@ -1094,25 +1019,18 @@ export class ScalerManager {
           this.managedAgentIndex.delete(managedId);
           this.warmAgents.delete(managedId);
           this.warmDestroying.delete(managedId);
-          // A rejected destroy leaves the agent alive, so it must become
-          // dispatchable again. On a successful destroy the entry is gone with
-          // the WebSocket and this is a no-op.
+          // A rejected destroy leaves the agent alive and dispatchable again; on
+          // success the entry is gone with the WebSocket and this is a no-op.
           this.agentRegistry?.clearDraining(managedId);
-          // The idle reaper is the one teardown that never goes through
-          // `onAgentDisconnected`, so this is where a reaped warm agent's
-          // reservation is freed. `releaseAll` is idempotent, so a disconnect
-          // arriving afterwards is a no-op.
+          // The idle reaper never goes through `onAgentDisconnected`, so a reaped
+          // warm agent's reservation is freed here; `releaseAll` is idempotent.
           //
-          // In the `finally`, so a REJECTED destroy releases too. The three
-          // lines above already forget the agent unconditionally, and a
-          // reservation for an agent nothing tracks any more can never be
-          // released by any later path — it would hold cpu and memory against
-          // `resourceCap`, `globalResourceCap` and the pool ledger for the
-          // lifetime of the process. That is the permanent cap leak
-          // `pruneStaleSpawningEntries` describes, and it is strictly worse
-          // than briefly over-reporting headroom while a teardown is retried.
-          // The durable row is the half that deliberately survives a rejected
-          // destroy, because the reaper retries the teardown from it.
+          // In the `finally`, so a REJECTED destroy releases too: the agent is
+          // already forgotten above, and a reservation nothing tracks would hold
+          // cpu and memory against `resourceCap`, `globalResourceCap` and the
+          // pool ledger for the process lifetime (the permanent cap leak
+          // `pruneStaleSpawningEntries` describes). The durable row survives a
+          // rejected destroy, because the reaper retries the teardown from it.
           this.releaseAll(managedId);
         }
       },
@@ -1137,16 +1055,14 @@ export class ScalerManager {
     };
     this.warmPool = new WarmPoolManager(this.warmPoolCallbacks);
 
-    // Configure warm pools from scaler config
     for (const entry of deps.config.scalers) {
       if (!entry.warmPool?.enabled) continue;
       for (const ls of entry.labelSets) {
-        // The readiness query has to carry the pool's taints, because the gate
-        // it applies demands them — see `warmPoolLabelSetFillable`. The spawn
-        // request does NOT: a backend resolves its image/binary by matching the
-        // requested set against its own `labelSets` and rejects anything else,
-        // so it only ever hears the declared set. The type comes from the config
-        // entry rather than a backend lookup, for symmetry with the reload path.
+        // The readiness query carries the pool's taints, because its gate
+        // demands them (see `warmPoolLabelSetFillable`). The spawn request does
+        // NOT: a backend matches the requested set against its own `labelSets`
+        // and rejects anything else. The type comes from the config entry, not a
+        // backend lookup, for symmetry with the reload path.
         const queryLabels = this.warmPoolQueryLabels(entry.name, entry.type, ls.labels);
         if (!this.warmPoolLabelSetFillable(entry.name, ls.labels, queryLabels)) continue;
         if (!this.warmPoolShapeDeclared(entry.name, ls.labels, ls.resources)) continue;
@@ -1162,19 +1078,14 @@ export class ScalerManager {
   }
 
   /**
-   * Pre-spawn one warm agent for a pool's label set.
+   * Pre-spawn one warm agent for a pool's label set: `requestScale` with no
+   * job term (no bound job, no run, resources from the label set then the
+   * scaler defaults). It reserves through the same {@link reserveForSpawn}: a
+   * warm agent occupies the same cpu and memory, and on an event backend claims
+   * a cluster slot, so a pool cannot carry a scaler past `maxAgents` fleet-wide.
    *
-   * The pool's counterpart of `requestScale`, with the job term of every
-   * resolution absent: no bound job, no run, and resources resolved
-   * from the label set (then the scaler defaults) alone. It takes the same
-   * reservations through the same {@link reserveForSpawn} helper — a warm
-   * agent occupies the same cpu and memory as a job-bound one, and on an event
-   * backend it claims a cluster slot too, so a pool can no longer carry a
-   * scaler past `maxAgents` fleet-wide.
-   *
-   * A refused reservation is reported back to the pool as a failed spawn, so
-   * the in-flight slot it holds is released and the deficit is retried on the
-   * next tick rather than the pool stalling below target.
+   * A refused reservation reports a failed spawn to the pool, releasing its
+   * in-flight slot so the deficit retries next tick instead of stalling.
    */
   private async spawnWarmAgent(labelSet: string[], backendName: string): Promise<void> {
     const backend = this.backends.get(backendName);
@@ -1207,9 +1118,8 @@ export class ScalerManager {
       return;
     }
 
-    // Counted once the spawn is admitted, not once it is asked for: a pool
-    // held at a cap re-asks on every tick, and counting the refusals would
-    // make the spawn counter climb without a single agent starting.
+    // Counted on admission, not request: a pool held at a cap re-asks every
+    // tick, and counting refusals would climb with no agent starting.
     incWarmPoolSpawns(backendName);
     this.spawningAgents.set(agentId, {
       labelSet,
@@ -1223,29 +1133,24 @@ export class ScalerManager {
 
     try {
       const onEvent = this.createEventEmitter(agentId);
-      // Warm-pool spawns hit the same backend socket as on-demand spawns, so
-      // they go through the same per-backend throttle — a cold pool fill must
-      // not storm the socket either.
+      // Same per-backend throttle as on-demand spawns: a cold pool fill must
+      // not storm the backend socket either.
       await this.spawnSemaphoreFor(backendName).run(() => {
         const entry = this.spawningAgents.get(agentId);
         if (entry) entry.spawnStartedAt = Date.now();
-        // Warm-pool replenishment has no bound job/org, so the cluster
-        // default spawn deadline applies (orgId undefined).
+        // No bound job/org, so the cluster default spawn deadline applies.
         return this.runSpawnWithTimeout(undefined, (signal) =>
           backend.spawn(
             labelSet,
             agentId,
             this.getOrchestratorUrl(backendName),
             onEvent,
-            // The same resolved limits a job-bound spawn of this label set
-            // would carry. A warm agent's shape is fixed when it starts, and
-            // it is the shape this pre-spawn just reserved and that
-            // the shape check matches jobs against — so the compute
-            // has to be started at it.
+            // The limits a job-bound spawn of this label set would carry: the
+            // shape just reserved and that the shape check matches jobs
+            // against, fixed when the agent starts.
             spawnLimitsFor(effective.limits),
-            // Unbound spawn, so no job/run identity — but the pool's taints
-            // still have to reach the agent, or the readiness query that
-            // drives this very pool can never count what it just spawned. The
+            // No job/run identity, but the pool's taints must reach the agent,
+            // or the pool's readiness query never counts what it spawned. The
             // gate is the one `persistSpawningAgent` records for this set.
             {
               platformTaints: this.platformTaintsFor(backendName, backend.type),
@@ -1255,14 +1160,13 @@ export class ScalerManager {
           ),
         );
       });
-      // The spawning entry and its durable row both survive a successful
-      // spawn, exactly as on the job-bound path: `spawn()` resolves when
-      // the compute starts, well before the agent registers, and the entry
-      // is what `onAgentRegistered` correlates against. Deleting it here
-      // made a warm agent arrive looking static — never marked
-      // scaler-managed, never gated by the pool's mandatory labels, and
-      // never torn down on disconnect. `pruneStaleSpawningEntries` reaps
-      // the entry if the agent never shows up.
+      // The spawning entry and durable row survive a successful spawn, as on
+      // the job-bound path: `spawn()` resolves when the compute starts, before
+      // the agent registers, and `onAgentRegistered` correlates against the
+      // entry. Without it a warm agent registers looking static: not
+      // scaler-managed, not gated by the pool's mandatory labels, not torn down
+      // on disconnect. `pruneStaleSpawningEntries` reaps an entry whose agent
+      // never shows up.
       if (this.onSpawnSettled(agentId, backend)) this.startLogForwarding(backend, agentId);
     } catch (err) {
       this.spawningAgents.delete(agentId);
@@ -1280,23 +1184,19 @@ export class ScalerManager {
   /**
    * Whether a warm pool for this label set can count its own agents.
    *
-   * The pool measures readiness with `AgentRegistry.findAvailable(labels)`, and
-   * that query applies the agent's `mandatoryLabels` gate: an agent is dropped
-   * unless every label in its gate also appears in the query. A scaler-spawned
-   * agent's gate is `mandatoryGate()`, which unions the configured gate with
-   * the pool's platform taints. `warmPoolQueryLabels` puts the structured
-   * taints into the query, so that part of the gate is satisfied by
-   * construction.
+   * Readiness is `AgentRegistry.findAvailable(labels)`, which drops an agent
+   * unless its whole `mandatoryLabels` gate appears in the query. The gate is
+   * `mandatoryGate()` (configured gate ∪ platform taints), and
+   * `warmPoolQueryLabels` puts the taints into the query by construction.
    *
-   * That leaves one residual case: a configured `mandatoryLabels` entry absent
-   * from the label set, which `scaler/config.ts` validation already rejects.
-   * The check stays as the fail-safe — without it a pool in that state would
-   * spawn to `maxAgents` with `ready` stuck at 0, starving the on-demand spawns
-   * that share the cap. A refused pool is inert, exactly as it is before it
-   * fills at all — never partially filled.
+   * The residual case is a configured `mandatoryLabels` entry absent from the
+   * label set, which `scaler/config.ts` validation already rejects. This check
+   * is the fail-safe: such a pool would spawn to `maxAgents` with `ready` stuck
+   * at 0, starving the on-demand spawns sharing the cap. A refused pool is
+   * inert, never partially filled.
    *
-   * The gate is compared against `queryLabels`: comparing it against
-   * `declaredLabels` alone would refuse every structurally-tainted pool.
+   * The gate is compared against `queryLabels`: against `declaredLabels` alone
+   * it would refuse every structurally-tainted pool.
    */
   private warmPoolLabelSetFillable(
     scalerName: string,
@@ -1320,9 +1220,7 @@ export class ScalerManager {
     return false;
   }
 
-  /**
-   * Whether this scaler pre-spawned (warm-filled) the agent.
-   */
+  /** Whether this scaler pre-spawned (warm-filled) the agent. */
   isPrespawnedAgent(agentId: string): boolean {
     return this.warmAgents.has(agentId);
   }
@@ -1390,68 +1288,47 @@ export class ScalerManager {
   /**
    * Whether a pre-spawned (warm) agent's shape fits the shape a job declares.
    *
-   * A warm agent is generic by construction: it was started before the job
-   * existed, at the pool's declared shape. The shape is applied when the agent
-   * starts and cannot be changed afterwards — nothing in the agent reads a
-   * job's `resources`. So a job that needs another shape must get its own
-   * agent instead of silently running with the pool's.
+   * A warm agent starts before the job exists, at the pool's declared shape,
+   * and nothing in the agent reads a job's `resources` afterwards. So a job
+   * needing another shape gets its own agent instead of silently running with
+   * the pool's. True for any agent this scaler did not pre-spawn: a job-bound
+   * agent started at its job's shape.
    *
-   * Returns true for any agent this scaler did not pre-spawn: a job-bound agent
-   * was started at its job's shape.
+   * Only fields the job declares are compared: `resolveEffective` layers the
+   * job over the label set and scaler defaults field by field, so an omitted
+   * field already matches the warm agent's reservation.
    *
-   * Only the fields the job actually declares are compared. `resolveEffective`
-   * layers a job's declaration over the label set and the scaler defaults field
-   * by field, and the warm agent's own reservation is what those two layers
-   * resolve to — so a field the job leaves out already matches whatever the
-   * agent was started at, and comparing it would refuse a job that fits.
+   * A declared field must match exactly. A bigger agent is not a superset:
+   * limits are kernel-enforced, so a job capped at 2 cpus on an agent started
+   * at 4 runs uncapped, so `>=` is not a safe relaxation.
    *
-   * A field the job DOES declare must match exactly, in both directions. A
-   * bigger ready agent is not a superset: limits are what the kernel enforces
-   * on the running agent, so a job asking to be capped at 2 cpus, served by an
-   * agent started at 4, runs uncapped. That is the same wrong execution
-   * environment as the under-provisioned case, in the other direction, so `>=`
-   * is not a safe relaxation.
-   *
-   * Both sides of the shape are compared, not just `requests`. The two answer
-   * different questions — `requests` is what the agent bills against the caps,
-   * `limits` is what the kernel enforces — and a declaration may legally set
-   * them apart, so a job matched on `requests` alone can still land on an agent
-   * capped somewhere else entirely.
+   * Both `requests` (billed against the caps) and `limits` (kernel-enforced)
+   * are compared: a declaration may set them apart, so matching `requests`
+   * alone can land a job on an agent capped elsewhere.
    */
   private prespawnedShapeFits(agentId: string, resources: ResourceRequest | undefined): boolean {
     if (!this.isPrespawnedAgent(agentId)) return true;
 
-    // A job that declares nothing takes the pool's shape by definition.
     const wanted = mirrorRequestsLimits(resources);
     if (!wanted) return true;
 
-    // A deliberate fail-open branch: no reservation means this cannot be told,
-    // and blocking dispatch on missing information strands jobs — while
-    // admitting on it only reproduces the behaviour that predates this
-    // predicate.
+    // Deliberate fail-open: with no reservation this cannot be told, and
+    // blocking dispatch on missing information strands jobs.
     const reservation = this.reservations.get(agentId);
     if (!reservation) return true;
 
-    // BOTH sides, because they are two different questions and a declaration
-    // may set them apart (`requests <= limits` is all the schema enforces).
-    // `requests` is what the agent bills against the caps; `limits` is what the
-    // kernel enforces on it — so a job matched on requests alone can still be
-    // admitted onto an agent capped somewhere else entirely, which is the
-    // "silently runs with the pool's" defect on the other dimension.
+    // BOTH sides: the schema enforces only `requests <= limits`, so they can
+    // differ (see the JSDoc).
     if (!this.shapeSideMatches(wanted.requests, reservation.requests)) return false;
-    // `limits` is in-memory only, so a reservation rehydrated after a restart
-    // has none. Same fail-open reading as a missing reservation, narrowed to
-    // this one dimension.
+    // A reservation rehydrated after a restart has no in-memory `limits`:
+    // fail open on this dimension alone.
     return this.shapeSideMatches(wanted.limits, reservation.limits);
   }
 
   /**
    * Whether one side (`requests` or `limits`) of a job's declared shape leaves
-   * the agent's resolved side unchanged.
-   *
-   * True when the job declares nothing on this side, and true when `resolved`
-   * is absent — both mean "this cannot be told", and the predicate's rule is to
-   * fail open rather than strand a job.
+   * the agent's resolved side unchanged. Fails open (true) when the job declares
+   * nothing on this side or `resolved` is absent, rather than strand a job.
    */
   private shapeSideMatches(
     declared: ResourceSpec | undefined,
@@ -1460,10 +1337,9 @@ export class ScalerManager {
     if (!declared || !resolved) return true;
     if (declared.cpus !== undefined && declared.cpus !== resolved.cpus) return false;
     if (declared.memory === undefined) return true;
-    // A memory string this cannot parse is the same "cannot tell", and it must
-    // stay one: this runs on the ordinary dispatch path, so throwing here would
-    // fail a dispatch that a malformed declaration only ever failed at spawn
-    // time.
+    // An unparseable memory string is also "cannot tell": this runs on the
+    // dispatch path, and throwing would fail a dispatch that a malformed
+    // declaration otherwise fails only at spawn time.
     let memBytes: number;
     try {
       memBytes = parseMemoryString(declared.memory);
@@ -1476,27 +1352,18 @@ export class ScalerManager {
   /**
    * Whether a warm pool for this label set has a declared agent shape.
    *
-   * A warm agent starts before any job exists, so its cpu and memory come from
-   * the label set (or the scaler defaults) and from nowhere else. Both are
-   * applied when the agent starts and cannot be changed afterwards, so an
-   * undeclared shape means the pool reserves a guess and no job can be tested
-   * for fit against it. Refusing is the fail-safe reading, and it is what makes
-   * a pool predictable — on a cloud backend it is what lets an operator reason
-   * about instance size and cost at all.
+   * A warm agent's cpu and memory come only from the label set (or the scaler
+   * defaults) and are fixed at start, so an undeclared shape reserves a guess
+   * no job can be tested against. Refusing is the fail-safe, and on a cloud
+   * backend it is what lets an operator reason about instance size and cost.
+   * Limits alone count: `resolveEffective` mirrors limits into requests. A
+   * refused pool is inert, never partially filled.
    *
-   * Limits alone count as a declaration: `resolveEffective` mirrors limits into
-   * requests, so a label set naming only `limits` still resolves to a concrete
-   * shape.
-   *
-   * A refused pool is inert, exactly as it was before it filled at all — never
-   * partially filled.
-   *
-   * A declaration this cannot resolve is refused the same way, and must never
-   * throw: the config schema types `resources.*.memory` as a plain string, so
-   * an unparseable value such as `4Gi` reaches `resolveEffective` and
-   * `parseMemoryString` rejects it. This runs inside the constructor and inside
-   * the commit block of {@link reload}, where an exception would abort
-   * orchestrator startup or leave a half-applied config behind.
+   * An unresolvable declaration is refused the same way and must never throw:
+   * the schema types `resources.*.memory` as a plain string, so a value such as
+   * `4Gi` reaches `parseMemoryString` and is rejected. This runs in the
+   * constructor and in {@link reload}'s commit block, where an exception would
+   * abort startup or leave a half-applied config.
    */
   private warmPoolShapeDeclared(
     scalerName: string,
@@ -1533,24 +1400,18 @@ export class ScalerManager {
    * Agents this backend may still start before it reaches the scaler's
    * `maxAgents` or the orchestrator's `globalMaxAgents`, whichever binds first.
    *
-   * The warm pool clamps its deficit to this, so a pool that has reached a
-   * count cap asks for nothing at all rather than `size` spawns on every tick.
-   * Only the count caps are visible here: a pool with count headroom but no
-   * cpu/memory headroom still asks, and {@link reserveForSpawn} refuses each
-   * request under the reservation lock. Those refusals cost a log line and a
-   * `spawn_refusals` increment per tick, never a spawned agent.
+   * The warm pool clamps its deficit to this, so a pool at a count cap asks for
+   * nothing rather than `size` spawns every tick. Cpu/memory caps are not seen
+   * here: {@link reserveForSpawn} refuses those under the reservation lock, at
+   * the cost of a log line and a `spawn_refusals` increment per tick.
    *
-   * It is a best-effort read, not a reservation: the authority is
-   * {@link reserveForSpawn}, which every warm pre-spawn goes through and which
-   * re-checks both count caps under the reservation lock. The two backend
-   * families read differently here. A local backend (container, bare-metal,
-   * Firecracker) pins its compute to this host, so `getActiveCount()` is the
-   * whole population and the room it reports is exact. An **event** backend is
-   * capped cluster-wide — the reserve sequence claims a spawn row under
-   * `withScalerCapLock` — while `getActiveCount()` sees only the provisions
-   * this coordinator tracks, so the room reported here counts slots a peer may
-   * already hold. The cluster-wide cap is still enforced, by that claim rather
-   * than by this clamp.
+   * A best-effort read, not a reservation: {@link reserveForSpawn} re-checks both
+   * count caps under the lock. For a local backend (container, bare-metal,
+   * Firecracker) `getActiveCount()` is the whole population, so the room is
+   * exact. An **event** backend is capped cluster-wide (a spawn row claimed
+   * under `withScalerCapLock`) while `getActiveCount()` sees only this
+   * coordinator's provisions, so the room here may count slots a peer holds;
+   * the claim, not this clamp, enforces the cluster-wide cap.
    */
   private warmCapacityRemaining(backendName: string): number {
     const backend = this.backends.get(backendName);
@@ -1561,10 +1422,8 @@ export class ScalerManager {
   }
 
   /**
-   * Publish the warm-pool gauges from the pool's current fill state.
-   *
-   * Called after each pool tick and after a config reload, so an operator sees
-   * a newly configured target immediately rather than at the next tick.
+   * Publish the warm-pool gauges. Called after each pool tick and after a
+   * reload, so a newly configured target shows immediately.
    */
   private publishWarmPoolGauges(): void {
     setWarmPoolGauges(
@@ -1572,10 +1431,8 @@ export class ScalerManager {
         scaler: row.backendName,
         // The pool's own key, never the widened query set: two label sets on one
         // scaler can widen to the same query (one declaring the plain platform
-        // label the other only gets from the taint), and a dimension built from
-        // that widened set collapses them into a single series — the later row
-        // overwrites the earlier one and a whole pool's fill state disappears
-        // from the gauges.
+        // label the other gets from the taint), collapsing into one series where
+        // the later row hides a whole pool's fill state.
         labelSet: row.key,
         target: row.target,
         ready: row.ready,
@@ -1593,12 +1450,11 @@ export class ScalerManager {
   /**
    * Resolve the pool's platform for label + taint derivation. Precedence:
    *   1. A declared `platform` field always wins (even on a linux host).
-   *   2. Otherwise a bare-metal pool derives its platform from the host OS/arch.
-   *   3. Otherwise (container / firecracker, undeclared) returns null — those
-   *      pools run linux agents and are not auto-tainted; only an explicit
-   *      declared platform taints them.
-   * Returns null when a bare-metal host's OS/arch is not a supported enum value
-   * (the caller falls back to the raw host-label derivation for labels).
+   *   2. Otherwise a bare-metal pool derives it from the host OS/arch.
+   *   3. Otherwise (container / firecracker) null: linux agents, not
+   *      auto-tainted unless a platform is declared.
+   * Also null for a bare-metal host whose OS/arch is not a supported enum value
+   * (the caller falls back to raw host labels).
    */
   private resolveScalerPlatform(name: string, backendType: string): ScalerPlatform | null {
     const declared = this.scalerPlatform.get(name);
@@ -1611,14 +1467,13 @@ export class ScalerManager {
    * The plain platform-taint tokens (`windows`, `macos`, `arm64`) for a scaler,
    * derived from the same resolved platform `mandatoryGate` gates on.
    *
-   * This is the single source for the taint: it feeds the matcher's view of the
-   * label sets, the taint gate, the labels the spawned agent registers with, and
-   * the warm-pool readiness query. Deriving it anywhere else — in a backend, say
-   * — is what let the gate and the agent's labels disagree, so a tainted pool
-   * spawned agents `AgentRegistry.findAvailable` could never return.
+   * The single source for the taint: the matcher's label sets, the taint gate,
+   * the agent's registered labels and the warm-pool readiness query. Deriving it
+   * elsewhere (in a backend, say) lets the gate and the agent's labels disagree,
+   * so a tainted pool spawns agents `AgentRegistry.findAvailable` never returns.
    *
-   * `backendType` is passed rather than looked up because the constructor
-   * configures warm pools from config entries whose backend may not be indexed.
+   * `backendType` is passed, not looked up: the constructor configures warm
+   * pools from config entries whose backend may not be indexed.
    */
   private platformTaintsFor(name: string, backendType: string): string[] {
     const resolved = this.resolveScalerPlatform(name, backendType);
@@ -1630,17 +1485,15 @@ export class ScalerManager {
    * plus the pool's platform taints.
    *
    * `AgentRegistry.findAvailable` drops an agent unless its whole
-   * `mandatoryLabels` gate appears in the query, and a tainted pool's gate
-   * carries the taints — so a query built from the declared labels alone counts
-   * none of the pool's own agents and the pool fills to `maxAgents` with `ready`
-   * stuck at 0. Both construction sites (the constructor and the reload path)
-   * call this so the two can never diverge.
+   * `mandatoryLabels` gate (taints included) appears in the query, so declared
+   * labels alone count none of the pool's agents and it fills to `maxAgents`
+   * with `ready` stuck at 0. The constructor and the reload path both call this
+   * so they never diverge.
    *
-   * These labels are for the QUERY only. The pool is keyed by, and spawns with,
-   * the DECLARED label set: a backend matches the requested set against its own
-   * `labelSets` to resolve the image / binary / VM config and throws on a set it
-   * does not have, and every in-flight release path normalizes the spawn labels
-   * back to the map key.
+   * QUERY only. The pool is keyed by, and spawns with, the DECLARED set: a
+   * backend resolves its image / binary / VM config by matching its own
+   * `labelSets` and throws on any other set, and every in-flight release path
+   * normalizes the spawn labels back to the map key.
    */
   private warmPoolQueryLabels(name: string, backendType: string, labels: string[]): string[] {
     return [...new Set([...labels, ...this.platformTaintsFor(name, backendType)])];
@@ -1650,9 +1503,8 @@ export class ScalerManager {
    * Taint gate for a scaler's label sets: the configured `mandatoryLabels` plus
    * the platform taints derived from the pool's resolved structured platform.
    *
-   * This is the gate every routing and stamping decision uses. `backend`
-   * carries only `type`, so a caller that holds one label set never has to
-   * reach for the whole backend.
+   * Every routing and stamping decision uses it. `backend` needs only `type`,
+   * so a caller holding one label set never reaches for the whole backend.
    */
   private mandatoryGate(name: string, backend: { type: string }): string[] {
     const config = this.scalerMandatoryLabels.get(name) ?? [];
@@ -1661,18 +1513,14 @@ export class ScalerManager {
   }
 
   /**
-   * Build enriched scaler entries with auto-labels injected into each label set.
-   * This ensures label matching accounts for auto-injected labels (kici:role:*,
-   * kici:os:*, kici:arch:*, kici:agent:*, kici:scaler:*) that agents receive
-   * at spawn time.
+   * Scaler entries with the auto-labels agents receive at spawn (kici:role:*,
+   * kici:os:*, kici:arch:*, kici:agent:*, kici:scaler:*) injected into each
+   * label set, so label matching accounts for them.
    *
-   * The os/arch labels derive from the pool's resolved structured platform
-   * (declared field wins, else host-derive for bare-metal, else linux), and the
-   * mandatory labels combine the per-scaler config gate with the platform taint,
-   * so the label matcher applies the gate alongside subset matching.
-   *
-   * Retiring scalers are skipped: they were removed from the config and must
-   * take no new work while their remaining agents finish.
+   * os/arch derive from the resolved structured platform, and the mandatory
+   * labels combine the config gate with the platform taint, so the matcher
+   * applies the gate alongside subset matching. Retiring scalers are skipped:
+   * they take no new work while their remaining agents finish.
    */
   private getEnrichedScalerEntries() {
     return [...this.backends.entries()]
@@ -1688,10 +1536,9 @@ export class ScalerManager {
             : // Container / firecracker always run linux agents.
               deriveOsArchLabels('linux', os.arch());
         const roleLabels = resolveRoleLabels(this.backendRoles.get(name));
-        // The plain platform-taint tokens (`windows`, `macos`, `arm64`) derived
-        // from the structured field are injected as matchable labels so a job that
-        // requests the platform can route here without the operator also declaring
-        // a plain platform label — the structured field is the single source for
+        // The plain taint tokens (`windows`, `macos`, `arm64`) are matchable
+        // labels too, so a job requesting the platform routes here without a
+        // declared plain label: the structured field is the single source for
         // the taint gate AND the label that satisfies it.
         const platformTokens = resolved ? platformToTaints(resolved) : [];
         const autoLabels = [
@@ -1700,9 +1547,9 @@ export class ScalerManager {
           agentTypeLabel(backend.type),
           scalerLabel(name),
           ...roleLabels,
-          // The agent-feature labels a spawned agent of this build self-reports
-          // at registration, so a job routed by one (a global eval round that
-          // must skip result-aware generators) matches a pool that can serve it.
+          // Agent-feature labels this build self-reports at registration, so a
+          // job routed by one (a global eval round that must skip result-aware
+          // generators) matches a pool that can serve it.
           ...AGENT_FEATURE_LABELS,
         ];
 
@@ -1712,8 +1559,7 @@ export class ScalerManager {
             ...ls,
             labels: [...new Set([...ls.labels, ...autoLabels])],
           })),
-          // Index-aligned with `labelSets` by construction: both are
-          // `backend.labelSets.map(...)` over the same array, in order.
+          // Index-aligned with `labelSets`: both map `backend.labelSets` in order.
           labelSetMandatoryLabels: backend.labelSets.map(() => this.mandatoryGate(name, backend)),
         };
       });
@@ -1743,10 +1589,9 @@ export class ScalerManager {
    * dedicated per-backend watcher.
    */
   private async sweepRetiredBackends(): Promise<void> {
-    // An in-flight spawn holds a retirement open (below), and a spawn that
-    // died before registering never clears itself. Pruning here — not only on
-    // the `requestScale` path, which a retiring scaler no longer takes — is
-    // what bounds that wait: a crashed spawn ages out and the teardown runs.
+    // An in-flight spawn holds a retirement open (below), and one that died
+    // before registering never clears itself. Pruning here, not only on the
+    // `requestScale` path a retiring scaler no longer takes, bounds that wait.
     this.pruneStaleSpawningEntries();
 
     for (const name of [...this.retiring]) {
@@ -1757,23 +1602,17 @@ export class ScalerManager {
         continue;
       }
       if (backend.getActiveCount() > 0) continue;
-      // A spawn the manager started is invisible to the backend until
-      // `backend.spawn` runs — it may still be queued behind the per-backend
-      // spawn semaphore, and the container/VM it will create does not exist
-      // yet. Tearing the backend down on that zero would let the spawn land a
-      // live agent on a backend nobody holds any more: routing cannot see it,
-      // `shutdownAll` no longer reaches it, and `onAgentDisconnected` finds no
-      // backend to destroy it through, so the container outlives the scaler.
+      // A spawn still queued behind the semaphore is invisible to the backend.
+      // Tearing down on that zero would land a live agent on a backend nobody
+      // holds: invisible to routing and `shutdownAll`, with no backend for
+      // `onAgentDisconnected` to destroy it through, so it outlives the scaler.
       if (this.hasSpawnInFlight(name)) continue;
 
-      // Drop every trace of the scaler BEFORE the await. `shutdownAll` yields,
-      // and two things can run inside that window: a second sweep (the interval
-      // racing an agent disconnect), which would shut the same backend down
-      // twice; and a `reload` re-adding this name, whose resurrect branch would
-      // then hand routing a backend this sweep is about to forget — leaving a
-      // configured scaler with no backend at all. Forgetting first makes the
-      // transition atomic: the second sweep no longer sees the name, and a
-      // reload sees no backend and builds a fresh one.
+      // Forget the scaler BEFORE the await. Inside `shutdownAll`'s yield, a
+      // second sweep (interval racing a disconnect) would shut it down twice,
+      // and a `reload` re-adding the name would resurrect a backend this sweep
+      // then forgets, leaving a configured scaler with none. Forgetting first
+      // makes the transition atomic: a reload sees no backend and builds one.
       const startedAt = this.retiredAt.get(name);
       this.forgetScaler(name);
 
@@ -1794,9 +1633,8 @@ export class ScalerManager {
 
   /**
    * True while any spawn this manager started for `name` has neither registered
-   * nor failed — including one still queued behind the spawn semaphore, which
-   * has not reached `backend.spawn` at all. Such a spawn counts toward the
-   * scaler's drain even though the backend reports no active agent.
+   * nor failed, including one still queued behind the spawn semaphore. Such a
+   * spawn holds the drain open though the backend reports no active agent.
    */
   private hasSpawnInFlight(name: string): boolean {
     for (const entry of this.spawningAgents.values()) {
@@ -1829,20 +1667,11 @@ export class ScalerManager {
   }
 
   /**
-   * Main entry point: called by the Dispatcher when no agent is available.
-   *
-   * `resources` is the per-job request/limit declaration (or `undefined` to fall
-   * back to scaler defaults). Used by per-scaler / per-orchestrator / per-machine
-   * resource caps; the cap math is wired up by ScalerManager itself.
-   */
-  /**
-   * Run a single backend spawn under the resolved spawn deadline. Returns the
-   * ManagedAgent on success. On deadline: aborts the signal (so the backend's
-   * threaded container-runtime/HTTP calls cancel and its own catch cleans up)
-   * AND rejects, so the caller's semaphore `run()` finally releases the slot
-   * even if the backend's unwind stalls in a non-abortable spot. The backing
-   * spawn promise gets a no-op catch attached so a late abort-rejection doesn't
-   * surface as an unhandled rejection.
+   * Run one backend spawn under the resolved spawn deadline. On deadline it
+   * aborts the signal (so the backend's container-runtime/HTTP calls cancel and
+   * its own catch cleans up) AND rejects, so the caller's semaphore `run()`
+   * releases the slot even if the backend's unwind stalls somewhere
+   * non-abortable.
    */
   private async runSpawnWithTimeout(
     orgId: string | undefined,
@@ -1863,8 +1692,8 @@ export class ScalerManager {
     });
 
     const spawnPromise = spawn(controller.signal);
-    // Prevent an unhandled rejection when the deadline wins the race but the
-    // backing spawn later rejects (via the abort) or resolves.
+    // The deadline may win the race; a later abort-rejection must not surface
+    // as an unhandled rejection.
     spawnPromise.catch(() => {});
 
     try {
@@ -1874,6 +1703,12 @@ export class ScalerManager {
     }
   }
 
+  /**
+   * Main entry point: called by the Dispatcher when no agent is available.
+   * `resources` is the per-job request/limit declaration (`undefined` falls
+   * back to scaler defaults), billed against the per-scaler, per-orchestrator
+   * and per-machine resource caps.
+   */
   async requestScale(
     labels: string[],
     jobId: string,
@@ -1882,23 +1717,20 @@ export class ScalerManager {
     resources?: ResourceRequest,
     orgId?: string,
     /**
-     * The job's resolved container image + registry credentials, when it
-     * declared one. Threaded to the backend so it can spawn the job's own
-     * image instead of the pool's fixed agent image.
+     * The job's resolved container image + registry credentials, when declared,
+     * so the backend can spawn the job's own image instead of the pool's.
      */
     containerSpawn?: ResolvedContainerSpawn,
   ): Promise<ScaleResult> {
-    // Coordinator draining: do not spawn fresh capacity for the held Pending
-    // backlog. In-flight jobs on existing agents finish; scale-down / idle
-    // reaping is untouched.
+    // Draining: no fresh capacity for the held Pending backlog. In-flight jobs
+    // finish; scale-down / idle reaping is untouched.
     if (this.isDraining()) {
       return { action: 'skipped', reason: 'draining' };
     }
-    // One job, one provision. The pending-scale re-drive offers every still-
-    // pending job again, including one whose agent is still provisioning or
-    // has registered but not yet claimed it; a second agent for it would sit
-    // idle (and, on an event scaler, bill). Checked and marked before the
-    // first await, so two concurrent offers of one job cannot both pass.
+    // One job, one provision. The pending-scale re-drive re-offers a job whose
+    // agent is still provisioning or registered but unclaimed; a second agent
+    // would sit idle (and, on an event scaler, bill). Checked and marked before
+    // the first await, so two concurrent offers of one job cannot both pass.
     if (this.hasLocalProvisionFor(jobId)) {
       return { action: 'skipped', reason: PROVISION_IN_FLIGHT };
     }
@@ -1936,10 +1768,9 @@ export class ScalerManager {
     orgId: string | undefined,
     containerSpawn: ResolvedContainerSpawn | undefined,
   ): Promise<ScaleResult> {
-    // 0. Prune stale spawning entries (agents that crashed before WS registration).
+    // Agents that crashed before WS registration.
     this.pruneStaleSpawningEntries();
 
-    // 1. Find which backend handles this label set (filtering excluded).
     const scalerEntries = this.getEnrichedScalerEntries();
     const match = findBackendForLabels(labels, scalerEntries, excludeLabels);
 
@@ -1959,26 +1790,20 @@ export class ScalerManager {
     const backend = this.backends.get(backendName)!;
     const spawnLabelSet = backend.labelSets[match.labelSetIndex].labels;
 
-    // A scaler whose provisioning is repeatedly failing is deferred rather than
-    // asked again immediately. Placed after the match so the deferral is scoped
-    // to the one scaler that is failing; placed before the reservation so a
-    // deferred request takes no capacity it will not use.
+    // A repeatedly failing scaler is deferred. After the match, so the deferral
+    // is scoped to that scaler; before the reservation, so a deferred request
+    // takes no capacity.
     const deferred = await this.provisionBackoffRefusal(backendName);
     if (deferred) return deferred;
 
-    // The warm pool is not consulted here. `requestScale` runs only once the
-    // dispatcher has already failed to find an available agent, so a ready warm
-    // agent was dispatched through the ordinary path and there is nothing left
-    // in a pool to claim.
+    // The warm pool is not consulted: `requestScale` runs only after the
+    // dispatcher found no available agent, so no ready warm agent is left.
 
-    // 2. Resolve effective resources (job → label-set → scaler default → 0).
     const labelSetResources = backend.labelSets[match.labelSetIndex].resources;
     const effective = this.resolveEffective(backendName, labelSetResources, resources);
 
-    // 3. Check + reserve. The agentId is minted here rather than after the
-    // check because the cluster-slot claim writes the spawn row, and that row
-    // is keyed by it. Minting one for a request that ends up refused costs a
-    // discarded uuid.
+    // The agentId is minted before the check because the cluster-slot claim
+    // writes the spawn row keyed by it; a refusal costs a discarded uuid.
     const agentId = this.generateAgentId(backend.type);
     const reserve = await this.reserveForSpawn(
       agentId,
@@ -2009,18 +1834,15 @@ export class ScalerManager {
         spawnsInJobImage(backend.type, backend.labelSets[match.labelSetIndex]),
     });
     // A claimed cluster slot already wrote this row inside the cap
-    // transaction; re-writing it here would only reset `spawned_at`, which the
-    // reaper ages every provision on.
+    // transaction; re-writing it would reset `spawned_at`, which the reaper
+    // ages every provision on.
     if (!reserve.slotClaimed)
       this.persistSpawningAgent(agentId, spawnLabelSet, backendName, jobId, runId);
 
-    // 5. Spawn asynchronously (fire-and-forget), throttled by the per-backend
-    // spawn semaphore. The reservation (steps 3-4a) is already taken and was
-    // recorded in `this.reservations` inside the reservation lock, which is
-    // what the count caps read — so an agent queued in the semaphore still
-    // counts against `globalMaxAgents` and its scaler's `maxAgents`. The
-    // semaphore only bounds the concurrent provisioning rate.
-    // On failure, release reservations.
+    // Fire-and-forget spawn, throttled by the per-backend semaphore. The
+    // reservation is already in `this.reservations` (what the count caps read),
+    // so an agent queued in the semaphore still counts against
+    // `globalMaxAgents` and `maxAgents`; the semaphore bounds only the rate.
     const orchestratorUrl = this.getOrchestratorUrl(backendName);
     const onEvent = this.createEventEmitter(agentId);
     const effectiveLimits = spawnLimitsFor(effective.limits);
@@ -2031,11 +1853,10 @@ export class ScalerManager {
       mandatoryLabels: this.mandatoryGate(backendName, backend),
       ...(containerSpawn ? { container: containerSpawn } : {}),
     };
-    // The spawn outlives this call. It runs in its own request store holding
+    // The spawn outlives this call, so it runs in its own request store holding
     // the bound job: the caller's store is mutated per dispatched run
-    // (`enrichRequestContext`), so a continuation reading it later would log
-    // whichever run the request reached last.
-    // A snapshot of the caller's store keeps its routing key and trace ids.
+    // (`enrichRequestContext`), and a later read would log whichever run came
+    // last. The snapshot keeps the caller's routing key and trace ids.
     const callerContext = getRequestContext();
     const logContext = {
       ...callerContext,
@@ -2047,8 +1868,8 @@ export class ScalerManager {
     requestContext.run(logContext, () => {
       this.spawnSemaphoreFor(backendName)
         .run(() => {
-          // The spawn has been admitted past the throttle: start the "never
-          // registered" staleness clock now, not at enqueue time.
+          // Admitted past the throttle: start the "never registered" staleness
+          // clock now, not at enqueue time.
           const entry = this.spawningAgents.get(agentId);
           if (entry) entry.spawnStartedAt = Date.now();
           return this.runSpawnWithTimeout(orgId, (signal) =>
@@ -2085,30 +1906,23 @@ export class ScalerManager {
   }
 
   /**
-   * Take every reservation one spawn needs, or take none at all.
-   *
-   * The single reserve sequence both spawn paths share — the job-bound
-   * `requestScale` and the warm pool's pre-spawn. The only difference between
-   * them is `boundJobId`, which is `undefined` for a pre-spawn; a warm agent
-   * costs the same host resources as a job-bound one, so it takes the same
-   * reservations.
+   * Take every reservation one spawn needs, or none. Shared by `requestScale`
+   * and the warm pre-spawn (`boundJobId` `undefined`): a warm agent costs the
+   * same host resources, so it takes the same reservations.
    *
    * Ordering, and why:
    * - Count caps and the in-memory resource reservation run under the
-   *   in-process reservation lock, so the check and the reserve are atomic
-   *   against a concurrent caller. A local backend counts its own host's
-   *   agents in process, which is what its cap means: the compute is pinned to
-   *   this machine. An event backend provisions cloud instances any
-   *   coordinator can start, so its cap is counted — and its slot claimed —
-   *   cluster-wide, inside one advisory-locked transaction. The in-process
-   *   lock stays the outer guard so the two never contend.
-   * - The cross-process machine-pool ledger is taken outside that lock,
-   *   because the ledger has its own cross-process mutex; holding both at once
-   *   buys nothing.
+   *   in-process reservation lock, so check and reserve are atomic. A local
+   *   backend counts its own host's agents in process (its compute is pinned
+   *   here). An event backend's cloud instances can be started by any
+   *   coordinator, so its cap is counted, and its slot claimed, cluster-wide in
+   *   one advisory-locked transaction; the in-process lock stays the outer
+   *   guard so the two never contend.
+   * - The machine-pool ledger is taken outside that lock: it has its own
+   *   cross-process mutex, and holding both buys nothing.
    *
-   * Every refusal rolls back exactly what it already took, so a `false` return
-   * leaves no reservation behind. On success the caller owns the release,
-   * which is always `releaseAll(agentId)`.
+   * Every refusal rolls back what it took, so `false` leaves no reservation.
+   * On success the caller owns the release: `releaseAll(agentId)`.
    */
   private async reserveForSpawn(
     agentId: string,
@@ -2126,14 +1940,11 @@ export class ScalerManager {
     const clusterCapped = backend.type === ScalerBackendType.enum.event && this.stateStore != null;
     let slotClaimed = false;
     const reserveOutcome = await this.runWithReservationLock(async () => {
-      // Count caps. Both read `Math.max(<backend's own count>, <reserved>)`:
-      // `requestScale` fires the spawn asynchronously AFTER this lock is
-      // released, so a reservation is invisible to `getActiveCount()` for as
-      // long as the agent sits in the spawn semaphore's queue — and one
-      // `retryPendingScaleRequests` batch can admit ten agents against a cap of
-      // one. `max` rather than a sum: the two views cover the same agents at
-      // different points of their lifecycle, so it never double-counts and
-      // never under-counts.
+      // Count caps read `Math.max(<backend's own count>, <reserved>)`: the spawn
+      // fires AFTER this lock, so while it waits in the semaphore it is invisible
+      // to `getActiveCount()`, and one `retryPendingScaleRequests` batch could
+      // admit ten agents against a cap of one. `max`, not a sum: the two views
+      // cover the same agents at different lifecycle points.
       if (Math.max(this.getGlobalActiveCount(), this.reservations.size) >= this.globalMaxAgents) {
         this.reportCountCapRefusal(backendName, backend);
         return 'at-capacity-count' as const;
@@ -2146,7 +1957,6 @@ export class ScalerManager {
         this.reportCountCapRefusal(backendName, backend);
         return 'at-capacity-count' as const;
       }
-      // Resource caps (in-memory: per-scaler + global).
       if (!this.tryReserveAll(backendName, requests)) {
         return 'at-capacity-resource' as const;
       }
@@ -2167,14 +1977,13 @@ export class ScalerManager {
         }
         slotClaimed = true;
       }
-      // Record the admission INSIDE the critical section. `this.reservations`
-      // is the admitted set the count caps above read, so a write outside the
-      // lock is a cap that cannot see what it just granted.
+      // Record the admission INSIDE the critical section: `this.reservations`
+      // is the set the count caps read, so a write outside the lock is a cap
+      // that cannot see what it just granted.
       //
-      // `limits` rides along in memory only. The caps this reservation bills
-      // against are all `requests`, which is what `persistReservation` stores
-      // and what recovery needs; `limits` is here so the suitability predicate
-      // can compare the OTHER half of the shape — the half the kernel enforces.
+      // `limits` is in memory only: the caps bill `requests` (what
+      // `persistReservation` stores and recovery needs); `limits` lets the
+      // suitability predicate compare the kernel-enforced half of the shape.
       this.reservations.set(agentId, {
         scalerName: backendName,
         requests: { ...requests },
@@ -2195,9 +2004,9 @@ export class ScalerManager {
         requests.memBytes,
       );
       if (!ok) {
-        // Roll back the in-memory reservation we just took, and the
-        // cluster-wide slot with it — an unreleased spawn row would count
-        // against every coordinator's cap for an agent that never spawned.
+        // Roll back the in-memory reservation and the cluster-wide slot: an
+        // unreleased spawn row counts against every coordinator's cap for an
+        // agent that never spawned.
         this.releaseInMemory(backendName, requests);
         this.reservations.delete(agentId);
         if (slotClaimed) this.deleteSpawningAgentFromStore(agentId);
@@ -2210,29 +2019,17 @@ export class ScalerManager {
   }
 
   /**
-   * How many reservations one scaler currently holds.
+   * Record a refusal on one of the two agent-count caps.
    *
-   * Derived from `this.reservations` rather than kept as a counter beside it:
-   * the map IS the admitted set, so a derived count cannot drift out of step
-   * with it — including on the boot/leader-switch rehydrate path, which
-   * repopulates the map directly.
-   */
-  /**
-   * Record a refusal taken on one of the two agent-count caps.
+   * The dispatcher gets `at-capacity`, which queues the job and logs nothing,
+   * indistinguishable from a scaler that stopped spawning. So the counter the
+   * metric's help text promises (`maxAgents`, `globalMaxAgents`) is
+   * incremented here, beside the resource caps.
    *
-   * The refusal itself is returned to the dispatcher as `at-capacity`, which
-   * leaves the job queued and logs nothing — correct while agents are genuinely
-   * busy, and indistinguishable from a scaler that has stopped spawning
-   * altogether. So the counter the metric's own help text promises
-   * (`maxAgents`, `globalMaxAgents`) is incremented here, beside the resource
-   * caps that already increment it.
-   *
-   * The warning is narrower than the counter on purpose. Ordinary saturation
-   * refuses with live agents holding the cap, and warning on that would emit a
-   * line per queued job for as long as the cluster is busy. A refusal where the
-   * reservation ledger outruns every backend's active count is the other shape:
-   * capacity billed to agents that are not running, which does not resolve on
-   * its own.
+   * The warning is narrower on purpose: ordinary saturation would warn per
+   * queued job while busy. It fires only when the reservation ledger outruns
+   * every backend's active count: capacity billed to agents not running, which
+   * does not resolve on its own.
    */
   private reportCountCapRefusal(scalerName: string, backend: ScalerBackend): void {
     incScalerSpawnRefusals();
@@ -2249,6 +2046,11 @@ export class ScalerManager {
     });
   }
 
+  /**
+   * Reservations one scaler holds, derived from `this.reservations` rather than
+   * a separate counter: the map IS the admitted set, so the count cannot drift,
+   * even on the boot/leader-switch rehydrate path that repopulates the map.
+   */
   private reservedCountForScaler(scalerName: string): number {
     let n = 0;
     for (const entry of this.reservations.values()) {
@@ -2257,10 +2059,7 @@ export class ScalerManager {
     return n;
   }
 
-  /**
-   * Run a critical section under the reservation lock. Serializes concurrent
-   * `requestScale()` calls so the check+reserve sequence is atomic.
-   */
+  /** Serializes concurrent `requestScale()` calls so check+reserve is atomic. */
   private async runWithReservationLock<T>(fn: () => T | Promise<T>): Promise<T> {
     const previous = this.reservationLock;
     let release!: () => void;
@@ -2269,12 +2068,10 @@ export class ScalerManager {
     });
     try {
       await previous;
-      // `return await`, not a bare `return`: in a `try`/`finally` the finally
-      // block runs at the return statement, before the returned promise
-      // settles. A bare return would release the lock the moment an async
-      // critical section reached its first await, and two callers would sit
-      // inside it at once — which is precisely what the event-scaler cap check
-      // does when it goes to the database.
+      // `return await`, not a bare `return`: the finally runs at the return
+      // statement, before the promise settles, so a bare return would release
+      // the lock at the critical section's first await (as the event-scaler cap
+      // check's database call does) and admit two callers at once.
       return await fn();
     } finally {
       release();
@@ -2282,9 +2079,8 @@ export class ScalerManager {
   }
 
   /**
-   * Lazily resolve the per-backend spawn throttle, sized by the scaler's
-   * `maxConcurrentSpawns` (falling back to the cluster default). One semaphore
-   * per backend name, since each backend has its own container socket.
+   * Lazily resolve the per-backend spawn throttle, sized by `maxConcurrentSpawns`
+   * (else the cluster default). One per backend: each has its own container socket.
    */
   private spawnSemaphoreFor(backendName: string): SpawnSemaphore {
     let semaphore = this.spawnSemaphores.get(backendName);
@@ -2299,13 +2095,11 @@ export class ScalerManager {
   /**
    * Resolve the effective `{ requests, limits }` for a job at this scaler.
    *
-   * Layered defaults (highest priority first):
+   * Layered per field, highest priority first:
    * 1. Job's own `resources` (after request<->limit mirroring).
    * 2. Label-set's `resources`.
    * 3. Scaler's `defaults.resources` (already merged from global defaults at construction).
-   * 4. Zero (`{ cpus: 0, memBytes: 0 }`).
-   *
-   * Returns both sides fully resolved as numeric `{ cpus, memBytes }` pairs.
+   * 4. Zero.
    */
   private resolveEffective(
     backendName: string,
@@ -2332,10 +2126,8 @@ export class ScalerManager {
   }
 
   /**
-   * Attempt to reserve `requests` against the per-scaler and per-orchestrator
-   * caps. Returns false (no state change) if any cap would be exceeded.
-   *
-   * Caller must hold the reservation lock.
+   * Reserve `requests` against the per-scaler and per-orchestrator caps, or
+   * return false with no state change. Caller must hold the reservation lock.
    */
   private tryReserveAll(scalerName: string, requests: { cpus: number; memBytes: number }): boolean {
     const cap = this.resourceCaps.get(scalerName);
@@ -2399,17 +2191,14 @@ export class ScalerManager {
   }
 
   /**
-   * Push the current `perScalerUsage` and `globalUsage` snapshot into the
-   * Prometheus observable gauges. Called on every successful reservation /
-   * release so the gauge callback always reflects the latest state without
-   * doing any work itself (gauge callbacks are synchronous and MUST NOT
-   * touch this map directly — they just read whatever was last published).
+   * Push the `perScalerUsage` / `globalUsage` snapshot into the observable
+   * gauges on every reservation / release. Gauge callbacks are synchronous and
+   * MUST NOT touch this map; they read whatever was last published.
    *
-   * Note: pool-level usage is intentionally not emitted here. The on-disk
-   * machine-pool ledger requires async I/O + a file lock to read accurately,
-   * and OTel observable-gauge callbacks must be synchronous. Operators
-   * dashboarding pool utilization can derive a lower bound from the sum of
-   * `kici_orch_scaler_cpus_used` rows whose scaler belongs to the pool.
+   * Pool-level usage is deliberately not emitted: reading the on-disk ledger
+   * needs async I/O + a file lock, and OTel gauge callbacks are synchronous. A
+   * lower bound is the sum of `kici_orch_scaler_cpus_used` over the pool's
+   * scalers.
    */
   private publishUsageMetrics(): void {
     setScalerUsageBreakdown(
@@ -2422,9 +2211,8 @@ export class ScalerManager {
   }
 
   /**
-   * Release the reservation tracked for an agent. Idempotent. Also releases
-   * the cross-process pool reservation (best-effort) when the scaler
-   * references a pool.
+   * Release an agent's reservation, and (best-effort) its cross-process pool
+   * reservation. Idempotent.
    */
   private releaseAll(agentId: string): void {
     const entry = this.reservations.get(agentId);
@@ -2444,19 +2232,16 @@ export class ScalerManager {
       });
     }
 
-    // Capacity just freed: signal the dispatcher to re-drive pending jobs. This
-    // single site covers the spawn-failure release and every onAgentDisconnected
-    // release (both route through releaseAll).
+    // Re-drive pending jobs. This one site covers the spawn-failure and every
+    // onAgentDisconnected release.
     this.notifyCapacityFreed();
   }
 
   /**
    * Signal that scaler capacity freed. Trailing-debounced by
-   * {@link CAPACITY_FREED_DEBOUNCE_MS} so a burst of simultaneous releases (and
-   * the onJobComplete → onAgentDisconnect pair for a single-use agent) coalesces
-   * into one re-drive pass that runs after the last release settles. No-op when
-   * no callback is wired. The timer is `unref`'d so it never keeps the process
-   * alive, and cleared on shutdown.
+   * {@link CAPACITY_FREED_DEBOUNCE_MS} so a burst of releases (and a single-use
+   * agent's onJobComplete → onAgentDisconnect pair) coalesces into one re-drive
+   * after the last release. The timer is `unref`'d and cleared on shutdown.
    */
   private notifyCapacityFreed(): void {
     if (!this.onCapacityFreed) return;
@@ -2475,10 +2260,8 @@ export class ScalerManager {
   }
 
   /**
-   * Subtract the given `requests` from the per-scaler and global in-memory
-   * counters. Used both by `releaseAll()` and by the rollback path when a
-   * machine-pool reservation refuses after the in-memory reservation
-   * already succeeded.
+   * Subtract `requests` from the per-scaler and global in-memory counters; used
+   * by `releaseAll()` and by rollbacks after the in-memory reservation succeeded.
    */
   private releaseInMemory(scalerName: string, requests: { cpus: number; memBytes: number }): void {
     const usage = this.perScalerUsage.get(scalerName);
@@ -2492,12 +2275,9 @@ export class ScalerManager {
   }
 
   /**
-   * Resolve the scaler-level default resources, merging the global
-   * `defaults.resources` underneath any scaler-specific override.
-   *
-   * Currently scaler entries themselves do not carry their own `defaults` (the
-   * label-set level does). The merged result is stored per-scaler so that
-   * future scaler-level defaults can be added without touching the resolver.
+   * Resolve a scaler's default resources. Scaler entries carry no `defaults` of
+   * their own (label sets do), so this is the global `defaults.resources`;
+   * storing it per scaler leaves room for scaler-level defaults.
    */
   private resolveScalerDefaults(
     config: ScalerConfig,
@@ -2507,33 +2287,28 @@ export class ScalerManager {
   }
 
   /**
-   * Called from agent-handler.ts when an agent registers via WS.
-   * Correlates the registered agent to a spawned tracking entry.
+   * Called from agent-handler.ts when an agent registers via WS; correlates it to
+   * its spawning entry.
    *
    * Returns:
-   * - `boundJobId` (optional): the queued jobId this agent was spawned for.
-   *   Used by the caller to eagerly dispatch the bound job before the
-   *   agent's idle timer fires, skipping the generic queue drain race.
-   * - `mandatoryLabels` (always populated for scaler-managed agents): the
-   *   spawning scaler's effective `mandatoryLabels` gate — its configured
-   *   labels plus the platform taint derived from the pool's declared OS/arch.
-   *   Threaded into the
-   *   AgentRegistry so the queue-drain path (`onAgentAvailable` →
-   *   `dequeueForLabels`) and the eager-dispatch path
-   *   (`dispatchBoundJob` → `dequeueById`) both reject queued jobs whose
-   *   `runsOn` does not include every gate label.
+   * - `boundJobId` (optional): the queued job this agent was spawned for, which
+   *   the caller dispatches eagerly before the idle timer fires, skipping the
+   *   generic queue drain race.
+   * - `mandatoryLabels` (always set for scaler-managed agents): the scaler's
+   *   effective gate (configured labels plus the platform taint). Threaded into
+   *   the AgentRegistry so both the queue-drain path (`onAgentAvailable` →
+   *   `dequeueForLabels`) and the eager-dispatch path (`dispatchBoundJob` →
+   *   `dequeueById`) reject jobs whose `runsOn` lacks a gate label.
    *
-   * Returns `null` for a static agent — no spawning entry exists, and no other
-   * instance's spawn record claims the agent either. A warm-pool spawn is not
-   * that case: its spawning entry (and durable row) survives until it
+   * Returns `null` for a static agent: no spawning entry and no peer spawn
+   * record. A warm-pool spawn keeps its entry (and durable row) until it
    * registers, so it resolves with `mandatoryLabels` and no `boundJobId`, which
-   * is exactly what marks the agent warm on `register.ack`.
+   * marks the agent warm on `register.ack`.
    *
-   * A local hit (this instance spawned the agent) is answered from memory. A
-   * miss falls back to the shared spawn record: on an HA cluster behind one
-   * endpoint the agent routinely reaches an instance that did not spawn it,
-   * and adopting is the normal path, not an exception. Adoption is a
-   * conditional UPDATE, so exactly one instance can win.
+   * A local hit is answered from memory; a miss falls back to the shared spawn
+   * record, since on an HA cluster behind one endpoint the agent routinely
+   * reaches an instance that did not spawn it. Adoption is a conditional
+   * UPDATE, so exactly one instance wins.
    */
   async onAgentRegistered(
     agentId: string,
@@ -2543,11 +2318,9 @@ export class ScalerManager {
     if (spawning) return this.completeLocalRegistration(agentId, labels, spawning);
 
     if (!this.stateStore) {
-      // A store-less manager (worker mode) keeps its spawn records in memory
-      // only, so a restart erases them. The memory miss above is therefore the
-      // same condition the `!adopted` branch below handles, reached without a
-      // store to ask — and it needs the same answer, or a worker restart hands
-      // every still-running scaler agent back as static with no
+      // A store-less manager (worker mode) loses its spawn records on restart,
+      // so this miss is the `!adopted` case below and needs the same answer, or
+      // a worker restart hands every running scaler agent back as static with no
       // `mandatoryLabels` gate.
       if (agentId.startsWith(SCALER_AGENT_ID_PREFIX)) {
         logger.error('scaler: no spawn record for a scaler-managed agent; refusing registration', {
@@ -2563,17 +2336,15 @@ export class ScalerManager {
       adopted = await this.stateStore.adoptSpawningAgent(agentId, this.instanceId);
     } catch (err) {
       incScalerAdoptionLookupFailure();
-      // A store error says nothing about whether this agent is scaler-managed,
-      // and the two wrong answers are not symmetric. Registering a scaler agent
-      // as static drops its `mandatoryLabels` gate for the agent's whole life,
-      // so a queued job whose `runsOn` does not include the platform taint can
-      // land on it — the wrong-OS dispatch this gate exists to stop. Refusing a
-      // static agent costs it a reconnect.
+      // A store error says nothing about whether the agent is scaler-managed,
+      // and the wrong answers are asymmetric: registering a scaler agent as
+      // static drops its `mandatoryLabels` gate for life (letting a job lacking
+      // the platform taint land on the wrong OS); refusing a static agent costs
+      // a reconnect.
       //
-      // The agent id discriminates the two: every scaler-spawned id is minted by
-      // `generateAgentId` as `scaler-<type>-<uuid>`, and an event agent cannot
-      // present a different one because its ephemeral token is minted against
-      // the claim keyed by that exact id.
+      // The id discriminates: `generateAgentId` mints every scaler id as
+      // `scaler-<type>-<uuid>`, and an event agent cannot present another
+      // because its ephemeral token is minted against the claim keyed by it.
       if (agentId.startsWith(SCALER_AGENT_ID_PREFIX)) {
         logger.error(
           'scaler: adoption lookup failed; refusing to register a scaler-managed agent',
@@ -2582,11 +2353,10 @@ export class ScalerManager {
             error: toErrorMessage(err),
           },
         );
-        // Deliberately NOT reclaimed, unlike the two branches that read a clean
-        // "no such record". A store that failed to answer is not evidence the
-        // agent is unowned — its spawn record may be intact behind a transient
-        // fault, and reclaiming would destroy a healthy provision over a DB
-        // hiccup. The agent reconnects, and the next read decides.
+        // Deliberately NOT reclaimed, unlike the clean "no such record"
+        // branches: a failed read is not evidence the agent is unowned, and
+        // reclaiming would destroy a healthy provision over a DB hiccup. The
+        // agent reconnects and the next read decides.
         throw new ScalerAdoptionLookupError(agentId, err);
       }
       logger.error('scaler: adoption lookup failed; treating agent as static', {
@@ -2596,30 +2366,19 @@ export class ScalerManager {
       return null;
     }
     if (!adopted) {
-      // Same asymmetry as the lookup-error branch above, reached by a different
-      // route. `completeLocalRegistration` deletes a local-backend spawn row at
-      // registration, so an orchestrator restart leaves a still-running scaler
-      // agent with no row to adopt. Registering it as static drops its
-      // `mandatoryLabels` gate for the agent's whole life, so a queued job whose
-      // `runsOn` does not include the platform taint can land on it — the
-      // wrong-OS dispatch this gate exists to stop. Refusing leaves the agent
-      // retrying with backoff and receiving no work, and
-      // `reclaimUnownedScalerAgent` below takes its compute back through each
-      // backend's `reapUnowned`: the container backend removes the container by
-      // its `kici-agent-id` label, the Firecracker backend kills a VM whose
-      // jailer chroot is on this host, and the bare-metal backend removes its
-      // agent's container by the same labels. A bare-metal
-      // agent running as a plain process is the one that stays: its PID lives
-      // in the in-memory entry alone, so a restart leaves nothing durable to
-      // key a reclaim off, and it holds its host process until an operator
-      // stops it. A refused agent never arms its own idle-shutdown timer
-      // either — the agent arms that only once a registration succeeds.
-      //
-      // The id is the same discriminator the error branch uses: every
-      // scaler-spawned id is minted by `generateAgentId` as
-      // `scaler-<type>-<uuid>`, and an agent cannot present a different one
-      // because its ephemeral token is minted against the claim keyed by that
-      // exact id.
+      // Same asymmetry and id discriminator as the lookup-error branch above.
+      // `completeLocalRegistration` deletes a local-backend spawn row at
+      // registration, so after an orchestrator restart a running scaler agent
+      // has no row to adopt. Refusing leaves it retrying with backoff and no
+      // work, and `reclaimUnownedScalerAgent` takes its compute back through
+      // each backend's `reapUnowned`: the container backend removes the
+      // container by its `kici-agent-id` label, the Firecracker backend kills a
+      // VM whose jailer chroot is on this host, and the bare-metal backend
+      // removes its agent's container by the same labels. A bare-metal agent
+      // running as a plain process stays: its PID lives only in memory, so it
+      // holds its host process until an operator stops it. A refused agent never
+      // arms its idle-shutdown timer, which arms only on a successful
+      // registration.
       if (agentId.startsWith(SCALER_AGENT_ID_PREFIX)) {
         logger.error('scaler: no spawn record for a scaler-managed agent; refusing registration', {
           agentId,
@@ -2631,18 +2390,15 @@ export class ScalerManager {
     }
 
     this.managedAgentIndex.set(agentId, adopted.scalerName);
-    // An adopted agent IS a successful provision — the coordinator that spawned
-    // it is not the one it reached. Counting only local registrations
-    // would leave a perfectly healthy scaler deferred on an HA cluster.
+    // An adopted agent IS a successful provision; counting only local
+    // registrations would leave a healthy scaler deferred on an HA cluster.
     this.clearProvisionFailures(adopted.scalerName);
-    // Same provenance capture as the local path: a spawn record with no bound
-    // job is a warm fill, and only such an agent may be reaped.
+    // As on the local path: no bound job means a warm fill, the only reapable kind.
     if (adopted.boundJobId == null) {
       this.warmAgents.add(agentId);
     } else {
-      // Adoption takes event rows only, and an event spawn never starts
-      // inside the job's image (`spawnsInJobImage`), so the binding carries no
-      // image restriction.
+      // Adoption takes event rows only, and an event spawn never starts inside
+      // the job's image (`spawnsInJobImage`).
       this.boundAgents.set(agentId, { jobId: adopted.boundJobId, jobImage: false });
     }
     this.adoptedAgents.set(agentId, {
@@ -2650,10 +2406,9 @@ export class ScalerManager {
       provisioningTargets: adopted.provisioningTargets ?? [],
     });
 
-    // Seed the local backend's own agent map when the scaler IS configured here.
-    // Without this `EventScalerBackend.destroy()` opens with
-    // `if (!this.agents.has(managedId)) return;` and the teardown silently
-    // no-ops — the VM leaks even though every other part of adoption worked.
+    // Seed the local backend's agent map when the scaler is configured here, or
+    // `EventScalerBackend.destroy()` returns early on the unknown id and the VM
+    // leaks.
     const backend = this.backends.get(adopted.scalerName);
     if (backend instanceof EventScalerBackend) {
       backend.adopt(agentId, adopted.labelSet);
@@ -2664,9 +2419,9 @@ export class ScalerManager {
       boundJobId: adopted.boundJobId,
     });
 
-    // The taint comes from the persisted spawn record, not from local config:
-    // the coordinator the agent reached may have no entry for this scaler at
-    // all, and an un-stamped gate lets a wrong-OS queued job land on it.
+    // The taint comes from the persisted spawn record, not local config: this
+    // coordinator may not configure the scaler, and an un-stamped gate lets a
+    // wrong-OS job land on the agent.
     const mandatoryLabels = adopted.mandatoryLabels ?? [];
     return adopted.boundJobId
       ? { boundJobId: adopted.boundJobId, mandatoryLabels: [...mandatoryLabels] }
@@ -2674,53 +2429,43 @@ export class ScalerManager {
   }
 
   /**
-   * Reclaim the host-local compute of a scaler-spawned agent this coordinator
-   * refused for want of a spawn record.
+   * Reclaim the host-local compute of a scaler-spawned agent refused for want of
+   * a spawn record.
    *
-   * Refusing closes the WS before registration completes, so `onAgentDisconnected`
-   * never runs for that agent, and `managedAgentIndex` never held it in the first
-   * place — the two writes that populate it (`completeLocalRegistration` and the
-   * adoption branch) both come after this point. So even the disconnect hook is a
-   * no-op here: it reads that index, finds nothing, and takes the static-agent
-   * exit. The agent keeps its VM or host process, reconnects, is refused again,
-   * and loops until an operator stops it by hand.
+   * Refusing closes the WS before registration completes, and
+   * `managedAgentIndex` is only populated after this point, so the disconnect
+   * hook takes the static-agent exit. Without this the agent keeps its VM or
+   * host process and loops reconnect-refuse until an operator stops it.
    *
    * **This force-destroys a live instance, so read what makes it safe.**
    *
-   * - **Local backends only.** An event agent's compute is a customer cloud
-   *   instance, reachable from any coordinator, and its missing adoption is
-   *   ambiguous: `adoptSpawningAgent` resolves `null` both when no row exists AND
-   *   when a peer coordinator already holds the row, so an event agent that is
-   *   alive and legitimately owned elsewhere reaches this exact branch. Tearing
-   *   it down there would destroy a peer's healthy provision. A local backend's
-   *   compute cannot be reached that way: it lives on the host that spawned it.
-   * - **Host-local evidence decides, not this verdict.** The verdict alone is NOT
-   *   evidence the agent is this host's: `adoptSpawningAgent` adopts `event` rows
-   *   only, so a `container` / `bare-metal` / `firecracker` agent that reconnects
-   *   to a peer behind a shared endpoint is refused here even though its spawn
-   *   row is intact and its compute is alive on the peer's host. What keeps that
-   *   harmless is that each backend reclaims only what its own tracking or its
-   *   own on-host artifacts name — never a shared database row, which on an HA
-   *   pair names an identically-configured scaler on both hosts. A wrongly-routed
-   *   agent id finds nothing here and nothing is touched.
+   * - **Local backends only.** `adoptSpawningAgent` resolves `null` both when no
+   *   row exists AND when a peer already holds it, so a live event agent owned
+   *   elsewhere reaches this branch; tearing down its cloud instance would
+   *   destroy a peer's healthy provision. Local compute lives on the host that
+   *   spawned it.
+   * - **Host-local evidence decides, not this verdict.** `adoptSpawningAgent`
+   *   adopts `event` rows only, so a `container` / `bare-metal` / `firecracker`
+   *   agent reconnecting to a peer behind a shared endpoint is refused here with
+   *   its row intact and compute alive on the peer's host. Each backend reclaims
+   *   only what its own tracking or on-host artifacts name, never a shared
+   *   database row (which on an HA pair names an identically-configured scaler
+   *   on both hosts), so a wrongly-routed id touches nothing.
    * - **Never on a transient failure.** The caller must have positive evidence
-   *   the agent is unowned. A store read that merely *failed* is not evidence —
-   *   the record may exist and be perfectly healthy.
+   *   the agent is unowned; a store read that merely *failed* is not evidence.
    *
-   * Fire-and-forget, matching `onAgentDisconnected`'s own teardown: the caller
-   * refuses the registration immediately rather than holding the agent's socket
-   * open for a VM shutdown.
+   * Fire-and-forget, like `onAgentDisconnected`'s teardown: the registration is
+   * refused immediately rather than holding the socket open for a VM shutdown.
    */
   private reclaimUnownedScalerAgent(agentId: string): void {
     for (const [backendName, backend] of this.backends) {
       if (backend.type === ScalerBackendType.enum.event) continue;
       void (async () => {
-        // In-memory first: when this process still tracks the agent, `destroy`
-        // holds its live TAP and IP and is the complete teardown.
+        // In-memory first: if still tracked, `destroy` holds its live TAP and IP
+        // and is the complete teardown.
         await backend.destroy(agentId);
-        // Then the restart-surviving half, for a backend that keeps durable
-        // on-host artifacts. `destroy` above went through its own in-memory
-        // miss, so this cannot double-reclaim.
+        // Then the durable on-host artifacts that survive a restart; `destroy`
+        // already missed in memory, so this cannot double-reclaim.
         const reaped = (await backend.reapUnowned?.(agentId)) ?? false;
         if (reaped) {
           logger.warn('scaler: reclaimed an unowned agent left by a refused registration', {
@@ -2738,18 +2483,14 @@ export class ScalerManager {
     }
   }
 
-  /**
-   * Finish registration for an agent this instance spawned itself, from the
-   * in-memory spawning entry.
-   */
+  /** Finish registration for an agent this instance spawned, from its spawning entry. */
   private completeLocalRegistration(
     agentId: string,
     labels: string[],
     spawning: SpawningEntry,
   ): { boundJobId?: string; mandatoryLabels: string[] } {
-    // A warm spawn binds no job. The spawning entry is the only carrier of that
-    // fact and is deleted immediately below, so capture it now — and the same
-    // for the job a bound spawn was started for.
+    // Capture warm-vs-bound now: the spawning entry, the only carrier of that
+    // fact, is deleted below.
     if (spawning.boundJobId == null) {
       this.warmAgents.add(agentId);
     } else {
@@ -2759,37 +2500,27 @@ export class ScalerManager {
       });
     }
 
-    // The in-memory entry always goes; what happens to the durable row depends
-    // on the backend.
+    // The durable row's fate depends on the backend.
     this.spawningAgents.delete(agentId);
 
     const backend = this.backends.get(spawning.backendName);
     backend?.markRegistered?.(agentId);
     if (backend?.type === ScalerBackendType.enum.event) {
-      // Seed the backend's own agent map, the same way the cross-instance
-      // adoption path does. `spawn()` already seeded it in the common case, and
-      // `adopt()` is a no-op then — but a spawning entry rehydrated by
-      // `recoverState` after a restart has no backend entry at all, so without
-      // this the disconnect's `destroy()` opens with
-      // `if (!this.agents.has(id)) return;`, silently no-ops, and the row is
-      // deleted by the `.then()` with no `scale-down` ever emitted.
+      // Seed the backend's agent map as adoption does. Usually `spawn()` did
+      // and `adopt()` no-ops, but an entry `recoverState` rehydrated has no
+      // backend entry, so `destroy()` would return early and the `.then()`
+      // delete the row with no `scale-down` emitted.
       if (backend instanceof EventScalerBackend) backend.adopt(agentId, spawning.labelSet);
-      // An event agent's row is the live ownership record, not spawn-time
-      // scratch. Its compute is a customer cloud instance that only a
-      // `scale-down` tears down, and if this coordinator dies mid-job the
-      // agent's WS dies with it — the row is then the only thing left pointing
-      // at the provision. Stamp it adopted by this instance, so registering
-      // locally produces exactly the durable state the cross-instance path
-      // produces, so the reaper reads one shape whichever coordinator the agent
-      // reached. Local-backend rows keep today's delete: their compute is
-      // pinned to a host this process manages, so the process dying IS the
-      // teardown.
+      // An event agent's row is the live ownership record: only a `scale-down`
+      // tears its cloud instance down, and if this coordinator dies mid-job
+      // the row is the only pointer left. Stamp it adopted here, so the reaper
+      // reads the same shape as the cross-instance path produces. Local-backend
+      // rows are deleted: their compute is pinned to this host, so the process
+      // dying IS the teardown.
       this.markSpawningAgentAdopted(agentId);
-      // Same spec the cross-instance path records, so the teardown addresses
-      // the targets this provision was spawned with whichever coordinator the
-      // agent reached — including this one. Without it the local path has no
-      // recorded targets and falls back to live config, so an operator edit
-      // between spawn and teardown retargets the scale-down.
+      // Record the spawn-time targets as the cross-instance path does, so an
+      // operator edit between spawn and teardown cannot retarget the
+      // scale-down via live config.
       this.adoptedAgents.set(agentId, {
         scalerName: spawning.backendName,
         provisioningTargets: spawning.provisioningTargets,
@@ -2798,17 +2529,13 @@ export class ScalerManager {
       this.deleteSpawningAgentFromStore(agentId);
     }
 
-    // Store in managed index
     this.managedAgentIndex.set(agentId, spawning.backendName);
-    // The provision this coordinator asked for produced a live agent, so the
-    // scaler is healthy again whatever it did before.
+    // A live agent: the scaler is healthy again.
     this.clearProvisionFailures(spawning.backendName);
 
-    // Use the scaler's `mandatoryGate`, the gate the local matcher and
-    // cross-peer advertisement apply, so a platform-tainted pool
-    // (windows/macos/arm64) stamps that taint onto the registered agent — the
-    // queue-drain and eager-dispatch paths then reject an unqualified job that
-    // would otherwise land on a wrong-OS scaler agent.
+    // `mandatoryGate` (what the local matcher and cross-peer advertisement
+    // apply) stamps a platform taint (windows/macos/arm64) on the agent, so
+    // queue-drain and eager dispatch reject an unqualified wrong-OS job.
     const mandatoryLabels = backend
       ? this.mandatoryGate(spawning.backendName, backend)
       : (this.scalerMandatoryLabels.get(spawning.backendName) ?? []);
@@ -2818,9 +2545,8 @@ export class ScalerManager {
       mandatoryLabels,
     });
 
-    // A spawn with no bound job is a warm fill. Releasing its in-flight slot
-    // lets the next deficit pass count it as ready rather than still pending.
-    // The registry is what holds it from here — there is no pool to add it to.
+    // A warm fill: release its in-flight slot so the next deficit pass counts it
+    // as ready. From here the registry holds it.
     if (!spawning.boundJobId) {
       this.warmPool.onWarmAgentRegistered(spawning.labelSet);
     }
@@ -2842,21 +2568,16 @@ export class ScalerManager {
   ): void {
     const backendName = this.managedAgentIndex.get(agentId);
     if (!backendName) {
-      // Not a scaler-managed agent (static agent)
       this.releaseAll(agentId);
       return;
     }
 
     const backend = this.backends.get(backendName);
     if (!backend) {
-      // This instance adopted an agent for a scaler it does not configure, so
-      // there is no backend to route the teardown through. Emit it straight
-      // from the persisted spawn spec — read before the map entry goes, or the
-      // customer's cloud instance is never torn down.
-      //
-      // The reason is the one the backend path passes for the same trigger, so
-      // which coordinator the agent happened to reach is invisible to the
-      // customer's teardown workflow.
+      // Adopted for a scaler not configured here: emit the teardown from the
+      // persisted spawn spec, read before the map entry goes, or the cloud
+      // instance is never torn down. Same reason as the backend path, so the
+      // teardown workflow cannot tell which coordinator the agent reached.
       const adopted = this.adoptedAgents.get(agentId);
       if (adopted) {
         runDetached(
@@ -2875,16 +2596,10 @@ export class ScalerManager {
     }
 
     // All agents are single-use: always destroy on disconnect. The durable row
-    // goes only once the teardown actually resolved: an event row outlives
-    // registration (it is the sole pointer to a running cloud instance), so
-    // dropping it before the scale-down lands would leave a failed teardown
-    // with nothing for the reaper to retry from.
-    // The teardown is addressed to the targets the spawn recorded, not to this
-    // coordinator's live config: the record is what the provision was spawned
-    // with, while live config may name a different — or since-edited —
-    // `provisioningTargets` for the same scaler. Both registration paths record
-    // it, so the addressing does not depend on which coordinator the agent
-    // reached.
+    // goes only once the teardown resolved: an event row is the sole pointer to
+    // a running cloud instance, and the reaper retries a failed teardown from
+    // it. The teardown targets the spawn-recorded `provisioningTargets`, not
+    // live config, which may differ or have been edited since.
     const heldSpec = this.adoptedAgents.get(agentId);
     const destroyContext = {
       reason,
@@ -2910,9 +2625,9 @@ export class ScalerManager {
     this.deleteAgentJobFromStore(agentId);
     this.releaseAll(agentId);
 
-    // A retiring scaler may have just lost its last agent. `backend.destroy`
-    // above is fire-and-forget, so `getActiveCount()` may not have dropped yet;
-    // the periodic sweep armed in `start()` is the backstop that catches it.
+    // A retiring scaler may have lost its last agent. `destroy` is
+    // fire-and-forget, so `getActiveCount()` may lag; the periodic sweep armed
+    // in `start()` is the backstop.
     runDetached(logger, 'Retired backend sweep', () => this.sweepRetiredBackends());
   }
 
@@ -2920,31 +2635,26 @@ export class ScalerManager {
    * Tear down a stranded provision the `EventProvisionReaper` found.
    *
    * Public because the reaper is leader-gated and lives outside the manager,
-   * while the emit and the row delete must stay in one place. The reason comes
-   * from the reaper's verdict — a provision whose agent never registered is a
-   * `spawn-timeout`, one whose agent went away is a `heartbeat-timeout` — so
-   * unlike the disconnect path this does not default to `shutdown`.
+   * while the emit and the row delete stay in one place. The reason is the
+   * reaper's verdict (never registered → `spawn-timeout`, went away →
+   * `heartbeat-timeout`), never a `shutdown` default.
    *
    * `kici_orch_scaler_external_provision_timeout_total` counts the spawn-timeout
-   * arm. Nothing else increments it in production: `runSpawnWithTimeout` bounds
-   * only the `spawn()` call, and an event backend's `spawn()` returns the moment
-   * the scale-up event is emitted.
+   * arm, and nothing else increments it in production: an event backend's
+   * `spawn()` returns once the scale-up is emitted, inside
+   * `runSpawnWithTimeout`'s bound.
    *
    * The spawn-timeout arm is also where an external provisioning failure enters
-   * the ordinary failure machinery. The local backends report a dead spawn
-   * through the `scaler.failed` event their `spawn()` emits; an event scaler's
-   * `spawn()` succeeds by definition (it only emits a scale-up), so the failure
-   * is not observable until the provision it asked for never registers — which
-   * is exactly this verdict. Synthesizing the event here gives the fleet
-   * counter, the operator's `diagnose scaler` view, and `last_provisioning_error`
-   * the same input every other backend already supplies, so a job whose external
-   * provisioning failed settles with the provisioning cause instead of a
-   * label-mismatch complaint that sends its operator to fix a correct `runsOn`.
+   * the failure machinery. Local backends emit `scaler.failed` from `spawn()`;
+   * an event scaler's `spawn()` always succeeds, so the failure shows only when
+   * the provision never registers. Synthesizing the event here feeds the fleet
+   * counter, `diagnose scaler` and `last_provisioning_error`, so the job
+   * settles with the provisioning cause instead of a label-mismatch complaint
+   * that sends its operator to fix a correct `runsOn`.
    */
   async emitOrphanScaleDown(candidate: ReapCandidate, reason: ScaleDownReason): Promise<void> {
-    // A provision whose bound job already ended was not a failed one: the job
-    // no longer needed it. It is torn down as `job-complete`, the reason the
-    // withdrawal sweep uses, and nothing is reported.
+    // A provision whose bound job already ended did not fail: tear it down as
+    // `job-complete` (as the withdrawal sweep does) and report nothing.
     const withdrawn =
       reason === ScaleDownReason.enum['spawn-timeout'] &&
       candidate.boundJobId !== undefined &&
@@ -2966,17 +2676,13 @@ export class ScalerManager {
       candidate.agentId,
       effective,
     );
-    // Only a teardown that actually went out counts. A row that reaches no
-    // emitter, or names nowhere to deliver to, keeps its record and is retried
-    // — so counting the attempt would let one permanently undeliverable row
-    // inflate the metric on every retry, forever. The same test gates the
-    // durable verdict below: an undelivered teardown has reached no verdict.
+    // Only a teardown that went out counts: an undeliverable row keeps its
+    // record and is retried, and counting attempts would inflate the metric on
+    // every retry forever. An undelivered teardown has no durable verdict either.
     if (!emitted) return;
-    // The durable verdict, for BOTH reasons — a `heartbeat-timeout` condemns a
-    // provision that was adopted, and the record has to say so. Fire-and-forget
-    // like every other store write on this path: a failure here degrades to the
-    // behaviour of having no record at all (the prune reports), never to a
-    // wrong suppression.
+    // The durable verdict, for BOTH reasons (a `heartbeat-timeout` condemns an
+    // adopted provision). Fire-and-forget: a failure degrades to having no
+    // record (the prune reports), never to a wrong suppression.
     this.stateStore
       ?.recordProvisionCondemned(candidate.agentId, candidate.scalerName, effective)
       .catch((err) => {
@@ -2990,23 +2696,19 @@ export class ScalerManager {
     if (withdrawn) this.eventBuffer.delete(candidate.agentId);
     if (effective === ScaleDownReason.enum['spawn-timeout']) {
       incScalerExternalProvisionTimeout(candidate.scalerName);
-      // The identity comes off the candidate, not off the in-memory maps: the
-      // reaper is leader-gated, so the condemning coordinator often never
-      // spawned this agent, and the agent never registered anywhere.
+      // Identity from the candidate, not the in-memory maps: the leader-gated
+      // reaper often never spawned this agent, which never registered anywhere.
       this.reportProvisionFailure({
         scalerName: candidate.scalerName,
         agentId: candidate.agentId,
         ...(candidate.runId !== undefined && { runId: candidate.runId }),
         ...(candidate.boundJobId !== undefined && { jobId: candidate.boundJobId }),
       });
-      // An unattributed failure is buffered for a correlation that establishes
-      // itself only after the agent registers — which is precisely what this
-      // provision never did, and never will now that its row is gone. Nothing
-      // else ever clears the entry (`correlateAgentToJob` and
-      // `onAgentDisconnected` are the only other erasers, and neither can fire
-      // for an agent that never connected), so leaving it grows the buffer by
-      // one dead entry per warm provision the reaper condemns, for the life of
-      // the process.
+      // An unattributed failure waits for a correlation that comes only after
+      // registration, which this provision never reaches. The only other erasers
+      // (`correlateAgentToJob`, `onAgentDisconnected`) never fire for an agent
+      // that never connected, so the buffer would leak one entry per condemned
+      // warm provision.
       this.eventBuffer.delete(candidate.agentId);
     }
   }
@@ -3014,19 +2716,16 @@ export class ScalerManager {
   /**
    * Refuse a spawn request while the scaler is inside its backoff window.
    *
-   * Returns the refusal to hand back, or null to proceed. The message names how
-   * many consecutive failures produced the deferral and when it lifts. It
-   * reaches the operator through this method's own log line: the dispatcher
-   * branches on `action` alone and discards `reason`, so a job deferred here
-   * carries no record of the deferral on its queue row. The job whose provision
-   * actually failed is the one that gets `last_provisioning_error`, written by
-   * the `scaler.failed` this backoff's own trigger emits.
+   * Returns the refusal, or null to proceed. The operator sees it only through
+   * this method's log line: the dispatcher branches on `action` and discards
+   * `reason`, so a deferred job's queue row records nothing. The job whose
+   * provision failed gets `last_provisioning_error` from the triggering
+   * `scaler.failed`.
    *
-   * The knobs are read here per request rather than per process, so an operator
-   * lowering the failure limit mid-outage sees the repeated-failure wording on
-   * the next refusal. The window itself was armed by `recordProvisionFailure`
-   * from the base and ceiling live at that moment, so a retuned window applies
-   * from the next recorded failure.
+   * The knobs are read per request, so a lowered failure limit changes the
+   * wording on the next refusal; the window itself was armed from the base and
+   * ceiling live at the last `recordProvisionFailure`, so a retuned window
+   * applies from the next failure.
    */
   private async provisionBackoffRefusal(backendName: string): Promise<ScaleResult | null> {
     const state = this.provisionFailures.get(backendName);
@@ -3037,11 +2736,9 @@ export class ScalerManager {
     const settings = await this.resolveProvisionBackoff();
     const waitMs = state.deferUntilMs - now;
     const repeated = state.consecutive >= settings.maxConsecutiveFailures;
-    // Two distinct causes, because they send an operator to different places. A
-    // handful of failures is plausibly one bad spawn; passing the configured
-    // limit means provisioning for this scaler is broken, not unlucky. An event
-    // scaler provisions through an external workflow; any other backend's
-    // failures here are launches its own host refused.
+    // Distinct wording sends an operator to different places: past the limit,
+    // provisioning is broken, not unlucky; an event scaler fails in its external
+    // workflow, any other backend in a launch its own host refused.
     const seconds = Math.ceil(waitMs / 1000);
     const external = this.backends.get(backendName)?.type === ScalerBackendType.enum.event;
     let reason: string;
@@ -3069,27 +2766,21 @@ export class ScalerManager {
   }
 
   /**
-   * Record a consecutive provisioning failure for a scaler and arm its next
-   * deferral.
-   *
-   * The delay doubles per consecutive failure and is capped, so a provider
-   * outage settles into a steady retry cadence rather than either hammering the
-   * provider or growing without bound. `2 ** (n - 1)` is bounded by the cap
-   * before it is used, so a long outage cannot overflow the shift.
+   * Record a consecutive provisioning failure and arm the next deferral. The
+   * delay doubles per failure up to the cap, so an outage settles into a steady
+   * retry cadence. `2 ** (n - 1)` is capped before use, so it cannot overflow.
    */
   private async recordProvisionFailure(
     backendName: string,
     kind: ProvisionFailureKind,
   ): Promise<void> {
-    // The settings read comes first so the get/set below is one uninterrupted
-    // microtask: reading the count before awaiting would let two concurrent
-    // reports read the same value and lose one increment.
+    // Await first, so the get/set below is one uninterrupted microtask; two
+    // concurrent reports would otherwise read one value and lose an increment.
     const settings = await this.resolveProvisionBackoff();
     const prior = this.provisionFailures.get(backendName);
     const consecutive = (prior?.consecutive ?? 0) + 1;
     const uncapped = settings.baseMs * 2 ** (consecutive - 1);
-    // `uncapped` is Infinity once the exponent runs away; Math.min still yields
-    // the cap, so the window stays finite for any failure count.
+    // `uncapped` may be Infinity; Math.min still yields the finite cap.
     const delayMs = Math.min(uncapped, settings.maxMs);
     this.provisionFailures.set(backendName, {
       consecutive,
@@ -3112,20 +2803,16 @@ export class ScalerManager {
   }
 
   /**
-   * Claim a dead provision as counted, or report that someone already did.
-   *
-   * The same provision is seen twice on the leader — once by its own
-   * stale-spawn prune, once by the leader-gated reaper — and every consequence
-   * of a failure is counted per provision, not per observer. The claim is
-   * synchronous and happens before any await, so two observers arriving in the
-   * same tick cannot both pass it.
+   * Claim a dead provision as counted, or report that someone already did. The
+   * leader sees one provision twice (its stale-spawn prune and the reaper), and
+   * a failure counts per provision, not per observer. Synchronous, before any
+   * await, so two observers in the same tick cannot both pass.
    */
   private claimFailedProvision(backendName: string, agentId: string): boolean {
     const prior = this.provisionFailures.get(backendName);
     if (!prior) {
-      // Seeded at zero: the count is incremented by `recordProvisionFailure`,
-      // and a zero count is what `provisionBackoffRefusal` reads as "nothing to
-      // defer" until it lands.
+      // Seeded at zero, which `provisionBackoffRefusal` reads as "nothing to
+      // defer" until `recordProvisionFailure` increments it.
       this.provisionFailures.set(backendName, {
         consecutive: 0,
         deferUntilMs: 0,
@@ -3136,8 +2823,7 @@ export class ScalerManager {
     if (prior.countedAgents.has(agentId)) return false;
     prior.countedAgents.add(agentId);
     if (prior.countedAgents.size > MAX_COUNTED_FAILED_AGENTS) {
-      // Insertion-ordered, so this drops the oldest — the one whose second
-      // observer, if it were ever coming, arrived long ago.
+      // Insertion-ordered: drops the oldest, whose second observer is long past.
       prior.countedAgents.delete(prior.countedAgents.values().next().value!);
     }
     return true;
@@ -3146,22 +2832,19 @@ export class ScalerManager {
   /**
    * Report one dead external provision, wherever this coordinator noticed it.
    *
-   * Everything a failed provision owes an operator happens here: the fleet
-   * spawn-failure counter, the structured warn, the `ScalerFailureTracker`
-   * record `kici-admin diagnose scaler` reads, the `last_provisioning_error`
-   * that tells the waiting job why it never ran, and the backoff.
+   * Everything a failed provision owes an operator: the fleet spawn-failure
+   * counter, the structured warn, the `ScalerFailureTracker` record
+   * `kici-admin diagnose scaler` reads, the job's `last_provisioning_error`,
+   * and the backoff.
    *
-   * It is deliberately reachable from BOTH observers rather than from the
-   * reaper alone. `ScalerFailureTracker` and `provisionFailures` are
-   * per-process, and the reaper is leader-gated — so a reaper-only report left
-   * every non-leader with an empty `diagnose scaler` for a scaler failing
-   * fleet-wide, and dispatching at the un-deferred cadence while only the
-   * leader backed off. The local prune is the observation every coordinator has
-   * of its own spawns.
+   * Reachable from BOTH observers, not the reaper alone: the tracker and
+   * `provisionFailures` are per-process and the reaper is leader-gated, so a
+   * reaper-only report leaves every non-leader with an empty `diagnose scaler`
+   * and an un-deferred cadence. The local prune is every coordinator's view of
+   * its own spawns.
    *
-   * Synchronous up to the backoff arm, so a caller that must clean up after the
-   * event (the prune drops the agent's event buffer) sees the effect
-   * immediately.
+   * Synchronous up to the backoff arm, so a caller cleaning up after the event
+   * (the prune drops the agent's event buffer) sees the effect at once.
    */
   private reportProvisionFailure(opts: {
     scalerName: string;
@@ -3203,14 +2886,13 @@ export class ScalerManager {
    * Defer a scaler whose host refused to start an agent, then free the spawn's
    * reservation.
    *
-   * Arming comes first: the release notifies freed capacity, and the re-drive
-   * that follows 250 ms later must meet the deferral rather than spawn straight
-   * into the same refusal. The release still notifies, because a job waiting on
-   * another scaler, or on the global cap, is legitimately unblocked by it.
-   * Two failures come here: a `spawn()` that rejected with a
+   * Arm first: the release notifies freed capacity, and the re-drive 250 ms
+   * later must meet the deferral rather than spawn into the same refusal. The
+   * release still notifies, since it legitimately unblocks a job waiting on
+   * another scaler or the global cap. Callers: a `spawn()` rejected with a
    * `DeterministicSpawnError`, and a settled spawn whose compute stopped before
-   * its agent registered (`dropFailedSettledSpawn`). Every other spawn
-   * rejection is released at once and retried.
+   * its agent registered (`dropFailedSettledSpawn`). Any other rejection is
+   * released at once and retried.
    */
   private deferRefusedLaunch(backendName: string, agentId: string): void {
     const claimed = this.claimFailedProvision(backendName, agentId);
@@ -3229,9 +2911,8 @@ export class ScalerManager {
   }
 
   /**
-   * Whether a bound job has ended. A read error, a missing row, an unknown
-   * run, or no reader wired all read as "not ended", so the caller keeps
-   * reporting the provision as it would without the check.
+   * Whether a bound job has ended. A read error, missing row, unknown run or
+   * missing reader all read as "not ended", so the caller reports as usual.
    */
   private async boundJobEnded(runId: string | undefined, jobId: string): Promise<boolean> {
     if (!this.readJobStatuses || runId === undefined) return false;
@@ -3253,8 +2934,8 @@ export class ScalerManager {
    *
    * The job's row is the shared truth: a cancel reaches whichever coordinator
    * the Platform picks, while the spawning entry lives on the one that asked.
-   * A withdrawal is not a provisioning failure, so nothing is reported and no
-   * backoff is armed. Returns how many provisions were withdrawn.
+   * A withdrawal is not a failure: nothing is reported, no backoff armed.
+   * Returns the withdrawn count.
    */
   async withdrawEndedBoundProvisions(): Promise<number> {
     if (!this.readJobStatuses) return 0;
@@ -3294,11 +2975,11 @@ export class ScalerManager {
    * Forget one pending provision and tear it down as `job-complete` — unless a
    * peer adopted its agent, in which case the adopter owns the teardown.
    *
-   * The teardown goes through `emitScaleDownForSpec`, which drops the spawn
-   * row only once the scale-down is out: a failed emit keeps the row for the
-   * reaper, whose spawn-timeout verdict re-checks the job and sends
-   * `job-complete` too. `backend.destroy` is not used — a rehydrated entry is
-   * not tracked by the backend, so it would emit nothing.
+   * Via `emitScaleDownForSpec`, which drops the spawn row only once the
+   * scale-down is out; a failed emit leaves it for the reaper, whose
+   * spawn-timeout verdict re-checks the job and also sends `job-complete`. Not
+   * `backend.destroy`: the backend does not track a rehydrated entry, so it
+   * would emit nothing.
    */
   private withdrawProvision(agentId: string, entry: SpawningEntry, jobStatus: string): void {
     this.spawningAgents.delete(agentId);
@@ -3318,12 +2999,10 @@ export class ScalerManager {
       logger,
       'Withdraw provision',
       async () => {
-        // Nothing tells this coordinator that a peer adopted the agent, so the
-        // entry outlives adoption — and on the ordinary HA success path the job
-        // ends because it ran on that adopted agent. The adopter owns that
-        // agent's teardown; emitting here would delete a live instance and the
-        // adopter's row. An unanswerable lookup emits nothing either: the row
-        // stays, and the reaper re-checks adoption and the job.
+        // The entry outlives a peer's adoption, and on the ordinary HA path the
+        // job ended because it ran on that adopted agent. The adopter owns the
+        // teardown; emitting here would delete a live instance and its row. A
+        // failed lookup emits nothing: the reaper re-checks from the row.
         let adoptedBy: string | null;
         try {
           adoptedBy = (await this.stateStore?.provisionAdopter(agentId)) ?? null;
@@ -3353,8 +3032,7 @@ export class ScalerManager {
           agentId,
           ScaleDownReason.enum['job-complete'],
         );
-        // The claim code in the scale-up is single-use; once the provision is
-        // withdrawn nothing may redeem it.
+        // Nothing may redeem a withdrawn provision's single-use claim code.
         await claims?.invalidate(agentId).catch((err: unknown) => {
           logger.warn('scaler: could not invalidate a withdrawn provision’s claim', {
             agentId,
@@ -3369,32 +3047,25 @@ export class ScalerManager {
   /**
    * Report a pruned event spawn as a dead provision — unless a peer adopted it.
    *
-   * The prune is NOT proof of failure on an HA cluster. Nothing tells the
-   * spawning coordinator that its agent registered on a peer, so the entry
-   * survives adoption and lands in the prune the stale window later next to a
-   * perfectly live agent — the same asymmetry `deleteUnadoptedSpawningAgent`
-   * exists for. Reporting that as a dead provision writes a `scaler.failed` and
-   * a `last_provisioning_error` onto a job that is running, and backs a healthy
-   * scaler off, which is the misattribution this whole report exists to remove.
-   * The reaper already applies the same test: it returns `spawn-timeout` only
-   * for a candidate with no `adoptedBy`, so without this the two observers of
-   * one provision disagree.
+   * The prune is NOT proof of failure on an HA cluster: the spawning coordinator
+   * never learns its agent registered on a peer, so the entry reaches the prune
+   * next to a live agent (the asymmetry `deleteUnadoptedSpawningAgent` exists
+   * for). Reporting it would write `scaler.failed` and
+   * `last_provisioning_error` onto a running job and back off a healthy scaler.
+   * The reaper applies the same test (`spawn-timeout` only without
+   * `adoptedBy`), so the two observers agree.
    *
-   * The question is "was this provision ever adopted?", and the spawn row alone
-   * cannot answer it: the row is deleted on teardown, so its absence is BOTH
-   * "never adopted" and "adopted, then torn down". `provisionAdopter` reads the
-   * live row first and the durable provision-outcome record second, which
-   * survives the delete — so an adopted provision the reaper has since
-   * condemned no longer reads as a dead one.
+   * The spawn row alone cannot say "ever adopted?": it is deleted on teardown.
+   * `provisionAdopter` reads the live row, then the durable provision-outcome
+   * record that survives the delete, so an adopted provision the reaper has
+   * since condemned does not read as dead.
    *
-   * The lookup is fire-and-forget so the prune stays off the request path, and
-   * it fails open. Both "the store errored" and "there is no verdict" leave the
-   * failure reported, deliberately: a provision with no positive evidence of
-   * adoption is what a single coordinator sees on a real provisioning outage,
-   * and suppressing there would disarm the per-coordinator backoff on every
-   * follower — an invisible missing report in place of a visible false one. The
-   * only rows with no verdict are those adopted before the outcome table
-   * existed, and they age out within one stale-prune window of the deploy.
+   * The lookup is fire-and-forget (off the request path) and fails open: a
+   * store error or no verdict leaves the failure reported, because that is what
+   * a real outage looks like to one coordinator, and suppressing it would
+   * disarm every follower's backoff. The only rows with no verdict were adopted
+   * before the outcome table existed and age out within one stale-prune window
+   * of the deploy.
    */
   private reportPrunedProvisionFailure(agentId: string, entry: SpawningEntry): void {
     const boundJobId = entry.boundJobId;
@@ -3402,9 +3073,8 @@ export class ScalerManager {
       this.reportPrunedUnlessAdopted(agentId, entry);
       return;
     }
-    // A job that already ended (cancelled, timed out, ran on another agent)
-    // no longer needs this provision: it is withdrawn, not failed. The row
-    // stays for the reaper, which tears the provision down as `job-complete`.
+    // An ended job's provision is withdrawn, not failed; the row stays for the
+    // reaper, which tears it down as `job-complete`.
     runDetached(
       logger,
       'Pruned provision verdict',
@@ -3433,10 +3103,9 @@ export class ScalerManager {
         ...(entry.runId !== undefined && { runId: entry.runId }),
         ...(entry.boundJobId !== undefined && { jobId: entry.boundJobId }),
       });
-      // The prune's own buffer drop has already run by the time an async report
-      // lands, so an unbound failure would park a fresh entry nothing can ever
-      // flush — the correlation it waits for needs the agent to register, which
-      // this one never did.
+      // The prune's buffer drop ran before this async report, so an unbound
+      // failure would park an entry nothing flushes: correlation needs a
+      // registration that never happened.
       this.eventBuffer.delete(agentId);
     };
     if (!this.stateStore) {
@@ -3467,13 +3136,9 @@ export class ScalerManager {
   }
 
   /**
-   * Clear a scaler's consecutive-failure state after a successful provision.
-   *
-   * Called from `onAgentRegistered`, which is the single entry point for BOTH a
-   * locally-spawned agent and one this coordinator adopted from a peer. An
-   * adopted agent is a successful provision — the instance that spawned it
-   * is not the one it reached — so counting only local registrations
-   * would leave a healthy scaler deferred on an HA cluster.
+   * Clear a scaler's consecutive-failure state after a successful provision,
+   * from both the local and the adopted registration paths (see
+   * `onAgentRegistered`).
    */
   private clearProvisionFailures(backendName: string): void {
     if (this.provisionFailures.delete(backendName)) {
@@ -3488,16 +3153,11 @@ export class ScalerManager {
    * drop the durable row.
    *
    * Used where the instance holding the agent has no local backend for its
-   * scaler — the ordinary shape on an HA cluster behind one shared endpoint,
-   * where the coordinator the agent reached may not configure the scaler that
-   * spawned it. The row's own targets are therefore primary, with local config
-   * as the fallback for a row that recorded none.
+   * scaler, the ordinary shape on an HA cluster behind one shared endpoint.
    *
-   * A failed emit leaves the row in place: it is the only durable pointer at
-   * the customer's running instance, so the reaper needs it to retry from.
-   *
-   * Returns whether the teardown was actually emitted, so a caller that counts
-   * teardowns counts deliveries rather than attempts.
+   * A failed emit leaves the row: it is the only durable pointer at the
+   * customer's running instance, and the reaper retries from it. Returns
+   * whether the teardown was emitted, so callers count deliveries, not attempts.
    */
   private async emitScaleDownForSpec(
     spec: AdoptedSpec,
@@ -3512,21 +3172,16 @@ export class ScalerManager {
       });
       return false; // leave the row so the reaper retries
     }
-    // The row's own targets are primary — the instance holding the agent may
-    // not configure this scaler at all, which is the whole reason they are
-    // persisted. Local config is the fallback for a row that recorded none:
-    // whichever coordinator does configure the scaler can then resolve it,
-    // which is the only way such a row ever clears.
+    // The row's targets are primary (this instance may not configure the
+    // scaler). Local config is the fallback for a row that recorded none: only
+    // a coordinator that configures the scaler can ever clear such a row.
     const targets = spec.provisioningTargets.length
       ? spec.provisioningTargets
       : (this.scalerProvisioningTargets.get(spec.scalerName) ?? []);
     if (targets.length === 0) {
-      // Neither the row nor this instance's config names anywhere to deliver
-      // the teardown, so an emit would reach no subscriber while counting as a
-      // scale-down and dropping the row. Keep the row instead — it is the only
-      // pointer left at the customer's running instance — and say so loudly on
-      // every attempt until a coordinator that configures the scaler picks it
-      // up through the fallback above.
+      // Nowhere to deliver: an emit would reach no subscriber yet count and drop
+      // the row. Keep the row (the last pointer at the running instance) and say
+      // so loudly until a coordinator configuring the scaler takes it up.
       logger.error('scaler: adopted provision has no provisioning targets to tear it down', {
         agentId,
         scalerName: spec.scalerName,
@@ -3552,17 +3207,13 @@ export class ScalerManager {
   }
 
   /**
-   * Look up the scaler backend TYPE (a `ScalerBackendType` — `container`,
-   * `firecracker`, `bare-metal`, `event`, …) for a registered agent.
-   * Returns null if the agent is not scaler-managed (a static / stateful
-   * agent).
+   * The backend TYPE (`container`, `firecracker`, `bare-metal`, `event`, …) of
+   * a registered agent, or null for a static / stateful agent.
    *
-   * Used by AgentMetricsAggregator to stamp the `scaler` label on each
-   * kici_agent_* series. The label MUST be the backend type, not the
-   * operator-chosen scaler name: the Platform catalog filter constrains
-   * it to the ScalerBackendType set (plus `stateful`), so a free-form name is
-   * dropped as bad_label_value. `managedAgentIndex` stores the scaler
-   * name, so resolve it through `backends` to the type.
+   * AgentMetricsAggregator stamps it as the `scaler` label on each
+   * kici_agent_* series. It MUST be the type, not the operator-chosen name: the
+   * Platform catalog filter allows only the ScalerBackendType set (plus
+   * `stateful`) and drops anything else as bad_label_value.
    */
   getBackendType(agentId: string): string | null {
     const scalerName = this.managedAgentIndex.get(agentId);
@@ -3573,25 +3224,22 @@ export class ScalerManager {
   /**
    * Exchange a provisioning claim code for freshly minted ephemeral credentials.
    *
-   * Reads the shared claim table directly rather than routing through the
-   * backend that minted the code: the mint needs only the agent-token store,
-   * which is already DB-backed, so redemption succeeds on an instance that has
-   * never heard of the emitting scaler. That is what lets an HA cluster front
-   * its coordinators with one shared endpoint — the provisioned agent reaches
-   * whichever coordinator the load balancer picks.
+   * Reads the shared claim table directly, not through the minting backend: the
+   * mint needs only the DB-backed agent-token store, so redemption works on an
+   * instance that never heard of the emitting scaler. That lets an HA cluster
+   * front its coordinators with one shared endpoint.
    *
-   * Returns `{ error }` when this instance has no claim store (no database), or
-   * when the redeem is rejected (unknown / consumed / expired / minting error).
-   * Called from the `scaler.claim-credentials` WS handler.
+   * Returns `{ error }` with no claim store (no database) or a rejected redeem
+   * (unknown / consumed / expired / minting error). Called from the
+   * `scaler.claim-credentials` WS handler.
    */
   async claimScalerCredentials(
     code: string,
   ): Promise<{ credentials?: ClaimedCredentials; error?: string }> {
     if (!this.claimStore) {
-      // A coordinator with no scaler config has no claim store, so it rejects
-      // every claim a provisioned agent presents. Behind one shared endpoint
-      // that is roughly half of them, and the agent only sees "invalid claim
-      // code" — say what actually happened, on the one side that knows.
+      // A coordinator with no scaler config rejects every claim; behind a shared
+      // endpoint that is about half, and the agent sees only "invalid claim
+      // code", so log the real cause here.
       logger.error(
         'scaler: refusing a provisioning claim because this coordinator has no scaler claim store; every event scaler must be configured on every coordinator',
       );
@@ -3605,14 +3253,12 @@ export class ScalerManager {
   }
 
   /**
-   * Called from agent-handler.ts when an agent sends config.ack.
-   * For Firecracker agents, clears MMDS data (belt-and-suspenders with in-VM iptables).
-   * For non-Firecracker agents, this is a no-op.
+   * Called from agent-handler.ts on config.ack. Clears a Firecracker agent's MMDS
+   * data (belt-and-suspenders with in-VM iptables); a no-op for other agents.
    */
   onConfigAck(agentId: string): void {
     const backendName = this.managedAgentIndex.get(agentId);
     if (!backendName) {
-      // Not a scaler-managed agent (static agent) -- config.ack is a no-op
       logger.debug(`config.ack from non-managed agent ${agentId}, ignoring`);
       return;
     }
@@ -3633,9 +3279,7 @@ export class ScalerManager {
     }
   }
 
-  /**
-   * Called when a scaler-managed agent completes a job.
-   */
+  /** Called when a scaler-managed agent completes a job. */
   onJobComplete(agentId: string): void {
     const backendName = this.managedAgentIndex.get(agentId);
     if (!backendName) return;
@@ -3643,23 +3287,20 @@ export class ScalerManager {
     const backend = this.backends.get(backendName);
     if (!backend) return;
 
-    // Single-job model: the agent disconnects on its own after completion, which
-    // frees its reservation via releaseAll. Signal capacity-freed early to shave
-    // re-dispatch latency; the trailing debounce coalesces this with the
-    // subsequent disconnect release so the re-drive still runs after the slot
-    // actually opens.
+    // The single-job agent disconnects next, freeing its reservation. Signal
+    // early to cut re-dispatch latency; the trailing debounce coalesces this
+    // with the disconnect release, so the re-drive runs after the slot opens.
     this.notifyCapacityFreed();
   }
 
   /**
-   * Correlate an agentId to a runId/jobId after the dispatcher assigns a job
-   * to a scaler-managed agent. Flushes any buffered pre-dispatch events.
+   * Correlate an agent to a runId/jobId after dispatch, flushing buffered
+   * pre-dispatch events.
    */
   correlateAgentToJob(agentId: string, runId: string, jobId: string): void {
     this.agentJobCorrelation.set(agentId, { runId, jobId });
     this.persistAgentJob(agentId, runId, jobId);
 
-    // Flush buffered events for this agent
     const buffered = this.eventBuffer.get(agentId);
     if (buffered && this.onScalerEvent) {
       for (const event of buffered) {
@@ -3669,26 +3310,19 @@ export class ScalerManager {
     this.eventBuffer.delete(agentId);
   }
 
-  /**
-   * Sum of all backends' active count + spawning agents.
-   */
+  /** Sum of all backends' active counts, which include spawning agents. */
   getGlobalActiveCount(): number {
     let total = 0;
     for (const backend of this.backends.values()) {
       total += backend.getActiveCount();
     }
-    // Note: spawningAgents is NOT added here. Real backends (container, bare-metal,
-    // firecracker) all add to their internal agents map synchronously at the start
-    // of spawn(), so getActiveCount() already includes spawning agents. Adding
-    // spawningAgents.size would double-count them. spawningAgents is used only
-    // for registration correlation (onAgentRegistered), not capacity tracking.
+    // spawningAgents is NOT added: the container, bare-metal and firecracker
+    // backends add to their agents map synchronously at the start of spawn(),
+    // so it would double-count; it serves only registration correlation.
     //
-    // This total is still blind to an agent that is RESERVED but whose
-    // `backend.spawn` has not started — `requestScale` fires the spawn after
-    // the reservation lock is released, so the backend's own map stays empty
-    // for as long as the agent waits in the spawn semaphore. `reserveForSpawn`
-    // closes that window by taking `Math.max` of this and the admitted set;
-    // a caller using this count alone sees only what has reached a backend.
+    // Still blind to an agent RESERVED but waiting in the spawn semaphore,
+    // before `backend.spawn` starts. `reserveForSpawn` closes that window with
+    // `Math.max` over this and the admitted set.
     return total;
   }
 
@@ -3726,9 +3360,7 @@ export class ScalerManager {
     }
   }
 
-  /**
-   * Stop warm pool, shutdown all backends, clear tracking maps.
-   */
+  /** Stop the warm pool, shut down all backends, clear tracking maps. */
   async shutdownAll(): Promise<void> {
     this.started = false;
     if (this.capacityFreedTimer) {
@@ -3742,8 +3374,7 @@ export class ScalerManager {
     this.warmPool.stop();
     if (this.machineLedger) {
       this.machineLedger.stop();
-      // Best-effort: release this orchestrator's reservations from every pool
-      // so peers don't have to wait for the next reaper tick.
+      // Best-effort, so peers need not wait for the next reaper tick.
       await this.machineLedger.releaseAllForInstance().catch((err) => {
         logger.warn('machine-ledger releaseAllForInstance failed', { error: String(err) });
       });
@@ -3802,15 +3433,11 @@ export class ScalerManager {
    * Validate the new config: label-set overlaps, backend type changes, and
    * each kept backend's own view of its label sets.
    *
-   * `backend.reload` validates and applies in one call, so a backend rejected
-   * late in the loop would otherwise leave the ones before it holding the new
-   * label sets and `maxAgents` while the commit never runs. Each successful
-   * call's previous state is therefore snapshotted and restored when any
-   * backend rejects — a rejected reload leaves every backend as it was.
-   *
-   * The snapshots are returned as well as used here: a later stage can still
-   * fail (an added scaler whose backend does not construct), and the same
-   * rollback is what keeps that rejection from half-applying too.
+   * `backend.reload` validates and applies in one call, so each successful
+   * call's previous state is snapshotted and restored if any backend rejects:
+   * a rejected reload leaves every backend as it was. The snapshots are also
+   * returned, so a later failing stage (an added backend that does not
+   * construct) can roll back the same way.
    */
   private validateReload(
     newConfig: ScalerConfig,
@@ -3842,9 +3469,8 @@ export class ScalerManager {
         maxAgents: backend.maxAgents,
         entry: backend.currentEntry,
       };
-      // The whole entry, not just labelSets + maxAgents: the event backend reads
-      // roles, mandatoryLabels, agentTokenTtlSeconds and provisioningTargets off
-      // it at every spawn, and the manager's own copies of those refresh here too.
+      // The whole entry: the event backend reads roles, mandatoryLabels,
+      // agentTokenTtlSeconds and provisioningTargets off it at every spawn.
       const result = backend.reload(entry.labelSets, { maxAgents: entry.maxAgents, entry });
       if (result.valid) {
         applied.push(previous);
@@ -3872,8 +3498,8 @@ export class ScalerManager {
   }
 
   /**
-   * Construct every added backend into a staging list. On any failure the
-   * partially built set is torn down and the caller keeps the old config.
+   * Construct every added backend into a staging list; on any failure the
+   * partial set is torn down and the old config stays.
    */
   private async buildAddedBackends(
     added: ScalerEntry[],
@@ -3954,9 +3580,8 @@ export class ScalerManager {
   }
 
   /**
-   * Refresh per-scaler metadata from the new config. Keys are deleted only for
-   * scalers that are neither configured nor retiring — a retiring scaler keeps
-   * its cap, URL, roles and defaults until its last agent is gone.
+   * Refresh per-scaler metadata. A retiring scaler keeps its cap, URL, roles and
+   * defaults until its last agent is gone.
    */
   private applyScalerMetadata(newConfig: ScalerConfig): void {
     const configured = new Set(newConfig.scalers.map((s) => s.name));
@@ -3980,10 +3605,9 @@ export class ScalerManager {
       this.scalerPlatform.set(entry.name, entry.platform);
       if (this.maxConcurrentSpawns.get(entry.name) !== entry.maxConcurrentSpawns) {
         this.maxConcurrentSpawns.set(entry.name, entry.maxConcurrentSpawns);
-        // Drop the stale semaphore so the next spawn builds one at the new width.
+        // The next spawn builds one at the new width.
         this.spawnSemaphores.delete(entry.name);
       }
-      // Preserve existing usage counters; only initialize for new scalers.
       if (!this.perScalerUsage.has(entry.name)) {
         this.perScalerUsage.set(entry.name, { cpus: 0, memBytes: 0 });
       }
@@ -3993,9 +3617,9 @@ export class ScalerManager {
   }
 
   /**
-   * Register every configured machine pool with the ledger, building the
-   * ledger when this reload is the first config to declare a pool. `cap` is
-   * re-registered on every reload, so a changed cap applies without a restart.
+   * Register every configured machine pool, building the ledger when this reload
+   * first declares a pool. `cap` is re-registered every reload, so a changed cap
+   * applies without a restart.
    */
   private applyMachinePools(newConfig: ScalerConfig): void {
     const pools = newConfig.machinePools ?? [];
@@ -4056,25 +3680,22 @@ export class ScalerManager {
   /**
    * Validate and reload configuration: plan → validate → build → commit.
    *
-   * Either the whole new config applies, or nothing does and the previous one
-   * keeps running. A scaler the new config no longer names is retired, not
-   * dropped: it stops taking work at once, its idle warm agents are destroyed,
-   * its job-bound agents finish, and its backend is torn down when it drains.
+   * All or nothing: a rejected config leaves the previous one running. A scaler
+   * the new config drops is retired: it stops taking work at once, its idle
+   * warm agents are destroyed, its job-bound agents finish, and its backend is
+   * torn down when it drains.
    */
   async reload(newConfig: ScalerConfig): Promise<ScalerReloadResult> {
     const plan = this.planReload(newConfig);
 
-    // Validate against live state. `backend.reload` applies as it validates, so
-    // `applied` carries what each kept backend held before this call.
+    // `backend.reload` applies as it validates; `applied` holds the prior state.
     const { errors, applied } = this.validateReload(newConfig, plan);
     if (errors.length > 0) return { valid: false, errors };
 
-    // Build added backends into a staging list; a failure leaves the old config.
     const { built, errors: buildErrors } = await this.buildAddedBackends(plan.added, newConfig);
     if (buildErrors.length > 0) {
-      // The kept backends already took the new label sets during validation.
-      // Nothing else has moved, so putting them back is what keeps a scaler
-      // that failed to construct from half-applying the rest of the file.
+      // Kept backends already took the new label sets; put them back so a
+      // failed construction does not half-apply the file.
       this.restoreReloadedBackends(applied);
       return { valid: false, errors: buildErrors };
     }
@@ -4107,11 +3728,10 @@ export class ScalerManager {
       unchanged: plan.kept.length,
     });
 
-    // Post-commit, best-effort: host prep + orphan reap for the new backends.
+    // Post-commit, best-effort.
     await this.prepareAddedBackends(built);
 
-    // A scaler removed while it had no agents drains instantly — tear it down
-    // now rather than leaving it visible until the next sweep tick.
+    // A scaler removed with no agents drains instantly; tear it down now.
     await this.sweepRetiredBackends();
 
     return { valid: true, plan: reloadPlan };
@@ -4143,17 +3763,12 @@ export class ScalerManager {
     };
   }
 
-  /**
-   * Return status summary for metrics and health endpoints.
-   */
-  /**
-   * Recent scaler spawn failures grouped per backend instance, for the
-   * diagnose scaler check. `nowMs` is injected by the caller.
-   */
+  /** Recent spawn failures per backend instance, for the diagnose scaler check. */
   recentSpawnFailures(windowMs: number, nowMs: number): Map<string, BackendFailureSummary> {
     return this.failureTracker.recentByBackend(windowMs, nowMs);
   }
 
+  /** Status summary for metrics and health endpoints. */
   getStatus(): ScalerStatus {
     const backendStatuses: ScalerStatus['backends'] = [];
     const enrichedEntries = this.getEnrichedScalerEntries();
@@ -4172,9 +3787,8 @@ export class ScalerManager {
         usage: { cpus: usage.cpus, memBytes: usage.memBytes },
         resourceCap: this.resourceCaps.get(name),
         machinePool: this.scalerMachinePools.get(name),
-        // A retiring scaler has no enriched entry, so the gate derives directly
-        // — `labelSets` above falls back to `backend.labelSets` in the same
-        // case, and the two must stay in step.
+        // A retiring scaler has no enriched entry; derive the gate directly, in
+        // step with the `labelSets` fallback above.
         labelSetMandatoryLabels:
           enriched?.labelSetMandatoryLabels ??
           backend.labelSets.map(() => this.mandatoryGate(name, backend)),
@@ -4196,10 +3810,9 @@ export class ScalerManager {
   /**
    * Scaler capacity advertised to peers in the cluster heartbeat.
    *
-   * Retiring backends are excluded: they accept no new work locally, so a peer
-   * that saw them would keep selecting this host for jobs it can no longer
-   * serve. Agents still draining on a retiring backend stay visible through the
-   * separate per-agent inventory, so in-flight work is unaffected.
+   * Retiring backends are excluded, or peers would keep selecting this host for
+   * jobs it can no longer serve. Their draining agents stay visible through the
+   * per-agent inventory, so in-flight work is unaffected.
    */
   getRoutableCapacity(): ScalerCapacitySummary[] {
     return this.getStatus()
@@ -4215,53 +3828,41 @@ export class ScalerManager {
       }));
   }
 
-  /**
-   * Get the backend name managing a specific agent.
-   * Returns null if the agent is not scaler-managed (standalone).
-   */
+  /** The scaler name managing an agent, or null for a standalone agent. */
   getBackendForAgent(agentId: string): string | null {
     return this.managedAgentIndex.get(agentId) ?? null;
   }
 
   /**
-   * Get a backend instance by scaler name. Returns undefined for an unknown
-   * name. Used by diagnostics to reach backend-specific accessors (e.g. the
-   * Firecracker backend's `getBridgeConfig()`).
+   * A backend by scaler name, for diagnostics reaching backend-specific
+   * accessors (e.g. the Firecracker backend's `getBridgeConfig()`).
    */
   getBackend(name: string): ScalerBackend | undefined {
     return this.backends.get(name);
   }
 
   /**
-   * Whether some configured backend could spawn capacity for this label set —
-   * the same `findBackendForLabels` match `requestScale` makes, asked without
-   * spawning anything.
+   * Whether some configured backend could spawn for this label set: the
+   * `findBackendForLabels` match `requestScale` makes, without spawning.
    *
-   * Read by the queue-expiry sweep to tell a fleet/label problem apart from a
-   * capacity one: a job whose labels no agent AND no backend can serve could
-   * never have run (`unroutable`), while a job whose backend matched but whose
-   * spawn kept failing is a provisioning/capacity problem (`timed_out_stale`),
-   * and mislabelling the latter would tell an operator to fix a `runsOn` that
-   * is perfectly correct.
+   * The queue-expiry sweep uses it to separate a label problem (no agent AND no
+   * backend: `unroutable`) from a provisioning/capacity one (`timed_out_stale`),
+   * so an operator is not told to fix a correct `runsOn`.
    *
-   * Exact labels only — the scaler's own routing (`requestScale`) matches on
-   * exact labels, so a regex `runsOn` matcher is not expressible here. On a
-   * scaler-configured orchestrator that makes the answer conservative for a
-   * pattern-only `runsOn`: a backend whose labelSets carry no mandatory labels
-   * matches the empty exact set, so such a job is reported routable and settles
-   * `timed_out_stale` rather than `unroutable`. That loses precision, never
-   * safety — the job is still terminal and the run still fails, which is the
-   * invariant that matters. Tightening it means teaching scaler routing about
-   * patterns, which would change where jobs actually spawn.
+   * Exact labels only, as in `requestScale`, so a regex `runsOn` is not
+   * expressible. For a pattern-only `runsOn` a backend with no mandatory labels
+   * matches the empty set, so the job settles `timed_out_stale` instead of
+   * `unroutable`: less precise, never unsafe (the job is terminal and the run
+   * fails either way). Tightening it means teaching scaler routing about
+   * patterns, which would change where jobs spawn.
    */
   hasBackendForLabels(labels: string[], excludeLabels: string[] = []): boolean {
     return findBackendForLabels(labels, this.getEnrichedScalerEntries(), excludeLabels) !== null;
   }
 
   /**
-   * Get scaler-specific configuration metadata for a managed agent.
-   * Returns undefined for non-scaler-managed (static) agents.
-   * Used to enrich job.context before forwarding to Platform.
+   * Scaler-specific metadata for a managed agent (undefined for a static one),
+   * used to enrich job.context before forwarding to the Platform.
    */
   getScalerContextForAgent(agentId: string): Record<string, unknown> | undefined {
     const backendName = this.managedAgentIndex.get(agentId);
@@ -4274,13 +3875,9 @@ export class ScalerManager {
   }
 
   /**
-   * Start the machine-pool ledger reaper and the retirement sweep that tears
-   * down drained retiring backends, and publish the warm-pool gauges so each
-   * pool's target is visible before its first fill.
-   *
-   * The warm pools themselves are NOT started here — see
-   * {@link startWarmPools}, which the host calls once every dependency a fill
-   * can reach is wired.
+   * Start the machine-pool ledger reaper and the retirement sweep, and publish
+   * the warm-pool gauges so each target is visible before its first fill. The
+   * warm pools themselves start in {@link startWarmPools}.
    */
   start(): void {
     this.started = true;
@@ -4290,10 +3887,10 @@ export class ScalerManager {
     }
     this.retirementSweep ??= setInterval(() => {
       runDetached(logger, 'Retired backend sweep', () => this.sweepRetiredBackends());
-      // Separate from the sweep: its job-status read awaits, and the sweep's
-      // retirement half must reach its first await without yielding. A
-      // provision the prune meets first is not reported either — the prune
-      // re-checks the job — and the reaper then tears it down as job-complete.
+      // Separate from the sweep, whose retirement half must reach its first
+      // await without yielding to this job-status read. A provision the prune
+      // meets first is not reported either (the prune re-checks the job), and
+      // the reaper tears it down as job-complete.
       runDetached(logger, 'Bound provision withdrawal', () => this.withdrawEndedBoundProvisions());
     }, RETIREMENT_SWEEP_INTERVAL_MS);
     this.retirementSweep.unref?.();
@@ -4301,23 +3898,19 @@ export class ScalerManager {
 
   /**
    * Run the warm pools' first deficit pass and arm their periodic tick.
-   *
-   * Separate from {@link start} because the first pass spawns immediately,
-   * and on an event backend a spawn emits through the event emitter — which
-   * the coordinator assigns after the scaler is built. The coordinator calls
-   * this once the emitter exists; the worker, which hosts no event backend,
-   * calls it right after `start()`.
+   * Separate from {@link start}: the first pass spawns at once, and an event
+   * backend's spawn needs the event emitter, which the coordinator assigns
+   * after building the scaler. The worker (no event backend) calls it right
+   * after `start()`.
    */
   startWarmPools(): void {
     this.warmPool.start();
   }
 
   /**
-   * Provision/heal every backend's host prerequisites before spawning starts.
-   * Awaits each backend's optional ensureHostReady, catching per-backend so one
-   * scaler's host-prep failure degrades only that scaler (its spawns will fail
-   * with clear errors + the firecracker-network diagnostic reports it) rather
-   * than aborting orchestrator startup.
+   * Provision/heal every backend's host prerequisites before spawning starts. A
+   * failure degrades only that scaler (its spawns fail with clear errors and
+   * the firecracker-network diagnostic reports it), never aborts startup.
    */
   async ensureHostsReady(): Promise<void> {
     for (const [name, backend] of this.backends.entries()) {
@@ -4337,13 +3930,11 @@ export class ScalerManager {
   /**
    * The window a spawning entry may sit unregistered before it is pruned.
    *
-   * An entry cannot be stale before its own spawn deadline has passed, so the
-   * window is floored at the configured deadline: an operator raising
-   * `KICI_SCALER_SPAWN_TIMEOUT_MS` for a slow cloud must not have this prune
-   * fire first and drop the correlation a provision booting inside the raised
-   * deadline still needs. The floor only ever extends the window — a lowered
-   * deadline keeps the default five minutes, because a local backend's agent
-   * boots and registers well after `spawn()` itself returns.
+   * Floored at the configured spawn deadline, so raising
+   * `KICI_SCALER_SPAWN_TIMEOUT_MS` for a slow cloud never has the prune drop
+   * the correlation of a provision still booting inside it. A lowered deadline
+   * keeps the default five minutes: a local backend's agent registers well
+   * after `spawn()` returns.
    */
   private stalePruneWindowMs(): number {
     return Math.max(this.spawnTimeoutMs, DEFAULT_STALE_SPAWN_PRUNE_MS);
@@ -4351,78 +3942,49 @@ export class ScalerManager {
 
   /**
    * Remove spawning entries whose `backend.spawn` started longer ago than the
-   * stale window but never registered via WS (e.g., process/container crashed
-   * on startup). Without cleanup, these entries would leak in spawningAgents
-   * forever.
+   * stale window and never registered via WS (e.g. a crash on startup), which
+   * would otherwise leak forever.
    *
-   * The window is measured from `spawnStartedAt` (when the throttled spawn
-   * actually began), NOT from `spawnedAt` (enqueue time): a spawn still waiting
-   * behind the per-backend spawn semaphore has not started and must not be
-   * reaped mid-queue during a large burst. Recovered orphan entries carry
-   * `spawnStartedAt` set to their persisted enqueue time, so they are subject to
-   * the normal window.
+   * Measured from `spawnStartedAt`, NOT `spawnedAt` (enqueue): a spawn still
+   * queued behind the semaphore must not be reaped mid-burst. Recovered entries
+   * carry `spawnStartedAt` = their persisted enqueue time.
    *
-   * What happens to the durable row depends on the backend type the spawn
-   * recorded, which the entry carries so a scaler since removed from this
-   * coordinator's config still resolves. A local backend's
-   * compute is pinned to a host this process manages, so a pruned entry means
-   * the spawn is dead and the row goes. An event backend's row is the only
-   * durable pointer at a customer cloud instance, and it is precisely the
-   * reaper's `spawn-timeout` candidate — so the row STAYS, and the reaper
-   * decides. Deleting it here would beat the reaper by the flap grace on any
-   * coordinator serving jobs, so the teardown the row exists to trigger would
-   * never be emitted.
+   * The durable row's fate follows the backend type the spawn recorded. A local
+   * backend's pruned spawn is dead, so the row goes. An event backend's row is
+   * the only pointer at a customer cloud instance and is the reaper's
+   * `spawn-timeout` candidate, so it STAYS: deleting it would beat the reaper by
+   * the flap grace and the teardown would never be emitted.
    */
   private pruneStaleSpawningEntries(): void {
     const staleThreshold = Date.now() - this.stalePruneWindowMs();
     for (const [id, entry] of this.spawningAgents) {
-      // Skip spawns still queued in the semaphore (not yet started).
       if (entry.spawnStartedAt === undefined) continue;
       if (entry.spawnStartedAt < staleThreshold) {
         this.spawningAgents.delete(id);
-        // A warm fill that never registered still holds an in-flight slot.
-        // Release it here or the pool stays permanently below target.
+        // Release a warm fill's in-flight slot, or the pool stays below target.
         if (!entry.boundJobId) this.warmPool.onWarmSpawnFailed(entry.labelSet);
         const backend = this.backends.get(entry.backendName);
-        // Branch on the type the spawn recorded, not on whether a backend is
-        // configured here. A scaler removed from this coordinator's config has
-        // no backend, and reading that as "not an event scaler" deletes the row
-        // that is the only pointer at a running customer cloud instance —
-        // `recoverState` rehydrates every owned row whether or not its scaler
-        // still exists, so a restart after such an edit would leak every
-        // in-flight provision. Live config resolves the type only for a row
-        // that recorded none.
+        // Branch on the recorded type, not on a configured backend: a removed
+        // scaler has none, and reading that as "not event" deletes the only
+        // pointer at a running cloud instance (`recoverState` rehydrates rows of
+        // removed scalers too). Live config resolves only a row with no type.
         const backendType = entry.backendType ?? backend?.type;
         if (backendType === ScalerBackendType.enum.event) {
-          // Nothing tells this instance that a peer adopted the agent, so the
-          // backend entry `spawn()` seeded would otherwise live until the
-          // process exits — counting against the global cap forever and
-          // handing `shutdownAll()` a peer's live agent. Forgetting emits
-          // nothing: this coordinator stops tracking the provision, and the
-          // adopter (or the reaper) owns the teardown. There is nothing to
-          // forget when the scaler is no longer configured here — the backend
-          // that held the entry went with it.
+          // A peer may have adopted the agent unseen; the seeded backend entry
+          // would count against the global cap forever and hand `shutdownAll()`
+          // a peer's live agent. Forgetting emits nothing: the adopter (or the
+          // reaper) owns the teardown.
           if (backend instanceof EventScalerBackend) backend.forget(id);
-          // A pruned event spawn is a failed external provision UNLESS the
-          // durable provision-outcome record says it was adopted — a teardown
-          // deletes the spawn row, so the row's absence proves nothing. See
-          // `reportPrunedProvisionFailure`. Reporting it here
-          // at all is what makes the backoff work on a multi-coordinator
-          // cluster: the reaper is leader-gated and `provisionFailures` is
-          // per-instance, so a non-leader would record nothing and keep
-          // dispatching at the un-deferred cadence through the whole outage
-          // while only the leader backed off. Deduped by agent id, so the
-          // leader seeing the same provision twice still counts it once.
+          // A failed external provision unless the provision-outcome record
+          // says adopted (see `reportPrunedProvisionFailure`). Reporting here
+          // arms the backoff on non-leaders too; deduped by agent id.
           this.reportPrunedProvisionFailure(id, entry);
         } else {
-          // Conditional on `adopted_by IS NULL` for safety even here: a
-          // local-backend row is never adoptable, so the predicate is a
-          // belt-and-braces guard rather than a live branch.
+          // `adopted_by IS NULL` is belt-and-braces: a local row is never adoptable.
           this.deleteUnadoptedSpawningAgentFromStore(id);
-          // The compute itself may still exist: a VM whose guest stopped
-          // after `spawn()` resolved, or a process that never connected.
-          // Without a teardown the backend keeps counting it against
-          // `maxAgents` and its host resources outlive it.
+          // The compute may still exist (a VM whose guest stopped after
+          // `spawn()` resolved, a process that never connected); without a
+          // teardown it counts against `maxAgents` and holds host resources.
           if (backend && entry.spawnSettled) {
             runDetached(
               logger,
@@ -4432,21 +3994,14 @@ export class ScalerManager {
             );
           }
         }
-        // Release the reservation this spawn is holding. A spawn that is pruned
-        // never registered an agent (otherwise it would have left the spawning
-        // map on WS register) and never will, so neither the spawn-failure path
-        // nor onAgentDisconnected will ever fire for it — this is the only place
-        // its reservation can be freed. Without this the per-scaler / global cap
-        // (and the persisted scaler_reservations row + machine-pool ledger slot)
-        // leak permanently, and on a boot/leader switch recoverState rehydrates
-        // the orphaned rows, inflating `used` until every future requestScale is
-        // rejected at-capacity with zero agents ever spawned.
+        // The only place a pruned spawn's reservation can be freed: neither the
+        // spawn-failure path nor onAgentDisconnected fires for it. Otherwise the
+        // caps (and the scaler_reservations row + machine-pool ledger slot) leak
+        // permanently, and recoverState rehydrates them until every requestScale
+        // is refused at-capacity with zero agents spawned.
         this.releaseAll(id);
-        // Same argument, applied to the event buffer. A backend that emitted a
-        // `scaler.failed` for an unbound spawn parked it here waiting for a
-        // correlation, and the paragraph above is exactly the proof that the
-        // correlation can never arrive — so the entry would sit in the map for
-        // the life of the process, one per pruned warm spawn.
+        // Same for the event buffer: a `scaler.failed` parked for an unbound
+        // spawn waits for a correlation that can never arrive.
         this.eventBuffer.delete(id);
         logger.warn(
           `Pruned stale spawning entry for agent ${id} (spawn started ${Math.round((Date.now() - entry.spawnStartedAt) / 1000)}s ago)`,
@@ -4456,25 +4011,20 @@ export class ScalerManager {
   }
 
   // ── DB write-through helpers ─────────────────────────────────────
-  // All store calls are fire-and-forget: HA correctness lives in the
-  // post-write fan-out (other coords read from the store on recovery)
-  // and a transient DB error is fine to log + continue — the L1 cache
-  // is still the authoritative view inside this process.
+  // Store calls are fire-and-forget: other coordinators read the store on
+  // recovery, and on a transient DB error the in-process cache stays
+  // authoritative, so log and continue.
 
   /**
    * The spawn row for one agent, as every writer of it must build it.
    *
-   * Ownership and self-describing columns are assembled only here.
-   * `backend_type` is what `adoptSpawningAgent`'s conditional UPDATE matches
-   * on, so a row without it can never be adopted by any instance — including
-   * the one that spawned it. `owner_instance_id` scopes recovery to that
-   * instance, and `mandatory_labels` carries the platform taint to a
-   * coordinator that has no config entry for this scaler and can therefore
-   * derive it from nothing else. `provisioning_targets` is the same story for
-   * teardown: it is the only address such a coordinator has for the customer's
-   * teardown workflow, and an emit to an empty target list reaches nobody, so
-   * the provision would bill forever. `roles` travels with it so the row stays
-   * a complete description of the spawn.
+   * Ownership and self-describing columns are assembled only here:
+   * `backend_type` is what `adoptSpawningAgent`'s conditional UPDATE matches, so
+   * a row without it is never adoptable; `owner_instance_id` scopes recovery;
+   * `mandatory_labels` and `provisioning_targets` give a coordinator with no
+   * config entry for the scaler its platform taint and its only teardown
+   * address (an empty target list reaches nobody, so the provision would bill
+   * forever); `roles` keeps the row a complete description of the spawn.
    */
   private spawningAgentSnapshot(
     agentId: string,
@@ -4482,10 +4032,9 @@ export class ScalerManager {
     scalerName: string,
     boundJobId: string | undefined,
     /**
-     * The run the bound job belongs to. Persisted so a coordinator that never
-     * spawned this agent — the leader-gated reaper is routinely a different one
-     * — can still attribute a provisioning failure back to the waiting job.
-     * Absent for a warm pre-spawn, which has no run.
+     * The bound job's run, so a coordinator that never spawned the agent (often
+     * the leader-gated reaper) can attribute a failure to the waiting job.
+     * Absent for a warm pre-spawn.
      */
     runId?: string,
   ): SpawningAgentSnapshot {
@@ -4504,8 +4053,7 @@ export class ScalerManager {
       ...(roles && { roles }),
       ...(backend && {
         backendType: backend.type,
-        // The scaler's `mandatoryGate`: the adopting coordinator stamps this
-        // row's value straight onto the agent.
+        // The adopting coordinator stamps this straight onto the agent.
         mandatoryLabels: this.mandatoryGate(scalerName, backend),
       }),
     };
@@ -4514,32 +4062,24 @@ export class ScalerManager {
   /**
    * Claim one slot against an event scaler's cluster-wide `maxAgents`.
    *
-   * The count and the claim share a single advisory-locked transaction, so the
-   * row this writes is already visible to the next coordinator that takes the
-   * lock. A store failure is never an admission: returning false costs a job a
-   * queue wait, while admitting on a count nobody recorded provisions a cloud
-   * instance the cap cannot see. Failing closed is not silent — a refusal
-   * increments the spawn-refusal counter and a store failure its own counter,
-   * labelled so a database outage, a contended lock, and a full cluster are
-   * three distinguishable things rather than one.
+   * Count and claim share one advisory-locked transaction, so the row is visible
+   * to the next coordinator taking the lock. A store failure never admits:
+   * refusing costs a queue wait, admitting provisions an instance the cap
+   * cannot see. Refusals and store failures are counted, labelled so a database
+   * outage, a contended lock and a full cluster are distinguishable.
    *
-   * The failure arm bounds the admission, not the row: a transaction that
-   * commits and then loses its acknowledgement leaves `slotClaimed` false, so
-   * neither rollback path fires and the row counts against the cap for an
-   * agent that never spawned. Closing that window needs two-phase commit; the
-   * event-provision reaper is the backstop, clearing the row once the spawn
-   * deadline passes with nothing adopted.
+   * A transaction that commits but loses its acknowledgement leaves
+   * `slotClaimed` false, so the row counts against the cap for an agent that
+   * never spawned. Closing that needs two-phase commit; the event-provision
+   * reaper is the backstop, clearing the row once the spawn deadline passes
+   * with nothing adopted.
    */
   private async claimClusterSlot(
     agentId: string,
     labelSet: string[],
     scalerName: string,
     maxAgents: number,
-    /**
-     * The job this spawn serves, or `undefined` for a warm pre-spawn. The
-     * durable snapshot has always accepted an unbound spawn; only this
-     * parameter was narrower.
-     */
+    /** The job this spawn serves, or `undefined` for a warm pre-spawn. */
     boundJobId: string | undefined,
     /** The bound job's run, persisted alongside it so a failure stays attributable. */
     runId: string | undefined,
@@ -4547,9 +4087,8 @@ export class ScalerManager {
     if (!this.stateStore) return ClusterSlotClaim.Refused;
     try {
       return await this.stateStore.withScalerCapLock(scalerName, async (slot) => {
-        // Another coordinator may already provision this job: the re-drive
-        // runs on any coordinator against the shared queue. Read under the
-        // same lock the claim writes under, so two cannot both admit it.
+        // The re-drive runs on any coordinator, so a peer may already provision
+        // this job. Read under the claim's lock, so two cannot both admit it.
         if (boundJobId !== undefined && (await slot.hasProvisionForJob(boundJobId))) {
           return ClusterSlotClaim.ProvisionInFlight;
         }
@@ -4612,9 +4151,8 @@ export class ScalerManager {
   }
 
   /**
-   * Stamp `adopted_by = this instance` on the spawning row of an agent that just
-   * registered here. Reuses the cross-instance conditional UPDATE, so a row some
-   * other instance already claimed is left exactly as it is.
+   * Stamp `adopted_by = this instance` on a just-registered agent's row, via the
+   * conditional UPDATE, so a row another instance claimed is left as it is.
    */
   private markSpawningAgentAdopted(agentId: string): void {
     if (!this.stateStore) return;
@@ -4629,11 +4167,10 @@ export class ScalerManager {
   /**
    * Record that `backend.spawn()` resolved for a spawn this instance started.
    *
-   * Returns false when the stale-spawn prune dropped the entry while
-   * `spawn()` was still running (a per-org spawn deadline can outlast the
-   * prune window). Nothing else would ever tear that compute down, so a local
-   * backend's is destroyed here. An event backend's provision is left to the
-   * reaper, as the prune leaves it.
+   * False when the prune dropped the entry while `spawn()` ran (a per-org
+   * deadline can outlast the prune window). Nothing else would tear that
+   * compute down, so a local backend's is destroyed here; an event provision is
+   * left to the reaper.
    */
   private onSpawnSettled(agentId: string, backend: ScalerBackend): boolean {
     const entry = this.spawningAgents.get(agentId);
@@ -4658,19 +4195,16 @@ export class ScalerManager {
   /**
    * Drop a settled local spawn whose backend reported it failed.
    *
-   * After `spawn()` resolved, a backend that finds its compute gone before the
-   * agent registered (a Firecracker guest that exited, a bare-metal agent
-   * process that exited) tears the compute down itself and emits
-   * `scaler.failed`. The agent will never register, so the spawning entry, its
-   * durable row and its reservation go now — waiting for the stale-spawn prune
-   * would hold the scaler's slot for minutes.
+   * A backend whose compute dies before registration (a Firecracker guest or a
+   * bare-metal agent process that exited) tears it down and emits
+   * `scaler.failed`. The entry, durable row and reservation go now; waiting
+   * for the prune would hold the slot for minutes.
    *
-   * A spawn that produced no agent is a refused launch, the same rule an event
-   * scaler's dead provision follows: the scaler is deferred before the
-   * reservation is freed, so an agent that dies at startup every time is not
-   * respawned at its own startup cadence. Only a spawn that has not registered
-   * reaches here — registration deletes the spawning entry — so an agent that
-   * registered and exits later never arms the backoff.
+   * Like an event scaler's dead provision, it is a refused launch: the scaler is
+   * deferred before the reservation is freed, so an agent dying at every
+   * startup is not respawned at its startup cadence. Only an unregistered spawn
+   * reaches here, so an agent that exits after registering never arms the
+   * backoff.
    */
   private dropFailedSettledSpawn(agentId: string, spawning: SpawningEntry): void {
     this.spawningAgents.delete(agentId);
@@ -4703,9 +4237,8 @@ export class ScalerManager {
         scalerName,
         cpus: requests.cpus,
         memBytes: requests.memBytes,
-        // Recovery reads reservations owner-scoped, so an unstamped row belongs
-        // to nobody: this instance would rehydrate zero usage after a restart
-        // and its caps would under-count every agent it is still running.
+        // Recovery is owner-scoped: an unstamped row rehydrates as zero usage,
+        // and the caps under-count every agent still running.
         ownerInstanceId: this.instanceId,
       })
       .catch((err) => {
@@ -4750,28 +4283,22 @@ export class ScalerManager {
   }
 
   /**
-   * Hydrate the in-memory Maps from the DB-backed state store after a
-   * coord boot or Raft leader switch. Reconstructs:
+   * Hydrate the in-memory maps from the state store after a coordinator boot
+   * or Raft leader switch:
    *
-   *   - `spawningAgents` (with `boundJobId` preserved for eager-dispatch on register)
+   *   - `spawningAgents` (with `boundJobId` for eager-dispatch on register)
    *     — event-backend rows only; a local-backend row is dropped, see below
    *   - `agentJobCorrelation` (so scaler-lifecycle events route correctly)
-   *   - `reservations` + `perScalerUsage` (so the cap-check critical
-   *     section reflects the cluster-wide truth, not the local empty
-   *     starting state)
+   *   - `reservations` + `perScalerUsage` (so the cap check sees the real
+   *     state, not an empty start)
    *
-   * The `globalUsage` counter is recomputed from `perScalerUsage` to
-   * keep the cap math consistent. `eventBuffer` is NOT restored — events
-   * emitted by the previous coord before correlation are lost (they are
-   * observability, not correctness: nothing downstream waits on them).
+   * `globalUsage` is recomputed from `perScalerUsage`. `eventBuffer` is NOT
+   * restored: its events are observability, and nothing waits on them.
    *
-   * Both reads are scoped to this instance's own rows. An unscoped read
-   * hydrates a peer's in-flight spawns and reservations as our own, so our
-   * spawn-timeout reaper destroys agents that peer is still legitimately
-   * waiting on and our caps double-count its reservations. Rows owned by a
-   * dead instance are the leader-gated reaper's business, not ours.
-   *
-   * No-op when no store is wired (unit-test path).
+   * Both reads are scoped to this instance's own rows. An unscoped read would
+   * hydrate a peer's in-flight spawns as ours, so our spawn-timeout reaper
+   * destroys agents the peer still waits on and our caps double-count. A dead
+   * instance's rows belong to the leader-gated reaper. No-op with no store.
    */
   async recoverState(): Promise<ScalerStateRecovery> {
     const recovery: ScalerStateRecovery = {
@@ -4787,34 +4314,24 @@ export class ScalerManager {
     try {
       const spawning = await this.stateStore.listSpawningAgentsForOwner(this.instanceId);
       for (const entry of spawning) {
-        // A recovered LOCAL-backend spawn can never register, so it is released
-        // here rather than rehydrated. Its compute is pinned to a host this
-        // process manages and cannot outlive the process that spawned it:
-        // `cleanupOrphans` (which bootstrap runs right after this) removes the
-        // container or VM behind it, and `adoptSpawningAgent` adopts `event`
-        // rows only, so even an agent that raced in ahead of the cleanup would
-        // be refused and reclaimed. Rehydrating it would hold its reservation
-        // — a slot against the scaler's `maxAgents` and the global cap — until
-        // `pruneStaleSpawningEntries` aged it out, and on a restart mid-burst
-        // that is the whole pool: ten dead container spawns rehydrated into a
-        // ten-slot scaler refuse every request for five minutes with
-        // `scalerActiveCount: 0`, `scalerReservations: 10`, while the jobs
-        // that asked for those agents sit queued. The row itself is spawn-time
-        // scratch on a local backend (the prune deletes it on the same
-        // reasoning), so it goes too; the reservation loop below then drops the
-        // reservation row for lack of a spawn behind it. Only a type the row
-        // recorded or the live config resolves is trusted: a row of unknown type
-        // is rehydrated and left for the prune to decide.
+        // A recovered LOCAL-backend spawn can never register, so it is dropped,
+        // not rehydrated: bootstrap's `cleanupOrphans` (right after this)
+        // removes its container or VM, and `adoptSpawningAgent` adopts `event`
+        // rows only, so an agent racing ahead of cleanup is refused and
+        // reclaimed. Rehydrating would hold its reservation until the prune: on
+        // a restart mid-burst, ten dead spawns in a ten-slot scaler refuse every
+        // request for five minutes (`scalerActiveCount: 0`,
+        // `scalerReservations: 10`). The row goes too, and the reservation loop
+        // below drops its reservation row. A row of unknown type (neither
+        // recorded nor in live config) is rehydrated for the prune to decide.
         const backendType = entry.backendType ?? this.backends.get(entry.scalerName)?.type;
         if (backendType !== undefined && backendType !== ScalerBackendType.enum.event) {
           this.deleteUnadoptedSpawningAgentFromStore(entry.agentId);
           recovery.spawningDropped += 1;
           continue;
         }
-        // A recovered entry is orphaned from this instance's previous life: no
-        // live spawn backs it, so treat it as already-started (staleness
-        // measured from its persisted enqueue time) rather than a still-queued
-        // spawn we'd never reap.
+        // No live spawn backs a recovered entry: treat it as started (staleness
+        // from its persisted enqueue time), or it would never be reaped.
         this.spawningAgents.set(entry.agentId, {
           labelSet: entry.labelSet,
           backendName: entry.scalerName,
@@ -4823,10 +4340,8 @@ export class ScalerManager {
           spawnStartedAt: entry.spawnedAt.getTime(),
           ...(entry.backendType !== undefined && { backendType: entry.backendType }),
           ...(entry.boundJobId !== undefined && { boundJobId: entry.boundJobId }),
-          // Without the run id a failure on a recovered spawn cannot be routed
-          // to the job still waiting on it: `onScalerEvent` takes both halves,
-          // and the correlation map is only populated post-registration — which
-          // is exactly what never happened for a recovered spawning entry.
+          // `onScalerEvent` needs the run id to route a failure to the waiting
+          // job; the correlation map fills only after registration.
           ...(entry.runId !== undefined && { runId: entry.runId }),
           spawnSettled: true,
         });
@@ -4841,32 +4356,23 @@ export class ScalerManager {
 
       const reservations = await this.stateStore.listReservationsForOwner(this.instanceId);
       for (const r of reservations) {
-        // A reservation is only ever released through `releaseAll`, and every
-        // route to it — spawn failure, agent disconnect, warm-pool destroy,
-        // `pruneStaleSpawningEntries` — is keyed on `spawningAgents`. So a row
-        // rehydrated with no spawn behind it is reachable by none of them: it
-        // bills against `globalMaxAgents` and its scaler's `maxAgents` until the
-        // deployment is rebuilt, and `recoverState` faithfully restores it on
-        // every subsequent boot. Past the global cap that refuses every
-        // `requestScale` with `at-capacity`, which leaves each job queued and
-        // logs nothing — so the cluster stops spawning agents and says nothing.
+        // Every `releaseAll` route (spawn failure, disconnect, warm-pool destroy,
+        // `pruneStaleSpawningEntries`) is keyed on `spawningAgents`, so a
+        // reservation with no spawn behind it is never released: it bills
+        // against the caps on every boot, and past the global cap every
+        // `requestScale` is silently refused `at-capacity`.
         //
-        // Keyed on the spawning map rather than on the row's age: a spawn still
-        // in flight across a restart legitimately owns its reservation whatever
-        // its age, and an orphan is worthless the moment it is orphaned. The
-        // ordering is what makes the test sound — `spawningAgents` is fully
-        // rehydrated above, so a miss here means no spawn row exists, not that
-        // one has not been read yet.
+        // Keyed on the spawning map, not age: an in-flight spawn owns its
+        // reservation whatever its age. Sound because `spawningAgents` is fully
+        // rehydrated above.
         //
-        // A REGISTERED agent's reservation outlives its spawn row on a local
-        // backend, where registration deletes the row, so the test would read
-        // that as an orphan. It is only safe because this method runs once, at
-        // bootstrap, before any agent has registered — and a local scaler agent
-        // cannot survive the restart anyway: `adoptSpawningAgent` adopts `event`
-        // rows only, so it is refused with `ScalerAdoptionLookupError` and
-        // reclaimed. An event agent's row DOES survive registration, which is
-        // why its live reservation is kept here. Calling this on a leader-switch
-        // callback instead would drop the reservations of agents still running.
+        // A REGISTERED local agent's reservation outlives its spawn row (deleted
+        // at registration), so this test reads it as an orphan. Safe only
+        // because this runs once at bootstrap, before any registration, and a
+        // local agent cannot survive the restart (`adoptSpawningAgent` adopts
+        // `event` rows only, so it is refused and reclaimed). An event row
+        // survives registration, so its reservation is kept. Calling this on a
+        // leader switch would drop reservations of running agents.
         if (!this.spawningAgents.has(r.agentId)) {
           this.deleteReservationFromStore(r.agentId);
           recovery.reservationsDropped += 1;
@@ -4896,21 +4402,18 @@ export class ScalerManager {
   }
 
   /**
-   * Mint a scaler-managed agent id.
-   *
-   * Built from {@link SCALER_AGENT_ID_PREFIX} rather than a second copy of the
-   * literal: the registration guard in `onAgentRegistered` recognises a
-   * scaler-managed agent by that prefix alone when the spawn-record lookup
-   * fails, so a minting prefix that drifts from the constant leaves the guard
-   * matching nothing and failing open.
+   * Mint a scaler-managed agent id from {@link SCALER_AGENT_ID_PREFIX}, never a
+   * copy of the literal: `onAgentRegistered`'s guard recognises scaler agents by
+   * that prefix alone when the spawn-record lookup fails, so a drifted prefix
+   * would fail open.
    */
   private generateAgentId(backendType: string): string {
     return `${SCALER_AGENT_ID_PREFIX}${backendType}-${randomUUID().slice(0, 8)}`;
   }
 
   /**
-   * Start log forwarding for a scaler-managed agent if its backend supports LogCapture.
-   * Fire-and-forget: the forward() promise runs for the agent's lifetime.
+   * Start log forwarding if the backend supports LogCapture. Fire-and-forget:
+   * forward() runs for the agent's lifetime.
    */
   private startLogForwarding(backend: ScalerBackend, agentId: string): void {
     const capture = backend.getLogCapture?.(agentId);
@@ -4941,8 +4444,8 @@ export class ScalerManager {
   }
 
   /**
-   * Create a per-agent event emitter closure to pass to backend.spawn().
-   * The closure captures agentId and routes events through handleScalerEvent().
+   * Per-agent event emitter for backend.spawn(), routing through
+   * handleScalerEvent().
    */
   private createEventEmitter(_agentId: string): (event: ScalerEvent) => void {
     return (event: ScalerEvent) => {
@@ -4953,27 +4456,22 @@ export class ScalerManager {
   /**
    * Handle a scaler event from a backend.
    *
-   * For spawn FAILURES the bound spawning entry is the usual resolver, since
-   * correlation isn't set until a job is dispatched post-registration. The
-   * correlation map wins only in the rarer post-registration failure window
-   * (e.g. a bare-metal child 'error' firing after the agent already
-   * registered, by which point the spawning entry is gone). Warm-pool /
-   * unbound spawns resolve to neither. When attributed, the event is relayed
-   * immediately; otherwise it is buffered until correlateAgentToJob() flushes
-   * it.
+   * A spawn FAILURE usually resolves through the bound spawning entry, since
+   * correlation is set only at dispatch. The correlation map wins in the rarer
+   * post-registration window (e.g. a bare-metal child 'error' after
+   * registration, when the spawning entry is gone). Unbound spawns resolve to
+   * neither. An attributed event is relayed at once; otherwise it is buffered
+   * until correlateAgentToJob() flushes it.
    *
-   * Every `scaler.failed` also increments the fleet-wide spawn-failure counter
-   * and emits a structured warn, regardless of whether it could be attributed.
-   * The backend label is resolved from the spawning entry first, then the
-   * managed-agent index — so a late failure after the spawning entry is gone
-   * still buckets under the real backend instead of "unknown".
+   * Every `scaler.failed` increments the fleet-wide spawn-failure counter and
+   * warns, attributed or not. The backend label comes from the spawning entry,
+   * then the managed-agent index, so a late failure still buckets under the
+   * real backend, not "unknown".
    *
-   * `attribution` is the last resort for a failure this coordinator did not
-   * spawn and never registered: the reaper is leader-gated, so the instance that
-   * condemns a stranded external provision routinely has neither a spawning
-   * entry nor a managed-agent index row for it, and every in-memory resolver
-   * above comes back empty. It is read only where the maps are silent, so a live
-   * local entry always wins over a durable row that may be a sweep behind.
+   * `attribution` is the last resort for a failure this coordinator neither
+   * spawned nor registered (typical for the leader-gated reaper). It is read
+   * only where the maps are silent, so a live local entry beats a durable row
+   * that may be a sweep behind.
    */
   private handleScalerEvent(event: ScalerEvent, attribution?: ScalerEventAttribution): void {
     const correlated = this.agentJobCorrelation.get(event.agentId);
@@ -4981,7 +4479,6 @@ export class ScalerManager {
     const runId = correlated?.runId ?? spawning?.runId ?? attribution?.runId;
     const jobId = correlated?.jobId ?? spawning?.boundJobId ?? attribution?.jobId;
 
-    // Fleet-wide signal: count + warn on EVERY spawn failure, bound or not.
     if (event.eventType === ScalerEventType.enum['scaler.failed']) {
       const backendName =
         spawning?.backendName ??
@@ -5014,7 +4511,6 @@ export class ScalerManager {
     if (runId && jobId && this.onScalerEvent) {
       this.onScalerEvent(runId, jobId, event);
     } else if (this.onScalerEvent) {
-      // Not attributable yet → buffer until correlateAgentToJob() flushes it.
       let buffer = this.eventBuffer.get(event.agentId);
       if (!buffer) {
         buffer = [];

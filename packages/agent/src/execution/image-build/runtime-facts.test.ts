@@ -33,9 +33,8 @@ describe('detectRuntimeFacts', () => {
   });
 
   it('separates being able to RUN a container from being able to BUILD one', () => {
-    // A containerized agent handed only a mounted socket can nest a job
-    // container and cannot build one — the build shells out to the CLI. Two
-    // facts, because a host can genuinely have one and not the other.
+    // A containerized agent with only a mounted socket can nest a job container
+    // but cannot build one (the build shells out to the CLI): two separate facts.
     const socketOnly = detectRuntimeFacts({
       ...none,
       pathExists: existing('/var/run/docker.sock'),
@@ -148,9 +147,9 @@ describe('resolveContainerRuntime', () => {
 
 describe('runtimeFactLabels', () => {
   it('renders facts under the self-reported kici:runtime: prefix', () => {
-    // The prefix matters: kici:runtime:* is a host FACT the register-time gate
-    // accepts unchallenged. kici:capability:* grants a privilege and must stay
-    // token-bound, so a fact must never be reported under it.
+    // kici:runtime:* is a host FACT the register-time gate accepts
+    // unchallenged; kici:capability:* grants a privilege and stays token-bound,
+    // so a fact must never be reported under it.
     const labels = runtimeFactLabels({ ...none, pathExists: () => true, binaryOnPath: () => true });
     expect(labels.length).toBeGreaterThan(0);
     for (const l of labels) {

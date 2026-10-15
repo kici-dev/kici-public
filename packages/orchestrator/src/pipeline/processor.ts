@@ -1,15 +1,11 @@
 /**
- * Core webhook processing pipeline.
+ * Core webhook processing pipeline: dedup -> normalize event -> fetch lock file ->
+ * get changed files -> match triggers -> cache check -> dispatch jobs.
  *
- * Connects all orchestrator modules into a complete processing flow:
- * dedup -> normalize event -> fetch lock file -> get changed files ->
- * match triggers -> cache check -> dispatch jobs
+ * Provider-agnostic: every provider-specific operation goes through the ProviderRegistry.
  *
- * Uses the ProviderRegistry for all provider-specific operations.
- * No direct GitHub/Octokit references -- fully provider-agnostic.
- *
- * Decision traces are forwarded to Platform via platformClient.send() (which buffers
- * internally when disconnected -- the caller does NOT check connection state).
+ * Decision traces go to the Platform via platformClient.send(), which buffers while
+ * disconnected, so the caller does NOT check connection state.
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -99,12 +95,10 @@ import { runDetached } from '../helpers/run-detached.js';
 const logger = createLogger({ prefix: 'pipeline' });
 
 /**
- * Pending dispatch context for jobs gated by the needs scheduler.
- * Keyed by `${runId}:${jobName}`. Populated at processWebhook time for all
- * non-root static jobs. Consumed by the onJobReady callback when the scheduler
- * determines a job's upstreams are all satisfied.
- *
- * Entries are cleaned up after dispatch or when the run completes.
+ * Pending dispatch context for a job gated by the needs scheduler, keyed by
+ * `${runId}:${jobName}`. Stored at processWebhook time for every non-root static
+ * job; consumed by onJobReady once its upstreams are satisfied; cleaned up after
+ * dispatch or on run completion.
  */
 interface PendingJobContext {
   jobInput: QueuedJobInput;
@@ -116,10 +110,9 @@ interface PendingJobContext {
    */
   invoke?: InvokeGateParams;
   /**
-   * Set for a job bound to a context: what `dispatchReadyJob` resolves the
-   * job's context variables and secrets from when the job leaves its pending
-   * context, since `jobInput` is stored without them. Absent for a job with no
-   * bound context, which dispatches its stored input unchanged.
+   * Set for a job bound to a context: `dispatchReadyJob` resolves the context
+   * variables and secrets from it, since `jobInput` is stored without them.
+   * Absent when no context is bound; the stored input dispatches unchanged.
    */
   contextResolution?: DeferredContextResolution;
   /**
@@ -175,15 +168,13 @@ const pendingJobContexts = new Map<string, PendingJobContext>();
 
 /**
  * Eval-gate registry for result-aware dynamic generators, keyed by
- * `${runId}:${evalJobName}`. A deferred `processDynamicEntry` background task
- * registers a gate and awaits it; the needs scheduler opens the gate (resolving
- * the promise) when the eval job's upstream `needs` reach a terminal state.
+ * `${runId}:${evalJobName}`. A deferred `processDynamicEntry` task registers a
+ * gate and awaits it; the needs scheduler opens it when the eval job's upstream
+ * `needs` reach a terminal state.
  *
- * This is the in-process signal that crosses from the scheduler's `onJobReady`
- * path back to the waiting dispatch task — the gating itself stays in the
- * DB-backed `execution_job_needs` scheduler. Like `pendingJobContexts`, it is a
- * module-level singleton because both producer and consumer run in the same
- * orchestrator process for the lifetime of the awaiting task.
+ * Only the in-process wake-up signal lives here; the gating itself stays in the
+ * DB-backed `execution_job_needs` scheduler. A module-level singleton because
+ * producer and consumer share one process for the awaiting task's lifetime.
  */
 const pendingEvalGates = new Map<string, () => void>();
 
@@ -191,10 +182,7 @@ function evalGateKey(runId: string, evalJobName: string): string {
   return `${runId}:${evalJobName}`;
 }
 
-/**
- * Register an eval gate and return a promise that resolves when the scheduler
- * opens it (the eval job's upstream needs are all satisfied).
- */
+/** Register an eval gate; resolves when the scheduler opens it. */
 export function trackEvalGate(runId: string, evalJobName: string): Promise<void> {
   return new Promise<void>((resolve) => {
     pendingEvalGates.set(evalGateKey(runId, evalJobName), resolve);
@@ -202,9 +190,8 @@ export function trackEvalGate(runId: string, evalJobName: string): Promise<void>
 }
 
 /**
- * Open a registered eval gate, unblocking the deferred dispatch task. Returns
- * true if a gate was registered for this eval job (so the scheduler knows it
- * handled the ready signal itself and must not run the normal dispatch path).
+ * Open a registered eval gate. Returns true when one existed, so the scheduler
+ * must not also run the normal dispatch path.
  */
 export function openEvalGate(runId: string, evalJobName: string): boolean {
   const key = evalGateKey(runId, evalJobName);
@@ -229,9 +216,7 @@ export function clearEvalGatesForRun(runId: string): void {
 }
 
 /**
- * Store a pending dispatch context for a job that will be dispatched later
- * by the needs scheduler. The key is `${runId}:${jobName}`.
- * Writes to both in-memory Map and DB table for crash recovery.
+ * Store a pending dispatch context in memory and in the DB (for crash recovery).
  * @internal Exported for testing
  */
 export async function storePendingJobContext(
@@ -268,16 +253,12 @@ export async function storePendingJobContext(
 }
 
 /**
- * Consume and remove a pending dispatch context for a job.
- * Returns undefined if no context is stored (e.g. job was already dispatched).
- * Deletes from both in-memory Map and DB table.
+ * Consume a pending dispatch context from memory and the DB; undefined when none
+ * is stored (e.g. the job already dispatched).
  *
- * Cluster correctness: `storePendingJobContext` writes to both the local
- * in-memory Map and the shared DB. In an HA cluster the peer that ingested
- * the webhook stores the context, but `onJobReady` fires on whichever peer
- * tracked the upstream job's completion — which, for a rerouted upstream,
- * is a different peer whose Map is empty. Falling through to an atomic
- * `DELETE ... RETURNING` ensures exactly one peer claims the context.
+ * Cluster correctness: `onJobReady` fires on whichever peer tracked the upstream's
+ * completion, which for a rerouted upstream is not the ingesting peer, so its Map
+ * is empty. The atomic `DELETE ... RETURNING` fallback lets exactly one peer claim it.
  * @internal Exported for testing
  */
 export async function consumePendingJobContext(
@@ -319,11 +300,9 @@ export async function consumePendingJobContext(
   const row = claimed[0];
   return {
     ...unsealedJobInput({ ...row, run_id: runId, job_name: jobName }),
-    // A context stored before labels were canonicalized still carries the case
-    // the workflow author typed, so fold on read. Routing takes its selectors
-    // from `jobInput`; this value is what `addJobsToRun` writes to the job's
-    // `runs_on_labels` reporting column, so folding keeps the dashboard showing
-    // one case for a label however old the stored row is.
+    // A context stored before labels were canonicalized keeps the author's case,
+    // so fold on read. Routing uses `jobInput`; this value feeds the
+    // `runs_on_labels` reporting column, so the dashboard shows one case per label.
     runsOnLabels: canonicalizeLabels(row.runs_on_labels as unknown as string[]),
     ...(row.invoke_config != null && {
       invoke: JSON.parse(row.invoke_config) as InvokeGateParams,
@@ -333,14 +312,10 @@ export async function consumePendingJobContext(
 }
 
 /**
- * Is the pending context for this (run, job) an invoke gate?
- *
- * Reads WITHOUT consuming, which is why it exists as its own function: the
- * ready-dispatch concurrency re-gate runs before `consumePendingJobContext`, and
- * consuming there would delete the resume path of a job it goes on to re-hold.
- *
- * `undefined` means "no pending context" — the caller already handles that a few
- * lines later, when the consume returns nothing.
+ * Is the pending context for this (run, job) an invoke gate? Reads WITHOUT
+ * consuming: the ready-dispatch concurrency re-gate runs before
+ * `consumePendingJobContext`, and consuming there would delete the resume path of
+ * a job it goes on to re-hold. A missing context is handled by the later consume.
  */
 async function pendingJobContextIsInvokeGate(
   db: Kysely<Database> | undefined,
@@ -359,10 +334,7 @@ async function pendingJobContextIsInvokeGate(
   return row?.invoke_config != null;
 }
 
-/**
- * Clean up all pending dispatch contexts for a run (called on run completion).
- * Deletes from both in-memory Map and DB table.
- */
+/** Drop a run's pending dispatch contexts from memory and the DB on run completion. */
 export async function cleanupPendingJobContexts(
   db: Kysely<Database> | undefined,
   runId: string,
@@ -379,14 +351,12 @@ export async function cleanupPendingJobContexts(
 }
 
 /**
- * Restore all pending job contexts from DB into the in-memory Map.
- * Called on startup before the needs scheduler recovery loop so that
- * dispatchReadyJob has context available for recovered jobs.
+ * Restore pending job contexts from the DB into memory. Runs on startup before
+ * the needs scheduler recovery loop, so dispatchReadyJob has them for recovered jobs.
  */
 export async function restorePendingJobContexts(db: Kysely<Database>): Promise<number> {
-  // Clean up stale rows for runs that already reached terminal state.
-  // These can linger if the orchestrator crashed after run completion but before
-  // the fire-and-forget cleanupPendingJobContexts DB delete finished.
+  // Rows of terminal runs linger when a crash beat the fire-and-forget
+  // cleanupPendingJobContexts delete.
   await db
     .deleteFrom('pending_job_contexts')
     .where(
@@ -404,8 +374,7 @@ export async function restorePendingJobContexts(db: Kysely<Database>): Promise<n
     const key = `${row.run_id}:${row.job_name}`;
     pendingJobContexts.set(key, {
       ...unsealedJobInput(row),
-      // Same fold as the consume path: a row restored from before the fold
-      // shipped must report the same way a freshly stored one does.
+      // Same label fold as the consume path.
       runsOnLabels: canonicalizeLabels(row.runs_on_labels as unknown as string[]),
       ...(row.invoke_config != null && {
         invoke: JSON.parse(row.invoke_config) as InvokeGateParams,
@@ -417,7 +386,7 @@ export async function restorePendingJobContexts(db: Kysely<Database>): Promise<n
 }
 
 /**
- * Clear all entries from the in-memory pending job contexts Map.
+ * Clear the in-memory pending job contexts.
  * @internal Exported for testing only.
  */
 export function clearPendingJobContextsMap(): void {
@@ -425,14 +394,13 @@ export function clearPendingJobContextsMap(): void {
 }
 
 /**
- * Determine if a lock job is a "root" job (no concrete needs and no dependsOnGroups).
- * Root jobs can be dispatched immediately; non-root jobs wait for the scheduler.
+ * A root job (no concrete needs, no dependsOnGroups) dispatches immediately;
+ * others wait for the scheduler.
  */
 export function isRootJob(lockJob: LockJob): boolean {
-  // Check for concrete needs (string or NeedsEntry with 'name'). A lock job
-  // read from the registration store can arrive without a `needs` array (the
-  // compiler always emits `needs: []`, but a directly-registered global entry
-  // may omit it); a missing `needs` means no upstreams — a root job.
+  // A concrete need is a string or a NeedsEntry with 'name'. A directly-registered
+  // global entry may omit `needs` (the compiler always emits `needs: []`); missing
+  // means no upstreams.
   const hasConcreteNeeds = (lockJob.needs ?? []).some(
     (n) => typeof n === 'string' || (typeof n === 'object' && 'name' in n),
   );
@@ -448,44 +416,24 @@ export function isRootJob(lockJob: LockJob): boolean {
  * webhook's provider bundle first, then falling back to other provider bundles
  * registered against the SAME customer's registrations for the SAME repo.
  *
- * Why this exists
- * ----------------
- * The webhook pipeline binds `lockFileFetcher` to the inbound webhook's
- * provider bundle. When a local-sourced webhook (e.g., a failover-dispatch
- * push sent through the internal ingress) arrives for a repo whose lock file
- * is only accessible via a different provider (e.g., github), the inbound
- * fetcher returns null and trigger matching silently drops the webhook.
- * This resolver lets the pipeline consult OTHER bundles whose registrations
- * prove they own the repo for the same tenant.
+ * Why: `lockFileFetcher` is bound to the inbound provider bundle. A local-sourced
+ * webhook (e.g. a failover-dispatch push through the internal ingress) for a repo
+ * whose lock file only another provider (e.g. github) can read gets null, and
+ * trigger matching silently drops the webhook.
  *
- * Tenant boundary (security-critical)
- * -----------------------------------
- * The fallback iterates ONLY registrations returned by
- * `registrationIndex.getByOrgAndRepo(customerId, repoIdentifier)`. That
- * index is keyed by `${customerId}|${repoIdentifier}`, so cross-customer
- * leakage is structurally impossible — a customer-B registration for
- * `owner/repo` will never be returned when we pass `customerId = 'custA'`.
- * The resolver also skips any registration whose `routingKey` matches the
- * inbound routing key (no self-recursion) and dedupes by routing key so a
- * repo with many workflows registered through the same source only
- * triggers one fallback fetch.
+ * Tenant boundary (security-critical): the fallback iterates ONLY
+ * `registrationIndex.getByOrgAndRepo(customerId, repoIdentifier)`, keyed by
+ * `${customerId}|${repoIdentifier}`, so cross-customer leakage is structurally
+ * impossible. It skips the inbound routing key (no self-recursion) and dedupes by
+ * routing key, so many workflows from one source trigger one fallback fetch.
  *
- * Ordering
- * --------
- * Registrations are consulted in the order returned by the index (which
- * preserves insertion order = createdAt ascending). The first non-null
- * lock file wins. If all fallbacks return null the function returns null
- * and the caller falls through to the existing `Lock file not found`
+ * Ordering: index order (createdAt ascending); the first non-null lock file wins.
+ * All null returns null, and the caller falls through to the `Lock file not found`
  * global-workflow-matching path.
  *
- * Credentials
- * -----------
- * Each fallback fetcher is invoked with the REGISTRATION'S
- * `providerContext`, NOT the inbound normalizer's credentials. This is
- * load-bearing: the LocalWebhookNormalizer returns `{}` as
- * credentials, which would never satisfy a github fetcher that requires
- * `installationId`. The registration carries the correct credentials
- * because it was created via the owning provider's source.
+ * Credentials: each fallback fetcher gets the REGISTRATION'S `providerContext`,
+ * NOT the inbound credentials. Load-bearing: LocalWebhookNormalizer returns `{}`,
+ * which never satisfies a github fetcher needing `installationId`.
  */
 export async function resolveLockFileWithFallback(args: {
   inboundBundle: ProviderBundle;
@@ -500,23 +448,20 @@ export async function resolveLockFileWithFallback(args: {
   deliveryId: string;
   /**
    * False when cross-source repo mode already evaluated this delivery's
-   * other-source registrations for the same repository: the fallback would
-   * re-read exactly those registrations. Defaults to true.
+   * other-source registrations for the repo, which the fallback would re-read.
+   * Defaults to true.
    */
   allowRegistrationFallback?: boolean;
 }): Promise<{
   lockFile: FullLockFile | null;
   resolvedVia: 'inbound' | 'fallback' | 'miss' | 'corrupt';
   fallbackRoutingKey?: string;
-  /** The winning provider bundle when resolvedVia='fallback'. Used by the dispatch
-   *  site to swap repoUrlBuilder and cloneTokenProvider (Layer 4 cross-provider fix). */
+  /** Set on 'fallback': the dispatch site swaps in its repoUrlBuilder and cloneTokenProvider. */
   fallbackBundle?: ProviderBundle;
-  /** The winning registration's providerContext when resolvedVia='fallback'.
-   *  Carries installationId etc. for clone token issuance. */
+  /** Set on 'fallback': the registration's providerContext (installationId etc.) for clone tokens. */
   fallbackCredentials?: Record<string, unknown>;
-  /** Set when resolvedVia='corrupt': the parse error seen while attempting to
-   *  resolve a lock file. A valid fallback always wins over a corrupt inbound,
-   *  so this is only surfaced when NOTHING resolved. */
+  /** Set on 'corrupt': the parse error. A valid fallback beats a corrupt inbound,
+   *  so this surfaces only when NOTHING resolved. */
   corruptError?: LockFileParseError;
 }> {
   const {
@@ -532,10 +477,8 @@ export async function resolveLockFileWithFallback(args: {
     deliveryId,
   } = args;
 
-  // A corrupt lock file (present-but-unparseable) is remembered here. If no
-  // provider resolves a valid lock, a remembered parse error turns the final
-  // 'miss' into a 'corrupt' outcome so the pipeline can record a
-  // lock_resolution init-failure run. A valid lock from any provider still wins.
+  // A present-but-unparseable lock file turns the final 'miss' into 'corrupt', so
+  // the pipeline records a lock_resolution init-failure run. Any valid lock wins.
   let parseError: LockFileParseError | undefined;
   const missOrCorrupt = (): {
     lockFile: FullLockFile | null;
@@ -546,7 +489,7 @@ export async function resolveLockFileWithFallback(args: {
       ? { lockFile: null, resolvedVia: 'corrupt', corruptError: parseError }
       : { lockFile: null, resolvedVia: 'miss' };
 
-  // 1. Try inbound bundle first (existing behavior).
+  // 1. Inbound bundle first.
   if (inboundBundle.lockFileFetcher) {
     try {
       const lockFile = (await lockFileCache.get(
@@ -569,16 +512,12 @@ export async function resolveLockFileWithFallback(args: {
 
   if (args.allowRegistrationFallback === false) return missOrCorrupt();
 
-  // 2. Gate on preconditions: no fallback if no registrationIndex or no
-  //    tenant context, and skip fallback entirely when customerId is the
-  //    global default (fallback only makes sense within a real tenant).
+  // 2. Fallback only within a real tenant: never for the global default customerId.
   if (!registrationIndex || customerId === '__default__') {
     return missOrCorrupt();
   }
 
-  // 3. Iterate same-customer registrations for this repo. The index is
-  //    keyed by `${customerId}|${repoIdentifier}` so cross-tenant leakage
-  //    is structurally impossible.
+  // 3. Same-customer registrations only (tenant boundary: see JSDoc).
   const sameTenantRegistrations = registrationIndex.getByOrgAndRepo(customerId, repoIdentifier);
   if (sameTenantRegistrations.length === 0) {
     logger.info('Multi-provider fallback: no same-customer registrations for repo', {
@@ -620,9 +559,7 @@ export async function resolveLockFileWithFallback(args: {
     const fallbackBundle = providerRegistry.getByRoutingKey(fallbackRoutingKey);
     if (!fallbackBundle?.lockFileFetcher) continue;
 
-    // Use the registration's own providerContext as credentials — the
-    // inbound normalizer's credentials (e.g. {} for local) would not
-    // satisfy a github fetcher which needs installationId.
+    // The registration's own credentials, never the inbound ones (see JSDoc).
     const registration = sameTenantRegistrations.find((r) => r.routingKey === fallbackRoutingKey);
     if (!registration) continue;
     const fallbackCredentials = registration.providerContext;
@@ -679,16 +616,12 @@ export async function resolveLockFileWithFallback(args: {
 }
 
 /**
- * Resolve the customer/org ID for a routing key.
- *
- * Checks the `sources` table first (GitHub App sources), then
- * `generic_webhook_sources` (generic webhook sources), then `remote_sources`
- * (the auto-provisioned anchor for Platform-relayed `kici run remote`, routing
- * key `remote:<orgId>`). Falls back to '__default__' if none of the three
- * tables has the routing key.
+ * Resolve the customer/org ID for a routing key from `sources` (GitHub App), then
+ * `generic_webhook_sources`, then `remote_sources` (the auto-provisioned anchor for
+ * Platform-relayed `kici run remote`, routing key `remote:<orgId>`); '__default__'
+ * when none has it.
  */
 export async function resolveOrgId(db: Kysely<Database>, routingKey: string): Promise<string> {
-  // Check sources table (GitHub App sources)
   const source = await db
     .selectFrom('sources')
     .select('customer_id')
@@ -699,7 +632,6 @@ export async function resolveOrgId(db: Kysely<Database>, routingKey: string): Pr
     return source.customer_id;
   }
 
-  // Check generic_webhook_sources table
   const genericSource = await db
     .selectFrom('generic_webhook_sources')
     .select('customer_id')
@@ -710,7 +642,6 @@ export async function resolveOrgId(db: Kysely<Database>, routingKey: string): Pr
     return genericSource.customer_id;
   }
 
-  // Check remote_sources (Platform-relayed `kici run remote` anchor)
   const remoteSource = await db
     .selectFrom('remote_sources')
     .select('customer_id')
@@ -725,10 +656,7 @@ export async function resolveOrgId(db: Kysely<Database>, routingKey: string): Pr
   return '__default__';
 }
 
-/**
- * Map GitHub webhook event types to lock file trigger type strings.
- * Used for global workflow matching via RegistrationIndex.getGlobalByTriggerType().
- */
+/** Map a GitHub event type to its lock file trigger type, for RegistrationIndex.getGlobalByTriggerType(). */
 export function eventTypeToTriggerType(eventType: string): string {
   const map: Record<string, string> = {
     push: 'push',
@@ -749,27 +677,21 @@ export function eventTypeToTriggerType(eventType: string): string {
   return map[eventType] ?? eventType;
 }
 
-/**
- * Extract a human-readable trigger event string from webhook info.
- * Combines event type with action (e.g. "push", "pull_request:opened").
- */
+/** Trigger event string: event plus action, e.g. "push", "pull_request:opened". */
 export function buildTriggerEvent(event: string, action: string | null | undefined): string {
   if (action) return `${event}:${action}`;
   return event;
 }
 
 /**
- * Best-effort extraction of a repository identifier from a generic webhook
- * payload for cross-source dispatch. Generic webhooks have no
- * canonical repo shape, so we probe the conventions a sender is most likely
- * to use:
+ * Best-effort repo identifier from a generic webhook payload, for cross-source
+ * dispatch. Generic webhooks have no canonical repo shape, so this probes:
  *
  *   1. GitHub-style `repository.full_name` (`owner/repo`)
  *   2. GitHub-style `repository.owner.login` + `repository.name`
  *   3. Flat `repository` string (e.g. `{"repository": "owner/repo"}`)
  *
- * Returns null when no recognisable repo field is present, in which case the
- * cross-source repo lookup is skipped (event-name fan-out still runs).
+ * Null skips the cross-source repo lookup; event-name fan-out still runs.
  */
 export function extractInboundRepoIdentifier(payload: unknown): string | null {
   if (!payload || typeof payload !== 'object') return null;
@@ -799,9 +721,8 @@ export function extractInboundRepoIdentifier(payload: unknown): string | null {
 }
 
 /**
- * Extract the first line of the commit message from a webhook payload, for run
- * display. Handles push (head_commit.message), PR (pull_request.title) and
- * issue_comment (issue.title) events.
+ * First line of the commit message for run display: push (head_commit.message),
+ * PR (pull_request.title), issue_comment (issue.title).
  *
  * The Tier-0 `commitMessage` trigger filter deliberately reads a DIFFERENT text
  * (the full message, and PR title + body) — see `githubFilterText`.
@@ -811,20 +732,15 @@ export function extractCommitMessage(event: string, payload: unknown): string | 
 }
 
 /**
- * Build a human-readable summary for a security hold check.
+ * Summary for a security hold check.
  *
- * `tier` is the resolved trust tier, or undefined when trust never resolved;
- * the summary displays `unknown` for the latter. The caller passes the resolved
- * value rather than forging `unknown` for an absent one, so this summary and
- * `buildReducedPrivilegeNote` (`../security/reduced-privilege-note.ts`) cannot
- * disagree about which case a run is in.
+ * `tier` is undefined when trust never resolved (displayed as `unknown`). The
+ * caller never forges `unknown`, so this and `buildReducedPrivilegeNote`
+ * (`../security/reduced-privilege-note.ts`) cannot disagree about a run's case.
  *
- * Carries no reduced-privilege note of its own: the note is appended by the
- * call site, because the two summaries this builds are read on checks with
- * different fates. The trust-policy HOLD stores a resume context, so
- * `/kici approve` replays its dispatch and its call site
- * (`holdRunForSecurityPolicy`) appends the note; the trust-policy REJECTION
- * never runs, so `buildSecurityRejectionSummary`'s call site appends nothing.
+ * The reduced-privilege note is the call site's job: a trust-policy HOLD stores a
+ * resume context that `/kici approve` replays, so `holdRunForSecurityPolicy`
+ * appends it; a trust-policy REJECTION never runs, so its call site appends nothing.
  */
 export function buildSecurityHoldSummary(
   reason: string,
@@ -859,18 +775,13 @@ export function buildSecurityHoldSummary(
 }
 
 /**
- * Build the failure check-run description for a run the org trust policy
- * REJECTED.
+ * Failure check-run description for a run the org trust policy REJECTED.
  *
- * Deliberately not `buildSecurityHoldSummary`: a rejected run creates no
- * `held_runs` row, so telling the contributor to seek "approval from a user
- * with ci_trust:write or higher" points at a queue the run will never appear
- * in. Only an org policy change can unblock it.
- *
- * Carries no reduced-privilege note for the same reason: the summary's own next
- * line says the run cannot be approved, so a posture note beside it would read
- * as "it ran with reduced privileges and that is why it failed" for a run that
- * never dispatched at all.
+ * Not `buildSecurityHoldSummary`: a rejected run has no `held_runs` row, so
+ * "approval from a user with ci_trust:write" points at a queue it never joins;
+ * only an org policy change unblocks it. No reduced-privilege note either: beside
+ * "cannot be approved" it would read as the cause of failure for a run that never
+ * dispatched.
  */
 export function buildSecurityRejectionSummary(
   reason: string,
@@ -892,10 +803,9 @@ export function buildSecurityRejectionSummary(
 }
 
 /**
- * Build the pending check-run description for a job/workflow approval hold,
- * naming the clauses an approver must satisfy. `{team:X}` renders as
- * "team X", `{user:Y}` as "user Y". An empty clause list (any eligible
- * reviewer satisfies the hold) falls back to a generic message.
+ * Pending check-run description for a job/workflow approval hold, naming the
+ * clauses ("team X", "user Y"). An empty list (any eligible reviewer) gets a
+ * generic message.
  */
 export function summarizeApprovalClauses(
   clauses: ReadonlyArray<{ team: string } | { user: string }>,
@@ -910,206 +820,172 @@ export function summarizeApprovalClauses(
 }
 
 /**
- * The line appended to an approval hold's check description when a security
- * trust hold gates the SAME job.
- *
- * Both holds must be answered before the job runs, and the check run carries one
- * description. Without this line the check names only the approval clauses — so
- * the named approver approves, nothing runs, and the text does not change: a
- * contributor is left with a satisfied requirement, no statement of what is
- * still outstanding, and no idea that a different permission clears it. Naming
- * the second gate and how it is released is the minimum that makes the check
- * honest.
+ * Appended to an approval hold's check description when a security trust hold
+ * gates the SAME job. Both holds must clear and the check carries one description;
+ * without this line the named approver approves, nothing runs, and nothing says
+ * what is outstanding or that a different permission clears it.
  */
 export const SECURITY_HOLD_ALSO_GATES_NOTE =
   'A security trust hold also gates this job, and both must be released before it runs. ' +
   'That one is cleared by a `ci_trust:write` approver, or by commenting `/kici approve` on this pull request.';
 
 /**
- * Dependencies for the processing pipeline.
- * All injected for testability. Fully provider-agnostic.
- *
- * sourceCache and buildCoordinator are optional for backward compatibility --
- * existing tests and deployments without cache configured still work.
+ * Dependencies for the processing pipeline, all injected for testability.
+ * Optional caches keep tests and cache-less deployments working.
  */
 export interface ProcessingDeps {
   dedup: DedupCache;
   providerRegistry: ProviderRegistry;
   /**
    * Re-register the provider bundle for a generic routing key from server
-   * truth, returning true when a bundle is now present.
+   * truth; true when a bundle is now present.
    *
-   * The registry is an in-memory CACHE of `generic_webhook_sources`, populated
-   * by three independent paths (startup enumeration, the admin write handler,
-   * and the LISTEN/NOTIFY drain). None of them can guarantee the entry is
-   * present for a delivery that arrives at an arbitrary moment, and a miss is
-   * not benign: `getByRoutingKey` used to substitute an unrelated `generic:`
-   * bundle whose normalizer reports "this payload has no repository", so the
-   * delivery was discarded with nothing above `debug` to say why.
+   * The registry is an in-memory CACHE of `generic_webhook_sources`, filled by
+   * startup enumeration, the admin write handler and the LISTEN/NOTIFY drain;
+   * none guarantees the entry exists when a delivery arrives. A miss is not
+   * benign: an unrelated `generic:` bundle would report "no repository" and the
+   * delivery would be discarded with nothing above `debug`.
    *
-   * Optional — hand-built test deps and wirings with no generic-source manager
-   * keep the previous behaviour (a miss stays a miss, reported loudly).
+   * Optional: without it a miss stays a miss, reported loudly.
    */
   ensureProviderBundle?: (routingKey: string) => Promise<boolean>;
   lockFileCache: LockFileCache;
   /**
-   * Cache for the Tier-1 `requires` static content filter (source-file bytes at
-   * a ref, keyed by (repo, sha, path)). Optional so hand-built test deps and
-   * independent deployments that never use `requires` keep working; when absent,
-   * a candidate carrying `requires` is dropped fail-visible rather than
-   * dispatched unfiltered (see content-filter.ts).
+   * Cache for the Tier-1 `requires` static content filter (file bytes keyed by
+   * (repo, sha, path)). When absent, a candidate carrying `requires` is dropped
+   * fail-visible rather than dispatched unfiltered (see content-filter.ts).
    */
   contentRequirementsCache?: ContentRequirementsCache;
   dispatcher: Dispatcher;
   /** Null/undefined in Independent mode. send() buffers when disconnected. */
   platformClient?: PlatformClient;
-  /** Directory for writing raw webhook payloads. If set, writes {dir}/{repo}/{deliveryId}/payload.json. */
+  /** If set, raw payloads go to {dir}/{repo}/{deliveryId}/payload.json. */
   webhookPayloadDir?: string;
-  /** Bundle cache for compiled workflow bundles. Optional -- if not set, cache is bypassed. */
+  /** Compiled workflow bundle cache; absent bypasses the cache. */
   sourceCache?: SourceCache;
-  /** Build coordinator for deduplicating concurrent builds. Optional -- if not set, cache is bypassed. */
+  /** Deduplicates concurrent builds; absent bypasses the cache. */
   buildCoordinator?: BuildCoordinator;
-  /** Dep cache for dependency tarballs. Optional -- if not set, dep caching is bypassed. */
+  /** Dependency tarball cache; absent bypasses dep caching. */
   depCache?: DepCache;
-  /** Pending build tracker -- waits for build agents to finish before dispatching execution jobs. */
+  /** Waits for build agents before dispatching execution jobs. */
   pendingBuilds?: PendingBuildTracker;
-  /** Pending init tracker -- waits for init agents to resolve dynamic fields before static dispatch. */
+  /** Waits for init agents to resolve dynamic fields before static dispatch. */
   pendingInits?: PendingInitTracker;
-  /** Pending dynamic tracker -- waits for agents to evaluate DynamicJobFn and return generated LockJob[]. */
+  /** Waits for agents to evaluate DynamicJobFn into generated LockJob[]. */
   pendingDynamics?: PendingDynamicTracker;
-  /** Pending global-eval tracker -- waits for the pre-run round that decides which global workflows apply. */
+  /** Waits for the pre-run round that decides which global workflows apply. */
   pendingGlobalEvals?: PendingGlobalEvalTracker;
-  /** Round-result cache for the pre-run global eval round. Optional -- if not set, every round re-runs. */
+  /** Pre-run global eval round result cache; absent re-runs every round. */
   globalEvalCache?: GlobalEvalRoundCache;
-  /** Cluster default for the whole-round budget handed to the eval agent (ms).
-   *  The live per-cluster override is `cluster_settings.global_eval_round_timeout_ms`. */
+  /** Cluster default whole-round eval-agent budget (ms); live override
+   *  `cluster_settings.global_eval_round_timeout_ms`. */
   globalEvalRoundTimeoutMs?: number;
-  /** Cluster default for the per-candidate budget handed to the eval agent (ms).
-   *  The live per-cluster override is `cluster_settings.global_eval_candidate_timeout_ms`. */
+  /** Cluster default per-candidate eval-agent budget (ms); live override
+   *  `cluster_settings.global_eval_candidate_timeout_ms`. */
   globalEvalCandidateTimeoutMs?: number;
-  /** Cluster default for the orchestrator's own ceiling on awaiting a round (ms).
-   *  Unlike the two budgets above, this one is enforced here rather than by the
-   *  agent, so it also bounds a round no agent ever picked up. The live
-   *  per-cluster override is `cluster_settings.global_eval_wait_timeout_ms`. */
+  /** Cluster default orchestrator-side ceiling on awaiting a round (ms). Enforced
+   *  here, not by the agent, so it also bounds a round no agent picked up. Live
+   *  override `cluster_settings.global_eval_wait_timeout_ms`. */
   globalEvalWaitTimeoutMs?: number;
-  /** Commit status reporter for setting pending/success/failure/error on commits. Optional. */
+  /** Sets pending/success/failure/error commit statuses. */
   checkRunReporter?: CheckRunReporter;
-  /** Execution tracker for DB persistence. Optional -- if not set, execution tracking is skipped. */
+  /** DB persistence of executions; absent skips tracking. */
   executionTracker?: ExecutionTracker;
-  /** Agent registry for determining execution target platform/arch. Optional -- if not set, defaults to linux/x64. */
+  /** Picks the execution target platform/arch; absent defaults to linux/x64. */
   agentRegistry?: AgentRegistry;
-  /** Run coordinator for multi-orchestrator job routing. Optional -- if not set, all jobs dispatch locally (single-orchestrator mode). */
+  /** Multi-orchestrator job routing; absent dispatches every job locally. */
   coordinator?: RunCoordinator;
-  /** Secret resolver for dispatch-time secret resolution. Optional -- if not set, secrets are not resolved. */
+  /** Dispatch-time secret resolution; absent leaves secrets unresolved. */
   secretResolver?: SecretResolverApi;
   /**
-   * Cached per-org container-sandbox escape-hatch allow-list reader. Optional --
-   * when absent, dispatch defaults to the safe deny-all allow-list, so no
-   * workflow can escalate capabilities / host networking.
+   * Cached per-org container-sandbox escape-hatch allow-list. When absent, dispatch
+   * uses the deny-all allow-list, so no workflow can escalate capabilities / host
+   * networking.
    */
   sandboxAllowListReader?: SandboxAllowListReader;
-  /** Optional callback when source locations are extracted from a lock file workflow. */
   onSourceLocationsExtracted?: (
     workflowName: string,
     jobName: string,
     sourceLocations: Array<{ file: string; line: number; column: number } | undefined>,
   ) => void;
-  /** Event router for registering lock file event subscriptions. Optional -- if not set, event routing is inactive. */
+  /** Lock file event subscriptions; absent leaves event routing inactive. */
   eventRouter?: EventRouter;
   /**
-   * Invoke-gate dependencies (summon callback + chain-depth bound). Optional --
-   * when absent an invoke gate cannot summon (it fails loudly rather than
-   * silently reaching an agent). Built at the composition root.
+   * Summon callback + chain-depth bound, built at the composition root. When
+   * absent an invoke gate fails loudly rather than silently reaching an agent.
    */
   invokeGateDeps?: InvokeGateDeps;
-  /** Registration store for persisting workflow registrations. Optional -- if not set, registration is skipped. */
+  /** Absent skips registration. */
   registrationStore?: RegistrationStore;
-  /** Registration index for in-memory lookup. Optional -- if not set, registration is skipped. */
+  /** In-memory registration lookup; absent skips registration. */
   registrationIndex?: RegistrationIndex;
-  /** Cron scheduler for cache refresh after registration changes. Optional -- if not set, cron cache refresh is skipped. */
+  /** Refreshes the cron cache after registration changes; absent skips it. */
   cronScheduler?: CronScheduler;
-  /** Database connection for ephemeral key storage. Optional -- if not set, cross-job secret output support is inactive. */
+  /** Ephemeral key storage; absent disables cross-job secret outputs. */
   db?: Kysely<Database>;
-  /** Secret key (KICI_SECRET_KEY) for encrypting ephemeral private keys. Required when db is set. */
+  /** KICI_SECRET_KEY, encrypts ephemeral private keys. Required when db is set. */
   secretKey?: string;
-  /** Log storage backend for persisting webhook payloads. Optional -- if not set, payload storage is skipped. */
+  /** Persists webhook payloads; absent skips payload storage. */
   logStorage?: LogStorage;
   /**
-   * Durable step-log writer. Optional -- when present, the deferred-init path
-   * uses it to surface a post-init env warning on the run's log stream so a
-   * blocking `kici run remote` test run prints it (the accept response has
-   * already been returned by the time the init round resolves).
+   * Durable step-log writer. The deferred-init path writes a post-init env
+   * warning to the run's log stream, so a blocking `kici run remote` prints it
+   * (the accept response has already returned when the init round resolves).
    */
   logWriter?: Pick<LogWriter, 'appendChunk' | 'drain'>;
-  /** Context store for looking up deployment contexts. Optional -- if not set, context features are inactive. */
+  /** Deployment contexts; absent disables context features. */
   contextStore?: ContextStore;
-  /** Variable store for resolving context variables. Optional -- if not set, context vars are not merged. */
+  /** Context variables; absent merges none. */
   variableStore?: VariableStore;
-  /** Held run store for persisting protection rule holds. Optional -- if not set, holds are not persisted. */
+  /** Persists protection rule holds; absent persists none. */
   heldRunStore?: HeldRunStore;
-  /**
-   * Cache of the Platform-owned org trust policy. Read per PR event by the
-   * trust-policy gate. Optional so existing tests and independent deployments
-   * that construct deps by hand keep working.
-   */
+  /** Cache of the Platform-owned org trust policy, read per PR event by the trust-policy gate. */
   trustPolicyStore?: TrustPolicyStore;
   /**
-   * This orchestrator's mode. The trust-policy gate needs it to decide what an
-   * absent policy means: Platform-attached modes fail closed (a push is
-   * imminent), independent mode has no upstream authority and keeps legacy
-   * behavior. Defaults to `'platform'` at the read site — the fail-closed side —
-   * so a hand-built deps object never accidentally opens the gate.
+   * Decides what an absent trust policy means: Platform-attached modes fail closed
+   * (a push is imminent); independent mode has no upstream authority and keeps
+   * legacy behavior. The read site defaults to `'platform'` (fail-closed), so a
+   * hand-built deps object never opens the gate.
    */
   orchestratorMode?: OrchestratorMode;
-  /** Identity links pushed from Platform, read by the comment-approval path. Optional -- defaults to empty. */
+  /** Platform-pushed identity links for the comment-approval path; defaults to empty. */
   identityLinks?: IdentityLink[];
-  /** ci_trust permission levels per user ID from Platform push. Optional -- defaults to empty. */
+  /** Platform-pushed ci_trust levels per user ID; defaults to empty. */
   orgMemberPermissions?: Map<string, PermissionLevel>;
   /**
    * Persisted approval directory, read at `/kici approve` time when neither
    * `identityLinks` nor `orgMemberPermissions` was supplied.
    *
-   * The two fields above are the Platform-push path: `server.ts` keeps them in
-   * memory and refreshes them on every `trust_policy.update`, so it always
-   * supplies both and this store is never consulted there. Every other
-   * assembly of these deps — the direct-ingress pipeline in `app.ts`, which is
-   * the ONLY one an independent orchestrator has — supplies neither, and
-   * without this store its approval path would resolve an empty directory and
-   * refuse every commenter forever.
-   *
-   * Optional so a hand-built deps object keeps working; the read is skipped
-   * when it is absent.
+   * `server.ts` (the Platform-push path) always supplies both, so it never reads
+   * this. The direct-ingress pipeline in `app.ts` — the ONLY one an independent
+   * orchestrator has — supplies neither; without this store it would resolve an
+   * empty directory and refuse every commenter forever. Absent skips the read.
    */
   trustDirectoryStore?: TrustDirectoryStore;
-  /** Global workflow policy for org-level permission enforcement. Optional -- if not set, global workflows are unrestricted. */
+  /** Org-level global workflow permissions; absent leaves global workflows unrestricted. */
   globalWorkflowPolicy?: GlobalWorkflowPolicy;
-  /** Inbound webhook delivery log writer. Optional -- if not set, deliveries are not persisted to event_log. */
+  /** Delivery log; absent persists nothing to event_log. */
   eventLog?: EventLogRecorder;
-  /** Where this delivery arrived: 'relay' (Platform WS) or 'direct' (HTTP).
-   *  Used by the eventLog writer to populate the source column. Defaults to
-   *  'direct' when omitted (independent / direct paths). */
+  /** event_log source column: 'relay' (Platform WS) or 'direct' (HTTP, the default). */
   eventLogSource?: EventLogSource;
-  /** Access-log writer for the orchestrator audit stream. Optional -- if not
-   *  set, hold-creation audit rows (`held_run.request`) are skipped. */
+  /** Audit stream; absent skips hold-creation rows (`held_run.request`). */
   accessLogWriter?: AccessLogWriter;
-  /** Host roster store for runsOnAll fan-out resolution. Optional -- if not set,
-   *  runsOnAll jobs cannot be resolved and fail at materialize. */
+  /** runsOnAll fan-out resolution; absent makes runsOnAll jobs fail at materialize. */
   hostRosterStore?: HostRosterStore;
-  /** This orchestrator instance id (for the cross-cluster host-fanout pin reroute). */
+  /** For the cross-cluster host-fanout pin reroute. */
   instanceId?: string;
-  /** Static-host grace before a disconnected static host reads unreachable (ms). */
+  /** Grace before a disconnected static host reads unreachable (ms). */
   rosterGraceMs?: number;
-  /** Cap on runsOnAll per-host children (default 1024). Cluster default; the
-   * live per-cluster override is read from `cluster_settings.max_fanout_hosts`. */
+  /** Cap on runsOnAll per-host children (default 1024). Cluster default; live
+   * override `cluster_settings.max_fanout_hosts`. */
   maxFanoutHosts?: number;
-  /** Reader for fleet-wide cluster tunables (max_fanout_hosts live override). */
+  /** Fleet-wide cluster tunables (max_fanout_hosts live override). */
   clusterSettings?: ClusterSettingsReader;
 }
 
 /**
- * Check if any trigger in the lock file workflows uses path filters.
- * Used to skip the changedFilesFetcher call when no path patterns are configured,
- * saving one provider API call per webhook.
+ * Does any trigger use path filters? When none does, the changedFilesFetcher call
+ * is skipped, saving one provider API call per webhook.
  */
 export function anyTriggerHasPathPatterns(workflows: LockWorkflow[]): boolean {
   for (const wf of workflows) {
@@ -1122,10 +998,7 @@ export function anyTriggerHasPathPatterns(workflows: LockWorkflow[]): boolean {
   return false;
 }
 
-/**
- * Check if a single trigger has path-based filters.
- * Only pr and push triggers support paths (including !-prefixed exclusions).
- */
+/** Only pr and push triggers support paths (including !-prefixed exclusions). */
 function triggerHasPathFilters(trigger: LockTrigger): boolean {
   if (trigger._type === 'pr' || trigger._type === 'push') {
     return trigger.paths !== undefined && trigger.paths.length > 0;
@@ -1133,10 +1006,7 @@ function triggerHasPathFilters(trigger: LockTrigger): boolean {
   return false;
 }
 
-// Re-export the webhook processing entry point. The implementation lives in
-// `process-webhook.ts` (split out per the function-body-length refactor); this
-// re-export keeps `./processor.js` as the canonical module path for callers
-// (server.ts, app.ts) and tests.
+// `./processor.js` stays the canonical module path for callers (server.ts, app.ts) and tests.
 export { processWebhook } from './process-webhook.js';
 
 /** How many times {@link hasPendingHold} reads before it gives up and refuses. */
@@ -1147,31 +1017,23 @@ export const PENDING_HOLD_RETRY_BASE_MS = 25;
 /**
  * Is there a still-pending hold for this (run, job)?
  *
- * `held_runs.job_id` carries the expanded job NAME for job-scoped holds, which
- * is the same key the pending dispatch context uses. A missing row, or any
- * non-pending status, means nothing is gating the job.
+ * `held_runs.job_id` carries the expanded job NAME for job-scoped holds, the
+ * pending dispatch context's key. A missing row or non-pending status means
+ * nothing gates the job.
  *
- * **Fails CLOSED** once the read has genuinely failed: a job whose hold state
- * cannot be read is treated as held and left for the release path. This gate is
- * the enforcement point for "every requirement answered" on a job carrying two
- * holds — the reviewer row and the security row are written together and BOTH
- * must leave `pending` before dispatch — so answering `false` on a read error
- * dispatched a job with neither hold released and the approval boundary
- * bypassed entirely. That is unrecoverable; the failure in the other direction
- * is not.
+ * **Fails CLOSED** on a genuine read failure: the job is treated as held. This is
+ * the enforcement point for a job carrying two holds (reviewer and security rows,
+ * written together, BOTH must leave `pending`); answering `false` on error would
+ * dispatch with neither released, bypassing approval unrecoverably.
  *
- * A refusal leaves the job pending rather than losing it: the context is not
- * consumed (the check runs before the consume), every release path re-drives
- * `dispatchReadyJob`, and the needs-scheduler recovery loop on the next start
- * recomputes `needs_satisfied` for every non-terminal run and re-fires the
- * ready jobs. So the worst case of a closed failure is a delay, against a
- * silently bypassed approval for an open one.
+ * A refusal only delays: the context is not consumed (the check precedes the
+ * consume), every release path re-drives `dispatchReadyJob`, and the
+ * needs-scheduler recovery loop on the next start re-fires ready jobs of every
+ * non-terminal run.
  *
- * The retries are what keep that trade cheap. The realistic error here is a
- * transient one — a deadlock, a statement timeout, a lost connection — and a
- * single blip must not park a job until the next restart, so the read is
- * attempted {@link PENDING_HOLD_READ_ATTEMPTS} times with a short linear
- * backoff before the refusal stands.
+ * Transient errors (deadlock, statement timeout, lost connection) must not park a
+ * job until restart, so the read is tried {@link PENDING_HOLD_READ_ATTEMPTS} times
+ * with a short linear backoff first.
  */
 export async function hasPendingHold(
   db: Kysely<Database>,
@@ -1198,8 +1060,7 @@ export async function hasPendingHold(
         jobName,
         attempt,
         attempts,
-        // Names the consequence, so an operator reading the line knows whether
-        // the job was parked or the read is about to be retried.
+        // Tells the operator whether the job was parked or the read retries.
         outcome: lastAttempt ? 'refusing dispatch (fail closed)' : 'retrying',
         error: toErrorMessage(err),
       });
@@ -1207,8 +1068,7 @@ export async function hasPendingHold(
       await new Promise((resolve) => setTimeout(resolve, retryBaseMs * attempt));
     }
   }
-  // Unreachable: the loop either returns a row verdict or returns true on the
-  // last attempt. Kept so the fail-closed direction is the function's only exit.
+  // Unreachable; keeps fail-closed the only exit.
   return true;
 }
 
@@ -1218,14 +1078,11 @@ export const NEEDS_READ_ATTEMPTS = 3;
 export const NEEDS_RETRY_BASE_MS = 25;
 
 /**
- * Read whether a job's `needs` upstreams are satisfied, for the dispatch guard.
+ * Are a job's `needs` upstreams satisfied? For the dispatch guard.
  *
- * Fails CLOSED, exactly as {@link hasPendingHold} does and for the same reason:
- * an unreadable verdict must never be read as permission to dispatch. A closed
- * failure returns `{ satisfied: false }`, which the guard treats as "upstream
- * still pending" — the recoverable branch, since the start-up recovery loop
- * recomputes `needs_satisfied` for every non-terminal run and re-fires its ready
- * jobs, and the stale-run expiry sweep is the backstop.
+ * Fails CLOSED like {@link hasPendingHold}: `{ satisfied: false }` reads as
+ * "upstream still pending", the recoverable branch (the start-up recovery loop
+ * re-fires ready jobs; the stale-run expiry sweep is the backstop).
  *
  * Reads only. It never writes `needs_satisfied` — the scheduler owns that claim.
  */
@@ -1254,33 +1111,28 @@ export async function readNeedsVerdict(
       await new Promise((resolve) => setTimeout(resolve, retryBaseMs * attempt));
     }
   }
-  // Unreachable: the loop either returns a verdict or fails closed on the last
-  // attempt. Kept so the fail-closed direction is the function's only exit.
+  // Unreachable; keeps fail-closed the only exit.
   return { satisfied: false };
 }
 
 /**
  * Resolve the `execution_jobs.job_id` a ready job is currently tracked under.
  *
- * `onJobStatus` keys on the job ID, not the job name: the tracker's in-memory
- * job map, its scheduler hook, its run-completion check and the
- * `(run_id, job_id)` upsert conflict target all use it. Passing a name matches
- * nothing, so the upsert INSERTs a second row under `job_id = <name>` while the
- * real placeholder stays `pending` and the scheduler hook never runs.
+ * `onJobStatus` keys on the job ID (in-memory job map, scheduler hook,
+ * run-completion check, `(run_id, job_id)` upsert target). A name matches nothing:
+ * the upsert INSERTs a second row while the placeholder stays `pending` and the
+ * scheduler hook never runs.
  *
- * A job still waiting on a gate sits on a `NEEDS_PENDING_JOB_ID_PREFIX`
- * placeholder — the one synthetic shape this codebase builds, for the needs
- * gate, the approval hold and the rolling-wave hold alike — which
- * {@link ExecutionTracker.findSyntheticJobId} resolves from memory and from the
- * DB. `undefined` therefore means the job is NOT waiting on a gate: it already
- * dispatched and had its placeholder swapped for a real id, or nothing tracks
- * it at all. Neither is this gate's to terminalize.
+ * A gated job sits on a `NEEDS_PENDING_JOB_ID_PREFIX` placeholder — the one
+ * synthetic shape, shared by the needs gate, approval hold and rolling-wave hold —
+ * which {@link ExecutionTracker.findSyntheticJobId} resolves from memory and DB.
+ * `undefined` means the job is NOT gated (already dispatched, or untracked), so
+ * not this gate's to terminalize.
  *
- * A by-name `execution_jobs` fallback would resolve exactly those already-
- * dispatched rows, and the caller would then mark a running or completed job
- * `skipped` — the upsert carries no terminal-status guard, so a `success` row
- * would be overwritten. Answering `undefined` is the safe direction: the caller
- * leaves the context in place and a later recompute can still act.
+ * No by-name `execution_jobs` fallback: it would resolve already-dispatched rows
+ * and mark a running or completed job `skipped` (the upsert has no terminal-status
+ * guard, so `success` is overwritten). `undefined` leaves the context for a later
+ * recompute.
  */
 async function resolveTrackedJobId(
   executionTracker: ExecutionTracker,
@@ -1293,31 +1145,24 @@ async function resolveTrackedJobId(
 /**
  * Pre-dispatch `needs` gate for {@link dispatchReadyJob}.
  *
- * A needs-gated job must not dispatch merely because a hold was released. The
- * needs scheduler claims a downstream on `needs_satisfied` alone, so every
+ * A needs-gated job must not dispatch merely because a hold was released: every
  * release path (approval, the stale detector's concurrency sweep, wait holds,
- * admin release) funnels through `dispatchReadyJob` and would otherwise run the
- * job beside a pending upstream — or after a failed one.
+ * admin release) funnels through `dispatchReadyJob`, and would otherwise run the
+ * job beside a pending or failed upstream.
  *
- * Four outcomes:
- * - upstreams satisfied and admitted -> `'proceed'`, the ordinary path (a job
- *   with no needs edges reads as dispatchable, so this is a no-op for it);
- * - upstream not terminal yet -> `'stop'` without consuming the context, so the
- *   scheduler's next `onJobReady` still has one to dispatch with;
- * - upstream terminal but its status not admitted by the edge's `run_on`, and
- *   {@link resolveTrackedJobId} finds the placeholder the job waits on ->
- *   consume the context and terminalize that row as `skipped`;
- * - same, but no tracker or no placeholder -> `'stop'` without consuming, so
- *   the context outlives the miss and a later recompute can still resume the
- *   job. Consuming with nothing to terminalize would delete the only resume
- *   path and leave the job pending until the context expiry sweep.
+ * Outcomes:
+ * - upstreams satisfied -> `'proceed'` (a job with no needs edges always is);
+ * - upstream not terminal -> `'stop'` without consuming, so the scheduler's next
+ *   `onJobReady` still has the context;
+ * - upstream terminal but not admitted by the edge's `run_on`, and
+ *   {@link resolveTrackedJobId} finds the placeholder -> consume and terminalize
+ *   it as `skipped`;
+ * - same, but no tracker or placeholder -> `'stop'` without consuming, so a later
+ *   recompute can resume the job instead of it waiting for the context expiry sweep.
  *
  * Reads only. The scheduler owns the `needs_satisfied` claim; see the warning on
- * `recomputeNeedsSatisfied` about handing claims back.
- *
- * Called BEFORE the context is consumed, for the same reason
- * {@link hasPendingHold} is: refusing after the consume would delete the resume
- * path and strand the job.
+ * `recomputeNeedsSatisfied` about handing claims back. Runs BEFORE the consume,
+ * like {@link hasPendingHold}, so a refusal never strands the job.
  */
 async function applyNeedsGate(
   db: Kysely<Database>,
@@ -1327,8 +1172,7 @@ async function applyNeedsGate(
 ): Promise<'proceed' | 'stop'> {
   const verdict = await readNeedsVerdict(db, runId, jobName);
   if (!verdict.satisfied) {
-    // Upstream is not terminal yet. The scheduler re-fires `onJobReady` when it
-    // completes, and the context is still here for that call.
+    // The scheduler re-fires `onJobReady` on upstream completion; the context stays.
     logger.info('Ready job has unsatisfied needs — leaving it for the scheduler', {
       runId,
       jobName,
@@ -1336,20 +1180,16 @@ async function applyNeedsGate(
     return 'stop';
   }
   if (verdict.action === 'skip') {
-    // Upstream IS terminal but its status is not admitted by the edge's
-    // `run_on`. The scheduler will never fire ready again, so returning early
-    // would strand the job until the expiry sweep. Terminalize it instead —
-    // `onJobStatus` drives `runSchedulerHook` -> `evaluateDownstreams`, which
-    // propagates the skip to this job's own downstreams.
+    // The scheduler never fires ready again, so terminalize instead of stranding
+    // the job: `onJobStatus` -> `runSchedulerHook` -> `evaluateDownstreams`
+    // propagates the skip downstream.
     logger.info('Ready job upstream is terminal and unmet — skipping', {
       runId,
       jobName,
       reason: verdict.reason,
     });
-    // Resolve the tracked job id BEFORE consuming the context. Without a row to
-    // terminalize, consuming would delete the only resume path and leave the
-    // placeholder pending forever; leaving the context in place keeps the job
-    // recoverable by a later recompute.
+    // Resolve BEFORE consuming: with no row to terminalize, consuming would delete
+    // the only resume path.
     const jobId = executionTracker
       ? await resolveTrackedJobId(executionTracker, runId, jobName)
       : undefined;
@@ -1362,8 +1202,7 @@ async function applyNeedsGate(
       return 'stop';
     }
     await consumePendingJobContext(db, runId, jobName);
-    // `error` (not `reason`) is the field the tracker persists to
-    // `error_message`, so the skip carries its cause to the dashboard.
+    // The tracker persists `error` (not `reason`) to `error_message`, for the dashboard.
     await executionTracker.onJobStatus(
       runId,
       jobId,
@@ -1378,14 +1217,12 @@ async function applyNeedsGate(
 }
 
 /**
- * The subset of a context row the ready-dispatch re-gate reads.
+ * The raw (snake_case) `contexts` row subset the ready-dispatch re-gate reads.
  *
- * `ContextStore.matchContext` returns the raw `contexts` row, so the field names
- * are snake_case. `concurrency_strategy` and `hold_expiry_seconds` are optional
- * because the release-path callers already in the tree narrow their closure to
- * `concurrency_limit` alone; an absent strategy resolves to
- * {@link DEFAULT_CONCURRENCY_STRATEGY} and an absent hold window to
- * {@link DEFAULT_HOLD_EXPIRY_SECONDS}, which are also the columns' own defaults.
+ * `concurrency_strategy` and `hold_expiry_seconds` are optional because some
+ * release-path callers narrow their closure to `concurrency_limit`; absent values
+ * resolve to {@link DEFAULT_CONCURRENCY_STRATEGY} and
+ * {@link DEFAULT_HOLD_EXPIRY_SECONDS}, the columns' own defaults.
  */
 export interface ReadyDispatchContextRow {
   id: string;
@@ -1399,18 +1236,15 @@ export interface ReadyDispatchGateDeps {
   matchContext: (orgId: string, name: string) => Promise<ReadyDispatchContextRow | null>;
   heldRunStore: Pick<HeldRunStore, 'create'>;
   /**
-   * Audits each re-hold, mirroring the `held_run.request` row the dispatch-pass
-   * path writes for every hold it mints. Optional: a call site with no writer
-   * still gates, exactly as the dispatch path's own `accessLogWriter?.record`
-   * degrades.
+   * Audits each re-hold with the `held_run.request` row the dispatch pass writes.
+   * Without a writer the gate still gates.
    */
   accessLogWriter?: Pick<AccessLogWriter, 'record'>;
-  /** The routing key the audit row is attributed to, when the call site knows it. */
+  /** Audit row attribution, when the call site knows it. */
   routingKey?: string | null;
   /**
-   * The stores a released held job's context variables and secrets resolve
-   * against. Called at release time, so a call site whose stores are built after
-   * it is wired can still supply them.
+   * Stores for a released job's context variables and secrets. Called at release
+   * time, so stores built after wiring can still be supplied.
    */
   contextData?: () => ContextDataDeps;
 }
@@ -1423,20 +1257,16 @@ export interface RunConcurrency {
   limit: number | null;
   strategy: EngineContext['concurrencyStrategy'];
   /**
-   * The context's own hold window, seconds. A queued hold this gate mints must
-   * expire on the same schedule as one the dispatch pass mints for the same
-   * context, or an operator's configured queue timeout applies to one path and
-   * not the other.
+   * The context's hold window, seconds, so this gate's queued holds expire on the
+   * dispatch pass's schedule and the configured queue timeout applies to both.
    */
   holdExpirySeconds: number;
 }
 
 /**
- * Resolve a run's bound context to the inputs the concurrency gate needs.
- *
- * `null` means no concurrency constraint applies — the run has no bound context,
- * or the context it names no longer exists. That is the common case, so the cost
- * on the ready-dispatch path is one indexed lookup by `run_id`.
+ * Resolve a run's bound context to concurrency gate inputs. `null` (no bound
+ * context, or it no longer exists) is the common case, costing one indexed
+ * lookup by `run_id`.
  */
 export async function resolveRunConcurrency(
   db: Kysely<Database>,
@@ -1467,25 +1297,19 @@ export async function resolveRunConcurrency(
 /**
  * Pre-dispatch concurrency re-gate for {@link dispatchReadyJob}.
  *
- * The context protection pipeline runs once, at dispatch-pass time. Only the
- * CONCURRENCY gate is time-varying — branch, trust, reviewer and wait-timer
- * verdicts cannot change between then and now, and approval state is already
- * covered by {@link hasPendingHold}. So a job that reaches this chokepoint after
- * its `needs` were satisfied, or after an approval / wait / admin hold released,
- * would otherwise dispatch with no limit check at all and run over its group's
- * limit.
+ * The context protection pipeline runs once, at dispatch-pass time, and only its
+ * CONCURRENCY gate is time-varying (approval is {@link hasPendingHold}'s). Without
+ * this, a job released after its `needs` or a hold would run over its group's limit.
  *
- * Only {@link evaluateConcurrencyGate} is consulted. Re-running the whole
- * pipeline would re-litigate branch/trust/reviewer decisions already made — and
- * could re-derive the very approval hold `hasPendingHold` exists to respect.
+ * Only {@link evaluateConcurrencyGate} runs: the whole pipeline would re-litigate
+ * branch/trust/reviewer decisions and could re-derive the approval hold
+ * `hasPendingHold` respects.
  *
- * Re-holding a just-released job is CORRECT, not a ping-pong: the slot that
- * freed can be retaken by another job before this one dispatches, and the queued
- * hold is what the stale detector's sweep releases when a slot frees again.
+ * Re-holding a just-released job is CORRECT, not a ping-pong: another job can
+ * retake the freed slot first, and the stale detector's sweep releases the queued
+ * hold when a slot frees again.
  *
- * Called BEFORE the context is consumed, for the same reason every other guard
- * here is: a re-held job must keep its pending context so the release path can
- * resume it.
+ * Runs BEFORE the consume, so a re-held job keeps its pending context.
  */
 async function applyContextProtectionGate(
   db: Kysely<Database>,
@@ -1493,13 +1317,10 @@ async function applyContextProtectionGate(
   jobName: string,
   gateDeps: ReadyDispatchGateDeps,
 ): Promise<'proceed' | 'stop'> {
-  // An invoke gate never reaches an agent — `releaseInvokeGate` summons the
-  // source repo's subscribers — so it never becomes a `running` row and holds no
-  // slot in the group `countOccupyingJobs` counts. Gating it would queue a cross-repo
-  // summon behind jobs it does not compete with, and expire it outright if no
-  // slot freed inside the hold window. The three call sites that dispatch ROOT
-  // invoke gates pass no gate deps at all for the same reason; this is the
-  // needs-gated case, which reaches the shared ready callback.
+  // An invoke gate never reaches an agent, so it holds no slot `countOccupyingJobs`
+  // counts. Gating it would queue a cross-repo summon behind jobs it does not
+  // compete with, and expire it if no slot freed in the hold window. Root invoke
+  // gates get no gate deps for the same reason; this covers the needs-gated case.
   if (await pendingJobContextIsInvokeGate(db, runId, jobName)) return 'proceed';
 
   const conc = await resolveRunConcurrency(db, gateDeps.matchContext, runId);
@@ -1530,10 +1351,8 @@ async function applyContextProtectionGate(
     reason: verdict.reason ?? `Concurrency limit reached (${running}/${conc.limit})`,
     expiresAt: new Date(Date.now() + conc.holdExpirySeconds * 1000),
   });
-  // One audit row per hold, matching what the dispatch-pass path writes for
-  // every row it mints: a hold that appears in the approval queue with no trail
-  // saying it was raised is a gap, whichever gate raised it. The actor is the
-  // dispatcher system component — no operator is present on this path.
+  // One audit row per hold, as the dispatch pass writes: a queued hold with no
+  // trail is a gap. The actor is the dispatcher; no operator is on this path.
   runDetached(
     logger,
     'Access log write',
@@ -1564,11 +1383,10 @@ async function applyContextProtectionGate(
 /**
  * The dispatch input for a job leaving its pending context.
  *
- * A job bound to a context was stored without its context data; resolve it
- * now. A failure fails the job and returns `undefined` — a job bound to a
- * context never dispatches without that context's secrets. A pending job with
- * no record (no bound context, or a row stored before records existed, whose
- * input still carries its data) dispatches its stored input unchanged.
+ * A context-bound job was stored without its context data; resolve it now. A
+ * failure fails the job and returns `undefined`: it never dispatches without its
+ * context's secrets. No record (no bound context, or an older row whose input
+ * still carries its data) dispatches the stored input unchanged.
  */
 async function releasedJobInput(
   runId: string,
@@ -1577,8 +1395,8 @@ async function releasedJobInput(
   gateDeps: ReadyDispatchGateDeps | undefined,
   executionTracker: ExecutionTracker | undefined,
 ): Promise<QueuedJobInput | undefined> {
-  // A pending context is not handed to another coordinator the way a queued
-  // row is, so a seal this one cannot open fails the job, naming the fix.
+  // Unlike a queued row, a pending context never moves to another coordinator,
+  // so an unopenable seal fails the job, naming the fix.
   // fails-when: a job whose sealed secrets cannot be decrypted is dispatched without them
   // breaks-if-wrong: a pending context whose seal opened dispatches as before
   if (pendingCtx.secretsUnavailable) {
@@ -1614,8 +1432,7 @@ async function failReleasedJob(
   error: string,
 ): Promise<void> {
   if (!executionTracker) return;
-  // The job is tracked under its `needs-pending-` placeholder id — see
-  // {@link resolveTrackedJobId}.
+  // Tracked under its placeholder id — see {@link resolveTrackedJobId}.
   await executionTracker.onJobStatus(
     runId,
     (await executionTracker.findSyntheticJobId(runId, jobName)) ?? jobName,
@@ -1627,12 +1444,9 @@ async function failReleasedJob(
 }
 
 /**
- * Dispatch a job that has become ready via the needs scheduler.
- *
- * Called by the onJobReady callback registered on the execution tracker.
- * Consumes the pending dispatch context stored at processWebhook time,
- * dispatches the job through the normal dispatcher path, and updates the
- * execution tracker with the real job ID.
+ * Dispatch a job the needs scheduler made ready (the tracker's onJobReady
+ * callback): consume its pending context, dispatch normally, and record the real
+ * job ID.
  */
 export async function dispatchReadyJob(
   runId: string,
@@ -1644,16 +1458,13 @@ export async function dispatchReadyJob(
   invokeGateDeps?: InvokeGateDeps,
   gateDeps?: ReadyDispatchGateDeps,
 ): Promise<void> {
-  // A job can be BOTH needs-gated and held for approval, and the two use the
-  // SAME `needs-pending-` synthetic id and the same pending context. The needs
-  // scheduler claims a downstream on `needs_satisfied` alone, so without this
-  // gate an upstream completing dispatched a held job straight to an agent while
-  // its `held_runs` row still said `pending` — approval bypassed entirely.
+  // A job can be BOTH needs-gated and held for approval, sharing one synthetic id
+  // and pending context. The scheduler claims on `needs_satisfied` alone, so
+  // without this an upstream completing would dispatch a held job, bypassing
+  // approval.
   //
-  // Checked BEFORE consuming the context: refusing after the consume would
-  // delete the resume path and strand the job forever. Every release path flips
-  // the row out of `pending` before it dispatches, so a legitimate resume passes
-  // straight through.
+  // Checked BEFORE the consume, so a refusal never strands the job. Release paths
+  // flip the row out of `pending` first, so a legitimate resume passes.
   if (db && (await hasPendingHold(db, runId, jobName))) {
     logger.info('Ready job is held for approval — leaving it for the release path', {
       runId,
@@ -1664,8 +1475,8 @@ export async function dispatchReadyJob(
 
   if (db && (await applyNeedsGate(db, runId, jobName, executionTracker)) === 'stop') return;
 
-  // Ordering is load-bearing: the needs gate runs first, so a job whose upstream
-  // failed is skipped rather than queued for a slot it would never use.
+  // Load-bearing order: needs first, so a job with a failed upstream is skipped,
+  // not queued for a slot it would never use.
   if (db && gateDeps && (await applyContextProtectionGate(db, runId, jobName, gateDeps)) === 'stop')
     return;
 
@@ -1678,9 +1489,8 @@ export async function dispatchReadyJob(
     return;
   }
 
-  // An invoke gate never reaches an agent: on release it summons the source
-  // repo's subscribers instead of dispatching its (stepless) job input. Fail
-  // loudly rather than silently hanging if the gate deps are missing.
+  // An invoke gate summons the source repo's subscribers instead of dispatching
+  // its stepless input; missing gate deps fail loudly rather than hang.
   if (pendingCtx.invoke) {
     if (!db || !executionTracker || !invokeGateDeps) {
       logger.error('Invoke gate ready but gate dependencies are unavailable; failing the gate', {
@@ -1691,8 +1501,7 @@ export async function dispatchReadyJob(
         hasInvokeGateDeps: !!invokeGateDeps,
       });
       if (executionTracker) {
-        // The gate is tracked under its `needs-pending-` placeholder id, and
-        // `onJobStatus` keys on the job id — see {@link resolveTrackedJobId}.
+        // Tracked under its placeholder id — see {@link resolveTrackedJobId}.
         await executionTracker.onJobStatus(
           runId,
           (await executionTracker.findSyntheticJobId(runId, jobName)) ?? jobName,
@@ -1725,9 +1534,8 @@ export async function dispatchReadyJob(
         reason: (result as any).reason,
       });
       if (executionTracker) {
-        // Terminalize the `needs-pending-` placeholder the job is still tracked
-        // under, not its name — see {@link resolveTrackedJobId}. A rejected
-        // dispatch never got a real job id to swap it for.
+        // A rejected dispatch has no real id, so terminalize the placeholder — see
+        // {@link resolveTrackedJobId}.
         await executionTracker.onJobStatus(
           runId,
           (await executionTracker.findSyntheticJobId(runId, jobName)) ?? jobName,
@@ -1738,28 +1546,21 @@ export async function dispatchReadyJob(
         );
       }
     } else {
-      // `queued-no-backend` is handled exactly like `queued`: the job IS in the
-      // dispatch queue under `result.jobId`, so swapping the synthetic
-      // `needs-pending-*` placeholder for the real id is what lets the queue
-      // expiry sweep terminalize it (`unroutable`) instead of leaving the run
-      // pinned on a placeholder no agent will ever update.
+      // `queued-no-backend` is handled like `queued`: the job IS queued under
+      // `result.jobId`, and the placeholder swap lets the queue expiry sweep
+      // terminalize it (`unroutable`) instead of pinning the run.
       if (result.status === 'queued-no-backend') {
         logger.warn('Scheduler-dispatched job has no matching backend (tracked)', {
           runId,
           jobName,
         });
       }
-      // Update the execution tracker with the real job ID from the dispatcher.
-      // Find and replace the synthetic needs-pending-* entry so isRunComplete
-      // doesn't block on a placeholder that no agent will ever update.
+      // Swap the placeholder for the real id, so isRunComplete does not block on it.
       if (executionTracker) {
         const syntheticId = await executionTracker.findSyntheticJobId(runId, jobName);
-        // The swap INSERTs a fresh row, so anything the synthetic row carried is
-        // lost unless it is restated here — the same hazard the `needs_satisfied`
-        // restore below covers. `git_credentials` is the job's lock declaration,
-        // and the credential relay fails a request CLOSED when the column is
-        // empty, so dropping it would refuse every declared credential on a
-        // needs-gated job.
+        // The swap INSERTs a fresh row, losing what the synthetic row carried unless
+        // restated. The credential relay fails CLOSED on empty `git_credentials`, so
+        // dropping it would refuse every declared credential on a needs-gated job.
         const declaredCredentials =
           db && syntheticId
             ? ((
@@ -1784,11 +1585,9 @@ export async function dispatchReadyJob(
           undefined,
           syntheticId,
         );
-        // The scheduler has decided this job is ready to dispatch, so its needs
-        // are satisfied by definition. addJobsToRun INSERTs the real row with
-        // needs_satisfied=false (DB default), losing the flag set on the synthetic
-        // row by evaluateDownstreams. Restore it here so checkSchedulerInvariant
-        // doesn't flag the real row as "stuck" on the next completion check.
+        // A ready job's needs are satisfied by definition, but addJobsToRun INSERTs
+        // needs_satisfied=false (DB default). Restore it so checkSchedulerInvariant
+        // does not flag the real row as "stuck".
         if (db) {
           await db
             .updateTable('execution_jobs')
@@ -1814,17 +1613,12 @@ export async function dispatchReadyJob(
 }
 
 /**
- * Read the repository's default branch out of a webhook payload.
- *
- * Resolution order:
- *   1. `normalizer.extractDefaultBranch?(payload)` — provider-specific hook
- *      (universal-git reads a JSONPath from the source's `payloadPaths.defaultBranch`).
- *   2. Fallback to `payload.repository.default_branch` — the GitHub-shaped
- *      default that most forges mirror.
- *
- * `null` when neither source names one. Shared by `isDefaultBranchPush` (which
- * compares it against the pushed branch) and the registration write path (which
- * persists it, so a scheduled run can present it as its own branch).
+ * The repository's default branch from a webhook payload:
+ *   1. `normalizer.extractDefaultBranch?(payload)` — provider hook (universal-git
+ *      reads the source's `payloadPaths.defaultBranch` JSONPath);
+ *   2. `payload.repository.default_branch` — the GitHub shape most forges mirror;
+ * else `null`. The registration write path persists it, so a scheduled run can
+ * present it as its own branch.
  */
 export function extractDefaultBranch(
   payload: Record<string, unknown>,
@@ -1835,10 +1629,7 @@ export function extractDefaultBranch(
   return viaHook ?? repository?.default_branch ?? null;
 }
 
-/**
- * Check whether a webhook event is a push to the repository's default branch.
- * Used to trigger registration extraction for workflow event subscriptions.
- */
+/** A push to the default branch triggers registration extraction for event subscriptions. */
 export function isDefaultBranchPush(
   info: WebhookInfo,
   event: SimulatedEvent,
@@ -1852,21 +1643,16 @@ export function isDefaultBranchPush(
 }
 
 /**
- * Cap on the per-decision trace forwarded to the Platform.
- *
- * A fixed bound on a debug payload, not a behavior an operator tunes: the
- * summary rides an `execution.event` and lands in a stored row, so an
- * essay-length trace from a workflow with hundreds of triggers must not be able
- * to grow either without limit.
+ * Cap on the per-decision trace forwarded to the Platform. Fixed, not tunable: the
+ * summary rides an `execution.event` into a stored row, and hundreds of triggers
+ * must not grow either without limit.
  */
 export const DECISION_TRACE_MAX_CHECKS = 50;
 
 /**
- * Create a serializable summary of a workflow decision for Platform forwarding.
- *
- * Carries the individual checks, capped, so the dashboard can answer "why did
- * this workflow not fire" from the delivery alone. `checksCount` stays the
- * untruncated total, and `checksTruncated` marks a trace the cap shortened.
+ * Serializable workflow decision summary for the Platform. Carries the capped
+ * checks, so the dashboard answers "why did this not fire" from the delivery
+ * alone; `checksCount` is the untruncated total, `checksTruncated` marks a cut.
  */
 export function summarizeDecision(decision: WorkflowDecision): Record<string, unknown> {
   return {
@@ -1881,27 +1667,19 @@ export function summarizeDecision(decision: WorkflowDecision): Record<string, un
 }
 
 /**
- * Byte budget for the whole forwarded trace, across every workflow on the
- * delivery.
+ * Byte budget for the whole forwarded trace, across every workflow on the delivery.
  *
- * The per-decision check cap and the per-field text clamp bound one entry; this
- * bounds the frame. One event is evaluated against every workflow in the lock
- * file plus every organization-wide registration, so a repository with a
- * hundred comment-triggered workflows multiplies a bounded entry into an
- * unbounded message. A frame past the Platform's WebSocket payload ceiling
- * closes the orchestrator's connection, stalling every delivery for that
- * organization until it reconnects — so the budget sits well under the
- * Platform's own storage guard, which is then a backstop rather than the only
- * limit.
+ * The check cap and per-field clamp bound one entry; this bounds the frame, since
+ * one event is evaluated against every lock file workflow plus every org-wide
+ * registration. A frame past the Platform's WebSocket payload ceiling closes the
+ * connection, stalling every delivery for the org until reconnect, so the budget
+ * sits well under the Platform's storage guard, which stays a backstop.
  */
 export const DECISION_TRACE_MAX_BYTES = 131_072;
 
 /**
- * Bound the serialized trace, replacing whatever did not fit with a marker.
- *
- * Truncating rather than dropping keeps the delivery's answer to "why did my
- * workflow not fire" partially readable, and says out loud that the rest was
- * dropped.
+ * Bound the serialized trace, replacing what did not fit with a marker: the answer
+ * stays partially readable and says the rest was dropped.
  */
 export function capDecisionSummaries(
   summaries: readonly Record<string, unknown>[],

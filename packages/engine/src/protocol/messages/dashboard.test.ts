@@ -567,10 +567,9 @@ describe('dashboardOrchToPlatformSchema (discriminated union)', () => {
   });
 
   it('accepts held-runs.list.response rows with a nulled context reference', () => {
-    // A held run whose environment was deleted carries contextId AND
-    // contextName as null (held_runs.context_id is FK ON DELETE SET
-    // NULL). The union must accept the row — a rejection here drops the WS
-    // response in the relay and surfaces as a Platform proxy timeout.
+    // A held run whose environment was deleted has contextId AND contextName
+    // null (held_runs.context_id is FK ON DELETE SET NULL). Rejecting the row
+    // drops the WS response in the relay, surfacing as a Platform proxy timeout.
     const msg = {
       type: 'dashboard.held-runs.list.response',
       requestId: 'r3',
@@ -1477,10 +1476,9 @@ describe('context concurrencyLimit boundary validation', () => {
 });
 
 describe('context holdExpirySeconds boundary validation', () => {
-  // A stored `0` puts every hold's deadline at the instant it is created, so
-  // the stale detector sweeps it to `expired` before a reviewer can act. The
-  // orchestrator's admin routes reject it; the dashboard write path is the
-  // other way a value reaches the same column and must agree.
+  // A stored `0` puts every hold's deadline at creation, so the stale detector
+  // sweeps it to `expired` before a reviewer can act. The orchestrator's admin
+  // routes reject it, and the dashboard write path to the same column must agree.
   const baseCreate = {
     type: 'dashboard.contexts.create' as const,
     requestId: 'r1',
@@ -1533,7 +1531,7 @@ describe('context holdExpirySeconds boundary validation', () => {
 
   it('still accepts waitTimerSeconds: 0 on update', () => {
     // The wait-timer gate skips on `null` only, so a 0-second wait timer is a
-    // coherent "release immediately" and must not be caught by the tightening.
+    // coherent "release immediately", unlike a 0-second hold expiry.
     expect(update({ waitTimerSeconds: 0 }).success).toBe(true);
   });
 });
@@ -1598,12 +1596,11 @@ describe('held-runs list response — status and queue-type vocabulary', () => {
   });
 
   it('does not reject the whole message on one unknown status', () => {
-    // The defect: a strict enum failed safeParse for the ENTIRE relayed message
-    // on a single unrecognized row. Because `dashboard.held-runs.list.response`
-    // is a type the Platform *knows*, the recognition chain treats the failure
-    // as malformed rather than version skew and closes the orchestrator's
-    // WebSocket — taking every in-flight run, log stream and webhook relay with
-    // it, in a reconnect loop.
+    // A strict enum would fail safeParse for the ENTIRE relayed message on one
+    // unrecognized row. The Platform *knows* `dashboard.held-runs.list.response`,
+    // so it treats the failure as malformed rather than version skew and closes
+    // the orchestrator's WebSocket, taking every in-flight run, log stream and
+    // webhook relay with it, in a reconnect loop.
     const parsed = dashboardOrchToPlatformSchema.safeParse(
       message(row(HeldRunStatus.enum.pending), row('a_status_from_a_newer_orchestrator')),
     );
@@ -1697,11 +1694,9 @@ describe('dashboard.admin-tokens.list', () => {
   });
 
   it('never carries the token hash — the field is absent from the parsed summary', () => {
-    // The load-bearing assertion. A hash is a credential verifier: relaying it
-    // would put an offline-crackable value on the dashboard plane for a report
-    // that has no use for it. Zod strips unknown keys, so a hash supplied on
-    // the wire cannot survive the parse; adding a hash field to the schema
-    // would make it survive, and this test is what fails in that case.
+    // A hash is a credential verifier: relaying it puts an offline-crackable
+    // value on the dashboard plane. Zod strips unknown keys, so this fails only
+    // if the schema gains a hash field.
     const parsed = dashboardAdminTokenSummarySchema.parse({
       ...summary,
       token_hash: 'deadbeef',

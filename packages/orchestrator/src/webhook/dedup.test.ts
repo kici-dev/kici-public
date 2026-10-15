@@ -181,7 +181,6 @@ describe('DedupCache', () => {
         expires_at: pastDate,
       });
 
-      // Insert a valid entry
       await dedup.mark('valid-001');
 
       const deleted = await dedup.cleanup();
@@ -202,7 +201,6 @@ describe('DedupCache', () => {
     it('serves from memory after mark() without DB query', async () => {
       await dedup.mark('delivery-001');
 
-      // Reset mocks to track new calls
       vi.mocked(db.selectFrom).mockClear();
 
       const result = await dedup.exists('delivery-001');

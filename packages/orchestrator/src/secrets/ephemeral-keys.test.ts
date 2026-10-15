@@ -53,7 +53,6 @@ function agentEncryptSecret(
   value: string,
   runPublicKeyDer: Buffer,
 ): { agentPublicKey: string; encrypted: string } {
-  // Generate agent ephemeral key pair
   const agentKeyPair = generateKeyPairSync('x25519', {
     publicKeyEncoding: { type: 'spki', format: 'der' },
     privateKeyEncoding: { type: 'pkcs8', format: 'der' },
@@ -76,12 +75,10 @@ function agentEncryptSecret(
     publicKey: runPublicKeyObj,
   });
 
-  // HKDF to derive AES key
   const aesKey = Buffer.from(
     hkdfSync('sha256', sharedSecret, Buffer.alloc(0), 'kici-run-secret-outputs', 32),
   );
 
-  // AES-256-GCM encrypt
   const iv = randomBytes(12);
   const cipher = createCipheriv('aes-256-gcm', aesKey, iv, { authTagLength: 16 });
   const encrypted = Buffer.concat([cipher.update(value, 'utf-8'), cipher.final()]);

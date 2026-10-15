@@ -1,22 +1,16 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `check_run_tracking.terminal_sent_at` (nullable timestamptz).
+ * Add `check_run_tracking.terminal_sent_at`.
  *
- * `check_run_id` is written at CREATE time, while the check run is still
- * `queued`, so it proves creation and never completion. Without a completion
- * signal a check run stuck `queued` on the provider is indistinguishable from
- * the provider simply lagging, which is what made a check-run poll timeout
- * unattributable: nothing on our side recorded whether the terminal update had
- * been sent at all.
+ * `check_run_id` is written at create time, while the check run is `queued`, so it proves
+ * creation, never completion. Without a completion signal a check run stuck `queued` on the
+ * provider is indistinguishable from provider lag, so a check-run poll timeout was
+ * unattributable.
  *
- * Stamped only after the provider accepts a `completed` update. Nullable and
- * best-effort like every write on this table — a tracking write must never
- * break check-run reporting — so NULL means "we have no record of sending it",
- * not "it was never sent".
- *
- * Idempotent: guarded on column existence; a re-run on a DB that already has
- * the column is a no-op.
+ * Stamped only after the provider accepts a `completed` update. Best-effort like every write on
+ * this table (a tracking write must never break check-run reporting), so NULL means "no record
+ * of sending it", not "never sent". Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

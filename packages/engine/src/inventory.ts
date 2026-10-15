@@ -75,8 +75,8 @@ export const InventorySelectorSchema = z.object({
 export function coerceHostPropertyValue(raw: string): HostPropertyValue {
   if (raw === 'true') return true;
   if (raw === 'false') return false;
-  // Only treat as a number when the trimmed string round-trips exactly, so
-  // e.g. '1.2.3' or '08x' stay strings.
+  // Only a plain integer/decimal literal (no trimming) becomes a number, so
+  // e.g. '1.2.3', '08x' or ' 1' stay strings.
   if (raw !== '' && /^-?\d+(\.\d+)?$/.test(raw) && Number.isFinite(Number(raw))) {
     return Number(raw);
   }

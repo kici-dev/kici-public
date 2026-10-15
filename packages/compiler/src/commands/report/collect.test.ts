@@ -60,8 +60,7 @@ describe('createReportBundle', () => {
 
   it('returns a sha256 that actually matches the file on disk', async () => {
     const { result } = await build();
-    // Recompute independently: asserting only the hex SHAPE would pass if
-    // digestOf hashed a constant, which is the bug this guards.
+    // Recomputed independently: a hex-shape check passes if digestOf hashed a constant.
     const expected = createHash('sha256').update(fs.readFileSync(result.path)).digest('hex');
     expect(result.sha256).toBe(expected);
     expect(result.sha256).toMatch(/^[0-9a-f]{64}$/);
@@ -84,8 +83,7 @@ describe('createReportBundle', () => {
     );
     expect(entries['runs/r1/detail.json']).toBeDefined();
     const logs = entries['runs/r1/logs.txt']!;
-    // Non-vacuity: the un-scrubbed input contains the token, so the assertion
-    // below detects scrubbing rather than an empty log entry.
+    // Non-vacuity: the un-scrubbed input contains the token.
     expect(`failed with ${token}`).toContain(token);
     expect(logs).not.toContain(token);
     expect(logs).toContain('***REDACTED');
@@ -185,8 +183,7 @@ describe('createReportBundle redaction completeness', () => {
 
   it('scrubs the manifest too, so a secret in --metadata cannot ride along', async () => {
     const { entries } = await build({}, { metadata: { ticket: `see ${TOKEN}` } });
-    // Non-vacuity: the value really was passed in, so its absence is the
-    // scrub working rather than the metadata being dropped.
+    // Non-vacuity: the value was passed in, so its absence is the scrub, not a drop.
     const manifest = entries['manifest.json']!;
     expect(manifest).toContain('ticket');
     expect(manifest).not.toContain(TOKEN);
@@ -194,8 +191,8 @@ describe('createReportBundle redaction completeness', () => {
   });
 
   it('leaves the config unredacted when --no-redact is given', async () => {
-    // The flag promises an unredacted bundle; leaving the allowlist on
-    // regardless made its help text and the published docs wrong.
+    // The flag promises an unredacted bundle, as its help text and the docs say:
+    // the allowlist must not run either.
     const { entries } = await build({}, { redact: false });
     const config = JSON.parse(entries['config/config.json']!);
     expect(config.pat).toBe('kici-pat-secret');
@@ -227,8 +224,7 @@ describe('createReportBundle redaction completeness', () => {
   });
 
   it('rejects cleanly when the output path cannot be written', async () => {
-    // Without an 'error' listener on the write stream this escalated to an
-    // uncaught exception and killed the process.
+    // Without a write-stream 'error' listener this is an uncaught exception that kills the process.
     const unwritable = path.join(tmp, 'a-file');
     fs.writeFileSync(unwritable, 'not a directory');
     await expect(

@@ -1,12 +1,7 @@
 /**
- * `kici-admin attestations` — orchestrator-DB-direct provenance maintenance.
- *
- *   attestations reverify [--all]   Recompute stored verdicts (verify-at-ingest
- *                                   backfill). Default scope: pending /
- *                                   unverifiable rows; `--all` re-evaluates
- *                                   every row. Direct DB + object storage.
- *
- * Belongs to `kici-admin`: it works on the orchestrator's database.
+ * `kici-admin attestations`: provenance maintenance on the orchestrator DB.
+ * `reverify` (direct DB + object storage) recomputes pending / unverifiable
+ * verdicts, or every row with `--all`.
  */
 import type { Command } from 'commander';
 import { createLogger, createPool } from '@kici-dev/shared';
@@ -28,7 +23,6 @@ import { cliAction, resolveDatabaseUrl } from './shared/cli-action.js';
 
 const logger = createLogger({ prefix: 'kici-admin-attestations' });
 
-/** Build the provenance object-storage handle from config (s3 / filesystem). */
 function buildStorage(config: ReturnType<typeof loadConfig>): CacheStorage | undefined {
   if (config.storage?.type === 's3') {
     return createCacheStorage({
@@ -162,10 +156,8 @@ export function registerAttestationsCommands(
           json?: boolean;
           databaseUrl?: string;
         }) => {
-          // Pure DB read — no storage / trust-root config needed, so resolve the
-          // URL directly from --database-url / KICI_DATABASE_URL (matching the
-          // sibling `host list` / `environment list` reads) rather than through
-          // loadConfig(), whose full validation would demand platform env vars.
+          // A pure DB read: resolve the URL directly, as `host list` does, not via
+          // loadConfig(), whose full validation demands platform env vars.
           const url = resolveDatabaseUrl(opts.databaseUrl);
           const limit = Math.min(Math.max(Number.parseInt(opts.limit, 10) || 20, 1), 100);
           const pool = createPool(url);

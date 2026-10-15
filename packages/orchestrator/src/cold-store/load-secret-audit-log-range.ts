@@ -1,19 +1,15 @@
 /**
  * Read-through helper for `secret_audit_log` (Orchestrator).
  *
- * Mirrors the execution-table reader pattern. Wraps `AuditLogger.query()`'s
- * existing offset/limit shape; cold-store rows are fetched only when
- * `includeArchived === true`.
+ * Follows the execution-table reader pattern with `AuditLogger.query()`'s
+ * offset/limit shape. Cold rows are fetched only when `includeArchived` is
+ * true (`kici-admin secret audit --include-archived`, or the admin HTTP query
+ * param); hot-only is the default so tooling skips an S3 round-trip.
  *
- * Design contract: the `kici-admin secret audit` CLI surfaces an
- * explicit `--include-archived` flag; admin HTTP route mirrors via a
- * query param. Default is hot-only so existing tooling doesn't pay an
- * S3 round-trip on every invocation.
- *
- * Cold-side filter handling: any filter that the hot SELECT applies
- * (contextName, action, run_id, ...) is re-applied in-process to cold
- * rows after streaming. This is correct because cold chunks are
- * partitioned by `(routing_key, day)`, not by the secondary filters.
+ * Hot-side filters also apply to cold rows: routingKey selects the tenant, the
+ * time bounds go to `fetchRange`, and contextName / action are checked
+ * in-process, because cold chunks are partitioned by `(routing_key, day)`,
+ * not by the secondary filters.
  */
 import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
@@ -57,7 +53,7 @@ export async function loadSecretAuditLogRange(
     includeArchived,
   } = args;
 
-  // 1. Hot path mirroring AuditLogger.query().
+  // Hot path mirroring AuditLogger.query().
   let hotQuery = db.selectFrom('secret_audit_log').selectAll().orderBy('timestamp', 'desc');
   if (contextName) hotQuery = hotQuery.where('context_name', '=', contextName);
   if (routingKey) hotQuery = hotQuery.where('routing_key', '=', routingKey);
@@ -68,10 +64,9 @@ export async function loadSecretAuditLogRange(
   const hotRows = (await hotQuery.limit(limit).offset(offset).execute()) as SecretAuditLogRow[];
 
   if (!includeArchived || !coldStore) return hotRows;
-  // The bound is the table's MINIMUM per-category TTL, resolved from the same
-  // adapter config the archiver uses: sampled `resolve` / `resolve_named` rows
-  // archive soonest, while mutations stay far longer via the adapter's
-  // per-row CASE, so the minimum keeps the read window as wide as any bucket.
+  // The bound is the table's MINIMUM per-category TTL from the archiver's
+  // adapter config: sampled `resolve` / `resolve_named` rows archive soonest
+  // and mutations far later, so the minimum keeps the read window widest.
   const warmCutoff = coldStore.warmCutoff('secret_audit_log');
   const coldFromTs = fromTs ?? new Date(0);
   if (coldFromTs >= warmCutoff) return hotRows;
@@ -93,19 +88,13 @@ export async function loadSecretAuditLogRange(
 
   const coldToTs = toTs && toTs < warmCutoff ? toTs : warmCutoff;
 
-  // Cold rows live under one tenant per chunk: `routing_key` (or
-  // synthetic `__orchestrator__`). When the caller filters by
-  // routingKey we hit a single tenant; otherwise we'd need a list
-  // helper, but the adapter doesn't expose one. For the
-  // current API surface (`kici-admin secret audit`), routingKey is
-  // typically supplied; when it isn't, we fall back to scanning the
-  // synthetic tenant only — covers orchestrator-level rotations.
+  // Each chunk has one tenant: `routing_key` or synthetic `__orchestrator__`.
+  // The adapter has no tenant-list helper, so without a routingKey filter only
+  // the synthetic tenant (orchestrator-level rotations) is scanned.
   const tenantsToScan = routingKey ? [routingKey] : [SYNTHETIC_ORCH_TENANT];
 
   const coldRows: SecretAuditLogRow[] = [];
-  // The cold stream arrives newest-first, so the page is complete once
-  // `coldOffset + remaining` matching rows are in hand; the rest of the
-  // archive is never read.
+  // The cold stream is newest-first: stop once `coldOffset + remaining` rows match.
   try {
     for (const tenant of tenantsToScan) {
       for await (const row of coldStore.fetchRange<SecretAuditLogRow>({
@@ -124,11 +113,8 @@ export async function loadSecretAuditLogRange(
     }
   } catch (err) {
     if (hotRows.length === 0) {
-      // No hot fallback for this page — the caller paginated past the
-      // hot tail and cold was the only source. Returning [] would look
-      // like end-of-results to the caller and silently drop the
-      // remaining cold rows. Propagate so the upstream HTTP handler
-      // surfaces a typed error instead.
+      // Past the hot tail, cold is the only source: returning [] would read as
+      // end-of-results, so propagate and let the HTTP handler send a typed error.
       logger.error('cold-store fetchRange failed with no hot fallback; propagating', {
         error: toErrorMessage(err),
       });

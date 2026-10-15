@@ -1,17 +1,11 @@
 /**
- * Real-time log streaming output formatter for CLI observer.
- *
- * Manages colored output for multi-job runs:
- * - Assigns distinct colors per job name (cycling through a palette)
- * - Formats log lines with colored job-name prefix
- * - Prints step transition headers
- * - Tracks elapsed time with in-place status updates
+ * Real-time log streaming for the CLI observer: per-job colored prefixes, step
+ * transition headers, and an in-place elapsed-time line.
  */
 
 import pc from 'picocolors';
 import { formatDuration } from '@kici-dev/core';
 
-/** Available color functions for job name assignment. */
 const COLOR_PALETTE: Array<(text: string) => string> = [
   pc.blue,
   pc.green,
@@ -21,15 +15,11 @@ const COLOR_PALETTE: Array<(text: string) => string> = [
 ];
 
 /**
- * The text a stored log line carries.
- *
- * The orchestrator stores every step log line as a JSON envelope —
- * `{"ts":…,"level":"stdout","msg":"…","meta":{}}` — and the Platform relay
- * returns those envelopes verbatim, so a run's log stream is the envelope
- * stream. The dashboard unwraps `msg` before rendering; the terminal must too,
- * or the developer watching `kici run remote` reads raw JSON. A line that is
- * not an envelope (an orchestrator phase marker, a plain line from an older
- * store) passes through unchanged.
+ * The `msg` of a stored log line. The orchestrator stores each step log line as
+ * a JSON envelope (`{"ts":…,"level":"stdout","msg":"…","meta":{}}`) and the
+ * Platform relays it verbatim, so the terminal unwraps it as the dashboard does.
+ * A non-envelope line (a phase marker, a plain line from an older store) passes
+ * through unchanged.
  */
 export function unwrapStoredLogLine(line: string): string {
   if (!line.startsWith('{')) return line;
@@ -43,31 +33,25 @@ export function unwrapStoredLogLine(line: string): string {
       return (parsed as { msg: string }).msg;
     }
   } catch {
-    // Not JSON — a plain line.
+    // A plain line.
   }
   return line;
 }
 
 export class StreamingFormatter {
-  /** Color assignment per job name. */
   private readonly jobColors = new Map<string, (text: string) => string>();
   private colorIndex = 0;
 
-  /** Track the current step per job to detect transitions. */
+  /** Per job, to detect step transitions. */
   private readonly currentStep = new Map<string, string>();
 
-  /** Start timestamp for elapsed time tracking. */
   private startTime: number = Date.now();
 
-  /** Elapsed timer interval reference. */
   private elapsedTimer: ReturnType<typeof setInterval> | null = null;
 
-  /** If true, suppress all streaming output. */
+  /** Suppresses all streaming output. */
   isQuiet = false;
 
-  /**
-   * Get or assign a color function for a job name.
-   */
   private getColor(jobName: string): (text: string) => string {
     let color = this.jobColors.get(jobName);
     if (!color) {
@@ -78,14 +62,7 @@ export class StreamingFormatter {
     return color;
   }
 
-  /**
-   * Format a log line with colored job-name prefix.
-   *
-   * If the step has changed since the last log for this job,
-   * a step header is emitted first.
-   *
-   * @returns The formatted line(s) to print, or empty string if quiet.
-   */
+  /** Prefixes a step header when the job's step changed. Empty when quiet. */
   formatLogLine(jobName: string, stepName: string, line: string): string {
     if (this.isQuiet) return '';
 
@@ -93,7 +70,6 @@ export class StreamingFormatter {
     const prefix = color(`[${jobName}]`);
     let output = '';
 
-    // Check for step transition
     const currentStep = this.currentStep.get(jobName);
     if (currentStep !== stepName) {
       this.currentStep.set(jobName, stepName);
@@ -104,11 +80,7 @@ export class StreamingFormatter {
     return output;
   }
 
-  /**
-   * Format a step lifecycle change.
-   *
-   * @returns The formatted status line, or empty string if quiet.
-   */
+  /** Empty when quiet. */
   formatStepChange(jobName: string, stepName: string, state: string, durationMs?: number): string {
     if (this.isQuiet) return '';
 
@@ -116,11 +88,8 @@ export class StreamingFormatter {
     const prefix = color(`[${jobName}]`);
     const duration = durationMs !== undefined ? ` (${formatDuration(durationMs)})` : '';
 
-    // Deliberately narrow: only the step states that get their own sentence are
-    // cased. Anything else — including a status added after this build — falls
-    // through to the default arm, which prints the status verbatim. That is the
-    // honest degrade for a log stream: an unrecognised state reads as itself,
-    // never as a benign one.
+    // Deliberately narrow: any other state, including one newer than this
+    // build, prints verbatim so it never reads as a benign one.
     switch (state) {
       case 'running':
         return `${prefix} ▶ Step '${stepName}' started\n`;
@@ -135,17 +104,11 @@ export class StreamingFormatter {
     }
   }
 
-  /**
-   * Format a run status change.
-   *
-   * @returns The formatted status line, or empty string if quiet.
-   */
+  /** Empty when quiet. */
   formatStatusChange(status: string, jobName?: string): string {
     if (this.isQuiet) return '';
 
-    // Same narrow-by-design shape as `formatStepEvent` above: a status without
-    // its own sentence prints verbatim via the default arm rather than being
-    // collapsed into one that has.
+    // Narrow by design, as in `formatStepChange`: an unknown status prints verbatim.
     switch (status) {
       case 'queued':
         return `${pc.dim('Queued...')}\n`;
@@ -162,10 +125,7 @@ export class StreamingFormatter {
     }
   }
 
-  /**
-   * Start the elapsed timer that updates a status line in-place.
-   * Uses \\r to overwrite the current line.
-   */
+  /** Rewrites the stderr status line in place with `\r`. */
   startElapsedTimer(): void {
     if (this.isQuiet) return;
     this.startTime = Date.now();
@@ -176,14 +136,11 @@ export class StreamingFormatter {
     }, 1000);
   }
 
-  /**
-   * Stop the elapsed timer and clear the status line.
-   */
+  /** Also clears the status line. */
   stopElapsedTimer(): void {
     if (this.elapsedTimer) {
       clearInterval(this.elapsedTimer);
       this.elapsedTimer = null;
-      // Clear the elapsed line
       process.stderr.write('\r\x1b[K');
     }
   }

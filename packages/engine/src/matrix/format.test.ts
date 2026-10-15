@@ -15,8 +15,7 @@ describe('formatMatrixSuffix', () => {
   });
 
   it('keeps all dimensions when a multi-dim matrix has a dimension named "value"', () => {
-    // A dimension literally named `value` must not be mistaken for the
-    // single-dimension sentinel — otherwise sibling combinations collide.
+    // A dimension named `value` is not the single-dimension sentinel, or siblings collide.
     expect(formatMatrixSuffix({ value: 'x86', os: 'linux' })).toBe('x86, linux');
     expect(formatMatrixSuffix({ value: 'x86', os: 'macos' })).toBe('x86, macos');
   });

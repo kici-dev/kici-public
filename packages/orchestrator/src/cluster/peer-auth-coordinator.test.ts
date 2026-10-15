@@ -77,7 +77,6 @@ describe('PeerAuthCoordinator.decideAuth — non-concurrent', () => {
     await c.decideAuth();
     const written = JSON.parse(await readFile(credFile, 'utf-8')) as CredentialFileData;
     expect(written.credential).toBe('fresh-1');
-    // a subsequent decideAuth now sees the credential
     const d2 = await c.decideAuth();
     expect(d2.mode).toBe('credential');
   });
@@ -91,15 +90,12 @@ describe('PeerAuthCoordinator.decideAuth — concurrency (single-flight)', () =>
       joinToken: 'tok',
     });
 
-    // First decider becomes the joiner.
     const first = await c.decideAuth();
     if (first.mode !== 'token-join') throw new Error('expected first to be joiner');
 
-    // While the join is in flight, three siblings decide concurrently — they
-    // must await, not each become a joiner.
+    // Siblings deciding mid-join must await, not each become a joiner.
     const siblings = Promise.all([c.decideAuth(), c.decideAuth(), c.decideAuth()]);
 
-    // Joiner completes with a fresh credential.
     first.complete(cred('coord-a', 'fresh-join'));
 
     const results = await siblings;

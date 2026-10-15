@@ -1,28 +1,8 @@
 /**
- * Access log commands for kici-admin.
- *
- * Operator-facing read access to the orchestrator's access_log table
- * (read + mutation attribution with ActorPrincipal). Use it instead of raw
- * psql when an operator asks "who read this run's payload last Tuesday" or
- * "show me everything a platform_operator actor did".
- *
- *   access-log list   List access-log rows with filters (cursor-paginated)
- *   access-log show   Show a single entry by id
- *
- * Filter flags for `list`:
- *   --org             -> ?orgId=
- *   --actor-type      -> ?actorType=
- *   --actor-id        -> ?actorId=
- *   --action          -> ?action=
- *   --source          -> ?source=
- *   --outcome         -> ?outcome=
- *   --target-type     -> ?targetType=
- *   --target-id       -> ?targetId=
- *   --from / --to     -> ?from= / ?to= (ISO timestamps)
- *   --q               -> ?q= (substring of error_message, trigram-indexed)
- *   --limit           -> ?limit= (default 50, max 200)
- *   --cursor          -> ?cursor=
- *   --json            Emit raw JSON
+ * `kici-admin access-log`: the access_log table (read and mutation
+ * attribution by ActorPrincipal) instead of raw psql. `list` filter flags map
+ * 1:1 to query params; `--q` is a trigram-indexed substring of error_message,
+ * and `--limit` defaults to 50, max 200.
  */
 
 import type { Command } from 'commander';

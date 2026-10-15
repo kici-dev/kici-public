@@ -1,24 +1,16 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `workflow_registrations.default_branch text` (nullable).
+ * Add `workflow_registrations.default_branch`.
  *
- * A `__schedule_fire` run executes the default branch's lock file, so the
- * default branch IS that run's branch — which is what a branch-restricted
- * context needs in order to accept it. The value is already computed at
- * registration time from the webhook payload (the default-branch-push check),
- * it was simply never persisted, so a scheduled run had no branch to present.
+ * A `__schedule_fire` run executes the default branch's lock file, so the default branch IS its
+ * branch, which a branch-restricted context needs to accept it. Registration already computes it
+ * from the webhook payload (the default-branch-push check); this persists it.
  *
- * NULLABLE with no default, deliberately. The default branch is knowable only
- * from a webhook payload, so there is nothing to backfill a pre-existing row
- * with: a registration written before this migration reads NULL until its
- * repo's next default-branch push re-registers it. The dispatch path reads NULL
- * as "no branch" and the context branch gate then rejects with its honest
- * named-cause verdict — a DEFAULT would instead invent a branch the
- * registration never proved, which is exactly the confusion this whole column
- * exists to end.
- *
- * Idempotent: a re-run on a DB that already has the column is a no-op.
+ * NULLABLE with no default, deliberately: only a webhook payload reveals the default branch, so
+ * a pre-existing row reads NULL until its repo's next default-branch push re-registers it.
+ * Dispatch reads NULL as "no branch" and the context branch gate rejects with its named cause; a
+ * DEFAULT would invent a branch the registration never proved. Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colCheck = await sql<{ exists: boolean }>`

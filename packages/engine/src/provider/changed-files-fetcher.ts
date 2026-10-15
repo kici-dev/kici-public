@@ -1,26 +1,17 @@
-/**
- * ChangedFilesFetcher interface.
- *
- * Retrieves the list of files changed in a webhook event from the provider's API.
- * Used by the orchestrator for path-based trigger filtering.
- */
+/** Fetches a webhook event's changed files from the provider API, for path trigger filtering. */
 
 import type { ProviderType } from './types.js';
 import type { ChangedFilesStatus } from '../trigger/types.js';
 
 /**
- * Result of a changed-files fetch.
- *
- * `status` distinguishes an authoritative diff from a capability gap so path
+ * `status` separates an authoritative diff from a capability gap, so path
  * filters never infer a no-match from an empty list:
- * - `fetched` — the list is authoritative; an empty `files` genuinely means
- *   "no files changed" and does NOT match a path filter.
- * - `unavailable` — the diff could not be determined (e.g. a universal-git PR
- *   event with no per-commit diff in the webhook body). Path filters match
- *   conservatively so a real change is never silently dropped.
+ * - `fetched` — authoritative; an empty `files` does NOT match a path filter.
+ * - `unavailable` — no diff (e.g. a universal-git PR event with no per-commit
+ *   diff in the body); path filters match conservatively.
  *
- * `skipped` is intentionally NOT a fetcher outcome — it is set by the pipeline
- * when no trigger has path patterns and the fetch never runs.
+ * `skipped` is not a fetcher outcome: the pipeline sets it when no trigger has
+ * path patterns and the fetch never runs.
  */
 export interface ChangedFilesResult {
   files: string[];
@@ -31,16 +22,11 @@ export interface ChangedFilesFetcher {
   readonly provider: ProviderType;
 
   /**
-   * Get changed files for a webhook event.
+   * For a PR, the files changed in the pull/merge request; for a push, across
+   * the pushed commits. Paths are relative to the repo root.
    *
-   * For PRs: files changed in the pull/merge request.
-   * For pushes: files changed across the pushed commits.
-   *
-   * @param repoIdentifier - Provider-specific repo identifier (e.g., "owner/repo" for GitHub)
-   * @param eventType - Normalized event type ("pull_request" or "push")
-   * @param payload - Raw webhook payload (provider-specific)
-   * @param credentials - Provider-specific auth credentials
-   * @returns The changed file paths (relative to repo root) plus an availability status.
+   * @param repoIdentifier - e.g. "owner/repo" for GitHub
+   * @param eventType - "pull_request" or "push"
    */
   getChangedFiles(
     repoIdentifier: string,

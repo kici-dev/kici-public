@@ -38,17 +38,15 @@ export interface BetweenJobsOutcome {
 }
 
 /**
- * Supervisor-owned between-jobs phase for a reused (bare-metal / in-place) agent.
- * After every job it sequences: (1) out-of-band declared-cleanup re-run when the
- * runner died before its completion hooks ran, (2) process-group reap of the
- * job's descendant tree, (3) workdir deletion, (4) the operator reset command.
- * Each phase is delegated so the class stays unit-testable, and a persistently
- * failing reset can drain the agent via the consecutive-failure counter.
+ * Supervisor-owned between-jobs phase for a reused (bare-metal / in-place)
+ * agent. Each phase is delegated so the class stays unit-testable, and a
+ * persistently failing reset can drain the agent via the consecutive-failure
+ * counter.
  */
 export class BetweenJobsController {
   private _consecutiveResetFailures = 0;
 
-  /** Consecutive between-jobs reset failures, for the supervisor's drain gate. */
+  /** For the supervisor's drain gate. */
   get consecutiveResetFailures(): number {
     return this._consecutiveResetFailures;
   }
@@ -103,9 +101,9 @@ export class BetweenJobsController {
   }
 
   async afterJob(ctx: AfterJobContext): Promise<BetweenJobsOutcome> {
-    // Each phase is isolated: an earlier phase failing (a rejected reap or
-    // workdir delete) must NOT skip the operator reset — leaving host state
-    // un-reset is exactly the residue this phase exists to prevent.
+    // Each phase is isolated: an earlier failure (a rejected reap or workdir
+    // delete) must NOT skip the operator reset — un-reset host state is the
+    // residue this phase exists to prevent.
 
     // 1. Out-of-band declared cleanup, only when the runner died before it ran.
     let rerun: CleanupRerunStatus = 'skipped';

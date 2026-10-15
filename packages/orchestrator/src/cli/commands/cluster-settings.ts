@@ -1,15 +1,11 @@
 /**
- * Cluster-settings management commands for kici-admin.
+ * `kici-admin cluster-settings <show|set|reset>`, against the orchestrator
+ * admin API directly (`routes/admin-cluster-settings.ts`), never the Platform
+ * proxy, so it works while the Platform is down. `show` also lists the settings
+ * version each coordinator and worker applied.
  *
- * Subcommand namespace: `kici-admin cluster-settings <show|set|reset>`.
- *
- * Talks to the orchestrator admin API directly (not the Platform dashboard
- * proxy), so the CLI stays operable even when Platform is unavailable. Backed
- * by `packages/orchestrator/src/routes/admin-cluster-settings.ts`. `show` also
- * lists which settings version each coordinator and worker applied.
- *
- * These knobs are fleet-wide (a single `cluster_settings` row), not per-tenant.
- * For per-tenant knobs use `kici-admin org-settings`.
+ * The knobs are fleet-wide (one `cluster_settings` row); per-tenant knobs live
+ * in `kici-admin org-settings`.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -29,33 +25,29 @@ interface KnobSpec {
   flag: string;
   min: number;
   /**
-   * Optional ceiling, mirroring the route's Zod `.max()`. Only the three LRU
-   * entry-count knobs carry one, and theirs is a boot-safety bound rather than
-   * a policy preference — see {@link CACHE_MAX_ENTRIES_CEILING}.
+   * Mirrors the route's Zod `.max()`. Only the LRU entry-count knobs carry
+   * one: a boot-safety bound, not a policy ({@link CACHE_MAX_ENTRIES_CEILING}).
    */
   max?: number;
   label: string;
 }
 
 /**
- * One text knob. Kept separate from {@link KnobSpec} because the value parser,
- * the PATCH body type, and the `show` formatter all differ — a string knob has
- * no `min` floor and is validated by shape, not by magnitude.
+ * One text knob, separate from {@link KnobSpec} because its parser, PATCH type
+ * and `show` formatter differ: it has no `min` and is validated by shape.
  */
 interface StringKnobSpec {
   field: string;
   flag: string;
   label: string;
-  /** Human-facing description of the accepted shape, used in the error message. */
+  /** The accepted shape, as the error message names it. */
   expects: string;
   validate: (value: string) => boolean;
 }
 
 /**
- * One boolean knob. A third spec type for the same reason {@link StringKnobSpec}
- * is separate from {@link KnobSpec}: the value parser, the PATCH body type, and
- * the `show` formatter all differ. A boolean also has no bounds to validate —
- * only two accepted spellings.
+ * One boolean knob, separate for the same reason as {@link StringKnobSpec}; no
+ * bounds, two spellings.
  */
 interface BooleanKnobSpec {
   field: string;
@@ -63,11 +55,7 @@ interface BooleanKnobSpec {
   label: string;
 }
 
-/**
- * The cluster-global knobs. `field` matches the admin route's camelCase
- * schema; `flag` is the kebab-case CLI option; `min` mirrors the route's Zod
- * floor.
- */
+/** The cluster-global knobs; `field` matches the admin route schema, `min` its Zod floor. */
 const KNOBS: KnobSpec[] = [
   {
     field: 'maxGithubPayloadBytes',
@@ -194,19 +182,15 @@ const KNOBS: KnobSpec[] = [
     min: 60_000,
     label: 'Ingest queue claim timeout (ms)',
   },
-  // Cache sizing and TTLs are structural to the underlying LRU, which is built
-  // once at boot, so a change here lands at the next orchestrator restart.
+  // Cache sizing and TTLs shape an LRU built once at boot: a change lands at
+  // the next restart.
   //
-  // Spelling: `lockfile`, one word, for every knob about the lock-file CACHE —
-  // and for anything added next to them. It reads oddly beside
-  // `--lock-file-max-bytes` above (a limit on a single fetch, not a cache), and
-  // that inconsistency is deliberate rather than overlooked: `lockfile` is the
-  // conventional single-word spelling, and each of these knobs spells it that
-  // way across all five links of its chain — CLI flag, `KICI_LOCKFILE_CACHE_*`
-  // env var, `lockfile_cache_*` column, config field, and runtime read. Aligning
-  // the flag alone with the older neighbour would break that chain; aligning all
-  // five would cost a migration to rename a column no customer types. The older
-  // flag is released, so it stays as it is.
+  // Spelling: `lockfile`, one word, for every lock-file CACHE knob and anything
+  // added beside them. The clash with `--lock-file-max-bytes` (a single-fetch
+  // limit) is deliberate: each knob spells it the same across its whole chain —
+  // CLI flag, `KICI_LOCKFILE_CACHE_*` env var, `lockfile_cache_*` column, config
+  // field, runtime read. Aligning the flag alone breaks that chain; aligning all
+  // costs a column-rename migration. The older flag is released and stays.
   {
     field: 'lockfileCacheMax',
     flag: 'lockfile-cache-max',
@@ -245,9 +229,8 @@ const KNOBS: KnobSpec[] = [
     min: 1000,
     label: 'Content cache TTL (ms)',
   },
-  // The two round budgets are read per round and handed to the agent in the
-  // round's job config, so a change lands on the next push. The cache size is
-  // structural to its LRU and applies at the next restart.
+  // The round budgets ride each round's job config, so a change lands on the
+  // next push; the cache size applies at the next restart.
   {
     field: 'globalEvalRoundTimeoutMs',
     flag: 'global-eval-round-timeout-ms',
@@ -284,9 +267,9 @@ const KNOBS: KnobSpec[] = [
     min: 1000,
     label: 'Firecracker API socket wait (ms)',
   },
-  // Event-scaler provision reaper. Unlike the cache knobs above, all four are
-  // read per sweep, so a change lands on the next tick with no restart — the
-  // interval reschedules the timer at the end of the sweep that observed it.
+  // Event-scaler provision reaper: read per sweep, so a change lands on the
+  // next tick with no restart (the interval reschedules after the sweep that
+  // observed it).
   {
     field: 'scalerReapIntervalMs',
     flag: 'scaler-reap-interval-ms',
@@ -403,11 +386,7 @@ export const PROPAGATION_UNSUPPORTED_NOTE =
   'Note: this orchestrator does not report cluster-settings propagation; ' +
   'upgrade it to see which version each orchestrator applied.';
 
-/**
- * Fetch the propagation report. A 404 means the orchestrator predates the
- * route; `show` then prints the settings alone, because this CLI may be newer
- * than the orchestrator it talks to.
- */
+/** A 404 means an orchestrator older than this CLI; `show` then prints the settings alone. */
 export async function fetchPropagation(client: AdminApiClient): Promise<PropagationFetch> {
   let body: { propagation?: unknown } | null;
   try {
@@ -465,8 +444,8 @@ export function formatPropagation(report: SettingsPropagationReport): string {
 }
 
 /**
- * What `show` prints. The JSON keeps the flat settings map exactly as before
- * and adds one `propagation` key, so scripts that read knob keys keep working.
+ * The JSON keeps the flat settings map plus one `propagation` key, so knob-key
+ * scripts keep working.
  */
 export function renderShow(
   settings: ClusterSettings,
@@ -497,12 +476,7 @@ async function patchSettings(client: AdminApiClient, body: PatchBody): Promise<C
   return res.settings;
 }
 
-/**
- * Parse an integer CLI flag against its knob's bounds, exiting on failure.
- *
- * `max` is optional because most knobs have no meaningful ceiling; the ones
- * that do carry a hard boot-safety bound (see {@link KnobSpec.max}).
- */
+/** Exits on a value outside the bounds; `max` is a boot-safety bound ({@link KnobSpec.max}). */
 export function parseKnobValue(flag: string, value: string, min: number, max?: number): number {
   const n = Number(value);
   const bounds = max === undefined ? `>= ${min}` : `between ${min} and ${max}`;
@@ -524,11 +498,9 @@ export function parseStringKnobValue(knob: StringKnobSpec, value: string): strin
 }
 
 /**
- * Parse a boolean CLI flag, exiting on failure.
- *
- * Accepts only the exact strings `true` and `false`. A permissive parser (any
- * non-empty string is true) would read `--global-workflows-enabled no` as an
- * enable, which for this knob turns a typo into a security posture change.
+ * Accepts only `true` and `false`, else exits. A permissive parser would read
+ * `--global-workflows-enabled no` as an enable: a typo becomes a security
+ * posture change.
  */
 export function parseBooleanKnobValue(knob: BooleanKnobSpec, value: string): boolean {
   const trimmed = value.trim();
@@ -568,17 +540,13 @@ export function buildClusterPatch(opts: Record<string, string | undefined>): Pat
 }
 
 /**
- * Warn when only one of the two ordered global-eval timeouts is being set.
+ * Warns when only one of an ordered global-eval timeout pair is set. The wait
+ * ceiling must exceed the round budget, which starts only once the round job
+ * is RUNNING, or every round that waited for an agent fails silently. The
+ * server rejects a bad pair only when both are stored: a NULL column means the
+ * orchestrator's configured default, which the route cannot see.
  *
- * The orchestrator's wait ceiling must exceed the agent's round budget — the
- * agent's budget starts only once the round job is RUNNING, so a lower ceiling
- * fires on every round that merely waited for a free agent, failing every round
- * silently. The server rejects the pair outright when BOTH effective values are
- * stored, but it cannot compare against a column left NULL: NULL means "the
- * orchestrator's configured default applies", and the route does not know that
- * number. Setting one alone is exactly that blind spot, so warn here.
- *
- * Returns the lines rather than printing them so the check is unit-testable.
+ * Returns the lines, unprinted, so the check is unit-testable.
  */
 export function unpairedEvalTimeoutWarnings(patch: PatchBody): string[] {
   const setting = (v: unknown): boolean => typeof v === 'number';
@@ -598,9 +566,8 @@ export function unpairedEvalTimeoutWarnings(patch: PatchBody): string[] {
     );
   }
 
-  // The adjacent axis, with the same blind spot: a per-candidate budget at or
-  // above the whole round's lets ONE candidate consume the entire round, and
-  // every sibling workflow in it is then suppressed with no retry.
+  // Same blind spot: a candidate budget at or above the round's lets ONE
+  // candidate consume the round, suppressing every sibling with no retry.
   const candidate = patch.globalEvalCandidateTimeoutMs;
   if (setting(candidate) !== setting(round)) {
     const which = setting(candidate) ? 'candidate timeout' : 'round timeout';
@@ -631,13 +598,10 @@ export function buildClusterReset(opts: Record<string, boolean | undefined>): Pa
 const VERIFIED_ISSUER_PROBE_TIMEOUT_MS = 5000;
 
 /**
- * Check that `issuer` actually publishes a dashboard-encryption key.
- *
- * Runs after the setting has already been written, so it never throws: a
- * network fault, a non-2xx status and a malformed body all come back as a
- * `reason` the caller prints as a warning. The check is advisory — the CLI may
- * sit in a different network position than the browser that will do the real
- * fetch, so a failure is definitive but a pass is not a guarantee.
+ * Checks that `issuer` publishes a dashboard-encryption key. It runs after the
+ * write, so it never throws: every fault becomes a `reason` warning. Advisory:
+ * the CLI may sit elsewhere on the network than the browser, so a failure is
+ * definitive and a pass is not a guarantee.
  */
 export async function checkVerifiedIssuerPublishes(
   issuer: string,
@@ -722,11 +686,10 @@ export function registerClusterSettingsCommands(
       console.error(`Error: ${toErrorMessage(err)}`);
       process.exit(1);
     }
-    // Advisory post-set probe. The Verified tier hard-blocks every encrypted
-    // dashboard write when the origin publishes no key, and nothing else would
-    // tell the operator until a browser failed much later. Warn, never fail:
-    // the set has already landed, and this shell may not sit where the browser
-    // does. Clearing goes through `reset`, so a value here is always a URL.
+    // The Verified tier hard-blocks every encrypted dashboard write when the
+    // origin publishes no key, and nothing else tells the operator until a
+    // browser fails. Warn, never fail: the set landed, and this shell may not
+    // sit where the browser does. Clearing uses `reset`, so this is a URL.
     const issuer = patch.dashboardVerifiedIssuer;
     if (typeof issuer === 'string' && issuer.length > 0) {
       const check = await checkVerifiedIssuerPublishes(issuer);

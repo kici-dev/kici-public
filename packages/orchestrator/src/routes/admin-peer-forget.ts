@@ -31,7 +31,6 @@ import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-peer-forget' });
 
-/** What the route needs from the coordinator it runs on. */
 export interface PeerForgetRouteDeps {
   /**
    * Forget `instanceId` here, then on every connected sibling coordinator
@@ -46,7 +45,7 @@ export interface PeerForgetRouteDeps {
   ) => Promise<PeerForgetResult[]>;
 }
 
-/** How long the route waits for each sibling coordinator by default. */
+/** Default wait per sibling coordinator. */
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 const bodySchema = z.object({
@@ -76,10 +75,9 @@ export function createPeerForgetRoutes(deps: {
     const acknowledgeBackstop = body.data.acknowledgeBackstop === true;
     const results = await deps.peerForget.forget(instanceId, timeoutMs, acknowledgeBackstop);
 
-    // The first result is this coordinator's: a peer it keeps (connected,
-    // heard from inside its liveness window, or guarding its backstop without an
-    // acknowledgement) is refused outright, and nothing changed anywhere. A
-    // peer no coordinator knows is unknown.
+    // A peer this coordinator keeps (connected, heard from inside its liveness
+    // window, or guarding its backstop without an acknowledgement) is refused
+    // outright, with nothing changed anywhere. A peer no coordinator knows is unknown.
     const local = results[0];
     let error: { status: 404 | 409; message: string } | undefined;
     if (local && LOCAL_REFUSALS.has(local.outcome)) {

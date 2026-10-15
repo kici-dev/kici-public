@@ -1,8 +1,8 @@
 /**
- * A job a `DynamicJobFn` generates binds its contexts through the same gates a
- * static job does: the all-must-pass reject rules (repository, branch, trigger,
- * enabled) and the protection gates (required reviewers, wait timer, minimum
- * trust, concurrency). Its context's secrets are resolved only once both pass.
+ * A `DynamicJobFn`-generated job passes the same context gates as a static job:
+ * the all-must-pass reject rules (repository, branch, trigger, enabled) and the
+ * protection gates (required reviewers, wait timer, minimum trust, concurrency).
+ * Secrets resolve only once both pass.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { ContextGateRejectReason, ExecutionJobStatus } from '@kici-dev/engine';
@@ -221,8 +221,8 @@ describe('dispatchMatchedWorkflow — generated jobs pass their contexts protect
     });
     await awaitDispatchTasksSettled(tracker);
     expect(dispatched.find((d) => d.jobName === GEN)).toBeUndefined();
-    // The resume path exists and carries the generated job's own config, and no
-    // context secret was resolved for a job that has not been approved.
+    // The resume path carries the generated job's config, with no secret resolved
+    // before approval.
     const pending = await consumePendingJobContext(undefined, 'run-1', GEN);
     expect(pending?.jobInput.jobConfig.dynamicSource).toBeDefined();
     expect(pending?.jobInput.jobConfig).not.toHaveProperty('secrets');

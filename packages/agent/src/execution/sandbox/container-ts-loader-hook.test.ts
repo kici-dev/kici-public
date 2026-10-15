@@ -56,7 +56,7 @@ describe('container-ts-loader-hook', () => {
   it('throws with the file path when the source has a transpile error', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'hook-'));
     const file = path.join(dir, 'bad.ts');
-    // A genuinely un-transpilable construct: a decorator on a bare statement.
+    // Genuinely un-transpilable: a type annotation with no type and an empty initializer.
     await writeFile(file, 'const x: = ;\n');
     const url = pathToFileURL(file).href;
     const nextLoad = () => {

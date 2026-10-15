@@ -9,12 +9,8 @@ import { type Kysely, sql } from 'kysely';
  *     keeping the JSONB minimal — matches setDashboardWritePolicy normalization)
  *   - already-string enum values → left untouched (idempotent re-run)
  *
- * Runtime reads coerce booleans defensively too (so an un-migrated row is never
- * mis-read), but this migration normalizes the at-rest shape so the stored JSONB
- * matches what the tri-state writer produces.
- *
- * Pure SQL rewrite: for each row, rebuild the object keeping only non-`true`
- * entries and mapping `false` → `'disabled'`, leaving existing string values.
+ * Runtime reads also coerce booleans, so an un-migrated row is never mis-read;
+ * this normalizes the at-rest shape to what the tri-state writer produces.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`

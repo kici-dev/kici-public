@@ -8,15 +8,11 @@ export interface PatCreateOptions {
   name?: string;
   /** Mint an agent-kind PAT (the only credential the developer MCP server accepts). */
   agent?: boolean;
-  /**
-   * Agent label (required with `--agent`) — the human-set name recorded on every
-   * audit row the agent produces. Also used as the token name when `--name` is
-   * omitted.
-   */
+  /** Required with `--agent`: the human-set name recorded on every audit row the agent produces. */
   label?: string;
-  /** Custom expiry in days (server default: 120). */
+  /** Days (server default: 120). */
   expiresInDays?: number;
-  /** Injected fetch for tests. Defaults to the global fetch. */
+  /** For tests. */
   fetchImpl?: typeof fetch;
 }
 
@@ -28,13 +24,11 @@ interface CreatePatResponse {
 }
 
 /**
- * Mint a personal access token under the logged-in user's identity.
- *
- * `kici pat create --agent --name <label>` mints an agent-kind PAT: it inherits
- * the user's permissions (provenance only, no authority change), carries its
- * label into every audit row, and is the credential a coding agent points the
- * KiCI developer MCP server at. The token is printed once — there is no way to
- * retrieve it later.
+ * Mints a PAT under the logged-in user's identity. An agent-kind PAT (`--agent`)
+ * inherits the user's permissions (provenance only, no authority change),
+ * carries its label into every audit row, and is the credential a coding agent
+ * points the KiCI developer MCP server at. The token is printed once and cannot
+ * be retrieved later.
  */
 export async function patCreateCommand(options: PatCreateOptions = {}): Promise<boolean> {
   const doFetch = options.fetchImpl ?? fetch;

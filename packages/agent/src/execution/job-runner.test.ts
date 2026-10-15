@@ -44,9 +44,8 @@ const loggerMock = vi.hoisted(() => ({
 
 // --- Mocks ---
 
-// Mock @kici-dev/shared (createLogger + getRequestContext + createMeter +
-// kiciTmpBase — the bring-up handler resolves the agent-payload cache dir via
-// defaultPayloadCacheDir() → kiciTmpBase()).
+// kiciTmpBase: the bring-up handler resolves the agent-payload cache dir via
+// defaultPayloadCacheDir() → kiciTmpBase().
 vi.mock('@kici-dev/shared', () => {
   const noopInstrument = { add: vi.fn(), record: vi.fn() };
   return {
@@ -62,11 +61,9 @@ vi.mock('@kici-dev/shared', () => {
   };
 });
 
-// Mock fs for mkdtemp and rm. The workdir now flows through the
-// @kici-dev/core/tmp allocator, which imports the *named* mkdtemp/rm/writeFile
-// from node:fs/promises, while job-runner still uses the default import — so
-// named and default exports share the same vi.fn instances (assertions read
-// the default export).
+// The @kici-dev/core/tmp allocator imports the *named* mkdtemp/rm/writeFile
+// while job-runner uses the default import, so named and default exports share
+// the same vi.fn instances (assertions read the default export).
 const { mkdtempFn, rmFn, accessFn, writeFileFn, mkdirFn } = vi.hoisted(() => ({
   mkdtempFn: vi.fn().mockResolvedValue('/tmp/kici-test123'),
   rmFn: vi.fn().mockResolvedValue(undefined),
@@ -90,13 +87,12 @@ vi.mock('node:fs/promises', () => ({
   mkdir: mkdirFn,
 }));
 
-// Mock dockerode to prevent real Docker connections
 vi.mock('dockerode', () => ({
   default: vi.fn(),
 }));
 
-// Mock sandbox barrel -- all sandbox classes return the shared mockSandboxInstance
-// Use function() instead of arrow functions so they can be called with `new`
+// Every sandbox class returns the shared mockSandboxInstance; function(), not
+// arrows, so they can be called with `new`.
 vi.mock('./sandbox/index.js', () => ({
   BareMetalSandbox: vi.fn(function () {
     return mockSandboxInstance;
@@ -111,14 +107,10 @@ vi.mock('./sandbox/index.js', () => ({
   fileCloneSourceBinds: vi.fn(() => [] as string[]),
 }));
 
-// Mock the eval child's process boundary, NOT the evaluation itself.
-//
-// `runEvalChild` forks `eval-runner.js`; a unit test cannot drive a real fork,
-// but the evaluation it performs is `runEvalRequest` in `eval-dispatch.ts`. The
-// fake calls that real function, so every assertion below still exercises the
-// production evaluation path (and the module mocks it depends on) — it just
-// skips the process boundary. A hand-written imitation would drift from the
-// child the moment either side changed.
+// Mock the eval child's process boundary, NOT the evaluation itself: the fake
+// calls the real `runEvalRequest` (`eval-dispatch.ts`) that the forked
+// `eval-runner.js` runs, so assertions exercise the production evaluation path.
+// A hand-written imitation would drift from the child.
 const runEvalChildMock = vi.hoisted(() => vi.fn());
 vi.mock('./sandbox/eval-fork-runner.js', () => ({
   runEvalChild: (opts: {
@@ -151,27 +143,24 @@ vi.mock('./image-build/build-step.js', () => ({
   }),
 }));
 
-// Mock workflow loader (used by build / init / dynamic jobs to load author
-// TS and verify contentHash). The init and dynamic handlers also call
-// extractWorkflow / extractDynamicJobFn; stub them so the unit tests can
-// drive the handler past the load step without a real workflow module.
+// Build / init / dynamic jobs load author TS and verify contentHash here;
+// extractWorkflow / extractDynamicJobFn stubs drive the handlers past the load
+// step without a real workflow module.
 vi.mock('./workflow-loader.js', () => ({
   loadWorkflowSource: vi.fn().mockResolvedValue({ module: {} }),
   extractWorkflow: vi.fn().mockReturnValue({ name: 'test-workflow', jobs: [] }),
   extractDynamicJobFn: vi.fn().mockReturnValue(async () => [{ name: 'generated-job', steps: [] }]),
 }));
 
-// Mock init-runner (used by handleInitJob to evaluate dynamic fields, and by
-// handleDynamicJobFn to evaluate a workflow-level filter before the generator).
+// handleInitJob evaluates dynamic fields here; handleDynamicJobFn evaluates a
+// workflow-level filter before the generator.
 vi.mock('./init-runner.js', () => ({
   evaluateDynamicFields: vi.fn().mockResolvedValue({}),
   evaluateWorkflowFilter: vi.fn().mockResolvedValue(true),
 }));
 
-// Mock dynamic-job-serializer (used by handleDynamicJobFn to serialize
-// generated jobs to LockJob[]). Keep the real MatrixExpansionError so the
-// handler's `instanceof` check in handleDynamicJobFn resolves against the
-// same class the test throws.
+// Keep the real MatrixExpansionError so handleDynamicJobFn's `instanceof`
+// check resolves against the class the test throws.
 vi.mock('./dynamic-job-serializer.js', async (importActual) => {
   const actual = await importActual<typeof import('./dynamic-job-serializer.js')>();
   return {
@@ -192,9 +181,8 @@ vi.mock('./source-restore.js', () => ({
   restoreSource: vi.fn().mockResolvedValue(undefined),
 }));
 
-// Mock log streamer -- track instances for verifying destroy() calls. Each
-// instance records the step index it was built for, so a test can find the
-// workflow-level (step -1) streamer among the per-step ones.
+// Instances are tracked for destroy() assertions; each records its step index
+// so a test can find the workflow-level (step -1) streamer.
 const logStreamerInstances: Array<{
   stepIndex: number;
   addLine: Mock;
@@ -265,7 +253,6 @@ vi.mock('./download.js', () => ({
   uploadToPresignedUrl: vi.fn().mockResolvedValue(undefined),
 }));
 
-// Import mocks after setup
 const { BareMetalSandbox, ContainerSandbox } = await import('./sandbox/index.js');
 const { gitClone } = await import('../checkout/git-clone.js');
 const { checkHostInstallEligibility, HostInstallRefusal } =
@@ -388,7 +375,6 @@ describe('JobRunner', () => {
     // BareMetalSandbox should have been constructed (default mode)
     expect(BareMetalSandbox).toHaveBeenCalledOnce();
 
-    // Full sandbox lifecycle
     expect(mockSandboxInstance.setup).toHaveBeenCalledOnce();
     expect(mockSandboxInstance.executeJob).toHaveBeenCalledOnce();
     expect(mockSandboxInstance.teardown).toHaveBeenCalledOnce();
@@ -396,7 +382,6 @@ describe('JobRunner', () => {
     // gitClone should NOT be called for execution jobs (sandbox handles clone)
     expect(gitClone).not.toHaveBeenCalled();
 
-    // Verify status messages: running -> success
     const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     expect(jobStatuses).toHaveLength(2);
     expect((jobStatuses[0] as { state: string }).state).toBe('running');
@@ -423,7 +408,6 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDispatch());
 
-    // Job reports failed
     const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     expect((jobStatuses[jobStatuses.length - 1] as { state: string }).state).toBe('failed');
   });
@@ -449,7 +433,6 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDispatch());
 
-    // Job reports failed with 2 stepResults
     const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     const failedStatus = jobStatuses.find((m) => (m as { state: string }).state === 'failed') as {
       data?: { stepResults?: unknown[] };
@@ -547,7 +530,6 @@ describe('JobRunner', () => {
     expect(ContainerSandbox).toHaveBeenCalledOnce();
     expect(BareMetalSandbox).not.toHaveBeenCalled();
 
-    // Full sandbox lifecycle
     expect(mockSandboxInstance.setup).toHaveBeenCalledOnce();
     expect(mockSandboxInstance.executeJob).toHaveBeenCalledOnce();
     expect(mockSandboxInstance.teardown).toHaveBeenCalledOnce();
@@ -555,9 +537,7 @@ describe('JobRunner', () => {
 
   it('job-image agent runs bare-metal instead of nesting another container', async () => {
     // The scaler spawned this agent FROM the job's image with the runtime
-    // injected, so it is already inside the image the job asked for. Nesting a
-    // second container from the same image would need a runtime inside a
-    // runtime.
+    // injected; nesting a second container would need a runtime inside a runtime.
     const deps = makeDeps();
     deps.config = { ...deps.config, jobImageAgent: true } as typeof deps.config;
     const dispatch = makeDispatch({
@@ -923,7 +903,7 @@ describe('JobRunner', () => {
       await new JobRunner(deps).execute(containerJob());
 
       // breaks-if-wrong: lifecycle scripts must never run on the host; with
-      // them allowed the runner installs inside the container, as before.
+      // them allowed the runner installs inside the container instead.
       expect(runHostIsolatedInstall).not.toHaveBeenCalled();
       expect(checkHostInstallEligibility).not.toHaveBeenCalled();
       const workflowLog = logStreamerInstances.find((s) => s.stepIndex === -1);
@@ -1193,7 +1173,6 @@ describe('JobRunner', () => {
 
     await runner.execute(dispatch);
 
-    // ContainerSandbox constructor called with correct image
     expect(ContainerSandbox).toHaveBeenCalledWith(
       expect.objectContaining({
         image: 'node:20-alpine',
@@ -1245,7 +1224,6 @@ describe('JobRunner', () => {
   });
 
   it('cancel: abort() called on active sandbox', async () => {
-    // Make sandbox.executeJob block until manually resolved
     let resolveExecution!: (value: JobExecutionResult) => void;
     const executionPromise = new Promise<JobExecutionResult>((resolve) => {
       resolveExecution = resolve;
@@ -1261,10 +1239,8 @@ describe('JobRunner', () => {
     // Wait for the job to start and sandbox to be set
     await new Promise((r) => setTimeout(r, 20));
 
-    // Cancel the job
     runner.cancel(dispatch.jobId, 'user cancelled');
 
-    // Verify sandbox.abort() was called
     expect(mockSandboxInstance.abort).toHaveBeenCalled();
 
     // Resolve the execution so the test can finish cleanly
@@ -1291,7 +1267,6 @@ describe('JobRunner', () => {
   });
 
   it('step status callbacks: onStepStatus invoked, step.status messages sent', async () => {
-    // Make sandbox.executeJob invoke the onStepStatus callback
     mockSandboxInstance.executeJob.mockReset().mockImplementation(async (opts: unknown) => {
       const options = opts as {
         onStepStatus: (
@@ -1317,7 +1292,6 @@ describe('JobRunner', () => {
     const stepStatuses = deps.messages.filter((m) => m.type === 'step.status');
     expect(stepStatuses).toHaveLength(4);
 
-    // Verify step status message content
     const firstStep = stepStatuses[0] as { stepIndex: number; stepName: string; state: string };
     expect(firstStep.stepIndex).toBe(0);
     expect(firstStep.stepName).toBe('build');
@@ -1370,11 +1344,9 @@ describe('JobRunner', () => {
   });
 
   it('step status: terminal step.status messages carry logBytesStreamed from LogStreamer', async () => {
-    // The agent calls onStepStatus from inside sandbox.executeJob; the
-    // job-runner looks up the per-step LogStreamer (created lazily by
-    // onLogLine) and forwards getTotalBytes() on terminal states. Drive
-    // distinct return values on the mocked streamers so we can prove the
-    // wiring picks the right streamer per step index.
+    // On terminal states the job-runner forwards getTotalBytes() from the
+    // per-step LogStreamer (created lazily by onLogLine); distinct mocked
+    // values prove it picks the right streamer per step index.
     mockSandboxInstance.executeJob.mockReset().mockImplementation(async (opts: unknown) => {
       const options = opts as {
         onStepStatus: (
@@ -1390,7 +1362,6 @@ describe('JobRunner', () => {
       options.onLogLine(1, 'test line 1');
 
       // Mocked LogStreamer instances are pushed in creation order.
-      // Mock distinct byte totals so we can verify per-step wiring.
       logStreamerInstances[0]!.getTotalBytes.mockReturnValue(2048);
       logStreamerInstances[1]!.getTotalBytes.mockReturnValue(512);
 
@@ -1444,10 +1415,7 @@ describe('JobRunner', () => {
   it('activeJobs map tracks running jobs', async () => {
     let sawActive = false;
 
-    // Make sandbox.executeJob check activeJobs mid-execution
     mockSandboxInstance.executeJob.mockReset().mockImplementation(async () => {
-      // runner is captured via closure below -- use deps.messages as proxy
-      // Instead, we check from outside after a tick
       return defaultSuccessResult;
     });
 
@@ -1455,7 +1423,6 @@ describe('JobRunner', () => {
     const runner = new JobRunner(deps);
     const dispatch = makeDispatch();
 
-    // Use a blocking sandbox to check activeJobs mid-execution
     let resolveExecution!: (value: JobExecutionResult) => void;
     const executionPromise = new Promise<JobExecutionResult>((resolve) => {
       resolveExecution = resolve;
@@ -1464,13 +1431,10 @@ describe('JobRunner', () => {
 
     const executePromise = runner.execute(dispatch);
 
-    // Wait for the job to start
     await new Promise((r) => setTimeout(r, 20));
 
-    // Check activeJobs mid-execution
     sawActive = runner.activeJobs.has(dispatch.jobId);
 
-    // Unblock
     resolveExecution(defaultSuccessResult);
     await executePromise;
 
@@ -1499,7 +1463,6 @@ describe('JobRunner', () => {
 
     // gitClone not called at job-runner level -- sandbox handles clone
     expect(gitClone).not.toHaveBeenCalled();
-    // sandbox.executeJob was called (execution delegated to sandbox)
     expect(mockSandboxInstance.executeJob).toHaveBeenCalledOnce();
   });
 
@@ -1515,7 +1478,6 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDispatch());
 
-    // rm should have been called to clean up
     expect(fsPromises.rm).toHaveBeenCalled();
   });
 
@@ -1529,7 +1491,6 @@ describe('JobRunner', () => {
 
     await runner.execute(makeDispatch());
 
-    // teardown should still be called
     expect(mockSandboxInstance.teardown).toHaveBeenCalledOnce();
   });
 
@@ -1609,7 +1570,6 @@ describe('JobRunner', () => {
   });
 
   it('collectEnvVars returns KICI_ system vars from process.env', async () => {
-    // Set a KICI_ env var for the test
     process.env.KICI_TEST_VAR = 'test-value';
 
     const sendJobContext = vi.fn();
@@ -1628,7 +1588,6 @@ describe('JobRunner', () => {
   // --- D2. LogStreamer lifecycle ---
 
   it('log streamers are destroyed (not just flushed) after execution', async () => {
-    // Make sandbox call onLogLine so LogStreamers are created
     mockSandboxInstance.executeJob.mockReset().mockImplementation(async (opts: unknown) => {
       const options = opts as {
         onLogLine: (stepIndex: number, line: string) => void;
@@ -1700,11 +1659,9 @@ describe('JobRunner', () => {
     // Build jobs use in-process gitClone
     expect(gitClone).toHaveBeenCalledOnce();
 
-    // No sandbox created for build jobs
     expect(BareMetalSandbox).not.toHaveBeenCalled();
     expect(ContainerSandbox).not.toHaveBeenCalled();
 
-    // Status: running -> success
     const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     const states = jobStatuses.map((m) => (m as { state: string }).state);
     expect(states[0]).toBe('running');
@@ -1713,12 +1670,10 @@ describe('JobRunner', () => {
 
   // --- F. Init / dynamic loadWorkflowSource contentHash propagation ---
   //
-  // The orchestrator dispatch payloads carry `contentHash` and
-  // `resolvedHashFiles` for init and dynamic eval jobs so the agent's
-  // loadWorkflowSource drift gate fires at every author-TS load site. These
-  // tests pin the wiring: the handler must forward both fields into
-  // loadWorkflowSource, and a thrown drift error must surface as a failed
-  // job status.
+  // Init and dynamic eval dispatches carry `contentHash` and
+  // `resolvedHashFiles` so the loadWorkflowSource drift gate fires at every
+  // author-TS load site: the handler must forward both, and a thrown drift
+  // error must surface as a failed job status.
 
   // --- E2. Bring-up job tests (init-runner SSH bring-up, no sandbox) ---
 
@@ -2550,21 +2505,17 @@ describe('resolveJobWorkDir', () => {
 });
 
 describe('global eval round: shell cwd matches the sandbox re-evaluation', () => {
-  // The property is a cross-module invariant no unit test can observe without
-  // driving a whole fork-runner, so assert it at the source level.
+  // A cross-module invariant no unit test can observe without driving a whole
+  // fork-runner, so it is asserted at the source level.
   //
-  // The sandbox re-evaluation hands a generator the AMBIENT `$`
-  // (`workflow-loader.ts` does a bare `const { $ } = await import('zx')`), whose
-  // cwd is the forked runner's — `fork-runner.ts` spawns with
-  // `cwd: effectiveWorkDir`, i.e. `options.workDir`, the PARENT of `workflow/`
-  // and `source/`. If the round rooted its own shell at `workflowDir`, a
-  // generator running a relative `$` command would see the workflow repo here
-  // and an almost-empty parent directory on re-eval — two different worlds.
+  // The sandbox re-evaluation hands a generator the AMBIENT `$` (a bare zx
+  // import in `workflow-loader.ts`), whose cwd is the forked runner's
+  // `options.workDir` — the PARENT of `workflow/` and `source/`. A round shell
+  // rooted at `workflowDir` would show a relative `$` command the workflow repo
+  // here and an almost-empty parent on re-eval — two different worlds.
   const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 
-  // The shells are built inside the eval child, which is where customer
-  // evaluation code runs; `eval-dispatch.ts` is that code with the IPC shell
-  // factored out.
+  // The shells are built in the eval child; `eval-dispatch.ts` is its code minus the IPC shell.
   const evalDispatchSrc = read('./sandbox/eval-dispatch.ts');
   const loaderSrc = read('./workflow-loader.ts');
   const forkRunnerSrc = read('./sandbox/fork-runner.ts');
@@ -2586,13 +2537,10 @@ describe('global eval round: shell cwd matches the sandbox re-evaluation', () =>
 });
 
 describe('handleDynamicJobFn eval shell: live env, matching the round', () => {
-  // The non-global DynamicJobFn path builds its eval shell through
-  // buildEvalShell, which resolves the LIVE process.env — never an
-  // `env: { ...process.env }` spread, which would snapshot env before the
-  // workflow module loads and hide any var a module sets at import time from a
-  // subprocess the DynamicJobFn shells out to. This matches the global eval
-  // round. The env-live behavior itself is covered by the buildEvalShell
-  // behavioral test above; this asserts the call site is wired through it.
+  // buildEvalShell resolves the LIVE process.env, as the global eval round
+  // does; an `env: { ...process.env }` spread would snapshot env before the
+  // workflow module loads and hide its import-time vars from DynamicJobFn
+  // subprocesses. The behavior is tested above; this asserts the call site.
   const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
   const evalDispatchSrc = read('./sandbox/eval-dispatch.ts');
 
@@ -2614,16 +2562,14 @@ describe('buildEvalShell', () => {
   });
 
   it('resolves env LIVE, so a key set after the shell is built reaches a subprocess', async () => {
-    // The round applies the seven KICI_* keys INSIDE runGlobalEvalRound, after
-    // the shell is built. A `{ ...process.env }` spread snapshots at build time,
-    // so a filter that shells out would see nothing here while the sandbox
-    // re-evaluation's ambient `$` — which resolves process.env at spawn — does.
-    // Same two-worlds determinism failure as the cwd, one layer down.
+    // The round applies the KICI_* keys INSIDE runGlobalEvalRound, after the
+    // shell is built; a `{ ...process.env }` snapshot would hide them from a
+    // filter's subprocess while the sandbox's ambient `$` sees them — the
+    // two-worlds determinism failure, one layer down.
     delete process.env[PROBE];
     const shell = await buildEvalShell(process.cwd(), () => {});
 
-    // Positive control: the key is genuinely absent at build time, so a passing
-    // assertion below cannot be explained by it having been set all along.
+    // Positive control: absent at build time, so the pass below is not ambient state.
     const beforeSet = (await shell`printenv ${PROBE} || true`).stdout.trim();
     expect(beforeSet).toBe('');
 
@@ -2678,9 +2624,9 @@ describe('JobRunner global eval round — malformed dispatch', () => {
     const deps = makeDeps();
     const runner = new JobRunner(deps);
 
-    // A global-eval-round dispatch with `candidates` omitted. The opening log
-    // line reads `config.candidates.length` before the handler's `try`, so the
-    // defect it guards against is a throw that rejects execute() with no verdict.
+    // `candidates` omitted: the opening log line reads `config.candidates.length`
+    // before the handler's `try`, so the defect is a throw rejecting execute()
+    // with no verdict.
     const dispatch = makeDispatch({
       jobConfig: {
         globalEvalRound: true,

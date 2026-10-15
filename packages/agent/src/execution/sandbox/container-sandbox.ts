@@ -1,22 +1,15 @@
 /**
- * Container execution sandbox implementation.
+ * Container execution sandbox: the strongest isolation model. The agent stays
+ * on the host; the whole job (clone, dependency install, compile, steps) runs
+ * in a disposable Docker/Podman container that lives for the job
+ * (`sleep infinity`), talking JSON-lines over the demuxed exec stdin/stdout.
  *
- * The strongest isolation model: the agent runs on the host while the entire
- * job lifecycle (clone, dependency install, compile, step execution) runs
- * inside a disposable Docker/Podman container. Communication uses stdin/stdout
- * JSON-lines via dockerode's exec API.
- *
- * Key properties:
- * - Container stays alive for the entire job (sleep infinity)
- * - Workflow runner is bind-mounted read-only into the container
- * - Agent-internal credentials (KICI_*, KICI_DATABASE_URL, etc.) NEVER enter the container
- * - IPC uses demuxed Docker stream with JSON-line parsing on stdout
- *
- * The container image does NOT need Node.js or git. KiCI provisions its own
- * runtime — a pinned, official glibc-2.17 Node plus the runner bundle, mounted
- * read-only at /opt/kici — and launches the runner with THAT node. The image
- * needs only a glibc and a shell, which the preflight asserts before the
- * container is created.
+ * - The workflow runner is bind-mounted read-only.
+ * - Agent-internal credentials (KICI_*, KICI_DATABASE_URL, etc.) NEVER enter the container.
+ * - The image needs no Node.js or git: KiCI mounts a pinned, official
+ *   glibc-2.17 Node plus the runner bundle read-only at /opt/kici and launches
+ *   the runner with THAT node. The image needs only a glibc and a shell, which
+ *   the preflight asserts before the container is created.
  */
 
 import { PassThrough } from 'node:stream';
@@ -70,92 +63,74 @@ const MAX_STDERR_LINES = 20;
 /** How long (ms) a crash report waits on the exec inspect before reporting an unknown exit code. */
 const CRASH_INSPECT_TIMEOUT_MS = 5_000;
 
-/** Grace period (ms) to wait for graceful abort before killing. */
+/** Grace period (ms) for a graceful abort before killing. */
 const ABORT_GRACE_MS = 10_000;
 
-/** Stop timeout (seconds) for container stop. */
+/** Container stop timeout (seconds). */
 const CONTAINER_STOP_TIMEOUT = 10;
 
-/** Fixed mount target for the pure-JS container loader hook bundle. */
+/** Mount target of the pure-JS container loader hook bundle. */
 const HOOK_MOUNT_PATH = '/opt/kici/ts-loader-hook.js';
 
 /**
- * Agent-internal env vars the sandbox always sets on the container + each exec.
- * They are NOT customer-derived: they point the in-container runner at the
- * mounted loader hook and route runner-internal logs to stderr (fd2) so they
- * cannot corrupt the fd1 JSON-lines IPC channel that container/stdio mode uses.
+ * Agent-internal (not customer-derived) env set on the container and each
+ * exec: points the runner at the mounted loader hook, and routes runner logs
+ * to stderr so they cannot corrupt the fd1 JSON-lines IPC channel.
  */
 const INTERNAL_ENV = [`KICI_TS_LOADER_HOOK_PATH=${HOOK_MOUNT_PATH}`, 'KICI_LOG_STDERR=1'];
 
 // --- Options ---
 
 interface ContainerSandboxOptions {
-  /** Dockerode instance (from orchestrator/scaler or created locally). */
+  /** From the orchestrator/scaler, or created locally. */
   docker: Docker;
-  /** Container image to use (from job config or scaler label-set). */
+  /** From the job config or the scaler label-set. */
   image: string;
-  /** Path to workflow-runner.js on the HOST (will be bind-mounted). */
+  /** workflow-runner.js on the HOST (bind-mounted). */
   runnerPath: string;
-  /** Mount target inside container (default: /opt/kici/workflow-runner.js). */
+  /** Default: /opt/kici/workflow-runner.js. */
   runnerMountPath?: string;
   /**
-   * Pre-provisioned KiCI Node tree (the directory whose `bin/node` is the
-   * injected runtime), bind-mounted read-only at `/opt/kici/node`. A HOST
-   * path, or the name of a volume already holding the tree.
-   *
-   * When supplied, the runner launches on THAT node and the image needs no
-   * Node of its own. Wins over `runtimeImage` — a caller that already has the
-   * tree should not pay a materialization to get the same one.
+   * Pre-provisioned KiCI Node tree (whose `bin/node` is the injected runtime),
+   * bind-mounted read-only at `/opt/kici/node`: a HOST path, or a volume
+   * already holding the tree. The runner then launches on THAT node. Wins over
+   * `runtimeImage`, so a caller holding the tree skips a materialization.
    */
   runtimeNodePath?: string;
   /**
-   * KiCI agent image carrying `/opt/kici`, from which the Node tree is
-   * materialized into a named volume during setup.
+   * KiCI agent image carrying `/opt/kici`, whose Node tree setup materializes
+   * into a named volume. A nesting agent may itself be containerized, so it
+   * cannot bind-mount a HOST `/opt/kici`; a volume works either way.
    *
-   * This is how an agent nesting a job container gets a runtime: a bind mount
-   * needs a HOST path, and the agent may itself be containerized, so it cannot
-   * assume `/opt/kici` exists on the host filesystem. Copying the tree out of
-   * the image into a volume once, then mounting that volume, works either way.
-   *
-   * Absent (and no `runtimeNodePath`) means no injection: the runner falls
-   * back to the image's own `node`, which is the historical contract and still
-   * correct for an image that ships one. Both modes are correct; the fallback
-   * is not a workaround for a missing mount but the mode a caller that has no
-   * runtime to inject is in.
+   * Absent (and no `runtimeNodePath`): no injection, and the runner uses the
+   * image's own `node` — a correct mode for a caller with no runtime to
+   * inject, not a workaround for a missing mount.
    */
   runtimeImage?: string;
   /**
-   * Tag this sandbox's image was BUILT under, when the job declared a
-   * Dockerfile rather than naming an image.
-   *
-   * Present only for a built image, and removed at teardown — a tag per run
-   * would otherwise accumulate on the host forever. Removing the tag leaves the
-   * layer cache untouched, which is what makes the next build fast, so this
-   * costs nothing but the name.
+   * Tag a job-declared Dockerfile was BUILT under; present only for a built
+   * image. Removed at teardown so per-run tags do not accumulate; the layer
+   * cache that makes the next build fast survives.
    */
   buildTag?: string;
-  /**
-   * Registry credentials for pulling `image`, already resolved by the
-   * orchestrator. Absent means an anonymous pull.
-   */
+  /** Pull credentials, resolved by the orchestrator. Absent: anonymous pull. */
   registryAuth?: { username: string; password: string; serveraddress: string };
   /**
-   * Path to the pure-JS container loader-hook bundle on the HOST (bind-mounted
-   * read-only). Defaults to `container-ts-loader-hook.js` next to `runnerPath`.
+   * Pure-JS loader-hook bundle on the HOST (bind-mounted read-only). Defaults
+   * to `container-ts-loader-hook.js` next to `runnerPath`.
    */
   hookPath?: string;
-  /** Pre-sanitized environment variables for the container. */
+  /** Pre-sanitized. */
   env: Record<string, string>;
-  /** Whether to keep failed containers for debugging. */
+  /** Keep failed containers for debugging. */
   keepFailed?: boolean;
-  /** Job ID for container labeling and orphan cleanup. */
+  /** For container labeling and orphan cleanup. */
   jobId?: string;
   /**
-   * Resolved hardening posture for the job container (cap-drop, no-new-privileges,
-   * cgroup caps, tmpfs, user, network). When omitted, no hardening is applied —
-   * the production caller (job-runner) always supplies this from agent config so
-   * the secure-by-default posture is in force; leaving it optional keeps the
-   * constructor testable and lets non-production callers opt out explicitly.
+   * Hardening posture (cap-drop, no-new-privileges, cgroup caps, tmpfs, user,
+   * network). Omitted means none: the production caller (job-runner) always
+   * supplies it from agent config; optional only for tests and explicit
+   * non-production opt-out.
    */
   hardening?: SandboxHardeningOptions;
   /**
@@ -168,12 +143,7 @@ interface ContainerSandboxOptions {
 
 // --- Internal helper types ---
 
-/**
- * Stream context returned by attachExecStream — bundles the bidirectional
- * exec stream, the demuxed stdout passthrough, the rolling stderr buffer,
- * the stderr readline (so the caller can close it), and the abort handler
- * (so the caller can detach it on cleanup).
- */
+/** Returned by attachExecStream; the caller closes `stderrRl` and detaches `abortHandler`. */
 interface ExecStreamContext {
   exec: Docker.Exec;
   stream: NodeJS.ReadWriteStream;
@@ -183,10 +153,7 @@ interface ExecStreamContext {
   abortHandler: () => void;
 }
 
-/**
- * Mutable state threaded through the readline message dispatcher. Mutated by
- * dispatchRunnerMessage so `awaitJobCompletion` can resolve with a snapshot.
- */
+/** Mutated by dispatchRunnerMessage; `awaitJobCompletion` resolves with a snapshot. */
 interface MutableRunnerState {
   jobStatus: 'success' | 'failed' | 'cancelled';
   /** The failure reason the runner reported on job.complete. */
@@ -199,10 +166,7 @@ interface MutableRunnerState {
   depRestoreRelay: DepRestoreReportRelay;
 }
 
-/**
- * Snapshot returned by awaitJobCompletion — the per-promise final state of
- * the runner just before the abort-signal short-circuit fires.
- */
+/** The runner's final state, taken just before the abort-signal short-circuit fires. */
 interface RunnerOutcome {
   jobStatus: 'success' | 'failed' | 'cancelled';
   stepResults: SandboxStepResult[];
@@ -239,11 +203,7 @@ function endOutputsWithStream(
   });
 }
 
-/**
- * Relay event.emit from the container runner to the orchestrator via
- * options.onEventEmit, then write the response back through `stream`.
- * Errors land as a structured error response (not a thrown rejection).
- */
+/** Relay event.emit; an error returns as a structured response, not a rejection. */
 function relayEventEmit(
   stream: NodeJS.ReadWriteStream,
   options: JobExecutionOptions,
@@ -273,11 +233,7 @@ function relayEventEmit(
   );
 }
 
-/**
- * Relay concurrency.report from the container runner to the orchestrator,
- * then write the ack back through `stream`. On error, returns a synthetic
- * `cancel` ack carrying the error message.
- */
+/** Relay concurrency.report to the orchestrator; an error returns a synthetic `cancel` ack. */
 function relayConcurrencyReport(
   stream: NodeJS.ReadWriteStream,
   options: JobExecutionOptions,
@@ -307,11 +263,7 @@ function relayConcurrencyReport(
   );
 }
 
-/**
- * Relay agent.api.request from the container runner to the orchestrator
- * via options.onApiRequest. If the agent doesn't expose an API relay,
- * write a structured error response so the runner doesn't hang.
- */
+/** Relay agent.api.request; with no relay, answer with an error so the runner does not hang. */
 function relayApiRequest(
   stream: NodeJS.ReadWriteStream,
   options: JobExecutionOptions,
@@ -361,12 +313,7 @@ function relayApiRequest(
   }
 }
 
-/**
- * Relay cache.request from the container runner to the orchestrator via
- * options.onCacheRequest, then write the response back through `stream`. If
- * the agent doesn't expose a cache relay, write a structured error response
- * so the runner doesn't hang.
- */
+/** Relay cache.request; with no relay, answer with an error so the runner does not hang. */
 function relayCacheRequest(
   stream: NodeJS.ReadWriteStream,
   options: JobExecutionOptions,
@@ -398,10 +345,7 @@ function relayCacheRequest(
   );
 }
 
-/**
- * Relay git.grant.request from the container runner to the agent's grant table
- * via options.onGitGrantRequest, then write the response back through `stream`.
- */
+/** Relay git.grant.request to the agent's grant table (not the orchestrator). */
 function relayGitGrantRequest(
   stream: NodeJS.ReadWriteStream,
   options: JobExecutionOptions,
@@ -432,12 +376,7 @@ function relayGitGrantRequest(
       }),
   );
 }
-/**
- * Relay provenance.request from the container runner to the orchestrator via
- * options.onProvenanceRequest, then write the response back through `stream`.
- * If the agent doesn't expose a provenance relay, write a structured error so
- * the runner doesn't hang.
- */
+/** Relay provenance.request; with no relay, answer with an error so the runner does not hang. */
 function relayProvenanceRequest(
   stream: NodeJS.ReadWriteStream,
   options: JobExecutionOptions,
@@ -469,12 +408,7 @@ function relayProvenanceRequest(
   );
 }
 
-/**
- * Relay artifacts.request from the container runner to the orchestrator via
- * options.onArtifactRequest, then write the response back through `stream`. If
- * the agent doesn't expose an artifacts relay, write a structured error so the
- * runner doesn't hang.
- */
+/** Relay artifacts.request; with no relay, answer with an error so the runner does not hang. */
 function relayArtifactRequest(
   stream: NodeJS.ReadWriteStream,
   options: JobExecutionOptions,
@@ -506,12 +440,7 @@ function relayArtifactRequest(
   );
 }
 
-/**
- * Relay approval.request from the container runner to the orchestrator via
- * options.onApprovalRequest, then write the resolution back through `stream`.
- * If the agent doesn't expose an approval relay (or it throws), write a
- * fail-closed reject so the runner doesn't hang.
- */
+/** Relay approval.request; with no relay (or a throw), fail closed so the runner never hangs. */
 function relayApprovalRequest(
   stream: NodeJS.ReadWriteStream,
   options: JobExecutionOptions,
@@ -543,11 +472,7 @@ function relayApprovalRequest(
   );
 }
 
-/**
- * Apply a job.complete message to the mutable runner state: capture status,
- * merge any bulk-reported step results, propagate plain outputs, and encrypt
- * secret outputs if a run public key is available.
- */
+/** Apply job.complete; secret outputs are encrypted only when the run has a public key. */
 function applyJobComplete(
   msg: Extract<RunnerToAgentMessage, { type: 'job.complete' }>,
   stepResults: SandboxStepResult[],
@@ -556,24 +481,21 @@ function applyJobComplete(
 ): void {
   state.jobStatus = msg.status;
   // A runner that fails before its first step (clone, deps, compile, rules)
-  // reports the reason only here; carry it so the orchestrator records it.
+  // reports the reason only here.
   state.reportedError = msg.error;
   state.droppedJobs = msg.droppedJobs;
 
-  // Merge any step results we didn't already see via step.complete
-  // (e.g. skipped steps reported in bulk).
+  // The runner's list is authoritative when it has steps step.complete never
+  // reported (e.g. skipped steps reported in bulk).
   if (msg.stepResults && msg.stepResults.length > stepResults.length) {
-    // Replace with the runner's authoritative list.
     stepResults.length = 0;
     stepResults.push(...msg.stepResults);
   }
 
-  // Capture plain outputs for cross-job transport
   if (msg.outputs) {
     state.jobOutputs = msg.outputs;
   }
 
-  // Encrypt secret outputs if present and run has a public key
   if (msg.secretOutputs && options.dispatch.runPublicKey) {
     try {
       state.encryptedSecretOutputs = encryptSecretOutputs(
@@ -598,16 +520,14 @@ export class ContainerSandbox implements ExecutionSandbox {
   private readonly runtimeImage: string | undefined;
   private readonly buildTag: string | undefined;
   /**
-   * The runtime actually injected into this job's container — the configured
-   * path, or the volume materialized during setup. Resolved once in setup()
-   * because materialization needs the container runtime, and read by both the
-   * bind list and the runner launch.
+   * The injected runtime: the configured path, or the volume materialized in
+   * setup() (which needs the container runtime). Read by the bind list and the
+   * runner launch.
    */
   private resolvedRuntimeNode: string | undefined;
   private readonly registryAuth:
     { username: string; password: string; serveraddress: string } | undefined;
   private readonly runnerMountPath: string;
-  /** Host path to the pure-JS container loader-hook bundle (bind-mounted :ro). */
   private readonly hookHostPath: string;
   private readonly env: Record<string, string>;
   private readonly keepFailed: boolean;
@@ -616,16 +536,14 @@ export class ContainerSandbox implements ExecutionSandbox {
   private readonly networkIsolation: boolean;
   /** Container IP the applied egress rules are keyed on; unset when none were applied. */
   private egressRuleIp: string | undefined;
-  /** Resolved container user (image-user override / grant), applied to createContainer + each exec. */
+  /** Image-user override / grant, applied to createContainer and each exec. */
   private resolvedUser?: string;
 
-  /** The running container instance (set during setup). */
   private container: Docker.Container | null = null;
-  /** The active exec stream (set during executeJob, used for abort). */
+  /** Set during executeJob; used for abort. */
   private execStream: NodeJS.ReadWriteStream | null = null;
-  /** Whether the job failed (used in teardown for keepFailed). */
+  /** Read by teardown for keepFailed. */
   private jobFailed = false;
-  /** Container name for logging/debugging. */
   private containerName = '';
 
   constructor(options: ContainerSandboxOptions) {
@@ -649,15 +567,11 @@ export class ContainerSandbox implements ExecutionSandbox {
   // --- Lifecycle: setup ---
 
   /**
-   * Ensure the job's container image is present locally, pulling it on demand
-   * when it is not.
-   *
-   * dockerode's `createContainer` — unlike `docker run` / `podman run` — never
-   * auto-pulls a missing image; it fails with `(HTTP code 404) ... No such
-   * image`. A bare-metal executor that aggressively prunes unused images under
-   * disk pressure can leave a container job with nothing to run, so the agent
-   * pulls the image itself. Already-present images (the common case, and how
-   * private images pre-pulled with registry auth stay working) skip the pull.
+   * Pull the job image when it is not present locally. dockerode's
+   * `createContainer`, unlike `docker run` / `podman run`, never auto-pulls
+   * (`(HTTP code 404) ... No such image`), and a disk-pressure image prune can
+   * remove it. A present image (including one pre-pulled with registry auth)
+   * skips the pull.
    */
   private async ensureImagePresent(): Promise<void> {
     try {
@@ -667,8 +581,8 @@ export class ContainerSandbox implements ExecutionSandbox {
       // Not present locally — pull it below.
     }
 
-    // The authconfig is deliberately absent from this line — it carries a
-    // registry password, and this log reaches run output.
+    // Never log the authconfig: it carries a registry password, and this log
+    // reaches run output.
     logger.info('Pulling sandbox image (not present locally)', {
       image: this.image,
       authenticated: this.registryAuth !== undefined,
@@ -686,18 +600,13 @@ export class ContainerSandbox implements ExecutionSandbox {
   }
 
   /**
-   * Resolve the Node tree to inject into the job container, materializing it
-   * when only an image was configured.
+   * Resolve the Node tree to inject: a configured path wins (no copy), else it
+   * is materialized from `runtimeImage`. `undefined` (no runtime source) is a
+   * real outcome: the job runs on the image's own `node`.
    *
-   * A configured path wins: a caller that already provisioned the tree should
-   * not pay a copy to arrive at the same one. Returning `undefined` is a real
-   * outcome, not a failure — an agent with no runtime source runs the job on
-   * the image's own `node`, which is what a `node:*` image was always doing.
-   *
-   * A materialization that FAILS is not softened into that outcome. Continuing
-   * would start the job against an image the operator never claimed ships Node,
-   * and the resulting "node: not found" says nothing about the runtime that was
-   * supposed to be there.
+   * A FAILED materialization throws rather than falling back: the fallback
+   * would run an image nobody claimed ships Node, and its "node: not found"
+   * says nothing about the missing runtime.
    */
   private async resolveRuntimeNode(): Promise<string | undefined> {
     if (this.runtimeNodePath) return this.runtimeNodePath;
@@ -706,12 +615,10 @@ export class ContainerSandbox implements ExecutionSandbox {
     return await ensureRuntimeVolume({
       docker: this.docker,
       agentImage: this.runtimeImage,
-      // The node tree ALONE. The runner bundle and the loader hook are bound
-      // from this agent's own build, at fixed paths under /opt/kici — mounting
-      // the whole tree there would put those two binds inside a read-only
-      // mount, whose mountpoints cannot be created. Binding the agent's own
-      // runner is also what keeps the runner and the agent driving it from
-      // ever being two different versions.
+      // The node tree ALONE. The runner bundle and loader hook are bound from
+      // this agent's own build at fixed /opt/kici paths: a whole-tree mount
+      // would put those binds inside a read-only mount, whose mountpoints
+      // cannot be created. It also keeps runner and agent the same version.
       subtree: RuntimeSubtree.enum.node,
       onProgress: (message) => logger.info(message, { jobId: this.jobId }),
     });
@@ -720,10 +627,7 @@ export class ContainerSandbox implements ExecutionSandbox {
   async setup(options: SandboxSetupOptions): Promise<void> {
     this.containerName = `kici-sandbox-${this.jobId}-${Date.now()}`;
 
-    // Build env array (key=value format) from sanitized env.
-    // This env has already been processed by buildSanitizedEnv() -- NO agent credentials.
-    // The two INTERNAL_ENV entries (loader-hook path + stderr routing) are
-    // agent-owned, never customer-derived.
+    // this.env went through buildSanitizedEnv(): NO agent credentials.
     const envArray = [...Object.entries(this.env).map(([k, v]) => `${k}=${v}`), ...INTERNAL_ENV];
 
     logger.info('Creating sandbox container', {
@@ -732,12 +636,9 @@ export class ContainerSandbox implements ExecutionSandbox {
       workDir: options.workDir,
     });
 
-    // Resolve the hardening posture (cap-drop, no-new-privileges, cgroup caps,
-    // tmpfs, user, network). Merged into the HostConfig below; the resolved
-    // user (if any) is applied top-level and re-applied on each exec.
     // Egress filtering applies only to a bridged container: `host` is the host
-    // namespace by request and `none` has no egress at all. Resolve the effective
-    // network the same way buildContainerHardening does.
+    // namespace by request and `none` has no egress. The effective network
+    // resolves the same way buildContainerHardening does.
     const effectiveNetwork = this.hardening?.grant?.network ?? this.hardening?.networkMode;
     const filterEgress =
       this.networkIsolation && effectiveNetwork !== 'host' && effectiveNetwork !== 'none';
@@ -754,42 +655,26 @@ export class ContainerSandbox implements ExecutionSandbox {
       : { hostConfig: {} as Partial<Docker.HostConfig>, user: undefined };
     this.resolvedUser = hardened.user;
 
-    // Resolve the runtime BEFORE the bind list, which mounts it. A configured
-    // path is taken verbatim; otherwise the tree is materialized out of the
-    // agent image into a named volume, reused across every later job on this
-    // host that shares the image.
+    // BEFORE the bind list, which mounts it. A materialized volume is reused by
+    // every later job on this host that shares the agent image.
     this.resolvedRuntimeNode = await this.resolveRuntimeNode();
 
     const binds = this.buildBinds(options, hardened.hostConfig);
 
-    // Ensure the image is present before createContainer — dockerode does NOT
-    // auto-pull a missing image (the `docker`/`podman run` CLI does), so a job
-    // whose image was never pulled, or was reaped by a disk-pressure image
-    // prune, fails with a 404 "No such image" instead of running.
     await this.ensureImagePresent();
 
-    // AFTER the pull, never before: the probe creates a container from the
-    // image, which a not-yet-pulled image cannot satisfy. Only when we inject
-    // the runtime — the glibc requirement exists BECAUSE a glibc-linked node
-    // is mounted in, so a job supplying its own node from the image is
-    // unaffected and preflighting it would reject images that work.
+    // AFTER the pull: the probe creates a container from the image. Only when
+    // injecting the runtime — the glibc requirement exists BECAUSE a
+    // glibc-linked node is mounted in; preflighting an image that brings its
+    // own node would reject images that work.
     if (this.resolvedRuntimeNode) {
       await assertImageRunnable(this.docker, this.image);
     }
 
-    // Create container:
-    // - sleep infinity keeps it alive for the entire job
-    // - /workspace is a container-owned anonymous volume (`Volumes`), created
-    //   fresh and owned by the container user — NOT a host bind. This dissolves
-    //   the host-uid ↔ container-uid ownership conflict that made a read-write
-    //   host bind unwritable under rootful docker once `CapDrop: ['ALL']` removes
-    //   CAP_DAC_OVERRIDE. The clone/install/execute all run inside the container,
-    //   so the host workDir is never read back — a private volume is sufficient.
-    // - Workflow runner bind-mounted read-only
-    // - file:// clone-source dir(s) and (under host networking) the host's
-    //   name-resolution files bind-mounted read-only — see buildBinds
-    // - Hardening posture (cap-drop ALL, no-new-privileges, cgroup caps, tmpfs
-    //   /tmp) merged from buildContainerHardening
+    // /workspace is a container-owned anonymous volume, NOT a host bind: under
+    // rootful docker a read-write host bind is unwritable by the container uid
+    // once `CapDrop: ['ALL']` removes CAP_DAC_OVERRIDE. Everything runs inside
+    // the container, so the host workDir is never read back.
     this.container = await this.docker.createContainer({
       Image: this.image,
       name: this.containerName,
@@ -812,21 +697,18 @@ export class ContainerSandbox implements ExecutionSandbox {
 
     if (egressRulesActive) {
       // The default RFC1918 + cloud-metadata drops are ALREADY in the chain,
-      // keyed on the job subnet by ensureJobNetwork above — before this
-      // container was created, so the image's own ENTRYPOINT has never run
-      // outside them.
+      // keyed on the job subnet by ensureJobNetwork before this container
+      // existed, so the image's ENTRYPOINT never ran outside them.
       //
-      // What this adds is the per-job layer, keyed on this container's address,
-      // on both hooks: the forward rules above, and the host-access rules that
-      // let this container reach DNS on the bridge gateway and no other host
-      // service. `undefined` is the forward-hook policy: no per-job allowlist
-      // or denyAll. The host set takes no policy argument at all, so a job
-      // cannot widen its own host reachability — the escape hatch the boundary
-      // closes.
-      // addIsolationRules inserts at the chain head, so a per-container rule is
-      // evaluated before the subnet set. A later repair of a partial subnet set
-      // re-inserts above these, so a per-job policy has to reinstall its own
-      // rules to keep winning.
+      // This adds the per-job layer keyed on this container's address, on both
+      // hooks: forward rules, and host-access rules allowing DNS on the bridge
+      // gateway and no other host service. `undefined` is the forward-hook
+      // policy (no per-job allowlist or denyAll). The host set takes no policy
+      // at all, so a job cannot widen its own host reachability.
+      // addIsolationRules inserts at the chain head, so per-container rules
+      // precede the subnet set; a later repair of a partial subnet set
+      // re-inserts above them, so a per-job policy must reinstall its rules to
+      // keep winning.
       this.egressRuleIp = await applyJobEgressRules(this.docker, this.container.id, undefined);
     }
 
@@ -841,32 +723,24 @@ export class ContainerSandbox implements ExecutionSandbox {
   }
 
   /**
-   * Populate the container's `/workspace` volume from the host working tree.
-   *
-   * `/workspace` is a container-owned anonymous volume rather than a host bind,
-   * which is what dissolves the host-uid vs container-uid conflict once
-   * `CapDrop: ['ALL']` removes CAP_DAC_OVERRIDE — so the tree is streamed in as
-   * a tar rather than mounted.
-   *
-   * A failure here is fatal on purpose. Swallowing it would start the job
-   * against an EMPTY workspace, which surfaces as a baffling "file not found"
-   * in whichever step happens to touch the repo first.
+   * Stream the host working tree into the `/workspace` volume as a tar (it is
+   * a volume, not a bind; see setup()). Fatal on purpose: swallowing a failure
+   * would start the job on an EMPTY workspace, surfacing as a baffling "file
+   * not found" in whichever step first touches the repo.
    */
   private async copyWorkspaceIn(workDir: string): Promise<void> {
     const started = Date.now();
     try {
-      // `portable` drops uid/gid and mtime noise so the archive lands owned by
-      // the container user rather than replaying host ownership. A workdir with
-      // a pnpm `node_modules` holds hard-linked files; the single-link caches
-      // copy each one in as a regular file so node-tar never stalls on them.
+      // `portable` drops uid/gid and mtime so files land owned by the container
+      // user. The single-link caches copy pnpm `node_modules` hard links in as
+      // regular files so node-tar never stalls on them.
       const stream = tarCreate(
         { cwd: workDir, portable: true, ...(await singleLinkTarCaches(workDir, ['.'])) },
         ['.'],
       );
 
-      // The stream errors ASYNCHRONOUSLY (an unreadable or missing workDir
-      // surfaces after tarCreate returned), so without racing it the failure
-      // escapes this try/catch and the job starts on an empty workspace.
+      // The stream errors ASYNCHRONOUSLY (a missing workDir surfaces after
+      // tarCreate returns); without the race the failure escapes this catch.
       const streamFailed = new Promise<never>((_, reject) => {
         stream.on('error', reject);
       });
@@ -892,26 +766,18 @@ export class ContainerSandbox implements ExecutionSandbox {
   }
 
   /**
-   * Build the container's read-only bind list.
-   *
-   * The workspace is NOT bound here — it is a container-owned anonymous volume
-   * (`Volumes: { '/workspace': {} }` on the container config), so the container
-   * user can write it on every runtime with `CapDrop: ['ALL']` intact. This
-   * method binds the workflow runner (read-only) plus two parity affordances
-   * that mirror the bare-metal bwrap sandbox — both strictly additive and gated,
-   * so the default posture for a production (https-source, bridge-network) job is
+   * The read-only bind list (the workspace is a volume, not a bind). Besides
+   * the runner, hook and runtime, two gated additions mirror the bare-metal
+   * bwrap sandbox and leave a production (https-source, bridge-network) job
    * unchanged:
    *
    * - **`file://` clone-source dir(s)** (`options.extraReadOnlyBinds`): the
-   *   workflow runner clones the repo from inside the container, so a local
-   *   `file://` source dir must be exposed read-only or `git clone` fails.
-   *   Empty for https/ssh remotes — mirrors fork-runner's `extraReadOnlyBinds`.
-   * - **Host name-resolution files under host networking**: when the effective
-   *   network posture is `host` (`KICI_SANDBOX_NETWORK=host`, or a per-job host
-   *   grant), bind the host's `/etc/hosts` (+ `/etc/nsswitch.conf`) read-only so
-   *   an `/etc/hosts`-only name the host resolves — e.g. a private registry —
-   *   resolves inside the container too. Mirrors fork-runner's
-   *   `--ro-bind /etc/hosts` for the bwrap host-network mode.
+   *   runner clones from inside the container, so a local source dir must be
+   *   visible or `git clone` fails. Empty for https/ssh remotes.
+   * - **`/etc/hosts` and `/etc/nsswitch.conf` under host networking**
+   *   (`KICI_SANDBOX_NETWORK=host` or a per-job grant): an `/etc/hosts`-only
+   *   name the host resolves (e.g. a private registry) resolves inside too.
+   *   Mirrors fork-runner's `--ro-bind /etc/hosts`.
    */
   private buildBinds(
     options: SandboxSetupOptions,
@@ -949,12 +815,8 @@ export class ContainerSandbox implements ExecutionSandbox {
 
     const startTime = Date.now();
 
-    // Phase 1: Create exec, start the bidirectional stream, demux Docker
-    // multiplexed stream, capture stderr for crash diagnostics, and install
-    // the abort signal listener.
     const streamCtx = await this.attachExecStream(options);
 
-    // Phase 2: Drive the readline message loop until job.complete (or crash).
     let outcome: RunnerOutcome;
     try {
       outcome = await this.awaitJobCompletion(streamCtx, options);
@@ -976,30 +838,23 @@ export class ContainerSandbox implements ExecutionSandbox {
       this.execStream = null;
     }
 
-    // Phase 3: Apply abort-signal short-circuit, finalize jobFailed flag, and
-    // build the JobExecutionResult.
     return this.buildExecutionResult(outcome, options, startTime);
   }
 
   /**
-   * Phase 1 of executeJob: create the docker exec, start it in hijack mode,
-   * demux the multiplexed stream into stdout / stderr passthroughs, capture
-   * stderr lines for crash diagnostics, and install the abort listener.
+   * Start the runner exec in hijack mode, demux it, keep stderr for crash diagnostics, and
+   * install the abort listener.
    */
   private async attachExecStream(options: JobExecutionOptions): Promise<ExecStreamContext> {
-    // Build the exec environment -- same sanitized env, no agent credentials.
-    // Plus the agent-owned INTERNAL_ENV (loader-hook path + stderr routing).
+    // Same sanitized env as the container: no agent credentials.
     const execEnv = [...Object.entries(this.env).map(([k, v]) => `${k}=${v}`), ...INTERNAL_ENV];
 
-    // Create exec inside the running container. The runner process (and every
-    // workflow step it spawns) inherits the container's hardened posture —
-    // CapDrop ALL, no-new-privileges, and the cgroup caps — because the runtime
-    // copies the container's process spec into each exec; the dockerode exec API
-    // exposes no per-exec capability/no-new-privileges fields to re-assert them.
-    // A step can confirm the inherited posture by reading /proc/self/status
-    // (CapEff, NoNewPrivs) from inside this exec. Re-apply the resolved user
-    // explicitly since some runtimes do not inherit the container's configured
-    // user into exec.
+    // The exec (and every step it spawns) inherits CapDrop ALL,
+    // no-new-privileges and the cgroup caps, because the runtime copies the
+    // container's process spec into each exec; the exec API has no per-exec
+    // fields to re-assert them (a step can read CapEff / NoNewPrivs from
+    // /proc/self/status). The user IS re-applied: some runtimes do not
+    // inherit it into exec.
     const exec = await this.container!.exec({
       Cmd: this.resolvedRuntimeNode
         ? runnerLaunchArgv(this.runnerMountPath)
@@ -1012,18 +867,15 @@ export class ContainerSandbox implements ExecutionSandbox {
       ...(this.resolvedUser ? { User: this.resolvedUser } : {}),
     });
 
-    // Start exec with hijack mode for bidirectional stdin/stdout.
     const stream = await exec.start({ hijack: true, stdin: true });
     this.execStream = stream;
 
-    // Demux the Docker multiplexed stream.
-    // Docker multiplexes stdout and stderr into a single stream with 8-byte headers.
+    // Docker multiplexes stdout and stderr into one stream with 8-byte headers.
     const stdout = new PassThrough();
     const stderr = new PassThrough();
     this.docker.modem.demuxStream(stream, stdout, stderr);
     endOutputsWithStream(stream, stdout, stderr);
 
-    // Capture stderr for crash diagnostics (last N lines).
     const stderrLines: string[] = [];
     const stderrRl = createInterface({ input: stderr, crlfDelay: Infinity });
     stderrRl.on('line', (line) => {
@@ -1033,7 +885,6 @@ export class ContainerSandbox implements ExecutionSandbox {
       }
     });
 
-    // Set up abort signal listener.
     const abortHandler = () => {
       this.handleAbort().catch((err) => {
         logger.warn('Error during abort', {
@@ -1046,11 +897,7 @@ export class ContainerSandbox implements ExecutionSandbox {
     return { exec, stream, stdout, stderrLines, stderrRl, abortHandler };
   }
 
-  /**
-   * Phase 2 of executeJob: drive the readline IPC loop until job.complete,
-   * exec exit, or crash. Returns the final job status, accumulated step
-   * results, and any captured outputs.
-   */
+  /** Drive the readline IPC loop until job.complete, exec exit, or crash. */
   private awaitJobCompletion(
     streamCtx: ExecStreamContext,
     options: JobExecutionOptions,
@@ -1059,7 +906,7 @@ export class ContainerSandbox implements ExecutionSandbox {
     /** Non-JSON stdout: the container runtime writes an exec failure there. */
     const rawStdoutLines: string[] = [];
     const stepResults: SandboxStepResult[] = [];
-    /** Track step names from step.start messages (stepIndex -> name). */
+    /** stepIndex -> name, from step.start. */
     const stepNames = new Map<number, string>();
     const state: MutableRunnerState = {
       jobStatus: ExecutionJobStatus.enum.failed,
@@ -1071,7 +918,6 @@ export class ContainerSandbox implements ExecutionSandbox {
     };
 
     return new Promise<RunnerOutcome>((resolve, reject) => {
-      // Parse JSON-lines from stdout using readline.
       const rl = createInterface({ input: stdout, crlfDelay: Infinity });
       let completed = false;
 
@@ -1080,7 +926,6 @@ export class ContainerSandbox implements ExecutionSandbox {
         try {
           msg = JSON.parse(line) as RunnerToAgentMessage;
         } catch {
-          // Not valid JSON -- treat as raw output, log as warning.
           logger.warn('Non-JSON output from runner', { line: line.slice(0, 200) });
           pushBounded(rawStdoutLines, line, MAX_RAW_STDOUT_LINES);
           return;
@@ -1100,8 +945,7 @@ export class ContainerSandbox implements ExecutionSandbox {
       });
 
       rl.on('close', () => {
-        // Readline closed -- exec may have exited.
-        // If we haven't received job.complete, this is a crash.
+        // Closed with no job.complete and no step results: a crash.
         if (
           !completed &&
           state.jobStatus === ExecutionJobStatus.enum.failed &&
@@ -1111,7 +955,7 @@ export class ContainerSandbox implements ExecutionSandbox {
             reject(new Error(message)),
           );
         } else {
-          // We already resolved or have partial results.
+          // Already resolved, or partial results.
           resolve({
             jobStatus: state.jobStatus,
             stepResults,
@@ -1129,10 +973,7 @@ export class ContainerSandbox implements ExecutionSandbox {
     });
   }
 
-  /**
-   * Build the failure message for a runner that exited without job.complete,
-   * from the exec's exit code and the runner's last output lines.
-   */
+  /** Failure message for a runner that exited without job.complete. */
   private async describeCrash(
     exec: Docker.Exec,
     stdoutTail: string[],
@@ -1163,12 +1004,9 @@ export class ContainerSandbox implements ExecutionSandbox {
   }
 
   /**
-   * Dispatch one parsed RunnerToAgentMessage. Mutates `state`, `stepNames`,
-   * and `stepResults` in place; writes responses back through `stream` for
-   * the relay messages (event.emit / concurrency.report / agent.api.request).
-   *
-   * Returns `true` when the caller should resolve the awaitJobCompletion
-   * promise (only for `job.complete`); `false` otherwise.
+   * Dispatch one runner message, mutating `state`, `stepNames` and
+   * `stepResults` in place; relay messages answer through `stream`. Returns
+   * `true` only for `job.complete`.
    */
   private dispatchRunnerMessage(
     msg: RunnerToAgentMessage,
@@ -1180,7 +1018,6 @@ export class ContainerSandbox implements ExecutionSandbox {
   ): boolean {
     switch (msg.type) {
       case 'ready':
-        // Runner is ready, send the execution request.
         this.sendExecuteRequest(stream, options);
         return false;
 
@@ -1218,7 +1055,6 @@ export class ContainerSandbox implements ExecutionSandbox {
           ...(msg.data && msg.data),
         });
 
-        // Track step results.
         stepResults.push({
           name,
           stepIndex: msg.stepIndex,
@@ -1285,9 +1121,8 @@ export class ContainerSandbox implements ExecutionSandbox {
 
       case 'hooks-declared':
       case 'completion-hooks-done':
-        // Between-jobs lifecycle markers. The container backend reaps the whole
-        // tree (and external state) on teardown, so it needs no out-of-band
-        // re-run — acknowledge the markers without acting on them.
+        // Between-jobs lifecycle markers, ignored: teardown reaps the whole
+        // tree (and external state), so no out-of-band re-run is needed.
         return false;
 
       default:
@@ -1298,10 +1133,7 @@ export class ContainerSandbox implements ExecutionSandbox {
     }
   }
 
-  /**
-   * Phase 3 of executeJob: apply abort-signal short-circuit, set jobFailed,
-   * and assemble the final JobExecutionResult.
-   */
+  /** An aborted signal forces `cancelled`; also sets jobFailed. */
   private buildExecutionResult(
     outcome: RunnerOutcome,
     options: JobExecutionOptions,
@@ -1309,13 +1141,11 @@ export class ContainerSandbox implements ExecutionSandbox {
   ): JobExecutionResult {
     let { jobStatus } = outcome;
 
-    // Check if job was cancelled via abort signal.
     if (options.signal.aborted) {
       jobStatus = ExecutionJobStatus.enum.cancelled;
     }
 
-    // jobStatus is mutated inside the readline callback; TypeScript control flow
-    // cannot track it across the async boundary, so we cast to the full union.
+    // Control flow cannot track the async mutation; cast to the full union.
     const finalStatus = jobStatus as 'success' | 'failed' | 'cancelled';
     this.jobFailed = finalStatus !== ExecutionJobStatus.enum.success;
 
@@ -1327,8 +1157,7 @@ export class ContainerSandbox implements ExecutionSandbox {
       // cancellation, not a crash, so only a failed job carries the crash text.
       ...(finalStatus === ExecutionJobStatus.enum.failed &&
         outcome.error && { error: outcome.error }),
-      // The runner-reported reason is carried whatever the final status, the
-      // same as the fork backend does.
+      // The runner-reported reason is carried whatever the status, as in the fork backend.
       ...(outcome.reportedError && { error: outcome.reportedError }),
       ...(outcome.droppedJobs?.length && { droppedJobs: outcome.droppedJobs }),
       ...(outcome.jobOutputs && { outputs: outcome.jobOutputs }),
@@ -1345,11 +1174,8 @@ export class ContainerSandbox implements ExecutionSandbox {
   // --- Lifecycle: teardown ---
 
   /**
-   * Drop the tag a `container.dockerfile` build produced.
-   *
-   * Best-effort: teardown must not fail a job that already finished. The LAYER
-   * cache — the thing that makes the next build fast — is not a tag and is
-   * untouched by this.
+   * Drop the tag a `container.dockerfile` build produced. Best-effort:
+   * teardown must not fail a finished job. The layer cache survives.
    */
   private async reclaimBuiltImage(): Promise<void> {
     if (!this.buildTag) return;
@@ -1366,9 +1192,8 @@ export class ContainerSandbox implements ExecutionSandbox {
     await removeJobEgressRules(this.egressRuleIp);
     this.egressRuleIp = undefined;
 
-    // Before the early return, not after: a setup that failed AFTER the build —
-    // an image preflight rejecting a musl base, say — leaves a tag and no
-    // container, and that tag would otherwise stay on the host forever.
+    // Before the early return: a setup that failed AFTER the build (e.g. the
+    // preflight rejecting a musl base) leaves a tag and no container.
     if (!this.container) {
       await this.reclaimBuiltImage();
       return;
@@ -1401,9 +1226,8 @@ export class ContainerSandbox implements ExecutionSandbox {
       // Container may already be removed.
     }
 
-    // A built image's tag is per-run, so leaving it behind accumulates one dead
-    // tag per job on the host. The keepFailed early-return above deliberately
-    // skips this: a container kept for debugging needs its image kept too.
+    // The keepFailed early-return deliberately skips this: a container kept
+    // for debugging needs its image too.
     await this.reclaimBuiltImage();
 
     this.container = null;
@@ -1412,33 +1236,24 @@ export class ContainerSandbox implements ExecutionSandbox {
   // --- Internal helpers ---
 
   /**
-   * Send the execute request to the workflow runner via the exec's stdin.
-   *
-   * The runner in stdio mode reads from stdin. We write a single JSON object
-   * (the execute message) followed by a newline, then signal end of input.
-   *
-   * Reuses buildRequest() from fork-runner.ts to ensure consistent field
-   * mapping from JobDispatch to JobExecutionRequest.
+   * Write the execute message as one JSON line to the exec's stdin; stdin
+   * stays open for later relay responses and abort. buildRequest() is shared
+   * with fork-runner so the JobDispatch mapping stays consistent.
    */
   private sendExecuteRequest(stream: NodeJS.ReadWriteStream, options: JobExecutionOptions): void {
-    // workDir is /workspace inside the container — a container-owned anonymous
-    // volume the runner clones into (not a host bind).
     const request = buildRequest(options.dispatch, '/workspace');
     const msg: AgentToRunnerMessage = { type: 'execute', request };
     stream.write(JSON.stringify(msg) + '\n');
   }
 
-  /**
-   * Handle abort: write abort message to stdin, wait for grace period,
-   * then kill the container if still running.
-   */
+  /** Write abort to stdin, wait the grace period, then force-stop the container. */
   private async handleAbort(): Promise<void> {
     if (!this.execStream && !this.container) return;
 
     logger.info('Aborting sandbox execution', { name: this.containerName });
 
-    // Try writing abort message to stdin (runner listens for this in fork mode,
-    // but in container mode SIGTERM is the primary mechanism).
+    // Best-effort: the runner honours this in fork mode; in container mode
+    // SIGTERM is the primary mechanism.
     if (this.execStream) {
       try {
         const abortMsg: AgentToRunnerMessage = { type: 'abort' };
@@ -1448,10 +1263,8 @@ export class ContainerSandbox implements ExecutionSandbox {
       }
     }
 
-    // Wait grace period, then force-stop.
     await new Promise<void>((resolve) => setTimeout(resolve, ABORT_GRACE_MS));
 
-    // If container is still running, force-stop it.
     if (this.container) {
       try {
         await this.container.stop({ t: 0 });

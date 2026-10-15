@@ -1,3 +1,4 @@
+import '../__test-helpers__/shared-mocks.js';
 import { describe, it, expect, vi } from 'vitest';
 import { HeldRunWithdrawal } from '../cancel/cancel-held-run.js';
 import {
@@ -24,22 +25,8 @@ import type {
 } from '@kici-dev/engine';
 import { InitFailureCategory } from '@kici-dev/engine';
 import { gzipSync } from 'node:zlib';
-import { createMockDb } from '../__test-helpers__/mock-db.js';
+import { createMockDb, type MockDbOptions } from '../__test-helpers__/mock-db.js';
 
-vi.mock('@kici-dev/shared', () => ({
-  createLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
-
-  toErrorMessage: (err) => (err instanceof Error ? err.message : String(err)),
-}));
-
-/**
- * Create a mock LogStorage.
- */
 function createMockLogStorage() {
   return {
     append: vi.fn(),
@@ -56,18 +43,32 @@ const noopCallbacks = {
   onManualSchedule: vi.fn().mockRejectedValue(new Error('unexpected onManualSchedule call')),
 };
 
+/** Returns the mock DB result too, so a case destructures the query mocks it scripts. */
+function makeHandler(
+  overrides: Partial<ConstructorParameters<typeof DashboardHandler>[0]> = {},
+  dbOptions?: MockDbOptions,
+) {
+  const mockDb = createMockDb(dbOptions);
+  const logStorage = createMockLogStorage();
+  const send = vi.fn();
+  const handler = new DashboardHandler({
+    db: mockDb.db,
+    logStorage,
+    send,
+    ...noopCallbacks,
+    ...overrides,
+  });
+  return { ...mockDb, handler, logStorage, send };
+}
+
 /**
- * Prepend mocks for `resolveOrgForRun` so existing tests that mock the
- * handler's own `executeTakeFirst()` queries don't have their script
- * shifted by the new lookup. The resolver issues at most three queries:
+ * Prepends the `resolveOrgForRun` probe so a test scripting the handler's own
+ * `executeTakeFirst()` queries is not shifted by it. The resolver issues at most:
  *   1. SELECT routing_key FROM execution_runs WHERE run_id = ? LIMIT 1
  *   2. SELECT customer_id FROM sources WHERE routing_key = ? LIMIT 1
  *   3. SELECT customer_id FROM generic_webhook_sources ... LIMIT 1
- * Returning `{ routing_key: null }` from #1 short-circuits #2 / #3 — the
- * resolver returns null, the handler falls back to its bound (null/null)
- * context, and the access recorder is a no-op for tests that don't pass an
- * `accessLog`. This keeps these older tests passing without coupling them
- * to the new lookup chain.
+ * `{ routing_key: null }` from #1 short-circuits #2 / #3: the handler falls back to its
+ * bound (null/null) context, and the access recorder is a no-op without an `accessLog`.
  */
 function mockNoopResolveOrgForRun(executeTakeFirst: ReturnType<typeof vi.fn>): void {
   executeTakeFirst.mockResolvedValueOnce({ routing_key: null });
@@ -77,13 +78,10 @@ describe('DashboardHandler', () => {
   describe('handleRunDetail', () => {
     it('returns jobs with nested steps', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecute: execute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       // First execute: jobs query
       execute.mockResolvedValueOnce([
@@ -166,13 +164,10 @@ describe('DashboardHandler', () => {
 
     it('handles matrix jobs with matrixValues populated', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecute: execute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       execute.mockResolvedValueOnce([
         {
@@ -213,13 +208,10 @@ describe('DashboardHandler', () => {
 
     it('returns empty jobs array for run with no jobs', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecute: execute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       execute.mockResolvedValueOnce([]); // No jobs
       execute.mockResolvedValueOnce([]); // No steps
@@ -241,16 +233,12 @@ describe('DashboardHandler', () => {
 
     it('validates outgoing response against engine schema', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecute: execute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
+      } = makeHandler();
 
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
-
-      // Return a job with an invalid matrixValues type (string instead of record or null)
-      // to trigger Zod schema validation failure
+      // A string matrixValues (not a record or null) fails Zod schema validation.
       execute.mockResolvedValueOnce([
         {
           job_id: 'j1',
@@ -271,25 +259,20 @@ describe('DashboardHandler', () => {
         runId: 'run-bad',
       };
 
-      // matrixValues is a string, not a record — Zod schema validation fails
       await handler.handleRunDetail(msg);
 
       const response = send.mock.calls[0][0];
       expect(response.type).toBe('dashboard.run.detail.response');
       expect(response.requestId).toBe('req-val-fail');
-      // Should get error response from schema validation failure
       expect(response.error).toBeDefined();
     });
 
     it('sends error response on DB failure', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecute: execute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       execute.mockRejectedValueOnce(new Error('DB connection lost'));
 
@@ -310,13 +293,10 @@ describe('DashboardHandler', () => {
 
     it('includes run-scoped initFailure on the response when execution_runs.init_failure is populated', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecute: execute, selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       // resolveOrgForRun probe — return null routing_key to short-circuit
       mockNoopResolveOrgForRun(executeTakeFirst);
@@ -353,13 +333,10 @@ describe('DashboardHandler', () => {
 
     it('includes job-scoped initFailure on the per-job entry when execution_jobs.init_failure is populated', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecute: execute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       // jobs query — one synthetic rejected job with init_failure
       execute.mockResolvedValueOnce([
@@ -405,13 +382,10 @@ describe('DashboardHandler', () => {
 
     it('returns the bound context list (parsed from jsonb text) on the run-detail job', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecute: execute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       execute.mockResolvedValueOnce([
         {
@@ -555,13 +529,11 @@ describe('DashboardHandler', () => {
   describe('handleStepLogs', () => {
     it('returns log lines for a step', async () => {
       const {
-        db,
+        handler,
+        logStorage,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       executeTakeFirst.mockResolvedValueOnce({
@@ -592,7 +564,6 @@ describe('DashboardHandler', () => {
       expect(response.totalLines).toBe(3);
       expect(response.error).toBeUndefined();
 
-      // Verify log storage was read with correct path
       expect(logStorage.read).toHaveBeenCalledWith('executions/run-42/job-test/step-0.log');
       // Unbounded read (no limit): all lines, nextCursor null.
       expect(response.nextCursor).toBeNull();
@@ -600,12 +571,11 @@ describe('DashboardHandler', () => {
 
     it('paginates step logs by cursor and limit', async () => {
       const {
-        db,
+        handler,
+        logStorage,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       const fiveLines = { data: 'a\nb\nc\nd\ne\n', cursor: 10, complete: true };
 
@@ -663,17 +633,11 @@ describe('DashboardHandler', () => {
 
     it("serves a job's setup log (step -1), which has no step row", async () => {
       const {
-        db,
-        mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({
-        db,
-        logStorage: logStorage as never,
+        handler,
+        logStorage,
         send,
-        ...noopCallbacks,
-      });
+        mocks: { selectExecuteTakeFirst: executeTakeFirst },
+      } = makeHandler();
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       executeTakeFirst
@@ -706,17 +670,11 @@ describe('DashboardHandler', () => {
 
     it('answers an empty page, not an error, when a job wrote no setup log', async () => {
       const {
-        db,
-        mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({
-        db,
-        logStorage: logStorage as never,
+        handler,
+        logStorage,
         send,
-        ...noopCallbacks,
-      });
+        mocks: { selectExecuteTakeFirst: executeTakeFirst },
+      } = makeHandler();
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       executeTakeFirst.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ job_name: 'b' });
@@ -740,17 +698,11 @@ describe('DashboardHandler', () => {
 
     it('reports a stored setup log that holds no lines as recorded', async () => {
       const {
-        db,
-        mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({
-        db,
-        logStorage: logStorage as never,
+        handler,
+        logStorage,
         send,
-        ...noopCallbacks,
-      });
+        mocks: { selectExecuteTakeFirst: executeTakeFirst },
+      } = makeHandler();
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       executeTakeFirst.mockResolvedValueOnce(undefined).mockResolvedValueOnce({ job_name: 'b' });
@@ -774,13 +726,10 @@ describe('DashboardHandler', () => {
 
     it('returns error when step not found', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       executeTakeFirst.mockResolvedValueOnce(undefined);
@@ -805,13 +754,10 @@ describe('DashboardHandler', () => {
 
     it('returns error when step has no log_path', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       executeTakeFirst.mockResolvedValueOnce({ log_path: null });
@@ -836,13 +782,11 @@ describe('DashboardHandler', () => {
 
     it('validates outgoing step logs response against engine schema', async () => {
       const {
-        db,
+        handler,
+        logStorage,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       executeTakeFirst.mockResolvedValueOnce({
@@ -868,7 +812,6 @@ describe('DashboardHandler', () => {
       const response = send.mock.calls[0][0];
       expect(response.type).toBe('dashboard.step.logs.response');
       expect(response.requestId).toBe('req-val-ok');
-      // Validated data should pass through correctly
       expect(response.lines).toEqual(['line 1', 'line 2']);
       expect(response.totalLines).toBe(2);
       expect(response.error).toBeUndefined();
@@ -876,13 +819,11 @@ describe('DashboardHandler', () => {
 
     it('sends error response on log storage failure', async () => {
       const {
-        db,
+        handler,
+        logStorage,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       executeTakeFirst.mockResolvedValueOnce({
@@ -949,21 +890,12 @@ describe('DashboardHandler', () => {
     };
 
     it('lists attestations for a run with inlined bundles', async () => {
-      const {
-        db,
-        mocks: { selectExecuteTakeFirst: executeTakeFirst, selectExecute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const provenanceStorage = createMockProvenanceStorage();
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        provenanceStorage,
+      const {
+        handler,
         send,
-        ...noopCallbacks,
-      });
+        mocks: { selectExecuteTakeFirst: executeTakeFirst, selectExecute },
+      } = makeHandler({ provenanceStorage });
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       selectExecute.mockResolvedValueOnce([attestationRow]);
@@ -1019,21 +951,12 @@ describe('DashboardHandler', () => {
     });
 
     it('returns an empty list when the run has no attestations', async () => {
-      const {
-        db,
-        mocks: { selectExecuteTakeFirst: executeTakeFirst, selectExecute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const provenanceStorage = createMockProvenanceStorage();
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        provenanceStorage,
+      const {
+        handler,
         send,
-        ...noopCallbacks,
-      });
+        mocks: { selectExecuteTakeFirst: executeTakeFirst, selectExecute },
+      } = makeHandler({ provenanceStorage });
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       selectExecute.mockResolvedValueOnce([]);
@@ -1052,21 +975,12 @@ describe('DashboardHandler', () => {
     });
 
     it('skips rows whose bundle is missing from object storage', async () => {
-      const {
-        db,
-        mocks: { selectExecuteTakeFirst: executeTakeFirst, selectExecute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const provenanceStorage = createMockProvenanceStorage(async () => null);
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        provenanceStorage,
+      const {
+        handler,
         send,
-        ...noopCallbacks,
-      });
+        mocks: { selectExecuteTakeFirst: executeTakeFirst, selectExecute },
+      } = makeHandler({ provenanceStorage });
 
       mockNoopResolveOrgForRun(executeTakeFirst);
       selectExecute.mockResolvedValueOnce([attestationRow]);
@@ -1085,13 +999,10 @@ describe('DashboardHandler', () => {
 
     it('replies with an error when provenance storage is not configured', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       mockNoopResolveOrgForRun(executeTakeFirst);
 
@@ -1221,21 +1132,12 @@ describe('DashboardHandler', () => {
     };
 
     it('returns metadata-only summaries, paginated, and access-logged', async () => {
-      const {
-        db,
-        mocks: { selectExecute, selectExecuteTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const accessLog = { record: vi.fn() };
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
+      const {
+        handler,
         send,
-        accessLog: accessLog as never,
-        ...noopCallbacks,
-      });
+        mocks: { selectExecute, selectExecuteTakeFirst },
+      } = makeHandler({ accessLog: accessLog as never });
 
       selectExecute.mockResolvedValueOnce([summaryRowA, summaryRowB]);
       selectExecuteTakeFirst.mockResolvedValueOnce({ count: 2 });
@@ -1305,22 +1207,12 @@ describe('DashboardHandler', () => {
     };
 
     it('inlines exactly one bundle and logs against the attestation target', async () => {
-      const {
-        db,
-        mocks: { selectExecuteTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const provenanceStorage = mockProvenanceStorage();
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        provenanceStorage,
+      const {
+        handler,
         send,
-        provenanceSigningIssuer: 'https://orch.example',
-        ...noopCallbacks,
-      });
+        mocks: { selectExecuteTakeFirst },
+      } = makeHandler({ provenanceStorage, provenanceSigningIssuer: 'https://orch.example' });
 
       // 1) the get row, then 2) resolveOrgForRun short-circuit.
       selectExecuteTakeFirst.mockResolvedValueOnce(getRow);
@@ -1343,21 +1235,12 @@ describe('DashboardHandler', () => {
     });
 
     it('returns null attestation when the id is not found', async () => {
-      const {
-        db,
-        mocks: { selectExecuteTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const provenanceStorage = mockProvenanceStorage();
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        provenanceStorage,
+      const {
+        handler,
         send,
-        ...noopCallbacks,
-      });
+        mocks: { selectExecuteTakeFirst },
+      } = makeHandler({ provenanceStorage });
 
       selectExecuteTakeFirst.mockResolvedValueOnce(undefined);
 
@@ -1376,13 +1259,11 @@ describe('DashboardHandler', () => {
 
   describe('handleRunsList', () => {
     /**
-     * The handler now resolves the org's routing keys before the main query.
-     * The mock-db routes every `.execute()` through one shared mock, so each
-     * test seeds the resolution queries first (in invocation order):
+     * The handler resolves the org's routing keys before the main query, and the mock-db
+     * routes every `.execute()` through one shared mock, so tests seed in order:
      *   1. SELECT routing_key FROM sources WHERE customer_id = ? ...
      *   2. SELECT routing_key FROM generic_webhook_sources WHERE customer_id = ? ...
-     * …then the `execution_runs` list query. `seedRoutingKeys(execute, gh, gen)`
-     * queues the first two so the third `mockResolvedValueOnce` is the runs page.
+     * then the `execution_runs` list query, which the next `mockResolvedValueOnce` feeds.
      */
     function seedRoutingKeys(
       execute: ReturnType<typeof vi.fn>,
@@ -1406,9 +1287,8 @@ describe('DashboardHandler', () => {
         logStorage,
         send,
         orgId: 'org-1',
-        // Bound to the github key — but the org ALSO owns a generic key, and a
-        // run came in under that sibling key. This is the regression guard for
-        // the single-bound-key bug: the run under the generic key MUST appear.
+        // Bound to the github key, but the org ALSO owns a generic key with a run under
+        // it. Regression guard: the run under the generic key MUST appear.
         routingKey: 'github:42',
         ...noopCallbacks,
       });
@@ -1416,9 +1296,8 @@ describe('DashboardHandler', () => {
       // Org owns two routing keys: one github-ish, one generic-ish.
       seedRoutingKeys(execute, ['github:42'], ['generic:org-1:src-9']);
 
-      // execution_runs page: one run under EACH key, newest-first. Rich
-      // columns (workflow_name / sha / ref / duration_ms / lineage / actors /
-      // failure_reason) are populated so the enriched mapping is exercised.
+      // One run under EACH key, newest-first, with rich columns populated so the enriched
+      // mapping is exercised.
       execute.mockResolvedValueOnce([
         {
           run_id: 'run-generic',
@@ -1520,9 +1399,8 @@ describe('DashboardHandler', () => {
       expect(run2.compileJobId).toBeUndefined();
       expect(run2.source).toMatchObject({ routingKey: 'github:42', provider: 'github' });
 
-      // Scoped to the UNION of the org's routing keys (not just the bound
-      // one), ordered newest-first with a stable (created_at, run_id) keyset,
-      // fetching limit+1 to detect "has more".
+      // UNION of the org's routing keys, newest-first on a stable (created_at, run_id)
+      // keyset, fetching limit+1 to detect "has more".
       expect(selectWhere).toHaveBeenCalledWith('routing_key', 'in', [
         'github:42',
         'generic:org-1:src-9',
@@ -1536,20 +1414,9 @@ describe('DashboardHandler', () => {
 
     it('returns an empty page (no query) when the org owns no routing keys', async () => {
       const {
-        db,
+        handler,
         mocks: { selectExecute: execute, selectWhere },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        orgId: 'org-1',
-        routingKey: 'github:42',
-        ...noopCallbacks,
-      });
+      } = makeHandler({ orgId: 'org-1', routingKey: 'github:42' });
 
       // Both source tables resolve to zero routing keys.
       seedRoutingKeys(execute, [], []);
@@ -1569,12 +1436,6 @@ describe('DashboardHandler', () => {
     });
 
     it('records a platform_operator access_log row with source platform_proxy', async () => {
-      const {
-        db,
-        mocks: { selectExecute: execute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const accessLogRecord = vi.fn();
       const accessLog = {
         record: accessLogRecord,
@@ -1583,16 +1444,10 @@ describe('DashboardHandler', () => {
         setColdStore: vi.fn(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        orgId: 'org-1',
-        routingKey: 'github:42',
-        accessLog,
-        ...noopCallbacks,
-      });
+      const {
+        handler,
+        mocks: { selectExecute: execute },
+      } = makeHandler({ orgId: 'org-1', routingKey: 'github:42', accessLog });
 
       seedRoutingKeys(execute, ['github:42'], []);
       execute.mockResolvedValueOnce([]);
@@ -1618,12 +1473,6 @@ describe('DashboardHandler', () => {
     });
 
     it('defaults to limit 50 when none supplied and records an error row on db failure', async () => {
-      const {
-        db,
-        mocks: { selectExecute: execute, selectLimit },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const accessLogRecord = vi.fn();
       const accessLog = {
         record: accessLogRecord,
@@ -1632,16 +1481,11 @@ describe('DashboardHandler', () => {
         setColdStore: vi.fn(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
+      const {
+        handler,
         db,
-        logStorage,
-        send,
-        orgId: 'org-1',
-        routingKey: 'github:42',
-        accessLog,
-        ...noopCallbacks,
-      });
+        mocks: { selectExecute: execute, selectLimit },
+      } = makeHandler({ orgId: 'org-1', routingKey: 'github:42', accessLog });
 
       // Resolution succeeds; the main execution_runs query is what fails.
       seedRoutingKeys(execute, ['github:42'], []);
@@ -1671,20 +1515,9 @@ describe('DashboardHandler', () => {
 
     it('emits a nextCursor when hitting the page limit and paginates to the end', async () => {
       const {
-        db,
+        handler,
         mocks: { selectExecute: execute, selectLimit },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        orgId: 'org-1',
-        routingKey: 'github:42',
-        ...noopCallbacks,
-      });
+      } = makeHandler({ orgId: 'org-1', routingKey: 'github:42' });
 
       const baseRow = {
         routing_key: 'github:42',
@@ -1717,9 +1550,8 @@ describe('DashboardHandler', () => {
         'eyJjcmVhdGVkQXQiOiIyMDI2LTAxLTE1VDA5OjAwOjAwLjAwMFoiLCJydW5JZCI6InJ1bi0yIn0',
       );
 
-      // Second page: feed the cursor back; only the remaining row comes out
-      // (no "extra" row → no further cursor). Routing-key resolution runs
-      // again per request.
+      // Second page: only the remaining row, so no further cursor. Routing-key resolution
+      // runs again per request.
       seedRoutingKeys(execute, ['github:42'], []);
       execute.mockResolvedValueOnce([
         { ...baseRow, run_id: 'run-3', created_at: new Date('2026-01-15T08:00:00Z') },
@@ -1742,10 +1574,9 @@ describe('DashboardHandler', () => {
 
   describe('handleRunsFilters', () => {
     /**
-     * Same resolution-then-query script as `handleRunsList`: the handler first
-     * resolves the org's routing keys (two source-table queries), then runs the
-     * distinct-value scan over `execution_runs`, then resolves per-routing-key
-     * source identities (two more source-table queries) for the `sources` list.
+     * Script order: the org's routing keys (two source-table queries), the distinct-value
+     * scan over `execution_runs`, then per-routing-key source identities (two more
+     * source-table queries) for the `sources` list.
      */
     function seedRoutingKeys(
       execute: ReturnType<typeof vi.fn>,
@@ -1757,12 +1588,6 @@ describe('DashboardHandler', () => {
     }
 
     it('returns distinct sorted filter options scoped to the org and records access', async () => {
-      const {
-        db,
-        mocks: { selectExecute: execute, selectWhere },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const accessLogRecord = vi.fn();
       const accessLog = {
         record: accessLogRecord,
@@ -1771,16 +1596,10 @@ describe('DashboardHandler', () => {
         setColdStore: vi.fn(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        orgId: 'org-1',
-        routingKey: 'github:42',
-        accessLog,
-        ...noopCallbacks,
-      });
+      const {
+        handler,
+        mocks: { selectExecute: execute, selectWhere },
+      } = makeHandler({ orgId: 'org-1', routingKey: 'github:42', accessLog });
 
       // Routing-key resolution: org owns one github key.
       seedRoutingKeys(execute, ['github:42'], []);
@@ -1840,12 +1659,6 @@ describe('DashboardHandler', () => {
     });
 
     it('returns all-empty arrays and issues no run query when the org is unbound', async () => {
-      const {
-        db,
-        mocks: { selectExecute: execute, selectWhere },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const accessLogRecord = vi.fn();
       const accessLog = {
         record: accessLogRecord,
@@ -1854,16 +1667,10 @@ describe('DashboardHandler', () => {
         setColdStore: vi.fn(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        orgId: null,
-        routingKey: null,
-        accessLog,
-        ...noopCallbacks,
-      });
+      const {
+        handler,
+        mocks: { selectExecute: execute, selectWhere },
+      } = makeHandler({ orgId: null, routingKey: null, accessLog });
 
       const res = await handler.handleRunsFilters({
         type: 'dashboard.runs.filters',
@@ -1891,11 +1698,7 @@ describe('DashboardHandler', () => {
 
   describe('handlePayload', () => {
     it('returns parsed payload from log storage', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      const { handler, logStorage, send } = makeHandler();
 
       const payload = { repository: { full_name: 'owner/repo' }, ref: 'refs/heads/main' };
       logStorage.read.mockResolvedValueOnce({
@@ -1923,11 +1726,7 @@ describe('DashboardHandler', () => {
     });
 
     it('returns error when payload not found (empty data)', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      const { handler, logStorage, send } = makeHandler();
 
       logStorage.read.mockResolvedValueOnce({
         data: '',
@@ -1950,11 +1749,7 @@ describe('DashboardHandler', () => {
     });
 
     it('returns error when payload is invalid JSON', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      const { handler, logStorage, send } = makeHandler();
 
       logStorage.read.mockResolvedValueOnce({
         data: 'not-valid-json{',
@@ -1977,11 +1772,7 @@ describe('DashboardHandler', () => {
     });
 
     it('returns error on log storage failure', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      const { handler, logStorage, send } = makeHandler();
 
       logStorage.read.mockRejectedValueOnce(new Error('Storage down'));
 
@@ -2002,12 +1793,8 @@ describe('DashboardHandler', () => {
 
   describe('handleRerunRequest', () => {
     it('delegates to onRerun callback and returns newRunId', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const onRerun = vi.fn().mockResolvedValue({ newRunId: 'new-run-abc' });
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks, onRerun });
+      const { handler, send } = makeHandler({ onRerun });
 
       const msg: RunRerunRequest = {
         type: 'run.rerun.request',
@@ -2038,12 +1825,8 @@ describe('DashboardHandler', () => {
     });
 
     it('returns error message from onRerun failure', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const onRerun = vi.fn().mockRejectedValue(new Error('Run is not in a terminal state'));
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks, onRerun });
+      const { handler, send } = makeHandler({ onRerun });
 
       const msg: RunRerunRequest = {
         type: 'run.rerun.request',
@@ -2135,12 +1918,8 @@ describe('DashboardHandler', () => {
 
   describe('handleCancelRequest', () => {
     it('delegates to onCancel callback and returns cancelled job count', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const onCancel = vi.fn().mockResolvedValue({ cancelledJobs: 3 });
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks, onCancel });
+      const { handler, send } = makeHandler({ onCancel });
 
       const msg: RunCancelRequest = {
         type: 'run.cancel.request',
@@ -2166,12 +1945,8 @@ describe('DashboardHandler', () => {
     });
 
     it('passes force flag to onCancel callback', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const onCancel = vi.fn().mockResolvedValue({ cancelledJobs: 2 });
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks, onCancel });
+      const { handler, send } = makeHandler({ onCancel });
 
       const msg: RunCancelRequest = {
         type: 'run.cancel.request',
@@ -2194,12 +1969,8 @@ describe('DashboardHandler', () => {
     });
 
     it('returns error message from onCancel failure', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const onCancel = vi.fn().mockRejectedValue(new Error('Database connection lost'));
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks, onCancel });
+      const { handler, send } = makeHandler({ onCancel });
 
       const msg: RunCancelRequest = {
         type: 'run.cancel.request',
@@ -2271,11 +2042,7 @@ describe('DashboardHandler', () => {
 
   describe('handleOrchLogs', () => {
     it('returns orchestration log lines from log storage', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      const { handler, logStorage, send } = makeHandler();
 
       const logLine1 = JSON.stringify({ ts: 1000, phase: 'dispatch', message: 'Job dispatched' });
       const logLine2 = JSON.stringify({ ts: 2000, phase: 'setup', message: 'Agent assigned' });
@@ -2308,11 +2075,7 @@ describe('DashboardHandler', () => {
     });
 
     it('returns empty lines when log file does not exist', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      const { handler, logStorage, send } = makeHandler();
 
       logStorage.read.mockRejectedValueOnce(new Error('File not found'));
 
@@ -2333,11 +2096,7 @@ describe('DashboardHandler', () => {
     });
 
     it('merges orchestration and provisioning log lines', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      const { handler, logStorage, send } = makeHandler();
 
       const orchLine = JSON.stringify({ ts: 1000, phase: 'dispatch', message: 'Job dispatched' });
       const provLine = JSON.stringify({
@@ -2389,18 +2148,8 @@ describe('DashboardHandler', () => {
 
   describe('handleManualScheduleRequest', () => {
     it('delegates to onManualSchedule callback and returns newRunId', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const onManualSchedule = vi.fn().mockResolvedValue({ newRunId: 'new-run-sched' });
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        ...noopCallbacks,
-        onManualSchedule,
-      });
+      const { handler, send } = makeHandler({ onManualSchedule });
 
       const msg: ManualScheduleRequest = {
         type: 'run.manual_schedule.request',
@@ -2426,20 +2175,10 @@ describe('DashboardHandler', () => {
     });
 
     it('returns error message from onManualSchedule failure', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const onManualSchedule = vi
         .fn()
         .mockRejectedValue(new Error('Schedule registration not found'));
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        ...noopCallbacks,
-        onManualSchedule,
-      });
+      const { handler, send } = makeHandler({ onManualSchedule });
 
       const msg: ManualScheduleRequest = {
         type: 'run.manual_schedule.request',
@@ -2463,14 +2202,11 @@ describe('DashboardHandler', () => {
   describe('handleEventLogList', () => {
     it('returns rows mapped to EventLogListItem shape', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecute: execute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
-      // Mock the event_log query response
       execute.mockResolvedValueOnce([
         {
           id: '00000000-0000-0000-0000-000000000001',
@@ -2531,12 +2267,10 @@ describe('DashboardHandler', () => {
 
     it('emits a nextCursor when hitting the page limit', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecute: execute },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       // Limit=2 → handler asks for limit+1=3 rows; if we return 3 it should emit a cursor.
       const baseRow = {
@@ -2640,11 +2374,9 @@ describe('DashboardHandler', () => {
     });
 
     it('sends a structured error response when the query throws', async () => {
-      const { db, mocks } = createMockDb();
+      const { handler, send, mocks } = makeHandler();
+
       mocks.selectExecuteTakeFirstOrThrow.mockRejectedValueOnce(new Error('boom'));
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
 
       await handler.handleEventLogActivity(activityMsg);
 
@@ -2658,12 +2390,11 @@ describe('DashboardHandler', () => {
   describe('handleEventLogDetail', () => {
     it('returns row metadata only (payload streams separately)', async () => {
       const {
-        db,
+        handler,
+        logStorage,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       executeTakeFirst.mockResolvedValueOnce({
         id: 'row-1',
@@ -2702,20 +2433,19 @@ describe('DashboardHandler', () => {
       expect(response.type).toBe('dashboard.event-log.detail.response');
       expect(response.requestId).toBe('req-el-d-1');
       expect(response.item.deliveryId).toBe('d-1');
-      // Body bytes never travel inline anymore — the dashboard fetches them
-      // via the chunked-WS path (handleEventLogPayloadStream).
+      // Body bytes never travel inline; the dashboard fetches them via the chunked-WS
+      // path (handleEventLogPayloadStream).
       expect(response.payload).toBeUndefined();
       expect(logStorage.read).not.toHaveBeenCalled();
     });
 
     it('reflects payload_omitted on the row regardless of streaming', async () => {
       const {
-        db,
+        handler,
+        logStorage,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       executeTakeFirst.mockResolvedValueOnce({
         id: 'row-1',
@@ -2757,12 +2487,10 @@ describe('DashboardHandler', () => {
 
     it('returns Delivery not found error when row is missing', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
       executeTakeFirst.mockResolvedValueOnce(undefined);
 
       await handler.handleEventLogDetail({
@@ -2808,12 +2536,11 @@ describe('DashboardHandler', () => {
 
     it('streams a 200 KiB payload as four chunks (64 KiB + 64 + 64 + remainder)', async () => {
       const {
-        db,
+        handler,
+        logStorage,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       // 200 KiB ASCII text — JSON-parseable as a string when concatenated.
       const totalBytes = 200 * 1024;
@@ -2853,12 +2580,11 @@ describe('DashboardHandler', () => {
 
     it('emits a single terminal chunk with payload_unavailable when payload_omitted=true', async () => {
       const {
-        db,
+        handler,
+        logStorage,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       executeTakeFirst.mockResolvedValueOnce(
         makeRow({
@@ -2886,12 +2612,10 @@ describe('DashboardHandler', () => {
 
     it('emits a single terminal chunk with not_found when row is missing', async () => {
       const {
-        db,
+        handler,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
       executeTakeFirst.mockResolvedValueOnce(undefined);
 
       await handler.handleEventLogPayloadStream({
@@ -2910,12 +2634,11 @@ describe('DashboardHandler', () => {
 
     it('emits a terminal read_failed chunk when LogStorage throws', async () => {
       const {
-        db,
+        handler,
+        logStorage,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       executeTakeFirst.mockResolvedValueOnce(makeRow());
       logStorage.read = vi.fn().mockRejectedValue(new Error('s3 down'));
@@ -2936,12 +2659,11 @@ describe('DashboardHandler', () => {
 
     it('emits a terminal empty-body chunk for an empty (zero-byte) payload', async () => {
       const {
-        db,
+        handler,
+        logStorage,
+        send,
         mocks: { selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      } = makeHandler();
 
       const gz = gzipSync(Buffer.alloc(0));
       logStorage.read = vi.fn().mockResolvedValue({
@@ -2967,20 +2689,11 @@ describe('DashboardHandler', () => {
     });
   });
 
-  // ── multi-tenant orgId resolution ───────────────────────────────
-  //
-  // The invariant: when the orchestrator hosts more than one tenant,
-  // the access recorder MUST attribute the dashboard read to the **run's** owning
-  // org / routing key — not the handler-bound (LIMIT-1, no-ORDER-BY,
-  // non-deterministic) pair set by `setOrgContext`.
+  // Invariant: on a multi-tenant orchestrator the access recorder MUST attribute the
+  // dashboard read to the **run's** owning org / routing key, not the handler-bound
+  // (LIMIT-1, no-ORDER-BY, non-deterministic) pair set by `setOrgContext`.
   describe('multi-tenant orgId resolution', () => {
     it('handleRunDetail attributes access_log to the run-owning org, not the bound org', async () => {
-      const {
-        db,
-        mocks: { selectExecute: execute, selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const accessLogRecord = vi.fn();
       const accessLog = {
         record: accessLogRecord,
@@ -2989,19 +2702,11 @@ describe('DashboardHandler', () => {
         setColdStore: vi.fn(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      // Bound context = "wrong-org" / "generic:wrong-org:src-foo" — mimics
-      // the LIMIT-1 resolver picking the wrong tenant on a multi-tenant
-      // orchestrator at boot.
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        orgId: 'wrong-org',
-        routingKey: 'generic:wrong-org:src-foo',
-        accessLog,
-        ...noopCallbacks,
-      });
+      // The bound context mimics the LIMIT-1 resolver picking the wrong tenant at boot.
+      const {
+        handler,
+        mocks: { selectExecute: execute, selectExecuteTakeFirst: executeTakeFirst },
+      } = makeHandler({ orgId: 'wrong-org', routingKey: 'generic:wrong-org:src-foo', accessLog });
 
       // Resolver script:
       //   1. SELECT routing_key FROM execution_runs WHERE run_id = 'run-42'
@@ -3040,12 +2745,6 @@ describe('DashboardHandler', () => {
     it('handleRunDetail falls back to bound context when the run row is missing', async () => {
       // Cold-archived run case: execution_runs lookup returns undefined,
       // resolver returns null → contextOrFallback uses the bound pair.
-      const {
-        db,
-        mocks: { selectExecute: execute, selectExecuteTakeFirst: executeTakeFirst },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const accessLogRecord = vi.fn();
       const accessLog = {
         record: accessLogRecord,
@@ -3054,16 +2753,10 @@ describe('DashboardHandler', () => {
         setColdStore: vi.fn(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        orgId: 'bound-org',
-        routingKey: 'generic:bound-org:src-x',
-        accessLog,
-        ...noopCallbacks,
-      });
+      const {
+        handler,
+        mocks: { selectExecute: execute, selectExecuteTakeFirst: executeTakeFirst },
+      } = makeHandler({ orgId: 'bound-org', routingKey: 'generic:bound-org:src-x', accessLog });
 
       // 1. resolveOrgForRun → execution_runs lookup → undefined (cold-archived)
       executeTakeFirst.mockResolvedValueOnce(undefined);
@@ -3113,9 +2806,6 @@ describe('DashboardHandler', () => {
     }
 
     it('returns DLQ rows mapped to the wire shape', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const eventStore = {
         listDlq: vi.fn().mockResolvedValue([makeStoredEvent()]),
         countDlq: vi.fn(),
@@ -3125,14 +2815,7 @@ describe('DashboardHandler', () => {
         getDb: vi.fn(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        eventStore,
-        ...noopCallbacks,
-      });
+      const { handler, send } = makeHandler({ eventStore });
 
       await handler.handleEventDlqList({
         type: 'dashboard.event-dlq.list',
@@ -3234,10 +2917,7 @@ describe('DashboardHandler', () => {
     });
 
     it('returns an empty list when eventStore is missing', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      const { handler, send } = makeHandler();
 
       await handler.handleEventDlqList({
         type: 'dashboard.event-dlq.list',
@@ -3254,21 +2934,11 @@ describe('DashboardHandler', () => {
 
   describe('handleEventDlqCount', () => {
     it('returns the DLQ depth', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const eventStore = {
         countDlq: vi.fn().mockResolvedValue(7),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        eventStore,
-        ...noopCallbacks,
-      });
+      const { handler, send } = makeHandler({ eventStore });
 
       await handler.handleEventDlqCount({
         type: 'dashboard.event-dlq.count',
@@ -3283,10 +2953,7 @@ describe('DashboardHandler', () => {
     });
 
     it('returns 0 when eventStore is missing', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-      const handler = new DashboardHandler({ db, logStorage, send, ...noopCallbacks });
+      const { handler, send } = makeHandler();
 
       await handler.handleEventDlqCount({
         type: 'dashboard.event-dlq.count',
@@ -3302,23 +2969,13 @@ describe('DashboardHandler', () => {
 
   describe('handleEventDlqRetry', () => {
     it('returns 404 when the row is not in DLQ', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const eventStore = {
         getById: vi.fn().mockResolvedValue(null),
         resetFromDlq: vi.fn(),
         getDb: vi.fn(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        eventStore,
-        ...noopCallbacks,
-      });
+      const { handler, send } = makeHandler({ eventStore });
 
       await handler.handleEventDlqRetry({
         type: 'dashboard.event-dlq.retry',
@@ -3355,9 +3012,8 @@ describe('DashboardHandler', () => {
           dlqAt: new Date('2026-04-17T11:00:00Z'),
         }),
         resetFromDlq: vi.fn().mockResolvedValue(true),
-        // sql`...`.execute(getDb()) is called on the result — our mock returns
-        // something with no .execute() but the code wraps the call in try/catch
-        // and logs a warn on failure. So the test passes either way.
+        // The mock has no .execute(), but the code wraps the sql`...`.execute(getDb())
+        // call in try/catch and logs a warn, so the test passes either way.
         getDb: vi.fn().mockReturnValue(fakeDb),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
@@ -3393,22 +3049,12 @@ describe('DashboardHandler', () => {
 
   describe('handleEventDlqDiscard', () => {
     it('returns 404 when the row is not in DLQ', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const eventStore = {
         getById: vi.fn().mockResolvedValue(null),
         deleteDlq: vi.fn(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        eventStore,
-        ...noopCallbacks,
-      });
+      const { handler, send } = makeHandler({ eventStore });
 
       await handler.handleEventDlqDiscard({
         type: 'dashboard.event-dlq.discard',
@@ -3425,9 +3071,6 @@ describe('DashboardHandler', () => {
     });
 
     it('writes an access_log row and deletes the row on success', async () => {
-      const { db } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const accessLogRecord = vi.fn();
       const accessLog = {
         record: accessLogRecord,
@@ -3444,15 +3087,7 @@ describe('DashboardHandler', () => {
         deleteDlq: vi.fn().mockResolvedValue(true),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        eventStore,
-        accessLog,
-        ...noopCallbacks,
-      });
+      const { handler, send } = makeHandler({ eventStore, accessLog });
 
       await handler.handleEventDlqDiscard({
         type: 'dashboard.event-dlq.discard',
@@ -3476,12 +3111,6 @@ describe('DashboardHandler', () => {
 
   describe('handleSourcesList', () => {
     it('handleSourcesList returns source summaries from both tables and records a platform_operator access_log row', async () => {
-      const {
-        db,
-        mocks: { selectExecute: execute, selectWhere },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
       const accessLogRecord = vi.fn();
       const accessLog = {
         record: accessLogRecord,
@@ -3490,16 +3119,10 @@ describe('DashboardHandler', () => {
         setColdStore: vi.fn(),
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any;
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        orgId: 'org-1',
-        routingKey: 'github:42',
-        accessLog,
-        ...noopCallbacks,
-      });
+      const {
+        handler,
+        mocks: { selectExecute: execute, selectWhere },
+      } = makeHandler({ orgId: 'org-1', routingKey: 'github:42', accessLog });
 
       // mock the two scoped queries IN ORDER: sources, then generic_webhook_sources.
       execute.mockResolvedValueOnce([
@@ -3581,20 +3204,9 @@ describe('DashboardHandler', () => {
 
     it('handleSourcesList returns {sources:[]} when orgId is unbound', async () => {
       const {
-        db,
+        handler,
         mocks: { selectExecute: execute, selectFrom },
-      } = createMockDb();
-      const logStorage = createMockLogStorage();
-      const send = vi.fn();
-
-      const handler = new DashboardHandler({
-        db,
-        logStorage,
-        send,
-        orgId: null,
-        routingKey: null,
-        ...noopCallbacks,
-      });
+      } = makeHandler({ orgId: null, routingKey: null });
 
       const res = await handler.handleSourcesList({
         type: 'dashboard.sources.list',

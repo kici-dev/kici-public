@@ -92,7 +92,7 @@ describe('applyEnvDelta single-dir addPath mapping', () => {
     const target: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
     applyEnvDelta({ env: {}, pathPrepends: ['/a'] }, { operatorSecretKeys: new Set(), target });
     applyEnvDelta({ env: {}, pathPrepends: ['/b'] }, { operatorSecretKeys: new Set(), target });
-    // Second call's dir lands further left -- matches the legacy addPath behavior.
+    // A later call's dir lands further left.
     expect(target.PATH).toBe('/b:/a:/usr/bin');
   });
 

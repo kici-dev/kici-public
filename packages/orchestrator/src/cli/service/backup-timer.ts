@@ -1,14 +1,9 @@
 /**
- * Scheduled orchestrator database backups.
- *
- * Renders and registers a `kici-<instance>-db-backup` service + timer pair that
- * runs `kici-admin db backup --output-dir <dir> --keep <n>` on a calendar
- * schedule. systemd gets a `.service` plus a `.timer`; launchd gets one plist
- * with a `StartCalendarInterval`.
- *
- * Windows and Compose are refused: `sc.exe` has no timer concept, and a
- * Compose orchestrator runs in a container whose host scheduler KiCI does not
- * own. Both refusals name the platform-native equivalent.
+ * Scheduled database backups: a `kici-<instance>-db-backup` unit that runs
+ * `kici-admin db backup --output-dir <dir> --keep <n>` on a calendar (systemd
+ * `.service` + `.timer`; one launchd plist with `StartCalendarInterval`).
+ * Windows (`sc.exe` has no timers) and Compose (KiCI does not own the host
+ * scheduler) are refused with the platform-native equivalent.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -32,27 +27,18 @@ export interface BackupTimerConfig {
   serviceName: string;
   /** Calendar spec: a systemd `OnCalendar=` value, or `daily` / `HH:MM`. */
   schedule: string;
-  /** Directory the timestamped dumps are written to. */
   outputDir: string;
-  /** How many dumps to retain after each run. */
   keep: number;
-  /** Node binary the scheduled unit runs. */
   nodeBinPath: string;
-  /** `kici-admin` entry script the scheduled unit runs. */
   cliScriptPath: string;
   /** Env file carrying `KICI_DATABASE_URL` for the scheduled run. */
   envFilePath: string;
   /** User-level (`systemctl --user`, LaunchAgent) vs system-level. */
   isUserLevel: boolean;
-  /** Account a system-level unit runs as. */
   user?: string;
 }
 
-/**
- * `kici-orchestrator` -> `kici-orchestrator-db-backup`. A name that already
- * carries the `kici-` prefix keeps exactly one, so the unit is always
- * `kici-<instance>-db-backup`.
- */
+/** `kici-orchestrator` -> `kici-orchestrator-db-backup`: always exactly one `kici-` prefix. */
 export function backupTimerName(serviceName: string): string {
   const instance = serviceName.replace(/^kici-/, '');
   return `kici-${instance}-db-backup`;
@@ -71,10 +57,7 @@ export function backupCommandArgs(config: BackupTimerConfig): string[] {
   ];
 }
 
-/**
- * Explain why a platform cannot carry a KiCI-managed backup timer, and what to
- * use instead. Returns null when the platform is supported.
- */
+/** Why a platform cannot carry a KiCI backup timer and what to use instead; null when supported. */
 export function unsupportedPlatformMessage(
   platform: ServicePlatform,
   outputDir: string,
@@ -152,9 +135,8 @@ export function renderSystemdBackupTimer(config: BackupTimerConfig): string {
 }
 
 /**
- * Translate a calendar spec into the launchd `StartCalendarInterval` fields.
- * launchd has no calendar-expression parser, so only the two forms that map
- * cleanly are accepted; anything else is refused by name.
+ * Calendar spec to launchd `StartCalendarInterval` fields. launchd has no
+ * calendar-expression parser, so only `daily` and `HH:MM` are accepted.
  */
 export function parseLaunchdSchedule(schedule: string): { hour: number; minute: number } {
   if (schedule === 'daily' || schedule === 'midnight') return { hour: 0, minute: 0 };
@@ -177,20 +159,15 @@ function escapeXml(s: string): string {
 }
 
 /**
- * Read one key out of a `KEY=value` env file. Returns undefined when the file
- * or the key is absent — the caller decides whether that is fatal.
+ * Read one key out of a `KEY=value` env file; undefined when absent.
  *
- * The value is trimmed and stripped of surrounding quotes, because these files
- * are hand-edited as often as they are generated: a path written as
- * `"/etc/kici/scalers.yaml"` or left with a trailing space names the same file
- * and must read back the same way. Only the outer quote characters go — an
- * embedded `=` stays, so `B=two=three` still reads as `two=three`.
+ * The value is trimmed and its outer quotes stripped, since these files are
+ * hand-edited: `"/etc/kici/scalers.yaml"` names the same file. An embedded `=`
+ * stays (`B=two=three` reads `two=three`).
  *
- * A duplicated key takes its **last** occurrence, because that is the value the
- * running process holds: systemd's `EnvironmentFile=` applies each assignment in
- * order, so the last one wins. Reporting an earlier one would name a path or a
- * database the service never used, which is the opposite of what these readers
- * are for. Every other env-file reader in the repo takes the last occurrence too.
+ * A duplicated key takes its **last** occurrence, the value the running process
+ * holds (systemd's `EnvironmentFile=` applies assignments in order), like every
+ * other env-file reader in the repo.
  */
 export function readEnvValue(content: string, key: string): string | undefined {
   let value: string | undefined;
@@ -209,9 +186,8 @@ export function readEnvValue(content: string, key: string): string | undefined {
 }
 
 /**
- * launchd starts a job with a minimal `PATH` that omits Homebrew and the
- * Postgres.app bin directory, so a scheduled dump would not find `pg_dump` at
- * all. The systemd unit above sets `Environment=PATH=…` for the same reason,
+ * launchd's minimal `PATH` omits Homebrew and Postgres.app, so a scheduled dump
+ * would not find `pg_dump`; the systemd unit sets `Environment=PATH=…` likewise,
  * and the service plist renderer prepends the node bin dir the same way.
  */
 const LAUNCHD_DEFAULT_PATH = '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin';
@@ -341,14 +317,12 @@ export function installBackupTimer(
     return { unitName: name, files: [servicePath, timerPath] };
   }
 
-  // launchd carries no EnvironmentFile directive, so the database URL the
-  // scheduled run needs is lifted out of the env file at install time.
+  // launchd has no EnvironmentFile, so the database URL is copied in at install time.
   let envContent = '';
   try {
     envContent = io.readFile(config.envFilePath);
   } catch {
-    // No env file: the plist still installs, and the run reports the missing
-    // URL itself rather than failing here with less context.
+    // No env file: install anyway; the run reports the missing URL with more context.
   }
   const databaseUrl = readEnvValue(envContent, 'KICI_DATABASE_URL');
   const env: Record<string, string> = databaseUrl ? { KICI_DATABASE_URL: databaseUrl } : {};

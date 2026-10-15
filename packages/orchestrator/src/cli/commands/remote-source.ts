@@ -1,16 +1,10 @@
 /**
- * Remote-source inspection command for kici-admin.
- *
- * Subcommand namespace: `kici-admin remote-source show`.
- *
- * The remote-source anchor (`remote_sources` table) maps the deterministic
- * routing key `remote:<orgId>` to the orchestrator's canonical org id so a
- * Platform-relayed `kici run remote` resolves the real tenant. It is
- * auto-provisioned on Platform auth; this command lets an operator inspect or
- * confirm the row when debugging org-anchor issues on a hidden orchestrator.
- *
- * Reads the orchestrator DB directly (on-host operator inspection), so it stays
- * usable even when Platform is unreachable.
+ * `kici-admin remote-source show`. The `remote_sources` row maps the routing
+ * key `remote:<orgId>` to the orchestrator's canonical org id, so a
+ * Platform-relayed `kici run remote` resolves the real tenant. Platform auth
+ * provisions it; this inspects it when debugging org anchoring on a hidden
+ * orchestrator. It reads the DB directly, so it works with the Platform
+ * unreachable.
  */
 import type { Command } from 'commander';
 import { toErrorMessage } from '@kici-dev/shared';

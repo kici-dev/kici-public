@@ -1,18 +1,14 @@
 /**
- * Bare-metal execution sandbox.
- *
- * Uses child_process.fork() with sanitized environment and optional bubblewrap
- * (bwrap) namespace isolation. The workflow runner runs as a separate Node.js
- * process with only explicitly allowed environment variables.
+ * Bare-metal execution sandbox: forks the workflow runner as a separate Node.js
+ * process with only explicitly allowed env vars, optionally under bubblewrap.
  *
  * Security model:
  * - Environment sanitization: only ALLOWED_SYSTEM_VARS + user env + secrets
  * - Optional bwrap: PID/IPC namespace isolation, read-only system mounts
  * - Network isolation via --unshare-net when bwrap is enabled (loopback only)
  *
- * Without bwrap (sandbox=false), the runner process has full filesystem and
- * network access. This mode provides credential isolation only and should
- * be used in trusted environments.
+ * Without bwrap (sandbox=false) the runner has full filesystem and network
+ * access: credential isolation only, for trusted environments.
  */
 
 import { access } from 'node:fs/promises';
@@ -28,21 +24,19 @@ import { createForkRunner, fileCloneSourceBinds, type ForkRunnerHandle } from '.
 
 const logger = createLogger({ prefix: 'bare-metal-sandbox' });
 
-/** Configuration options for BareMetalSandbox. */
 interface BareMetalSandboxOptions {
   /** Absolute path to the compiled workflow-runner.js entry point. */
   runnerPath: string;
-  /** Whether to use bubblewrap (bwrap) for namespace isolation. */
+  /** Use bubblewrap (bwrap) for namespace isolation. */
   sandbox: boolean;
   /**
-   * Network mode when sandbox=true.
-   * - 'isolated' (default): bwrap --unshare-net (loopback only).
-   * - 'host': keep the host network namespace so workflows can talk to npm,
-   *   git, package registries, etc.
    * Ignored when sandbox=false.
+   * - 'isolated' (default): bwrap --unshare-net (loopback only).
+   * - 'host': keep the host network namespace so workflows can reach npm,
+   *   git, package registries, etc.
    */
   sandboxNetwork?: 'isolated' | 'host';
-  /** Pre-sanitized environment variables (system allowlist + user env). */
+  /** Pre-sanitized (system allowlist + user env). */
   env: Record<string, string>;
   /**
    * When true (and bwrap is off), spawn the runner in its own process group so
@@ -56,12 +50,6 @@ interface BareMetalSandboxOptions {
   runnerUser?: string;
 }
 
-/**
- * Bare-metal execution sandbox implementation.
- *
- * Forks the workflow runner as a child process with sanitized environment.
- * Optionally wraps execution in bubblewrap for PID/IPC/filesystem isolation.
- */
 export class BareMetalSandbox implements ExecutionSandbox {
   private readonly runnerPath: string;
   private readonly useBwrap: boolean;
@@ -71,8 +59,7 @@ export class BareMetalSandbox implements ExecutionSandbox {
   private readonly runnerUser: string | undefined;
   private runner: ForkRunnerHandle | null = null;
   private workDir: string | undefined;
-  // The most recent job's execution options, retained so an out-of-band
-  // cleanup-only re-run can reuse the same dispatch + orchestrator relays.
+  // Retained so an out-of-band cleanup-only re-run reuses the dispatch + relays.
   private lastOptions: JobExecutionOptions | null = null;
 
   constructor(options: BareMetalSandboxOptions) {
@@ -84,19 +71,15 @@ export class BareMetalSandbox implements ExecutionSandbox {
     this.runnerUser = options.runnerUser;
   }
 
-  /**
-   * Validate that the runner path exists and bwrap is available (if needed).
-   */
+  /** Validates the runner path and, when needed, bwrap availability. */
   async setup(options: SandboxSetupOptions): Promise<void> {
     this.workDir = options.workDir;
-    // Validate runner path exists
     try {
       await access(this.runnerPath);
     } catch {
       throw new Error(`Workflow runner not found at: ${this.runnerPath}`);
     }
 
-    // Validate bwrap binary if sandbox mode enabled
     if (this.useBwrap) {
       try {
         const { execSync } = await import('node:child_process');
@@ -123,15 +106,10 @@ export class BareMetalSandbox implements ExecutionSandbox {
     }
   }
 
-  /**
-   * Execute a job by forking the workflow runner with sanitized environment.
-   */
   async executeJob(options: JobExecutionOptions): Promise<JobExecutionResult> {
-    // When bwrap is enabled and the dispatch repo URL is a `file://` clone
-    // (the internal provider clones local repositories), expose the source dir
-    // read-only inside the sandbox so the workflow runner's `git clone`
-    // step can read it. Without this the clone fails inside bwrap with
-    // `does not appear to be a git repository`.
+    // Under bwrap, a `file://` repo URL (the internal provider clones local
+    // repos) needs its source dir bound read-only, or the runner's `git clone`
+    // fails with `does not appear to be a git repository`.
     const extraReadOnlyBinds = this.useBwrap ? fileCloneSourceBinds(options.dispatch.repoUrl) : [];
     this.lastOptions = options;
 
@@ -141,10 +119,7 @@ export class BareMetalSandbox implements ExecutionSandbox {
         env: this.env,
         useBwrap: this.useBwrap,
         workDir: this.workDir,
-        // Network isolation is opt-out via KICI_SANDBOX_NETWORK=host. When
-        // 'isolated' (the default), bwrap creates a network namespace with
-        // only loopback — no external connectivity. Workflows that need to
-        // talk to npm/git/package registries must opt out via 'host'.
+        // Opt-out via KICI_SANDBOX_NETWORK=host; 'isolated' (default) is loopback only.
         networkIsolation: this.useBwrap && this.sandboxNetwork === 'isolated',
         extraReadOnlyBinds,
         // Detach into a fresh process group only for the plain (non-bwrap) fork:
@@ -158,11 +133,7 @@ export class BareMetalSandbox implements ExecutionSandbox {
     return this.runner.result;
   }
 
-  /**
-   * Abort the running job.
-   *
-   * Sends abort IPC message, then SIGTERM after 10s, SIGKILL after 15s.
-   */
+  /** Sends the abort IPC message and SIGTERM, then SIGKILL after the grace period (30s default). */
   async abort(): Promise<void> {
     if (this.runner) {
       await this.runner.abort();
@@ -170,10 +141,9 @@ export class BareMetalSandbox implements ExecutionSandbox {
   }
 
   /**
-   * Clean up the child process if still running. The handle reference is kept
-   * (not nulled) so the between-jobs phase can still read `completionHooksRan` /
-   * `declaresCleanup` and reap the process group after teardown — the group
-   * survives the single child's death. The next `executeJob` overwrites it.
+   * Kills the child. The handle is kept (not nulled) so the between-jobs phase
+   * can still read `completionHooksRan` / `declaresCleanup` and reap the process
+   * group, which survives the child's death. The next `executeJob` overwrites it.
    */
   async teardown(): Promise<void> {
     if (this.runner) {
@@ -181,27 +151,21 @@ export class BareMetalSandbox implements ExecutionSandbox {
     }
   }
 
-  /** Whether the runner signalled its completion hooks ran. */
   get completionHooksRan(): boolean {
     return this.runner?.completionHooksRan ?? true;
   }
 
-  /** Whether the job declared an onFailure / cleanup hook. */
   get declaresCleanup(): boolean {
     return this.runner?.declaresCleanup ?? false;
   }
 
-  /** Reap the finished job's process group. */
   async reap(): Promise<number> {
     return this.runner?.reap() ?? 0;
   }
 
   /**
-   * Re-run the finished job's declared cleanup / onFailure hooks against the
-   * preserved workdir, in a fresh cleanup-only child. Reuses the last job's
-   * dispatch + orchestrator relays but suppresses step/log callbacks (the
-   * original job already reported and its log streamers are gone). Rejects when
-   * the cleanup-only child fails so the caller can time it out.
+   * Reuses the last job's dispatch + relays but suppresses step/log callbacks:
+   * the original job already reported and its log streamers are gone.
    */
   async runCleanupOnly(workDir: string, signal: AbortSignal): Promise<void> {
     const opts = this.lastOptions;
@@ -223,9 +187,9 @@ export class BareMetalSandbox implements ExecutionSandbox {
     );
     const result = await handle.result;
     handle.kill();
-    // Reject on any non-success terminal status. A caller timeout aborts the
-    // child, which resolves 'cancelled' (not 'failed'); throwing here lets the
-    // caller's own AbortSignal.aborted check classify it as 'timeout'.
+    // Reject on any non-success status: a caller timeout resolves 'cancelled'
+    // (not 'failed'), and throwing lets the caller's AbortSignal check classify
+    // it as 'timeout'.
     if (result.status !== ExecutionJobStatus.enum.success) {
       throw new Error(result.error ?? `cleanup-only re-run did not succeed (${result.status})`);
     }

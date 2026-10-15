@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/core",
-  "version": "0.17.0",
+  "version": "0.18.0",
   "description": "Light shared utilities for the KiCI stack (logging, errors, formatting, crypto, zx init, the TypeScript ESM loader hook). No server-side dependencies.",
   "keywords": [
     "ci",
@@ -78,7 +78,7 @@
     }
   },
   "scripts": {
-    "build": "node ../../scripts/build-ts.mjs && tsc --emitDeclarationOnly",
+    "build": "node ../../scripts/build-ts.mjs && tsc -p tsconfig.build.json --emitDeclarationOnly",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",

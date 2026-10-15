@@ -1,16 +1,11 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `host_roster.s3_reachable BOOLEAN` (nullable).
- *
- * Per-host delivery hint for fresh-box bring-up: when true, the box can reach
- * the orchestrator's object storage, so the bring-up handler picks the
- * `s3-direct` delivery mode (the box pulls the payload via a presigned URL
- * itself, no 50 MB through the ops agent). NULL / false ⇒ the conservative
- * `ssh-push` fallback (the ops agent fetches the payload and streams it to the
- * box over scp). Declared via `kici-admin host declare --s3-reachable`.
- *
- * Idempotent: a re-run on a DB that already has the column is a no-op.
+ * Add `host_roster.s3_reachable`, a fresh-box bring-up delivery hint set via
+ * `kici-admin host declare --s3-reachable`. True: the box reaches the orchestrator's object
+ * storage, so bring-up uses `s3-direct` (the box pulls the payload via a presigned URL, no 50 MB
+ * through the ops agent). NULL / false: the `ssh-push` fallback (the ops agent fetches the
+ * payload and scp's it to the box). Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colCheck = await sql<{ exists: boolean }>`

@@ -1,20 +1,16 @@
 #!/usr/bin/env node
 /**
- * Bundle a service package into single-file entry points.
+ * Bundle a service package into single-file entry points with internal code
+ * inlined (build-ts.mjs, by contrast, transpiles file by file).
  *
- * Unlike build-ts.mjs (library mode: file-per-file transpile), this script
- * produces one JS file per entry point with all internal code inlined.
- * External npm dependencies stay as bare imports resolved from node_modules.
+ * Usage: node ../../scripts/build-service.mjs (from a service package directory)
  *
- * Usage: node ../../scripts/build-service.mjs (run from any service package directory)
- *
- * The script reads the package's build.entries field from package.json to determine
- * entry points. Each entry maps an output filename to a source file:
+ * `build.entries` in package.json maps output filenames to sources:
  *
  *   "build": { "entries": { "server.js": "src/server.ts", "worker.js": "src/worker.ts" } }
  *
- * All bare imports (anything not starting with . or /) are kept external.
- * Workspace packages (@kici-dev/*) are also external — they ship as separate packages.
+ * Bare imports (not starting with . or /), `@kici-dev/*` included, stay
+ * external: they resolve from node_modules or ship as separate packages.
  */
 
 import { build, RolldownMagicString } from 'rolldown';
@@ -32,11 +28,9 @@ import {
 import { builtinModules } from 'node:module';
 
 /**
- * The container-sandbox runner is delivered to the customer job container as a
- * single file, so it must be self-contained: `zx` + `@kici-dev/*` (all pure JS)
- * are inlined, and only `node:` built-ins stay external (present in any Node
- * image). Every other entry keeps the default "all bare imports external"
- * behavior because it runs where node_modules / the pnpm workspace is present.
+ * Entries delivered to the customer job container as single files, so they are
+ * self-contained: `zx` and `@kici-dev/*` (pure JS) are inlined and only `node:`
+ * built-ins stay external. Other entries run where node_modules exists.
  */
 const BUNDLE_ENTRIES = new Set(['workflow-runner-bundle.js', 'container-ts-loader-hook.js']);
 const nodeBuiltinExternal = [
@@ -46,20 +40,16 @@ const nodeBuiltinExternal = [
 ];
 
 /**
- * Whether the bundled code references the CJS-style filename/dirname globals.
+ * Whether the bundled code references `__filename` / `__dirname`.
  *
- * NOTE: this regex assumes minification is OFF — there is no `minify` in the
- * rolldown config below, so `__filename` / `__dirname` survive verbatim in the
- * emitted chunk. A minifier could rename these globals, which would make the
- * regex miss them and silently drop the shim from a server entry that needs it
- * (runtime `__dirname is not defined`, no build-time error). Revisit this
- * heuristic if minification is ever enabled.
+ * Assumes minification is OFF: a minifier could rename the globals, so the
+ * regex would miss them and silently drop the shim (runtime `__dirname is not
+ * defined`, no build error). Revisit if minification is enabled.
  */
 export const usesCjsGlobals = (code) => /\b__(filename|dirname)\b/.test(code);
 
-// Resolve the repo root by climbing until pnpm-workspace.yaml is found.
-// `private: true` alone is not a reliable marker — individual service packages
-// are also private. The only unambiguous root marker is pnpm-workspace.yaml.
+// The repo root is the nearest directory with pnpm-workspace.yaml: `private:
+// true` is no marker, since service packages are private too.
 export function findRepoRoot(start) {
   let dir = start;
   for (let i = 0; i < 10; i++) {
@@ -67,7 +57,7 @@ export function findRepoRoot(start) {
       statSync(path.join(dir, 'pnpm-workspace.yaml'));
       return dir;
     } catch {
-      // Not here — climb.
+      // Not here.
     }
     const parent = path.dirname(dir);
     if (parent === dir) break;
@@ -78,27 +68,20 @@ export function findRepoRoot(start) {
 }
 
 /**
- * Read a workspace dependency's version + bundle hash for drift diagnostics.
+ * A workspace dependency's version and `dist/index.js` sha256, for drift
+ * diagnostics. Either is `'unknown'` when unreadable (peer not yet built); a
+ * self-build returns both `'unknown'` rather than read its own stale dist.
  *
- * Returns `{ version, bundleHash }` when `packages/<depName>/dist/index.js` exists,
- * or `{ version, bundleHash: 'unknown' }` when it doesn't (e.g. building shared
- * before shared's dist exists, or peer not yet built). Self-builds (depName ===
- * current pkg name) short-circuit to 'unknown' so we don't read our own stale dist.
- *
- * `dist/index.js` is produced by build-ts.mjs for shared / sdk / engine — pnpm's
- * workspace build topology (shared -> engine -> sdk -> everything else) ensures
- * the peers are fully built before agent / orchestrator / platform are bundled.
- *
- * Pure helper — no side effects — so it's directly testable. The main() block
- * below is the only caller that resolves `repoRoot` and `selfName` from the
- * process environment.
+ * pnpm's build topology (shared -> engine -> sdk -> everything else) builds the
+ * peers before agent / orchestrator / platform are bundled. Pure, so it is
+ * directly testable; main() is the only caller resolving `repoRoot` and
+ * `selfName` from the process environment.
  */
 export function readDepMeta(depName, opts = {}) {
   const root = opts.repoRoot ?? findRepoRoot(process.cwd());
   const selfName = opts.selfName;
   const depPkgName = `@kici-dev/${depName}`;
 
-  // Self-build: skip (avoid reading our own stale dist/index.js).
   if (selfName && selfName === depPkgName) {
     return { version: 'unknown', bundleHash: 'unknown' };
   }
@@ -124,13 +107,11 @@ export function readDepMeta(depName, opts = {}) {
 }
 
 /**
- * The version a service bundle reports as `KICI_PKG_VERSION`. A published
- * package carries the release version in its own package.json (the
- * single-version invariant). A private one — the Platform — keeps a placeholder
- * version that never moves, so it reports the release it was built with: the
- * repository root's version. A version bump writes the root and the published
- * packages together, and the private package depends on those, so its task hash
- * moves with the root version.
+ * The version a service bundle reports as `KICI_PKG_VERSION`: a published
+ * package's own version (the single-version invariant), or for a private one
+ * (the Platform, whose placeholder version never moves) the repository root's.
+ * A bump writes the root and the published packages the private one depends
+ * on, so its task hash moves with the root version.
  *
  * @param {{ version: string, private?: boolean }} pkg the package's package.json
  * @param {() => string} readReleaseVersion reads the repository root's version;
@@ -142,11 +123,9 @@ export function serviceVersion(pkg, readReleaseVersion) {
 }
 
 /**
- * The build-time constants baked into a service bundle: its version (see
- * {@link serviceVersion}), the build date, and the version and bundle hash of
- * the sdk, shared and engine packages it carries. Each value is JSON-encoded, so
- * rolldown replaces the identifier with a string literal. `scripts/package.mjs`
- * bakes the same set into the standalone packages.
+ * The build-time constants baked into a service bundle (and, by
+ * `scripts/package.mjs`, the standalone packages), JSON-encoded so rolldown
+ * replaces each identifier with a string literal.
  *
  * No build commit: it names a commit in the private repository, and every
  * service shows its constants to customers (`/health`, the startup log,
@@ -162,9 +141,8 @@ export function serviceDefines({ version, buildDate, sdkMeta, sharedMeta, engine
   return {
     KICI_PKG_VERSION: JSON.stringify(version),
     KICI_BUILD_DATE: JSON.stringify(buildDate),
-    // Workspace dep drift diagnostics: a log grep answers "did agent and
-    // orchestrator ship the same @kici-dev/sdk bundle?" — see
-    // docs/operator/troubleshooting.md.
+    // Drift diagnostics: did agent and orchestrator ship the same sdk bundle?
+    // See docs/operator/troubleshooting.md.
     KICI_SDK_VERSION: JSON.stringify(sdkMeta.version),
     KICI_SDK_BUNDLE_HASH: JSON.stringify(sdkMeta.bundleHash),
     KICI_SHARED_VERSION: JSON.stringify(sharedMeta.version),
@@ -184,12 +162,9 @@ async function main() {
     process.exit(1);
   }
 
-  // Dev-only entries (e.g. an orchestrator test-double server that wires
-  // fault injection) are built ONLY behind an explicit gate — `--dev` or
-  // KICI_BUILD_DEV_ENTRIES=1 — so a release/publish build (which passes
-  // neither) never emits them into dist/, and they therefore never reach a
-  // published npm tarball or a container image. Test builds opt in via the
-  // gate.
+  // Dev-only entries (e.g. a fault-injecting orchestrator test double) build
+  // ONLY with `--dev` or KICI_BUILD_DEV_ENTRIES=1. A release build passes
+  // neither, so they never reach an npm tarball or a container image.
   const includeDevEntries =
     process.argv.includes('--dev') || process.env.KICI_BUILD_DEV_ENTRIES === '1';
   const devEntries = pkg.build?.devEntries;
@@ -198,7 +173,6 @@ async function main() {
       ? { ...entries, ...devEntries }
       : entries;
 
-  // Build-time constants (hardcoded into every service bundle).
   const buildDate = new Date().toISOString();
 
   const repoRoot = findRepoRoot(cwd);
@@ -216,30 +190,21 @@ async function main() {
     engineMeta,
   });
 
-  // Build into a staging directory and move each entry onto its destination
-  // with an atomic rename, so a concurrent reader never sees a missing module.
+  // Staged, then renamed atomically, so a concurrent reader never sees a
+  // missing module.
   const stage = stageDir(cwd);
 
-  // ESM shim for modules that reference __filename/__dirname (e.g. peer cluster
-  // code). It pulls in node:url + node:path, so it is prepended ONLY to entries
-  // whose bundled output actually references __filename/__dirname. Browser-safe
-  // subpaths (an entry a web app imports) carry no
-  // such references and therefore stay free of node built-in imports, so a
-  // browser bundler can resolve them.
+  // ESM shim for __filename/__dirname (e.g. peer cluster code).
   const esmCjsShimBanner = `import { fileURLToPath as __cjs_fileURLToPath } from 'node:url';
 import { dirname as __cjs_dirname } from 'node:path';
 const __filename = __cjs_fileURLToPath(import.meta.url);
 const __dirname = __cjs_dirname(__filename);
 `;
 
-  // Prepend the CJS shim only to chunks that actually reference
-  // __filename/__dirname, via a renderChunk hook that returns a
-  // RolldownMagicString. Going through MagicString.prepend means rolldown
-  // offsets the chunk's sourcemap by the banner's line count by construction —
-  // a manual string concat after rolldown computed the map would shift every
-  // mapping down and break stack-trace resolution. Chunks without the globals
-  // (a browser-safe subpath a web app imports) are returned unchanged, so they stay free of node:url/node:path
-  // imports and a browser bundler can resolve them.
+  // Prepended only to chunks using the globals, so browser-safe subpaths stay
+  // free of node:url/node:path imports a browser bundler cannot resolve.
+  // MagicString.prepend makes rolldown offset the sourcemap; a manual concat
+  // after the map is computed would break stack-trace resolution.
   const conditionalCjsShimPlugin = {
     name: 'conditional-cjs-shim',
     renderChunk(code) {
@@ -254,20 +219,16 @@ const __dirname = __cjs_dirname(__filename);
     const inputPath = path.join(cwd, srcFile);
     const outputPath = path.join(stage, outputFile);
 
-    // The self-contained container-sandbox bundles keep only node built-ins
-    // external; every other entry keeps all bare imports external.
     const isBundleEntry = BUNDLE_ENTRIES.has(outputFile);
     const externalForEntry = isBundleEntry ? nodeBuiltinExternal : [/^[^./]/];
 
     await build({
       input: inputPath,
       platform: 'node',
-      external: externalForEntry, // Bundle entry: node builtins only; others: all bare imports
-      // Tree-shake ONLY the self-contained bundle: inlining `@kici-dev/*` +
-      // `zx` pulls in their barrels, so without shaking, unreached transitive
-      // deps (winston file-rotator, pg-native, aws-sdk) bloat the bundle and
-      // leave dynamic `require()`s that a bare job container cannot resolve.
-      // Every other entry keeps its bare imports external and stays unshaken.
+      external: externalForEntry,
+      // Shake ONLY the self-contained bundles: inlined barrels otherwise drag
+      // in unreached deps (winston file-rotator, pg-native, aws-sdk) and
+      // dynamic `require()`s a bare job container cannot resolve.
       treeshake: isBundleEntry,
       plugins: [conditionalCjsShimPlugin],
       transform: { define: defines },
@@ -275,11 +236,8 @@ const __dirname = __cjs_dirname(__filename);
         file: outputPath,
         format: 'es',
         sourcemap: true,
-        codeSplitting: false, // Single-file output (dynamic imports inlined)
+        codeSplitting: false, // Dynamic imports inlined
       },
-      // write: true (default) — rolldown writes every chunk + its .map and any
-      // assets to disk natively, with the shim's sourcemap offset already
-      // applied by the renderChunk hook above.
     });
 
     const size = statSync(outputPath).size;
@@ -293,8 +251,7 @@ const __dirname = __cjs_dirname(__filename);
   pruneOrphanDeclarations(cwd);
 
   console.log(`Built ${Object.keys(allEntries).length} entry points to dist/`);
-  // Emit baked workspace dep metadata so local builds make drift visible in one line.
-  // `unknown` indicates the peer's dist/index.js didn't exist (self-build or out-of-order).
+  // One line of baked dep metadata makes drift visible in local builds.
   const shortHash = (h) => (h === 'unknown' ? 'unknown' : h.slice(0, 12));
   console.log(
     `  deps: sdk=${sdkMeta.version}@${shortHash(sdkMeta.bundleHash)} ` +
@@ -303,8 +260,7 @@ const __dirname = __cjs_dirname(__filename);
   );
 }
 
-// Run the build only when invoked as a script — not on bare import
-// (tests import `readDepMeta` without wanting the full rolldown run).
+// Not on import: tests import `readDepMeta` without a rolldown run.
 const isMain = import.meta.url === pathToFileURL(process.argv[1] ?? '').href;
 if (isMain) {
   await main();

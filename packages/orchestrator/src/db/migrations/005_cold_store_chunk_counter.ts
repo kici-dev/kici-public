@@ -1,17 +1,11 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Cold-store chunk counter table.
+ * Per-(db, table, tenant) archived-chunk totals, so the `cold_store_chunks_total` gauge and
+ * `kici-admin cold-store list-chunks` avoid S3 LIST calls (expensive + rate-limited).
  *
- * Tracks per-(db, table, tenant) archived-chunk metadata so the
- * `cold_store_chunks_total` Prometheus gauge and the
- * `kici-admin cold-store list-chunks` CLI can report totals without
- * issuing S3 LIST calls (expensive + rate-limited).
- *
- * The table starts empty; the cold-store archiver
- * updates it transactionally with every successful chunk
- * write via `INSERT ... ON CONFLICT (db, table_name, tenant_id) DO
- * UPDATE SET chunk_count = chunk_count + EXCLUDED.chunk_count, ...`.
+ * Starts empty; the archiver upserts it in the same transaction as every successful chunk
+ * write (`INSERT ... ON CONFLICT (db, table_name, tenant_id) DO UPDATE ...`).
  */
 
 export async function up(db: Kysely<unknown>): Promise<void> {

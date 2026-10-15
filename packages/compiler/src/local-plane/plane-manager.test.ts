@@ -45,25 +45,20 @@ vi.mock('./platform-attach.js', () => ({
   revokeOrchestratorKey: vi.fn().mockResolvedValue(true),
 }));
 
-// Static imports of the mocked modules, so the per-case default restoration in
-// `beforeEach` does not have to be async. `vi.mock` is hoisted above these.
+// Static, so `beforeEach` restores defaults synchronously; `vi.mock` is hoisted above.
 import { classifyPlane, reclaimPlanePort } from './plane-liveness.js';
 import { spawnOrchestratorProcess, awaitOrchestratorReady } from './orchestrator-process.js';
 import { isPortFree, processCommandLine } from './port-holder.js';
 
 describe('planeUp / planeStatus / planeDown', () => {
-  // Every case boots a plane into its own config dir. They are removed in the
-  // afterEach below rather than left in the temp base: each case writes a stamp,
-  // a pidfile, an admin token, a secret key and a dev-identity keypair, so a run
-  // that leaves them behind accumulates one directory tree per test, per run,
-  // forever.
+  // Each case's config dir (stamp, pidfile, admin token, secret key, dev-identity
+  // keypair) is removed in afterEach, or every run would leak one tree per test.
   let configDir: string;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    // `clearAllMocks` clears recorded calls but keeps implementations, so a case
-    // that narrows one of these leaks its stub into every later case. Restoring
-    // the defaults here is what keeps the file order-independent.
+    // `clearAllMocks` keeps implementations, so restoring defaults here keeps a
+    // case's narrowed stub from leaking into later cases.
     vi.mocked(classifyPlane).mockResolvedValue({ kind: 'free' });
     vi.mocked(reclaimPlanePort).mockResolvedValue({ freed: true });
     vi.mocked(spawnOrchestratorProcess).mockReturnValue({ pid: 9001, port: 4319 });
@@ -76,11 +71,9 @@ describe('planeUp / planeStatus / planeDown', () => {
     process.env.KICI_CONFIG_DIR = configDir;
   });
 
-  // Guaranteed teardown of the injected build-identity globals. The build-stale
-  // tests below set these inline and delete them on success; this afterEach
-  // ensures a mid-test failure cannot leak a concrete identity into a later
-  // test (notably the "current identity is unknown" guard test, which requires
-  // no globals to be set).
+  // The build-stale tests delete the identity globals only on success; this keeps
+  // a mid-test failure from leaking one into the "identity is unknown" test,
+  // which needs none set.
   afterEach(() => {
     delete (globalThis as Record<string, unknown>).KICI_VERSION;
     delete (globalThis as Record<string, unknown>).KICI_BUILD_DATE;
@@ -88,10 +81,7 @@ describe('planeUp / planeStatus / planeDown', () => {
     delete process.env.KICI_CONFIG_DIR;
   });
 
-  /**
-   * Write a plane stamp over the current-layout defaults. A key set to
-   * `undefined` is left out of the file, as an older layout leaves it out.
-   */
+  /** Over current-layout defaults; an `undefined` key is omitted, as an older layout omits it. */
   async function seedStamp(fields: Record<string, unknown>): Promise<void> {
     const { planePaths, PLANE_STAMP_VERSION } = await import('./paths.js');
     const { stampFile } = planePaths();
@@ -150,7 +140,6 @@ describe('planeUp / planeStatus / planeDown', () => {
     const { planeUp } = await import('./plane-manager.js');
     const { planePaths, PLANE_STAMP_VERSION } = await import('./paths.js');
     const paths = planePaths();
-    // Seed a stamp from an incompatible layout plus a marker file in pgData.
     fs.mkdirSync(paths.pgData, { recursive: true });
     fs.writeFileSync(path.join(paths.pgData, 'marker'), 'stale');
     await seedStamp({ mode: undefined, ...stamp });
@@ -158,7 +147,6 @@ describe('planeUp / planeStatus / planeDown', () => {
     expect(st.running).toBe(true);
     expect(st.stampVersion).toBe(PLANE_STAMP_VERSION);
     expect(st.mode).toBe('independent');
-    // The stale data dir was wiped as part of the recreate.
     expect(fs.existsSync(path.join(paths.pgData, 'marker'))).toBe(false);
     expect(spawnOrchestratorProcess).toHaveBeenCalled();
   });
@@ -170,7 +158,6 @@ describe('planeUp / planeStatus / planeDown', () => {
     const { planeUp } = await import('./plane-manager.js');
     const { planePaths } = await import('./paths.js');
     const paths = planePaths();
-    // Concrete current identity, different from the seeded stamp below.
     (globalThis as Record<string, unknown>).KICI_VERSION = '0.1.28';
     (globalThis as Record<string, unknown>).KICI_BUILD_DATE = '2026-09-27T00:00:00.000Z';
     fs.mkdirSync(paths.pgData, { recursive: true });
@@ -181,7 +168,7 @@ describe('planeUp / planeStatus / planeDown', () => {
     const st = await planeUp();
     expect(st.running).toBe(true);
     expect(spawnOrchestratorProcess).toHaveBeenCalled(); // rebooted, not reused
-    // pgdata is PRESERVED on an identity reboot (unlike a stampVersion wipe).
+    // Unlike a stampVersion wipe, an identity reboot keeps pgdata.
     expect(fs.existsSync(path.join(paths.pgData, 'marker'))).toBe(true);
     delete (globalThis as Record<string, unknown>).KICI_VERSION;
     delete (globalThis as Record<string, unknown>).KICI_BUILD_DATE;
@@ -343,14 +330,12 @@ describe('planeUp / planeStatus / planeDown', () => {
     const { planeUp, devIdentityKeyFile } = await import('./plane-manager.js');
     await planeUp();
     const keyFile = devIdentityKeyFile();
-    // Private JWK persisted at mode 0600, freshly generated (EC P-256 with `d`).
     expect(fs.existsSync(keyFile)).toBe(true);
     expect(fs.statSync(keyFile).mode & 0o777).toBe(0o600);
     const jwk = JSON.parse(fs.readFileSync(keyFile, 'utf-8'));
     expect(jwk.kty).toBe('EC');
     expect(jwk.crv).toBe('P-256');
     expect(typeof jwk.d).toBe('string');
-    // The private-key path is threaded to spawnOrchestratorProcess.
     const call = vi.mocked(spawnOrchestratorProcess).mock.calls.at(-1);
     expect(call?.[1].devIdentityKeyFile).toBe(keyFile);
   });
@@ -393,13 +378,12 @@ describe('planeUp / planeStatus / planeDown', () => {
       orgId: 'acmeOrg00001',
       keyId: 'key-123',
     });
-    // Orchestrator booted hybrid with the minted token.
     const call = vi.mocked(spawnOrchestratorProcess).mock.calls.at(-1);
     expect(call?.[1].attach).toMatchObject({
       platformWsUrl: 'wss://platform.example.com/kici/ws',
       platformToken: 'kici_ok_secret',
     });
-    // Token persisted 0600, NOT in the stamp; durable attachment written.
+    // The token lives in its own 0600 file, NOT in the stamp.
     expect(readPlatformToken()).toBe('kici_ok_secret');
     expect(fs.statSync(planePaths().platformTokenFile).mode & 0o777).toBe(0o600);
     const stamp = JSON.parse(fs.readFileSync(planePaths().stampFile, 'utf-8'));
@@ -550,10 +534,9 @@ describe('planeUp / planeStatus / planeDown', () => {
     vi.mocked(classifyPlane).mockResolvedValue({ kind: 'free' });
     await planeUp();
 
-    // The port reads free — the stamped orchestrator spawned but has not bound
-    // it yet (a boot caught between spawn and bind). The reclaim never signals
-    // anything, so without the extra stop the process survives a "successful"
-    // teardown and takes the port back moments later.
+    // A boot caught between spawn and bind: the port reads free, so the reclaim
+    // signals nothing, and without the extra stop the process survives a
+    // "successful" teardown and takes the port back.
     vi.mocked(reclaimPlanePort).mockResolvedValue({ freed: true });
 
     const result = await planeDown();
@@ -569,9 +552,8 @@ describe('planeUp / planeStatus / planeDown', () => {
     vi.mocked(classifyPlane).mockResolvedValue({ kind: 'free' });
     await planeUp();
 
-    // The stamp outlives its process, so the pid it names may have been
-    // recycled onto something unrelated. Signalling it blind would stop a
-    // stranger's program — the port is already free, so there is nothing to gain.
+    // The stamped pid may be recycled; signalling it blind would stop a stranger's
+    // program for nothing, since the port is already free.
     vi.mocked(reclaimPlanePort).mockResolvedValue({ freed: true });
     vi.mocked(processCommandLine).mockResolvedValue('/usr/lib/firefox/firefox');
     vi.mocked(terminatePid).mockClear();
@@ -639,9 +621,8 @@ describe('planeUp / planeStatus / planeDown', () => {
 
     const result = await planeDown();
     expect(result).toEqual({ stopped: true, port: 4319, holderPid: 4168194 });
-    // With no stamp there is no pgKind, so only the data-dir-scoped embedded
-    // backend is stopped. The podman container name is host-global, so removing
-    // it could tear down a different plane's database.
+    // No stamp, no pgKind: only the data-dir-scoped embedded backend stops. The
+    // podman container name is host-global and may be another plane's database.
     expect(stopPlanePostgres).toHaveBeenCalledWith('embedded');
     expect(stopPlanePostgres).not.toHaveBeenCalledWith('podman');
   });
@@ -771,8 +752,7 @@ describe('planeUp / planeStatus / planeDown', () => {
       error: 'port 4319 is still held after stopping pid 9001',
     });
 
-    // Booting anyway would only re-fail as a readiness timeout naming the log
-    // rather than the survivor.
+    // Booting anyway would re-fail as a readiness timeout naming the log, not the survivor.
     await expect(planeUp()).rejects.toThrow('still held after stopping pid 9001');
     expect(spawnOrchestratorProcess).not.toHaveBeenCalled();
   });

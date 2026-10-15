@@ -6,12 +6,11 @@ import type { AgentPackageDownloadStorage } from './download.js';
 /**
  * Resolve the agent-package store the bring-up presign handler reads from.
  *
- * Defaults to the orchestrator's OWN cache bucket (`cacheStorage`) — never a
- * vendor CDN. An `s3://bucket[/prefix]` override (`KICI_AGENT_BINARY_SOURCE`)
- * points the presign at another bucket on the SAME S3 endpoint (the customer
- * supply-chain mirror); the config schema already rejects an http(s) source so
- * no external HTTP default can slip in. Returns undefined when no cache storage
- * is configured and no override is set (the presign RPC then refuses loudly).
+ * Defaults to the orchestrator's OWN cache bucket, never a vendor CDN. An
+ * `s3://bucket[/prefix]` override (`KICI_AGENT_BINARY_SOURCE`) points at another
+ * bucket on the SAME S3 endpoint (a customer supply-chain mirror); the config
+ * schema rejects an http(s) source. Undefined when neither is set, so the
+ * presign RPC refuses loudly.
  */
 export function resolveAgentPackageStore(
   config: AppConfig,

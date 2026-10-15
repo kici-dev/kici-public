@@ -1,14 +1,8 @@
 /**
- * Job ownership tracker for agent message validation.
- *
  * Validates that agents only send messages (job.status, log.chunk, step.status,
- * job.heartbeat, cache.upload.request, cache.upload.complete) for jobs that were
- * actually dispatched to them.
- *
- * Includes:
- * - Ownership check via dispatcher's isJobOwnedByAgent
- * - Violation counting with sliding window (default: 5 violations in 60s)
- * - Escalation: disconnect agent after threshold violations
+ * job.heartbeat, cache.upload.request, cache.upload.complete) for jobs
+ * dispatched to them. Violations are counted in a window (default: 5 in 60s);
+ * reaching the threshold disconnects the agent.
  */
 
 import { createLogger } from '@kici-dev/shared';
@@ -16,13 +10,10 @@ import { createLogger } from '@kici-dev/shared';
 const logger = createLogger({ prefix: 'ownership-tracker' });
 
 /**
- * Verdict of the DB-backed ownership lookup.
- *
- * `unknown` is the load-bearing member: it separates "the database says this
- * agent does not own the job" (evidence of a misrouted or spoofed frame) from
- * "the lookup could not be answered" (a query failure or a timeout). Only the
- * former is a violation — counting an unanswerable check as evidence would let
- * one transient database outage disconnect every connected agent at once.
+ * Verdict of the DB-backed ownership lookup. `unknown` (query failure or
+ * timeout) is distinct from `not-owned` (evidence of a misrouted or spoofed
+ * frame): only `not-owned` is a violation, else one transient database outage
+ * would disconnect every connected agent at once.
  */
 export type OwnershipDbResult = 'owned' | 'not-owned' | 'unknown';
 
@@ -30,10 +21,8 @@ export type OwnershipDbResult = 'owned' | 'not-owned' | 'unknown';
 export const DEFAULT_OWNERSHIP_DB_CHECK_TIMEOUT_MS = 5_000;
 
 /**
- * Largest delay `setTimeout` honours. Node silently collapses anything above
- * the signed 32-bit maximum to 1ms, so a deadline past this point would invert
- * into an instant one and refuse every frame — the opposite of what an
- * operator raising the knob asked for.
+ * Largest delay `setTimeout` honours: Node silently collapses anything above
+ * the signed 32-bit maximum to 1ms, which would refuse every frame.
  */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
@@ -41,25 +30,19 @@ interface OwnershipTrackerOpts {
   /** Check if a job is owned by the given agent (active or in grace window). */
   isJobOwnedByAgent: (agentId: string, jobId: string) => boolean;
   /**
-   * Optional DB-backed fallback. Returns `owned` when the orchestrator DB shows
-   * the (agent, job) pair as held by this coord OR a sibling coord — i.e.
-   * currently `dispatched`/`recovering` with the same `agent_id` /
-   * `recovery_agent_id`, or already terminal. `not-owned` is a decided refusal;
-   * `unknown` means the lookup itself could not be answered.
-   *
-   * When a Raft leader switch wipes the in-memory `agentJobs` Map on the
-   * replacement coord, this fallback accepts late frames from agents that are
-   * still draining instead of rejecting them as ownership violations.
+   * Optional DB-backed fallback: `owned` when the DB shows the (agent, job)
+   * pair held by this coord OR a sibling — `dispatched`/`recovering` with the
+   * same `agent_id` / `recovery_agent_id`, or already terminal. It accepts late
+   * frames from draining agents after a Raft leader switch wipes the in-memory
+   * `agentJobs` Map on the replacement coord.
    */
   isJobOwnedByAgentInDb?: (agentId: string, jobId: string) => Promise<OwnershipDbResult>;
   /**
    * Per-lookup deadline in ms, read fresh on every call so an operator can
-   * retune it fleet-wide without a restart. The read is itself bounded by
-   * {@link DEFAULT_OWNERSHIP_DB_CHECK_TIMEOUT_MS}, which is also the fallback
-   * when it stalls, throws, or returns a delay `setTimeout` cannot honour.
+   * retune it without a restart. Bounded and defaulted as `resolveTimeoutMs`
+   * describes.
    */
   getTimeoutMs?: () => Promise<number>;
-  /** Callback to disconnect an agent after escalation. */
   onDisconnect: (agentId: string, reason: string) => void;
   /** Number of violations before escalation (default: 5). */
   violationThreshold?: number;
@@ -82,12 +65,9 @@ export class OwnershipTracker {
   private readonly violationWindowMs: number;
   private readonly violations = new Map<string, ViolationEntry>();
   /**
-   * L1 cache of `(agentId, jobId)` pairs proven by a positive DB
-   * fallback. Pre-empts a synchronous warn-and-reject for the very
-   * next chunk on the same pair, since `checkOwnership` is called
-   * once per inbound message and the local Map repopulation lags
-   * behind. The cache is intentionally small (per-agent capped) and
-   * is cleaned on agent disconnect via `cleanup(agentId)`.
+   * `(agentId, jobId)` pairs proven by a positive DB fallback, so the next
+   * per-message `checkOwnership` on the pair passes while the local Map
+   * repopulation lags. Per-agent capped; cleared by `cleanup(agentId)`.
    */
   private readonly dbAccepted = new Map<string, Set<string>>();
 
@@ -101,15 +81,11 @@ export class OwnershipTracker {
   }
 
   /**
-   * Synchronous ownership check. Returns true if ownership is valid
-   * per the in-memory dispatcher OR a previously-accepted DB fallback.
-   *
-   * Returns false WITHOUT recording a violation when a DB fallback is
-   * configured: the caller is expected to invoke `validateAsync` to
-   * confirm or reject the ownership before treating it as a real
-   * violation. This makes the writer idempotent across HA failover —
-   * a `log.chunk` arriving on the replacement coord doesn't get
-   * counted as a violation just because the local Map is empty.
+   * True when the in-memory dispatcher OR a previously-accepted DB fallback
+   * shows ownership. With a DB fallback configured, returns false WITHOUT
+   * recording a violation: the caller must run `validateAsync` to decide, so a
+   * `log.chunk` on an HA replacement coord with an empty local Map is not
+   * counted as a violation.
    */
   checkOwnership(agentId: string, jobId: string, messageType: string): boolean {
     if (this.isJobOwnedByAgent(agentId, jobId)) return true;
@@ -118,10 +94,7 @@ export class OwnershipTracker {
     if (cached?.has(jobId)) return true;
 
     if (this.isJobOwnedByAgentInDb) {
-      // Defer the violation decision to the async validator the caller
-      // is expected to run. The synchronous return signals "do not
-      // process this message in the synchronous path yet" — the async
-      // handler then re-evaluates.
+      // Not processed synchronously; the caller's `validateAsync` decides.
       logger.debug(
         `Ownership pending DB check: ${messageType} from agent ${agentId} for job ${jobId}`,
       );
@@ -134,17 +107,12 @@ export class OwnershipTracker {
   }
 
   /**
-   * Async fallback used by message handlers that want HA-safe
-   * acceptance of post-failover frames. Returns true if the DB shows
-   * the (agent, job) pair as currently or recently owned by any coord
-   * in the cluster. On `owned`, caches the result so subsequent
-   * same-pair frames return true synchronously via `checkOwnership`.
-   * On `not-owned`, records a violation exactly once (no recursive
-   * recordViolation from the synchronous call site — `checkOwnership`
-   * skipped it when the DB fallback was configured). On `unknown` the
-   * frame is refused without a violation: an unanswerable check is not
-   * evidence of misbehaviour, and treating it as such would let one
-   * database outage disconnect the whole fleet.
+   * HA-safe acceptance of post-failover frames: true when the DB shows the
+   * (agent, job) pair currently or recently owned by any coord. `owned` is
+   * cached so later same-pair frames pass `checkOwnership` synchronously.
+   * `not-owned` records the violation exactly once (`checkOwnership` skipped
+   * it). `unknown` refuses the frame without a violation (see
+   * {@link OwnershipDbResult}).
    */
   async validateAsync(agentId: string, jobId: string, messageType: string): Promise<boolean> {
     if (this.isJobOwnedByAgent(agentId, jobId)) return true;
@@ -152,8 +120,7 @@ export class OwnershipTracker {
     if (cached?.has(jobId)) return true;
 
     if (!this.isJobOwnedByAgentInDb) {
-      // No async fallback configured: parity with the synchronous path,
-      // whose `checkOwnership` already recorded the violation.
+      // `checkOwnership` already recorded the violation.
       return false;
     }
 
@@ -179,9 +146,8 @@ export class OwnershipTracker {
   }
 
   /**
-   * Run the DB-backed lookup under a deadline. A query that throws or outruns
-   * the deadline resolves `unknown` — never `not-owned` — so a sick database
-   * refuses frames without accusing the agent of anything.
+   * DB lookup under a deadline. A query that throws or outruns it resolves
+   * `unknown`, never `not-owned`, so a sick database never accuses the agent.
    */
   private async resolveFromDb(agentId: string, jobId: string): Promise<OwnershipDbResult> {
     const lookup = this.isJobOwnedByAgentInDb;
@@ -209,15 +175,12 @@ export class OwnershipTracker {
   }
 
   /**
-   * Resolve the deadline for one lookup, itself bounded by
-   * {@link DEFAULT_OWNERSHIP_DB_CHECK_TIMEOUT_MS}.
-   *
-   * The knob is stored in the same database the deadline exists to survive, so
-   * reading it unbounded would stall the very frame the deadline is there to
-   * refuse — the agent would wait out its own acknowledgment deadline instead
-   * of getting an answer. A read that stalls, throws, or yields a value
-   * `setTimeout` cannot honour (non-finite, sub-millisecond, or past
-   * {@link MAX_TIMER_DELAY_MS}) falls back to the compile-time default.
+   * The per-lookup deadline, its read bounded by
+   * {@link DEFAULT_OWNERSHIP_DB_CHECK_TIMEOUT_MS}: the knob lives in the same
+   * database the deadline exists to survive, and an unbounded read would make
+   * the agent wait out its own acknowledgment deadline. A read that stalls,
+   * throws, or yields a value `setTimeout` cannot honour (non-finite,
+   * sub-millisecond, or past {@link MAX_TIMER_DELAY_MS}) uses the default.
    */
   private async resolveTimeoutMs(): Promise<number> {
     const read = this.getTimeoutMs;
@@ -248,10 +211,8 @@ export class OwnershipTracker {
   }
 
   /**
-   * Cache a DB-proven (agent, job) pair so the next frame on the same pair
-   * short-circuits in `checkOwnership`. The per-agent set is capped (generously
-   * — a typical agent runs a handful of jobs) so a misbehaving agent cannot
-   * grow it without bound.
+   * The per-agent set is capped (generously — a typical agent runs a handful
+   * of jobs) so a misbehaving agent cannot grow it without bound.
    */
   private rememberDbAccepted(agentId: string, jobId: string): void {
     let set = this.dbAccepted.get(agentId);
@@ -267,8 +228,8 @@ export class OwnershipTracker {
   }
 
   /**
-   * Record a violation for an agent. If threshold is exceeded within the
-   * violation window, triggers disconnect escalation.
+   * Record a violation for an agent. Reaching the threshold within the
+   * violation window triggers disconnect escalation.
    */
   private recordViolation(agentId: string): void {
     const now = Date.now();
@@ -279,7 +240,6 @@ export class OwnershipTracker {
       this.violations.set(agentId, entry);
     }
 
-    // Reset counter if window has expired
     if (entry.windowStart + this.violationWindowMs < now) {
       entry.count = 0;
       entry.windowStart = now;
@@ -294,9 +254,8 @@ export class OwnershipTracker {
   }
 
   /**
-   * Clean up violation tracking AND the DB-accepted cache for a
-   * disconnected agent. Avoids cross-agent leakage when the same
-   * agent id is later reused.
+   * Clears violations AND the DB-accepted cache for a disconnected agent, so a
+   * reused agent id inherits nothing.
    */
   cleanup(agentId: string): void {
     this.violations.delete(agentId);

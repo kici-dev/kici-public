@@ -97,8 +97,6 @@ interface ExecErrorFields {
 }
 
 /**
- * Convert an `execFile` rejection into a {@link CommandError}.
- *
  * Reads the fields Node sets on the error: `code` (the exit code, or an errno
  * string when the process never started), `signal`, `killed` and `stderr`.
  * A rejection without them, such as a plain `Error`, keeps its own message.
@@ -146,7 +144,6 @@ export function toCommandError(err: unknown, ctx: CommandContext): CommandError 
   );
 }
 
-/** The text before the first newline. */
 function firstLine(message: string): string {
   const nl = message.indexOf('\n');
   return nl === -1 ? message : message.slice(0, nl);

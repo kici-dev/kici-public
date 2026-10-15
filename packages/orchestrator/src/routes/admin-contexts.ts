@@ -18,14 +18,12 @@
  *   DELETE /api/v1/admin/contexts/:name/source-overrides/:routingKey/:key?orgId=<id>
  *                                                                    — delete a source override
  *
- * Backs the `kici-admin context` dual-mode CLI. Offline (direct-DB) mode
- * bypasses this router entirely — the CLI calls `*Direct` helpers from
- * @kici-dev/shared. This HTTP surface exists so tooling with only an admin
- * token (no DB reach) can do the same operations.
+ * Backs the `kici-admin context` dual-mode CLI for tooling with only an admin
+ * token (no DB reach); offline (direct-DB) mode bypasses this router and calls
+ * the `*Direct` helpers from @kici-dev/shared.
  *
- * All routes are protected by the admin auth middleware mounted in admin.ts
- * (at `/api/v1/admin/*`). That middleware sets `role` + `userId` on the
- * context, which we use for RBAC gating here.
+ * The admin auth middleware in admin.ts (at `/api/v1/admin/*`) sets the
+ * `role` + `userId` the RBAC gates here read.
  */
 import { Hono } from 'hono';
 import { sql, type Kysely } from 'kysely';
@@ -109,20 +107,14 @@ const setSourceOverrideSchema = z.object({
   value: z.string(),
 });
 
-/**
- * Create admin API routes for context management.
- *
- * @param deps - db (Kysely) + rbac enforcer
- * @returns Hono app mounted at /api/v1/admin
- */
+/** Context routes; the returned app mounts at /api/v1/admin. */
 export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger, { logBeforeHandling: 'admin-contexts route failed' });
   const envStore = new ContextStore(deps.db as Kysely<any>);
   const bindingStore = new BindingStore(deps.db as Kysely<any>);
   const variableStore = new VariableStore(deps.db as Kysely<any>);
 
-  // Contexts are org-scoped, not routing-key-scoped — refuse any
-  // request from a token that is restricted to a single routing key.
+  // Contexts are org-scoped, so a routing-key-scoped token is refused.
   app.use('/contexts', requireUnscoped);
   app.use('/contexts/*', requireUnscoped);
 
@@ -174,7 +166,7 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
       return c.json({ error: `context not found (org=${body.orgId}, name=${name})` }, 404);
     }
 
-    // Check if binding already exists to report create vs noop honestly.
+    // Lets the response report create vs no-op honestly.
     const existing = await deps.db
       .selectFrom('context_bindings')
       .select('scope_pattern')
@@ -329,7 +321,6 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
     deps.rbac.requirePermission(c.get('role'), 'secret.write');
     const body = createTemplateSchema.parse(await c.req.json());
 
-    // Upsert the template-type context.
     const existing = await envStore.getByName(body.orgId, body.templateName);
     let envId: string;
     let created: boolean;
@@ -345,10 +336,10 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
       envId = existing.id;
       created = false;
     } else {
-      // NOTE: The DB CHECK constraint currently only allows 'fixed' | 'glob'.
-      // Callers that need real "template" semantics should use the direct-DB
-      // helper which bypasses the CHECK. For HTTP callers, we coerce to
-      // 'fixed' to avoid a 500 — the semantics are equivalent for seeding.
+      // The DB CHECK constraint allows only 'fixed' | 'glob', so HTTP callers
+      // are coerced to 'fixed' (equivalent for seeding) rather than a 500.
+      // Real "template" semantics need the direct-DB helper, which bypasses
+      // the CHECK.
       const rawType = body.type ?? 'template';
       const safeType: ContextType =
         rawType === ContextType.enum.glob ? ContextType.enum.glob : ContextType.enum.fixed;
@@ -366,7 +357,6 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
       created = true;
     }
 
-    // Seed variables (if any).
     let variablesSet = 0;
     if (body.variables) {
       for (const [key, value] of Object.entries(body.variables)) {
@@ -375,8 +365,8 @@ export function createAdminContextRoutes(deps: AdminContextRoutesDeps): Hono<Adm
       }
     }
 
-    // Touch updated_at when template seed was a no-op but variables changed
-    // (avoids a silent no-change response).
+    // Touch updated_at when the template upsert was a no-op but variables
+    // changed, so the change is not silent.
     if (!created && variablesSet > 0) {
       await deps.db
         .updateTable('contexts')

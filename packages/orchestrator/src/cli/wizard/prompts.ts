@@ -1,13 +1,7 @@
-/**
- * Shared prompt utilities for the setup wizards.
- *
- * Wraps @inquirer/prompts with consistent formatting and
- * validation for common input types (DB URLs, ports, etc.).
- */
+/** Validated @inquirer/prompts wrappers shared by the setup wizards. */
 
 import { input, select, confirm, password } from '@inquirer/prompts';
 
-/** Prompt for a PostgreSQL database URL with validation. */
 export async function promptDbUrl(): Promise<string> {
   return input({
     message: 'PostgreSQL database URL:',
@@ -21,7 +15,6 @@ export async function promptDbUrl(): Promise<string> {
   });
 }
 
-/** Prompt for a port number with validation. */
 export async function promptPort(defaultPort: number): Promise<number> {
   const value = await input({
     message: 'Port:',
@@ -37,12 +30,11 @@ export async function promptPort(defaultPort: number): Promise<number> {
   return parseInt(value.trim(), 10);
 }
 
-/** Prompt for a yes/no confirmation. */
 export async function promptConfirm(message: string, defaultValue = true): Promise<boolean> {
   return confirm({ message, default: defaultValue });
 }
 
-/** Prompt for a URL with http(s):// validation. */
+/** Requires an http(s):// URL. */
 export async function promptUrl(message: string, defaultValue?: string): Promise<string> {
   return input({
     message,
@@ -63,10 +55,9 @@ export async function promptUrl(message: string, defaultValue?: string): Promise
 }
 
 /**
- * Prompt for an optional URL: an empty answer returns undefined, any other
- * answer must carry an http(s)/ws(s) scheme. Used where a URL genuinely may be
- * left unset (the hybrid public ingress base), which `promptUrl` cannot express
- * because its validator rejects a blank answer.
+ * Blank returns undefined; anything else needs an http(s)/ws(s) scheme. For a
+ * URL that may stay unset (the hybrid public ingress base), which `promptUrl`
+ * rejects.
  */
 export async function promptOptionalUrl(message: string): Promise<string | undefined> {
   const value = await input({
@@ -88,7 +79,7 @@ export async function promptOptionalUrl(message: string): Promise<string | undef
   return value.trim() || undefined;
 }
 
-/** Prompt for a secret/password (masked input). */
+/** Masked input. */
 export async function promptSecret(message: string): Promise<string> {
   return password({
     message,
@@ -100,7 +91,6 @@ export async function promptSecret(message: string): Promise<string> {
   });
 }
 
-/** Prompt for a selection from a list of options. */
 export async function promptSelect<T extends string>(
   message: string,
   choices: { name: string; value: T; description?: string }[],

@@ -1,12 +1,8 @@
 /**
- * Per-action warm-retention policy for the three audit-style tables:
- * Platform `audit_log`, Orchestrator `access_log`, Orchestrator
- * `secret_audit_log`.
- *
- * Single source of truth for "how long does a row stay in PG before being
- * archived to cold storage." Mirrors the per-action sampling policy in
- * `./access-log-policy.ts`; both modules classify by the same action
- * dimension, just for different downstream decisions.
+ * Per-action warm-retention policy (how long a row stays in PG before cold
+ * archival) for Platform `audit_log`, Orchestrator `access_log` and
+ * Orchestrator `secret_audit_log`. Classifies by the same action dimension as
+ * the sampling policy in `./access-log-policy.ts`.
  *
  * Two override layers apply uniformly:
  *
@@ -16,12 +12,10 @@
  *
  * Override 1 wins over override 2 when both apply (more conservative).
  *
- * The SQL-fragment generators emit Postgres `CASE` expressions so the
- * adapters can splice them directly into Kysely raw SQL without duplicating
- * the classification logic. The strings produced are derived deterministically
- * from the JS tables here, so editing the JS regenerates the SQL — and the
- * `validateActionShape()` test guards against SQL-injection surface by
- * asserting every action key matches `/^[a-z0-9_.-]+$/`.
+ * The SQL-fragment generators derive Postgres `CASE` expressions from the JS
+ * tables here, so adapters splice them into Kysely raw SQL without duplicating
+ * the classification. Every action key must match `/^[a-z0-9_.-]+$/`: a test
+ * asserts it, and SQL generation throws on a mismatch.
  *
  * Browser-safe: this module MUST NOT import any Node built-ins. It is
  * re-exported via the `@kici-dev/engine` barrel which the dashboard imports.
@@ -129,7 +123,8 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'db.reindex': 180,
   'db.refresh_collation_version': 180,
 
-  // 180 days — event DLQ admin actions (at-least-once delivery)
+  // event DLQ admin actions (at-least-once delivery): list read 30 days,
+  // retry / discard 180 days
   'event_dlq.list.read': 30,
   'event_dlq.retry': 180,
   'event_dlq.discard': 180,
@@ -153,10 +148,9 @@ const FORENSIC_OUTCOME_DAYS = 180;
 const PLATFORM_OPERATOR_DAYS = 365;
 
 /**
- * Default warm TTL for action strings outside `AccessLogAction.options`. Hit
- * by synthetic test action names and would-be-future enum additions on a
- * rolling deploy. Matches the conservative `180d` mutations bucket so
- * unknown rows are never archived sooner than a tenant-plane mutation.
+ * Warm TTL for action strings outside `AccessLogAction.options` (synthetic test
+ * names, future enum additions on a rolling deploy). Matches the 180d mutations
+ * bucket so unknown rows are never archived sooner than a tenant-plane mutation.
  */
 const UNKNOWN_ACTION_WARM_DAYS = 180;
 
@@ -245,8 +239,8 @@ export function getSecretAuditLogWarmDays(args: {
 
 /**
  * Action strings that may appear in SQL must match this shape. A failed match
- * means an action key was added that could escape the string-literal context
- * — that's a bug, not user input, but we still reject it at test time.
+ * means an added action key could escape the string-literal context: a bug,
+ * not user input, still rejected when the SQL is generated.
  */
 const SAFE_ACTION_RE = /^[a-z0-9_.-]+$/;
 
@@ -284,33 +278,26 @@ function groupByDays<K extends string>(map: Record<K, number>): Map<number, K[]>
  */
 export function accessLogWarmSqlCase(): string {
   const groups = groupByDays(ACCESS_LOG_WARM_DAYS);
-  // Emit longest-retention buckets first inside the action-IN clauses so the
-  // generated SQL is stable and easy to eyeball; the override layers come first
-  // so they short-circuit cleanly.
+  // Longest-retention buckets first keeps the generated SQL stable; the
+  // override layers precede them so they short-circuit.
   const sortedDays = [...groups.keys()].sort((a, b) => b - a);
 
-  // The ELSE defaults genuinely-unknown actions to the same conservative TTL
-  // the JS getter uses (UNKNOWN_ACTION_WARM_DAYS). Every known action lands in
-  // an explicit WHEN clause below, so the ELSE is reached only by action
-  // strings outside the enum — synthetic test names, future enum additions on a
-  // rolling deploy, post-rollback rows. For warm retention the conservative
-  // choice is to keep those rows LONGER, not shorter: archiving an unknown row
-  // early evicts it from PG (losing indexability) and the SQL pre-filter never
-  // re-runs the JS getter's overrides, so a too-eager ELSE would silently lose
-  // data the getter would have retained.
+  // The ELSE is reached only by action strings outside the enum (synthetic
+  // test names, future enum additions on a rolling deploy, post-rollback rows)
+  // and keeps them LONGER, like the JS getter: archiving an unknown row early
+  // evicts it from PG (losing indexability), and the SQL pre-filter never
+  // re-runs the getter's overrides, so a too-eager ELSE silently loses data.
   const defaultDays = UNKNOWN_ACTION_WARM_DAYS;
 
   const whenClauses: string[] = [];
-  // Override 1: denied / error → 180 days.
   whenClauses.push(
     `WHEN outcome IN ('denied','error') THEN INTERVAL '${FORENSIC_OUTCOME_DAYS} days'`,
   );
-  // Override 2: platform_operator → 365 days.
   whenClauses.push(
     `WHEN actor_type = 'platform_operator' THEN INTERVAL '${PLATFORM_OPERATOR_DAYS} days'`,
   );
-  // Per-action buckets — every known TTL group gets an explicit WHEN clause,
-  // including the 30-day group, so the ELSE stays reserved for unknown actions.
+  // Every known TTL group, the 30-day one included, gets an explicit WHEN so
+  // the ELSE stays reserved for unknown actions.
   for (const days of sortedDays) {
     const actions = groups.get(days)!;
     whenClauses.push(`WHEN action IN (${quoteList(actions)}) THEN INTERVAL '${days} days'`);
@@ -321,38 +308,26 @@ export function accessLogWarmSqlCase(): string {
 /**
  * Postgres CASE for Platform `audit_log`. Mirrors `auditLogWarmDays()`.
  *
- * The Platform `audit_log` table has neither an `outcome` nor an `actor_type`
- * column. Actor type only exists in the JS
- * application layer — when an actor is written, the JS code derives `actor_id`
- * from `actor.sub` (or a fixed string like `'platform-admin-cli'`). Because of
- * that, the SQL CASE here cannot apply the `actor.type='platform_operator'`
- * override the way `accessLogWarmSqlCase()` does — the column doesn't exist.
- *
- * In practice this is fine: there is no Platform code path that writes a
- * `platform_operator` actor into Platform `audit_log`. Platform-operator
- * break-glass (`makePlatformOperatorActor`) is exclusively used to proxy
- * orchestrator reads via the support-read listener; those rows land in the
- * orchestrator's `access_log`, where the per-row CASE *can* see `actor_type`.
- *
- * The TS-side `getAuditLogWarmDays()` keeps the override defensively so any
- * future call site that genuinely passes a `platform_operator` actor still
- * gets the right TTL — just not the SQL pre-filter, which has no column to
- * inspect.
+ * The table has neither an `outcome` nor an `actor_type` column (the writer
+ * derives `actor_id` from `actor.sub` or a fixed string like
+ * `'platform-admin-cli'`), so this CASE cannot apply the `platform_operator`
+ * override. No Platform code path writes a `platform_operator` actor here:
+ * break-glass (`makePlatformOperatorActor`) only proxies orchestrator reads via
+ * the support-read listener, and those rows land in the orchestrator's
+ * `access_log`, whose CASE sees `actor_type`. `getAuditLogWarmDays()` keeps the
+ * override defensively for a future caller that passes one.
  */
 export function auditLogWarmSqlCase(): string {
   const exact = [...COMPLIANCE_AUDIT_EXACT];
   const whenClauses: string[] = [];
-  // Compliance prefixes — emit one OR'd predicate.
   const prefixPredicate = COMPLIANCE_AUDIT_PREFIXES.map((p) => {
     assertSafeAction(p.replace(/\.$/, '')); // trailing dot is allowed in pattern
     return `action LIKE '${p}%'`;
   }).join(' OR ');
   whenClauses.push(`WHEN ${prefixPredicate} THEN INTERVAL '365 days'`);
-  // Compliance exact-match set.
   if (exact.length > 0) {
     whenClauses.push(`WHEN action IN (${quoteList(exact)}) THEN INTERVAL '365 days'`);
   }
-  // Default: 180 days for all tenant-plane mutations.
   return `CASE\n  ${whenClauses.join('\n  ')}\n  ELSE INTERVAL '180 days'\nEND`;
 }
 
@@ -363,8 +338,7 @@ export function auditLogWarmSqlCase(): string {
 export function secretAuditLogWarmSqlCase(): string {
   const sampled = [...SAMPLED_RESOLVE_ACTIONS];
   const whenClauses: string[] = [];
-  // Override: denied → 180 days. The column on this table is just 'allowed'/
-  // 'denied' (no 'error' variant).
+  // This table's outcome is only 'allowed' / 'denied' (no 'error').
   whenClauses.push(`WHEN outcome = 'denied' THEN INTERVAL '${FORENSIC_OUTCOME_DAYS} days'`);
   if (sampled.length > 0) {
     whenClauses.push(`WHEN action IN (${quoteList(sampled)}) THEN INTERVAL '30 days'`);
@@ -374,15 +348,11 @@ export function secretAuditLogWarmSqlCase(): string {
 
 /* ──────────────────────────── Cold retention ──────────────────────────── */
 
-/**
- * Cold-store retention horizon. Number of days a chunk lives in S3 after
- * archival before it is purged; `'forever'` means the chunk is never purged.
- */
+/** Days a chunk lives in S3 after archival before purge; `'forever'` never purges. */
 export type ColdRetention = number | 'forever';
 
 /**
- * Cold-retention days per `AccessLogAction`. Mirrors `ACCESS_LOG_WARM_DAYS`'s
- * shape (exhaustive over the enum). Buckets:
+ * Cold-retention days per `AccessLogAction`, exhaustive over the enum. Buckets:
  *
  * - 30 days: internal-ops reads (only denied/error rows survive write-time
  *   sampling; once they age out of warm, no need to keep them in cold either).
@@ -480,7 +450,8 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'db.reindex': 730,
   'db.refresh_collation_version': 730,
 
-  // 730 days — event DLQ admin actions (at-least-once delivery)
+  // event DLQ admin actions (at-least-once delivery): list read 180 days,
+  // retry / discard 730 days
   'event_dlq.list.read': 180,
   'event_dlq.retry': 730,
   'event_dlq.discard': 730,
@@ -504,10 +475,8 @@ const FORENSIC_OUTCOME_COLD_DAYS: ColdRetention = 730;
 const PLATFORM_OPERATOR_COLD: ColdRetention = 'forever';
 
 /**
- * Default cold TTL for action strings outside `AccessLogAction.options`. Same
- * conservative-by-default reasoning as `UNKNOWN_ACTION_WARM_DAYS`; matches
- * the 730d "tenant-plane mutations" bucket so unknown rows are kept long
- * enough for any forensic review.
+ * Cold TTL for action strings outside `AccessLogAction.options`; matches the
+ * 730d tenant-plane mutations bucket, as `UNKNOWN_ACTION_WARM_DAYS` does.
  */
 const UNKNOWN_ACTION_COLD_DAYS: ColdRetention = 730;
 
@@ -524,11 +493,8 @@ export function getAccessLogColdDays(args: {
 /**
  * Cold retention for Platform `audit_log`. Mirrors `auditLogWarmDays()`.
  * Compliance-class actions (billing, RBAC, platform-admin, system events) are
- * `'forever'`; everything else (tenant-plane mutations) is 730 days.
- *
- * Same column-availability caveat as `auditLogWarmSqlCase()` — Platform
- * `audit_log` has no `outcome` or `actor_type` column; the JS-side override
- * still applies for callers that genuinely have an `actorType` to pass.
+ * `'forever'`; everything else (tenant-plane mutations) is 730 days. The
+ * `platform_operator` override lives in `getAuditLogColdDays()`, as for warm.
  */
 export function auditLogColdDays(action: string): ColdRetention {
   if (COMPLIANCE_AUDIT_EXACT.has(action)) return 'forever';
@@ -563,11 +529,9 @@ export function getSecretAuditLogColdDays(args: {
 }
 
 /**
- * Test-only helper that returns the minimum warm-retention TTL across all
- * `AccessLogAction` actions and override paths. Used by adapter tests to
- * sanity-check that `DEFAULT_CONFIG.warmTtlDays` matches this minimum (so
- * the framework's partition-day scan doesn't pre-filter out rows the adapter
- * would consider eligible).
+ * Minimum warm-retention TTL in `ACCESS_LOG_WARM_DAYS`. The cold-store adapter
+ * uses it as `warmTtlDays`, so the partition-day scan never pre-filters out
+ * rows the adapter would consider eligible.
  */
 export function minAccessLogWarmDays(): number {
   return Math.min(...Object.values(ACCESS_LOG_WARM_DAYS));

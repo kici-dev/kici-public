@@ -2,16 +2,14 @@
  * The `cold-store` admin subcommands shared by `kici-admin` (orchestrator
  * database) and `kici-platform-admin` (Platform database).
  *
- * Each side passes a `ColdStoreAdminSide`: the `db` key segment its chunks
- * live under, the noun its errors name, the `archiverInstanceId` a rebuilt
- * manifest records, and a `build()` that opens its own Postgres pool and
- * cold store. Every op:
+ * Each side passes a `ColdStoreAdminSide` whose `build()` opens its own
+ * Postgres pool and cold store. Every op:
  *
  *   - builds a fresh store per invocation (the CLI holds no long-lived state)
  *     and closes it when done
  *   - reaches S3 only through public `BaseColdStore` helpers
- *   - prints results to stdout (JSON Lines for list-chunks, JSONL for
- *     peek-chunk, free-form for the others)
+ *   - prints to stdout (JSON Lines for list-chunks and peek-chunk, free-form
+ *     for the others)
  *   - throws on failure (the caller maps it to an exit code)
  */
 import { sha256 } from '@kici-dev/core';
@@ -176,9 +174,8 @@ async function resolveChunkKeys(
 }
 
 /**
- * List the table's (optionally one tenant's) chunk objects and group the
- * data and manifest keys of each chunk. `skip` drops a chunk by its
- * partition date before it is grouped.
+ * Group each chunk's data and manifest keys, for the table or one tenant.
+ * `skip` drops a chunk by its partition date before grouping.
  */
 async function groupChunkKeys(
   side: ColdStoreAdminSide,
@@ -210,11 +207,7 @@ async function groupChunkKeys(
   return groups;
 }
 
-/**
- * Run one synchronous archive cycle restricted to a single registered
- * adapter, for an operator who wants to flush a freshly-eligible
- * partition immediately rather than wait for the hourly cron tick.
- */
+/** One synchronous archive cycle for one adapter, instead of waiting for the hourly tick. */
 async function archiveNow(
   side: ColdStoreAdminSide,
   opts: ColdStoreAdminStoreOpts & { table: string },
@@ -568,11 +561,7 @@ async function reconcile(
   });
 }
 
-/**
- * List chunks past their cold-retention horizon. Read-only; no S3 or
- * Postgres mutation. Emits one JSON line per row so the output pipes
- * through `jq` / `column -t`.
- */
+/** Read-only: one JSON line per chunk past its cold-retention horizon, for `jq` / `column -t`. */
 async function listPurgeable(
   side: ColdStoreAdminSide,
   opts: ColdStoreAdminPurgeOpts,

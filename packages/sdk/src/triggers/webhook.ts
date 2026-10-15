@@ -1,15 +1,10 @@
-/**
- * Webhook trigger helper - catch-all trigger for any GitHub webhook event.
- * Returns a frozen WebhookTriggerConfig directly.
- *
- * Unlike other triggers, `events` is required -- catch-all must specify what to catch.
- */
-
 import type { BranchPattern, WebhookConfigInput, WebhookTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';
 
 /**
- * Create a catch-all webhook trigger configuration.
+ * Create a frozen catch-all trigger for any GitHub webhook event. Unlike other
+ * triggers, `events` is required (a catch-all must name what it catches);
+ * an empty list throws.
  *
  * @example
  * // Match deployment events

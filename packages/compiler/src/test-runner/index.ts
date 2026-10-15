@@ -1,7 +1,3 @@
-/**
- * Test runner utilities and exports
- */
-
 export * from './event-types.js';
 export * from './git-detector.js';
 export * from './step-context.js';

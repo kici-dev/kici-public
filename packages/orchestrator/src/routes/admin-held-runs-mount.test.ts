@@ -1,16 +1,11 @@
 /**
  * The `createAdminRoutes` mount seam for the held-run routes.
- *
- * `admin-held-runs.test.ts` drives the route factory directly, which proves
- * nothing about whether `admin.ts` ever mounts it — a test driving one layer
- * misses a defect in the layer beside it. So these go through
- * `createAdminRoutes` with real bearer auth, and
- * assert the three-part mount condition: a database, an audit sink, AND the
- * release wiring.
- *
- * The condition matters in both directions. Dropping the wiring must leave the
- * route ABSENT (404) rather than mounted with an approve that flips a row and
- * dispatches nothing; supplying it must make the route answer.
+ * `admin-held-runs.test.ts` drives the factory directly, which proves nothing
+ * about whether `admin.ts` mounts it. These go through `createAdminRoutes`
+ * with real bearer auth and assert the mount condition: a database, an audit
+ * sink, AND the release wiring. Both directions matter: without the wiring the
+ * route is ABSENT (404), not mounted with an approve that dispatches nothing;
+ * with it, the route answers.
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { Kysely } from 'kysely';
@@ -21,19 +16,9 @@ import { PLATFORM_MANAGED_HELD_RUN_MESSAGE } from './admin-held-runs.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import type { Database } from '../db/types.js';
 import type { ReleaseSignal } from '../contexts/held-runs.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 const TOKEN = 'admin-token';
-
-/** A query builder that resolves to nothing — no held run exists in these tests. */
-function fakeDb(): Kysely<Database> {
-  const chain: Record<string, unknown> = {};
-  for (const m of ['select', 'selectAll', 'where', 'innerJoin', 'orderBy', 'limit']) {
-    chain[m] = () => chain;
-  }
-  chain.executeTakeFirst = async () => undefined;
-  chain.execute = async () => [];
-  return { selectFrom: () => chain } as unknown as Kysely<Database>;
-}
 
 function makeDeps(over: Partial<AdminRouteDeps>): AdminRouteDeps {
   return {
@@ -68,7 +53,7 @@ describe('held-run routes mount', () => {
   it('is mounted when db + accessLog + release wiring are all present', async () => {
     const app = createAdminRoutes(
       makeDeps({
-        db: fakeDb(),
+        db: createMockDb().db as Kysely<Database>,
         accessLog,
         heldRunRelease: release,
         mode: OrchestratorMode.enum.independent,
@@ -82,7 +67,7 @@ describe('held-run routes mount', () => {
   it('carries the mode through, so a Platform-attached orchestrator refuses', async () => {
     const app = createAdminRoutes(
       makeDeps({
-        db: fakeDb(),
+        db: createMockDb().db as Kysely<Database>,
         accessLog,
         heldRunRelease: release,
         mode: OrchestratorMode.enum.platform,
@@ -94,14 +79,20 @@ describe('held-run routes mount', () => {
   });
 
   it('defaults an unset mode to the refusing one, never to independent', async () => {
-    const app = createAdminRoutes(makeDeps({ db: fakeDb(), accessLog, heldRunRelease: release }));
+    const app = createAdminRoutes(
+      makeDeps({ db: createMockDb().db as Kysely<Database>, accessLog, heldRunRelease: release }),
+    );
     const res = await get(app, '/api/v1/admin/held-runs?customerId=org-1&runId=run-1');
     expect(res.status).toBe(409);
   });
 
   it('is ABSENT without the release wiring — a decision that cannot dispatch is no surface', async () => {
     const app = createAdminRoutes(
-      makeDeps({ db: fakeDb(), accessLog, mode: OrchestratorMode.enum.independent }),
+      makeDeps({
+        db: createMockDb().db as Kysely<Database>,
+        accessLog,
+        mode: OrchestratorMode.enum.independent,
+      }),
     );
     const res = await get(app, '/api/v1/admin/held-runs?customerId=org-1&runId=run-1');
     expect(res.status).toBe(404);
@@ -110,7 +101,7 @@ describe('held-run routes mount', () => {
   it('is ABSENT without an audit sink — a locally-answered hold must be attributable', async () => {
     const app = createAdminRoutes(
       makeDeps({
-        db: fakeDb(),
+        db: createMockDb().db as Kysely<Database>,
         heldRunRelease: release,
         mode: OrchestratorMode.enum.independent,
       }),
@@ -132,7 +123,7 @@ describe('held-run routes mount', () => {
   it('still requires a bearer token', async () => {
     const app = createAdminRoutes(
       makeDeps({
-        db: fakeDb(),
+        db: createMockDb().db as Kysely<Database>,
         accessLog,
         heldRunRelease: release,
         mode: OrchestratorMode.enum.independent,

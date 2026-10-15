@@ -1,15 +1,8 @@
 /**
- * Host roster management commands for kici-admin (orchestrator data plane).
- *
- *   host list      List all roster hosts with derived status
- *   host get       Show one roster host
- *   host declare   Pre-declare a static host before its agent connects
- *   host remove    Remove a host from the roster
- *
- * Reads/writes the orchestrator DB directly (via withDb), so this lives in
- * kici-admin — never in the public `kici` or the Platform `kici-platform-admin`.
- * Writes run as the operator: they may set reserved `kici:` labels and
- * properties, change any host, and confirm a host the dashboard created.
+ * `kici-admin host` roster commands. They use the orchestrator DB directly, so
+ * they live in kici-admin, never `kici` or `kici-platform-admin`. Writes run as
+ * the operator: they may set reserved `kici:` labels and properties, change any
+ * host, and confirm a host the dashboard created.
  */
 
 import type { Command } from 'commander';
@@ -23,15 +16,13 @@ import { deriveHostStatus, HostRosterStore, HostWriteAuthority } from '../../age
 import type { Database, HostRosterRow } from '../../db/types.js';
 import { cliAction } from './shared/cli-action.js';
 
-/** Collect a repeatable `--prop key=value` flag into an array. */
 function collectProp(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
 /**
- * The CLI reads the roster DB directly (no full orchestrator config load), so
- * it sources the grace window from the same env var the orchestrator config
- * defaults from. Default mirrors `config.ts` rosterGraceMs (300_000).
+ * No orchestrator config load here, so the grace window comes from the env var
+ * the config defaults from. Default mirrors `config.ts` rosterGraceMs (300_000).
  */
 function rosterGraceMs(): number {
   const v = Number(process.env.KICI_ROSTER_GRACE_MS);
@@ -46,7 +37,7 @@ function formatHostTable(rows: HostRosterRow[]): string {
   const now = Date.now();
   const grace = rosterGraceMs();
   const body = rows.map((r) => {
-    // SAME deriveHostStatus the store uses — no divergent inline logic.
+    // The store's own deriveHostStatus: no divergent inline logic.
     const status = deriveHostStatus(r, now, grace);
     const labels = (JSON.parse(r.labels) as string[]).join(',');
     return `${r.agent_id} | ${r.lifecycle_class} | ${status} | ${r.connected_instance_id ?? '-'} | ${new Date(r.last_seen).toISOString()} | ${labels} | ${r.identity_source}`;

@@ -1,10 +1,7 @@
 /**
- * `kici report` — produce a redacted diagnostic bundle to share when reporting
- * an issue, and optionally upload it privately to KiCI.
- *
- * Writing and sending are separate acts. The default writes a ZIP next to you
- * and tells you where it is, so you can open it and see exactly what you would
- * be sharing; `--upload` is the explicit second step.
+ * `kici report`: a redacted diagnostic bundle, optionally uploaded privately to
+ * KiCI. Writing and sending are separate acts: the default writes a local ZIP
+ * to review, and `--upload` is the explicit second step.
  */
 
 import * as path from 'node:path';
@@ -52,11 +49,8 @@ export interface ReportWithdrawOptions {
 }
 
 /**
- * Parse repeatable `--metadata key=value` into a record.
- *
- * The accumulator is null-prototyped so a `__proto__=x` pair is stored as an
- * ordinary key rather than silently vanishing into the prototype — a dropped
- * pair in a diagnostic bundle is a lie about what the reporter attached.
+ * The accumulator is null-prototyped so a `__proto__=x` pair is kept as an
+ * ordinary key instead of silently vanishing from the bundle.
  */
 export function parseMetadata(pairs: string[]): Record<string, string> {
   const out: Record<string, string> = Object.create(null) as Record<string, string>;
@@ -70,7 +64,7 @@ export function parseMetadata(pairs: string[]): Record<string, string> {
   return { ...out };
 }
 
-/** Default bundle path: timestamped, in the working directory. */
+/** Timestamped, in the working directory. */
 export function defaultOutputPath(now: Date): string {
   const stamp = now.toISOString().replace(/[:.]/g, '-').replace(/Z$/, '');
   return path.resolve(`./kici-report-${stamp}.zip`);
@@ -83,9 +77,7 @@ export async function reportCommand(options: ReportOptions): Promise<boolean> {
     const outputPath = options.output ? path.resolve(options.output) : defaultOutputPath(now);
 
     if (!options.redact && options.upload) {
-      // The docs say --no-redact is for a bundle you keep. Uploading one sends
-      // plaintext secrets to KiCI storage, which no warning makes safe, so the
-      // combination is refused rather than warned about.
+      // No warning makes uploading plaintext secrets safe, so this is refused.
       throw new Error(
         '--no-redact cannot be combined with --upload: that would send unredacted ' +
           'secrets to KiCI. Write the bundle locally, review it, and share it yourself.',
@@ -93,9 +85,7 @@ export async function reportCommand(options: ReportOptions): Promise<boolean> {
     }
 
     if (!options.redact) {
-      // Deliberately console.warn rather than logger.warn: a raised log level
-      // would suppress a logger call, and the one warning a user must never
-      // miss is the one saying their bundle holds secrets in plain text.
+      // console.warn, not logger.warn: a raised log level must never hide this.
       console.warn(
         pc.yellow(
           'WARNING: --no-redact was given. This bundle keeps secrets in plain text. ' +
@@ -121,8 +111,7 @@ export async function reportCommand(options: ReportOptions): Promise<boolean> {
     console.log(`  sha256: ${result.sha256}`);
     console.log(`  ${result.fileCount} file(s) collected`);
     if (problems.length > 0) {
-      // Named rather than counted: a reader deciding whether the bundle is
-      // worth sending needs to know WHICH section is thin.
+      // Named, not counted: the reader needs to know which section is thin.
       console.log(
         `  incomplete: ${problems.map((p) => `${p.collector} (${p.status})`).join(', ')}`,
       );
@@ -197,8 +186,7 @@ export async function reportWithdrawCommand(options: ReportWithdrawOptions): Pro
 
     const result = await withdraw(options.ref);
     if (!result.deleted) {
-      // Never claim a deletion the Platform did not report. A customer
-      // withdrawing a bundle needs to know it is actually gone.
+      // Never claim a deletion the Platform did not report.
       logger.error(pc.red(`Report ${options.ref} was NOT deleted. Try again, or contact KiCI.`));
       return false;
     }

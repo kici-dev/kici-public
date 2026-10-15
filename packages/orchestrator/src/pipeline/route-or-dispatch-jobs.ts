@@ -1,13 +1,8 @@
 /**
- * Shared coordinator-route / direct-dispatch machinery for the orchestrator
- * pipeline.
- *
- * The re-run path (`rerun.ts`) and the manual-schedule path
- * (`manual-schedule.ts`) both materialize a workflow's static jobs, try to
- * route them through the cluster coordinator (local dispatch first, then
- * reroute to peers), fall back to direct local dispatch in standalone mode or
- * on a coordinator timeout, and synthesize records for rejected jobs. This
- * module implements that once so a fix lands in a single place.
+ * Shared coordinator-route / direct-dispatch machinery for `rerun.ts` and
+ * `manual-schedule.ts`: materialize static jobs, route through the cluster
+ * coordinator (local first, then peers), fall back to direct local dispatch in
+ * standalone mode or on a coordinator timeout, and synthesize rejected records.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -38,24 +33,22 @@ export interface DispatchedJobEntry {
   matrixValues?: Record<string, unknown>;
   runsOnLabels?: string[];
   /**
-   * The unexpanded job name a materialized child came from. Persisted to
-   * `execution_jobs.base_job_name`, which is the key the rolling-wave scheduler
-   * groups a wave's children by — a NULL there makes the wave gate bail.
+   * Unexpanded job name of a materialized child, persisted to
+   * `execution_jobs.base_job_name`: the rolling-wave scheduler groups a wave by it,
+   * and a NULL makes the wave gate bail.
    */
   baseJobName?: string;
   /**
-   * `gate` marks an invoke-gate row (runs the gate executor, never an agent).
-   * The global-workflow dispatch path registers a gate as a synthetic pending
-   * row and carries its kind through to `execution_jobs.job_kind`.
+   * `gate` marks an invoke-gate row (gate executor, never an agent). The
+   * global-workflow dispatch path carries it to `execution_jobs.job_kind`.
    */
   jobKind?: JobKind;
   /** For a gate job, its wall-clock timeout in ms (orchestrator-swept). */
   timeoutMs?: number;
   /**
-   * The `gitCredentials` map this job's lock entry declared, verbatim.
-   * Persisted to `execution_jobs.git_credentials`, which the credential relay
-   * authorizes a workflow-supplied ref against. Dropping it here would refuse
-   * every declared credential on a job this path registered.
+   * The lock entry's `gitCredentials`, verbatim, persisted to
+   * `execution_jobs.git_credentials`; the credential relay authorizes against it,
+   * so dropping it refuses every declared credential.
    */
   gitCredentials?: Readonly<Record<string, Readonly<Record<string, string>>>>;
 }
@@ -72,10 +65,7 @@ export interface RejectedJobEntry {
   reason: string;
 }
 
-/**
- * Distinguishes the race timeout from any other `routeJobs` rejection so the
- * fallback log line names the real cause.
- */
+/** Lets the fallback log tell a race timeout from other `routeJobs` rejections. */
 class RouteJobsTimeoutError extends Error {
   constructor(timeoutMs: number) {
     super(`routeJobs timed out after ${timeoutMs}ms`);
@@ -85,7 +75,7 @@ class RouteJobsTimeoutError extends Error {
 
 export interface RouteOrDispatchOptions {
   newRunId: string;
-  /** Static jobs before materialization — the helper materializes + handles FanoutError. */
+  /** Unmaterialized; the helper materializes and handles FanoutError. */
   staticJobs: LockJob[];
   workflowName: string;
   repoUrl: string;
@@ -99,19 +89,18 @@ export interface RouteOrDispatchOptions {
   runContext: RunContext;
   /** Per-caller jobConfig shape (schedule dispatchInputs vs. rerun source fallback). */
   buildJobConfig: (mat: MaterializedJob) => Record<string, unknown>;
-  /** Caller's own logger — keeps the originating prefix ('manual-schedule' / 'rerun'). */
+  /** Keeps the caller's log prefix ('manual-schedule' / 'rerun'). */
   logger: ReturnType<typeof createLogger>;
-  /** Human label used in log messages: 'Manual schedule' | 'Re-run'. */
+  /** Log label: 'Manual schedule' | 'Re-run'. */
   label: string;
   coordinator: RunCoordinator | null;
   dispatcher: Dispatcher;
 }
 
 /**
- * Materialize the static jobs (degrading gracefully on a matrix that can no
- * longer expand), then route them via the coordinator or, in standalone mode /
- * on a coordinator timeout, dispatch directly. Returns the jobs to register
- * with the execution tracker plus any synthetic-rejected IDs to mark failed.
+ * Materialize (degrading on a matrix that can no longer expand), then route via
+ * the coordinator or dispatch directly. Returns jobs to register plus
+ * synthetic-rejected IDs to mark failed.
  */
 export async function routeOrDispatchJobs(opts: RouteOrDispatchOptions): Promise<{
   dispatchedJobs: DispatchedJobEntry[];
@@ -134,9 +123,8 @@ export async function routeOrDispatchJobs(opts: RouteOrDispatchOptions): Promise
 }
 
 /**
- * Re-materialize the matrix fresh from the current lock content. A matrix that
- * can no longer expand fails only that job (synthetic-rejected); the rest of
- * the run proceeds.
+ * Materialize fresh from the current lock content. A matrix that can no longer
+ * expand fails only that job (synthetic-rejected); the run proceeds.
  */
 function materializeWithDegradation(staticJobs: LockJob[]): {
   materializedJobs: MaterializedJob[];
@@ -217,10 +205,8 @@ async function tryRouteViaCoordinator(
 }
 
 /**
- * Race `coordinator.routeJobs` against a timeout, clearing the timer in every
- * exit path. A timeout is reported distinctly from any other rejection so the
- * fallback log names the real cause. Returns null on any failure (the caller
- * then dispatches directly).
+ * Race `coordinator.routeJobs` against a timeout, clearing the timer on every
+ * exit. Null on any failure; the caller then dispatches directly.
  */
 async function raceRouteJobs(
   coordinator: RunCoordinator,
@@ -275,10 +261,7 @@ function toJobToRoute(opts: RouteOrDispatchOptions, mat: MaterializedJob): JobTo
   };
 }
 
-/**
- * Standalone mode OR coordinator timeout/error: direct dispatch locally,
- * synthesizing a rejected entry for any job the dispatcher rejects.
- */
+/** Standalone mode OR coordinator failure: dispatch locally, synthesizing rejected entries. */
 async function dispatchDirectly(
   opts: RouteOrDispatchOptions,
   materializedJobs: MaterializedJob[],
@@ -350,10 +333,7 @@ export interface RegisterDispatchedJobsOptions {
   executionTracker: ExecutionTracker;
 }
 
-/**
- * Register dispatched jobs with the execution tracker, then mark any
- * synthetic-rejected jobs failed. No-op when nothing was dispatched.
- */
+/** Register dispatched jobs, then fail synthetic-rejected ones. No-op when none dispatched. */
 export async function registerDispatchedJobs(opts: RegisterDispatchedJobsOptions): Promise<void> {
   const { newRunId, dispatchedJobs, rejectedJobs, executionTracker } = opts;
   if (dispatchedJobs.length === 0) {
@@ -362,9 +342,8 @@ export async function registerDispatchedJobs(opts: RegisterDispatchedJobsOptions
 
   await executionTracker.addJobsToRun(newRunId, dispatchedJobs);
 
-  // Mark rejected jobs as failed. Synthetic rejected IDs come from an
-  // unexpandable matrix (FanoutError) or a direct-dispatch rejection; the
-  // coordinator logs its own failed jobs separately and produces none here.
+  // Synthetic rejected IDs come from FanoutError or a direct-dispatch rejection;
+  // the coordinator logs its own failed jobs and produces none here.
   for (const { jobId, reason } of rejectedJobs) {
     await executionTracker.onJobStatus(
       newRunId,

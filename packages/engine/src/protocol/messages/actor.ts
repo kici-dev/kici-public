@@ -4,11 +4,10 @@ import { z } from 'zod';
  * Typed actor principal for attributable reads, writes, and admin operations
  * across the Platform → orchestrator and orchestrator → agent boundaries.
  *
- * Every dashboard.* / run.* proxy message carries an `actor` field so the
- * orchestrator can write an `access_log` row attributable to a specific
- * principal. The discriminated union prevents string-shape drift between
- * tiers and encodes the reason for break-glass operator access at the
- * protocol level rather than in free-text metadata.
+ * Every dashboard.* / run.* proxy message carries an `actor` so the
+ * orchestrator can attribute its `access_log` row. The discriminated union
+ * prevents string-shape drift between tiers and carries the break-glass
+ * operator reason at the protocol level, not in free-text metadata.
  */
 
 export const ActorType = z.enum([
@@ -115,9 +114,8 @@ export type ActorPrincipal = z.infer<typeof actorPrincipalSchema>;
 export const ACTOR_AGENT_SUFFIX = ' via agent:';
 
 /**
- * Convert an ActorPrincipal to a colon-prefixed string suitable for DB
- * persistence in columns like `execution_runs.triggered_by` / `.cancelled_by`.
- * The inverse of parseActor().
+ * Convert an ActorPrincipal to a colon-prefixed string for DB columns like
+ * `execution_runs.triggered_by` / `.cancelled_by`. The inverse of parseActor().
  *
  * Format: `${type}:${id}` where id is the variant's natural identifier, plus
  * {@link ACTOR_AGENT_SUFFIX} and the label when the actor acted through an
@@ -145,9 +143,9 @@ export function stringifyActor(actor: ActorPrincipal): string {
 }
 
 /**
- * Parse a `${type}:${id}` string back into a partial ActorPrincipal.
- * Because the string form drops metadata, api_key.ownerSub and
- * platform_operator.reason are null when the source is a string.
+ * Parse a `${type}:${id}` string into its actor type and id. The string form
+ * drops variant metadata, so api_key.ownerSub and platform_operator.reason are
+ * not recovered.
  *
  * Returns null for unrecognized inputs; callers that need strict parsing
  * should throw on null.
@@ -166,10 +164,9 @@ export function parseActor(
 }
 
 /**
- * Flatten an ActorPrincipal into the three columns the orchestrator
- * `access_log` table uses: (actor_type, actor_id, actor_meta).
- * actor_meta preserves the variant-specific extras that are lost in
- * stringifyActor().
+ * Flatten an ActorPrincipal into the orchestrator `access_log` columns
+ * (actor_type, actor_id, actor_meta). actor_meta keeps the variant-specific
+ * extras that stringifyActor() drops.
  */
 export function flattenActor(actor: ActorPrincipal): {
   actorType: ActorType;
@@ -210,9 +207,8 @@ export function flattenActor(actor: ActorPrincipal): {
 }
 
 /**
- * Extract the agent provenance label from an actor, when present. Returns the
- * label for agent-kind `user` (PAT) and `api_key` (org key) actors, else null.
- * The single label extractor reused by run capture and the access-log writer so
+ * The agent provenance label of an agent-kind `user` (PAT) or `api_key` (org
+ * key) actor, else null. Run capture and the access-log writer share it, so
  * both credential families surface agent provenance identically.
  */
 export function agentLabelOf(actor: ActorPrincipal): string | null {

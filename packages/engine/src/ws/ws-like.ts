@@ -1,24 +1,21 @@
 /**
- * Minimal WebSocket interface for testability.
- *
- * Avoids importing framework-specific types so registries and handlers
- * can be unit-tested with plain mock objects.
+ * Minimal WebSocket interface, free of framework types, so registries and
+ * handlers can be unit-tested with plain mock objects.
  */
 export interface WsLike {
   send(data: string | ArrayBuffer): void;
   close(code?: number, reason?: string): void;
   readyState: number;
   /**
-   * Bytes queued in the socket's send buffer, when the transport exposes it.
-   * The `ws` library socket does; used by the browser fan-out to terminate a
-   * slow consumer past a watermark instead of buffering unboundedly in heap.
-   * Optional so mock sockets and non-`ws` transports need not provide it.
+   * Bytes queued in the send buffer, when the transport exposes it (`ws`
+   * does). The browser fan-out terminates a slow consumer past a watermark
+   * instead of buffering unboundedly in heap. Optional for mocks and non-`ws`
+   * transports.
    */
   bufferedAmount?: number;
   /**
-   * Force-close the underlying socket immediately, when the transport exposes
-   * it (the `ws` library socket does). Optional for the same reason as
-   * `bufferedAmount`.
+   * Force-close the socket immediately, when the transport exposes it (`ws`
+   * does). Optional, like `bufferedAmount`.
    */
   terminate?(): void;
 }

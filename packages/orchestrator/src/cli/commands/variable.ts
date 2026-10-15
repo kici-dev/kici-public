@@ -6,11 +6,9 @@
  *   kici-admin variable set    <orgId> <context> <key> [--value | --from-stdin | --from-file | --from-env | --prompt]
  *   kici-admin variable delete <orgId> <context> <key>
  *
- * Org-level context variables are plaintext-at-rest in the
- * orchestrator's DB; the dashboard write path is gated by the
- * `variables.set` / `variables.delete` switches in the dashboard-write
- * policy. This CLI is the always-available authority path when the
- * dashboard is disabled for either switch.
+ * Context variables are plaintext at rest. The dashboard write path is gated
+ * by the `variables.set` / `variables.delete` dashboard-write switches; this
+ * CLI is the always-available path when either is off.
  */
 
 import type { Command } from 'commander';

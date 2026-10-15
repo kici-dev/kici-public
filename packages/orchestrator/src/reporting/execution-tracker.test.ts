@@ -21,8 +21,8 @@ import {
   TERMINAL_RUN_STATES,
   resolveWhenToRunOn,
 } from '@kici-dev/engine';
+import { startRun } from '../__test-helpers__/tracker.js';
 
-// Mock Prometheus metrics
 vi.mock('../metrics/prometheus.js', () => ({
   executionsTotal: { add: vi.fn() },
   executionDurationSeconds: { record: vi.fn() },
@@ -48,13 +48,9 @@ interface MockDelete {
 }
 
 /**
- * Create a mock Kysely DB that captures insert/update operations.
- * Sufficient for testing ExecutionTracker's DB write-through behavior.
- *
- * NOTE: This test uses a specialized stateful mock (capturing inserts/updates
- * with per-table tracking and step row simulation) instead of the shared
- * createMockDb() from '../__test-helpers__/mock-db.js' because
- * ExecutionTracker tests verify exact captured DB operations.
+ * A stateful mock Kysely DB that captures inserts/updates per table and simulates step rows.
+ * The shared createMockDb() ('../__test-helpers__/mock-db.js') does not fit: these tests
+ * verify exact captured DB operations.
  */
 function createMockDb() {
   const inserts: MockRow[] = [];
@@ -82,10 +78,8 @@ function createMockDb() {
       workflow_name?: string;
       repo_identifier?: string;
       workflow_repo_identifier?: string;
-      // The run's trust posture. Tracked so the rehydration path below returns
-      // what the row really holds: the columns are written by a separate
-      // dispatch-side UPDATE, never by the insert, so a mock that only echoed
-      // insert values could not express a recovered posture at all.
+      // The run's trust posture. A separate dispatch-side UPDATE writes these columns, never
+      // the insert, so tracking them lets the rehydration path return a recovered posture.
       trust_tier?: string | null;
       lock_file_source?: string | null;
       registration_window_instance_id?: string | null;
@@ -96,9 +90,8 @@ function createMockDb() {
     }
   >();
   /**
-   * `cluster_instances` rows with a fresh heartbeat. The registration-window
-   * holder check reads liveness from here, so a test declares which sibling
-   * coordinators are alive.
+   * `cluster_instances` rows with a fresh heartbeat: the registration-window holder check
+   * reads liveness here, so a test declares which sibling coordinators are alive.
    */
   const liveInstances = new Set<string>();
 
@@ -111,12 +104,10 @@ function createMockDb() {
           const executeInsert = async () => {
             for (const v of insertValues) {
               inserts.push({ table, values: v });
-              // Track step rows for subsequent upserts
               if (table === 'execution_steps') {
                 const key = `${v.run_id}:${v.job_id}:${v.step_index}`;
                 stepRows.set(key, { id: `step-${stepRows.size}` });
               }
-              // Track execution_jobs rows for subsequent upserts
               if (table === 'execution_jobs') {
                 const key = `${v.run_id}:${v.job_id}`;
                 jobRows.set(key, {
@@ -126,17 +117,14 @@ function createMockDb() {
                   status: v.status as string | undefined,
                 });
               }
-              // Track execution_runs rows for subsequent upserts
               if (table === 'execution_runs') {
                 runRows.set(String(v.run_id), {
                   status: v.status as string | undefined,
-                  // Carried so the rehydration path below can return the name
-                  // the row was really written with — the round-job guard in
-                  // `recoverRunFromDb` reads exactly this column.
+                  // Carried so rehydration returns the name the row was written with:
+                  // the round-job guard in `recoverRunFromDb` reads exactly this column.
                   workflow_name: v.workflow_name as string | undefined,
-                  // Same reason, and it matters more here: the cross-repo marker
-                  // MEANS "differs from repo_identifier", so a mock that echoed
-                  // one and hardcoded the other could not express the invariant.
+                  // Same reason, and more so: the cross-repo marker MEANS "differs from
+                  // repo_identifier", so echoing one and hardcoding the other hides it.
                   repo_identifier: v.repo_identifier as string | undefined,
                   workflow_repo_identifier: v.workflow_repo_identifier as string | undefined,
                   failure_reason: v.failure_reason as string | null | undefined,
@@ -148,13 +136,11 @@ function createMockDb() {
           return {
             execute: vi.fn(executeInsert),
             onConflict: vi.fn((ocFn: (oc: unknown) => unknown) => {
-              // Record which conflict resolution the caller chose, so a test can
-              // tell an upsert from a doNothing. Without this the mock treats
-              // both alike and any assertion about upsert behavior is vacuous.
+              // Records the chosen conflict resolution so a test can tell an upsert from
+              // a doNothing; otherwise any assertion about upsert behavior is vacuous.
               let resolution: 'doNothing' | 'doUpdateSet' = 'doNothing';
-              // Captured from the production `.where(col, op, values)` guard so
-              // the mock applies the caller's condition instead of restating it
-              // — deleting the guard from the source must fail a test.
+              // The production `.where(col, op, values)` guard, applied rather than
+              // restated: deleting the guard from the source must fail a test.
               let guard: [string, string, unknown] | undefined;
               const target = () => ({
                 doNothing: () => {
@@ -172,12 +158,11 @@ function createMockDb() {
                 },
               });
               ocFn({ column: target, columns: target });
-              // Returns how many rows the upsert actually wrote, so a caller
-              // that gates on `numInsertedOrUpdatedRows` (the terminal-clobber
-              // guard) sees the guard's real verdict rather than a constant.
+              // The rows the upsert really wrote, so a caller gating on
+              // `numInsertedOrUpdatedRows` (the terminal-clobber guard) sees the real verdict.
               const runUpsert = async (): Promise<number> => {
                 const before = inserts.length + updates.length;
-                // Simulate upsert: if row exists, record as update; otherwise, record as insert
+                // Existing row → recorded as an update; otherwise as an insert
                 for (const v of insertValues) {
                   if (table === 'execution_steps') {
                     const key = `${v.run_id}:${v.job_id}:${v.step_index}`;
@@ -199,10 +184,9 @@ function createMockDb() {
                     const key = `${v.run_id}:${v.job_id}`;
                     const existingJob = jobRows.get(key);
                     if (existingJob) {
-                      // A conflicting row exists. The tracker's monotonicity
-                      // guard keeps an already-terminal row untouched, so the
-                      // mock applies the caller's own condition — deleting the
-                      // guard from the source must fail a test.
+                      // A conflicting row exists. The tracker's monotonicity guard keeps
+                      // a terminal row untouched; the mock applies the caller's own
+                      // condition, so deleting the guard from the source fails a test.
                       if (resolution === 'doNothing') continue;
                       if (guard && existingJob.status !== undefined) {
                         const [col, op, val] = guard;
@@ -244,9 +228,8 @@ function createMockDb() {
                     const key = String(v.run_id);
                     const existing = runRows.get(key);
                     if (existing) {
-                      // A conflicting row exists. `doNothing` leaves it alone;
-                      // an upsert rewrites it, but the tracker's guard keeps an
-                      // already-terminal row untouched.
+                      // A conflicting row exists: `doNothing` leaves it; an upsert
+                      // rewrites it, but the tracker's guard keeps a terminal row untouched.
                       if (resolution === 'doNothing') continue;
                       if (guard && existing.status !== undefined) {
                         const [col, op, val] = guard;
@@ -323,23 +306,19 @@ function createMockDb() {
               runUpdate();
               return [];
             }),
-            // Mirrors `execute`, but reports the row count so a caller that
-            // gates on `numUpdatedRows` (the terminal-clobber guard) sees the
-            // guard's real verdict rather than a constant.
+            // Like `execute`, but reports the row count, so a caller gating on
+            // `numUpdatedRows` (the terminal-clobber guard) sees the real verdict.
             executeTakeFirst: vi.fn(async () => ({
               numUpdatedRows: BigInt(runUpdate()),
             })),
           });
           /**
-           * Apply one guarded UPDATE. Honours a `status` predicate — `in`, `=`
-           * or `not in` — against the tracked run row, so an update whose guard
-           * excludes the row's current status is a no-op, the same way Postgres
-           * behaves. Without this the mock would apply every write and any
-           * assertion about a clobber guard would be vacuous. All three forms
-           * are honoured, not just `in`: the rehydration path resets a
-           * prematurely-failed run with `where status = 'failed'`, and applying
-           * that unconditionally rewrote the tracked row to `running` for every
-           * later read.
+           * Apply one guarded UPDATE. Honours a `status` predicate (`in`, `=` or `not in`)
+           * against the tracked run row, so an update whose guard excludes the current
+           * status is a no-op, as in Postgres; otherwise every clobber-guard assertion is
+           * vacuous. `=` matters: the rehydration path resets a prematurely-failed run with
+           * `where status = 'failed'`, and applying that unconditionally would rewrite the
+           * tracked row to `running` for every later read.
            */
           const runUpdate = (): number => {
             const runId = currentWheres.find((w) => w[0] === 'run_id')?.[2];
@@ -357,9 +336,8 @@ function createMockDb() {
                 return 0;
               }
             }
-            // The registration-window clear is guarded on the holder still
-            // being this coordinator; a clear against a sibling's window is a
-            // no-op, the same way Postgres behaves.
+            // The registration-window clear is guarded on the holder still being this
+            // coordinator; against a sibling's window it is a no-op, as in Postgres.
             const holderGuard = currentWheres.find(
               (w) => w[0] === 'registration_window_instance_id' && w[1] === '=',
             );
@@ -370,10 +348,9 @@ function createMockDb() {
               }
             }
             updates.push({ table, values: vals, where: [...currentWheres] });
-            // Keep the tracked run row current, so a later upsert's guard and
-            // the rehydration path both see what the row actually holds. Merged
-            // rather than replaced: a status-only UPDATE must not erase the
-            // columns a different UPDATE wrote.
+            // Keep the tracked run row current for a later upsert's guard and the
+            // rehydration path. Merged, not replaced: a status-only UPDATE must not erase
+            // columns another UPDATE wrote.
             if (table === 'execution_runs' && runId) {
               const existing = runRows.get(String(runId)) ?? {};
               const next = { ...existing };
@@ -410,14 +387,11 @@ function createMockDb() {
                 currentWheres.push([c, o, v]);
                 return buildExecute();
               }),
-              // Row-set read, served for exactly one query shape: every
-              // `execution_jobs` row of a run, unfiltered. That is the
-              // DB-fallback completion path, which is the case where the tracked
-              // rows and the in-memory map disagree. Every other row-set read
-              // (the scheduler-invariant scan and its `needs_satisfied` /
-              // `status` predicates, `execution_job_needs`, …) gets an empty
-              // set — serving those from this map would answer a question the
-              // map cannot represent.
+              // Row-set reads serve exactly one shape: every `execution_jobs` row of a run,
+              // unfiltered — the DB-fallback completion path, where tracked rows and the
+              // in-memory map disagree. Every other row-set read (the scheduler-invariant
+              // scan and its `needs_satisfied` / `status` predicates, `execution_job_needs`,
+              // …) gets an empty set: this map cannot represent those questions.
               execute: vi.fn(async () => {
                 selects.push({ table, where: [...currentWheres] });
                 // The finished-elsewhere sweep: every tracked run row whose id
@@ -468,9 +442,8 @@ function createMockDb() {
                 // findSyntheticJobId fallback: match (run_id, job_name, job_id LIKE)
                 if (table === 'execution_jobs') {
                   const runId = currentWheres.find((w) => w[0] === 'run_id')?.[2];
-                  // Point read by (run_id, job_id) — `isJobTerminal` and the
-                  // post-rejection status read. The row's stored status is the
-                  // whole point of both, so serve it from the tracked rows.
+                  // Point read by (run_id, job_id): `isJobTerminal` and the post-rejection
+                  // status read, both of which need the stored status.
                   const jobIdEq = currentWheres.find((w) => w[0] === 'job_id' && w[1] === '=')?.[2];
                   if (runId && jobIdEq) {
                     const row = jobRows.get(`${runId}:${jobIdEq}`);
@@ -610,18 +583,11 @@ describe('ExecutionTracker', () => {
 
   describe('onExecutionStarted', () => {
     it('inserts execution_runs row in DB', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        { installationId: 42 },
-        { matched: true },
-        baseJobs,
-      );
+      await startRun(tracker, {
+        providerContext: { installationId: 42 },
+        triggerDecision: { matched: true },
+        jobs: baseJobs,
+      });
 
       const runInsert = mockDb.inserts.find((i) => i.table === 'execution_runs');
       expect(runInsert).toBeDefined();
@@ -645,19 +611,11 @@ describe('ExecutionTracker', () => {
           return rk === 'generic:org-a:s1' ? 'org-a' : '__default__';
         },
       });
-      await t.onExecutionStarted(
-        'run-org',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        {},
-        null,
-        baseJobs,
-        'generic:org-a:s1', // routingKey
-      );
+      await startRun(t, {
+        runId: 'run-org',
+        jobs: baseJobs,
+        routingKey: 'generic:org-a:s1',
+      });
       const runInsert = mockDb.inserts.find(
         (i) => i.table === 'execution_runs' && i.values.run_id === 'run-org',
       );
@@ -672,19 +630,10 @@ describe('ExecutionTracker', () => {
           throw new Error('resolveOrgId must not be called for a null routing key');
         },
       });
-      await t.onExecutionStarted(
-        'run-nokey',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        {},
-        null,
-        baseJobs,
-        undefined, // routingKey
-      );
+      await startRun(t, {
+        runId: 'run-nokey',
+        jobs: baseJobs,
+      });
       const runInsert = mockDb.inserts.find(
         (i) => i.table === 'execution_runs' && i.values.run_id === 'run-nokey',
       );
@@ -693,19 +642,12 @@ describe('ExecutionTracker', () => {
 
     it('falls back to __default__ customer_id when no resolver is injected', async () => {
       // The default `tracker` (beforeEach) has no resolveOrgId dep.
-      await tracker.onExecutionStarted(
-        'run-noresolver',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        {},
-        null,
-        baseJobs,
-        'generic:org-a:s1', // routingKey present, but no resolver wired
-      );
+      await startRun(tracker, {
+        runId: 'run-noresolver',
+        jobs: baseJobs,
+        // routingKey present, but no resolver wired
+        routingKey: 'generic:org-a:s1',
+      });
       const runInsert = mockDb.inserts.find(
         (i) => i.table === 'execution_runs' && i.values.run_id === 'run-noresolver',
       );
@@ -713,27 +655,10 @@ describe('ExecutionTracker', () => {
     });
 
     it('persists workflow_timeout_ms when provided', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        {},
-        null,
-        baseJobs,
-        undefined, // routingKey
-        undefined, // dispatchedContexts
-        undefined, // triggerEvent
-        undefined, // commitMessage
-        undefined, // parentRunId
-        undefined, // triggeredBy
-        undefined, // originalRunId
-        undefined, // concurrency
-        1_800_000, // workflowTimeoutMs
-      );
+      await startRun(tracker, {
+        jobs: baseJobs,
+        workflowTimeoutMs: 1_800_000,
+      });
 
       const runInsert = mockDb.inserts.find((i) => i.table === 'execution_runs');
       expect(runInsert).toBeDefined();
@@ -741,18 +666,9 @@ describe('ExecutionTracker', () => {
     });
 
     it('omits workflow_timeout_ms when not provided', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        jobs: baseJobs,
+      });
 
       const runInsert = mockDb.inserts.find((i) => i.table === 'execution_runs');
       expect(runInsert).toBeDefined();
@@ -760,46 +676,19 @@ describe('ExecutionTracker', () => {
     });
 
     it('persists check_mode when provided', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        {},
-        null,
-        baseJobs,
-        undefined, // routingKey
-        undefined, // dispatchedContexts
-        undefined, // triggerEvent
-        undefined, // commitMessage
-        undefined, // parentRunId
-        undefined, // triggeredBy
-        undefined, // originalRunId
-        undefined, // concurrency
-        undefined, // workflowTimeoutMs
-        'check', // checkMode
-      );
+      await startRun(tracker, {
+        jobs: baseJobs,
+        checkMode: 'check',
+      });
 
       const runInsert = mockDb.inserts.find((i) => i.table === 'execution_runs');
       expect(runInsert!.values.check_mode).toBe('check');
     });
 
     it('omits check_mode when not provided', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        jobs: baseJobs,
+      });
 
       const runInsert = mockDb.inserts.find((i) => i.table === 'execution_runs');
       expect(runInsert!.values).not.toHaveProperty('check_mode');
@@ -808,31 +697,12 @@ describe('ExecutionTracker', () => {
     it('onExecutionStarted persists the trigger actor into the run insert + context', async () => {
       const onExecutionStatusChange = vi.fn();
       const t = new ExecutionTracker({ db: mockDb.db as any, onExecutionStatusChange });
-      await t.onExecutionStarted(
-        'run-actor',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        {},
-        null,
-        baseJobs,
-        undefined, // routingKey
-        undefined, // dispatchedContexts
-        undefined, // triggerEvent
-        undefined, // commitMessage
-        undefined, // parentRunId
-        undefined, // triggeredBy
-        undefined, // originalRunId
-        undefined, // concurrency
-        undefined, // workflowTimeoutMs
-        undefined, // checkMode
-        undefined, // localWorkingTree
-        'octocat', // triggerActorUsername
-        '583231', // triggerActorUserId
-      );
+      await startRun(t, {
+        runId: 'run-actor',
+        jobs: baseJobs,
+        triggerActorUsername: 'octocat',
+        triggerActorUserId: '583231',
+      });
 
       const runInsert = mockDb.inserts.find(
         (i) => i.table === 'execution_runs' && i.values.run_id === 'run-actor',
@@ -847,18 +717,10 @@ describe('ExecutionTracker', () => {
     });
 
     it('getRunIdForJob maps a dispatched jobId back to its owning run', async () => {
-      await tracker.onExecutionStarted(
-        'run-emit',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        runId: 'run-emit',
+        jobs: baseJobs,
+      });
 
       // Both dispatched jobs resolve to the owning run (the agent's event.emit
       // is job-scoped; this is what lets the run-keyed context resolve).
@@ -869,18 +731,10 @@ describe('ExecutionTracker', () => {
     });
 
     it('inserts execution_jobs rows in DB', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        null,
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        deliveryId: null,
+        jobs: baseJobs,
+      });
 
       const jobInserts = mockDb.inserts.filter((i) => i.table === 'execution_jobs');
       expect(jobInserts).toHaveLength(2);
@@ -896,36 +750,19 @@ describe('ExecutionTracker', () => {
         { jobId: 'job-1', jobName: 'test[node-18]', matrixValues: { node: '18' } },
       ];
 
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        null,
-        {},
-        null,
-        matrixJobs,
-      );
+      await startRun(tracker, {
+        deliveryId: null,
+        jobs: matrixJobs,
+      });
 
       const jobInsert = mockDb.inserts.find((i) => i.table === 'execution_jobs');
       expect(jobInsert!.values.matrix_values).toBe('{"node":"18"}');
     });
 
     it('handles empty jobs array', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        null,
-        {},
-        null,
-        [],
-      );
+      await startRun(tracker, {
+        deliveryId: null,
+      });
 
       const jobInserts = mockDb.inserts.filter((i) => i.table === 'execution_jobs');
       expect(jobInserts).toHaveLength(0);
@@ -934,18 +771,12 @@ describe('ExecutionTracker', () => {
 
   describe('onJobStatus', () => {
     it('updates job status in DB', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: baseJobs,
+      });
 
       await tracker.onJobStatus(
         'run-1',
@@ -964,18 +795,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('sets completed_at on terminal state', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
 
@@ -987,18 +812,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('stores error message from data on failure', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onJobStatus(
         'run-1',
@@ -1018,18 +837,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('does not overwrite started_at on subsequent running messages (build job progress)', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: '__build__hello-world' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: '__build__hello-world' }],
+      });
 
       const firstRunning = 1000000;
       await tracker.onJobStatus(
@@ -1047,26 +860,24 @@ describe('ExecutionTracker', () => {
       const thirdRunning = firstRunning + 5000;
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.running, thirdRunning);
 
-      // Job completes
       const completionTime = firstRunning + 5010;
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, completionTime);
 
-      // DB: started_at should be from the FIRST running message, not the last
       const runningUpdates = mockDb.updates.filter(
         (u) => u.table === 'execution_jobs' && u.values.status === 'running',
       );
-      // Only the first running message should set started_at
+      // Only the FIRST running message sets started_at
       const updatesWithStartedAt = runningUpdates.filter((u) => u.values.started_at);
       expect(updatesWithStartedAt).toHaveLength(1);
       expect(updatesWithStartedAt[0].values.started_at).toEqual(new Date(firstRunning));
 
-      // Subsequent running messages should still update last_heartbeat_at
+      // Later running messages still update last_heartbeat_at
       expect(runningUpdates.length).toBe(3);
       for (const u of runningUpdates) {
         expect(u.values.last_heartbeat_at).toBeDefined();
       }
 
-      // Completion duration should be from first running to completion
+      // Duration runs from the first running message to completion
       const successUpdate = mockDb.updates.find(
         (u) => u.table === 'execution_jobs' && u.values.status === 'success',
       );
@@ -1080,18 +891,12 @@ describe('ExecutionTracker', () => {
         onJobStatusChange,
       });
 
-      await statusTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: '__build__hello-world' }],
-      );
+      await startRun(statusTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: '__build__hello-world' }],
+      });
 
       const firstRunning = 1000000;
       await statusTracker.onJobStatus(
@@ -1148,24 +953,16 @@ describe('ExecutionTracker', () => {
     it('stores duration_ms based on job start time (not run start)', async () => {
       const runStart = Date.now();
 
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
-      // Job starts 2 seconds after run
       const jobStart = runStart + 2000;
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.running, jobStart);
 
-      // Job completes 5 seconds after job start
       const jobEnd = jobStart + 5000;
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, jobEnd);
 
@@ -1180,18 +977,13 @@ describe('ExecutionTracker', () => {
 
   describe('monotonic job-status writes', () => {
     const startOneJobRun = async () =>
-      tracker.onExecutionStarted(
-        'run-mono',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      startRun(tracker, {
+        runId: 'run-mono',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
     it('does not let a late running frame resurrect a failed job', async () => {
       await startOneJobRun();
@@ -1262,11 +1054,10 @@ describe('ExecutionTracker', () => {
 
     it('completes a run whose job rows went terminal behind the in-memory map', async () => {
       await startOneJobRun();
-      // What `cancelRunWithReason` does to a run whose jobs were never
-      // dispatched: one direct UPDATE stamps every row `cancelled`. The tracker
-      // is not told, so its map still reads `pending` and `isRunComplete` says
-      // no — while the database says the run is over and nothing else will
-      // finish it.
+      // What `cancelRunWithReason` does to a run whose jobs never dispatched: one direct
+      // UPDATE stamps every row `cancelled`. The tracker's map still reads `pending`, so
+      // `isRunComplete` says no while the database says the run is over and nothing else
+      // will finish it.
       const stored = mockDb.jobRows.get('run-mono:job-1');
       if (!stored) throw new Error('the run-start insert did not track a job row');
       mockDb.jobRows.set('run-mono:job-1', {
@@ -1296,10 +1087,9 @@ describe('ExecutionTracker', () => {
 
       await tracker.completeRunIfAllJobsTerminal('run-mono');
 
-      // The fallback now runs with in-memory state present, and that state is
-      // what the cluster health API reports. A run finished in the database but
-      // left unstamped in memory is served as active for the life of the
-      // process, and its state is never released.
+      // The fallback runs with in-memory state present, and the cluster health API reports
+      // that state: a run finished in the DB but unstamped in memory is served as active
+      // for the life of the process, and its state is never released.
       expect(tracker.getActiveRunCount()).toBe(0);
       expect(tracker.getActiveRuns()).toEqual([]);
     });
@@ -1311,11 +1101,10 @@ describe('ExecutionTracker', () => {
       onJobComplete.mockClear();
       onExecutionComplete.mockClear();
 
-      // The prune the completion scheduled has run, so memory is empty while the
-      // DB rows stand. An agent's durable outbox now replays the same terminal
-      // frame: the row agrees with it, but the run it would drive is already
-      // over, and re-driving it posts a second provider check and forwards a
-      // second terminal status the Platform never revisits.
+      // The scheduled prune has run: memory is empty, the DB rows stand. An agent's durable
+      // outbox replays the same terminal frame; the row agrees, but re-driving the finished
+      // run posts a second provider check and forwards a second terminal status the
+      // Platform never revisits.
       (tracker as unknown as { runs: Map<string, unknown> }).runs.delete('run-mono');
 
       await tracker.onJobStatus('run-mono', 'job-1', ExecutionJobStatus.enum.success, Date.now());
@@ -1361,10 +1150,14 @@ describe('ExecutionTracker', () => {
       return { t, onStatusChange, onComplete, onWfComplete };
     }
 
-    const startRun = (t: ExecutionTracker, runId: string) =>
-      t.onExecutionStarted(runId, 'ci', 'github', 'owner/repo', 'main', 'abc', null, {}, null, [
-        { jobId: 'job-1', jobName: 'test' },
-      ]);
+    const startTestRun = (t: ExecutionTracker, runId: string) =>
+      startRun(t, {
+        runId,
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
     const forgetRun = (t: ExecutionTracker, runId: string) =>
       (t as unknown as { runs: Map<string, unknown> }).runs.delete(runId);
@@ -1382,7 +1175,7 @@ describe('ExecutionTracker', () => {
 
     it('reopens a prematurely failed run on a live job report and raises its generation', async () => {
       const { t, onStatusChange } = epochTracker();
-      await startRun(t, 'run-reopen');
+      await startTestRun(t, 'run-reopen');
       await t.onJobStatus('run-reopen', 'job-1', ExecutionJobStatus.enum.running, Date.now());
       // Failed while its job was already on an agent: memory is dropped, the
       // job row stays `running`.
@@ -1408,7 +1201,7 @@ describe('ExecutionTracker', () => {
 
     it('does not reopen a failed run on a replay of a job frame its row already records', async () => {
       const { t, onStatusChange, onComplete, onWfComplete } = epochTracker();
-      await startRun(t, 'run-replay');
+      await startTestRun(t, 'run-replay');
       await t.onJobStatus('run-replay', 'job-1', ExecutionJobStatus.enum.failed, Date.now());
       expect(onComplete).toHaveBeenCalledOnce();
       expect(onWfComplete).toHaveBeenCalledOnce();
@@ -1429,7 +1222,7 @@ describe('ExecutionTracker', () => {
 
     it('never reopens a run that failed on a build failure', async () => {
       const { t } = epochTracker();
-      await startRun(t, 'run-build');
+      await startTestRun(t, 'run-build');
       await t.onJobStatus('run-build', 'job-1', ExecutionJobStatus.enum.running, Date.now());
       await t.failRun('run-build', 'Build timed out');
       forgetRun(t, 'run-build');
@@ -1443,7 +1236,7 @@ describe('ExecutionTracker', () => {
 
     it('forwards generation 0 for a run that never left a terminal status', async () => {
       const { t, onStatusChange } = epochTracker();
-      await startRun(t, 'run-plain');
+      await startTestRun(t, 'run-plain');
       await t.onJobStatus('run-plain', 'job-1', ExecutionJobStatus.enum.success, Date.now());
       for (const call of onStatusChange.mock.calls) {
         expect((call[2] as ExecutionContext).statusEpoch ?? 0).toBe(0);
@@ -1480,7 +1273,7 @@ describe('ExecutionTracker', () => {
 
     it('recordRunHeld forwards nothing when its guarded write kept a terminal row', async () => {
       const { t, onStatusChange } = epochTracker();
-      await startRun(t, 'run-held-done');
+      await startTestRun(t, 'run-held-done');
       await t.onJobStatus('run-held-done', 'job-1', ExecutionJobStatus.enum.success, Date.now());
       onStatusChange.mockClear();
 
@@ -1494,18 +1287,12 @@ describe('ExecutionTracker', () => {
 
   describe('log_bytes aggregation (operator-side capacity-planning gauge)', () => {
     it('accumulates per-step bytes into execution_jobs.log_bytes on job-terminal', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       // Two terminal step events with logBytesStreamed.
       await tracker.onStepStatus(
@@ -1538,22 +1325,18 @@ describe('ExecutionTracker', () => {
     });
 
     it('persists a step error as its message, not [object Object]', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'wf',
-        'push',
-        'repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        workflowName: 'wf',
+        provider: 'push',
+        repoIdentifier: 'repo',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
-      // The agent sends a STRUCTURED error on step.complete; a plain String()
-      // over it renders the literal '[object Object]' on the step row the
-      // dashboard shows, which is what an operator saw for every failing step.
+      // The agent sends a STRUCTURED error on step.complete; String() over it renders
+      // '[object Object]' on the dashboard's step row for every failing step.
       await tracker.onStepStatus(
         'run-1',
         'job-1',
@@ -1580,18 +1363,15 @@ describe('ExecutionTracker', () => {
     });
 
     it('still persists a plain-string error unchanged', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'wf',
-        'push',
-        'repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        workflowName: 'wf',
+        provider: 'push',
+        repoIdentifier: 'repo',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onStepStatus(
         'run-1',
@@ -1618,21 +1398,15 @@ describe('ExecutionTracker', () => {
     });
 
     it('writes summed run total into execution_runs.log_bytes on run-terminal', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [
           { jobId: 'job-1', jobName: 'a' },
           { jobId: 'job-2', jobName: 'b' },
         ],
-      );
+      });
 
       await tracker.onStepStatus(
         'run-1',
@@ -1673,18 +1447,12 @@ describe('ExecutionTracker', () => {
         onExecutionStatusChange,
       });
 
-      await t.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'a' }],
-      );
+      await startRun(t, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'a' }],
+      });
       await t.onStepStatus(
         'run-1',
         'job-1',
@@ -1708,18 +1476,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('defaults log_bytes to 0 when no agent telemetry was reported', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'a' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'a' }],
+      });
       // Job goes terminal without any onStepStatus(logBytesStreamed=…) call.
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
 
@@ -1737,18 +1499,12 @@ describe('ExecutionTracker', () => {
 
   describe('run completion detection', () => {
     it('detects completion when all jobs are terminal', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: baseJobs,
+      });
 
       expect(tracker.isRunComplete('run-1')).toBe(false);
 
@@ -1771,18 +1527,12 @@ describe('ExecutionTracker', () => {
         jobName: `job${i}`,
       }));
 
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
         jobs,
-      );
+      });
 
       for (let i = 0; i < states.length; i++) {
         await tracker.onJobStatus('run-1', `job-${i}`, states[i], Date.now());
@@ -1811,28 +1561,13 @@ describe('ExecutionTracker', () => {
 
     /** Start a single-job run in the given check mode, report a step, complete the job. */
     async function setupCheckModeRun(checkMode: string, stepCheckOutcome: string): Promise<void> {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'deploy' }],
-        undefined, // routingKey
-        undefined, // dispatchedContexts
-        undefined, // triggerEvent
-        undefined, // commitMessage
-        undefined, // parentRunId
-        undefined, // triggeredBy
-        undefined, // originalRunId
-        undefined, // concurrency
-        undefined, // workflowTimeoutMs
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'deploy' }],
         checkMode,
-      );
+      });
       await tracker.onStepStatus(
         'run-1',
         'job-1',
@@ -1861,18 +1596,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('returns running for incomplete run', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: baseJobs,
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
       // job-2 still pending
@@ -1884,10 +1613,9 @@ describe('ExecutionTracker', () => {
     });
 
     it('preserves a stamped failure_reason when a cancelled run completes', async () => {
-      // A cancelled run carries a reason stamped earlier by the cancel path
-      // (e.g. the workflow_timeout reason from cancelRunWithReason). The
-      // run-completion UPDATE must NOT clobber it to null — the dashboard reads
-      // failure_reason to label the run "timed out".
+      // A cancelled run carries a reason the cancel path stamped earlier (e.g. the
+      // workflow_timeout reason from cancelRunWithReason). The run-completion UPDATE must NOT
+      // clobber it to null: the dashboard reads failure_reason to label the run "timed out".
       await setupAndCompleteRun(['success', 'cancelled']);
       const runCompletionUpdate = mockDb.updates.find(
         (u) =>
@@ -1927,18 +1655,13 @@ describe('ExecutionTracker', () => {
         onExecutionStatusChange: onStatusChange,
         onWorkflowComplete: onWf,
       });
-      await t.onExecutionStarted(
-        'run-fc',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(t, {
+        runId: 'run-fc',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
       await t.onJobStatus('run-fc', 'job-1', jobStatus, Date.now());
     }
 
@@ -1994,18 +1717,13 @@ describe('ExecutionTracker', () => {
         onExecutionStatusChange: onStatusChange,
         onWorkflowComplete: onWf,
       });
-      await t.onExecutionStarted(
-        'run-if',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(t, {
+        runId: 'run-if',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
       await t.failRun('run-if', 'No agents available', {
         scope: 'run',
         category: InitFailureCategory.enum.no_agent,
@@ -2106,11 +1824,10 @@ describe('ExecutionTracker', () => {
     });
 
     it('recordGlobalEvalRoundFailureRun records and forwards the workflow repo', async () => {
-      // A global eval round is definitionally the cross-repository case: the
-      // round exists to decide one workflow repository's global workflows
-      // against another repository's event. A failed round is exactly the run
-      // the authoring team most needs to see, so it must not record a NULL
-      // marker and read as an ordinary per-repository run.
+      // A global eval round is by definition cross-repository: it decides one workflow
+      // repository's global workflows against another repository's event. A failed round is
+      // the run the authoring team most needs to see, so it must not record a NULL marker
+      // and read as an ordinary per-repository run.
       const onStatusChange = vi.fn();
       const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange: onStatusChange });
       await t.recordGlobalEvalRoundFailureRun({
@@ -2221,10 +1938,9 @@ describe('ExecutionTracker', () => {
     });
 
     it('recordInitFailureRun records and forwards the workflow repo', async () => {
-      // A run that fails before any job starts is still a run of the authoring
-      // team's workflow. Recording a NULL marker for it would say the opposite:
-      // that the workflow lives in the repository the run acted on, which is
-      // what the defining-repository predicate then matches registrations by.
+      // A run that fails before any job starts is still a run of the authoring team's
+      // workflow. A NULL marker would say the workflow lives in the repository the run acted
+      // on, which is what the defining-repository predicate matches registrations by.
       const onStatusChange = vi.fn();
       const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange: onStatusChange });
       await t.recordInitFailureRun({
@@ -2418,14 +2134,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('a late round-job status does not rehydrate and undo the errored round row', async () => {
-      // The scenario this guards is the ordinary one: the orchestrator's wait
-      // ceiling breaches, it writes the errored row and gives up, and the agent
-      // it gave up on finishes the round afterwards. That status carries the
-      // round job's run id, and no in-memory run exists for it, so recovery
-      // would rehydrate from the DB — resetting the row to `running` (the reset
-      // spares only a failure whose reason mentions "build") and then rolling it
-      // up as `success`, because the agent's round runner reports success even
-      // when it decided nothing.
+      // The ordinary case: the orchestrator's wait ceiling breaches, it writes the errored
+      // row and gives up, and the agent finishes the round afterwards. That status carries
+      // the round job's run id with no in-memory run, so recovery would rehydrate from the
+      // DB — reset the row to `running` (the reset spares only a failure whose reason
+      // mentions "build") and roll it up as `success`, because the agent's round runner
+      // reports success even when it decided nothing.
       const t = new ExecutionTracker({ db: mockDb.db });
       await t.recordGlobalEvalRoundFailureRun({
         runId: 'run-round-late',
@@ -2488,18 +2202,13 @@ describe('ExecutionTracker', () => {
 
   describe('onExecutionComplete callback', () => {
     it('fires on completion with correct status, context, and no description for success', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        { installationId: 42 },
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        providerContext: { installationId: 42 },
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
 
@@ -2518,26 +2227,21 @@ describe('ExecutionTracker', () => {
     });
 
     it('finalizes a run at most once', async () => {
-      // Finalization stamps `completedAt` but only prunes the in-memory run on
-      // a delay, so the run is still tracked afterwards. A late terminal status
-      // arriving in that window finds a complete run, and without the
-      // `completedAt` guard rolls it up a second time — a duplicate provider
-      // check and a second terminal run status forwarded to the Platform.
-      await tracker.onExecutionStarted(
-        'run-idem',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        { installationId: 42 },
-        null,
-        [
+      // Finalization stamps `completedAt` but prunes the in-memory run only after a delay.
+      // A late terminal status in that window finds a complete run; without the
+      // `completedAt` guard it rolls up again — a duplicate provider check and a second
+      // terminal run status forwarded to the Platform.
+      await startRun(tracker, {
+        runId: 'run-idem',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        providerContext: { installationId: 42 },
+        jobs: [
           { jobId: 'job-1', jobName: 'test' },
           { jobId: 'job-2', jobName: 'lint' },
         ],
-      );
+      });
 
       await tracker.onJobStatus('run-idem', 'job-1', ExecutionJobStatus.enum.success, Date.now());
       // Both jobs terminal: the run is finalized exactly here.
@@ -2552,22 +2256,16 @@ describe('ExecutionTracker', () => {
     });
 
     it('includes failed job names in description for failed runs', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [
           { jobId: 'job-1', jobName: 'lint' },
           { jobId: 'job-2', jobName: 'test' },
           { jobId: 'job-3', jobName: 'build' },
         ],
-      );
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.failed, Date.now());
       await tracker.onJobStatus('run-1', 'job-2', ExecutionJobStatus.enum.success, Date.now());
@@ -2582,18 +2280,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('does not fire for non-terminal states', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: baseJobs,
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.running, Date.now());
 
@@ -2601,18 +2293,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('updates execution_runs table on completion', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.failed, Date.now());
 
@@ -2627,18 +2313,13 @@ describe('ExecutionTracker', () => {
     it('receives requestId from RunState captured at execution start', async () => {
       // Start execution inside a requestContext.run() scope (simulating pipeline)
       await requestContext.run({ requestId: 'test-req-id' }, async () => {
-        await tracker.onExecutionStarted(
-          'run-1',
-          'ci',
-          'github',
-          'owner/repo',
-          'main',
-          'abc',
-          null,
-          { installationId: 42 },
-          null,
-          [{ jobId: 'job-1', jobName: 'test' }],
-        );
+        await startRun(tracker, {
+          ref: 'main',
+          sha: 'abc',
+          deliveryId: null,
+          providerContext: { installationId: 42 },
+          jobs: [{ jobId: 'job-1', jobName: 'test' }],
+        });
       });
 
       // Complete the job (outside ALS scope -- requestId should come from stored RunState)
@@ -2654,18 +2335,12 @@ describe('ExecutionTracker', () => {
 
     it('receives undefined requestId when execution started without ALS scope', async () => {
       // Start execution without requestContext.run()
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
 
@@ -2678,30 +2353,22 @@ describe('ExecutionTracker', () => {
     });
 
     it('finalizes a run when the last job finishes before its synthetic→real swap', async () => {
-      // Reproduces the failure-propagation race: a downstream job dispatched by
-      // the needs scheduler (via dispatchReadyJob → addJobsToRun) can report its
-      // terminal status BEFORE addJobsToRun swaps the synthetic placeholder for
-      // the real job id. Without the re-check in addJobsToRun the run hangs in
-      // `running` forever because the early status update saw the synthetic
-      // placeholder (still pending) and bailed, and nothing else drives the
-      // completion check afterwards.
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [
+      // The failure-propagation race: a downstream job the needs scheduler dispatched (via
+      // dispatchReadyJob → addJobsToRun) can report its terminal status BEFORE addJobsToRun
+      // swaps the synthetic placeholder for the real id. The early update sees the
+      // placeholder still pending and bails, and nothing else drives the completion check,
+      // so without the re-check in addJobsToRun the run hangs in `running` forever.
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [
           { jobId: 'build-id', jobName: 'build' },
           // The scheduler-gated downstream is tracked as a synthetic placeholder
           // until dispatchReadyJob swaps in the real id.
           { jobId: 'needs-pending-cleanup-xyz', jobName: 'cleanup' },
         ],
-      );
+      });
 
       // build fails (terminal). Run is not complete: the synthetic cleanup
       // placeholder is still pending.
@@ -2714,9 +2381,9 @@ describe('ExecutionTracker', () => {
       await tracker.onJobStatus('run-1', 'cleanup-id', ExecutionJobStatus.enum.success, Date.now());
       expect(onExecutionComplete).not.toHaveBeenCalled();
 
-      // dispatchReadyJob finally performs the synthetic→real swap. With the fix,
-      // addJobsToRun preserves cleanup's already-arrived `success` (instead of
-      // resetting to `pending`) and re-checks completion → run finalizes failed.
+      // dispatchReadyJob performs the synthetic→real swap. addJobsToRun keeps cleanup's
+      // already-arrived `success` (not reset to `pending`) and re-checks completion → the
+      // run finalizes failed.
       await tracker.addJobsToRun(
         'run-1',
         [{ jobId: 'cleanup-id', jobName: 'cleanup' }],
@@ -2735,18 +2402,12 @@ describe('ExecutionTracker', () => {
 
   describe('onStepStatus', () => {
     it('inserts step row for new step', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onStepStatus(
         'run-1',
@@ -2769,18 +2430,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('persists check_outcome / drift_summary / drift from step data', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onStepStatus(
         'run-1',
@@ -2806,18 +2461,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('updates step row for existing step', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       // First call creates the step (inserts into stepRows tracking)
       await tracker.onStepStatus(
@@ -2853,18 +2502,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('forwards step status to Platform callback', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       const ts = Date.now();
       await tracker.onStepStatus(
@@ -2891,18 +2534,12 @@ describe('ExecutionTracker', () => {
 
     it('forwards requestId from RunState to step status callback', async () => {
       await requestContext.run({ requestId: 'step-req-id' }, async () => {
-        await tracker.onExecutionStarted(
-          'run-1',
-          'ci',
-          'github',
-          'owner/repo',
-          'main',
-          'abc',
-          null,
-          {},
-          null,
-          [{ jobId: 'job-1', jobName: 'test' }],
-        );
+        await startRun(tracker, {
+          ref: 'main',
+          sha: 'abc',
+          deliveryId: null,
+          jobs: [{ jobId: 'job-1', jobName: 'test' }],
+        });
       });
 
       const ts = Date.now();
@@ -2929,18 +2566,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('constructs correct log path using job name', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'my-build' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'my-build' }],
+      });
 
       await tracker.onStepStatus(
         'run-1',
@@ -2973,18 +2604,12 @@ describe('ExecutionTracker', () => {
 
   describe('getJobName', () => {
     it('returns job name from in-memory state', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       expect(tracker.getJobName('run-1', 'job-1')).toBe('test');
     });
@@ -2994,18 +2619,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('returns undefined for unknown job', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       expect(tracker.getJobName('run-1', 'unknown')).toBeUndefined();
     });
@@ -3013,18 +2632,12 @@ describe('ExecutionTracker', () => {
 
   describe('resolveJobName', () => {
     it('returns the in-memory job name when present (fast path)', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await expect(tracker.resolveJobName('run-1', 'job-1')).resolves.toBe('test');
     });
@@ -3047,36 +2660,23 @@ describe('ExecutionTracker', () => {
     it('resolves a rerouted job seeded via registerJobName from the in-memory fast path', async () => {
       // The coordinator seeds a worker-rerouted job's name in-memory (no
       // dispatch_queue row exists for it on the coordinator).
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+      });
       tracker.registerJobName('run-1', 'rerouted-job', 'build');
 
       await expect(tracker.resolveJobName('run-1', 'rerouted-job')).resolves.toBe('build');
     });
 
     it('registerJobName does not clobber an existing job entry', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'real' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'real' }],
+      });
       tracker.registerJobName('run-1', 'job-1', 'other');
 
       expect(tracker.getJobName('run-1', 'job-1')).toBe('real');
@@ -3085,18 +2685,12 @@ describe('ExecutionTracker', () => {
 
   describe('getExecutionContext', () => {
     it('returns execution context from in-memory state', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc123',
-        null,
-        { installationId: 42 },
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        deliveryId: null,
+        providerContext: { installationId: 42 },
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       const ctx = tracker.getExecutionContext('run-1');
       expect(ctx).toEqual({
@@ -3113,18 +2707,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('carries the trust posture once the dispatch site stamps it', async () => {
-      await tracker.onExecutionStarted(
-        'run-posture',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc123',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        runId: 'run-posture',
+        ref: 'main',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
       // Absent before the stamp — the fields are optional, not defaulted.
       expect(tracker.getExecutionContext('run-posture')).not.toHaveProperty('trustTier');
 
@@ -3142,18 +2730,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('returns context without installationId when not provided', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       const ctx = tracker.getExecutionContext('run-1');
       expect(ctx).toBeDefined();
@@ -3163,18 +2745,12 @@ describe('ExecutionTracker', () => {
 
   describe('memory pruning', () => {
     it('removes completed run from memory after 5 minutes', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
 
@@ -3191,19 +2767,13 @@ describe('ExecutionTracker', () => {
 
   describe('onWorkflowComplete callback', () => {
     it('fires with correct data when run reaches terminal state (all success)', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        baseJobs,
-        'github:42',
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: baseJobs,
+        routingKey: 'github:42',
+      });
 
       const t1 = Date.now();
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, t1);
@@ -3227,18 +2797,13 @@ describe('ExecutionTracker', () => {
     });
 
     it('fires with failed status when a job fails', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'deploy',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        workflowName: 'deploy',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: baseJobs,
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.failed, Date.now());
       await tracker.onJobStatus('run-1', 'job-2', ExecutionJobStatus.enum.success, Date.now());
@@ -3253,18 +2818,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('does not fire until all jobs are terminal', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: baseJobs,
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.running, Date.now());
       expect(onWorkflowComplete).not.toHaveBeenCalled();
@@ -3276,19 +2835,13 @@ describe('ExecutionTracker', () => {
 
   describe('onJobComplete callback', () => {
     it('fires with correct data when a job reaches terminal state', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        baseJobs,
-        'github:42',
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: baseJobs,
+        routingKey: 'github:42',
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
 
@@ -3304,18 +2857,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('fires with failed status', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.failed, Date.now());
 
@@ -3327,19 +2874,13 @@ describe('ExecutionTracker', () => {
       // The check run is completed from this hook, so a job the orchestrator
       // itself ends (a needs-scheduler skip — no agent message involved) must
       // reach it, or its check run stays queued forever on the commit.
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-        'github:42',
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+        routingKey: 'github:42',
+      });
 
       await tracker.onJobStatus(
         'run-1',
@@ -3358,18 +2899,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('fires for a drift-dropped job', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await tracker.onJobStatus(
         'run-1',
@@ -3383,18 +2918,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('fires independently for each job', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: baseJobs,
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
       expect(onJobComplete).toHaveBeenCalledTimes(1);
@@ -3406,18 +2935,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('does not fire for non-terminal states', async () => {
-      await tracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        baseJobs,
-      );
+      await startRun(tracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: baseJobs,
+      });
 
       await tracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.running, Date.now());
       expect(onJobComplete).not.toHaveBeenCalled();
@@ -3426,24 +2949,18 @@ describe('ExecutionTracker', () => {
 
   describe('callbacks are optional', () => {
     it('omitting onWorkflowComplete and onJobComplete causes no errors', async () => {
-      // Create tracker WITHOUT the new callbacks
+      // A tracker without these callbacks
       const minimalTracker = new ExecutionTracker({
         db: mockDb.db,
         onExecutionComplete,
       });
 
-      await minimalTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(minimalTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       // Should not throw even without callbacks
       await minimalTracker.onJobStatus(
@@ -3472,21 +2989,11 @@ describe('ExecutionTracker', () => {
     });
 
     it('emits orchestrator.dispatch on execution started', async () => {
-      await eventTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-        undefined,
-        undefined,
-        'push',
-      );
+      await startRun(eventTracker, {
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+        triggerEvent: 'push',
+      });
 
       // SECURITY: orgId is intentionally absent from emitted run.event
       // payloads (see docs/architecture/security/ws-tenant-isolation.md).
@@ -3504,18 +3011,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('emits orchestrator.job.started on job running', async () => {
-      await eventTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(eventTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await eventTracker.onJobStatus(
         'run-1',
@@ -3533,18 +3034,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('emits orchestrator.job.completed on terminal state', async () => {
-      await eventTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(eventTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await eventTracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.running, Date.now());
       await eventTracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
@@ -3562,18 +3057,12 @@ describe('ExecutionTracker', () => {
         // No orgId
       });
 
-      await noOrgTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(noOrgTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       expect(onRunEventEmit).not.toHaveBeenCalled();
     });
@@ -3603,18 +3092,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('writes dispatch log on execution started', async () => {
-      await logTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(logTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       expect(mockLogStorage.append).toHaveBeenCalledWith(
         'executions/run-1/jobs/job-1/orchestration.jsonl',
@@ -3623,18 +3106,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('writes setup log on job started', async () => {
-      await logTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(logTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await logTracker.onJobStatus(
         'run-1',
@@ -3652,18 +3129,12 @@ describe('ExecutionTracker', () => {
     });
 
     it('writes teardown log on job completed', async () => {
-      await logTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(logTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await logTracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.running, Date.now());
       await logTracker.onJobStatus('run-1', 'job-1', ExecutionJobStatus.enum.success, Date.now());
@@ -3683,18 +3154,12 @@ describe('ExecutionTracker', () => {
         onOrchLog,
       });
 
-      await forwardTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(forwardTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       // The dispatch write both persists AND forwards the same line.
       expect(onOrchLog).toHaveBeenCalledWith(
@@ -3741,18 +3206,12 @@ describe('ExecutionTracker', () => {
         onOrchLog,
       });
 
-      await noOrgTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(noOrgTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       expect(onOrchLog).not.toHaveBeenCalled();
     });
@@ -3812,22 +3271,15 @@ describe('ExecutionTracker', () => {
       const cancelTracker = new ExecutionTracker({ db });
 
       // Set up in-memory state so getJobName works
-      await cancelTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(cancelTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await cancelTracker.cancelStepsForJob('run-1', 'job-1', 'Job stale: no heartbeat');
 
-      // Should have an update to execution_steps with cancelled status
       const stepUpdates = capturedUpdates.filter((u) => u.table === 'execution_steps');
       expect(stepUpdates.length).toBe(1);
       expect(stepUpdates[0].values.status).toBe(ExecutionJobStatus.enum.cancelled);
@@ -3840,18 +3292,12 @@ describe('ExecutionTracker', () => {
       const { db, capturedUpdates } = createCancelStepsMockDb([]);
       const cancelTracker = new ExecutionTracker({ db });
 
-      await cancelTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(cancelTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await cancelTracker.cancelStepsForJob('run-1', 'job-1', 'Job stale');
 
@@ -3869,24 +3315,17 @@ describe('ExecutionTracker', () => {
       const stepForward = vi.fn();
       const cancelTracker = new ExecutionTracker({ db, onStepStatusForward: stepForward });
 
-      await cancelTracker.onExecutionStarted(
-        'run-1',
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'test' }],
-      );
+      await startRun(cancelTracker, {
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
 
       await cancelTracker.cancelStepsForJob('run-1', 'job-1', 'Orphan recovery');
 
       expect(stepForward).toHaveBeenCalledTimes(2);
 
-      // First step
       expect(stepForward).toHaveBeenCalledWith(
         'run-1',
         'job-1',
@@ -3899,7 +3338,6 @@ describe('ExecutionTracker', () => {
         undefined,
       );
 
-      // Second step
       expect(stepForward).toHaveBeenCalledWith(
         'run-1',
         'job-1',
@@ -3917,20 +3355,14 @@ describe('ExecutionTracker', () => {
   describe('completeRunIfAllJobsTerminal', () => {
     it('should complete a run that transitioned through cancelling state', async () => {
       await requestContext.run({ requestId: 'req-cancel', runId: 'run-cancel' }, async () => {
-        await tracker.onExecutionStarted(
-          'run-cancel',
-          'ci',
-          'github',
-          'owner/repo',
-          'main',
-          'abc123',
-          null,
-          { installationId: 1 },
-          null,
-          [{ jobId: 'job-1', jobName: 'test' }],
-        );
+        await startRun(tracker, {
+          runId: 'run-cancel',
+          ref: 'main',
+          deliveryId: null,
+          providerContext: { installationId: 1 },
+          jobs: [{ jobId: 'job-1', jobName: 'test' }],
+        });
 
-        // Job goes running
         await tracker.onJobStatus(
           'run-cancel',
           'job-1',
@@ -3946,17 +3378,17 @@ describe('ExecutionTracker', () => {
           Date.now(),
         );
 
-        // Job reaches terminal cancelled state. Mirror the production cancel
-        // path (`cancel/cancel-run.ts`), which marks the remaining job row
-        // directly and then asks the tracker to finish the run — going through
-        // `onJobStatus` instead would auto-complete the run first, leaving
-        // nothing for the call under test to do.
+        // Job reaches terminal cancelled. Mirrors the production cancel path
+        // (`cancel/cancel-run.ts`): mark the remaining job row directly, then ask the tracker
+        // to finish the run; `onJobStatus` would auto-complete the run first, leaving nothing
+        // for the call under test.
         tracker.updateInMemoryJob('run-cancel', 'job-1', ExecutionJobStatus.enum.cancelled);
 
         // Now call completeRunIfAllJobsTerminal (stale detector path)
         await tracker.completeRunIfAllJobsTerminal('run-cancel');
 
-        // The DB update for execution_runs should accept both 'running' and 'cancelling'
+        // The execution_runs status update must be guarded by a status IN list that includes
+        // 'cancelling', so a run that passed through cancelling still completes.
         const runUpdates = mockDb.updates.filter(
           (u) =>
             u.table === 'execution_runs' &&
@@ -3970,25 +3402,20 @@ describe('ExecutionTracker', () => {
                 (w[2] as string[]).includes('cancelling'),
             ),
         );
-        // Should have at least one update that matches both 'running' and 'cancelling'
+        // At least one such guarded update ran.
         expect(runUpdates.length).toBeGreaterThan(0);
       });
     });
 
     it('clears the test-run marker when the stale detector, not the normal path, finishes the run', async () => {
       await requestContext.run({ requestId: 'req-tr', runId: 'run-tr' }, async () => {
-        await tracker.onExecutionStarted(
-          'run-tr',
-          'ci',
-          'github',
-          'owner/repo',
-          'main',
-          'abc123',
-          null,
-          { installationId: 1 },
-          null,
-          [{ jobId: 'job-1', jobName: 'test' }],
-        );
+        await startRun(tracker, {
+          runId: 'run-tr',
+          ref: 'main',
+          deliveryId: null,
+          providerContext: { installationId: 1 },
+          jobs: [{ jobId: 'job-1', jobName: 'test' }],
+        });
         tracker.markTestRun('run-tr');
         expect(tracker.isTestRun('run-tr')).toBe(true);
 
@@ -4001,10 +3428,8 @@ describe('ExecutionTracker', () => {
         // The marker survives the grace period — a late status still broadcasts.
         expect(tracker.isTestRun('run-tr')).toBe(true);
 
-        // ...and is dropped with the rest of the run's in-memory state once the
-        // prune fires. Without this, a run finished by the stale detector rather
-        // than the normal completion path leaks its marker for the process's
-        // lifetime.
+        // ...and is dropped with the run's in-memory state once the prune fires; otherwise
+        // a run the stale detector finished leaks its marker for the process's lifetime.
         vi.advanceTimersByTime(5 * 60 * 1000 + 1);
         expect(tracker.isTestRun('run-tr')).toBe(false);
       });
@@ -4012,33 +3437,26 @@ describe('ExecutionTracker', () => {
 
     it('stamps the generic stale reason guarded by failure_reason IS NULL on a failed run', async () => {
       await requestContext.run({ requestId: 'req-fail', runId: 'run-fail' }, async () => {
-        await tracker.onExecutionStarted(
-          'run-fail',
-          'ci',
-          'github',
-          'owner/repo',
-          'main',
-          'abc123',
-          null,
-          { installationId: 1 },
-          null,
-          [{ jobId: 'job-1', jobName: 'test' }],
-        );
+        await startRun(tracker, {
+          runId: 'run-fail',
+          ref: 'main',
+          deliveryId: null,
+          providerContext: { installationId: 1 },
+          jobs: [{ jobId: 'job-1', jobName: 'test' }],
+        });
 
         await tracker.onJobStatus('run-fail', 'job-1', ExecutionJobStatus.enum.running, Date.now());
-        // Mirror the production stale-detector flow (`stale-run-detector.ts`):
-        // it mutates the in-memory job directly and then asks the tracker to
-        // finish the run. Routing this through `onJobStatus` would auto-complete
-        // the run first, so the call under test would find an already-terminal
-        // row and correctly do nothing.
+        // Mirrors the production stale-detector flow (`stale-run-detector.ts`): mutate the
+        // in-memory job directly, then ask the tracker to finish the run. Through
+        // `onJobStatus` the run auto-completes first, and the call under test correctly
+        // does nothing.
         tracker.updateInMemoryJob('run-fail', 'job-1', ExecutionJobStatus.enum.timed_out_stale);
 
         await tracker.completeRunIfAllJobsTerminal('run-fail');
 
-        // The failure_reason write is a SEPARATE, clobber-guarded UPDATE: it
-        // sets only failure_reason and carries a `failure_reason IS NULL` guard
-        // so a more specific cause (e.g. a scaler provisioning error) is never
-        // overwritten.
+        // The failure_reason write is a SEPARATE UPDATE setting only failure_reason,
+        // guarded on `failure_reason IS NULL` so a more specific cause (e.g. a scaler
+        // provisioning error) is never overwritten.
         const guardedReasonUpdates = mockDb.updates.filter(
           (u) =>
             u.table === 'execution_runs' &&
@@ -4050,10 +3468,9 @@ describe('ExecutionTracker', () => {
         );
         expect(guardedReasonUpdates.length).toBe(1);
 
-        // The stale-detector status/timing UPDATE (the one carrying the
-        // `status IN (pending, running, cancelling)` guard) must NOT also set
-        // failure_reason — the generic reason only flows through the guarded
-        // write above.
+        // The stale-detector status/timing UPDATE (guarded on
+        // `status IN (pending, running, cancelling)`) must NOT also set failure_reason; the
+        // generic reason flows only through the guarded write above.
         const staleStatusUpdates = mockDb.updates.filter(
           (u) =>
             u.table === 'execution_runs' &&
@@ -4073,18 +3490,13 @@ describe('ExecutionTracker', () => {
 
     it('does not stamp a stale reason when the run completes successfully', async () => {
       await requestContext.run({ requestId: 'req-ok', runId: 'run-ok' }, async () => {
-        await tracker.onExecutionStarted(
-          'run-ok',
-          'ci',
-          'github',
-          'owner/repo',
-          'main',
-          'abc123',
-          null,
-          { installationId: 1 },
-          null,
-          [{ jobId: 'job-1', jobName: 'test' }],
-        );
+        await startRun(tracker, {
+          runId: 'run-ok',
+          ref: 'main',
+          deliveryId: null,
+          providerContext: { installationId: 1 },
+          jobs: [{ jobId: 'job-1', jobName: 'test' }],
+        });
 
         await tracker.onJobStatus('run-ok', 'job-1', ExecutionJobStatus.enum.running, Date.now());
         // In-memory mutation (not `onJobStatus`) so the run is still open when
@@ -4107,27 +3519,20 @@ describe('ExecutionTracker', () => {
     });
 
     it('does not forward a recomputed status the terminal guard rejected', async () => {
-      // A job marked `timed_out_stale` after the run already finished green
-      // recomputes the run to `failed`. The DB guard keeps the recorded
-      // `success` — and the Platform forward must be suppressed with it, or the
-      // Platform mirror reads `failed` for a run this orchestrator reads as
-      // `success`, forever (the mirror reconciler only revisits NON-terminal
-      // rows, so nothing ever corrects it).
+      // A job marked `timed_out_stale` after the run finished green recomputes the run to
+      // `failed`. The DB guard keeps the recorded `success`, and the Platform forward must
+      // be suppressed with it: the mirror reconciler revisits only NON-terminal rows, so the
+      // Platform would read `failed` for a `success` run forever.
       const onExecutionStatusChange = vi.fn();
       const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
       await requestContext.run({ requestId: 'req-late', runId: 'run-late-stale' }, async () => {
-        await t.onExecutionStarted(
-          'run-late-stale',
-          'ci',
-          'github',
-          'owner/repo',
-          'main',
-          'abc123',
-          null,
-          { installationId: 1 },
-          null,
-          [{ jobId: 'job-1', jobName: 'test' }],
-        );
+        await startRun(t, {
+          runId: 'run-late-stale',
+          ref: 'main',
+          deliveryId: null,
+          providerContext: { installationId: 1 },
+          jobs: [{ jobId: 'job-1', jobName: 'test' }],
+        });
         await t.onJobStatus('run-late-stale', 'job-1', ExecutionJobStatus.enum.running, Date.now());
         // Normal completion: the run finishes green and forwards `success`.
         await t.onJobStatus('run-late-stale', 'job-1', ExecutionJobStatus.enum.success, Date.now());
@@ -4269,9 +3674,9 @@ describe('ExecutionTracker', () => {
     });
 
     it('fails a DB-fallback run whose only non-success job never ran', async () => {
-      // The false-green this guards: `__build__` succeeded and the declared job
-      // was settled `unroutable` / `drift_dropped` without ever dispatching. A
-      // hand-listed failure set here reported the whole run `success`.
+      // The false-green this guards: `__build__` succeeded and the declared job was settled
+      // `unroutable` / `drift_dropped` without ever dispatching; a hand-listed failure set
+      // here reports the whole run `success`.
       for (const neverRan of [
         ExecutionJobStatus.enum.unroutable,
         ExecutionJobStatus.enum.drift_dropped,
@@ -4389,31 +3794,22 @@ describe('ExecutionTracker', () => {
     const syntheticId = 'needs-pending-deploy-fake-uuid-1234';
 
     async function setupRunWithSyntheticJob() {
-      // Create run with one real job
-      await tracker.onExecutionStarted(
-        'run-synth',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-1',
-        { installationId: 42 },
-        { matched: true },
-        [{ jobId: 'job-real-1', jobName: 'build' }],
-      );
+      await startRun(tracker, {
+        runId: 'run-synth',
+        providerContext: { installationId: 42 },
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'job-real-1', jobName: 'build' }],
+      });
 
-      // Add synthetic job entry (simulating what processor does for needs-gated jobs)
+      // The synthetic entry the processor adds for a needs-gated job
       await tracker.addJobsToRun('run-synth', [{ jobId: syntheticId, jobName: 'deploy' }]);
     }
 
     it('replaces synthetic entry with real jobId in run.jobs and deletes from DB', async () => {
       await setupRunWithSyntheticJob();
 
-      // Verify synthetic entry exists
       expect(tracker.isRunComplete('run-synth')).toBe(false);
 
-      // Now replace the synthetic with a real job ID
       await tracker.addJobsToRun(
         'run-synth',
         [{ jobId: 'real-deploy-job-id', jobName: 'deploy' }],
@@ -4421,7 +3817,7 @@ describe('ExecutionTracker', () => {
         syntheticId,
       );
 
-      // The synthetic ID should be gone from the DB (deleteFrom called)
+      // The synthetic ID is deleted from the DB
       const deleteOps = mockDb.deletes.filter(
         (d) =>
           d.table === 'execution_jobs' &&
@@ -4429,17 +3825,15 @@ describe('ExecutionTracker', () => {
       );
       expect(deleteOps.length).toBe(1);
 
-      // findSyntheticJobId should no longer find it
       expect(await tracker.findSyntheticJobId('run-synth', 'deploy')).toBeUndefined();
     });
 
     it('isRunComplete returns true after synthetic replacement and terminal states', async () => {
       await setupRunWithSyntheticJob();
 
-      // Before replacement: isRunComplete false (both jobs pending)
+      // Before replacement: both jobs pending
       expect(tracker.isRunComplete('run-synth')).toBe(false);
 
-      // Complete the build job
       await tracker.onJobStatus(
         'run-synth',
         'job-real-1',
@@ -4447,10 +3841,9 @@ describe('ExecutionTracker', () => {
         Date.now(),
       );
 
-      // Still false because synthetic deploy is pending
+      // The synthetic deploy is still pending
       expect(tracker.isRunComplete('run-synth')).toBe(false);
 
-      // Replace synthetic with real job
       await tracker.addJobsToRun(
         'run-synth',
         [{ jobId: 'real-deploy-job-id', jobName: 'deploy' }],
@@ -4458,10 +3851,9 @@ describe('ExecutionTracker', () => {
         syntheticId,
       );
 
-      // Still false -- real deploy job is pending
+      // The real deploy job is pending
       expect(tracker.isRunComplete('run-synth')).toBe(false);
 
-      // Complete the real deploy job
       await tracker.onJobStatus(
         'run-synth',
         'real-deploy-job-id',
@@ -4469,25 +3861,19 @@ describe('ExecutionTracker', () => {
         Date.now(),
       );
 
-      // NOW it should be complete
       expect(tracker.isRunComplete('run-synth')).toBe(true);
     });
 
     async function startBuildWindowRun(runId: string) {
-      await tracker.onExecutionStarted(
+      await startRun(tracker, {
         runId,
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-bw',
-        { installationId: 42 },
-        { matched: true },
+        deliveryId: 'delivery-bw',
+        providerContext: { installationId: 42 },
+        triggerDecision: { matched: true },
         // A run registered with ONLY the source-pack build job — the shape the
         // dispatch path produces while it awaits the build.
-        [{ jobId: 'build-1', jobName: '__build__ci' }],
-      );
+        jobs: [{ jobId: 'build-1', jobName: '__build__ci' }],
+      });
       tracker.holdRunForPendingJobs(runId);
     }
 
@@ -4577,7 +3963,7 @@ describe('ExecutionTracker', () => {
     it('handles race condition where real entry already exists (upsert)', async () => {
       await setupRunWithSyntheticJob();
 
-      // Simulate race: agent sends status for real job ID before addJobsToRun replaces synthetic
+      // Race: the agent reports the real job ID before addJobsToRun replaces the synthetic
       await tracker.onJobStatus(
         'run-synth',
         'real-deploy-job-id',
@@ -4585,7 +3971,7 @@ describe('ExecutionTracker', () => {
         Date.now(),
       );
 
-      // Now replace synthetic -- should delete synthetic, real entry already exists
+      // The synthetic is deleted although the real entry already exists
       await tracker.addJobsToRun(
         'run-synth',
         [{ jobId: 'real-deploy-job-id', jobName: 'deploy' }],
@@ -4593,7 +3979,6 @@ describe('ExecutionTracker', () => {
         syntheticId,
       );
 
-      // Synthetic should be deleted from DB
       const deleteOps = mockDb.deletes.filter(
         (d) =>
           d.table === 'execution_jobs' &&
@@ -4601,16 +3986,14 @@ describe('ExecutionTracker', () => {
       );
       expect(deleteOps.length).toBe(1);
 
-      // No synthetic entry should remain
       expect(await tracker.findSyntheticJobId('run-synth', 'deploy')).toBeUndefined();
     });
 
     it('handles missing synthetic ID gracefully (DB delete is a noop on nonexistent row)', async () => {
       await setupRunWithSyntheticJob();
 
-      // Pass a nonexistent synthetic ID -- should not error. The DB delete
-      // runs unconditionally (cluster correctness) but is a noop when the
-      // row does not exist, so the original synthetic entry survives.
+      // A nonexistent synthetic ID does not error. The DB delete runs unconditionally
+      // (cluster correctness) and is a no-op here, so the original synthetic entry survives.
       await tracker.addJobsToRun(
         'run-synth',
         [{ jobId: 'real-deploy-job-id', jobName: 'deploy' }],
@@ -4618,7 +4001,6 @@ describe('ExecutionTracker', () => {
         'nonexistent-synthetic-id',
       );
 
-      // DB delete IS issued (DELETE on a nonexistent row is a safe noop)
       const deleteOps = mockDb.deletes.filter(
         (d) =>
           d.table === 'execution_jobs' &&
@@ -4626,33 +4008,22 @@ describe('ExecutionTracker', () => {
       );
       expect(deleteOps.length).toBe(1);
 
-      // The original synthetic entry should still exist (different job_id)
       expect(await tracker.findSyntheticJobId('run-synth', 'deploy')).toBe(syntheticId);
     });
 
     it('cleans up synthetic DB row on rerouted peer with empty in-memory run.jobs', async () => {
-      // Simulate cluster: peer B receives onExecutionStarted for just the
-      // upstream job via reroute; the synthetic entry lives only in the
-      // shared DB (inserted by the ingesting peer). dispatchReadyJob then
-      // calls addJobsToRun on peer B with replaceSyntheticId. The DB row
-      // must be deleted even though run.jobs has no entry for it.
-      await tracker.onExecutionStarted(
-        'run-cross-peer',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-3',
-        { installationId: 42 },
-        { matched: true },
-        [{ jobId: 'job-upstream', jobName: 'build' }],
-      );
+      // Cluster: peer B gets onExecutionStarted for only the upstream job via reroute; the
+      // synthetic row lives only in the shared DB (inserted by the ingesting peer).
+      // dispatchReadyJob then calls addJobsToRun on peer B with replaceSyntheticId, and the
+      // orphan DB row must be deleted although run.jobs has no entry for it.
+      await startRun(tracker, {
+        runId: 'run-cross-peer',
+        deliveryId: 'delivery-3',
+        providerContext: { installationId: 42 },
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'job-upstream', jobName: 'build' }],
+      });
 
-      // Peer B's in-memory run.jobs has no entry for the synthetic ID — only
-      // the upstream job. The DB delete must still be issued unconditionally
-      // so the orphan synthetic row (inserted by the ingesting peer) is
-      // cleaned up when the gated job is dispatched.
       await tracker.addJobsToRun(
         'run-cross-peer',
         [{ jobId: 'real-deploy-x', jobName: 'deploy' }],
@@ -4669,21 +4040,15 @@ describe('ExecutionTracker', () => {
     });
 
     it('findSyntheticJobId falls back to DB when another peer inserted the synthetic row', async () => {
-      // Simulate cross-peer scenario: this tracker never ingested the webhook,
-      // so its in-memory Map has no run entry. The synthetic row exists only in
-      // the shared DB (inserted by the peer that ingested the webhook).
-      await tracker.onExecutionStarted(
-        'run-cross-peer',
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-2',
-        { installationId: 42 },
-        { matched: true },
-        [{ jobId: 'job-real-1', jobName: 'build' }],
-      );
+      // Cross-peer: this tracker never ingested the webhook, so the synthetic row exists
+      // only in the shared DB (inserted by the ingesting peer).
+      await startRun(tracker, {
+        runId: 'run-cross-peer',
+        deliveryId: 'delivery-2',
+        providerContext: { installationId: 42 },
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'job-real-1', jobName: 'build' }],
+      });
       await tracker.addJobsToRun('run-cross-peer', [
         { jobId: 'needs-pending-deploy-cross-peer-uuid', jobName: 'deploy' },
       ]);
@@ -4826,18 +4191,15 @@ describe('ExecutionTracker', () => {
       const runId = 'run-init-fail-upsert';
       // Dispatch already registered the run before init failed, so the insert
       // conflicts. Leaving the pending row untouched would strand the run.
-      await tracker.onExecutionStarted(
+      await startRun(tracker, {
         runId,
-        'wf',
-        'github',
-        'org/repo',
-        'refs/heads/main',
-        'deadbeef',
-        'd1',
-        {},
-        { matched: true },
-        [{ jobId: 'j1', jobName: 'build' }],
-      );
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        sha: 'deadbeef',
+        deliveryId: 'd1',
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'j1', jobName: 'build' }],
+      });
       await tracker.recordInitFailureRun(initFailureArgs(runId));
 
       const update = mockDb.updates.find(
@@ -4849,18 +4211,15 @@ describe('ExecutionTracker', () => {
 
     it('a late job status cannot re-finalize an init-failed run', async () => {
       const runId = 'run-init-fail-late-status';
-      await tracker.onExecutionStarted(
+      await startRun(tracker, {
         runId,
-        'wf',
-        'github',
-        'org/repo',
-        'refs/heads/main',
-        'deadbeef',
-        'd1',
-        {},
-        { matched: true },
-        [{ jobId: 'j1', jobName: 'build' }],
-      );
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        sha: 'deadbeef',
+        deliveryId: 'd1',
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'j1', jobName: 'build' }],
+      });
       await tracker.recordInitFailureRun(initFailureArgs(runId));
 
       // The run is stamped complete, so the late success neither rolls it up nor
@@ -4881,18 +4240,15 @@ describe('ExecutionTracker', () => {
       const runId = 'run-init-fail-terminal-guard';
       // A run that genuinely finished must not be rewritten as failed by a late
       // init-failure record.
-      await tracker.onExecutionStarted(
+      await startRun(tracker, {
         runId,
-        'wf',
-        'github',
-        'org/repo',
-        'refs/heads/main',
-        'deadbeef',
-        'd1',
-        {},
-        { matched: true },
-        [{ jobId: 'j1', jobName: 'build' }],
-      );
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        sha: 'deadbeef',
+        deliveryId: 'd1',
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'j1', jobName: 'build' }],
+      });
       await tracker.onJobStatus(runId, 'j1', ExecutionJobStatus.enum.success, Date.now());
       const before = mockDb.updates.filter(
         (u) => u.table === 'execution_runs' && u.values.run_id === runId,
@@ -4907,25 +4263,21 @@ describe('ExecutionTracker', () => {
     });
 
     it('does not forward a failure the terminal guard rejected', async () => {
-      // The mirror the Platform serves is whatever it was last told, and it
-      // never revisits a terminal mirror row. So a forward the orchestrator's
-      // own guard refused to record would leave the Platform reading `failed`
-      // for a run this orchestrator reads as `success` — permanently.
+      // The Platform serves what it was last told and never revisits a terminal mirror row,
+      // so forwarding a write this orchestrator's own guard refused would leave it reading
+      // `failed` for a run this orchestrator reads as `success`, permanently.
       const runId = 'run-init-fail-no-forward';
       const onExecutionStatusChange = vi.fn();
       const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
-      await t.onExecutionStarted(
+      await startRun(t, {
         runId,
-        'wf',
-        'github',
-        'org/repo',
-        'refs/heads/main',
-        'deadbeef',
-        'd1',
-        {},
-        { matched: true },
-        [{ jobId: 'j1', jobName: 'build' }],
-      );
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        sha: 'deadbeef',
+        deliveryId: 'd1',
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'j1', jobName: 'build' }],
+      });
       await t.onJobStatus(runId, 'j1', ExecutionJobStatus.enum.success, Date.now());
       // Positive control: the genuine completion did forward `success`.
       expect(onExecutionStatusChange.mock.calls.at(-1)?.[1]).toBe(ExecutionRunStatus.enum.success);
@@ -4954,18 +4306,15 @@ describe('ExecutionTracker', () => {
 
     it('overwrites a live run row so the hold is visible', async () => {
       const runId = 'run-held-upsert';
-      await tracker.onExecutionStarted(
+      await startRun(tracker, {
         runId,
-        'wf',
-        'github',
-        'org/repo',
-        'refs/heads/main',
-        'deadbeef',
-        'd1',
-        {},
-        { matched: true },
-        [{ jobId: 'j1', jobName: 'build' }],
-      );
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        sha: 'deadbeef',
+        deliveryId: 'd1',
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'j1', jobName: 'build' }],
+      });
       await tracker.recordRunHeld(heldArgs(runId));
 
       const update = mockDb.updates.find(
@@ -4977,18 +4326,15 @@ describe('ExecutionTracker', () => {
 
     it('drops the in-memory run so a held run is not finalized', async () => {
       const runId = 'run-held-delete';
-      await tracker.onExecutionStarted(
+      await startRun(tracker, {
         runId,
-        'wf',
-        'github',
-        'org/repo',
-        'refs/heads/main',
-        'deadbeef',
-        'd1',
-        {},
-        { matched: true },
-        [{ jobId: 'j1', jobName: 'build' }],
-      );
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        sha: 'deadbeef',
+        deliveryId: 'd1',
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'j1', jobName: 'build' }],
+      });
       await tracker.recordRunHeld(heldArgs(runId));
 
       // The jobs registered before the gate held the run must not satisfy the
@@ -5275,19 +4621,14 @@ describe('ExecutionTracker', () => {
         onExecutionStatusChange,
       });
 
-      await initFailTracker.onExecutionStarted(
-        'run-fr-1',
-        'wf',
-        'github',
-        'org/repo',
-        'refs/heads/main',
-        'd1',
-        null,
-        {},
-        null,
-        [],
-        'github:1',
-      );
+      await startRun(initFailTracker, {
+        runId: 'run-fr-1',
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        sha: 'd1',
+        deliveryId: null,
+        routingKey: 'github:1',
+      });
 
       await initFailTracker.failRun('run-fr-1', 'No agent for label kici:os:linux', {
         scope: 'run',
@@ -5325,19 +4666,14 @@ describe('ExecutionTracker', () => {
         onExecutionStatusChange,
         onWorkflowComplete,
       });
-      await tracker.onExecutionStarted(
-        'run-fr-2',
-        'wf',
-        'github',
-        'org/repo',
-        'refs/heads/main',
-        'd1',
-        null,
-        {},
-        null,
-        [],
-        'github:1',
-      );
+      await startRun(tracker, {
+        runId: 'run-fr-2',
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        sha: 'd1',
+        deliveryId: null,
+        routingKey: 'github:1',
+      });
       await tracker.failRun('run-fr-2', 'No agent for label kici:os:linux', {
         scope: 'run',
         category: InitFailureCategory.enum.no_agent,
@@ -5396,19 +4732,14 @@ describe('ExecutionTracker', () => {
     it('failRun drops the run in-process state for a tracked run', async () => {
       const onRunTerminalCleanup = vi.fn();
       const tracker = new ExecutionTracker({ db: mockDb.db, onRunTerminalCleanup });
-      await tracker.onExecutionStarted(
-        'run-cleanup-2',
-        'wf',
-        'github',
-        'org/repo',
-        'refs/heads/main',
-        'd1',
-        null,
-        {},
-        null,
-        [],
-        'github:1',
-      );
+      await startRun(tracker, {
+        runId: 'run-cleanup-2',
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        sha: 'd1',
+        deliveryId: null,
+        routingKey: 'github:1',
+      });
       await tracker.failRun('run-cleanup-2', 'No agents available');
       expect(onRunTerminalCleanup).toHaveBeenCalledWith('run-cleanup-2');
     });
@@ -5464,19 +4795,16 @@ describe('ExecutionTracker', () => {
 
   describe('onJobStatus precursor_result persistence', () => {
     const start = (jobId: string, jobName: string) =>
-      tracker.onExecutionStarted(
-        'run-pre',
-        'wf',
-        'github',
-        'org/repo',
-        'main',
-        'refs/heads/main',
-        'd1',
-        {},
-        null,
-        [{ jobId, jobName }],
-        'github:1',
-      );
+      startRun(tracker, {
+        runId: 'run-pre',
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        ref: 'main',
+        sha: 'refs/heads/main',
+        deliveryId: 'd1',
+        jobs: [{ jobId, jobName }],
+        routingKey: 'github:1',
+      });
     const terminalUpdate = (jobId: string) =>
       mockDb.updates.find(
         (u) =>
@@ -5544,19 +4872,16 @@ describe('ExecutionTracker', () => {
         onJobStatusChange,
       });
 
-      await initFailJobTracker.onExecutionStarted(
-        'run-job-init',
-        'wf',
-        'github',
-        'org/repo',
-        'main',
-        'refs/heads/main',
-        'd1',
-        {},
-        null,
-        [{ jobId: 'rejected-xyz', jobName: 'deploy' }],
-        'github:1',
-      );
+      await startRun(initFailJobTracker, {
+        runId: 'run-job-init',
+        workflowName: 'wf',
+        repoIdentifier: 'org/repo',
+        ref: 'main',
+        sha: 'refs/heads/main',
+        deliveryId: 'd1',
+        jobs: [{ jobId: 'rejected-xyz', jobName: 'deploy' }],
+        routingKey: 'github:1',
+      });
 
       await initFailJobTracker.onJobStatus(
         'run-job-init',
@@ -5628,18 +4953,13 @@ describe('ExecutionTracker', () => {
 
     /** The owner registers the run with its build job alone and takes the window token. */
     const ownerStartsBuildWindow = async (owner: ExecutionTracker) => {
-      await owner.onExecutionStarted(
-        RUN,
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-ha',
-        { installationId: 42 },
-        { matched: true },
-        [{ jobId: 'build-1', jobName: '__build__ci' }],
-      );
+      await startRun(owner, {
+        runId: RUN,
+        deliveryId: 'delivery-ha',
+        providerContext: { installationId: 42 },
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'build-1', jobName: '__build__ci' }],
+      });
       expect(owner.holdRunForPendingJobs(RUN)).toBe(true);
       await owner.registrationWindowSettled(RUN);
     };
@@ -5780,21 +5100,14 @@ describe('ExecutionTracker', () => {
       // the sibling's agent finishes one job while the other still runs.
       const { tracker: owner } = coordinator(OWNER);
       const { tracker: sibling, complete: siblingComplete } = coordinator(SIBLING);
-      await owner.onExecutionStarted(
-        RUN,
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-ha',
-        {},
-        null,
-        [
+      await startRun(owner, {
+        runId: RUN,
+        deliveryId: 'delivery-ha',
+        jobs: [
           { jobId: 'j1', jobName: 'lint' },
           { jobId: 'j2', jobName: 'test' },
         ],
-      );
+      });
       mockDb.dispatchQueueRows.set('j1', 'lint');
       await sibling.onJobStatus(RUN, 'j1', ExecutionJobStatus.enum.success, Date.now(), 'ag');
 
@@ -5810,18 +5123,11 @@ describe('ExecutionTracker', () => {
     });
 
     it('a tracker with no instance id holds no durable window', async () => {
-      await tracker.onExecutionStarted(
-        RUN,
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'delivery-ha',
-        {},
-        null,
-        [{ jobId: 'build-1', jobName: '__build__ci' }],
-      );
+      await startRun(tracker, {
+        runId: RUN,
+        deliveryId: 'delivery-ha',
+        jobs: [{ jobId: 'build-1', jobName: '__build__ci' }],
+      });
       tracker.holdRunForPendingJobs(RUN);
       await tracker.registrationWindowSettled(RUN);
       expect(mockDb.runRows.get(RUN)?.registration_window_instance_id).toBeUndefined();
@@ -5831,18 +5137,11 @@ describe('ExecutionTracker', () => {
   describe('runs finished by another coordinator are released from memory', () => {
     const RUN = 'run-elsewhere';
     const start = async (t: ExecutionTracker, runId = RUN) => {
-      await t.onExecutionStarted(
+      await startRun(t, {
         runId,
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'd',
-        {},
-        null,
-        [{ jobId: 'build-1', jobName: '__build__ci' }],
-      );
+        deliveryId: 'd',
+        jobs: [{ jobId: 'build-1', jobName: '__build__ci' }],
+      });
     };
     const finishedElsewhere = (runId: string, status: string) =>
       mockDb.runRows.set(runId, { ...mockDb.runRows.get(runId), status });
@@ -5921,18 +5220,11 @@ describe('ExecutionTracker', () => {
 
   describe('terminal run writes are monotonic', () => {
     const start = async (t: ExecutionTracker, runId: string) => {
-      await t.onExecutionStarted(
+      await startRun(t, {
         runId,
-        'ci',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        'd',
-        {},
-        null,
-        [{ jobId: 'build-1', jobName: '__build__ci' }],
-      );
+        deliveryId: 'd',
+        jobs: [{ jobId: 'build-1', jobName: '__build__ci' }],
+      });
     };
 
     it('onBuildFailed does not overwrite a run a sibling already finished', async () => {
@@ -6064,12 +5356,10 @@ describe('ExecutionTracker', () => {
 
 /**
  * Cross-file guard: the run roll-up (`computeRunStatus`, orchestrator) and the
- * `on-failure` needs-edge expansion (`resolveWhenToRunOn`, engine) are two
- * separate answers to one question — "did this job fail?" — and both read
- * `STATUS_FAILURE_CLASS`. This pins them to the same answer for every terminal
- * status, across the package boundary that separates them: a run that fails on
- * a given status must be exactly a run whose status releases an `on-failure`
- * downstream. Nothing else in either package checks the two agree.
+ * `on-failure` needs-edge expansion (`resolveWhenToRunOn`, engine) both answer "did this
+ * job fail?" from `STATUS_FAILURE_CLASS`. This pins them to the same answer for every
+ * terminal status, across the package boundary: a run fails on a status exactly when that
+ * status releases an `on-failure` downstream. Nothing else in either package checks this.
  */
 describe('run rollup agrees with the on-failure needs edge', () => {
   const onFailure = new Set<string>(resolveWhenToRunOn('on-failure'));
@@ -6080,18 +5370,13 @@ describe('run rollup agrees with the on-failure needs edge', () => {
       const onComplete = vi.fn();
       const t = new ExecutionTracker({ db: db.db, onExecutionComplete: onComplete });
 
-      await t.onExecutionStarted(
-        `run-${status}`,
-        'ci',
-        'github',
-        'owner/repo',
-        'main',
-        'abc',
-        null,
-        {},
-        null,
-        [{ jobId: 'job-1', jobName: 'only' }],
-      );
+      await startRun(t, {
+        runId: `run-${status}`,
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: null,
+        jobs: [{ jobId: 'job-1', jobName: 'only' }],
+      });
       await t.onJobStatus(`run-${status}`, 'job-1', status as ExecutionJobStatus, Date.now());
 
       expect(onComplete).toHaveBeenCalled();
@@ -6102,15 +5387,13 @@ describe('run rollup agrees with the on-failure needs edge', () => {
 });
 
 /**
- * A global workflow lives in one repository and fires on events from many
- * others. The run is attributed to the SOURCE repository, and the repository
- * that DEFINES the workflow travels alongside it — recorded on the run row and
- * forwarded to the Platform on `execution.status`.
+ * A global workflow lives in one repository and fires on events from many others. The run
+ * is attributed to the SOURCE repository; the DEFINING repository is recorded on the run
+ * row and forwarded to the Platform on `execution.status`.
  *
- * Both halves are written only when the two repositories differ, which is what
- * makes "workflow repo present" a precise cross-repo marker. A frame that
- * carried the workflow repo for an ordinary per-repository run would destroy
- * that property for every downstream consumer.
+ * Both are written only when the two repositories differ, which makes "workflow repo
+ * present" a precise cross-repo marker; carrying it for an ordinary per-repository run
+ * would destroy that property for every downstream consumer.
  */
 describe('ExecutionTracker cross-repo workflow attribution', () => {
   const SOURCE_REPO = 'owner/source-repo';
@@ -6122,39 +5405,19 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
     return { identifier, sha: null, branch: null };
   }
 
-  function startRun(
+  function startCrossRepoRun(
     t: ExecutionTracker,
     runId: string,
     workflowRepo: WorkflowRepoProvenance | null | undefined,
   ): Promise<void> {
-    return t.onExecutionStarted(
+    return startRun(t, {
       runId,
-      'ci',
-      'github',
-      SOURCE_REPO,
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      JOBS,
-      'github:1', // routingKey
-      undefined, // dispatchedContexts
-      'push', // triggerEvent
-      undefined, // commitMessage
-      undefined, // parentRunId
-      undefined, // triggeredBy
-      undefined, // originalRunId
-      undefined, // concurrency
-      undefined, // workflowTimeoutMs
-      undefined, // checkMode
-      undefined, // localWorkingTree
-      undefined, // triggerActorUsername
-      undefined, // triggerActorUserId
-      undefined, // triggeredByAgentLabel
-      undefined, // prNumber
+      repoIdentifier: SOURCE_REPO,
+      jobs: JOBS,
+      routingKey: 'github:1',
+      triggerEvent: 'push',
       workflowRepo,
-    );
+    });
   }
 
   function contextsOf(fn: ReturnType<typeof vi.fn>): ExecutionContext[] {
@@ -6177,7 +5440,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
   });
 
   it('records and forwards the workflow repo when it differs from the source repo', async () => {
-    await startRun(tracker, 'run-global', repoOnly(WORKFLOW_REPO));
+    await startCrossRepoRun(tracker, 'run-global', repoOnly(WORKFLOW_REPO));
 
     const runInsert = mockDb.inserts.find(
       (i) => i.table === 'execution_runs' && i.values.run_id === 'run-global',
@@ -6192,7 +5455,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
   });
 
   it('records workflow_sha and workflow_branch for a cross-repo run, and none for a same-repo run', async () => {
-    await startRun(tracker, 'run-global-provenance', {
+    await startCrossRepoRun(tracker, 'run-global-provenance', {
       identifier: WORKFLOW_REPO,
       sha: 'wfsha123',
       branch: 'main',
@@ -6205,7 +5468,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
     expect(cross!.values.workflow_sha).toBe('wfsha123');
     expect(cross!.values.workflow_branch).toBe('main');
 
-    await startRun(tracker, 'run-same-provenance', {
+    await startCrossRepoRun(tracker, 'run-same-provenance', {
       identifier: SOURCE_REPO,
       sha: 'wfsha123',
       branch: 'main',
@@ -6221,7 +5484,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
   });
 
   it('keeps forwarding the workflow repo on the terminal frame', async () => {
-    await startRun(tracker, 'run-global-terminal', repoOnly(WORKFLOW_REPO));
+    await startCrossRepoRun(tracker, 'run-global-terminal', repoOnly(WORKFLOW_REPO));
     await tracker.onJobStatus(
       'run-global-terminal',
       'job-1',
@@ -6235,7 +5498,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
   });
 
   it('carries the workflow repo on the reconnect state replay', async () => {
-    await startRun(tracker, 'run-global-replay', repoOnly(WORKFLOW_REPO));
+    await startCrossRepoRun(tracker, 'run-global-replay', repoOnly(WORKFLOW_REPO));
 
     const replayed = tracker.getReplayData().find((r) => r.runId === 'run-global-replay');
     expect(replayed!.workflowRepoIdentifier).toBe(WORKFLOW_REPO);
@@ -6245,7 +5508,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
     // The load-bearing case: an ordinary per-repository run whose caller passes
     // the same repository for both. Recording it would make "workflow repo
     // present" stop meaning "cross-repo global run".
-    await startRun(tracker, 'run-same', repoOnly(SOURCE_REPO));
+    await startCrossRepoRun(tracker, 'run-same', repoOnly(SOURCE_REPO));
 
     const runInsert = mockDb.inserts.find(
       (i) => i.table === 'execution_runs' && i.values.run_id === 'run-same',
@@ -6258,7 +5521,7 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
   });
 
   it('records nothing when no workflow repo is supplied', async () => {
-    await startRun(tracker, 'run-none', undefined);
+    await startCrossRepoRun(tracker, 'run-none', undefined);
 
     const runInsert = mockDb.inserts.find(
       (i) => i.table === 'execution_runs' && i.values.run_id === 'run-none',
@@ -6271,10 +5534,9 @@ describe('ExecutionTracker cross-repo workflow attribution', () => {
 });
 
 /**
- * The paths a *restarted* orchestrator takes. In-memory state is gone, so the
- * cross-repo marker has to come back off the run row — and these are exactly
- * the paths where it is most likely to be silently lost, because nothing else
- * in the process still knows the run was global.
+ * The paths a *restarted* orchestrator takes. In-memory state is gone, so the cross-repo
+ * marker must come back off the run row; these paths lose it most easily, because nothing
+ * else in the process still knows the run was global.
  */
 describe('ExecutionTracker cross-repo attribution survives DB rehydration', () => {
   const SOURCE_REPO = 'owner/source-repo';
@@ -6296,34 +5558,14 @@ describe('ExecutionTracker cross-repo attribution survives DB rehydration', () =
   /** Write a global run's row, then hand back a tracker with NO in-memory state. */
   async function writeGlobalRunThenRestart(runId: string): Promise<ExecutionTracker> {
     const writer = new ExecutionTracker({ db: mockDb.db });
-    await writer.onExecutionStarted(
+    await startRun(writer, {
       runId,
-      'ci',
-      'github',
-      SOURCE_REPO,
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      [{ jobId: 'job-1', jobName: 'test' }],
-      'github:1', // routingKey
-      undefined, // dispatchedContexts
-      'push', // triggerEvent
-      undefined, // commitMessage
-      undefined, // parentRunId
-      undefined, // triggeredBy
-      undefined, // originalRunId
-      undefined, // concurrency
-      undefined, // workflowTimeoutMs
-      undefined, // checkMode
-      undefined, // localWorkingTree
-      undefined, // triggerActorUsername
-      undefined, // triggerActorUserId
-      undefined, // triggeredByAgentLabel
-      undefined, // prNumber
-      { identifier: WORKFLOW_REPO, sha: null, branch: null },
-    );
+      repoIdentifier: SOURCE_REPO,
+      jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      routingKey: 'github:1',
+      triggerEvent: 'push',
+      workflowRepo: { identifier: WORKFLOW_REPO, sha: null, branch: null },
+    });
     // A fresh tracker over the same DB is the restart: `this.runs` is empty, so
     // the next status update must rehydrate from the row above.
     return new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
@@ -6349,19 +5591,12 @@ describe('ExecutionTracker cross-repo attribution survives DB rehydration', () =
     // row with a NULL marker must forward nothing, so the test cannot be passing
     // on a mock that echoes the field unconditionally.
     const writer = new ExecutionTracker({ db: mockDb.db });
-    await writer.onExecutionStarted(
-      'run-recover-plain',
-      'ci',
-      'github',
-      SOURCE_REPO,
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      [{ jobId: 'job-1', jobName: 'test' }],
-      'github:1',
-    );
+    await startRun(writer, {
+      runId: 'run-recover-plain',
+      repoIdentifier: SOURCE_REPO,
+      jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      routingKey: 'github:1',
+    });
     const restarted = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
 
     await restarted.onJobStatus(
@@ -6380,19 +5615,12 @@ describe('ExecutionTracker cross-repo attribution survives DB rehydration', () =
     // Without recovery, a job whose completion lands after a coord restart
     // would drop the note from its check summary while its siblings carry it.
     const writer = new ExecutionTracker({ db: mockDb.db });
-    await writer.onExecutionStarted(
-      'run-posture-recover',
-      'ci',
-      'github',
-      SOURCE_REPO,
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      [{ jobId: 'job-1', jobName: 'test' }],
-      'github:1',
-    );
+    await startRun(writer, {
+      runId: 'run-posture-recover',
+      repoIdentifier: SOURCE_REPO,
+      jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      routingKey: 'github:1',
+    });
     await mockDb.db
       .updateTable('execution_runs')
       .set({ trust_tier: 'unknown', lock_file_source: 'base' })
@@ -6600,11 +5828,10 @@ describe('reconcileSummonedRunIfTerminal', () => {
 // ── hasJobStarted ────────────────────────────────────────────────
 
 /**
- * Minimal Kysely stub for the one `execution_jobs` read `hasJobStarted` makes.
- * Purpose-built rather than folded into `createMockDb()`: that mock keys its
- * `execution_jobs` reads off the `findSyntheticJobId` shape (job_name + a LIKE
- * on job_id) and tracks no status column, so it cannot express the four rows
- * this method has to distinguish.
+ * Minimal Kysely stub for `hasJobStarted`'s one `execution_jobs` read. `createMockDb()`
+ * keys its `execution_jobs` reads off the `findSyntheticJobId` shape (job_name + a LIKE
+ * on job_id) and tracks no status column, so it cannot express the rows this method
+ * has to distinguish.
  */
 function jobStateMockDb(row: { status: string; started_at: Date | null } | undefined) {
   const wheres: Array<[string, string, unknown]> = [];

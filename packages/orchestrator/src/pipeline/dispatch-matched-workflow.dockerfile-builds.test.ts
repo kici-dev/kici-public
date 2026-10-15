@@ -2,10 +2,9 @@
  * The dockerfile-build trust gate, which lives in `dispatch-matched-workflow.ts`
  * beside the sandbox-grant gate it mirrors.
  *
- * A file of its own rather than a block inside
- * `dispatch-matched-workflow.test.ts`: that suite carries heavy dispatch
- * scaffolding, and this gate is a pure function over a workflow, a ref scope and
- * a boolean. Named after its subject so the pairing is not a guess.
+ * Kept out of `dispatch-matched-workflow.test.ts` and its heavy dispatch
+ * scaffolding: this gate is a pure function over a workflow, a ref scope and a
+ * boolean.
  */
 import { describe, it, expect } from 'vitest';
 import { CacheRefScope } from '@kici-dev/engine';
@@ -55,12 +54,10 @@ describe('resolveWorkflowDockerfileBuilds', () => {
     expect(reason).toMatch(/job 'build'/);
     expect(reason).toMatch(/\.kici\/ci\.Dockerfile/);
     expect(reason).toMatch(/allow-untrusted-dockerfile-builds/);
-    // ...and it has to name every way a ref gets here. An internally-triggered
-    // run (a `kiciEvent()` subscriber that inherited a non-trusted tier, or
-    // inherited nothing at all) reaches this gate too, and telling its author it
-    // is "a fork PR, or a contributor whose trust could not be resolved" is
-    // false. "without a trusted emitter" is the wording that covers the
-    // inherited-untrusted case AND the inherited-nothing fallback.
+    // ...and every way a ref gets here: a `kiciEvent()` subscriber that
+    // inherited a non-trusted tier, or nothing at all, is neither "a fork PR"
+    // nor "a contributor whose trust could not be resolved". "without a trusted
+    // emitter" covers both the inherited-untrusted and inherited-nothing cases.
     expect(reason).toMatch(/internally-triggered run without a trusted emitter/);
   });
 

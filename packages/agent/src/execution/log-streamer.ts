@@ -7,30 +7,26 @@ import {
 } from '../metrics/prometheus.js';
 
 interface LogStreamerOptions {
-  /** Callback to send log.chunk messages */
   send: (msg: AgentLogChunk) => void;
-  /** Run ID for log.chunk messages */
   runId: string;
-  /** Job ID for log.chunk messages */
   jobId: string;
-  /** Step index for log.chunk messages */
   stepIndex: number;
   /** Max log bytes per step (default: 10MB). Truncates after this limit. */
   maxLogSizeBytes?: number;
-  /** Flush interval in ms (default: 100ms) */
+  /** Default: 100ms. */
   flushIntervalMs?: number;
-  /** Flush line threshold (default: 50 lines) */
+  /** Default: 50 lines. */
   flushLineThreshold?: number;
 
   // --- Backpressure options ---
 
-  /** Get current WS send buffer size in bytes. When provided, enables backpressure. */
+  /** Current WS send buffer size in bytes. When provided, enables backpressure. */
   getBufferedAmount?: () => number;
-  /** Backpressure mode: 'pause' stops the source stream, 'drop' discards lines. Default: 'pause'. */
+  /** 'pause' stops the source stream, 'drop' discards lines. Default: 'pause'. */
   backpressureMode?: 'pause' | 'drop';
-  /** Callback invoked when backpressure is detected (pause mode) -- caller should pause child stdout. */
+  /** Pause mode: backpressure detected, caller should pause child stdout. */
   onBackpressure?: () => void;
-  /** Callback invoked when backpressure clears (pause mode) -- caller should resume child stdout. */
+  /** Pause mode: backpressure cleared, caller should resume child stdout. */
   onBackpressureClear?: () => void;
   /** Register a one-time drain event listener on the WS. */
   onWsDrain?: (callback: () => void) => void;
@@ -40,26 +36,23 @@ const DEFAULT_MAX_LOG_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 const DEFAULT_FLUSH_INTERVAL_MS = 100;
 const DEFAULT_FLUSH_LINE_THRESHOLD = 50;
 
-/** WS send buffer threshold in bytes before backpressure kicks in (1MB). */
+/** WS send buffer bytes before backpressure kicks in (1MB). */
 export const BACKPRESSURE_THRESHOLD = 1_048_576;
 
-/** Safety timeout for pause mode: switch to drop mode temporarily if drain hasn't fired. */
+/** Pause mode: drop buffered lines and resume if drain hasn't fired by then. */
 const PAUSE_SAFETY_TIMEOUT_MS = 30_000;
 
 /**
- * Batches step output lines and flushes them as log.chunk messages.
+ * Batches step output lines into log.chunk messages, flushing at the line
+ * threshold or when the flush timer fires.
  *
- * Optimizes WS delivery by collecting lines and flushing either:
- * - When the line count reaches the flush threshold (default: 50 lines)
- * - After a timer fires (default: 100ms)
+ * Past the per-step size limit it sends a truncation notice and silently drops
+ * further lines.
  *
- * Enforces a maximum total log size per step. After exceeding the limit,
- * a truncation notice is sent and further lines are silently dropped.
- *
- * Supports sender-side backpressure with two modes:
- * - **pause**: Pauses the child process stdout via callback, resumes on WS drain event.
- *   Includes a 30s safety timeout that temporarily switches to drop mode to prevent deadlocks.
- * - **drop**: Discards buffered lines when backpressure is detected, emits a count marker on resume.
+ * Sender-side backpressure:
+ * - **pause**: pauses child stdout via callback, resumes on WS drain. A 30s
+ *   safety timeout drops the buffer and resumes, to prevent deadlocks.
+ * - **drop**: discards buffered lines, emits a count marker on resume.
  */
 export class LogStreamer {
   private buffer: string[] = [];
@@ -70,15 +63,12 @@ export class LogStreamer {
   /** Which stream the currently-buffered lines came from. */
   private bufferStream: LogStream = LogStream.enum.stdout;
 
-  /** Number of lines dropped due to backpressure (drop mode). */
   private droppedCount = 0;
-  /** Whether we are currently in a backpressured state (pause mode). */
+  /** Pause-mode backpressure state. */
   private paused = false;
-  /** Whether drop mode is currently shedding lines. Tracked separately from
-   *  `paused` so the Prometheus `kici_agent_log_backpressure_active` gauge
-   *  reflects the actual shedding state (not just pause mode). */
+  /** Drop-mode shedding state, separate from `paused` so the
+   *  `kici_agent_log_backpressure_active` gauge reflects actual shedding. */
   private dropping = false;
-  /** Safety timeout timer for pause mode. */
   private pauseSafetyTimer: ReturnType<typeof setTimeout> | null = null;
 
   private readonly send: (msg: AgentLogChunk) => void;
@@ -114,21 +104,15 @@ export class LogStreamer {
   }
 
   /**
-   * Add a line to the buffer. Triggers flush if threshold reached,
-   * otherwise schedules a timer-based flush.
+   * A chunk carries a single stream, so a stream flip closes the pending chunk
+   * first; in-order delivery preserves the stdout/stderr interleaving.
    *
-   * A chunk carries a single stream, so a kind flip closes the pending chunk
-   * before the new line is buffered. Chunks are delivered in order, so the
-   * stdout/stderr interleaving is preserved across that boundary.
-   *
-   * `bufferStream` is only advanced once the buffer is actually empty. Under
-   * pause-mode backpressure `flush()` deliberately leaves the buffer intact
-   * until the socket drains, so the flip cannot close the pending chunk;
-   * advancing the tag there would relabel the already-buffered lines as the
-   * newly-arrived stream. The buffer keeps the tag of its first lines instead,
-   * which means a chunk assembled while backpressured reports one stream for
-   * lines that came from both — stderr in such a chunk is under-reported as
-   * stdout. Separating them needs a queue of pending per-stream chunks.
+   * `bufferStream` advances only once the buffer is empty. Under pause-mode
+   * backpressure `flush()` keeps the buffer until the socket drains, so the
+   * flip cannot close it, and advancing the tag would relabel the buffered
+   * lines. A chunk assembled while backpressured therefore reports its first
+   * lines' stream for lines from both — stderr under-reported as stdout.
+   * Separating them needs a queue of pending per-stream chunks.
    */
   addLine(line: string, stream: LogStream = LogStream.enum.stdout): void {
     if (this.truncated) {
@@ -162,14 +146,9 @@ export class LogStreamer {
   }
 
   /**
-   * Flush buffered lines as a log.chunk message.
-   * No-op if buffer is empty.
-   *
-   * When backpressure is enabled (getBufferedAmount provided), checks the WS
-   * send buffer before sending:
-   * - **drop mode**: Discards buffered lines and increments droppedCount.
-   * - **pause mode**: Signals the caller to pause the child process, registers
-   *   a drain listener to resume, and sets a 30s safety timeout.
+   * When the WS send buffer is over the threshold: drop mode discards the
+   * buffer; pause mode signals the caller to pause, registers a drain listener
+   * to resume, and arms the 30s safety timeout.
    */
   flush(): void {
     if (this.buffer.length === 0) {
@@ -178,7 +157,6 @@ export class LogStreamer {
 
     this.clearTimer();
 
-    // Check backpressure before sending
     if (this.getBufferedAmount && this.getBufferedAmount() > BACKPRESSURE_THRESHOLD) {
       if (this.backpressureMode === 'drop') {
         if (!this.dropping) {
@@ -191,7 +169,6 @@ export class LogStreamer {
         return;
       }
 
-      // Pause mode: signal caller to pause child stdout
       if (!this.paused) {
         this.paused = true;
         logBackpressureEventsTotal.add(1, { mode: 'pause' });
@@ -199,11 +176,10 @@ export class LogStreamer {
         this.onBackpressure?.();
         this.registerDrainResume();
       }
-      // Don't send -- buffer stays until drain fires
+      // Buffer stays until drain fires.
       return;
     }
 
-    // Prepend drop marker if we previously dropped lines
     const lines = this.buildLinesWithDropMarker();
 
     this.send({
@@ -218,44 +194,29 @@ export class LogStreamer {
     });
   }
 
-  /**
-   * Flush remaining buffer and clean up. Call at end of step.
-   */
+  /** Call at end of step: sends the remaining buffer regardless of backpressure. */
   destroy(): void {
-    // Force flush regardless of backpressure (step is ending)
     this.forceSend();
     this.clearTimer();
     this.clearPauseSafetyTimer();
   }
 
-  /**
-   * Total bytes tracked across all lines added.
-   */
   getTotalBytes(): number {
     return this.totalBytes;
   }
 
-  /**
-   * Number of lines dropped due to backpressure.
-   * Exposed for testing.
-   */
+  /** Exposed for testing. */
   getDroppedCount(): number {
     return this.droppedCount;
   }
 
-  /**
-   * Whether backpressure pause is currently active.
-   * Exposed for testing.
-   */
+  /** Exposed for testing. */
   isPaused(): boolean {
     return this.paused;
   }
 
   // --- Private helpers ---
 
-  /**
-   * Build the lines array, prepending a drop marker if lines were dropped.
-   */
   private buildLinesWithDropMarker(): string[] {
     const lines = this.buffer.splice(0);
     if (this.droppedCount > 0) {
@@ -270,10 +231,6 @@ export class LogStreamer {
     return lines;
   }
 
-  /**
-   * Force send all buffered lines, bypassing backpressure checks.
-   * Used during destroy() to ensure remaining data is sent.
-   */
   private forceSend(): void {
     if (this.buffer.length === 0 && this.droppedCount === 0) {
       return;
@@ -296,10 +253,6 @@ export class LogStreamer {
     });
   }
 
-  /**
-   * Register a WS drain listener that resumes sending after backpressure clears.
-   * Includes a 30s safety timeout that temporarily switches to drop mode.
-   */
   private registerDrainResume(): void {
     const resume = () => {
       this.clearPauseSafetyTimer();
@@ -308,18 +261,15 @@ export class LogStreamer {
         logBackpressureActive.add(-1, { mode: 'pause' });
       }
       this.onBackpressureClear?.();
-      // Retry flushing now that backpressure has cleared
       this.flush();
     };
 
-    // Register drain callback
     this.onWsDrain?.(resume);
 
-    // Safety timeout: if drain hasn't fired in 30s, drop buffered lines and resume
+    // Safety timeout: if drain hasn't fired, drop buffered lines and resume.
     this.pauseSafetyTimer = setTimeout(() => {
       this.pauseSafetyTimer = null;
       if (this.paused) {
-        // Switch to temporary drop: discard buffer and resume
         this.droppedCount += this.buffer.length;
         this.buffer = [];
         this.paused = false;

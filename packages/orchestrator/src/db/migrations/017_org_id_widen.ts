@@ -1,31 +1,15 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Widen every orchestrator-side `org_id varchar(12)` column to
- * `varchar(16)` to match Platform's new prefixed canonical org ID
- * format (`org_<12-char NanoID>`).
+ * Widen orchestrator `org_id varchar(12)` columns to `varchar(16)` for the Platform's prefixed
+ * org ID format (`org_<12-char NanoID>`, from Platform migration 018). The orchestrator only
+ * stores the org IDs the WS relay delivers.
  *
- * The orchestrator receives org IDs from Platform via the WS relay —
- * it does not generate them. After Platform's migration 018 deploys,
- * every new run/event/etc. routed through this orchestrator carries
- * the prefixed 16-char ID. The orchestrator just stores whatever
- * string it receives.
+ * No backfill: older rows keep obsolete un-prefixed 12-char IDs and are orphans by design;
+ * the dashboard queries with prefixed IDs, so `WHERE org_id = $1` hides them.
  *
- * No row backfill on this side: pre-migration rows carry un-prefixed
- * 12-char values and reference Platform org IDs that are now obsolete.
- * They are orphans by design — once Platform's migration runs, the
- * dashboard queries the orchestrator API with the new prefixed IDs
- * and the orchestrator's `WHERE org_id = $1` filter naturally hides
- * the old rows. New activity writes fresh rows under the prefixed IDs.
- *
- * Tables widened: `access_log`, `environment_bindings`,
- * `environment_source_overrides`, `environment_variables`,
- * `environments`, `event_log`, `held_runs`, `scoped_secrets`.
- *
- * Not touched: `org_settings.customer_id` and
- * `generic_webhook_sources.customer_id` (already `text` /
- * `varchar(255)` — wide enough), `sources.customer_id` (varchar(255)
- * — wide enough).
+ * The `customer_id` columns (`org_settings`, `generic_webhook_sources`, `sources`) are already
+ * `text` / `varchar(255)` and stay untouched.
  */
 
 const ORG_ID_TABLES = [

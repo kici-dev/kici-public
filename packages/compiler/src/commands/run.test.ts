@@ -10,7 +10,6 @@ import {
   withStdoutOnStderr,
 } from './run.js';
 
-// Shared mock PlatformRunClient instance -- all tests configure this
 const mockClient = {
   initUpload: vi.fn(),
   trigger: vi.fn(),
@@ -19,7 +18,6 @@ const mockClient = {
   cancel: vi.fn(),
 };
 
-// Mock dependencies
 vi.mock('../remote/config.js', () => ({
   loadGlobalConfig: vi.fn(),
 }));
@@ -143,7 +141,7 @@ vi.mock('../remote/secret-upload.js', () => ({
   buildEncryptedSecrets: vi.fn().mockResolvedValue(null),
 }));
 
-// Mock node:fs/promises readFile for inline lock file tests
+// readFile serves the inline lock file.
 const mockReadFile = vi.fn();
 vi.mock('node:fs/promises', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs/promises')>();
@@ -159,7 +157,6 @@ vi.mock('../execution/index.js', () => ({
   discoverWorkflows: vi.fn().mockResolvedValue({ workflows: [] }),
 }));
 
-// Suppress logger output in tests
 vi.mock('@kici-dev/core', () => ({
   logger: {
     info: vi.fn(),
@@ -218,7 +215,6 @@ describe('kici run command', () => {
     createOverlayTarball = uploaderMod.createOverlayTarball as ReturnType<typeof vi.fn>;
     uploadTarball = uploaderMod.uploadTarball as ReturnType<typeof vi.fn>;
 
-    // Default: authenticated, org-targeted config
     loadGlobalConfig.mockResolvedValue({
       pat: 'test-pat',
       platformEndpoint: 'https://platform.invalid',
@@ -285,14 +281,11 @@ describe('kici run command', () => {
         expect.objectContaining({
           fixtureId: 'push-main',
           uploadId: 'upload-456',
-          // Overlay-tarball key is always sent (independent of secrets) so the
-          // orchestrator can decrypt the overlay.
+          // Always sent, independent of secrets, so the orchestrator can decrypt the overlay.
           cliPublicKey: Buffer.from('clipubkey').toString('base64'),
-          // Every run-remote uploads the full local working tree.
           fullRepo: true,
         }),
       );
-      // PlatformRunClient built against the configured Platform endpoint + PAT.
       expect(platformClientConfigs[0]).toEqual({
         platformEndpoint: 'https://platform.invalid',
         token: 'test-pat',
@@ -471,8 +464,7 @@ describe('kici run command', () => {
     beforeEach(async () => {
       const compileMod = await import('./compile.js');
       compileCommand = compileMod.compileCommand as ReturnType<typeof vi.fn>;
-      // Reset to success each test (clearAllMocks keeps implementations, so the
-      // failure test below would otherwise leak into the next case).
+      // clearAllMocks keeps implementations, so the failure case would leak.
       compileCommand.mockResolvedValue(true);
     });
 
@@ -1036,7 +1028,7 @@ describe('kici run command', () => {
     });
 
     it('sends inlineLockFile, fullRepo, and the overlay key even WITH a remote', async () => {
-      // overlay default mock = hasRemote: true → proves the uniform behavior.
+      // The default overlay mock has hasRemote: true.
       await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
 
       expect(mockReadFile).toHaveBeenCalledWith('/mock/.kici/kici.lock.json', 'utf-8');
@@ -1060,8 +1052,7 @@ describe('kici run command', () => {
     it('emits the working-tree status line in human mode', async () => {
       vi.mocked(logger.info).mockClear();
       await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
-      // The overlay now includes `.git`, so the message states git steps work
-      // (no "will fail" warning).
+      // The overlay includes `.git`, so git steps work.
       const infoCalls = vi.mocked(logger.info).mock.calls.map((c) => String(c[0]));
       expect(infoCalls.some((line) => line.includes('local working tree'))).toBe(true);
       expect(infoCalls.some((line) => line.includes('git steps work'))).toBe(true);

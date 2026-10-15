@@ -140,8 +140,8 @@ describe('matrix input guards (static path)', () => {
   });
 
   it('still allows a product above the fan-out cap that excludes back under it', () => {
-    // 300 raw combinations, excluded down to 200 — succeeds today and must keep
-    // succeeding. This is the regression guard for the two-threshold split.
+    // 300 raw combinations, excluded down to 200, must succeed: the regression
+    // guard for the two-threshold split.
     const twenty = Array.from({ length: 20 }, (_, i) => `a${i}`);
     const fifteen = Array.from({ length: 15 }, (_, i) => `b${i}`);
     const lockJob = base({

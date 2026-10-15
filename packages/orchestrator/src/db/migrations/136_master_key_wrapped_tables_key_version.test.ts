@@ -3,18 +3,16 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './136_master_key_wrapped_tables_key_version.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 136: asserts `key_version` exists on all
- * three master-key-wrapped tables that lacked it, as a NOT NULL integer
- * defaulting to 1, and that up/down are idempotent. Gated on
- * `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 136: asserts `key_version` exists on every
+ * master-key-wrapped table that lacked it, as a NOT NULL integer defaulting to
+ * 1, and that up/down are idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  *
- * The default is the load-bearing part: every pre-existing row was sealed at
- * version 1 by the hardcoded `keyVersion: 1` at each write site, so a row that
- * predates the column must read back as 1 — not NULL — for the rotation sweep's
- * concurrent-write guard to compare against anything.
+ * The default is load-bearing: older rows were sealed at version 1 (the
+ * hardcoded `keyVersion: 1` at each write site), and must read back 1, not NULL,
+ * for the rotation sweep's concurrent-write guard to compare against anything.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;

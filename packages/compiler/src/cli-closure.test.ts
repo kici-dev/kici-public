@@ -10,23 +10,19 @@ const __dirname = path.dirname(__filename);
 
 // packages/compiler/src -> repo root
 const REPO_ROOT = path.resolve(__dirname, '../../..');
-// The real CLI entrypoint customers run: the `kici` bin shim, which lazily
-// `await import('@kici-dev/compiler/cli')`. Tracing it (rather than dist/cli.js
-// directly) proves the production entrypoint's load closure stays light.
+// The `kici` bin shim customers run, which lazily imports
+// `@kici-dev/compiler/cli`: tracing it, not dist/cli.js, covers the real closure.
 const KICI_BIN = path.resolve(REPO_ROOT, 'packages/kici/bin/kici.js');
 const TRACER = path.resolve(__dirname, '../hack/trace-loaded-modules.mjs');
 
-// Heavy server-side dependencies that must NEVER be pulled into the `kici`
-// CLI's `--version` load closure. A static import re-introducing any of these
-// (the OpenTelemetry SDK, AWS SDK, the Kysely query builder, the pg driver, or
-// the Hono HTTP framework) would re-inflate CLI startup from ~0.07s to ~3.3s.
+// Server-side dependencies that must NEVER enter the `kici --version` load
+// closure: a static import of any of them inflates CLI startup from ~0.07s to ~3.3s.
 const FORBIDDEN = ['@opentelemetry', '@aws-sdk', 'kysely', 'pg', 'hono'] as const;
 
 const SPAWN_TIMEOUT_MS = 30_000;
 
-// Match `pg` precisely: the bare specifier, a subpath import (`pg/...`), or a
-// node_modules path segment (`.../node_modules/pg/...`). A naive substring
-// check would false-positive on unrelated specifiers like `picocolors`.
+// `pg` matches only as the bare specifier, a `pg/...` subpath or a
+// `node_modules/pg/` segment: a substring check would match `picocolors`.
 function loadsForbidden(specifier: string, forbidden: string): boolean {
   if (forbidden === 'pg') {
     return (
@@ -66,10 +62,8 @@ describe('kici --version load closure', () => {
     () => {
       const specifiers = traceVersionClosure();
 
-      // Guard against a broken tracer silently capturing nothing — an empty
-      // trace would make the forbidden-deps assertion below vacuously pass.
-      // A working trace of `kici --version` always resolves at least the
-      // commander argument parser and the compiler CLI entrypoint.
+      // An empty trace would pass the forbidden-deps assertion vacuously; a
+      // working one always resolves commander and the compiler CLI entrypoint.
       expect(specifiers.length).toBeGreaterThan(0);
       expect(specifiers).toContain('commander');
       expect(specifiers.some((s) => s.includes('@kici-dev/compiler'))).toBe(true);

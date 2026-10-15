@@ -15,21 +15,14 @@ export async function sha256File(filePath: string): Promise<string> {
 /**
  * Normalize line endings to LF so hashes computed on different platforms agree.
  *
- * Git for Windows ships with `core.autocrlf=true` in the system gitconfig, so a
- * `git clone` of a Linux-authored repo on a Windows host checks out text files
- * with CRLF in the working tree. The compiler hashed the LF source on Linux,
- * but the agent on Windows reads CRLF and computes a different hash — every
- * dispatch fails with a "lock file is out of date" error even though the
- * semantic content is identical.
+ * Git for Windows defaults to `core.autocrlf=true`, so a Windows agent reads
+ * CRLF where the Linux compiler hashed LF, and every dispatch would fail with
+ * "lock file is out of date".
  *
- * Applied at the boundaries where source / asset content enters the hash:
- *   - raw workflow source (`.kici/workflows/*.ts`) at hash time, in both the
- *     compiler (lockfile generation) and the agent (drift verification).
- *   - file content portions of the asset digest (`hashFiles` resolution) on
- *     both sides.
- *
- * Standalone `\r` is also collapsed to `\n` for safety against legacy
- * Mac-style endings, though TypeScript source files rarely carry those.
+ * Applied wherever content enters a hash, in both the compiler (lockfile
+ * generation) and the agent (drift verification): raw workflow source
+ * (`.kici/workflows/*.ts`) and the file content in the asset digest
+ * (`hashFiles`). A lone legacy-Mac `\r` also becomes `\n`.
  */
 export function normalizeLineEndings(input: string): string {
   return input.replace(/\r\n?/g, '\n');

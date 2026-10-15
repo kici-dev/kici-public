@@ -1,9 +1,4 @@
-/**
- * Tests for the Windows service manager.
- *
- * Mocks child_process.execSync and fs operations to test service
- * lifecycle commands via shawl + sc.exe without requiring Windows.
- */
+/** Windows service manager (shawl + sc.exe); child_process and fs are mocked to run off Windows. */
 
 import path from 'node:path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -11,7 +6,6 @@ import type { ServiceConfig } from './types.js';
 import { DEFAULT_RESTART_POLICY } from './types.js';
 import { restrictDirArgs } from './windows-acl.js';
 
-// Mock child_process
 const mockExecSync = vi.fn();
 const mockExecFileSync = vi.fn();
 vi.mock('node:child_process', () => ({
@@ -19,7 +13,6 @@ vi.mock('node:child_process', () => ({
   execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
 }));
 
-// Mock fs
 const mockExistsSync = vi.fn(() => false);
 const mockMkdirSync = vi.fn();
 const mockWriteFileSync = vi.fn();
@@ -40,7 +33,6 @@ vi.mock('node:fs', async () => {
   };
 });
 
-// Mock lazy deps
 const mockEnsureDep = vi.fn().mockResolvedValue('/cache/shawl/1.5.2');
 const mockGetDepMetadata = vi.fn().mockReturnValue({
   name: 'shawl',
@@ -59,7 +51,6 @@ vi.mock('../lazy-deps/registry.js', () => ({
   getDepMetadata: (...args: unknown[]) => mockGetDepMetadata(...args),
 }));
 
-// Mock platform-detect
 vi.mock('./platform-detect.js', () => ({
   getCacheDir: () => '/cache/',
 }));
@@ -80,11 +71,8 @@ describe('WindowsServiceManager', () => {
     vi.clearAllMocks();
     mockExecFileSync.mockReset();
     mockExistsSync.mockReturnValue(false);
-    // Fresh-box default: no pre-existing service, so `sc.exe query` throws
-    // (exit non-zero). This makes install()'s serviceExists() guard return
-    // false so the happy-path install tests run unchanged; everything else
-    // succeeds silently. Tests that need a different shape override this with
-    // their own mockReturnValueOnce / mockImplementation.
+    // Fresh-box default: `sc.exe query` throws (no service), so install()'s
+    // serviceExists() guard is false; every other command succeeds. Tests override it.
     mockExecSync.mockImplementation((cmd: unknown) => {
       if (typeof cmd === 'string' && cmd.includes('sc.exe query')) {
         throw new Error('service does not exist');
@@ -108,8 +96,7 @@ describe('WindowsServiceManager', () => {
       const mgr = new WindowsServiceManager();
       await mgr.install(testConfig);
 
-      // path.dirname behaves differently on Linux vs Windows for backslash paths,
-      // so we just verify mkdirSync was called with recursive: true
+      // path.dirname differs on Linux for backslash paths, so only `recursive` is checked.
       expect(mockMkdirSync).toHaveBeenCalledWith(expect.any(String), { recursive: true });
     });
 
@@ -118,7 +105,6 @@ describe('WindowsServiceManager', () => {
       const mgr = new WindowsServiceManager();
       await mgr.install(testConfig);
 
-      // Find the shawl add call
       const shawlCall = mockExecSync.mock.calls.find(
         (c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes('shawl'),
       );
@@ -517,7 +503,7 @@ describe('WindowsServiceManager', () => {
 
   describe('start', () => {
     it('polls until STOPPED, then runs sc.exe start', async () => {
-      // Mock sc.exe query to return STOPPED (code 1) so the pre-start wait loop exits.
+      // STOPPED (code 1) ends the pre-start wait loop.
       mockExecSync.mockImplementation((cmd: string) => {
         if (typeof cmd === 'string' && cmd.includes('sc.exe query')) {
           return Buffer.from('        STATE              : 1  STOPPED\r\n');
@@ -537,8 +523,7 @@ describe('WindowsServiceManager', () => {
     });
 
     it('is a no-op when the service is already RUNNING', async () => {
-      // Mock sc.exe query to return RUNNING (code 4). start() must NOT call sc.exe start —
-      // calling it on a running service would fail with error 1056.
+      // RUNNING (code 4): `sc.exe start` on a running service fails with error 1056.
       mockExecSync.mockImplementation((cmd: string) => {
         if (typeof cmd === 'string' && cmd.includes('sc.exe query')) {
           return Buffer.from('        STATE              : 4  RUNNING\r\n');
@@ -559,7 +544,7 @@ describe('WindowsServiceManager', () => {
 
   describe('stop', () => {
     it('runs sc.exe stop, then polls until STOPPED', async () => {
-      // Mock sc.exe query to return STOPPED (code 1) so the post-stop wait loop exits.
+      // STOPPED (code 1) ends the post-stop wait loop.
       mockExecSync.mockImplementation((cmd: string) => {
         if (typeof cmd === 'string' && cmd.includes('sc.exe query')) {
           return Buffer.from('        STATE              : 1  STOPPED\r\n');
@@ -774,7 +759,7 @@ describe('WindowsServiceManager', () => {
 
   describe('restart', () => {
     it('runs stop, polls until stopped, then start', async () => {
-      // Mock sc.exe query to return STOPPED state (code 1) after stop
+      // STOPPED (code 1) after the stop.
       mockExecSync.mockImplementation((cmd: string) => {
         if (typeof cmd === 'string' && cmd.includes('sc.exe query')) {
           return Buffer.from(
@@ -864,8 +849,7 @@ describe('WindowsServiceManager', () => {
 
   describe('uninstall', () => {
     it('stops and deletes the service', async () => {
-      // After sc.exe delete, the poll loop calls sc.exe query to confirm
-      // the service is gone. Make query throw to simulate successful deletion.
+      // After `sc.exe delete`, a throwing query reads as the service gone.
       let deleteSeen = false;
       mockExecSync.mockImplementation((cmd: string) => {
         if (typeof cmd === 'string' && cmd.includes('sc.exe delete')) {
@@ -960,7 +944,6 @@ describe('WindowsServiceManager', () => {
       const mgr = new WindowsServiceManager();
       await mgr.install({ ...testConfig, component: 'orchestrator' });
 
-      // Find the sc.exe description call carrying the marker prefix.
       const descCall = mockExecSync.mock.calls.find(
         (c: unknown[]) =>
           typeof c[0] === 'string' &&
@@ -975,7 +958,6 @@ describe('WindowsServiceManager', () => {
       const mgr = new WindowsServiceManager();
       await mgr.install(testConfig);
 
-      // No call should carry the [KiCI: marker when component is unset.
       const markerCall = mockExecSync.mock.calls.find(
         (c: unknown[]) => typeof c[0] === 'string' && (c[0] as string).includes('[KiCI:'),
       );
@@ -1142,8 +1124,7 @@ describe('WindowsServiceManager', () => {
     });
 
     it('list() decodes a single-object JSON payload (PowerShell single-row form)', async () => {
-      // PowerShell's ConvertTo-Json emits a bare object (not a single-element array)
-      // when only one row matches. The driver must wrap it in [] before iterating.
+      // ConvertTo-Json emits a bare object, not a one-element array, for one row.
       mockExecSync.mockImplementation((cmd: string) => {
         if (typeof cmd === 'string' && cmd.includes('Get-CimInstance')) {
           return Buffer.from(

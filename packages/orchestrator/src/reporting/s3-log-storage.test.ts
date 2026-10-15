@@ -1,8 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// In-memory fake S3 client shared with the S3LogStorage under test. The active
-// instance is swapped per makeStore()/makeStoreWithObjects() call before the
-// storage constructor runs (which calls the mocked createS3Client).
+// In-memory fake S3, swapped per makeStore()/makeStoreWithObjects() call before the storage
+// constructor calls the mocked createS3Client.
 let activeFake: FakeS3;
 
 vi.mock('@kici-dev/shared', async (importOriginal) => {
@@ -178,13 +177,11 @@ describe('S3LogStorage buffered streaming segments (appendStreaming)', () => {
 
 describe('S3LogStorage append() single-shot durability (v1-revert guard)', () => {
   it('append() stays immediately durable + readable with NO finalize', async () => {
-    // A single-shot writer (webhook payload, rerun payload, orchestration log)
-    // writes once via append() and must read the content back without any
-    // appendStreaming/finalize. The reverted v1 broke exactly this by routing
-    // append() through the buffer; this guard fails loudly if it recurs.
+    // A single-shot writer (webhook payload, rerun payload, orchestration log) writes once
+    // via append() and must read it back with no appendStreaming/finalize; routing append()
+    // through the buffer breaks exactly this.
     const { store, fake } = makeStore({ flushBytes: 1_000_000, flushMs: 60_000 });
     await store.append('event-log/deliveries/d1.json.gz', 'payload-bytes');
-    // No appendStreaming/finalize was called.
     expect(fake.puts.length).toBe(1); // written immediately as a single object
     expect(fake.puts.some((p) => p.Key.includes('/seg-'))).toBe(false); // NOT a segment
     const res = await store.read('event-log/deliveries/d1.json.gz');
@@ -265,7 +262,6 @@ describe('S3LogStorage segment-aware read/exists/list', () => {
 
 describe('S3LogStorage round-trip', () => {
   beforeEach(() => {
-    // isolate module-level fake between round-trip cases
     activeFake = new FakeS3();
   });
 
@@ -362,12 +358,10 @@ describe('S3LogStorage key validation', () => {
 });
 
 describe('S3LogStorage retention over a legacy malformed key', () => {
-  // A key carrying `..` cannot be minted any more, but a bucket written before
-  // objectKey() started refusing them still holds one. listWithMetadata()
-  // reports it verbatim, so the retention sweep feeds it straight back into
-  // deleteMany(). If that path re-applied the minting assert it would throw
-  // while building the batch, aborting the whole sweep — so every expired
-  // object in the bucket would be retained forever, not just the malformed one.
+  // objectKey() refuses to mint a `..` key, but an older bucket can still hold one.
+  // listWithMetadata() reports it verbatim, so the retention sweep feeds it back into
+  // deleteMany(). Re-applying the minting assert there would throw while building the batch
+  // and abort the whole sweep, retaining every expired object forever, not just this one.
   const LEGACY_MALFORMED = 'executions/r/job-../../evil/step-0.log';
 
   it('lists a legacy malformed key rather than hiding it', async () => {
@@ -394,8 +388,7 @@ describe('S3LogStorage retention over a legacy malformed key', () => {
       LEGACY_MALFORMED,
       'executions/r/job-b/step-0.log',
     ]);
-    // All three keys reached S3 in ONE batch — the malformed one did not throw
-    // while the batch was being built, which is the whole point.
+    // Every key reached S3 in ONE batch: the malformed one did not throw while building it.
     expect(n).toBe(3);
     expect(fake.deleteBatches).toHaveLength(1);
     expect(fake.deleteBatches[0]).toContain(LEGACY_MALFORMED);
@@ -403,8 +396,7 @@ describe('S3LogStorage retention over a legacy malformed key', () => {
   });
 
   it('still refuses to MINT a malformed key on the write and read paths', async () => {
-    // The removal carve-out is scoped to deleteMany: append/read/exists still
-    // reject, so nothing can create another one.
+    // The carve-out is deleteMany only: append/read/exists still reject, so nothing mints one.
     const { store } = makeStore({ flushBytes: 1_000_000, flushMs: 60_000 });
     await expect(store.append(LEGACY_MALFORMED, 'x\n')).rejects.toThrow();
     await expect(store.read(LEGACY_MALFORMED)).rejects.toThrow();

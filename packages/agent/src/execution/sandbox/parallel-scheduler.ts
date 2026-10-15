@@ -1,14 +1,9 @@
 /**
- * Concurrency-aware scheduler for `parallel()` step groups.
- *
- * A parallel group's children each run as their own observable step (own logs,
- * status, timing, retry, cache, hooks — all task-scoped per child) through the
- * same `runStepIteration` machinery the sequential loop
- * uses. Children launch behind a `maxParallel` window (queued children report
- * `pending`); the group joins at a barrier. On the first non-`continueOnError`
- * child failure when `failFast`, every in-flight sibling's per-task abort
- * controller is fired so its step race rejects and it is reported `cancelled`
- * (which is NOT a failure).
+ * Scheduler for `parallel()` step groups. Each child runs as its own observable step
+ * (logs, status, timing, retry, cache, hooks, all task-scoped) through the sequential
+ * loop's `runStepIteration`, behind a `maxParallel` window (queued children report
+ * `pending`), joined at a barrier. With `failFast`, the first non-`continueOnError`
+ * failure aborts every in-flight sibling, reported `cancelled` (NOT a failure).
  */
 
 import { StepConcurrencyKind } from '@kici-dev/engine';
@@ -19,7 +14,6 @@ import type { SandboxStepResult } from './types.js';
 type ParallelNode = Extract<StepNode, { kind: 'parallel' }>;
 type ParallelChild = ParallelNode['children'][number];
 
-/** Outcome of running one parallel group. */
 export interface ParallelGroupOutcome {
   /** True when at least one non-`continueOnError` child failed. */
   failed: boolean;
@@ -30,9 +24,8 @@ export interface ParallelGroupOutcome {
 }
 
 /**
- * Wrap `sendIpc` so a child's own `step.start` / `step.complete` messages carry
- * the parallel-child concurrency role + the group id. Cache/secret pseudo-step
- * messages (different stepIndex) pass through untouched.
+ * Stamp the parallel-child role and group id on the child's own `step.start` /
+ * `step.complete`; cache/secret pseudo-step messages (other stepIndex) pass untouched.
  */
 function stampChildSend(
   sendIpc: (msg: RunnerToAgentMessage) => void,
@@ -96,11 +89,6 @@ function emitCancelledSkip(
   };
 }
 
-/**
- * Run a parallel group: launch children with a bounded-concurrency window, join
- * at a barrier, and fail-fast-cancel in-flight siblings on the first hard
- * failure.
- */
 export async function runParallelGroup(
   node: ParallelNode,
   opts: StepLoopOptions,
@@ -112,7 +100,7 @@ export async function runParallelGroup(
   let failed = false;
   let failedStepName: string | undefined;
 
-  // Children beyond the initial window wait for a slot — announce them pending.
+  // Children beyond the initial window wait for a slot.
   for (let i = limit; i < children.length; i++) {
     emitPending(opts, children[i], groupId);
   }
@@ -124,7 +112,6 @@ export async function runParallelGroup(
       if (idx >= children.length) return;
       const child = children[idx];
 
-      // Fail-fast already tripped: skip remaining children as cancelled.
       if (failFast && failed) {
         results[idx] = emitCancelledSkip(opts, child, groupId);
         continue;
@@ -138,10 +125,8 @@ export async function runParallelGroup(
       try {
         const outcome = await runStepIteration(child.step, child.stepIndex, childOpts);
         results[idx] = outcome.result;
-        // `shouldBreak` is the hard-failure signal: a failed step that is NOT
-        // `continueOnError`. A `continueOnError` child failure sets
-        // `failedStepName` but leaves `shouldBreak` false, so it never trips
-        // fail-fast nor fails the job (per the parallel() semantics).
+        // `shouldBreak` is the hard-failure signal; a `continueOnError` child failure
+        // sets `failedStepName` but never trips fail-fast nor fails the job.
         if (outcome.shouldBreak) {
           if (!failed) {
             failed = true;

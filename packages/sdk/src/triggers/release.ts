@@ -1,7 +1,4 @@
-/**
- * Release trigger helper - creates triggers for release events.
- * Returns a frozen ReleaseTriggerConfig directly.
- */
+/** Release trigger helper for release events; returns a frozen config. */
 
 import type { BranchPattern, ReleaseConfigInput, ReleaseTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';

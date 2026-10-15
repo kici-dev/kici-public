@@ -1,7 +1,4 @@
-/**
- * KiCI event trigger helper - creates triggers for custom named events.
- * Returns a frozen KiciEventTriggerConfig directly.
- */
+/** KiCI event trigger helper for custom named events; returns a frozen config. */
 
 import type { KiciEventConfigInput, KiciEventTriggerConfig } from './types.js';
 

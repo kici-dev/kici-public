@@ -57,7 +57,7 @@ describe('FilesystemLogStorage', () => {
       const path = 'executions/r1/job-a/step-0.log';
       await storage.appendStreaming(path, 'line1\n');
       await storage.appendStreaming(path, 'line2\n');
-      // finalize must not throw and requires no prior buffering on FS.
+      // No prior buffering needed on FS.
       await expect(storage.finalize(path)).resolves.toBeUndefined();
       const res = await storage.read(path);
       expect(res.data).toBe('line1\nline2\n');
@@ -89,19 +89,16 @@ describe('FilesystemLogStorage', () => {
       const content = 'AAAAAAAAAA' + 'BBBBBBBBBB' + 'CCCCCCCCCC'; // 30 bytes
       await storage.append(path, content);
 
-      // Read first 10 bytes
       const page1 = await storage.read(path, { limit: 10 });
       expect(page1.data).toBe('AAAAAAAAAA');
       expect(page1.cursor).toBe(10);
       expect(page1.complete).toBe(false);
 
-      // Read next 10 bytes from cursor
       const page2 = await storage.read(path, { cursor: page1.cursor, limit: 10 });
       expect(page2.data).toBe('BBBBBBBBBB');
       expect(page2.cursor).toBe(20);
       expect(page2.complete).toBe(false);
 
-      // Read remaining bytes
       const page3 = await storage.read(path, { cursor: page2.cursor, limit: 10 });
       expect(page3.data).toBe('CCCCCCCCCC');
       expect(page3.cursor).toBe(30);
@@ -158,8 +155,8 @@ describe('FilesystemLogStorage', () => {
 
     it('returns false for a directory path', async () => {
       await storage.append('dir/file.log', 'data\n');
-      // 'dir' is a directory, not a file -- but stat returns true for dirs too
-      // This is fine for our use case, exists just checks something is there
+      // exists() stats the path, so 'dir' itself reports true; this checks that a missing
+      // file inside an existing directory reports false.
       expect(await storage.exists('dir/nonexistent.log')).toBe(false);
     });
   });
@@ -201,7 +198,7 @@ describe('FilesystemLogStorage', () => {
   // -- Path containment --
 
   describe('path containment', () => {
-    // Six-character escape, never a raw byte — see the top of this file.
+    // Six-character escape, never a raw byte — see the assertSafeLogPath() tests below.
     const NUL_PATH = 'executions/run-1/job-\u0000evil/step-0.log';
 
     const escaping: Array<[name: string, path: string]> = [
@@ -223,9 +220,8 @@ describe('FilesystemLogStorage', () => {
         it('is refused by deleteMany()', async () => {
           await expect(storage.deleteMany([path])).rejects.toThrow();
         });
-        // Read verbs. log-pull-handler and the dashboard orch-logs handler
-        // both reach read()/exists() with wire-supplied ids, so an unguarded
-        // read is an exfiltration primitive, not just an unguarded write.
+        // Read verbs. log-pull-handler and the dashboard orch-logs handler reach read()/exists()
+        // with wire-supplied ids, so an unguarded read is an exfiltration primitive.
         it('is refused by read()', async () => {
           await expect(storage.read(path)).rejects.toThrow();
         });
@@ -267,8 +263,108 @@ describe('FilesystemLogStorage', () => {
     it('accepts the empty prefix, which addresses the root itself', async () => {
       await storage.append('executions/run-1/job-build/step-0.log', 'x\n');
       const files = await storage.list('');
-      expect(files).toContain(join('executions', 'run-1', 'job-build', 'step-0.log'));
+      // A logical key is `/`-separated on every host, never joined with the host separator.
+      expect(files).toContain('executions/run-1/job-build/step-0.log');
     });
+  });
+});
+
+describe('FilesystemLogStorage on a Windows host', () => {
+  // The delivery key shape a generic webhook source produces: `encodeKeySegment` keeps `:`.
+  const EVENT_KEY = 'event-log/e2e-win-1/generic:e2e-win-1:e2e-source:9cd3eed5.json.gz';
+  // Every character a Windows file name refuses, in one directory and one file name. The
+  // control character is the six-character escape, never a raw byte.
+  const RESERVED_KEY = 'executions/run-1/job-build (node:20 "a|b" <x>)/step-*?\\\u0001.log';
+  /** A character no Windows file name may hold (NUL aside, which never reaches the disk). */
+  const WINDOWS_ILLEGAL_RE = /["*:<>?|\\\u0001-\u001f]/;
+
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), 'kici-log-win32-test-'));
+  });
+
+  afterEach(async () => {
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  /** Every name under `dir`, recursively, as the disk holds it. */
+  async function diskNames(dir: string): Promise<string[]> {
+    const out: string[] = [];
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      out.push(entry.name);
+      if (entry.isDirectory()) out.push(...(await diskNames(join(dir, entry.name))));
+    }
+    return out;
+  }
+
+  for (const key of [EVENT_KEY, RESERVED_KEY]) {
+    it(`round-trips ${JSON.stringify(key)} through append, list, read and deleteMany`, async () => {
+      const storage = new FilesystemLogStorage({ basePath: tempDir, platform: 'win32' });
+      await storage.append(key, 'payload');
+
+      // fails-when: the win32 platform is ignored — the file name keeps its `:` (and the rest),
+      // which Windows refuses with ENOENT on open.
+      const names = await diskNames(tempDir);
+      expect(names.filter((n) => WINDOWS_ILLEGAL_RE.test(n))).toEqual([]);
+
+      // fails-when: list() returns the on-disk (mapped) name instead of the logical key.
+      const prefix = key.slice(0, key.indexOf('/') + 1);
+      expect(await storage.list(prefix)).toEqual([key]);
+      const listed = await storage.listWithMetadata(prefix);
+      expect(listed.map((o) => o.path)).toEqual([key]);
+
+      expect(await storage.exists(key)).toBe(true);
+      expect((await storage.read(key)).data).toBe('payload');
+
+      // The retention sweep feeds listWithMetadata() output straight back into deleteMany().
+      expect(await storage.deleteMany(listed.map((o) => o.path))).toBe(1);
+      expect(await storage.exists(key)).toBe(false);
+    });
+  }
+
+  it('keeps every name Windows already accepts byte-for-byte on disk', async () => {
+    // breaks-if-wrong: a file an older orchestrator wrote on Windows must still resolve, so a
+    // name with no reserved character maps to itself.
+    const storage = new FilesystemLogStorage({ basePath: tempDir, platform: 'win32' });
+    const key = 'executions/run-1/job-a..b (linux, 20)/step--1.log';
+    await storage.append(key, 'x\n');
+    expect(await readFile(join(tempDir, key), 'utf-8')).toBe('x\n');
+  });
+
+  it('refuses a key that already holds a mapped private-use character', async () => {
+    // U+F03A decodes to `:`, so storing it verbatim would come back from list() as another key.
+    const storage = new FilesystemLogStorage({ basePath: tempDir, platform: 'win32' });
+    const key = 'executions/run-1/job-a\uf03ab/step-0.log';
+    await expect(storage.append(key, 'x\n')).rejects.toThrow(/Windows file-name mapping/);
+    await expect(storage.read(key)).rejects.toThrow(/Windows file-name mapping/);
+    expect(await diskNames(tempDir)).toEqual([]);
+  });
+
+  it('keeps a drive-relative-looking segment inside the storage root', async () => {
+    const storage = new FilesystemLogStorage({ basePath: tempDir, platform: 'win32' });
+    await storage.append('C:escape/step-0.log', 'x\n');
+    expect(await storage.list('')).toEqual(['C:escape/step-0.log']);
+    expect((await diskNames(tempDir)).every((n) => !WINDOWS_ILLEGAL_RE.test(n))).toBe(true);
+  });
+
+  it('still refuses a .. segment and an absolute path', async () => {
+    const storage = new FilesystemLogStorage({ basePath: tempDir, platform: 'win32' });
+    await expect(storage.append('../escape', 'x\n')).rejects.toThrow();
+    await expect(storage.append('/tmp/kici-escape-target', 'x\n')).rejects.toThrow();
+  });
+
+  it("writes a POSIX host's file under the logical name unchanged", async () => {
+    // breaks-if-wrong: the on-disk layout of every Linux / macOS store stays byte-for-byte as it
+    // was; the mapping is Windows-only.
+    const storage = new FilesystemLogStorage({ basePath: tempDir, platform: 'linux' });
+    await storage.append(EVENT_KEY, 'payload');
+    expect(await readFile(join(tempDir, EVENT_KEY), 'utf-8')).toBe('payload');
+    expect(await storage.list('event-log/')).toEqual([EVENT_KEY]);
+    // A private-use character is an ordinary name character off Windows.
+    const puaKey = 'executions/run-1/job-a\uf03ab/step-0.log';
+    await storage.append(puaKey, 'x\n');
+    expect(await readFile(join(tempDir, puaKey), 'utf-8')).toBe('x\n');
   });
 });
 
@@ -298,8 +394,7 @@ describe('assertSafeLogPath()', () => {
   const accepted: Array<[name: string, path: string]> = [
     ['the canonical step-log path', 'executions/run-1/job-build/step-0.log'],
     ['the canonical orchestration path', 'executions/run-1/jobs/job-1/orchestration.jsonl'],
-    // `..` as a SUBSTRING of a legitimate segment must pass. A substring check
-    // would reject this, which is why the validator splits into segments.
+    // `..` as a SUBSTRING of a segment must pass — why the validator splits into segments.
     ['a name containing .. as a substring', 'executions/r/job-a..b/step-0.log'],
     ['a name ending in a dot', 'executions/r/job-a./step-0.log'],
     ['a single-dot segment', 'executions/./run-1/job-b/step-0.log'],

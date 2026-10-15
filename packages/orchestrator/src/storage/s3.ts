@@ -1,15 +1,11 @@
 /**
- * S3-backed cache storage.
+ * S3-backed cache storage; AWS SDK v3 modules load only when S3 storage is configured.
  *
- * Stores cached items in S3 with custom metadata headers for TTL tracking.
- * Uses AWS SDK v3 modular imports -- only loaded when S3 storage is configured.
- *
- * Metadata storage:
+ * TTL metadata headers:
  *   x-amz-meta-created-at      -- ISO timestamp of creation
  *   x-amz-meta-last-accessed-at -- ISO timestamp of last access
  *
  * TTL is enforced lazily: expired items are deleted on access.
- * Pre-signed URLs are generated for getUrl() with 15-minute expiry.
  */
 
 import {
@@ -42,38 +38,31 @@ export interface S3CacheStorageOptions {
   /** Custom endpoint URL for S3-compatible services (e.g., SeaweedFS, LocalStack) */
   endpoint?: string;
   /**
-   * Separate endpoint for pre-signed URLs (upload and download).
-   * When set, pre-signed URLs use this endpoint instead of `endpoint`.
-   * Useful when the orchestrator accesses S3 on localhost but agents
-   * need a container-routable address (e.g., container DNS name).
+   * Endpoint for pre-signed URLs (upload and download) instead of `endpoint`, e.g. when the
+   * orchestrator reaches S3 on localhost but agents need a container DNS name.
    */
   externalEndpoint?: string;
   /**
-   * Separate endpoint for the pre-signed URL a developer machine running
-   * `kici run remote` PUTs the overlay to. The developer's machine may reach
-   * the bucket at a different address than the orchestrator or its agents (an
-   * orchestrator in a container uses the compose DNS name while the host CLI
-   * uses localhost). When unset, `getInternalUploadUrl` signs with the
-   * agent-facing `externalEndpoint`, else with `endpoint`.
+   * Endpoint for the pre-signed URL a developer machine running `kici run remote` PUTs the
+   * overlay to, which may differ from the orchestrator's and agents' (compose DNS name vs the
+   * host CLI's localhost). When unset, `getInternalUploadUrl` signs with `externalEndpoint`,
+   * else `endpoint`.
    */
   uploadEndpoint?: string;
-  /** Use path-style access instead of virtual-hosted-style (required for most S3-compatible services) */
+  /** Path-style instead of virtual-hosted-style access (most S3-compatible services need it). */
   forcePathStyle?: boolean;
 }
 
 export class S3CacheStorage implements CacheStorage {
   private readonly client: S3Client;
-  /** Separate client for pre-signed URL generation (uses externalEndpoint if configured). */
+  /** Pre-signing client: externalEndpoint when configured. */
   private readonly presignClient: S3Client;
   /** Client for the developer upload URL: uploadEndpoint, else the presign client. */
   private readonly uploadPresignClient: S3Client;
   private readonly bucket: string;
   private readonly prefix: string;
   private readonly ttlMs: number;
-  /**
-   * False once the backend answered a conditional self-copy with
-   * `501 NotImplemented`. From then on `updateMeta` copies unconditionally.
-   */
+  /** False once the backend answered a conditional self-copy with `501 NotImplemented`. */
   private conditionalCopySupported = true;
 
   constructor(options: S3CacheStorageOptions) {
@@ -82,7 +71,6 @@ export class S3CacheStorage implements CacheStorage {
     this.ttlMs = options.ttlMs;
     this.client = createS3Client(options);
 
-    // Create a separate S3Client for pre-signed URLs if externalEndpoint is set
     if (options.externalEndpoint) {
       this.presignClient = createS3Client({
         ...options,
@@ -92,8 +80,6 @@ export class S3CacheStorage implements CacheStorage {
       this.presignClient = this.client;
     }
 
-    // Developer uploads (getInternalUploadUrl) sign against uploadEndpoint,
-    // else the agent-facing presign client (externalEndpoint, else endpoint).
     this.uploadPresignClient = options.uploadEndpoint
       ? createS3Client({ ...options, endpoint: options.uploadEndpoint })
       : this.presignClient;
@@ -101,7 +87,6 @@ export class S3CacheStorage implements CacheStorage {
 
   // -- Helpers --
 
-  /** Build the full S3 object key from a cache key. */
   private objectKey(key: string): string {
     return `${this.prefix}${key}`;
   }
@@ -113,18 +98,12 @@ export class S3CacheStorage implements CacheStorage {
     return Date.now() - lastAccessed > ttl;
   }
 
-  /**
-   * Read metadata from an S3 object's custom headers.
-   * Returns null if the object doesn't exist (NoSuchKey/NotFound).
-   */
+  /** Null when the object does not exist (NoSuchKey/NotFound). */
   private async readMeta(key: string): Promise<CacheMetadata | null> {
     return (await this.readHead(key))?.meta ?? null;
   }
 
-  /**
-   * Read an object's TTL metadata together with the ETag of the version it
-   * belongs to. Returns null if the object doesn't exist (NoSuchKey/NotFound).
-   */
+  /** TTL metadata plus the ETag of its version; null when the object does not exist. */
   private async readHead(key: string): Promise<{ meta: CacheMetadata; etag?: string } | null> {
     try {
       const head = await this.client.send(
@@ -147,25 +126,16 @@ export class S3CacheStorage implements CacheStorage {
   }
 
   /**
-   * Update metadata on an S3 object by copying it to itself.
-   * This is the standard S3 pattern for updating metadata without re-uploading data.
+   * Updates metadata by self-copy, conditional on `etag` (the version the caller read). A
+   * self-copy is a whole-object write: unconditioned, one racing a `put()` of the key can write
+   * the older body back, reverting a cache pointer to a deleted tarball. `CopySourceIfMatch`
+   * pins the copied bytes; `IfMatch` refuses the write unless the key still holds that version.
    *
-   * The copy is conditional on `etag`, the version whose metadata the caller
-   * read. A self-copy is a whole-object write: without the condition, one that
-   * races a `put()` of the same key can land after it and write the older body
-   * back. Cache pointers are rewritten in place while builds publish them, so a
-   * touch-on-read racing a publish reverted the pointer to a tarball that no
-   * longer exists. `CopySourceIfMatch` pins the bytes copied to that version and
-   * `IfMatch` refuses the write unless the key still holds it.
+   * Returns false when the object was replaced since the read (`412`) or is being replaced
+   * (`409 ConditionalRequestConflict`): the newer write stamps its own metadata.
    *
-   * Returns false when the object was replaced since the read (`412`), or is
-   * being replaced right now (`409 ConditionalRequestConflict`): the newer
-   * write stamps metadata of its own, so there is nothing left to refresh.
-   *
-   * An S3-compatible backend that does not implement conditional copies
-   * answers `501 NotImplemented`. The copy then runs again without the
-   * condition, and later copies skip it, as on a backend that ignores the
-   * headers.
+   * A backend without conditional copies answers `501 NotImplemented`; the copy reruns
+   * unconditionally, and later copies skip the condition.
    */
   private async updateMeta(key: string, meta: CacheMetadata, etag?: string): Promise<boolean> {
     const condition = this.conditionalCopySupported ? etag : undefined;
@@ -206,17 +176,17 @@ export class S3CacheStorage implements CacheStorage {
     );
   }
 
-  /** Check if an error is a failed conditional request (PreconditionFailed, 412). */
+  /** A failed conditional request (PreconditionFailed, 412). */
   private isPreconditionFailedError(err: unknown): boolean {
     return this.hasErrorShape(err, 'PreconditionFailed', 412);
   }
 
-  /** Check if an error is a conditional write that raced another write (ConditionalRequestConflict, 409). */
+  /** A conditional write that raced another write (ConditionalRequestConflict, 409). */
   private isConditionalConflictError(err: unknown): boolean {
     return this.hasErrorShape(err, 'ConditionalRequestConflict', 409);
   }
 
-  /** Check if an error is a request the backend does not implement (NotImplemented, 501). */
+  /** A request the backend does not implement (NotImplemented, 501). */
   private isNotImplementedError(err: unknown): boolean {
     return this.hasErrorShape(err, 'NotImplemented', 501);
   }
@@ -228,7 +198,7 @@ export class S3CacheStorage implements CacheStorage {
     return code === status;
   }
 
-  /** Check if an error is a "not found" error (NoSuchKey, NotFound, 404). */
+  /** NoSuchKey, NotFound or 404. */
   private isNotFoundError(err: unknown): boolean {
     if (typeof err !== 'object' || err === null) return false;
     const name = (err as { name?: string }).name;
@@ -286,13 +256,12 @@ export class S3CacheStorage implements CacheStorage {
       throw err;
     }
 
-    // Touch on read -- update lastAccessedAt (best-effort: don't lose
-    // already-fetched data if the metadata update fails)
+    // Best-effort touch: a failed metadata update must not lose already-fetched data.
     try {
       meta.lastAccessedAt = new Date().toISOString();
       await this.updateMeta(key, meta, etag);
     } catch {
-      // Transient S3 errors or concurrent deletes shouldn't discard cached data
+      // Transient S3 errors or concurrent deletes must not discard cached data.
     }
 
     return data;
@@ -311,7 +280,7 @@ export class S3CacheStorage implements CacheStorage {
   }
 
   async delete(key: string): Promise<boolean> {
-    // HeadObject first to check existence (S3 delete is idempotent)
+    // S3 delete is idempotent, so HEAD first to report existence.
     const meta = await this.readMeta(key);
     const existed = meta !== null;
 
@@ -359,8 +328,7 @@ export class S3CacheStorage implements CacheStorage {
       new PutObjectCommand({
         Bucket: this.bucket,
         Key: objectKey,
-        // No Metadata in pre-signed URL -- two-phase approach
-        // Orchestrator will set metadata via initMeta() after agent confirms upload
+        // Two-phase: the orchestrator sets metadata via initMeta() after the agent confirms.
       }),
       { expiresIn: UPLOAD_URL_EXPIRY_SECONDS },
     );

@@ -2,10 +2,10 @@ import { describe, it, expect } from 'vitest';
 import type { SpawnContext, ResolvedContainerSpawn } from './types.js';
 
 /**
- * `SpawnContext.container` is how a job's own image reaches a backend. The
- * manager threads it verbatim; these assert the shape both ends agree on,
- * without standing up a manager (whose spawn path needs a backend, a
- * semaphore, a registry and a live config).
+ * `SpawnContext.container` carries a job's own image to a backend; the manager
+ * threads it verbatim. These pin the shape both ends agree on without standing
+ * up a manager (its spawn path needs a backend, a semaphore, a registry and a
+ * live config).
  */
 describe('SpawnContext.container', () => {
   it('carries the image and the resolved registry credentials', () => {
@@ -20,8 +20,8 @@ describe('SpawnContext.container', () => {
   });
 
   it('is absent for an ordinary spawn, which uses the pool image', () => {
-    // Absence is the discriminator a backend branches on: no container means
-    // "spawn the pool's fixed agent image", exactly as before this existed.
+    // A backend branches on absence: no container means "spawn the pool's fixed
+    // agent image".
     const ctx: SpawnContext = { boundJobId: 'job-1', runId: 'run-1' };
     expect(ctx.container).toBeUndefined();
   });

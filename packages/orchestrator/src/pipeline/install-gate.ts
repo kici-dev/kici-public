@@ -2,17 +2,14 @@
  * The workflow install gate: the protection rules of every context a
  * workflow's `registries:` / `installEnv:` references name.
  *
- * Every context is evaluated before the gate decides, with the combination rule
- * the job-level multi-context gate uses: a reject from any context rejects,
- * whatever the others say. When none rejects and at least one holds, the gate
- * raises ONE hold whose requirement aggregates every context's rules, most
- * restrictive wins (`aggregateProtectionParams`): the reviewers of every held
- * context must approve, the longest wait timer applies. That hold records which
- * contexts held — its approval covers them — and which were admitted.
+ * Every context is evaluated before deciding, as on the job-level gate: any
+ * reject rejects. Otherwise any hold raises ONE hold aggregating every context's
+ * rules, most restrictive wins (`aggregateProtectionParams`: every held
+ * context's reviewers approve, the longest wait timer applies), and records
+ * which contexts held (covered by its approval) and which were admitted.
  *
  * The release gates again every context the approval did not cover, and
- * refuses when any recorded context now matches a different row than the one
- * the hold was raised against.
+ * refuses when a recorded context now matches a different row.
  */
 import { z } from 'zod';
 import type { Context as EngineContext, ProtectionGateResult } from '@kici-dev/engine';
@@ -33,10 +30,7 @@ import { InstallSecretsDecisionReason } from '../metrics/prometheus.js';
 export const InstallGateContextSchema = z.object({ name: z.string(), id: z.string() });
 export type InstallGateContext = z.infer<typeof InstallGateContextSchema>;
 
-/**
- * What an install-gate hold records about its contexts. Stored with the held
- * dispatch, so the release knows which contexts the approval covers.
- */
+/** Stored with the held dispatch, so the release knows which contexts the approval covers. */
 export const InstallGateRecordSchema = z.object({
   /** Contexts whose rules held. The hold's approval covers every one of them. */
   held: z.array(InstallGateContextSchema),
@@ -93,18 +87,14 @@ function rejectAll(rejections: readonly Rejection[]): InstallGateOutcome {
   };
 }
 
-/** Whether a verdict holds the install rather than passing or rejecting it. */
 function isHold(result: ProtectionGateResult): result is InstallGateHoldResult {
   return result.action === 'hold' || result.action === 'wait' || result.action === 'queue';
 }
 
 /**
- * Run one context's protection rules for the workflow install.
- *
- * A workflow install has no per-job concurrency group, so the context name is
- * the group, and the running count is always 0: the concurrency gate never
- * holds a workflow install. Concurrency limits apply at the job scope, enforced
- * by the concurrency-groups module on dispatch.
+ * Run one context's protection rules for the workflow install. The context
+ * name is the group and the running count is 0, so the concurrency gate never
+ * holds an install; job-scope dispatch enforces concurrency limits.
  */
 function evaluateInstallContext(
   envName: string,
@@ -121,9 +111,8 @@ function evaluateInstallContext(
 }
 
 /**
- * The rejection a context's own verdict produces. On the first dispatch only a
- * `reject` verdict reaches here; on a release a hold does too, because a
- * release never raises a second hold.
+ * The rejection a context's own verdict produces. On a release a hold verdict
+ * reaches here too: a release never raises a second hold.
  */
 function ruleRejection(envName: string, result: ProtectionGateResult): Rejection {
   if (result.action === 'reject') {
@@ -141,11 +130,9 @@ function ruleRejection(envName: string, result: ProtectionGateResult): Rejection
 }
 
 /**
- * Evaluate every referenced context's rules and decide the install gate.
- *
- * Reject wins over hold, as on the job-level gate. A hold aggregates the rules
- * of every context, so its requirement is at least as strict as each held
- * context's own, and its record lists which contexts held and which passed.
+ * Evaluate every referenced context's rules and decide the install gate. Reject
+ * wins over hold; a hold's aggregated requirement is at least as strict as each
+ * held context's own.
  */
 export async function gateInstall(inputs: GateInputs): Promise<InstallGateOutcome> {
   const rejections: Rejection[] = [];
@@ -180,8 +167,7 @@ export async function gateInstall(inputs: GateInputs): Promise<InstallGateOutcom
   return {
     kind: 'hold',
     primary: primary.ref,
-    // The aggregate is at least as strict as any one context, so it holds
-    // whenever one does. The primary's own verdict covers a non-hold anyway.
+    // The aggregate holds whenever one context does; the primary's verdict is a fallback.
     result: isHold(aggregate) ? aggregate : primary.result,
     record: { held: held.map((h) => h.ref), admitted },
   };
@@ -190,14 +176,12 @@ export async function gateInstall(inputs: GateInputs): Promise<InstallGateOutcom
 /**
  * Decide the install gate for a dispatch resumed from a released hold.
  *
- * The contexts the hold recorded as held are covered by its approval and are
- * not gated again: their reviewer and wait-timer rules are stateless and would
- * hold the approved run once more. Every other context is gated again, and any
- * verdict but pass rejects — a release never raises a second hold. A context
- * the hold recorded must still match the row it matched then.
+ * Held contexts are covered by the approval and skip the gate: their reviewer
+ * and wait-timer rules are stateless and would hold the approved run again.
+ * Every other context is gated, and any verdict but pass rejects. A recorded
+ * context must still match its recorded row.
  *
- * `releasedHold` comes from stored JSON, so it is parsed here: an absent or
- * malformed record covers no context, and every context is gated again.
+ * `releasedHold` is stored JSON: absent or malformed, it covers no context.
  */
 export async function gateReleasedInstall(
   inputs: GateInputs & { releasedHold: unknown },

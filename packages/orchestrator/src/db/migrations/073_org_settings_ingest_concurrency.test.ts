@@ -3,15 +3,12 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m073 from './073_org_settings_ingest_concurrency.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 073.
- *
- * Creates a uniquely-named throwaway database, applies migrations 001..073
- * via the production migration provider, and asserts the nullable
- * `ingest_max_concurrency` column exists (no default — NULL = cluster default).
- * The throwaway database is dropped in teardown.
+ * Real-Postgres test for migration 073: in a throwaway database (dropped in
+ * teardown), 001..073 via the production provider add the nullable
+ * `ingest_max_concurrency` column (no default — NULL = cluster default).
  *
  * Gated on `KICI_TEST_ADMIN_DATABASE_URL`: skips when unset, fails loudly when
  * set but unreachable.

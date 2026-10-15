@@ -1,13 +1,8 @@
 /**
- * `kici-admin agent status` command.
- *
- * Shows OS-level service status (state, PID, uptime) and queries the
- * running agent's `/health` endpoint for its ID, orchestrator connection,
- * active job count, version, build fingerprint and uptime.
- *
- * Target resolution goes through resolveInstanceTarget — the same priority chain
- * every lifecycle command uses (--instance-dir > --name > CWD manifest >
- * refusal with candidate list).
+ * `kici-admin agent status`: OS-level service state (state, PID, uptime) plus
+ * the agent's `/health` (ID, orchestrator connection, active jobs, version,
+ * build fingerprint, uptime). The target resolves via resolveInstanceTarget,
+ * like every lifecycle command.
  */
 
 import type { Command } from 'commander';
@@ -32,13 +27,9 @@ import {
 } from '../service-health.js';
 import { cliAction } from '../shared/cli-action.js';
 
-/** Column the values of the agent section start at. */
 const VALUE_COLUMN = 14;
 
-/**
- * A `/health` body. Every field is optional: an agent older than this CLI may
- * report fewer of them.
- */
+/** Every field is optional: an agent older than this CLI may report fewer. */
 type AgentHealth = Partial<LivenessResponse<AgentLivenessInfo>>;
 
 function formatStatus(

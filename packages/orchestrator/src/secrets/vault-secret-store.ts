@@ -11,13 +11,9 @@ import Vault from 'hashi-vault-js';
 import type { SecretStore } from '@kici-dev/engine';
 import type { Logger } from '@kici-dev/shared';
 
-/**
- * Configuration for the Vault secret store backend.
- */
 export interface VaultConfig {
   /** Vault server URL (e.g., 'http://vault:8200'). */
   vaultUrl: string;
-  /** Authentication method. */
   authMethod: 'approle' | 'token';
   /** AppRole role ID (required for 'approle' auth). */
   roleId?: string;
@@ -142,9 +138,6 @@ export class VaultSecretStore implements SecretStore {
     }
   }
 
-  /**
-   * Build the full Vault path for a scoped secret.
-   */
   private secretPath(orgId: string, scope: string): string {
     return `${this.config.basePath}/${orgId}/${scope}`;
   }
@@ -222,9 +215,6 @@ export class VaultSecretStore implements SecretStore {
     });
   }
 
-  /**
-   * Delete a secret key from a scope.
-   */
   async deleteSecret(orgId: string, scope: string, key: string): Promise<void> {
     const path = this.secretPath(orgId, scope);
     await this.withRetry(async (token) => {
@@ -272,9 +262,6 @@ export class VaultSecretStore implements SecretStore {
     });
   }
 
-  /**
-   * List all secret key names in a scope.
-   */
   async listKeys(orgId: string, scope: string): Promise<string[]> {
     const secrets = await this.getSecrets(orgId, scope);
     return Object.keys(secrets);
@@ -312,10 +299,8 @@ export class VaultSecretStore implements SecretStore {
         for (const key of keys) {
           const fullKey = prefix ? `${prefix}${key}` : key;
           if (key.endsWith('/')) {
-            // Directory — recurse
             await walk(fullKey);
           } else {
-            // Leaf secret
             scopes.push(fullKey);
           }
         }

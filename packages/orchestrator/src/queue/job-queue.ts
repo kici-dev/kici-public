@@ -39,7 +39,6 @@ const logger = createLogger({ prefix: 'job-queue' });
  * cannot cause the failure this predicate exists to prevent.
  *
  * @param ownerColumn a fully qualified column reference (`dispatch_queue.owner_instance_id`)
- * @param graceMs how stale a heartbeat may be and still read as live
  */
 function ownerNotLiveSql(ownerColumn: string, graceMs: number) {
   return sql<SqlBool>`NOT EXISTS (
@@ -248,18 +247,14 @@ function rowToExpiredJobInfo(r: ExpiryRowShape): ExpiredJobInfo {
 }
 
 /**
- * Point-in-time breakdown of dispatch_queue depth used for Prometheus gauges
- * and operator-facing depth warnings.
+ * Point-in-time dispatch_queue depth for Prometheus gauges and operator depth warnings.
  *
- * `byStatus` carries the raw COUNT(*) for each {@link DispatchQueueStatus.Pending}
- * and {@link DispatchQueueStatus.Dispatched} bucket (other statuses are
- * terminal and not surfaced here).
+ * `byStatus` carries the raw COUNT(*) for the {@link DispatchQueueStatus.Pending}
+ * and {@link DispatchQueueStatus.Dispatched} buckets only (other statuses are terminal).
  *
- * `byLabel` is a flat rollup of pending-only jobs keyed by each distinct label
- * in `runs_on_labels`. Multi-label jobs fan out: a job with `runs_on_labels =
- * ['linux', 'x64']` contributes 1 to both `linux` and `x64`. This matches the
- * "label pool" mental model operators use in Grafana (agents advertise their
- * labels; the gauge answers "how many pending jobs want this label").
+ * `byLabel` counts pending jobs per distinct `runs_on_labels` label. Multi-label jobs
+ * fan out: `['linux', 'x64']` adds 1 to both, matching the "label pool" model operators
+ * use in Grafana ("how many pending jobs want this label").
  */
 export interface DispatchQueueDepthBreakdown {
   byStatus: Partial<Record<DispatchQueueStatus, number>>;
@@ -336,8 +331,8 @@ export interface QueuedJobInput {
   provider: string;
   /** Provider-specific context (e.g., { installationId: 42 } for GitHub) */
   providerContext: Record<string, unknown>;
-  /** Routing key (e.g. "github:12345") for selecting the per-app provider
-   *  bundle when dispatching. Required for multi-app safety. */
+  /** Routing key (e.g. "github:12345") that selects the per-app provider bundle on
+   *  dispatch. Required for multi-app safety. */
   routingKey: string;
   /** Override default timeout. 0 = indefinite (no expiry). */
   timeoutMs?: number;
@@ -375,9 +370,7 @@ export interface QueuedJobInput {
   connectedInstanceId?: string | null;
 }
 
-/**
- * Full queued job as stored in the database.
- */
+/** Full queued job as stored in the database. */
 export interface QueuedJob {
   id: string;
   runId: string;
@@ -397,8 +390,8 @@ export interface QueuedJob {
   provider: string;
   /** Provider-specific context */
   providerContext: Record<string, unknown>;
-  /** Routing key (e.g. "github:12345") used to look up the per-app provider
-   *  bundle on dispatch. Required for multi-app safety. */
+  /** Routing key (e.g. "github:12345") that selects the per-app provider bundle on
+   *  dispatch. Required for multi-app safety. */
   routingKey: string;
   /** URL to pre-compiled bundle (from cache). Passed through to job.dispatch. */
   sourceTarUrl?: string;
@@ -436,20 +429,15 @@ export interface QueuedJob {
 }
 
 /**
- * The resource shape a job declares, read from the one location that always
- * carries it.
+ * The resource shape a job declares, read from `jobConfig.resources`: the one
+ * location that always carries it, across the DB round trip and over the wire.
  *
- * `jobConfig.resources` is where the declaration is stored and transported: it
- * is what `job_config` holds across the DB round trip and what a worker
- * receives over the wire. The typed `resources` field on {@link QueuedJobInput}
- * and {@link QueuedJob} is a convenience mirror, and it is optional — several
- * dispatch paths build their input without it (the worker's reroute handler and
- * the webhook dispatch path among them). So a consumer that reads only the
- * mirror sees a job that declares nothing, and a shape-sensitive decision made
- * on that reading is wrong rather than merely unaware.
- *
- * Callers that hold a mirror still prefer it — it is the same value — and fall
- * back here.
+ * The typed `resources` field on {@link QueuedJobInput} and {@link QueuedJob} is
+ * an optional convenience mirror that several dispatch paths omit (the worker's
+ * reroute handler and the webhook dispatch path among them), so a consumer that
+ * reads only the mirror sees a job that declares nothing and makes a wrong
+ * shape-sensitive decision. Callers holding a mirror prefer it (same value) and
+ * fall back here.
  */
 export function resourcesFromJobConfig(
   jobConfig: Record<string, unknown> | undefined,
@@ -610,7 +598,6 @@ export class JobQueue {
       .onConflict((oc) => oc.column('id').doNothing())
       .execute();
 
-    // Invalidate both caches so the next enqueue / gauge scrape sees the updated counts
     this.depthCache = null;
     this.breakdownCache = null;
 
@@ -625,17 +612,11 @@ export class JobQueue {
    * Semantics: agentLabels @> runs_on_labels (agent provides all labels the job requires).
    * FOR UPDATE SKIP LOCKED prevents concurrent dequeue races between agents.
    *
-   * When `agentMandatoryLabels` is non-empty, an additional containment check
-   * (`runs_on_labels @> agentMandatoryLabels`) enforces the
-   * Kubernetes-taint-style gate inherited from the spawning scaler: a gated
-   * agent only accepts jobs whose `runsOn` lists every gate label. The
-   * default (`[]`) is a no-op for static / non-scaler agents — every JSONB
-   * array trivially contains the empty array, so the predicate is vacuously
-   * true.
+   * A non-empty `agentMandatoryLabels` adds `runs_on_labels @> agentMandatoryLabels`:
+   * the Kubernetes-taint-style gate inherited from the spawning scaler, so a gated
+   * agent only accepts jobs whose `runsOn` lists every gate label. The default `[]`
+   * is a no-op for static / non-scaler agents: every JSONB array contains the empty array.
    *
-   * @param agentLabels Labels the agent provides.
-   * @param agentMandatoryLabels Mandatory labels the spawning scaler declared
-   *   (empty for static / non-scaler agents).
    * @param canServe Optional extra predicate applied to every candidate row
    *   before it is claimed. Labels cannot express whether an agent may run a
    *   job — a pre-spawned agent's fixed shape, a container job on an agent with
@@ -815,18 +796,15 @@ export class JobQueue {
   }
 
   /**
-   * Pattern path: load a small batch of pattern-bearing candidate rows, apply
-   * the JS regex post-filter (matcherSatisfiedBy), and atomically claim the
-   * first match by id with a conditional `status = Pending` guard. The claim is
-   * a conditional UPDATE rather than relying on the SELECT lock alone because
-   * the JS filter runs after the per-statement lock window has closed, so two
-   * agents could both pass the filter for the same row; the `where status =
-   * Pending` makes exactly one of them win. The claim transitions the row to
-   * Dispatched, matching the value the caller-side markDispatched would set
-   * (which then re-sets it idempotently).
+   * Pattern path: load a small batch of pattern-bearing rows, apply the JS regex
+   * post-filter (matcherSatisfiedBy), and claim the first match by id. The claim
+   * is a conditional `status = Pending` UPDATE, not the SELECT lock alone: the JS
+   * filter runs after the per-statement lock window has closed, so two agents can
+   * both pass it for the same row, and the guard makes exactly one win. The
+   * caller's markDispatched then re-sets the same Dispatched state idempotently.
    *
-   * Losing the claim continues to the next candidate rather than returning
-   * null, so a lost race costs this agent a candidate and not a whole drain.
+   * A lost claim continues to the next candidate, so it costs this agent a
+   * candidate and not a whole drain.
    */
   private async claimWithPatterns(
     agentLabels: string[],
@@ -946,22 +924,21 @@ export class JobQueue {
    * specific queued job, the orchestrator claims that exact job on agent
    * registration instead of racing the generic dequeueForLabels drain.
    *
-   * Applies the same `agentMandatoryLabels` gate as `dequeueForLabels` so
-   * the eager-dispatch path can never claim a job that the scaler-side gate
-   * would have rejected (e.g. when the bound jobId outlived the scaler that
-   * spawned the agent and was reassigned to a different queued job).
+   * Applies the same `agentMandatoryLabels` gate as `dequeueForLabels` so the
+   * eager path never claims a job the scaler-side gate would reject (e.g. when
+   * the bound jobId outlived the scaler that spawned the agent and was
+   * reassigned to a different queued job).
    *
    * Returns null if the job is gone, no longer pending, expired, its label
    * requirements are no longer satisfied by the agent, the agent's gate is not
    * satisfied by the job's `runsOn`, or another claimant won the row first.
    *
-   * That last case is the one this shares with every other claim path: the
-   * eager bound claim and the generic drain can target the same row moments
-   * apart, and a SELECT that returns the row still Pending lets both dispatch
-   * it. The conditional UPDATE below is the arbiter, and it runs after the JS
-   * post-filter so a pattern-rejected row is never claimed and stranded. A
-   * loser returns null, and `dispatchBoundJob` then falls back to the generic
-   * `onAgentAvailable` drain exactly as it does for an already-gone job.
+   * The eager bound claim and the generic drain can target the same row moments
+   * apart, and a SELECT that returns it still Pending lets both dispatch it. The
+   * conditional UPDATE is the arbiter, run after the JS post-filter so a
+   * pattern-rejected row is never claimed and stranded. A loser returns null,
+   * and `dispatchBoundJob` falls back to the generic `onAgentAvailable` drain
+   * exactly as for an already-gone job.
    *
    * @param claimingAgentId Recorded as the row's durable owner as part of the
    *   claim. Optional so existing 3-arg callers keep working; the caller's
@@ -1026,16 +1003,15 @@ export class JobQueue {
    * dispatched the moment it is inserted, so it never passes through
    * `markDispatched` and would otherwise carry a NULL owner for its whole life.
    * A coordinator that never saw the dispatch resolves ownership from this
-   * column alone, so omitting it here would make {@link hasAgentOwnedJob} answer
-   * "not owned" for every directly-dispatched job after a failover.
+   * column alone, so without it {@link hasAgentOwnedJob} answers "not owned" for
+   * every directly-dispatched job after a failover.
    *
    * Idempotent on the primary key: a reroute re-dispatch reuses a preassigned
-   * jobId, so a concurrent reroute from a sibling coordinator (or a duplicate
-   * delivery) may target a row this instance already wrote. ON CONFLICT (id) DO
-   * NOTHING makes that a no-op instead of a dispatch_queue_pkey error; the
-   * returned `inserted` flag tells the caller whether a fresh row was created so
-   * it can avoid double-dispatching an already-present job. The conflicting row
-   * keeps the owner the winning writer recorded.
+   * jobId, so a concurrent sibling reroute (or a duplicate delivery) may target
+   * a row this instance already wrote. ON CONFLICT (id) DO NOTHING makes that a
+   * no-op instead of a dispatch_queue_pkey error, and `inserted` tells the caller
+   * whether a fresh row was created so it does not double-dispatch. The
+   * conflicting row keeps the owner the winning writer recorded.
    *
    * A job whose run has already stopped is refused, with the same stopped-run
    * guard the queue drain applies (`notTerminalRunSql`). The row is still
@@ -1063,10 +1039,7 @@ export class JobQueue {
         run_id: job.runId,
         workflow_name: job.workflowName,
         job_name: job.jobName,
-        // The exact-label columns are stored canonical: the SQL `@>` prefilter
-        // below compares them byte for byte against an agent's canonical labels.
-        // The PATTERN columns keep their source verbatim — a regex source cannot
-        // be lowercased, so its fold rides on the `i` flag the read forces.
+        // Exact labels canonical, patterns verbatim: same reason as in `enqueue`.
         runs_on_labels: JSON.stringify(canonicalizeLabels(job.runsOnLabels)),
         ...sealedJobConfigColumns(job),
         repo_url: job.repoUrl,
@@ -1089,11 +1062,10 @@ export class JobQueue {
         routing_key: job.routingKey,
         pinned_agent_id: job.pinnedAgentId ?? null,
         agent_id: agentId,
-        // The row is born `dispatched`, so it never passes through
-        // `markDispatched` and these two are the only chance to stamp them.
-        // Without the owner, a cluster-wide sweep reads the row as
-        // unknown-owner: startup recovery spares it, so a directly-dispatched
-        // job whose coordinator died is never recovered by the survivor.
+        // Born `dispatched`, the row never passes through `markDispatched`, so
+        // these two are stamped here or never. Without the owner, startup recovery
+        // reads it as unknown-owner and spares it, so a survivor never recovers a
+        // directly-dispatched job whose coordinator died.
         owner_instance_id: this.instanceId ?? null,
         dispatched_at: new Date(),
       })
@@ -1189,11 +1161,9 @@ export class JobQueue {
   }
 
   /**
-   * Mark a job as failed.
-   *
-   * Note: reason is not persisted in the dispatch_queue table.
-   * Failure details are tracked in execution_jobs via the reporting pipeline.
-   * The dispatch_queue only tracks routing status transitions.
+   * Mark a job as failed. The reason is not persisted: failure details live in
+   * execution_jobs via the reporting pipeline, and dispatch_queue tracks only
+   * routing status transitions.
    */
   async markFailed(jobId: string, _reason: string): Promise<void> {
     await this.db
@@ -1206,12 +1176,11 @@ export class JobQueue {
   /**
    * Mark a dispatched job as completed (terminal success).
    *
-   * Only transitions rows from `Dispatched` or `Recovering`. A row that has
-   * already reached a terminal state (`Failed`, `Expired`, `Completed`,
-   * `Cancelled`) is left untouched — if the orchestrator already declared
-   * the job failed (e.g. build-coordinator timeout cascading through
-   * {@link failByRunId}), a late `job.complete` from the agent that was
-   * still working must NOT silently flip the row back to `Completed`.
+   * Only transitions rows from `Dispatched` or `Recovering`; a terminal row
+   * (`Failed`, `Expired`, `Completed`, `Cancelled`) is left untouched. If the
+   * orchestrator already declared the job failed (e.g. a build-coordinator
+   * timeout cascading through {@link failByRunId}), a late `job.complete` from
+   * the still-working agent must NOT flip the row back to `Completed`.
    */
   async markCompleted(jobId: string): Promise<void> {
     await this.db
@@ -1225,12 +1194,10 @@ export class JobQueue {
   /**
    * Expire timed-out pending jobs.
    * SELECT-then-UPDATE so callers get the expired job details for forwarding.
-   * @returns Array of expired job info (id, runId, jobName).
    */
   async markExpired(): Promise<ExpiredJobInfo[]> {
     const now = new Date().toISOString();
 
-    // 1. SELECT the about-to-expire rows
     const rows = await this.db
       .selectFrom('dispatch_queue')
       .select([
@@ -1251,7 +1218,6 @@ export class JobQueue {
 
     if (rows.length === 0) return [];
 
-    // 2. UPDATE those rows by ID
     await this.db
       .updateTable('dispatch_queue')
       .set({ status: DispatchQueueStatus.Expired })
@@ -1269,16 +1235,12 @@ export class JobQueue {
    * Bulk-fail every still-non-terminal dispatch_queue entry for a run.
    *
    * Called from the run-level failure cascades in `ExecutionTracker`
-   * (`onBuildFailed`, `failRun`). At that point the run itself is being
-   * declared failed, so any dispatch_queue row still in `Pending`,
-   * `Recovering`, or `Dispatched` is by definition orphaned and must
-   * also be moved to `Failed` — leaving a `Dispatched` row in place
-   * keeps the row in a non-terminal state forever, which any caller
-   * polling for a terminal state (and any operator query for "is this
-   * run actually done") relies on never happening. The complementary
-   * {@link markCompleted} status guard ensures a late `job.complete` from
-   * the agent that was still working when the run was declared failed
-   * cannot flip the row back to `Completed`.
+   * (`onBuildFailed`, `failRun`). The run is being declared failed, so any row
+   * still `Pending`, `Recovering` or `Dispatched` is orphaned and moves to
+   * `Failed`: a `Dispatched` row left in place stays non-terminal forever, which
+   * callers polling for a terminal state (and operator "is this run done"
+   * queries) rely on never happening. The {@link markCompleted} status guard
+   * keeps a late `job.complete` from flipping the row back to `Completed`.
    *
    * @returns Number of affected rows.
    */
@@ -1354,13 +1316,11 @@ export class JobQueue {
    * Delete terminal dispatch_queue rows older than `retentionDays`.
    *
    * `dispatch_queue` is operational dispatch state; the durable run history
-   * lives in the cold-stored execution_runs/jobs/steps tables, so a terminal
-   * ({@link DispatchQueueStatus.Completed}/{@link DispatchQueueStatus.Failed}/
-   * {@link DispatchQueueStatus.Expired}) row has no archival value once it ages
-   * out. Non-terminal rows ({@link DispatchQueueStatus.Pending}/
-   * {@link DispatchQueueStatus.Dispatched}/{@link DispatchQueueStatus.Recovering})
-   * are never pruned — a still-active run keeps every one of its rows. Both the
-   * terminal-status filter and the age cutoff must hold for a row to be deleted.
+   * lives in the cold-stored execution_runs/jobs/steps tables, so a terminal row
+   * ({@link TERMINAL_DISPATCH_STATUSES}) has no archival value once it ages out.
+   * Non-terminal rows (pending, dispatched, recovering) are never pruned, so a
+   * still-active run keeps every row. A row is deleted only when both the
+   * terminal-status filter and the age cutoff hold.
    *
    * `retentionDays <= 0` disables pruning (returns 0 without a query).
    *
@@ -1401,15 +1361,9 @@ export class JobQueue {
    * Compute the current dispatch-queue depth breakdown (pending + dispatched),
    * aggregated per status and, for pending rows, per label.
    *
-   * Uses the same 1-second TTL cache pattern as {@link JobQueue.getDepth}: if
-   * the cached breakdown is still fresh (or was refreshed within the last
-   * second), the cached value is returned without issuing a query. This keeps
-   * the Prometheus gauge callback cheap on high-frequency scrapes and avoids
-   * any extra DB load during enqueue bursts.
-   *
-   * Multi-label jobs fan out: a pending row with `runs_on_labels = ['linux',
-   * 'x64']` contributes `1` to both the `linux` and `x64` entries in
-   * `byLabel`. The `byStatus` buckets always contain raw counts.
+   * Uses the same 1-second TTL cache as {@link JobQueue.getDepth}, which keeps
+   * the Prometheus gauge callback cheap on high-frequency scrapes and adds no DB
+   * load during enqueue bursts. Label fan-out: see {@link DispatchQueueDepthBreakdown}.
    */
   async getDepthBreakdown(): Promise<DispatchQueueDepthBreakdown> {
     const now = Date.now();
@@ -1417,9 +1371,8 @@ export class JobQueue {
       return this.breakdownCache.breakdown;
     }
 
-    // Single pass: grab status + runs_on_labels for every non-terminal row.
-    // This is O(n) with n bounded by maxDepth + a handful of dispatched rows,
-    // so the work is negligible even at the 10k queue-depth guardrail.
+    // O(n), n bounded by maxDepth plus a handful of dispatched rows: negligible
+    // even at the 10k queue-depth guardrail.
     const rows = await this.db
       .selectFrom('dispatch_queue')
       .select(['status', 'runs_on_labels'])
@@ -1518,18 +1471,16 @@ export class JobQueue {
    * Mark a job as recovering (agent disconnected, within grace period).
    * Only transitions from 'dispatched' state for safety.
    *
-   * When `deadline` and `agentId` are provided, persists them so a
-   * replacement coord on Raft leader switch can recreate the recovery
-   * timer (via `getRecoveringJobs()` on boot) or expire the row in
-   * the leader-gated sweep (`sweepExpiredRecoveries()`).
+   * `deadline` and `agentId`, when given, are persisted so a replacement coord
+   * on Raft leader switch can recreate the recovery timer (`getRecoveringJobs()`
+   * on boot) or expire the row in the leader-gated `sweepExpiredRecoveries()`.
    *
-   * Carries the permissive ownership write guard: a row owned by a LIVE sibling
-   * is left alone. Callers are expected to have selected owned rows already
-   * ({@link JobQueue.getOrphanedDispatchedJobs}); this is the backstop for a
-   * path that forgets to, since flipping a live sibling's row to `recovering`
-   * starts a 120-second clock that ends by failing a job nobody disconnected
-   * from. A NULL owner still passes — a local disconnect must be able to move a
-   * pre-upgrade row.
+   * Carries the permissive ownership write guard: a LIVE sibling's row is left
+   * alone. Callers should already have selected owned rows
+   * ({@link JobQueue.getOrphanedDispatchedJobs}); this is the backstop for a path
+   * that forgets, since flipping a live sibling's row starts a 120-second clock
+   * that ends by failing a job nobody disconnected from. A NULL owner still
+   * passes: a local disconnect must be able to move a pre-upgrade row.
    *
    * @returns whether a row was flipped.
    */
@@ -1555,12 +1506,11 @@ export class JobQueue {
    * The `dispatched` rows this coordinator may start recovery timers for on
    * boot: its own, and those whose owning coordinator is no longer alive.
    *
-   * Replaces an unfiltered `getJobsByStatus(Dispatched)` over the shared table.
-   * That scan made every coordinator boot flip every sibling's in-flight row to
-   * `recovering`; the agents running those jobs were never disconnected, so
-   * nothing reclaimed them, and 120 seconds later the booting coordinator
-   * failed every one of them while they ran to completion. The documented
-   * rolling-restart procedure triggered it on every restart.
+   * Not an unfiltered `getJobsByStatus(Dispatched)` over the shared table: that
+   * scan flips every sibling's in-flight row to `recovering` on every boot, and
+   * since those agents never disconnected nothing reclaims them, so 120 seconds
+   * later the booting coordinator fails them all while they run to completion,
+   * on every step of the documented rolling-restart procedure.
    *
    * A NULL owner is spared — see {@link recoverableByOwner} for why, and for
    * what reaps a genuinely orphaned one instead.
@@ -1693,14 +1643,12 @@ export class JobQueue {
   }
 
   /**
-   * Sweep every `recovering` row whose `recovery_deadline` is in the
-   * past, marking them `failed`. Returns the rows that flipped so the
-   * caller can fire the per-job `onJobFailedPermanently` hook in process.
+   * Fail every `recovering` row whose `recovery_deadline` is past, returning the
+   * flipped rows so the caller can fire the per-job `onJobFailedPermanently` hook.
    *
-   * Intended for the leader-gated `Dispatcher.sweepExpiredRecoveries`
-   * tick — running on N coords would still be correct (the WHERE
-   * `status='recovering'` clause prevents double-failure) but only one
-   * needs to do the work.
+   * Intended for the leader-gated `Dispatcher.sweepExpiredRecoveries` tick;
+   * running on N coords is still correct (the `status='recovering'` guard
+   * prevents double-failure), but only one needs to do the work.
    */
   async sweepExpiredRecoveries(
     now: Date,
@@ -1742,10 +1690,9 @@ export class JobQueue {
   }
 
   /**
-   * Return a dispatched job to the pending queue for re-dispatch, bumping
-   * its attempt counter. Used when an agent explicitly rejects a dispatch
-   * (job.reject) and when a scaler-managed agent disconnects before the
-   * job started. Only flips rows still in 'dispatched' — a job that was
+   * Return a dispatched job to the pending queue, bumping its attempt counter.
+   * Used on an explicit job.reject and when a scaler-managed agent disconnects
+   * before the job started. Only flips rows still 'dispatched', so a job
    * concurrently completed / failed / cancelled is left untouched.
    *
    * `countAttempt: false` leaves the counter alone — used for a busy rejection
@@ -1768,10 +1715,9 @@ export class JobQueue {
         ack_deadline: null,
         ack_agent_id: null,
         agent_id: null,
-        // The row is going back on the queue, so nobody owns it and nothing has
-        // been dispatched: leaving either stamped would make a sweep act on a
-        // pending row and would leave the stale detector measuring a dispatch
-        // that was undone.
+        // Back on the queue, the row has no owner and no dispatch: a stale owner
+        // makes a sweep act on a pending row, and a stale `dispatched_at` makes
+        // the stale detector measure an undone dispatch.
         owner_instance_id: null,
         dispatched_at: null,
         // A job that got dispatched was routable at that moment, so any grace
@@ -1914,22 +1860,18 @@ export class JobQueue {
   }
 
   /**
-   * HA-safe ownership check. Returns true if the DB shows that
-   * `agentId` holds or previously held `jobId` according to any of:
+   * HA-safe ownership check: true if the DB shows `agentId` holds or held `jobId`:
    *
-   *   - `status='dispatched'` AND `agent_id = <agent>` — the live
-   *     owner of an in-flight job, readable by any coordinator
-   *     including one that never saw the dispatch,
-   *   - `status='recovering'` AND `recovery_agent_id = <agent>` (so a
-   *     replacement coord still recognises in-flight chunks), OR
-   *   - the row is already terminal (`completed` / `failed` /
-   *     `expired`) — late `log.chunk` chunks from the agent's drain
-   *     window are accepted as benign duplicates rather than
-   *     rejected.
+   *   - `status='dispatched'` AND `agent_id = <agent>` — the live owner, readable
+   *     by any coordinator, including one that never saw the dispatch;
+   *   - `status='recovering'` AND `recovery_agent_id = <agent>`, so a
+   *     replacement coord still recognises in-flight chunks; or
+   *   - the row is terminal (`completed` / `failed` / `expired`) — late
+   *     `log.chunk` chunks from the agent's drain window are accepted as benign
+   *     duplicates.
    *
-   * Used by `OwnershipTracker.validateAsync` so a Raft leader switch
-   * doesn't turn the next 30s of legitimate per-job chunks into a
-   * stream of ownership violations.
+   * Used by `OwnershipTracker.validateAsync` so a Raft leader switch doesn't
+   * turn the next 30s of legitimate per-job chunks into ownership violations.
    */
   async hasAgentOwnedJob(agentId: string, jobId: string): Promise<boolean> {
     const row = await this.db
@@ -1966,8 +1908,8 @@ export class JobQueue {
   }
 
   /**
-   * Get all jobs matching a given status.
-   * Used on startup to find 'dispatched' jobs from a previous instance for recovery.
+   * Get all jobs matching a given status, unfiltered across coordinators. Boot
+   * recovery uses `getOrphanedDispatchedJobs` instead.
    */
   async getJobsByStatus(
     status: DispatchQueueStatus,
@@ -2030,9 +1972,8 @@ export class JobQueue {
    * Pending, non-expired jobs with the facts the unroutable probe needs:
    * routing selectors, any recorded provisioning error, and the grace clock.
    *
-   * Read-only — no claim, no `FOR UPDATE`; the probe never dispatches. Reuses
-   * the shared pending query so it inherits the same FIFO ordering and
-   * not-yet-expired filter the rest of the queue uses.
+   * Read-only — no claim, no `FOR UPDATE`; the probe never dispatches. Shares
+   * the queue's FIFO ordering and not-yet-expired filter.
    */
   async listUnroutableCandidates(limit: number): Promise<UnroutableCandidate[]> {
     // The probe reads every pending job: a deferred one still expires on time.
@@ -2072,17 +2013,15 @@ export class JobQueue {
   /**
    * Claim a still-pending row for fast-fail, moving it out of the queue.
    *
-   * Mirrors {@link markExpired}: the queue row has to leave `Pending` in the
-   * same breath the job is terminalized, and for the same two reasons.
-   * A row left pending is still dispatchable, so an agent connecting later
+   * Mirrors {@link markExpired}: the row must leave `Pending` as the job is
+   * terminalized. A row left pending is still dispatchable, so a later agent
    * would pick up a job whose `execution_jobs` row already reads terminal; and
-   * the probe re-lists it on every tick, re-running the whole terminalize path
-   * (and re-counting the fast-fail metric) until the queue timeout finally
-   * expires it.
+   * the probe re-lists it every tick, re-running the terminalize path (and
+   * re-counting the fast-fail metric) until the queue timeout expires it.
    *
    * The `status = Pending` guard is also the concurrency arbiter — probe ticks
    * are NOT leader-gated, so exactly one coordinator's UPDATE hits a row and
-   * the losers get `false` and move on.
+   * the losers get `false`.
    *
    * @returns true when this call claimed the row, false when it was already
    *   dispatched, cancelled, expired, or claimed by another coordinator.

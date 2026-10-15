@@ -4,18 +4,15 @@ import { type Kysely, sql } from 'kysely';
  * Add `execution_runs.dispatch_routing_key TEXT NULL` — the source whose
  * credentials a run's `provider_context` actually holds.
  *
- * `routing_key` records the source the event ARRIVED on. For a cross-provider
- * global workflow those are two different sources: the lock file resolves
- * through another source's bundle, and `provider_context` is written from that
- * source's credentials. Anything that pairs the inbound routing key with the
- * stored context therefore hands one source's credentials to another source's
- * API client — the re-run of a failed evaluation round did exactly that, and
- * the resulting fetch either fails or reads the wrong tree.
+ * `routing_key` is the source the event ARRIVED on. For a cross-provider global
+ * workflow the lock file resolves through another source's bundle, whose
+ * credentials fill `provider_context`. Pairing the inbound routing key with that
+ * context hands one source's credentials to another's API client (as the re-run
+ * of a failed evaluation round did): the fetch fails or reads the wrong tree.
  *
- * Nullable, with no default: NULL means "the same source the event arrived on",
- * which is true of every run except a cross-provider dispatch and of every row
- * written before this column existed. A default would have to name a routing
- * key, and there is no cluster-wide one to name.
+ * Nullable, no default: NULL means the arrival source, true of every run except
+ * a cross-provider dispatch and of every older row. There is no cluster-wide
+ * routing key a default could name.
  *
  * Idempotent: the add is guarded on existence and the drop uses IF EXISTS, so a
  * re-run is a no-op.

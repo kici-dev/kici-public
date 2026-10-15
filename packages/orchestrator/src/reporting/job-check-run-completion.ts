@@ -6,9 +6,8 @@ import type { ExecutionContext } from './execution-tracker.js';
 const logger = createLogger({ prefix: 'check-run-completion' });
 
 /**
- * Job-terminal signal this module reacts to. Shaped after the payload the
- * execution tracker hands its `onJobComplete` hook — its primary caller — plus
- * the agent-supplied `data` blob used to build the enriched check-run summary.
+ * Shaped after the payload the execution tracker (the primary caller) hands its
+ * `onJobComplete` hook, plus the agent-supplied `data` blob for the enriched summary.
  */
 export interface JobCheckRunCompletionInput {
   runId: string;
@@ -19,11 +18,9 @@ export interface JobCheckRunCompletionInput {
   /** Agent-supplied job payload (step results, error, duration). */
   data?: Record<string, unknown>;
   /**
-   * Explicit check-run description, overriding the conclusion mapper's default
-   * wording. A caller that already holds the specific reason a job ended the way
-   * it did passes it here — the queue-expiry sweep's `unroutable` message, for
-   * instance, is the only statement of WHICH `runsOn` selectors went unmatched,
-   * and the mapper's generic phrasing cannot name them.
+   * Overrides the conclusion mapper's default wording with a reason the caller already
+   * holds — e.g. the queue-expiry sweep's `unroutable` message is the only statement of
+   * WHICH `runsOn` selectors went unmatched, which the mapper's phrasing cannot name.
    */
   description?: string;
 }
@@ -36,34 +33,26 @@ export interface JobCheckRunCompletionDeps {
 }
 
 /**
- * Narrow a raw status string to the terminal subset.
- *
- * Keyed on the canonical `TERMINAL_JOB_STATES` set rather than a second
- * hand-written status list: a status added to the engine enum joins the set (and
- * widens `TerminalJobStatus`) automatically, so nothing here has to be
- * remembered and updated a second time.
+ * Keyed on the canonical `TERMINAL_JOB_STATES` set rather than a hand-written list, so a
+ * status added to the engine enum joins the set (and widens `TerminalJobStatus`)
+ * automatically.
  */
 function isTerminalJobStatus(status: string): status is TerminalJobStatus {
   return TERMINAL_JOB_STATES.has(status);
 }
 
 /**
- * Post the terminal conclusion for a job's check run.
+ * Every terminal job must resolve the check run `setPending()` created at trigger match.
+ * A check run left `queued` is not cosmetic: branch protection requiring it can never be
+ * satisfied, and a developer reads it as "still running" indefinitely.
  *
- * Every job that reaches a terminal state must resolve the check run that
- * `setPending()` created for it at trigger match. A check run left `queued` is
- * not cosmetic: branch protection that requires it can never be satisfied, and
- * a developer reads it as "still running" indefinitely with nothing to point at.
+ * A non-terminal status is a no-op — a check run is completed once, when the job stops.
  *
- * A non-terminal status is a no-op — a check run is completed once, when the job
- * stops.
- *
- * Never throws. Its callers are hot paths whose remaining work matters more than
- * this report: the tracker's terminal-job hook runs inside `onJobStatus`, ahead
- * of the job-complete event emission and the needs/wave scheduler hooks, and the
- * expiry sweep runs it per job inside a loop. `buildJobFailureDescription` reads
- * an agent-supplied payload, so a malformed `stepResults` entry is enough to
- * raise — and a check-run report is not worth stalling a run's scheduling for.
+ * Never throws. Its callers are hot paths whose remaining work matters more: the
+ * tracker's terminal-job hook runs inside `onJobStatus`, ahead of the job-complete event
+ * and the needs/wave scheduler hooks, and the expiry sweep runs it per job in a loop.
+ * `buildJobFailureDescription` reads an agent-supplied payload, so a malformed
+ * `stepResults` entry can raise — not worth stalling a run's scheduling for.
  */
 export function reportJobCheckRunCompletion(
   deps: JobCheckRunCompletionDeps,
@@ -98,9 +87,7 @@ function postJobCheckRunCompletion(
 
   const [owner, repo] = execContext.repoIdentifier.split('/');
 
-  // An explicit description wins; otherwise build a meaningful one from agent
-  // data on failure, and let every other terminal status take the mapper's own
-  // wording.
+  // Explicit wins; else build one from agent data on failure; else the mapper's wording.
   const description =
     input.description ??
     (input.status === ExecutionJobStatus.enum.failed && input.data
@@ -122,21 +109,18 @@ function postJobCheckRunCompletion(
     installationId: execContext.installationId,
     routingKey: execContext.routingKey,
     description,
-    // The run's trust posture, so the completion summary can say why a job on
-    // an untrusted ref behaved differently. Absent when trust never resolved.
+    // Trust posture, so the summary can say why a job on an untrusted ref behaved
+    // differently. Absent when trust never resolved.
     ...(execContext.trustTier !== undefined && { trustTier: execContext.trustTier }),
     ...(execContext.lockFileSource !== undefined && {
       lockFileSource: execContext.lockFileSource,
     }),
-    // Pass additional data for enriched summaries
     data: input.data,
     runIdForLogs: input.runId,
     jobId: input.jobId,
-    // Explicit runId — this fires from the tracker's terminal-job hook, which
-    // runs outside the request-context ALS frame that wrapped the original
-    // dispatch, so the reporter cannot pull runId from getRequestContext().
-    // Without it, the completion update omits details_url and GitHub falls back
-    // to the App's homepage URL.
+    // Explicit: the terminal-job hook runs outside the dispatch's request-context ALS
+    // frame, so getRequestContext() has no runId; without it the update omits
+    // details_url and GitHub falls back to the App's homepage URL.
     runId: input.runId,
   });
 }

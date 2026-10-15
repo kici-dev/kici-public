@@ -27,13 +27,13 @@ describe('initTelemetry', () => {
   });
 
   it('does not configure OTLP exporter when otlpEndpoint is not set', () => {
-    // This test verifies no error is thrown when otlpEndpoint is absent
+    // Proves only that no error is thrown
     sdk = initTelemetry({ serviceName: 'no-otlp' });
     expect(sdk).toBeDefined();
   });
 
   it('configures OTLP exporter when otlpEndpoint is set', () => {
-    // This test verifies no error is thrown when otlpEndpoint is present
+    // Proves only that no error is thrown
     sdk = initTelemetry({
       serviceName: 'with-otlp',
       otlpEndpoint: 'http://localhost:4318',
@@ -47,7 +47,6 @@ describe('createMeter', () => {
     const { createMeter } = await import('./metrics.js');
     const meter = createMeter('test-service');
     expect(meter).toBeDefined();
-    // Should be able to create instruments
     const counter = meter.createCounter('test_counter');
     expect(counter).toBeDefined();
   });

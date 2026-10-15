@@ -3,19 +3,16 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Add `cluster_settings.dashboard_verified_issuer` (nullable text).
  *
- * The verified-tier origin the dashboard fetches the orchestrator's X25519
- * dashboard-encryption public key from — and always displays next to a secret /
- * variable entry field — under the `encrypted` dashboard-write posture. Fetching
- * the key straight from the customer's own origin makes TLS to that domain the
- * trust root, so an active hosted-control-plane MITM of the key cannot happen.
+ * Under the `encrypted` dashboard-write posture, the verified-tier origin the
+ * dashboard fetches the orchestrator's X25519 public key from and always shows
+ * next to a secret / variable entry field. TLS to the customer's own origin is
+ * the trust root, so the hosted control plane cannot MITM the key.
  *
- * Cluster-global (one orchestrator identity, one `.well-known`), not per-tenant,
- * so it lives on `cluster_settings` rather than `org_settings`. The tier is
- * explicit opt-in with no environment fallback: NULL ⇒ the verified tier is not
- * offered and the convenient tier is used.
+ * Cluster-global (one orchestrator identity, one `.well-known`), so it lives on
+ * `cluster_settings`, not `org_settings`. Explicit opt-in with no environment
+ * fallback: NULL ⇒ the verified tier is not offered; the convenient tier is used.
  *
- * Idempotent: guarded on column existence; a re-run on a DB that already has the
- * column is a no-op.
+ * Idempotent: guarded on column existence.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

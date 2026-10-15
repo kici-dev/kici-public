@@ -408,6 +408,7 @@ Uptime:     2h 15m
 --- Config files ---
 Env file:      /etc/kici/kici-orchestrator/kici-orchestrator.env
 Scaler config: /etc/kici/scalers.yaml
+Agent binary:  /usr/local/bin/kici-agent
 ```
 
 - **Health** is `ok` whenever the orchestrator answers `/health`.
@@ -418,6 +419,8 @@ Scaler config: /etc/kici/scalers.yaml
 A running service that does not answer on its port prints `(Could not reach health API)` in place of the section.
 
 The **Config files** block comes from the install manifest and the env file on disk, so it prints for a stopped service too. A compose install also lists the generated compose file. The scaler line appears only when the env file names a scaler config.
+
+The **Agent binary** line names the `kici-agent` that `npm install -g kici-admin` installed with the Node.js runtime the service runs. The command reads that runtime from the service unit. Use this path as the `binaryPath` of a bare-metal scaler: `kici-admin orchestrator upgrade` installs the new agent at this path, so the agent upgrades with the orchestrator. The line shows `(not installed)` when the file is missing. It does not appear for a compose install, or for a service that does not run from an npm install of `kici-admin`. The `--json` output carries the same value as `agentBinary`.
 
 Use `--json` for machine-readable output. The `health` and `readiness` objects carry the `/health` and `/ready` responses, and the config paths come back as a `configPaths` object.
 
@@ -548,6 +551,19 @@ An orchestrator upgrade takes two steps before anything stops:
    The drain needs the admin API. If the CLI has no `--url` / `--token` configured it cannot reach it, and the upgrade warns and continues rather than refusing.
 
 Neither step applies to an agent upgrade: an agent has no database and no drain.
+
+### The bare-metal `binaryPath` check
+
+Before an orchestrator upgrade installs or restarts anything, it reads the scaler config that the env file names (`KICI_SCALER_CONFIG_PATH` and `KICI_SCALER_CONFIG_DIR`). It then checks the `binaryPath` of each bare-metal label set. The expected agent is the `kici-agent` installed with the runtime of the service unit: the path that `kici-admin orchestrator status` prints as **Agent binary**.
+
+- **Not an executable file** — the upgrade stops. Nothing is installed and the service keeps running, because the restarted orchestrator would not start. The message names the expected agent. Set `binaryPath` to that path and run the upgrade again. To upgrade anyway, pass `--skip-binary-path-check`: the upgrade then prints the problem as a warning and continues.
+- **A version-manager shim** — the upgrade stops, as for a file that is not executable. A mise shim links to the `mise` executable, a Volta shim links to `volta-shim`, and an asdf or nodenv shim is a script in a `shims` folder. Each one runs the version manager, not the agent, so the restarted orchestrator refuses it at startup. The message names the expected agent, or the command that prints the file behind the shim, such as `mise which kici-agent`.
+- **An agent from another runtime** — the upgrade continues with a warning. The warning names both paths and the version each one runs. The upgrade does not update that agent, so set `binaryPath` to the expected agent.
+- **A path through a version-manager alias** — the upgrade continues with a warning. An example is the mise alias `~/.local/share/mise/installs/node/24/…`. Such a path moves to another runtime when you install a new Node.js version, and that runtime has no `kici-agent`. The warning names a stable path to use.
+
+An upgrade from an archive (`--from` / `--url`) does the same check, but it has no expected agent, so it does not report an agent from another runtime.
+
+`--rollback` and `--pick` run the same check before they stop the service, but they only warn. They never stop for a `binaryPath`, because they are recovery paths. Read the warnings: a `binaryPath` that the check would refuse also stops the restarted orchestrator.
 
 ### Rollback
 

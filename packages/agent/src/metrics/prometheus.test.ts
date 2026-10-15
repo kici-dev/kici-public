@@ -14,7 +14,6 @@ import {
 
 describe('prometheus metrics', () => {
   it('exports all 6 expected metrics plus connectionStatus', () => {
-    // All metrics should be defined (OTel instruments)
     expect(jobsTotal).toBeDefined();
     expect(jobsActive).toBeDefined();
     expect(stepsTotal).toBeDefined();
@@ -44,7 +43,6 @@ describe('prometheus metrics', () => {
   });
 
   it('metric operations do not throw', () => {
-    // Verify all metric instruments can be used without errors
     expect(() => jobsTotal.add(1, { status: 'success' })).not.toThrow();
     expect(() => stepsTotal.add(1, { status: 'success' })).not.toThrow();
     expect(() => logBytesTotal.add(1024)).not.toThrow();

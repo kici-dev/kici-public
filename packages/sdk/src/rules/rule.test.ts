@@ -29,7 +29,6 @@ describe('rule()', () => {
   it('check function can be sync (returns boolean)', () => {
     const r = rule('sync check', () => false);
     const mockContext = {} as RuleContext;
-    // Sync function returns boolean directly
     const result = r.check(mockContext);
     expect(result).toBe(false);
   });
@@ -80,7 +79,6 @@ describe('skip()', () => {
   });
 
   it('returns false when check returns true (skips when condition met)', async () => {
-    // Condition: all files are markdown
     const s = skip('docs only PR', (ctx) => {
       return ctx.changedFiles.every((f) => f.endsWith('.md'));
     });
@@ -98,7 +96,6 @@ describe('skip()', () => {
   });
 
   it('returns true when check returns false (runs when condition not met)', async () => {
-    // Condition: all files are markdown
     const s = skip('docs only PR', (ctx) => {
       return ctx.changedFiles.every((f) => f.endsWith('.md'));
     });

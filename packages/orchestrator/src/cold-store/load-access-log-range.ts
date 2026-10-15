@@ -1,22 +1,15 @@
 /**
  * Read-through helper for `access_log` (Orchestrator).
  *
- * Unlike `audit_log` and `secret_audit_log`, the `access_log` callers
- * (dashboard "Data access" tab, admin HTTP route, `kici-admin
- * access-log list` CLI) all use the same cursor-based pagination
- * already implemented by `AccessLogWriter.query()`. access_log is
- * "paginated/transparent" — there
- * is NO `--include-archived` flag. The helper merges cold rows
- * automatically when pagination crosses the warm cutoff or the caller
- * supplies a `from` timestamp older than warm.
+ * Unlike `audit_log` and `secret_audit_log`, every `access_log` caller (dashboard "Data access"
+ * tab, admin HTTP route, `kici-admin access-log list`) shares the cursor pagination of
+ * `AccessLogWriter.query()`, so there is NO `--include-archived` flag: cold rows merge in
+ * automatically when pagination crosses the warm cutoff or `from` is older than warm.
  *
- * Cursor extension: the existing cursor encodes `{createdAt, id}` for
- * the hot tuple comparison `(created_at, id) < (cursor.createdAt, cursor.id)`.
- * The cursor also carries a `source: 'hot' | 'cold'` discriminator so a
- * cursor minted while the page boundary was inside cold can resume in
- * the cold stream on the next request. A cursor without a valid `source` is
- * invalid, like any other unparsable cursor, and the read starts from the
- * first page.
+ * The cursor encodes `{createdAt, id}` for the tuple comparison
+ * `(created_at, id) < (cursor.createdAt, cursor.id)`, plus a `source: 'hot' | 'cold'`
+ * discriminator so a page boundary inside cold resumes in the cold stream. A cursor without a
+ * valid `source` is unparsable, and the read starts from the first page.
  */
 import { sql, type Kysely, type Selectable } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
@@ -34,13 +27,10 @@ import type { AccessLogTable, Database } from '../db/types.js';
 const logger = createLogger({ prefix: 'load-access-log-range' });
 
 /**
- * Synthetic tenant placeholder for orchestrator-level rows whose `org_id IS
- * NULL` — collapses every NULL-tenant row under one cold-store prefix so the
- * `(tenant_id, day)` partition scheme still yields a single scan key. Shared
- * across every cold-store reader / adapter touching tables that may emit
- * NULL-tenant rows (`access_log`, `secret_audit_log`); export once here so
- * the four call sites in `cold-store/` and the fallback in
- * `audit/access-log.ts` cannot drift apart.
+ * Synthetic tenant for orchestrator-level rows whose `org_id IS NULL`: it collapses them under
+ * one cold-store prefix so the `(tenant_id, day)` partition still yields a single scan key.
+ * Exported once so the `cold-store/` readers and adapters for NULL-tenant tables (`access_log`,
+ * `secret_audit_log`) and the fallback in `audit/access-log.ts` cannot drift apart.
  */
 export const SYNTHETIC_ORCH_TENANT = '__orchestrator__';
 
@@ -60,10 +50,7 @@ export interface LoadAccessLogRangeArgs {
     targetId?: string;
     fromTimestamp?: Date | string;
     toTimestamp?: Date | string;
-    /**
-     * Full-text search over `error_message`. Trigram-indexed via migration
-     * `009_access_log_trigram.ts`. Min ~3 chars for the index to help.
-     */
+    /** Search over `error_message`; trigram-indexed (migration 009), so ~3+ chars use the index. */
     q?: string;
     /** Exact-match filter on the agent provenance label (`agent_label` column). */
     agentLabel?: string;
@@ -92,8 +79,7 @@ export async function loadAccessLogRange(
   const cursor = args.cursor ? parseCursor(args.cursor) : null;
 
   // ── 1. Hot path ────────────────────────────────────────────────
-  // Skip when the cursor explicitly resumes in cold; otherwise run
-  // the hot SELECT with limit + 1 to detect "needs more".
+  // Skipped when the cursor resumes in cold; limit + 1 detects "needs more".
   const fromTs = parseDate(filter.fromTimestamp);
   const toTs = parseDate(filter.toTimestamp);
 
@@ -140,19 +126,13 @@ export async function loadAccessLogRange(
   }
 
   // ── 2. Decide whether to descend into cold ─────────────────────
-  // Cold becomes relevant when:
-  //   (a) caller passed cursor.source === 'cold'
-  //   (b) hot returned fewer than `limit` items AND fromTs (if any)
-  //       is older than warmCutoff
-  //   (c) no cold-store wired → skip
+  // Cold is read when a cold-store is wired and either the cursor resumes in cold, or hot
+  // returned fewer than `limit` items and fromTs (if any) is older than warmCutoff.
   const wantCold =
     !!coldStore && (cursor?.source === 'cold' || (!hotHasMore && hotItems.length < limit));
   const coldFromTs = fromTs ?? new Date(0);
-  // The bound is the table's MINIMUM per-category TTL, resolved from the same
-  // adapter config the archiver uses: any row younger than it is guaranteed
-  // still in PG (no category archives sooner). The `null` arm covers the
-  // no-cold-store case; the `warmCutoff === null` guard below is what narrows
-  // it to a `Date` for the `coldToTs` clamp.
+  // The table's MINIMUM per-category TTL, from the archiver's adapter config: any younger row is
+  // guaranteed still in PG. The `warmCutoff === null` guard narrows it to a `Date` for the clamp.
   const warmCutoff = coldStore ? coldStore.warmCutoff('access_log') : null;
   if (!wantCold || warmCutoff === null || coldFromTs >= warmCutoff) {
     return {
@@ -166,11 +146,8 @@ export async function loadAccessLogRange(
   const coldToTs = toTs && toTs < warmCutoff ? toTs : warmCutoff;
   const coldRemaining = limit - hotItems.length;
 
-  // Tenants to scan: when caller supplies orgId, scan that tenant
-  // exclusively. When orgId is omitted (which the dashboard rarely
-  // does — admin queries can), scan the synthetic tenant only.
-  // Multi-tenant scans without an orgId are not supported via this
-  // helper — callers should supply an orgId.
+  // Scan only the caller's orgId tenant, or the synthetic tenant when orgId is omitted (admin
+  // queries). Multi-tenant cold scans are not supported.
   const tenantToScan = filter.orgId ?? SYNTHETIC_ORCH_TENANT;
 
   const matches = (row: AccessLogColdRow): boolean => {
@@ -195,12 +172,10 @@ export async function loadAccessLogRange(
     it.createdAt < cursor.createdAt ||
     (it.createdAt === cursor.createdAt && it.id < cursor.id);
 
-  // The cold stream arrives newest-first, so the page is complete as soon as
-  // `coldRemaining` rows are in hand and the next row is strictly older than
-  // the last of them — every row that could still tie on `createdAt` has been
-  // seen by then. Stopping there is what keeps a narrow filter from reading
-  // the tenant's whole archive: collecting everything and then sorting would
-  // fetch every chunk in range even for a five-row page.
+  // The cold stream is newest-first, so the page is complete once `coldRemaining` rows are in
+  // hand and the next row is strictly older than the last (no further `createdAt` tie is
+  // possible). Stopping there keeps a narrow filter from fetching every chunk in range, which
+  // collect-then-sort would do even for a five-row page.
   const coldItems: AccessLogItem[] = [];
   let stoppedEarly = false;
   try {
@@ -226,12 +201,9 @@ export async function loadAccessLogRange(
     }
   } catch (err) {
     if (cursor?.source === 'cold') {
-      // Cold-resume mode has no hot fallback: hotItems is empty and
-      // hotHasMore is false because the hot SELECT was skipped above.
-      // Returning {items:[], nextCursor:null} would look like
-      // end-of-results to the dashboard / CLI and silently drop the
-      // remaining cold rows. Propagate so handleAccessLogList surfaces
-      // the error band instead.
+      // Cold-resume has no hot fallback (the hot SELECT was skipped), and an empty page would
+      // read as end-of-results and silently drop the remaining cold rows. Propagate so
+      // handleAccessLogList surfaces the error band.
       logger.error('cold-store fetchRange failed during cold-resume; propagating', {
         tenantId: tenantToScan,
         error: toErrorMessage(err),
@@ -283,11 +255,8 @@ function parseDate(v: Date | string | undefined): Date | undefined {
 }
 
 /**
- * Canonical hot-or-cold `AccessLogRow → AccessLogItem` adapter. Exported
- * because `AccessLogWriter.getById` (in `audit/access-log.ts`) needs to
- * convert both hot (`AccessLogRow`) and cold (`AccessLogColdRow`) rows
- * into the same `AccessLogItem` shape — the two row types are
- * structurally identical (`Selectable<AccessLogTable>`), so a single
+ * Canonical hot-or-cold row → `AccessLogItem` adapter, exported for `AccessLogWriter.getById`
+ * (`audit/access-log.ts`). Hot and cold rows are both `Selectable<AccessLogTable>`, so one
  * converter avoids drift.
  */
 export function toAccessLogItem(row: AccessLogColdRow): AccessLogItem {

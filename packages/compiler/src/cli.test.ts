@@ -34,9 +34,8 @@ function runCli(args: string): CliResult {
   }
 }
 
-// Each test spawns `node dist/cli.js` via execSync — under parallel test-package
-// load (pnpm -r test) the default 5s timeout is not always enough for a fresh
-// Node startup + CLI parse. Bump to 30s to absorb cold-cache jitter.
+// Each test spawns `node dist/cli.js`; under parallel load (pnpm -r test) a cold
+// Node startup can exceed the default 5s timeout.
 const SPAWN_TIMEOUT_MS = 30_000;
 
 describe('CLI argument errors', () => {
@@ -44,8 +43,7 @@ describe('CLI argument errors', () => {
     'kici preview without event shows usage help',
     () => {
       const result = runCli('preview');
-      // kici preview (no event) prints usage help and exits 0.
-      // It should NOT show argument errors about events.
+      // No event: usage help, exit 0, no argument errors.
       expect(result.stderr).not.toContain('missing required argument');
       expect(result.stderr).not.toContain('Allowed choices');
     },
@@ -56,8 +54,7 @@ describe('CLI argument errors', () => {
     'kici fixture without event shows missing argument error',
     () => {
       const result = runCli('fixture');
-      // Commander shows "missing required argument" when no event is provided.
-      // The choices are only listed when an invalid value is given (see next test).
+      // Commander lists the choices only for an invalid value (next test).
       expect(result.stderr).toContain('missing required argument');
       expect(result.stderr).toContain('event');
     },
@@ -68,8 +65,7 @@ describe('CLI argument errors', () => {
     'kici preview with fixture-like name shows migration message, not an argument error',
     () => {
       const result = runCli('preview some-fixture');
-      // A non-event arg prints the "moved to kici run remote" migration message.
-      // It exits non-zero but must NOT show Commander argument errors.
+      // Non-zero exit, but no Commander argument errors.
       expect(result.stderr).not.toContain('Allowed choices');
       expect(result.stderr).not.toContain('missing required argument');
     },
@@ -92,7 +88,6 @@ describe('CLI argument errors', () => {
     'kici preview with a valid event does not show an argument error',
     () => {
       const result = runCli('preview pr:open');
-      // A known event type runs the dry-run preview path. No argument errors.
       expect(result.stderr).not.toContain('missing required argument');
       expect(result.stderr).not.toContain('Allowed choices');
     },
@@ -102,9 +97,8 @@ describe('CLI argument errors', () => {
   it(
     'kici run local is retired and redirects to the routed run (exit 2)',
     () => {
-      // The `local` subcommand is gone; `kici run local` reaches the parent
-      // `kici run` action (event === 'local'), which prints the retirement hint
-      // pointing at `kici run <event> --local` and exits non-zero.
+      // `kici run local` reaches the parent action (event === 'local'), which
+      // prints the retirement hint.
       const result = runCli('run local');
       expect(result.exitCode).toBe(2);
       const out = `${result.stdout}\n${result.stderr}`;
@@ -142,8 +136,7 @@ describe('CLI argument errors', () => {
       const result = runCli('bogus');
       expect(result.exitCode).not.toBe(0);
       expect(result.stderr).toContain('kici --help');
-      // The retired-command map is scoped, not a catch-all: an unrelated typo
-      // must not print a redirect that names kici runs.
+      // The retired-command map is not a catch-all.
       expect(result.stderr).not.toContain('kici runs');
     },
     SPAWN_TIMEOUT_MS,
@@ -154,8 +147,7 @@ describe('version banner', () => {
   it(
     'prints the banner on a plain command invocation',
     () => {
-      // `runs show` errors without auth, but the banner fires in the preAction
-      // hook before the action runs, so it lands on stdout regardless.
+      // The banner fires in the preAction hook, before the unauthenticated action errors.
       const result = runCli('runs show some-fake-id');
       expect(result.stdout).toContain('kici v');
     },
@@ -174,8 +166,7 @@ describe('version banner', () => {
   it(
     'suppresses the banner when --quiet is set',
     () => {
-      // run remote carries --quiet; it errors fast without config but the
-      // preAction hook has already decided whether to print.
+      // Errors fast without config, after the preAction hook decided whether to print.
       const result = runCli('run remote --quiet');
       expect(result.stdout).not.toContain('kici v');
     },
@@ -194,25 +185,20 @@ describe('run remote --approve-all / --yes option wiring', () => {
   }
 
   it('binds the approve-all/--yes flags to the approveAll property (not `yes`)', () => {
-    // Commander derives an option's property name from its LAST long flag. If the
-    // flag string lists `--approve-all` last, the property is `approveAll`; had it
-    // listed `--yes` last, `options.approveAll` would silently be undefined and the
-    // breakglass would never fire. This asserts the correct binding.
+    // Commander names an option's property after its LAST long flag: with `--yes`
+    // last, `options.approveAll` would be undefined and the breakglass never fire.
     const remote = runRemoteCommand();
     const opt = remote.options.find((o) => o.attributeName() === 'approveAll');
     expect(opt, 'run remote must expose an --approve-all option bound to approveAll').toBeDefined();
     expect(opt!.long).toBe('--approve-all');
-    // Both spellings remain accepted aliases.
     expect(opt!.flags).toContain('--approve-all');
     expect(opt!.flags).toContain('--yes');
-    // The mis-binding would have produced a `yes` attribute instead.
     expect(remote.options.some((o) => o.attributeName() === 'yes')).toBe(false);
   });
 
   it('parses --approve-all and --yes to approveAll:true', () => {
     for (const flag of ['--approve-all', '--yes']) {
       const remote = runRemoteCommand();
-      // Neutralise the action so parsing does not execute the real command.
       remote.action(() => {});
       remote.parse(['fixture-id', flag], { from: 'user' });
       expect(remote.opts().approveAll, `${flag} should set approveAll`).toBe(true);
@@ -226,9 +212,7 @@ describe('isMainEntryPoint (symlink-tolerant entry-point guard)', () => {
   });
 
   it('returns true when argv[1] is a SYMLINK to the module (the .bin/kici case)', () => {
-    // node_modules/.bin/kici is a symlink to the compiler's dist/cli.js.
-    // Executing the symlink sets process.argv[1] to the symlink path; the guard
-    // must still recognise the module as the entry point.
+    // node_modules/.bin/kici symlinks dist/cli.js, so argv[1] is the symlink path.
     const dir = mkdtempSync(path.join(tmpdir(), 'kici-cli-guard-'));
     const link = path.join(dir, 'kici');
     try {
@@ -248,8 +232,7 @@ describe('isMainEntryPoint (symlink-tolerant entry-point guard)', () => {
   });
 
   it('falls back to resolve() comparison when argv[1] does not exist on disk', () => {
-    // A non-existent argv[1] makes realpathSync throw; the fallback compares
-    // resolved paths. Identical non-existent paths still match.
+    // realpathSync throws on a non-existent path; the fallback compares resolved paths.
     const ghost = path.join(tmpdir(), 'does-not-exist-kici-cli.js');
     expect(isMainEntryPoint(ghost, pathToFileURL(ghost).href)).toBe(true);
     expect(isMainEntryPoint(ghost, pathToFileURL(CLI_PATH).href)).toBe(false);
@@ -260,9 +243,8 @@ describe('CLI invoked through a bin symlink', () => {
   it(
     'runs (prints version) when launched via a symlink to dist/cli.js',
     () => {
-      // Reproduces a launch through a bin symlink: `node <symlink-to-cli.js> ...`.
-      // Before the symlink-tolerant guard, the main-module check failed and the
-      // CLI silently exited 0 with no output (no command ran).
+      // `node <symlink-to-cli.js>`: a symlink-intolerant main-module check makes
+      // the CLI exit 0 silently with no command run.
       const dir = mkdtempSync(path.join(tmpdir(), 'kici-cli-binlink-'));
       const link = path.join(dir, 'kici');
       try {

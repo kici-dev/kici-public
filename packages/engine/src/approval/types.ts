@@ -1,11 +1,8 @@
 /**
- * Shared approval requirement + clause types.
- *
- * One normalized `ApprovalRequirement` is produced by both approval triggers —
- * a mandatory context policy and an explicit SDK `approval` config — and is
- * consumed identically by the orchestrator gate, the resolver, the held-run
- * store, and the agent step round-trip. Pure Zod (no node built-ins), so this
- * module is safe in the browser-facing engine barrel.
+ * Both approval triggers — a mandatory context policy and an explicit SDK
+ * `approval` config — produce one normalized `ApprovalRequirement`, consumed
+ * identically by the orchestrator gate, the resolver, the held-run store and
+ * the agent step round-trip. Pure Zod, so safe in the browser-facing barrel.
  */
 import { z } from 'zod';
 
@@ -29,10 +26,9 @@ export const TriggerSource = z.enum(['context', 'explicit']);
 export type TriggerSource = z.infer<typeof TriggerSource>;
 
 /**
- * A valid manual-approval timeout: a positive integer number of seconds. The
- * single source of truth for the positivity invariant — referenced by the
- * `step.approval-request` wire schema, the SDK compile-time check, and the
- * orchestrator's pre-dispatch approval-timeout guard.
+ * A manual-approval timeout in seconds. The single source of the positivity
+ * invariant for the `step.approval-request` wire schema, the SDK compile-time
+ * check and the orchestrator's pre-dispatch approval-timeout guard.
  */
 export const approvalTimeoutSecondsSchema = z.number().int().positive();
 

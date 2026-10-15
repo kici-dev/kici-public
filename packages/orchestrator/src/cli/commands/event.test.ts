@@ -1,8 +1,8 @@
 import { describe, expect, it, vi, beforeEach, afterAll } from 'vitest';
-import { Command } from 'commander';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { runCli } from '../../__test-helpers__/cli.js';
 
 const mockEmitKiciEventDirect = vi.fn();
 
@@ -30,44 +30,10 @@ async function runCommand(
   args: string[],
   client: MockClient = makeMockClient(),
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null; client: MockClient }> {
-  const program = new Command();
-  program.exitOverride();
-  registerEventCommands(program, () => client as any);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:') && !err.code?.startsWith('commander.')) {
-      console.log = origLog;
-      console.error = origError;
-      process.exit = origExit;
-      throw err;
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode, client };
+  return { ...(await runCli((p) => registerEventCommands(p, () => client as any), args)), client };
 }
 
-// Create a tmp directory for payload fixture files shared by all tests.
+// Payload fixture files shared by all tests.
 const TMP_DIR = mkdtempSync(join(tmpdir(), 'kici-event-cli-test-'));
 
 function writePayloadFile(name: string, body: unknown): string {

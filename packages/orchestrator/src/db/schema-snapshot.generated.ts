@@ -54,7 +54,7 @@ export const SCHEMA_SNAPSHOT: SchemaFingerprint = {
       default: 'gen_random_uuid()',
     },
     'access_log.org_id': {
-      type: 'character varying(16)',
+      type: 'character varying(255)',
       nullable: true,
       default: null,
     },
@@ -959,7 +959,7 @@ export const SCHEMA_SNAPSHOT: SchemaFingerprint = {
       default: 'gen_random_uuid()',
     },
     'context_bindings.org_id': {
-      type: 'character varying(16)',
+      type: 'character varying(255)',
       nullable: false,
       default: null,
     },
@@ -989,7 +989,7 @@ export const SCHEMA_SNAPSHOT: SchemaFingerprint = {
       default: null,
     },
     'context_source_overrides.org_id': {
-      type: 'character varying(16)',
+      type: 'character varying(255)',
       nullable: false,
       default: null,
     },
@@ -1034,7 +1034,7 @@ export const SCHEMA_SNAPSHOT: SchemaFingerprint = {
       default: 'false',
     },
     'context_variables.org_id': {
-      type: 'character varying(16)',
+      type: 'character varying(255)',
       nullable: false,
       default: null,
     },
@@ -1114,7 +1114,7 @@ export const SCHEMA_SNAPSHOT: SchemaFingerprint = {
       default: null,
     },
     'contexts.org_id': {
-      type: 'character varying(16)',
+      type: 'character varying(255)',
       nullable: false,
       default: null,
     },
@@ -1489,7 +1489,7 @@ export const SCHEMA_SNAPSHOT: SchemaFingerprint = {
       default: '0',
     },
     'event_log.org_id': {
-      type: 'character varying(16)',
+      type: 'character varying(255)',
       nullable: false,
       default: null,
     },
@@ -2375,7 +2375,7 @@ export const SCHEMA_SNAPSHOT: SchemaFingerprint = {
       default: null,
     },
     'held_runs.org_id': {
-      type: 'character varying(16)',
+      type: 'character varying(255)',
       nullable: false,
       default: null,
     },
@@ -3660,7 +3660,7 @@ export const SCHEMA_SNAPSHOT: SchemaFingerprint = {
       default: '1',
     },
     'scoped_secrets.org_id': {
-      type: 'character varying(16)',
+      type: 'character varying(255)',
       nullable: false,
       default: null,
     },

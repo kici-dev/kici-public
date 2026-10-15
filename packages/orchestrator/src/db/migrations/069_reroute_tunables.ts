@@ -1,21 +1,13 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the three reroute-tunable columns to `org_settings` (all nullable):
+ * Add the per-org reroute tunables to `org_settings` (nullable; NULL is the cluster default; set
+ * via `kici-admin org-settings`). Each add is guarded on column existence.
  *
- * - `reroute_spawn_window_ms BIGINT` — how long the coordinator waits after a
- *   peer ACKs a reroute before treating "accepted but no progress" as a spawn
- *   failure and re-dispatching. NULL falls back to the cluster default
- *   (`rerouteSpawnWindowMs`, 90s).
- * - `reroute_ack_timeout_ms BIGINT` — the reroute `sendAndWaitAck` deadline.
- *   NULL falls back to `rerouteAckTimeoutMs` (15s).
- * - `reroute_max_hops INTEGER` — maximum peer hops for a rerouted job. NULL
- *   falls back to `rerouteMaxHops` (3).
- *
- * Operators tune them per-org via `kici-admin org-settings`.
- *
- * Idempotent: each column add is guarded on column existence, so a re-run on a
- * DB that already has a column is a no-op for that column.
+ * - `reroute_spawn_window_ms` — wait after a peer ACKs a reroute before "accepted but no
+ *   progress" counts as a spawn failure and re-dispatches (`rerouteSpawnWindowMs`, 90s).
+ * - `reroute_ack_timeout_ms` — the reroute `sendAndWaitAck` deadline (`rerouteAckTimeoutMs`, 15s).
+ * - `reroute_max_hops` — max peer hops for a rerouted job (`rerouteMaxHops`, 3).
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await addColumnIfMissing(db, 'reroute_spawn_window_ms', 'BIGINT');

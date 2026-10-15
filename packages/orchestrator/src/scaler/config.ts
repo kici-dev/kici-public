@@ -1,11 +1,6 @@
 /**
- * YAML configuration loading and Zod validation for the scaler module.
- *
- * Handles:
- * - Main YAML config file parsing
- * - scalers.d/ directory merging (alphabetically sorted)
- * - Zod schema validation with type-specific refinements
- * - Memory string parsing (e.g., "2g" -> bytes)
+ * Scaler config loading: the main YAML file plus `scalers.d/` (merged in
+ * alphabetical order), validated by Zod with type-specific refinements.
  */
 
 import { readFile, readdir } from 'node:fs/promises';
@@ -28,10 +23,9 @@ import { parseHostAccess } from '@kici-dev/shared/net';
 import { toErrorMessage } from '@kici-dev/shared';
 
 /**
- * Default cap on concurrent `backend.spawn` operations per backend when a
- * scaler entry does not set `maxConcurrentSpawns`. Bounds the provisioning rate
- * (image pull + create + start) so a burst of queued jobs cannot storm the
- * container socket / registry.
+ * Default per-backend `maxConcurrentSpawns`. Bounds the provisioning rate (image
+ * pull + create + start) so a burst of queued jobs cannot storm the container
+ * socket / registry.
  */
 export const DEFAULT_MAX_CONCURRENT_SPAWNS = 8;
 
@@ -51,10 +45,9 @@ const PLAIN_PLATFORM_LABELS = new Set<string>([
 ]);
 
 /**
- * Resource request schema accepted at the label-set / defaults level:
- * `{ requests?: {cpus, memory}, limits?: {cpus, memory} }`. A `{ cpus, memory }`
- * object written directly under `resources` is refused with a message naming
- * the nested form, so the operator is told where the keys belong.
+ * `{ requests?: {cpus, memory}, limits?: {cpus, memory} }`, at the label-set /
+ * defaults level. A flat `{ cpus, memory }` is refused with a message naming the
+ * nested form.
  */
 const resourceRequestSchema = z.preprocess((value, ctx) => {
   if (value && typeof value === 'object' && ('cpus' in value || 'memory' in value)) {
@@ -69,10 +62,8 @@ const resourceRequestSchema = z.preprocess((value, ctx) => {
 }, resourceRequestNestedSchema);
 
 /**
- * Zod schema for an aggregate resource cap (per-scaler / per-orchestrator / per-machine).
- *
- * `maxMemory` is parsed at config-load to bytes, exposed downstream as
- * `maxMemoryBytes` so the scaler doesn't re-parse on every spawn check.
+ * Aggregate resource cap (per-scaler / per-orchestrator / per-machine).
+ * `maxMemory` is parsed once at load into `maxMemoryBytes`, not on every spawn check.
  */
 const resourceCapSchema = z
   .object({
@@ -97,9 +88,6 @@ const resourceCapSchema = z
     return { maxCpu: value.maxCpu, maxMemoryBytes };
   });
 
-/**
- * Zod schema for warm pool configuration.
- */
 const warmPoolSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -109,8 +97,7 @@ const warmPoolSchema = z
   .optional();
 
 /**
- * Zod schema for network policy configuration on a label set.
- * Controls RFC1918 and internet access for spawned agents.
+ * A label set's RFC1918 and internet access for spawned agents.
  */
 export const networkPolicySchema = z
   .object({
@@ -138,9 +125,6 @@ export const networkPolicySchema = z
   })
   .optional();
 
-/**
- * Zod schema for a label-set configuration entry.
- */
 export const labelSetConfigSchema = z
   .object({
     labels: z
@@ -150,14 +134,12 @@ export const labelSetConfigSchema = z
         message: "Labels with 'kici:' prefix are reserved and cannot be used in scaler labelSets",
       })
       // Config load is an ingress into the matching domain, so the fold happens
-      // here — a pool declaring `Docker` must spawn an agent a `runsOn:
-      // ['docker']` job can reach, and these labels flow verbatim into the
-      // agent's KICI_LABELS with no further normalization downstream.
+      // here: a pool declaring `Docker` must reach a `runsOn: ['docker']` job,
+      // and these labels flow verbatim into the agent's KICI_LABELS.
       .transform((labels) => canonicalizeLabels(labels)),
     image: z.string().optional(),
-    // Default IfNotPresent: KiCI agent images are pinned + immutable, so
-    // re-pulling on every spawn only storms the registry/socket. A label set on
-    // a moving tag opts into `Always` explicitly.
+    // Default IfNotPresent: KiCI agent images are pinned + immutable, so a
+    // per-spawn pull only storms the registry/socket. A moving tag opts into `Always`.
     imagePullPolicy: ImagePullPolicy.default(ImagePullPolicy.enum.IfNotPresent),
     binaryPath: z.string().optional(),
     /** Per-label-set resource request and limit (`{ requests, limits }`). */
@@ -166,13 +148,12 @@ export const labelSetConfigSchema = z
     containerSocket: z.boolean().default(false),
     env: z.record(z.string(), z.string()).optional(),
 
-    // Backpressure mode for agent log streaming
+    // Agent log streaming backpressure.
     backpressureMode: z.enum(['pause', 'drop']).optional(),
 
-    // Network isolation policy
     networkPolicy: networkPolicySchema,
 
-    // Firecracker-specific label-set overrides
+    // Firecracker-only overrides
     rootfsPath: z.string().optional(),
     kernelPath: z.string().optional(),
     vcpuCount: z.number().int().positive().optional(),
@@ -182,8 +163,7 @@ export const labelSetConfigSchema = z
   .strict();
 
 /**
- * Zod schema for a single scaler entry.
- * Includes type-specific refinements:
+ * Type-specific refinements:
  * - Docker scalers require 'image' on every label set
  * - Bare-metal label sets name a `binaryPath` or an `image`; on a Windows host a
  *   batch-file `binaryPath` must be one cmd.exe can run
@@ -193,10 +173,8 @@ const scalerEntrySchema = z
     name: z.string(),
     type: ScalerBackendType.exclude(['kubernetes']),
     maxAgents: z.number().int().positive(),
-    // Provisioning-rate throttle: at most this many `backend.spawn` operations
-    // (image pull + create + start) run concurrently per backend. Orthogonal to
-    // `maxAgents` (the population cap) — a burst of in-cap jobs still spawns all
-    // of them, just this many at a time, so it does not storm the socket.
+    // Provisioning-rate throttle, per backend. Orthogonal to `maxAgents` (the
+    // population cap): a burst of in-cap jobs still all spawn, this many at a time.
     maxConcurrentSpawns: z.number().int().positive().default(DEFAULT_MAX_CONCURRENT_SPAWNS),
     labelSets: z.array(labelSetConfigSchema).min(1),
     host: z.string().optional(),
@@ -214,19 +192,13 @@ const scalerEntrySchema = z
     warmPool: warmPoolSchema,
 
     /**
-     * Labels a job MUST declare in `runsOn` to allocate on this scaler.
-     *
-     * Mirrors the Kubernetes "taints" concept: if a scaler has
-     * `mandatoryLabels: ['gpu']`, a job's `runsOn` must include `gpu` for
-     * the scaler to be considered. Generic jobs that don't list every
-     * mandatory label are blocked from this scaler entirely, even if
-     * their other labels are a subset of one of the scaler's labelSets.
+     * Labels a job MUST declare in `runsOn` to allocate on this scaler, like
+     * Kubernetes taints: a job missing any of them is blocked from this scaler
+     * even if its other labels are a subset of a label set.
      *
      * The `kici:` prefix is reserved for auto-injected system labels
-     * (kici:role:*, kici:os:*, kici:arch:*, kici:agent:*, kici:scaler:*)
-     * and cannot be used here — same as `labelSets[].labels`.
-     *
-     * Default: `[]` (no gating; behavior is unchanged from before this feature).
+     * (kici:role:*, kici:os:*, kici:arch:*, kici:agent:*, kici:scaler:*), as in
+     * `labelSets[].labels`. Default: `[]` (no gating).
      */
     mandatoryLabels: z
       .array(z.string())
@@ -258,12 +230,12 @@ const scalerEntrySchema = z
         return roles.filter((r) => r !== 'all') as string[];
       }),
 
-    // Resource caps + machine-pool reference (cap math wired in scaler manager)
+    // Cap math lives in the scaler manager.
     resourceCap: resourceCapSchema.optional(),
     machinePool: z.string().optional(),
     enforceCgroups: z.boolean().default(false),
 
-    // Firecracker-specific scaler-level fields
+    // Firecracker-only
     firecrackerPath: z.string().optional(),
     jailerPath: z.string().optional(),
     kernelPath: z.string().optional(),
@@ -273,12 +245,11 @@ const scalerEntrySchema = z
     vcpuCount: z.number().int().positive().default(2),
     memSizeMib: z.number().int().positive().default(512),
     /**
-     * When the orchestrator runs as a non-root user (e.g. user-mode systemd on
-     * an edge worker), set this to true so privileged commands are wrapped with
-     * `sudo -n`: `ip`, `chown`, `chmod`, `kill` and `nft` for a Firecracker
-     * scaler, `nft` for a bare-metal scaler's job-image label sets. Operators
-     * must have a NOPASSWD sudoers entry for those binaries. On hosts where the
-     * orchestrator is already root, leave unset.
+     * For a non-root orchestrator (e.g. user-mode systemd on an edge worker),
+     * wraps privileged commands in `sudo -n`: `ip`, `chown`, `chmod`, `kill` and
+     * `nft` for a Firecracker scaler, `nft` for a bare-metal scaler's job-image
+     * label sets. Operators need a NOPASSWD sudoers entry for those binaries.
+     * Leave unset when the orchestrator is already root.
      */
     requireSudo: z.boolean().default(false),
 
@@ -324,15 +295,11 @@ const scalerEntrySchema = z
       });
     }
     if (data.type === ScalerBackendType.enum['bare-metal']) {
-      // A bare-metal label set names what to launch: a local binary, an agent
-      // image, or both. `binaryPath` alone spawns a host process. `image`
-      // alone is job-image mode — a job that names its own container image runs
-      // IN that image with the KiCI runtime injected, which is the only thing
-      // an image-and-no-binary set can mean. Both together spawn the process,
-      // and the image is where that process materializes the runtime from when
-      // it nests a job container. Requiring `binaryPath` unconditionally made
-      // job-image mode unreachable: no validated config could express the shape
-      // that selects it.
+      // `binaryPath` alone spawns a host process. `image` alone is job-image
+      // mode: a job naming its own container image runs IN it with the KiCI
+      // runtime injected. Both spawn the process, which materializes the runtime
+      // from the image when it nests a job container. Requiring `binaryPath`
+      // always would make job-image mode unreachable by any valid config.
       data.labelSets.forEach((ls, i) => {
         if (!ls.binaryPath && !ls.image) {
           ctx.addIssue({
@@ -344,9 +311,8 @@ const scalerEntrySchema = z
             path: ['labelSets', i, 'binaryPath'],
           });
         }
-        // A Windows host runs a batch-file binary through cmd.exe, which reads
-        // some path characters as syntax. Refused here so the orchestrator
-        // fails at startup (and a reload fails) instead of every launch.
+        // cmd.exe reads some path characters in a Windows batch-file path as
+        // syntax; refusing here fails startup or reload, not every launch.
         const refusal = ls.binaryPath ? agentLaunchRefusal(ls.binaryPath, process.platform) : null;
         if (refusal) {
           ctx.addIssue({
@@ -357,10 +323,8 @@ const scalerEntrySchema = z
         }
       });
     }
-    // A plain platform label (`windows`, `macos`, `arm64`, …) does not taint a
-    // pool: only the structured `platform` field does. A pool that names one
-    // without declaring `platform` would take every unqualified job, so it is
-    // refused and the operator is pointed at the field.
+    // Only the structured `platform` field taints a pool, so a plain platform
+    // label without it would take every unqualified job: refused.
     if (!data.platform) {
       data.labelSets.forEach((ls, i) => {
         for (const label of ls.labels) {
@@ -374,19 +338,15 @@ const scalerEntrySchema = z
         }
       });
     }
-    // Every label set's gate must be reachable from that label set, otherwise
-    // no job can route through it: the matcher demands every gate label in the
-    // job's `runsOn`, and only labels the set actually matches on can supply
-    // them. The gate is the configured `mandatoryLabels` plus the structured
-    // platform taints — the same pair the manager unions per label set. The
-    // reachable set is the label set plus the structured platform taints, which
-    // the manager injects into every label set as matchable labels.
+    // Every gate label must be matchable on its label set, or no job can route
+    // through it: the matcher demands every gate label in `runsOn`. The gate is
+    // `mandatoryLabels` plus the platform taints (the manager's per-set union);
+    // the reachable set is the labels plus the same taints, which the manager
+    // injects into every label set.
     //
-    // A bare-metal pool that declares no `platform` host-derives it at runtime,
-    // which this validation deliberately does not do: a config's validity must
-    // not depend on the machine loading it. Those taints are self-satisfying
-    // anyway, since the same resolved platform supplies both the gate and the
-    // injected label.
+    // A bare-metal pool with no `platform` host-derives it at runtime; this
+    // check does not, since config validity must not depend on the loading
+    // machine. Those taints are self-satisfying anyway.
     const structuredTaints = data.platform ? platformToTaints(data.platform) : [];
     data.labelSets.forEach((ls, i) => {
       const gate = new Set([
@@ -409,7 +369,6 @@ const scalerEntrySchema = z
       }
     });
     if (data.type === ScalerBackendType.enum.firecracker) {
-      // Scaler-level required fields
       if (!data.firecrackerPath) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -458,7 +417,6 @@ const scalerEntrySchema = z
           });
         }
       });
-      // Per-label-set required fields
       data.labelSets.forEach((ls, i) => {
         if (!ls.rootfsPath) {
           ctx.addIssue({
@@ -472,7 +430,6 @@ const scalerEntrySchema = z
   });
 
 /**
- * Zod schema for Firecracker network configuration.
  * Global across all Firecracker scalers on the orchestrator.
  */
 export const firecrackerNetworkSchema = z.object({
@@ -484,17 +441,12 @@ export const firecrackerNetworkSchema = z.object({
   table: z.string().default('kici'),
   /**
    * When true (default), the orchestrator verifies and provisions this host
-   * bridge on startup (self-heal), so a fresh Firecracker host needs no manual
-   * `kici-admin firecracker provision`. Set false to keep explicit operator
-   * control of the host network (the CLI provision flow stays available).
+   * bridge on startup, so a fresh host needs no manual `kici-admin firecracker
+   * provision`. False keeps operator control (the CLI flow stays available).
    */
   autoProvisionHost: z.boolean().default(true),
 });
 
-/**
- * Zod schema for the complete scaler configuration file.
- * Validates version, global limits, defaults, and scaler entries.
- */
 export const scalerFileSchema = z
   .object({
     version: z.literal(1),
@@ -521,7 +473,6 @@ export const scalerFileSchema = z
     firecracker: firecrackerNetworkSchema.optional(),
   })
   .superRefine((data, ctx) => {
-    // Cross-validate: every `machinePool: 'foo'` reference must resolve.
     const poolNames = new Set((data.machinePools ?? []).map((p) => p.name));
     data.scalers.forEach((entry, i) => {
       if (entry.machinePool !== undefined && !poolNames.has(entry.machinePool)) {
@@ -532,7 +483,7 @@ export const scalerFileSchema = z
         });
       }
     });
-    // Reject duplicate pool names (config error -- silent overwrite would mask intent).
+    // Duplicate pool names are refused: a silent overwrite would mask intent.
     const seen = new Set<string>();
     (data.machinePools ?? []).forEach((p, i) => {
       if (seen.has(p.name)) {
@@ -547,12 +498,8 @@ export const scalerFileSchema = z
   });
 
 /**
- * Parse a memory string with unit suffix to bytes.
- *
- * Supported formats:
- * - "512m" or "512M" -> 536870912 (512 * 1024^2)
- * - "2g" or "2G" -> 2147483648 (2 * 1024^3)
- * - "1024k" or "1024K" -> 1048576 (1024 * 1024)
+ * Parse a memory string to bytes, with binary units: "512m" -> 512 * 1024^2,
+ * "2G" -> 2 * 1024^3, "1024k" -> 1024 * 1024 (suffix case-insensitive).
  *
  * @throws Error if the format is invalid
  */
@@ -580,28 +527,18 @@ export function parseMemoryString(memory: string): number {
 }
 
 /**
- * Load and validate the scaler configuration from YAML files.
+ * Load the main YAML config, append the `scalers` arrays of every `*.yaml` /
+ * `*.yml` in `scalersDirPath` (alphabetical order), and validate the result.
  *
- * 1. Reads the main config file
- * 2. If scalersDirPath provided, reads all *.yaml and *.yml files
- *    from the directory (sorted alphabetically) and merges their
- *    scalers arrays into the main config
- * 3. Validates the merged config through Zod schema
- *
- * @param configPath - Path to the main scaler YAML config file
- * @param scalersDirPath - Optional path to scalers.d/ directory for additional scaler definitions
- * @returns Validated ScalerConfig
  * @throws ZodError if validation fails
  */
 export async function loadScalerConfig(
   configPath: string,
   scalersDirPath?: string,
 ): Promise<ScalerConfig> {
-  // 1. Read main config
   const mainYaml = await readFile(configPath, 'utf-8');
   const mainConfig = parseYaml(mainYaml) as Record<string, unknown>;
 
-  // 2. Read and merge scalers.d/ files
   if (scalersDirPath) {
     const files = await readdir(scalersDirPath);
     const yamlFiles = files.filter((f) => f.endsWith('.yaml') || f.endsWith('.yml')).sort();
@@ -616,6 +553,5 @@ export async function loadScalerConfig(
     }
   }
 
-  // 3. Validate through Zod
   return scalerFileSchema.parse(mainConfig) as ScalerConfig;
 }

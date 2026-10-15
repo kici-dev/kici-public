@@ -82,12 +82,8 @@ describeDb('migration 098_execution_runs_customer_id', () => {
   });
 
   it('backfills customer_id from generic_webhook_sources by routing_key when the column is added', async () => {
-    // The backfill runs INSIDE up() only when the column is first added (it is
-    // guarded by columnExists), so exercise it against the real pre-098 schema:
-    // roll the column back with down(), seed a generic source (routing_key →
-    // customer_id) and a legacy run created before the column existed, then run
-    // up() so the ADD COLUMN + backfill block actually executes and resolves the
-    // org from the source table.
+    // The backfill runs only when up() first adds the column, so roll back to the pre-098 schema,
+    // seed a generic source and a legacy run, then run up() so ADD COLUMN + backfill execute.
     await down(db);
     await sql`
       INSERT INTO public.generic_webhook_sources

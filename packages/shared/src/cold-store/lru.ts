@@ -1,13 +1,7 @@
 /**
- * In-process size-bounded LRU cache.
- *
- * Used by the cold-store rehydrate path to keep recently-read
- * chunks hot in memory, so that e.g. a user paginating a 90-day audit
- * window doesn't re-fetch the same S3 chunks for each page.
- *
- * Size is tracked in bytes via a caller-supplied `sizeOf` function.
- * Eviction happens on `set()` when the accumulated byte count exceeds
- * `maxBytes`.
+ * Byte-bounded LRU (sized by `sizeOf`, evicting on `set()` past `maxBytes`).
+ * Keeps recently read cold-store chunks hot, so paginating a 90-day audit
+ * window does not re-fetch the same S3 chunks per page.
  */
 export interface ChunkLruOptions<V> {
   maxBytes: number;
@@ -40,7 +34,7 @@ export class ChunkLru<K, V> {
   get(key: K): V | undefined {
     const v = this.map.get(key);
     if (v === undefined) return undefined;
-    // Re-insert to move to MRU position.
+    // Re-insert to move to MRU.
     this.map.delete(key);
     this.map.set(key, v);
     return v;

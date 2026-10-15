@@ -19,14 +19,8 @@ import { configReloadTotal, setConfigVersion } from '../metrics/prometheus.js';
 import { toErrorMessage } from '@kici-dev/shared';
 import type { ScalerFileReloadResult } from '../scaler/file-reload.js';
 
-/**
- * Source of a reload trigger.
- */
 export type ReloadSource = 'sighup' | 'http' | 'cluster' | 'cli';
 
-/**
- * Result of a reload operation.
- */
 export interface ReloadResult {
   success: boolean;
   version?: number;
@@ -138,7 +132,6 @@ export class ConfigReloader {
    * Used by tests and direct API calls that need synchronous results.
    */
   async executeReload(opts: ReloadOptions): Promise<ReloadResult> {
-    // Acquire mutex
     if (this.reloading) {
       return { success: false, errors: ['Reload already in progress'] };
     }
@@ -332,9 +325,6 @@ function hasProviderChanges(_oldConfig: AppConfig, _newConfig: AppConfig): boole
   return false;
 }
 
-/**
- * Check if Platform connection config has changed between old and new configs.
- */
 function hasPlatformChanges(oldConfig: AppConfig, newConfig: AppConfig): boolean {
   return (
     oldConfig.platformUrl !== newConfig.platformUrl ||

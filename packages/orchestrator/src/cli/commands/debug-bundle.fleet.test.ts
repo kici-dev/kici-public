@@ -91,7 +91,7 @@ describe('debug-bundle --fleet', () => {
         throw new Error('should not be called');
       }) as unknown as AdminApiClient['getFleetTopology'],
     });
-    // The local path calls diagnose()/configExport() etc; stub them to no-op.
+    // The local path calls diagnose(), configExport() and others: no-op stubs.
     Object.assign(client, {
       diagnose: vi.fn(async () => ({})),
       configExport: vi.fn(async () => ({})),

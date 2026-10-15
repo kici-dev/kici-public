@@ -25,13 +25,9 @@ import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
 export interface LocalPhaseResult {
   /** The raw local config (from YAML + env overlay) */
   local: Record<string, unknown>;
-  /** Resolved database URL */
   databaseUrl: string;
-  /** Resolved instance ID */
   instanceId: string;
-  /** Resolved server port */
   port: number;
-  /** Resolved instance mode */
   mode: OrchestratorMode;
 }
 
@@ -50,7 +46,6 @@ export async function resolveLocalConfig(configPath?: string): Promise<LocalPhas
     process.env,
   );
 
-  // Extract local-only fields
   const db = localWithEnv.database as Record<string, unknown> | undefined;
   const databaseUrl = (db?.url as string) || '';
 
@@ -100,10 +95,8 @@ export function resolveFullConfig(
   // Layer 4: Apply env overrides (highest precedence)
   merged = applyEnvOverrides(merged, effectiveEnv);
 
-  // Flatten to AppConfig shape
   const flat = flattenToAppConfig(merged);
 
-  // Validate with appConfigSchema
   const result = appConfigSchema.safeParse(flat);
 
   if (!result.success) {

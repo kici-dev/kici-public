@@ -95,12 +95,11 @@ describe('LogWriter', () => {
       const data = mockStorage.appended[0].data;
       const lines = data.trim().split('\n');
 
-      // Should be valid JSON
       for (const line of lines) {
         expect(() => JSON.parse(line)).not.toThrow();
       }
 
-      // Nested JSON should be escaped in msg field
+      // Nested JSON is escaped in msg
       const parsed = JSON.parse(lines[0]);
       expect(parsed.msg).toBe('{"nested":"json"}');
     });
@@ -109,10 +108,8 @@ describe('LogWriter', () => {
       await writer.appendChunk('run-1', 'test', 0, ['a', 'b', 'c'], Date.now());
 
       const data = mockStorage.appended[0].data;
-      // The combined data should end with a newline
       expect(data.endsWith('\n')).toBe(true);
 
-      // Each line (when split) should have been terminated
       const parts = data.split('\n').filter(Boolean);
       expect(parts).toHaveLength(3);
     });
@@ -122,7 +119,6 @@ describe('LogWriter', () => {
         new Error('disk full'),
       );
 
-      // Should not throw
       await expect(
         writer.appendChunk('run-1', 'test', 0, ['line'], Date.now()),
       ).resolves.not.toThrow();
@@ -131,9 +127,8 @@ describe('LogWriter', () => {
 
   describe('drain', () => {
     it('awaits an in-flight append before resolving', async () => {
-      // A slow append that resolves only when we release it. `appendChunk` is
-      // called fire-and-forget (not awaited) — the way the agent WS handler
-      // calls it — so its storage write is still pending when drain() runs.
+      // An append that resolves only on release. `appendChunk` is fire-and-forget (as the
+      // agent WS handler calls it), so its write is still pending when drain() runs.
       let releaseAppend: (() => void) | undefined;
       let appendCompleted = false;
       (mockStorage.storage.appendStreaming as ReturnType<typeof vi.fn>).mockImplementationOnce(
@@ -148,7 +143,7 @@ describe('LogWriter', () => {
 
       // Fire-and-forget, mirroring onLogChunk: do NOT await the chunk.
       void writer.appendChunk('run-1', 'test', 0, ['marker:OK'], Date.now());
-      // Let the synchronous portion of appendChunk register the pending append.
+      // Let appendChunk's synchronous part register the pending append.
       await Promise.resolve();
 
       let drained = false;
@@ -173,8 +168,7 @@ describe('LogWriter', () => {
 
     it('forgets a run once its appends have settled', async () => {
       await writer.appendChunk('run-1', 'test', 0, ['line'], Date.now());
-      // The append already settled (appendChunk awaited it), so the pending set
-      // for run-1 is cleaned up and a later drain is a no-op.
+      // The append settled, so run-1's pending set is cleaned up.
       await expect(writer.drain('run-1')).resolves.toBeUndefined();
     });
 
@@ -222,7 +216,6 @@ describe('LogWriter', () => {
       const callsAfterFirst = (mockStorage.storage.finalize as ReturnType<typeof vi.fn>).mock.calls
         .length;
       await writer.drain('run-1');
-      // A second drain finds no tracked paths → no further finalize calls.
       expect((mockStorage.storage.finalize as ReturnType<typeof vi.fn>).mock.calls.length).toBe(
         callsAfterFirst,
       );

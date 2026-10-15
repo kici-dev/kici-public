@@ -101,9 +101,8 @@ describe('diffYamlContent', () => {
     const local = 'clients:\n  - name: alpha\n  - name: beta\n  - name: gamma\n';
     const remote = 'clients:\n  - name: alpha\n  - name: BETA\n';
     const out = diffYamlContent(local, remote);
-    // One changed name + one added array element. The added entry is
-    // emitted at the array-index path (subtree collapse) rather than the
-    // descendant leaf — see `emitLeafOrTree`'s jsdoc.
+    // The added array element is emitted at its array-index path (subtree
+    // collapse), not the descendant leaf: see `emitLeafOrTree`.
     const paths = out.map((e) => `${e.kind}:${e.path}`).sort();
     expect(paths).toEqual(['added:clients[2]', 'changed:clients[1].name']);
   });

@@ -42,7 +42,6 @@ describe('injectRunsOnLabel', () => {
     for (const job of jobs) {
       expect(job.runsOn).toContainEqual({ kind: 'exact', value: 'self-hosted' });
     }
-    // The pre-existing selector on job a is preserved.
     expect(jobs[0].runsOn).toContainEqual({ kind: 'exact', value: 'default' });
   });
 

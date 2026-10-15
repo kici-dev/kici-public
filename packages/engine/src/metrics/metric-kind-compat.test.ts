@@ -12,8 +12,8 @@ describe('mapDataPointTypeToWireKind', () => {
   });
 
   it('splits SUM on monotonicity', () => {
-    // The live defect: v8js.memory.heap.space.size is SUM + isMonotonic=false,
-    // i.e. an upDownCounter, but was catalogued as a gauge and dropped.
+    // v8js.memory.heap.space.size is SUM + isMonotonic=false, an upDownCounter;
+    // catalogued as a gauge, it is dropped.
     expect(mapDataPointTypeToWireKind(OTEL_DATA_POINT_TYPE.SUM, false)).toBe('upDownCounter');
     expect(mapDataPointTypeToWireKind(OTEL_DATA_POINT_TYPE.SUM, true)).toBe('counter');
     expect(mapDataPointTypeToWireKind(OTEL_DATA_POINT_TYPE.SUM)).toBe('counter');
@@ -30,8 +30,8 @@ describe('isCompatibleMetricKind', () => {
   });
 
   it('accepts the observable catalog spellings', () => {
-    // These are why the guard cannot use string equality: the catalog uses the
-    // OTel instrument vocabulary, the wire uses the narrower set.
+    // Why the guard cannot use string equality: the catalog uses the OTel
+    // instrument vocabulary, the wire the narrower set.
     expect(isCompatibleMetricKind('gauge', 'observableGauge')).toBe(true);
     expect(isCompatibleMetricKind('counter', 'observableCounter')).toBe(true);
     expect(isCompatibleMetricKind('upDownCounter', 'observableUpDownCounter')).toBe(true);

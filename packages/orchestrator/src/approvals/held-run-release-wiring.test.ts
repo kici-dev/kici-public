@@ -1,15 +1,12 @@
 /**
- * Tests for the release wiring behind the local held-run decision surface.
+ * The release wiring behind the local held-run decision surface. Its defect
+ * class is a MISSING field, so the assertions pin which fields the bag carries
+ * and what each reaches. Load-bearing:
  *
- * The defect class this factory exists to catch is a MISSING field, so the
- * assertions are about which fields the bag carries and what each one reaches —
- * not about an algorithm. Two of them are load-bearing:
- *
- * - No `onJobRelease` ⇒ NO bag at all, which leaves the decision route
- *   unmounted rather than mounted with a release that dispatches nothing.
- * - Both callbacks read the processing-deps bag at CALL time. A captured bag
- *   would resolve a check poster out of a provider registry that a source
- *   reload has since replaced.
+ * - No `onJobRelease` ⇒ NO bag, leaving the decision route unmounted rather
+ *   than mounted with a release that dispatches nothing.
+ * - Both callbacks read the processing-deps bag at CALL time; a captured bag
+ *   would use a provider registry a source reload has replaced.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -76,9 +73,8 @@ describe('buildHeldRunRelease', () => {
     const [hold, procDeps, db, reason] = rejectWorkflow.mock.calls[0] as unknown[];
     expect(hold).toBe(HOLD);
     expect(reason).toBe('operator said no');
-    // The db handed to `rejectWorkflow` is the one ON the bag, not a second
-    // handle: a mismatch is how a cancel writes to a different connection than
-    // the dispatch it is undoing.
+    // The db ON the bag, or a cancel writes to a different connection than
+    // the dispatch it undoes.
     expect(db).toBe((procDeps as ProcessingDeps).db);
   });
 
@@ -99,8 +95,7 @@ describe('buildHeldRunRelease', () => {
       buildProcessingDeps: () => current,
     })!;
     expect(bag.resolveCheckStatusPoster!('github:1')).toMatchObject({ name: 'old-poster' });
-    // A source reload swaps the registry. A bag captured at build time would
-    // keep answering `old-poster` here.
+    // A source reload swaps the registry.
     current = makeDeps('new-poster');
     expect(bag.resolveCheckStatusPoster!('github:1')).toMatchObject({ name: 'new-poster' });
     expect(bag.resolveCheckStatusPoster!('github:missing')).toBeUndefined();
@@ -111,15 +106,13 @@ describe('app.ts wiring seam', () => {
   const source = readFileSync(fileURLToPath(new URL('../app.ts', import.meta.url)), 'utf8');
 
   it('hands the bag to createAdminRoutes, built from the mode hook’s own callbacks', () => {
-    // A factory nothing calls changes nothing. `createApp` is a composition
-    // root no test instantiates, so this seam is asserted against the source —
-    // the same shape `independent-wiring.test.ts` uses for `standalone.ts`.
+    // No test instantiates the `createApp` composition root, so the seam is
+    // asserted against source, as `independent-wiring.test.ts` does.
     const call = source.slice(source.indexOf('createAdminRoutes({'));
     const body = call.slice(0, call.indexOf('\n      }),'));
     expect(body).toContain('heldRunRelease: buildHeldRunRelease({');
-    // Both callbacks come off the deps bag the mode hooks populate through
-    // `appDepsExtras`. A hand-rolled second pair here could diverge from the
-    // ones the stale detector and the dashboard applier already use.
+    // From the `appDepsExtras` bag the mode hooks populate; a hand-rolled pair
+    // could diverge from the stale detector's and the dashboard applier's.
     expect(body).toContain('onJobRelease: deps.onJobRelease');
     expect(body).toContain('onWorkflowRelease: deps.onWorkflowRelease');
     expect(body).toContain('buildProcessingDeps,');

@@ -1,19 +1,14 @@
-/**
- * Extract a human-readable error message from an unknown thrown value.
- */
+/** Human-readable message of an unknown thrown value. */
 export function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
 /**
- * Serialize an error into a structured object suitable for logging.
- *
- * Captures the message, error type name, common diagnostic fields
- * (`code`, `status`, response details), and the chained `cause`.
- * Falls back to a non-empty descriptor when `err.message` is empty —
- * an empty message field is a debugging dead end (we've hit it on
- * sync failures where the underlying library throws errors with no
- * message but populated `.code` / `.response.status`).
+ * Serialize an error for logging: message, type name, `code`, response
+ * `status` and details, and the chained `cause`. An empty `err.message` falls
+ * back to a shape descriptor: an empty message is a debugging dead end, and
+ * a library has thrown sync failures with no message but a populated `.code` /
+ * `.response.status`.
  */
 export function serializeError(err: unknown): Record<string, unknown> {
   if (err === null || err === undefined) {
@@ -51,10 +46,7 @@ export function serializeError(err: unknown): Record<string, unknown> {
   return out;
 }
 
-/**
- * Describe an error's shape when its `.message` is empty so logs
- * still convey something useful (vs. a bare `error: ""`).
- */
+/** Describe an error's shape when its `.message` is empty. */
 function describeShape(err: object): string {
   const ctor = (err as { constructor?: { name?: string } }).constructor?.name;
   if (ctor && ctor !== 'Object') return `${ctor} with empty message`;
@@ -62,9 +54,7 @@ function describeShape(err: object): string {
   return keys ? `object{${keys}}` : 'empty error';
 }
 
-/**
- * Cap response payload size to keep logs readable.
- */
+/** Cap response payload size to keep logs readable. */
 function trimResponseData(data: unknown): unknown {
   const s = typeof data === 'string' ? data : JSON.stringify(data);
   if (s.length <= 500) return data;

@@ -3,9 +3,9 @@ const PG_UNIQUE_VIOLATION = '23505';
 
 /**
  * True iff `err` is a Postgres unique-violation, optionally scoped to a named
- * constraint. Pure guard over `unknown` — no `pg` import — so callers in the
- * data layer can translate a raw driver error into a domain error, and it can
- * be unit-tested without a live database.
+ * constraint. A pure guard over `unknown` with no `pg` import, so the data
+ * layer can translate a raw driver error into a domain error and tests need no
+ * live database.
  */
 export function isPgUniqueViolation(err: unknown, constraint?: string): boolean {
   if (typeof err !== 'object' || err === null) return false;

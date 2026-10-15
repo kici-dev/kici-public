@@ -16,19 +16,16 @@ describe('ConcurrencyStrategy', () => {
   });
 
   it('exposes exactly the members every consumer derives from', () => {
-    // Drift guard. The dashboard Select builds its options from a
-    // `Record<ConcurrencyStrategy, string>` label map, the orchestrator store
-    // and aggregate type their fields with the inferred union, and the wire
-    // schemas embed this enum. Adding or renaming a member here is a
-    // deliberate vocabulary change, so it must break this assertion — and the
-    // dashboard's own label-coverage guard — rather than slip through.
+    // Drift guard: the dashboard label map, the orchestrator store and aggregate,
+    // and the wire schemas all derive from this enum, so adding or renaming a
+    // member must break this assertion (and the dashboard label-coverage guard).
     expect(ConcurrencyStrategy.options).toEqual(['queue', 'cancel-pending']);
   });
 
   it('defaults to queue', () => {
-    // A context may carry an effective limit with no explicit strategy. The
-    // dashboard form, the snapshot round-trip, and the orchestrator aggregate
-    // must all apply the same default or the form reads as permanently dirty.
+    // A limit with no explicit strategy: the dashboard form, the snapshot
+    // round-trip and the orchestrator aggregate must share this default, or the
+    // form reads as permanently dirty.
     expect(DEFAULT_CONCURRENCY_STRATEGY).toBe(ConcurrencyStrategy.enum.queue);
   });
 });

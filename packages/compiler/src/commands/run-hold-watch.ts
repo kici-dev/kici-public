@@ -1,15 +1,9 @@
 /**
- * Hold-visibility + inline approve/reject for `kici run remote`.
- *
- * While a run is being watched, the orchestrator may pause it on an approval
- * gate (a `when: 'always'` step/job/workflow gate, or a `when: 'drift'` step
- * gate that carries a computed-drift payload). The poll loop calls
- * `handleNewHolds` each tick with the run's pending holds. For each hold not
- * seen before it prints the payload (if any) and, in a TTY, prompts the
- * operator to approve/reject inline — through the run transport's hold access
- * (the Platform held-run path `kici approve` / `kici reject` use, or the
- * orchestrator's admin held-run routes on a direct run). In a non-TTY it prints
- * guidance and keeps polling (the run stays held until resolved out-of-band).
+ * Hold visibility and inline approve/reject for `kici run remote`. Each new
+ * pending hold (a `when: 'always'` gate, or a `when: 'drift'` step gate with a
+ * computed-drift payload) is printed and, in a TTY, prompted for inline through
+ * the transport's hold access. In a non-TTY the run stays held until resolved
+ * out of band.
  */
 
 import pc from 'picocolors';
@@ -22,22 +16,15 @@ import {
   type HeldRunContext,
 } from './held-run-client.js';
 
-/** A yes/no prompt; injected so the poll branch is unit-testable. */
+/** Injected so the poll branch is unit-testable. */
 export type ConfirmPrompt = (message: string) => Promise<boolean>;
 
-/** Where hold/approve text is written. Injected so callers can route it to
- *  stderr in quiet/json mode (keeping stdout a pure JSON channel). */
 export type HoldOutput = (line: string) => void;
 
-/** What to do with a newly-observed hold. Pure — no IO. */
 export type HoldAction =
   { kind: 'prompt'; hold: HeldRunSummary } | { kind: 'notify'; hold: HeldRunSummary };
 
-/**
- * Classify the holds observed this tick against the set already seen. Returns
- * one action per genuinely-new pending hold (TTY ⇒ prompt, non-TTY ⇒ notify),
- * and the updated seen-set. Pure: the caller performs the IO.
- */
+/** One action per new pending hold (TTY ⇒ prompt, else notify). Pure: the caller does the IO. */
 export function classifyNewHolds(
   holds: readonly HeldRunSummary[],
   seen: Set<string>,
@@ -54,7 +41,6 @@ export function classifyNewHolds(
   return { actions, seen: next };
 }
 
-/** Print a hold's identity + its drift payload (when present) via `out`. */
 function printHold(hold: HeldRunSummary, out: HoldOutput): void {
   const scope = hold.holdScope ?? 'job';
   const where =
@@ -73,10 +59,9 @@ function printHold(hold: HeldRunSummary, out: HoldOutput): void {
 }
 
 /**
- * Process the new holds observed this tick: print each, and in a TTY prompt the
- * operator to approve/reject inline (posting the decision via the shared
- * held-run HTTP path). Returns the updated seen-set. A resolved context is
- * resolved lazily on first need and cached for the run.
+ * Prints each new hold and, in a TTY, prompts to approve/reject inline over the
+ * shared held-run HTTP path. The held-run context is resolved lazily on first
+ * need and reused across the tick's holds.
  */
 export async function handleNewHolds(args: {
   holds: readonly HeldRunSummary[];
@@ -84,25 +69,17 @@ export async function handleNewHolds(args: {
   isTty: boolean;
   confirm: ConfirmPrompt;
   /**
-   * `--approve-all` breakglass: auto-approve each hold (run-scoped) instead of
-   * prompting, marking the approval as `auto_approve` so the orchestrator
-   * audits it distinctly. Eligibility is still enforced server-side.
+   * `--approve-all` breakglass: each hold is auto-approved (run-scoped) instead
+   * of prompted; approvals are marked `auto_approve` so the
+   * orchestrator audits them distinctly; eligibility is enforced server-side.
    */
   approveAll?: boolean;
-  /**
-   * Where hold/approve text goes. Defaults to `logger.info` (stdout). Quiet /
-   * `--json` callers pass a stderr sink so the machine-readable stdout payload
-   * stays pure.
-   */
+  /** Defaults to `logger.info` (stdout); quiet / `--json` callers pass a stderr sink. */
   output?: HoldOutput;
-  /**
-   * The command that answers a hold out of band, printed instead of the
-   * Platform's `kici approve` text (a direct run names `kici-admin`).
-   */
+  /** Replaces the `kici approve` hint (a direct run names `kici-admin`). */
   answerHint?: (hold: HeldRunSummary) => string;
-  /** Override for tests; defaults to the shared Platform held-run context. */
+  /** Defaults to the shared Platform held-run context. */
   resolveContext?: () => Promise<HeldRunContext | null>;
-  /** Override for tests. */
   approve?: (ctx: HeldRunContext, heldRunId: string, autoApprove?: boolean) => Promise<boolean>;
   reject?: (ctx: HeldRunContext, heldRunId: string, reason: string) => Promise<boolean>;
 }): Promise<Set<string>> {
@@ -129,9 +106,8 @@ export async function handleNewHolds(args: {
     printHold(action.hold, out);
     ctx = ctx ?? (await resolveCtx());
     if (!ctx) {
-      // Names the hold, not just the run: one job can carry two pending holds
-      // (an SDK `requireApproval` plus a security-typed context gate), and a
-      // run-only command cannot tell them apart.
+      // Names the hold: one job can carry two pending holds (an SDK
+      // `requireApproval` plus a security-typed context gate).
       out(
         pc.dim(
           hint(action.hold) ??
@@ -141,7 +117,6 @@ export async function handleNewHolds(args: {
       continue;
     }
     if (args.approveAll) {
-      // Breakglass: auto-approve (run-scoped); eligibility enforced server-side.
       if (await doApprove(ctx, action.hold.id, true)) {
         out(pc.green('[kici] Auto-approved.'));
       }

@@ -1,15 +1,12 @@
 /**
- * Backup-freshness diagnostic check.
+ * Whether the orchestrator DB has a recent `kici-admin db backup`, from the newest
+ * `backup_runs.created_at`: FAIL when none was ever recorded, WARN when older than the
+ * effective staleness threshold, else PASS.
  *
- * Reads the newest `backup_runs.created_at` and reports whether the
- * orchestrator DB has a recent `kici-admin db backup`. FAIL when none was ever
- * recorded, WARN when the newest is older than the effective staleness
- * threshold, else PASS.
- *
- * The threshold is cluster-configurable: the strictest (minimum) non-null
- * `org_settings.backup_staleness_warn_hours` across all orgs, falling back to
- * `config.backupStalenessWarnHours` when no org sets an override. A stale
- * whole-DB backup affects every org, so the tightest org requirement wins.
+ * The threshold is the strictest (minimum) non-null
+ * `org_settings.backup_staleness_warn_hours` across all orgs, else
+ * `config.backupStalenessWarnHours`. A stale whole-DB backup affects every org, so the
+ * tightest org requirement wins.
  */
 import type { DiagnosticDeps, DiagnosticResult } from '../types.js';
 import { toErrorMessage } from '@kici-dev/shared';

@@ -30,10 +30,9 @@ const configSchema = z.object({
     .string()
     .default('')
     .transform((s) => s.split(',').filter(Boolean)),
-  // Typed host-vars reported at registration (the inventory `properties` bag),
-  // shallow-merged into the orchestrator's host roster. Comma-separated
-  // key=value pairs; values are typed (true/false ⇒ boolean, numeric ⇒ number,
-  // otherwise string). e.g. "region=eu,cores=8,gpu=true".
+  // Host-vars reported at registration, shallow-merged into the orchestrator's
+  // host roster: "region=eu,cores=8,gpu=true" (true/false ⇒ boolean, numeric ⇒
+  // number, otherwise string).
   properties: z
     .string()
     .default('')
@@ -62,6 +61,7 @@ const configSchema = z.object({
     }),
   port: z.coerce.number().default(AGENT_DEFAULT_PORT),
   logLevel: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+  // `kat_`-prefixed PSK for orchestrator authentication.
   agentToken: z.string().optional(),
   githubToken: z.string().optional(),
   maxLogSizeBytes: z.coerce.number().default(10 * 1024 * 1024), // 10MB
@@ -72,89 +72,71 @@ const configSchema = z.object({
     .transform((s) => s === 'true'),
   jobHeartbeatIntervalMs: z.coerce.number().default(60_000),
   backpressureMode: z.enum(['pause', 'drop']).default('pause'),
-  // Local directory holding version-keyed self-contained agent payloads
-  // (`<dir>/<version>/kici-agent-<platform>.tar.gz`), produced by
-  // `kici-admin agent package`. When set, an ops agent stages the matching
-  // payload onto a bare box during bring-up so it boots with no system Node.
+  // Directory of `kici-admin agent package` payloads
+  // (`<dir>/<version>/kici-agent-<platform>.tar.gz`). An ops agent stages the
+  // matching one onto a bare box during bring-up, so it boots with no system Node.
   agentPayloadDir: z.string().optional(),
-  // Golden-image escape hatch: a fixed command to start the init-runner on a
-  // bring-up target that already ships `kici-agent` + a Node runtime at a known
-  // path. When set, payload staging is skipped. Leave unset for a stock rescue
-  // box (a payload dir is staged instead).
+  // Golden-image escape hatch: the command that starts the init-runner on a
+  // target already shipping `kici-agent` + Node at a known path. Set, it skips
+  // payload staging; leave it unset for a stock rescue box.
   agentCommand: z.string().optional(),
+  // Bubblewrap (bwrap) namespace isolation for bare-metal execution.
   sandbox: z
     .string()
     .default('false')
     .transform((s) => s === 'true'),
-  // Trusted fleet-agent execution profile (default false). When true, the step
-  // sandbox passes the ambient host env through (minus the agent's own KiCI
-  // identity/operational secrets) instead of restricting to the system-var
-  // allowlist. Orthogonal to KICI_SANDBOX (bwrap namespace isolation). Set ONLY
-  // by the operator at agent/scaler launch — never derivable from a dispatch
-  // payload or workflow. Intended for trusted host-configuration / fleet agents.
+  // Trusted fleet-agent profile: steps get the ambient host env (minus the
+  // agent's own KiCI identity/operational secrets) instead of the system-var
+  // allowlist. Orthogonal to KICI_SANDBOX. Set ONLY by the operator at
+  // agent/scaler launch — never derivable from a dispatch payload or workflow.
   trustedEnv: z
     .string()
     .default('false')
     .transform((s) => s === 'true'),
-  // In-place no-clone execution profile (default false). When true, and the
-  // dispatched source is a `file://` local source, the agent uses the source's
-  // real repo path as the job workDir and skips the git clone (checkout=false)
-  // instead of cloning into a throwaway tmpdir. This lets an operator run their
-  // own already-built working tree directly (module-relative paths, node_modules,
-  // dist all present). Gated to `file://` sources and set ONLY by the operator
-  // at agent/scaler launch (the local dev plane's trusted+in-place label set) —
-  // never derivable from a dispatch payload, so a Platform-connected agent
-  // (https sources) can never be pushed onto the operator's tree.
+  // In-place no-clone profile: for a `file://` source, the job workDir is the
+  // source's real repo path and the clone is skipped, so an operator runs their
+  // already-built tree (node_modules, dist) directly. Set ONLY by the operator
+  // at agent/scaler launch (the local dev plane's trusted+in-place label set),
+  // never from a dispatch payload, so a Platform-connected agent (https
+  // sources) can never be pushed onto the operator's tree.
   inPlace: z
     .string()
     .default('false')
     .transform((s) => s === 'true'),
   // Sandbox network posture for BOTH backends.
-  // 'isolated' (default): bwrap --unshare-net (loopback only, strongest
-  // isolation, breaks workflows that need npm/git/etc.); the container backend
-  // keeps the runtime default bridge (egress works).
-  // 'host': keep the host network namespace and allow outbound traffic — use
-  // when workflows must reach package registries or external services. On the
-  // container backend this also binds the host /etc/hosts read-only so a
-  // host-resolved-only registry name resolves inside the job container. The
-  // container backend applies this under the default hardened posture
-  // (KICI_SANDBOX_HARDENED=true).
+  // 'isolated': bwrap --unshare-net (loopback only; breaks workflows that need
+  // npm/git); the container backend keeps the runtime default bridge (egress works).
+  // 'host': share the host network namespace. On the container backend it also
+  // binds the host /etc/hosts read-only, so a host-resolved-only registry name
+  // resolves in the job container; the container backend applies it under the
+  // default hardened posture (KICI_SANDBOX_HARDENED=true).
   sandboxNetwork: z.enum(['isolated', 'host']).default('isolated'),
-  // Container-sandbox hardening posture (the per-job Docker/Podman sandbox).
-  // Secure-by-default: every job container drops all Linux capabilities, sets
-  // no-new-privileges, and gets pids/memory/CPU cgroup caps + a private
-  // tmpfs /tmp. These knobs tune that posture; see execution/sandbox/
-  // container-hardening.ts for how they map to the HostConfig.
-  //
-  // Master rollback affordance (documented-temporary): setting this false
-  // reproduces the legacy unhardened container posture. Default ON.
+  // Per-job container hardening: drop all capabilities, no-new-privileges,
+  // pids/memory/CPU cgroup caps and a private tmpfs /tmp (HostConfig mapping:
+  // execution/sandbox/container-hardening.ts). False is the documented-temporary
+  // rollback to the unhardened posture.
   sandboxHardened: z
     .string()
     .default('true')
     .transform((s) => s !== 'false'),
-  // Opt-in read-only rootfs. Off by default — many images write outside
-  // /workspace (npm cache, /home, tool state); /tmp is always a writable tmpfs.
+  // Opt-in, because many images write outside /workspace (npm cache, /home,
+  // tool state); /tmp is always a writable tmpfs.
   sandboxReadonlyRootfs: z
     .string()
     .default('false')
     .transform((s) => s === 'true'),
-  // Explicit container user override (uid, uid:gid, or name). When unset the
-  // image's configured user is honored as-is — a root image is never silently
-  // rewritten.
+  // Container user (uid, uid:gid or name). Unset honors the image's user — a
+  // root image is never silently rewritten.
   sandboxUser: z.string().optional(),
-  // Dedicated uid for the bare-metal runner child (uid, uid:gid, or a user
-  // name). Opt-in: unset, the child runs as the agent's own user, so the env
-  // allowlist that strips the agent's credentials from the child is not a
-  // credential boundary — anything running as that uid can still reach the
-  // agent process. Setting it makes the boundary real, at the cost of an
-  // operator-provisioned account and a chown of each job workdir.
+  // Dedicated uid for the bare-metal runner child (uid, uid:gid or name).
+  // Unset, the child runs as the agent's user, so the credential-stripping env
+  // allowlist is no boundary: that uid can still reach the agent process.
+  // Setting it costs an operator-provisioned account and a chown per workdir.
   runnerUser: z.string().optional(),
-  // Echo the runner child's raw stdout and stderr onto the agent's own stderr.
-  // Off by default: for a scaler-spawned agent that stream is copied into the
-  // orchestrator's journal, where it is readable without the `runs:read` check
-  // that guards the run log and with no per-org scoping. Declared here rather
-  // than read straight from the environment so the unknown-KICI_*-var check
-  // knows it — an undeclared name makes the agent refuse to start.
+  // Echo the runner child's raw stdio onto the agent's stderr. Off by default:
+  // a scaler-spawned agent's stderr lands in the orchestrator's journal, readable
+  // without the run log's `runs:read` check or per-org scoping. Declared here so
+  // the unknown-KICI_*-var check knows it, or the agent refuses to start.
   runnerDebugStdio: z
     .string()
     .default('false')
@@ -167,30 +149,26 @@ const configSchema = z.object({
     .string()
     .default('true')
     .transform((s) => s !== 'false'),
-  // Operator opt-out from `--ignore-scripts` on the `.kici/` dependency
-  // install. Lifecycle scripts are customer code executed by the process that
-  // runs the install, so they are off by default for every package manager.
-  // Read only here, never from a dispatch payload or a workflow, so a pull
-  // request cannot re-enable them for itself.
+  // Operator opt-out from `--ignore-scripts` on the `.kici/` install: lifecycle
+  // scripts are customer code run by the installing process. Read only here,
+  // never from a dispatch payload or workflow, so a pull request cannot
+  // re-enable them for itself.
   allowInstallScripts: z
     .string()
     .default('false')
     .transform((s) => s === 'true'),
-  // Registry origins a container job's `.kici/` install on the agent host may
-  // contact, beyond the public npm registry and the agent user's own
-  // `~/.npmrc` registries: comma-separated origins such as
-  // `http://registry.local:4873`, matched exactly after URL normalization.
-  // The host install runs outside the job network's egress filter, so a
-  // registry a workflow or repository names qualifies only when its origin is
-  // listed here. Read only here, never from a dispatch payload or a workflow.
-  // An entry that is not an http(s) origin refuses startup.
+  // Extra registry origins (e.g. `http://registry.local:4873`, matched exactly
+  // after URL normalization) a container job's host-side `.kici/` install may
+  // contact, beyond public npm and the agent user's `~/.npmrc`. The host install
+  // bypasses the job egress filter, so a workflow-named registry qualifies only
+  // when listed here. Read only here, never from a dispatch payload or workflow.
+  // A non-http(s) entry refuses startup.
   hostInstallRegistries: z
     .string()
     .default('')
     .transform((raw, ctx) => {
       const { origins, invalid } = parseHostInstallRegistries(raw);
-      // `invalid` entries carry no credentials, and neither does the issue: the
-      // raw setting may hold a password in another entry.
+      // Report entries, never the raw setting: another entry may hold a password.
       for (const { entry, reason } of invalid) {
         ctx.addIssue({
           code: 'custom',
@@ -200,9 +178,8 @@ const configSchema = z.object({
       }
       return invalid.length > 0 ? z.NEVER : origins;
     }),
-  // cgroup caps for the job container. Defaults mirror the operator-visible
-  // constants in container-hardening.ts (512 pids / 2 GiB / 2 CPUs). Raise
-  // these for heavy builds; they bound fork-bomb / memory / CPU DoS on the host.
+  // Job container cgroup caps bounding fork-bomb / memory / CPU DoS; defaults
+  // mirror container-hardening.ts (512 pids / 2 GiB / 2 CPUs).
   sandboxPidsLimit: z.coerce.number().int().positive().default(512),
   sandboxMemoryBytes: z.coerce
     .number()
@@ -214,112 +191,86 @@ const configSchema = z.object({
     .int()
     .positive()
     .default(2 * 1_000_000_000),
-  // Scaler integration. The auto-scaler injects KICI_SCALER_MANAGED=1 into
-  // every ephemeral agent it spawns; the agent uses these to know when it
-  // should self-shutdown after going idle.
+  // The auto-scaler sets KICI_SCALER_MANAGED=1 on every ephemeral agent it
+  // spawns; such an agent self-shuts down once idle.
   scalerManaged: z
     .string()
     .optional()
     .transform((s) => s === '1'),
-  // Set by the scaler when it spawned this agent FROM the job's own container
-  // image. Such an agent is already inside the image the job asked for, so it
-  // must run steps directly rather than nesting a second container from the
-  // same image — which would need a runtime inside a runtime and fail.
+  // Set by the scaler when this agent runs IN the job's own image: steps run
+  // directly, because nesting a second container would need a runtime inside a
+  // runtime and fail.
   jobImageAgent: z
     .string()
     .optional()
     .transform((s) => s === '1'),
-  // Where the KiCI runtime comes from when this agent NESTS a job container.
-  //
-  // A job may name any image, and that image is no more likely to ship Node
-  // than one a scaler spawns — so the agent injects the same pinned,
-  // glibc-2.17 Node the published agent image carries. It needs an image to
-  // copy that tree out of: a bind mount needs a host path, and the agent may
-  // itself be containerized, so it materializes the tree into a named volume
-  // exactly as the scaler does.
-  //
-  // Set automatically on every agent a scaler spawns (to the pool's own agent
-  // image, which is by construction present on that host). An operator running
-  // an agent by hand sets it to the kici-agent image matching their agent.
-  // Unset means no injection: the job container falls back to the image's own
-  // `node`, which is the historical contract and still correct for an image
-  // that ships one.
+  // Image to copy the pinned glibc-2.17 Node out of when this agent NESTS a job
+  // container, since a job image may lack Node. The tree goes into a named
+  // volume as the scaler does it (a bind mount needs a host path, and the agent
+  // may be containerized). A scaler sets it to the pool's agent image, present on
+  // the host by construction; a hand-run agent sets its matching kici-agent
+  // image. Unset, no injection: the job uses the image's own `node`.
   runtimeImage: z.string().optional(),
-  // Pre-provisioned Node tree to inject instead of materializing one — a host
-  // directory whose `bin/node` is the runtime, or the name of a volume holding
-  // it. Wins over runtimeImage. For a host that provisions the tree out of band
-  // (an air-gapped fleet with no agent image to pull).
+  // Pre-provisioned Node tree (a host dir whose `bin/node` is the runtime, or a
+  // volume name); wins over runtimeImage. For air-gapped fleets with no agent
+  // image to pull.
   runtimeNodeSource: z.string().optional(),
-  // Which build CLI runs a job's `container.dockerfile`. Unset auto-detects,
-  // preferring docker. Set it explicitly on a host that has both CLIs and whose
-  // container runtime is the other one — the build and the job container have to
-  // land on the same daemon, or the sandbox starts on a daemon that has never
-  // seen the image.
+  // Build CLI for `container.dockerfile`; unset auto-detects, preferring docker.
+  // Set it on a host with both CLIs whose runtime is the other one: build and job
+  // container must share a daemon, or the job's image is missing.
   containerBuildCli: ContainerBuildCli.optional(),
-  // Self-bootstrap: a single-use claim code the agent exchanges for its own
-  // ephemeral credentials (scaler.claim-credentials) before registering. Set by
-  // an event-scaler provisioning path (e.g. a GitHub Actions runner) so the real
-  // token never transits the provisioning channel. Ignored when a static
-  // KICI_AGENT_TOKEN is present.
+  // Single-use claim code exchanged for ephemeral credentials
+  // (scaler.claim-credentials) before registering, so the real token never
+  // transits an event-scaler's provisioning channel (e.g. a GitHub Actions
+  // runner). Ignored when KICI_AGENT_TOKEN is set.
   scalerClaimCode: z.string().optional(),
+  // Idle wait (ms) before a scaler-managed agent shuts down.
   scalerIdleTimeoutMs: z.coerce.number().default(5_000),
+  // Extended idle window (ms) when register.ack signals a queued bound job.
   scalerPendingDispatchTimeoutMs: z.coerce.number().default(60_000),
-  // Explicit execution-mode override. Optional — when unset, the runner picks
-  // 'container' / 'firecracker' / 'bare-metal' from job dispatch + scaler
-  // signals (see execution/job-runner.ts#determineExecutionMode).
+  // Unset, the runner picks the mode from dispatch + scaler signals
+  // (execution/job-runner.ts#determineExecutionMode).
   executionMode: ExecutionMode.optional(),
-  // OpenTelemetry exporter endpoint (optional; consumed by initTelemetry).
+  // Consumed by initTelemetry.
   otelExporterOtlpEndpoint: z.string().optional(),
-  // Maximum time the workflow-runner waits for a follow-up `concurrency.ack`
-  // after receiving `{ action: 'wait' }`. Default 1 hour. Inherited by the
-  // workflow-runner child process via env.
+  // How long the workflow-runner waits for a follow-up `concurrency.ack` after
+  // `{ action: 'wait' }`; the runner child inherits it via env.
   concurrencyWaitTimeoutMs: z.coerce.number().int().min(1000).default(3_600_000),
-  // Co-located guard for workflow-level host restart: when true, this agent
-  // shares its host with the orchestrator, so a `restartHost()` request is
-  // refused locally (the orchestrator also refuses it). Defaults to false.
+  // True when this agent shares its host with the orchestrator: `restartHost()`
+  // is then refused locally (the orchestrator also refuses it).
   isOrchestratorHost: z
     .string()
     .optional()
     .transform((v) => v === 'true'),
-  // Operator-supplied host-reset command run between jobs on a reused agent
-  // (unset = disabled). Runs in the supervisor after the job's process tree is
-  // reaped and its workdir removed. Meaningful on host-sharing backends
-  // (bare-metal / in-place); a no-op elsewhere. Fail-open: a failure never
-  // crashes the agent and never changes the finished job's result.
+  // Host-reset command run between jobs on a reused agent, in the supervisor,
+  // after the job's tree is reaped and its workdir removed. Meaningful on
+  // bare-metal / in-place only. Fail-open: a failure never crashes the agent or
+  // changes the finished job's result.
   betweenJobsResetCommand: z.string().optional(),
   betweenJobsResetTimeoutMs: z.coerce.number().int().positive().default(60_000),
-  // When the reset command runs: 'always' (default) or only 'on-failure'.
   betweenJobsResetRunOn: BetweenJobsRunOn.default('always'),
-  // Master switch for bare-metal process-group reaping of a finished job's
-  // descendant tree. Default on. 'false' restores the single-child-signal
-  // behavior — an escape hatch for a workload that legitimately backgrounds a
-  // daemon meant to outlive the job.
+  // Bare-metal process-group reaping of a finished job's tree. 'false' signals
+  // only the runner child — an escape hatch for a job that backgrounds a daemon
+  // meant to outlive it.
   orphanCleanup: z
     .string()
     .default('true')
     .transform((s) => s !== 'false'),
-  // Opt-in: drain the agent (stop accepting new jobs) after repeated
-  // consecutive between-jobs reset failures, so a persistently dirty host stops
-  // taking work. Default off.
+  // Opt-in: drain the agent after repeated consecutive reset failures, so a
+  // persistently dirty host stops taking work.
   drainOnResetFailure: z
     .string()
     .default('false')
     .transform((s) => s === 'true'),
 });
 
-/**
- * App configuration type. Includes computed agentId when not provided.
- */
+/** App configuration; `agentId` is computed when not provided. */
 export type AppConfig = z.infer<typeof configSchema> & {
   /** Unique identifier for this agent instance */
   agentId: string;
 };
 
-/**
- * Env-var definition for the agent. Exported so the docs generator and config
- * pre-validation can inspect / re-parse without round-tripping through
- * process.env.
- */
+/** Exported so the docs generator and config pre-validation can re-parse without process.env. */
 export const envDef = defineEnv({
   service: 'agent',
   schema: configSchema,
@@ -376,83 +327,33 @@ export const envDef = defineEnv({
 });
 
 /**
- * Load and validate agent configuration from environment variables.
- *
- * Maps env vars with KICI_ prefix:
- * - KICI_ORCHESTRATOR_URL (required)
- * - KICI_AGENT_ID (optional, auto-generated from hostname-uuid8)
- * - KICI_LABELS (comma-separated, e.g. "linux,docker"). Labels with the 'kici:' prefix are reserved.
- * - KICI_PROPERTIES (comma-separated key=value host-vars, e.g. "region=eu,cores=8,gpu=true"). Typed (bool/number/string), reported into the host roster.
- * - KICI_ROLES (comma-separated agent roles, e.g. "builder,init-runner". undefined=all, empty=execution-only)
- * - KICI_PORT (default: 8080)
- * - KICI_LOG_LEVEL (default: info)
- * - KICI_AGENT_TOKEN (optional, kat_ prefixed PSK for orchestrator authentication)
- * - KICI_GITHUB_TOKEN (optional)
- * - KICI_MAX_LOG_SIZE_BYTES (default: 10MB)
- * - KICI_DEFAULT_STEP_TIMEOUT_MS (default: 30 min)
- * - KICI_DOCKER_KEEP_FAILED (default: false)
- * - KICI_JOB_HEARTBEAT_INTERVAL_MS (default: 60000)
- * - KICI_BACKPRESSURE_MODE (default: pause, options: pause | drop)
- * - KICI_SANDBOX (default: false) — enable bubblewrap (bwrap) namespace isolation for bare-metal execution
- * - KICI_TRUSTED_ENV (default: false) — trusted fleet-agent profile: pass the ambient host env (minus the agent's own KiCI identity secrets) through to steps
- * - KICI_IN_PLACE (default: false) — in-place no-clone profile: for a file:// source, use the real repo path as workDir and skip the clone
- * - KICI_SANDBOX_NETWORK (default: isolated, options: isolated | host) — sandbox network posture for BOTH backends: the bwrap network namespace (when sandbox=true) and the container job network. `host` shares the host network (container backend also binds host /etc/hosts read-only for name resolution); applies to the container backend under the default hardened posture (KICI_SANDBOX_HARDENED=true)
- * - KICI_SANDBOX_HARDENED (default: true) — hardened-by-default job containers (CapDrop ALL, no-new-privileges, cgroup caps, tmpfs /tmp); set false to roll back to the legacy unhardened posture
- * - KICI_SANDBOX_READONLY_ROOTFS (default: false) — opt-in read-only container rootfs (/tmp stays a writable tmpfs)
- * - KICI_SANDBOX_USER (optional) — container user override (uid, uid:gid, or name); honors the image user when unset
- * - KICI_SANDBOX_PIDS_LIMIT (default: 512) — max PIDs in the job container cgroup
- * - KICI_SANDBOX_MEMORY_BYTES (default: 2 GiB) — memory cap in bytes for the job container cgroup
- * - KICI_SANDBOX_NANO_CPUS (default: 2 CPUs) — CPU cap in nano-CPUs for the job container cgroup
- * - KICI_SCALER_MANAGED (set to "1" by the orchestrator's auto-scaler — agent self-shuts down on idle)
- * - KICI_SCALER_CLAIM_CODE (optional single-use claim code the agent exchanges for its own ephemeral credentials before registering; ignored when KICI_AGENT_TOKEN is set)
- * - KICI_SCALER_IDLE_TIMEOUT (ms, default 5000) — how long a scaler-managed agent waits before shutdown after going idle
- * - KICI_SCALER_PENDING_DISPATCH_TIMEOUT (ms, default 60000) — extended idle window when register.ack signals a queued bound job
- * - KICI_RUNNER_USER (optional, uid | uid:gid | name) — run the bare-metal runner child as a dedicated user instead of the agent's own
- * - KICI_ALLOW_INSTALL_SCRIPTS (default: false) — re-enable package lifecycle scripts during the `.kici/` dependency install
- * - KICI_HOST_INSTALL_REGISTRIES (optional, comma-separated http(s) origins) — registry origins a container job's `.kici/` install on the agent host may contact, beyond the public npm registry and the agent user's `~/.npmrc`
- * - KICI_SANDBOX_NETWORK_ISOLATION (default: true) — RFC1918 + cloud-metadata egress filtering for nested job containers
- * - KICI_RUNNER_DEBUG_STDIO (default: false) — echo the runner child's raw stdio onto the agent's stderr
- * - KICI_EXECUTION_MODE (optional, options: container | bare-metal | firecracker) — override the runner's mode-pick logic
- * - KICI_CONCURRENCY_WAIT_TIMEOUT_MS (default: 3_600_000) — workflow-runner timeout when long-polling for a slot-release follow-up `concurrency.ack`
- * - KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND (optional) — host-reset command run between jobs on a reused agent (fail-open)
- * - KICI_AGENT_BETWEEN_JOBS_RESET_TIMEOUT_MS (default: 60000) — reset command timeout
- * - KICI_AGENT_BETWEEN_JOBS_RESET_RUN_ON (default: always, options: always | on-failure) — when the reset command runs
- * - KICI_AGENT_ORPHAN_CLEANUP (default: true) — reap a finished job's leaked process tree (bare-metal); false = only signal the runner child
- * - KICI_AGENT_DRAIN_ON_RESET_FAILURE (default: false) — drain the agent after repeated consecutive reset failures
- */
-/**
- * Env vars the boot-time unknown-KICI_* validator tolerates **only** under
- * `NODE_ENV=test`. `KICI_SKIP_DB_TESTS` is the vitest Postgres harness's
- * opt-out (`scripts/db-test-postgres.ts`), so a suite run with it set must not
- * fail the agent's own config tests. Mirrors the orchestrator's list, which
- * already carries it. Under any other NODE_ENV the allowance is empty, so a
- * production boot with a stray one still fails the validator.
+ * Env vars the unknown-KICI_* validator tolerates **only** under `NODE_ENV=test`:
+ * `KICI_SKIP_DB_TESTS` is the vitest Postgres harness opt-out
+ * (`scripts/db-test-postgres.ts`), also in the orchestrator list. A production
+ * boot with a stray one still fails the validator.
  */
 const TEST_ONLY_ENV_VARS = ['KICI_SKIP_DB_TESTS'];
 
+/**
+ * Load and validate agent configuration from the `KICI_*` environment variables
+ * (see `envDef`). `KICI_AGENT_ID` defaults to `<hostname>-<uuid8>`. Labels with
+ * the reserved `kici:` prefix are refused unless the agent is scaler-managed or
+ * has `KICI_AGENT_TOKEN`. An unknown `KICI_*` variable fails the load.
+ */
 export function loadConfig(): AppConfig {
   const data = envDef.parse();
 
-  // Validate no reserved kici:* prefix in user-provided labels. This is a
-  // client-side guardrail against a user spoofing a system label; it does NOT
-  // apply when the orchestrator is the authority on which reserved labels the
-  // agent may advertise:
-  //   - scaler-managed agents get kici:role:* injected into KICI_LABELS by the
-  //     orchestrator's scaler;
-  //   - token-authenticated agents (an ssh-transport ops agent advertising
-  //     kici:capability:ssh-transport, or an init-runner advertising
-  //     kici:init / kici:privileged:root / kici:host:* from its bootstrap
-  //     token) have every wire label checked against the token's authorized set
-  //     at register time (agent-handler Gate 1), so an unauthorized reserved
-  //     label is rejected there rather than needing a client-side block.
+  // Client-side guard against spoofing a reserved kici:* label. Skipped when the
+  // orchestrator is the authority: a scaler-managed agent gets kici:role:*
+  // injected by the scaler, and a token-authenticated agent (ssh-transport ops
+  // agent, init-runner with kici:init / kici:privileged:root / kici:host:*) has
+  // every wire label checked against its token at register time (agent-handler
+  // Gate 1).
   if (!data.scalerManaged && !data.agentToken) {
     validateNoReservedLabels(data.labels, 'KICI_LABELS');
   }
 
-  // Reject typo'd KICI_* env vars — drift catcher. Adds the logger's vars
-  // (KICI_LOG_DIR, KICI_LOG_MAX_SIZE, …) to the known set so they don't trip
-  // the unknown-var check, plus the vitest Postgres harness's own opt-out
-  // under NODE_ENV=test only.
+  // Reject typo'd KICI_* vars; the logger's vars (KICI_LOG_DIR, …) are known too.
   validateUnknownKiciVars([
     ...envDef.listKnownEnvVars(),
     ...LOGGER_ENV_VARS,
@@ -466,12 +367,9 @@ export function loadConfig(): AppConfig {
 }
 
 /**
- * Environment variables holding an agent credential, removed from the agent's
- * own `process.env` once `loadConfig()` has read them into the config object.
- *
- * `KICI_ORCHESTRATOR_URL` is deliberately NOT here — it is a URL, not a
- * credential, and `resolveOrchestratorUrl` reads it from the environment in both
- * the agent and the runner child.
+ * Credential vars removed from `process.env` once `loadConfig()` has read them.
+ * `KICI_ORCHESTRATOR_URL` is deliberately absent: it is no credential, and
+ * `resolveOrchestratorUrl` reads it from the env in the agent and runner child.
  */
 const CREDENTIAL_ENV_VARS = [
   'KICI_AGENT_TOKEN',
@@ -480,20 +378,14 @@ const CREDENTIAL_ENV_VARS = [
 ] as const;
 
 /**
- * Remove the agent's own credentials from `process.env` after boot.
+ * Remove the agent's own credentials from `process.env` after boot; returns the
+ * names removed. Under the default bare-metal backend a step can read
+ * `/proc/<agent-pid>/environ` and steal the token to register a rogue agent.
  *
- * The runner child runs as the agent's user under the default bare-metal
- * backend, so `/proc/<agent-pid>/environ` is readable from inside a job: a step
- * could print the agent token, register a rogue agent with it, and receive every
- * dispatch routed to this one. Stripping the variables closes that read on every
- * platform, whatever backend is selected.
- *
- * This is defence in depth, not isolation — a same-uid `ptrace` or
- * `/proc/<pid>/mem` read still reaches the value the config object holds. The
- * boundary is `KICI_RUNNER_USER` (a dedicated uid) or the container backend.
- *
- * Safe because each variable has exactly one reader: `loadConfig()`, which has
- * one caller and runs before this. Returns the names actually removed.
+ * Defence in depth, not isolation: a same-uid `ptrace` or `/proc/<pid>/mem`
+ * read still reaches the config object. The boundary is `KICI_RUNNER_USER` or
+ * the container backend. Safe because `loadConfig()` is each variable's only
+ * reader and runs before this.
  */
 export function scrubCredentialEnv(): string[] {
   const removed: string[] = [];
@@ -507,18 +399,12 @@ export function scrubCredentialEnv(): string[] {
 }
 
 /**
- * Describe the runner-isolation posture when it offers no boundary between a
- * job's step code and the agent process, or `undefined` when one is in place.
+ * A warning when no boundary separates step code from the agent process, else
+ * `undefined`. That is the default bare-metal posture: `KICI_SANDBOX=false`, no
+ * `KICI_RUNNER_USER`, no container backend.
  *
- * The exposed posture is the default bare-metal one: `KICI_SANDBOX=false` (a
- * plain `fork()`, no namespaces), no `KICI_RUNNER_USER`, and no container
- * backend. The child then runs as the agent's own user, so the env allowlist
- * that keeps the agent's credentials out of the child is not a credential
- * boundary — anything running as that uid can still reach the agent process.
- *
- * Reported as one startup warning naming both remedies, rather than refused:
- * bwrap is Linux-only and the container backend imposes a container runtime, so
- * neither can be a default without breaking existing installs.
+ * A warning, not a refusal: bwrap is Linux-only and the container backend needs
+ * a runtime, so neither can be a default without breaking existing installs.
  */
 export function describeExposedPosture(
   config: Pick<AppConfig, 'sandbox' | 'runnerUser' | 'executionMode' | 'jobImageAgent'>,
@@ -534,15 +420,9 @@ export function describeExposedPosture(
 }
 
 /**
- * Connection/identity options for the orchestrator WebSocket client, derived
- * purely from config.
- *
- * The agent entry point spreads this into `new OrchestratorClient({ ... })`
- * alongside its dispatch/cancel handler closures. Keeping `token` here — next
- * to the other required connection fields — guarantees it travels with the
- * connection: when `KICI_AGENT_TOKEN` is set the client sends `auth.request`
- * (token mode); when it is absent the client falls back to `agent.register`
- * (unauthenticated mode).
+ * Orchestrator WebSocket client options derived purely from config. `token`
+ * lives here so it always travels with the connection: set, the client sends
+ * `auth.request`; absent, it falls back to unauthenticated `agent.register`.
  */
 export function agentClientConnectionOptions(config: AppConfig) {
   return {

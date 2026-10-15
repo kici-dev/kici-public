@@ -2,37 +2,24 @@ import { describe, it, expect, vi } from 'vitest';
 import { ExecutionRunStatus } from '@kici-dev/engine';
 import { createDashboardCancelHandler } from './dashboard-cancel-handler.js';
 import type { CancelRunDeps } from './cancel-run.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 function makeDeps(over?: { runStatus?: string; dispatchedJobIds?: string[]; ws?: unknown }): {
   deps: CancelRunDeps;
   cancelByRunId: ReturnType<typeof vi.fn>;
-  updates: string[];
+  updates: unknown[][];
   send: ReturnType<typeof vi.fn> | undefined;
 } {
-  const updates: string[] = [];
   const cancelByRunId = vi.fn().mockResolvedValue(0);
-  const db = {
-    selectFrom: vi.fn(() => {
-      const chain: Record<string, any> = {};
-      chain.select = vi.fn(() => chain);
-      chain.where = vi.fn(() => chain);
-      chain.executeTakeFirst = vi.fn(async () => ({
-        status: over?.runStatus ?? ExecutionRunStatus.enum.running,
-      }));
-      // `host_roster` / `cluster_instances` reads: empty is the
-      // single-coordinator shape (no roster row, no live sibling).
-      chain.execute = vi.fn(async () => []);
-      return chain;
-    }),
-    updateTable: vi.fn((table: string) => {
-      updates.push(table);
-      const chain: Record<string, any> = {};
-      chain.set = vi.fn(() => chain);
-      chain.where = vi.fn(() => chain);
-      chain.execute = vi.fn(async () => [{ numUpdatedRows: 1n }]);
-      return chain;
-    }),
-  };
+  // Default empty `selectRows` for `host_roster` / `cluster_instances`: the
+  // single-coordinator shape (no roster row, no live sibling).
+  const { db, mocks } = createMockDb({
+    selectFirstRow: { status: over?.runStatus ?? ExecutionRunStatus.enum.running },
+  });
+  // Kysely's UpdateQueryBuilder.execute() resolves to UpdateResult[].
+  mocks.updateExecute.mockResolvedValue([{ numUpdatedRows: 1n }]);
+  // Live view: each `updateTable(table)` call lands here as it happens.
+  const updates = mocks.updateTable.mock.calls;
   const entry = over && 'ws' in over ? { ws: over.ws } : undefined;
   const deps = {
     db: db as unknown as CancelRunDeps['db'],
@@ -74,8 +61,7 @@ describe('createDashboardCancelHandler', () => {
   });
 
   it('cancels queued dispatch rows for a live run', async () => {
-    // The inline path this replaces never called cancelByRunId, so a queued job
-    // could still dispatch after a "successful" cancel.
+    // Without cancelByRunId, a queued job dispatches after a "successful" cancel.
     const { deps, cancelByRunId } = makeDeps();
     const onCancel = createDashboardCancelHandler(deps);
 
@@ -86,8 +72,8 @@ describe('createDashboardCancelHandler', () => {
   });
 
   it('skips a mid-close socket instead of aborting the cancellation', async () => {
-    // The inline path this replaces sent without a readyState check, so one
-    // closing socket threw and skipped every remaining job.
+    // Without a readyState check, one closing socket throws and skips every
+    // remaining job.
     const send = vi.fn(() => {
       throw new Error('WebSocket is not open');
     });
@@ -130,8 +116,7 @@ describe('createDashboardCancelHandler', () => {
     const sent = JSON.parse(String(send!.mock.calls[0]![0]));
     expect(sent.reason).toBe('run cancelled by user:alice');
     expect(sent.force).toBe(true);
-    // cancelledJobs is agentsNotified + pendingCancelled, matching the operator
-    // route — the inline path it replaces counted notified agents only.
+    // agentsNotified + pendingCancelled, matching the operator route.
     expect(result.cancelledJobs).toBe(2);
   });
 });

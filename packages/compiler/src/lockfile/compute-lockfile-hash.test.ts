@@ -4,11 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { computeLockfileHash } from './generator.js';
 
-/**
- * `computeLockfileHash` keys the dep cache on the manager-appropriate lockfile,
- * prefixed with the manager name so two managers never collide on identical
- * lockfile bytes.
- */
+/** The dep-cache key is prefixed with the manager name so identical lockfile bytes never collide. */
 describe('computeLockfileHash', () => {
   let root: string;
   let savedUserAgent: string | undefined;
@@ -16,8 +12,7 @@ describe('computeLockfileHash', () => {
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), 'kici-lockhash-'));
     await mkdir(join(root, '.kici'), { recursive: true });
-    // The test runner sets npm_config_user_agent (pnpm), which would pollute
-    // tier-3 detection; clear it so each case exercises the intended tier.
+    // The runner's npm_config_user_agent (pnpm) would pollute tier-3 detection.
     savedUserAgent = process.env.npm_config_user_agent;
     delete process.env.npm_config_user_agent;
   });
@@ -39,7 +34,7 @@ describe('computeLockfileHash', () => {
 
   it('hashes the repo-root pnpm-lock.yaml for a pnpm workspace', async () => {
     await writeFile(join(root, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
-    // No .kici/package-lock.json — the old behavior returned null here.
+    // No .kici/package-lock.json, yet a hash is still produced.
     expect(computeLockfileHash(root)).toMatch(/^[0-9a-f]{64}$/);
   });
 
@@ -59,9 +54,8 @@ describe('computeLockfileHash', () => {
   });
 
   it('falls back to .kici/pnpm-lock.yaml for a standalone pnpm .kici project', async () => {
-    // The mirror of the yarn fallback: a repo whose root is npm (or carries no
-    // pnpm signal) but whose .kici is pnpm. Without the .kici fallback the hash
-    // was null, so the orchestrator never wrote a dep-cache key.
+    // Mirror of the yarn fallback: an npm (or signal-less) root with a pnpm
+    // .kici. Without the .kici fallback the hash is null and no dep-cache key is written.
     await writeFile(
       join(root, '.kici', 'package.json'),
       JSON.stringify({ name: 'k', packageManager: 'pnpm@10.0.0' }),
@@ -70,13 +64,10 @@ describe('computeLockfileHash', () => {
     expect(computeLockfileHash(root)).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  // Detection falls back to the ambient `npm_config_user_agent` when a directory
-  // carries no signal of its own, so the manager that INVOKED the compiler leaks
-  // into the answer for a repo whose root holds neither a package.json nor a
-  // lockfile. Every case above deletes that variable in beforeEach, which is why
-  // none of them could see this: the search was restricted to the guessed
-  // manager's candidates, found none, and returned null — silently disabling the
-  // orchestrator's dependency cache for the repo.
+  // With no signal on disk, detection falls back to the ambient
+  // `npm_config_user_agent`, so the INVOKING manager leaks in. Restricting the
+  // search to that guess finds nothing and returns null, silently disabling the
+  // dependency cache. The cases above clear the variable, so they cannot see this.
   it('hashes .kici/package-lock.json even when compiled under pnpm', async () => {
     process.env.npm_config_user_agent = 'pnpm/11.3.0 npm/? node/v24.15.0 linux x64';
     await writeFile(join(root, '.kici', 'package-lock.json'), '{"a":1}');
@@ -89,10 +80,8 @@ describe('computeLockfileHash', () => {
     expect(computeLockfileHash(root)).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  // The ambient guess must not change the KEY either: the prefix names the
-  // manager whose lockfile actually matched, so the same repo hashes the same
-  // whoever compiled it. A prefix that tracked the guess would give one repo two
-  // dep-cache keys and halve the hit rate for no reason.
+  // The prefix names the manager whose lockfile matched, not the ambient guess,
+  // or one repo would get two dep-cache keys and half the hit rate.
   it('is independent of which manager invoked the compiler', async () => {
     await writeFile(join(root, '.kici', 'package-lock.json'), '{"a":1}');
 
@@ -105,9 +94,8 @@ describe('computeLockfileHash', () => {
     expect(underPnpm).toBe(clean);
   });
 
-  // Ordering, not restriction: a real root pnpm workspace still wins over a
-  // stray `.kici/package-lock.json`, so the widened search cannot demote a
-  // manager that has actual evidence on disk.
+  // Ordering, not restriction: a real root pnpm workspace still beats a stray
+  // `.kici/package-lock.json`.
   it('prefers the detected manager when both lockfiles exist', async () => {
     await writeFile(join(root, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.0.0' }));
     await writeFile(join(root, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');

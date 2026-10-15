@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
-// Mock os module
 vi.mock('node:os', async () => {
   const actual = await vi.importActual<typeof import('node:os')>('node:os');
   return {
@@ -15,11 +14,10 @@ vi.mock('node:os', async () => {
   };
 });
 
-// Mock global fetch
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
-// Mock the local dev plane (detach on logout).
+// Logout detaches the local dev plane.
 const planeStatusMock = vi.fn().mockResolvedValue({ running: false, mode: 'independent' });
 const detachPlaneMock = vi.fn().mockResolvedValue({ mode: 'independent' });
 vi.mock('../local-plane/plane-manager.js', () => ({
@@ -39,10 +37,8 @@ describe('kici logout', () => {
     vi.clearAllMocks();
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-logout-test-'));
     vi.mocked(os.homedir).mockReturnValue(tempDir);
-    // The homedir mock alone does not isolate this suite: getConfigDir()
-    // refuses the ambient config under the KiCI test-isolation marker before
-    // it consults homedir(). Name the same directory the mock produces
-    // explicitly.
+    // getConfigDir() refuses the ambient config under the test-isolation marker
+    // before it consults homedir(), so name the mocked directory explicitly.
     process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
     consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -70,7 +66,6 @@ describe('kici logout', () => {
 
     expect(result).toBe(true);
 
-    // Should have called DELETE on the PAT endpoint
     expect(mockFetch).toHaveBeenCalledWith(
       'https://platform.example.com/api/v1/pats/pat-123',
       expect.objectContaining({
@@ -81,7 +76,6 @@ describe('kici logout', () => {
       }),
     );
 
-    // Verify local config is cleared
     const config = await loadGlobalConfig();
     expect(config.pat).toBeUndefined();
     expect(config.patId).toBeUndefined();
@@ -107,7 +101,6 @@ describe('kici logout', () => {
 
     expect(result).toBe(true);
 
-    // Config should still be cleared
     const config = await loadGlobalConfig();
     expect(config.pat).toBeUndefined();
     expect(config.patId).toBeUndefined();
@@ -126,7 +119,6 @@ describe('kici logout', () => {
     const output = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
     expect(output).toMatch(/not logged in/i);
 
-    // Should not have called fetch
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
@@ -144,9 +136,8 @@ describe('kici logout', () => {
     await logoutCommand();
 
     const config = await loadGlobalConfig();
-    // Auth fields cleared
+    // Auth is cleared; connection settings survive.
     expect(config.pat).toBeUndefined();
-    // Connection settings preserved
     expect(config.endpoint).toBe('https://orch.example.com');
     expect(config.routingKey).toBe('github:42');
     expect(config.platformEndpoint).toBe('https://platform.example.com');

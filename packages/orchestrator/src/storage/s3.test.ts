@@ -3,12 +3,10 @@ import { S3CacheStorage } from './s3.js';
 
 // -- Unit tests (mocked S3 client) --
 
-// Mock the AWS SDK presigner module
 vi.mock('@aws-sdk/s3-request-presigner', () => ({
   getSignedUrl: vi.fn().mockResolvedValue('https://mock-s3.example.com/signed-url'),
 }));
 
-// Mock the AWS SDK client module
 vi.mock('@aws-sdk/client-s3', async () => {
   const mockSend = vi.fn().mockResolvedValue({});
   return {
@@ -54,7 +52,6 @@ describe('S3CacheStorage (unit)', () => {
       await storage.getUploadUrl('test-key');
       expect(getSignedUrl).toHaveBeenCalledTimes(1);
       const args = vi.mocked(getSignedUrl).mock.calls[0];
-      // Second arg should be a PutObjectCommand instance
       expect(PutObjectCommand).toHaveBeenCalledWith({
         Bucket: 'test-bucket',
         Key: 'test-prefix/test-key',
@@ -64,7 +61,6 @@ describe('S3CacheStorage (unit)', () => {
     it('uses 1800 seconds expiry for uploads', async () => {
       await storage.getUploadUrl('test-key');
       const args = vi.mocked(getSignedUrl).mock.calls[0];
-      // Third arg is the options object with expiresIn
       expect(args[2]).toEqual({ expiresIn: 1800 });
     });
 
@@ -105,7 +101,6 @@ describe('S3CacheStorage (unit)', () => {
 
   describe('get() touch-on-read resilience', () => {
     it('returns data even when updateMeta (touch) fails', async () => {
-      // Access the mocked send function on the internal client
       const mockSend = (storage as any).client.send as ReturnType<typeof vi.fn>;
 
       const bodyContent = Buffer.from('cached-data');
@@ -339,11 +334,10 @@ describe('S3CacheStorage (unit)', () => {
         CopySource: 'test-bucket/test-prefix/test-key',
         MetadataDirective: 'REPLACE',
       });
-      // Verify metadata has timestamps
       expect(args.Metadata).toBeDefined();
       expect(args.Metadata!['created-at']).toBeDefined();
       expect(args.Metadata!['last-accessed-at']).toBeDefined();
-      // Both timestamps should be equal (same call to toISOString)
+      // Same toISOString call, so both timestamps are equal.
       expect(args.Metadata!['created-at']).toBe(args.Metadata!['last-accessed-at']);
     });
   });

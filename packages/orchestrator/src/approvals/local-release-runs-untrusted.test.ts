@@ -1,24 +1,18 @@
 /**
- * A hold released by `kici-admin held-run approve` RUNS, and runs untrusted.
+ * A hold released by `kici-admin held-run approve` RUNS, and runs untrusted —
+ * proven as one chain:
  *
- * Two claims that only hold together, and that this file proves as one chain
- * rather than as two adjacent stories:
- *
- * 1. **It actually dispatches.** The approve is driven through the real admin
- *    route → the real `applyDecision` → the real `routeRelease` → the real
- *    `resumeWorkflow`, and the assertion is on `dispatchMatchedWorkflow` being
- *    called with the held run's own id. A release
- *    which flips the row and never dispatches is indistinguishable from a
- *    working one if you assert on the row.
- * 2. **The dispatch it produces is still degraded.** The context the replay
- *    hands `dispatchMatchedWorkflow` is fed to the REAL install-secret resolver
- *    and the REAL cache-scope decider, each with a trusted positive control so
- *    a decider that answered the same way regardless fails rather than passes.
+ * 1. **It dispatches.** The approve goes through the real admin route →
+ *    `applyDecision` → `routeRelease` → `resumeWorkflow`, asserting
+ *    `dispatchMatchedWorkflow` gets the held run's own id. A row assertion
+ *    cannot tell a release that never dispatches from a working one.
+ * 2. **The dispatch is still degraded.** Its context feeds the REAL
+ *    install-secret resolver and cache-scope decider, each with a trusted
+ *    positive control so a decider answering the same regardless fails.
  *
  * `released-hold-stays-untrusted.test.ts` proves the degradations survive the
- * stored row. This file proves the surface added here lands on that same
- * replay — the two are not interchangeable, because a local release that took a
- * shortcut past `resumeWorkflow` would leave that file green and this one red.
+ * stored row; a local release that shortcut past `resumeWorkflow` would leave
+ * that file green and this one red.
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
@@ -50,11 +44,7 @@ import {
   type WorkflowDispatchContext,
 } from '../pipeline/dispatch-matched-workflow.js';
 
-/**
- * Only the dispatch itself is stubbed. `deriveCacheRefScope` comes from the same
- * module and stays REAL, so the degradation assertions below run the shipped
- * decider rather than a fixture.
- */
+/** Only the dispatch is stubbed; the same module's `deriveCacheRefScope` stays REAL. */
 const dispatchMatchedWorkflow = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock('../pipeline/dispatch-matched-workflow.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../pipeline/dispatch-matched-workflow.js')>()),
@@ -111,8 +101,7 @@ function forkPolicyHold(): HeldRun {
     trigger_source: TriggerSource.enum.context,
     approval_requirement: null,
     payload: null,
-    // No pending check was posted in this fixture, so the settle declines and
-    // cannot fabricate one — the claim here is the dispatch, not the check.
+    // No pending check, so the settle declines: the claim is the dispatch.
     posted_pending_check: false,
   } as HeldRun;
 }
@@ -151,10 +140,7 @@ function makeDb(): Kysely<Database> {
   return { selectFrom: () => chain } as unknown as Kysely<Database>;
 }
 
-/**
- * Approve the fork-policy hold through the real route, with the REAL
- * `resumeWorkflow` behind the workflow-release arm.
- */
+/** Approve through the real route, with the REAL `resumeWorkflow` behind it. */
 async function approveThroughTheRoute(): Promise<Response> {
   const inner = createHeldRunRoutes({
     store: makeStore(forkPolicyHold()),
@@ -167,8 +153,7 @@ async function approveThroughTheRoute(): Promise<Response> {
       onJobRelease: async () => {
         throw new Error('a workflow-scoped hold must not take the job path');
       },
-      // The wiring `createApp` builds, verbatim: the release replays the stored
-      // dispatch context through the shipped resume.
+      // The wiring `createApp` builds, verbatim.
       onWorkflowRelease: (signal) => resumeWorkflow(signal, LIVE_DEPS, undefined),
     },
   });
@@ -207,8 +192,7 @@ describe('a hold released through kici-admin runs, and runs untrusted', () => {
     expect(dispatchMatchedWorkflow).toHaveBeenCalledTimes(1);
     expect((dispatchMatchedWorkflow.mock.calls[0] as unknown[])[1]).toMatchObject({
       reuseRunId: RUN,
-      // The fork-policy hold is not the install gate, so its replay re-evaluates
-      // that gate rather than skipping it.
+      // Not the install gate, so the replay re-evaluates that gate.
       skipInstallProtectionGate: false,
     });
   });
@@ -248,8 +232,7 @@ describe('a hold released through kici-admin runs, and runs untrusted', () => {
       resolvedOrgId: ORG,
       trustResolution: dispatchedContext().trustResolution,
       contextStore: undefined,
-      // Absent on purpose: reaching a resolver at all would mean the strip did
-      // not happen, since the strip returns before any lookup.
+      // Absent on purpose: the strip returns before any lookup.
       secretResolver: undefined,
       protectionContext: {} as never,
       skipProtectionGate: true,

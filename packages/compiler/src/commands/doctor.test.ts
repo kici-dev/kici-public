@@ -249,8 +249,7 @@ describe('checkLabels', () => {
         },
       ],
     } as unknown as LockFile;
-    // The sole connected agent matches runsOn (linux) but carries the excluded
-    // label (gpu), so real dispatch would never place the job on it.
+    // The sole agent matches runsOn (linux) but carries the excluded gpu label.
     const r = checkLabels(excludeLock, {
       ok: true,
       infra: infra([
@@ -262,7 +261,6 @@ describe('checkLabels', () => {
   });
 
   it('names a mixed exact and regex requirement exactly as before', () => {
-    // One job, built from the shared lock shape with mixed selectors swapped in.
     const job = {
       ...(lock.workflows[0]!.jobs[0] as object),
       runsOn: [
@@ -311,9 +309,8 @@ describe('checkLabels', () => {
     expect(r.status).toBe('pass');
   });
 
-  // The orchestrator reports canonical (folded) agent labels, while lock
-  // matchers carry whatever case the workflow author wrote. Without folding
-  // both sides, doctor calls a perfectly dispatchable job unreachable.
+  // The orchestrator reports folded agent labels; lock matchers keep the
+  // author's case. Without folding both sides, a dispatchable job reads unreachable.
   it('passes when the lock matcher and the agent labels differ only by case', () => {
     const mixedCaseLock = {
       schemaVersion: 1,
@@ -364,11 +361,8 @@ describe('checkLabels', () => {
     expect(r.status).toBe('pass');
   });
 
-  // The fold must reach the exclude arm too. runsOn is deliberately lowercase
-  // here so it matches with or without the fold: the only thing this case can
-  // turn on is whether `GPU` in the lock disqualifies the agent's `gpu` label.
-  // Folding runsOn alone would report the job reachable on an agent dispatch
-  // would never place it on.
+  // The fold must reach the exclude arm too. runsOn is lowercase so it matches
+  // either way: this case turns only on whether `GPU` disqualifies `gpu`.
   it('still excludes when the exclude matcher and the agent label differ only by case', () => {
     const mixedCaseExcludeLock = {
       schemaVersion: 1,

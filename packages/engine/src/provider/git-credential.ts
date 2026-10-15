@@ -2,10 +2,8 @@
  * Git credential types shared by the orchestrator broker, the agent helper,
  * and the SDK surface.
  *
- * Browser-safe by construction: these types sit on the `provider/` barrel that
- * the dashboard transitively imports, so this module declares plain TypeScript
- * and imports no Zod. The validating mirror lives in
- * `protocol/messages/git-credential-relay.ts`.
+ * Plain TypeScript, no Zod: the dashboard transitively imports the `provider/`
+ * barrel. The validating mirror is `protocol/messages/git-credential-relay.ts`.
  */
 
 import type { ProviderType } from './types.js';
@@ -22,10 +20,9 @@ export type ForgeName = Exclude<ProviderType, 'local'>;
  * `<context>:<secret-name>` reference resolved from the secrets backend, or
  * material supplied at runtime.
  *
- * The field NAME is the discriminator, so neither a reader nor the broker ever
- * has to guess whether a value is a key or a credential. This follows the
- * convention `packages/sdk/src/workflow.ts` already sets with
- * `registries[].tokenSecret` and `isQualifiedSecretRef`.
+ * The field NAME is the discriminator, so nobody guesses whether a value is a
+ * key or a credential — the convention of `registries[].tokenSecret` and
+ * `isQualifiedSecretRef` in `packages/sdk/src/workflow.ts`.
  */
 export type Sourced<Name extends string> =
   { [K in `${Name}Secret`]: string } | { [K in `${Name}Value`]: string };

@@ -174,7 +174,6 @@ export function envKeyToConfigPath(key: string): string[] | null {
 
   const remainder = key.slice(5); // strip KICI_
 
-  // Check direct mappings first
   if (DIRECT_MAPPINGS[remainder]) {
     return DIRECT_MAPPINGS[remainder];
   }

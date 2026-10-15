@@ -8,9 +8,6 @@ interface DryRunOptions {
   job?: string;
 }
 
-/**
- * Display dry-run output showing what would execute.
- */
 export function displayDryRun(
   workflows: readonly LockWorkflow[],
   decisions: WorkflowDecision[],
@@ -27,7 +24,6 @@ export function displayDryRun(
   }
 
   for (const decision of matchedWorkflows) {
-    // Filter by --workflow if specified
     if (options.workflow && decision.workflowName !== options.workflow) {
       continue;
     }
@@ -39,23 +35,19 @@ export function displayDryRun(
       logger.info(pc.gray(`  ${workflow.description}`));
     }
 
-    // Show triggers
     logger.info(pc.yellow(`  Triggers:`));
     for (const trigger of workflow.triggers) {
       logger.info(`    - ${trigger._type}`);
     }
 
-    // Show matched trigger
     if (decision.matchedTrigger !== undefined) {
       logger.info(pc.green(`  ✓ Matched trigger ${decision.matchedTrigger + 1}`));
     }
 
-    // Show jobs
     const staticJobs = workflow.jobs.filter((j): j is LockJob => j._type === 'static');
     logger.info(pc.yellow(`  Jobs (${staticJobs.length}):`));
 
     for (const job of staticJobs) {
-      // Filter by --job if specified
       if (options.job && job.name !== options.job) {
         continue;
       }
@@ -85,7 +77,6 @@ export function displayDryRun(
       }
     }
 
-    // Show dynamic jobs
     const dynamicJobs = workflow.jobs.filter((j) => j._type === 'dynamic');
     if (dynamicJobs.length > 0) {
       logger.info(pc.yellow(`  Dynamic job generators (${dynamicJobs.length}):`));
@@ -101,9 +92,6 @@ export function displayDryRun(
   logger.info(pc.green('✓ Dry run complete\n'));
 }
 
-/**
- * Display decision trace summary.
- */
 function displayDecisionSummary(decisions: WorkflowDecision[]): void {
   logger.info(pc.bold('\nDecision Summary:\n'));
 
@@ -113,7 +101,7 @@ function displayDecisionSummary(decisions: WorkflowDecision[]): void {
     logger.info(`  ${decision.workflowName}: ${status}`);
     logger.info(pc.gray(`    ${decision.summary}`));
 
-    // Show key checks
+    // For a skipped workflow, the first failed check.
     if (decision.checks.length > 0 && !decision.matched) {
       const failedCheck = decision.checks.find((c) => !c.passed);
       if (failedCheck) {

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { PeerJobCancel } from '@kici-dev/engine';
 import { DispatchQueueStatus } from '../queue/job-queue.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 import {
   deliverPeerJobCancel,
   PeerCancelOutcome,
@@ -225,19 +226,8 @@ describe('deliverPeerJobCancel', () => {
 
 describe('readDispatchedAgents', () => {
   function recordingDb(rows: Array<{ id: string; agent_id: string | null }>) {
-    const wheres: unknown[][] = [];
-    const chain = {
-      select: () => chain,
-      where: (...args: unknown[]) => {
-        wheres.push(args);
-        return chain;
-      },
-      execute: async () => rows,
-    };
-    const db = { selectFrom: vi.fn(() => chain) } as unknown as Parameters<
-      typeof readDispatchedAgents
-    >[0];
-    return { db, wheres };
+    const { db, mocks } = createMockDb({ selectRows: rows });
+    return { db, wheres: mocks.selectWhere.mock.calls };
   }
 
   it('reads live rows of the run, narrowed to one job when given', async () => {

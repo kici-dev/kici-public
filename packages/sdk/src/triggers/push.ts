@@ -1,8 +1,3 @@
-/**
- * Push trigger helper - creates triggers for push events.
- * Returns a frozen PushTriggerConfig directly (no builder pattern).
- */
-
 import {
   type BranchPattern,
   type PushConfigInput,
@@ -12,8 +7,7 @@ import {
 } from './types.js';
 
 /**
- * Create a push trigger configuration.
- * Returns a frozen (immutable) PushTriggerConfig object directly.
+ * Create a frozen (immutable) push trigger configuration.
  *
  * @example
  * // No-arg: matches any push

@@ -232,6 +232,8 @@ The `orgId` and `sourceId` are assigned when creating the source via the admin A
 
 `orgId` is one value in three places: the segment in this URL, the organization segment of the routing key, and the organization that owns the source on the Platform. Pass your Platform organization id to `--org`. A source created under a different value is refused when the orchestrator is Platform-connected, and the error names the correct id.
 
+An orchestrator with no Platform connection takes any organization id of up to 255 characters. It stores the id unchanged in its event log, contexts, secrets and access log.
+
 ### Creating a source
 
 Create a generic webhook source via the CLI or admin API:
@@ -270,7 +272,7 @@ curl -X POST https://<orchestrator>/api/v1/admin/generic-sources \
 
 | Field                  | Type     | Required | Description                                                                |
 | ---------------------- | -------- | -------- | -------------------------------------------------------------------------- |
-| `customerId`           | string   | yes      | Customer or organization identifier                                        |
+| `customerId`           | string   | yes      | Customer or organization identifier, up to 255 characters                  |
 | `name`                 | string   | yes      | Human-readable source name (unique per customer)                           |
 | `verificationMethod`   | enum     | no       | `hmac_sha256`, `bearer_token`, `ip_allowlist`, or `none` (default: `none`) |
 | `verificationConfig`   | object   | no       | Method-specific config (see below)                                         |

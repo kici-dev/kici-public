@@ -4,22 +4,17 @@ import type { ScalerRedispatchTrigger } from '../scaler/types.js';
 // ── Lazy meter + instrument resolution ────────────────────────────
 //
 // `@opentelemetry/api` returns a no-op instrument if `createMeter()` /
-// `createX()` runs BEFORE `initTelemetry()` has registered the global
-// MeterProvider. Service entry points (server.ts, standalone.ts) call
-// `initTelemetry()` first and then load the rest of the graph, but the
-// bundler hoists some statically-imported modules' top-level code above
-// that call — so a `const meter = createMeter(...)` at module scope here
-// would bind to the no-op provider and its instruments would never reach
-// the Prometheus exporter (the orchestrator /metrics scrape would be
-// missing every `kici_orch_*` series defined in this file).
+// `createX()` runs BEFORE `initTelemetry()` registers the global
+// MeterProvider. The entry points (server.ts, standalone.ts) call
+// `initTelemetry()` first, but the bundler hoists some statically-imported
+// modules' top-level code above that call, so a module-scope meter here would
+// bind to the no-op provider and /metrics would miss every `kici_orch_*` series.
 //
-// We therefore resolve the meter on first use and build every instrument
-// lazily: counters/histograms create their real instrument on the first
-// `.add()` / `.record()` call (always at runtime, after telemetry is
-// wired), and the observable gauges register inside
-// `registerOrchestratorMetrics()`, which `createApp()` invokes once
-// during bootstrap — after `initTelemetry()`. Same hazard, same fix as
-// `@kici-dev/shared`'s cold-store metrics module.
+// So the meter resolves on first use: counters/histograms create their real
+// instrument on the first `.add()` / `.record()` call, and the observable
+// gauges register inside `registerOrchestratorMetrics()`, which `createApp()`
+// invokes once during bootstrap, after `initTelemetry()`. Same hazard, same
+// fix as `@kici-dev/shared`'s cold-store metrics module.
 
 type OrchMeter = ReturnType<typeof createMeter>;
 type Counter = ReturnType<OrchMeter['createCounter']>;
@@ -62,10 +57,7 @@ type ObservableGauge = ReturnType<OrchMeter['createObservableGauge']>;
 type ObservableGaugeOptions = Parameters<OrchMeter['createObservableGauge']>[1];
 type ObservableCallback = Parameters<ObservableGauge['addCallback']>[0];
 
-// Deferred observable-gauge registrations. Each entry creates and registers
-// its gauge on the real meter when registerOrchestratorMetrics() runs (after
-// initTelemetry). Defining a gauge here only queues a thunk — it does not
-// touch the meter at module-eval time.
+// Thunks run by registerOrchestratorMetrics(); queuing one never touches the meter.
 const _observableGauges: Array<() => void> = [];
 
 /**
@@ -85,11 +77,9 @@ function defineObservableGauge(
 
 // ── Observable gauge state ──────────────────────────────────────────
 //
-// OTel ObservableGauges report values via a callback, not .set().
-// We use module-level variables + setter functions so callers can
-// update values imperatively. The callback reads the latest value
-// on each Prometheus scrape. The gauges themselves register in
-// registerOrchestratorMetrics() (called once after initTelemetry()).
+// OTel ObservableGauges report via a callback, not .set(), so callers update
+// module-level values through setters and the callback reads the latest value
+// on each Prometheus scrape.
 
 let _agentsActiveValue = 0;
 
@@ -241,10 +231,9 @@ defineObservableGauge(
 
 // ── Database collation drift ────────────────────────────────────
 //
-// 1 when the orchestrator DB's stamped collation version differs from the
-// running libc (text b-tree indexes may silently miss present rows — the
-// failure mode that read a present source private key back as absent); 0 when
-// consistent. Set once at startup by the collation-drift boot guard.
+// Text b-tree indexes built under another libc collation may silently miss
+// present rows — the failure mode that read a present source private key back
+// as absent.
 
 const _dbCollationDrift: Record<string, number> = {};
 
@@ -274,14 +263,11 @@ defineObservableGauge(
 
 // ── Scaler resource usage (observable gauges with labels) ────────
 //
-// One CPU and one memory gauge fan out per (scaler, machinePool) combination
-// the manager has seen. Operators can dashboard "% utilization per scaler",
-// alert on a scaler hovering near its cap, or correlate spawn refusals with
-// remaining headroom. The breakdown also emits whole-orchestrator totals
-// (scaler="__global__"), and rows for any pool the orchestrator participates
-// in (machinePool="<pool>"). Pool rows reflect the file-backed ledger snapshot,
-// not just this orchestrator's reservations, so they reveal cross-process
-// usage too.
+// One CPU and one memory gauge per (scaler, machinePool) the manager has seen,
+// plus whole-orchestrator totals (scaler="__global__") and rows for each pool
+// the orchestrator participates in (machinePool="<pool>"). Pool rows reflect the
+// file-backed ledger snapshot, not just this orchestrator's reservations, so
+// they reveal cross-process usage too.
 
 interface ScalerUsageRow {
   scaler: string;
@@ -295,12 +281,10 @@ interface ScalerUsageRow {
 let _scalerUsageRows: ScalerUsageRow[] = [];
 
 /**
- * Replace the current scaler-usage breakdown.
- *
- * Called by ScalerManager whenever a reservation lands or releases. Caller is
- * responsible for including a `scaler="__global__"` row for the orchestrator-wide
- * total and one row per active machine pool (with `machinePool` set) reflecting
- * the on-disk ledger snapshot. Per-scaler rows omit `machinePool`.
+ * Called by ScalerManager whenever a reservation lands or releases. The caller
+ * includes a `scaler="__global__"` orchestrator-wide row and one row per active
+ * machine pool (`machinePool` set) from the on-disk ledger snapshot. Per-scaler
+ * rows omit `machinePool`.
  */
 export function setScalerUsageBreakdown(rows: ScalerUsageRow[]): void {
   _scalerUsageRows = rows;
@@ -373,8 +357,6 @@ interface WarmPoolGaugeRow {
 let _warmPoolRows: WarmPoolGaugeRow[] = [];
 
 /**
- * Replace the current warm-pool fill state.
- *
  * Called by ScalerManager after each warm-pool tick and after a config reload,
  * so the gauges follow the pool rather than the scrape.
  */
@@ -711,26 +693,20 @@ defineObservableGauge(
 
 // ── Dispatch queue depth (observable gauges with labels) ──────────
 //
-// These two gauges expose the current dispatch_queue depth so operators can
-// alert on queue growth without querying the DB directly. Both share a
-// single breakdown state fed by the orchestrator's periodic refresher,
-// which calls {@link setDispatchQueueDepthBreakdown} after refreshing the
-// JobQueue cache. The callbacks are synchronous and MUST NOT perform I/O —
-// they just read the last known breakdown.
+// Both gauges read one breakdown that the periodic refresher sets through
+// {@link setDispatchQueueDepthBreakdown} after refreshing the JobQueue cache.
+// The callbacks are synchronous and MUST NOT perform I/O.
 //
-// - `kici_orch_dispatch_queue_depth{status}` emits one series per known
-//   non-terminal status (pending, dispatched). Empty queues emit explicit
-//   zero-valued series so Grafana shows "0" instead of absent data.
-// - `kici_orch_dispatch_queue_depth_by_label{status,label}` emits one
-//   series per (status, label) combination. Once a label has been seen
-//   this process, its series keeps reporting — dropping to an explicit
-//   `0` when that label's queue drains — so the per-label panel resets to
-//   `0` instead of freezing at the last non-zero value (an observable
-//   gauge that stops reporting a series leaves the last sample frozen in
-//   the TSDB). Multi-label jobs fan out across labels so `sum by (label)`
-//   matches the "label pool" mental model. Only `status=pending` is
-//   emitted today; dispatched jobs don't block new dispatch so their
-//   per-label breakdown isn't operationally useful.
+// - `kici_orch_dispatch_queue_depth{status}`: one series per non-terminal
+//   status (pending, dispatched); empty queues emit explicit zeros so Grafana
+//   shows "0" instead of absent data.
+// - `kici_orch_dispatch_queue_depth_by_label{status,label}`: once a label has
+//   been seen this process, its series keeps reporting, dropping to an explicit
+//   `0` when its queue drains (an observable gauge that stops reporting a
+//   series leaves the last sample frozen in the TSDB). Multi-label jobs fan out
+//   across labels so `sum by (label)` matches the "label pool" mental model.
+//   Only `status=pending` is emitted: dispatched jobs don't block new dispatch,
+//   so their per-label breakdown isn't operationally useful.
 
 interface QueueDepthBreakdownSnapshot {
   /** Raw COUNT per non-terminal status. Always includes pending + dispatched. */
@@ -744,21 +720,16 @@ let _queueDepthBreakdown: QueueDepthBreakdownSnapshot = {
   byLabel: {},
 };
 
-// Tracks every runs_on label observed since process start so the by-label
-// gauge can emit an explicit 0 for a label whose queue has drained — instead
-// of dropping the series, which leaves the last value frozen in the TSDB and
-// the by-label panel never resets. Mirrors the per-status gauge's explicit-zero
-// behavior. Cardinality is bounded by the configured runs_on label pool
+// Every runs_on label observed since process start, for the by-label sticky
+// zeros. Cardinality is bounded by the configured runs_on label pool
 // (default/linux/container/...) and resets on restart.
 const _everSeenQueueLabels = new Set<string>();
 
 /**
  * Merge current per-label counts with explicit `0`s for previously-seen labels
  * whose queue has drained. Mutates `everSeen` to include the current labels.
- *
- * Exported for direct unit testing of the sticky-zero invariant: a label that
- * appears in one snapshot and is absent from the next must report `0` rather
- * than vanish, otherwise the by-label gauge series freezes at its last value.
+ * Exported to unit-test the sticky-zero invariant: a label absent from the next
+ * snapshot must report `0`, or its series freezes at its last value.
  */
 export function applyStickyQueueLabels(
   everSeen: Set<string>,
@@ -776,12 +747,8 @@ export function applyStickyQueueLabels(
 }
 
 /**
- * Update the dispatch-queue depth breakdown used by the Prometheus gauges.
- *
- * Called by the orchestrator's periodic depth refresher after polling the
- * JobQueue. Normalizes the input so the gauge callback can emit explicit
- * zero series for known statuses even when the queue is empty, and keeps
- * emitting `0` for any per-label series whose queue has drained.
+ * Called by the periodic depth refresher after polling the JobQueue. Missing
+ * statuses normalize to `0`, and drained labels keep emitting `0`.
  */
 export function setDispatchQueueDepthBreakdown(snapshot: {
   byStatus: Partial<Record<'pending' | 'dispatched', number>>;
@@ -831,11 +798,10 @@ defineObservableGauge(
 
 // ── Webhook ingest admission control ──────────────────────────────
 //
-// State gauges are fed by the IngestAdmissionController's onStateChange hook via
+// The IngestAdmissionController's onStateChange hook feeds the state gauges via
 // setIngestAdmissionState; limit gauges are config-sourced (setIngestAdmissionLimits)
-// so their value reflects the deployed cap and never drifts like a hardcoded
-// dashboard threshold. The controller stays OTel-free — it calls the injected
-// counter/state hooks, and this module owns the instruments.
+// so they track the deployed cap, unlike a hardcoded dashboard threshold. The
+// controller stays OTel-free: it calls injected hooks, and this module owns the instruments.
 
 interface IngestMetricState {
   inflight: number;
@@ -1020,9 +986,8 @@ defineObservableGauge(
   { description: 'Current webhook-ingest overflow buffer depth (buffered rows awaiting replay)' },
   (r) => r.observe(_overflowBuffered),
 );
-// Config-sourced cap for the buffered-depth gauge above: the dashboard overlays
-// current-vs-limit (buffered / max) and the fullness ratio alert tracks the
-// deployed cap rather than a hardcoded threshold.
+// Config-sourced cap for the gauge above, so the dashboard's buffered / max
+// overlay and the fullness ratio alert track the deployed cap.
 defineObservableGauge(
   'kici_orch_ingest_overflow_max',
   { description: 'Configured overflow buffer row cap (KICI_INGEST_OVERFLOW_MAX)' },
@@ -1046,14 +1011,10 @@ export const ingestOverflowDroppedTotal = lazyCounter('kici_orch_ingest_overflow
 });
 
 /**
- * Replay reservations the admission controller refused. This is the drain's own
- * backpressure signal, kept off `kici_orch_ingest_shed_total` because that one
- * means "a sender was refused" and a background drain deciding not to start is
- * not that.
- *
- * It is also the evidence that the gate can still stop the replayer: a drain
- * that converges proves the mechanism works, while a non-zero count here during
- * that drain proves the reservation is refusable rather than an exempt lane.
+ * Replay reservations the admission controller refused: the drain's own
+ * backpressure signal, kept off `kici_orch_ingest_shed_total`, which means "a
+ * sender was refused". A non-zero count during a converging drain proves the
+ * reservation is refusable rather than an exempt lane.
  *
  * Labels: reason (loop_overload|queue_full).
  */
@@ -1131,14 +1092,12 @@ export function setTrustDirectoryUpdatedAt(updatedAt: Date): void {
 }
 
 /**
- * Seconds since the approval directory was last refreshed.
+ * Seconds since the approval directory was last refreshed: how long a revoked
+ * member's CI trust can still authorize `/kici approve` here.
  *
- * `/kici approve` is authorized against that directory, and it carries no TTL
- * on purpose: an expiring cache would refuse approvals during exactly the
- * Platform outage it exists to survive. The cost is that a member whose CI
- * trust the Platform revoked keeps it here until the next push lands, and an
- * orchestrator that cannot reach the Platform never gets that push. This gauge
- * is how long that window has been open.
+ * The directory has no TTL on purpose: an expiring cache would refuse approvals
+ * during exactly the Platform outage it exists to survive. An orchestrator that
+ * cannot reach the Platform never gets the push that revokes trust.
  *
  * @conditionallyEmitted An independent orchestrator receives no push, and a
  * Platform-attached one emits nothing until its first push lands.
@@ -1252,8 +1211,7 @@ export const depCacheMissesTotal = lazyCounter('kici_orch_dep_cache_misses_total
 });
 
 /**
- * Duration of build agent operations in seconds.
- * Tracks how long it takes to compile a workflow bundle via a build agent.
+ * Duration of compiling a workflow bundle via a build agent.
  * Buckets: 1s to 10min covering fast to slow compilations.
  */
 export const buildDurationSeconds = lazyHistogram('kici_orch_build_duration_seconds', {
@@ -1387,11 +1345,9 @@ export const staleDetectionDurationSeconds = lazyHistogram(
 
 /**
  * Number of webhook-trigger registrations matched when an inbound generic
- * webhook fans out across sources in the same org.
- *
- * Recorded once per inbound webhook on the cross-source dispatch path
- * (including zero-match cases). The label carries the inbound event name
- * (NOT the literal 'generic_webhook').
+ * webhook fans out across sources in the same org. Recorded once per inbound
+ * webhook on the cross-source path, zero matches included; the label carries the
+ * inbound event name (NOT the literal 'generic_webhook').
  *
  * Buckets cover small fan-outs (1-2 typical) through large org-wide fan-outs.
  *
@@ -1419,12 +1375,10 @@ export const crossSourceErrorsTotal = lazyCounter('kici_cross_source_errors_tota
 });
 
 /**
- * Counter for universal-git source registration errors at orchestrator
- * startup or config reload. A non-zero rate indicates at least one
- * `generic_webhook_sources` row with a non-null `git_config` could not be
- * promoted to a provider bundle — the row stays in the DB but its routing
- * key has no bundle, so webhooks for it will fall through to the generic
- * bundle's payload-only path.
+ * Universal-git source registration errors at startup or config reload: a
+ * `generic_webhook_sources` row with a non-null `git_config` could not become a
+ * provider bundle, so its webhooks fall through to the generic bundle's
+ * payload-only path.
  *
  * Labels:
  * - reason: 'invalid_config' (Zod parse failed) | 'bundle_build' (factory
@@ -1455,20 +1409,15 @@ export const trustMatchRefusedNoIdTotal = lazyCounter('kici_orch_trust_match_ref
 //
 // A global workflow declaring a `filter` predicate or a `DynamicJobFn` is
 // decided by a pre-run agent job, so nothing the orchestrator logs explains
-// what the round concluded. These five instruments are that explanation: how
-// many candidates entered, what each of them was decided to be, how long the
-// round took, how many jobs its generators produced, and whether the
-// redelivery cache answered.
+// what the round concluded; these instruments do.
 
 /**
  * Candidates handed to a global eval round.
  *
  * Equal to `sum(kici_orch_global_eval_verdicts_total)` by construction: every
- * candidate receives exactly one verdict, including on the fail-closed path
- * where the round never runs. Kept as its own series because it is the natural
- * top-line rate and the denominator the outcome breakdown divides — a
- * divergence between the two would be a bug in the round, never a condition an
- * operator should watch for.
+ * candidate gets exactly one verdict, even on the fail-closed path where the
+ * round never runs. Kept as the top-line rate and the outcome denominator; a
+ * divergence is a bug in the round, not a condition for operators to watch.
  */
 export const globalEvalCandidatesTotal = lazyCounter('kici_orch_global_eval_candidates_total', {
   description: 'Global workflow candidates handed to a Tier-2 eval round',
@@ -1516,14 +1465,12 @@ export const globalEvalJobsGenerated = lazyHistogram('kici_orch_global_eval_jobs
 /**
  * Global eval round cache lookups by outcome.
  *
- * Three outcomes, not two. An input that cannot be serialized yields no cache
- * key at all, so it never reaches the cache and registers neither a hit nor a
- * miss — counting only hits and misses would drop those lookups from the
- * denominator and make the hit rate read higher than it is.
+ * An unserializable input yields no cache key, so it is neither a hit nor a
+ * miss; counting only those would inflate the hit rate.
  *
  * Expect a hit rate near zero on a healthy cluster: the key covers the whole
- * event, so every real push is a miss by construction. This cache is a
- * redelivery guard, not a steady-state optimization.
+ * event, so every real push misses. This cache is a redelivery guard, not a
+ * steady-state optimization.
  *
  * Labels:
  * - result: hit | miss | unkeyable (the round input could not be serialized)
@@ -1593,12 +1540,10 @@ export function incEventUnmatched(eventName: string, reason: string): void {
 /**
  * Startup catch-up scans that threw. Emits no labels.
  *
- * The scan recovers the internal-event backlog a restart left behind, and it
- * runs behind a boot latch that the composition root resolves after startup
- * continues — so a failure cannot fail the bootstrap and is otherwise invisible
- * until the backlog quietly ages into the DLQ. This counter is what an alert
- * fires on; the accompanying `Deferred catch-up scan failed` log line carries
- * the reason.
+ * The scan recovers the internal-event backlog a restart left behind, behind a
+ * boot latch resolved after startup continues, so a failure cannot fail the
+ * bootstrap and is otherwise invisible until the backlog ages into the DLQ.
+ * Alert on this; the `Deferred catch-up scan failed` log line carries the reason.
  */
 export const eventCatchUpFailuresTotal = lazyCounter('kici_orch_event_catch_up_failures_total', {
   description: 'Startup internal-event catch-up scans that threw',
@@ -1638,26 +1583,18 @@ defineObservableGauge(
 
 // ── Install-secrets resolution ────────────────────────────────────
 //
-// Counters + histogram covering the resolver in
-// `pipeline/install-secrets-resolver.ts`, which evaluates a workflow's
-// `registries:` block (Option A) and committed-`.npmrc` `installEnv:`
-// entries (Option C) against the per-environment protection pipeline and
-// secret resolver before each dispatch.
-//
-// These metrics let operators dashboard:
-//   - Volume of install-secrets decisions (pass vs reject) and the reason
-//     breakdown of rejects (URL scheme, malformed ref, env not found, …).
-//   - Which channels and scopes installs actually use day-to-day.
-//   - The defense-in-depth contributor-strip path (fork PRs from untrusted
-//     contributors get no tokens; if a misconfigured env let them through
-//     the protection gate, this counter fires).
-//   - Token-resolution latency by environment, which surfaces slow Vault /
-//     Postgres lookups before they bleed into dispatch latency.
+// Cover `pipeline/install-secrets-resolver.ts`, which evaluates a workflow's
+// `registries:` block (Option A) and committed-`.npmrc` `installEnv:` entries
+// (Option C) against the per-environment protection pipeline and secret
+// resolver before each dispatch. The contributor-strip counter is
+// defense-in-depth: fork PRs from untrusted contributors get no tokens, so it
+// fires only when a misconfigured env let one through the protection gate.
+// Token-resolution latency surfaces slow Vault / Postgres lookups before they
+// bleed into dispatch latency.
 
 /**
- * Reason values for the `kici_orch_install_secrets_decisions_total` counter.
- * The single source of truth — the resolver and tests both reference these
- * constants, so adding a new reject path requires extending the union here.
+ * Reason values for `kici_orch_install_secrets_decisions_total`, the single
+ * source of truth for the resolver and tests: a new reject path extends it here.
  */
 export const InstallSecretsDecisionReason = {
   Ok: 'ok',
@@ -1694,10 +1631,9 @@ export type InstallSecretsChannel =
  * - decision: pass | reject | hold
  * - reason: ok (only with `pass`), held (only with `hold`), or one of the reject reasons enumerated in `InstallSecretsDecisionReason`
  *
- * Pass series are emitted exactly once per resolver call that does any work
- * (workflows declaring neither `registries:` nor `installEnv:` are NOT
- * counted — that's the trivial early-return path and dashboard rates would
- * be dominated by it).
+ * Pass series are emitted once per resolver call that does work: workflows
+ * declaring neither `registries:` nor `installEnv:` take the trivial
+ * early-return path and are NOT counted, or they would dominate dashboard rates.
  */
 export const installSecretsDecisionsTotal = lazyCounter(
   'kici_orch_install_secrets_decisions_total',
@@ -1707,9 +1643,8 @@ export const installSecretsDecisionsTotal = lazyCounter(
 );
 
 /**
- * Total registry / installEnv entries that successfully resolved on a
- * passing dispatch. Each entry contributes one increment, so a workflow
- * with two `registries:` rows and one `installEnv:` entry adds three.
+ * Registry / installEnv entries resolved on a passing dispatch, one increment
+ * per entry.
  *
  * Labels:
  * - channel: registries (Option A workflow block) | install_env (Option C committed .npmrc + installEnv:)
@@ -1727,9 +1662,8 @@ export const installSecretsRegistryUsedTotal = lazyCounter(
 /**
  * Total dispatches where the orchestrator stripped registry tokens because
  * the resolved contributor trust tier was not `trusted` (fork PRs from
- * unknown contributors). Defense-in-depth: even if a misconfigured
- * environment lacks a `minimum_trust` rule, this strip prevents tokens
- * from leaving the orchestrator for those dispatches.
+ * unknown contributors). Defense-in-depth: even when a misconfigured
+ * environment lacks a `minimum_trust` rule, no token leaves the orchestrator.
  *
  * Labels:
  * - trust_tier: unknown (the `trusted` tier does not strip and therefore never fires this counter)
@@ -1746,10 +1680,9 @@ export const installSecretsContributorStrippedTotal = lazyCounter(
  * Dispatches where a job's container-registry credentials were withheld because
  * the contributor tier was not `trusted`.
  *
- * The sibling of `installSecretsContributorStrippedTotal`, for the other class
- * of credential a dispatch resolves orchestrator-side. Counted separately
- * because the two fire on different jobs: install secrets are workflow-level
- * and registry auth is per-job, so one run can strip both, either, or neither.
+ * Sibling of `installSecretsContributorStrippedTotal`, counted separately because
+ * install secrets are workflow-level and registry auth is per-job, so one run
+ * can strip both, either, or neither.
  *
  * Labels:
  * - trust_tier: unknown (the `trusted` tier does not strip and therefore never fires this counter)
@@ -1878,14 +1811,10 @@ export const wsNackReceivedTotal = lazyCounter('kici_orch_ws_nack_received_total
 let _observableGaugesRegistered = false;
 
 /**
- * Register every queued orchestrator observable gauge on the real meter.
- *
- * Must run AFTER `initTelemetry()` has wired the global MeterProvider —
- * `createApp()` calls it once during bootstrap. Registering the gauges at
- * module-eval time instead would bind them to the no-op provider (the
- * bundler hoists some module init above the entry's `initTelemetry()` call),
- * leaving every `kici_orch_*` gauge absent from the /metrics scrape and the
- * Platform push. Idempotent: repeat calls are no-ops.
+ * Register every queued observable gauge on the real meter. Must run AFTER
+ * `initTelemetry()` (see the lazy-resolution note at the top of this file), or
+ * every `kici_orch_*` gauge is absent from the /metrics scrape and the Platform
+ * push. `createApp()` calls it once during bootstrap; repeat calls are no-ops.
  */
 export function registerOrchestratorMetrics(): void {
   if (_observableGaugesRegistered) return;

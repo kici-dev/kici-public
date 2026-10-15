@@ -3,8 +3,7 @@ import type { LabelMatcher } from '../labels-match.js';
 import { assertSafeRegex } from '../safe-regex.js';
 import { stripStatefulRegexFlags } from '../regex-flags.js';
 
-// Re-exported so existing importers of the label-compile module keep resolving
-// the shared ReDoS guard from here.
+// Re-exported so importers of this module keep resolving the shared ReDoS guard.
 export { assertSafeRegex };
 
 /**
@@ -74,9 +73,8 @@ export function normalizeRunsOnToMatchers(
 }
 
 /**
- * Resolve a `runsOn` author value's single-agent selection policy, defaulting to
- * `'deterministic'` for every form (string / array shorthand inherit the default
- * after normalization; the selector object's explicit `pick` wins).
+ * Resolve a `runsOn` value's single-agent selection policy: the selector
+ * object's explicit `pick`, else `'deterministic'`.
  */
 export function runsOnPickFromInput(runsOn: RunsOnAuthorInput): RunsOnPickInput {
   if (typeof runsOn === 'string' || runsOn instanceof RegExp || Array.isArray(runsOn)) {

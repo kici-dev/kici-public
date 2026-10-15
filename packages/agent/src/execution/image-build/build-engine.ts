@@ -1,11 +1,10 @@
 /**
  * Build a job's container image with the host's build CLI.
  *
- * The CLI is REQUIRED — there is deliberately no socket-API fallback. One build
- * path means one set of Dockerfile semantics: `.dockerignore`, BuildKit and
- * every directive behave as they do on the author's own machine, instead of
- * depending on which agent happened to pick the job up. A host without a CLI
- * cannot run a Dockerfile job, and says so in as many words.
+ * The CLI is REQUIRED, with deliberately no socket-API fallback: one build path
+ * means `.dockerignore`, BuildKit and every directive behave as on the
+ * author's machine, whichever agent picks the job up. A host without a CLI
+ * refuses a Dockerfile job with an explicit error.
  */
 
 import { spawn } from 'node:child_process';
@@ -37,13 +36,10 @@ export function binaryOnPath(bin: string): boolean {
 }
 
 /**
- * The daemon address a build is pointed at: the runtime the SANDBOX will start
- * the built image on (`resolveContainerRuntime`).
- *
- * Build and run have to provably agree. A host with both runtimes whose
- * sandbox runs on podman would otherwise build with docker and then start the
- * job container on a daemon that has never heard of that image — a failure
- * that surfaces as "no such image" and names nothing.
+ * The daemon a build targets: the runtime the SANDBOX starts the image on
+ * (`resolveContainerRuntime`). Build and run must agree, or a host with both
+ * runtimes could build on docker and run on podman, failing with an
+ * uninformative "no such image".
  */
 export function runtimeAddress(runtime: ContainerRuntimeEndpoint): string {
   return 'socketPath' in runtime ? runtime.socketPath : runtime.host;
@@ -96,7 +92,7 @@ export function buildArgv(args: {
   for (const [k, v] of Object.entries(spec.args)) argv.push('--build-arg', `${k}=${v}`);
   for (const [k, v] of Object.entries(spec.labels)) argv.push('--label', `${k}=${v}`);
   argv.push('-t', spec.tag);
-  // The context is the last positional, as both CLIs expect.
+  // Both CLIs expect the context as the last positional.
   argv.push(spec.contextDir);
   return argv;
 }
@@ -109,12 +105,9 @@ export interface BuildAuthconfig {
 }
 
 /**
- * Write `authconfig` into a throwaway config directory and return the env that
- * points the CLI at it.
- *
- * A throwaway directory rather than the host's own credential file: the build
- * runs on a shared agent host, and a job's registry token has no business being
- * written where the next job (or the operator) can read it.
+ * Write `authconfig` into a throwaway config dir and return the env pointing
+ * the CLI at it — never the host's credential file, where the next job (or the
+ * operator) on a shared agent host could read the token.
  */
 async function withTempAuth(
   cli: ContainerBuildCli,
@@ -140,12 +133,9 @@ async function withTempAuth(
 }
 
 /**
- * Split a chunk stream into whole lines, carrying the remainder between chunks.
- *
- * `flush` matters: a builder whose last line has no trailing newline — which is
- * exactly the shape of an error written just before exit — would otherwise leave
- * that line in the carry, and the one line the author most needs would be the
- * one that never reaches the run log.
+ * Split a chunk stream into whole lines. `flush` emits a final line with no
+ * trailing newline — typically the error written just before exit, the line
+ * the author most needs.
  */
 export function makeLineSplitter(onLine: (line: string) => void): {
   write: (chunk: Buffer) => void;
@@ -178,19 +168,14 @@ export interface BuildJobImageArgs {
 }
 
 /**
- * Run the build. Resolves when the image is tagged; rejects with the builder's
- * own last words otherwise.
- *
- * The rejection carries real output rather than an exit code because the author
- * is the one who has to act on it, and "exit 1" tells them nothing about which
- * `RUN` failed.
+ * Resolves when the image is tagged; otherwise rejects with the builder's last
+ * output lines, since "exit 1" does not tell the author which `RUN` failed.
  */
 export async function buildJobImage(args: BuildJobImageArgs): Promise<void> {
   const { spec, cli, socketPath, authconfig, onLog, signal } = args;
 
-  // Before the temp auth dir and the spawn: a job cancelled while it was still
-  // cloning would otherwise run its whole build to completion, because an
-  // already-aborted signal never fires the listener installed below.
+  // An already-aborted signal never fires the listener below, so a job
+  // cancelled during clone would otherwise run its whole build.
   if (signal?.aborted) throw signal.reason ?? new Error('job image build aborted');
 
   const auth = authconfig ? await withTempAuth(cli, authconfig) : undefined;
@@ -209,8 +194,7 @@ export async function buildJobImage(args: BuildJobImageArgs): Promise<void> {
         tail.push(line);
         if (tail.length > FAILURE_TAIL_LINES) tail.shift();
       };
-      // Both streams matter: BuildKit writes its progress to stderr, and a
-      // reader who only saw stdout would watch a successful build in silence.
+      // BuildKit writes its progress to stderr.
       const outSplitter = makeLineSplitter(record);
       const errSplitter = makeLineSplitter(record);
       child.stdout.on('data', outSplitter.write);
@@ -226,8 +210,6 @@ export async function buildJobImage(args: BuildJobImageArgs): Promise<void> {
 
       child.on('close', (code) => {
         signal?.removeEventListener('abort', onAbort);
-        // Emit whatever sat in each carry: a builder's dying words often have no
-        // trailing newline.
         outSplitter.flush();
         errSplitter.flush();
         if (code === 0) {

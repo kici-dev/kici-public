@@ -1,16 +1,12 @@
 /**
- * Diagnostic check runner.
- *
- * Executes all diagnostic checks in parallel with timeout safety.
- * Each check runs independently -- a failing or timing out check
- * does not prevent other checks from completing.
+ * Runs all diagnostic checks in parallel, each with its own timeout: a failing or
+ * timed-out check does not prevent the others from completing.
  */
 
 import type { DiagnosticCheck, DiagnosticDeps, DiagnosticResult } from './types.js';
 import { defaultChecks } from './checks/index.js';
 import { toErrorMessage } from '@kici-dev/shared';
 
-/** Options for the diagnostic runner. */
 export interface RunDiagnosticsOptions {
   /** Timeout per check in milliseconds. Default: 5000. */
   timeoutMs?: number;
@@ -20,9 +16,9 @@ export interface RunDiagnosticsOptions {
  * Run all diagnostic checks and return results.
  *
  * @param deps - Dependencies available to checks
- * @param checks - Array of check functions (defaults to all 6 checks)
+ * @param checks - Array of check functions (defaults to `defaultChecks`)
  * @param options - Runner options (timeout, etc.)
- * @returns Array of diagnostic results, one per check
+ * @returns Array of diagnostic results; a check may yield more than one
  */
 export async function runDiagnostics(
   deps: DiagnosticDeps,
@@ -41,8 +37,7 @@ export async function runDiagnostics(
       return Array.isArray(result.value) ? result.value : [result.value];
     }
 
-    // Promise.allSettled rejected -- this shouldn't happen since runWithTimeout catches,
-    // but handle defensively
+    // Defensive: runWithTimeout catches, so this should never reject
     return [
       {
         name: `Check ${index + 1}`,
@@ -54,10 +49,7 @@ export async function runDiagnostics(
   });
 }
 
-/**
- * Run a single check with a timeout.
- * If the check throws or times out, return a fail result.
- */
+/** A check that throws or times out yields a fail result. */
 async function runWithTimeout(
   check: DiagnosticCheck,
   deps: DiagnosticDeps,

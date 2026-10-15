@@ -2,12 +2,10 @@
  * The `POST /api/v1/admin/generic-sources` organization guard.
  *
  * A generic source mints the routing key `generic:<orgId>:<id>`, and the
- * Platform refuses to register a key whose organization segment is not the
- * one the orchestrator authenticated as. A source created under a mismatched
- * `--org` would therefore register, be rejected, and never deliver — and its
- * published webhook URL, which the Platform composes from the Platform
- * organization id, would 404. The create handler refuses the mismatch up
- * front and names the correct value.
+ * Platform refuses a key whose organization segment is not the one the
+ * orchestrator authenticated as. Under a mismatched `--org` the source would
+ * never deliver, and its webhook URL (composed from the Platform organization
+ * id) would 404. The create handler refuses up front and names the correct value.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { RbacEnforcer } from '../secrets/rbac.js';
@@ -70,8 +68,8 @@ describe('POST /generic-sources — Platform organization guard', () => {
 
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
-    // Both values and the corrective action are named, since the operator
-    // cannot otherwise tell which of the two ids is the right one.
+    // Both values and the fix are named: the operator cannot otherwise tell
+    // which id is right.
     expect(body.error).toContain('org_someoneelse');
     expect(body.error).toContain(PLATFORM_ORG);
     expect(body.error).toContain(`--org ${PLATFORM_ORG}`);
@@ -89,8 +87,8 @@ describe('POST /generic-sources — Platform organization guard', () => {
   });
 
   it('does not gate when the orchestrator has no Platform organization', async () => {
-    // Independent mode, or before the first successful auth: there is no
-    // canonical value to compare against, so the operator's choice stands.
+    // Independent mode, or before the first successful auth: nothing canonical to
+    // compare against, so the operator's choice stands.
     const { app, sourceManager } = buildApp(() => undefined);
     const res = await post(app, 'org_anything');
 

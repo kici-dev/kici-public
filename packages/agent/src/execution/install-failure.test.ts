@@ -28,8 +28,8 @@ function execFileError(fields: {
 }
 
 describe('describeInstallFailure', () => {
-  // fails-when: the description is the raw execFile message — with an empty
-  // stderr it is the command line alone, and the exit code and stdout are lost.
+  // fails-when: the description is the raw execFile message, which with an
+  // empty stderr is the command line alone, losing the exit code and stdout.
   it('keeps the exit code and stdout when the installer wrote nothing to stderr', () => {
     const out = describeInstallFailure(
       execFileError({ code: 1, stdout: 'npm error code EBUSY\nnpm error busy' }),

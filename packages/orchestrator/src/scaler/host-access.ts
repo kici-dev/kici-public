@@ -3,21 +3,18 @@
  *
  * An agent container or Firecracker VM sends its packets to one of the host's
  * addresses — a bridge gateway, the host's LAN address — and those are
- * delivered on the netfilter input hook. The `forward` rules the backends
- * already write never see them, so until the `input` chain existed a sandbox
- * reached every port on the host. These helpers resolve the narrow set it
- * actually needs, expressed in the same `hostAccess` vocabulary an operator
- * writes in `scalers.yaml`.
+ * delivered on the netfilter input hook, which the backends' `forward` rules
+ * never see: without an `input` chain a sandbox reaches every port on the host.
+ * These helpers resolve the narrow set it needs, in the `hostAccess`
+ * vocabulary an operator writes in `scalers.yaml`.
  */
 
 import type { NetworkPolicy } from '@kici-dev/shared/net';
 import type { AppConfig } from '../config.js';
 import { resolveAgentFacingStorage } from '../storage/loopback-guard.js';
 
-/** Port a DNS resolver on the bridge gateway listens on. */
 const DNS_PORT = 53;
 
-/** Default port for a URL whose scheme implies one. */
 const IMPLICIT_PORTS: Record<string, string> = {
   'http:': '80',
   'ws:': '80',
@@ -25,15 +22,12 @@ const IMPLICIT_PORTS: Record<string, string> = {
   'wss:': '443',
 };
 
-/** An IPv4 dotted quad, as a URL hostname would carry it. */
 const IPV4_LITERAL_RE = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
 
 /**
- * The port half of a URL, or null when the URL cannot be parsed.
- *
- * `explicit` distinguishes a port the URL names from one its scheme implies.
- * That difference decides whether a storage endpoint is treated as a host-local
- * service or as a public one — see {@link storageHostAccessEntries}.
+ * `explicit` distinguishes a port the URL names from one its scheme implies; it
+ * decides whether a storage endpoint is host-local or public — see
+ * {@link storageHostAccessEntries}.
  */
 function portOf(url: string): { port: string; explicit: boolean; hostname: string } | null {
   let parsed: URL;
@@ -59,13 +53,11 @@ function portOf(url: string): { port: string; explicit: boolean; hostname: strin
  * orchestrator-port-only default would cut off every deployment running its own
  * object store beside the orchestrator.
  *
- * Two shapes are recognised, and nothing else:
+ * Only two shapes are recognised:
  *
- *  - **An IP literal.** The entry is scoped to that exact address and port, the
- *    narrowest rule that can work.
+ *  - **An IP literal.** The entry is scoped to that exact address and port.
  *  - **A name with an explicit port.** No address rule can be built for a name
- *    that may move, so the entry names the port on any host address. It is
- *    still one port rather than the whole host.
+ *    that may move, so the entry names the port on any host address.
  *
  * A name with no port is a public endpoint (`https://…`), which the agent
  * reaches through the host over the `forward` hook and which no input rule
@@ -113,8 +105,7 @@ export function resolveAgentHostAccess(input: {
   if (orchestrator) entries.push(`*:${orchestrator.port}`);
   entries.push(...(input.hostServices ?? []));
 
-  // An operator can name the same service twice (a storage endpoint on the
-  // orchestrator's own port is the common case); duplicate accepts are inert
-  // but make the chain harder to read.
+  // The same service can appear twice (storage on the orchestrator's own port);
+  // duplicate accepts are inert but make the chain harder to read.
   return [...new Set(entries)];
 }

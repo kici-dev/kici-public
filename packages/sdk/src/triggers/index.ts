@@ -1,6 +1,4 @@
-/**
- * Trigger helpers for defining when workflows run.
- */
+/** Trigger helpers for defining when workflows run. */
 
 // Factory functions
 export { pr } from './pr.js';

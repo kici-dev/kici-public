@@ -12,10 +12,8 @@ import { resetDiscoveryCache } from './oidc-discovery.js';
 import open from 'open';
 
 /**
- * Build the OIDC discovery document a mock server returns for the test
- * issuer. The endpoint paths mirror the OIDC `/oauth/v2/*`
- * routes the existing mock handlers already serve, so the discovery flow
- * routes traffic through the same handlers without test-server changes.
+ * The mock OIDC discovery document. Its endpoints are the `/oauth/v2/*` routes
+ * the mock handlers already serve, so discovery reuses them unchanged.
  */
 function discoveryDoc(origin: string): string {
   return JSON.stringify({
@@ -31,16 +29,12 @@ function isDiscoveryReq(url: string | undefined): boolean {
 }
 
 /**
- * How long a console wait may run before it gives up and reports what it saw.
- * It must stay well under the package-wide 15s vitest timeout so the helper's
- * diagnosis — not a bare "Test timed out" — is what a developer reads.
+ * Console-wait deadline. It stays well under the package-wide 15s vitest timeout
+ * so a developer reads the helper's diagnosis, not a bare "Test timed out".
  */
 const CALLBACK_WAIT_MS = 5_000;
 
-/**
- * The authorize URL as it appears on stdout. The character class excludes ESC
- * so a colorized line cannot capture a trailing style reset into the URL.
- */
+/** The class excludes ESC so a colorized line cannot capture a trailing style reset. */
 const AUTHORIZE_URL = /(http:\/\/127\.0\.0\.1:\d+\/oauth\/v2\/authorize\?[^\s\u001B]+)/;
 
 function consoleText(spy: MockInstance): string {
@@ -48,9 +42,8 @@ function consoleText(spy: MockInstance): string {
 }
 
 /**
- * Wait for `pattern` to appear on the spied console, bounded by a deadline and
- * raced against the flow that is supposed to print it. Exactly three exits, and
- * none of them hang: the pattern matches, the flow rejects, or the deadline
+ * Wait for `pattern` on the spied console, raced against the flow that prints
+ * it. It never hangs: the pattern matches, the flow rejects, or the deadline
  * fires with a diagnosis naming what was awaited and what the console held.
  */
 async function waitForConsole(
@@ -63,8 +56,7 @@ async function waitForConsole(
   let interval: ReturnType<typeof setInterval> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
-  // A flow cannot resolve before its callback is driven, so the resolve branch
-  // parks forever; only a rejection is allowed to win this race.
+  // A flow cannot resolve before its callback is driven, so only a rejection may win.
   const flowRejected = opts.flow.then(
     () => new Promise<never>(() => {}),
     (err: unknown) => {
@@ -74,8 +66,7 @@ async function waitForConsole(
       });
     },
   );
-  // Swallow the loser of the race so a late flow rejection is not reported as
-  // an unhandled rejection inside whichever test runs next.
+  // Swallow the loser so a late rejection is not reported as unhandled in the next test.
   flowRejected.catch(() => {});
 
   const polled = new Promise<RegExpMatchArray>((resolve, reject) => {
@@ -103,9 +94,8 @@ async function waitForConsole(
 }
 
 /**
- * Wait for the authorize URL the flow prints, then drive the OIDC callback the
- * browser would normally deliver. The callback fetch is awaited, so a callback
- * that fails to land surfaces here instead of being dropped.
+ * Wait for the printed authorize URL, then drive the browser's OIDC callback.
+ * The fetch is awaited, so a callback that fails to land surfaces here.
  */
 async function driveCallback(
   spy: MockInstance,
@@ -143,20 +133,16 @@ describe('pkceFlow', () => {
   it('constructs correct authorization URL with PKCE parameters', async () => {
     let capturedUrl: string | undefined;
 
-    // Capture the URL that would be opened in the browser
     vi.mocked(open).mockImplementation(async (target: string) => {
       capturedUrl = target;
-      // Simulate browser callback by extracting the redirect_uri from the auth URL
       const authUrl = new URL(target);
       const redirectUri = authUrl.searchParams.get('redirect_uri')!;
       const state = authUrl.searchParams.get('state')!;
 
-      // Simulate OIDC callback with an auth code
       await fetch(`${redirectUri}?code=test-auth-code&state=${state}`);
       return {} as any;
     });
 
-    // Create a mock token endpoint
     mockAuthServer = createServer((req, res) => {
       if (isDiscoveryReq(req.url)) {
         const origin = `http://127.0.0.1:${(mockAuthServer.address() as AddressInfo).port}`;
@@ -241,7 +227,6 @@ describe('pkceFlow', () => {
       const redirectUri = authUrl.searchParams.get('redirect_uri')!;
       const state = authUrl.searchParams.get('state')!;
 
-      // Verify the redirect URI uses the fixed port
       expect(redirectUri).toContain(':19876/callback');
 
       await fetch(`${redirectUri}?code=test-code&state=${state}`);
@@ -312,9 +297,8 @@ describe('pkceFlow', () => {
   });
 
   it('rejects with an actionable error when KICI_CALLBACK_PORT is busy', async () => {
-    // The OIDC discovery fetch runs before the callback server binds, so the
-    // issuer must point at a real discovery endpoint — not at the squatter,
-    // which speaks no OIDC.
+    // Discovery runs before the callback server binds, so the issuer must be a
+    // real discovery endpoint, not the squatter.
     mockAuthServer = createServer((req, res) => {
       if (isDiscoveryReq(req.url)) {
         const origin = `http://127.0.0.1:${(mockAuthServer.address() as AddressInfo).port}`;
@@ -387,15 +371,12 @@ describe('pkceFlow', () => {
       clientId: 'test-client-id',
     });
 
-    // This test exists to prove the machine-readable form is printed, so wait
-    // on that exact marker rather than the generic authorize-URL pattern.
+    // Wait on the machine-readable marker itself, the thing under test.
     await driveCallback(consoleSpy, tokenPromise, { pattern: /KICI_AUTH_URL=(\S+)/ });
     const token = await tokenPromise;
 
     expect(token).toBe('browser-cmd-none-token');
-    // Should NOT have called open()
     expect(open).not.toHaveBeenCalled();
-    // Should have printed the auth URL
     const allOutput = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
     expect(allOutput).toContain('KICI_AUTH_URL=');
   });
@@ -436,10 +417,9 @@ describe('pkceFlow', () => {
     const token = await tokenPromise;
 
     expect(token).toBe('default-open-token');
-    // The default path does attempt the launch...
+    // The URL prints even after a launch, so a launch that silently shows no
+    // browser still leaves the user something to click.
     expect(open).toHaveBeenCalledTimes(1);
-    // ...and prints the URL regardless, so a launch that silently fails to
-    // display a browser still leaves the user something to click.
     const allOutput = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
     expect(allOutput).toContain('If it does not open, visit:');
     expect(allOutput).toContain('/oauth/v2/authorize?');
@@ -550,10 +530,8 @@ describe('pkceFlow', () => {
       nudgeAfterMs: 50,
     });
 
-    // Wait for the nudge to appear, and only then drive the callback: the flow
-    // runs with a 50ms nudge delay, so driving it first would mean the asserted
-    // nudge never fires. Waiting for the nudge rather than sleeping a fixed
-    // duration is what keeps this deterministic.
+    // Drive the callback only after the 50ms nudge appears, or the asserted
+    // nudge never fires. Waiting on it, not sleeping, keeps this deterministic.
     await waitForConsole(consoleSpy, /Still waiting for the browser callback/, {
       flow: tokenPromise,
       label: 'the nudge',
@@ -613,11 +591,9 @@ describe('pkceFlow', () => {
 
     const consoleSpy = vi.spyOn(console, 'log');
 
-    // The nudge delay is deliberately far longer than a loopback callback
-    // round-trip, and the token exchange is held past it. So the nudge window
-    // opens strictly *after* the callback landed and strictly *before* the
-    // token arrives — the exact window in which the nudge's "press Ctrl-C"
-    // advice would abort a login that is succeeding.
+    // The nudge delay far exceeds a loopback round-trip and the token exchange is
+    // held past it, so the nudge window falls strictly between callback and
+    // token: where "press Ctrl-C" would abort a succeeding login.
     const NUDGE_AFTER_MS = 1_000;
     const TOKEN_HOLD_MS = 1_400;
 
@@ -655,9 +631,8 @@ describe('pkceFlow', () => {
     await driveCallback(consoleSpy, tokenPromise);
     const token = await tokenPromise;
 
-    // Guard the premise: if the loopback callback somehow took longer than the
-    // nudge delay, the nudge fired legitimately and the assertion below would
-    // be meaningless. Fail loudly rather than pass vacuously.
+    // Premise guard: a callback slower than the nudge delay would make the
+    // assertion below vacuous.
     expect(tokenRequestAt).toBeDefined();
     expect(tokenRequestAt! - startedAt).toBeLessThan(NUDGE_AFTER_MS);
 
@@ -682,9 +657,8 @@ describe('pkceFlow', () => {
   it('driveCallback surfaces a flow rejection instead of timing out', async () => {
     const consoleSpy = vi.spyOn(console, 'log');
 
-    // Bind+close a probe server to get a port nothing listens on. Discovery
-    // then rejects before any authorize URL is printed — the exact shape that
-    // leaves an unbounded poller waiting for a line that will never arrive.
+    // A dead port makes discovery reject before any URL prints: the shape that
+    // leaves an unbounded poller waiting forever.
     const probe = createServer();
     await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', () => resolve()));
     const deadPort = (probe.address() as AddressInfo).port;
@@ -739,11 +713,9 @@ describe('deviceFlow', () => {
         } else if (req.url === '/oauth/v2/token') {
           pollCount++;
           if (pollCount < 3) {
-            // First two polls return pending
             res.writeHead(400, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'authorization_pending' }));
           } else {
-            // Third poll succeeds
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ access_token: 'device-access-token', token_type: 'Bearer' }));
           }
@@ -955,10 +927,8 @@ describe('deviceFlow', () => {
     const deadPort = (probe.address() as AddressInfo).port;
     await new Promise<void>((resolve) => probe.close(() => resolve()));
 
-    // With OIDC discovery in place, an unreachable issuer fails on the
-    // /.well-known/openid-configuration fetch — not on the
-    // device_authorization endpoint — so the error message points at
-    // discovery rather than the device-flow endpoint.
+    // An unreachable issuer fails on the /.well-known/openid-configuration
+    // fetch, so the error names discovery, not the device-flow endpoint.
     await expect(
       deviceFlow({ issuer: `http://127.0.0.1:${deadPort}`, clientId: 'c' }),
     ).rejects.toThrow(
@@ -1098,7 +1068,7 @@ describe('exchangeTokenForPat', () => {
   });
 
   it('throws an actionable error when platform URL is unreachable', async () => {
-    // Bind+close a server to get a port we know nothing is listening on.
+    // Bind+close yields a port nothing listens on.
     const probe = createServer();
     await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', () => resolve()));
     const deadPort = (probe.address() as AddressInfo).port;

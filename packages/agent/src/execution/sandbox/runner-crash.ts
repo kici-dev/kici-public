@@ -1,10 +1,9 @@
 /**
- * Diagnostics for a container runner that exited without sending
- * `job.complete`: the message the job fails with, built from the exec exit
- * code and the runner's last stdout / stderr lines.
+ * The failure message for a container runner that exited without sending
+ * `job.complete`, built from the exec exit code and its last stdout / stderr lines.
  */
 
-/** How many non-JSON stdout lines to keep for the crash message. */
+/** Non-JSON stdout lines kept for the crash message. */
 export const MAX_RAW_STDOUT_LINES = 5;
 
 /** Exit code a shell or container runtime reports for a command it cannot find. */
@@ -17,32 +16,26 @@ export const EXIT_COMMAND_NOT_FOUND = 127;
  */
 const EXECUTABLE_NOT_FOUND = /executable file .*not found/i;
 
-/** Inputs to {@link describeRunnerCrash}. */
 export interface RunnerCrashInput {
-  /** The job's container image. */
   image: string;
   /** Whether the runner ran on an injected KiCI runtime instead of the image's own `node`. */
   runtimeInjected: boolean;
-  /** Exec exit code, or undefined when the runtime could not report one. */
+  /** Undefined when the runtime could not report one. */
   exitCode: number | null | undefined;
   /** Last non-JSON stdout lines. The container runtime writes an exec failure there. */
   stdoutTail: string[];
-  /** Last stderr lines. */
   stderrTail: string[];
 }
 
-/**
- * Append `line` to `lines`, keeping at most `max` entries (oldest dropped).
- */
+/** Keeps at most `max` entries, dropping the oldest. */
 export function pushBounded(lines: string[], line: string, max: number): void {
   lines.push(line);
   if (lines.length > max) lines.shift();
 }
 
 /**
- * Whether the crash is the image's own `node` missing: only possible when no
- * runtime was injected, and recognized by the command-not-found exit code or
- * the runtime's not-found error text.
+ * The image's own `node` is missing: only possible with no injected runtime,
+ * recognized by the command-not-found exit code or the not-found error text.
  */
 export function isImageNodeMissing(input: RunnerCrashInput): boolean {
   if (input.runtimeInjected) return false;
@@ -50,9 +43,6 @@ export function isImageNodeMissing(input: RunnerCrashInput): boolean {
   return [...input.stdoutTail, ...input.stderrTail].some((line) => EXECUTABLE_NOT_FOUND.test(line));
 }
 
-/**
- * Build the failure message for a runner that exited without `job.complete`.
- */
 export function describeRunnerCrash(input: RunnerCrashInput): string {
   const exit =
     input.exitCode === null || input.exitCode === undefined

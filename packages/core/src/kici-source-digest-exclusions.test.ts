@@ -59,8 +59,7 @@ describe('criterion 1 — a run-rewritten tree hashes identically', () => {
   });
 
   it('CONTROL — still moves when a workflow source file changes', async () => {
-    // Proves the fix is not "hash nothing". Without this the suite above
-    // would pass against a digest that always returns a constant.
+    // Control: without it the suite above passes against a constant digest.
     const before = await hashKiciSourceTree(kiciDir);
     await write('lib/deploy.ts', 'export const run = () => 2;\n');
     expect(await hashKiciSourceTree(kiciDir)).not.toBe(before);

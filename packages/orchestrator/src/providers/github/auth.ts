@@ -80,7 +80,6 @@ export class GitHubCloneTokenProvider implements CloneTokenProvider {
 
   constructor(private readonly config: GitHubAppConfig) {}
 
-  /** Get the GitHub App config for this provider instance. */
   getAppConfig(): GitHubAppConfig {
     return this.config;
   }

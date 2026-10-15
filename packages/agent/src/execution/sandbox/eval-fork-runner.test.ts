@@ -122,9 +122,8 @@ describe('runEvalChild', () => {
   });
 
   it("carries the child's stderr into the died-without-reporting message", async () => {
-    // The shape a Firecracker rootfs missing eval-runner.js produces: node
-    // starts, cannot load the module, and exits 1 having sent no IPC message.
-    // Without the tail the operator sees only `code=1`.
+    // A Firecracker rootfs missing eval-runner.js: node cannot load the module
+    // and exits 1 with no IPC message. Without the tail the operator sees only `code=1`.
     const { runEvalChild } = await import('./eval-fork-runner.js');
     const p = runEvalChild({
       evalRunnerPath: '/opt/kici/eval-runner.js',

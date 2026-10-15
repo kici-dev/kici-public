@@ -2,18 +2,14 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration, migrateToPreviousMigration } from '../migration-test-harness.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
  * Real-Postgres test for migration 140, the `dispatch_queue` label fold.
  *
- * This is a DATA migration, so the test has to straddle it: the rows it folds
- * must already exist when it runs. `migrateToOwnMigration()` alone applies
- * `001..140` in one shot and leaves no window to insert them, so the
- * assertions would run against rows 140 never saw — a check that passes
- * identically with the migration body deleted. The suite therefore migrates to
- * the migration before this one, inserts the rows an upgraded database holds,
- * then migrates to 140 and asserts what moved.
+ * A DATA migration, so the test straddles it: `migrateToOwnMigration()` alone leaves no window
+ * to insert rows, and assertions on rows 140 never saw pass with the body deleted. The suite
+ * migrates to 139, inserts the rows an upgraded database holds, then migrates to 140.
  *
  * Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
@@ -34,11 +30,7 @@ describeDb('migration 140_dispatch_queue_canonical_labels', () => {
   let preFoldMixed: { runs_on_labels: unknown; exclude_labels: unknown };
   const adminUrl = ADMIN_URL!;
 
-  /**
-   * Insert a row with the NOT NULL column set `dispatch_queue` requires at
-   * migration 139, plus the label and pattern columns under test. `job_name`
-   * is the handle each assertion reads the row back by.
-   */
+  /** Fills the NOT NULL columns `dispatch_queue` requires at 139; `job_name` is the read handle. */
   const insertRow = async (row: {
     jobName: string;
     runsOnLabels: string;
@@ -91,8 +83,7 @@ describeDb('migration 140_dispatch_queue_canonical_labels', () => {
     const before = await migrateToPreviousMigration(db, import.meta.url);
     if (before.error) throw before.error;
 
-    // 2. The rows an upgraded database actually holds, written before the fold
-    //    existed and therefore carrying whatever case the author used.
+    // 2. Rows an upgraded database holds, in whatever case the author used.
     await insertRow({
       jobName: 'mixed',
       runsOnLabels: JSON.stringify(['Docker', 'Linux']),
@@ -110,13 +101,9 @@ describeDb('migration 140_dispatch_queue_canonical_labels', () => {
     });
     await insertRow({
       jobName: 'padded',
-      // The three entries cover the whole trim set: spaces, then tab and
-      // newline, then vertical tab, carriage return and form feed. A set that
-      // omits any of them leaves that label padded.
-      //
-      // The trailing `v` is not load-bearing. `E'\v'` and `E'\x0B'` are the
-      // same character in Postgres, so this label reads `kvm-v` under either
-      // spelling of TRIM_CHARS.
+      // Covers the whole trim set: spaces; tab and newline; vertical tab, carriage return and
+      // form feed. A set omitting any leaves that label padded. `E'\v'` and `E'\x0B'` are the
+      // same character in Postgres, so the label reads `kvm-v` under either TRIM_CHARS spelling.
       runsOnLabels: JSON.stringify([' Docker ', '\tARM64\n', '\u000B\rKVM-V\u000C']),
       excludeLabels: JSON.stringify([' Canary ']),
     });
@@ -133,15 +120,12 @@ describeDb('migration 140_dispatch_queue_canonical_labels', () => {
       excludePatterns: JSON.stringify(['Canary-\\d+']),
     });
 
-    // 2b. What the rows hold with 140 not yet applied. Captured so a later
-    //     assertion can pin the before/after pair: without it, "the row is
-    //     lowercase" would also be true of a suite that inserted lowercase
-    //     rows after the migration had already run.
+    // 2b. Pins the before/after pair: otherwise "the row is lowercase" also holds for a suite
+    //     that inserted lowercase rows after the migration ran.
     preFoldMixed = await readRow('mixed');
 
-    // 3. The migration under test, and only it. The harness throws if the call
-    //    applied nothing, so a suite that had already reached 140 before the
-    //    rows went in fails loudly instead of asserting against untouched rows.
+    // 3. Only the migration under test. The harness throws when nothing applied, so a suite
+    //    already at 140 before the inserts fails loudly.
     const after = await migrateToOwnMigration(db, import.meta.url);
     if (after.error) throw after.error;
     const applied = (after.results ?? []).map((r) => r.migrationName);
@@ -166,10 +150,8 @@ describeDb('migration 140_dispatch_queue_canonical_labels', () => {
   }, 60_000);
 
   it('folds mixed-case labels on a row that predates the migration', async () => {
-    // The row was mixed-case while only 001..139 had run — so the suite really
-    // does straddle the migration, and the folded values below are 140's work
-    // rather than the shape the row was inserted with. An emptied `up()` leaves
-    // this row at its captured pre-fold value and reddens the two assertions.
+    // Mixed-case at 139 proves the straddle, so the folded values are 140's work. An emptied
+    // `up()` leaves the pre-fold value and reddens the assertions below.
     expect(preFoldMixed.runs_on_labels).toEqual(['Docker', 'Linux']);
     expect(preFoldMixed.exclude_labels).toEqual(['Canary']);
 
@@ -186,11 +168,9 @@ describeDb('migration 140_dispatch_queue_canonical_labels', () => {
 
   it('preserves an empty exclude_labels array rather than nulling it', async () => {
     const row = await readRow('empty-exclude');
-    // A negative control, not a check on the COALESCE. The `EXISTS` guard never
-    // admits an empty array, so this row is skipped outright and reads back
-    // unchanged whether or not the COALESCE is there. What it does pin is that
-    // the guard keeps skipping it: a fold that touched every row would have to
-    // get the empty case right, and this assertion is where that would surface.
+    // A negative control, not a COALESCE check: the `EXISTS` guard never admits an empty
+    // array, so the row is skipped either way. It pins that the guard keeps skipping it; a
+    // fold touching every row would have to get the empty case right, and fails here if not.
     expect(row.exclude_labels).toEqual([]);
     expect(row.exclude_labels).not.toBeNull();
   });

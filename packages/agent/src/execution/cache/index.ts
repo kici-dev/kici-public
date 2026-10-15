@@ -1,9 +1,4 @@
-/**
- * User-facing cache engine barrel (sandbox-side).
- *
- * Re-exports the pure pack/extract/checksum helpers and the imperative
- * `ctx.cache` API factory plus its transport interface.
- */
+/** Sandbox-side cache engine barrel, including the `ctx.cache` API factory. */
 export {
   createCacheApi,
   packCachePaths,

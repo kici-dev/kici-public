@@ -135,11 +135,9 @@ describe('createWorkerStatusHandler', () => {
     const drainHandler = createWorkerDrainHandler(deps);
     const statusHandler = createWorkerStatusHandler(deps);
 
-    // Drain first
     const drainRes = createMockRes();
     drainHandler({} as IncomingMessage, drainRes);
 
-    // Then check status
     const statusRes = createMockRes();
     statusHandler({} as IncomingMessage, statusRes);
 

@@ -1,10 +1,3 @@
-/**
- * Diagnostic check registry.
- *
- * Exports the array of all diagnostic check functions
- * in the order they should be displayed.
- */
-
 import type { DiagnosticCheck } from '../types.js';
 import { checkDbConnectivity } from './db.js';
 import { checkBackupFreshness } from './backup.js';

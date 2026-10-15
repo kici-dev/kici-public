@@ -1,19 +1,16 @@
 /**
- * An organization-wide workflow's git-credential declaration reaches BOTH
- * halves of the authorization model.
- *
- * The credential relay pins a workflow-supplied `ref` to
- * `execution_jobs.git_credentials`, which the orchestrator writes at dispatch.
- * The agent, meanwhile, names an entry out of `jobConfig.gitCredentials`. The
- * two must be written together: a path that ships the map to the agent but
- * registers the job without it leaves the relay reading an empty declaration,
- * so every request the workflow legitimately makes is refused as undeclared.
+ * An organization-wide workflow's git-credential declaration reaches BOTH halves
+ * of the authorization model: the relay pins a workflow-supplied `ref` to
+ * `execution_jobs.git_credentials` (written at dispatch), and the agent names an
+ * entry from `jobConfig.gitCredentials`. Shipping the map to the agent without
+ * registering it leaves the relay refusing every legitimate request as undeclared.
  *
  * The fixture shape mirrors `process-webhook-globals-secrets.test.ts`.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { processWebhook } from './process-webhook.js';
 import type { WebhookInfo } from '../webhook/handler.js';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 const SOURCE_REPO = 'acme/app';
 const GLOBAL_REPO = 'acme/org-workflows';
@@ -48,14 +45,12 @@ function makeGlobalRegistration() {
         { _type: 'pr', events: ['opened'], targetBranches: [], sourceBranches: [], paths: [] },
       ],
       jobs: [
-        {
-          _type: 'static',
+        staticJob({
           name: 'scan',
           runsOn: [{ kind: 'exact', value: 'default' }],
-          needs: [],
           steps: [{ name: 'scan', hasOutputs: false }],
           gitCredentials: DECLARED,
-        },
+        }),
       ],
     },
   };
@@ -140,8 +135,7 @@ describe('an organization-wide workflow job carries its git-credential declarati
     expect(addJobsToRun).toHaveBeenCalled();
     const jobs = addJobsToRun.mock.calls[0][1] as Array<Record<string, unknown>>;
     expect(jobs).toHaveLength(1);
-    // Without this the relay reads an empty declaration and refuses every
-    // workflow-supplied ref the job config above tells the agent to send.
+    // Without it the relay refuses every workflow-supplied ref the job config sends.
     expect(jobs[0].gitCredentials).toEqual(DECLARED);
   });
 });

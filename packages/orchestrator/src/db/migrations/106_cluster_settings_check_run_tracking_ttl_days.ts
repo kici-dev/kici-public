@@ -1,18 +1,10 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `cluster_settings.check_run_tracking_ttl_days` (nullable integer).
- *
- * Retention window for `check_run_tracking` rows. The hourly cleanup sweep
- * deletes rows untouched for longer than this; 0 disables the sweep.
- *
- * Cluster-global (the sweep runs once per fleet on the cleanup tick, with no
- * tenant in scope at the read site), so it lives on `cluster_settings` rather
- * than `org_settings`. NULL means the orchestrator's own configured default
- * applies.
- *
- * Idempotent: guarded on column existence; a re-run on a database that already
- * has the column is a no-op.
+ * Add `cluster_settings.check_run_tracking_ttl_days`: the hourly cleanup sweep deletes
+ * `check_run_tracking` rows untouched for longer than this; 0 disables the sweep; NULL uses the
+ * orchestrator's configured default. Cluster-global, not `org_settings`, because the sweep runs
+ * fleet-wide with no tenant in scope at the read site. Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

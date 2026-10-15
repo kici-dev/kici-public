@@ -1,20 +1,14 @@
 /**
- * Tests for the agent and orchestrator uninstall commands' folder-anchored behavior:
- * refusal when no targeting flag and no CWD manifest, --instance-dir / --name
- * / CWD-manifest resolution, manager.uninstall + index-removal call shape,
- * and the orphan-self-heal path where the unit is already gone but the index
- * row still needs to disappear.
- *
- * Same partial-mock strategy as install.test.ts — stub only the platform-
- * touching surface of service/index.js (createServiceManager, detectPlatform,
- * resolveUserLevel, kiciConfigRoot) and re-export the real instance helpers
- * (resolveInstance, removeIndexEntry, readIndex, writeIndex, writeManifest).
+ * Folder-anchored agent and orchestrator uninstall, including the orphan
+ * self-heal (unit gone, index row still removed). As in install.test.ts, only
+ * the platform-touching surface of service/index.js is stubbed; the instance
+ * helpers are real.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
+import { makeTempDir } from '@kici-dev/test-support/tmp';
 import { Command } from 'commander';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import type {
   DiscoveredInstance,
@@ -24,8 +18,7 @@ import type {
   ServiceStatus,
 } from '../../../service/types.js';
 
-// Per-test mock state. Reassigned in beforeEach so each test gets its own
-// tmpdirs + a clean manager stub.
+// Per-test mock state, reassigned in beforeEach.
 let mockListResult: DiscoveredInstance[] = [];
 let mockIsInstalled = true;
 let mockStatusResult: ServiceStatus = { state: 'stopped' };
@@ -75,24 +68,20 @@ vi.mock('../../../service/index.js', async () => {
     resolveUserLevel: vi.fn().mockReturnValue(true),
     kiciConfigRoot: vi.fn(() => mockKiciRoot),
     createServiceManager: vi.fn(async (platform: ServicePlatform) => makeManager(platform)),
-    // Manager selection lives in the seam, so the real one runs here with the
-    // driver factory injected: every candidate platform gets its own double, and
-    // `op` records which one the command actually operated through.
+    // The real manager selection runs with the driver factory injected: each
+    // platform gets its own double, and `op` records which one the command used.
     resolveInstanceTarget: (args: Parameters<typeof actual.resolveInstanceTarget>[0]) =>
       actual.resolveInstanceTarget({ ...args, createManager: async (p) => makeManager(p) }),
   };
 });
 
-// The real resolveInstanceTarget above imports detectPlatform from
-// platform-detect.js itself, so the barrel's detectPlatform mock never reaches
-// discovery. Pin the host here as well (as service/instance/resolve.test.ts
-// does), so "a systemd host" holds on a host without systemd.
+// resolveInstanceTarget imports detectPlatform from platform-detect.js, past the
+// barrel mock, so pin the host here too (as service/instance/resolve.test.ts does).
 vi.mock('../../../service/platform-detect.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../service/platform-detect.js')>();
   return { ...actual, detectPlatform: vi.fn((): ServicePlatform => 'systemd') };
 });
 
-// Import after mocks so the action picks up the mocked module.
 import { registerServiceLifecycleVerbs, type ServiceComponent } from '../service-verbs.js';
 import {
   InstanceNotFoundError,
@@ -102,10 +91,6 @@ import {
 } from '../../../service/index.js';
 import type { InstanceManifest } from '../../../service/index.js';
 import { detectPlatform } from '../../../service/platform-detect.js';
-
-function mkTmp(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function makeManifest(
   component: ServiceComponent,
@@ -134,8 +119,8 @@ describe.each(['agent', 'orchestrator'] as const)('%s uninstall — folder-ancho
   let consoleErrorSpy: MockInstance<typeof console.error>;
 
   beforeEach(() => {
-    tmpInstanceDir = mkTmp(`kici-${component}-un-i-`);
-    tmpConfigRoot = mkTmp(`kici-${component}-un-c-`);
+    tmpInstanceDir = makeTempDir(`kici-${component}-un-i-`);
+    tmpConfigRoot = makeTempDir(`kici-${component}-un-c-`);
 
     mockListResult = [];
     mockIsInstalled = true;
@@ -184,7 +169,7 @@ describe.each(['agent', 'orchestrator'] as const)('%s uninstall — folder-ancho
     ]);
 
     const savedCwd = process.cwd();
-    const emptyCwd = mkTmp(`kici-${component}-un-cwd-`);
+    const emptyCwd = makeTempDir(`kici-${component}-un-cwd-`);
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
       throw new Error('process.exit called');
     }) as never);
@@ -247,7 +232,6 @@ describe.each(['agent', 'orchestrator'] as const)('%s uninstall — folder-ancho
     expect(cfg.envFilePath).toBe(manifest.envFilePath);
     expect(cfg.workingDirectory).toBe(manifest.configDir);
 
-    // Index entry removed.
     expect(readIndex(tmpConfigRoot)).toEqual([]);
   });
 
@@ -326,11 +310,9 @@ describe.each(['agent', 'orchestrator'] as const)('%s uninstall — folder-ancho
 
     await program.parseAsync(['node', component, 'uninstall', '--instance-dir', tmpInstanceDir]);
 
-    // Did NOT call manager.uninstall because nothing is installed.
     expect(mockUninstall).not.toHaveBeenCalled();
-    // But the index row IS gone — orphan self-heal.
+    // The index row is still removed: orphan self-heal.
     expect(readIndex(tmpConfigRoot)).toEqual([]);
-    // And the "not installed" line was printed.
     const logs = consoleLogSpy.mock.calls.map((c) => c.join(' ')).join('\n');
     expect(logs).toContain('is not installed');
   });
@@ -371,8 +353,8 @@ describe.each(['agent', 'orchestrator'] as const)('%s uninstall — folder-ancho
     expect([...new Set(operatedPlatforms)]).toEqual(['compose']);
   });
 
-  // breaks-if-wrong: the overwhelmingly common case must be unaffected — a
-  // systemd install on a systemd host still operates through the systemd driver.
+  // breaks-if-wrong: a systemd install on a systemd host still operates through
+  // the systemd driver.
   it('operates a systemd-manifest install through the systemd driver', async () => {
     writeManifest(
       tmpInstanceDir,

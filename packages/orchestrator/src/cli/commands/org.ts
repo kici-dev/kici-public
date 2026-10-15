@@ -32,7 +32,7 @@ const OFFLINE_NOTE =
 const PENDING_NOTE =
   'Note: the orchestrator has not authenticated with the Platform yet, so its Platform org is not listed.\n';
 
-/** Print the listing as a table, with a note when it lacks the Platform attachment. */
+/** Adds a note when the listing lacks the Platform attachment. */
 function printOrgList(result: OrgListResponse): void {
   if (result.orgs.length === 0) {
     console.log('No org ids found.');

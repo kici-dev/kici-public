@@ -39,8 +39,7 @@ describe('validateSecretKey', () => {
 
   it('rejects the concrete confusion pair from the defect report', () => {
     // scope="b", key="c:d" and scope="b:c", key="d" both render AAD "a:b:c:d".
-    // The scope half is already rejected by validateScopeName; rejecting the key
-    // half is what closes the pair.
+    // validateScopeName already rejects the scope half; this closes the key half.
     const ambiguous = 'c:d';
     expect(validateSecretKey(ambiguous)).not.toBeNull();
   });
@@ -74,12 +73,9 @@ describe('validateSecretKey', () => {
     expect(SECRET_KEY_PATTERN.test('A9._-')).toBe(true);
     expect(SECRET_KEY_PATTERN.test('a:b')).toBe(false);
 
-    // Assert the identity the name claims, rather than spot-checking two
-    // strings: sweep every single-byte code point and require both patterns to
-    // agree. The two literals are written in a different order
-    // (`[A-Za-z0-9._-]` vs `[A-Za-z0-9_.-]`), so comparing `.source` would
-    // report a difference that does not exist — compare behaviour instead.
-    // This is what fails if either charset is ever widened on its own.
+    // Compare behaviour over every ASCII code point, not `.source`: the literals
+    // order their classes differently (`[A-Za-z0-9._-]` vs `[A-Za-z0-9_.-]`).
+    // This fails if either charset is ever widened on its own.
     for (let code = 0; code < 128; code++) {
       const ch = String.fromCharCode(code);
       expect(SECRET_KEY_PATTERN.test(ch), `code point ${code}`).toBe(

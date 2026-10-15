@@ -1,20 +1,17 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the `pending_attestations` deferred-attestation outbox and an idempotency
- * unique index on `attestations`.
+ * The `pending_attestations` deferred-attestation outbox, plus an idempotency unique index on
+ * `attestations`.
  *
- * When a build's provenance mint fails transiently, the agent freezes and
- * DSSE-signs the statement at build time; the orchestrator records the frozen
- * envelope here instead of failing the job. A Raft-leader-only retrier later
- * mints the deferred token, attaches it, uploads the bundle, and records one
- * `attestations` row — deleting the pending row. The unique index on
- * `attestations (run_id, job_id, subject_digest)` makes that fulfilment
- * idempotent across a cluster (ON CONFLICT DO NOTHING).
+ * When a provenance mint fails transiently, the agent freezes and DSSE-signs the statement at
+ * build time, and the orchestrator records the envelope here instead of failing the job. A
+ * Raft-leader-only retrier later mints the token, uploads the bundle, records one
+ * `attestations` row and deletes the pending row; the `(run_id, job_id, subject_digest)` unique
+ * index makes that idempotent across a cluster (ON CONFLICT DO NOTHING).
  *
- * `origin_kind` holds the non-`live` `AttestationOrigin` values
- * (`deferred` / `offline-backfill`); the `created_at` default anchors the true
- * build time so temporal honesty survives a later mint.
+ * `origin_kind` holds the non-`live` `AttestationOrigin` values (`deferred` /
+ * `offline-backfill`); `created_at` anchors the true build time across a later mint.
  *
  * Idempotent: guarded on table existence.
  */

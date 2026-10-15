@@ -1,21 +1,13 @@
-/**
- * Token management commands for kici-admin.
- *
- * Provides CRUD operations for admin API tokens:
- *   token create, list, revoke
- */
+/** `kici-admin token create | list | revoke` for admin API tokens. */
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { cliAction } from './shared/cli-action.js';
 
 /**
- * Parse a `--expires` value into an absolute expiry Date.
- *
- * Accepts either a duration shorthand relative to now (`<N>d` days,
- * `<N>h` hours, `<N>m` minutes — e.g. `30d`, `12h`, `45m`) or an
- * absolute ISO-8601 datetime (e.g. `2026-12-31T00:00:00Z`). Throws on any
- * other input so a typo never silently creates a non-expiring token.
+ * `--expires` as an absolute Date: `<N>d`, `<N>h` or `<N>m` from now, or an
+ * ISO-8601 datetime. Anything else throws, so a typo never creates a
+ * non-expiring token.
  */
 export function parseExpiresAt(input: string, now: Date = new Date()): Date {
   const durationMatch = /^(\d+)([dhm])$/.exec(input.trim());
@@ -38,9 +30,6 @@ export function parseExpiresAt(input: string, now: Date = new Date()): Date {
   return asDate;
 }
 
-/**
- * Format tokens as a table.
- */
 export function formatTokenTable(tokens: any[]): string {
   if (tokens.length === 0) return 'No tokens found.';
 
@@ -52,9 +41,7 @@ export function formatTokenTable(tokens: any[]): string {
     const id = t.id ?? '-';
     const label = t.label ?? '-';
     const role = t.role ?? '-';
-    // An absent subject prints `unlinked`, not `-`: the listing names the
-    // condition the RBAC drift report looks for instead of rendering it as
-    // one more empty cell.
+    // `unlinked`, not `-`: it names the condition the RBAC drift report looks for.
     const subject = t.subject ?? 'unlinked';
     const rk = t.routingKey ?? t.routing_key ?? '-';
     const created = t.createdAt ?? t.created_at ?? '-';

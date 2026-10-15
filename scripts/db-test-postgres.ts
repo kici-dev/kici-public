@@ -1,17 +1,14 @@
 /**
  * Shared vitest `globalSetup` that gives the real-Postgres suites a database.
  *
- * The suites that exercise real SQL — per-migration
- * schema tests, repositories, stores, and everything downstream of them — read
- * the admin connection string from `KICI_TEST_ADMIN_DATABASE_URL` at module
- * scope and skip when it is absent. This setup starts a throwaway PostgreSQL
- * container and sets that variable before the test workers fork, so those
- * suites execute in an ordinary `pnpm test` instead of reporting skipped-green.
+ * The real-SQL suites (migrations, repositories, stores and downstream) read
+ * `KICI_TEST_ADMIN_DATABASE_URL` at module scope and skip when it is absent.
+ * This setup starts a throwaway PostgreSQL container and sets the variable
+ * before the workers fork, so `pnpm test` runs them instead of skipping green.
  *
- * It is selection-aware: the container starts only when the run's selected
- * specs actually include a gated module, so `vitest run src/routes` costs
- * nothing. Each package with such suites references this file by relative
- * path from its own vitest config.
+ * The container starts only when the selected specs include a gated module, so
+ * `vitest run src/routes` costs nothing. Each package references this file by
+ * relative path from its vitest config.
  */
 import { readFileSync } from 'node:fs';
 import { $ } from 'zx';
@@ -27,10 +24,10 @@ import {
 } from './db-test-postgres-support.ts';
 
 /**
- * Prefix every throwaway container shares, so a leaked one is identifiable by
- * name. `--rm` plus the returned teardown removes the container on any ordinary
- * exit (including a SIGINT vitest handles); a hard kill of the runner leaves it
- * running, and `podman/docker rm -f kici-db-test-pg-*` clears it by hand.
+ * Makes a leaked container identifiable by name. `--rm` plus the teardown
+ * removes it on any ordinary exit (including a SIGINT vitest handles); a hard
+ * kill leaves it running until the next setup reaps it, or
+ * `podman/docker rm -f kici-db-test-pg-*` clears it by hand.
  */
 const CONTAINER_PREFIX = 'kici-db-test-pg';
 
@@ -53,19 +50,15 @@ const shell = $({ nothrow: true, stdio: ['ignore', 'pipe', 'pipe'] });
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Vitest exposes the CLI's positional filters as an undocumented
- * `filenamePattern` field. Calling `getRelevantTestSpecifications()` with no
- * argument ignores the filter and returns every spec in the project, which
- * would spin a container for `vitest run src/routes`; `config.filters` is
- * always undefined. A unit test guards that this field still exists, so a
- * vitest upgrade that moves it fails loudly instead of silently returning the
- * gated suites to skipped-green.
+ * Vitest exposes the CLI's positional filters only as the undocumented
+ * `filenamePattern` field: `config.filters` is always undefined, and
+ * `getRelevantTestSpecifications()` with no argument returns every spec. A unit
+ * test guards the field, so a vitest upgrade that moves it fails loudly.
  */
 function cliFilters(project: TestProject): string[] {
   return (project.vitest as unknown as { filenamePattern?: string[] }).filenamePattern ?? [];
 }
 
-/** Resolve the host port the container's 5432 was published on. */
 async function publishedPort(runtime: ContainerRuntime, name: string): Promise<string> {
   const out = await shell`${runtime} port ${name} 5432`;
   if (out.exitCode !== 0) {
@@ -81,13 +74,11 @@ async function publishedPort(runtime: ContainerRuntime, name: string): Promise<s
 }
 
 /**
- * Poll `pg_isready` from INSIDE the container, so the host needs no psql
- * client and the probe follows the same network path the server listens on.
+ * Polls `pg_isready` INSIDE the container, so the host needs no psql client.
  *
- * `-h 127.0.0.1` forces the probe over TCP rather than the default unix
- * socket. The entrypoint runs its bootstrap steps against a socket-only
- * server started with `listen_addresses=''`, so a socket probe can report
- * "accepting connections" while the port the suites dial is still closed.
+ * `-h 127.0.0.1` forces TCP: the entrypoint bootstraps against a socket-only
+ * server (`listen_addresses=''`), so a socket probe can report ready while the
+ * port the suites dial is still closed.
  */
 async function waitForReady(runtime: ContainerRuntime, name: string): Promise<void> {
   for (let attempt = 0; attempt < READY_ATTEMPTS; attempt++) {
@@ -105,8 +96,8 @@ export default async function setup(project: TestProject): Promise<() => Promise
   const noop = async (): Promise<void> => {};
 
   if (process.env[DB_SKIP_ENV] === '1') return noop;
-  // An operator-supplied server wins: this is the documented long-lived-server
-  // debugging workflow, and we must not shadow it with a throwaway container.
+  // An operator-supplied server (the documented long-lived-server debugging
+  // workflow) wins over a throwaway container.
   if (process.env[DB_GATE_ENV]) return noop;
 
   const specs = await project.vitest.getRelevantTestSpecifications(cliFilters(project));
@@ -118,11 +109,8 @@ export default async function setup(project: TestProject): Promise<() => Promise
 
   const runtime = resolveContainerRuntime();
 
-  // A hard-killed vitest runner skips the teardown below, so `--rm` never fires
-  // and the container is left running — the leak the CONTAINER_PREFIX comment
-  // predicts. Reap old strays here, where the runtime is already resolved.
-  // Purely best-effort: hygiene must never fail a test run, so every call goes
-  // through the module's nothrow `shell` and a failure is ignored.
+  // Reap strays a hard-killed runner left behind. Best-effort: hygiene must
+  // never fail a test run, so every call uses the nothrow `shell`.
   const listed =
     await shell`${runtime} ps --filter ${`name=${CONTAINER_PREFIX}`} --format {{.Names}}`;
   if (listed.exitCode === 0) {
@@ -137,9 +125,8 @@ export default async function setup(project: TestProject): Promise<() => Promise
   }
   const name = `${CONTAINER_PREFIX}-${process.pid}-${Date.now().toString(36)}`;
 
-  // Built as an argv array rather than a multi-line template: zx passes the
-  // literal text to a shell verbatim, so an embedded newline would end the
-  // command early and drop every flag after it.
+  // An argv array, not a multi-line template: zx passes literal text to the
+  // shell verbatim, so a newline would end the command and drop later flags.
   const runArgs = [
     'run',
     '-d',
@@ -147,8 +134,7 @@ export default async function setup(project: TestProject): Promise<() => Promise
     '--name',
     name,
     // `<ip>::<containerPort>` is the one random-host-port form both runtimes
-    // accept — podman rejects `0:5432` outright — and binding to loopback
-    // keeps the throwaway database off every other interface.
+    // accept (podman rejects `0:5432`); loopback keeps it off other interfaces.
     '-p',
     '127.0.0.1::5432',
     '-e',

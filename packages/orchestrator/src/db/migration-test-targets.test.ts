@@ -4,25 +4,16 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 /**
- * Per-migration test target guard.
+ * `NNN_thing.test.ts` asserts the schema migration `NNN` produces, so it must migrate only as
+ * far as `NNN`: under `migrateToLatest()` a later migration may have reshaped the column, and
+ * the test fails or passes for the wrong reason. Those suites run only with
+ * `KICI_TEST_ADMIN_DATABASE_URL`, so the rot is invisible in a normal `pnpm test`.
  *
- * A test named `NNN_thing.test.ts` documents the schema that migration `NNN`
- * produces, so it must apply the migration set only as far as `NNN`. Applying
- * the whole set instead (`migrateToLatest()`) runs the assertions against the
- * schema at the head of the migration list, where a later migration may already
- * have dropped or reshaped the column the test checks — the test then fails, or
- * worse passes for the wrong reason. Those suites only execute when
- * `KICI_TEST_ADMIN_DATABASE_URL` is set, so the rot is invisible in a normal
- * `pnpm test` run.
+ * This guard reads the sources off disk, so it runs in every `pnpm test` and fails once a
+ * per-migration test bypasses `migrateToOwnMigration()`, which derives the target from the
+ * test's file name.
  *
- * This guard needs no database: it reads the test sources off disk, so it runs
- * in every `pnpm test` and fails the moment a per-migration test stops going
- * through `migrateToOwnMigration()` — the harness that derives the target from
- * the test file's own name and has no path back to the whole set.
- *
- * Repo/store tests outside `migrations/` (host roster, artifact store, the repo
- * suites) legitimately want head-of-list schema and are deliberately out of
- * this guard's scope.
+ * Repo/store tests outside `migrations/` want head-of-list schema and are out of scope.
  */
 describe('per-migration test targets', () => {
   const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), 'migrations');
@@ -40,11 +31,9 @@ describe('per-migration test targets', () => {
   }
 
   /**
-   * A test that opens a real database — the only kind that has a target to get
-   * wrong. Matched on any of the three real-connection signals rather than the
-   * env-var name alone, so a test that reaches the gate through a shared helper
-   * still has to go through the harness. A mock-database unit test casts an
-   * object to `Kysely<…>` and matches none of these.
+   * A test that opens a real database, the only kind with a target to get wrong. Any
+   * real-connection signal matches, not only the env-var name, so a test gated through a shared
+   * helper still must use the harness. A mock-database test casts to `Kysely<…>` and matches none.
    */
   function databaseBacked(t: { source: string }): boolean {
     return (

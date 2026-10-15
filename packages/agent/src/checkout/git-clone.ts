@@ -1,73 +1,48 @@
-// Git operations use execFileSync directly (not zx) to avoid
-// PowerShell quoting issues with Windows paths containing backslashes.
+// execFileSync, not zx: zx's PowerShell quoting mangles Windows backslash paths.
 
 import { execFileSync } from 'node:child_process';
 import { setupSshAuth, type SshAuthSetup } from './ssh-auth.js';
 
 /**
- * Structured clone auth. Mirrors `gitAuthSchema` on the orchestrator-agent
- * protocol so a single shape carries both HTTPS Basic (GitHub App tokens,
- * PATs) and SSH (universal-git, pinned host keys).
+ * Mirrors the protocol's `gitAuthSchema`: HTTPS Basic (GitHub App tokens, PATs)
+ * or SSH (universal-git, pinned host keys).
  */
 export interface GitAuth {
   kind: 'basic' | 'ssh';
-  /** Basic-auth username. Omit for SSH. */
   user?: string;
   /** Basic-auth password/PAT, or PEM-encoded SSH private key. */
   secret: string;
-  /** SSH-only. `accept-new` (default) or `pinned`. */
+  /** SSH-only; defaults to `accept-new`. */
   sshHostKeyPolicy?: 'accept-new' | 'pinned';
   /** SSH-only. Required when `sshHostKeyPolicy === 'pinned'`. */
   sshKnownHostsPem?: string;
 }
 
-/**
- * Options for cloning a git repository.
- */
 interface CloneOptions {
-  /** Full HTTPS repo URL (e.g., https://github.com/org/repo.git) */
   repoUrl: string;
-  /** Git ref to checkout (branch name or tag) */
+  /** Branch or tag; empty clones the default branch. */
   ref: string;
-  /** Expected commit SHA (for verification after clone) */
+  /** Expected commit, verified after the clone. */
   sha: string;
-  /** Directory to clone into */
   workDir: string;
-  /**
-   * Structured auth material. When `kind === 'basic'`, the credential goes
-   * through `http.extraHeader`. When `kind === 'ssh'`, the clone uses
-   * `GIT_SSH_COMMAND` with a temp private key (and optional pinned known_hosts).
-   */
+  /** Basic goes through `http.extraHeader`; SSH through `GIT_SSH_COMMAND` with a temp key. */
   gitAuth?: GitAuth;
-  /** Clone depth (default: 1 for shallow clone) */
+  /** Defaults to 1 (shallow). */
   depth?: number;
-  /**
-   * When set, the clone is configured to use this credential helper, so every
-   * later git network operation asks the agent for a freshly minted credential
-   * instead of relying on one captured at clone time.
-   */
+  /** Later git network operations ask this helper for a freshly minted credential. */
   credentialHelperPath?: string;
-  /**
-   * When set, the temp SSH key is handed to the job rather than deleted when
-   * the clone returns — which is what lets a later step push. Omit and the
-   * existing cleanup applies unchanged.
-   */
+  /** Set, the temp SSH key is handed to the job instead of deleted, so a later step can push. */
   sshCleanupRegistry?: SshCleanupRegistry;
 }
 
-/** Hands SSH key cleanup to the job, so the key outlives the clone. */
 export interface SshCleanupRegistry {
   defer(cleanup: () => Promise<void>): void;
 }
 
 /**
- * Point a clone at the agent's credential helper.
- *
- * Only the helper PATH is written — never a secret — which is what makes it
- * safe to persist in `.git/config`. `useHttpPath` makes git include
- * `path=owner/repo.git` in every credential query, without which the helper
- * could not tell one repository from another and a write grant could not be
- * confined to its own repo.
+ * Point a clone at the agent's credential helper. Only the helper path, never a
+ * secret, lands in `.git/config`. `useHttpPath` adds `path=owner/repo.git` to
+ * every query, so a write grant can be confined to its own repo.
  */
 export function configureCredentialHelper(workDir: string, helperPath: string): void {
   execFileSync('git', ['-C', workDir, 'config', 'credential.helper', helperPath], {
@@ -81,10 +56,8 @@ export function configureCredentialHelper(workDir: string, helperPath: string): 
 }
 
 /**
- * Strip auth credentials from git error messages to prevent token leakage.
- * Node's execFileSync includes the full command line (including -c http.extraHeader
- * and GIT_SSH_COMMAND flags) in error messages, which would expose Base64-encoded
- * tokens or the absolute path of a temporary SSH key file in logs.
+ * execFileSync errors embed the full command line, which would leak the Base64
+ * `http.extraHeader` token or the temp SSH key path into logs.
  */
 function sanitizeGitError(error: unknown): Error {
   if (!(error instanceof Error)) return new Error(String(error));
@@ -104,13 +77,9 @@ function redactSensitive(input: string): string {
 }
 
 /**
- * Shallow-clone a git repository at a specific ref with optional token auth.
- *
- * Token authentication uses git's `-c http.extraHeader` mechanism which keeps
- * the token out of the clone URL (not visible in `git remote -v` or logs).
- *
- * After clone, verifies that HEAD matches the expected SHA to prevent
- * wrong-ref execution.
+ * Shallow-clone at a ref, then verify HEAD is the expected SHA to prevent
+ * wrong-ref execution. `-c http.extraHeader` keeps a token out of the URL
+ * (`git remote -v`, logs).
  *
  * @throws Error if clone fails or SHA does not match
  */
@@ -128,19 +97,15 @@ export async function gitClone(options: CloneOptions): Promise<void> {
 
   const auth: GitAuth | undefined = gitAuth;
 
-  // Build git clone args and optional env overrides
   const args: string[] = [];
   const envEntries: Record<string, string> = {};
   let needsCustomEnv = false;
   let safeDirCleanup: (() => Promise<void>) | undefined;
 
-  // For file:// URLs, disable git's safe.directory check. The agent runs in a
-  // rootless-podman container where the bind-mounted source repo's host UID
-  // does not match the container UID. `GIT_CONFIG_KEY_*` env vars and `-c
-  // safe.directory` flags are NOT honoured by the `upload-pack` subprocess
-  // git spawns to read the source repo for a file:// clone, so we have to
-  // write a temp gitconfig file and point `GIT_CONFIG_GLOBAL` at it — that
-  // path is re-read by every git process that inherits the env.
+  // file://: disable safe.directory, since in rootless podman the bind-mounted
+  // repo's host UID differs from the container UID. The `upload-pack` child
+  // ignores `GIT_CONFIG_KEY_*` and `-c safe.directory`, so write a temp config
+  // and point `GIT_CONFIG_GLOBAL` at it; every inheriting git re-reads it.
   if (repoUrl.startsWith('file://')) {
     const { writeFile } = await import('node:fs/promises');
     const path = await import('node:path');
@@ -158,9 +123,7 @@ export async function gitClone(options: CloneOptions): Promise<void> {
   let sshSetup: SshAuthSetup | undefined;
   try {
     if (auth?.kind === 'basic') {
-      // HTTPS Basic auth via `http.extraHeader` — keeps the secret out of
-      // the clone URL (not visible in `git remote -v` or logs). Default
-      // username is `x-access-token` for GitHub App install tokens.
+      // `x-access-token` is the GitHub App install-token username.
       const user = auth.user ?? 'x-access-token';
       const basic = Buffer.from(`${user}:${auth.secret}`).toString('base64');
       args.push('-c', `http.extraHeader=Authorization: Basic ${basic}`);
@@ -178,15 +141,12 @@ export async function gitClone(options: CloneOptions): Promise<void> {
       ? ({ ...process.env, ...envEntries } as Record<string, string>)
       : undefined;
 
-    // When ref is empty, clone the default branch (omit --branch)
     if (ref) {
       args.push('clone', '--depth', String(depth), '--branch', ref, repoUrl, workDir);
     } else {
       args.push('clone', '--depth', String(depth), repoUrl, workDir);
     }
 
-    // Execute clone using execFileSync to bypass zx/PowerShell quoting issues
-    // on Windows (backslashes in paths get mangled by PowerShell's quote function).
     const { execFileSync } = await import('node:child_process');
     try {
       execFileSync('git', args, { stdio: 'pipe', timeout: 120_000, ...(env && { env }) });
@@ -194,18 +154,13 @@ export async function gitClone(options: CloneOptions): Promise<void> {
       throw sanitizeGitError(err);
     }
 
-    // Configure the credential helper as soon as the clone exists, so every
-    // later git network operation on this tree (fetch, push) asks the agent for
-    // a freshly minted credential. Done here rather than at the end of the
-    // function because the SHA check below can return early.
+    // Before the SHA check, which can return early.
     if (credentialHelperPath) {
       configureCredentialHelper(workDir, credentialHelperPath);
     }
 
-    // Verify HEAD matches expected SHA (skip when sha is empty or 'HEAD' — no specific commit to verify)
     if (!sha || sha === 'HEAD') return;
 
-    // Pass env overrides (e.g., safe.directory, GIT_SSH_COMMAND) to all subsequent git calls
     const envOpts = env ? { env } : {};
 
     const actualSha = execFileSync('git', ['-C', workDir, 'rev-parse', 'HEAD'], {
@@ -215,15 +170,14 @@ export async function gitClone(options: CloneOptions): Promise<void> {
     }).trim();
 
     if (!actualSha.startsWith(sha)) {
-      // SHA mismatch — the branch may have advanced since the webhook was received.
-      // Deepen the clone to find the target commit and check it out.
+      // The branch may have advanced since the webhook: deepen to the target commit.
       const fetchArgs: string[] = [];
       if (auth?.kind === 'basic') {
         const user = auth.user ?? 'x-access-token';
         const basic = Buffer.from(`${user}:${auth.secret}`).toString('base64');
         fetchArgs.push('-c', `http.extraHeader=Authorization: Basic ${basic}`);
       }
-      // SSH auth propagates via GIT_SSH_COMMAND in `env` (no per-call flag).
+      // SSH auth rides GIT_SSH_COMMAND in `env`.
       fetchArgs.push('fetch', '--depth', '50', 'origin', sha);
 
       try {
@@ -241,7 +195,6 @@ export async function gitClone(options: CloneOptions): Promise<void> {
         ...envOpts,
       });
 
-      // Re-verify after checkout
       const recheckedSha = execFileSync('git', ['-C', workDir, 'rev-parse', 'HEAD'], {
         encoding: 'utf-8',
         timeout: 10_000,
@@ -254,8 +207,7 @@ export async function gitClone(options: CloneOptions): Promise<void> {
   } finally {
     if (sshSetup) {
       if (sshCleanupRegistry) {
-        // Hand over: the key must outlive this clone so a later `git push` can
-        // use it. SSH keys do not expire, so holding it for the job is safe.
+        // Holding the key for the job is safe: SSH keys do not expire.
         const setup = sshSetup;
         sshCleanupRegistry.defer(() => setup.cleanup().catch(() => {}));
       } else {

@@ -1,10 +1,9 @@
 /**
  * Zod argument schemas for the KiCI developer MCP tools.
  *
- * Browser-safe (zod only) so they live in the shared engine barrel. Each export
- * is a Zod *raw shape* (a plain object of Zod fields) so it can be passed
- * directly as an MCP tool `inputSchema`. The Platform-hosted developer MCP
- * server is the consumer.
+ * Browser-safe (zod only), so they live in the shared engine barrel. Each export
+ * is a Zod *raw shape*, passed directly as an MCP tool `inputSchema` by the
+ * Platform-hosted developer MCP server.
  */
 import { z } from 'zod';
 

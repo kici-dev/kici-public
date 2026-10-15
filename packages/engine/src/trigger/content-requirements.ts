@@ -3,13 +3,13 @@
  *
  * A git-event trigger may carry a `requires` list ({@link LockContentRequirement}):
  * pure DATA describing a query over the bytes of one source file at the event's
- * ref. The orchestrator interprets that data here — it never executes author
- * code — which is what keeps content filtering inside the orchestrator under the
- * execution-purity model.
+ * ref. The orchestrator interprets it here and never executes author code, which
+ * keeps content filtering inside the orchestrator under the execution-purity
+ * model.
  *
- * This module imports `yaml`, so it is a Node-safe subpath export
- * (`@kici-dev/engine/trigger/content-requirements`) and is deliberately kept out
- * of the browser-facing engine barrel (`src/index.ts`).
+ * It imports `yaml`, so it is the Node-only subpath export
+ * `@kici-dev/engine/trigger/content-requirements`, kept out of the browser-facing
+ * engine barrel.
  */
 import { JSONPath } from 'jsonpath-plus';
 import { parse as parseYaml } from 'yaml';
@@ -24,10 +24,9 @@ export type { ContentFormat, ContentRequirement, LockContentRequirement } from '
 const MAX_CONTENT_BYTES = 1024 * 1024; // 1 MiB
 
 /**
- * Anchor/alias expansion cap for YAML parsing. The `yaml` library's default of
- * 100 does not reject a small billion-laughs bomb; 50 rejects it while staying
- * generous for legitimately-anchored configs (merge keys, shared defaults). The
- * 1 MiB byte cap above bounds total node count as the complementary limit.
+ * YAML anchor/alias expansion cap. The `yaml` default of 100 lets a small
+ * billion-laughs bomb through; 50 rejects it and still fits anchored configs
+ * (merge keys, shared defaults). The 1 MiB byte cap bounds total node count.
  */
 const YAML_MAX_ALIAS_COUNT = 50;
 
@@ -39,10 +38,9 @@ export interface ContentRequirementResult {
 }
 
 /**
- * Parse `bytes` for the given concrete format. `text` returns the raw string;
- * `json` uses `JSON.parse`; `yaml` uses a hardened `yaml.parse` with an explicit
- * anchor/alias cap. Throws on a malformed document (the caller treats a throw as
- * indeterminate).
+ * Parse `bytes` for the given format (`yaml` with the alias cap; `text` as the
+ * raw string). Throws on a malformed document, which the caller treats as
+ * indeterminate.
  */
 export function parseForFormat(bytes: string, format: 'json' | 'yaml' | 'text'): unknown {
   switch (format) {
@@ -55,22 +53,19 @@ export function parseForFormat(bytes: string, format: 'json' | 'yaml' | 'text'):
   }
 }
 
-/** True when the JSONPath resolves to ≥1 node in the parsed document. */
 function pathExists(doc: unknown, path: string): boolean {
   const results = JSONPath({ path, json: doc as never, wrap: true }) as unknown[];
   return results.length > 0;
 }
 
-/** JSONPath queries need an object root; wrap a non-object parsed doc so lookups stay safe. */
+/** JSONPath queries need an object root; a non-object parsed doc becomes `{}`. */
 function asJsonRoot(doc: unknown): Record<string, unknown> {
   return typeof doc === 'object' && doc !== null ? (doc as Record<string, unknown>) : {};
 }
 
 /**
- * Evaluate one content requirement against the resolved file map.
- * Returns a per-entry {@link ContentRequirementResult}. `pass:false` with no
- * `indeterminate` is a definite negative; `indeterminate` means the file could
- * not be evaluated (oversize, parse failure, unsafe regex) and is fail-visible.
+ * `pass:false` with no `indeterminate` is a definite negative; `indeterminate`
+ * means the file could not be evaluated (oversize, parse failure, unsafe regex).
  */
 function evaluateOne(
   req: LockContentRequirement,
@@ -89,8 +84,8 @@ function evaluateOne(
     return { pass: false, indeterminate: `${req.file}: exceeds 1 MiB size cap` };
   }
 
-  // The raw-text keys are independent of parse format; the shared matcher owns
-  // their semantics so this site and the Tier-0 `commitMessage` filter agree.
+  // The raw-text keys ignore parse format; the shared matcher keeps this site and
+  // the Tier-0 `commitMessage` filter in agreement.
   const textResult = evaluateTextMatch(bytes, {
     ...(req.contains !== undefined && { contains: req.contains }),
     ...(req.notContains !== undefined && { notContains: req.notContains }),
@@ -134,11 +129,9 @@ function evaluateOne(
 /**
  * Evaluate an AND-ed list of content requirements against a resolved file map.
  *
- * Every entry must pass for the overall result to pass; an empty list passes.
- * The first indeterminate entry short-circuits and is surfaced (fail-visible):
- * an unevaluable file NEVER passes silently.
+ * An empty list passes. The first indeterminate entry short-circuits and is
+ * surfaced: an unevaluable file NEVER passes silently.
  *
- * @param reqs  The lock `requires` list (each entry AND-ed).
  * @param files Resolved file contents keyed by repo-relative path. A missing key
  *              or `{ present: false }` means the file does not exist at the ref.
  */

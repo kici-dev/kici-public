@@ -1,23 +1,13 @@
 /**
- * Internal event CLI commands for kici-admin.
+ * `kici-admin event`. `list` and `show` are HTTP-only
+ * (`GET /api/v1/admin/events[/:id]`): dispatch state, how the router resolved
+ * the event (`matched`, or why nothing matched), and for `show` the redacted
+ * payload and dispatched runs.
  *
- *   event emit <name> --payload-file <path> [--source-routing-key <k>] [--source-repo <r>]
- *                     [--database-url] [--json]
- *   event list [--name <n>] [--outcome <o>] [--since <iso>] [--before <cursor>] [--limit <n>] [--json]
- *   event show <eventId> [--json]
- *
- * `list` and `show` are HTTP-only (`GET /api/v1/admin/events[/:id]`): each
- * event's dispatch state, how the router resolved it (`matched`, or why
- * nothing matched), and for `show` the redacted payload and the runs the
- * event dispatched.
- *
- * Landing pad for manually emitting an internal event (mirrors what
- * `agent ctx.emit()` does from within a step execution) by inserting a row into
- * `kici_events` and firing `pg_notify('kici_event_channel', <id>)` so the
- * orchestrator EventRouter picks it up immediately.
- *
- * Dual-mode: HTTP (`POST /api/v1/admin/events/emit`) or `--database-url`
- * (direct DB via `emitKiciEventDirect` from `@kici-dev/shared`).
+ * `emit` does what `ctx.emit()` does in a step: insert a `kici_events` row and
+ * fire `pg_notify('kici_event_channel', <id>)` so the EventRouter picks it up
+ * at once, over HTTP (`POST /api/v1/admin/events/emit`) or `--database-url`
+ * (`emitKiciEventDirect`).
  */
 import { readFileSync } from 'node:fs';
 import type { Command } from 'commander';
@@ -63,9 +53,9 @@ interface EventDetail extends EventRow {
 }
 
 /**
- * Turn the bare 404 an orchestrator without these routes answers into an
- * upgrade hint. A known route's 404 carries a JSON `error`, which the client
- * surfaces verbatim, so only the router's default body matches here.
+ * The bare 404 of an orchestrator without these routes becomes an upgrade
+ * hint. A known route's 404 carries a JSON `error`, so only the router's
+ * default body matches.
  */
 function describeReadError(err: unknown, subcommand: string): string {
   const message = toErrorMessage(err);
@@ -233,9 +223,8 @@ export function registerEventCommands(program: Command, getClient: () => AdminAp
             json?: boolean;
           },
         ) => {
-          // Read and parse the payload file. We do this client-side so both
-          // dual-mode paths share the same validation surface and so ENOENT /
-          // JSON-parse errors surface before any DB connection is opened.
+          // Client-side, so both modes share one validation and ENOENT / parse
+          // errors surface before any DB connection opens.
           let payloadContents: string;
           try {
             payloadContents = readFileSync(opts.payloadFile, 'utf-8');

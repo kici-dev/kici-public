@@ -23,21 +23,16 @@ import { dashboardEncryptionJwkSchema } from './dashboard-sealed-write.js';
 export const OrchRole = z.enum(['coordinator', 'worker']);
 export type OrchRole = z.infer<typeof OrchRole>;
 
-/**
- * Orchestrator-advertised capabilities sent in auth.request.
- * Uses .passthrough() so newer orchestrators sending unknown flags are preserved.
- */
+/** Orchestrator-advertised capabilities sent in auth.request. */
 export const orchCapabilitiesSchema = z
   .object({
     /** Orchestrator's role in the cluster (coordinator manages DB/vault, worker is stateless). */
     orchRole: OrchRole,
     /**
-     * Per-operation dashboard-write policy. Sparse map where each
-     * present key flips one `DashboardWriteOperation` to false. Missing
-     * keys are treated as `true` (permissive default). Sent on auth so
-     * Platform's per-org cache populates immediately; rebroadcast via
-     * the standalone `orch.capabilities.update` message on policy
-     * change (see platform-orchestrator.ts).
+     * Per-operation dashboard-write policy: a sparse map where each present key
+     * flips one `DashboardWriteOperation` to false; missing keys mean `true`.
+     * Sent on auth so the Platform's per-org cache populates immediately, and
+     * rebroadcast via `orch.capabilities.update` on policy change.
      */
     dashboardWrites: dashboardWritePolicyMap.optional(),
     /**
@@ -59,7 +54,6 @@ export const orchCapabilitiesSchema = z
   })
   .passthrough();
 
-/** Inferred type for orchestrator capabilities. */
 export type OrchCapabilities = z.infer<typeof orchCapabilitiesSchema>;
 
 /** Default orchestrator capabilities sent in auth.request. */
@@ -70,7 +64,6 @@ export const ORCH_CAPABILITIES = Object.freeze({
 /** Platform-advertised capabilities sent to the orchestrator after auth. */
 export const platformCapabilitiesSchema = z.object({}).passthrough();
 
-/** Inferred type for Platform capabilities. */
 export type PlatformCapabilities = z.infer<typeof platformCapabilitiesSchema>;
 
 /** Default Platform capabilities advertised to the orchestrator after auth. */
@@ -79,7 +72,6 @@ export const PLATFORM_CAPABILITIES = Object.freeze({} satisfies PlatformCapabili
 /** Orchestrator -> agent capabilities, advertised on `register.ack`. */
 export const orchAgentCapabilitiesSchema = z.object({}).passthrough();
 
-/** Inferred type for orchestrator -> agent capabilities. */
 export type OrchAgentCapabilities = z.infer<typeof orchAgentCapabilitiesSchema>;
 
 /** Default orchestrator -> agent capabilities advertised on register.ack. */
@@ -88,7 +80,6 @@ export const ORCH_AGENT_CAPABILITIES = Object.freeze({} satisfies OrchAgentCapab
 /** Agent -> orchestrator capabilities, advertised on `agent.register`. */
 export const agentCapabilitiesSchema = z.object({}).passthrough();
 
-/** Inferred type for agent -> orchestrator capabilities. */
 export type AgentCapabilities = z.infer<typeof agentCapabilitiesSchema>;
 
 /** Default agent -> orchestrator capabilities advertised on agent.register. */

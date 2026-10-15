@@ -3,13 +3,10 @@ import path from 'node:path';
 import fg from 'fast-glob';
 
 /**
- * Resolve hashFiles patterns (paths and globs) relative to git root and build a deterministic
- * digest string: sorted resolved paths, each followed by "\n" and file content.
- * Used as input to the content hash so workflow cache invalidates when these files change.
- *
- * @param gitRoot - Absolute path to git repository root
- * @param patterns - Paths or glob patterns relative to repo root (e.g. ["config.json", "scripts/*.sh"])
- * @returns Object with digest string and list of resolved paths (relative to git root), or null if no patterns or resolution fails
+ * Resolve hashFiles paths and globs (git-root-relative) into a deterministic
+ * digest: sorted paths, each followed by "\n" and its content. It feeds the
+ * content hash, so the workflow cache invalidates when these files change.
+ * Null only when no patterns are given.
  */
 export function resolveHashFiles(
   gitRoot: string,
@@ -44,7 +41,7 @@ export function resolveHashFiles(
       const content = readFileSync(path.join(gitRoot, rel), 'utf-8');
       parts.push(`${rel}\n${content}`);
     } catch {
-      // Skip files that can't be read (e.g. missing); consistent with "no content" affecting hash
+      // An unreadable file contributes its path with empty content.
       parts.push(`${rel}\n`);
     }
   }

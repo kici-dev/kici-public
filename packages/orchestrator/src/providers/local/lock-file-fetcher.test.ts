@@ -4,26 +4,26 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { LockFileParseError } from '@kici-dev/engine';
 import { LocalLockFileFetcher } from './lock-file-fetcher.js';
+import { lockFileFixture, lockWorkflow } from '../../__test-helpers__/lock-fixtures.js';
 
 describe('LocalLockFileFetcher', () => {
   const testDir = join(tmpdir(), `kici-local-lock-test-${Date.now()}`);
   const repoDir = join(testDir, 'test-repo');
   const kiciDir = join(repoDir, '.kici');
 
-  const validLockFile = {
+  const validLockFile = lockFileFixture({
     schemaVersion: 4,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
     contentHash: 'abc123',
     workflows: [
-      {
+      lockWorkflow({
         name: 'test',
         contentHash: 'def456',
         compileSchemaVersion: 2,
         triggers: [{ _type: 'push', branches: [], paths: [] }],
         jobs: [],
-      },
+      }),
     ],
-  };
+  });
 
   beforeAll(() => {
     mkdirSync(kiciDir, { recursive: true });

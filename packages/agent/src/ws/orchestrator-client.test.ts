@@ -16,24 +16,17 @@ import { readAgentVersion } from '../version.js';
 
 // ── Hoisted mock state ──────────────────────────────────────────────
 
-/**
- * vi.hoisted runs before any imports, making these values available
- * inside the vi.mock factory which is also hoisted.
- */
+/** vi.hoisted makes these visible inside the (also hoisted) vi.mock factory. */
 const { mockInstances, mockConstructorArgs } = vi.hoisted(() => {
   return {
     mockInstances: [] as import('node:events').EventEmitter[],
-    // Each entry is the argv array a single `new WebSocket(...)` call received.
-    // Used by the compression-bomb-defense invariant test to introspect
-    // the options object passed to the WS constructor.
+    // The argv of each `new WebSocket(...)` call; the compression-bomb test
+    // inspects its options object.
     mockConstructorArgs: [] as unknown[][],
   };
 });
 
-/**
- * Mock the 'ws' module. The factory must be self-contained.
- * We import EventEmitter inside the factory to avoid hoisting issues.
- */
+/** The hoisted factory must be self-contained, so it imports EventEmitter itself. */
 vi.mock('ws', async () => {
   const { EventEmitter } = await import('node:events');
 
@@ -101,7 +94,7 @@ function simulateOpen(mock: MockWsInstance): void {
   mock.emit('open');
 }
 
-/** Simulate the orchestrator sending register.ack to complete the handshake. */
+/** The orchestrator's register.ack, completing the handshake. */
 function simulateRegisterAck(
   mock: MockWsInstance,
   overrides: Partial<{
@@ -136,10 +129,7 @@ function createClient(overrides: Partial<OrchestratorClientOptions> = {}) {
   });
 }
 
-/**
- * Connect and register the client. Simulates the full handshake:
- * connect -> open -> send agent.register -> receive register.ack -> registered.
- */
+/** Full handshake: connect -> open -> agent.register -> register.ack -> registered. */
 function registerClient(
   client: OrchestratorClient,
   ackOverrides: Parameters<typeof simulateRegisterAck>[1] = {},
@@ -214,9 +204,7 @@ describe('OrchestratorClient', () => {
       expect(msg.agentId).toBe('my-agent');
       // Labels include user-specified labels plus auto-derived os/arch/host labels
       expect(msg.labels).toEqual(expect.arrayContaining(['gpu', 'linux']));
-      // Should NOT have maxConcurrency
       expect(msg.maxConcurrency).toBeUndefined();
-      // Should have a messageId
       expect(msg.messageId).toBeDefined();
       // Reports its own package version so the Infrastructure page can show it.
       expect(msg.version).toBe(readAgentVersion());
@@ -388,7 +376,6 @@ describe('OrchestratorClient', () => {
         timestamp: Date.now(),
       };
 
-      // Should not throw
       client.sendDirect(msg);
     });
   });
@@ -419,7 +406,6 @@ describe('OrchestratorClient', () => {
 
       expect(client.getBufferedCount()).toBe(2);
 
-      // Connect
       client.connect();
       const mock = getLatestMock();
       simulateOpen(mock);
@@ -524,7 +510,6 @@ describe('OrchestratorClient', () => {
         state: 'success',
         timestamp: Date.now(),
       });
-      // It was sent immediately
       expect(getSentMessages(mock1)).toHaveLength(1);
 
       // Disconnect unexpectedly
@@ -663,7 +648,6 @@ describe('OrchestratorClient', () => {
 
       mock.emit('message', 'not-json{{{');
 
-      // Should still be registered
       expect(client.state).toBe('registered');
     });
 
@@ -694,7 +678,6 @@ describe('OrchestratorClient', () => {
 
       expect(client.state).toBe('connecting');
 
-      // Should not create another WS
       client.connect();
       expect(mockInstances.length).toBe(1);
     });
@@ -728,14 +711,12 @@ describe('OrchestratorClient', () => {
       simulateOpen(mock);
       expect(client.state).toBe('authenticating');
 
-      // Orchestrator responds with auth.success
       simulateMessage(mock, {
         type: 'auth.success',
         connectionId: 'conn-123',
       });
       expect(client.state).toBe('registering');
 
-      // Should have sent agent.register after auth.success
       const sent = getSentMessages(mock);
       const registerMsg = sent.find(
         (m) => (m as Record<string, unknown>).type === 'agent.register',
@@ -746,7 +727,6 @@ describe('OrchestratorClient', () => {
       // Labels include user-specified labels plus auto-derived os/arch/host labels
       expect(registerMsg!.labels).toEqual(expect.arrayContaining(['linux', 'docker']));
 
-      // Orchestrator sends register.ack
       simulateRegisterAck(mock);
       expect(client.state).toBe('registered');
     });
@@ -763,7 +743,6 @@ describe('OrchestratorClient', () => {
       simulateOpen(mock);
       expect(client.state).toBe('authenticating');
 
-      // Orchestrator rejects the token
       simulateMessage(mock, {
         type: 'auth.failure',
         reason: 'Invalid or expired token',
@@ -778,17 +757,15 @@ describe('OrchestratorClient', () => {
       // Wait a very long time -- should NOT reconnect
       vi.advanceTimersByTime(300_000);
 
-      // Only 1 mock instance created (the initial one) -- no reconnection
       expect(mockInstances.length).toBe(1);
       // The close that follows the auth.failure frame must not fire it again.
       expect(onAuthFailedPermanently).toHaveBeenCalledTimes(1);
     });
 
-    // defense in depth: the close-code branch must stop the
-    // reconnect loop even when the preceding auth.failure message is
-    // dropped / arrives garbled. Without this, a revoked token's WS
-    // close (code 4010) would leave intentionalDisconnect=false and
-    // the agent would reconnect-storm.
+    // Defense in depth: the close code alone must stop reconnecting when the
+    // auth.failure message is dropped or garbled; otherwise a revoked token's
+    // close (4010) leaves intentionalDisconnect=false and the agent
+    // reconnect-storms.
     it('close code 4010 (WS_CLOSE_AGENT_AUTH_FAILED) stops reconnecting permanently', () => {
       const client = createClient({ token: 'kat_revoked_token' });
       const onAuthFailedPermanently = vi.fn();
@@ -801,10 +778,8 @@ describe('OrchestratorClient', () => {
       simulateRegisterAck(mock);
       expect(client.state).toBe('registered');
 
-      // Orchestrator revokes the token mid-connection. Simulate the
-      // kick: the auth.failure message is *not* delivered (it
-      // could be lost on a saturated socket) -- only the WS close with
-      // code 4010 reaches the agent.
+      // Mid-connection revoke where only the 4010 close arrives (the
+      // auth.failure message can be lost on a saturated socket).
       mock.emit('close', 4010, Buffer.from('Token revoked'));
 
       expect(client.state).toBe('disconnected');
@@ -816,7 +791,6 @@ describe('OrchestratorClient', () => {
       // Wait a very long time -- the agent must NOT reconnect.
       vi.advanceTimersByTime(300_000);
 
-      // Only 1 mock instance ever created.
       expect(mockInstances.length).toBe(1);
     });
 
@@ -827,7 +801,6 @@ describe('OrchestratorClient', () => {
       const mock = getLatestMock();
       simulateOpen(mock);
 
-      // Should only have auth.request, not agent.register
       const sent = getSentMessages(mock);
       expect(sent).toHaveLength(1);
       expect((sent[0] as Record<string, unknown>).type).toBe('auth.request');
@@ -841,7 +814,6 @@ describe('OrchestratorClient', () => {
       simulateOpen(mock);
       expect(client.state).toBe('authenticating');
 
-      // Buffer a message
       client.send({
         type: 'job.status',
         messageId: 'msg-buffered',
@@ -853,11 +825,9 @@ describe('OrchestratorClient', () => {
 
       expect(client.getBufferedCount()).toBe(1);
 
-      // Complete auth and registration
       simulateMessage(mock, { type: 'auth.success', connectionId: 'conn-1' });
       simulateRegisterAck(mock);
 
-      // Buffer should be flushed
       expect(client.getBufferedCount()).toBe(0);
     });
 
@@ -980,7 +950,6 @@ describe('OrchestratorClient', () => {
         type: 'agent.register',
         agentId: 'agent-test-1',
       });
-      // inFlightJobs should NOT be present
       expect((sent[0] as Record<string, unknown>).inFlightJobs).toBeUndefined();
     });
 
@@ -1063,7 +1032,6 @@ describe('OrchestratorClient', () => {
 
       const sent = getSentMessages(mock2);
 
-      // Find the gap marker (agent.log message with gap marker text)
       const gapMarkerMsg = sent.find((m) => {
         const msg = m as Record<string, unknown>;
         if (msg.type !== 'agent.log') return false;
@@ -1077,7 +1045,6 @@ describe('OrchestratorClient', () => {
       expect(gapLines[0]).toContain('1 buffered events');
       expect(gapLines[0]).toContain('0 buffered log lines');
 
-      // Verify buffered event was also flushed
       expect(sent).toContainEqual(
         expect.objectContaining({ type: 'job.status', messageId: 'msg-buffered' }),
       );
@@ -1107,7 +1074,6 @@ describe('OrchestratorClient', () => {
       client.streamLog('log line 2');
       client.streamLog('log line 3');
 
-      // Advance time
       vi.advanceTimersByTime(3000);
 
       // Reconnect
@@ -1118,7 +1084,6 @@ describe('OrchestratorClient', () => {
 
       const sent = getSentMessages(mock2);
 
-      // Find the gap marker
       const gapMarkerMsg = sent.find((m) => {
         const msg = m as Record<string, unknown>;
         if (msg.type !== 'agent.log') return false;
@@ -1169,7 +1134,6 @@ describe('OrchestratorClient', () => {
 
       const sent = getSentMessages(mock2);
 
-      // Find the gap marker
       const gapMarkerMsg = sent.find((m) => {
         const msg = m as Record<string, unknown>;
         if (msg.type !== 'agent.log') return false;
@@ -1237,7 +1201,6 @@ describe('OrchestratorClient', () => {
 
       const sent = getSentMessages(mock3);
 
-      // Find the gap marker for this second reconnection
       const gapMarkerMsg = sent.find((m) => {
         const msg = m as Record<string, unknown>;
         if (msg.type !== 'agent.log') return false;
@@ -1267,7 +1230,6 @@ describe('OrchestratorClient', () => {
 
       const sent = getSentMessages(mock2);
 
-      // No gap marker should be sent
       const gapMarkerMsg = sent.find((m) => {
         const msg = m as Record<string, unknown>;
         if (msg.type !== 'agent.log') return false;
@@ -1325,20 +1287,19 @@ describe('OrchestratorClient', () => {
       const client = createClient();
       const mock1 = registerClient(client);
 
-      // Stream log lines (pending in batch, timer not fired yet)
+      // Pending in the batch; the timer has not fired.
       client.streamLog('batch line 1');
       client.streamLog('batch line 2');
 
-      // Simulate ws transitioning to CLOSING state before timer fires:
-      // Set readyState to CLOSED but do NOT emit 'close' yet, then fire the timer.
+      // The socket closes before the timer fires, without a 'close' event yet.
       mock1.readyState = 3; // CLOSED
 
-      // Advance time to fire the log flush timer (100ms)
-      // The sendLogBatch() should detect ws is not open and fall back to logBuffer
+      // The 100ms flush timer: sendLogBatch() sees the socket is not open and
+      // falls back to logBuffer.
       vi.advanceTimersByTime(100);
 
-      // Now emit the close event (which would normally drain pending batch,
-      // but the timer already ran — the fix ensures lines went to logBuffer)
+      // The close handler would drain the pending batch, but the timer already
+      // moved the lines to logBuffer.
       mock1.emit('close', 1006, Buffer.from('abnormal'));
 
       // Reconnect
@@ -1350,7 +1311,7 @@ describe('OrchestratorClient', () => {
 
       const sent = getSentMessages(mock2);
 
-      // The 2 log lines should be replayed via LogBuffer
+      // Replayed via LogBuffer.
       const logReplayMsg = sent.find((m) => {
         const msg = m as Record<string, unknown>;
         if (msg.type !== 'agent.log') return false;
@@ -1366,16 +1327,12 @@ describe('OrchestratorClient', () => {
 
   // ── `permessage-deflate` compression bomb defense (security invariant) ──
   //
-  // Every WS endpoint that negotiates `permessage-deflate` MUST cap the maximum
-  // decompressed message size via `maxPayload`. Client-side too: a rogue or
-  // compromised orchestrator could send the agent a single compressed frame
-  // that decompresses to ~100 MiB (ws@8.x default `maxPayload`) and OOM the
-  // agent process. Single-tenant impact (the agent is a per-tenant data-plane
-  // worker), but with auto-scaler thrash and dispatcher retries it can amplify
-  // into queue starvation.
-  //
-  // Asserts the EXACT configured value (positive control) so any regression
-  // that changes `maxPayload` is loud.
+  // Every WS endpoint negotiating `permessage-deflate` MUST cap decompressed
+  // size via `maxPayload`, client-side too: a rogue orchestrator could send one
+  // frame that decompresses to ~100 MiB (the ws@8.x default) and OOM the agent.
+  // The impact is single-tenant, but scaler thrash and dispatcher retries can
+  // amplify it into queue starvation. The exact configured value is asserted,
+  // so any change to `maxPayload` is loud.
   describe('compression bomb defense (security invariant)', () => {
     it('caps maxPayload on the WebSocket constructor (= WS_MAX_PAYLOAD_BYTES)', () => {
       const client = createClient({ url: 'ws://orchestrator.example.com/ws/agent' });
@@ -1745,12 +1702,9 @@ describe('OrchestratorClient', () => {
       const promise = client.requestUserArtifact('job-1', completeRequest('ipc-2'));
       const sent = sentComplete(mock);
 
-      // Any reason relays verbatim: the agent is content-agnostic here, and the
-      // orchestrator only ever sends a fixed, classified string (never raw
-      // exception text), so this placeholder stands in for whichever literal it
-      // picked. Deliberately NOT a copy of one of the orchestrator's literals —
-      // they live in an orchestrator-internal module this package cannot import,
-      // so a verbatim copy here would be a silent-drift duplicate.
+      // Any reason relays verbatim; the orchestrator sends only fixed,
+      // classified strings. A placeholder, not a copy of one: those live in an
+      // orchestrator-internal module, so a copy would drift silently.
       const reason = 'a fixed classified commit-failure reason';
       simulateMessage(mock, {
         type: 'artifacts.upload.complete.ack',
@@ -1786,8 +1740,8 @@ describe('OrchestratorClient', () => {
 
     it('waits for artifacts.upload.complete.ack without a capability check', async () => {
       // breaks-if-wrong: hard-wiring the ack must keep the wait, not drop it.
-      // fails-when: the agent resolves before the ack, as the removed
-      // fire-and-forget path did when register.ack carried no capabilities.
+      // fails-when: the agent resolves before the ack (fire-and-forget) when
+      // register.ack carries no capabilities.
       const client = createClient();
       const mock = registerClient(client, { capabilities: {} });
 
@@ -1807,10 +1761,7 @@ describe('OrchestratorClient', () => {
       await expect(promise).resolves.toEqual({ type: 'artifacts.response', requestId: 'ipc-4' });
     });
 
-    /**
-     * Drop the socket unintentionally, let the backoff fire, and re-register.
-     * Returns the mock for the new connection.
-     */
+    /** Drop the socket, let the backoff fire, re-register; returns the new mock. */
     function reconnect(mock: MockWsInstance): MockWsInstance {
       mock.readyState = 3;
       mock.emit('close', 1006, Buffer.from('abnormal'));

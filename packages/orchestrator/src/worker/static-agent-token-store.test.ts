@@ -34,10 +34,9 @@ describe('StaticAgentTokenStore', () => {
   it('validate returns null for expired ephemeral tokens', async () => {
     const store = new StaticAgentTokenStore();
 
-    // Create an ephemeral token with 1ms TTL
+    // TTL is in ms.
     const token = await store.createEphemeral('agent-1', ['linux'], 1);
 
-    // Wait for expiry
     await new Promise((r) => setTimeout(r, 10));
 
     const result = await store.validate(token);

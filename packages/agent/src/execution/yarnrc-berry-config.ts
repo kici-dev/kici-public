@@ -1,24 +1,16 @@
 /**
- * Apply yarn-berry registry auth + a forced `nodeLinker: node-modules` to a
- * workflow's `.kici/.yarnrc.yml` for the lifetime of one `yarn install`, then
- * restore the file on cleanup. The berry analog of `npm-registry-config.ts`:
- * berry reads `.yarnrc.yml` (not `.npmrc`), so the auth block uses berry's
- * `npmRegistryServer` / `npmScopes` / `npmAuthToken` keys with `${VAR}`
- * env-var interpolation. Token bytes never reach disk — each registry token is
- * exposed as a job-scoped env var and the on-disk value is the `${VAR}`
- * reference.
+ * Applies yarn-berry registry auth + a forced `nodeLinker: node-modules` to
+ * `.kici/.yarnrc.yml` for one `yarn install`, restoring the file on cleanup:
+ * the berry analog of `npm-registry-config.ts`, using `npmRegistryServer` /
+ * `npmScopes` / `npmAuthToken` with `${VAR}` interpolation. Token bytes never
+ * reach disk: each token is a job-scoped env var the file references.
  *
- * `nodeLinker: node-modules` makes berry lay down a real `node_modules` tree
- * (no PnP `.pnp.cjs`), so the agent's packer / restore / sibling-walk /
- * workflow-loader work unchanged. `enableScripts: false` keeps dependency
- * lifecycle scripts from running at all — for every install, not only one
- * against a private registry — the same security model as npm/pnpm/classic
- * `--ignore-scripts`. An operator opts back in with
- * `KICI_ALLOW_INSTALL_SCRIPTS=true`, which arrives here as
- * `ignoreScripts: false`.
- *
- * Reuses the same `ApplyNpmRegistryConfigArgs` / `ApplyNpmRegistryConfigResult`
- * shapes as the npm overlay so `dep-installer` can pick either by flavor.
+ * `nodeLinker: node-modules` gives a real `node_modules` tree (no PnP
+ * `.pnp.cjs`), so the packer, restore, sibling-walk and workflow-loader work
+ * unchanged. `enableScripts: false` applies to every install, the same model as
+ * `--ignore-scripts` elsewhere; `KICI_ALLOW_INSTALL_SCRIPTS=true` arrives here
+ * as `ignoreScripts: false`. The npm overlay's Args / Result shapes let
+ * `dep-installer` pick either by flavor.
  */
 
 import { readFile, unlink, writeFile } from 'node:fs/promises';
@@ -30,12 +22,11 @@ import type {
   ApplyNpmRegistryConfigResult,
 } from './npm-registry-config.js';
 
-/** Build the synthesized env-var name for registry index `i`. */
 function tokenEnvName(jobIdShort: string, index: number): string {
   return `KICI_NPM_TOKEN_${jobIdShort}_${index}`;
 }
 
-/** Read + parse an existing `.yarnrc.yml`, or `{}` when absent/empty. */
+/** `{}` when absent or empty. */
 async function readOriginalYarnrc(
   path: string,
 ): Promise<{ raw: string | null; doc: Record<string, unknown> }> {
@@ -49,7 +40,6 @@ async function readOriginalYarnrc(
   }
 }
 
-/** One berry npm-scope/registry auth block built from a registry spec. */
 interface BerryRegistryBlock {
   npmRegistryServer: string;
   npmAuthToken: string;
@@ -76,7 +66,7 @@ export async function applyYarnrcBerryConfig(
 
   const { path: cacheFolder, cleanup: cleanupCache } = await makeTempDir('yarn-berry-cache');
 
-  // Agent-managed keys win over committed ones (managed token beats committed).
+  // Agent-managed keys (and tokens) win over committed ones.
   const merged: Record<string, unknown> = {
     ...doc,
     nodeLinker: 'node-modules',
@@ -87,9 +77,8 @@ export async function applyYarnrcBerryConfig(
   const tokenEnv: Record<string, string> = {};
   const tokensForRedaction: string[] = [];
 
-  // Lifecycle scripts are off for every install, not only a private-registry
-  // one: a `postinstall` in a committed package.json is customer code running
-  // in whichever process performs the install.
+  // Off for every install, not only a private-registry one: a committed
+  // `postinstall` is customer code running in the installing process.
   if (args.ignoreScripts !== false) {
     merged.enableScripts = false;
   }

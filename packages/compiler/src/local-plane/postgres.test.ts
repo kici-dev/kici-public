@@ -36,8 +36,7 @@ describe('startPlanePostgres', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     delete process.env.KICI_LOCAL_PG_MODE;
-    // Fresh, non-existent state dir so the one-time cluster init path runs
-    // (no PG_VERSION file yet).
+    // No PG_VERSION yet, so the one-time cluster init path runs.
     process.env.KICI_CONFIG_DIR = `/tmp/pgtest-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   });
 
@@ -46,7 +45,6 @@ describe('startPlanePostgres', () => {
     embeddedStart.mockResolvedValue(undefined);
     embeddedCreateDb.mockResolvedValue(undefined);
     const { startPlanePostgres } = await import('./postgres.js');
-    // Stub the pg_ctl daemonizer so the unit test never spawns a real process.
     const h = await startPlanePostgres({ embeddedDaemon: async () => {} });
     expect(h.kind).toBe('embedded');
     expect(h.url).toContain('kici_local');
@@ -171,8 +169,7 @@ describe('plane Postgres log rotation', () => {
   async function seedPgLog(size: number): Promise<{ dir: string; pgLogFile: string }> {
     const dir = mkdtempSync(join(tmpdir(), 'kici-pglog-'));
     process.env.KICI_CONFIG_DIR = dir;
-    // This describe has no beforeEach of its own; the embedded path must be the
-    // one under test, so clear a podman force left by an earlier case.
+    // No beforeEach here: clear a podman force left by an earlier case.
     delete process.env.KICI_LOCAL_PG_MODE;
     const { planePaths } = await import('./paths.js');
     const { pgLogFile, root } = planePaths();
@@ -231,11 +228,10 @@ describe('plane Postgres log rotation', () => {
     // then runs `pg_ctl start` against the running cluster, which fails and
     // falls the plane through to the Podman backend.
     //
-    // The serving cluster is real as far as pg_ctl can tell: a data dir with a
-    // PG_VERSION marker but no bootstrap stamp (a plane from an older CLI) and a
-    // postmaster.pid naming this plane's port and a live same-user pid.
-    // `pg_ctl status` checks liveness with kill(pid, 0) and refuses only its own
-    // pid and its parent's; the vitest main process is neither.
+    // pg_ctl sees a real serving cluster: PG_VERSION without a bootstrap stamp
+    // (an older CLI's plane) and a postmaster.pid with this port and a live pid.
+    // `pg_ctl status` uses kill(pid, 0) and refuses only its own pid and its
+    // parent's; the vitest main process is neither.
     const { PLANE_LOG_MAX_BYTES } = await import('./plane-log.js');
     const { dir, pgLogFile } = await seedPgLog(PLANE_LOG_MAX_BYTES + 1);
     try {
@@ -295,8 +291,7 @@ describe('embeddedClusterIsServing', () => {
   });
 
   it('is false when a postmaster is running on a DIFFERENT port', async () => {
-    // Reusing it would hand the plane a database on the wrong port; the check
-    // must return before it ever consults pg_ctl.
+    // Must return before consulting pg_ctl: reuse would give the wrong port.
     const dir = seedPidFile(45999);
     const { embeddedClusterIsServing } = await import('./postgres.js');
     expect(await embeddedClusterIsServing(45432)).toBe(false);
@@ -304,8 +299,7 @@ describe('embeddedClusterIsServing', () => {
   });
 
   it('is false when pg_ctl reports the cluster is not running (stale pid file)', async () => {
-    // pg_ctl is unresolvable/failing under the mocked module graph, which is the
-    // same signal as a non-zero status: start it rather than assume it is up.
+    // A failing pg_ctl under the mocked graph signals like a non-zero status.
     const dir = seedPidFile(45432);
     const { embeddedClusterIsServing } = await import('./postgres.js');
     expect(await embeddedClusterIsServing(45432)).toBe(false);

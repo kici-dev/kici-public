@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { Command } from 'commander';
+import { runCli } from '../../__test-helpers__/cli.js';
 
 const mockListAll = vi.fn();
 const mockGet = vi.fn();
@@ -34,43 +34,7 @@ const { HostWriteAuthority } = await import('../../agent/host-roster.js');
 async function runCommand(
   args: string[],
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  const program = new Command();
-  program.exitOverride();
-  registerHostCommands(program);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:')) {
-      console.log = origLog;
-      console.error = origError;
-      process.exit = origExit;
-      if (err.code?.startsWith('commander.'))
-        return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
-      throw err;
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
+  return runCli((p) => registerHostCommands(p), args);
 }
 
 describe('kici-admin host', () => {

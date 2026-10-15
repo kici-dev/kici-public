@@ -1,6 +1,3 @@
-/**
- * Tests for JSONPath payload matching utility.
- */
 import { describe, it, expect } from 'vitest';
 import { matchJsonPath, matchJsonPathNot } from './jsonpath-matcher.js';
 
@@ -45,7 +42,7 @@ describe('matchJsonPath', () => {
 
   it('matches array element', () => {
     const payload = { tags: ['ci', 'deploy', 'prod'] };
-    // JSONPath $.tags[*] returns all elements; any match = pass
+    // $.tags[*] returns all elements; any match = pass
     expect(matchJsonPath(payload, { '$.tags[*]': 'deploy' })).toBe(true);
     expect(matchJsonPath(payload, { '$.tags[*]': 'staging' })).toBe(false);
   });

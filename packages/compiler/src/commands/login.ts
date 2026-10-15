@@ -18,9 +18,7 @@ import { toErrorMessage } from '@kici-dev/core';
 import { planeStatus, attachPlane } from '../local-plane/plane-manager.js';
 
 export interface LoginOptions {
-  /** Platform relay URL */
   platformEndpoint?: string;
-  /** OIDC issuer URL override */
   oidcIssuer?: string;
   /**
    * `--routing-key`: still written to the config, never read.
@@ -28,16 +26,13 @@ export interface LoginOptions {
    * @deprecated Nothing reads the saved value; removed in v1.0.0.
    */
   routingKey?: string;
-  /** Force device authorization flow regardless of environment */
+  /** Force the device flow regardless of environment. */
   device?: boolean;
   /** Skip the post-login "attach the local dev plane?" prompt (scripted logins). */
   noAttachPrompt?: boolean;
 }
 
-/**
- * Prompt the user for input via stdin.
- * Returns the trimmed input string.
- */
+/** Trimmed answer; the prompt goes to stderr. */
 async function promptInput(prompt: string): Promise<string> {
   const rl = createInterface({
     input: process.stdin,
@@ -52,9 +47,7 @@ async function promptInput(prompt: string): Promise<string> {
   });
 }
 
-/**
- * Check if a PAT is expiring within 7 days and print a warning.
- */
+/** Warn when the PAT expires within 7 days. */
 function checkPatExpiry(expiresAt: string): void {
   const expiryDate = new Date(expiresAt);
   const now = new Date();
@@ -70,20 +63,10 @@ function checkPatExpiry(expiresAt: string): void {
   }
 }
 
-/**
- * Run the OAuth authentication flow (PKCE or device flow).
- *
- * Steps:
- * 1. Detect environment (headless vs desktop)
- * 2. Run appropriate OAuth flow to get OIDC access token
- * 3. Exchange OIDC token for a personal access token (PAT)
- * 4. Save PAT to global config
- */
+/** PKCE or device flow → OIDC access token → PAT saved to the global config. */
 async function oauthLogin(options: LoginOptions): Promise<boolean> {
-  // Default to the hosted KiCI Platform so `kici login` works with zero
-  // configuration. Each value is overridable: the --platform-endpoint flag
-  // and the KICI_* env vars take precedence. Resolution stays local — never
-  // written to process.env — so the orchestrator's WS reading of
+  // Defaults to the hosted Platform; flags and KICI_* env vars override.
+  // Resolution never writes process.env, so the orchestrator's WS reading of
   // KICI_PLATFORM_URL is untouched.
   const existing = await loadGlobalConfig();
   const platformUrl =
@@ -91,16 +74,14 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
   const issuer = options.oidcIssuer || process.env.KICI_OIDC_ISSUER || PROD_OIDC_ISSUER;
   const clientId = process.env.KICI_OIDC_CLIENT_ID || PROD_OIDC_CLIENT_ID;
 
-  // Step 1: Detect environment
   console.log(pc.cyan('\n  Step 1/4: Detecting environment...'));
-  // If KICI_BROWSER_CMD is set (even to 'none'), the user explicitly configured browser handling,
-  // so skip headless auto-detection and use PKCE. The --device flag still forces device flow.
+  // A set KICI_BROWSER_CMD (even 'none') is explicit browser config: skip
+  // headless detection and use PKCE. --device still forces the device flow.
   const browserCmdSet = !!process.env.KICI_BROWSER_CMD;
   const useDeviceFlow = options.device || (!browserCmdSet && (await isHeadless()));
   const flowName = useDeviceFlow ? 'device authorization' : 'PKCE (browser)';
   console.log(pc.gray(`  Using ${flowName} flow`));
 
-  // Step 2: Authenticate with the IdP
   console.log(pc.cyan(`\n  Step 2/4: Authenticating with IdP (${flowName})...`));
   let accessToken: string;
   const oauthOpts = { issuer, clientId };
@@ -110,7 +91,6 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
     accessToken = await pkceFlow(oauthOpts);
   }
 
-  // Step 3: Exchange token for PAT
   console.log(pc.cyan('\n  Step 3/4: Exchanging token for personal access token...'));
   const machineName = os.hostname();
   const patResult = await exchangeTokenForPat({
@@ -119,7 +99,6 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
     machineName,
   });
 
-  // Step 4: Save credentials
   console.log(pc.cyan('\n  Step 4/4: Saving credentials...'));
 
   const endpointChanged = existing.platformEndpoint !== platformUrl;
@@ -143,8 +122,7 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
     next.routingKey = options.routingKey;
   }
 
-  // activeOrgId + defaultClusters belong to a specific environment; a new
-  // endpoint invalidates them, so drop them and let `kici org use` re-select.
+  // A new endpoint invalidates activeOrgId and defaultClusters; `kici org use` re-selects.
   if (endpointChanged) {
     delete next.activeOrgId;
     delete next.defaultClusters;
@@ -158,11 +136,8 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
   console.log(pc.gray(`  PAT expires: ${expiryDate}`));
   console.log(pc.gray(`  Config saved to ${configPath}`));
 
-  // Check for near-expiry warning
   checkPatExpiry(patResult.expiresAt);
 
-  // Offer to attach the local dev plane so `kici run --local` uses real
-  // Platform identity. Interactive + opt-out only.
   await maybePromptAttach(options, {
     apiBase: platformUrl,
     pat: patResult.token,
@@ -173,11 +148,9 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
 }
 
 /**
- * After a successful login, prompt an interactive user to attach their local
- * dev plane to the Platform. Skipped entirely for non-TTY / piped input, when
- * `--no-attach` is set, when no org is selected (nothing to attach against), or
- * when a plane is already attached. Any failure here is non-fatal — login has
- * already succeeded.
+ * Offer to attach the local dev plane so `kici run --local` uses real Platform
+ * identity. Skipped for non-TTY input, `--no-attach`, no selected org, or an
+ * attached plane. Non-fatal: login has already succeeded.
  */
 async function maybePromptAttach(
   options: LoginOptions,
@@ -185,7 +158,6 @@ async function maybePromptAttach(
 ): Promise<void> {
   try {
     if (options.noAttachPrompt) return;
-    // Only prompt for a genuinely interactive terminal.
     if (!process.stdin.isTTY) return;
     if (!ctx.orgId) {
       console.log(
@@ -197,7 +169,7 @@ async function maybePromptAttach(
       return;
     }
     const current = await planeStatus();
-    if (current.mode === 'hybrid') return; // already attached
+    if (current.mode === 'hybrid') return;
 
     console.log(
       "\n  You don't have your local dev plane attached to the Platform.\n" +
@@ -221,14 +193,7 @@ async function maybePromptAttach(
   }
 }
 
-/**
- * Authenticate with KiCI.
- *
- * - Runs the OAuth flow: PKCE (desktop) or device (headless)
- * - With `--device`, forces device authorization flow
- *
- * Returns true on success, false on error.
- */
+/** OAuth login: PKCE on a desktop, the device flow headless or with `--device`. */
 export async function loginCommand(options: LoginOptions): Promise<boolean> {
   try {
     return await oauthLogin(options);

@@ -1,7 +1,4 @@
-/**
- * Workflow complete trigger helper - creates triggers for workflow completion events.
- * Returns a frozen WorkflowCompleteTriggerConfig directly.
- */
+/** Workflow completion trigger helper; returns a frozen WorkflowCompleteTriggerConfig. */
 
 import type { WorkflowCompleteConfigInput, WorkflowCompleteTriggerConfig } from './types.js';
 

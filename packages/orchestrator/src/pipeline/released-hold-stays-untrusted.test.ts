@@ -1,13 +1,9 @@
 /**
  * Approving a security hold means "let it run", never "make it trusted".
  *
- * Wiring the approval subsystem into independent mode is what makes a fork PR
- * reach a hold there at all, so the property that hold's RELEASE must preserve
- * is worth asserting on its own: the resumed dispatch replays with the tier the
- * held dispatch resolved, and every reduced-privilege decision is derived from
- * that tier rather than from anything the approval carries.
- *
- * The three degradations, and the value each reads:
+ * The resumed dispatch replays with the tier the held dispatch resolved, and
+ * every reduced-privilege decision derives from that tier, never from the
+ * approval. Each degradation and the value it reads:
  *
  * | Degradation | Derived from |
  * | --- | --- |
@@ -15,10 +11,10 @@
  * | stripped install / registry secrets | `ctx.trustResolution.tier` |
  * | isolated cache write scope | `ctx.trustResolution.tier` |
  *
- * None of them reads the hold row, the approver, or the orchestrator's mode —
- * so the test drives the real round trip (`toSerializableInputs` → the JSON the
- * `pending_workflow_contexts` row stores → `rebuildWorkflowDispatchContext`) and
- * then feeds the rebuilt values to the real deciders.
+ * None reads the hold row, the approver, or the orchestrator's mode, so the
+ * test drives the real round trip (`toSerializableInputs` → the
+ * `pending_workflow_contexts` JSON → `rebuildWorkflowDispatchContext`) into the
+ * real deciders.
  */
 import { describe, expect, it } from 'vitest';
 import { CacheRefScope } from '@kici-dev/engine';
@@ -73,8 +69,7 @@ const LIVE_DEPS = {
 /** Replay the persisted hold context exactly as `resumeWorkflow` does. */
 function replay(trustResolution: TrustResolution): RebuiltWorkflowDispatchContext {
   const stored = toSerializableInputs(heldContext(trustResolution));
-  // The `pending_workflow_contexts` row is `JSON.stringify`d, so anything that
-  // does not survive a JSON round trip is gone by the time a release reads it.
+  // The `pending_workflow_contexts` row is `JSON.stringify`d.
   const fromRow = JSON.parse(JSON.stringify(stored));
   const rebuilt = rebuildWorkflowDispatchContext(fromRow, LIVE_DEPS);
   if (!rebuilt) throw new Error('the replay could not rebuild its dispatch context');
@@ -112,12 +107,10 @@ describe('a released security hold replays with the tier its held dispatch resol
       resolvedOrgId: 'org-1',
       trustResolution: replay(UNTRUSTED).trustResolution,
       contextStore: undefined,
-      // Deliberately absent: reaching a resolver at all would already mean the
-      // strip did not happen, since the strip returns before any lookup.
+      // Deliberately absent: the strip returns before any lookup.
       secretResolver: undefined,
       protectionContext: {} as never,
-      // The resume path's own flag. The strip runs first regardless, which is
-      // exactly the claim — a released hold does not skip it.
+      // The resume path's flag; the strip still runs first.
       skipProtectionGate: true,
     });
     expect(resolved).toMatchObject({

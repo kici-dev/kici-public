@@ -27,9 +27,8 @@ describe('blocksNewCheckout', () => {
   });
 
   it('allows checkout on a status outside the known vocabulary', () => {
-    // The column is plain text written straight from Stripe. A status we do not
-    // recognise must not be read as "live" — that would lock an org out of
-    // subscribing with no way back.
+    // The column is plain text from Stripe. Reading an unknown status as "live"
+    // would lock the org out of subscribing with no way back.
     expect(blocksNewCheckout('sub_1', 'some_future_status')).toBe(false);
     expect(blocksNewCheckout('sub_1', null)).toBe(false);
   });

@@ -1,12 +1,11 @@
 /**
- * Auto-refresh of version-keyed agent payloads on `orchestrator upgrade`.
+ * Auto-refresh of version-keyed agent payloads on `orchestrator upgrade`
+ * (auto-deploy ⟹ auto-upgrade ⟹ auto-package).
  *
- * The automation-completeness principle: auto-deploy ⟹ auto-upgrade ⟹
- * auto-package. After the orchestrator is upgraded to version V, this hook
- * produces + uploads `agent-packages/V/kici-agent-<platform>.tar.gz(.sha256)`
- * for the platforms the fleet already runs, so the convergence gate finds the
- * bytes it needs with no separate operator step. Idempotent: a platform whose
- * payload already exists for V is skipped, so a re-run is a no-op.
+ * After an upgrade to version V, produces + uploads
+ * `agent-packages/V/kici-agent-<platform>.tar.gz(.sha256)` for the fleet's platforms, so the
+ * convergence gate finds its bytes with no operator step. Idempotent: an existing payload for V
+ * is skipped.
  */
 import { AgentPlatform } from '@kici-dev/shared';
 import { assertPayloadsAvailable } from './availability.js';
@@ -38,11 +37,9 @@ export interface RefreshResult {
 }
 
 /**
- * The platforms the fleet already has payloads for — the union across every
- * version present in the store EXCEPT `excludeVersion` (the just-upgraded
- * target, whose payloads we are about to (re)produce). Preserves the fleet's
- * arch coverage across an upgrade. Empty ⇒ the caller falls back to the
- * bootstrap default set.
+ * The platforms the fleet has payloads for: the union across every stored version EXCEPT
+ * `excludeVersion` (the target about to be (re)produced), preserving arch coverage across an
+ * upgrade. Empty ⇒ the caller falls back to the bootstrap default set.
  */
 export async function discoverFleetPlatforms(
   storage: RefreshStorage,
@@ -61,10 +58,9 @@ export async function discoverFleetPlatforms(
 }
 
 /**
- * Produce + upload the target version's payloads for the fleet's platform set,
- * skipping any already present (idempotent). Explicit `platforms` override the
- * discovery; otherwise the fleet's existing arch coverage is preserved, falling
- * back to the bootstrap default (`AgentPlatform.options`) on a fresh store.
+ * Produce + upload the target version's missing payloads. Explicit `platforms` override
+ * discovery; otherwise the fleet's arch coverage is kept, or the bootstrap default
+ * (`AgentPlatform.options`) on a fresh store.
  */
 export async function refreshAgentPackages(
   storage: RefreshStorage,
@@ -100,8 +96,7 @@ export async function refreshAgentPackages(
     produced.push(platform);
   }
 
-  // Re-assert availability so a partial produce/upload surfaces loudly rather
-  // than silently leaving the fleet without bytes for a platform.
+  // A partial produce/upload fails loudly instead of leaving a platform without bytes.
   const { available, missing } = await assertPayloadsAvailable(storage, version, platforms);
   if (!available) {
     throw new Error(

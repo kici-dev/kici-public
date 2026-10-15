@@ -1,26 +1,22 @@
 /**
  * The direct-ingress `ProcessingDeps` assembly.
  *
- * This is a WIRING seam, and a wiring seam is where an approval defect hides:
- * a field the composition root forgets reads as `undefined`, every guard
- * downstream degrades rather than throws, and the whole feature is silently
- * inert. Two omissions of exactly that shape are what this file exists to
- * prevent from recurring — `trustPolicyStore` (so the fork switch always
- * applied `FAIL_CLOSED_POLICY` and DROPPED every fork PR) and `heldRunStore`
- * (so no hold could be raised on the one pipeline an independent orchestrator
- * has).
+ * A forgotten wiring field reads as `undefined`, downstream guards degrade
+ * rather than throw, and the feature is silently inert. This file guards the
+ * two fields that matter most: `trustPolicyStore` (without it the fork switch
+ * applies `FAIL_CLOSED_POLICY` and drops every fork PR) and `heldRunStore`
+ * (without it no hold can be raised on an independent orchestrator's only
+ * pipeline).
  *
- * The second block is the end-to-end proof, against a real database: the same
- * assembled bag, handed to the same `evaluateSecurityPolicy` the pipeline
- * calls, answers `ignore` for an org with no stored row and `hold` for one
- * whose operator chose `hold`. A stub store would prove the field was READ; it
- * would not prove an operator's `kici-admin trust-policy set` reaches the
- * verdict, which is the claim.
+ * The second block runs against a real database: the assembled bag, handed to
+ * the pipeline's `evaluateSecurityPolicy`, answers `ignore` for an org with no
+ * stored row and `hold` for one whose operator chose `hold`. A stub store would
+ * prove only that the field is read, not that `kici-admin trust-policy set`
+ * reaches the verdict.
  */
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Kysely, PostgresDialect, sql } from 'kysely';
-import pg from 'pg';
-import { Migrator } from 'kysely/migration';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { type Kysely, sql } from 'kysely';
+import { describeWithTestDb } from '@kici-dev/test-support/test-db';
 import { ForkPolicy, OrchestratorMode } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import { createMigrationProvider } from '../db/migration-provider.js';
@@ -38,9 +34,8 @@ import type { ProviderBundle } from '../provider-registry.js';
 const NOOP_HOOKS = { onSourceLocationsExtracted: vi.fn() };
 
 /**
- * The smallest source object the factory type-checks against. Every field the
- * assertions below read is set explicitly; the rest are left undefined, which
- * is exactly what a deployment without that subsystem hands over.
+ * The smallest source the factory type-checks against. Unset fields stay
+ * undefined, as a deployment without that subsystem hands them over.
  */
 function sourceWith(partial: Partial<DirectIngressDepsSource> = {}): DirectIngressDepsSource {
   return {
@@ -68,9 +63,9 @@ describe('createDirectIngressProcessingDeps', () => {
   });
 
   it('supplies no in-memory directory, so the store is what gets read', () => {
-    // `resolveApprovalDirectory` prefers an in-memory directory outright. If
-    // this bag ever grew either field, the store read would stop happening and
-    // an independent orchestrator would refuse every commenter forever.
+    // `resolveApprovalDirectory` prefers an in-memory directory, so either field
+    // here would skip the store and an independent orchestrator would refuse
+    // every commenter.
     const bag = createDirectIngressProcessingDeps(sourceWith(), NOOP_HOOKS).build();
     expect(bag.identityLinks).toBeUndefined();
     expect(bag.orgMemberPermissions).toBeUndefined();
@@ -91,16 +86,14 @@ describe('createDirectIngressProcessingDeps', () => {
   });
 
   it('leaves the held-run store undefined when the mode hook supplied none', () => {
-    // The degraded shape, asserted so its absence stays a deliberate state
-    // rather than an accident: every hold site guards on this field.
+    // The deliberate degraded shape: every hold site guards on this field.
     expect(
       createDirectIngressProcessingDeps(sourceWith(), NOOP_HOOKS).build().heldRunStore,
     ).toBeUndefined();
   });
 
   it('reassembles per call, so a swapped provider registry is picked up', () => {
-    // The registry is replaced wholesale on a source reload. A bag captured
-    // once would keep dispatching through the replaced one.
+    // A source reload replaces the registry; a captured bag would keep the old one.
     const src = sourceWith();
     const { build } = createDirectIngressProcessingDeps(src, NOOP_HOOKS);
     expect((build().providerRegistry as unknown as { name: string }).name).toBe('registry-a');
@@ -127,110 +120,81 @@ describe('createDirectIngressProcessingDeps', () => {
 // End-to-end: the assembled bag against a real stored policy.
 // ---------------------------------------------------------------------------
 
-const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
-const describeDb = ADMIN_URL ? describe : describe.skip;
-const TEST_DB = `kici_directingress_test_${process.pid}_${Date.now()}`;
-
-function withDatabase(url: string, dbName: string): string {
-  const parsed = new URL(url);
-  parsed.pathname = `/${dbName}`;
-  return parsed.toString();
-}
-
 /** The one field `evaluateSecurityPolicy` reads off the bundle. */
 const FORK_MODEL_BUNDLE = { hasForkModel: true } as unknown as ProviderBundle;
 
-describeDb('the fork switch, driven through the assembled direct-ingress bag', () => {
-  let db: Kysely<Database>;
-  let pool: pg.Pool;
-  const adminUrl = ADMIN_URL!;
-
-  beforeAll(async () => {
-    const adminPool = new pg.Pool({ connectionString: adminUrl });
-    try {
-      await adminPool.query(`CREATE DATABASE "${TEST_DB}"`);
-    } finally {
-      await adminPool.end();
-    }
-    pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
-    db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) });
-    const migrator = new Migrator({ db, provider: createMigrationProvider() });
-    const { error } = await migrator.migrateToLatest();
-    if (error) throw error;
-  }, 120_000);
-
-  afterAll(async () => {
-    await db?.destroy();
-    await pool?.end().catch(() => {});
-    const adminPool = new pg.Pool({ connectionString: adminUrl });
-    try {
-      await adminPool.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
-    } finally {
-      await adminPool.end();
-    }
-  }, 60_000);
-
-  beforeEach(async () => {
-    await sql`DELETE FROM org_trust_policy`.execute(db);
-  });
-
-  const evaluate = (mode: OrchestratorMode) =>
-    evaluateSecurityPolicy({
-      deps: createDirectIngressProcessingDeps(
-        sourceWith({ db: db as never, config: { mode } }),
-        NOOP_HOOKS,
-      ).build(),
-      bundle: FORK_MODEL_BUNDLE,
-      isPREvent: true,
-      resolvedOrgId: 'org-1',
-      mode,
-      trustResolution: undefined,
-      isForkPR: true,
+describeWithTestDb<Database>(
+  'the fork switch, driven through the assembled direct-ingress bag',
+  {
+    prefix: 'kici_directingress_test',
+    provider: createMigrationProvider(),
+    timeoutMs: 120_000,
+  },
+  (getDb) => {
+    let db: Kysely<Database>;
+    beforeAll(() => {
+      ({ db } = getDb());
     });
 
-  it('drops a fork PR for an org that has chosen nothing', async () => {
-    // The fail-closed default, unchanged: no row means no operator opted in,
-    // and adding the store must not flip such a deployment to running forks.
-    expect(await evaluate(OrchestratorMode.enum.independent)).toEqual({
-      action: 'ignore',
-      forkSwitch: {
-        policy: ForkPolicy.enum.ignore,
-        source: EffectivePolicySource.enum.unconfigured,
-        platformManaged: false,
-      },
+    beforeEach(async () => {
+      await sql`DELETE FROM org_trust_policy`.execute(db);
     });
-  });
 
-  it('HOLDS a fork PR once the operator stored `hold`', async () => {
-    // This is the behaviour change. Before the store reached this bag the same
-    // call answered `ignore` here too, so `kici-admin trust-policy set
-    // --fork-policy hold` had no effect on the direct-ingress pipeline.
-    await new TrustPolicyStore(db).upsertLocal('org-1', { forkPolicy: ForkPolicy.enum.hold });
-    const outcome = await evaluate(OrchestratorMode.enum.independent);
-    expect(outcome).toMatchObject({
-      action: 'hold',
-      reason: SecurityHoldReason.enum.fork_pr,
+    const evaluate = (mode: OrchestratorMode) =>
+      evaluateSecurityPolicy({
+        deps: createDirectIngressProcessingDeps(
+          sourceWith({ db: db as never, config: { mode } }),
+          NOOP_HOOKS,
+        ).build(),
+        bundle: FORK_MODEL_BUNDLE,
+        isPREvent: true,
+        resolvedOrgId: 'org-1',
+        mode,
+        trustResolution: undefined,
+        isForkPR: true,
+      });
+
+    it('drops a fork PR for an org that has chosen nothing', async () => {
+      // Fail closed: no row means no operator opted in, so forks must not run.
+      expect(await evaluate(OrchestratorMode.enum.independent)).toEqual({
+        action: 'ignore',
+        forkSwitch: {
+          policy: ForkPolicy.enum.ignore,
+          source: EffectivePolicySource.enum.unconfigured,
+          platformManaged: false,
+        },
+      });
     });
-  });
 
-  it('RUNS a fork PR once the operator stored `allow`', async () => {
-    await new TrustPolicyStore(db).upsertLocal('org-1', { forkPolicy: ForkPolicy.enum.allow });
-    expect(await evaluate(OrchestratorMode.enum.independent)).toEqual({
-      action: 'pass',
-      forkSwitch: {
-        policy: ForkPolicy.enum.allow,
-        source: EffectivePolicySource.enum.stored,
-        platformManaged: false,
-      },
+    it('HOLDS a fork PR once the operator stored `hold`', async () => {
+      // Without the store in this bag, `kici-admin trust-policy set
+      // --fork-policy hold` has no effect on the direct-ingress pipeline.
+      await new TrustPolicyStore(db).upsertLocal('org-1', { forkPolicy: ForkPolicy.enum.hold });
+      const outcome = await evaluate(OrchestratorMode.enum.independent);
+      expect(outcome).toMatchObject({
+        action: 'hold',
+        reason: SecurityHoldReason.enum.fork_pr,
+      });
     });
-  });
 
-  it('reads the same stored row in every mode, so no mode is quietly exempt', async () => {
-    // The direct GitHub ingress is served in hybrid and observed as well as
-    // independent, and all three were dropping fork PRs regardless of policy.
-    await new TrustPolicyStore(db).upsertLocal('org-1', { forkPolicy: ForkPolicy.enum.hold });
-    for (const mode of OrchestratorMode.options) {
-      expect(await evaluate(mode)).toMatchObject({ action: 'hold' });
-    }
-  });
-});
+    it('RUNS a fork PR once the operator stored `allow`', async () => {
+      await new TrustPolicyStore(db).upsertLocal('org-1', { forkPolicy: ForkPolicy.enum.allow });
+      expect(await evaluate(OrchestratorMode.enum.independent)).toEqual({
+        action: 'pass',
+        forkSwitch: {
+          policy: ForkPolicy.enum.allow,
+          source: EffectivePolicySource.enum.stored,
+          platformManaged: false,
+        },
+      });
+    });
+
+    it('reads the same stored row in every mode, so no mode is quietly exempt', async () => {
+      // The direct GitHub ingress also serves hybrid and observed mode.
+      await new TrustPolicyStore(db).upsertLocal('org-1', { forkPolicy: ForkPolicy.enum.hold });
+      for (const mode of OrchestratorMode.options) {
+        expect(await evaluate(mode)).toMatchObject({ action: 'hold' });
+      }
+    });
+  },
+);

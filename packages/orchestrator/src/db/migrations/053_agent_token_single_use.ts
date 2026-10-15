@@ -1,17 +1,13 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add a single-use marker to agent tokens for the bootstrap (init-runner)
- * bring-up flow:
+ * `agent_tokens.consumed_at timestamptz NULL`: the single-use marker for the
+ * bootstrap (init-runner) flow, set when a single-use token is consumed at
+ * `agent.register`; a second register with it is rejected. NULL = never
+ * consumed, the default for existing static / ephemeral tokens, which stay
+ * reusable until expiry.
  *
- * - `agent_tokens.consumed_at timestamptz NULL` — set the first time a
- *   single-use bootstrap token is consumed (at `agent.register`). A second
- *   register with the same token is rejected. NULL = never consumed (the
- *   default for every existing static / ephemeral token, which stay reusable
- *   until expiry).
- *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so existing data is
- * preserved.
+ * Idempotent and additive.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.agent_tokens

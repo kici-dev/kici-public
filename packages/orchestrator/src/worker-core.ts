@@ -426,7 +426,6 @@ export async function bootstrapWorker(
     throw new Error('Worker mode requires cluster.coordinatorUrls to be set');
   }
 
-  // Set structured identity fields on all log lines
   logger.defaultMeta = {
     ...logger.defaultMeta,
     'kici.instanceId': config.cluster.instanceId,
@@ -1108,7 +1107,6 @@ export async function bootstrapWorker(
     });
   });
 
-  // Worker status and drain endpoints
   const statusHandler = createWorkerStatusHandler({
     instanceId: config.cluster.instanceId,
     executionTracker,
@@ -1258,7 +1256,6 @@ export async function bootstrapWorker(
     upgradeWebSocket(() => agentWsHandler),
   );
 
-  // Start HTTP server
   const server = applyProxyKeepAliveTimeouts(
     serve(
       { fetch: app.fetch, port: config.port, hostname: config.host, websocket: { server: wss } },

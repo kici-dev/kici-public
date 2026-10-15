@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Kysely } from 'kysely';
-import type { Database } from '../db/types.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 import {
   CacheUploadSettleOutcome,
   InFlightCacheUploads,
@@ -113,14 +112,9 @@ describe('awaitCacheUploadSettle', () => {
 
 describe('createCacheUploadSettleTimeoutReader', () => {
   function fakeDb(result: { row?: Record<string, unknown>; error?: Error }) {
-    const executeTakeFirst = vi.fn(async () => {
-      if (result.error) throw result.error;
-      return result.row;
-    });
-    const where = vi.fn(() => ({ executeTakeFirst }));
-    const select = vi.fn(() => ({ where }));
-    const selectFrom = vi.fn(() => ({ select }));
-    return { db: { selectFrom } as unknown as Kysely<Database>, selectFrom, select, where };
+    const { db, mocks } = createMockDb({ selectFirstRow: result.row });
+    if (result.error) mocks.selectExecuteTakeFirst.mockRejectedValue(result.error);
+    return { db, selectFrom: mocks.selectFrom, select: mocks.select, where: mocks.selectWhere };
   }
 
   it('returns the org override (pg BIGINT string → number)', async () => {

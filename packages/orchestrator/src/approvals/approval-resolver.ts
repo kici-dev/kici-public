@@ -1,14 +1,9 @@
 /**
- * Pure approval-clause evaluator. No DB access, no I/O — given a requirement,
- * a team-membership lookup, the recorded decisions, and (for eligibility) the
- * run's triggerer + the self-approval policy, it answers:
- *
- * - `evaluate` — is the requirement satisfied (all clauses ANDed), and was it
- *   rejected (any single reject decision)?
- * - `canApprove` — may a given actor cast an approve decision right now?
- *
- * Both the dashboard handler and the CLI HTTP route funnel through these so the
- * authorization story is identical regardless of the surface.
+ * Pure approval-clause evaluator (no DB, no I/O). `evaluate` answers whether a
+ * requirement is satisfied (all clauses ANDed) or rejected (any reject);
+ * `canApprove` whether an actor may cast an approve now. The dashboard handler
+ * and the CLI HTTP route both funnel through these, so authorization is
+ * identical on every surface.
  */
 import type { ApprovalRequirement, ApproverClause } from '@kici-dev/engine';
 
@@ -37,10 +32,7 @@ export interface EvaluationResult {
   perClause: PerClauseResult[];
 }
 
-/**
- * Is a single clause satisfied by any approve decision whose approver is
- * eligible for the clause? Reject decisions never satisfy.
- */
+/** Satisfied by any approve from an eligible approver; rejects never satisfy. */
 export function isClauseSatisfied(
   clause: ApproverClause,
   decisions: RecordedDecision[],
@@ -51,7 +43,7 @@ export function isClauseSatisfied(
   );
 }
 
-/** Does an actor satisfy/qualify for a clause (team membership or exact user)? */
+/** Team membership or exact user match. */
 export function isActorEligibleForClause(
   actorSub: string,
   clause: ApproverClause,
@@ -74,8 +66,6 @@ function clauseSatisfiedBy(
 }
 
 /**
- * Evaluate a requirement against the recorded decisions.
- *
  * - A single reject decision sets `rejected` (the caller fails the element).
  * - Empty clauses ⇒ satisfied by ANY single approve decision.
  * - Non-empty clauses ⇒ satisfied iff every clause is satisfied (AND).
@@ -108,13 +98,11 @@ export interface CanApproveContext {
 }
 
 /**
- * May `actorSub` cast an approve decision on this requirement right now?
- *
- * - Self-approval gate: when `allowSelfApproval` is false and the actor is the
- *   run's triggerer, they may never approve.
+ * - Self-approval gate: when `allowSelfApproval` is false, the run's triggerer
+ *   may never approve.
  * - Eligibility: the actor must qualify for at least one still-UNSATISFIED
- *   clause. (Approving a clause that is already satisfied adds nothing.) For an
- *   empty-clause requirement, any non-triggerer-blocked actor qualifies.
+ *   clause (approving a satisfied clause adds nothing). For an empty-clause
+ *   requirement, any actor the self-approval gate passes qualifies.
  */
 export function canApprove(
   actorSub: string,
@@ -128,7 +116,6 @@ export function canApprove(
   if (requirement.clauses.length === 0) return true;
 
   const { perClause } = evaluate(requirement, decisions, lookup);
-  // Eligible for at least one clause that is not yet satisfied.
   return perClause.some(
     (c) => !c.satisfied && isActorEligibleForClause(actorSub, c.clause, lookup),
   );

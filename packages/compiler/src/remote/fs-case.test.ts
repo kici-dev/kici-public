@@ -4,11 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isCaseInsensitiveDir } from './fs-case.js';
 
-/** Error the mocked `stat` raises for the twin lookup, when set. */
+/** When set, the mocked `stat` raises it for the twin lookup. */
 const twinLookup = vi.hoisted(() => ({ error: null as NodeJS.ErrnoException | null }));
 
-// Real `stat` everywhere except the probe's twin lookup, which cannot be made to
-// fail with a non-ENOENT errno through the filesystem alone.
+// Only the twin lookup is mocked: no filesystem makes it fail with a non-ENOENT errno.
 vi.mock('node:fs/promises', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs/promises')>();
   return {
@@ -33,8 +32,7 @@ async function freshDir(): Promise<string> {
 }
 
 describe('isCaseInsensitiveDir', () => {
-  // Which branch the probe takes is a property of the executor's filesystem, so
-  // the answer itself is never asserted — only that one is produced.
+  // The answer depends on the executor's filesystem, so only its type is asserted.
   it('answers with a boolean', async () => {
     const dir = await freshDir();
     expect(typeof (await isCaseInsensitiveDir(dir))).toBe('boolean');
@@ -63,8 +61,8 @@ describe('isCaseInsensitiveDir', () => {
     const dir = await freshDir();
     twinLookup.error = Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
 
-    // Answering "case-sensitive" here would let a colliding set overwrite
-    // itself, so an unanswerable probe reaches the caller as a rejection.
+    // "Case-sensitive" would let a colliding set overwrite itself, so an
+    // unanswerable probe rejects.
     await expect(isCaseInsensitiveDir(dir)).rejects.toThrow('EIO');
     expect(await readdir(dir)).toEqual([]);
   });

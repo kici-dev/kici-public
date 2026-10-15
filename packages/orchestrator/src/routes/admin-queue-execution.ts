@@ -1,13 +1,13 @@
 /**
- * Admin API routes for queue + execution READ operations (5a #3 /).
+ * Admin API routes for queue + execution READ operations.
  *
  *   GET /api/v1/admin/queue                   — list dispatch_queue
  *   GET /api/v1/admin/queue/:id               — show one dispatch_queue row
  *   GET /api/v1/admin/executions              — list execution_runs
  *   GET /api/v1/admin/executions/:runId       — show one run + its jobs
  *
- * All routes are gated by the admin auth middleware mounted in admin.ts
- * and require `secret.read` RBAC (the closest existing read-grade permission).
+ * Gated by the admin auth middleware in admin.ts; each requires `secret.read`
+ * RBAC (the closest existing read-grade permission).
  */
 import { Hono } from 'hono';
 import { sql, type Kysely } from 'kysely';

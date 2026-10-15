@@ -1,20 +1,10 @@
-/**
- * Tests for `kici-admin workflow list` CLI subcommand.
- *
- * Verifies that the command:
- *  - Talks to /api/v1/admin/registrations via AdminApiClient (NEVER touches the DB)
- *  - Maps each --flag to the correct query string parameter
- *  - Renders a default table including column headers
- *  - Adds an org_id column when --org is omitted
- *  - Emits raw JSON when --json is supplied
- */
+/** `kici-admin workflow`; `list` goes through AdminApiClient and NEVER touches the DB. */
 
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
+import { runCli } from '../../__test-helpers__/cli.js';
 
-// Mock readFileSync so register-manual tests can supply an inline lock file
-// without touching the filesystem.
+// Lets register-manual tests supply an inline lock file.
 const mockReadFileSync = vi.fn<(path: string, encoding: string) => string>();
 vi.mock('node:fs', async () => {
   return {
@@ -61,45 +51,8 @@ const sampleRegistration = {
 };
 
 async function runCommand(args: string[], client: Partial<AdminApiClient>): Promise<CommandResult> {
-  const program = new Command();
-  program.exitOverride();
-
   const getClient = () => client as AdminApiClient;
-  registerWorkflowCommands(program, getClient);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:')) {
-      console.log = origLog;
-      console.error = origError;
-      process.exit = origExit;
-      if (err.code?.startsWith('commander.'))
-        return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
-      throw err;
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
+  return runCli((p) => registerWorkflowCommands(p, getClient), args);
 }
 
 describe('kici-admin workflow CLI commands', () => {
@@ -131,10 +84,8 @@ describe('kici-admin workflow CLI commands', () => {
     it('W-3: --json prints the raw response and skips the table', async () => {
       const { stdout } = await runCommand(['workflow', 'list', '--json'], client);
 
-      // Must contain the JSON serialization of the response
       expect(stdout).toContain('"registrations"');
       expect(stdout).toContain('"reg-1"');
-      // Must NOT include the table header divider style
       expect(stdout).not.toMatch(/^id\s+repo_identifier/m);
     });
 
@@ -167,7 +118,7 @@ describe('kici-admin workflow CLI commands', () => {
       await runCommand(['workflow', 'list', '--trigger-type', 'webhook', '--event', 'foo'], client);
 
       const path = mockGet.mock.calls[0][0] as string;
-      // Order is determined by the implementation; assert on substring presence.
+      // Param order is the implementation's; assert presence only.
       expect(path.startsWith('/api/v1/admin/registrations?')).toBe(true);
       expect(path).toContain('triggerType=webhook');
       expect(path).toContain('event=foo');

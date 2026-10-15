@@ -66,7 +66,6 @@ export interface ApplyServiceEnvFileDeps {
 
 /** What {@link applyServiceEnvFile} applied. */
 export interface AppliedServiceEnvFile {
-  /** The env file that was applied. */
   path: string;
   /**
    * The keys the file changed that the Node.js runtime reads only as the
@@ -136,10 +135,9 @@ export function loadServiceEnvFile(): AppliedServiceEnvFile | undefined {
  * on Windows, when the file changed a variable the Node.js runtime reads only
  * as it starts.
  *
- * Only on Windows, the one platform whose installer sets `KICI_ENV_FILE`. The
- * Linux and macOS service managers apply the env file before the process
- * starts, and there a second process could not pass on a signal sent to the
- * first one.
+ * Windows only: its installer alone sets `KICI_ENV_FILE`. Linux and macOS
+ * service managers apply the env file before start, and there a second process
+ * could not pass on a signal sent to the first.
  */
 export function mustRelaunch(
   applied: AppliedServiceEnvFile | undefined,

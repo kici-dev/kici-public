@@ -1,15 +1,8 @@
-/**
- * Tests for the systemd service manager.
- *
- * Mocks child_process and fs to verify unit file generation,
- * lifecycle commands, and status parsing without requiring
- * a real systemd installation.
- */
+/** The systemd service manager, with child_process, fs and os mocked. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ServiceConfig, RestartPolicy } from './types.js';
 
-// Mock child_process
 vi.mock('node:child_process', () => ({
   execFileSync: vi.fn(),
   spawn: vi.fn(() => ({
@@ -19,7 +12,6 @@ vi.mock('node:child_process', () => ({
   })),
 }));
 
-// Mock node:fs
 vi.mock('node:fs', () => ({
   default: {
     writeFileSync: vi.fn(),
@@ -37,7 +29,6 @@ vi.mock('node:fs', () => ({
   readFileSync: vi.fn(() => ''),
 }));
 
-// Mock node:os
 vi.mock('node:os', () => ({
   default: {
     homedir: vi.fn(() => '/home/testuser'),
@@ -79,12 +70,9 @@ function makeConfig(overrides: Partial<ServiceConfig> = {}): ServiceConfig {
 }
 
 /**
- * Split a generated unit file into `{ sectionName: directiveLines }`.
- *
- * systemd assigns each directive to the section header above it and drops
- * directives that are not valid for that section, so an assertion that only
- * checks whether a line appears *somewhere* in the file cannot tell a working
- * unit from one systemd will silently ignore.
+ * `{ sectionName: directiveLines }`. systemd drops a directive invalid for its
+ * section, so a whole-file `toContain` cannot tell a working unit from an
+ * ignored one.
  */
 function parseUnitSections(unit: string): Record<string, string[]> {
   const sections: Record<string, string[]> = {};
@@ -157,11 +145,8 @@ describe('systemd service manager', () => {
     });
 
     it('sets Environment=PATH with the executable bin dir first so spawned agents find node', () => {
-      // The bare-metal scaler spawns `kici-agent` (a `#!/usr/bin/env node`
-      // script) as a child of the orchestrator. systemd starts the
-      // orchestrator with a minimal default PATH that omits non-standard
-      // node installs (mise/nvm/asdf). Prepending the executable's own bin
-      // dir guarantees `env node` resolves in the spawned agent.
+      // The scaler's `kici-agent` child is an `env node` script, and systemd's
+      // minimal PATH omits mise/nvm/asdf node installs.
       const config = makeConfig({
         executablePath: '/home/op/.local/share/mise/installs/node/24/bin/node',
         args: ['/opt/kici/dist/server.js'],
@@ -191,24 +176,17 @@ describe('systemd service manager', () => {
       const config = makeConfig();
       const sections = parseUnitSections(manager.generateUnitFile(config));
 
-      // StartLimitIntervalSec= and StartLimitBurst= are [Unit] directives.
-      // systemd has no [Service].StartLimitIntervalSec key at all — it logs
-      // "Unknown key 'StartLimitIntervalSec' in section [Service], ignoring"
-      // and falls back to the manager-wide DefaultStartLimitIntervalSec (10s),
-      // so the configured window only takes effect from [Unit].
+      // In [Service], systemd ignores StartLimitIntervalSec ("Unknown key")
+      // and falls back to the manager-wide DefaultStartLimitIntervalSec (10s).
       expect(sections.Unit).toContain('StartLimitBurst=5');
       expect(sections.Unit).toContain('StartLimitIntervalSec=300');
 
-      // Restart= and RestartSec= are [Service] directives.
       expect(sections.Service).toContain('Restart=on-failure');
       expect(sections.Service).toContain('RestartSec=1s');
 
-      // No StartLimit* key may appear outside [Unit] — this is exactly the
-      // misplacement a section-agnostic `toContain` assertion cannot catch.
       expect(sections.Service!.filter((l) => l.startsWith('StartLimit'))).toEqual([]);
       expect(sections.Install!.filter((l) => l.startsWith('StartLimit'))).toEqual([]);
 
-      // ...and no Restart* key may leak into [Unit].
       expect(sections.Unit!.filter((l) => /^Restart(Sec)?=/.test(l))).toEqual([]);
     });
 
@@ -342,8 +320,6 @@ describe('systemd service manager', () => {
     });
 
     it('runs loginctl enable-linger for user-level services when linger is disabled', async () => {
-      // Make `loginctl show-user --property=Linger` return "Linger=no" so the
-      // install path takes the enable-linger branch.
       mockedExecFileSync.mockImplementation((cmd: string, args: readonly string[]) => {
         if (cmd === 'loginctl' && args[0] === 'show-user') {
           return 'Linger=no\n';
@@ -362,7 +338,6 @@ describe('systemd service manager', () => {
     });
 
     it('skips loginctl enable-linger when linger is already enabled (idempotent)', async () => {
-      // Simulate `loginctl show-user --property=Linger` returning "Linger=yes".
       mockedExecFileSync.mockImplementation((cmd: string, args: readonly string[]) => {
         if (cmd === 'loginctl' && args[0] === 'show-user') {
           return 'Linger=yes\n';
@@ -373,7 +348,6 @@ describe('systemd service manager', () => {
       const config = makeConfig({ isUserLevel: true, user: 'testuser' });
       await manager.install(config);
 
-      // show-user was called, but enable-linger must NOT have been.
       expect(mockedExecFileSync).toHaveBeenCalledWith(
         'loginctl',
         ['show-user', 'testuser', '--property=Linger'],
@@ -387,8 +361,7 @@ describe('systemd service manager', () => {
     });
 
     it('throws a helpful error when enable-linger fails and linger is not yet enabled', async () => {
-      // show-user returns Linger=no so we take the enable-linger branch, and
-      // enable-linger itself throws (simulating polkit "Access denied").
+      // enable-linger throws, as polkit's "Access denied" does.
       mockedExecFileSync.mockImplementation((cmd: string, args: readonly string[]) => {
         if (cmd === 'loginctl' && args[0] === 'show-user') {
           return 'Linger=no\n';

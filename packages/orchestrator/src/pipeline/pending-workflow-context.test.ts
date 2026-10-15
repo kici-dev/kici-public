@@ -11,11 +11,10 @@ import {
 } from './pending-workflow-context.js';
 
 /**
- * Mock DB that models both `pending_workflow_contexts` and `execution_runs`,
- * and actually simulates the terminal-run prune so the restore test can prove
- * a terminal run's row is deleted (and not restored) while a non-terminal one
- * survives. `deleteFrom('pending_workflow_contexts').where('run_id','in', <subquery>)`
- * removes every pending row whose run status is in `TERMINAL_RUN_STATES`.
+ * Mock DB of `pending_workflow_contexts` and `execution_runs` that simulates
+ * the terminal-run prune: `deleteFrom(...).where('run_id','in', <subquery>)`
+ * removes every pending row whose run status is in `TERMINAL_RUN_STATES`, so
+ * the restore test proves a terminal run's row is deleted, not restored.
  */
 function createMockDb(
   pendingRows: Array<{ run_id: string; context: SerializableWorkflowDispatchInputs }>,
@@ -31,7 +30,6 @@ function createMockDb(
           expect(op).toBe('in');
           return {
             execute: async () => {
-              // Prune rows whose run reached a terminal state.
               for (let i = rows.length - 1; i >= 0; i--) {
                 const status = runStatuses[rows[i].run_id];
                 if (status !== undefined && TERMINAL_RUN_STATES.has(status)) {

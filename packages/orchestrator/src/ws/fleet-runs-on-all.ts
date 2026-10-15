@@ -1,12 +1,7 @@
 /**
  * Resolve a workflow's `runsOnAll` host-fan-out predicate from the orchestrator's
  * persisted registrations, for the fleet runsOnAll-preview read path.
- *
- * The orchestrator stores each registered workflow's full lock entry in
- * `workflow_registrations.lock_entry` (JSON). This reader parses that entry,
- * finds the first static job carrying a `runsOnAll` predicate, and returns its
- * `{ include, exclude, onUnreachable }` — or null when no registered workflow of
- * that name declares a host fan-out.
+ * Reads the lock entry stored as JSON in `workflow_registrations.lock_entry`.
  */
 import type { Kysely } from 'kysely';
 import { isLockStaticJob, type LockWorkflow } from '@kici-dev/engine';

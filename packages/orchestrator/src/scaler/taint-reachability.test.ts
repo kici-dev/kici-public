@@ -9,26 +9,23 @@ import type { WsLike } from '@kici-dev/engine';
 import { AgentRegistry } from '../agent/registry.js';
 
 /**
- * The whole path a platform taint travels, asserted end to end through the
- * registry rather than on an intermediate.
+ * A platform taint's whole path, asserted end to end through the registry.
  *
- * A taint gates a job AND has to reach the agent it gates. When it reached only
- * the gate, `AgentRegistry.findAvailable` failed its SUBSET check — no agent
- * carried the plain token — so a tainted pool spawned agents the dispatcher
- * could never find: the job re-queued and spawned again forever. The warm pool
- * hit the same defect through its GATE check and reported `ready: 0`.
+ * A taint gates a job AND must reach the agent it gates. Reaching only the gate,
+ * `AgentRegistry.findAvailable` fails its SUBSET check (no agent carries the
+ * plain token), so a tainted pool spawns agents the dispatcher never finds and
+ * the job re-queues and respawns forever; the warm pool fails its GATE check
+ * and reports `ready: 0`.
  *
- * The pool below is linux/arm64 on purpose: an x86 linux host derives no taint
- * at all, so it would never exercise this path.
+ * The pool is linux/arm64 on purpose: an x86 linux host derives no taint.
  */
 describe('platform taint reachability', () => {
   const platform: ScalerPlatform = { os: 'linux', arch: 'arm64' };
   const taints = platformToTaints(platform);
 
   /**
-   * The labels an agent this pool spawned actually registers with: the set the
-   * scaler injects (and binds the ephemeral token to), plus the os/arch facts
-   * the agent self-reports on top.
+   * What a spawned agent registers with: the scaler-injected set (bound to the
+   * ephemeral token) plus the os/arch facts the agent self-reports.
    */
   function registeredLabels(labelSet: string[]): string[] {
     const injected = scalerAgentLabels(labelSet, 'bare-metal', 'gpu-pool', undefined, taints);
@@ -63,8 +60,8 @@ describe('platform taint reachability', () => {
   it('lets a job asking for the platform find the pool it was routed to', () => {
     const registry = registryWithPoolAgent(['linux']);
 
-    // The job that could never match before: `findAvailable` intersects the
-    // required labels, and no agent carried the plain `arm64` token.
+    // `findAvailable` intersects the required labels, so the agent must carry
+    // the plain `arm64` token.
     expect(registry.findAvailable(['linux', ...taints])).toHaveLength(1);
   });
 
@@ -86,9 +83,9 @@ describe('platform taint reachability', () => {
   });
 
   it('is not vacuous: dropping the taint from the injected set breaks the match', () => {
-    // Reproduces the defect exactly — the same agent WITHOUT the taint in its
-    // labels, still gated by it. Asserted here rather than by reverting the
-    // source, which a concurrent build would ship.
+    // Reproduces the defect: the same agent WITHOUT the taint in its labels,
+    // still gated by it. Not by reverting the source, which a concurrent build
+    // would ship.
     const withoutTaint = scalerAgentLabels(['linux'], 'bare-metal', 'gpu-pool', undefined);
     const registry = new AgentRegistry();
     registry.register(

@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
-// Mock os.homedir to isolate tests from real home directory
 vi.mock('node:os', async () => {
   const actual = await vi.importActual<typeof import('node:os')>('node:os');
   return {
@@ -15,7 +14,6 @@ vi.mock('node:os', async () => {
   };
 });
 
-// Mock global fetch
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
@@ -29,10 +27,8 @@ describe('kici workflows list', () => {
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-workflows-test-'));
     vi.mocked(os.homedir).mockReturnValue(tempDir);
-    // The homedir mock alone does not isolate this suite: getConfigDir()
-    // refuses the ambient config under the KiCI test-isolation marker before
-    // it consults homedir(). Name the same directory the mock produces
-    // explicitly.
+    // The homedir mock alone does not isolate: getConfigDir() refuses the
+    // ambient config under the test-isolation marker before consulting homedir().
     process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
     consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -163,17 +159,14 @@ describe('kici workflows list', () => {
       const registrations = [
         {
           ...sampleRegistrations[0],
-          // Triggered 2 hours ago -- not stale
           lastTriggeredAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
         },
         {
           ...sampleRegistrations[1],
-          // Triggered 45 days ago -- stale
           lastTriggeredAt: new Date(Date.now() - 45 * 24 * 60 * 60 * 1000).toISOString(),
         },
         {
           ...sampleRegistrations[2],
-          // Never triggered -- stale
           lastTriggeredAt: null,
         },
       ];
@@ -183,10 +176,8 @@ describe('kici workflows list', () => {
 
       expect(result).toBe(true);
       const output = consoleLogSpy.mock.calls.map((c) => c[0]).join('\n');
-      // Should show stale ones
       expect(output).toContain('nightly-cleanup');
       expect(output).toContain('on-release');
-      // Should NOT show the recently triggered one
       expect(output).not.toContain('deploy-on-event');
     });
   });
@@ -210,7 +201,6 @@ describe('kici workflows list', () => {
 
   describe('authentication', () => {
     it('shows login prompt when no credentials configured', async () => {
-      // No config file at all
       const result = await workflowsListCommand({});
 
       expect(result).toBe(false);

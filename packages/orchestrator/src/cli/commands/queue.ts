@@ -1,13 +1,7 @@
 /**
- * Queue read CLI commands for kici-admin.
- *
- *   queue list [--status <s>] [--job-name-prefix <p>] [--limit <n>]
- *   queue show <id>
- *
- * READ-ONLY — mutations live in `maintenance.ts` (queue clear) instead.
- * Dual-mode: HTTP (via AdminApiClient) or `--database-url` (direct DB).
- *
- * The rows come from dispatch_queue, not a dedup cache.
+ * `queue list` / `queue show <id>`: READ-ONLY (mutations live in
+ * `maintenance.ts`, `queue clear`). Dual-mode: HTTP (AdminApiClient) or
+ * `--database-url` (direct DB). Rows come from dispatch_queue, not a dedup cache.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -42,9 +36,8 @@ function printQueueTable(entries: DispatchQueueRow[]): void {
 }
 
 export function registerQueueCommands(program: Command, getClient: () => AdminApiClient): void {
-  // Re-use the `queue` namespace already registered by maintenance.ts if
-  // present, otherwise create a fresh one. This lets read verbs land
-  // alongside `queue clear` in the same command group.
+  // Re-use maintenance.ts's `queue` group when present, so the read verbs sit
+  // beside `queue clear`.
   const existing = program.commands.find((c) => c.name() === 'queue');
   const queue =
     existing ?? program.command('queue').description('Dispatch queue read + maintenance');

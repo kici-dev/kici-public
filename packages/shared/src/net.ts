@@ -1,10 +1,8 @@
 /**
- * Node-only network primitives, kept off the main barrel.
- *
- * `nftables.ts` promisifies `child_process.execFile` at module scope, so
- * exporting it from `index.ts` would pull `node:child_process` into the module
- * graph of every `@kici-dev/shared` consumer — including ones that only wanted
- * a logger. Importers ask for it explicitly: `@kici-dev/shared/net`.
+ * Node-only network primitives, imported as `@kici-dev/shared/net`. Kept off
+ * the main barrel because `nftables.ts` promisifies `child_process.execFile` at
+ * module scope, which would pull `node:child_process` into every consumer's
+ * module graph.
  */
 
 export * from './net/nftables.js';

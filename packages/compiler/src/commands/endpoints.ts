@@ -1,10 +1,4 @@
-/**
- * kici endpoints command
- *
- * Lists all webhook entrypoints for the current project, grouped by type.
- * Reads the compiled lock file to enumerate trigger types and displays
- * webhook URLs that developers can paste into external service configurations.
- */
+/** `kici endpoints`: the project's webhook entrypoints from the lock file, grouped by type. */
 
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -15,7 +9,7 @@ import { loadGlobalConfig } from '../remote/config.js';
 import type { LockFile, LockWorkflow, LockTrigger } from '../types.js';
 
 export interface EndpointsOptions {
-  /** Path to .kici directory (defaults to .kici) */
+  /** Defaults to .kici */
   kiciDir?: string;
 }
 
@@ -27,16 +21,11 @@ interface TriggerGroup {
   kiciEvent: Array<{ workflowName: string; eventName: string }>;
 }
 
-/**
- * Main endpoints command entry point.
- * Reads the lock file and displays all webhook entrypoints grouped by type.
- */
 export async function endpointsCommand(options: EndpointsOptions): Promise<boolean> {
   try {
     const kiciDir = resolveKiciDir(options.kiciDir);
     const lockFilePath = path.join(kiciDir, 'kici.lock.json');
 
-    // Load lock file
     let lockFile: LockFile;
     try {
       const content = await readFile(lockFilePath, 'utf-8');
@@ -48,14 +37,12 @@ export async function endpointsCommand(options: EndpointsOptions): Promise<boole
       return false;
     }
 
-    // Load config for org ID (set by `kici org use`)
+    // `activeOrgId` is set by `kici org use`.
     const config = await loadGlobalConfig();
     const orgId = config.activeOrgId ?? '{orgId}';
 
-    // Group triggers by type
     const groups = groupTriggers(lockFile.workflows);
 
-    // Display output
     displayEndpoints(groups, orgId);
 
     return true;
@@ -66,9 +53,6 @@ export async function endpointsCommand(options: EndpointsOptions): Promise<boole
   }
 }
 
-/**
- * Group all workflow triggers by their type category.
- */
 export function groupTriggers(workflows: readonly LockWorkflow[]): TriggerGroup {
   const groups: TriggerGroup = {
     gitProvider: [],
@@ -87,12 +71,8 @@ export function groupTriggers(workflows: readonly LockWorkflow[]): TriggerGroup 
   return groups;
 }
 
-/**
- * Categorize a single trigger into the appropriate group.
- */
 function categorizeTrigger(workflowName: string, trigger: LockTrigger, groups: TriggerGroup): void {
   switch (trigger._type) {
-    // Git provider triggers
     case 'pr':
     case 'push':
     case 'tag':
@@ -109,7 +89,6 @@ function categorizeTrigger(workflowName: string, trigger: LockTrigger, groups: T
     case 'star':
     case 'watch':
     case 'webhook':
-      // Only add GitHub once per workflow
       if (!groups.gitProvider.some((g) => g.workflowName === workflowName)) {
         groups.gitProvider.push({ workflowName, provider: 'GitHub' });
       }
@@ -170,19 +149,14 @@ function categorizeTrigger(workflowName: string, trigger: LockTrigger, groups: T
   }
 }
 
-/**
- * Display the grouped endpoints in a human-readable format.
- */
 export function displayEndpoints(groups: TriggerGroup, orgId: string): void {
   let hasOutput = false;
   let hasWebhookUrls = false;
 
-  // Git provider webhooks
   if (groups.gitProvider.length > 0) {
     hasOutput = true;
     hasWebhookUrls = true;
     logger.info(pc.bold('\nGit provider webhooks:'));
-    // Deduplicate providers
     const providers = [...new Set(groups.gitProvider.map((g) => g.provider))];
     for (const provider of providers) {
       const urlPath = `/webhook/${orgId}/${provider.toLowerCase()}`;
@@ -190,12 +164,10 @@ export function displayEndpoints(groups: TriggerGroup, orgId: string): void {
     }
   }
 
-  // Generic webhooks
   if (groups.genericWebhook.length > 0) {
     hasOutput = true;
     hasWebhookUrls = true;
     logger.info(pc.bold('\nGeneric webhooks:'));
-    // Deduplicate by source
     const seen = new Set<string>();
     for (const gw of groups.genericWebhook) {
       if (seen.has(gw.source)) continue;
@@ -205,7 +177,6 @@ export function displayEndpoints(groups: TriggerGroup, orgId: string): void {
     }
   }
 
-  // Scheduled workflows
   if (groups.schedule.length > 0) {
     hasOutput = true;
     logger.info(pc.bold('\nScheduled workflows:'));
@@ -216,7 +187,6 @@ export function displayEndpoints(groups: TriggerGroup, orgId: string): void {
     }
   }
 
-  // Event-driven workflows (lifecycle + kici_event)
   const eventDriven = [
     ...groups.lifecycle.map((l) => ({
       workflowName: l.workflowName,

@@ -1,17 +1,16 @@
 /**
  * The receiving end of `peer.job.cancel`.
  *
- * A sibling forwards a cancel to the coordinator its agent is connected to,
- * which it reads from the host roster. That coordinator's dispatcher tracks the
- * job only when it dispatched or re-adopted it: an agent that reconnected here
- * from a sibling, or one not yet back after this process restarted, is known
- * only to `dispatch_queue.agent_id`. So the agent is resolved from the
- * dispatcher first and from the dispatch record second, and a cancel that
- * cannot be delivered is logged with the reason.
+ * A sibling forwards a cancel to the coordinator its agent is connected to (read
+ * from the host roster). That dispatcher tracks the job only when it dispatched
+ * or re-adopted it: an agent that reconnected here from a sibling, or one not yet
+ * back after this process restarted, is known only to `dispatch_queue.agent_id`.
+ * So the agent is resolved from the dispatcher first and the dispatch record
+ * second, and an undeliverable cancel is logged with the reason.
  *
- * On a worker the receiver also removes the jobs of the cancel that are still
- * queued (waiting for an agent spawn), and stop-marks the dispatched ones so a
- * requeue cannot bring them back. A removed job is reported `dequeued`.
+ * On a worker the receiver also removes the cancel's still-queued jobs (waiting
+ * for an agent spawn), reported `dequeued`, and stop-marks the dispatched ones so
+ * a requeue cannot bring them back.
  */
 import type { Kysely } from 'kysely';
 import { z } from 'zod';
@@ -48,10 +47,8 @@ export interface PeerJobCancelDeps {
   /** The durable dispatch record. Absent on a worker, which has no database. */
   lookupDispatched?: (runId: string, jobId: string | undefined) => Promise<DispatchedAgent[]>;
   /**
-   * Remove this process's queued (not yet dispatched) jobs of the cancel, and
-   * stop-mark its dispatched ones so a requeue cannot bring them back. Wired only
-   * on a worker, whose queue lives in memory; a coordinator's queue rows are
-   * settled by its own run-cancel path.
+   * Wired only on a worker, whose queue lives in memory; a coordinator's queue rows
+   * are settled by its own run-cancel path.
    */
   releaseQueued?: (runId: string, jobId: string | undefined) => Promise<string[]>;
   logger: {

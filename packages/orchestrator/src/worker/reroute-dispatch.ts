@@ -1,10 +1,8 @@
 /**
- * Worker-mode dispatch of a job rerouted from a coordinator.
- *
- * A worker holds no provider credentials. The coordinator pre-resolves the
- * clone tokens and carries them on the `job.reroute` message. The worker keeps
- * them in the queued job's config and turns them into the agent's clone auth
- * at dispatch time.
+ * Worker-mode dispatch of a job rerouted from a coordinator. A worker holds no
+ * provider credentials: the coordinator pre-resolves clone tokens onto the
+ * `job.reroute` message, and the worker keeps them in the queued job's config and
+ * turns them into the agent's clone auth at dispatch time.
  */
 import type { JobReroute, ProviderGitAuth } from '@kici-dev/engine';
 import { cloneTokenGitAuth } from '../git/clone-token-auth.js';
@@ -38,9 +36,8 @@ export function rerouteJobConfig(msg: JobReroute): Record<string, unknown> {
 }
 
 /**
- * Clone auth for a rerouted job, from the clone tokens the coordinator
- * pre-resolved: the source repository's `cloneToken` becomes `sourceAuth`, and
- * an organization-wide job's `workflowCloneToken` becomes `workflowAuth`.
+ * The source repository's `cloneToken` becomes `sourceAuth`; an
+ * organization-wide job's `workflowCloneToken` becomes `workflowAuth`.
  */
 function rerouteCloneAuth(cfg: Record<string, unknown>): {
   workflowAuth?: ProviderGitAuth;
@@ -110,9 +107,8 @@ export function buildWorkerDispatchMessage(
     jobConfig: cleanJobConfig,
     // The fleet-wide concurrency-slot wait, from the worker's pulled settings.
     concurrencyWaitTimeoutMs: ids.concurrencyWaitTimeoutMs,
-    // Lift user-cache namespacing from jobConfig to top-level dispatch
-    // fields so the worker's agent-WS handler resolves the cache ref from
-    // the tracked dispatch (matches the coordinator dispatch path).
+    // Lift cache namespacing to top-level fields, as the coordinator dispatch
+    // does, so the worker's agent-WS handler resolves the cache ref.
     ...(typeof cleanJobConfig.cacheOrgId === 'string' && {
       orgId: cleanJobConfig.cacheOrgId,
     }),
@@ -122,8 +118,6 @@ export function buildWorkerDispatchMessage(
     ...(typeof cleanJobConfig.cacheRefScope === 'string' && {
       cacheRefScope: cleanJobConfig.cacheRefScope,
     }),
-    // The coordinator pre-resolves the clone tokens and carries them in
-    // jobConfig; they reach the agent as structured auth (see rerouteCloneAuth).
     ...rerouteCloneAuth(cfg),
     ...(dispatchSecrets && { secrets: dispatchSecrets }),
     ...(dispatchNamespacedSecrets && { namespacedSecrets: dispatchNamespacedSecrets }),

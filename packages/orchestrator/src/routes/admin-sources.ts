@@ -1,12 +1,11 @@
 /**
- * Admin API routes for webhook source management.
+ * Admin CRUD API for webhook sources (GitHub Apps, etc.). Source secrets
+ * (private keys, webhook secrets) are stored via PgSecretStore and never
+ * exposed in list/get responses; only GET /sources/:routingKey/webhook-secret
+ * returns the webhook secret.
  *
- * Provides CRUD endpoints for managing webhook sources (GitHub Apps, etc.)
- * through the admin API. Source secrets (private keys, webhook secrets) are
- * stored via PgSecretStore and never exposed in list/get responses.
- *
- * All routes are mounted under /api/v1/admin/sources and protected by
- * the admin auth middleware in admin.ts.
+ * Mounted under /api/v1/admin/sources, behind the admin auth middleware in
+ * admin.ts.
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
@@ -34,12 +33,11 @@ const logger = createLogger({ prefix: 'admin-sources' });
 interface SourceRouteDeps {
   sourceStore: SourceStore;
   /**
-   * Resolve the public webhook URL for a freshly added source so the CLI can
-   * print it, by mode: platform and hybrid read the Platform's URL from the
-   * `source.register.ack` (hybrid falls back to its own URL); observed and
-   * independent return this orchestrator's own per-source URL. A null URL
-   * carries a `webhookNote` that says why. Omitted in deployments with no
-   * resolver wired (the route then returns `webhookUrl: null`).
+   * Resolve a freshly added source's public webhook URL for the CLI, by mode:
+   * platform and hybrid read the Platform's URL from the `source.register.ack`
+   * (hybrid falls back to its own URL); observed and independent return this
+   * orchestrator's own per-source URL. A null URL carries a `webhookNote`
+   * saying why. Without a resolver the route returns `webhookUrl: null`.
    */
   resolveSourceWebhookUrl?: (params: {
     routingKey: string;
@@ -47,11 +45,10 @@ interface SourceRouteDeps {
     sourceId: string;
   }) => Promise<WebhookUrlResolution>;
   /**
-   * Resolve the org-scoped GitHub webhook URL for the manifest setup flow
-   * BEFORE any App exists. The GitHub webhook URL is org-scoped
-   * (`<base>/webhook/<orgId>/github`), not app-scoped, so it can be computed
-   * up front and baked into the App manifest. Returns null + a note when the
-   * orchestrator cannot resolve it for its mode.
+   * Resolve the GitHub webhook URL for the manifest setup flow BEFORE any App
+   * exists: it is org-scoped (`<base>/webhook/<orgId>/github`), not
+   * app-scoped, so it can be baked into the App manifest. Returns null + a
+   * note when the orchestrator cannot resolve it for its mode.
    */
   resolveGithubWebhookUrl?: () => Promise<WebhookUrlResolution>;
   /**
@@ -61,20 +58,14 @@ interface SourceRouteDeps {
    */
   resolveSourceIngressUrl?: (row: { id: string; customerId: string | null }) => string | null;
   /**
-   * Fetch a GitHub App's authoritative `{ name, slug }`, events and permissions
-   * from GitHub. Injectable for tests; defaults to the real
-   * `fetchGithubAppIdentity`. Used by the `source refresh` route.
+   * Fetch a GitHub App's authoritative `{ name, slug }`, events and
+   * permissions, for the `source refresh` route. Test seam; defaults to
+   * `fetchGithubAppIdentity`.
    */
   fetchAppIdentity?: FetchGithubAppIdentity;
-  /**
-   * List a GitHub App's installations. Injectable for tests; defaults to
-   * `listGithubAppInstallations`. Used by the `source refresh` route.
-   */
+  /** For the `source refresh` route. Test seam; defaults to `listGithubAppInstallations`. */
   fetchAppInstallations?: FetchGithubAppInstallations;
-  /**
-   * Replay a window of GitHub webhook deliveries for one App. Injectable for
-   * tests; defaults to the real `redeliverWindow`.
-   */
+  /** Test seam; defaults to `redeliverWindow`. */
   redeliverDeliveries?: RedeliverDeliveries;
 }
 
@@ -85,9 +76,9 @@ export type RedeliverDeliveries = (
 ) => Promise<RedeliverWindowResult>;
 
 /**
- * Body of `POST /sources/:routingKey/redeliver`. Both bounds are required: a
- * replay with no upper bound would resend everything GitHub still holds, which
- * is never what an operator recovering one outage window means.
+ * Body of `POST /sources/:routingKey/redeliver`. Both bounds are required: an
+ * unbounded replay would resend everything GitHub still holds, never what an
+ * operator recovering one outage window means.
  */
 const redeliverRequestSchema = z.object({
   since: z.string().datetime({ offset: true }),
@@ -98,10 +89,9 @@ const redeliverRequestSchema = z.object({
 export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
 
-  // POST /api/v1/admin/sources -- add a new source. Creates a fresh
-  // routing key on the orchestrator, so it cannot be reached by a
-  // routing-key-scoped token (the token has no say in the future routing
-  // key the new source will receive).
+  // POST /api/v1/admin/sources -- add a new source. It mints a fresh routing
+  // key, so a routing-key-scoped token cannot reach it (it has no say in the
+  // new source's key).
   app.post('/sources', requireUnscoped, async (c) => {
     try {
       const body = await c.req.json();
@@ -111,11 +101,10 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
         return c.json({ error: 'Missing required fields: provider, name, appId, privateKey' }, 400);
       }
 
-      // For GitHub sources, GitHub is the source of truth for the stored name +
-      // slug: the credential validation already calls `GET /app`, so adopt its
-      // authoritative name/slug instead of the CLI-supplied `--name`. The
-      // manifest flow passes GitHub's values already; the manual `--app-id`
-      // flow passes only the CLI name, which we replace here.
+      // GitHub is the source of truth for a GitHub source's name + slug: the
+      // credential validation already calls `GET /app`, so adopt its values
+      // over the CLI `--name` (which the manual `--app-id` flow passes; the
+      // manifest flow already passes GitHub's).
       let storedName = name;
       let storedSlug: string | undefined = slug;
       if (provider === 'github') {
@@ -137,9 +126,8 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
         webhookSecret,
       });
 
-      // Resolve the public webhook URL to surface in the CLI output. Best
-      // effort — a resolver failure (disconnect/timeout) must not fail the add,
-      // which already succeeded in the DB.
+      // Best effort: a resolver failure (disconnect/timeout) must not fail the
+      // add, which already succeeded in the DB.
       let webhookUrl: string | null = null;
       let webhookNote: WebhookUrlNote | undefined;
       if (deps.resolveSourceWebhookUrl) {
@@ -176,10 +164,9 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
     }
   });
 
-  // GET /api/v1/admin/sources/github-webhook-url -- manifest pre-flight.
-  // Resolves the org-scoped GitHub webhook URL so the manifest setup flow can
-  // bake it into the App before the App exists. Registered before the
-  // parameterized routes so the static segment wins.
+  // GET /api/v1/admin/sources/github-webhook-url -- manifest pre-flight (see
+  // `resolveGithubWebhookUrl`). Registered before the parameterized routes so
+  // the static segment wins.
   app.get('/sources/github-webhook-url', async (c) => {
     try {
       if (!deps.resolveGithubWebhookUrl) {
@@ -236,11 +223,10 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
       const body = await c.req.json();
       const { name, privateKey, webhookSecret, config, customerId } = body;
 
-      // Check source exists before attempting update
       const existing = await deps.sourceStore.getSource(routingKey);
       if (!existing) return c.json({ error: 'Source not found' }, 404);
 
-      // If updating privateKey, re-validate against the existing appId
+      // A new privateKey is re-validated against the existing appId.
       if (privateKey) {
         const parsed = (
           typeof existing.config === 'string' ? JSON.parse(existing.config) : existing.config
@@ -267,10 +253,9 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
   const fetchAppInstallations =
     deps.fetchAppInstallations ?? ((creds) => listGithubAppInstallations(creds));
 
-  // POST /api/v1/admin/sources/refresh-all -- re-sync every GitHub source's
-  // name + slug from GitHub, and report each App's missing events and
-  // permissions and its installations pending approval. Registered before the
-  // parameterized refresh route so the static `refresh-all` segment wins.
+  // POST /api/v1/admin/sources/refresh-all -- the per-source refresh below, for
+  // every GitHub source. Registered before the parameterized refresh route so
+  // the static `refresh-all` segment wins.
   app.post('/sources/refresh-all', requireUnscoped, async (c) => {
     try {
       const all = await deps.sourceStore.listSources();
@@ -325,10 +310,9 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
   });
 
   // POST /api/v1/admin/sources/:routingKey/redeliver -- ask GitHub to send this
-  // App's deliveries from a time window again. The orchestrator holds the App
-  // private key, so it is the only tier that can drive the App-level delivery
-  // endpoints; nothing upstream carries that credential. Recovers a window
-  // whose deliveries never landed, since GitHub does not retry on its own.
+  // App's deliveries from a time window again, recovering a window that never
+  // landed (GitHub does not retry on its own). Only the orchestrator holds the
+  // App private key the App-level delivery endpoints need.
   app.post('/sources/:routingKey/redeliver', async (c) => {
     try {
       const routingKey = c.req.param('routingKey');

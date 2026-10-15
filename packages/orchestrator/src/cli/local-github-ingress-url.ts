@@ -1,10 +1,9 @@
 import { githubIngressPath, githubWebhookPath } from '@kici-dev/engine';
 
 /**
- * Build the orchestrator's OWN direct GitHub ingress URL for a source, from
- * the configured public base (`KICI_WEBHOOK_PUBLIC_URL`). Returns null when no
- * public base is configured (the CLI then prints an honest "set
- * KICI_WEBHOOK_PUBLIC_URL" note instead of a fabricated URL).
+ * The orchestrator's OWN per-source GitHub ingress URL under
+ * `KICI_WEBHOOK_PUBLIC_URL`. Null without it, so the CLI prints a "set
+ * KICI_WEBHOOK_PUBLIC_URL" note instead of a fabricated URL.
  */
 export function buildLocalGithubIngressUrl(
   webhookPublicUrl: string | undefined,
@@ -17,9 +16,8 @@ export function buildLocalGithubIngressUrl(
 }
 
 /**
- * Build the orchestrator's OWN org-scoped GitHub App ingress URL
- * (`<base>/webhook/<orgId>/github`), served by the org-scoped direct route.
- * Null when no public base is configured.
+ * The orchestrator's OWN org-scoped GitHub App ingress URL
+ * (`<base>/webhook/<orgId>/github`). Null without a public base.
  */
 export function buildLocalGithubAppIngressUrl(
   webhookPublicUrl: string | undefined,

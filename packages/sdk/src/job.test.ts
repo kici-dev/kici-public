@@ -10,10 +10,9 @@ import { dynamicJob, getDynamicJobGitCredentials, getDynamicJobNeeds } from './t
 
 describe('dynamic function event fields', () => {
   it('stores context/env/concurrencyGroup dynamic functions on the job', () => {
-    // Runtime contract: dynamic context / env / concurrencyGroup functions
-    // are stored verbatim on the job. The compile-time guarantee that these
-    // functions receive the narrowable EventPayload union lives in
-    // events/event-payloads.test-d.ts (run through Vitest's typecheck runner).
+    // Dynamic context / env / concurrencyGroup functions are stored verbatim;
+    // events/event-payloads.test-d.ts pins that they receive the narrowable
+    // EventPayload union.
     const j = job('typed-dynamic', {
       runsOn: 'default',
       context: (event: EventPayload) =>
@@ -421,7 +420,6 @@ describe('job()', () => {
       expect(deploy._tag).toBe('Job');
       expect(deploy.name).toBe('deploy');
       expect(deploy.steps).toHaveLength(1);
-      // The run function is stored as a bare function in the steps array
       expect(typeof deploy.steps[0]).toBe('function');
     });
 
@@ -480,11 +478,9 @@ describe('job()', () => {
       });
 
       expect(j.steps).toHaveLength(3);
-      // First is a Step object
       expect((j.steps[0] as any)._tag).toBe('Step');
-      // Second is a bare function
       expect(typeof j.steps[1]).toBe('function');
-      // Third is a Step object (id-less step)
+      // An id-less step is still a Step object.
       expect((j.steps[2] as any)._tag).toBe('Step');
     });
   });

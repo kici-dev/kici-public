@@ -6,8 +6,7 @@
  * POST /admin/fleet-bundle     — drive the recursive fan-out and stream the
  *                               assembled nested ZIP back as an octet-stream.
  *
- * Both are protected by the same Bearer admin-token auth as the other admin
- * routes (token-manager validation).
+ * Both use the same Bearer admin-token auth as the other admin routes.
  */
 import { Hono } from 'hono';
 import type { MiddlewareHandler } from 'hono';
@@ -26,12 +25,10 @@ export interface FleetAdminRouteDeps {
 export function createFleetRoutes(deps: FleetAdminRouteDeps): Hono {
   const app = new Hono();
 
-  // ── Bearer token auth middleware ────────────────────────────────
-  // Scoped to the fleet admin paths only. This router is mounted at '/' on
-  // the orchestrator app, so a '*' matcher would attach the auth gate to
-  // every orchestrator route (including /health, /cluster/health, and the
-  // webhook ingress) and 401 them. Mirror the path-scoped pattern used by
-  // the main admin router (routes/admin.ts).
+  // Bearer auth scoped to the fleet paths only: this router mounts at '/', so
+  // a '*' matcher would 401 every orchestrator route (/health,
+  // /cluster/health, the webhook ingress). Same path-scoped pattern as
+  // routes/admin.ts.
   const authMiddleware: MiddlewareHandler = createBearerAuthMiddleware({
     tokenManager: deps.tokenManager,
     scope: 'fleet',

@@ -57,8 +57,7 @@ describe('activityFilterSchema', () => {
   });
 
   it('parses agentOnly query strings correctly (no z.coerce.boolean footgun)', () => {
-    // `?agentOnly=false` MUST parse to false. z.coerce.boolean('false') === true,
-    // which would silently invert the filter and force agent-only on every request.
+    // z.coerce.boolean('false') === true would force agent-only on every request.
     expect(activityFilterSchema.parse({ agentOnly: 'false' }).agentOnly).toBe(false);
     expect(activityFilterSchema.parse({ agentOnly: 'true' }).agentOnly).toBe(true);
   });

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { jsonResponse } from '@kici-dev/test-support/http';
 import {
   PlatformRunClient,
   AmbiguousClusterError,
@@ -8,13 +9,6 @@ import {
   NotFoundError,
   ConnectionError,
 } from './platform-client.js';
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
 
 describe('PlatformRunClient', () => {
   const fetchMock = vi.fn();

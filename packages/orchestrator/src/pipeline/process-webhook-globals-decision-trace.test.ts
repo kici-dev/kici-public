@@ -2,22 +2,20 @@
  * The decision trace forwarded to the Platform covers organization-wide
  * workflows, and names the repo each one is defined in.
  *
- * A per-repo workflow's author can read its trace off the delivery, because
- * the started `execution.event` carries one summary per lock-file workflow. An
- * organization-wide workflow lives in a different repo, so it never appears in
- * that lock file — and its author, who sees neither the source repo's lock file
- * nor the orchestrator's logs, had nothing at all to read. A global that did
- * not fire and a global that was never registered looked identical.
- *
- * So the global pass returns its own decision summaries, each tagged with
+ * The started `execution.event` carries one summary per lock-file workflow. An
+ * organization-wide workflow lives in another repo, so it is not in that lock
+ * file, and its author sees neither the lock file nor the orchestrator's logs:
+ * without its own summaries, a global that did not fire and one never
+ * registered look identical. The global pass returns summaries tagged with
  * `workflowRepoIdentifier`, and Phase K concatenates them onto the same array.
  *
- * The fixture shape mirrors `process-webhook-globals-event.test.ts`; the
- * lock-file path is the one under test because Phase K only runs there.
+ * Fixture shape mirrors `process-webhook-globals-event.test.ts`; the lock-file
+ * path is under test because Phase K only runs there.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { processWebhook } from './process-webhook.js';
 import type { WebhookInfo } from '../webhook/handler.js';
+import { lockFileFixture, lockWorkflow, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 const SOURCE_REPO = 'acme/app';
 const GLOBAL_REPO = 'acme/org-workflows';
@@ -58,13 +56,11 @@ function makeGlobalRegistration(name: string, repos?: Array<{ type: 'glob'; patt
         },
       ],
       jobs: [
-        {
-          _type: 'static',
+        staticJob({
           name: 'scan',
           runsOn: [{ kind: 'exact', value: 'default' }],
-          needs: [],
           steps: [{ name: 'scan', hasOutputs: false }],
-        },
+        }),
       ],
     },
   };
@@ -120,20 +116,21 @@ function makeDeps(): {
     },
     dispatcher: { dispatch },
     lockFileCache: {
-      get: vi.fn(async () => ({
-        schemaVersion: 9,
-        source: { file: '.kici/workflows/ci.ts', export: '#default' },
-        contentHash: 'srchash',
-        workflows: [
-          {
-            name: 'src-push-only',
-            contentHash: 'shash',
-            compileSchemaVersion: 1,
-            triggers: [{ _type: 'push', branches: [], paths: [] }],
-            jobs: [],
-          },
-        ],
-      })),
+      get: vi.fn(async () =>
+        lockFileFixture({
+          schemaVersion: 9,
+          contentHash: 'srchash',
+          workflows: [
+            lockWorkflow({
+              name: 'src-push-only',
+              contentHash: 'shash',
+              compileSchemaVersion: 1,
+              triggers: [{ _type: 'push', branches: [], paths: [] }],
+              jobs: [],
+            }),
+          ],
+        }),
+      ),
     },
   } as unknown as Parameters<typeof processWebhook>[1];
 
@@ -202,10 +199,9 @@ describe('the forwarded decision trace covers global workflows', () => {
   });
 
   it('forwards the trace for a source repo that has no lock file at all', async () => {
-    // A repository with no `.kici/` lock file is the canonical target of an
-    // organization-wide workflow — nothing else can run for it. That path
-    // returned before the trace was forwarded, so the one case the trace exists
-    // for produced no trace.
+    // A repo with no `.kici/` lock file is the canonical target of an
+    // organization-wide workflow (nothing else runs for it), so the trace must be
+    // forwarded on that path too.
     const { deps, send } = makeDeps();
     (deps as unknown as { lockFileCache: { get: () => Promise<null> } }).lockFileCache.get =
       async () => null;

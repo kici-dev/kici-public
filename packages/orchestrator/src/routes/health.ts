@@ -18,40 +18,27 @@ declare const KICI_SHARED_BUNDLE_HASH: string;
 declare const KICI_ENGINE_VERSION: string;
 declare const KICI_ENGINE_BUNDLE_HASH: string;
 
-/**
- * The fields the orchestrator adds to its `/health` body. The route below
- * returns this type, and `kici-admin orchestrator status` renders it.
- */
+/** Fields the orchestrator adds to `/health`, rendered by `kici-admin orchestrator status`. */
 export interface OrchestratorLivenessInfo extends BuildFingerprint {
   /** ISO-8601 time the orchestrator bundle was built. */
   buildDate: string;
 }
 
 export interface HealthRoutesDeps {
-  /** Optional DB instance for readiness checks */
+  /** Enables the DB readiness check. */
   db?: Kysely<Database>;
   /**
-   * Optional warmth latch. Returns `true` only once the orchestrator boot
-   * sequence has finished (all subsystems started, HTTP server serving). When
-   * provided, `/ready` returns `503` until it flips `true`, so a caller can
-   * gate on the orchestrator being ready to serve rather than merely live.
-   * Absent → warm defaults to `true` (callers that don't wire the latch are
-   * unaffected).
+   * Warmth latch: `true` only once boot has finished (all subsystems started,
+   * HTTP server serving). When provided, `/ready` returns `503` until it flips,
+   * so a caller can gate on ready-to-serve rather than merely live. Absent →
+   * warm defaults to `true`.
    */
   isWarm?: () => boolean;
 }
 
 /**
- * Create orchestrator health routes with database readiness check.
- *
- * Delegates to the shared health route helper, providing
- * a database connectivity check as the readiness probe.
- *
  * - GET /health - Liveness probe (always 200)
  * - GET /ready  - Readiness probe (checks DB if provided)
- *
- * @param deps - Dependencies (optional database for readiness)
- * @returns Hono app with health routes
  */
 export function createHealthRoutes(deps: HealthRoutesDeps = {}) {
   return createBaseHealthRoutes({
@@ -84,8 +71,7 @@ export function createHealthRoutes(deps: HealthRoutesDeps = {}) {
           } catch {
             checks.database = false;
           }
-          // Boot-completion latch: false until every startup subsystem is wired
-          // and the HTTP server is serving. Absent latch defaults to warm.
+          // Absent latch defaults to warm.
           checks.warm = deps.isWarm ? deps.isWarm() : true;
           return checks;
         }

@@ -33,9 +33,9 @@ export interface ProvenanceOidcRoutesDeps {
   /** Whether orchestrator-owned signing is configured. */
   enabled: boolean;
   /**
-   * Dashboard-encryption key repo. When present, the JWKS additionally serves
-   * the non-revoked X25519 `use:'enc'` key(s) for browser-sealed dashboard
-   * writes (the Verified tier's trust root). Independent of provenance signing.
+   * When present, the JWKS also serves the non-revoked X25519 `use:'enc'` key(s)
+   * for browser-sealed dashboard writes (the Verified tier's trust root).
+   * Independent of provenance signing.
    */
   dashboardEncryptionRepo?: Pick<DashboardEncryptionKeyRepo, 'listNonRevoked'>;
 }
@@ -54,18 +54,15 @@ export function createProvenanceOidcRoutes(deps: ProvenanceOidcRoutesDeps): Hono
 
   /**
    * The `.well-known` documents are public, unauthenticated key material that a
-   * browser fetches cross-origin: the dashboard reads the X25519 encryption key
-   * straight from the customer's own origin under the Verified dashboard-write
-   * tier. Without this header the browser blocks the response and every
-   * encrypted write fails closed.
+   * browser fetches cross-origin: under the Verified dashboard-write tier the
+   * dashboard reads the X25519 encryption key from the customer's own origin.
+   * Without this header the browser blocks the response and every encrypted
+   * write fails closed.
    *
-   * Deliberately scoped to this router only — the orchestrator's admin API must
-   * NOT become cross-origin readable. The header is set before the handler runs
-   * so error responses carry it too, otherwise a misconfiguration surfaces as an
-   * opaque CORS failure instead of its real status.
-   *
-   * No preflight handling is needed: the fetch is a simple GET with no
-   * credentials and no custom request headers.
+   * Scoped to this router only — the admin API must NOT become cross-origin
+   * readable. Set before the handler so error responses carry it too, instead of
+   * surfacing as an opaque CORS failure. No preflight: the fetch is a simple GET
+   * with no credentials and no custom headers.
    */
   app.use('/.well-known/*', async (c, next) => {
     c.header('Access-Control-Allow-Origin', '*');
@@ -73,31 +70,27 @@ export function createProvenanceOidcRoutes(deps: ProvenanceOidcRoutesDeps): Hono
   });
 
   app.get('/.well-known/openid-configuration', (c) => {
-    // This document IS the provenance issuer's document and cannot be built
-    // without an issuer. The Verified dashboard tier does not read it — the
-    // browser fetches the JWKS URL directly — so gating it costs that tier
-    // nothing.
+    // Cannot be built without an issuer. The Verified dashboard tier fetches the
+    // JWKS URL directly, so gating this costs that tier nothing.
     if (!deps.enabled || !deps.issuer) return c.json({ error: 'oidc_issuer_not_configured' }, 503);
     return c.json(buildOpenidConfiguration(deps.issuer));
   });
 
   app.get('/.well-known/jwks.json', async (c) => {
-    // A JWKS needs no issuer — it is a key list. Dashboard-encryption keys and
-    // build-provenance signing keys are unrelated features and are gated
-    // separately: a shared gate would make the Verified dashboard tier require
-    // an attestation issuer it has no use for.
+    // A JWKS needs no issuer. Encryption and signing keys are gated separately:
+    // a shared gate would make the Verified dashboard tier require an
+    // attestation issuer it has no use for.
     const keys: unknown[] = [];
     if (deps.enabled) {
       const signingRows = await deps.repo.listTrusted();
       for (const r of signingRows) keys.push(r.public_jwk);
     }
-    // All non-revoked enc keys are served so a key rotation is seamless.
+    // All non-revoked enc keys, so a rotation is seamless.
     if (deps.dashboardEncryptionRepo) {
       const encRows = await deps.dashboardEncryptionRepo.listNonRevoked();
       for (const r of encRows) keys.push(r.public_jwk);
     }
-    // Nothing to publish: signing is off (or its key is not provisioned yet)
-    // and there is no dashboard-encryption key either.
+    // Signing is off (or its key not provisioned yet) and no encryption key exists.
     if (keys.length === 0) return c.json({ error: 'no_published_keys' }, 503);
     return c.json({ keys });
   });

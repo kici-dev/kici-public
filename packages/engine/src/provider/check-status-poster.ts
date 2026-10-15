@@ -1,8 +1,6 @@
 /**
- * CheckStatusPoster interface for posting check statuses to git providers.
- *
- * Used by the CI security system to post approval/hold status checks
- * on PRs, enabling visibility into trust-tier gating decisions.
+ * Posts approval/hold status checks on PRs for the CI security system, making
+ * trust-tier gating decisions visible.
  */
 import type { CheckRunConclusion } from './check-run-conclusion.js';
 import type { ProviderType } from './types.js';
@@ -11,12 +9,11 @@ import type { ProviderType } from './types.js';
  * Status values for a check run: still running, or one of the terminal
  * conclusions.
  *
- * The terminal half is `CheckRunConclusion` — the same vocabulary the workflow
- * and per-job `kici/…` check runs conclude with — plus `neutral`, which those
- * runs never use and the informational security checks do. One vocabulary means
- * a hold that ends is reported the same way on the security check and on the
- * `kici/…` checks of the same event: `cancelled` for a rejection, `timed_out`
- * for an elapsed approval window.
+ * The terminal half is `CheckRunConclusion`, shared with the workflow and
+ * per-job `kici/…` check runs, plus `neutral`, which only the informational
+ * security checks use. So an ending hold reports the same on the security check
+ * and the `kici/…` checks of the same event: `cancelled` for a rejection,
+ * `timed_out` for an elapsed approval window.
  */
 export type CheckStatus = 'pending' | 'neutral' | CheckRunConclusion;
 
@@ -26,7 +23,6 @@ export interface WorkflowModificationInfo {
   workflowName: string;
 }
 
-/** Posts check statuses to a git hosting provider. */
 export interface CheckStatusPoster {
   readonly provider: ProviderType;
   postCheckStatus(
@@ -53,13 +49,12 @@ export interface CheckStatusPoster {
    * organization's global workflows could not be completed, so none of the
    * workflows it was deciding on ran for this commit.
    *
-   * Its own check name, for the same reason as the notice above: the
-   * security-hold check is a single named run per commit, so posting this
-   * through `postCheckStatus` would UPDATE that run and replace a pending
-   * "Held for approval" state with a completed conclusion.
+   * Its own check name: the security-hold check is a single named run per
+   * commit, so posting this through `postCheckStatus` would UPDATE that run and
+   * replace a pending "Held for approval" state with a completed conclusion.
    *
-   * Optional so a provider bundle that has no notion of commit checks — or a
-   * hand-built one — is silent rather than failing the delivery.
+   * Optional so a provider bundle with no notion of commit checks (or a
+   * hand-built one) is silent rather than failing the delivery.
    */
   postGlobalEvalFailedCheck?(
     repoIdentifier: string,
@@ -73,8 +68,8 @@ export interface CheckStatusPoster {
    * re-run of the failed round completes cleanly, so a bot gating on all-green
    * is unblocked without a new commit.
    *
-   * Optional for the same reason as the failure poster: a bundle with no notion
-   * of commit checks is silent rather than failing the re-run.
+   * Optional, like the failure poster: a bundle with no notion of commit checks
+   * is silent rather than failing the re-run.
    */
   postGlobalEvalSucceededCheck?(
     repoIdentifier: string,

@@ -1,14 +1,12 @@
 /**
- * Tests for the admin event-DLQ routes.
- *
+ * Admin event-DLQ routes:
  *   GET    /api/v1/admin/event-dlq         — list with limit + cursor
  *   GET    /api/v1/admin/event-dlq/count   — total DLQ depth
  *   POST   /api/v1/admin/event-dlq/:id/retry  — reset + pg_notify
  *   DELETE /api/v1/admin/event-dlq/:id     — discard
  *
- * The retry path's pg_notify is exercised by stubbing `eventStore.getDb()` to
- * return a Kysely-shaped object whose `executeQuery` is a vi.fn(); this lets us
- * verify the retry reroute fires without needing a real DB.
+ * Retry's pg_notify runs against a stubbed `eventStore.getDb()` whose
+ * `executeQuery` is a vi.fn(), so no real DB is needed.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createAdminEventDlqRoutes, type AdminEventDlqRoutesDeps } from './admin-event-dlq.js';
@@ -56,9 +54,8 @@ function createMockDeps(): Deps {
   const countDlq = vi.fn().mockResolvedValue(0);
   const resetFromDlq = vi.fn().mockResolvedValue(true);
   const deleteDlq = vi.fn().mockResolvedValue(true);
-  // The retry / discard routes call `eventStore.getById(id)` before
-  // applying the routing-key-scope check; default to a DLQ-flavored
-  // row so the unscoped happy paths pass without per-test wiring.
+  // Retry / discard call `eventStore.getById(id)` before the routing-key-scope
+  // check; a default DLQ row lets the unscoped happy paths pass unwired.
   const getById = vi.fn().mockResolvedValue(makeStoredEvent());
   const notifyExecuteQuery = vi.fn().mockResolvedValue({ rows: [] });
   const accessLogRecord = vi.fn().mockResolvedValue(undefined);
@@ -70,8 +67,7 @@ function createMockDeps(): Deps {
     deleteDlq,
     getById,
     getDb: () => ({
-      // Kysely sql template `.execute(handle)` ultimately calls `executeQuery`
-      // on the driver; we only need that surface for pg_notify in retry.
+      // A Kysely sql template's `.execute(handle)` ends in `executeQuery`.
       executeQuery: notifyExecuteQuery,
       getExecutor: () => ({
         executeQuery: notifyExecuteQuery,
@@ -258,11 +254,10 @@ describe('admin event-DLQ routes', () => {
   // ── Retry ───────────────────────────────────────────────────────
 
   it('resets a DLQ event and writes the access log entry', async () => {
-    // Note: pg_notify behavior needs a real DB, which this file does not use.
-    // A mocked Kysely executor is incomplete enough that the sql template
-    // execution path throws and the route swallows it (the retry scanner is
-    // the safety net) — the unit test verifies the row reset + access log,
-    // and "still returns 200 when pg_notify fails" covers the swallow path.
+    // pg_notify needs a real DB. With the mocked executor the sql template
+    // throws and the route swallows it (the retry scanner is the safety net), so
+    // this verifies the row reset + access log; "still returns 200 when
+    // pg_notify fails" covers the swallow path.
     const res = await request(app, '/api/v1/admin/event-dlq/evt-1/retry', {
       method: 'POST',
       token: TOKEN,
@@ -280,8 +275,7 @@ describe('admin event-DLQ routes', () => {
   });
 
   it('returns 404 when retry target is not in DLQ', async () => {
-    // The route now short-circuits on the getById lookup before the
-    // resetFromDlq call, so the 404 is driven by the missing row.
+    // The getById lookup short-circuits before resetFromDlq, so the missing row drives the 404.
     deps.getById.mockResolvedValue(null);
     deps.resetFromDlq.mockResolvedValue(false);
     const res = await request(app, '/api/v1/admin/event-dlq/missing/retry', {
@@ -322,8 +316,7 @@ describe('admin event-DLQ routes', () => {
   });
 
   it('returns 404 when discard target is not in DLQ', async () => {
-    // The route now short-circuits on the getById lookup before the
-    // deleteDlq call, so the 404 is driven by the missing row.
+    // The getById lookup short-circuits before deleteDlq, so the missing row drives the 404.
     deps.getById.mockResolvedValue(null);
     deps.deleteDlq.mockResolvedValue(false);
     const res = await request(app, '/api/v1/admin/event-dlq/missing', {

@@ -68,8 +68,7 @@ describe('waitFor (generic helper)', () => {
   });
 
   it('throws WaitForTimeoutError with stats when no onTimeout is supplied', async () => {
-    // Node's setTimeout can fire a few ms early on Linux; assert with a small
-    // tolerance band against the literal timeout.
+    // Node's setTimeout can fire a few ms early on Linux, so allow a tolerance band.
     const TIMEOUT = 80;
     const TIMER_SLACK = 5;
     const before = Date.now();
@@ -152,8 +151,7 @@ describe('waitFor (generic helper)', () => {
   });
 
   it('respects initialDelayMs before the first check()', async () => {
-    // Node's setTimeout can fire a few milliseconds early on some hosts, so
-    // we assert against a tolerance band rather than the literal delay value.
+    // Node's setTimeout can fire a few ms early on some hosts, so allow a tolerance band.
     const INITIAL_DELAY = 80;
     const TIMER_SLACK = 5;
     const start = Date.now();

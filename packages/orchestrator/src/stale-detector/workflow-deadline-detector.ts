@@ -1,14 +1,8 @@
 /**
- * WorkflowDeadlineDetector: periodic DB scanner enforcing the workflow-level
- * run deadline.
- *
- * A workflow `timeout` caps the whole run's wall-clock across all jobs.
- * Because jobs span multiple agents, the cap is a run-level deadline owned by
- * the orchestrator. This scanner finds non-terminal runs whose
- * `started_at + workflow_timeout_ms` has passed and cancels them through the
- * canonical run-cancel path, recording the distinct
- * TimeoutReason.workflow_timeout so the dashboard labels the run "timed out"
- * rather than a generic cancel.
+ * Periodic DB scanner enforcing the workflow `timeout`: a run-level wall-clock deadline the
+ * orchestrator owns because jobs span multiple agents. It cancels non-terminal runs past
+ * `started_at + workflow_timeout_ms` through the canonical run-cancel path with
+ * TimeoutReason.workflow_timeout, so the dashboard labels the run "timed out", not cancelled.
  */
 
 import { sql, type Kysely } from 'kysely';
@@ -20,25 +14,18 @@ import type { JobQueue } from '../queue/job-queue.js';
 const logger = createLogger({ prefix: 'workflow-deadline-detector' });
 
 /**
- * Recency window for the deadline-bounded scan: a run stays in scope while its
- * deadline (`started_at + workflow_timeout_ms`) lapsed within this window. 24h is
- * the crash-recovery horizon — a run whose deadline lapsed while the orchestrator
- * was down for less than this is still caught by the immediate `start()` scan; a
- * deadline that lapsed longer ago is out of scope (separate stale-recovery concern).
- * The window bounds the DEADLINE, not `started_at`, so timeouts >= 24h are enforced.
+ * A run is in scope while its deadline lapsed within this window: the 24h crash-recovery
+ * horizon for the immediate `start()` scan; older lapses are a separate stale-recovery
+ * concern. It bounds the DEADLINE, not `started_at`, so timeouts >= 24h are enforced.
  */
 export const DEADLINE_RECENCY_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export interface WorkflowDeadlineDetectorDeps {
   db: Kysely<Database>;
-  /**
-   * Canonical "cancel this whole run with a reason" callback — the same
-   * implementation the user-initiated `kici cancel` route uses
-   * (cancelRunWithReason bound to the orchestrator's deps).
-   */
+  /** cancelRunWithReason bound to the orchestrator's deps, as the `kici cancel` route uses. */
   cancelRun: (runId: string, reason: string, options: { force: boolean }) => Promise<unknown>;
   jobQueue: JobQueue;
-  /** How often to scan in ms. Default supplied by the caller (reuses the stale-detector interval). */
+  /** Milliseconds; the caller reuses the stale-detector interval. */
   scanIntervalMs: number;
 }
 
@@ -56,10 +43,7 @@ export class WorkflowDeadlineDetector {
     this.scanIntervalMs = deps.scanIntervalMs;
   }
 
-  /**
-   * Start the detector: an immediate scan (crash recovery — catch runs that
-   * blew their deadline while the orchestrator was down), then periodic scans.
-   */
+  /** An immediate scan catches deadlines that lapsed while the orchestrator was down. */
   async start(): Promise<void> {
     await this.scan();
     this.interval = setInterval(() => {
@@ -76,11 +60,6 @@ export class WorkflowDeadlineDetector {
     }
   }
 
-  /**
-   * Run a single deadline scan: find non-terminal runs with a configured
-   * workflow timeout whose `started_at + workflow_timeout_ms` has passed and
-   * cancel each one.
-   */
   async scan(): Promise<void> {
     try {
       const overdue = await this.buildOverdueQuery().execute();
@@ -102,19 +81,12 @@ export class WorkflowDeadlineDetector {
   }
 
   /**
-   * Build the SELECT for overdue runs. Extracted so a unit test can compile the
-   * exact predicate set (Kysely `.compile()`) and assert the deadline-recency
-   * bound without a live database.
+   * Separate so a unit test can `.compile()` the exact predicates without a live database.
    *
-   * Bound the scan to runs whose DEADLINE lapsed within the recency window:
-   * overdue (deadline < now) AND recent (deadline > now - window). Bounding by
-   * the deadline (`started_at + workflow_timeout_ms`) rather than `started_at`
-   * keeps long-timeout runs (timeout >= the window, e.g. >= 24h) in scope once
-   * overdue — a `started_at > (now - window)` guard silently excluded those
-   * forever because their deadline only lapses after `started_at` has already
-   * aged past the window — while still skipping runs whose deadline passed long
-   * ago (already handled), preserving the "don't re-scan ancient history every
-   * tick" performance intent.
+   * Overdue (deadline < now) AND recent (deadline > now - window). A
+   * `started_at > (now - window)` guard would exclude timeouts >= the window forever, since
+   * their deadline lapses only after `started_at` aged past it; the deadline bound still skips
+   * long-past deadlines, so ancient history is not re-scanned every tick.
    */
   private buildOverdueQuery() {
     const deadline = sql`started_at + (workflow_timeout_ms * interval '1 millisecond')`;
@@ -128,10 +100,8 @@ export class WorkflowDeadlineDetector {
           ExecutionRunStatus.enum.cancelling,
         ])
         .where('workflow_timeout_ms', 'is not', null)
-        // deadline < now() — the run is overdue.
+        // Overdue, but lapsed within the recency window.
         .where(sql<boolean>`${deadline} < now()`)
-        // deadline > now() - <recency window> — the deadline lapsed recently; replaces
-        // the old started_at > (now - window) guard so long-timeout runs stay in scope.
         .where(
           sql<boolean>`${deadline} > now() - (${DEADLINE_RECENCY_WINDOW_MS} * interval '1 millisecond')`,
         )
@@ -146,8 +116,6 @@ export class WorkflowDeadlineDetector {
     const reason = `${TimeoutReason.enum.workflow_timeout}: run exceeded the workflow timeout of ${timeoutMs}ms`;
     logger.warn('Workflow run exceeded its deadline; cancelling', { runId, timeoutMs });
 
-    // Cancel queued dispatch rows for this run, then drive the run + its
-    // running jobs through the canonical cancel path with the distinct reason.
     await this.jobQueue.cancelByRunId(runId);
     await this.cancelRun(runId, reason, { force });
   }

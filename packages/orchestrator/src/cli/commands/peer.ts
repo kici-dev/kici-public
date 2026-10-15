@@ -1,7 +1,5 @@
 /**
- * Peer management commands for kici-admin.
- *
- * Provides admin operations for peer token and credential management:
+ * Peer token and credential commands for kici-admin:
  *   peer create-token   Create a join token for a new peer
  *   peer list           List active peer credentials
  *   peer revoke         Revoke a specific peer's credential
@@ -25,9 +23,6 @@ import {
 } from '../../cluster/peer-credentials.js';
 import { cliAction, resolveDirectDbUrl } from './shared/cli-action.js';
 
-/**
- * Format peer credentials as a table.
- */
 function formatPeerTable(
   peers: Array<{
     instanceId: string;
@@ -98,13 +93,10 @@ function printForgetResults(body: PeerForgetResponseBody, json: boolean, io: Pee
 }
 
 /**
- * `kici-admin peer forget`: drop a departed peer from this coordinator's live
- * peer registry and every connected sibling's. Exits 1 when any coordinator
- * kept it (connected, heard from recently, or no answer).
- *
- * When the forget would switch a coordinator's event-provision backstop back
- * on, the operator confirms that consequence first; `--yes` acknowledges it up
- * front, and without a terminal the command refuses instead of asking.
+ * Exits 1 when any coordinator kept the peer (connected, heard from recently,
+ * or no answer). A forget that would switch a coordinator's event-provision
+ * backstop back on needs confirmation: `--yes` gives it up front, and without
+ * a terminal the command refuses.
  *
  * @returns the process exit code
  */
@@ -205,9 +197,8 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
             process.exit(1);
           }
 
-          // In --json mode, stdout is reserved for the structured record.
-          // Silence the JoinTokenManager logger so its info line doesn't
-          // break downstream JSON parsers.
+          // --json reserves stdout for the record; the JoinTokenManager info
+          // line would break JSON parsers.
           if (opts.json) {
             silenceJoinTokenLogger();
           }
@@ -225,8 +216,6 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
 
           const expiresAt = new Date(Date.now() + expiryHours * 3600_000);
           if (opts.json) {
-            // JSON mode: stdout carries only the structured record so scripts
-            // can parse it without tripping on human-readable prose.
             console.log(
               JSON.stringify(
                 {

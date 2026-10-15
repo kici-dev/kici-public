@@ -1,26 +1,16 @@
 /**
- * Shared input-mode helper for `kici-admin secret set` and
- * `kici-admin variable set`.
- *
- * Resolves a value from exactly one of:
+ * Input mode for `secret set` and `variable set`: exactly one of
  *   --value <plaintext>   — argv literal (warned; goes into shell history)
  *   --prompt              — interactive no-echo prompt (TTY only)
  *   --from-stdin          — pipe (full stdin until EOF)
  *   --from-file <path>    — file contents (--trim default-on)
  *   --from-env  <VAR>     — env var contents
  *
- * Default-mode resolution when no flag is provided:
- *   TTY     -> --prompt
- *   non-TTY -> --from-stdin
+ * With no flag: TTY -> --prompt, non-TTY -> --from-stdin.
+ * `--confirm-fingerprint <hex>` guards against paste corruption (SHA-256).
  *
- * Optional checks:
- *   --confirm-fingerprint <hex>  — SHA-256 fingerprint guard against
- *     paste corruption.
- *
- * The helper does NOT print to stdout (it returns the value). It DOES
- * write to stderr for the `--value` warning, the prompt label, and any
- * "empty value" warning. Stdout is reserved for the caller's confirmation
- * output so the caller's `--dry-run` summary stays clean.
+ * Writes only to stderr (warnings, prompt label): stdout is reserved for the
+ * caller's output, so its `--dry-run` summary stays clean.
  */
 
 import { promises as fs } from 'node:fs';
@@ -38,7 +28,7 @@ export interface SecretInputOptions {
 
 export interface SecretInputResult {
   value: string;
-  /** Which input mode supplied the value (after default resolution). */
+  /** After default resolution. */
   source: 'value' | 'stdin' | 'file' | 'env' | 'prompt';
 }
 
@@ -98,7 +88,6 @@ export async function resolveSecretInput(
     }
     result = { value: await readAllStdin(stdin), source: 'stdin' };
   } else {
-    // Default-mode resolution.
     if (stdin.isTTY) {
       result = { value: await promptSecret(stderr, stdin), source: 'prompt' };
     } else {
@@ -181,11 +170,7 @@ async function promptSecret(
   });
 }
 
-/**
- * Compute the canonical SHA-256 fingerprint for a value. Helper for
- * callers (tests, --dry-run output) that want to display the same hex
- * the user would pass to `--confirm-fingerprint`.
- */
+/** The SHA-256 hex a user passes to `--confirm-fingerprint`. */
 export function fingerprintValue(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }

@@ -1,26 +1,15 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `dispatch_queue.recovery_deadline TIMESTAMPTZ` and
- * `dispatch_queue.recovery_agent_id TEXT` columns persisting per-job
- * recovery state for HA-safe agent-disconnect handling.
+ * Persists per-job agent-disconnect recovery state, so a coord crash between starting the
+ * recovery timer and its firing cannot leave a `recovering` job with no deadline or owning
+ * agent, lingering forever.
  *
- * `Dispatcher.recoveringJobs` previously held the timer handle, agent
- * ID, and deadline entirely in process memory. A coord crash between
- * starting the timer and it firing dropped the timer; the replacement
- * coord saw the row as `status='recovering'` but had no record of when
- * the deadline expired or which agent owned the job. Jobs lingered
- * forever.
+ * A leader-gated sweep (`Dispatcher.sweepExpiredRecoveries`) fails rows matching
+ * `WHERE status='recovering' AND recovery_deadline < now()`; on coord boot
+ * `Dispatcher.recoverState()` re-creates the timers from the persisted deadlines.
  *
- * The new columns make the deadline durable. A leader-gated sweep
- * (`Dispatcher.sweepExpiredRecoveries`) scans
- * `WHERE status='recovering' AND recovery_deadline < now()` and marks
- * each row failed; on coord boot, `Dispatcher.recoverState()`
- * hydrates the in-memory Map by re-creating timers from the persisted
- * deadlines.
- *
- * Idempotent: re-running on a DB that already has either column is a
- * no-op.
+ * Idempotent: an existing column is a no-op.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colExists = async (name: string): Promise<boolean> => {
@@ -49,8 +38,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
     `.execute(db);
   }
 
-  // Partial index supports the leader-gated sweep's
-  // `WHERE status='recovering' AND recovery_deadline < now()`.
+  // Serves the leader-gated sweep.
   await sql`
     CREATE INDEX IF NOT EXISTS idx_dispatch_queue_recovery_deadline
       ON public.dispatch_queue (recovery_deadline)

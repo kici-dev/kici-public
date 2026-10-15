@@ -1,16 +1,10 @@
 /**
- * Shared access-log recorder for the direct-DB kici-admin subcommands.
+ * Access-log recorder for the direct-DB kici-admin subcommands, which bypass
+ * the HTTP admin API and would otherwise leave no `access_log` trail. It writes
+ * one `admin_cli` row per mutation, attributed to the operator's OS identity.
  *
- * The mutating db / host subcommands act straight against Postgres (bypassing
- * the orchestrator HTTP admin API), so without this they would leave no
- * `access_log` trail — unlike the HTTP/WS admin path. This helper records one
- * `admin_cli`-source row per mutation, attributed to a service_account actor
- * derived from the operator's OS identity, so the audit story is identical
- * regardless of transport.
- *
- * Best-effort by design: the orchestrator access_log is a broad audit stream
- * whose writer swallows insert failures so a broken audit table can never take
- * down an admin command. This recorder inherits that contract.
+ * Best-effort, like the access_log writer: a broken audit table never takes
+ * down an admin command.
  */
 
 import os from 'node:os';
@@ -40,17 +34,15 @@ export interface AdminCliAccessEntry {
 }
 
 /**
- * The actor for a bare-metal CLI operator. There is no Keycloak sub on the
- * box, so we attribute to a service_account keyed on the OS identity — the
- * same actor family the HTTP CLI-driven admin routes use.
+ * No Keycloak sub exists on the box, so the actor is a service_account keyed
+ * on the OS identity, as the HTTP CLI-driven admin routes use.
  */
 export function adminCliActor(): ServiceAccountActor {
   let username = 'unknown';
   try {
     username = os.userInfo().username || 'unknown';
   } catch {
-    // os.userInfo() can throw when there is no passwd entry (rare container
-    // setups); fall back to the env or 'unknown'.
+    // Throws without a passwd entry (some containers).
     username = process.env.USER || 'unknown';
   }
   return { type: 'service_account', id: `${username}@${os.hostname()}` };
@@ -83,11 +75,9 @@ export async function recordAdminCliAccessOnDb(
 }
 
 /**
- * Open a short-lived connection to the orchestrator's own DB (auditDbUrl, or
- * KICI_DATABASE_URL) and record there. Used by the provisioning subcommands
- * whose own connection targets a schemaless / admin DB with no access_log
- * table. A best-effort no-op when no URL resolves (pure bootstrap): the
- * subcommand's stderr banner is the audit floor in that case.
+ * Record through a short-lived connection to the orchestrator DB, for
+ * provisioning subcommands whose own DB has no access_log table. A no-op with
+ * no URL (pure bootstrap), where the stderr banner is the audit floor.
  */
 export async function recordAdminCliAccess(
   entry: AdminCliAccessEntry,

@@ -86,9 +86,7 @@ describe('resolveRunConcurrency', () => {
 /**
  * A db for the full `dispatchReadyJob` path: no approval hold, no needs edges,
  * a run bound to context `prod`, and `running` jobs currently in the group.
- *
- * `onCountRunning` fires when the `execution_jobs` running-count query actually
- * executes, so a test can assert the gate short-circuited before reaching it.
+ * `onCountRunning` fires when the running-count query executes.
  */
 function gateDb(running: number, context: string | null = 'prod', onCountRunning?: () => void) {
   return {
@@ -190,8 +188,8 @@ describe('dispatchReadyJob concurrency re-gate', () => {
       contextId: 'ctx-1',
       holdType: HoldType.enum.concurrency,
     });
-    // Non-vacuous by construction: the context surviving proves the re-gate
-    // returned BEFORE consumePendingJobContext, so the release path can resume it.
+    // The surviving context proves the re-gate returned BEFORE
+    // consumePendingJobContext, so the release path can resume it.
     expect(await consumePendingJobContext(undefined, 'run-at-limit', 'deploy')).toBeDefined();
   });
 
@@ -217,9 +215,8 @@ describe('dispatchReadyJob concurrency re-gate', () => {
     );
     const after = Date.now();
 
-    // Bounded by the configured window on both sides, and the window is an order
-    // of magnitude below `DEFAULT_HOLD_EXPIRY_SECONDS` — an implementation that
-    // ignored the column and fell back to the default cannot land in this range.
+    // The window is an order of magnitude below `DEFAULT_HOLD_EXPIRY_SECONDS`,
+    // so a fallback to the default cannot land in this range.
     const expiresAt = (create.mock.calls[0]![1] as { expiresAt: Date }).expiresAt.getTime();
     expect(expiresAt).toBeGreaterThanOrEqual(before + SHORT_HOLD_SECONDS * 1000);
     expect(expiresAt).toBeLessThanOrEqual(after + SHORT_HOLD_SECONDS * 1000);
@@ -266,9 +263,8 @@ describe('dispatchReadyJob concurrency re-gate', () => {
   it('treats a null limit as unlimited and never queries the running count', async () => {
     const dispatch = okDispatcher();
     const create = vi.fn();
-    // The count query is the assertion, not scenery: it is what the gate must
-    // not reach on an unlimited context, and `gateDb(99)` would otherwise
-    // report a group far over any limit.
+    // The gate must not reach the count query on an unlimited context;
+    // `gateDb(99)` would report a group far over any limit.
     const countRunning = vi.fn();
     await storeCtx('run-unlimited', 'deploy');
 
@@ -292,9 +288,7 @@ describe('dispatchReadyJob concurrency re-gate', () => {
   });
 
   it('queries the running count when a limit IS set', async () => {
-    // The positive control for the assertion above: same db, same call shape,
-    // a limit present — so `countRunning` not firing there can only mean the
-    // gate short-circuited, never that the spy is unwired.
+    // Positive control for the test above: proves the `countRunning` spy is wired.
     const countRunning = vi.fn();
     await storeCtx('run-limited-control', 'deploy');
 
@@ -318,9 +312,9 @@ describe('dispatchReadyJob concurrency re-gate', () => {
 
 describe('dispatchReadyJob re-gate exemptions and audit', () => {
   it('does not re-gate an invoke gate, which occupies no slot', async () => {
-    // An invoke gate summons the source repo's subscribers instead of reaching
-    // an agent, so it never becomes a `running` row the count would see. Gating
-    // it queues a cross-repo summon behind jobs it does not compete with.
+    // An invoke gate summons the source repo's subscribers instead of an agent,
+    // so it never becomes a `running` row; gating it would queue a cross-repo
+    // summon behind jobs it does not compete with.
     const matchContext = vi.fn();
     const create = vi.fn();
     const countRunning = vi.fn();
@@ -336,8 +330,7 @@ describe('dispatchReadyJob re-gate exemptions and audit', () => {
       { dispatch: vi.fn() } as never,
       undefined,
       undefined,
-      // A group far over its limit — the only reason no hold is minted is the
-      // exemption, not the arithmetic.
+      // Far over the limit: only the exemption prevents the hold.
       gateDb(99, 'prod', countRunning),
       undefined,
       { matchContext, heldRunStore: { create } },
@@ -352,9 +345,7 @@ describe('dispatchReadyJob re-gate exemptions and audit', () => {
   });
 
   it('audits each re-hold with a held_run.request row naming the created hold', async () => {
-    // The dispatch-pass path writes one `held_run.request` row per hold it
-    // mints; a hold that shows up in the approval queue with no trail saying it
-    // was raised is a gap whichever gate raised it.
+    // As on the dispatch-pass path, every minted hold needs its audit trail.
     const record = vi.fn();
     await storeCtx('run-audited', 'deploy');
 

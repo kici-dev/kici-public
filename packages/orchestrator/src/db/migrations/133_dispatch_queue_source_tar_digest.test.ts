@@ -3,17 +3,15 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './133_dispatch_queue_source_tar_digest.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 133: asserts `dispatch_queue.source_tar_digest`
- * exists as a nullable text column with no default after migrations 001..133,
- * and that up/down are idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 133: `dispatch_queue.source_tar_digest` is nullable text with
+ * no default, and up/down are idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  *
- * Nullability is the load-bearing part: every row queued before this column
- * existed has no digest, and no cluster-wide value could stand in for one. The
- * agent reads NULL as "nothing to verify against" and restores unverified, so
- * an in-flight queue survives the upgrade rather than failing every job.
+ * Nullability is load-bearing: rows queued before the column have no digest, and the agent reads
+ * NULL as "nothing to verify against" and restores unverified, so an in-flight queue survives
+ * the upgrade.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;

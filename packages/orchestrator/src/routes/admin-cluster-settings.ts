@@ -1,17 +1,14 @@
 /**
- * Admin API routes for cluster-global (fleet-wide) orchestrator tunables.
+ * Admin API for fleet-wide orchestrator tunables.
  *
- * Exposes GET / PATCH `/api/v1/admin/cluster-settings` so `kici-admin
- * cluster-settings` can read and write the single `cluster_settings` row
- * (id='default') without going through the Platform dashboard proxy — the CLI
- * stays operable even when Platform is unavailable. `GET
+ * GET / PATCH `/api/v1/admin/cluster-settings` let `kici-admin cluster-settings`
+ * read and write the single `cluster_settings` row (id='default') without the
+ * Platform dashboard proxy, so the CLI works while Platform is down. `GET
  * /api/v1/admin/cluster-settings/propagation` reports which settings version
  * each orchestrator this coordinator knows has applied.
  *
- * These knobs are fleet-wide, not per-tenant, so the route is deliberately NOT
- * under `/orgs/:customerId/*`. Mutations require the `secret.write` RBAC
- * capability (already granted to admin / owner roles), matching the gating
- * posture used by `admin-org-settings.ts`.
+ * Fleet-wide, not per-tenant, so deliberately NOT under `/orgs/:customerId/*`.
+ * Mutations require `secret.write` (admin / owner), like `admin-org-settings.ts`.
  */
 import { Hono } from 'hono';
 import { sql, type Kysely } from 'kysely';
@@ -44,7 +41,8 @@ interface ClusterSettingsRouteDeps {
 
 /**
  * camelCase (wire) ↔ snake_case (column) map. Single source of truth for the
- * Zod schema, GET projection, and PATCH upsert so they can never drift.
+ * GET projection and PATCH upsert so they can never drift; `updateSchema` is
+ * written by hand and must list the same knobs.
  */
 const COLUMNS = {
   maxGithubPayloadBytes: 'max_github_payload_bytes',
@@ -93,10 +91,8 @@ const COLUMNS = {
 type CamelKnob = keyof typeof COLUMNS;
 
 /**
- * Text-valued cluster knobs. Kept in a separate map from {@link COLUMNS} so the
- * numeric projection / merge stay `number | null` end to end — the two families
- * are validated, projected, and merged side by side rather than by widening the
- * numeric types.
+ * Text-valued knobs, separate from {@link COLUMNS} so the numeric projection /
+ * merge stay `number | null` end to end rather than widening the numeric types.
  */
 const STRING_COLUMNS = {
   dashboardVerifiedIssuer: 'dashboard_verified_issuer',
@@ -105,10 +101,8 @@ const STRING_COLUMNS = {
 type CamelStringKnob = keyof typeof STRING_COLUMNS;
 
 /**
- * Boolean-valued cluster knobs. A third map rather than a widened
- * {@link COLUMNS}: the numeric projection and merge stay `number | null` end to
- * end, and a boolean `false` must never be confused with an unset `null` the
- * way a falsy number would be.
+ * Boolean-valued knobs, a third map for the same reason, and so a boolean
+ * `false` is never confused with an unset `null` the way a falsy number would be.
  */
 const BOOLEAN_COLUMNS = {
   globalWorkflowsEnabled: 'global_workflows_enabled',
@@ -116,10 +110,9 @@ const BOOLEAN_COLUMNS = {
 
 type CamelBooleanKnob = keyof typeof BOOLEAN_COLUMNS;
 
-// Per-knob minimum floors mirroring the config.ts field constraints. Strict,
-// like the sibling org-settings and trust-policy bodies: a field this route
-// does not know — a removed knob from an older kici-admin — is refused with a
-// 400 rather than silently dropped.
+// Per-knob floors mirror the config.ts field constraints. Strict, like the
+// org-settings and trust-policy bodies: an unknown field (a removed knob from an
+// older kici-admin) is refused with a 400 rather than silently dropped.
 const updateSchema = z
   .object({
     maxGithubPayloadBytes: z.number().int().min(1024).nullable().optional(),
@@ -153,15 +146,15 @@ const updateSchema = z
      */
     ingestOverflowClaimTimeoutMs: z.number().int().min(60_000).nullable().optional(),
     /**
-     * Lock-file and Tier-1 content cache sizing. Structural to the underlying
-     * LRU, which is built once at boot, so a change lands at the next restart.
+     * Lock-file and Tier-1 content cache sizing. The LRU is built once at boot,
+     * so a change lands at the next restart.
      *
-     * The two entry counts are capped at {@link CACHE_MAX_ENTRIES_CEILING}: the
-     * LRU allocates its index arrays eagerly from `max`, so an unbounded value
-     * crashes `bootstrapOrchestrator` before the admin API listens — taking away
-     * the only route back to the stored value. This rejection is the good error
-     * message; `clampCacheMaxEntries` at the read site is the actual guarantee,
-     * since a bad value may already be stored.
+     * Entry counts are capped at {@link CACHE_MAX_ENTRIES_CEILING}: the LRU
+     * allocates its index arrays eagerly from `max`, so an unbounded value crashes
+     * `bootstrapOrchestrator` before the admin API listens, removing the only route
+     * back to the stored value. This rejection gives the good error; the real
+     * guarantee is `clampCacheMaxEntries` at the read site, since a bad value may
+     * already be stored.
      */
     lockfileCacheMax: z.number().int().min(1).max(CACHE_MAX_ENTRIES_CEILING).nullable().optional(),
     lockfileCacheMaxBytes: z.number().int().min(1024).nullable().optional(),
@@ -176,9 +169,8 @@ const updateSchema = z
     globalEvalRoundTimeoutMs: z.number().int().min(1000).nullable().optional(),
     globalEvalCandidateTimeoutMs: z.number().int().min(1000).nullable().optional(),
     /**
-     * Round-result cache size. Capped at {@link CACHE_MAX_ENTRIES_CEILING} for the
-     * same boot-safety reason as the two cache knobs above — the LRU allocates
-     * eagerly from `max`, and this one is built during bootstrap too.
+     * Round-result cache size, capped at {@link CACHE_MAX_ENTRIES_CEILING} for the
+     * same boot-safety reason: this LRU is also built during bootstrap.
      */
     globalEvalCacheMax: z
       .number()
@@ -203,12 +195,11 @@ const updateSchema = z
     firecrackerApiSocketWaitMs: z.number().int().min(1000).nullable().optional(),
     /**
      * Event-scaler provision reaper. All four are read per sweep, so a change
-     * lands on the next tick with no restart — the interval itself reschedules
-     * the timer at the end of the sweep that observed it.
+     * lands on the next tick with no restart; the interval reschedules the timer
+     * at the end of the sweep that observed it.
      *
-     * Floor of 5s on the interval: the sweep does a table scan plus a delete, so
-     * a sub-second value would hammer the database for a backstop whose whole
-     * point is to run rarely.
+     * Interval floor 5s: the sweep is a table scan plus a delete, and a
+     * sub-second value would hammer the database for a backstop meant to run rarely.
      */
     scalerReapIntervalMs: z.number().int().min(5000).nullable().optional(),
     /**
@@ -229,14 +220,13 @@ const updateSchema = z
      * External-provision backoff. All three are read per spawn request, so a
      * change lands on the next request with no restart.
      *
-     * Floor of 1s on the base: the point of the deferral is to stop hammering a
-     * provider that is already refusing work, and a sub-second first step defers
-     * nothing in practice. The ceiling carries the same floor, so no setting can
-     * cap a deferral below one second. Their ORDERING is checked in the PATCH
-     * handler instead, against the effective pair — the patch overlaid on the
-     * stored row. A patch that lowers only the ceiling carries no base for a
-     * schema-level check to compare it against, and that is the case an operator
-     * actually reaches.
+     * Floor 1s on the base: the deferral exists to stop hammering a provider that
+     * already refuses work, and a sub-second first step defers nothing in
+     * practice. The ceiling has the same floor, so no setting caps a deferral
+     * below one second. ORDERING is checked in the PATCH handler against the
+     * effective pair (patch overlaid on the stored row): a patch lowering only
+     * the ceiling carries no base for a schema check, and that is the case an
+     * operator actually reaches.
      */
     scalerProvisionBackoffBaseMs: z.number().int().min(1000).nullable().optional(),
     scalerProvisionBackoffMaxMs: z.number().int().min(1000).nullable().optional(),
@@ -350,11 +340,9 @@ export function createClusterSettingsRoutes(deps: ClusterSettingsRouteDeps): Hon
         .where('id', '=', 'default')
         .executeTakeFirst();
 
-      // Overlay each provided field on the existing value; undefined = leave
-      // as-is, an explicit null clears the override → cluster default. Track
-      // whether any knob actually changes so the monotonic `version` (advertised
-      // to DB-less workers so they pull the new settings) bumps only on a real
-      // change and never on a no-op PATCH.
+      // undefined = leave as-is; explicit null clears the override → cluster
+      // default. The monotonic `version` (advertised to DB-less workers so they
+      // pull new settings) bumps only on a real change, never on a no-op PATCH.
       const existingRow = existing as Record<string, unknown> | undefined;
       const merged: Record<string, number | string | boolean | null> = {};
       let changed = false;
@@ -384,17 +372,14 @@ export function createClusterSettingsRoutes(deps: ClusterSettingsRouteDeps): Hon
         merged[snake] = next;
         if (provided !== undefined && next !== cur) changed = true;
       }
-      // The orchestrator's wait ceiling must exceed the agent's round budget:
-      // the agent's budget starts only once the round job is RUNNING, so a
-      // ceiling at or below it fires on every round that merely waited for a
-      // free agent — every round fails, silently and permanently. Checked on
-      // the EFFECTIVE values (patch overlaid on the stored row), so setting
-      // either one alone is covered.
-      //
-      // A null on either side means "the orchestrator's configured default
-      // applies", and this route does not know that number, so the pair is
-      // only comparable when both are set. That is the case an operator
-      // actually reaches by tuning one of them.
+      // The wait ceiling must exceed the agent's round budget: that budget starts
+      // only once the round job is RUNNING, so a ceiling at or below it fires on
+      // every round that merely waited for a free agent, failing every round
+      // silently and permanently. Checked on the EFFECTIVE values (patch
+      // overlaid on the stored row), so setting either one alone is covered.
+      // A null means "the configured default applies", a number this route does
+      // not know, so the pair is compared only when both are set — the case an
+      // operator actually reaches by tuning one of them.
       const roundBudget = merged[COLUMNS.globalEvalRoundTimeoutMs];
       const waitCeiling = merged[COLUMNS.globalEvalWaitTimeoutMs];
       if (
@@ -413,10 +398,9 @@ export function createClusterSettingsRoutes(deps: ClusterSettingsRouteDeps): Hon
         );
       }
 
-      // The adjacent axis, on the same terms. A per-candidate budget at or above
-      // the whole round's lets ONE candidate consume the entire round, after
-      // which every sibling is padded indeterminate and suppressed — and the
-      // group is decided, so nothing retries it. Same null semantics as above.
+      // Same terms: a per-candidate budget at or above the round's lets ONE
+      // candidate consume the round; every sibling is padded indeterminate and
+      // suppressed, and the group is decided, so nothing retries it.
       const candidateBudget = merged[COLUMNS.globalEvalCandidateTimeoutMs];
       if (
         typeof roundBudget === 'number' &&
@@ -434,12 +418,9 @@ export function createClusterSettingsRoutes(deps: ClusterSettingsRouteDeps): Hon
         );
       }
 
-      // Third ordering constraint, on the same terms as the two above. The
-      // external-provision backoff is `min(base * 2^(n-1), ceiling)`, so a
-      // ceiling below the base collapses it to a constant from the very first
-      // failure — the growth the two knobs exist to express never happens, and
-      // nothing at runtime reports that it did not. Same null semantics: the
-      // pair is only comparable when both are set.
+      // Same terms: the backoff is `min(base * 2^(n-1), ceiling)`, so a ceiling
+      // below the base collapses it to a constant from the first failure, and
+      // nothing at runtime reports the missing growth.
       const backoffBase = merged[COLUMNS.scalerProvisionBackoffBaseMs];
       const backoffCeiling = merged[COLUMNS.scalerProvisionBackoffMaxMs];
       if (

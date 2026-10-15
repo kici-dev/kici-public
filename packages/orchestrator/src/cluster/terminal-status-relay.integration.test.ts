@@ -1,4 +1,3 @@
-// packages/orchestrator/src/cluster/terminal-status-relay.integration.test.ts
 import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

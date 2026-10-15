@@ -77,10 +77,9 @@ describe('buildBridgeCommands', () => {
       (c) => c.bin === 'nft' && c.args[0] === 'add' && c.args[1] === 'rule',
     );
     expect(ruleCmds.length).toBeGreaterThan(0);
-    // Every rule except the inbound established/related rule is saddr-scoped to
-    // the bridge subnet; the inbound rule is daddr-scoped to it instead. The
-    // tail `jump baseline` carries no address by construction — it is the hop
-    // into the chain whose rules are the ones being scoped.
+    // Every rule is saddr-scoped to the bridge subnet, except the inbound
+    // established/related rule (daddr-scoped) and the tail `jump baseline`, which
+    // by construction carries no address: it is the hop into the scoped chain.
     for (const c of ruleCmds) {
       const line = c.args.join(' ');
       if (line.endsWith('jump baseline')) continue;
@@ -130,10 +129,9 @@ describe('NetworkManager unmanaged conf', () => {
   });
 
   it('renders every FIRECRACKER_NET_INTERFACES pattern with the += operator', () => {
-    // The watchdog derives its expected-pattern set from this constant, so every
-    // pattern it advertises must actually reach the rendered drop-in. Assert the
-    // constant is non-empty first: an empty list would make the loop below
-    // vacuously green while the drop-in silently rendered no unmanaged rule.
+    // The watchdog derives its expected patterns from this constant, so each must
+    // reach the rendered drop-in. An empty constant would make the loop below
+    // vacuously green, hence the non-empty assertion.
     expect(FIRECRACKER_NET_INTERFACES.length).toBeGreaterThan(0);
     for (const pattern of FIRECRACKER_NET_INTERFACES) {
       expect(NM_CONF_CONTENT).toContain(`unmanaged-devices+=interface-name:${pattern}`);
@@ -157,10 +155,9 @@ describe('provisionBridge', () => {
   });
 
   it('never deletes the table, so a self-heal cannot strip a live VM of its rules', async () => {
-    // `ensureHostReady` re-provisions on any of four conditions, none of which
-    // knows how many VMs are running. Deleting the table left every one of
-    // them fail-open — full RFC1918 and cloud-metadata reach — until it was
-    // destroyed, and logged nothing.
+    // `ensureHostReady` re-provisions without knowing how many VMs run, and
+    // deleting the table would leave each one silently fail-open (full RFC1918
+    // and cloud-metadata reach) until destroyed.
     const calls: string[] = [];
     const runner = async (spec: CommandSpec) => {
       calls.push([spec.bin, ...spec.args].join(' '));
@@ -178,9 +175,8 @@ describe('provisionBridge', () => {
   });
 
   it('is idempotent on a re-run: tolerates an existing bridge + already-assigned addr', async () => {
-    // Second provision against an already-set-up host: `ip link add` answers
-    // "File exists", `ip addr add` answers "Address already assigned." Both
-    // must be treated as benign no-ops so the deploy stays green on re-run.
+    // On re-provision, `ip link add` answers "File exists" and `ip addr add`
+    // "Address already assigned."; both must be benign no-ops.
     const runner = async (spec: CommandSpec) => {
       const line = [spec.bin, ...spec.args].join(' ');
       if (line.startsWith('ip link add')) throw new Error('RTNETLINK answers: File exists');
@@ -239,9 +235,8 @@ describe('verifyBridge', () => {
   });
 
   it('reports healthy for an admin-up bridge with no carrier (no TAP enslaved yet)', async () => {
-    // Freshly-provisioned bridge with no microVM: IFF_UP is set but operstate
-    // is DOWN + NO-CARRIER. This is the normal post-provision state and must
-    // verify as healthy, or the deploy verify step fails a working host.
+    // A fresh bridge with no microVM has IFF_UP but operstate DOWN + NO-CARRIER:
+    // the normal post-provision state, which must verify as healthy.
     const runner = async (spec: CommandSpec) => {
       const line = [spec.bin, ...spec.args].join(' ');
       if (line.startsWith('ip -j link show kici-br0'))
@@ -262,9 +257,8 @@ describe('verifyBridge', () => {
   });
 
   it('reports unhealthy when the forward chain does not end in the baseline jump', async () => {
-    // A half-provisioned host: per-VM rules but no host baseline behind them,
-    // so nothing NATs or drops for the subnet. It must not read as healthy, or
-    // `ensureHostReady` skips the self-heal that would fix it.
+    // Per-VM rules but no host baseline: nothing NATs or drops for the subnet.
+    // Reading healthy would make `ensureHostReady` skip the self-heal.
     const runner = async (spec: CommandSpec) => {
       const line = [spec.bin, ...spec.args].join(' ');
       if (line.startsWith('ip -j link show kici-br0')) return { stdout: '[{"operstate":"UP"}]' };
@@ -335,9 +329,9 @@ describe('teardownBridge', () => {
     await teardownBridge(cfgA, { runner });
     expect(calls).toContain('nft delete table ip kici');
     expect(calls).toContain('ip link del kici-br0');
-    // The host-scoped NM conf (interface-name:kici-* — matches every bridge +
-    // TAP) must survive a per-bridge teardown, or NetworkManager adopts the
-    // OTHER bridges and strips their gateway IPs. Pin that invariant.
+    // The host-scoped NM conf (interface-name:kici-*, every bridge + TAP) must
+    // survive a per-bridge teardown, or NetworkManager adopts the OTHER bridges
+    // and strips their gateway IPs.
     expect(calls.join('\n')).not.toContain(NM_CONF_PATH);
     expect(calls.join('\n')).not.toContain('90-kici-unmanaged');
   });
@@ -375,11 +369,9 @@ describe('renderBootScript', () => {
       bridgeCidr: '10.0.0.1/24',
       table: 'kici',
     });
-    // The conf must reach the host with its keyfile section + directive on
-    // their own lines. A `printf '%s'` with \n-escaped content collapses it
-    // onto a single comment line that NetworkManager ignores, leaving kici-*
-    // interfaces NM-managed on reboot. Assert the real-newline structure and
-    // that no literal backslash-n leaks into the conf body.
+    // The keyfile section and directive need their own lines: a `printf '%s'`
+    // with \n-escaped content collapses them onto one comment line NetworkManager
+    // ignores, leaving kici-* interfaces NM-managed on reboot.
     expect(script).toContain('[keyfile]\nunmanaged-devices+=interface-name:kici-*');
     expect(script).not.toContain('[keyfile]\\nunmanaged-devices');
     // The whole NM_CONF_CONTENT lands verbatim somewhere in the script.
@@ -392,8 +384,8 @@ describe('renderBootScript', () => {
       bridgeCidr: '10.0.0.1/24',
       table: 'kici',
     });
-    // The nft iifname match must reach nft literally, not be expanded by the
-    // shell against the CWD. Assert the token is single-quoted, never bare.
+    // The nft iifname match must be single-quoted, or the shell globs it
+    // against the CWD.
     expect(script).toContain("iifname 'kici-*'");
     expect(script).not.toMatch(/iifname kici-\*/);
   });

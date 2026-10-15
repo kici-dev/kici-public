@@ -1,16 +1,12 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `init_failure jsonb` columns to `execution_runs` and `execution_jobs`.
+ * `init_failure` on `execution_runs` / `execution_jobs`: non-NULL means the run/job never
+ * executed a step because of an init-phase failure. Shape: `InitFailure` from
+ * `@kici-dev/engine`. The dashboard reads it directly, so it renders the banner without a
+ * round-trip to a possibly offline orchestrator.
  *
- * Presence of this column on a row means the run/job never executed a step
- * because of an init-phase failure; absence (NULL) means a normal run.
- * Shape on the wire is `InitFailure` from `@kici-dev/engine`. The dashboard
- * reads this column directly so it can render the right banner without
- * round-tripping to the orchestrator (which may be offline).
- *
- * Idempotent: re-running on a DB that already has either column is a no-op
- * for that column.
+ * Idempotent per column.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colExists = async (table: string, name: string): Promise<boolean> => {

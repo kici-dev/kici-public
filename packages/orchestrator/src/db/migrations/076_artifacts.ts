@@ -4,16 +4,15 @@ import { type Kysely, sql } from 'kysely';
  * Add the `artifacts` table for user-facing build artifacts and the per-org
  * artifact quota + TTL knobs on `org_settings`.
  *
- * When a workflow step calls `ctx.artifacts.upload(name, paths)`, the agent
- * uploads the packed tarball to object storage under
- * `artifacts/{run_id}/{name}-{discriminator}.tar.gz` (the discriminator is a
- * hash of the exact name) and the orchestrator records one row here
- * so a later job (`ctx.artifacts.download`) and the dashboard can resolve it.
- * `UNIQUE (run_id, name)` is the immutability constraint — the first upload of a
- * name within a run wins; a duplicate name fails at the DB layer as a backstop
+ * On `ctx.artifacts.upload(name, paths)` the agent uploads the tarball to
+ * `artifacts/{run_id}/{name}-{discriminator}.tar.gz` (discriminator = hash of
+ * the exact name) and the orchestrator records one row here, so a later job
+ * (`ctx.artifacts.download`) and the dashboard can resolve it.
+ * `UNIQUE (run_id, name)` is the immutability constraint: the first upload of
+ * a name within a run wins, and a duplicate fails at the DB layer as a backstop
  * to the handler's pre-mint duplicate check.
  *
- * Idempotent: a re-run on a DB that already has the table / columns is a no-op.
+ * Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const tableCheck = await sql<{ exists: boolean }>`
@@ -47,8 +46,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
     `.execute(db);
   }
 
-  // Per-org artifact quota + TTL overrides on org_settings (BIGINT, nullable —
-  // NULL means "use the cluster-wide default"). Idempotent via IF NOT EXISTS.
+  // Per-org artifact quota + TTL overrides; NULL = the cluster-wide default.
   await sql`
     ALTER TABLE public.org_settings
       ADD COLUMN IF NOT EXISTS artifact_quota_bytes BIGINT,

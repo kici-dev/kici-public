@@ -51,7 +51,6 @@ export interface FilterContext {
   changedFiles: string[];
   /** Availability of `changedFiles` (see `changedFiles`). */
   changedFilesStatus: ChangedFilesStatus;
-  /** Environment variables. */
   env: Record<string, string | undefined>;
   /** zx shell executor. */
   $: typeof Shell;

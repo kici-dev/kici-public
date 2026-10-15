@@ -10,12 +10,9 @@ import {
 import { REDUCED_PRIVILEGE_MARKER } from '../security/reduced-privilege-note.js';
 import { SUMMARY_BYTE_LIMIT } from './check-run-summary.js';
 
-// Mock Prometheus metrics
 vi.mock('../metrics/prometheus.js', () => ({
   githubCheckRunTotal: { add: vi.fn() },
 }));
-
-// -- Mock createInstallationOctokit --
 
 let checkRunIdCounter = 1000;
 const mockChecksCreate = vi.fn().mockImplementation(() => {
@@ -35,11 +32,8 @@ vi.mock('../providers/github/auth.js', () => ({
   }),
 }));
 
-// -- Mock the app-level Octokit used only by stale check-run cleanup --
-//
-// Cleanup is the one path that discovers check runs through the GitHub API
-// instead of the in-memory id map, so it authenticates as the App to resolve
-// the repository's installation before listing.
+// App-level Octokit for stale check-run cleanup: the one path that lists check runs from the
+// GitHub API instead of the in-memory id map, so it resolves the installation as the App.
 const mockGetRepoInstallation = vi.fn().mockResolvedValue({ data: { id: 77 } });
 
 vi.mock('@octokit/rest', () => ({
@@ -68,12 +62,43 @@ function githubRegistry(routingKey: string = ROUTING_KEY): ProviderRegistry {
   return registry;
 }
 
+type PendingOptions = Parameters<CheckRunReporter['setPending']>[0];
+type JobStatusOptions = Parameters<CheckRunReporter['updateJobStatus']>[0];
+
+/** The `setPending` argument the cases start from: job `test` of workflow `CI`. */
+function pending(overrides: Partial<PendingOptions> = {}): PendingOptions {
+  return {
+    provider: 'github',
+    owner: 'myorg',
+    repo: 'myrepo',
+    sha: 'abc123',
+    workflowName: 'CI',
+    jobNames: ['test'],
+    installationId: 42,
+    routingKey: ROUTING_KEY,
+    ...overrides,
+  };
+}
+
+/** The `updateJobStatus` argument the cases start from: job `test` of workflow `CI` failed. */
+function jobUpdate(overrides: Partial<JobStatusOptions> = {}): JobStatusOptions {
+  return {
+    provider: 'github',
+    owner: 'myorg',
+    repo: 'myrepo',
+    sha: 'abc123',
+    workflowName: 'CI',
+    jobName: 'test',
+    state: ExecutionJobStatus.enum.failed,
+    installationId: 42,
+    routingKey: ROUTING_KEY,
+    ...overrides,
+  };
+}
+
 /**
- * An all-stub `CheckRunTrackingStore`. Shared by the tracking-store suite and
- * the cross-repository suite below, which overrides `getCheckRunId` on top of
- * it — both need the full method surface, since every write-through the
- * reporter performs would otherwise throw into a swallowing catch and read as
- * a passing test.
+ * An all-stub `CheckRunTrackingStore` with the full method surface: a missing method would
+ * throw into a swallowing catch on write-through and read as a passing test.
  */
 function createTrackingStoreStub() {
   return {
@@ -102,23 +127,12 @@ describe('CheckRunReporter', () => {
     it('creates check runs for workflow and jobs via checks.create', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'build',
-        jobNames: ['test', 'lint'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending({ workflowName: 'build', jobNames: ['test', 'lint'] }));
 
-      // Wait for fire-and-forget to complete
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(3);
       });
 
-      // Overall workflow check run
       expect(mockChecksCreate).toHaveBeenCalledWith(
         expect.objectContaining({
           owner: 'myorg',
@@ -133,7 +147,6 @@ describe('CheckRunReporter', () => {
         }),
       );
 
-      // Per-job check runs
       expect(mockChecksCreate).toHaveBeenCalledWith(
         expect.objectContaining({
           name: 'kici/build/job/test',
@@ -153,18 +166,8 @@ describe('CheckRunReporter', () => {
     it('handles non-GitHub provider gracefully (no-op with log)', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'gitlab',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'build',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending({ provider: 'gitlab', workflowName: 'build' }));
 
-      // Give the fire-and-forget a tick to complete
       await new Promise((r) => setTimeout(r, 50));
 
       expect(mockChecksCreate).not.toHaveBeenCalled();
@@ -173,16 +176,7 @@ describe('CheckRunReporter', () => {
     it('skips when no provider registry is configured', async () => {
       const reporter = new CheckRunReporter({});
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'build',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending({ workflowName: 'build' }));
 
       await new Promise((r) => setTimeout(r, 50));
 
@@ -211,34 +205,13 @@ describe('CheckRunReporter', () => {
     it('updates job check run with success conclusion', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      // First, create check runs so IDs are tracked
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
 
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
       });
 
-      // Now update job status
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.success,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.updateJobStatus(jobUpdate({ state: ExecutionJobStatus.enum.success }));
 
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
@@ -261,42 +234,21 @@ describe('CheckRunReporter', () => {
     });
 
     /**
-     * The trust policy let the run proceed, so no security check was ever
-     * posted and the job fails on something the run was never given.
-     * The two checks that do land — this one and the `kici/<workflow>`
-     * roll-up — are where the contributor can be told why.
+     * The trust policy let the run proceed, so no security check was posted and the job fails
+     * on something the run was never given; this check and the `kici/<workflow>` roll-up are
+     * where the contributor can be told why.
      */
     async function completeJobWithPosture(over: {
       trustTier?: string;
       lockFileSource?: string;
     }): Promise<string> {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
       });
 
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.failed,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-        ...over,
-      });
+      reporter.updateJobStatus(jobUpdate(over));
 
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
@@ -325,39 +277,17 @@ describe('CheckRunReporter', () => {
     });
 
     it('ignores a step-progress update that arrives after the job completed', async () => {
-      // The failure mode: a check run sits at `status: in_progress` with
-      // `conclusion: failure` already attached, because a step status arriving
-      // after the completion schedules a fresh debounce timer that then
-      // PATCHes the check run back open. A check run stuck in a non-terminal
-      // status is the very state this reporter exists to avoid, so completion
-      // has to be a one-way latch.
+      // Failure mode: a step status arriving after completion schedules a fresh debounce
+      // timer that PATCHes the check run back open (`in_progress` with `conclusion: failure`),
+      // so completion has to be a one-way latch.
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
       });
 
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.failed,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.updateJobStatus(jobUpdate());
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
       });
@@ -365,8 +295,8 @@ describe('CheckRunReporter', () => {
         expect.objectContaining({ status: 'completed' }),
       );
 
-      // A late step status for the same job. Without the latch this takes the
-      // "first running step" branch and PATCHes `in_progress` immediately.
+      // Without the latch, this late step takes the "first running step" branch and PATCHes
+      // `in_progress` immediately.
       reporter.updateStepProgress({
         provider: 'github',
         owner: 'myorg',
@@ -392,32 +322,13 @@ describe('CheckRunReporter', () => {
     it('maps failed to failure conclusion', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
 
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
       });
 
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.failed,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.updateJobStatus(jobUpdate());
 
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
@@ -437,32 +348,13 @@ describe('CheckRunReporter', () => {
     it('maps cancelled to cancelled conclusion', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
 
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
       });
 
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.cancelled,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.updateJobStatus(jobUpdate({ state: ExecutionJobStatus.enum.cancelled }));
 
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
@@ -482,33 +374,13 @@ describe('CheckRunReporter', () => {
     it('uses custom description when provided', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
 
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
       });
 
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.failed,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-        description: 'Step "Build" failed with exit code 1',
-      });
+      reporter.updateJobStatus(jobUpdate({ description: 'Step "Build" failed with exit code 1' }));
 
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
@@ -527,18 +399,7 @@ describe('CheckRunReporter', () => {
     it('skips when check run ID is not found (warning, no crash)', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      // Don't call setPending -- no check run IDs tracked
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.success,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.updateJobStatus(jobUpdate({ state: ExecutionJobStatus.enum.success }));
 
       await new Promise((r) => setTimeout(r, 50));
 
@@ -548,17 +409,9 @@ describe('CheckRunReporter', () => {
     it('handles non-GitHub provider gracefully', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.updateJobStatus({
-        provider: 'bitbucket',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.success,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.updateJobStatus(
+        jobUpdate({ provider: 'bitbucket', state: ExecutionJobStatus.enum.success }),
+      );
 
       await new Promise((r) => setTimeout(r, 50));
 
@@ -568,28 +421,16 @@ describe('CheckRunReporter', () => {
 
   describe('the reduced-privilege note and the summary byte cap', () => {
     it('keeps a note-led job summary under the API cap', async () => {
-      // `buildCheckRunSummary` spends the byte budget on its own, so a note
-      // added afterwards could push the update over the cap and GitHub would
-      // reject it outright — leaving the check run unresolved, which is
-      // strictly worse than a shorter log excerpt. The budget itself is pinned
-      // at its own seam in check-run-summary.test.ts; this pins the invariant
-      // end to end.
-      // The rich-summary branch needs a log buffer; an empty one keeps the
-      // fixture cheap while still taking that path.
+      // `buildCheckRunSummary` spends the byte budget on its own, so a note added afterwards
+      // could push the update over the cap; GitHub rejects it and the check run stays
+      // unresolved, worse than a shorter log excerpt. check-run-summary.test.ts pins the
+      // budget; this pins the invariant end to end. The empty log buffer still takes the
+      // rich-summary branch.
       const reporter = new CheckRunReporter({
         providerRegistry: githubRegistry(),
         stepLogBuffer: { getLastLines: () => undefined } as unknown as never,
       });
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
       });
@@ -607,9 +448,8 @@ describe('CheckRunReporter', () => {
         runIdForLogs: 'run-1',
         jobId: 'job-1',
         data: {
-          // ~30 KB of step-error text: well past the note's own size, and
-          // inside the cap so the builder returns a real summary rather than
-          // its minimal fallback.
+          // ~30 KB of step errors: past the note's size, inside the cap so the builder
+          // returns a real summary, not its minimal fallback.
           stepResults: Array.from({ length: 15 }, (_, i) => ({
             name: `step-${i}`,
             status: 'failed',
@@ -625,8 +465,7 @@ describe('CheckRunReporter', () => {
       });
 
       const summary = String(mockChecksUpdate.mock.calls[0][0].output.summary);
-      // Non-vacuity: the body really is at the scale the budget governs, and
-      // the note really is present in the string being measured.
+      // Non-vacuity: the body is at the scale the budget governs and carries the note.
       expect(Buffer.byteLength(summary, 'utf-8')).toBeGreaterThan(10_000);
       expect(summary.startsWith(REDUCED_PRIVILEGE_MARKER)).toBe(true);
       expect(Buffer.byteLength(summary, 'utf-8')).toBeLessThanOrEqual(SUMMARY_BYTE_LIMIT);
@@ -636,16 +475,7 @@ describe('CheckRunReporter', () => {
       // The roll-up is the check a branch-protection rule usually requires, so
       // a contributor may read only this one.
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
       });
@@ -674,16 +504,7 @@ describe('CheckRunReporter', () => {
 
     it('leaves the workflow roll-up alone for a trusted ref', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
       });
@@ -714,16 +535,7 @@ describe('CheckRunReporter', () => {
     it('updates workflow check run with success conclusion', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
 
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -763,16 +575,7 @@ describe('CheckRunReporter', () => {
     it('maps failed to failure with "One or more jobs failed"', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
 
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -807,16 +610,7 @@ describe('CheckRunReporter', () => {
     it('maps cancelled to cancelled conclusion', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
 
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -851,16 +645,7 @@ describe('CheckRunReporter', () => {
     it('uses custom description when provided', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
 
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -913,11 +698,7 @@ describe('CheckRunReporter', () => {
   });
 
   describe('terminal check-run updates record that they were sent', () => {
-    /**
-     * Minimal tracking-store double. Only the methods the reporter calls on
-     * this path are implemented; the rest resolve so a write-through never
-     * throws for an unrelated reason.
-     */
+    /** Every method resolves, so a write-through never throws for an unrelated reason. */
     function makeTrackingStore() {
       return {
         setCheckRunId: vi.fn().mockResolvedValue(undefined),
@@ -935,29 +716,17 @@ describe('CheckRunReporter', () => {
     }
 
     async function seedWorkflowCheckRun(reporter: CheckRunReporter) {
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(2);
       });
     }
 
     it('drops an in-flight in_progress write once the job has completed (no reopened check run)', async () => {
-      // Reproduces the malformed `status: in_progress, conclusion: <terminal>`
-      // state seen on a real failed-job check run: a step-progress in_progress
-      // write passes its `terminalSent` guard, then the job completes — latching
-      // the key and PATCHing `completed` — while the in_progress write is still
-      // awaiting its tracking-store persist. The final latch re-check inside
-      // updateCheckRun must drop the now-obsolete in_progress PATCH so it cannot
-      // land after the completion and reopen the check run.
+      // Reproduces the `status: in_progress, conclusion: <terminal>` state seen on a real
+      // failed-job check run: an in_progress write passes its `terminalSent` guard, then the
+      // job completes (latch + `completed` PATCH) while that write awaits its tracking-store
+      // persist. updateCheckRun's final latch re-check must drop the obsolete PATCH.
       let releaseStepPersist: () => void = () => {};
       const stepPersistGate = new Promise<void>((resolve) => {
         releaseStepPersist = resolve;
@@ -972,8 +741,7 @@ describe('CheckRunReporter', () => {
       });
       await seedWorkflowCheckRun(reporter);
 
-      // 1. First step goes running: the in_progress write starts and parks at the
-      //    gated setStepProgress (its terminalSent guard has already passed).
+      // 1. The in_progress write passes its terminalSent guard and parks at setStepProgress.
       reporter.updateStepProgress({
         provider: 'github',
         owner: 'myorg',
@@ -989,28 +757,15 @@ describe('CheckRunReporter', () => {
         runId: 'run-1',
       });
 
-      // 2. The job fails while the in_progress write is parked: latches the key
-      //    and PATCHes `completed`/`failure`.
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.failed,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-        runId: 'run-1',
-      });
+      // 2. The job fails meanwhile: latches the key and PATCHes `completed`/`failure`.
+      reporter.updateJobStatus(jobUpdate({ runId: 'run-1' }));
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledWith(
           expect.objectContaining({ status: 'completed', conclusion: 'failure' }),
         );
       });
 
-      // 3. Release the parked in_progress write. updateCheckRun's re-check must
-      //    now see the latch and drop the PATCH.
+      // 3. On release, updateCheckRun's re-check must see the latch and drop the PATCH.
       releaseStepPersist();
       await new Promise((r) => setTimeout(r, 50));
 
@@ -1021,21 +776,17 @@ describe('CheckRunReporter', () => {
         inProgressWrites,
         'the in-flight in_progress write must be dropped after completion',
       ).toHaveLength(0);
-      // The check run stays terminal.
       expect(mockChecksUpdate).toHaveBeenCalledWith(
         expect.objectContaining({ status: 'completed', conclusion: 'failure' }),
       );
     });
 
     it('serializes PATCHes per key so a live in_progress write cannot land after completion', async () => {
-      // The final latch re-check inside updateCheckRun runs BEFORE its network
-      // PATCH, so an in_progress PATCH that has passed the check and is awaiting
-      // GitHub can still land after the terminal `completed` PATCH and reopen
-      // the check run — the `{ status: in_progress, conclusion: failure }` state
-      // seen on a real failed-job check. The guard above parks the write before
-      // the PATCH; this one parks it mid-PATCH, which only per-key serialization
-      // of updateCheckRun can close: the completed PATCH must not be issued
-      // while the in_progress PATCH is still in flight for the same key.
+      // updateCheckRun's latch re-check runs BEFORE the network PATCH, so an in_progress
+      // PATCH already awaiting GitHub can land after `completed` and reopen the check run
+      // (`{ status: in_progress, conclusion: failure }`, seen on a real failed job). The
+      // previous test parks before the PATCH; this one parks mid-PATCH, which only per-key
+      // serialization closes: `completed` must wait for the in-flight in_progress PATCH.
       let releaseInProgress: () => void = () => {};
       const inProgressInFlight = new Promise<void>((resolve) => {
         releaseInProgress = resolve;
@@ -1052,8 +803,7 @@ describe('CheckRunReporter', () => {
       });
       await seedWorkflowCheckRun(reporter);
 
-      // 1. First step running: the in_progress PATCH passes every guard and
-      //    parks in flight at octokit.checks.update, holding the per-key lock.
+      // 1. The in_progress PATCH parks at octokit.checks.update, holding the per-key lock.
       reporter.updateStepProgress({
         provider: 'github',
         owner: 'myorg',
@@ -1074,25 +824,11 @@ describe('CheckRunReporter', () => {
         );
       });
 
-      // 2. The job fails while the in_progress PATCH is still in flight. The
-      //    completion PATCH must NOT be issued until the in_progress one settles.
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.failed,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-        runId: 'run-1',
-      });
+      // 2. The job fails meanwhile; its PATCH must wait for the in_progress one to settle.
+      reporter.updateJobStatus(jobUpdate({ runId: 'run-1' }));
       await new Promise((r) => setTimeout(r, 50));
 
-      // Discriminator: with per-key serialization the completed PATCH is blocked
-      // behind the in-flight in_progress PATCH. Without it, both PATCHes race at
-      // GitHub and the check run can be left reopened.
+      // Discriminator: without per-key serialization both PATCHes race at GitHub.
       const completedIssuedWhileInFlight = mockChecksUpdate.mock.calls.some(
         (c) => (c[0] as { status?: string }).status === 'completed',
       );
@@ -1101,8 +837,7 @@ describe('CheckRunReporter', () => {
         'the completed PATCH must not be issued while an in_progress PATCH is still in flight for the same key',
       ).toBe(false);
 
-      // 3. Release the in_progress PATCH. Completion now proceeds and the
-      //    terminal state is the last write.
+      // 3. On release, completion proceeds and the terminal state is the last write.
       releaseInProgress();
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledWith(
@@ -1201,10 +936,8 @@ describe('CheckRunReporter', () => {
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
       });
-      // Drain the queue rather than sleeping a wall-clock interval. Everything
-      // after the PATCH settles on this path is synchronous or a single awaited
-      // promise, so a handful of macrotask turns is enough — and unlike a fixed
-      // sleep it does not get shorter than the work under load.
+      // Drain the queue rather than sleep: the rest of this path is at most one awaited
+      // promise, and a fixed sleep gets shorter than the work under load.
       for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve));
       expect(trackingStore.markTerminalSent).not.toHaveBeenCalled();
     });
@@ -1242,57 +975,24 @@ describe('CheckRunReporter', () => {
     it('setPending -> updateJobStatus -> updateWorkflowStatus', async () => {
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      // 1. Create check runs (queued)
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test', 'build'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending({ jobNames: ['test', 'build'] }));
 
       await vi.waitFor(() => {
         expect(mockChecksCreate).toHaveBeenCalledTimes(3); // workflow + 2 jobs
       });
 
-      // 2. Update first job (success)
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'test',
-        state: ExecutionJobStatus.enum.success,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.updateJobStatus(jobUpdate({ state: ExecutionJobStatus.enum.success }));
 
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
       });
 
-      // 3. Update second job (failed)
-      reporter.updateJobStatus({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobName: 'build',
-        state: ExecutionJobStatus.enum.failed,
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.updateJobStatus(jobUpdate({ jobName: 'build' }));
 
       await vi.waitFor(() => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(2);
       });
 
-      // 4. Update overall workflow (failed)
       reporter.updateWorkflowStatus({
         provider: 'github',
         owner: 'myorg',
@@ -1308,18 +1008,15 @@ describe('CheckRunReporter', () => {
         expect(mockChecksUpdate).toHaveBeenCalledTimes(3);
       });
 
-      // Verify IDs: workflow=1000, test=1001, build=1002
+      // Ids: workflow=1000, test=1001, build=1002.
       const updateCalls = mockChecksUpdate.mock.calls;
 
-      // Job 'test' update (check_run_id 1001)
       expect(updateCalls[0][0].check_run_id).toBe(1001);
       expect(updateCalls[0][0].conclusion).toBe(CheckRunConclusion.enum.success);
 
-      // Job 'build' update (check_run_id 1002)
       expect(updateCalls[1][0].check_run_id).toBe(1002);
       expect(updateCalls[1][0].conclusion).toBe('failure');
 
-      // Workflow update (check_run_id 1000)
       expect(updateCalls[2][0].check_run_id).toBe(1000);
       expect(updateCalls[2][0].conclusion).toBe('failure');
     });
@@ -1340,21 +1037,11 @@ describe('CheckRunReporter', () => {
 
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
 
-      // Wait for the fire-and-forget to complete (it shouldn't throw)
       await new Promise((r) => setTimeout(r, 100));
 
-      // Should not throw -- error is caught internally
+      // The error is caught internally.
       expect(true).toBe(true);
     });
 
@@ -1363,22 +1050,10 @@ describe('CheckRunReporter', () => {
 
       const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
-      // This should not throw
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'CI',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-      });
+      reporter.setPending(pending());
 
-      // Wait for the fire-and-forget to complete
       await new Promise((r) => setTimeout(r, 100));
 
-      // No exception thrown -- fire-and-forget pattern works
       expect(true).toBe(true);
     });
   });
@@ -1391,17 +1066,7 @@ describe('CheckRunReporter', () => {
         trackingStore: trackingStore as never,
       });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'build',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-        runId: 'run-xyz',
-      });
+      reporter.setPending(pending({ workflowName: 'build', runId: 'run-xyz' }));
 
       await vi.waitFor(() => {
         expect(trackingStore.setCheckRunId).toHaveBeenCalledWith(
@@ -1419,17 +1084,7 @@ describe('CheckRunReporter', () => {
         trackingStore: trackingStore as never,
       });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'build',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-        runId: 'run-xyz',
-      });
+      reporter.setPending(pending({ workflowName: 'build', runId: 'run-xyz' }));
       await vi.waitFor(() => expect(trackingStore.setCheckRunId).toHaveBeenCalled());
 
       reporter.cleanupRun('run-xyz');
@@ -1438,10 +1093,9 @@ describe('CheckRunReporter', () => {
     });
 
     /**
-     * Tracking-store fake with real row state: `setCheckRunId` inserts and
-     * `deleteByRunId` removes, so a load-through after a delete genuinely
-     * misses. A stub whose delete is a no-op would pass the load-through
-     * assertion below whether or not `cleanupRun` still deleted.
+     * Tracking-store fake with real row state, so a load-through after a delete genuinely
+     * misses; a no-op delete would pass the load-through assertion whether or not
+     * `cleanupRun` deleted.
      */
     function createStatefulTrackingStore() {
       const rows = new Map<string, { checkRunId: number; runId?: string; terminalSentAt?: Date }>();
@@ -1455,9 +1109,7 @@ describe('CheckRunReporter', () => {
       base.getCheckRunId.mockImplementation(async (k: { checkName: string }) => {
         return rows.get(id(k))?.checkRunId;
       });
-      // Reads the SAME row as `getCheckRunId`, because the real store does:
-      // both go through `selectRow`. A fake where the two disagree models a
-      // state the database cannot be in.
+      // Reads the same row as `getCheckRunId`, as the real store does through `selectRow`.
       base.getState.mockImplementation(async (k: { checkName: string }) => {
         const row = rows.get(id(k));
         if (!row) return undefined;
@@ -1486,8 +1138,7 @@ describe('CheckRunReporter', () => {
     }
 
     it('the stateful fake really loses rows when deleteByRunId runs', async () => {
-      // Positive control for the pin below: prove the fake can detect a delete
-      // at all, so a green load-through assertion means something.
+      // Positive control for the load-through pin below: the fake can detect a delete.
       const { store, rows } = createStatefulTrackingStore();
       await store.setCheckRunId({ checkName: 'kici/build' } as never, 4242, 'run-xyz');
       expect(await store.getCheckRunId({ checkName: 'kici/build' } as never)).toBe(4242);
@@ -1499,27 +1150,15 @@ describe('CheckRunReporter', () => {
     });
 
     it('still resolves a check-run ID from the store after cleanupRun evicted L1', async () => {
-      // The point of leaving the row in place: a terminal PATCH that lands
-      // after the run was pruned must still find its check-run ID. With the
-      // row deleted at prune time this load-through returns undefined and the
-      // check run stays unresolved on the commit forever.
+      // The prune leaves the row so a terminal PATCH landing afterwards still finds its
+      // check-run ID; without it the check run stays unresolved on the commit forever.
       const { store: trackingStore } = createStatefulTrackingStore();
       const reporter = new CheckRunReporter({
         providerRegistry: githubRegistry(),
         trackingStore: trackingStore as never,
       });
 
-      reporter.setPending({
-        provider: 'github',
-        owner: 'myorg',
-        repo: 'myrepo',
-        sha: 'abc123',
-        workflowName: 'build',
-        jobNames: ['test'],
-        installationId: 42,
-        routingKey: ROUTING_KEY,
-        runId: 'run-xyz',
-      });
+      reporter.setPending(pending({ workflowName: 'build', runId: 'run-xyz' }));
       await vi.waitFor(() => expect(trackingStore.setCheckRunId).toHaveBeenCalledTimes(2));
       const workflowCheckRunId = await trackingStore.getCheckRunId({
         checkName: 'kici/build',
@@ -1527,7 +1166,7 @@ describe('CheckRunReporter', () => {
       expect(workflowCheckRunId).toEqual(expect.any(Number));
 
       reporter.cleanupRun('run-xyz');
-      // L1 is empty now, so the update has to load through to the store.
+      // L1 is empty, so the update loads through to the store.
 
       reporter.updateWorkflowStatus({
         provider: 'github',
@@ -1542,10 +1181,8 @@ describe('CheckRunReporter', () => {
       });
 
       await vi.waitFor(() => {
-        // `getState`, not `getCheckRunId`: the read-through pulls the whole row
-        // so it can rehydrate the terminal latch alongside the id. Asserting
-        // the old method here would pass on the test's own direct call above
-        // rather than on anything the reporter did.
+        // `getState`: the read-through pulls the whole row to rehydrate the terminal latch.
+        // `getCheckRunId` would pass on the test's own direct call above.
         expect(trackingStore.getState).toHaveBeenCalledWith(
           expect.objectContaining({ checkName: 'kici/build' }),
         );
@@ -1556,12 +1193,9 @@ describe('CheckRunReporter', () => {
     });
 
     it('does not reopen a completed job check run when a step arrives after cleanupRun', async () => {
-      // The prune deliberately keeps the `check_run_tracking` row so a late
-      // update can still resolve its check-run id — and used to drop the
-      // in-memory terminal latch with it. That pairing is what produced
-      // `status: in_progress` with `conclusion: failure` already attached: the
-      // id came back from the row, the latch did not, and the late step
-      // PATCHed the completed check run back open.
+      // The prune keeps the `check_run_tracking` row so a late update resolves its id. If
+      // the id comes back from the row without the terminal latch, the late step PATCHes
+      // the completed check run back open (`in_progress` with `conclusion: failure`).
       const { store: trackingStore } = createStatefulTrackingStore();
       const reporter = new CheckRunReporter({
         providerRegistry: githubRegistry(),
@@ -1591,8 +1225,7 @@ describe('CheckRunReporter', () => {
       });
       mockChecksUpdate.mockClear();
 
-      // The run is pruned: every in-memory entry for it goes, including the
-      // latch. Only the retained row remembers the completion.
+      // The prune drops every in-memory entry, latch included; only the row remembers.
       reporter.cleanupRun('run-xyz');
 
       reporter.updateStepProgress({
@@ -1602,18 +1235,15 @@ describe('CheckRunReporter', () => {
         state: ExecutionStepStatus.enum.running,
       });
 
-      // Drain rather than sleep — the suppressed path is a few awaited
-      // promises, and a fixed sleep gets shorter than the work under load.
+      // Drain rather than sleep: a fixed sleep gets shorter than the work under load.
       for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve));
 
       expect(mockChecksUpdate).not.toHaveBeenCalled();
     });
 
     it('still publishes step progress after cleanupRun when the job never completed', async () => {
-      // Positive control for the pin above. Without it, a reporter that
-      // stopped publishing progress after any prune would pass that test while
-      // being broken — the assertion there is an absence, and an absence proves
-      // nothing unless the same setup can produce a presence.
+      // Positive control for the absence pin above: a reporter that stopped publishing
+      // progress after any prune would pass that test.
       const { store: trackingStore } = createStatefulTrackingStore();
       const reporter = new CheckRunReporter({
         providerRegistry: githubRegistry(),
@@ -1635,8 +1265,7 @@ describe('CheckRunReporter', () => {
       await vi.waitFor(() => expect(trackingStore.setCheckRunId).toHaveBeenCalledTimes(2));
       mockChecksUpdate.mockClear();
 
-      // Pruned with no terminal update ever sent, so the retained row carries
-      // no `terminal_sent_at` and the late step is legitimate.
+      // No terminal update was sent, so the row has no `terminal_sent_at`.
       reporter.cleanupRun('run-xyz');
 
       reporter.updateStepProgress({
@@ -1702,22 +1331,12 @@ describe('CheckRunReporter multi-app credential resolution', () => {
 
     const reporter = new CheckRunReporter({ providerRegistry: registry });
 
-    reporter.setPending({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'build',
-      jobNames: ['test'],
-      installationId: 42,
-      routingKey: 'github:99999',
-    });
+    reporter.setPending(pending({ workflowName: 'build', routingKey: 'github:99999' }));
 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
     });
 
-    // Verify createInstallationOctokit was called with the app-specific config
     const { createInstallationOctokit } = await import('../providers/github/auth.js');
     expect(createInstallationOctokit).toHaveBeenCalledWith(appConfig, 42);
   });
@@ -1742,47 +1361,42 @@ describe('CheckRunReporter multi-app credential resolution', () => {
 
     const reporter = new CheckRunReporter({ providerRegistry: registry });
 
-    // Create check runs with app 1
-    reporter.setPending({
-      provider: 'github',
-      owner: 'org1',
-      repo: 'repo1',
-      sha: 'sha1',
-      workflowName: 'CI',
-      jobNames: ['test'],
-      installationId: 100,
-      routingKey: 'github:11111',
-    });
+    reporter.setPending(
+      pending({
+        owner: 'org1',
+        repo: 'repo1',
+        sha: 'sha1',
+        installationId: 100,
+        routingKey: 'github:11111',
+      }),
+    );
 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
     });
 
-    // Create check runs with app 2
-    reporter.setPending({
-      provider: 'github',
-      owner: 'org2',
-      repo: 'repo2',
-      sha: 'sha2',
-      workflowName: 'CI',
-      jobNames: ['lint'],
-      installationId: 200,
-      routingKey: 'github:22222',
-    });
+    reporter.setPending(
+      pending({
+        owner: 'org2',
+        repo: 'repo2',
+        sha: 'sha2',
+        jobNames: ['lint'],
+        installationId: 200,
+        routingKey: 'github:22222',
+      }),
+    );
 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(4);
     });
 
-    // doSetPending creates ONE octokit per setPending call (reused for all check runs)
+    // One octokit per setPending call, reused for all its check runs.
     const calls = mockedCreateOctokit.mock.calls;
     expect(calls).toHaveLength(2);
 
-    // First call: app1Config with installationId 100
     expect(calls[0][0]).toEqual(app1Config);
     expect(calls[0][1]).toBe(100);
 
-    // Second call: app2Config with installationId 200
     expect(calls[1][0]).toEqual(app2Config);
     expect(calls[1][1]).toBe(200);
   });
@@ -1796,16 +1410,7 @@ describe('CheckRunReporter multi-app credential resolution', () => {
     });
     const reporter = new CheckRunReporter({ providerRegistry: registry });
 
-    reporter.setPending({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'build',
-      jobNames: ['test'],
-      installationId: 42,
-      routingKey: 'github:unknown',
-    });
+    reporter.setPending(pending({ workflowName: 'build', routingKey: 'github:unknown' }));
 
     await new Promise((r) => setTimeout(r, 50));
     expect(mockChecksCreate).not.toHaveBeenCalled();
@@ -1814,16 +1419,7 @@ describe('CheckRunReporter multi-app credential resolution', () => {
   it('skips when no config is resolvable (no registry, no githubConfig)', async () => {
     const reporter = new CheckRunReporter({});
 
-    reporter.setPending({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'build',
-      jobNames: ['test'],
-      installationId: 42,
-      routingKey: 'github:12345',
-    });
+    reporter.setPending(pending({ workflowName: 'build', routingKey: 'github:12345' }));
 
     await new Promise((r) => setTimeout(r, 50));
 
@@ -1910,17 +1506,7 @@ describe('details_url with public alias', () => {
       getOrgPublicAlias: () => ALIAS,
     });
 
-    reporter.setPending({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'build',
-      jobNames: ['test'],
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.setPending(pending({ workflowName: 'build', runId: RUN_ID }));
 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -1942,17 +1528,7 @@ describe('details_url with public alias', () => {
       getOrgPublicAlias: () => ALIAS,
     });
 
-    reporter.setPending({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'build',
-      jobNames: ['test'],
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.setPending(pending({ workflowName: 'build', runId: RUN_ID }));
 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -1968,17 +1544,7 @@ describe('details_url with public alias', () => {
       getOrgPublicAlias: () => ALIAS,
     });
 
-    reporter.setPending({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'build',
-      jobNames: ['test'],
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.setPending(pending({ workflowName: 'build', runId: RUN_ID }));
 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -1994,17 +1560,7 @@ describe('details_url with public alias', () => {
       getOrgPublicAlias: () => undefined,
     });
 
-    reporter.setPending({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'build',
-      jobNames: ['test'],
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.setPending(pending({ workflowName: 'build', runId: RUN_ID }));
 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
@@ -2046,34 +1602,13 @@ describe('details_url with public alias', () => {
       getOrgPublicAlias: () => ALIAS,
     });
 
-    reporter.setPending({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'CI',
-      jobNames: ['test'],
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.setPending(pending({ runId: RUN_ID }));
 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
     });
 
-    reporter.updateJobStatus({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'CI',
-      jobName: 'test',
-      state: ExecutionJobStatus.enum.success,
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.updateJobStatus(jobUpdate({ state: ExecutionJobStatus.enum.success, runId: RUN_ID }));
 
     await vi.waitFor(() => {
       expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
@@ -2084,44 +1619,21 @@ describe('details_url with public alias', () => {
   });
 
   it('updateJobStatus emits details_url with explicit runId outside ALS frame', async () => {
-    // Regression: agent WS message handlers in app.ts call updateJobStatus
-    // without a request-context ALS frame, so the reporter must accept an
-    // explicit runId rather than relying on getRequestContext().
+    // Agent WS handlers in app.ts call updateJobStatus outside a request-context ALS frame,
+    // so the reporter must accept an explicit runId rather than rely on getRequestContext().
     const reporter = new CheckRunReporter({
       providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard',
       getOrgPublicAlias: () => ALIAS,
     });
 
-    reporter.setPending({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'CI',
-      jobNames: ['test'],
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.setPending(pending({ runId: RUN_ID }));
 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
     });
 
-    // Explicit runId — no ALS context set up by the caller.
-    reporter.updateJobStatus({
-      provider: 'github',
-      owner: 'myorg',
-      repo: 'myrepo',
-      sha: 'abc123',
-      workflowName: 'CI',
-      jobName: 'test',
-      state: ExecutionJobStatus.enum.failed,
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.updateJobStatus(jobUpdate({ runId: RUN_ID }));
 
     await vi.waitFor(() => {
       expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
@@ -2131,17 +1643,15 @@ describe('details_url with public alias', () => {
   });
 
   it('updateWorkflowStatus emits details_url with explicit runId outside ALS frame', async () => {
-    // Regression: orchestrator-core's onExecutionComplete callback fires
-    // outside any request-context ALS frame, so the reporter must accept
-    // an explicit runId for the workflow-level check-run completion path.
+    // orchestrator-core's onExecutionComplete fires outside any request-context ALS frame,
+    // so the workflow-level completion path must accept an explicit runId.
     const reporter = new CheckRunReporter({
       providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard',
       getOrgPublicAlias: () => ALIAS,
     });
 
-    // Use setPendingAwait so the workflow check-run id is in cache before
-    // updateWorkflowStatus runs its lookup (avoids fire-and-forget race).
+    // setPendingAwait caches the id before updateWorkflowStatus looks it up (no race).
     await reporter.setPendingAwait({
       provider: 'github',
       owner: 'myorg',
@@ -2180,36 +1690,32 @@ describe('details_url with public alias', () => {
       providerRegistry: githubRegistry(),
       dashboardUrl: 'https://example.test/kici/dashboard',
     });
-    // First call: no resolver yet → omit details_url.
-    reporter.setPending({
-      provider: 'github',
-      owner: 'a',
-      repo: 'a',
-      sha: 'a1',
-      workflowName: 'w1',
-      jobNames: [],
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.setPending(
+      pending({
+        owner: 'a',
+        repo: 'a',
+        sha: 'a1',
+        workflowName: 'w1',
+        jobNames: [],
+        runId: RUN_ID,
+      }),
+    );
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(1);
     });
     expect((mockChecksCreate.mock.calls[0][0] as any).details_url).toBeUndefined();
 
-    // Late-bind the resolver, second call gets details_url.
     reporter.setOrgPublicAliasResolver(() => ALIAS);
-    reporter.setPending({
-      provider: 'github',
-      owner: 'b',
-      repo: 'b',
-      sha: 'b1',
-      workflowName: 'w2',
-      jobNames: [],
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.setPending(
+      pending({
+        owner: 'b',
+        repo: 'b',
+        sha: 'b1',
+        workflowName: 'w2',
+        jobNames: [],
+        runId: RUN_ID,
+      }),
+    );
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
     });
@@ -2227,15 +1733,9 @@ describe('check-run conclusion mappers cover every terminal job status', () => {
   };
 
   /**
-   * The conclusion each terminal status must map to — named explicitly rather
-   * than asserted as "defined".
-   *
-   * A `toBeDefined()` loop would be satisfied by the catch-all `default` arm for
-   * ANY input, including a future terminal status falling through it, so it
-   * could not fail for the thing it exists to catch. Pinning the expected
-   * conclusion means a status reaching the default arm (which returns `failure`
-   * plus an "unrecognised status" description) fails every row that expects
-   * something else, and the description assertion below catches the rest.
+   * The conclusion each terminal status must map to. A `toBeDefined()` loop would pass on the
+   * catch-all `default` arm (`failure` plus "unrecognised status") for any input; pinning the
+   * conclusion fails every other row, and the description assertion below catches the rest.
    */
   const EXPECTED_CONCLUSION: Record<string, string> = {
     [ExecutionJobStatus.enum.success]: CheckRunConclusion.enum.success,
@@ -2248,8 +1748,7 @@ describe('check-run conclusion mappers cover every terminal job status', () => {
   };
 
   it('names an expected conclusion for every terminal status', () => {
-    // Guards the table itself: a terminal status added to the engine without a
-    // row here would otherwise silently skip its assertion below.
+    // A terminal status added to the engine without a row here would skip its assertion.
     expect(Object.keys(EXPECTED_CONCLUSION).sort()).toEqual([...TERMINAL_JOB_STATES].sort());
   });
 
@@ -2259,8 +1758,7 @@ describe('check-run conclusion mappers cover every terminal job status', () => {
         const result = call(mapper, status);
         expect(result).toBeDefined();
         expect(result.conclusion).toBe(EXPECTED_CONCLUSION[status]);
-        // The default arm's description says "unrecognised status"; a status
-        // that reached it must not pass as a real mapping.
+        // A status that reached the "unrecognised status" default arm must not pass.
         expect(result.description).toBeTruthy();
         expect(result.description).not.toContain('unrecognised');
       });
@@ -2275,9 +1773,8 @@ describe('check-run conclusion mappers cover every terminal job status', () => {
   });
 });
 describe('cross-repository global workflow check runs', () => {
-  // The acted-on repository (a global workflow's run is attributed here) and
-  // the repository that DEFINES the workflow. Both define a workflow named
-  // `ci`, which is legal: they are two lock files.
+  // The acted-on repository (where a global workflow's run is attributed) and the defining
+  // repository both define a workflow named `ci`, which is legal: they are two lock files.
   const OWNER = 'acme';
   const REPO = 'app';
   const ACTED_ON = `${OWNER}/${REPO}`;
@@ -2296,18 +1793,13 @@ describe('cross-repository global workflow check runs', () => {
   });
 
   /**
-   * A tracking store that resolves ONLY the global run's qualified keys.
+   * A tracking store that resolves ONLY the global run's qualified keys, so each test asserts
+   * WHICH check run was PATCHed instead of a wall-clock "nothing happened", which passes for
+   * free on a loaded executor.
    *
-   * Modelling the store this way is what turns each assertion below positive:
-   * the global run posts to a check run of its own, so the test asserts WHICH
-   * check run was PATCHed rather than waiting out a fixed delay to conclude
-   * that none was. A wall-clock "nothing happened" assertion passes for free on
-   * a loaded executor; this one cannot.
-   *
-   * Returning undefined for the acted-on repository's unqualified keys models
-   * the documented cache-only fallback, where a write-through failed and L1 is
-   * the only copy. That isolates the L1 state, which is what `cleanupRun`
-   * evicts and what the last test here is about.
+   * Undefined for the acted-on repository's unqualified keys models the documented cache-only
+   * fallback (a failed write-through leaves L1 the only copy), isolating the L1 state that
+   * `cleanupRun` evicts.
    */
   function createGlobalOnlyTrackingStore() {
     const qualified = `kici/${WORKFLOW_REPO}/${WORKFLOW}`;
@@ -2319,8 +1811,7 @@ describe('cross-repository global workflow check runs', () => {
     return {
       ...createTrackingStoreStub(),
       getCheckRunId: vi.fn(async (key: { checkName: string }) => idFor(key.checkName)),
-      // The reporter's read-through reads the whole row, not just the id — the
-      // real store answers both from one `selectRow`, so the fake must too.
+      // The read-through reads the whole row; the real store answers both from one `selectRow`.
       getState: vi.fn(async (key: { checkName: string }) => {
         const checkRunId = idFor(key.checkName);
         return checkRunId === undefined ? undefined : { checkRunId, stepProgress: [] };
@@ -2329,9 +1820,8 @@ describe('cross-repository global workflow check runs', () => {
   }
 
   /**
-   * Create the acted-on repository's own `ci` check runs, exactly as the
-   * per-repository dispatch path does. Returns the workflow check-run id and
-   * the job check-run id the global run must not touch.
+   * Create the acted-on repository's own `ci` check runs as the per-repository dispatch path
+   * does; returns the ids the global run must not touch.
    */
   async function seedPerRepositoryChecks(
     reporter: CheckRunReporter,
@@ -2385,9 +1875,8 @@ describe('cross-repository global workflow check runs', () => {
   });
 
   it('leaves the name unqualified when the workflow is defined in the repository it ran against', async () => {
-    // A global workflow firing on its own repository's event is not a
-    // cross-repository run: the acted-on and defining repositories are the
-    // same, so nothing can collide and the customer-visible name must not move.
+    // A global workflow firing on its own repository's event is not cross-repository:
+    // nothing can collide, so the customer-visible name must not move.
     const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
 
     await reporter.setPendingAwait({
@@ -2433,8 +1922,7 @@ describe('cross-repository global workflow check runs', () => {
     });
 
     await vi.waitFor(() => expect(mockChecksUpdate).toHaveBeenCalled());
-    // Assert the FIRST PATCH, so a run that posts to the acted-on repository's
-    // check run fails on the id it names rather than on a timeout.
+    // The FIRST PATCH, so a wrong target fails on the id it names, not on a timeout.
     expect(mockChecksUpdate.mock.calls[0][0]).toMatchObject({
       check_run_id: GLOBAL_WORKFLOW_CHECK_ID,
       status: 'completed',
@@ -2453,19 +1941,17 @@ describe('cross-repository global workflow check runs', () => {
     });
     const { jobCheckRunId } = await seedPerRepositoryChecks(reporter);
 
-    reporter.updateJobStatus({
-      provider: 'github',
-      owner: OWNER,
-      repo: REPO,
-      sha: SHA,
-      workflowName: WORKFLOW,
-      jobName: JOB,
-      state: ExecutionJobStatus.enum.failed,
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      workflowRepoIdentifier: WORKFLOW_REPO,
-      runId: 'run-global',
-    });
+    reporter.updateJobStatus(
+      jobUpdate({
+        owner: OWNER,
+        repo: REPO,
+        sha: SHA,
+        workflowName: WORKFLOW,
+        jobName: JOB,
+        workflowRepoIdentifier: WORKFLOW_REPO,
+        runId: 'run-global',
+      }),
+    );
 
     await vi.waitFor(() => expect(mockChecksUpdate).toHaveBeenCalled());
     expect(mockChecksUpdate.mock.calls[0][0]).toMatchObject({
@@ -2502,8 +1988,7 @@ describe('cross-repository global workflow check runs', () => {
     });
 
     await vi.waitFor(() => expect(mockChecksUpdate).toHaveBeenCalled());
-    // Reopening a check run is the harm here: `in_progress` on the acted-on
-    // repository's check would push a resolved check back to running.
+    // The harm: `in_progress` on the acted-on check would push a resolved check back open.
     expect(mockChecksUpdate.mock.calls[0][0]).toMatchObject({
       check_run_id: GLOBAL_JOB_CHECK_ID,
       status: 'in_progress',
@@ -2514,9 +1999,8 @@ describe('cross-repository global workflow check runs', () => {
   });
 
   it('leaves the acted-on repository check run resolvable after the global run is pruned', async () => {
-    // `cleanupRun` evicts every key the run touched. A global run that resolved
-    // the acted-on repository's key would register it as its own and evict that
-    // run's check-run id and terminal latch on prune.
+    // `cleanupRun` evicts every key the run touched, so a global run that resolved the
+    // acted-on key would evict that run's check-run id and terminal latch on prune.
     const trackingStore = createGlobalOnlyTrackingStore();
     const reporter = new CheckRunReporter({
       providerRegistry: githubRegistry(),
@@ -2539,26 +2023,24 @@ describe('cross-repository global workflow check runs', () => {
       workflowRepoIdentifier: WORKFLOW_REPO,
       runId: 'run-global',
     });
-    // A PATCH lands either way — its own check run, or the acted-on
-    // repository's — so this wait closes the race on the key registration that
-    // `cleanupRun` then evicts, without assuming which behaviour is under test.
+    // A PATCH lands on either check run, so this wait closes the key-registration race
+    // without assuming which behaviour is under test.
     await vi.waitFor(() => expect(mockChecksUpdate).toHaveBeenCalled());
     mockChecksUpdate.mockClear();
 
     reporter.cleanupRun('run-global');
 
-    reporter.updateJobStatus({
-      provider: 'github',
-      owner: OWNER,
-      repo: REPO,
-      sha: SHA,
-      workflowName: WORKFLOW,
-      jobName: JOB,
-      state: ExecutionJobStatus.enum.success,
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: 'run-per-repo',
-    });
+    reporter.updateJobStatus(
+      jobUpdate({
+        owner: OWNER,
+        repo: REPO,
+        sha: SHA,
+        workflowName: WORKFLOW,
+        jobName: JOB,
+        state: ExecutionJobStatus.enum.success,
+        runId: 'run-per-repo',
+      }),
+    );
 
     await vi.waitFor(() => {
       expect(mockChecksUpdate).toHaveBeenCalledWith(
@@ -2573,9 +2055,8 @@ describe('cross-repository global workflow check runs', () => {
 });
 
 describe('stale check-run cleanup names the workflow repository', () => {
-  // Both repositories define a workflow named `ci`, which is legal — they are
-  // two lock files. Cleanup lists the acted-on repository's commit, so both
-  // repositories' checks appear side by side in one response.
+  // Both repositories legally define `ci`; cleanup lists the acted-on commit, so both
+  // repositories' checks appear in one response.
   const OWNER = 'acme';
   const REPO = 'app';
   const ACTED_ON = `${OWNER}/${REPO}`;
@@ -2596,10 +2077,8 @@ describe('stale check-run cleanup names the workflow repository', () => {
   });
 
   /**
-   * A listing carrying the named in-progress checks, in order. The acted-on
-   * repository's unqualified check is listed FIRST wherever both appear, so an
-   * implementation that matches unqualified names PATCHes it on the first call
-   * — the assertion then fails on the id it names rather than on a timeout.
+   * In-progress checks, in order. Callers list the unqualified check FIRST, so a wrong match
+   * fails on the id of the first PATCH rather than on a timeout.
    */
   function listChecks(checks: Array<{ id: number; name: string }>): void {
     mockChecksListForRef.mockResolvedValue({
@@ -2675,10 +2154,8 @@ describe('stale check-run cleanup names the workflow repository', () => {
   });
 
   it('times out the unqualified check when the Platform sends no workflow repository', async () => {
-    // An older Platform omits the field on EVERY run, ordinary ones included,
-    // and an ordinary run is the overwhelming majority. Skipping on absence
-    // would trade a rare, bounded wrong red for hung checks on every stale run
-    // that Platform reports — so absence keeps naming the unqualified check.
+    // An older Platform omits the field on EVERY run, ordinary ones included; skipping on
+    // absence would trade a rare, bounded wrong red for hung checks on every stale run.
     const reporter = new CheckRunReporter({ providerRegistry: githubRegistry(ROUTING_KEY) });
     listChecks([{ id: PER_REPO_CHECK_ID, name: `kici/${WORKFLOW}` }]);
 
@@ -2693,10 +2170,8 @@ describe('stale check-run cleanup names the workflow repository', () => {
   });
 
   it('times out the unqualified check when the workflow repository is the acted-on one', async () => {
-    // A global workflow firing on its own repository's event is not a
-    // cross-repository run, so its check-run name never moved and cleanup must
-    // still reach it. This is the same case as an absent field, which is why
-    // the Platform never sends a value equal to the acted-on repository.
+    // Not a cross-repository run, so the name never moved and cleanup must reach it; the
+    // same case as an absent field, which is why the Platform never sends this value.
     const reporter = new CheckRunReporter({ providerRegistry: githubRegistry(ROUTING_KEY) });
     listChecks([{ id: PER_REPO_CHECK_ID, name: `kici/${WORKFLOW}` }]);
 
@@ -2740,8 +2215,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
   it('completes the workflow check and every per-job check with the given conclusion', async () => {
     const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
     await seedQueuedChecks(reporter, ['build', 'test']);
-    // Non-vacuity: the seed really created three QUEUED checks, so the
-    // completions below are turning those exact runs terminal.
+    // Non-vacuity: the seed created three QUEUED checks.
     expect(mockChecksCreate).toHaveBeenCalledTimes(3);
     expect((mockChecksCreate.mock.calls[0][0] as any).status).toBe('queued');
 
@@ -2791,8 +2265,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
     });
-    // Control: the build check exists and is resolvable, so its absence from
-    // the updates below is a decision and not a lookup miss.
+    // Control: the build check is resolvable, so its absence below is not a lookup miss.
     expect((mockChecksCreate.mock.calls[1][0] as any).name).toBe(`kici/${WORKFLOW}/setup`);
 
     await reporter.completeUndispatchedCheckRuns({
@@ -2814,12 +2287,10 @@ describe('completing the check runs of a workflow that never dispatched', () => 
   });
 
   it('resolves an L1-cached id without reading its tracking row', async () => {
-    // The mechanism behind excluding `kici/<workflow>/setup` from the target
-    // set. The terminal latch is rehydrated from `terminal_sent_at` only inside
-    // the store read, and this asserts that read does not happen on an L1 hit —
-    // so a build check `setBuildComplete` completed a moment ago (which stamps
-    // the row but adds nothing to the in-process set) resolves here with no
-    // latch, and completing it again would overwrite its real conclusion.
+    // Why `kici/<workflow>/setup` is excluded: the latch is rehydrated from
+    // `terminal_sent_at` only in the store read, which an L1 hit skips. A build check
+    // `setBuildComplete` just completed (row stamped, in-process set untouched) resolves
+    // with no latch, and completing it again would overwrite its real conclusion.
     const trackingStore = createTrackingStoreStub();
     const reporter = new CheckRunReporter({
       providerRegistry: githubRegistry(),
@@ -2842,8 +2313,7 @@ describe('completing the check runs of a workflow that never dispatched', () => 
       summary: 'cancelled',
     });
 
-    // It resolved and completed the check — so the store was genuinely not
-    // consulted, rather than the whole call being skipped.
+    // It completed the check, so the call was not skipped wholesale.
     expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
     expect(trackingStore.getState).not.toHaveBeenCalled();
   });
@@ -2870,18 +2340,17 @@ describe('completing the check runs of a workflow that never dispatched', () => 
   it('does not reopen a check this reporter already reported terminal', async () => {
     const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
     await seedQueuedChecks(reporter, ['build']);
-    reporter.updateJobStatus({
-      provider: 'github',
-      owner: OWNER,
-      repo: REPO,
-      sha: SHA,
-      workflowName: WORKFLOW,
-      jobName: 'build',
-      state: ExecutionJobStatus.enum.success,
-      installationId: 42,
-      routingKey: ROUTING_KEY,
-      runId: RUN_ID,
-    });
+    reporter.updateJobStatus(
+      jobUpdate({
+        owner: OWNER,
+        repo: REPO,
+        sha: SHA,
+        workflowName: WORKFLOW,
+        jobName: 'build',
+        state: ExecutionJobStatus.enum.success,
+        runId: RUN_ID,
+      }),
+    );
     await vi.waitFor(() => {
       expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
     });

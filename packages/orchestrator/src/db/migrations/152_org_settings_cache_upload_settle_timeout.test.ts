@@ -3,12 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m152 from './152_org_settings_cache_upload_settle_timeout.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 152. Applies migrations up to 152 in a
- * throwaway database and asserts the nullable, default-less
- * `cache_upload_settle_timeout_ms` column (NULL = cluster default). Gated on
+ * Real-Postgres test for migration 152: the nullable, default-less
+ * `cache_upload_settle_timeout_ms` (NULL = cluster default). Gated on
  * `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;

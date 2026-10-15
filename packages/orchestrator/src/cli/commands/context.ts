@@ -1,25 +1,13 @@
 /**
- * Context management CLI commands for kici-admin.
+ * `kici-admin context` commands. `context delete` cascades bindings, variables
+ * and overrides; held-run history survives, and a pending held run blocks the
+ * delete (a resolved hold does not).
  *
- *   context create         — upsert a context
- *   context bind           — bind a scope pattern to a context
- *   context set-policy     — update policy fields (branch, repo patterns, reviewers, timers, trust)
- *   context list           — list contexts for an org
- *   context show           — show a single context with variables + bindings
- *   context delete         — delete a context (cascades bindings, variables, overrides; held-run history survives; pending held runs block with a clear error, resolved holds do not)
- *   context create-template — create/update a context template + its seed variables
- *   context source-override list|set|delete — per-source variable overrides (HTTP only)
- *
- * Each command except `source-override` supports two modes, the same split
- * `maintenance.ts` uses:
- *
- *   HTTP mode (default): requires `--url` + `--token`, routes through the
- *   orchestrator admin HTTP API at /api/v1/admin/contexts.
- *
- *   Direct-DB mode: activated when `--database-url` is passed (or
- *   KICI_DATABASE_URL / DATABASE_URL is set). Opens its own pool and runs the
- *   SQL directly via *Direct helpers in @kici-dev/shared, so a setup script can
- *   seed contexts before the orchestrator is up.
+ * Every command except `source-override` has two modes, as in `maintenance.ts`:
+ * HTTP (default; `--url` + `--token`, /api/v1/admin/contexts), and direct-DB
+ * when `--database-url` (or KICI_DATABASE_URL / DATABASE_URL) is set, which runs
+ * the *Direct helpers of @kici-dev/shared so a setup script can seed contexts
+ * before the orchestrator is up.
  */
 import type { Command } from 'commander';
 import {
@@ -56,9 +44,8 @@ function parseJsonOption(raw: string | undefined, label: string): unknown | unde
 }
 
 /**
- * Parse `--repo-patterns`: a JSON array of `owner/repo` glob strings. Direct-DB
- * mode writes the column with no route schema in front of it, so the shape is
- * checked here. `[]` clears the rule.
+ * Parse `--repo-patterns`, a JSON array of `owner/repo` globs; `[]` clears the
+ * rule. Direct-DB mode has no route schema, so the shape is checked here.
  */
 function parseRepoPatternsOption(raw: string | undefined): string[] | undefined {
   const parsed = parseJsonOption(raw, '--repo-patterns');
@@ -81,9 +68,8 @@ function parseCsvOption(raw: string | undefined): string[] | undefined {
 }
 
 /**
- * Parse `--minimum-trust`. Direct-DB mode writes the row with no route schema
- * in front of it, so the CLI is where an unknown tier is refused. `"null"`
- * clears the floor.
+ * Parse `--minimum-trust`; `"null"` clears the floor. Direct-DB mode has no
+ * route schema, so an unknown tier is refused here.
  */
 function parseMinimumTrustOption(raw: string | undefined): MinimumTrust | undefined {
   if (raw === undefined) return undefined;
@@ -103,12 +89,9 @@ export function parseEnabledOption(raw: string | undefined): boolean | undefined
 }
 
 /**
- * Parse an integer option that also accepts an empty string meaning "clear".
- *
- * `Number('') === 0`, so routing an empty value through `parseIntOption` yields
- * a valid-looking `0` rather than a clear — and for a hold expiry a stored `0`
- * puts every hold's deadline at the current instant. The empty string is mapped
- * to `null` before any numeric parse can see it.
+ * Parse an integer option where an empty string means "clear" (`null`). The
+ * empty string never reaches a numeric parse: `Number('') === 0`, and a stored
+ * `0` hold expiry puts every hold's deadline at the current instant.
  */
 function parseIntOrClearOption(raw: string | undefined, label: string): number | null | undefined {
   if (raw === undefined) return undefined;
@@ -116,7 +99,6 @@ function parseIntOrClearOption(raw: string | undefined, label: string): number |
   return parseIntOption(raw, label);
 }
 
-/** Stringify policy fields for table output. */
 function summarizePolicy(env: ContextRow): string {
   const parts: string[] = [];
   try {
@@ -240,8 +222,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
           orgId: opts.org,
           name: opts.name,
           type: opts.type,
-          // Sent only when the flag is given, so re-running create on a
-          // disabled context does not re-enable it.
+          // Sent only when given, so re-running create does not re-enable a context.
           enabled: parseEnabledOption(opts.enabled),
           globPattern: opts.globPattern,
           branchRestrictions,
@@ -593,9 +574,8 @@ function sourceOverridePath(opts: {
 }
 
 /**
- * `context source-override list|set|delete` — the operator path for the
- * dashboard's per-source override writes (`contexts.source_overrides.*` in the
- * dashboard-write policy). HTTP only: each verb calls the orchestrator admin API.
+ * `context source-override list|set|delete`: the operator path for the
+ * dashboard's `contexts.source_overrides.*` writes. HTTP only.
  */
 function registerSourceOverrideCommands(context: Command, getClient: () => AdminApiClient): void {
   const so = context

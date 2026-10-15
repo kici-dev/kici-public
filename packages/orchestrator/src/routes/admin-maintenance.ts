@@ -1,16 +1,13 @@
 /**
- * Admin API routes for ops-grade maintenance operations that don't fit
- * cleanly under a single resource namespace:
+ * Admin maintenance operations that span resource namespaces:
  *
  *   POST /api/v1/admin/queue/clear             — TRUNCATE dispatch_queue
  *   POST /api/v1/admin/execution/purge-stale   — DELETE execution runs + jobs
  *   POST /api/v1/admin/sources/purge-stale     — DELETE orphan sources + scoped secrets
  *   POST /api/v1/admin/secrets/purge           — DELETE scoped_secrets (bulk)
  *
- * Each endpoint accepts a minimal JSON body for scoping (e.g. routing key,
- * org ID) and supports a "dry run" mode where applicable. All mutations are
- * gated by the admin auth middleware in admin.ts, so unauthenticated access
- * is impossible.
+ * Each takes a minimal JSON scoping body (routing key, org ID), with a dry run
+ * where applicable. All are gated by the admin auth middleware in admin.ts.
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
@@ -42,7 +39,6 @@ const purgeSecretsSchema = z.object({
 export function createMaintenanceRoutes(deps: MaintenanceRouteDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
 
-  // POST /api/v1/admin/queue/clear — TRUNCATE dispatch_queue.
   app.post('/queue/clear', requireUnscoped, async (c) => {
     try {
       await sql`TRUNCATE dispatch_queue`.execute(deps.db);
@@ -90,9 +86,9 @@ export function createMaintenanceRoutes(deps: MaintenanceRouteDeps): Hono<AdminE
 
   // POST /api/v1/admin/sources/purge-stale — DELETE orphan source secrets and
   // source rows for routing keys other than the current cluster's. Also
-  // clears `generic_webhook_sources` wholesale — that table is single-tenant
-  // per orchestrator deployment and the expected consumer (deploy.ts warm
-  // path) wants a clean slate for the new deploy.
+  // clears `generic_webhook_sources` wholesale: that table is single-tenant
+  // per deployment, and the expected consumer (deploy.ts warm path) wants a
+  // clean slate.
   app.post('/sources/purge-stale', async (c) => {
     try {
       const body = purgeStaleSourcesSchema.parse(await c.req.json());
@@ -114,10 +110,9 @@ export function createMaintenanceRoutes(deps: MaintenanceRouteDeps): Hono<AdminE
         const genericCount = await sql<{ count: number }>`
           SELECT COUNT(*)::int AS count FROM generic_webhook_sources
         `.execute(deps.db);
-        // The purge keeps only the sources under the routing key and the
-        // remote sources, and deletes every generic source, so every other
-        // registration, except one under a remote source, is left pointing at
-        // no source and is deleted.
+        // The purge keeps only the routing key's sources and the remote
+        // sources, and deletes every generic source, so every other
+        // registration except one under a remote source is orphaned and deleted.
         // fails-when: the count skips the generic sources' registrations the purge deletes,
         // or counts the registrations under a remote source the purge keeps
         const orphanRegsCount = await sql<{ count: number }>`
@@ -146,12 +141,12 @@ export function createMaintenanceRoutes(deps: MaintenanceRouteDeps): Hono<AdminE
         DELETE FROM sources WHERE routing_key != ${body.routingKey}
       `.execute(deps.db);
       const genericResult = await sql`DELETE FROM generic_webhook_sources`.execute(deps.db);
-      // Delete workflow_registrations rows whose routing_key no longer points
-      // at a live source (generic_webhook_sources was wiped above; only real
-      // provider rows remain in `sources`, and an org's remote source lives in
-      // `remote_sources`, which the purge never touches). Without this,
-      // cross-source dispatch fans out to long-dead repo identifiers from
-      // earlier tests and breaks subsequent runs.
+      // Delete registrations whose routing_key points at no live source (the
+      // generic sources are wiped above, so only real provider rows remain in
+      // `sources`; an org's remote source lives in
+      // `remote_sources`, which the purge never touches). Otherwise
+      // cross-source dispatch fans out to dead repo identifiers from earlier
+      // tests and breaks later runs.
       // fails-when: a registration under a live remote source (`remote:<orgId>`) is deleted
       // breaks-if-wrong: a registration under no source at all must still be deleted
       const registrationsResult = await sql`
@@ -178,10 +173,10 @@ export function createMaintenanceRoutes(deps: MaintenanceRouteDeps): Hono<AdminE
     }
   });
 
-  // POST /api/v1/admin/secrets/purge — bulk-delete scoped_secrets. Intended
-  // for ops recovery after encryption-key rotation leaves undecryptable rows,
-  // or for resetting per-source secrets in test setups. Scope is org-wide by
-  // default; pass orgId to constrain.
+  // POST /api/v1/admin/secrets/purge — bulk-delete scoped_secrets, for ops
+  // recovery after a key rotation leaves undecryptable rows, or to reset
+  // per-source secrets in test setups. Without orgId it deletes every org's
+  // rows; pass orgId to constrain it to one org.
   app.post('/secrets/purge', requireUnscoped, async (c) => {
     try {
       const body = purgeSecretsSchema.parse(await c.req.json());

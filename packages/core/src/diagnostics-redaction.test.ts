@@ -1,11 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { redactConfig, scrubText } from './diagnostics-redaction.js';
 
-// Assembled from parts rather than written as a literal: a whole Slack token
-// in the source trips GitHub push protection on the public mirror, which
-// blocks the release publish. The sibling fixtures in the scrubText table build
-// theirs the same way, with .repeat(). The runtime value is unchanged, so the
-// redaction assertion still exercises a real-shaped token.
+// Assembled from parts: a whole Slack token literal trips GitHub push
+// protection on the public mirror and blocks the release publish (the scrubText
+// fixtures use .repeat() for the same reason). The runtime value is still a
+// real-shaped token.
 const SLACK_BOT_TOKEN = ['xoxb', '123456789012', '1234567890123', 'AbCdEfGhIjKlMnOpQrStUvWx'].join(
   '-',
 );
@@ -27,8 +26,8 @@ describe('redactConfig', () => {
 
 describe('scrubText', () => {
   // Each case is [label, a line carrying a live-shaped secret, the secret itself].
-  // The secret is asserted absent from the output, which is the property that
-  // matters — the bundle is uploaded to KiCI object storage.
+  // The secret must be absent from the output: the bundle is uploaded to KiCI
+  // object storage.
   const SECRETS: ReadonlyArray<readonly [string, string, string]> = [
     [
       'AWS access key id',
@@ -146,9 +145,8 @@ describe('scrubText', () => {
 
   it.each(SECRETS)('masks a %s', (_label, line, secret) => {
     const out = scrubText(line);
-    // Non-vacuity: the assertion below is only meaningful because the raw
-    // input DOES contain the secret. A scrubber that returned '' would pass
-    // the `not.toContain` on its own.
+    // Non-vacuity: a scrubber that returned '' would pass `not.toContain`
+    // alone, so first prove the raw input DOES contain the secret.
     expect(line).toContain(secret);
     expect(out).not.toContain(secret);
     expect(out).toContain('***REDACTED');

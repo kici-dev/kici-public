@@ -59,7 +59,6 @@ describe('buildOutcomeMetadata', () => {
       startTime,
     });
 
-    // Duration should be approximately 5000ms (allow 200ms tolerance)
     expect(result.duration).toBeGreaterThanOrEqual(4800);
     expect(result.duration).toBeLessThanOrEqual(5200);
   });
@@ -102,7 +101,6 @@ describe('executeHook', () => {
     expect(hookRun).toHaveBeenCalledOnce();
     const receivedCtx = hookRun.mock.calls[0][0];
     expect(receivedCtx.outcome).toEqual(outcome);
-    // Original ctx fields are preserved
     expect(receivedCtx.workflow.name).toBe('test-wf');
   });
 
@@ -233,7 +231,6 @@ describe('executeHook', () => {
 
     expect(result.success).toBe(true);
     expect(bareHookFn).toHaveBeenCalledOnce();
-    // Should still send IPC messages
     expect(messages.some((m) => m.type === 'step.start')).toBe(true);
     expect(messages.some((m) => m.type === 'step.complete')).toBe(true);
   });
@@ -369,9 +366,8 @@ describe('the hook shell is bound to the hook timeout, not the step abort', () =
     expect(result.success).toBe(false);
     expect(Date.now() - started).toBeLessThan(20_000);
 
-    // The kill is asynchronous: the timeout's race rejects first and zx signals
-    // the child right after, so observe the process table with a bounded poll
-    // rather than a single read that would race the SIGTERM.
+    // The kill is asynchronous (the timeout's race rejects first, zx signals the
+    // child right after), so poll the process table instead of racing SIGTERM.
     const { execSync } = await import('node:child_process');
     let survivors = 'unread';
     for (let i = 0; i < 60; i++) {
@@ -383,9 +379,8 @@ describe('the hook shell is bound to the hook timeout, not the step abort', () =
   }, 40_000);
 
   it('gives a completion hook a LIVE shell even when the step signal is already aborted', async () => {
-    // The cancel path runs `cleanup` after the job-level abort has fired. Binding
-    // the hook's shell to the composed signal would hand it a dead shell for the
-    // very grace window cleanup exists to use.
+    // `cleanup` runs after the job-level abort fired; a shell bound to the
+    // composed signal would be dead for the grace window cleanup exists to use.
     const stepAbort = new AbortController();
     stepAbort.abort();
 

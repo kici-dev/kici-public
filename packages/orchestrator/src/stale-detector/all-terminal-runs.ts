@@ -6,22 +6,19 @@ import type { Database } from '../db/types.js';
 /**
  * Runs whose every job row is terminal while the run row is not.
  *
- * Every coordinator finalizes a run from its own in-memory view when the
- * last job it hears about finishes, and defers while a sibling still has a
- * registration window open on the run. So one shape reaches no finalizer at
- * all: the coordinator that saw the last job deferred to a live window holder,
- * and that holder then died before releasing it — its stale id reads as no
- * window, but nothing re-drives the check on the coordinator that deferred.
- * The same shape appears when a coordinator dies between its jobs going
- * terminal and its own finalization.
+ * A coordinator finalizes a run from its in-memory view when the last job it
+ * hears about finishes, but defers while a sibling holds a registration window
+ * on the run. If that holder dies before releasing it, its stale id reads as no
+ * window, yet nothing re-drives the check on the deferring coordinator. A
+ * coordinator dying between its jobs going terminal and its own finalization
+ * leaves the same shape.
  *
  * This sweep is the backstop: every job row terminal, the run row still
  * `pending` or `running`, the last completion older than the stale threshold
  * (so a normal completion in flight is not raced), and no LIVE registration
  * window holder. The caller finishes each candidate through the tracker's
- * DB-fallback completion, which is clobber-guarded and computes the status
- * from the rows — so a run a coordinator finishes in the meantime is left as
- * that coordinator wrote it.
+ * clobber-guarded DB-fallback completion, which computes the status from the
+ * rows, so a run a coordinator finishes in the meantime keeps what it wrote.
  */
 export async function selectAllTerminalRunCandidates(
   db: Kysely<Database>,

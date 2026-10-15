@@ -1,24 +1,16 @@
 /**
  * CIDR IP allocator for Firecracker VM networking.
  *
- * Two implementations behind a shared interface:
+ * - `DbIpAllocator` persists to PostgreSQL (coordinators), so a long-lived VM
+ *   keeps its IP across coordinator restarts.
+ * - `InMemoryIpAllocator` has no persistence (worker peers, no cluster DB). A
+ *   worker restart starts it empty, and the backend's `cleanupOrphans()`
+ *   Pass-2/Pass-3 walk of jailer chroots and host TAPs (on every spawn and in
+ *   the leak sweep) reaps the leftovers, so the allocator holds no recovery state.
  *
- * - `DbIpAllocator` — persists allocations to PostgreSQL. Used by
- *   coordinators where the cluster Postgres is reachable. Allocations
- *   survive orchestrator restarts so a long-lived VM keeps its IP across
- *   coord bounces.
- *
- * - `InMemoryIpAllocator` — Map-backed, no persistence. Used by worker
- *   peers where the cluster DB is not reachable. The firecracker backend's
- *   existing `cleanupOrphans()` Pass-2/Pass-3 walks the jailer chroot
- *   tree + host TAP devices on every spawn and during the leak sweep, so
- *   any worker-orch restart starts the allocator empty and the next
- *   cleanup pass reaps the leftover chroots and TAPs naturally — no
- *   recovery state needs to live in the allocator itself.
- *
- * Each orch has its own bridge with its own subnet (coord A: `kici`,
- * coord B: `kici_b`, Pi worker: `kici-br0`), so allocator state is
- * per-orch by design. No two orchs share an IP space.
+ * Each orch has its own bridge and subnet (coord A: `kici`, coord B: `kici_b`,
+ * Pi worker: `kici-br0`), so allocator state is per-orch; no two orchs share
+ * an IP space.
  */
 
 import { createLogger, isPgUniqueViolation } from '@kici-dev/shared';
@@ -29,46 +21,32 @@ const logger = createLogger({ prefix: 'ip-allocator' });
 
 /**
  * Bound on consecutive `ip_allocations_pkey` conflict retries in
- * `DbIpAllocator.allocate()`. Above any realistic concurrent-spawn fan-out —
- * hitting it signals pathological contention, so it throws loudly rather than
- * retrying unbounded. Internal robustness constant, not an operator-tunable
- * setting.
+ * `DbIpAllocator.allocate()`. Above any realistic concurrent-spawn fan-out, so
+ * hitting it means pathological contention and throws. Not operator-tunable.
  */
 const MAX_ALLOC_CONFLICT_RETRIES = 16;
 
-/**
- * Result of a successful IP allocation.
- */
 export interface IpAllocationResult {
-  /** Allocated IP address */
   ip: string;
-  /** Gateway IP for guest networking */
   gateway: string;
-  /** Subnet mask for guest networking */
   netmask: string;
-  /** Deterministic MAC address derived from IP */
+  /** Deterministic, derived from the IP. */
   mac: string;
-  /** TAP device name on the host */
+  /** TAP device name on the host. */
   tapDevice: string;
 }
 
-/**
- * Parsed CIDR range.
- */
+/** IPv4 addresses are 32-bit unsigned numbers. */
 export interface CidrRange {
-  /** Network address as a 32-bit number */
   networkAddress: number;
-  /** Prefix length (e.g. 24 for /24) */
   prefixLength: number;
-  /** First usable IP (network address + 1) as a 32-bit number */
+  /** First usable IP (network address + 1). */
   startIp: number;
-  /** Last usable IP (broadcast - 1) as a 32-bit number */
+  /** Last usable IP (broadcast - 1). */
   endIp: number;
 }
 
-/**
- * Parse an IPv4 address string to a 32-bit unsigned integer.
- */
+/** Parse an IPv4 address string to a 32-bit unsigned integer. */
 export function ipToNumber(ip: string): number {
   const parts = ip.split('.');
   if (parts.length !== 4) {
@@ -82,13 +60,9 @@ export function ipToNumber(ip: string): number {
     }
     result = (result << 8) | octet;
   }
-  // Convert to unsigned 32-bit
   return result >>> 0;
 }
 
-/**
- * Convert a 32-bit unsigned integer back to an IPv4 address string.
- */
 export function numberToIp(n: number): string {
   const unsigned = n >>> 0;
   return [
@@ -100,8 +74,6 @@ export function numberToIp(n: number): string {
 }
 
 /**
- * Parse a CIDR notation string into a CidrRange.
- *
  * @example parseCidr('10.0.0.0/24')
  * // => { networkAddress: 167772160, prefixLength: 24, startIp: 167772161, endIp: 167772414 }
  */
@@ -121,10 +93,8 @@ export function parseCidr(cidr: string): CidrRange {
   const networkAddress = ipToNumber(ip);
   const hostBits = 32 - prefixLength;
 
-  // Broadcast address = network address | all host bits set
   const broadcastAddress = (networkAddress | ((1 << hostBits) - 1)) >>> 0;
 
-  // First usable = network + 1, last usable = broadcast - 1
   const startIp = (networkAddress + 1) >>> 0;
   const endIp = (broadcastAddress - 1) >>> 0;
 
@@ -132,10 +102,8 @@ export function parseCidr(cidr: string): CidrRange {
 }
 
 /**
- * Generate a deterministic MAC address from an IP address.
- *
- * Uses the locally-administered unicast prefix 06:00:AC followed by
- * the last 3 octets of the IP address encoded as hex.
+ * Deterministic MAC: the locally-administered unicast prefix 06:00:AC, then the
+ * last 3 octets of the IP as hex.
  *
  * @example generateMac('10.0.0.5')  // => '06:00:AC:00:00:05'
  * @example generateMac('10.0.1.42') // => '06:00:AC:00:01:2A'
@@ -148,29 +116,22 @@ export function generateMac(ip: string): string {
 
   const hex = (n: number) => n.toString(16).toUpperCase().padStart(2, '0');
 
-  // Use octets 2, 3, 4 (0-indexed: 1, 2, 3) for the last 3 MAC bytes
   return `06:00:AC:${hex(parseInt(parts[1], 10))}:${hex(parseInt(parts[2], 10))}:${hex(parseInt(parts[3], 10))}`;
 }
 
 /**
- * Generate a TAP device name from a VM ID.
- * Linux interface names are limited to 15 characters (IFNAMSIZ).
- * Format: kici-XXXXXXXX (5 + 8 = 13 chars, well within limit).
+ * `kici-XXXXXXXX` (13 chars): Linux interface names are limited to 15 (IFNAMSIZ).
  *
- * Uses the LAST 8 characters of the vmId to avoid collisions.
- * VM IDs have format "scaler-firecracker-XXXXXXXX" where the unique
- * random suffix is at the end. Using slice(0, 8) would always produce
- * "scaler-f" for all Firecracker VMs.
+ * Uses the LAST 8 chars of the vmId: VM IDs are "scaler-firecracker-XXXXXXXX"
+ * with the random suffix at the end, so slice(0, 8) would always be "scaler-f".
  */
 export function generateTapName(vmId: string): string {
   return `kici-${vmId.slice(-8)}`;
 }
 
 /**
- * Shape of one row returned by `IpAllocator.getAllocations()` /
- * `getAllocationForVm()`. Matches the `ip_allocations` table columns so
- * the firecracker-backend's `cleanupOrphans()` can read both impls
- * uniformly.
+ * Matches the `ip_allocations` table columns so the firecracker-backend's
+ * `cleanupOrphans()` reads both impls uniformly.
  */
 export interface IpAllocationRecord {
   ip: string;
@@ -181,12 +142,8 @@ export interface IpAllocationRecord {
 }
 
 /**
- * Per-orch CIDR IP allocator interface.
- *
- * Two implementations: `DbIpAllocator` (Postgres, coordinator) and
- * `InMemoryIpAllocator` (Map-backed, worker). The firecracker-backend
- * depends only on this interface — never on the concrete class — so a
- * single backend implementation works in both deploy modes.
+ * The firecracker-backend depends only on this interface, never on a concrete
+ * class, so one backend implementation works in both deploy modes.
  */
 export interface IpAllocator {
   allocate(vmId: string, scalerName: string): Promise<IpAllocationResult>;
@@ -197,12 +154,8 @@ export interface IpAllocator {
 }
 
 /**
- * Walk the CIDR range and call `pickIp` with each candidate IP (as a
- * dotted-quad string). The first IP for which `pickIp` returns a truthy
- * result is allocated and returned. Skips the gateway. Throws if the
- * range is exhausted. Shared by both `DbIpAllocator` and
- * `InMemoryIpAllocator` — keeps the "scan + skip gateway + skip
- * already-allocated" loop in one place.
+ * Return the first IP in the range that is neither the gateway nor allocated.
+ * Throws if the range is exhausted.
  */
 function findFirstFreeIp(
   range: CidrRange,
@@ -221,14 +174,7 @@ function findFirstFreeIp(
   );
 }
 
-/**
- * DB-backed CIDR IP allocator.
- *
- * Allocates IPs from a configurable range, skipping the gateway.
- * All allocations are persisted in PostgreSQL — used by coordinators
- * where the cluster DB is reachable. Allocations survive orch restarts
- * so a long-lived VM keeps its IP across coord bounces.
- */
+/** Coordinator allocator; allocations persist in PostgreSQL across restarts. */
 export class DbIpAllocator implements IpAllocator {
   private readonly db: Kysely<Database>;
   private readonly range: CidrRange;
@@ -245,8 +191,7 @@ export class DbIpAllocator implements IpAllocator {
   }
 
   async allocate(vmId: string, scalerName: string): Promise<IpAllocationResult> {
-    // Loop-invariant: the TAP name derives only from vmId, so it's stable
-    // across retries (unlike the IP-derived MAC, which is re-picked per attempt).
+    // Loop-invariant: the TAP name derives only from vmId (the MAC is per-IP).
     const tapDevice = generateTapName(vmId);
 
     for (let attempt = 1; attempt <= MAX_ALLOC_CONFLICT_RETRIES; attempt++) {
@@ -274,8 +219,7 @@ export class DbIpAllocator implements IpAllocator {
 
         return { ip: candidateIp, gateway: this.gateway, netmask: this.netmask, mac, tapDevice };
       } catch (err) {
-        // A concurrent spawn won this IP between our SELECT and INSERT. Re-pick
-        // instead of surfacing a failed spawn. Any other error is real — rethrow.
+        // A concurrent spawn won this IP between SELECT and INSERT: re-pick.
         if (isPgUniqueViolation(err, 'ip_allocations_pkey')) {
           logger.debug(
             `IP ${candidateIp} lost concurrent-allocation race ` +
@@ -316,20 +260,12 @@ export class DbIpAllocator implements IpAllocator {
 }
 
 /**
- * In-memory CIDR IP allocator.
+ * Worker allocator, process-lifetime state only. After a restart,
+ * `cleanupOrphans()` reaps leftover chroots and TAPs (matching
+ * `VM_TAP_PATTERN`): the filesystem is the source of truth.
  *
- * Used by worker peers where the cluster Postgres is not reachable. State
- * lives in a `Map<vmId, IpAllocationRecord>` for the lifetime of the
- * orch process; on restart the allocator starts empty and the
- * firecracker-backend's existing `cleanupOrphans()` Pass-2/Pass-3 walks
- * the jailer chroot tree + host TAP devices (matching `VM_TAP_PATTERN`)
- * to reap any leftover state. No persistence and no chroot recovery
- * inside the allocator — the filesystem is the source of truth, and the
- * cleanup pass already consults it.
- *
- * Each orch has its own bridge with its own subnet, so per-process
- * state is by design. No locking needed: every method is synchronous on
- * the in-memory Map and only awaits to satisfy the async interface.
+ * No locking needed: every method is synchronous on the Map and only awaits
+ * to satisfy the async interface.
  */
 export class InMemoryIpAllocator implements IpAllocator {
   private readonly range: CidrRange;

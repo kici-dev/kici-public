@@ -1,12 +1,11 @@
 /**
  * Git credential-helper protocol, agent side.
  *
- * Git invokes the helper on EVERY network operation, which is the mechanism
- * that defeats the one-hour GitHub App token expiry: a token is always minted
- * seconds before it is used, and nothing is ever persisted to `.git/config`,
- * the step environment, or a log.
+ * Git invokes the helper on EVERY network operation, which defeats the one-hour
+ * GitHub App token expiry: a token is minted seconds before use and never
+ * persisted to `.git/config`, the step environment, or a log.
  *
- * The default is read-only. An elevated credential is served only while a write
+ * Read-only by default; an elevated credential is served only while a write
  * grant covers the repository git is contacting.
  */
 
@@ -36,7 +35,7 @@ export function parseCredentialInput(stdin: string): CredentialQuery {
   return query;
 }
 
-/** Render a reply in the same `key=value` form. */
+/** Same `key=value` form. */
 export function formatCredentialOutput(reply: CredentialReply): string {
   return `username=${reply.username}\npassword=${reply.password}\n`;
 }
@@ -48,7 +47,7 @@ function repositoryFromPath(path: string | undefined): string {
 
 export interface ServeCredentialDeps {
   grants: GrantTable;
-  /** Round-trip to the orchestrator broker. Returns null when there is no credential. */
+  /** Orchestrator broker round-trip; null when there is no credential. */
   request: (args: {
     repository: string;
     permissions: Readonly<Record<string, string>>;
@@ -56,9 +55,8 @@ export interface ServeCredentialDeps {
 }
 
 /**
- * Answer one `get`. Returns the reply block, or an empty string when we have no
- * credential — an empty reply lets git fall through to its own mechanisms
- * rather than failing outright.
+ * Answer one `get`. An empty string (no credential) lets git fall through to
+ * its own mechanisms instead of failing.
  */
 export async function serveCredential(
   query: CredentialQuery,

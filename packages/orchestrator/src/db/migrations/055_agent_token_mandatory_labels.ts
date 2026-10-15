@@ -1,18 +1,13 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add a token-bound mandatory-label taint to agent tokens:
+ * `agent_tokens.mandatory_labels text NULL`: a JSON-encoded `string[]` of
+ * Kubernetes-taint-style gate labels. A static agent registering with the
+ * token gets them as its registry-entry `mandatoryLabels` and accepts a job
+ * only when every one appears in the job's required labels. NULL = no taint,
+ * so every existing token stays unconfined until re-minted.
  *
- * - `agent_tokens.mandatory_labels text NULL` — a JSON-encoded `string[]` of
- *   Kubernetes-taint-style gate labels the token authorizes. When a static
- *   agent registers with this token, the set becomes the agent's registry-entry
- *   `mandatoryLabels`: the agent only accepts a job when every label here
- *   appears in the job's required labels. NULL = no taint (the default; the
- *   agent accepts any job its advertised labels match), so every existing token
- *   stays unconfined until re-minted.
- *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so existing data is
- * preserved.
+ * Idempotent and additive.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.agent_tokens

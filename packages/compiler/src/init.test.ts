@@ -11,10 +11,10 @@ describe('kici init', () => {
   beforeEach(async () => {
     originalCwd = process.cwd();
     originalCI = process.env.CI;
-    // Set CI to skip interactive prompts
+    // CI skips interactive prompts.
     process.env.CI = 'true';
 
-    // Create temp dir within package directory for proper module resolution
+    // Inside the package directory, so module resolution finds the SDK.
     const packageDir = path.resolve(import.meta.dirname, '..');
     tempDir = await fs.mkdtemp(path.join(packageDir, '.test-init-'));
     process.chdir(tempDir);
@@ -28,7 +28,6 @@ describe('kici init', () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  // Helper function
   async function exists(filePath: string): Promise<boolean> {
     try {
       await fs.access(filePath);
@@ -55,7 +54,6 @@ describe('kici init', () => {
       const success = await initCommand({ skipInstall: true });
       expect(success).toBe(true);
 
-      // Default workflows in CI mode
       expect(await exists('.kici/workflows/hello-world.ts')).toBe(true);
       expect(await exists('.kici/workflows/pr-checks.ts')).toBe(true);
     });
@@ -112,7 +110,6 @@ describe('kici init', () => {
     });
 
     it('does NOT overwrite an existing .kici/.npmrc.example', async () => {
-      // Pre-seed .kici/ as if a previous init ran
       await fs.mkdir(path.join(tempDir, '.kici', 'workflows'), { recursive: true });
       const npmrcPath = path.join(tempDir, '.kici', '.npmrc.example');
       await fs.writeFile(npmrcPath, '# customer-edited\n', 'utf-8');
@@ -122,36 +119,22 @@ describe('kici init', () => {
         skipInstall: true,
         privateRegistry: 'https://npm.pkg.github.com',
       });
-      // Note: --force removes the .kici/ directory before recreating, so this
-      // particular case proves the scaffolder skip-if-exists guard works for the
-      // re-entry path where another tool seeded the file *during* init. The
-      // baseline guard is exercised by writing the file BETWEEN two init calls,
-      // covered below.
+      // --force removes .kici/ first, so this asserts only that init succeeds
+      // over a pre-seeded file; the next test covers the file surviving.
       expect(success).toBe(true);
     });
 
     it('does NOT overwrite an existing .npmrc.example across two init runs without --force', async () => {
-      // First run scaffolds the file.
       const a = await initCommand({
         skipInstall: true,
         privateRegistry: 'https://npm.pkg.github.com',
       });
       expect(a).toBe(true);
       const npmrcPath = path.join(tempDir, '.kici', '.npmrc.example');
-      // User edits the file.
       await fs.writeFile(npmrcPath, '# user edited\n', 'utf-8');
 
-      // Second run with --force re-scaffolds — the .kici dir is removed first,
-      // so the user's edit is lost. We accept that for --force, but the
-      // scaffolder itself MUST never write over an existing file when the file
-      // is found in place. To prove THAT, simulate the flow without --force by
-      // poking the scaffold helper through a re-mkdir + retry.
-      // (The real init's --force semantics are tested elsewhere.)
-      // Here we just confirm the scaffolder is idempotent for repeated calls
-      // when the .kici/ already has the file:
       await fs.writeFile(npmrcPath, '# user edited again\n', 'utf-8');
-      // Direct re-invocation without --force should fail (init refuses to
-      // overwrite .kici/), so the file remains untouched.
+      // Without --force, init refuses an existing .kici/, so the edit survives.
       const b = await initCommand({
         skipInstall: true,
         privateRegistry: 'https://npm.pkg.github.com',
@@ -243,36 +226,28 @@ describe('kici init', () => {
 
   describe('--force flag', () => {
     it('errors without --force when .kici/ exists', async () => {
-      // First init
       await initCommand({ skipInstall: true });
 
-      // Second init without force
       const success = await initCommand({ skipInstall: true });
       expect(success).toBe(false);
     });
 
     it('succeeds with --force when .kici/ exists', async () => {
-      // First init
       await initCommand({ skipInstall: true });
 
-      // Second init with force
       const success = await initCommand({ force: true, skipInstall: true });
       expect(success).toBe(true);
     });
 
     it('removes old content when using --force', async () => {
-      // First init
       await initCommand({ skipInstall: true });
 
-      // Add a custom file
       const customFile = path.join(tempDir, '.kici', 'custom.txt');
       await fs.writeFile(customFile, 'test', 'utf-8');
       expect(await exists(customFile)).toBe(true);
 
-      // Second init with force
       await initCommand({ force: true, skipInstall: true });
 
-      // Custom file should be gone
       expect(await exists(customFile)).toBe(false);
     });
   });
@@ -282,10 +257,7 @@ describe('kici init', () => {
       const success = await initCommand({ skipInstall: true });
       expect(success).toBe(true);
 
-      // package.json exists
       expect(await exists('.kici/package.json')).toBe(true);
-
-      // node_modules does NOT exist (npm install was skipped)
       expect(await exists('.kici/node_modules')).toBe(false);
     });
   });
@@ -314,13 +286,11 @@ describe('kici init', () => {
       const success = await initCommand({ skipInstall: true });
       expect(success).toBe(true);
 
-      // .kici/.npmrc
       const npmrcPath = path.join(tempDir, '.kici', '.npmrc');
       expect(await exists(npmrcPath)).toBe(true);
       const content = await fs.readFile(npmrcPath, 'utf-8');
       expect(content).toContain('@kici-dev:registry=http://registry.local:4873');
 
-      // root .npmrc
       const rootNpmrcPath = path.join(tempDir, '.npmrc');
       expect(await exists(rootNpmrcPath)).toBe(true);
       const rootContent = await fs.readFile(rootNpmrcPath, 'utf-8');
@@ -329,7 +299,6 @@ describe('kici init', () => {
 
     it('creates .npmrc when root package.json has kici.development flag', async () => {
       process.env.KICI_DEV_REGISTRY = 'http://registry.local:4873';
-      // Write root package.json with dev flag
       await fs.writeFile(
         path.join(tempDir, 'package.json'),
         JSON.stringify({ kici: { development: true } }),
@@ -394,7 +363,7 @@ describe('kici init', () => {
 
       const content = await fs.readFile(gitignorePath, 'utf-8');
       expect(content).toContain('.kici/node_modules/');
-      // .npmrc entries only added in Verdaccio mode
+      // .npmrc entries are added only in Verdaccio mode.
       expect(content).not.toContain('.kici/.npmrc');
     });
 
@@ -412,7 +381,6 @@ describe('kici init', () => {
     });
 
     it('appends to existing .gitignore', async () => {
-      // Create existing .gitignore
       const gitignorePath = path.join(tempDir, '.gitignore');
       await fs.writeFile(gitignorePath, 'node_modules/\n*.log\n', 'utf-8');
 
@@ -426,7 +394,6 @@ describe('kici init', () => {
     });
 
     it('is idempotent - does not duplicate entries', async () => {
-      // First init
       await initCommand({ force: true, skipInstall: true });
 
       const gitignorePath = path.join(tempDir, '.gitignore');
@@ -434,7 +401,6 @@ describe('kici init', () => {
       const firstCount = (firstContent.match(/\.kici\/node_modules\//g) || []).length;
       expect(firstCount).toBe(1);
 
-      // Second init
       await initCommand({ force: true, skipInstall: true });
 
       const secondContent = await fs.readFile(gitignorePath, 'utf-8');
@@ -443,7 +409,6 @@ describe('kici init', () => {
     });
 
     it('does not duplicate if broader pattern exists', async () => {
-      // Create .gitignore with broader pattern
       const gitignorePath = path.join(tempDir, '.gitignore');
       await fs.writeFile(gitignorePath, '.kici/\n', 'utf-8');
 
@@ -451,7 +416,6 @@ describe('kici init', () => {
       expect(success).toBe(true);
 
       const content = await fs.readFile(gitignorePath, 'utf-8');
-      // Should not add .kici/node_modules/ since .kici/ covers it
       expect(content).not.toContain('.kici/node_modules/');
     });
   });
@@ -531,9 +495,6 @@ describe('kici init', () => {
     });
 
     it('dev mode with no KICI_DEV_REGISTRY writes no .npmrc at all', async () => {
-      // The registry URL is supplied by the environment rather than hard-coded
-      // in the published CLI source, so with nothing to point at there is
-      // nothing to write.
       process.env.KICI_DEV = 'true';
       try {
         await makePnpmWorkspace();

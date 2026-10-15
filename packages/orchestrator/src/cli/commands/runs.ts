@@ -1,30 +1,4 @@
-/**
- * Execution run commands for kici-admin.
- *
- * Provides operator-facing read access to execution runs and their
- * sub-resources via the orchestrator's admin HTTP API. Use it instead of
- * hand-rolled curl commands when inspecting run state.
- *
- *   runs list                          List execution runs (table or JSON)
- *   runs show <runId>                  Show run detail with jobs and steps
- *   runs jobs <runId>                  List jobs for a run (optional steps)
- *   runs logs <runId> --job <jobId>    Print a page of one step's log lines
- *   runs ephemeral-key <runId>         Show scrub status of the run's key
- *   runs secret-outputs <runId>        List secret outputs (masked / reveal)
- *
- * Filter flags for `runs list`:
- *   --status            -> ?status=<csv>  (comma-separated, e.g. success,failed)
- *   --workflow-name     -> ?workflowName=<name>
- *   --repo              -> ?repo=<owner/repo>
- *   --since             -> ?since=<ISO-8601>
- *   --count             -> ?count=true    (emits only the count)
- *   --limit             -> ?limit=<n>     (default 20, max 100)
- *   --offset            -> ?offset=<n>    (default 0)
- *
- * Output:
- *   default             Aligned ASCII table
- *   --json              Raw JSON.stringify of the full response
- */
+/** `kici-admin runs`: read access to execution runs and their sub-resources over the admin API. */
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -67,7 +41,6 @@ interface CountRunsResponse {
   repo: string | null;
 }
 
-/** Step detail nested inside job detail. */
 interface StepDTO {
   stepIndex: number;
   stepName: string;
@@ -166,7 +139,7 @@ interface SecretOutputsResponse {
 /** An untrusted-envelope value (or null) as returned by /structured. */
 type UntrustedOrNull = { untrusted: true; value: string } | null;
 
-/** Minimal AgentRunResult shape for human rendering (full type lives in engine). */
+/** The AgentRunResult fields the human view renders; the full type is in engine. */
 interface AgentRunResultDTO {
   runId: string;
   workflowName: UntrustedOrNull;
@@ -190,7 +163,6 @@ interface AgentRunResultDTO {
   }>;
 }
 
-/** Format duration in ms to human-readable string. */
 function formatDuration(ms: number | null): string {
   if (ms == null) return '-';
   if (ms < 1000) return `${ms}ms`;
@@ -203,10 +175,9 @@ function formatDuration(ms: number | null): string {
 
 /**
  * Header lines naming where an organization-wide run's workflow is defined.
- *
  * "Defined in" prints only when the workflow repository differs from the run's
- * own repository, which is the condition the dashboard's run metadata panel
- * uses for the same row. The commit and branch print whenever they are set.
+ * own, the same condition as the dashboard's run metadata panel; the commit and
+ * branch print whenever set.
  */
 function workflowProvenanceLines(run: RunDetailDTO): string[] {
   const lines: string[] = [];
@@ -241,9 +212,6 @@ export function emptyStepLogNote(
     : `(no log recorded for step ${stepIndex})`;
 }
 
-/**
- * Register the `runs` command group with kici-admin.
- */
 export function registerRunsCommands(program: Command, getClient: () => AdminApiClient): void {
   const runs = program.command('runs').description('Inspect execution runs, jobs, and steps');
 
@@ -333,11 +301,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
     );
 
   // ── runs show <runId> ──────────────────────────────────────────
-  // The orchestrator splits run detail across two endpoints:
-  //   GET /api/v1/admin/runs/:runId         → run fields only
-  //   GET /api/v1/admin/runs/:runId/jobs    → jobs (with ?includeSteps=true)
-  // The CLI composes both calls to preserve the historical "one shot"
-  // human view.
+  // Run fields and jobs (?includeSteps=true) are separate endpoints; this
+  // composes both into one view.
   runs
     .command('show <runId>')
     .description('Show run detail with jobs and steps')
@@ -361,7 +326,6 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
 
         const { run, jobs } = data;
 
-        // Run header
         console.log(`Run: ${run.runId}`);
         console.log(`  Workflow:    ${run.workflowName}`);
         console.log(`  Status:      ${run.status}`);
@@ -387,7 +351,6 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
           return;
         }
 
-        // Jobs table
         console.log('');
         const jobHeaders = ['job_id', 'name', 'status', 'agent', 'duration', 'steps'];
         const jobRows = jobs.map((j) => [
@@ -400,12 +363,9 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         ]);
         console.log(renderTable(jobHeaders, jobRows));
 
-        // A queued job nothing in the fleet can route says so here, while it is
-        // still waiting — the reason names the exact unmatched selectors, which
-        // is the one thing an operator needs to fix the `runsOn` or the fleet.
-        // Gated on the job still waiting: `routingReason` is not cleared by
-        // every path that takes a job out of the queue, and a terminal job
-        // states its cause in `errorMessage` (already rendered above).
+        // A waiting job nothing can route shows its unmatched selectors. Gated on
+        // the job still waiting: not every dequeue path clears `routingReason`,
+        // and a terminal job states its cause in `errorMessage`.
         const unroutableJobs = jobs.filter(
           (j) =>
             j.routingReason &&
@@ -419,7 +379,6 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
           }
         }
 
-        // Steps per job (only show if any job has steps)
         const jobsWithSteps = jobs.filter((j) => (j.steps?.length ?? 0) > 0);
         if (jobsWithSteps.length > 0) {
           for (const job of jobsWithSteps) {
@@ -551,12 +510,11 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
     );
 
   // ── runs logs <runId> ──────────────────────────────────────────
-  // The only kici-admin path to a step's log lines. It reads the admin route
-  // rather than the dashboard plane, which is what lets it serve a global eval
-  // round: that round writes no execution_runs row, so the dashboard cannot
-  // address it at all. Find the round's ids with
+  // The only kici-admin path to step log lines. It reads the admin route, not
+  // the dashboard plane, so it serves a global eval round, which writes no
+  // execution_runs row. Find the round's ids with
   // `kici-admin queue list --workflow-name '__globaleval__<owner>/<repo>' --json`
-  // — the row's `id` is the job id and `run_id` is the run id.
+  // (`id` is the job id, `run_id` the run id).
   runs
     .command('logs <runId>')
     .description(
@@ -581,8 +539,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
           console.log(JSON.stringify(response, null, 2));
           return;
         }
-        // Plain mode prints only the line values so the output stays pipeable;
-        // the pagination hint and the empty-log note go to stderr for the same reason.
+        // Only line values go to stdout so it stays pipeable; hints go to stderr.
         for (const line of response.lines) console.log(line.value);
         if (response.nextCursor) {
           console.error(`(more: re-run with --cursor ${response.nextCursor})`);

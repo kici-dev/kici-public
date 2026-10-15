@@ -37,10 +37,9 @@ describe('AgentMetricsAggregator', () => {
 
   // -- Cardinality contract --
   //
-  // The aggregator deliberately drops `agent_id` so Mimir cardinality
-  // doesn't grow with the number of agents that have ever existed (the
-  // ephemeral-firecracker-microVM problem). All output is collapsed to
-  // one series per (metric, labels-except-agent_id, scaler).
+  // `agent_id` is deliberately dropped so Mimir cardinality doesn't grow with every
+  // agent that ever existed (ephemeral firecracker microVMs): one series per
+  // (metric, labels-except-agent_id, scaler).
 
   it('never emits agent_id in Prometheus text output', () => {
     aggregator.update('agent-aaa', [{ name: 'kici_agent_jobs_total', type: 'counter', value: 3 }]);

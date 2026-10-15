@@ -12,8 +12,6 @@ import type { WebhookNormalizer, SimulatedEvent } from '@kici-dev/engine';
 import { githubFilterText } from '../github/commit-message.js';
 
 /**
- * Local provider implementation of WebhookNormalizer.
- *
  * Maps the synthetic webhook headers and payloads sent to a local source into
  * KiCI's universal SimulatedEvent format. Payloads use the same GitHub-shaped
  * structure the trigger CLI / post-receive hook build
@@ -23,8 +21,6 @@ export class LocalWebhookNormalizer implements WebhookNormalizer {
   readonly provider = 'local' as const;
 
   /**
-   * Extract routing key from the local-source webhook headers.
-   *
    * Checks x-kici-routing-key first (explicit routing), then falls back
    * to x-kici-source-id (generic source ID format).
    */
@@ -60,8 +56,6 @@ export class LocalWebhookNormalizer implements WebhookNormalizer {
   }
 
   /**
-   * Extract repository identifier from a local-source webhook payload.
-   *
    * Local-source events use GitHub-shaped payloads, so we extract from
    * payload.repository.full_name if present.
    */
@@ -79,8 +73,6 @@ export class LocalWebhookNormalizer implements WebhookNormalizer {
   }
 
   /**
-   * Extract ref from a local-source webhook payload.
-   *
    * Local-source events use GitHub-shaped payloads, so extraction logic
    * mirrors GitHub's: push -> payload.after, PR -> payload.pull_request.head.sha.
    */
@@ -110,8 +102,6 @@ export class LocalWebhookNormalizer implements WebhookNormalizer {
   }
 
   /**
-   * Normalize a local-source webhook event into a SimulatedEvent.
-   *
    * Extracts branch information from payload.ref (stripping refs/heads/ prefix)
    * and preserves the raw payload for trigger matching. Falls back to '__local__'
    * when no ref is present.
@@ -123,7 +113,6 @@ export class LocalWebhookNormalizer implements WebhookNormalizer {
   ): SimulatedEvent | null {
     const p = (payload as Record<string, unknown>) ?? {};
 
-    // Extract action from payload if present
     const action = typeof p.action === 'string' ? p.action : undefined;
 
     // Extract target branch from ref field (strip refs/heads/ prefix)

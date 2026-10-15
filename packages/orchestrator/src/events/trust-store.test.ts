@@ -296,7 +296,7 @@ describe('TrustStore', () => {
       const entries = await store.listTrust('github:42');
 
       expect(entries).toHaveLength(0);
-      // Verify or() was used for bidirectional lookup
+      // The mock does not record the bidirectional or() filter; this only checks the select ran.
       expect(mocks.selectAll).toHaveBeenCalled();
     });
   });

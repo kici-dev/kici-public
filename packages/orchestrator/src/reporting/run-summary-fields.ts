@@ -1,7 +1,6 @@
 /**
- * The run fields every `onExecutionStatusChange` context built from an
- * in-memory run carries, in one place so a new column cannot be forwarded from
- * some status transitions and silently dropped from others.
+ * The run fields every `onExecutionStatusChange` context built from an in-memory run carries,
+ * in one place so no status transition silently drops a new column.
  */
 import type { ExecutionContext } from './execution-tracker.js';
 
@@ -35,11 +34,9 @@ export function statusEpochField(epoch: number | null | undefined): { statusEpoc
 }
 
 /**
- * The shared part of a run's status-change context.
- *
- * `workflowRepoIdentifier` is copied only when set, because its presence is
- * what marks a cross-repository global run downstream. `localWorkingTree` is
- * left to the caller: only some transitions forward it.
+ * `workflowRepoIdentifier` is copied only when set: its presence marks a cross-repository
+ * global run downstream. `localWorkingTree` is left to the caller (only some transitions
+ * forward it).
  */
 export function runSummaryFields(
   run: RunSummarySource,

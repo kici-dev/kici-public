@@ -1,11 +1,6 @@
 /**
- * Calculate reconnection delay with exponential backoff and jitter.
- *
- * Formula: baseDelay * multiplier^attempts * (1.0 + random * 0.5)
- * - Initial delay: 1000ms
- * - Multiplier: 1.5x per attempt
- * - Jitter: 0-50% additional randomness
- * - Max delay: capped at maxDelayMs
+ * Reconnection delay in ms: 1000 * 1.5^attempts plus 0-50% jitter, capped at
+ * `maxDelayMs`.
  */
 export function getReconnectDelay(attempts: number, maxDelayMs: number): number {
   const baseDelay = 1000;

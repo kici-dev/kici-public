@@ -22,15 +22,12 @@ export interface CreateFilterContextInput {
 }
 
 /**
- * Build a `FilterContext` — the single construction site for the context a
- * workflow's `filter` predicate receives, mirroring {@link createRuleContext}.
- *
- * `changedFiles` is installed through the shared accessor, so it throws
- * `ChangedFilesUnavailableError` when the diff is unavailable instead of
- * reading as an empty list. That matters more here than in a rule: a `false`
- * verdict dispatches none of the workflow's own jobs, and on the
- * organization-wide path it produces no run at all — so a silently-empty diff
- * would suppress the workflow with nothing left to inspect.
+ * The single construction site for a `filter` predicate's context, mirroring
+ * {@link createRuleContext}. `changedFiles` throws `ChangedFilesUnavailableError`
+ * when the diff is unavailable rather than read as empty: a `false` verdict
+ * dispatches none of the workflow's jobs, and on the organization-wide path
+ * leaves no run, so a silently-empty diff would suppress it with nothing to
+ * inspect.
  */
 export function createFilterContext(input: CreateFilterContextInput): FilterContext {
   const status: ChangedFilesStatus = input.changedFilesStatus ?? 'fetched';

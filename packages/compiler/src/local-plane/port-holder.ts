@@ -1,11 +1,8 @@
 /**
- * OS-level ownership of the local dev plane's port.
- *
- * Answers two questions the plane's on-disk stamp cannot: is the port occupied
- * at all, and which process occupies it. Every external command is reached
- * through an injectable `ExecFn` so each platform branch has a real unit test on
- * any host, and every failure degrades to `null` rather than throwing — a
- * discovery failure must never break the command that asked.
+ * OS-level ownership of the local dev plane's port: whether it is occupied, and
+ * by which process — what the plane's on-disk stamp cannot answer. Every failure
+ * degrades to `null` rather than throwing: a discovery failure must never break
+ * the command that asked.
  */
 import net from 'node:net';
 import fs from 'node:fs';
@@ -24,13 +21,10 @@ const defaultExec: ExecFn = (cmd, args) =>
   });
 
 /**
- * Command line of process `pid`, or null when it cannot be determined.
- *
- * Linux exposes it as a NUL-separated `/proc` file; every other platform is
- * asked through the same injectable `ExecFn` the port discovery above uses.
+ * Command line of process `pid` (Linux reads `/proc`, other platforms `ps`).
  *
  * **A null means "cannot tell", never "not that process."** Callers must treat
- * it as an absence of evidence — the only safe reading when the answer decides
+ * it as absence of evidence — the only safe reading when the answer decides
  * whether to signal a pid.
  */
 export async function processCommandLine(
@@ -45,7 +39,6 @@ export async function processCommandLine(
   try {
     if (platform === 'linux') {
       const readProc = opts.readProc ?? ((p: string) => fs.readFileSync(p, 'utf-8'));
-      // Arguments are NUL-separated, with a trailing NUL on a normal process.
       const raw = readProc(`/proc/${pid}/cmdline`);
       const joined = raw.split('\0').filter(Boolean).join(' ').trim();
       return joined === '' ? null : joined;
@@ -62,9 +55,8 @@ export async function processCommandLine(
 }
 
 /**
- * Whether the port can be bound on loopback. Probes `127.0.0.1` because that is
- * the address the CLI talks to; a listener bound to `0.0.0.0` still makes this
- * bind fail with EADDRINUSE, so there is no false "free".
+ * Probes `127.0.0.1`, the address the CLI talks to; a `0.0.0.0` listener still
+ * makes this bind fail with EADDRINUSE, so there is no false "free".
  */
 export function isPortFree(port: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -76,10 +68,7 @@ export function isPortFree(port: number): Promise<boolean> {
   });
 }
 
-/**
- * Port of a socket address column. The port is the segment after the LAST
- * colon, because an IPv6 address is written `[::]:5355`.
- */
+/** The segment after the LAST colon, because an IPv6 address is written `[::]:5355`. */
 function addressPort(addr: string): number | null {
   const i = addr.lastIndexOf(':');
   if (i < 0) return null;
@@ -88,10 +77,9 @@ function addressPort(addr: string): number | null {
 }
 
 /**
- * Parse `ss -lptnH` rows. The process name is deliberately NOT matched — a Node
- * listener reports as `MainThread` — so only `pid=N` is extracted. A row for a
- * socket this user does not own carries no `users:(…)` field at all and yields
- * null, which is what sends the caller to the lsof fallback.
+ * Parse `ss -lptnH` rows. Only `pid=N` is matched, not the process name (a Node
+ * listener reports as `MainThread`). A socket this user does not own has no
+ * `users:(…)` field and yields null, which sends the caller to the lsof fallback.
  */
 export function parseSsOutput(stdout: string, port: number): number | null {
   for (const line of stdout.split('\n')) {
@@ -105,8 +93,8 @@ export function parseSsOutput(stdout: string, port: number): number | null {
 }
 
 /**
- * Parse `lsof -Fpn` field output, which is a stateful stream: each `p<pid>` line
- * precedes the `n<address>` lines belonging to that pid.
+ * Parse `lsof -Fpn`: a stateful stream where each `p<pid>` line precedes its
+ * `n<address>` lines.
  */
 export function parseLsofOutput(stdout: string, port: number): number | null {
   let current: number | null = null;
@@ -135,11 +123,10 @@ export function parseNetstatOutput(stdout: string, port: number): number | null 
 }
 
 /**
- * Pid of the process listening on `port`, or null when it cannot be determined.
- * Each platform runs the UNFILTERED listing and matches the port here rather
- * than passing a filter expression to the tool, whose syntax is the fragile
- * part. On Linux a null parse falls through to lsof as well as a non-zero exit,
- * because ss omits the owning-process field for sockets this user does not own.
+ * Pid listening on `port`. Each platform runs the UNFILTERED listing and matches
+ * the port here, because a tool's filter syntax is the fragile part. On Linux a
+ * null parse also falls through to lsof: ss omits the owning process for sockets
+ * this user does not own.
  */
 export async function findPortHolderPid(
   port: number,
@@ -176,17 +163,14 @@ const defaultKill: KillFn = (pid, signal) => process.kill(pid, signal);
 const HARD_KILL_WAIT_MS = 5_000;
 
 /**
- * Poll until process `pid` has exited, sending SIGTERM first and escalating to
- * SIGKILL past the grace window. `process.kill(pid, 0)` throws ESRCH once the
- * process is gone. On Windows every signal terminates unconditionally, so the
- * escalation collapses into a single hard kill there.
+ * SIGTERM `pid`, escalate to SIGKILL past the grace window, and poll until it
+ * exits. On Windows every signal terminates unconditionally, so this is a single
+ * hard kill there.
  *
- * Resolving does NOT prove the process died: a pid that survives SIGKILL (a
- * zombie awaiting reaping, or a task wedged in uninterruptible I/O) is given
- * `hardKillWaitMs` and then abandoned, because a teardown command that hangs
- * forever is worse than one that reports the port is still held. Callers decide
- * the outcome from the port itself — `waitForPortFree` — never from this
- * resolving.
+ * Resolving does NOT prove the process died: a pid surviving SIGKILL (a zombie,
+ * or a task wedged in uninterruptible I/O) is abandoned after `hardKillWaitMs`,
+ * because a teardown that hangs forever is worse than one reporting the port
+ * still held. Callers decide from `waitForPortFree`, never from this resolving.
  */
 export async function terminatePid(
   pid: number,
@@ -223,10 +207,9 @@ export async function terminatePid(
 }
 
 /**
- * Poll until the port is bindable. This, not `terminatePid` resolving, is what
- * decides a teardown: `terminatePid` abandons a pid that survives SIGKILL, and
- * even a process that did exit can leave its listening socket lingering a moment
- * longer on some platforms.
+ * Poll until the port is bindable. This, not `terminatePid`, decides a teardown:
+ * `terminatePid` abandons a pid that survives SIGKILL, and an exited process can
+ * leave its listening socket lingering a moment on some platforms.
  */
 export async function waitForPortFree(port: number, timeoutMs = 5_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;

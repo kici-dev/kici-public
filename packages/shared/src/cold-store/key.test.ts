@@ -8,10 +8,9 @@ import {
 } from './key.js';
 
 describe('encodeKeySegment', () => {
-  // Behavior-lock fixtures. These keys have been written to production
-  // object stores since the original event-log implementation; any
-  // change to the encoding would render previously-written keys
-  // unreachable. Do NOT edit these outputs without a migration plan.
+  // Behavior-lock fixtures: production object stores hold keys in this
+  // encoding, and any change to it makes them unreachable. Do NOT edit these
+  // outputs without a migration plan.
   const FIXTURES: ReadonlyArray<{ input: string; expected: string }> = [
     { input: 'plain-alphanumeric_123', expected: 'plain-alphanumeric_123' },
     { input: 'a.b.c', expected: 'a.b.c' },
@@ -120,9 +119,9 @@ describe('chunkObjectKey', () => {
   });
 
   it('single-chunk (v1) keys (no bucket) live at the day-prefix root', () => {
-    // V1 chunks omit the bucket segment. The framework still
-    // reads them via listRelevantManifests (recursive LIST under the
-    // tenant prefix) and treats them as `'forever'` for the GC sweep.
+    // V1 chunks omit the bucket segment; listRelevantManifests still reads them
+    // (recursive LIST under the tenant prefix) and the GC sweep treats them as
+    // `'forever'`.
     expect(
       chunkObjectKey({
         prefix: 'cold-store',

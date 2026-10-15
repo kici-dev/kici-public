@@ -54,8 +54,8 @@ import {
   ensureFilterSourceDir,
 } from './eval-context.js';
 
-// Re-exported for callers that imported these from the job runner before they
-// moved into `eval-context.ts` — the eval child imports them from their new home.
+// Re-exported for callers that import them from the job runner; the eval child
+// imports them from `eval-context.ts`.
 export { buildEvalNeedsContext, buildEvalShell, buildInitFilterInput, ensureFilterSourceDir };
 import { LogStreamer } from './log-streamer.js';
 import { CONTAINER_BUILD_STEP_INDEX, runJobImageBuild } from './image-build/build-step.js';
@@ -111,9 +111,6 @@ import { BetweenJobsController, type AfterJobContext } from './between-jobs-cont
 
 const logger = createLogger({ prefix: 'job-runner' });
 
-/**
- * Check if a file exists at the given path.
- */
 async function fileExists(p: string): Promise<boolean> {
   try {
     await fs.access(p);
@@ -124,32 +121,25 @@ async function fileExists(p: string): Promise<boolean> {
 }
 
 /**
- * Sanitized base environment for a dependency install that runs in the AGENT
- * process rather than in a child.
+ * Sanitized base environment for a dependency install in the agent process.
  *
- * `installDeps` defaults `baseEnv` to `process.env`, which is correct inside the
- * runner child (already the sanitized job environment) and wrong here: the agent
- * process holds the orchestrator connection and, before boot scrubs them, the
- * agent's own credentials. `buildSanitizedEnv` merges its first argument
- * wholesale at its user-env layer, so it must be `{}` and never `process.env` —
- * passing `process.env` re-adds every variable the sanitizer just excluded.
- *
- * `trustedEnv` is threaded because it is an operator-set agent-launch property a
- * trusted fleet agent legitimately relies on.
+ * `installDeps` defaults `baseEnv` to `process.env`: right in the runner child,
+ * wrong here, where the process holds the orchestrator connection and, before
+ * boot scrubs them, the agent's own credentials. `buildSanitizedEnv` merges its
+ * first argument wholesale at its user-env layer, so it must be `{}`: passing
+ * `process.env` re-adds every variable the sanitizer excluded. `trustedEnv` is
+ * an operator-set launch property a trusted fleet agent relies on.
  */
 function agentInstallBaseEnv(trustedEnv: boolean | undefined): NodeJS.ProcessEnv {
   return buildSanitizedEnv({}, { trustedEnv });
 }
 
 /**
- * Restore deps, materialize the workflow source, and install `.kici/`
- * dependencies for a dynamic-eval job — everything that has to exist before its
- * workflow module can be imported. A global workflow's job takes the global
- * layout (`global-eval-workspace.ts`); every other job fills its work dir.
- *
- * An init job's single-checkout path (`prepareInitWorkspace`) performs the same
- * three steps with its own log wording and its Loki-keyed `Init job: checking
- * deps` line. The global path of both jobs is `materializeGlobalEvalWorkspace`.
+ * Everything a dynamic-eval job needs before its workflow module imports: deps,
+ * the workflow source, and `.kici/` dependencies. A global workflow's job takes
+ * the global layout (`materializeGlobalEvalWorkspace`, shared with init jobs);
+ * every other job fills its work dir. `prepareInitWorkspace` is the init job's
+ * twin, with its own log wording and Loki-keyed `Init job: checking deps` line.
  */
 async function materializeEvalWorkspace(
   dispatch: JobDispatch,
@@ -157,8 +147,8 @@ async function materializeEvalWorkspace(
   log: (msg: string) => void,
   installOpts: { baseEnv: NodeJS.ProcessEnv; allowInstallScripts: boolean },
 ): Promise<void> {
-  // A global workflow's module lives in the workflow repository, not in the
-  // source repository the dispatch names, so it takes the global layout.
+  // A global workflow's module lives in the workflow repository, not the source
+  // repository the dispatch names.
   // fails-when: a global generator evaluation with no source pack clones only the source repository
   // breaks-if-wrong: a same-repo generator evaluation keeps its single checkout
   if (jobWorkspaceLayout(dispatch.jobConfig, workDir).isGlobal) {
@@ -166,8 +156,8 @@ async function materializeEvalWorkspace(
     return;
   }
 
-  // 1. Restore deps (needed for workflow imports like @kici-dev/sdk). A failed
-  //    restore leaves `depsRestored` false and step 3 installs inline.
+  // Workflow imports such as @kici-dev/sdk need deps; a failed restore leaves
+  // `depsRestored` false and the install below runs inline.
   let depsRestored = false;
   if (dispatch.depsUrl) {
     log('Restoring dependencies from cache');
@@ -179,8 +169,6 @@ async function materializeEvalWorkspace(
     });
   }
 
-  // 2. Materialize workflow source: extract from cached tarball if present,
-  //    otherwise clone from the source repo.
   if (dispatch.sourceTarUrl) {
     log('Restoring workflow source from cached tarball');
     await restoreSource(workDir, dispatch.sourceTarUrl, dispatch.sourceTarDigest);
@@ -197,8 +185,7 @@ async function materializeEvalWorkspace(
     cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
   }
 
-  // 3. Install deps locally when no cached tarball was restored —
-  //    @kici-dev/sdk must resolve under .kici/node_modules/ at import time.
+  // @kici-dev/sdk must resolve under .kici/node_modules/ at import time.
   const kiciDir = join(workDir, '.kici');
   if (!depsRestored && (await fileExists(join(kiciDir, 'package.json')))) {
     log('Installing dependencies locally');
@@ -212,13 +199,9 @@ async function materializeEvalWorkspace(
   }
 }
 
-/**
- * Dependencies injected into JobRunner.
- */
 export interface JobRunnerDeps {
-  /** Send function for WS messages (buffered; replayed on reconnect) */
+  /** Buffered; replayed on reconnect. */
   send: (msg: AgentToOrchestratorMessage) => void;
-  /** Agent config */
   config: AppConfig;
   /**
    * Supervisor-owned between-jobs phase, run after every job to reap the
@@ -226,7 +209,7 @@ export interface JobRunnerDeps {
    * run the operator reset command. Optional so unit harnesses can omit it.
    */
   betweenJobsController?: BetweenJobsController;
-  /** Request a pre-signed S3 upload URL from the orchestrator via WS request-response. */
+  /** A pre-signed S3 upload URL, over WS request-response. */
   requestUploadUrl: (
     jobId: string,
     cacheType: 'source' | 'deps',
@@ -242,7 +225,7 @@ export interface JobRunnerDeps {
       arch: string;
     },
   ) => Promise<string>;
-  /** Notify orchestrator that an S3 upload is complete (for metadata initialization). */
+  /** Lets the orchestrator initialize metadata for a finished S3 upload. */
   sendUploadComplete: (
     jobId: string,
     cacheType: 'source' | 'deps',
@@ -258,10 +241,7 @@ export interface JobRunnerDeps {
       siblingsDigest?: string;
     },
   ) => void;
-  /**
-   * Send an event.emit WS message to the orchestrator and await the response.
-   * Used to relay ctx.emit() from the sandbox through the WS connection.
-   */
+  /** Relays the sandbox's ctx.emit() as an event.emit WS message; awaits the response. */
   sendEventEmit: (
     jobId: string,
     requestId: string,
@@ -269,13 +249,11 @@ export interface JobRunnerDeps {
     payload: Record<string, unknown>,
     target?: { repos?: string[] },
   ) => Promise<{ requestId: string; deliveryId?: string; error?: string }>;
-  /** Get WS send buffer size in bytes. Used by LogStreamer for backpressure detection. */
+  /** WS send buffer size in bytes, for LogStreamer backpressure. */
   getBufferedAmount?: () => number;
   /** Register a one-time callback for the WS 'drain' event. */
   onDrain?: (callback: () => void) => void;
-  /**
-   * Send a job.context message to the orchestrator with execution environment details.
-   */
+  /** A job.context message with execution environment details. */
   sendJobContext: (
     runId: string,
     jobId: string,
@@ -292,9 +270,7 @@ export interface JobRunnerDeps {
       gitRef?: string;
     },
   ) => void;
-  /**
-   * Send a run.event message to the orchestrator for infrastructure lifecycle tracking.
-   */
+  /** A run.event message for infrastructure lifecycle tracking. */
   sendRunEvent: (
     runId: string,
     eventType: string,
@@ -304,57 +280,45 @@ export interface JobRunnerDeps {
       durationMs?: number;
     },
   ) => void;
-  /**
-   * Send a job.concurrency.report WS message and wait for job.concurrency.ack.
-   * Returns the orchestrator's ack with action (proceed/wait/cancel).
-   */
+  /** Sends job.concurrency.report and resolves with the job.concurrency.ack. */
   sendConcurrencyReport: (
     runId: string,
     jobId: string,
     group: string,
   ) => Promise<{ action: 'proceed' | 'wait' | 'cancel'; reason?: string }>;
   /**
-   * Send an agent.api.request WS message and await the response.
-   * Used to relay kici.* API calls from the sandbox through the WS connection.
+   * Relays the sandbox's kici.* API calls as agent.api.request WS messages.
    * Optional for backward compatibility.
    */
   sendApiRequest?: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
   /**
-   * Relay a user-facing cache request to the orchestrator and await the
-   * response. Translates the sandbox `cache.request` IPC into the matching
-   * `cache.user.restore.request` / `cache.user.save.request` /
-   * `cache.user.save.complete` WS message and returns the orchestrator's
-   * `cache.user.*.response` mapped back onto the IPC response shape.
-   * Optional for backward compatibility (callers that don't support the cache).
+   * Maps the sandbox `cache.request` IPC onto `cache.user.restore.request` /
+   * `cache.user.save.request` / `cache.user.save.complete`, and the
+   * `cache.user.*.response` back onto the IPC shape. Optional for backward
+   * compatibility.
    */
   requestUserCache?: (jobId: string, request: CacheRequestIpc) => Promise<CacheResponseIpc>;
   /**
-   * Relay a provenance bundle upload operation to the orchestrator and await the
-   * response. Translates the sandbox `provenance.request` IPC into the matching
-   * `provenance.upload.request` / `.complete` WS message. Optional for backward
-   * compatibility (callers that don't support provenance).
+   * Maps the sandbox `provenance.request` IPC onto `provenance.upload.request` /
+   * `.complete`. Optional for backward compatibility.
    */
   relayProvenance?: (
     jobId: string,
     request: ProvenanceRequestIpc,
   ) => Promise<ProvenanceResponseIpc>;
   /**
-   * Relay a user-facing artifact request to the orchestrator and await the
-   * response. Translates the sandbox `artifacts.request` IPC into the matching
-   * `artifacts.upload.request` / `.complete` / `artifacts.download.request` WS
-   * message and returns the orchestrator's response mapped back onto the IPC
-   * response shape. Optional for backward compatibility.
+   * Maps the sandbox `artifacts.request` IPC onto `artifacts.upload.request` /
+   * `.complete` / `artifacts.download.request`, and the response back onto the
+   * IPC shape. Optional for backward compatibility.
    */
   requestUserArtifact?: (
     jobId: string,
     request: ArtifactRequestIpc,
   ) => Promise<ArtifactResponseIpc>;
   /**
-   * Relay a step-level approval request to the orchestrator and await the
-   * resolution. Translates the sandbox `approval.request` IPC into a
-   * `step.approval-request` WS message and returns the orchestrator's
-   * `step.approval-resolved` mapped onto the IPC response shape. Optional for
-   * backward compatibility (callers that don't support approvals).
+   * Maps the sandbox `approval.request` IPC onto `step.approval-request`, and
+   * `step.approval-resolved` back onto the IPC shape. Optional for backward
+   * compatibility.
    */
   sendStepApproval?: (
     runId: string,
@@ -378,11 +342,9 @@ interface ActiveJob {
 }
 
 /**
- * Job-config shape for build-only jobs.
- *
- * Build jobs install dependencies, optionally pack a deps tarball
- * and a source tarball, and report status. They do not execute workflow steps.
- * Mirror of the orchestrator-side build-job dispatch payload.
+ * Mirrors the orchestrator's build-job dispatch payload. A build job installs
+ * dependencies, optionally packs deps and source tarballs, and reports status;
+ * it runs no workflow steps.
  */
 interface BuildJobConfig {
   buildOnly: true;
@@ -397,12 +359,10 @@ interface BuildJobConfig {
 }
 
 /**
- * Execution mode for the sandbox backend.
- *
- * Determined by KICI_EXECUTION_MODE env var or container config in job dispatch:
- * - 'container': Run inside a disposable Docker/Podman container (strongest isolation)
- * - 'bare-metal': Run as a child process on the host with env sanitization
- * - 'firecracker': Run as a child process inside a Firecracker VM (defense-in-depth)
+ * Set by KICI_EXECUTION_MODE or the dispatch's container config:
+ * - 'container': a disposable Docker/Podman container (strongest isolation)
+ * - 'bare-metal': a child process on the host with env sanitization
+ * - 'firecracker': a child process inside a Firecracker VM (defense-in-depth)
  */
 type ExecutionMode = 'container' | 'bare-metal' | 'firecracker';
 
@@ -426,15 +386,11 @@ function hostWorkflowDir(jobConfig: Record<string, unknown>, workDir: string): s
 }
 
 /**
- * Resolve the absolute path to the compiled workflow-runner.js entry point.
- *
- * The runner is a separate rolldown entry point. Its location depends on the
+ * The runner is a separate rolldown entry point whose location depends on the
  * build mode:
- * - Bundle mode (build-service.mjs): dist/workflow-runner.js (flat alongside server.js)
+ * - Bundle mode (build-service.mjs): dist/workflow-runner.js (beside server.js)
  * - Library mode (build-ts.mjs): dist/execution/sandbox/workflow-runner.js
  * - Library mode chunked: dist/ with chunks, runner at execution/sandbox/workflow-runner.js
- *
- * We try all possible locations.
  */
 function resolveRunnerPath(): string {
   const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -452,17 +408,14 @@ function resolveRunnerPath(): string {
 }
 
 /**
- * Resolve the compiled eval-runner path, using the same three-location probe as
- * {@link resolveRunnerPath}.
- *
- * The eval child is always forked on the agent's own host from the agent's own
- * build — an evaluation job never goes through a sandbox backend — so unlike the
- * step runner it needs no self-contained bundle sibling to mount into a customer
- * job container.
+ * Probes the same locations as {@link resolveRunnerPath}. The eval child always
+ * forks on the agent's host from the agent's build (an evaluation job never uses
+ * a sandbox backend), so it needs no self-contained bundle to mount into a job
+ * container.
  */
 function resolveEvalRunnerPath(): string {
   const __dirname = dirname(fileURLToPath(import.meta.url));
-  // Bundle mode: __dirname is dist/, the eval runner is a sibling entry point
+  // Bundle mode: __dirname is dist/
   const bundlePath = join(__dirname, 'eval-runner.js');
   if (existsSync(bundlePath)) return bundlePath;
   // Library mode: __dirname is dist/execution/
@@ -475,27 +428,23 @@ function resolveEvalRunnerPath(): string {
 }
 
 /**
- * Derive the self-contained runner bundle path from the resolved runner path.
- *
- * The container backend mounts the runner as a single file into the customer
- * job container, so it must run `workflow-runner-bundle.js` (zx + `@kici-dev/*`
- * inlined) rather than the external `workflow-runner.js`, which cannot resolve
- * its bare imports without the agent's node_modules / pnpm workspace. The
- * bundle is a flat sibling emitted alongside the runner by build-service.mjs.
- * bwrap / firecracker keep the external runner (they bind the workspace).
+ * The container backend mounts the runner as a single file, so it runs
+ * `workflow-runner-bundle.js` (zx and `@kici-dev/*` inlined): the external
+ * `workflow-runner.js` cannot resolve its bare imports without the agent's
+ * node_modules / pnpm workspace. build-service.mjs emits the bundle beside the
+ * runner. bwrap / firecracker keep the external runner (they bind the workspace).
  */
 export function resolveRunnerBundlePath(runnerPath: string): string {
   return join(dirname(runnerPath), 'workflow-runner-bundle.js');
 }
 
 /**
- * Determine the execution mode from agent config and job config.
- *
  * Priority:
- * 1. Container config in job dispatch -> 'container'
- * 2. config.executionMode (KICI_EXECUTION_MODE) -> explicit override
- * 3. config.scalerManaged (KICI_SCALER_MANAGED=1) with Firecracker detection -> 'firecracker'
- * 4. Default -> 'bare-metal'
+ * 1. config.jobImageAgent -> 'bare-metal'
+ * 2. Container config in job dispatch -> 'container'
+ * 3. config.executionMode (KICI_EXECUTION_MODE) -> explicit override
+ * 4. config.scalerManaged (KICI_SCALER_MANAGED=1) -> 'firecracker'
+ * 5. Default -> 'bare-metal'
  */
 function determineExecutionMode(
   jobConfig: Record<string, unknown>,
@@ -508,13 +457,11 @@ function determineExecutionMode(
     return 'bare-metal';
   }
 
-  // Container config in job dispatch takes highest priority
   const containerConfig = jobConfig.container;
   if (containerConfig) {
     return 'container';
   }
 
-  // Explicit config override (KICI_EXECUTION_MODE)
   if (agentConfig.executionMode) {
     return agentConfig.executionMode;
   }
@@ -524,13 +471,10 @@ function determineExecutionMode(
     return 'firecracker';
   }
 
-  // Default: bare-metal
   return 'bare-metal';
 }
 
 /**
- * Resolve a job's workDir and its cleanup.
- *
  * - Default: a fresh `mkdtemp` the agent clones into and removes after the job.
  * - **In-place profile** (`inPlace` config + a `file://` source): the source's
  *   real repo path used directly as the workDir, with **no clone** and **no
@@ -563,18 +507,12 @@ export async function resolveJobWorkDir(
 }
 
 /**
- * Top-level job execution orchestrator for the agent.
+ * Runs each `job.dispatch`: creates the work directory, selects the sandbox
+ * backend, delegates clone/compile/steps to it, wires its IPC to the WS
+ * pipeline, reports status, and cleans up.
  *
- * When a `job.dispatch` is received, the runner:
- * 1. Creates a temp work directory
- * 2. Selects the appropriate sandbox backend (container, bare-metal, firecracker)
- * 3. Delegates execution to the sandbox (clone, compile, run steps)
- * 4. Wires sandbox IPC callbacks to the WS message pipeline
- * 5. Reports status (running -> success/failed/cancelled/skipped)
- * 6. Cleans up work directory and sandbox
- *
- * Customer code runs in an isolated child process -- NEVER in the agent's V8 isolate.
- * Build jobs still run in-process (they don't execute customer workflow steps).
+ * Customer code runs in an isolated child process, never in the agent's V8
+ * isolate. Build jobs run in-process: they execute no customer workflow steps.
  */
 export class JobRunner {
   private readonly send: (msg: AgentToOrchestratorMessage) => void;
@@ -596,13 +534,12 @@ export class JobRunner {
   private readonly _sendStepApproval?: JobRunnerDeps['sendStepApproval'];
   private readonly resolveContainerRuntime: () => ContainerRuntimeEndpoint | null;
 
-  /** Tracks running jobs for concurrency and cancellation */
+  /** For concurrency and cancellation. */
   readonly activeJobs = new Map<string, ActiveJob>();
 
-  /** Active sandbox for the current job (used for abort). */
+  /** Used for abort. */
   private activeSandbox: ExecutionSandbox | null = null;
 
-  /** Supervisor-owned between-jobs phase (reap / cleanup re-run / reset). */
   private readonly betweenJobsController?: BetweenJobsController;
 
   /**
@@ -641,42 +578,30 @@ export class JobRunner {
       deps.resolveContainerRuntime ?? (() => resolveContainerRuntime());
   }
 
-  /**
-   * Execute a dispatched job through its full lifecycle.
-   *
-   * Creates a temp directory, delegates to the appropriate sandbox,
-   * reports status, and cleans up.
-   */
   async execute(dispatch: JobDispatch): Promise<void> {
     const { runId: _runId, jobId, jobConfig: _jobConfig } = dispatch;
     const abortController = new AbortController();
 
-    // Resolve the work directory: a fresh temp clone (default) or — under the
-    // in-place profile with a file:// source — the operator's real repo path
-    // used directly with no clone.
     const { workDir, cleanup, inPlace } = await resolveJobWorkDir(
       this.config.inPlace,
       dispatch.repoUrl,
     );
-    // In-place: skip the git clone so the pre-built working tree is used as-is.
-    // `checkout` is an agent-launch decision here (config-derived), never a
-    // wire/jobConfig value that a workflow could set.
+    // In-place skips the clone. `checkout` here is config-derived, never a
+    // wire/jobConfig value a workflow could set.
     if (inPlace) {
       (dispatch.jobConfig as Record<string, unknown>).checkout = false;
     }
 
     this.betweenJobsFacts = null;
 
-    // Stand up git credentials for this job: the helper socket git talks to and
-    // the grant table `withWrite` elevates. Started before the job so every
-    // clone it makes is configured to use the helper, and torn down in the same
+    // The helper socket git talks to and the grant table `withWrite` elevates.
+    // Started before the job so every clone uses the helper; closed in the same
     // `finally` as the workdir so a failed job cannot leak the socket.
     const gitCredentials = await this.startGitCredentials(
       jobId,
       dispatch.jobConfig as Record<string, unknown>,
     );
 
-    // Track this job
     const completionPromise = this.runJob(dispatch, workDir, abortController).finally(async () => {
       const facts = this.betweenJobsFacts;
       this.activeJobs.delete(jobId);
@@ -687,11 +612,9 @@ export class JobRunner {
         /* best effort — the socket lives in the job dir, reaped with it */
       });
 
-      // Between-jobs phase: reap the process tree, re-run declared cleanup
-      // out-of-band, delete the workdir, run the operator reset. Owns the
-      // workdir deletion so the out-of-band re-run can use the preserved dir
-      // first. A throw here must never break the supervisor loop — the job has
-      // already been reported.
+      // Owns the workdir deletion so the out-of-band cleanup re-run can use the
+      // preserved dir first. A throw here must never break the supervisor loop:
+      // the job is already reported.
       await this.runBetweenJobsPhase(facts, workDir, cleanup);
     });
 
@@ -701,12 +624,11 @@ export class JobRunner {
   }
 
   /**
-   * Stand up per-job git credentials, or `undefined` when the agent has no
-   * orchestrator relay (unit harnesses, offline local runs).
+   * `undefined` when the agent has no orchestrator relay (unit harnesses,
+   * offline local runs).
    *
    * A failure here must not fail the job: without a helper, git falls back to
-   * its own mechanisms exactly as it did before this existed. The job cannot
-   * push.
+   * its own mechanisms and the job cannot push.
    */
   private async startGitCredentials(
     jobId: string,
@@ -719,11 +641,10 @@ export class JobRunner {
         jobId,
         dir,
         sendApiRequest: this._sendApiRequest,
-        // Declared on the job as `gitCredentials` and carried from the lock
-        // through `jobConfig`. Values are secret NAMES — the agent resolves
-        // nothing; it names an entry by key and the orchestrator checks the
-        // resulting ref against the same declaration it persisted on the job
-        // row before resolving it.
+        // The job's `gitCredentials`, carried from the lock through `jobConfig`.
+        // Values are secret names: the agent resolves nothing, and the
+        // orchestrator checks each ref against the declaration it persisted on
+        // the job row before resolving it.
         credentials: jobConfig.gitCredentials as
           Readonly<Record<string, Readonly<Record<string, string>>>> | undefined,
       });
@@ -738,11 +659,10 @@ export class JobRunner {
     }
   }
   /**
-   * Run the supervisor-owned between-jobs phase after a job finishes. Delegates
-   * to the injected `BetweenJobsController` (out-of-band cleanup → reap →
+   * Delegates to the `BetweenJobsController` (out-of-band cleanup → reap →
    * workdir delete → operator reset) with facts captured before sandbox
-   * teardown. When no controller is wired (unit harnesses) it just deletes the
-   * workdir, preserving the historical behavior. Never throws.
+   * teardown. With no controller (unit harnesses) it only deletes the workdir.
+   * Never throws.
    */
   private async runBetweenJobsPhase(
     facts: JobRunner['betweenJobsFacts'],
@@ -750,7 +670,6 @@ export class JobRunner {
     deleteWorkdir: () => Promise<void>,
   ): Promise<void> {
     if (!this.betweenJobsController) {
-      // No between-jobs phase configured: preserve the workdir-cleanup behavior.
       await deleteWorkdir().catch((err) =>
         logger.warn('Work directory cleanup error', { error: toErrorMessage(err) }),
       );
@@ -774,17 +693,15 @@ export class JobRunner {
       await this.betweenJobsController.afterJob(ctx);
     } catch (err) {
       logger.error('Between-jobs phase error', { error: toErrorMessage(err) });
-      // The workdir may not have been deleted if the controller threw early;
-      // ensure it is removed so a reused agent does not accumulate workdirs.
+      // A controller that threw early may have left the workdir; a reused agent
+      // must not accumulate them.
       await deleteWorkdir().catch(() => {});
     }
   }
 
   /**
-   * Cancel a running job by signaling its abort controller
-   * and aborting the active sandbox.
-   *
-   * @param force When true, force-cancel (SIGKILL, skip hooks). When false, graceful cancel.
+   * Signals the job's abort controller and aborts the active sandbox. `_force`
+   * is ignored: no path here force-cancels.
    */
   cancel(jobId: string, reason: string, _force: boolean = false): void {
     const active = this.activeJobs.get(jobId);
@@ -792,40 +709,25 @@ export class JobRunner {
 
     active.abortController.abort(reason);
 
-    // Also abort the sandbox directly for graceful shutdown
     if (this.activeSandbox) {
       this.activeSandbox.abort().catch(() => {});
     }
   }
 
-  /**
-   * Internal job execution pipeline.
-   *
-   * For execution jobs: delegates to an ExecutionSandbox (customer code in
-   * isolated child process). For build-only jobs: runs in-process (no customer
-   * workflow steps).
-   */
+  /** Special job types (init / dynamicJobFn / build) short-circuit the sandbox pipeline. */
   private async runJob(
     dispatch: JobDispatch,
     workDir: string,
     abortController: AbortController,
   ): Promise<void> {
-    // Phase 1: Special-cased job types (init / dynamicJobFn / build) short-circuit
-    // before the standard sandbox pipeline.
     if (await this.dispatchSpecialJobType(dispatch, workDir, abortController)) {
       return;
     }
 
-    // Phase 2: Standard execution job — sandbox lifecycle.
     await this.executeStandardJob(dispatch, workDir, abortController);
   }
 
-  /**
-   * Route init-only / dynamicJobFn / build-only jobs to their dedicated handlers.
-   *
-   * Returns `true` when one of the special handlers ran (caller must early-return);
-   * `false` when the job is a standard execution job that should hit the sandbox path.
-   */
+  /** `true` when a special handler ran and the caller must return; `false` for a standard job. */
   private async dispatchSpecialJobType(
     dispatch: JobDispatch,
     workDir: string,
@@ -833,39 +735,36 @@ export class JobRunner {
   ): Promise<boolean> {
     const { runId, jobId, jobConfig } = dispatch;
 
-    // Check for init-only jobs (dynamic field resolution, handled before build/execution)
+    // Init-only jobs resolve dynamic fields.
     const isInitOnly = (jobConfig as { initOnly?: boolean }).initOnly === true;
     if (isInitOnly) {
       await this.handleInitJob(dispatch, workDir, abortController);
       return true;
     }
 
-    // Check for the pre-run global eval round (filters + generators for every
-    // candidate global workflow of one workflow repo, on one dual checkout).
+    // The pre-run global eval round: filters and generators for every candidate
+    // global workflow of one workflow repo, on one dual checkout.
     const isGlobalEvalRound = (jobConfig as { globalEvalRound?: boolean }).globalEvalRound === true;
     if (isGlobalEvalRound) {
       await this.handleGlobalEvalRound(dispatch, workDir, abortController);
       return true;
     }
 
-    // Check for DynamicJobFn evaluation jobs (runtime job generation)
     const isDynamicJobFnEval = (jobConfig as { dynamicJobFn?: boolean }).dynamicJobFn === true;
     if (isDynamicJobFnEval) {
       await this.handleDynamicJobFn(dispatch, workDir, abortController);
       return true;
     }
 
-    // Check for bring-up jobs (init-runner SSH bring-up; no clone, no sandbox).
     const isBringupOnly = (jobConfig as { bringupOnly?: boolean }).bringupOnly === true;
     if (isBringupOnly) {
       await this.handleBringupJob(dispatch);
       return true;
     }
 
-    // Check for build-only jobs (handled separately from execution jobs)
     const isBuildOnly = (jobConfig as { buildOnly?: boolean }).buildOnly === true;
     if (isBuildOnly) {
-      // Build jobs are not dispatched for fullRepo runs, but guard defensively
+      // A fullRepo run never dispatches a build job; guard anyway.
       if ((jobConfig as { fullRepo?: boolean }).fullRepo) {
         logger.warn('Build job received for fullRepo run -- skipping (should not happen)', {
           jobId,
@@ -881,13 +780,7 @@ export class JobRunner {
     return false;
   }
 
-  /**
-   * Run a standard execution job through its full sandbox lifecycle.
-   *
-   * Heartbeat timer + try/finally wrap sandbox creation, setup, execution, and
-   * teardown. Errors during execution are caught and reported as a failed job
-   * status; the sandbox is always torn down in the finally block.
-   */
+  /** An execution error reports a failed job; the sandbox is always torn down. */
   private async executeStandardJob(
     dispatch: JobDispatch,
     workDir: string,
@@ -895,14 +788,13 @@ export class JobRunner {
   ): Promise<void> {
     const { runId, jobId } = dispatch;
 
-    // Print trace header once per job (per locked decision)
+    // The trace header, once per job.
     const ctx = getRequestContext();
     logger.info(`Run: ${ctx.runId ?? runId} | Trace: ${ctx.requestId ?? 'N/A'}`);
 
-    // Send running status
     this.sendJobStatus(dispatch, ExecutionJobStatus.enum.running);
 
-    // Start per-job heartbeat timer for stale run detection
+    // Lets the orchestrator detect stale runs.
     const heartbeatTimer = setInterval(() => {
       this.send({
         type: 'job.heartbeat',
@@ -912,22 +804,18 @@ export class JobRunner {
       });
     }, this.config.jobHeartbeatIntervalMs);
 
-    // The sandbox for this job, recorded as soon as it is created. jobFailed
-    // is the failure disposition captured for the between-jobs facts below. It
-    // defaults to true: an agent-side throw before a result is a failure, and a
-    // job that leaked a daemon and then threw is exactly the leak the reap
-    // targets, so it must still be reaped.
+    // `slot` records the sandbox as soon as it exists. jobFailed defaults to
+    // true: an agent-side throw before a result is a failure, and a job that
+    // leaked a daemon and then threw is exactly what the reap targets.
     const slot: SandboxSlot = {};
     let jobFailed = true;
 
-    // Owned here (not inside runSandboxExecution) so an execution that throws
-    // still flushes whatever the failing step had already streamed. Without it
-    // the buffered tail — which is exactly where the failure diagnostics sit —
-    // dies with the streamer and the run log ends mid-step. The host-side setup
-    // narration of a container job lands in the same map, under step -1.
+    // Owned here, not in runSandboxExecution, so an execution that throws still
+    // flushes the failing step's buffered tail, where the diagnostics sit. A
+    // container job's host-side setup lines land here too, under step -1.
     const logStreamers = new Map<number, LogStreamer>();
-    // Whether the sandbox setup finished: an error before then is a setup
-    // failure, which the workflow-level log records beside its setup lines.
+    // An error before setup finishes is a setup failure, recorded in the
+    // workflow-level log beside its setup lines.
     let setupFinished = false;
 
     try {
@@ -936,7 +824,7 @@ export class JobRunner {
         slot,
       });
       if (!setupResult) {
-        // Aborted during setup — cancellation status was already sent.
+        // Aborted during setup; the cancellation status is already sent.
         return;
       }
       setupFinished = true;
@@ -952,20 +840,18 @@ export class JobRunner {
 
       this.reportExecutionResult(dispatch, result, logStreamers);
     } catch (error) {
-      // Unexpected error in job execution. Redacted like the host-side setup
-      // lines: a setup error can echo a registry token or an install secret.
+      // Redacted like the host-side setup lines: a setup error can echo a
+      // registry token or an install secret.
       const errorMsg = redactNpmOutput(toErrorMessage(error), hostInstallSecrets(dispatch));
       // A setup failure ends the job before any step runs, so the
-      // workflow-level log is the only log it has: record the error there,
-      // after the setup lines that led up to it.
+      // workflow-level log is the only log it has.
       if (!setupFinished) {
         this.getOrCreateStreamer(dispatch, logStreamers, WORKFLOW_LOG_STEP_INDEX).addLine(
           `${SETUP_FAILED_LOG_PREFIX} ${errorMsg}`,
         );
       }
-      // Flush before the terminal status so the in-flight step output reaches
-      // the orchestrator. destroy() is idempotent — a job that already went
-      // through reportExecutionResult re-enters here with empty buffers.
+      // Flush before the terminal status. destroy() is idempotent: a job that
+      // went through reportExecutionResult re-enters here with empty buffers.
       for (const streamer of logStreamers.values()) {
         streamer.destroy();
       }
@@ -976,11 +862,9 @@ export class JobRunner {
       clearInterval(heartbeatTimer);
       const jobSandbox = slot.sandbox;
       if (jobSandbox) {
-        // Capture the facts the between-jobs controller needs BEFORE teardown —
-        // and on the throw path too, so a job that leaked a daemon and then hit
-        // an agent-side error is still reaped. completionHooksRan /
-        // declaresCleanup read the (still-live) runner handle; reap + the
-        // cleanup-only re-run bind to this sandbox.
+        // Captured before teardown, on the throw path too, so a job that leaked
+        // a daemon and then threw is still reaped. completionHooksRan /
+        // declaresCleanup read the still-live runner handle.
         this.betweenJobsFacts = {
           completionHooksRan: jobSandbox.completionHooksRan ?? true,
           declaresCleanup: jobSandbox.declaresCleanup ?? false,
@@ -993,8 +877,7 @@ export class JobRunner {
               }
             : {}),
         };
-        // Always tear down the sandbox (kills the runner child; the process
-        // group survives for the reap in the between-jobs phase).
+        // Kills the runner child; the process group survives for the reap.
         this.emitRunEvent(runId, 'agent.teardown', { jobId });
         await jobSandbox.teardown().catch((err) => {
           logger.warn('Sandbox teardown error', {
@@ -1006,16 +889,13 @@ export class JobRunner {
   }
 
   /**
-   * Determine execution mode, build sanitized env, create + setup the sandbox,
-   * and emit the job.context message.
-   *
-   * Returns `null` if the abort signal fires before / during setup (the caller
-   * has already received a `cancelled` status via `sendJobStatus`).
+   * Returns `null` when the abort signal fires before or during setup; the
+   * `cancelled` status is then already sent.
    *
    * `io.slot` receives the sandbox the moment it exists, so the caller tears it
-   * down even when a later setup step throws. `io.logStreamers` holds the
-   * job's streamers: the host-side setup of a container job writes its lines to
-   * the step -1 streamer there, which the runner's own step -1 lines reuse.
+   * down even when a later setup step throws. A container job's host-side setup
+   * writes to the step -1 streamer in `io.logStreamers`, which the runner's own
+   * step -1 lines reuse.
    */
   private async setupSandboxForExecution(
     dispatch: JobDispatch,
@@ -1029,13 +909,11 @@ export class JobRunner {
   } | null> {
     const { runId, jobId, jobConfig } = dispatch;
 
-    // Check for abort before sandbox creation
     if (abortController.signal.aborted) {
       this.sendJobStatus(dispatch, ExecutionJobStatus.enum.cancelled);
       return null;
     }
 
-    // Step 1: Determine execution mode and create appropriate sandbox
     const executionMode = determineExecutionMode(jobConfig as Record<string, unknown>, {
       executionMode: this.config.executionMode,
       scalerManaged: this.config.scalerManaged,
@@ -1047,14 +925,13 @@ export class JobRunner {
     const sanitizedEnv = buildSanitizedEnv((typedConfig.env as Record<string, string>) ?? {}, {
       contextVars: (typedConfig.contextVars as Record<string, string>) ?? undefined,
       jobEnv: (typedConfig.jobEnv as Record<string, string>) ?? undefined,
-      // Trusted-env is an agent-launch property read ONLY from agent config —
-      // never from the dispatch/jobConfig, so a workflow cannot self-elevate.
+      // Read only from agent config, never the dispatch, so a workflow cannot
+      // self-elevate.
       trustedEnv: this.config.trustedEnv,
     });
 
-    // Step 1a: A container job needs a runtime to nest its container on. Found
-    // before the clone, so a job on a host without one fails at once, with a
-    // message naming what is missing, rather than on a bare ENOENT later.
+    // Resolved before the clone, so a host without a container runtime fails at
+    // once with a message naming it, not on a bare ENOENT later.
     const containerRuntime =
       executionMode === 'container'
         ? requireContainerRuntime({
@@ -1064,19 +941,14 @@ export class JobRunner {
           })
         : undefined;
 
-    // Step 1b: For a container job, clone on the HOST rather than inside the
-    // customer's image. Two things fall out of that: the image needs no git,
-    // and clone-time credentials stay on the host where the credential helper
-    // already works — instead of needing a route into a container hardened
-    // with `CapDrop: ALL`, which would hand anything in /workspace a direct
-    // line to the credential broker.
-    //
-    // The runner is then told the checkout is already done, so it does not
-    // re-clone over the tree we copy in.
+    // A container job clones on the host, not in the customer's image: the
+    // image needs no git, and clone-time credentials stay with the host's
+    // credential helper. A route into the `CapDrop: ALL` container would hand
+    // anything in /workspace a direct line to the credential broker. The runner
+    // is told the checkout is done, so it does not re-clone over the copied tree.
     const hostCheckout =
       executionMode === 'container' && (jobConfig as Record<string, unknown>).checkout !== false;
-    // Host-side setup lines are redacted of the dispatch's registry tokens and
-    // install secrets before they reach the run log.
+    // Redacts the dispatch's registry tokens and install secrets.
     const secrets = hostInstallSecrets(dispatch);
     const setupLog = (line: string): void => {
       this.getOrCreateStreamer(dispatch, io.logStreamers, WORKFLOW_LOG_STEP_INDEX).addLine(
@@ -1087,9 +959,8 @@ export class JobRunner {
       await this.checkoutOnHost(dispatch, workDir, setupLog);
     }
 
-    // Step 1c: A job may declare a Dockerfile instead of an image. Build it
-    // here — after the clone, whose tree is the build context, and before the
-    // sandbox, which runs the tag the build produces.
+    // A declared Dockerfile builds after the clone, whose tree is the build
+    // context, and before the sandbox, which runs the built tag.
     const builtImage = await this.buildJobImageIfDeclared(
       dispatch,
       jobConfig as Record<string, unknown>,
@@ -1114,10 +985,9 @@ export class JobRunner {
     io.slot.sandbox = sandbox;
     io.slot.executionMode = executionMode;
 
-    // Step 1d: Install `.kici/` dependencies into the host checkout, so the
-    // tree copied into the container already carries them. After the image
-    // build, so the Dockerfile's build context never holds the installed
-    // `.kici/node_modules`; before the setup, which copies the workspace in.
+    // `.kici/` deps install into the host checkout, so the copied tree carries
+    // them: after the image build, so its context never holds
+    // `.kici/node_modules`, and before the setup, which copies the workspace in.
     if (hostCheckout) {
       try {
         await this.installDepsOnHost(dispatch, workDir, setupLog, abortController.signal);
@@ -1133,10 +1003,9 @@ export class JobRunner {
       return null;
     }
 
-    // Step 2: Setup sandbox (container: create + start; bare-metal: validate).
-    // Thread the file:// clone-source dir(s) so a container-backend job can
-    // read a local source (the bare-metal backend derives its own equivalent
-    // internally and ignores this field). Empty for https/ssh remotes.
+    // Container: create + start; bare-metal: validate. The file:// clone-source
+    // binds let a container job read a local source (bare-metal derives its own
+    // and ignores them); empty for https/ssh remotes.
     await sandbox.setup({
       workDir,
       env: sanitizedEnv,
@@ -1149,7 +1018,6 @@ export class JobRunner {
       return null;
     }
 
-    // Emit job.context with execution environment details
     this._sendJobContext(runId, jobId, {
       runtime: {
         nodeVersion: process.version,
@@ -1166,12 +1034,8 @@ export class JobRunner {
   }
 
   /**
-   * Drive `sandbox.executeJob` with IPC callbacks wired to the WS pipeline.
-   *
-   * Lazily populates `logStreamers` (owned by the caller so a throw still
-   * leaves the buffered output flushable), forwards step + log + event-emit +
-   * concurrency-report + api-request messages, and emits the
-   * `agent.execution.start` / `agent.execution.end` lifecycle events.
+   * Wires the sandbox IPC callbacks to the WS pipeline. `logStreamers` fills
+   * lazily per step and is owned by the caller, so a throw leaves it flushable.
    */
   private async runSandboxExecution(
     dispatch: JobDispatch,
@@ -1181,20 +1045,14 @@ export class JobRunner {
   ): Promise<JobExecutionResult> {
     const { runId, jobId } = dispatch;
 
-    // Step 3: LogStreamers are created lazily per step, into the caller's map.
-
-    // Emit agent.execution.start event
     const executionStartMs = Date.now();
     this.emitRunEvent(runId, 'agent.execution.start', { jobId });
 
-    // Step 4: Execute job via sandbox with IPC callbacks wired to WS pipeline
     const result: JobExecutionResult = await sandbox.executeJob({
       dispatch,
       onStepStatus: (stepIndex, stepName, state, data) => {
-        // On terminal step states, look up the per-step LogStreamer (created
-        // lazily by onLogLine) and forward the raw byte total. The
-        // orchestrator accumulates these into per-job + per-run totals on
-        // execution_jobs.log_bytes / execution_runs.log_bytes.
+        // A terminal step forwards its raw byte total, which the orchestrator
+        // sums into execution_jobs.log_bytes / execution_runs.log_bytes.
         let logBytesStreamed: number | undefined;
         if (
           state === ExecutionStepStatus.enum.success ||
@@ -1205,8 +1063,7 @@ export class JobRunner {
           logBytesStreamed = streamer?.getTotalBytes() ?? 0;
         }
         // A cache pseudo-step (`cache:restore` / `cache:save`) also emits a
-        // `run.event` carrying its outcome so the run timeline records cache
-        // hit/miss/saved alongside the step status — same treatment hooks get.
+        // `run.event`, as hooks do, so the run timeline records its outcome.
         this.maybeEmitCacheRunEvent(runId, jobId, stepIndex, state, data);
         this.sendStepStatus(dispatch, stepIndex, stepName, state, data, logBytesStreamed);
       },
@@ -1215,7 +1072,6 @@ export class JobRunner {
         streamer.addLine(line, stream);
       },
       signal: abortController.signal,
-      // Wire event.emit relay: sandbox runner -> agent WS -> orchestrator
       onEventEmit: async (request) => {
         const response = await this.sendEventEmit(
           jobId,
@@ -1231,7 +1087,6 @@ export class JobRunner {
           error: response.error,
         };
       },
-      // Wire concurrency report relay: sandbox runner -> agent WS -> orchestrator
       onConcurrencyReport: async (report) => {
         const ack = await this._sendConcurrencyReport(dispatch.runId, dispatch.jobId, report.group);
         return {
@@ -1242,10 +1097,8 @@ export class JobRunner {
       },
       onApiRequest: this._sendApiRequest
         ? withBootstrapInterception(async (method, params) => {
-            // A git credential request from `ctx.kici.git.github.getToken()`
-            // reaches the orchestrator directly rather than through the
-            // credential helper, so it carries no ref of its own. Attach the
-            // job's declared credential here, where the map lives.
+            // `ctx.kici.git.github.getToken()` bypasses the credential helper,
+            // so its request carries no ref; attach the job's declared one.
             const patched =
               method === GIT_CREDENTIAL_REQUEST_METHOD
                 ? (this.jobGitCredentials.get(jobId)?.withRef(params ?? {}) ?? params)
@@ -1253,31 +1106,25 @@ export class JobRunner {
             return this._sendApiRequest!(method, patched);
           })
         : undefined,
-      // Wire the git write-grant relay: sandbox runner -> agent grant table.
-      // Unlike its siblings this does NOT reach the orchestrator directly — the
-      // grant lives in the agent, because the credential helper git spawns is a
-      // separate process that consults the agent, not the runner.
+      // The git write-grant relay ends at the agent's grant table, not the
+      // orchestrator: the credential helper git spawns consults the agent.
       onGitGrantRequest: this.jobGitCredentials.get(jobId)?.onGitGrantRequest,
       credentialHelperPath: this.jobGitCredentials.get(jobId)?.helperPath,
       allowInstallScripts: this.config.allowInstallScripts,
-      // Wire user-cache relay: sandbox runner -> agent WS -> orchestrator
       onCacheRequest: this._requestUserCache
         ? async (request) => this._requestUserCache!(jobId, request)
         : undefined,
       onProvenanceRequest: this._relayProvenance
         ? async (request) => this._relayProvenance!(jobId, request)
         : undefined,
-      // Wire user-artifacts relay: sandbox runner -> agent WS -> orchestrator
       onArtifactRequest: this._requestUserArtifact
         ? async (request) => this._requestUserArtifact!(jobId, request)
         : undefined,
-      // Wire step-approval relay: sandbox runner -> agent WS -> orchestrator
       onApprovalRequest: this._sendStepApproval
         ? async (request) => this._sendStepApproval!(dispatch.runId, dispatch.jobId, request)
         : undefined,
-      // Wire secret-mount audit events: sandbox runner -> agent -> orchestrator
-      // The orchestrator persists these alongside `secretsAccessed` (see
-      // execution-tracker.ts -- onStepStatusForward path).
+      // Secret-mount audit events; the orchestrator persists them beside
+      // `secretsAccessed` (execution-tracker.ts, onStepStatusForward).
       onSecretMount: (event) => {
         this.emitRunEvent(runId, 'step.secret_mount', {
           jobId,
@@ -1292,7 +1139,6 @@ export class JobRunner {
       },
     });
 
-    // Emit agent.execution.end event with duration
     this.emitRunEvent(runId, 'agent.execution.end', {
       jobId,
       durationMs: Date.now() - executionStartMs,
@@ -1302,22 +1148,18 @@ export class JobRunner {
     return result;
   }
 
-  /**
-   * Tear down log streamers, record step Prometheus metrics, log sandbox
-   * failure diagnostics, and send the terminal `job.status` message.
-   */
+  /** Flushes the streamers, records step metrics and sends the terminal `job.status`. */
   private reportExecutionResult(
     dispatch: JobDispatch,
     result: JobExecutionResult,
     logStreamers: Map<number, LogStreamer>,
   ): void {
-    // Step 5: Destroy all log streamers before reporting final status.
-    // destroy() force-sends remaining buffer (bypassing backpressure) and cleans up timers.
+    // Before the final status: destroy() force-sends the remaining buffer,
+    // bypassing backpressure.
     for (const streamer of logStreamers.values()) {
       streamer.destroy();
     }
 
-    // Step 5b: Record Prometheus metrics for step execution
     for (const stepResult of result.stepResults) {
       stepsTotal.add(1, { status: stepResult.status });
       if (stepResult.durationMs > 0) {
@@ -1325,11 +1167,8 @@ export class JobRunner {
       }
     }
 
-    // Log the sandbox failure with its actual cause so a remote-agent failure
-    // is diagnosable from the agent log alone, for persistent and ephemeral
-    // agents alike. For an init-phase failure there are no step results, so
-    // result.error is the only place the cause lives; for step failures we also
-    // list each failed step's error message.
+    // Makes a remote-agent failure diagnosable from the agent log alone. An
+    // init-phase failure has no step results, so result.error is its only cause.
     if (result.status === ExecutionJobStatus.enum.failed) {
       const stepErrors = result.stepResults
         .filter((r) => r.error)
@@ -1345,7 +1184,6 @@ export class JobRunner {
       });
     }
 
-    // Step 6: Report final status from sandbox result
     this.sendJobStatus(
       dispatch,
       result.status,
@@ -1353,7 +1191,7 @@ export class JobRunner {
         durationMs: result.durationMs,
         ...(result.error && { error: result.error }),
         ...(result.outputs && { outputs: result.outputs }),
-        // include dropped sibling job names for drift reporting
+        // For drift reporting.
         ...(result.droppedJobs?.length && { droppedJobs: result.droppedJobs }),
         stepResults: result.stepResults.map((r) => ({
           name: r.name,
@@ -1367,15 +1205,13 @@ export class JobRunner {
   }
 
   /**
-   * Handle a bring-up job: bring up a temporary init-runner on a declared-but-
-   * un-agented host over SSH (fresh-box bootstrap convergence). The orchestrator
-   * dispatches this synthetic `__bringup__` job to an agent holding the
-   * `kici:capability:ssh-transport` capability; here we run the agent-side
-   * `ensureInitRunner` helper (the privileged resolve is relayed to the
-   * orchestrator, the SSH transport happens in this agent process — never
-   * reaching workflow code). No clone, no sandbox — the init-runner then
-   * connects under the target's agent id and the orchestrator's pinned-hold
-   * drains the target's bootstrap steps onto it.
+   * Brings up a temporary init-runner over SSH on a declared host with no agent
+   * (fresh-box bootstrap). The orchestrator dispatches this synthetic
+   * `__bringup__` job to an agent with `kici:capability:ssh-transport`. The
+   * privileged resolve is relayed to the orchestrator; the SSH transport runs in
+   * this agent process and never reaches workflow code. No clone, no sandbox:
+   * the init-runner connects under the target's agent id, and the
+   * orchestrator's pinned-hold drains the target's bootstrap steps onto it.
    */
   private async handleBringupJob(dispatch: JobDispatch): Promise<void> {
     const { runId, jobId, jobConfig } = dispatch;
@@ -1392,17 +1228,15 @@ export class JobRunner {
         throw new Error('bring-up job requires an orchestrator API transport');
       }
       streamer.addLine(`Bringing up init-runner on ${targetAgentId}…`);
-      // This agent process performs the SSH transport itself (the privileged
-      // resolve is relayed to the orchestrator inside `ensureInitRunner`). Call
-      // the agent-side helper directly with the raw orchestrator transport — do
-      // NOT route through `withBootstrapInterception`, which exists to catch the
-      // method coming FROM a workflow sandbox.
-      // Stage a self-contained agent+Node payload onto the (possibly Node-less)
-      // target so a stock rescue box boots on its vendored Node. The PRIMARY
-      // source is the orchestrator's own cache bucket (pulled via a presigned
-      // URL over `kici.presignAgentPackage`); KICI_AGENT_PAYLOAD_DIR selects the
-      // air-gap local-dir fallback; KICI_AGENT_COMMAND (golden image) skips the
-      // payload copy entirely.
+      // This agent performs the SSH transport itself (`ensureInitRunner` relays
+      // the privileged resolve to the orchestrator), over the raw orchestrator
+      // transport, never `withBootstrapInterception`, which catches the method
+      // coming from a workflow sandbox.
+      // A self-contained agent+Node payload lets a Node-less stock rescue box
+      // boot on its vendored Node. Its primary source is the orchestrator's
+      // cache bucket (a presigned URL over `kici.presignAgentPackage`);
+      // KICI_AGENT_PAYLOAD_DIR selects the air-gap local dir, and
+      // KICI_AGENT_COMMAND (golden image) skips the payload copy.
       const transport = async (method: string, params: Record<string, unknown>) =>
         this._sendApiRequest!(method, params);
       const payloadSource = this.config.agentPayloadDir
@@ -1455,13 +1289,6 @@ export class JobRunner {
     }
   }
 
-  /**
-   * Handle a build-only job.
-   *
-   * Build jobs install dependencies, pack them into a tarball,
-   * and optionally compile the workflow bundle. They report
-   * status back to the orchestrator but do not execute workflow steps.
-   */
   private async handleBuildJob(
     dispatch: JobDispatch,
     workDir: string,
@@ -1469,20 +1296,18 @@ export class JobRunner {
   ): Promise<void> {
     const { runId, jobId, jobConfig } = dispatch;
 
-    // Print trace header once per build job (per locked decision)
+    // The trace header, once per job.
     const buildCtx = getRequestContext();
     logger.info(`Run: ${buildCtx.runId ?? runId} | Trace: ${buildCtx.requestId ?? 'N/A'}`);
 
     this.sendJobStatus(dispatch, ExecutionJobStatus.enum.running);
 
-    // Create a LogStreamer for the build step so logs appear in the dashboard.
     const buildStreamer = this.createStepStreamer(dispatch, 0);
     const buildLog = (msg: string) => buildStreamer.addLine(msg);
 
-    // Report synthetic step as running so orchestrator creates execution_steps record
+    // A synthetic step, so the orchestrator creates an execution_steps row.
     this.sendStepStatus(dispatch, 0, 'build', ExecutionStepStatus.enum.running);
 
-    // Emit job.context so the dashboard can show execution environment for build jobs
     this._sendJobContext(runId, jobId, {
       runtime: {
         nodeVersion: process.version,
@@ -1495,7 +1320,7 @@ export class JobRunner {
       envVars: this.collectEnvVars({}),
     });
 
-    // Start per-job heartbeat timer for stale run detection
+    // Lets the orchestrator detect stale runs.
     const heartbeatTimer = setInterval(() => {
       this.send({
         type: 'job.heartbeat',
@@ -1572,11 +1397,7 @@ export class JobRunner {
     }
   }
 
-  /**
-   * Phase 1 of build: clone the source repo (with Prometheus timing) and apply
-   * an overlay tarball if the dispatch carries one (test runs with
-   * uncommitted changes).
-   */
+  /** A test run with uncommitted changes carries an overlay tarball. */
   private async cloneAndApplyOverlay(
     dispatch: JobDispatch,
     workDir: string,
@@ -1584,7 +1405,6 @@ export class JobRunner {
   ): Promise<void> {
     const { runId, jobId, jobConfig } = dispatch;
 
-    // 1. Clone repo (with Prometheus timing)
     buildLog(`Cloning ${dispatch.repoUrl} (ref: ${dispatch.ref})`);
     const cloneStart = Date.now();
     this.emitRunEvent(runId, 'agent.clone.start', { jobId });
@@ -1600,7 +1420,6 @@ export class JobRunner {
     this.emitRunEvent(runId, 'agent.clone.end', { jobId, durationMs: cloneDurationMs });
     buildLog(`Clone completed in ${cloneDurationMs}ms`);
 
-    // 1b. Apply overlay tarball if present (test runs with uncommitted changes)
     const tarballUrl = (jobConfig as Record<string, unknown>).tarballUrl as string | undefined;
     const cliPublicKey = (jobConfig as Record<string, unknown>).cliPublicKey as string | undefined;
     const orchestratorPrivateKey = (jobConfig as Record<string, unknown>).orchestratorPrivateKey as
@@ -1622,15 +1441,11 @@ export class JobRunner {
   }
 
   /**
-   * Materialize the init job's workflow source into `workDir`. A test run ships
-   * its full working tree as an encrypted overlay tarball (`fullRepo`) rather
-   * than a git repo, so skip the clone and let the overlay populate the
-   * workspace — the same handling the normal execution-job path uses. Otherwise
-   * restore from the cached tarball if present, else clone. In every case, apply
-   * an attached overlay tarball afterward (test runs with uncommitted changes;
-   * for a fullRepo run this is what actually populates the workspace, so the
-   * init job resolves a dynamic context against the real source tree instead of
-   * an empty directory).
+   * A `fullRepo` test run ships its working tree as an encrypted overlay
+   * tarball, not a git repo, so it skips the clone, as the execution-job path
+   * does. Otherwise: the cached tarball if present, else a clone. An attached
+   * overlay applies afterward in every case; for a fullRepo run it is what
+   * populates the workspace, so the init job resolves against the real tree.
    */
   private async materializeInitJobSource(
     dispatch: JobDispatch,
@@ -1660,10 +1475,7 @@ export class JobRunner {
     await this.applyInitJobOverlay(dispatch, workDir, initLog);
   }
 
-  /**
-   * Apply a test run's overlay tarball, when the init job carries one, to the
-   * checkout that holds `.kici/`.
-   */
+  /** Applies to the checkout that holds `.kici/`. */
   private async applyInitJobOverlay(
     dispatch: JobDispatch,
     repoDir: string,
@@ -1696,11 +1508,9 @@ export class JobRunner {
   }
 
   /**
-   * Put everything the init job's evaluation imports on disk: the workflow
-   * source and its `.kici/` dependencies. A global workflow's init job takes the
-   * global layout, with the workflow repository's `.kici/` under `workflow/`
-   * and the source repository under `source/`; any other init job fills its
-   * work dir.
+   * Puts the workflow source and its `.kici/` dependencies on disk. A global
+   * workflow's init job takes the global layout (`workflow/` and `source/`);
+   * any other init job fills its work dir.
    */
   private async prepareInitWorkspace(
     dispatch: JobDispatch,
@@ -1727,8 +1537,8 @@ export class JobRunner {
       return;
     }
 
-    // 1. Restore deps (needed for workflow imports like @kici-dev/sdk). A failed
-    //    restore leaves `depsRestored` false and step 3 installs inline.
+    // Workflow imports such as @kici-dev/sdk need deps; a failed restore leaves
+    // `depsRestored` false and the install below runs inline.
     let depsRestored = false;
     if (dispatch.depsUrl) {
       initLog('Restoring dependencies from cache');
@@ -1740,12 +1550,9 @@ export class JobRunner {
       });
     }
 
-    // 2. Materialize the workflow source into workDir (overlay for a test run,
-    //    cached tarball, or git clone — plus any attached overlay).
     await this.materializeInitJobSource(dispatch, workDir, initLog);
 
-    // 3. Install deps locally when no cached tarball was restored —
-    //    @kici-dev/sdk must resolve under .kici/node_modules/ at import time.
+    // @kici-dev/sdk must resolve under .kici/node_modules/ at import time.
     const kiciDir = join(workDir, '.kici');
     const hasPackage = await fileExists(join(kiciDir, 'package.json'));
     logger.info('Init job: checking deps', {
@@ -1765,9 +1572,8 @@ export class JobRunner {
   }
 
   /**
-   * Phase 2 of build: install dependencies locally if needed for the build,
-   * and (when the orchestrator has flagged the dep cache as stale) pack
-   * `.kici/node_modules/` into a tarball and upload it to the deps cache.
+   * Installs dependencies when the build needs them and, when the orchestrator
+   * flagged the dep cache as stale, packs and uploads `.kici/node_modules/`.
    */
   private async packAndUploadDeps(
     dispatch: JobDispatch,
@@ -1775,7 +1581,7 @@ export class JobRunner {
     buildConfig: BuildJobConfig,
     buildLog: (msg: string) => void,
   ): Promise<void> {
-    // 2. Install deps if needed (bundle compilation also requires deps installed locally)
+    // The source pack needs deps installed locally too.
     const needDepsLocally = buildConfig.buildDepsNeeded || buildConfig.buildSourceNeeded;
     if (!needDepsLocally) return;
 
@@ -1792,16 +1598,15 @@ export class JobRunner {
     });
     buildLog('Dependencies installed');
 
-    // 3. Pack and upload dep tarball only when dep cache needs updating
     if (!buildConfig.buildDepsNeeded) return;
 
     const { tarball, hash } = await packNodeModules(kiciDir);
 
     const depKey = {
       lockfileHash: buildConfig.lockfileHash!,
-      // Echoed back so the orchestrator publishes the pointer under the same
-      // key its probe reads. A sibling edit moves no package-manager lock file,
-      // so without this the pointer would still name a stale sibling build.
+      // Echoed back so the pointer lands under the key the orchestrator's probe
+      // reads. A sibling edit moves no lock file, so without it the pointer
+      // would name a stale sibling build.
       ...(buildConfig.siblingsDigest && { siblingsDigest: buildConfig.siblingsDigest }),
       platform: os.platform(),
       arch: os.arch(),
@@ -1809,9 +1614,8 @@ export class JobRunner {
     logger.info('Requesting dep upload URL from orchestrator', {
       lockfileHash: buildConfig.lockfileHash,
     });
-    // Send the tarball's own hash with the REQUEST, not just the completion:
-    // the object is stored under that hash, so the orchestrator needs it to
-    // sign the URL. We already have it — `packNodeModules` returned it above.
+    // The hash goes with the request, not just the completion: the object is
+    // stored under it, so the orchestrator needs it to sign the URL.
     const depUploadUrl = await this.requestUploadUrl(dispatch.jobId, 'deps', {
       ...depKey,
       depsHash: hash,
@@ -1834,11 +1638,7 @@ export class JobRunner {
     });
   }
 
-  /**
-   * Phase 3 of build: verify the cloned workflow source against the lock
-   * file's expected `contentHash`, pack `.kici/` into a tarball, and upload
-   * it to the source cache.
-   */
+  /** Verifies the clone against the lock file's `contentHash`, then packs and uploads `.kici/`. */
   private async packAndUploadSource(
     dispatch: JobDispatch,
     workDir: string,
@@ -1847,20 +1647,16 @@ export class JobRunner {
     buildLog: (msg: string) => void,
     signal: AbortSignal,
   ): Promise<void> {
-    // 4. Pack source tarball if needed
     if (!buildConfig.buildSourceNeeded || !buildConfig.contentHash) return;
 
     const sourceFile = (dispatch.jobConfig as { source?: { file: string } }).source?.file;
     if (!sourceFile) return;
 
     buildLog(`Verifying workflow source (${sourceFile})...`);
-    // Verify the cloned source matches the lock file's expected contentHash
-    // before packing — catches drift where the orchestrator saw a different
-    // source revision than the agent cloned.
-    //
-    // The verification IS a module import, so it runs in the eval child: a
-    // workflow module's top-level is customer code. Its console output arrives
-    // as log lines and lands on this build step's log, as before.
+    // Catches drift where the orchestrator saw a different source revision than
+    // the agent cloned. The check is a module import, and module top-level is
+    // customer code, so it runs in the eval child; its console output lands on
+    // this build step's log.
     await this.runEvaluation({
       kind: 'build-verify',
       dispatch,
@@ -1877,9 +1673,8 @@ export class JobRunner {
     buildLog('Packing .kici/ source tarball...');
     const { tarball, hash: sourceTarDigest } = await packKiciSource(workDir);
 
-    // `sourceTarDigest` is the tarball's OWN digest — the orchestrator stores
-    // the object under it and the restoring agent verifies against it, exactly
-    // as `depsHash` works.
+    // The tarball's own digest: the orchestrator stores the object under it
+    // and the restoring agent verifies against it, as with `depsHash`.
     const sourceKey = {
       contentHash: buildConfig.contentHash,
       sourceTarDigest,
@@ -1911,18 +1706,14 @@ export class JobRunner {
   }
 
   /**
-   * Handle a pre-run global eval round.
+   * Runs once per (event × workflow repo), before any run row exists: checks
+   * out both repos and runs each candidate global workflow's `filter` and, for
+   * a survivor, its `DynamicJobFn`s, so the orchestrator learns which workflows
+   * apply and which jobs each generates.
    *
-   * The round runs once per (event × workflow repo) BEFORE any run row exists:
-   * it checks out the workflow repo and the source repo, then runs each
-   * candidate global workflow's `filter` and — for a survivor — its
-   * `DynamicJobFn`s, so the orchestrator learns which workflows apply to this
-   * source repo and which jobs each one generates.
-   *
-   * A candidate that fails is reported indeterminate inside the result, not as
-   * a job failure: the round carries several unrelated org-wide workflows, and
-   * one broken filter must not suppress the rest. The job itself fails only
-   * when the checkout or the round machinery breaks.
+   * A failed candidate is reported indeterminate in the result, not as a job
+   * failure: one broken filter must not suppress unrelated org-wide workflows.
+   * The job fails only when the checkout or the round machinery breaks.
    */
   private async handleGlobalEvalRound(
     dispatch: JobDispatch,
@@ -1934,27 +1725,23 @@ export class JobRunner {
 
     logger.info('Starting global eval round', {
       jobId,
-      // Read defensively: the opening log line runs before the `try` below, so a
-      // malformed dispatch with a missing/non-array `candidates` must not throw
-      // here — the guard inside the `try` turns that into a reported failure.
+      // Defensive: this runs before the `try`, whose guard reports a malformed
+      // `candidates` as a failure.
       candidateCount: Array.isArray(config.candidates) ? config.candidates.length : 0,
       workflowRepoIdentifier: config.workflowRepoIdentifier,
     });
     this.sendJobStatus(dispatch, ExecutionJobStatus.enum.running);
 
     const evalStreamer = this.createStepStreamer(dispatch, 0);
-    // The round's own deadline check bounds orphaned candidate work to one
-    // candidate, but it cannot preempt that candidate mid-`await` — so a late
-    // `console.log` can still arrive after the step is reported and the
-    // streamer destroyed. Drop those rather than buffering and emitting a
-    // `log.append` for a step already marked terminal.
+    // The round's deadline cannot preempt a candidate mid-`await`, so a late
+    // `console.log` can arrive after the streamer is destroyed. Drop it rather
+    // than emit a `log.append` for a step already terminal.
     let streamerClosed = false;
     const evalLog = (msg: string) => {
       if (!streamerClosed) evalStreamer.addLine(msg);
     };
-    // The zx shell writes to the streamer directly, so it needs the same guard
-    // — and it is the path an orphaned candidate is likeliest to use, since a
-    // candidate usually outlives its budget while waiting on a subprocess.
+    // The zx shell writes to the streamer directly and needs the same guard: an
+    // orphaned candidate usually outlives its budget waiting on a subprocess.
     const evalStreamLine = (line: string, stream: LogStream) => {
       if (!streamerClosed) evalStreamer.addLine(line, stream);
     };
@@ -1970,8 +1757,8 @@ export class JobRunner {
     }, this.config.jobHeartbeatIntervalMs);
 
     try {
-      // Validate the dispatch shape inside the `try` so a malformed dispatch is
-      // reported as a failed verdict rather than rejecting execute() silently.
+      // Inside the `try`, so a malformed dispatch reports a failed verdict
+      // rather than rejecting execute() silently.
       if (!Array.isArray(config.candidates)) {
         throw new Error('Global eval round dispatch is malformed: `candidates` must be an array');
       }
@@ -1990,8 +1777,6 @@ export class JobRunner {
         return;
       }
 
-      // Both repositories in the global layout, the workflow repository's
-      // dependencies and cached source over its checkout.
       await materializeGlobalEvalWorkspace({
         dispatch,
         workDir,
@@ -2002,12 +1787,11 @@ export class JobRunner {
         },
       });
 
-      // Evaluate in the eval child. Every candidate's `filter` and generator is
-      // customer code, and the round loads one module per distinct source file,
-      // so the whole round runs there — including its diff resolution and the zx
-      // `$` handed to filters, which the child builds against its own sanitized
-      // `process.env`. Captured output arrives as log lines on this same eval
-      // log, and `ctx.kici` calls are relayed back over the eval union.
+      // Every candidate's `filter` and generator is customer code (one module
+      // per distinct source file), so the whole round runs in the eval child,
+      // including the diff resolution and the zx `$` handed to filters, built
+      // against the child's sanitized `process.env`. `ctx.kici` calls relay
+      // back over the eval union.
       const roundResult = (await this.runEvaluation({
         kind: 'global-eval',
         dispatch,
@@ -2071,14 +1855,10 @@ export class JobRunner {
   }
 
   /**
-   * Run one evaluation in the eval child and stream its log onto the job's
-   * synthetic step-0 log.
-   *
-   * Every customer-module load and evaluation goes through here. The calling
-   * handler keeps what is the agent's own work — materializing the workspace,
-   * installing dependencies, packing and uploading a tarball, reporting status —
-   * and hands the child only the evaluation itself, in a process whose
-   * environment carries no agent credential.
+   * Every customer-module load and evaluation goes through here, in a child
+   * whose environment carries no agent credential; its log streams onto the
+   * job's synthetic step-0 log. The caller keeps the agent's own work:
+   * workspace, dependency install, tarball upload, status.
    */
   private runEvaluation<T>(args: {
     kind: EvalRequest['kind'];
@@ -2095,8 +1875,7 @@ export class JobRunner {
         kind: args.kind,
         workDir: args.workDir,
         config: args.config,
-        // The dispatch fields an evaluation reads. Passed as a plain record
-        // rather than the JobDispatch itself so the set is visible here: no
+        // A plain record, not the JobDispatch, so the set is visible here: no
         // secrets, no namespaced secrets, no agent token.
         dispatch: {
           runId: args.dispatch.runId,
@@ -2126,16 +1905,11 @@ export class JobRunner {
   }
 
   /**
-   * Handle an init-only job.
-   *
-   * Init jobs evaluate dynamic functions (environment, env, concurrencyGroup)
-   * from a compiled workflow bundle and report the resolved values back to the
-   * orchestrator via job.status data payload. They do not execute workflow steps.
-   *
-   * A synthetic step 0 "init" LogStreamer carries console.log / structured log
-   * output so operators get the same visibility into init jobs that they get
-   * for regular steps. Module top-level code and each dynamic field function
-   * run inside a runCaptured scope so their console.* writes land on this log.
+   * Evaluates dynamic functions (environment, env, concurrencyGroup) and
+   * reports the resolved values in the job.status payload; runs no workflow
+   * steps. A synthetic step 0 "init" log carries console and structured output,
+   * as regular steps do: module top-level code and each dynamic field function
+   * run in a runCaptured scope.
    */
   private async handleInitJob(
     dispatch: JobDispatch,
@@ -2170,13 +1944,10 @@ export class JobRunner {
 
     this.sendJobStatus(dispatch, ExecutionJobStatus.enum.running);
 
-    // Create a LogStreamer for the synthetic "init" step so user output during
-    // dynamic-field evaluation appears in the dashboard.
     const initStreamer = this.createStepStreamer(dispatch, 0);
-    // A filter may shell out, and `LogStreamer.destroy()` sets no closed flag —
-    // `addLine` buffers unconditionally — so a subprocess line arriving after
-    // the step was reported would emit a `log.chunk` for a terminal step. Drop
-    // those instead of buffering them.
+    // A filter may shell out, and `LogStreamer.destroy()` sets no closed flag
+    // (`addLine` buffers unconditionally), so a late subprocess line would emit
+    // a `log.chunk` for a terminal step. Drop it.
     let streamerClosed = false;
     const initLog = (msg: string) => {
       if (!streamerClosed) initStreamer.addLine(msg);
@@ -2184,8 +1955,8 @@ export class JobRunner {
     const initStreamLine = (line: string, stream: LogStream) => {
       if (!streamerClosed) initStreamer.addLine(line, stream);
     };
-    // Idempotent: the catch below also closes, so a throw from `sendStepStatus`
-    // on the success path would otherwise flush an already-destroyed streamer.
+    // Idempotent: the catch also closes, after a possible throw from
+    // `sendStepStatus` on the success path.
     const closeStreamer = async () => {
       if (streamerClosed) return;
       streamerClosed = true;
@@ -2195,7 +1966,6 @@ export class JobRunner {
 
     this.sendStepStatus(dispatch, 0, 'init', ExecutionStepStatus.enum.running);
 
-    // Start heartbeat for stale detection
     const heartbeatTimer = setInterval(() => {
       this.send({
         type: 'job.heartbeat',
@@ -2220,15 +1990,11 @@ export class JobRunner {
         return;
       }
 
-      // 1–3. Restore deps, materialize the workflow source, install `.kici/` deps.
       await this.prepareInitWorkspace(dispatch, workDir, initLog, config.source);
 
-      // 4. Evaluate in the eval child. The workflow module load, the workflow's
-      //    `filter`, and every dynamic environment / env / concurrencyGroup /
-      //    matrix function are customer code, so none of them runs here — the
-      //    child's environment carries no agent credential. Its console output
-      //    arrives as log lines and lands on this same init log, so the operator
-      //    -visible wording is unchanged.
+      // The module load, `filter` and every dynamic environment / env /
+      // concurrencyGroup / matrix function are customer code, so they run in
+      // the eval child, whose environment carries no agent credential.
       const initResult = (await this.runEvaluation({
         kind: 'init',
         dispatch,
@@ -2268,15 +2034,13 @@ export class JobRunner {
         initStreamer.getTotalBytes(),
       );
 
-      // 3. Report success with init results
       this.sendJobStatus(dispatch, ExecutionJobStatus.enum.success, {
         initResult,
         initComplete: true,
       });
     } catch (err) {
-      // A dynamic function that throws fails the job immediately. The eval
-      // child reports the throw as `eval.error`, so its message arrives here as
-      // the rejection of `runEvaluation`.
+      // A throwing dynamic function fails the job; the child's `eval.error`
+      // arrives as the rejection of `runEvaluation`.
       const errorMsg = toErrorMessage(err);
       logger.error('Init job failed', { jobId, error: errorMsg });
       initLog(`Error: ${errorMsg}`);
@@ -2300,13 +2064,7 @@ export class JobRunner {
     }
   }
 
-  /**
-   * Handle DynamicJobFn evaluation jobs.
-   *
-   * Loads the workflow bundle, extracts the DynamicJobFn by index, calls it
-   * with a DynamicJobContext, serializes the returned Job[] to LockJob[],
-   * and sends the result back to the orchestrator.
-   */
+  /** Calls the DynamicJobFn at `source.index` and reports the generated jobs as LockJob[]. */
   private async handleDynamicJobFn(
     dispatch: JobDispatch,
     workDir: string,
@@ -2321,10 +2079,7 @@ export class JobRunner {
       timeoutMs?: number;
       contentHash?: string;
       resolvedHashFiles?: string[];
-      /**
-       * From `LockWorkflow.hasFilter` — evaluate the workflow's `filter` before
-       * the generator. A `false` verdict generates no jobs at all.
-       */
+      /** From `LockWorkflow.hasFilter`; a `false` filter verdict generates no jobs. */
       hasFilter?: boolean;
       /** Paths the orchestrator could only match conservatively; a no-match generates no jobs. */
       deferredPaths?: string[][];
@@ -2342,13 +2097,11 @@ export class JobRunner {
 
     this.sendJobStatus(dispatch, ExecutionJobStatus.enum.running);
 
-    // Create LogStreamer for the "evaluate" step so logs appear in the dashboard.
     const evalStreamer = this.createStepStreamer(dispatch, 0);
     const evalLog = (msg: string) => evalStreamer.addLine(msg);
 
     this.sendStepStatus(dispatch, 0, 'evaluate', ExecutionStepStatus.enum.running);
 
-    // Start heartbeat for stale detection
     const heartbeatTimer = setInterval(() => {
       this.send({
         type: 'job.heartbeat',
@@ -2377,15 +2130,11 @@ export class JobRunner {
         allowInstallScripts: this.config.allowInstallScripts,
       });
 
-      // 3. Evaluate in the eval child: the module load, the workflow `filter`,
-      //    the DynamicJobFn body, and every per-generated-job env / environment /
-      //    concurrencyGroup / matrix function are customer code, so none of them
-      //    runs in this process. The child builds its own zx `$` and its own
-      //    generator context against its sanitized `process.env`, and streams
-      //    everything it captures back as log lines onto this same eval log — so
-      //    the operator-visible wording is unchanged. Its `ctx.kici` calls are
-      //    relayed back through the one privileged message on the eval union,
-      //    which is what a generator already held before the move.
+      // The module load, `filter`, DynamicJobFn body and every per-generated-job
+      // env / environment / concurrencyGroup / matrix function are customer
+      // code, so they run in the eval child, which builds its zx `$` and
+      // generator context against its sanitized `process.env`. `ctx.kici` calls
+      // relay back through the one privileged message on the eval union.
       const lockJobs = (await this.runEvaluation({
         kind: 'dynamic-job',
         dispatch,
@@ -2403,7 +2152,6 @@ export class JobRunner {
 
       evalLog(`Generated ${lockJobs.length} job(s): ${lockJobs.map((j) => j.name).join(', ')}`);
 
-      // 6. Report success with generated jobs
       await evalStreamer.flush();
       evalStreamer.destroy();
       this.sendStepStatus(
@@ -2450,19 +2198,15 @@ export class JobRunner {
   }
 
   /**
-   * Materialize a container job's workspace on the host: clone (or, for a
-   * full-repo run, just create the directory), then apply the run's overlay
-   * tarball when it carries one. Both happen before the job image is built,
-   * because the workspace is the Dockerfile's build context — a full-repo run
-   * has no clone at all, so without the overlay the context would be empty.
+   * Clones (a full-repo run only creates the directory), then applies the
+   * run's overlay tarball. Both precede the image build: the workspace is the
+   * Dockerfile's build context, which a full-repo run without its overlay
+   * leaves empty.
    *
-   * Afterwards the runner is told the workspace is done: `checkout` is turned
-   * off, and the overlay fields are dropped from the job config, so the runner
-   * does not apply the overlay a second time and its decryption key never
-   * enters the container. This holds only for a job that reaches this path: a
-   * container job that declares `checkout: false` skips the host checkout, so
-   * its overlay fields still travel to the runner inside the container, which
-   * applies the overlay there.
+   * Afterwards `checkout` is off and the overlay fields leave the job config,
+   * so the runner does not reapply the overlay and its decryption key never
+   * enters the container. A container job that declares `checkout: false`
+   * skips this path, so its runner applies the overlay inside the container.
    */
   private async checkoutOnHost(
     dispatch: JobDispatch,
@@ -2471,8 +2215,8 @@ export class JobRunner {
   ): Promise<void> {
     const jobConfig = dispatch.jobConfig as Record<string, unknown>;
     const { isGlobal, workflowDir, sourceDir } = jobWorkspaceLayout(jobConfig, workDir);
-    // Every line goes to the agent log and to the run's step -1 log, where a
-    // bare-metal job's runner narrates the same clone.
+    // Also to the step -1 log, where a bare-metal job's runner narrates the
+    // same clone.
     const log = (line: string) => {
       logger.info(`[host-checkout] ${line}`, { jobId: dispatch.jobId });
       setupLog(`[host-checkout] ${line}`);
@@ -2508,10 +2252,9 @@ export class JobRunner {
   }
 
   /**
-   * Install a container job's `.kici/` dependencies into its host checkout
-   * through the allowlisted, isolated installer (`host-isolated-install.ts`).
-   * `installKiciDepsOnHost` decides whether it runs at all; a job it declines
-   * keeps the in-container install. The job's abort signal kills the install.
+   * Through the allowlisted, isolated installer (`host-isolated-install.ts`).
+   * A job `installKiciDepsOnHost` declines keeps the in-container install. The
+   * job's abort signal kills the install.
    */
   private async installDepsOnHost(
     dispatch: JobDispatch,
@@ -2545,15 +2288,9 @@ export class JobRunner {
   }
 
   /**
-   * Build the job's container image when it declared a Dockerfile, and return
-   * the tag the sandbox must run.
-   *
-   * Returns `undefined` for every other job — one with no container, or one
-   * naming a finalized image — which is the common case and costs nothing.
-   *
-   * Extracted from `setupSandboxForExecution` so that function stays inside the
-   * 200-line ceiling, and so the build's streamer lifecycle is visibly bounded
-   * by one `finally`.
+   * Returns the tag the sandbox must run, or `undefined` for a job that
+   * declared no Dockerfile. Kept out of `setupSandboxForExecution` for the
+   * 200-line ceiling, and so one `finally` bounds the build's streamer.
    */
   private async buildJobImageIfDeclared(
     dispatch: JobDispatch,
@@ -2571,8 +2308,7 @@ export class JobRunner {
         container,
         workDir,
         jobId: dispatch.jobId,
-        // Same resolution fork-runner uses for the runner request: a matrix leg
-        // carries its expanded `name`, everything else its plain one.
+        // As fork-runner resolves it: a matrix leg carries its expanded `name`.
         jobName:
           (jobConfig.name as string | undefined) ??
           (jobConfig.baseJobName as string | undefined) ??
@@ -2582,8 +2318,7 @@ export class JobRunner {
           buildJobImage({
             spec,
             cli: resolveBuildCli({ configured: this.config.containerBuildCli }),
-            // The sandbox's own runtime, so the build and the container that
-            // runs it land on the same daemon.
+            // The sandbox's runtime, so the build and its container share a daemon.
             ...(runtime ? { socketPath: runtimeAddress(runtime) } : {}),
             ...(dispatch.containerRegistryAuth
               ? { authconfig: dispatch.containerRegistryAuth }
@@ -2607,9 +2342,6 @@ export class JobRunner {
     }
   }
 
-  /**
-   * Create the appropriate sandbox backend based on execution mode.
-   */
   private createSandbox(
     mode: ExecutionMode,
     opts: {
@@ -2627,8 +2359,7 @@ export class JobRunner {
     switch (mode) {
       case 'container': {
         const containerConfig = opts.jobConfig.container;
-        // A job that declared a Dockerfile has already been built; run THAT tag.
-        // It is local by construction, so the sandbox's pull path never fires.
+        // A built Dockerfile tag is local, so the sandbox's pull path never fires.
         const image =
           opts.builtImage ??
           (typeof containerConfig === 'string'
@@ -2638,22 +2369,17 @@ export class JobRunner {
         return new ContainerSandbox({
           docker: opts.containerRuntime ? dockerClientFor(opts.containerRuntime) : new Docker(),
           image,
-          // The container backend runs the self-contained bundle (zx +
-          // @kici-dev/* inlined) so the single-file runner mount loads inside a
-          // bare job container. bwrap / firecracker keep the external runner.
+          // The self-contained bundle; see resolveRunnerBundlePath.
           runnerPath: resolveRunnerBundlePath(opts.runnerPath),
           env: opts.env,
           keepFailed: this.config.dockerKeepFailed,
           jobId: opts.jobId,
-          // Secure-by-default job-container posture from agent config. The
-          // network posture honors KICI_SANDBOX_NETWORK: `host` shares the host
-          // network namespace (parity with the bwrap host-network mode — needed
-          // when a workflow must reach a host-resolved registry), anything else
-          // keeps the runtime default (bridge). The container backend's default
-          // therefore stays bridge unless the operator opts into host. The
-          // `grant` is the dispatch-resolved per-job escape hatch (allow-listed
-          // orchestrator-side); the agent applies only what dispatch authorized
-          // and never reads the allow-list itself (single enforcement point).
+          // Secure by default. KICI_SANDBOX_NETWORK=`host` shares the host
+          // network namespace (as bwrap's host-network mode does, for a
+          // host-resolved registry); anything else keeps the runtime default
+          // (bridge). `grant` is the per-job escape hatch the orchestrator
+          // allow-lists; the agent applies only what dispatch authorized and
+          // never reads the allow-list (single enforcement point).
           hardening: {
             hardened: this.config.sandboxHardened,
             readonlyRootfs: this.config.sandboxReadonlyRootfs,
@@ -2665,17 +2391,15 @@ export class JobRunner {
             grant: opts.jobConfig.sandboxGrant as ResolvedSandboxGrant | undefined,
           },
           networkIsolation: this.config.sandboxNetworkIsolation,
-          // Resolved by the ORCHESTRATOR — the lock carries secret names and
-          // the agent never resolves them itself. Absent on an older
-          // orchestrator, which pulls anonymously exactly as before.
+          // Resolved by the orchestrator: the lock carries secret names, which
+          // the agent never resolves. Absent from an older orchestrator, whose
+          // jobs pull anonymously.
           ...(opts.registryAuth ? { registryAuth: opts.registryAuth } : {}),
           // Reclaimed at teardown; see ContainerSandbox.buildTag.
           ...(opts.builtImage ? { buildTag: opts.builtImage } : {}),
-          // Where the injected KiCI runtime comes from, so the job's image
-          // needs neither Node nor git. A pre-provisioned tree wins; otherwise
-          // the sandbox materializes one out of the agent image. Both unset
-          // leaves the historical contract in force — the runner launches on
-          // the image's own `node`.
+          // The injected KiCI runtime, so the job's image needs neither Node nor
+          // git. A pre-provisioned tree wins over one materialized from the
+          // agent image; with both unset the runner uses the image's own `node`.
           ...(this.config.runtimeNodeSource
             ? { runtimeNodePath: this.config.runtimeNodeSource }
             : {}),
@@ -2696,9 +2420,8 @@ export class JobRunner {
           env: opts.env,
           sandbox: this.config.sandbox,
           sandboxNetwork: this.config.sandboxNetwork,
-          // Reap a finished job's leaked process tree (bwrap already contains
-          // it via its PID namespace, so detach only applies to the non-bwrap
-          // fork branch inside the sandbox).
+          // Reaps a finished job's leaked process tree. bwrap's PID namespace
+          // already contains it, so detach applies only to the non-bwrap fork.
           orphanCleanup: this.config.orphanCleanup,
           ...(this.config.runnerUser ? { runnerUser: this.config.runnerUser } : {}),
         });
@@ -2706,11 +2429,8 @@ export class JobRunner {
   }
 
   /**
-   * Collect relevant environment variables for the job.context message.
-   *
-   * Returns KICI_* system vars (visible) and user-defined workflow vars.
-   * Secret values are masked as '***'. Full process.env is NOT sent
-   * to avoid leaking host configuration.
+   * KICI_* system vars and user-defined workflow vars for job.context. The
+   * full process.env is not sent, to avoid leaking host configuration.
    */
   private collectEnvVars(
     sanitizedEnv: Record<string, string>,
@@ -2721,14 +2441,12 @@ export class JobRunner {
       category: 'system' | 'user' | 'inherited' | 'secret';
     }> = [];
 
-    // Collect KICI_* system vars from process.env
     for (const [key, value] of Object.entries(process.env)) {
       if (key.startsWith('KICI_') && value !== undefined) {
         vars.push({ name: key, value, category: 'system' });
       }
     }
 
-    // Collect user-defined env vars from sanitizedEnv (workflow-configured)
     for (const [key, value] of Object.entries(sanitizedEnv)) {
       if (!key.startsWith('KICI_')) {
         vars.push({ name: key, value, category: 'user' });
@@ -2738,9 +2456,6 @@ export class JobRunner {
     return vars;
   }
 
-  /**
-   * Emit a run.event message to the orchestrator for infrastructure lifecycle tracking.
-   */
   private emitRunEvent(
     runId: string,
     eventType: string,
@@ -2754,13 +2469,10 @@ export class JobRunner {
   }
 
   /**
-   * Emit a `cache.restore` / `cache.save` run event for a cache pseudo-step.
-   *
-   * The cache phase tags its `step.complete` IPC with a {@link CacheStepType}
-   * `step_type` and a `data.cacheOutcome` ({@link CacheOutcome}); when one of
-   * those terminal pseudo-step statuses arrives here, mirror it onto the run
-   * timeline as a `run.event` so hit/miss/saved/skipped/error is recorded for
-   * the dashboard. A no-op for regular steps and hooks.
+   * Mirrors a terminal cache pseudo-step (tagged with a {@link CacheStepType}
+   * `step_type` and a `data.cacheOutcome`, {@link CacheOutcome}) onto the run
+   * timeline as a `cache.restore` / `cache.save` run event. A no-op for
+   * regular steps and hooks.
    */
   private maybeEmitCacheRunEvent(
     runId: string,
@@ -2791,16 +2503,11 @@ export class JobRunner {
   }
 
   /**
-   * Create a LogStreamer for a synthetic step (build, evaluate, etc.).
-   *
-   * Backpressure wiring: the streamer detects WS buffer pressure and applies the
-   * agent's pause/drop strategy. onBackpressure/onBackpressureClear are
-   * intentionally unwired — the sandbox IPC boundary prevents direct
-   * stdout.pause()/resume() control, so the streamer buffers (pause) or drops
-   * (drop) internally. It increments kici_agent_log_backpressure_events_total,
-   * kici_agent_log_backpressure_active, and kici_agent_log_lines_dropped_total
-   * on rising edges / drop events, so operators can see pressure without
-   * callbacks.
+   * onBackpressure/onBackpressureClear are deliberately unwired: the sandbox
+   * IPC boundary prevents stdout.pause()/resume(), so the streamer buffers
+   * (pause) or drops (drop) internally. Operators see pressure through
+   * kici_agent_log_backpressure_events_total, kici_agent_log_backpressure_active
+   * and kici_agent_log_lines_dropped_total.
    */
   private createStepStreamer(dispatch: JobDispatch, stepIndex: number): LogStreamer {
     return new LogStreamer({
@@ -2816,9 +2523,8 @@ export class JobRunner {
   }
 
   /**
-   * The job's streamer for `stepIndex`, created on first use. One map per job
-   * holds them, so the host-side setup lines and the runner's lines for the
-   * same step share one streamer and reach the stored log in order.
+   * Created on first use. One map per job, so host-side setup lines and the
+   * runner's lines for one step share a streamer and stay in order.
    */
   private getOrCreateStreamer(
     dispatch: JobDispatch,
@@ -2833,22 +2539,16 @@ export class JobRunner {
     return streamer;
   }
 
-  /**
-   * Send a job.status message to the orchestrator.
-   *
-   * When secretOutputs are provided (encrypted envelopes from the sandbox),
-   * they are included as a top-level field on the WS message (not nested in data).
-   */
+  /** Encrypted `secretOutputs` ride as a top-level message field, not in `data`. */
   private sendJobStatus(
     dispatch: JobDispatch,
     state: JobStatus['state'],
     data?: Record<string, unknown>,
     secretOutputs?: Record<string, { agentPublicKey: string; encrypted: string }>,
   ): void {
-    // Buffered send: a terminal transition dropped by an at-completion disconnect
-    // is the most costly frame to lose (the run would sit "running" until stale
-    // detection). Routing through send() enqueues it in the reconnect-replay
-    // buffer instead of the silent-drop unbuffered path.
+    // Buffered: a terminal transition lost to an at-completion disconnect would
+    // leave the run "running" until stale detection, so it rides the
+    // reconnect-replay buffer, not the silent-drop unbuffered path.
     this.send({
       type: 'job.status',
       messageId: randomUUID(),
@@ -2862,13 +2562,8 @@ export class JobRunner {
   }
 
   /**
-   * Send a step.status message to the orchestrator.
-   *
-   * @param logBytesStreamed total raw stream bytes accumulated by this step's
-   *   LogStreamer. Set on terminal step states so the orchestrator can
-   *   accumulate per-job and per-run totals for the operator-side
-   *   `kici_org_log_bytes` capacity-planning gauge. Undefined for the
-   *   `running` transition.
+   * @param logBytesStreamed the step's raw stream bytes, set on terminal states;
+   *   the orchestrator sums them for the `kici_org_log_bytes` capacity gauge.
    */
   private sendStepStatus(
     dispatch: JobDispatch,
@@ -2878,17 +2573,14 @@ export class JobRunner {
     data?: Record<string, unknown>,
     logBytesStreamed?: number,
   ): void {
-    // Extract top-level fields from data (per protocol schema): secretsAccessed
-    // plus the parallel concurrency role + group id.
+    // The protocol schema puts these at the top level.
     const secretsAccessed = data?.secretsAccessed as string[] | undefined;
     const concurrencyKind = data?.concurrencyKind as AgentStepStatus['concurrencyKind'] | undefined;
     const groupId = data?.groupId as string | undefined;
     const { secretsAccessed: _s, concurrencyKind: _c, groupId: _g, ...restData } = data ?? {};
     const hasRestData = Object.keys(restData).length > 0;
 
-    // Buffered send (same rationale as sendJobStatus): step-status frames ride
-    // the reconnect-replay buffer so a disconnect at a step transition cannot
-    // silently drop it.
+    // Buffered, as in sendJobStatus.
     this.send({
       type: 'step.status',
       messageId: randomUUID(),

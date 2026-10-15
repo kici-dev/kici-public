@@ -1,12 +1,8 @@
 /**
- * Bare-metal scaler configuration for the local dev plane.
- *
- * A dispatched job needs an agent to run it. The plane orchestrator boots with
- * a single bare-metal scaler pointed at a label set matching the default
- * `runsOn` (`default`), so an offline `kici run --local` dispatch auto-spawns an
- * ephemeral, one-job-then-exit agent on this machine. The spawned binary is a
- * small executable wrapper that execs `node <@kici-dev/agent server entry>`,
- * which avoids a dependency on the (non-executable) shipped `kici-agent` script.
+ * Bare-metal scalers for the local dev plane, so a `kici run --local` dispatch
+ * spawns an ephemeral one-job agent on this machine. The spawned binary is an
+ * executable wrapper that execs `node <@kici-dev/agent server entry>`, avoiding
+ * the non-executable shipped `kici-agent` script.
  */
 
 import { createRequire } from 'node:module';
@@ -14,17 +10,14 @@ import fs from 'node:fs';
 import { stringify as stringifyYaml } from 'yaml';
 import { planePaths } from './paths.js';
 
-/** Resolve the built `@kici-dev/agent` server entry the bare-metal scaler runs. */
 export function resolveAgentBinary(): string {
   const require = createRequire(import.meta.url);
   return require.resolve('@kici-dev/agent/server');
 }
 
 /**
- * Write the executable wrapper the bare-metal scaler spawns. The scaler invokes
- * `spawn(binaryPath, [])` directly, so the target must be an executable file;
- * the shipped agent entry is a plain Node module without an exec bit, so this
- * wrapper bridges the gap. Returns the wrapper path.
+ * The scaler calls `spawn(binaryPath, [])`, so the target must be executable;
+ * the shipped agent entry is a plain Node module without an exec bit.
  */
 export function writeAgentWrapper(): string {
   const { agentWrapperFile, root } = planePaths();
@@ -39,51 +32,32 @@ export function writeAgentWrapper(): string {
 }
 
 /**
- * The non-reserved routing label a `kici run --local --trusted` run appends to
- * every job's `runsOn` so the dispatch lands on the plane's trusted label set.
- * `self-hosted` (not a `kici:`-prefixed reserved label) is also the `runsOn` the
- * CI deploy/CDN workflows already declare, so those route to the trusted profile
- * on this plane by construction.
+ * Appended to every job's `runsOn` by `kici run --local --trusted`. Not a
+ * reserved `kici:` label, and the `runsOn` the CI deploy/CDN workflows already
+ * declare, so those route to the trusted profile by construction.
  */
 export const TRUSTED_ROUTING_LABEL = 'self-hosted';
 
 /**
- * The non-reserved routing label a `kici run --local --trusted --in-place` run
- * appends (alongside `self-hosted`) so the dispatch lands on the plane's trusted
- * **in-place** label set — the agent runs the operator's real working tree
- * directly (no clone).
+ * Appended alongside `self-hosted` by `--trusted --in-place`: the agent runs the
+ * operator's real working tree directly, with no clone.
  */
 export const IN_PLACE_ROUTING_LABEL = 'in-place';
 
 /**
- * Write the plane's bare-metal scaler YAML and return its path. TWO coexisting
- * bare-metal scalers spawn the agent wrapper against the plane orchestrator's
- * localhost WS endpoint — a **sandboxed** pool and a `self-hosted`-**tainted**
- * TRUSTED pool:
+ * Writes two bare-metal scalers against the plane's localhost WS endpoint:
  *
- * - `kici-local-bare-metal` (sandboxed) — one `default` label set, no taint. The
- *   credential-isolated profile a normal `kici run --local` dispatch (jobs with
- *   `runsOn: ['default']` or none) lands on. Its agents inherit no
- *   `mandatoryLabels`, so a bare `default` job routes here.
- * - `kici-local-bare-metal-trusted` (TRUSTED) — carries `mandatoryLabels:
- *   ['self-hosted']`, so ONLY a job that explicitly requests `self-hosted`
- *   (i.e. a `kici run --local --trusted` run, whose lock patch appends the
- *   `self-hosted` routing label, or a `runsOn: self-hosted` workflow) is ever
- *   routed to it — at BOTH the scaler spawn matcher AND the orchestrator's
- *   agent-registry dispatch gate. Two label sets:
- *     - `default` + `self-hosted` — the trusted fleet profile
- *       (`KICI_TRUSTED_ENV=true`, bwrap off): steps run with the ambient host
- *       env passed through, minus the agent's own KiCI identity secrets.
- *     - `default` + `self-hosted` + `in-place` — the trusted **in-place**
- *       profile (adds `KICI_IN_PLACE=true`) a `kici run --local --trusted
- *       --in-place` run lands on: same trusted env, but the agent uses the
- *       operator's real working tree directly (no clone).
+ * - `kici-local-bare-metal` (sandboxed): one `default` label set, no taint; a
+ *   plain `kici run --local` job lands here.
+ * - `kici-local-bare-metal-trusted`: `mandatoryLabels: ['self-hosted']`, so only
+ *   a job requesting `self-hosted` routes here, at both the scaler spawn matcher
+ *   and the agent-registry dispatch gate. Its `default` + `self-hosted` set
+ *   passes the ambient host env through (bwrap off), minus the agent's own KiCI
+ *   identity secrets; adding `in-place` also sets `KICI_IN_PLACE=true`.
  *
- * The `self-hosted` taint is the isolation guarantee: without it, an idle
- * trusted agent (spawned for an earlier `--trusted` run and lingering for
- * follow-up jobs) would satisfy the agent-registry's subset match for a plain
- * `default` job and leak the ambient host env into a sandboxed run. The taint
- * closes that at the dispatch layer, not just the spawn heuristic.
+ * The taint is the isolation guarantee: without it, an idle trusted agent left
+ * from an earlier `--trusted` run would subset-match a plain `default` job and
+ * leak the host env into a sandboxed run.
  */
 export function writeScalerConfig(orchestratorPort: number): string {
   const { scalerConfigFile, root } = planePaths();
@@ -105,9 +79,6 @@ export function writeScalerConfig(orchestratorPort: number): string {
         type: 'bare-metal',
         maxAgents: 10,
         orchestratorUrl,
-        // Taint: only jobs whose runsOn includes `self-hosted` may spawn on or
-        // dispatch to this pool. Keeps a bare `default` run off every trusted
-        // agent (default-off host-env passthrough is enforced by routing).
         mandatoryLabels: [TRUSTED_ROUTING_LABEL],
         labelSets: [
           {

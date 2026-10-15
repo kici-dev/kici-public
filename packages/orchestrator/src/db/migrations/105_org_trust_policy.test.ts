@@ -5,8 +5,8 @@ import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './105_org_trust_policy.js';
 
 /**
- * Real-Postgres test for migration 104: asserts `public.org_trust_policy` exists
- * with every column NOT NULL after migrations 001..104, and that up/down are
+ * Real-Postgres test for migration 105: asserts `public.org_trust_policy` exists
+ * with every column NOT NULL after migrations 001..105, and that up/down are
  * idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
@@ -53,10 +53,9 @@ describeDb('migration 105_org_trust_policy', () => {
     await adminPool.end();
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    // The harness RETURNS (rather than throws) when the target migration is not
-    // registered in `migration-provider.ts`, so an unchecked call leaves the
-    // table absent and every assertion below fails with a confusing
-    // "column should exist" instead of naming the real cause.
+    // The harness RETURNS (not throws) the error when the target is not registered in
+    // `migration-provider.ts`; unchecked, every assertion below fails with a confusing
+    // "column should exist".
     const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 120_000);

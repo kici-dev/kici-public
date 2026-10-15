@@ -7,9 +7,8 @@ import {
 import type { DiagnosticDeps } from '../types.js';
 
 /**
- * db stub: `backup_runs` MAX(created_at) query returns `latest`; the
- * `org_settings` MIN(backup_staleness_warn_hours) query returns `minThreshold`.
- * We route by the table name passed to selectFrom.
+ * db stub routed by selectFrom table: `backup_runs` returns `latest`, the `org_settings`
+ * MIN(backup_staleness_warn_hours) query returns `minThreshold`.
  */
 function stubDb(latest: Date | null, minThreshold: number | null): DiagnosticDeps['db'] {
   return {

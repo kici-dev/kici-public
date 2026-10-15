@@ -42,7 +42,7 @@ async function freshDir(): Promise<string> {
 
 type Overrides = { sha256?: string; downloadUrl?: string | undefined };
 
-/** Mock DashboardClient.load + global fetch to serve the given tarballs. */
+/** DashboardClient.load and global fetch serve the given tarballs. */
 function mockClient(
   tarballByName: Record<string, Buffer>,
   overrides: Record<string, Overrides> = {},
@@ -73,7 +73,6 @@ function captureErrors(): string[] {
   return errs;
 }
 
-/** Force the filesystem probe to a chosen answer, or to fail. */
 function stubCaseInsensitive(answer: boolean | Error) {
   const spy = vi.spyOn(fsCaseMod, 'isCaseInsensitiveDir');
   if (answer instanceof Error) spy.mockRejectedValue(answer);
@@ -98,9 +97,8 @@ describe('runsArtifactsDownloadCommand', () => {
     await runsArtifactsDownloadCommand('run-1', 'app', { output: out });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit | undefined];
-    // The presigned URL is fetched verbatim, and whatever init the request grows
-    // must never carry credentials: the PAT authenticates to the Platform, not
-    // to the object-storage host.
+    // Fetched verbatim and never with credentials: the PAT authenticates to the
+    // Platform, not to the object-storage host.
     expect(url).toBe('https://s3.example/app?sig=1');
     const headers = new Headers((init?.headers ?? {}) as HeadersInit);
     expect(headers.has('authorization')).toBe(false);
@@ -248,8 +246,8 @@ describe('runsArtifactsDownloadCommand', () => {
   });
 
   it('refuses a case-colliding set when the name argument is an empty string', async () => {
-    // An empty `[name]` resolves to "download everything", so the guard has to
-    // key off the same predicate rather than `name === undefined`.
+    // An empty `[name]` means "download everything", so the guard cannot key
+    // off `name === undefined`.
     const fetchMock = mockClient({
       bundle: await repoTarball('fa', '1'),
       Bundle: await repoTarball('fb', '2'),
@@ -268,8 +266,7 @@ describe('runsArtifactsDownloadCommand', () => {
   });
 
   it('downloads the survivor when the colliding partner has no object left', async () => {
-    // The partner is skipped rather than written, so only one artifact ever
-    // reaches the output directory — refusing here would block a safe download.
+    // The partner is skipped, so only one artifact reaches the output directory.
     mockClient(
       { bundle: await repoTarball('fa', '1'), Bundle: await repoTarball('fb', '2') },
       { bundle: { downloadUrl: undefined } },

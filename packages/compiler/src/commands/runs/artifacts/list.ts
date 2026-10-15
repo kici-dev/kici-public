@@ -1,4 +1,4 @@
-/** kici runs artifacts list — the artifacts a run uploaded (the rows the dashboard Artifacts tab shows). */
+/** `kici runs artifacts list`: the rows the dashboard Artifacts tab shows. */
 import pc from 'picocolors';
 import { formatBytes, logger, toErrorMessage } from '@kici-dev/core';
 import { DashboardClient, DashboardClientError } from '../../../remote/dashboard-client.js';
@@ -8,7 +8,7 @@ export interface RunsArtifactsListOptions {
   json?: boolean;
 }
 
-/** Number of leading sha-256 hex chars shown in the table (full digest via --json). */
+/** Leading sha-256 hex chars in the table; --json gives the full digest. */
 const SHA_PREFIX_LENGTH = 12;
 
 export async function runsArtifactsListCommand(

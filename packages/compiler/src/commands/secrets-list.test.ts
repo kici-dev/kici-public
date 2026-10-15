@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
-// Mock os.homedir to isolate tests from real home directory
 vi.mock('node:os', async () => {
   const actual = await vi.importActual<typeof import('node:os')>('node:os');
   return {
@@ -15,13 +14,12 @@ vi.mock('node:os', async () => {
   };
 });
 
-// Mock global fetch
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
 
 import { secretsListCommand } from './secrets-list.js';
 
-/** Build a Response-like object DashboardClient understands (reads res.text()). */
+/** DashboardClient reads res.text(). */
 function jsonOk(body: unknown) {
   const text = JSON.stringify(body);
   return { ok: true, status: 200, text: async () => text, json: async () => JSON.parse(text) };
@@ -35,10 +33,8 @@ describe('kici secrets list', () => {
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-secrets-test-'));
     vi.mocked(os.homedir).mockReturnValue(tempDir);
-    // The homedir mock alone does not isolate this suite: getConfigDir()
-    // refuses the ambient config under the KiCI test-isolation marker before
-    // it consults homedir(). Name the same directory the mock produces
-    // explicitly.
+    // getConfigDir() refuses the ambient config under the test-isolation
+    // marker before consulting homedir(), so name the directory explicitly.
     process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
     consoleLogSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -107,9 +103,8 @@ describe('kici secrets list', () => {
       expect(output).toContain('host, port, password');
       expect(output).toContain('staging-api');
       expect(output).toContain('api_key');
-      // disabled flag shows when enabled=false
       expect(output).toContain('disabled');
-      // production env (allowLocalExecution=false) is filtered out
+      // production has allowLocalExecution=false.
       expect(output).not.toContain('production');
       expect(output).not.toContain('DB_PASSWORD');
     });
@@ -165,7 +160,6 @@ describe('kici secrets list', () => {
 
   describe('handles missing configuration', () => {
     it('returns false when not authenticated', async () => {
-      // No config file at all
       const result = await secretsListCommand();
 
       expect(result).toBe(false);

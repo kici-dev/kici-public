@@ -36,7 +36,6 @@ function createMockDb() {
     deleted_at: null,
   };
 
-  // Build a chainable mock that simulates Kysely query builder
   const createChainableQuery = (result: any = undefined) => {
     const chain: any = {};
     const methods = [
@@ -70,7 +69,6 @@ function createMockDb() {
     deleteFrom: vi.fn(),
   };
 
-  // Wire up the default behavior: return the mock source
   db.selectFrom.mockImplementation(() => createChainableQuery(mockSource));
   db.insertInto.mockImplementation(() => createChainableQuery(mockSource));
   db.updateTable.mockImplementation(() => createChainableQuery(mockSource));
@@ -111,7 +109,6 @@ describe('GenericSourceManager', () => {
       });
 
       expect(db.insertInto).toHaveBeenCalledWith('generic_webhook_sources');
-      // The insert values should contain a routing_key starting with 'generic:cust-abc:'
       const insertChain = db.insertInto.mock.results[0].value;
       const valuesCall = insertChain.values.mock.calls[0][0];
       expect(valuesCall.routing_key).toMatch(/^generic:cust-abc:/);
@@ -350,7 +347,6 @@ describe('GenericSourceManager', () => {
 
       expect(db.selectFrom).toHaveBeenCalledWith('generic_webhook_sources');
       expect(result).toBeDefined();
-      // Verify provider_type, enabled, and deleted_at filters were applied
       const selectChain = db.selectFrom.mock.results[0].value;
       const whereCalls = selectChain.where.mock.calls;
       const hasProviderTypeFilter = whereCalls.some(
@@ -498,10 +494,8 @@ describe('GenericSourceManager', () => {
     });
 
     it('makes subsequent getByRoutingKey return null', async () => {
-      // After soft delete, the source is no longer returned
       await manager.softDelete('src-123');
 
-      // Simulate the DB now returning null for routing key queries
       db.selectFrom.mockImplementation(() => db._chainFactory(undefined));
 
       const result = await manager.getByRoutingKey('generic:cust-1:src-123');
@@ -530,7 +524,6 @@ describe('GenericSourceManager', () => {
 
   describe('checkIdempotency', () => {
     it('returns false when no duplicate found', async () => {
-      // getById returns source, selectFrom kici_events returns undefined
       let callCount = 0;
       db.selectFrom.mockImplementation(() => {
         callCount++;
@@ -619,7 +612,6 @@ describe('GenericSourceManager', () => {
     });
 
     it('returns allowed=false when payload exceeds limit', async () => {
-      // Create source with small limit
       db.selectFrom.mockImplementation(() =>
         db._chainFactory({ ...db._mockSource, max_payload_bytes: 100 }),
       );

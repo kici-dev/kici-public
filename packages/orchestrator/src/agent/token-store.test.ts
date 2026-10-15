@@ -1,14 +1,4 @@
-/**
- * Tests for AgentTokenStore.
- *
- * Uses mock Kysely DB to verify:
- * - createStatic returns token with kat_ prefix, 68 chars total, unique id
- * - createEphemeral returns token with kat_ prefix, stores expires_at
- * - validate returns row for valid token, null for invalid/revoked/expired
- * - revoke returns true on first call, false on second
- * - list returns tokens, filters by type
- * - cleanupExpired removes expired ephemeral tokens
- */
+/** AgentTokenStore against a mock Kysely DB. */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createHash } from 'node:crypto';
 import { AgentTokenStore } from './token-store.js';
@@ -25,10 +15,7 @@ interface MockDbConfig {
   deleteResult?: { numDeletedRows: bigint };
 }
 
-/**
- * Create a mock Kysely DB for AgentTokenStore tests.
- * Returns { db, terminal, ... } for backward compatibility with existing assertions.
- */
+/** Returns { db, terminal, ... }; `terminal` serves the select-chain assertions. */
 function createMockDb(opts: MockDbConfig = {}) {
   const defaultInsertedRow = opts.insertedRow ?? {
     id: 'tok-001',
@@ -51,7 +38,6 @@ function createMockDb(opts: MockDbConfig = {}) {
     deleteResult: opts.deleteResult ?? { numDeletedRows: 0n },
   });
 
-  // Expose terminal-like object for backward-compatible test assertions
   const terminal = {
     execute: mocks.selectExecute,
     executeTakeFirst: mocks.selectExecuteTakeFirst,
@@ -104,7 +90,6 @@ describe('AgentTokenStore', () => {
       let callCount = 0;
       const { db } = createMockDb();
 
-      // Override to return different IDs each call
       const insertReturningAll = vi.fn().mockImplementation(() => ({
         executeTakeFirstOrThrow: vi.fn().mockResolvedValue({ id: `tok-${++callCount}` }),
       }));
@@ -126,7 +111,6 @@ describe('AgentTokenStore', () => {
       const insertValues = vi.fn();
       const { db } = createMockDb();
 
-      // Capture the values passed to insert
       let capturedValues: any;
       (db.insertInto as ReturnType<typeof vi.fn>).mockReturnValue({
         values: vi.fn().mockImplementation((v: any) => {
@@ -222,7 +206,6 @@ describe('AgentTokenStore', () => {
       expect(capturedValues.agent_type).toBe('ephemeral');
       expect(capturedValues.created_by).toBe('agent-002');
       expect(capturedValues.labels).toBe('["linux","arm64"]');
-      // expires_at should be approximately now + ttlMs
       const expiresAt = capturedValues.expires_at.getTime();
       expect(expiresAt).toBeGreaterThanOrEqual(now + ttlMs - 1000);
       expect(expiresAt).toBeLessThanOrEqual(now + ttlMs + 1000);
@@ -308,7 +291,6 @@ describe('AgentTokenStore', () => {
       expect(result!.id).toBe('tok-v1');
       expect(result!.agent_type).toBe('static');
       expect(result!.labels).toBe('["linux"]');
-      // Should NOT include token_hash
       expect((result as any).token_hash).toBeUndefined();
     });
 
@@ -359,7 +341,7 @@ describe('AgentTokenStore', () => {
 
       await store.validate(plaintext);
 
-      // updateTable should have been called for last_seen_at
+      // The last_seen_at update.
       expect(db.updateTable).toHaveBeenCalledWith('agent_tokens');
     });
   });
@@ -428,7 +410,7 @@ describe('AgentTokenStore', () => {
 
       await store.list({ agentType: 'static' });
 
-      // Should have called where with agent_type filter (among others)
+      // Only the table is asserted; the mock does not record the agent_type filter.
       expect(db.selectFrom).toHaveBeenCalledWith('agent_tokens');
     });
   });
@@ -468,11 +450,9 @@ describe('AgentTokenStore', () => {
     });
 
     it('invokes onBeforeDelete with expired token IDs before the DELETE', async () => {
-      // TTL-expiry kick: the orchestrator passes a callback that
-      // calls AgentRegistry.disconnectByTokenId(id) for every expired
-      // token, so any in-flight WS that survived the per-token timer
-      // (e.g. across a process restart) is still kicked before the DB
-      // row is deleted.
+      // TTL-expiry kick: the orchestrator's callback calls
+      // AgentRegistry.disconnectByTokenId(id) per expired token, so a WS that
+      // outlived the per-token timer (e.g. a restart) is kicked before deletion.
       const { db } = createMockDb({
         selectRows: [{ id: 'tok-A' }, { id: 'tok-B' }],
         deleteResult: { numDeletedRows: 2n },
@@ -504,9 +484,8 @@ describe('AgentTokenStore', () => {
     });
 
     it('awaits an async onBeforeDelete callback before issuing the DELETE', async () => {
-      // The callback is allowed to return a Promise (e.g. fan-out a
-      // peer-mesh broadcast before the DB row vanishes). The DELETE
-      // must wait for it to settle.
+      // An async callback (e.g. a peer-mesh broadcast fan-out) must settle
+      // before the DELETE.
       const { db } = createMockDb({
         selectRows: [{ id: 'tok-A' }],
         deleteResult: { numDeletedRows: 1n },

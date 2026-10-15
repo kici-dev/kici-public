@@ -1,9 +1,8 @@
 /**
- * Bounded memo for compiled trigger matchers. Regex and glob compilation is
- * pure and deterministic per pattern string, so we compile each distinct
- * pattern once and reuse it across every match call. Insertion-ordered Map
- * with oldest-eviction keeps the memo bounded without a new dependency, and
- * keeps the engine barrel browser-safe (no node:* imports).
+ * Bounded memo for compiled trigger matchers: compilation is pure per pattern
+ * string, so each distinct pattern compiles once. An insertion-ordered Map with
+ * oldest-eviction bounds it without a new dependency and keeps the engine
+ * barrel browser-safe (no node:* imports).
  */
 import picomatch from 'picomatch';
 import { assertSafeRegex } from '../safe-regex.js';
@@ -28,23 +27,22 @@ const globCache = new Map<string, (s: string) => boolean>();
 const repoGlobCache = new Map<string, (s: string) => boolean>();
 
 /**
- * Return a memoized RegExp for the given pattern + flags. The key encodes the
- * flags first with a space separator; regex flags are restricted to
- * `[dimsuv]` once the stateful ones are stripped, so the separator can never
- * collide with a pattern that starts with a space.
+ * Return a memoized RegExp. The key is the flags, a space, then the pattern;
+ * flags are restricted to `[dimsuv]` once the stateful ones are stripped, so
+ * the separator never collides with a pattern that starts with a space.
  *
- * `g` and `y` are dropped before compiling AND before building the memo key
+ * `g` and `y` are dropped before compiling AND before building the key
  * (`stripStatefulRegexFlags`): they make the instance carry `lastIndex` between
  * calls, which turns a memoized `.test()` into alternating verdicts. Stripping
- * here rather than only at the producers is what makes a lock file written by an
- * older compiler safe — that format is compat-protected, so `flags: 'g'` entries
- * keep arriving for the whole 0.x line.
+ * here, not only at the producers, keeps a lock file from an older compiler
+ * safe — that format is compat-protected, so `flags: 'g'` entries keep arriving
+ * for the whole 0.x line.
  *
- * Every pattern reaching here is author-supplied (branch/tag/repo patterns and
- * comment `bodyMatch`), so it is ReDoS-checked before compiling. The guard runs
- * inside the memo factory, so a benign pattern pays the check once (on cache
- * miss) and a catastrophic one throws — and, being unsafe, is never cached, so
- * it is rejected on every attempt. `ctx` names the dialect in the thrown error.
+ * Every pattern here is author-supplied (branch/tag/repo patterns and comment
+ * `bodyMatch`), so it is ReDoS-checked inside the memo factory: a benign
+ * pattern pays the check once, and a catastrophic one throws and is never
+ * cached, so it is rejected on every attempt. `ctx` names the dialect in the
+ * thrown error.
  */
 export function getCompiledRegex(pattern: string, flags?: string, ctx = 'trigger pattern'): RegExp {
   const safeFlags = stripStatefulRegexFlags(flags);
@@ -63,17 +61,14 @@ export function getGlobMatcher(pattern: string): (s: string) => boolean {
 }
 
 /**
- * Repo-identifier matcher. Identical to {@link getGlobMatcher} except it sets
- * picomatch's `dot: true`, so a dot-prefixed identifier (`.hidden/repo`) is
- * matched by `**` — `repos: ['**']` is documented as "every repo in the org",
- * and silently excluding a whole class of identifier contradicts that.
+ * Repo-identifier matcher: {@link getGlobMatcher} with picomatch's
+ * `dot: true`, so `**` matches a dot-prefixed identifier (`.hidden/repo`) —
+ * `repos: ['**']` is documented as "every repo in the org".
  *
  * Deliberately NOT the shared matcher: `dot: true` on path globs would make
- * `paths: ['**']` start matching `.github/**` for every existing workflow, a
- * semantics change this does not intend.
+ * `paths: ['**']` match `.github/**` for every existing workflow.
  *
- * Note a bare `.` still does not match, in either mode — picomatch will not
- * match a lone `.`. That is upstream behavior, not something this option fixes.
+ * A bare `.` matches in neither mode; that is upstream picomatch behavior.
  */
 export function getRepoGlobMatcher(pattern: string): (s: string) => boolean {
   return boundedGet(repoGlobCache, pattern, () => picomatch(pattern, { dot: true }));

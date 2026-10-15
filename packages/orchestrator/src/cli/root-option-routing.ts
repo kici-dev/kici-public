@@ -1,33 +1,25 @@
 /**
- * Decide which command each root-option token in a kici-admin argv belongs to.
+ * Decides which command each root-option token in a kici-admin argv belongs to.
  *
- * Commander matches a program option anywhere in argv: the root's own
- * `parseOptions` consumes `-u, --url`, `-t, --token` and `-V, --cli-version`
- * even after a command name. That lets an operator put a global option after
- * the command (`kici-admin runs list -u <url>`), but on its own it would also
- * take an option away from any command that declares one with the same flag,
- * such as `orchestrator upgrade --url <archive-url>` or
- * `join --token <join-token>`.
+ * Commander's root `parseOptions` consumes `-u, --url`, `-t, --token` and
+ * `-V, --cli-version` anywhere in argv. That allows `kici-admin runs list -u
+ * <url>`, but would also steal a same-named command option such as
+ * `orchestrator upgrade --url <archive-url>` or `join --token <join-token>`.
  *
- * {@link routeRootArgs} prepares the argv for the root's `parseOptions`:
+ * {@link routeRootArgs} prepares the argv for the root:
  *
- * - A flag that the command being run declares, and that also names a root
- *   option, belongs to that command when it comes after the command's name. It
- *   is hidden from the root behind an opaque stand-in token, which the root
- *   classifies as an unknown option and so hands on to the subcommand; the
- *   stand-ins are mapped back to the original tokens before the subcommand
- *   parses them.
- * - `--version` before the first command name is the root's version flag. The
- *   root cannot register `--version` itself (`orchestrator upgrade` and
- *   `agent upgrade` own `--version <version>`), so it is rewritten to the
- *   registered `--cli-version`. After a command name it is left alone.
- *
- * - The value of a command option, when it is shaped like an option (`-uP4ss`,
- *   `--url`), is hidden from the root the same way, so the root does not read
- *   it as one of its own flags.
+ * - A root-named flag that the running command declares, after the command's
+ *   name, belongs to the command. An opaque stand-in hides it; the root treats
+ *   the stand-in as unknown and passes it on, and it is restored before the
+ *   subcommand parses.
+ * - `--version` before the first command name becomes `--cli-version`: the
+ *   root cannot register `--version` (`orchestrator upgrade` and
+ *   `agent upgrade` own `--version <version>`). After a command name it stays.
+ * - An option-shaped command option value (`-uP4ss`, `--url`) is hidden the
+ *   same way.
  *
  * Every other token reaches the root unchanged, so a root option after a
- * command that does not declare that flag still sets the global option.
+ * command that does not declare it still sets the global option.
  */
 
 import type { Command, Option } from 'commander';
@@ -36,17 +28,15 @@ import type { Command, Option } from 'commander';
 export const ROOT_VERSION_FLAG = '--cli-version';
 
 /**
- * Prefix of the stand-in tokens. It starts with `--` so the root reads it as an
- * unknown option (which moves it and every later token to the subcommand's
- * argv), and the U+0000 makes a collision with a real argument impossible: a
- * process argument cannot contain a NUL byte.
+ * `--` makes the root read a stand-in as unknown, moving it and every later
+ * token to the subcommand; U+0000 rules out a collision, since a process
+ * argument cannot contain NUL.
  */
 const SHIELD_PREFIX = '--\u0000kici-admin-command-option-';
 
 /** The root's argv, routed, and the map from each stand-in back to its token. */
 export interface RoutedRootArgs {
   readonly args: string[];
-  /** Map a token from the root's parse result back to the original token. */
   readonly restore: (token: string) => string;
 }
 
@@ -71,10 +61,7 @@ function findSubcommand(cmd: Command, name: string): Command | undefined {
   return cmd.commands.find((c) => c.name() === name || c.aliases().includes(name));
 }
 
-/**
- * How many tokens after `args[i]` an option consumes as its value. An option
- * value given inline (`--url=x`) consumes none.
- */
+/** Tokens after `args[i]` an option takes as its value; an inline `--url=x` takes none. */
 function valueTokens(
   option: Option | undefined,
   inlineValue: boolean,
@@ -90,10 +77,7 @@ function valueTokens(
   return 0;
 }
 
-/**
- * Route a kici-admin argv (the user arguments, without `node` and the script)
- * for the root command's `parseOptions`. See the module comment.
- */
+/** `args` excludes `node` and the script. See the module comment. */
 export function routeRootArgs(root: Command, args: readonly string[]): RoutedRootArgs {
   const out = [...args];
   const shielded = new Map<string, string>();
@@ -103,11 +87,10 @@ export function routeRootArgs(root: Command, args: readonly string[]): RoutedRoo
     out[index] = token;
   };
 
-  // The commands entered so far, below the root, from the outermost down.
+  // Commands entered below the root, outermost first.
   const chain: Command[] = [];
   let current = root;
-  // Once the deepest command has a positional argument, later operands are
-  // arguments, not subcommand names.
+  // After the first positional, later operands are arguments, not subcommands.
   let operandSeen = false;
 
   for (let i = 0; i < args.length; i++) {

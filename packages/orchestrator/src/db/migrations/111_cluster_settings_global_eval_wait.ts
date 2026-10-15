@@ -4,16 +4,12 @@ import { type Kysely, sql } from 'kysely';
  * Cluster-global ceiling on how long webhook processing waits for a Tier-2
  * global eval round to settle.
  *
- * One additive, nullable column. NULL means the orchestrator's configured
- * default applies (`KICI_GLOBAL_EVAL_WAIT_TIMEOUT_MS` stays the cluster-wide
- * default). It is read fresh per round and applies orchestrator-side — unlike
- * the two agent budgets, which are shipped inside the round's job config — so a
+ * NULL → the configured default (`KICI_GLOBAL_EVAL_WAIT_TIMEOUT_MS`). Read fresh per round and
+ * applied orchestrator-side (unlike the agent budgets, shipped in the round's job config), so a
  * change lands on the next push.
  *
- * BIGINT rather than INTEGER: the value is in milliseconds, so an operator
- * raising it leaves INTEGER range with a single generous value.
- *
- * Idempotent: the column is guarded on existence, so a re-run is a no-op.
+ * BIGINT, not INTEGER: in milliseconds, one generous value leaves INTEGER range.
+ * Idempotent: guarded on column existence.
  */
 async function columnExists(db: Kysely<unknown>, table: string, column: string): Promise<boolean> {
   const check = await sql<{ exists: boolean }>`

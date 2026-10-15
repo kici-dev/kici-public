@@ -3,15 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m075 from './075_ingest_overflow_buffer.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 075.
- *
- * Creates a uniquely-named throwaway database, applies migrations 001..075
- * via the production migration provider, and asserts the `ingest_overflow_buffer`
- * table + its `(status, captured_at)` FIFO index exist and behave. The throwaway
- * database is dropped in teardown.
+ * Real-Postgres test for migration 075 (`ingest_overflow_buffer` and its
+ * `(status, captured_at)` FIFO index), on a throwaway database migrated through 075.
  *
  * Gated on `KICI_TEST_ADMIN_DATABASE_URL`: skips when unset, fails loudly when
  * set but unreachable.

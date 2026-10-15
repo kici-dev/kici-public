@@ -61,8 +61,8 @@ export async function tryResolveVerifiedIssuer(
  * out". An unknown read must therefore produce an object with no key at all —
  * not one whose value is `undefined`, which would still overwrite on spread.
  *
- * Extracted as a pure function because its only caller is a closure inside
- * server.ts's connection handler, which has no test seam.
+ * Pure so it is testable: its only caller is a closure in server.ts's connection
+ * handler, which has no test seam.
  */
 export function verifiedIssuerCapabilityUpdate(
   read: VerifiedIssuerRead,
@@ -70,7 +70,6 @@ export function verifiedIssuerCapabilityUpdate(
   return read.ok ? { dashboardVerifiedIssuer: read.issuer } : {};
 }
 
-/** The JWKS document URL for an issuer origin. */
 export function jwksUrlFor(issuer: string): string {
   return `${issuer.replace(/\/+$/, '')}/.well-known/jwks.json`;
 }

@@ -83,10 +83,9 @@ describe('applyAttestationFilters', () => {
 
 describe('basePendingAttestationsQuery', () => {
   it('joins execution_* with a ::text cast on every uuid key', () => {
-    // Regression for the org-wide attestations 500: joining the TEXT-keyed
-    // pending_attestations outbox to the uuid-keyed execution_runs /
-    // execution_jobs without a cast raised `operator does not exist: uuid = text`
-    // at runtime, returning a 500 from handleAttestationsListAll.
+    // Regression: joining the TEXT-keyed pending_attestations outbox to uuid-keyed
+    // execution_runs / execution_jobs without a cast raised `operator does not exist:
+    // uuid = text`, a 500 from handleAttestationsListAll.
     const sql = basePendingAttestationsQuery(db).selectAll().compile().sql;
     expect(sql).toContain('from "pending_attestations"');
     expect(sql).toContain('execution_runs.run_id::text');

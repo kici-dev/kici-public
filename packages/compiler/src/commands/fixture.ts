@@ -1,9 +1,4 @@
-/**
- * Fixture generation command
- *
- * Generates JSON fixture templates for all supported event types,
- * including internal events (schedule, lifecycle, generic_webhook, kici_event).
- */
+/** Generate JSON fixture templates for every supported event type, internal ones included. */
 
 import { writeFile } from 'node:fs/promises';
 import pc from 'picocolors';
@@ -16,7 +11,7 @@ export interface FixtureOptions {
   output?: string;
 }
 
-/** Internal event types that don't have GitHub webhook fixture files */
+/** Internal event types, which have no GitHub webhook fixture file. */
 const INTERNAL_EVENT_TYPES = new Set([
   'kici_event',
   'workflow_complete',
@@ -27,9 +22,6 @@ const INTERNAL_EVENT_TYPES = new Set([
   'lifecycle',
 ]);
 
-/**
- * Generate a fixture template for an internal event type.
- */
 function generateInternalFixture(eventType: ReturnType<typeof parseEventArg>): unknown {
   switch (eventType.type) {
     case 'schedule':
@@ -104,27 +96,20 @@ function generateInternalFixture(eventType: ReturnType<typeof parseEventArg>): u
   }
 }
 
-/**
- * Generate fixture template for event type
- */
 export async function fixtureCommand(event: string, options: FixtureOptions): Promise<void> {
   try {
-    // Parse the event to determine its type
     const eventType = parseEventArg(event);
 
     let result: unknown;
 
     if (INTERNAL_EVENT_TYPES.has(eventType.type)) {
-      // Internal event types: generate template directly
       result = generateInternalFixture(eventType);
     } else {
-      // GitHub event types: load from fixture files
       const fixture = getDefaultFixture(event);
 
-      // Detect repo info from git
       const repoInfo = await detectRepoFromGit();
 
-      // Apply repo overrides if detected
+      // Override the repository with the one detected from git.
       result =
         repoInfo && typeof fixture === 'object' && fixture !== null
           ? {

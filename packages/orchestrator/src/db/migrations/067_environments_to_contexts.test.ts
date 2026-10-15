@@ -3,7 +3,7 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './067_environments_to_contexts.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
  * Real-Postgres test for migration 067. Creates a throwaway database, applies
@@ -110,7 +110,7 @@ describeDb('migration 067_environments_to_contexts', () => {
   it("migrates a pre-rename held_runs row from 'environment' to 'context'", async () => {
     // Revert to the environment schema, seed a legacy row, then re-apply up().
     await down(db);
-    // FK triggers are bypassed so we can insert without seeding parent rows.
+    // FK triggers are bypassed so the insert needs no parent rows.
     await sql`SET session_replication_role = replica`.execute(db);
     await sql`
       INSERT INTO public.held_runs

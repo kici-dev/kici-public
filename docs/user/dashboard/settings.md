@@ -60,12 +60,13 @@ The sources tab shows webhook sources registered by connected orchestrators. Sou
 
 **Each source displays:**
 
+- **Name and kind** -- the source's name (or its routing key when it has none) and its kind, such as GitHub App or generic webhook
 - **Routing key** -- the source identifier (e.g., `github:12345` for a GitHub App, `generic:my-source` for a generic webhook)
-- **Webhook URL** -- the URL to configure in your provider's webhook settings
 - **Registered at** -- when the orchestrator first registered this source
-- **Copy button** -- copies the webhook URL to the clipboard
+- **Webhook URL** -- the URL to configure in your provider's webhook settings, with a copy button. An **observe-only** source (registered by an orchestrator in `observed` mode) shows no URL here: its webhooks go straight to that orchestrator's own public URL, which `kici-admin source list` prints
+- **Orchestrators** -- a badge for each connected orchestrator that registered the source. Hover a badge for its connection ID, instance ID, and last heartbeat
 
-**Read-only** -- sources cannot be created, edited, or deleted from the dashboard. They are managed entirely by orchestrator connections. When an orchestrator disconnects, its sources remain visible (they are not automatically removed).
+**Read-only** -- sources cannot be created, edited, or deleted from the dashboard. They are managed entirely by orchestrator connections. When an orchestrator disconnects, the sources it registered leave the tab. They come back when it reconnects and registers them again.
 
 **Empty state** -- if no orchestrator has connected yet, the tab shows "No webhook sources registered" with a link to the operator setup guide.
 
@@ -73,10 +74,8 @@ The sources tab shows webhook sources registered by connected orchestrators. Sou
 
 **Adding a new source** requires:
 
-1. Configure a new provider in the orchestrator (e.g., add a GitHub App to the orchestrator's provider config)
-2. Configure the webhook secret on the orchestrator (see the operator guide)
-3. Restart the orchestrator -- it will register the new source with the Platform on connection
-4. Configure the webhook URL (shown in the sources tab) in the provider's settings (e.g., GitHub App webhook URL)
+1. Add the source on the orchestrator with `kici-admin source add` (see [kici-admin source management](../../operator/orchestrator/kici-admin/sources.md)). The orchestrator stores the webhook secret and registers the source with the Platform at once, with no restart
+2. Configure the webhook URL (printed by the command and shown in the sources tab) in the provider's settings (e.g., GitHub App webhook URL). The `--manifest` setup for a new GitHub App sets the URL for you
 
 ## Billing
 
@@ -107,7 +106,7 @@ Organization-wide notification channels, Slack connections, subscriptions, and t
 
 
 
-The event log tab (`/orgs/:customerId/settings/event-log`) shows every inbound webhook this organization has received. The event log records, for each delivery: routing key, event, action, repo, status, processing outcome (`shed` / `processed` / `duplicate` / `lockfile_missing` / `failed`), the matched workflow count, and the first run spawned (if any).
+The event log tab (`/orgs/:customerId/settings/event-log`) shows every inbound webhook this organization has received. The event log records, for each delivery: routing key, event, action, repo, status, processing outcome (`received` / `shed` / `processed` / `duplicate` / `lockfile_missing` / `lockfile_corrupt` / `failed`), the matched workflow count, and the first run spawned (if any).
 
 The list view supports filters for routing key, event type, status, and free-text delivery ID search. Click a row to open a detail panel with the full delivery record plus the payload viewer.
 

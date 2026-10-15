@@ -4,13 +4,13 @@ import { DashboardBackendsHandler } from './dashboard-backends-handler.js';
 import type { BackendRegistry } from '../secrets/backend-registry.js';
 import type { BackendHealthChecker } from '../secrets/backend-health.js';
 import type { Database } from '../db/types.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 describe('DashboardBackendsHandler', () => {
   describe('not-found results', () => {
-    // The `error` field on the *.response messages is the internal-error
-    // channel: the Platform maps any `error` to HTTP 500. A missing backend
-    // must answer with the not-found sentinel WITHOUT `error` so the Platform
-    // can serve the structured 404 its routes intend.
+    // The Platform maps any `error` on a *.response to HTTP 500, so a missing
+    // backend answers with the not-found sentinel WITHOUT `error`, letting the
+    // Platform serve its structured 404.
     let send: ReturnType<typeof vi.fn>;
     let registry: { getBackend: ReturnType<typeof vi.fn> };
     let healthChecker: Record<string, never>;
@@ -26,16 +26,10 @@ describe('DashboardBackendsHandler', () => {
       syncManager = {
         syncBackend: vi.fn().mockResolvedValue({ scopeCount: 0 }),
       };
-      const db = {
-        selectFrom: vi.fn().mockReturnValue({
-          select: vi.fn().mockReturnThis(),
-          where: vi.fn().mockReturnThis(),
-          // Policy gate reads the org_settings row; undefined = permissive.
-          executeTakeFirst: vi.fn().mockResolvedValue(undefined),
-        }),
-      };
+      // Policy gate reads the org_settings row; none configured = permissive.
+      const { db } = createMockDb();
       handler = new DashboardBackendsHandler({
-        db: db as unknown as Kysely<Database>,
+        db: db as Kysely<Database>,
         registry: registry as unknown as BackendRegistry,
         healthChecker: healthChecker as unknown as BackendHealthChecker,
         syncManager: syncManager as never,

@@ -1,9 +1,6 @@
 /**
- * Periodic metrics reporter that collects OTel metrics and pushes them
- * to the Platform via WebSocket as `orch.metrics` messages.
- *
- * The Platform aggregates these metrics from all orchestrators and exposes
- * them on its `/metrics` endpoint for Prometheus scraping.
+ * Pushes OTel metrics to the Platform over WebSocket as `orch.metrics` messages; the Platform
+ * aggregates all orchestrators and exposes them on `/metrics` for Prometheus.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -31,8 +28,8 @@ export class MetricsReporter {
      * If provided, the reporter concatenates the aggregator's structured
      * snapshot onto its own snapshot before sending — so agent metrics
      * (`kici_agent_*`) land in Mimir per-org alongside `kici_orch_*`.
-     * Each agent metric carries an `agent_id` label injected by the
-     * aggregator. See the metrics enforcement plan.
+     * The aggregator sums each agent metric across agents and drops the
+     * `agent_id` label.
      */
     agentMetricsAggregator?: AgentMetricsAggregator;
   }) {
@@ -41,16 +38,14 @@ export class MetricsReporter {
     this.agentMetricsAggregator = opts.agentMetricsAggregator;
   }
 
-  /** Start periodic metric collection and push. */
   start(): void {
     this.timer = setInterval(() => {
       this.collectAndSend().catch(() => {
-        // Silently swallow collection errors to avoid disrupting orchestrator operation
+        // Swallowed so a collection error never disrupts the orchestrator.
       });
     }, this.intervalMs);
   }
 
-  /** Stop the periodic reporter. */
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
@@ -58,15 +53,12 @@ export class MetricsReporter {
     }
   }
 
-  /** Collect current metrics and send as orch.metrics message. */
   async collectAndSend(): Promise<void> {
     const orchMetrics = await this.collectSnapshot();
     const agentMetrics = this.agentMetricsAggregator?.getStructuredSnapshot() ?? [];
     const metrics = orchMetrics.concat(
-      // The aggregator returns its local MetricSnapshot type; the wire
-      // shape is structurally identical to OrchMetrics['metrics'][number]
-      // (same fields, same enum). Cast keeps both sides honest without
-      // dragging the engine type into the aggregator.
+      // MetricSnapshot is structurally identical to OrchMetrics['metrics'][number]; the cast
+      // keeps the engine type out of the aggregator.
       agentMetrics as OrchMetrics['metrics'],
     );
     if (metrics.length === 0) return;
@@ -78,7 +70,6 @@ export class MetricsReporter {
     });
   }
 
-  /** Collect a snapshot of all current OTel metrics. */
   async collectSnapshot(): Promise<OrchMetrics['metrics']> {
     const exporter = getPrometheusExporter();
     if (!exporter) return [];
@@ -111,7 +102,7 @@ export class MetricsReporter {
               sum: number;
             };
 
-            // Convert OTel per-bucket counts to cumulative Prometheus-style buckets
+            // OTel per-bucket counts → cumulative Prometheus buckets.
             const boundaries = histValue.buckets.boundaries;
             const counts = histValue.buckets.counts;
             const buckets: Array<{ le: number; count: number }> = [];
@@ -142,22 +133,16 @@ export class MetricsReporter {
       }
     }
 
-    // Pre-filter to the catalog's pushable set before sending. The OTel
-    // exporter registry also carries `target_info` / `otel_scope_info` and
-    // any other meta-series we never want in tenant Mimir; dropping them
-    // here means the Platform-side filter (the security boundary) stops
-    // bumping `unknown_metric` for our own junk. Catalog metrics — the
-    // orchestrator's `kici_orch_*`, forwarded `kici_agent_*`, and the
-    // Node runtime `nodejs.*` / `v8js.*` series — pass through.
+    // Keep only the catalog's pushable set (`kici_orch_*`, forwarded `kici_agent_*`,
+    // `nodejs.*` / `v8js.*`). Dropping meta-series such as `target_info` / `otel_scope_info`
+    // here stops the Platform-side filter (the security boundary) bumping `unknown_metric`.
     return result.filter((m) => ORCH_PUSHED_METRIC_NAMES.has(m.name as MetricName));
   }
 
-  /** Map OTel DataPointType to wire format type string. */
   private mapDataPointType(dataPointType: number, isMonotonic?: boolean): WireMetricKind {
     return mapDataPointTypeToWireKind(dataPointType, isMonotonic);
   }
 
-  /** Extract string labels from OTel Attributes. */
   private extractLabels(attributes: Record<string, unknown>): Record<string, string> {
     const labels: Record<string, string> = {};
     for (const [key, value] of Object.entries(attributes)) {

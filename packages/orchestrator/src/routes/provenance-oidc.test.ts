@@ -173,9 +173,8 @@ describe('createProvenanceOidcRoutes', () => {
   });
 });
 
-// The JWKS never consults `deps.issuer` — it publishes whatever keys exist, of
-// either kind — so its 503 body must not name the issuer configuration. These
-// pin the body to a reason that is true in every state that reaches it.
+// The JWKS never consults `deps.issuer` (it publishes whatever keys exist, of
+// either kind), so its 503 body must not name the issuer configuration.
 describe('the empty-JWKS 503 reports "nothing to publish", not "no issuer"', () => {
   async function jwksError(app: ReturnType<typeof createProvenanceOidcRoutes>) {
     const res = await app.request('/.well-known/jwks.json');
@@ -190,8 +189,8 @@ describe('the empty-JWKS 503 reports "nothing to publish", not "no issuer"', () 
     expect(body.error).toBe('no_published_keys');
   });
 
-  // The state that makes an issuer-shaped body a lie: the issuer IS configured
-  // and signing IS on, the signing key is not provisioned yet.
+  // An issuer-shaped body would lie here: the issuer IS configured and signing
+  // IS on, but the signing key is not provisioned yet.
   it('says no_published_keys when the issuer is configured but no key is provisioned', async () => {
     const body = await jwksError(
       createProvenanceOidcRoutes({
@@ -203,9 +202,8 @@ describe('the empty-JWKS 503 reports "nothing to publish", not "no issuer"', () 
     expect(body.error).toBe('no_published_keys');
   });
 
-  // Regression pin: the discovery document genuinely cannot be built without an
-  // issuer, so its body names the issuer configuration — while the JWKS, which
-  // needs no issuer, must not.
+  // The discovery document cannot be built without an issuer, so its body
+  // names the issuer configuration; the JWKS, needing none, must not.
   it('leaves the discovery document reporting oidc_issuer_not_configured', async () => {
     const app = createProvenanceOidcRoutes({
       issuer: undefined,
@@ -274,8 +272,8 @@ describe('dashboard-encryption keys are published independently of provenance si
     expect((await app.request('/.well-known/jwks.json')).status).toBe(503);
   });
 
-  // This is what makes the change a split rather than a blanket un-gating.
-  // Without it, deleting both gates would satisfy every other case here.
+  // Only the JWKS is un-gated: without this case, deleting both gates would
+  // satisfy every other case here.
   it('keeps the discovery document gated even when enc keys exist', async () => {
     const app = createProvenanceOidcRoutes({
       issuer: undefined,

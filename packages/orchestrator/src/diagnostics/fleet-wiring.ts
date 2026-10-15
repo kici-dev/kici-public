@@ -1,11 +1,7 @@
 /**
- * Fleet log collection wiring.
- *
- * Builds the FleetCollectorDeps / FleetTopologyDeps from an orchestrator's live
- * runtime pieces (agent registry, peer registry, agent collector, peer clients,
- * peer handler) and provides the peer-side responder that assembles this node's
- * subtree on an inbound peer.logs.collect.request. Kept out of the giant
- * orchestrator-core wiring file.
+ * Fleet log collection wiring, kept out of the orchestrator-core wiring file: builds
+ * FleetCollectorDeps / FleetTopologyDeps from the live runtime, plus the peer-side responder
+ * that assembles this node's subtree on an inbound peer.logs.collect.request.
  */
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
@@ -56,7 +52,6 @@ export interface FleetRuntime {
   peerClients: Map<string, PeerClient>;
   /** Incoming peer-handler with the dual-direction collect send. */
   peerHandler: FleetPeerHandlerLike;
-  /** Deps for the local createDebugBundle. */
   diagnosticDeps: DiagnosticDeps;
   /** Raw orchestrator config (redacted by createDebugBundle). */
   config: Record<string, unknown>;
@@ -64,7 +59,7 @@ export interface FleetRuntime {
   clusterHealthUrl?: string;
 }
 
-/** Build this node's own debug bundle as a Buffer via a temp file. */
+/** This node's own debug bundle, built through a temp file. */
 async function buildLocalBundleBuffer(runtime: FleetRuntime): Promise<Buffer> {
   const { path: tmp, cleanup } = await makeTempFile('fleet-local', { suffix: '.zip' });
   try {
@@ -83,7 +78,6 @@ async function buildLocalBundleBuffer(runtime: FleetRuntime): Promise<Buffer> {
   }
 }
 
-/** Send a fleet.logs.request to an agent over its WS and await the bundle. */
 function requestAgentBundle(runtime: FleetRuntime, agentId: string): Promise<Buffer> {
   const requestId = randomUUID();
   return runtime.fleetAgentCollector.request(requestId, agentId, () => {
@@ -102,9 +96,8 @@ function requestAgentBundle(runtime: FleetRuntime, agentId: string): Promise<Buf
 }
 
 /**
- * Request a peer's subtree bundle, trying the outgoing PeerClient first, then
- * falling back to the incoming peer-handler connection (the same dual-direction
- * lookup forwardReloadToPeer uses — a peer pair shares one WS).
+ * Outgoing PeerClient first, then the incoming peer-handler connection: a peer pair shares
+ * one WS (the same dual-direction lookup as forwardReloadToPeer).
  */
 function requestPeerSubtree(
   runtime: FleetRuntime,
@@ -126,7 +119,6 @@ function requestPeerSubtree(
   return runtime.peerHandler.sendLogsCollectAndWait(instanceId, msg, runtime.timeoutMs);
 }
 
-/** Map a peer-registry PeerInfo to the fleet-collector peer shape. */
 function listFleetPeers(
   runtime: FleetRuntime,
 ): { instanceId: string; role: 'coordinator' | 'worker'; kind: 'peer' | 'worker' }[] {
@@ -137,11 +129,7 @@ function listFleetPeers(
   }));
 }
 
-/**
- * Build the FleetCollectorDeps for a given selection of this node's downstream
- * agents/workers. The collector passes per-branch selection in when it knows
- * which downstream subset each peer should gather.
- */
+/** `perBranchSelection` names the downstream subset each peer gathers. */
 export function buildFleetCollectorDeps(
   runtime: FleetRuntime,
   perBranchSelection: (instanceId: string) => FleetSelection,
@@ -158,7 +146,7 @@ export function buildFleetCollectorDeps(
   };
 }
 
-/** Build the FleetTopologyDeps for `--list` / `--pick` enumeration. */
+/** For `--list` / `--pick` enumeration. */
 export function buildFleetTopologyDeps(runtime: FleetRuntime): FleetTopologyDeps {
   return {
     instanceId: runtime.instanceId,
@@ -179,14 +167,14 @@ export function buildFleetTopologyDeps(runtime: FleetRuntime): FleetTopologyDeps
   };
 }
 
-/** Enumerate this node's fleet topology (no fan-out). */
+/** No fan-out. */
 export function getFleetTopology(runtime: FleetRuntime): FleetTopology {
   return buildFleetTopology(buildFleetTopologyDeps(runtime));
 }
 
 /**
- * Collect this node's full subtree (root call: includeCoordinatorMesh=true) with
- * an optional per-orchestrator selection map. Absent map entry => collect all.
+ * Root call (includeCoordinatorMesh=true) for this node's subtree. An orchestrator absent from
+ * `selectionByOrch` collects all.
  */
 export function collectFleet(
   runtime: FleetRuntime,
@@ -214,8 +202,7 @@ export function collectFleet(
 }
 
 /**
- * Peer-side responder: on an inbound peer.logs.collect.request, assemble this
- * node's subtree (with the request's loop guard + selection) and stream it back
+ * Assembles this node's subtree under the request's loop guard and selection, streamed back
  * as peer.logs.collect.chunk frames, or a peer.logs.collect.error on failure.
  */
 export function makeFleetCollectResponder(

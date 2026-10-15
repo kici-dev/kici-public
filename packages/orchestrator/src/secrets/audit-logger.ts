@@ -46,8 +46,6 @@ export class AuditLogger {
    * `deleteSecret`, the scope writes, `rotateKey`, `secret-outputs.reveal`) bypass the
    * sampler — they are transactional with the mutation and must always
    * land.
-   *
-   * @param entry - The audit entry to record.
    */
   async log(entry: AuditEntry): Promise<void> {
     if (entry.action === 'resolve' || entry.action === 'resolve_named') {
@@ -83,7 +81,6 @@ export class AuditLogger {
   /**
    * Query audit log entries with optional filters.
    *
-   * @param opts - Query filters and pagination.
    * @returns Matching audit log rows ordered by timestamp descending.
    */
   async query(opts: {

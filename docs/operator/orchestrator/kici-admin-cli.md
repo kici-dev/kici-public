@@ -8,7 +8,6 @@ The `kici-admin` CLI manages the KiCI orchestrator: configuration, secrets, toke
 Some command groups deliberately bypass that API, because they must work while the orchestrator is down (or before it exists):
 
 - **Direct database** (`--database-url`, or `KICI_DATABASE_URL`): `check-run`, `cluster`, `signing-key`, `dashboard-encryption-key`, `remote-source`, and `peer prune-credentials` / `reset-raft-state`. `host` and the other `peer` verbs (`create-token`, `list`, `revoke`, `revoke-all`) also go straight to the database, but they read `KICI_DATABASE_URL` only. They carry no `--database-url` flag. Several API-backed commands offer a direct-DB mode through the same flag — each one says so in its guide entry.
-- **Direct object storage** (the orchestrator's `KICI_STORAGE_*` configuration; no database, no admin token): `cache`.
 - **Local host only** (no orchestrator, no database): `firecracker`, `scaler reap-orphans`, `inspect-bundle`, and the `agent` / `orchestrator` service-lifecycle verbs (`install`, `uninstall`, `start`, `stop`, `restart`, `status`, `logs`, `upgrade`, plus `agent package`; `orchestrator drain` / `resume` are API-backed).
 - **Own transport**: `join` connects straight to the Platform relay or a peer orchestrator.
 
@@ -142,7 +141,7 @@ The full command reference is split by area:
 - [Runs, execution & events](./kici-admin/runs-execution-events.md) — `runs`, `execution`, `check-run`, `queue`, `registration`, `workflow`, `event`, `event-dlq`
 - [Cluster & infrastructure](./kici-admin/cluster-and-infra.md) — `orchestrator`, `cluster`, `cluster-name`, `cluster-settings`, `scaler`, `firecracker`
 - [Org settings](./kici-admin/org-settings.md) — `org`, `org-settings`, `trust-policy`, `held-run`
-- [Inspection & recovery](./kici-admin/inspection-recovery.md) — `cold-store`, `cache`, `attestations`, `signing-key`, `dashboard-encryption-key`, `access-log`, `event-log`, `diagnose`, `debug-bundle`, `inspect-bundle`
+- [Inspection & recovery](./kici-admin/inspection-recovery.md) — `cold-store`, `attestations`, `signing-key`, `dashboard-encryption-key`, `access-log`, `event-log`, `diagnose`, `debug-bundle`, `inspect-bundle`
 
 Each area page carries a `## Guide` section (per-namespace concepts and worked examples) and a `## Reference` section (the always-current generated signature list for that area's commands).
 

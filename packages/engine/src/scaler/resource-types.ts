@@ -1,7 +1,6 @@
 /**
- * Resource request and limit types for jobs and scalers.
- *
- * Single source of truth — re-exported from the engine barrel and consumed by:
+ * Resource request and limit types for jobs and scalers. Single source of truth
+ * for:
  * - SDK (`Job` / `JobOptions` `resources` field)
  * - compiler (compile-time validation + lockfile emission)
  * - orchestrator (scaler accounting + backend enforcement)
@@ -22,11 +21,8 @@
 import { z } from 'zod';
 
 /**
- * A single resource specification (cpus + memory).
- *
- * - `cpus`: fractional cores (e.g., 1.5 means 1.5 cores).
- * - `memory`: container-style suffix (e.g., "2g", "512m", "1024k").
- *   No K8s "Mi/Gi" units — one parser, one format across the codebase.
+ * A single resource specification. `memory` uses a container-style suffix; no
+ * K8s "Mi/Gi" units, so one parser and one format serve the whole codebase.
  */
 export interface ResourceSpec {
   /** CPU in fractional cores. */
@@ -35,12 +31,7 @@ export interface ResourceSpec {
   memory?: string;
 }
 
-/**
- * Per-job resource request (declared in workflow source, threaded through to scaler).
- *
- * `requests` drive scheduling math (cap aggregation).
- * `limits` drive kernel-side enforcement of the spawned agent.
- */
+/** Per-job resource request, declared in workflow source and threaded through to the scaler. */
 export interface ResourceRequest {
   /** Requests drive the scheduler's cap math (per-scaler / per-orch / per-machine). */
   requests?: ResourceSpec;
@@ -48,9 +39,6 @@ export interface ResourceRequest {
   limits?: ResourceSpec;
 }
 
-/**
- * Zod schema for a single resource spec (cpus + memory).
- */
 export const resourceSpecSchema = z
   .object({
     cpus: z.number().positive().max(256).optional(),
@@ -58,9 +46,6 @@ export const resourceSpecSchema = z
   })
   .strict();
 
-/**
- * Zod schema for the nested request/limit form.
- */
 export const resourceRequestNestedSchema = z
   .object({
     requests: resourceSpecSchema.optional(),
@@ -69,18 +54,14 @@ export const resourceRequestNestedSchema = z
   .strict();
 
 /**
- * Memory string units supported across the codebase.
- *
- * Mirrors `parseMemoryString` in `packages/orchestrator/src/scaler/config.ts` —
- * keep both in sync. Hoisted here so the compiler (browser-safe) can validate
- * memory strings at compile time without depending on the orchestrator package.
+ * Mirrors `parseMemoryString` in `packages/orchestrator/src/scaler/config.ts`;
+ * keep both in sync. Lives here so the browser-safe compiler validates memory
+ * strings without depending on the orchestrator package.
  */
 const MEMORY_FORMAT_RE = /^(\d+(?:\.\d+)?)\s*([kmgKMG])$/;
 
 /**
- * Parse a memory string with unit suffix to bytes.
- *
- * Supported formats:
+ * Parse a memory string with unit suffix to bytes:
  * - "512m" or "512M" -> 536870912 (512 * 1024^2)
  * - "2g" or "2G" -> 2147483648 (2 * 1024^3)
  * - "1024k" or "1024K" -> 1048576 (1024 * 1024)
@@ -111,15 +92,12 @@ export function parseMemoryString(memory: string): number {
 }
 
 /**
- * Validate a `ResourceRequest` literal (e.g., from compile-time SDK input).
- *
- * Checks:
+ * Validate a `ResourceRequest` literal (e.g., from compile-time SDK input),
+ * throwing on the first violation:
  * - `memory` strings parse via `parseMemoryString`.
  * - `cpus` are positive numbers ≤ 256 (max practical scaler).
  * - When both `requests` and `limits` are set on the same dimension,
- *   `requests <= limits` (a request that exceeds its own limit is nonsensical).
- *
- * Throws on the first violation with a descriptive error.
+ *   `requests <= limits`.
  */
 export function validateResourceRequest(req: ResourceRequest): void {
   resourceRequestNestedSchema.parse(req);

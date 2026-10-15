@@ -131,10 +131,9 @@ describe('runInvokeGate', () => {
   });
 
   it('gives two runs with identical repo+workflow distinct, resolvable proxies', async () => {
-    // Duplicate registrations: same repo + workflow, two runs. The proxy job_name
-    // must be unique per run (it carries the run id) or the mirror's job_name
-    // lookup resolves one proxy and the other hangs; variant_label stays the
-    // shared human-readable label for the graph.
+    // Duplicate registrations (same repo + workflow, two runs): the proxy job_name
+    // carries the run id, or the mirror's lookup resolves one proxy and the other
+    // hangs; variant_label stays the shared graph label.
     const runs: SummonedRun[] = [
       { runId: 'run-aaaa', repo: 'myorg/backend', workflow: 'unit' },
       { runId: 'run-bbbb', repo: 'myorg/backend', workflow: 'unit' },
@@ -152,8 +151,7 @@ describe('runInvokeGate', () => {
       'myorg/backend:unit',
       'myorg/backend:unit',
     ]);
-    // Each spawned run is tagged with ITS proxy's unique job_name, so the mirror
-    // lookup keyed on job_name resolves exactly one proxy per run.
+    // Each run is tagged with ITS proxy's job_name: exactly one proxy per run.
     expect(tags[0].set.summoned_by_proxy_job).toBe(proxies[0].jobName);
     expect(tags[1].set.summoned_by_proxy_job).toBe(proxies[1].jobName);
     expect(tags[0].set.summoned_by_proxy_job).not.toBe(tags[1].set.summoned_by_proxy_job);
@@ -189,10 +187,9 @@ describe('runInvokeGate', () => {
   });
 
   /**
-   * A refusal must never be readable as a zero-subscriber skip. The `optional`
-   * variant is the one that matters: it is the configuration under which an
-   * empty result reports SUCCESS, so a callback that returned `[]` on refusal
-   * would turn a declined summon green.
+   * A refusal must never read as a zero-subscriber skip. `optional` matters most:
+   * there an empty result reports SUCCESS, so `[]` on refusal would turn a
+   * declined summon green.
    */
   it.each([[false], [true]])(
     'fails the gate on a refused summon even with optional: %s',
@@ -217,8 +214,8 @@ describe('runInvokeGate', () => {
   );
 
   it('still treats an EMPTY summon under optional as a green skip', async () => {
-    // The control for the pair above: an empty array is a real outcome and
-    // stays one. The failure above comes from the throw, not from the harness.
+    // Control: a real empty array stays success, so the failure above comes from
+    // the throw, not the harness.
     const { deps, onJobStatus } = makeDeps({ summon: vi.fn(async () => []) });
 
     await runInvokeGate(deps, { ...baseArgs, optional: true });
@@ -237,8 +234,7 @@ describe('runInvokeGate', () => {
     });
     const { deps, onJobStatus } = makeDeps({ summon });
 
-    // No rejection escapes: the gate would otherwise be left with no terminal
-    // status at all, which is worse than a false green.
+    // No rejection escapes: a gate with no terminal status is worse than a false green.
     await expect(runInvokeGate(deps, { ...baseArgs, optional: true })).resolves.toBeUndefined();
 
     expect(onJobStatus).toHaveBeenCalledWith(
@@ -280,13 +276,11 @@ describe('runInvokeGate', () => {
   });
 
   /**
-   * The gate's event name is authored in the workflow (`invokeSource('...')`)
-   * and reaches the dispatcher WITHOUT the `event.emit` guard — no agent
-   * message, no `kici_events` row. So this is the path's own authoritative stop:
-   * `__` would otherwise summon a run the trust classifier could read as
-   * orchestrator-minted, and `kici.` would forge a scaler event with an
-   * author-chosen payload — the exact forgery the scaler docs promise is
-   * impossible.
+   * The gate's event name is workflow-authored (`invokeSource('...')`) and skips
+   * the `event.emit` guard (no agent message, no `kici_events` row), so this is the
+   * path's authoritative stop: `__` would summon a run the trust classifier could
+   * read as orchestrator-minted, and `kici.` would forge a scaler event with an
+   * author-chosen payload — the forgery the scaler docs promise is impossible.
    */
   it.each([
     ['__schedule_fire', '__'],
@@ -298,8 +292,7 @@ describe('runInvokeGate', () => {
 
     await runInvokeGate(deps, { ...baseArgs, event });
 
-    // Refused BEFORE the summon: nothing is dispatched, so there is nothing to
-    // undo, and no proxy is created for a run that must not exist.
+    // Refused BEFORE the summon: nothing to undo, no proxy for a run that must not exist.
     expect(summon).not.toHaveBeenCalled();
     expect(addJobsToRun).not.toHaveBeenCalled();
     expect(onJobStatus).toHaveBeenCalledWith(
@@ -313,8 +306,7 @@ describe('runInvokeGate', () => {
   });
 
   it('still summons for an ordinary event name that merely contains the prefixes', async () => {
-    // The control for the suite above: prefix, not substring. A guard that
-    // refused everything would pass every case above.
+    // Control: prefix, not substring; a refuse-everything guard passes the cases above.
     const summon = vi.fn(async () => [{ runId: 'r1', repo: 'a', workflow: 'w' }]);
     const { deps, addJobsToRun } = makeDeps({ summon });
 
@@ -474,11 +466,9 @@ describe('aggregateGateStatus', () => {
 
 describe('JobKind enum parity', () => {
   it('the DB TS enum enumerates the same members as the engine wire enum', () => {
-    // The engine Zod `JobKind` is what a relayed job-status message carries on the
-    // wire; the orchestrator DB `JobKind` is what `execution_jobs.job_kind` stores.
-    // A member present in one but not the other silently mis-tags a gate/proxy
-    // row across the seam, so keep the two vocabularies in step (same precedent as
-    // HeldRunStatus). Sorted — declaration order is not part of the contract.
+    // The engine Zod `JobKind` travels on the wire; the DB `JobKind` is stored in
+    // `execution_jobs.job_kind`. A member in only one silently mis-tags a gate/proxy
+    // row across the seam (precedent: HeldRunStatus). Sorted: order is not contract.
     expect([...WireJobKind.options].sort()).toEqual(Object.values(JobKind).sort());
   });
 });

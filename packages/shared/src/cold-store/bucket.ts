@@ -10,8 +10,7 @@ import type { ColdRetention } from './types.js';
 /**
  * Map a `ColdRetention` to a stable S3 prefix segment. Rounds
  * non-canonical TTLs DOWN so the chunk lives at LEAST as long as any
- * row in it requires (we never purge sooner than the row's declared
- * retention).
+ * row in it requires.
  */
 export function coldDaysToBucket(days: ColdRetention): string {
   if (days === 'forever') return 'forever';

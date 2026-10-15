@@ -1,9 +1,7 @@
 /**
- * The env file `kici-admin agent install` writes for a new agent. Each field
- * lands in the variable the agent's config loader reads; that loader refuses
- * any KICI_* variable it does not know, so a misspelt key here stops the agent
- * at startup. `agent-env.test.ts` loads the rendered file through the agent's
- * own loader to hold the two together.
+ * The env file `kici-admin agent install` writes. The agent's config loader
+ * refuses unknown KICI_* variables, so a misspelt key stops the agent at
+ * startup; `agent-env.test.ts` loads the output through that loader.
  */
 
 export interface AgentEnvFields {
@@ -17,7 +15,6 @@ export interface AgentEnvFields {
   port?: number;
 }
 
-/** Render the env file, one `KEY=value` line per field that was given. */
 export function renderAgentEnvFile(fields: AgentEnvFields): string {
   const lines = [fields.header];
   if (fields.orchestratorUrl) lines.push(`KICI_ORCHESTRATOR_URL=${fields.orchestratorUrl}`);

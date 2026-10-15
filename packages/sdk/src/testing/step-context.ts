@@ -12,9 +12,8 @@ import { isEventDefinition } from '../events/define-event.js';
 import { createStepSecrets } from '../secrets.js';
 import { resolveStepOutputs, resolveJobOutputs } from '../outputs.js';
 
-// Initialize zx for cross-platform execution (module-level, runs once on import).
-// initZx() mutates the zx global's defaults; those defaults propagate into the
-// scoped shell built via zx$({ ... }) below.
+// Runs once on import; initZx() sets zx global defaults, which the scoped
+// zx$({ ... }) shell below inherits.
 initZx();
 
 /** A single recorded `ctx.emit(...)` invocation, for assertion in tests. */
@@ -25,10 +24,9 @@ export interface RecordedEmit {
 }
 
 /**
- * Options for {@link createTestStepContext}. Every field is optional — call it
- * with no arguments for a fully-defaulted context. Convenience seed fields
- * (`repoRoot`, `secrets`) sit alongside direct `StepContext` member overrides
- * (everything else), which are shallow-merged on top of the defaults.
+ * Options for {@link createTestStepContext}; every field is optional. `repoRoot`
+ * and `secrets` are seed fields; every other field is a `StepContext` member
+ * override, shallow-merged on top of the defaults.
  */
 export interface TestStepContextOptions extends Partial<Omit<StepContext, 'secrets' | 'log'>> {
   /** Working directory `ctx.$` is pinned to. Defaults to `process.cwd()`. */
@@ -74,11 +72,9 @@ function createConsoleLogger(): Logger {
 }
 
 /**
- * Wire a real secrets surface backed by an on-demand tmpdir file host.
- *
- * The tmpdir is allocated lazily on first `mountFile`/`exposeFile` so steps that
- * never mount pay nothing, and the `process.on('exit')` cleanup handler is
- * registered lazily too (to avoid Node's MaxListeners warning at scale).
+ * A real secrets surface over a tmpdir file host. The tmpdir and its
+ * `process.on('exit')` cleanup are created on the first `mountFile`/`exposeFile`,
+ * so non-mounting steps pay nothing and Node's MaxListeners warning stays away.
  */
 function createTestSecrets(
   mergedFlat: Record<string, string>,
@@ -89,9 +85,8 @@ function createTestSecrets(
   let mountCounter = 0;
   let exitHandlerRegistered = false;
   const onProcessExit = (): void => {
-    // Only clear the local `env` override the helper actually wrote to via
-    // `exposeFile` — it never writes `process.env`, so deleting from there
-    // would silently drop a pre-existing host var of the same name.
+    // Clear only the local `env` that `exposeFile` wrote; it never writes
+    // `process.env`, so deleting there would drop a host var of the same name.
     for (const envVar of exposedEnvVars) {
       delete env[envVar];
     }
@@ -139,10 +134,8 @@ function createTestSecrets(
 }
 
 /**
- * Sanitize a raw identifier into a valid temp label: lowercase, every
- * non-`[a-z0-9-]` char to `-`, falling back to `'step'` when the result is
- * empty. Applied to both the caller-supplied label and the default step id so
- * `ctx.mktemp(...)` never rejects a friendly-but-irregular label.
+ * Lowercase, map every non-`[a-z0-9-]` char to `-`, and fall back to `'step'`
+ * when empty, so `ctx.mktemp(...)` never rejects an irregular label.
  */
 function sanitizeTempLabel(raw: string): string {
   const cleaned = raw.toLowerCase().replace(/[^a-z0-9-]/g, '-');
@@ -157,20 +150,16 @@ interface TestTempScope {
 }
 
 /**
- * Wire a job-scoped temp allocator for the test step context.
- *
- * `mktemp`/`mktempFile` delegate to a {@link createTempScope} instance and track
- * each allocated root so an exit backstop can reclaim it. The `process.once('exit')`
- * handler is registered lazily on first allocation (to avoid Node's MaxListeners
- * warning at scale) and synchronously removes any still-live temp paths — mirroring
- * the secrets-tmpdir exit cleanup. `dispose()` drains the scope and removes the
- * handler; the scope is exposed for manual drain in tests.
+ * Job-scoped temp allocator over {@link createTempScope}. Each root is tracked
+ * for a `process.once('exit')` backstop, registered on first allocation (to
+ * avoid Node's MaxListeners warning), that removes live temp paths
+ * synchronously, mirroring the secrets-tmpdir exit cleanup. `dispose()` drains
+ * the scope and removes the handler.
  */
 function createTestTempScope(defaultLabel: string): TestTempScope {
   const scope = createTempScope();
-  // Roots to remove on exit: the temp dir for a `mktemp`, the holder dir for a
-  // `mktempFile` (whose handle path is the file inside it). `force: true` makes
-  // reclaiming an already-cleaned path a harmless no-op.
+  // A `mktemp` dir, or a `mktempFile` holder dir (the handle is the file inside).
+  // `force: true` makes an already-cleaned path a no-op.
   const liveRoots: string[] = [];
   let exitHandlerRegistered = false;
   const onProcessExit = (): void => {
@@ -236,11 +225,9 @@ export function createTestStepContext(options: TestStepContextOptions = {}): Tes
 
   const env = (overrides.env ?? { ...process.env }) as Record<string, string | undefined>;
 
-  // `setEnv` / `addPath` mutate the real `process.env` (so spawned `ctx.$`
-  // subprocesses see the change), so `dispose()` must restore it to avoid
-  // leaking env pollution across tests. Snapshot each key's prior value the
-  // first time it is mutated; restore (or delete, if it did not exist before)
-  // on dispose.
+  // `setEnv` / `addPath` mutate the real `process.env` (so `ctx.$` subprocesses
+  // see it); `dispose()` restores each key's first-seen value, or deletes it, so
+  // tests do not leak env into each other.
   const processEnvRestores = new Map<string, string | undefined>();
   const recordProcessEnvOriginal = (key: string): void => {
     if (!processEnvRestores.has(key)) processEnvRestores.set(key, process.env[key]);
@@ -252,18 +239,15 @@ export function createTestStepContext(options: TestStepContextOptions = {}): Tes
 
   const { secrets, dispose: disposeSecrets } = createTestSecrets(mergedFlat, env);
 
-  // The test builder has no per-step id, so the default `ctx.mktemp()` label
-  // derives from the (possibly-overridden) job name; an empty name sanitizes to
-  // 'step'.
+  // No per-step id here, so the default `ctx.mktemp()` label is the job name.
   const jobInfo = overrides.job ?? DEFAULT_JOB;
   const temp = createTestTempScope(jobInfo.name);
 
   const emitCalls: RecordedEmit[] = [];
-  // Recorder captures each call; a `defineEvent(...)` definition resolves to its
-  // `.name` (matching the agent's `resolveEmitEventName`) so `RecordedEmit.eventName`
-  // is always the string name, whichever emit overload the step used. The concrete
-  // signature is not directly assignable to the overloaded StepContext['emit'] type,
-  // so cast.
+  // A `defineEvent(...)` definition resolves to its `.name` (as the agent's
+  // `resolveEmitEventName` does), so `RecordedEmit.eventName` is always a string.
+  // The cast is needed because a concrete signature cannot satisfy the overloaded
+  // StepContext['emit'] type.
   const emit = (async (
     nameOrDefinition: string | EventDefinition,
     payload?: Record<string, unknown>,

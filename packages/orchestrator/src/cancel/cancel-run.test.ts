@@ -9,10 +9,9 @@ import { cancelRunWithReason, type CancelRunDeps } from './cancel-run.js';
 import { sweepStuckCancelling } from './sweep-stuck-cancelling.js';
 
 /**
- * Capture every updateTable(table) call's recorded `.set()` values and `.where()`
- * tuples so tests can assert what cancelRunWithReason wrote. Each updateTable
- * call returns a fresh chain whose terminal `.execute()` resolves to one
- * updated row by default (overridable per table).
+ * Records every updateTable(table) call's `.set()` values and `.where()` tuples.
+ * Each call returns a fresh chain whose `.execute()` resolves to one updated row
+ * by default (overridable per table).
  */
 function createMockDb(opts?: {
   updatedRowsByTable?: Record<string, bigint>;
@@ -36,8 +35,7 @@ function createMockDb(opts?: {
           : { status: opts?.runStatus ?? ExecutionRunStatus.enum.running },
       );
       // `host_roster` (the agent's current coordinator) and `cluster_instances`
-      // (which coordinators are alive). Empty by default, which reads as "no
-      // roster row, no live sibling" — the single-coordinator shape.
+      // (live coordinators). Empty by default: the single-coordinator shape.
       chain.execute = vi.fn(async () => opts?.rows?.[_table] ?? []);
       return chain;
     }),
@@ -128,8 +126,8 @@ function makeDeps(
 
 describe('cancelRunWithReason', () => {
   it('cancels orphaned non-terminal jobs and completes the run when no agent was notified', async () => {
-    // A job is dispatched (so getDispatchedJobIdsByRunId returns it) but its
-    // agent has no live WS — the workflow-timeout-within-1s-of-dispatch race.
+    // A dispatched job whose agent has no live WS — the
+    // workflow-timeout-within-1s-of-dispatch race.
     const { deps, mock, completeSpy } = makeDeps(undefined, {
       dispatchedJobIds: ['job-1'],
       agentIdForJob: 'agent-1',
@@ -140,8 +138,8 @@ describe('cancelRunWithReason', () => {
 
     expect(result.agentsNotified).toBe(0);
 
-    // The orphan-cancel UPDATE targets execution_jobs with a NOT-IN
-    // TERMINAL_JOB_STATES guard so a dispatched/running row gets cancelled.
+    // The orphan-cancel UPDATE carries a NOT-IN TERMINAL_JOB_STATES guard so a
+    // dispatched/running row gets cancelled.
     const orphanUpdate = mock.updates.find(
       (u) =>
         u.table === 'execution_jobs' &&
@@ -161,8 +159,8 @@ describe('cancelRunWithReason', () => {
   });
 
   it('does NOT orphan-cancel running jobs when an agent was notified', async () => {
-    // A live, OPEN agent WS exists → agentsNotified increments, the run will be
-    // driven terminal by the agent's later job.complete, not here.
+    // A live, OPEN agent WS → agentsNotified increments, and the agent's later
+    // job.complete drives the run terminal, not this call.
     const { deps, mock, completeSpy } = makeDeps(undefined, {
       dispatchedJobIds: ['job-1'],
       agentIdForJob: 'agent-1',
@@ -172,9 +170,9 @@ describe('cancelRunWithReason', () => {
     const result = await cancelRunWithReason(deps, 'run-1', 'workflow_timeout: ...');
 
     expect(result.agentsNotified).toBe(1);
-    // No NOT-IN-TERMINAL orphan sweep, and no immediate completion. Scoped to
-    // execution_jobs: the execution_runs writes carry their own NOT-IN-TERMINAL
-    // predicate (the lost-race guard) and are expected here.
+    // No orphan sweep over execution_jobs and no immediate completion. The
+    // execution_runs writes carry their own NOT-IN-TERMINAL predicate (the
+    // lost-race guard) and are expected.
     const orphanUpdate = mock.updates.find(
       (u) =>
         u.table === 'execution_jobs' && u.where.some((w) => w[0] === 'status' && w[1] === 'not in'),
@@ -184,12 +182,11 @@ describe('cancelRunWithReason', () => {
   });
 
   it('leaves a notified job out of the pending/queued sweep', async () => {
-    // A dispatched job reads `queued` until its agent reports its first frame,
-    // so the queue sweep below can reach a job an agent is actively unwinding.
-    // Cancelling it records a terminal verdict for work still in flight — and
-    // because `execution_jobs` writes are monotonic, it also makes the agent's
-    // own terminal frame a rejected write, so the run-completion fan-out that
-    // frame drives never fires and the run is stranded in `running`.
+    // A dispatched job reads `queued` until its agent's first frame, so the queue
+    // sweep can reach a job an agent is unwinding. Cancelling it would record a
+    // terminal verdict for in-flight work, and since `execution_jobs` writes are
+    // monotonic the agent's own terminal frame would be rejected, its run-completion
+    // fan-out would never fire, and the run would be stranded in `running`.
     const { deps, mock } = makeDeps(undefined, {
       dispatchedJobIds: ['job-1'],
       agentIdForJob: 'agent-1',
@@ -215,9 +212,8 @@ describe('cancelRunWithReason', () => {
   });
 
   it('leaves an unreachable job out of the pending/queued sweep', async () => {
-    // Same reasoning one step further out: the owner is alive, so the job is
-    // not an orphan and the re-drive sweep will try again. Recording it
-    // cancelled here would be a terminal verdict for a job that is running.
+    // The owner is alive, so the job is not an orphan and the re-drive sweep will
+    // retry; recording it cancelled would be a terminal verdict for a running job.
     const mockDb = createMockDb({ rows: { cluster_instances: [{ instance_id: 'coord-b' }] } });
     const { deps, mock } = makeDeps(mockDb, {
       dispatchedJobs: [{ jobId: 'job-1', agentId: 'agent-1', ownerInstanceId: 'coord-b' }],
@@ -270,10 +266,9 @@ describe('cancelRunWithReason', () => {
 
   describe('a forced cancel whose forward fails', () => {
     /**
-     * The sibling owner is live but no link reaches it, so the first forward
-     * fails and the run is left `cancelling`. The sweep then reads the stuck
-     * run carrying whatever the first cancel stamped, and re-drives through
-     * the real cancel path.
+     * The live sibling owner is unreachable, so the first forward fails and the run
+     * stays `cancelling`. The sweep reads it back with what the first cancel stamped
+     * and re-drives through the real cancel path.
      */
     async function cancelThenSweep(force: boolean) {
       const forward = vi.fn().mockReturnValue(false);
@@ -335,11 +330,10 @@ describe('cancelRunWithReason', () => {
 
   it('moves the run to cancelling when the owning coordinator is live but unreachable', async () => {
     // The job belongs to a live sibling and the peer forward fails. It is not an
-    // orphan — the agent is very likely still running it — so nothing may be
-    // marked terminal. But the cancel still has to leave a durable trace: no
-    // agent will report `cancelling` for a cancel that never arrived, and the
-    // stuck-cancelling re-drive selects on `cancelling`, so without this stamp
-    // the retry it promises can never fire and the cancel is dropped in silence.
+    // orphan (its agent is likely still running it), so nothing is marked terminal.
+    // The cancel still leaves a durable `cancelling` stamp: no agent will report
+    // `cancelling` for a cancel that never arrived, and the stuck-cancelling
+    // re-drive selects on it, so without the stamp the cancel is silently dropped.
     const mockDb = createMockDb({ rows: { cluster_instances: [{ instance_id: 'coord-b' }] } });
     const { deps, mock, completeSpy } = makeDeps(mockDb, {
       dispatchedJobs: [{ jobId: 'job-1', agentId: 'agent-1', ownerInstanceId: 'coord-b' }],
@@ -368,9 +362,9 @@ describe('cancelRunWithReason', () => {
   });
 
   it('treats a non-OPEN (mid-close) socket as orphaned and completes the run', async () => {
-    // The agent is still in the registry but its socket is CLOSING (readyState
-    // 2). Sending to it would throw; the loop must skip it, leave agentsNotified
-    // at 0, and fall into the orphan sweep so the run is driven terminal.
+    // The agent is registered but its socket is CLOSING (readyState 2). Sending
+    // would throw, so the loop skips it, agentsNotified stays 0, and the orphan
+    // sweep drives the run terminal.
     const send = vi.fn();
     const { deps, completeSpy } = makeDeps(undefined, {
       dispatchedJobIds: ['job-1'],
@@ -386,9 +380,9 @@ describe('cancelRunWithReason', () => {
   });
 
   it('does not abort the cancellation when a send throws', async () => {
-    // readyState reads OPEN but send() throws (socket raced to closed between
-    // the check and the send). The throw must be swallowed: the run is still
-    // fully cancelled (reason stamped) and the job counts as orphaned.
+    // readyState reads OPEN but send() throws (socket closed between check and
+    // send). The throw is swallowed: the run is still fully cancelled (reason
+    // stamped) and the job counts as orphaned.
     const send = vi.fn(() => {
       throw new Error('WebSocket is not open');
     });
@@ -429,9 +423,9 @@ describe('cancelRunWithReason', () => {
     ExecutionRunStatus.enum.cancelled,
   ])('short-circuits on an already-terminal run (%s) without writing anything', async (status) => {
     // A cancel racing a run that just finished must not rewrite the finished
-    // record. The two execution_runs UPDATEs (cancelled_by, failure_reason) are
-    // not status-guarded by themselves, so this short-circuit is what keeps a
-    // terminal run's attribution and failure_reason intact.
+    // record. The cancelled_by / failure_reason UPDATEs are not status-guarded by
+    // themselves, so this short-circuit keeps a terminal run's attribution and
+    // failure_reason intact.
     const mock = createMockDb({ runStatus: status });
     const { deps, completeSpy } = makeDeps(mock, {
       dispatchedJobIds: ['job-1'],
@@ -461,9 +455,8 @@ describe('cancelRunWithReason', () => {
   });
 
   it('cancels a run whose row is missing rather than short-circuiting', async () => {
-    // A missing row must not read as "already terminal": every entry point
-    // answers 404 before reaching here, and the status-guarded UPDATEs below
-    // no-op harmlessly on a row that does not exist.
+    // A missing row must not read as "already terminal": every entry point answers
+    // 404 first, and the status-guarded UPDATEs no-op on a missing row.
     const mock = createMockDb({ runStatus: null });
     const { deps } = makeDeps(mock);
 
@@ -473,9 +466,9 @@ describe('cancelRunWithReason', () => {
   });
 
   it('status-guards both execution_runs writes so a lost race writes nothing', async () => {
-    // The short-circuit above is a read-then-write: the run can go terminal
-    // between the SELECT and these UPDATEs. Both must carry a status predicate
-    // so a cancel that loses that race is a no-op at the database level.
+    // The short-circuit is a read-then-write: the run can go terminal between the
+    // SELECT and these UPDATEs, so both carry a status predicate and a lost race is
+    // a DB-level no-op.
     const mock = createMockDb();
     const { deps } = makeDeps(mock);
 
@@ -500,8 +493,8 @@ describe('cancelRunWithReason', () => {
   });
 
   it('never deletes execution_steps rows', async () => {
-    // Cancelling must never destroy recorded step history. No delete path
-    // exists here today; this pins the invariant so one cannot be introduced.
+    // Cancelling must never destroy recorded step history; this pins the invariant
+    // so no delete path can be introduced.
     const mock = createMockDb();
     const { deps } = makeDeps(mock, {
       dispatchedJobIds: ['job-1'],

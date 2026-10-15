@@ -1,19 +1,15 @@
 import { z } from 'zod';
 import { actorPrincipalSchema } from './actor.js';
 
-// --- Run event protocol messages ---
-//
-// These messages enable infrastructure event tracking and execution context
-// forwarding through the three-tier relay: orchestrator/agent -> Platform -> browser.
+// --- Run event protocol messages (orchestrator/agent -> Platform -> browser) ---
 
 // --- Orchestrator/Agent -> Platform: run event tracking ---
 
 /** Infrastructure event emitted by orchestrator or agent during run lifecycle.
  *
- * SECURITY INVARIANT: This schema MUST NOT carry an `orgId` (or any tenant
- * identifier). Orchestrator WS connections are single-tenant — `authState.orgId`
- * is fixed for the connection's lifetime, derived from a DB-backed API-key hash.
- * The Platform always uses `authState.orgId` for tenant attribution; trusting a
+ * SECURITY INVARIANT: this schema MUST NOT carry an `orgId` or any tenant
+ * identifier. The Platform attributes tenancy from `authState.orgId`, fixed for
+ * the single-tenant connection's lifetime from a DB-backed API-key hash; a
  * wire-supplied field would be a cross-tenant injection primitive (see
  * `docs/architecture/security/ws-tenant-isolation.md`).
  */
@@ -36,9 +32,8 @@ export const runEventMessageSchema = z.object({
 
 /** Execution context sent by agent at job start for the Summary tab.
  *
- * SECURITY INVARIANT: see `runEventMessageSchema` above — no tenant identifier
- * may appear on this wire schema. All tenant attribution comes from
- * `authState.orgId` on the receiving Platform side.
+ * SECURITY INVARIANT: no tenant identifier on this wire schema (see
+ * `runEventMessageSchema`).
  */
 export const jobContextMessageSchema = z.object({
   type: z.literal('job.context'),
@@ -83,9 +78,8 @@ export const jobContextMessageSchema = z.object({
 
 /** Run event forwarded to browser for live timeline updates.
  *
- * NOTE: `runId` is already present in this schema (and always populated by the
- * Platform WS fan-out in `browser-fan-out.ts::onRunEvent`). The dashboard uses it
- * to group events by their originating run in the rerun chain. Do not remove.
+ * `runId` is always populated by `browser-fan-out.ts::onRunEvent`; the dashboard
+ * groups events by originating run in the rerun chain with it. Do not remove.
  */
 export const browserRunEventSchema = z.object({
   type: z.literal('run.event'),

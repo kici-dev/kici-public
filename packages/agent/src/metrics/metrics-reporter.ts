@@ -1,9 +1,6 @@
 /**
- * Periodic metrics reporter that collects OTel metrics and pushes them
- * to the orchestrator via WebSocket as `agent.metrics` messages.
- *
- * The orchestrator aggregates these metrics from all agents and exposes
- * them on its `/metrics` endpoint for Prometheus scraping.
+ * Periodically pushes OTel metrics to the orchestrator as `agent.metrics` WS
+ * messages; the orchestrator aggregates all agents' metrics on its `/metrics`.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -27,16 +24,14 @@ export class MetricsReporter {
     this.intervalMs = opts.intervalMs ?? 30_000;
   }
 
-  /** Start periodic metric collection and push. */
   start(): void {
     this.timer = setInterval(() => {
       this.collectAndSend().catch(() => {
-        // Silently swallow collection errors to avoid disrupting agent operation
+        // A collection error must not disrupt agent operation.
       });
     }, this.intervalMs);
   }
 
-  /** Stop the periodic reporter. */
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
@@ -44,7 +39,6 @@ export class MetricsReporter {
     }
   }
 
-  /** Collect current metrics and send as agent.metrics message. */
   async collectAndSend(): Promise<void> {
     const metrics = await this.collectSnapshot();
     if (metrics.length === 0) return;
@@ -57,7 +51,6 @@ export class MetricsReporter {
     });
   }
 
-  /** Collect a snapshot of all current OTel metrics. */
   async collectSnapshot(): Promise<AgentMetrics['metrics']> {
     const exporter = getPrometheusExporter();
     if (!exporter) return [];
@@ -90,7 +83,7 @@ export class MetricsReporter {
               sum: number;
             };
 
-            // Convert OTel per-bucket counts to cumulative Prometheus-style buckets
+            // OTel per-bucket counts -> cumulative Prometheus-style buckets.
             const boundaries = histValue.buckets.boundaries;
             const counts = histValue.buckets.counts;
             const buckets: Array<{ le: number; count: number }> = [];
@@ -124,12 +117,10 @@ export class MetricsReporter {
     return result;
   }
 
-  /** Map OTel DataPointType to wire format type string. */
   private mapDataPointType(dataPointType: number, isMonotonic?: boolean): WireMetricKind {
     return mapDataPointTypeToWireKind(dataPointType, isMonotonic);
   }
 
-  /** Extract string labels from OTel Attributes. */
   private extractLabels(attributes: Record<string, unknown>): Record<string, string> {
     const labels: Record<string, string> = {};
     for (const [key, value] of Object.entries(attributes)) {

@@ -4,7 +4,8 @@
  * Verifies the 3-role permission model:
  * - owner has all permissions
  * - admin has context + secret + audit, not token.manage or key.rotate
- * - auditor has context.read, audit.read, and run.read only
+ * - auditor has read permissions only (context, audit, run, event log,
+ *   access log, event DLQ, scaler, test run)
  * - requirePermission throws for unauthorized role
  * - canAccessSecretValues returns true for owner/admin, false for auditor
  */

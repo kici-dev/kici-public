@@ -1,20 +1,13 @@
 /**
- * Shared environment allowlist constants for KiCI.
- *
- * Single source of truth for environment variable filtering used across tiers:
- * - Orchestrator bare-metal backend (spawned agent processes)
- * - Agent sandbox execution (customer code isolation)
- *
- * These constants ensure that orchestrator/agent secrets (DATABASE_URL,
- * GITHUB_PRIVATE_KEY, PLATFORM_TOKEN, WEBHOOK_SECRET, etc.) are never leaked
- * to child processes or customer code.
+ * Environment variable filtering shared by the orchestrator bare-metal backend
+ * (spawned agent processes) and agent sandbox execution (customer code), so
+ * orchestrator/agent secrets (DATABASE_URL, GITHUB_PRIVATE_KEY, PLATFORM_TOKEN,
+ * WEBHOOK_SECRET, etc.) never reach child processes or customer code.
  */
 
 /**
  * System environment variables that are safe to pass into spawned processes.
- *
- * This is an explicit allowlist -- anything NOT listed here is stripped.
- * Adding new variables to the host process will NOT leak them downstream.
+ * Anything NOT listed is stripped, so new host variables never leak downstream.
  */
 export const ALLOWED_SYSTEM_VARS = [
   'PATH',
@@ -27,13 +20,10 @@ export const ALLOWED_SYSTEM_VARS = [
   'TMPDIR',
   'NODE_PATH',
   'TZ',
-  // Windows-essential system variables. Without PATHEXT the OS cannot resolve
-  // a bare command name (e.g. `jq`) to its `.exe`, so a step that runs an
-  // installed tool by name fails with "not recognized" even when the tool's
-  // directory is on PATH. The rest are needed by most Windows tooling
-  // (temp dirs, profile/appdata locations, the command interpreter). None of
-  // these carry credentials — the allowlist's job is to keep KICI_* /
-  // DATABASE_URL / PLATFORM_TOKEN out, which these are not.
+  // Windows-essential, none carrying credentials. Without PATHEXT the OS cannot
+  // resolve a bare command name (e.g. `jq`) to its `.exe`, so a step fails with
+  // "not recognized" even when the tool's directory is on PATH. Most Windows
+  // tooling needs the rest (temp dirs, profile/appdata, the command interpreter).
   'PATHEXT',
   'SystemRoot',
   'windir',
@@ -48,22 +38,18 @@ export const ALLOWED_SYSTEM_VARS = [
 ] as const;
 
 /**
- * Default environment variables injected into every sandbox execution.
- *
- * These are set before user/secret env vars so they can be overridden.
- * - FORCE_COLOR=1: Ensures color-aware libraries (chalk, etc.) emit ANSI
- *   codes even when stdout is a pipe (non-TTY). Without this, log output
- *   appears uncolored in the dashboard log viewer.
+ * Default environment variables injected into every sandbox execution, set
+ * before user/secret env vars so those can override them.
+ * - FORCE_COLOR=1: color-aware libraries (chalk, etc.) emit ANSI codes even
+ *   when stdout is a pipe, so the dashboard log viewer shows color.
  */
 export const SANDBOX_DEFAULT_VARS: Record<string, string> = {
   FORCE_COLOR: '1',
 };
 
 /**
- * KICI environment variables required by the agent.
- *
- * These are set explicitly by the scaler (not copied from orchestrator process.env)
- * to ensure the agent receives only the values it needs with correct content.
+ * KICI environment variables required by the agent. The scaler sets them
+ * explicitly rather than copying the orchestrator's process.env.
  */
 export const AGENT_REQUIRED_KICI_VARS = [
   'KICI_ORCHESTRATOR_URL',
@@ -76,21 +62,17 @@ export const AGENT_REQUIRED_KICI_VARS = [
 ] as const;
 
 /**
- * Prefix for operator-defined environment variables that should be forwarded
- * from the orchestrator process to spawned agent processes.
- *
- * Variables with this prefix in the orchestrator's process.env are forwarded
- * to agent child processes with the prefix stripped. For example:
+ * Prefix for operator-defined orchestrator env vars forwarded to spawned agent
+ * processes with the prefix stripped. For example:
  *   KICI_AGENT_ENV_HTTP_PROXY=http://proxy:3128
  *   -> HTTP_PROXY=http://proxy:3128 in the agent process
  */
 export const KICI_AGENT_ENV_PREFIX = 'KICI_AGENT_ENV_' as const;
 
 /**
- * Non-`KICI_`-prefixed environment variables that are the agent's / orchestrator's
- * own infrastructure secrets. These are scrubbed from a trusted-env passthrough
- * in addition to the whole `KICI_*` namespace, so even a trusted fleet agent
- * never leaks its control-plane credentials into a workflow step.
+ * Non-`KICI_` agent/orchestrator infrastructure secrets, scrubbed from a
+ * trusted-env passthrough alongside the whole `KICI_*` namespace, so even a
+ * trusted fleet agent never leaks control-plane credentials into a step.
  */
 export const TRUSTED_ENV_SCRUB_EXACT = [
   'DATABASE_URL',
@@ -100,11 +82,10 @@ export const TRUSTED_ENV_SCRUB_EXACT = [
 ] as const;
 
 /**
- * A variable that must NEVER reach a workflow step even under the trusted-env
- * profile. The agent's entire `KICI_*` namespace (its orchestrator URL, agent
- * token, secret key, bootstrap admin token, scaler internals, identity) is
- * scrubbed, plus the non-`KICI_` infra-secret denylist above. So "trusted"
- * means "host env yes, the agent's KiCI identity no".
+ * Whether a variable must NEVER reach a workflow step, even under the
+ * trusted-env profile: the whole `KICI_*` namespace (orchestrator URL, agent
+ * token, secret key, bootstrap admin token, scaler internals, identity) plus
+ * the denylist above. "Trusted" means "host env yes, the agent's KiCI identity no".
  */
 export function isTrustedEnvScrubbed(key: string): boolean {
   return key.startsWith('KICI_') || (TRUSTED_ENV_SCRUB_EXACT as readonly string[]).includes(key);
@@ -112,10 +93,8 @@ export function isTrustedEnvScrubbed(key: string): boolean {
 
 /**
  * Build the trusted-env passthrough set: every defined entry of `source` whose
- * key is not scrubbed by `isTrustedEnvScrubbed`. Used by both env-narrowing
- * layers (scaler → agent process, agent → step) when the trusted-env profile is
- * active, so the ambient host env reaches the step minus the agent's own KiCI
- * identity/operational secrets.
+ * key `isTrustedEnvScrubbed` does not scrub. Both env-narrowing layers (scaler →
+ * agent process, agent → step) use it under the trusted-env profile.
  */
 export function buildTrustedPassthroughEnv(
   source: Record<string, string | undefined>,

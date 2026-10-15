@@ -3,7 +3,7 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './119_scaler_ha_ownership.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
  * Real-Postgres test for migration 119: asserts the scaler HA ownership schema
@@ -39,13 +39,11 @@ const SPAWNING_COLUMNS: Array<[string, string]> = [
 ];
 
 /**
- * Every column of `scaler_pending_claims`, with its data type. All ten are
- * listed so a column omitted from the CREATE TABLE fails here rather than at the
- * first INSERT a later change writes.
+ * Every column of `scaler_pending_claims` with its data type, so a column
+ * missing from the CREATE TABLE fails here, not at a later change's first INSERT.
  *
- * `agent_token_ttl_ms` is pinned to `bigint` deliberately: the TypeScript select
- * type in `db/types.ts` is `string` precisely because node-pg returns int8 as a
- * string, and that only holds while the column really is a BIGINT.
+ * `agent_token_ttl_ms` is pinned to `bigint`: its `db/types.ts` select type is
+ * `string` because node-pg returns int8 as a string, which holds only for BIGINT.
  */
 const CLAIMS_COLUMNS: Array<[string, string]> = [
   ['claim_hash', 'text'],
@@ -121,9 +119,7 @@ describeDb('migration 119_scaler_ha_ownership', () => {
       expect(state.exists, `${col} missing`).toBe(true);
       expect(state.dataType, `${col} has the wrong type`).toBe(dataType);
     }
-    // CLAIMS_COLUMNS is the whole table, not a sample of it — so a column added
-    // to the migration without a matching row here fails rather than going
-    // unasserted.
+    // CLAIMS_COLUMNS is the whole table, so an unlisted new column fails here.
     const actual = await sql<{ column_name: string }>`
       SELECT column_name FROM information_schema.columns
        WHERE table_schema = 'public' AND table_name = 'scaler_pending_claims'
@@ -179,8 +175,7 @@ describeDb('migration 119_scaler_ha_ownership', () => {
     expect((await columnState('scaler_pending_claims', 'consumed_at')).exists).toBe(false);
     expect((await columnState('scaler_spawning_agents', 'adopted_by')).exists).toBe(false);
     expect((await columnState('scaler_reservations', 'owner_instance_id')).exists).toBe(false);
-    // `scaler_name` pre-dates 119, so its index is the one down() has to drop
-    // explicitly — the column-drop loop cannot take it along.
+    // `scaler_name` pre-dates 119, so down() drops its index explicitly.
     expect(await indexExists('idx_scaler_spawning_agents_scaler_name')).toBe(false);
     // Migration 022's own index on the same table must survive the rollback.
     expect(await indexExists('idx_scaler_spawning_agents_spawned_at')).toBe(true);

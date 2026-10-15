@@ -1,25 +1,16 @@
 /**
- * regression: agent register-time label scope is bounded by the
- * token's `agent_tokens.labels` authorization scope.
+ * Regression: agent register-time labels are bounded by the token's
+ * `agent_tokens.labels` authorization scope.
  *
- * Trust model (enforced):
- *   `agent_tokens.labels` (the column on the orchestrator's agent_tokens
- *   table) pins which labels each token is authorized to register under.
- *   The agent's wire-supplied `agent.register.labels` MUST be a subset of
- *   this set; any wire label outside the token-bound scope is a token
- *   authorization failure and the WS is closed with
- *   `WS_CLOSE_AGENT_AUTH_FAILED`. `tokenRow.labels === null` is an unscoped
- *   token (minted without `--labels`), which carries no label constraint.
+ * The wire `agent.register.labels` MUST be a subset of that set; a label
+ * outside it closes the WS with `WS_CLOSE_AGENT_AUTH_FAILED`. `labels === null`
+ * is an unscoped token (minted without `--labels`) with no constraint. Without
+ * the check, a `[ci, build]` token could register as `[ci, build, prod,
+ * secret-vault]` and harvest `prod` secrets resolved at dispatch time.
  *
- *   Without this check, a token issued for `[ci, build]` could register as
- *   `[ci, build, prod, secret-vault]` and harvest secrets resolved for the
- *   `prod` environment at dispatch time — the path a compromised agent
- *   would take.
- *
- * Production stores `agent_tokens.labels` as `text` containing
- * `JSON.stringify(string[])` (or `null`). The mock here mirrors that
- * encoding so a regression that swaps the storage shape would surface as
- * a test failure rather than a silent contract drift.
+ * Production stores `agent_tokens.labels` as `text` holding
+ * `JSON.stringify(string[])` (or `null`); the mock mirrors that encoding so a
+ * storage-shape swap fails here.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PROTOCOL_VERSION, resolveRoleLabels, WS_CLOSE_AGENT_AUTH_FAILED } from '@kici-dev/engine';
@@ -28,7 +19,7 @@ import { authorizedAgentTokenLabels } from '../cli/commands/agent.js';
 import { AgentRegistry } from '../agent/registry.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
-import { mockWs } from '../__test-helpers__/mock-ws.js';
+import { mockWs, makeMessageEvent } from '../__test-helpers__/mock-ws.js';
 
 function mockDispatcher(): Dispatcher {
   return {
@@ -38,10 +29,6 @@ function mockDispatcher(): Dispatcher {
     onJobComplete: vi.fn(),
     releaseRebootPending: vi.fn().mockResolvedValue(undefined),
   } as unknown as Dispatcher;
-}
-
-function makeMessageEvent(data: unknown): MessageEvent {
-  return { data: JSON.stringify(data) } as MessageEvent;
 }
 
 function authRequestMsg(token = 'kat_' + 'a'.repeat(64)) {
@@ -61,10 +48,7 @@ function registerMsg(opts: { agentId: string; labels: string[] }) {
   };
 }
 
-/**
- * Build a token store whose `validate()` returns a token row matching the
- * production storage shape: `labels` is JSON-encoded `string[]` or `null`.
- */
+/** `labels` is JSON-encoded `string[]` or `null`, as production stores it. */
 function tokenStoreWithLabels(authorizedLabels: string[] | null): AgentTokenStore {
   return {
     validate: vi.fn().mockResolvedValue({
@@ -125,9 +109,7 @@ describe('agent register-time label-scope enforcement', () => {
       ws as any,
     );
 
-    // Registration must be refused: no entry in the registry, WS closed with
-    // an auth-failure close code that includes the elevated labels in the
-    // reason for operator debuggability.
+    // The close reason names the elevated labels for operator debuggability.
     expect(registry.get('agent-elevated')).toBeUndefined();
     expect(ws.close).toHaveBeenCalledWith(
       WS_CLOSE_AGENT_AUTH_FAILED,
@@ -139,9 +121,7 @@ describe('agent register-time label-scope enforcement', () => {
   });
 
   it('rejects wire labels that have NO overlap with the token-bound set', async () => {
-    // Distinct case: every wire label is unauthorized. Verifies the check
-    // doesn't accidentally allow "fully-disjoint elevation" when the rejection
-    // path expects at least one shared label.
+    // Every wire label is unauthorized: the check must not assume a shared label.
     const tokenStore = tokenStoreWithLabels(['ci', 'build']);
     const handler = createAgentWsHandler({
       registry,
@@ -166,10 +146,8 @@ describe('agent register-time label-scope enforcement', () => {
   });
 
   it('accepts a wire-label set that is a strict subset of the token-bound scope', async () => {
-    // Voluntary scope-narrowing is legitimate routing — an agent token
-    // authorized for `[ci, build, prod]` may register as just `[ci]` so the
-    // dispatch queue only routes ci-tagged jobs to it. The check is
-    // subset-not-equality.
+    // Voluntary scope-narrowing is legitimate routing: the check is subset,
+    // not equality.
     const tokenStore = tokenStoreWithLabels(['ci', 'build', 'prod']);
     const handler = createAgentWsHandler({
       registry,
@@ -193,9 +171,8 @@ describe('agent register-time label-scope enforcement', () => {
   });
 
   it('admits an agent whose wire labels differ from the token scope only by case', async () => {
-    // Label matching folds case, so `GPU` in the token scope and `gpu` on the
-    // wire name the same label. Treating the difference as elevation closes the
-    // socket with an auth failure that names no cause the operator can act on.
+    // Label matching folds case; treating a case difference as elevation closes
+    // the socket with an auth failure the operator cannot act on.
     const tokenStore = tokenStoreWithLabels(['GPU', 'Linux']);
     const handler = createAgentWsHandler({
       registry,
@@ -219,9 +196,8 @@ describe('agent register-time label-scope enforcement', () => {
   });
 
   it('stores the canonical form of a label the agent advertises in mixed case', async () => {
-    // The registry is the matching domain, so what it holds must already be
-    // folded — a dispatch selector for `docker` has to reach an agent that
-    // advertised `Docker`.
+    // The registry is the matching domain, so it holds folded labels: a `docker`
+    // selector must reach an agent that advertised `Docker`.
     const tokenStore = tokenStoreWithLabels(['Docker']);
     const handler = createAgentWsHandler({
       registry,
@@ -242,11 +218,9 @@ describe('agent register-time label-scope enforcement', () => {
   });
 
   it('still refuses a mixed-case privileged-root claim from a non-root agent', async () => {
-    // The control for the fold above. Gate 0 compares against the reserved
-    // `kici:privileged:root` literal, and the registry now stores the canonical
-    // form — so a gate that did not fold would miss `KICI:PRIVILEGED:ROOT`, let
-    // the agent register, and hand it root-demanding jobs at dispatch. The
-    // token authorizes the label, which isolates Gate 0 from Gate 1.
+    // Control for the fold above: a Gate 0 that did not fold would miss
+    // `KICI:PRIVILEGED:ROOT` and hand the agent root-demanding jobs. The token
+    // authorizes the label, which isolates Gate 0 from Gate 1.
     const tokenStore = tokenStoreWithLabels(['KICI:PRIVILEGED:ROOT']);
     const handler = createAgentWsHandler({
       registry,
@@ -273,9 +247,8 @@ describe('agent register-time label-scope enforcement', () => {
   });
 
   it('accepts wire labels verbatim when the token has no authorized-labels constraint (labels: null)', async () => {
-    // Back-compat carve-out for tokens issued before `agent_tokens.labels`
-    // became an enforced authorization signal. Removing this case re-breaks
-    // any deployment with pre-existing unscoped tokens.
+    // Back-compat for unscoped tokens; removing it breaks every deployment
+    // that holds one.
     const tokenStore = tokenStoreWithLabels(null);
     const handler = createAgentWsHandler({
       registry,
@@ -299,17 +272,14 @@ describe('agent register-time label-scope enforcement', () => {
 });
 
 /**
- * regression: a token minted by `kici-admin agent register --labels …` must
+ * Regression: a token minted by `kici-admin agent register --labels …` must
  * admit the real agent that presents it.
  *
- * An agent derives its `kici:role:*` labels from its own host capabilities and
- * advertises them at registration. The mint site cannot know which ones the
- * host will derive, so the authorized scope it writes carries the whole role
- * namespace. Without that, the documented `--labels linux,x64,gpu` example
- * mints a token every real agent is refused on with close code 4010.
- *
- * These drive the REAL register-time gate with the REAL mint-side scope, so
- * neither half can drift into agreeing with itself.
+ * An agent derives its `kici:role:*` labels from its host, which the mint site
+ * cannot know, so the minted scope carries the whole role namespace. Without
+ * that, the documented `--labels linux,x64,gpu` example mints a token every
+ * real agent is refused on with close code 4010. These tests drive the REAL
+ * gate with the REAL mint-side scope, so neither half can drift alone.
  */
 describe('a CLI-minted label scope admits the agent that presents it', () => {
   let registry: AgentRegistry;
@@ -325,7 +295,7 @@ describe('a CLI-minted label scope admits the agent that presents it', () => {
     vi.useRealTimers();
   });
 
-  /** Register `labels` against a token minted with `kici-admin agent register --labels linux,x64`. */
+  /** The token is minted as `kici-admin agent register --labels linux,x64`. */
   async function registerAgainstCliMintedToken(agentId: string, labels: string[]) {
     const tokenStore = tokenStoreWithLabels(
       authorizedAgentTokenLabels(['linux', 'x64'], undefined)!,

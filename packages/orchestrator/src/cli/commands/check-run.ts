@@ -1,25 +1,14 @@
 /**
- * Check-run read CLI command for kici-admin.
- *
- *   check-run list --sha <sha> [--check-name <name>] [--limit <n>] [--json]
- *
- * READ-ONLY. Answers "did we post that check run?" — the question that
- * previously needed raw SQL against `check_run_tracking`.
- *
- * Each column answers a different half of it:
+ * `kici-admin check-run list` (read-only): did we post that check run?
  *   - CHECK_RUN_ID   the check run was created at the provider.
  *   - CREATE_STATE   stamped `pending` BEFORE the create and never reset on
- *                    failure, so `pending` distinguishes an in-flight create
- *                    from a missing one — it does not prove success.
- *   - TERMINAL_SENT  the terminal `completed` update was accepted by the
- *                    provider.
+ *                    failure: it tells an in-flight create from a missing one,
+ *                    and does not prove success.
+ *   - TERMINAL_SENT  the provider accepted the terminal `completed` update.
+ * Every write on the table is best-effort, so an em dash means "no record",
+ * never proof the call failed.
  *
- * Every write on this table is best-effort, so an em dash is "no record", never
- * proof that the call failed.
- *
- * Direct-DB only: there is no admin HTTP route for check-run tracking, so this
- * requires `--database-url` (or `KICI_DATABASE_URL`) the same way `attestations`,
- * `cluster` and `cold-store` do.
+ * Direct-DB only (no admin HTTP route), like `attestations`, `cluster` and `cold-store`.
  */
 import type { Command } from 'commander';
 import { listCheckRunTrackingDirect, type CheckRunTrackingDirectRow } from '@kici-dev/shared';
@@ -46,13 +35,10 @@ function printTrackingTable(rows: CheckRunTrackingDirectRow[]): void {
   ];
   const table = rows.map((r) => [
     r.check_name,
-    // An em dash means no id was recorded. That is not proof the create
-    // failed: the write is best-effort and falls back to cache-only on a DB
-    // error, so the check run may exist at the provider anyway.
+    // No id recorded is not proof the create failed: the write falls back to
+    // cache-only on a DB error, so the check run may exist anyway.
     r.check_run_id ?? '—',
     r.build_creation_state ?? '—',
-    // Set means the provider accepted the terminal `completed` update. Em dash
-    // means we have no record of sending it — same best-effort caveat.
     r.terminal_sent_at ? new Date(r.terminal_sent_at).toISOString() : '—',
     r.run_id ?? '—',
     r.in_progress_sent_at ? new Date(r.in_progress_sent_at).toISOString() : '—',

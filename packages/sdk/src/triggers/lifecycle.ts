@@ -1,12 +1,9 @@
-/**
- * Lifecycle trigger helper - creates triggers for cross-workflow lifecycle events.
- * Returns a frozen LifecycleTriggerConfig directly.
- */
+/** Lifecycle trigger helper for cross-workflow lifecycle events. */
 
 import type { LifecycleConfigInput, LifecycleTriggerConfig } from './types.js';
 
 /**
- * Create a lifecycle trigger configuration.
+ * Create a frozen lifecycle trigger configuration.
  *
  * @example
  * // Trigger on any workflow completion

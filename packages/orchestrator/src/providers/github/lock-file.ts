@@ -13,8 +13,6 @@ import { createInstallationOctokit, type GitHubAppConfig, type GitHubCredentials
 import { parseLockDocument } from '../../lockfile-validate.js';
 
 /**
- * GitHub-specific implementation of LockFileFetcher.
- *
  * Fetches .kici/kici.lock.json from a GitHub repository using the Contents API.
  * Does NOT include caching -- the orchestrator wraps this fetcher with an LRU cache.
  */
@@ -24,8 +22,6 @@ export class GitHubLockFileFetcher implements LockFileFetcher {
   constructor(private readonly config: GitHubAppConfig) {}
 
   /**
-   * Fetch the lock file from a GitHub repository at a specific ref.
-   *
    * @param repoIdentifier - "owner/repo" format
    * @param ref - Git ref (branch, tag, SHA)
    * @param credentials - Must be GitHubCredentials with installationId
@@ -75,9 +71,6 @@ export class GitHubLockFileFetcher implements LockFileFetcher {
   }
 }
 
-/**
- * Check if an error is a GitHub 404 (Not Found) response.
- */
 function isNotFoundError(error: unknown): boolean {
   return (
     typeof error === 'object' &&

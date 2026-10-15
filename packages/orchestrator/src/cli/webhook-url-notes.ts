@@ -1,16 +1,14 @@
 /**
- * The text the CLI prints when the orchestrator returns no webhook URL. Shared
- * by `kici-admin source add` and the manifest setup flow, so each
- * `WebhookUrlNote` reads the same in both.
+ * Text for a missing webhook URL, shared by `kici-admin source add` and the
+ * manifest setup flow.
  */
 import { WebhookUrlNote } from '../sources/webhook-url-resolvers.js';
 
 const DASHBOARD_HINT = 'Find the webhook URL in the dashboard under Sources.';
 
 /**
- * Short reason shown in `(unavailable — <reason>)` when no webhook URL could be
- * resolved. Takes a plain string too, because an orchestrator of another
- * version can send a note this CLI does not know.
+ * The reason in `(unavailable — <reason>)`. Takes a plain string: another
+ * orchestrator version can send a note this CLI does not know.
  */
 export function webhookNoteReason(note: WebhookUrlNote | string | undefined): string {
   switch (note) {

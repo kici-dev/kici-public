@@ -3,12 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { S3CacheStorage } from './s3.js';
 
 /**
- * S3 cache storage against a real bucket.
- *
- * Requires AWS credentials in the environment and an S3 bucket; skipped unless
- * S3_TEST_BUCKET is set. It lives apart from the mocked suite in `s3.test.ts`
- * because that file replaces the SDK module for the whole file, which would
- * route these cases through the mock too.
+ * S3 cache storage against a real bucket; needs AWS credentials and skips unless
+ * S3_TEST_BUCKET is set. Kept apart from `s3.test.ts`, whose file-wide SDK mock would capture
+ * these cases too.
  *
  * Usage:
  *   S3_TEST_BUCKET=my-test-bucket S3_TEST_REGION=eu-central-1 \
@@ -18,10 +15,8 @@ import { S3CacheStorage } from './s3.js';
 const testBucket = process.env.S3_TEST_BUCKET;
 const testRegion = process.env.S3_TEST_REGION;
 
-// Unique prefix per test run to avoid collisions
 const testPrefix = `kici-test-${randomUUID().slice(0, 8)}/`;
 
-// Track keys for cleanup
 const createdKeys: string[] = [];
 
 describe.skipIf(!testBucket)('S3CacheStorage', () => {
@@ -35,7 +30,6 @@ describe.skipIf(!testBucket)('S3CacheStorage', () => {
     : (null as unknown as S3CacheStorage);
 
   afterAll(async () => {
-    // Clean up all test objects
     if (!testBucket || !storage) return;
     for (const key of createdKeys) {
       try {
@@ -175,10 +169,9 @@ describe.skipIf(!testBucket)('S3CacheStorage', () => {
 
   // -- touch against a concurrent rewrite --
   //
-  // A touch reads the object's metadata, then self-copies the object to write
-  // the refreshed timestamp. The stale ETag below is what a touch holds when a
-  // `put()` of the same key lands between its read and its copy: the race that
-  // put a rebuilt dependency pointer back onto a deleted tarball.
+  // A touch reads metadata, then self-copies to write the refreshed timestamp. The stale ETag
+  // below is what it holds when a `put()` of the key lands between read and copy: the race
+  // that put a rebuilt dependency pointer back onto a deleted tarball.
 
   describe('touch against a concurrent rewrite', () => {
     async function staleHeadAfterRewrite(key: string) {
@@ -254,7 +247,6 @@ describe.skipIf(!testBucket)('S3CacheStorage', () => {
 
       await shortTtlStorage.put(key, 'data');
 
-      // Wait for TTL to pass
       await new Promise((r) => setTimeout(r, 10));
 
       const result = await shortTtlStorage.get(key);

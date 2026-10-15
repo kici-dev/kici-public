@@ -1,23 +1,19 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Proxy-job + summon-correlation columns for the invoke gate.
+ * An invoke gate summons the source repo's opt-in workflows and tracks each spawned run as a
+ * **proxy job** in the gate's own run:
  *
- * An invoke gate summons the source repo's opt-in workflows and tracks each
- * spawned run as a **proxy job** in the gate's own run:
- *
- * - `execution_jobs.job_kind` marks a row `standard` (runs steps on an agent),
- *   `gate` (an invoke gate), or `proxy` (mirrors one summoned run's lifecycle).
- *   NOT NULL with a `standard` default so every pre-existing row reads correctly.
+ * - `execution_jobs.job_kind`: `standard` (runs steps on an agent), `gate` (the invoke gate
+ *   itself) or `proxy` (mirrors one summoned run). The `standard` default makes pre-existing
+ *   rows read correctly.
  * - `execution_jobs.summoned_run_id` — for a proxy, the spawned run it mirrors.
  * - `execution_runs.summoned_by_run_id` — for a spawned run, the summoning run.
- * - `execution_runs.summoned_by_proxy_job` — the proxy job name in the summoning
- *   run to update when the spawned run completes (resolves proxy completion even
- *   if the run finalizes on another HA instance).
+ * - `execution_runs.summoned_by_proxy_job` — the proxy job to update on completion, even when
+ *   the run finalizes on another HA instance.
  *
- * All four are additive; the two `execution_runs` columns are nullable and
- * unbackfilled (a null means "this run was not summoned by an invoke gate").
- * Idempotent: guarded on each column's existence, so re-running is a no-op.
+ * Additive; the `execution_runs` columns are nullable and unbackfilled (NULL = not summoned).
+ * Idempotent per column.
  */
 async function colExists(db: Kysely<unknown>, table: string, name: string): Promise<boolean> {
   const result = await sql<{ exists: boolean }>`

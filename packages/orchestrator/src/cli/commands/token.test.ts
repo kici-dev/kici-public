@@ -1,7 +1,4 @@
-/**
- * Tests for the `kici-admin token` CLI helpers — the `--expires` parser and
- * the `token list` table renderer.
- */
+/** The `--expires` parser and the `token list` table renderer. */
 import { describe, it, expect } from 'vitest';
 import { formatTokenTable, parseExpiresAt } from './token.js';
 

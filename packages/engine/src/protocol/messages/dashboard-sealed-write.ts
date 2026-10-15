@@ -1,16 +1,9 @@
 /**
- * Wire envelope for a browser-sealed dashboard write.
- *
- * Under the `encrypted` dashboard-write posture the browser seals the plaintext
- * value to the orchestrator's published X25519 encryption key before it leaves
- * the page, so the hosted Platform relays only opaque ciphertext. The envelope
- * is the exact shape the orchestrator's `decryptDashboardSealedWrite` consumes:
- * an ephemeral X25519 public key (base64 DER-SPKI) and the AES-256-GCM output
- * packed as `IV || authTag || ciphertext` (base64), plus the `keyId` (`kid`)
- * naming which published encryption key the browser sealed to.
- *
- * Browser-safe: pure Zod, no node built-ins, so the dashboard SPA imports it
- * directly.
+ * Wire envelope for a browser-sealed dashboard write. Under the `encrypted`
+ * posture the browser seals the value to the orchestrator's published X25519
+ * key before it leaves the page, so the hosted Platform relays only opaque
+ * ciphertext. The shape is exactly what the orchestrator's
+ * `decryptDashboardSealedWrite` consumes. Pure Zod: the dashboard SPA imports it.
  */
 import { z } from 'zod';
 
@@ -26,12 +19,10 @@ export const dashboardSealedEnvelopeSchema = z.object({
 export type DashboardSealedEnvelope = z.infer<typeof dashboardSealedEnvelopeSchema>;
 
 /**
- * The orchestrator's published X25519 dashboard-encryption public key, as an
- * OKP JWK (`kty:'OKP'`, `crv:'X25519'`, `use:'enc'`, `x` = the raw 32-byte
- * public key base64url-encoded, `kid` = its RFC 7638 thumbprint).
- *
- * `.passthrough()` because a JWK may legitimately carry members a given peer
- * does not know; only the members the seal actually needs are validated.
+ * The orchestrator's published X25519 dashboard-encryption public key as an
+ * OKP JWK: `x` is the raw 32-byte key base64url-encoded, `kid` its RFC 7638
+ * thumbprint. `.passthrough()` because a JWK may carry members a peer does not
+ * know; only the members the seal needs are validated.
  */
 export const dashboardEncryptionJwkSchema = z
   .object({
@@ -46,10 +37,9 @@ export const dashboardEncryptionJwkSchema = z
 export type DashboardEncryptionJwk = z.infer<typeof dashboardEncryptionJwkSchema>;
 
 /**
- * Structured error codes the orchestrator returns (in a `.set.response`
- * `error` field) when a sealed / plaintext write cannot be honored under the
- * `encrypted` posture. The dashboard renders a fail-closed affordance keyed on
- * these codes — never a silent fallback to plaintext-through-Platform.
+ * Error codes in a `.set.response` `error` field when a write cannot be honored
+ * under the `encrypted` posture. The dashboard renders a fail-closed affordance
+ * keyed on them, never a silent fallback to plaintext through the Platform.
  */
 export const DashboardSealedWriteError = z.enum([
   // A plaintext `value` arrived for an `encrypted`-posture op (fail-closed).

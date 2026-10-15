@@ -1,38 +1,23 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * `event_log` cold-store schema additions plus removal of the
- * `expires_at`-based 30-day hard delete.
+ * `event_log` cold-store schema: adds the `archived_at` /
+ * `archive_object_key` pair `007_audit_logs_archived_at.ts` added elsewhere
+ * (set inside the archive transaction before the DELETE; survivors carry
+ * NULL) and removes the `expires_at`-based 30-day hard delete.
  *
- * Part of the cold-storage archival system.
+ * `idx_event_log_routing_received` exists because the cold-store partitions
+ * `event_log` by `routing_key` (NOT NULL here, so no synthetic-tenant
+ * fallback); `event_log_org_received_idx` is keyed by `org_id` and does not
+ * serve the per-tenant archiver scan.
  *
- * Adds the same `archived_at TIMESTAMPTZ NULL` /
- * `archive_object_key TEXT NULL` pair
- * `007_audit_logs_archived_at.ts` added on this side. Set inside the archive
- * transaction before the DELETE; survivors carry NULL.
+ * Rows older than 30 days are now archived rather than deleted; the per-row
+ * `payload_key` blob is retained indefinitely so the dashboard
+ * delivery-detail page can still load the body of archived deliveries.
  *
- * Adds `idx_event_log_routing_received` on `(routing_key, received_at)`
- * because the orchestrator-side cold-store partitions `event_log` by
- * `routing_key` (NOT NULL on this table; no synthetic-tenant fallback
- * is needed). The existing `event_log_org_received_idx` is keyed by
- * `org_id`, fine for dashboard queries but not the per-tenant
- * archiver scan.
- *
- * Drops `event_log.expires_at` and the matching
- * `event_log_expires_at_idx` index. Before this migration, `expires_at`
- * powered the 30-day hard-delete sweep in
- * `packages/orchestrator/src/webhook/event-log.ts:cleanup`, called
- * from `packages/orchestrator/src/queue/cleanup.ts:runCleanup` step 4
- * (which also deleted the per-row `payload_key` blob from object
- * storage). With cold-store, rows older than 30 days are archived
- * rather than deleted; the per-row `payload_key` blob is retained
- * indefinitely so the dashboard delivery-detail page can still load
- * the body for archived deliveries.
- *
- * Per the project's "no backward compatibility (pre-release)" rule,
- * `down()` recreates `expires_at` with a default of `now() + 30 days`
- * — best effort; rows inserted between `up()` and a hypothetical
- * `down()` would not have meaningful retention bounds.
+ * `down()` recreates `expires_at` defaulting to `now() + 30 days` — best
+ * effort; rows inserted between `up()` and `down()` get no meaningful
+ * retention bound.
  */
 
 export async function up(db: Kysely<unknown>): Promise<void> {

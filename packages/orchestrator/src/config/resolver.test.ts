@@ -47,9 +47,7 @@ function makeMinimalShared(overrides?: Partial<SharedConfig>): SharedConfig {
   };
 }
 
-// ──────────────────────────────────────────────────────────────────────────
 // env-overlay.ts tests
-// ──────────────────────────────────────────────────────────────────────────
 
 describe('envKeyToConfigPath', () => {
   it('maps KICI_DATABASE_URL to database.url path', () => {
@@ -331,9 +329,7 @@ describe('applyEnvOverrides', () => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────────────────
 // resolver.ts tests
-// ──────────────────────────────────────────────────────────────────────────
 
 describe('getDefaults', () => {
   it('returns default values for shared config fields', () => {
@@ -349,7 +345,6 @@ describe('resolveLocalConfig', () => {
 
   beforeEach(async () => {
     tmpDir = await createTmpDir();
-    // Save and clear relevant env vars
     for (const key of Object.keys(process.env)) {
       if (key.startsWith('KICI_')) {
         savedEnv[key] = process.env[key];
@@ -360,7 +355,6 @@ describe('resolveLocalConfig', () => {
 
   afterEach(async () => {
     await rm(tmpDir, { recursive: true, force: true });
-    // Restore env vars
     for (const [key, val] of Object.entries(savedEnv)) {
       if (val !== undefined) process.env[key] = val;
       else delete process.env[key];
@@ -520,9 +514,8 @@ describe('resolveFullConfig', () => {
     expect(result.port).toBe(5000);
   });
 
-  it('legacy DATABASE_URL is ignored (P5: only KICI_DATABASE_URL accepted)', () => {
-    // P5 of the env-var standardization plan removed DATABASE_URL from the
-    // legacy map — only KICI_DATABASE_URL is honored now.
+  it('legacy DATABASE_URL is ignored (only KICI_DATABASE_URL accepted)', () => {
+    // The unprefixed DATABASE_URL is ignored — only KICI_DATABASE_URL is honored.
     const localConfig = makeMinimalLocal();
     const dbConfig = makeMinimalShared();
     const env = { DATABASE_URL: 'pg://legacy' };

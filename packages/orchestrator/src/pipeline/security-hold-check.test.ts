@@ -21,10 +21,9 @@ import {
 /**
  * A `held_runs` row with every column the predicate reads.
  *
- * `posted_pending_check` defaults to `null` — a row written before the column
- * existed, which is the only shape for which the shape derivation still
- * answers. Every row written since carries `false` until the post lands, so a
- * case that means "this hold posted" says so explicitly.
+ * `posted_pending_check` defaults to `null` (a row written before the column
+ * existed), the only shape the shape derivation still answers for. Newer rows
+ * carry `false` until the post lands, so a case meaning "this hold posted" says so.
  */
 function hold(overrides: Partial<SecurityCheckHold> = {}): SecurityCheckHold {
   return {
@@ -57,9 +56,8 @@ function makeDb(opts: { runRow?: unknown; contenders?: unknown[] } = {}) {
 }
 
 /**
- * Every hold shape, and whether it put a pending `KiCI Security` check on its
- * commit. Read off the three sites that post that pending status, not off the
- * queue type — which cannot make the distinction, because a security-typed
+ * Every hold shape, and whether it posted a pending `KiCI Security` check. Read
+ * off the sites that post that status, not the queue type: a security-typed
  * install gate carries `queue_type = 'security'` and posts nothing.
  */
 describe('postedPendingSecurityCheck', () => {
@@ -77,9 +75,8 @@ describe('postedPendingSecurityCheck', () => {
         hold({
           hold_scope: HoldScope.enum.workflow,
           job_id: installGateJobId('CI'),
-          // The install gate is written through `createHold`, so it carries a
-          // requirement — the clause that would otherwise accept it. Its job id
-          // is checked first for exactly this reason.
+          // Written through `createHold`, so it carries a requirement (the clause
+          // that would otherwise accept it); hence its job id is checked first.
           approval_requirement: REQUIREMENT,
         }),
       ),
@@ -87,9 +84,8 @@ describe('postedPendingSecurityCheck', () => {
   });
 
   it("recognises the SDK's workflow-level requireApproval, whose job_id is a job name", () => {
-    // Not a `SECURITY_HOLD_JOB_IDS` sentinel and not the install prefix — a
-    // predicate keyed on the sentinel alone would miss it and leave its check
-    // pending forever.
+    // Neither a `SECURITY_HOLD_JOB_IDS` sentinel nor the install prefix: a
+    // sentinel-only predicate would leave its check pending forever.
     expect(
       postedPendingSecurityCheck(
         hold({
@@ -131,11 +127,9 @@ describe('postedPendingSecurityCheck', () => {
   });
 
   it('answers false for a shape that would post, whose post never landed', () => {
-    // The mirror of the stuck check. Every shape above says what the code
-    // MEANT to post; a provider that refused the call, or a dispatch that
-    // reached no check poster, leaves the shape unchanged and the commit with
-    // nothing. Terminalizing then CREATES a completed `KiCI Security` run on a
-    // commit that never had one — a failing check on a pull request that
+    // The mirror of the stuck check. A shape says what the code MEANT to post; a
+    // refused call or a dispatch with no check poster leaves the commit with
+    // nothing, and terminalizing would CREATE a failing `KiCI Security` check
     // nothing put there.
     expect(postedPendingSecurityCheck(hold({ posted_pending_check: false }))).toBe(false);
     expect(
@@ -155,8 +149,7 @@ describe('postedPendingSecurityCheck', () => {
   });
 
   it('answers true for a recorded post, whatever the shape would have said', () => {
-    // The recorded fact is the answer in both directions, so a hold whose shape
-    // reads "posts nothing" still settles a check it demonstrably posted.
+    // The recorded fact wins both ways: a "posts nothing" shape still settles a check it posted.
     expect(
       postedPendingSecurityCheck(
         hold({ hold_type: HoldType.enum.timer, posted_pending_check: true }),
@@ -211,16 +204,15 @@ describe('buildHoldEndedSummary', () => {
   });
 
   it('names the job, not the run, at job scope', () => {
-    // A rejected job-scoped hold does not cancel the run — its sibling jobs
-    // keep going — so the run-scoped sentence would be false.
+    // A rejected job-scoped hold does not cancel the run; siblings keep going.
     expect(
       buildHoldEndedSummary({ outcome: HoldOutcome.Rejected, scope: HoldScope.enum.job }),
     ).toContain('A job in this run was cancelled before it started.');
     expect(
       buildHoldEndedSummary({ outcome: HoldOutcome.Expired, scope: HoldScope.enum.job }),
     ).toContain('The approval window for a job in this run elapsed');
-    // An approve at job scope releases ONE job. A still-pending step-approval
-    // hold on the same run makes the run-wide sentence false.
+    // A job-scope approve releases ONE job; a pending step-approval hold on the
+    // run makes the run-wide sentence false.
     expect(
       buildHoldEndedSummary({
         outcome: HoldOutcome.Approved,
@@ -231,9 +223,9 @@ describe('buildHoldEndedSummary', () => {
   });
 
   it('names the rejecter when the surface did not write one into the reason', () => {
-    // The dashboard / CLI / MCP applier passes the actor and, with no reason
-    // typed, nothing else — so without this clause the summary carried no
-    // attribution at all, while `/kici reject` kept its own inside `reason`.
+    // The dashboard / CLI / MCP applier passes only the actor when no reason is
+    // typed, so this clause is the summary's only attribution (`/kici reject`
+    // carries its own inside `reason`).
     expect(
       buildHoldEndedSummary({
         outcome: HoldOutcome.Rejected,
@@ -373,8 +365,7 @@ describe('settleSecurityHoldCheck', () => {
   });
 
   it('ignores the ending hold itself in the contention query', async () => {
-    // The row is still `pending` in a sweep that has not flipped its batch yet,
-    // so without the exclusion every hold would refuse on account of itself.
+    // Mid-sweep the row is still `pending`, so without the exclusion every hold refuses itself.
     const postCheckStatus = poster();
     const result = await settleSecurityHoldCheck({
       db: makeDb({ contenders: [hold()] }),
@@ -410,10 +401,9 @@ describe('settleSecurityHoldCheck', () => {
   });
 
   it('writes nothing for a hold whose pending post never reached the provider', async () => {
-    // The fabrication case: the shape says this hold posts, the record says the
-    // post did not land. `postCheckStatus` CREATES the run when it finds none,
-    // so posting a terminal status here would put a completed `KiCI Security`
-    // check on a commit that never carried one.
+    // The fabrication case: the shape says it posts, the record says the post
+    // did not land. `postCheckStatus` CREATES a missing run, so a terminal post
+    // would add a completed `KiCI Security` check to a commit that never had one.
     const postCheckStatus = poster();
     const result = await settleSecurityHoldCheck({
       db: makeDb(),
@@ -426,9 +416,8 @@ describe('settleSecurityHoldCheck', () => {
   });
 
   it('ignores a pending hold whose own post never landed', async () => {
-    // The same fact read through the contention query. A hold that posted
-    // nothing owns nothing, so it cannot hold the check open for the hold that
-    // did — which would leave a real pending check with no remaining writer.
+    // The same fact via the contention query: a hold that posted nothing cannot
+    // hold the check open, or a real pending check is left with no writer.
     const postCheckStatus = poster();
     const result = await settleSecurityHoldCheck({
       db: makeDb({
@@ -442,15 +431,11 @@ describe('settleSecurityHoldCheck', () => {
   });
 
   it('projects every column the ownership predicate reads into the contention query', async () => {
-    // The contention query names its columns, so one the predicate reads and
-    // the projection omits arrives `undefined` — and the predicate then answers
-    // from a partial row with nothing failing at runtime. No test driven through
-    // `createMockDb` can see that: the harness returns `selectRows` verbatim,
-    // never consulting the select list. The compiler does catch a dropped column
-    // today, but only because every field of `SecurityCheckHold` is REQUIRED —
-    // make one optional and the projection may silently shrink again. The
-    // fixture's own keys are the list, so a field added to that interface must
-    // be projected to pass here.
+    // A column the predicate reads but the projection omits arrives `undefined`,
+    // and the predicate silently answers from a partial row. `createMockDb`
+    // returns `selectRows` verbatim, ignoring the select list; the compiler
+    // catches it only while every `SecurityCheckHold` field is REQUIRED. The
+    // fixture's keys are the list, so a new interface field must be projected.
     const mock = createMockDb({ selectFirstRow: RUN_ROW, selectRows: [] });
     await settleSecurityHoldCheck({
       db: mock.db,
@@ -500,8 +485,7 @@ describe('settleSecurityHoldCheck', () => {
   });
 
   it('names no commit, and posts nothing, when there is no database', async () => {
-    // The commit coordinates come from `execution_runs`, so with no database in
-    // reach there is nothing to address a check run to.
+    // The commit coordinates come from `execution_runs`; no database, no address.
     const postCheckStatus = poster();
     const result = await settleSecurityHoldCheck({
       db: undefined,
@@ -534,10 +518,8 @@ describe('settleSecurityCheckForOutcome', () => {
 });
 
 /**
- * The applier's entry point holds a KiCI subject id, and the summary it produces
- * is published on a public commit check. Every case below asserts on the SUMMARY
- * the poster received, not on the argument handed inward — a subject that leaks
- * leaks in that string.
+ * The applier holds a KiCI subject id, and its summary is published on a public
+ * commit check, so every case asserts on the SUMMARY the poster received.
  */
 describe('settleSecurityCheckForDecision', () => {
   const settle = async (
@@ -566,9 +548,7 @@ describe('settleSecurityCheckForDecision', () => {
   });
 
   it('names an approver generically when the subject resolves to no account', async () => {
-    // The leak this closes: the raw subject reaching contributor-facing copy on
-    // a commit check anyone can open. Unattributed is the safe answer, not a
-    // fallback to the id.
+    // The raw subject must never reach a public commit check: unattributed, never the id.
     const summary = await settle({
       actorSub: 'b2c3d4e5-0000-4000-8000-111122223333',
       resolveDisplayName: () => undefined,

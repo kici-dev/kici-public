@@ -3,20 +3,15 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration, migrateToPreviousMigration } from '../migration-test-harness.js';
 import * as m142 from './142_sweep_deprecated_columns.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 142, the deprecated-column sweep.
+ * Real-Postgres test for migration 142, the deprecated-column sweep. Gated on
+ * `KICI_TEST_ADMIN_DATABASE_URL`.
  *
- * Half of it is a DATA migration (the `known` trust tier, the `reject` fork
- * switch, and the `known` context floor are rewritten), so the suite straddles
- * it: migrate to the migration before this one, seed the rows an upgraded
- * database holds — including values in every column the sweep drops — then
- * migrate to 142 and assert what moved and what is gone. Seeding after
- * `migrateToOwnMigration()` is impossible for the dropped columns, and would
- * leave the rewrites asserting against rows the migration never saw.
- *
- * Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Part of it is a DATA migration, so the suite straddles it: migrate to the previous migration,
+ * seed the rows an upgraded database holds (including a value in every dropped column), then
+ * migrate to 142 and assert what moved and what is gone.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -93,11 +88,8 @@ describeDb('migration 142_sweep_deprecated_columns', () => {
     const before = await migrateToPreviousMigration(db, import.meta.url);
     if (before.error) throw before.error;
 
-    // 2. The rows an upgraded database actually holds. Every seeded value below
-    //    is one the current code can no longer write: the retired `known` tier
-    //    and floor, the retired `reject` switch, and a value in each column the
-    //    sweep drops (the two arm columns are NOT NULL at 141, so the policy
-    //    rows must name them).
+    // 2. The rows an upgraded database holds: values current code can no longer write, and one
+    //    in each dropped column (the arm columns are NOT NULL at 141, so policy rows name them).
     await sql`
       INSERT INTO public.execution_runs
         (run_id, workflow_name, provider, repo_identifier, ref, sha, trust_tier)
@@ -134,9 +126,8 @@ describeDb('migration 142_sweep_deprecated_columns', () => {
               'sha142', 'd-142', 'rk-142', 'deadbeef')
     `.execute(db);
 
-    // 3. The migration under test, and only it. The harness throws if the call
-    //    applied nothing, so a suite that had already reached 142 before the
-    //    rows went in fails loudly instead of asserting against untouched rows.
+    // 3. Only the migration under test. The harness throws if it applied nothing, so a suite
+    //    already at 142 before seeding fails loudly.
     const after = await migrateToOwnMigration(db, import.meta.url);
     if (after.error) throw after.error;
     const applied = (after.results ?? []).map((r) => r.migrationName);
@@ -230,8 +221,7 @@ describeDb('migration 142_sweep_deprecated_columns', () => {
   });
 
   it('up() is idempotent', async () => {
-    // A second run finds no legacy value and no column to drop; every statement
-    // is guarded, so it must complete rather than throw on the missing columns.
+    // Every statement is guarded, so a re-run completes rather than throwing on missing columns.
     await expect(m142.up(db)).resolves.toBeUndefined();
     expect(await trustTierOf(RUN_TRUSTED)).toBe('trusted');
   });

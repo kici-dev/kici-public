@@ -1,9 +1,4 @@
-/**
- * Tests for platform detection and directory resolution.
- *
- * Mocks os.platform(), os.homedir(), fs.existsSync(), and process.env
- * to cover all platform/privilege combinations.
- */
+/** Mocks os, fs.existsSync and process.env to cover every platform/privilege combination. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import os from 'node:os';
@@ -51,7 +46,6 @@ describe('platform-detect', () => {
   beforeEach(() => {
     originalGetuid = process.getuid;
     savedEnv = { ...process.env };
-    // Reset to defaults
     mockedPlatform.mockReturnValue('linux');
     mockedHomedir.mockReturnValue('/home/testuser');
     mockedExistsSync.mockReturnValue(false);
@@ -182,7 +176,6 @@ describe('platform-detect', () => {
   });
 
   describe('name-scoped config + log dirs', () => {
-    // Different service names produce different per-instance dirs.
     it('different service names produce different configDir paths', () => {
       mockedPlatform.mockReturnValue('linux');
       mockedHomedir.mockReturnValue('/home/u');
@@ -190,7 +183,6 @@ describe('platform-detect', () => {
       expect(getConfigDir('kici-bar', true)).toBe('/home/u/.config/kici/kici-bar/');
     });
 
-    // Linux user
     it('user-level Linux configDir uses the service name', () => {
       mockedHomedir.mockReturnValue('/home/u');
       mockedPlatform.mockReturnValue('linux');
@@ -202,7 +194,6 @@ describe('platform-detect', () => {
       expect(getLogDir('kici-foo', true)).toBe('/home/u/.local/share/kici/kici-foo/logs/');
     });
 
-    // Linux system
     it('system Linux configDir uses the service name', () => {
       mockedPlatform.mockReturnValue('linux');
       expect(getConfigDir('kici-foo', false)).toBe('/etc/kici/kici-foo/');
@@ -212,7 +203,6 @@ describe('platform-detect', () => {
       expect(getLogDir('kici-foo', false)).toBe('/var/log/kici/kici-foo/');
     });
 
-    // macOS user
     it('user-level macOS configDir uses the service name', () => {
       mockedHomedir.mockReturnValue('/Users/u');
       mockedPlatform.mockReturnValue('darwin');
@@ -226,7 +216,6 @@ describe('platform-detect', () => {
       expect(getLogDir('kici-foo', true)).toBe('/Users/u/Library/Logs/kici/kici-foo/');
     });
 
-    // macOS system
     it('system macOS configDir uses the service name', () => {
       mockedPlatform.mockReturnValue('darwin');
       expect(getConfigDir('kici-foo', false)).toBe('/etc/kici/kici-foo/');
@@ -236,7 +225,6 @@ describe('platform-detect', () => {
       expect(getLogDir('kici-foo', false)).toBe('/var/log/kici/kici-foo/');
     });
 
-    // Windows user
     it('user-level Windows configDir uses the service name', () => {
       process.env.LOCALAPPDATA = 'C:\\Users\\u\\AppData\\Local';
       mockedPlatform.mockReturnValue('win32');
@@ -247,7 +235,6 @@ describe('platform-detect', () => {
       expect(getLogDir('kici-foo', true)).toBe('C:\\ProgramData\\kici\\kici-foo\\logs\\');
     });
 
-    // Windows system
     it('system Windows configDir uses the service name', () => {
       mockedPlatform.mockReturnValue('win32');
       expect(getConfigDir('kici-foo', false)).toBe('C:\\ProgramData\\kici\\kici-foo\\');

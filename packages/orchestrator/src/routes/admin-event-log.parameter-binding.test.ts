@@ -1,44 +1,29 @@
 /**
  * Event-log query parameter-binding tripwire.
  *
- * The orchestrator's `GET /api/v1/admin/event-log` handler accepts a
- * dozen filter parameters from the query string (`orgId`, `routingKey`,
- * `event`, `action`, `status`, `from`, `to`, `deliveryId`, …) and
- * applies each one to the underlying SQL via Kysely's parameterized
- * `where()` API. Two failure modes would catastrophically widen the
+ * `GET /api/v1/admin/event-log` applies each query-string filter (`orgId`,
+ * `routingKey`, `event`, `action`, `status`, `from`, `to`, `deliveryId`, …)
+ * through Kysely's parameterized `where()`. Two failure modes would widen the
  * attack surface:
  *
- *  1. **SQL injection.** If a future refactor swapped `.where('event',
- *     '=', event)` for `.whereRaw(\`event = '\${event}'\`)` (or a
- *     `sql\`event = '\${event}'\`` template literal that interpolated
- *     the user-supplied string into the SQL fragment), an attacker
- *     supplying `event=' OR 1=1 --` could escape the WHERE clause and
- *     dump rows beyond what their role would normally view, or
- *     UNION-pull data from other tables (admin_tokens, scoped_secrets,
- *     audit_log).
+ *  1. **SQL injection.** Swapping `.where('event', '=', event)` for
+ *     `.whereRaw(\`event = '\${event}'\`)` (or an interpolating `sql\`\``
+ *     template) would let `event=' OR 1=1 --` escape the WHERE clause, dump
+ *     rows beyond the role's view, or UNION-pull other tables (admin_tokens,
+ *     scoped_secrets, audit_log).
  *
- *  2. **Permission-after-query.** If the RBAC `event_log.read` check
- *     ran AFTER the `selectFrom('event_log')` query was built and
- *     executed, an unauthenticated caller could observe DB-level side
- *     effects (load on the event_log table, query timing) that an
- *     authenticated caller would. More important: it would allow the
- *     query to run at all for unauthorized callers, and a future bug
- *     might forget the role check entirely.
+ *  2. **Permission-after-query.** An RBAC `event_log.read` check AFTER the
+ *     query is built and executed lets the query run for unauthorized callers,
+ *     exposes DB-level side effects (table load, query timing), and leaves a
+ *     forgotten role check undetected.
  *
- * Trust model (must hold):
- *
- *   For an attacker holding an operator token, the parameter-binding
- *   gate is what prevents an authenticated-but-low-privilege role
- *   from escaping into restricted tables. Single-tenant orchestrator
- *   means there's no per-row authorization layer to leak via timing
- *   ("row exists but you can't see it"); any role with `event_log.read`
- *   sees ALL event_log rows by construction. The injection vector
- *   (cross-table read) and the order-of-operations vector (RBAC
- *   before DB work) are the two that matter.
- *
- *   For an external, unauthenticated attacker, the bearer-token
- *   middleware is the perimeter gate; this test
- *   layers the RBAC + parameter-binding invariants on top.
+ * Trust model (must hold): for an operator-token holder, parameter binding is
+ * what keeps a low-privilege role out of restricted tables. A single-tenant
+ * orchestrator has no per-row authorization to leak via timing; any role with
+ * `event_log.read` sees ALL event_log rows by construction. So injection
+ * (cross-table read) and order of operations (RBAC before DB work) are the two
+ * vectors that matter. For an unauthenticated attacker the bearer-token
+ * middleware is the perimeter; this test layers RBAC + binding on top.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createAdminEventLogRoutes } from './admin-event-log.js';
@@ -85,9 +70,7 @@ describe('GET /api/v1/admin/event-log parameter-binding invariants', () => {
       const { db, mocks, tokenManager, rbac, logStorage } = makeDeps({});
       const app = createAdminEventLogRoutes({ db, tokenManager, rbac, logStorage });
 
-      // A bouquet of injection-shaped strings, one per filter. If any of
-      // these is interpolated into a SQL fragment instead of being
-      // parameter-bound, the orchestrator is in serious trouble.
+      // One injection-shaped string per filter.
       const evil = {
         orgId: "org-1' OR '1'='1",
         routingKey: "github:42'; DROP TABLE admin_tokens; --",
@@ -105,28 +88,20 @@ describe('GET /api/v1/admin/event-log parameter-binding invariants', () => {
 
       expect(res.status).toBe(200);
 
-      // Collect every where() call. The handler runs the query twice
-      // (data query + count query), so each filter is bound twice.
+      // The handler runs a data query and a count query, so each filter is
+      // bound twice.
       const whereCalls = (mocks.selectWhere as ReturnType<typeof vi.fn>).mock.calls;
 
-      // For every evil value, find the matching .where() call and
-      // assert the value is the raw string, NOT an interpolated SQL
-      // fragment. Kysely's `.where(column, op, value)` form is the
-      // ONLY safe form: `value` is bound as a query parameter.
+      // `.where(column, op, value)` is the ONLY safe form: `value` is bound as
+      // a query parameter.
       const assertBound = (column: string, op: string, value: string) => {
         const matches = whereCalls.filter((c) => c[0] === column);
         expect(matches.length).toBeGreaterThan(0);
-        // Both data and count queries should have produced this where
-        // call (handler dedupes its filter logic across both queries).
         for (const call of matches) {
           expect(call[1]).toBe(op);
-          // The critical assertion: the value must be the EXACT raw
-          // string the attacker supplied. Any place that reshaped it
-          // (string concat, template literal into SQL, etc.) would
-          // fail this assertion.
+          // The EXACT raw string: any reshaping (concat, template into SQL)
+          // fails here.
           expect(call[2]).toBe(value);
-          // Belt-and-suspenders: the value must NOT have been wrapped
-          // in something that looks like a Kysely raw SQL fragment.
           // Raw SQL nodes from `sql\`\`` are objects, not strings.
           expect(typeof call[2]).toBe('string');
         }
@@ -137,10 +112,8 @@ describe('GET /api/v1/admin/event-log parameter-binding invariants', () => {
       assertBound('event', '=', evil.event);
       assertBound('action', '=', evil.action);
       assertBound('status', '=', evil.status);
-      // delivery_id uses LIKE with the raw value wrapped in '%...%'.
-      // The wrap is a Kysely-bound value (the % chars are part of the
-      // pattern, but the value itself is parameter-bound — no SQL
-      // interpolation).
+      // delivery_id uses LIKE with the raw value wrapped in '%...%', still
+      // parameter-bound.
       const deliveryIdCalls = whereCalls.filter((c) => c[0] === 'delivery_id');
       expect(deliveryIdCalls.length).toBeGreaterThan(0);
       for (const call of deliveryIdCalls) {
@@ -163,15 +136,12 @@ describe('GET /api/v1/admin/event-log parameter-binding invariants', () => {
         headers: { Authorization: 'Bearer test-token' },
       });
 
-      // Unauthorized — the handler's catch path returns the 403.
       expect(res.status).toBe(403);
 
-      // The critical invariant: the DB was never queried. A future
-      // refactor that built the query before the role check would
-      // fail this assertion.
+      // The DB was never queried: building the query before the role check
+      // fails here.
       expect(mocks.selectFrom).not.toHaveBeenCalled();
 
-      // And the RBAC enforcer was called.
       expect(vi.mocked(rbac.requirePermission)).toHaveBeenCalledWith('admin', 'event_log.read');
     });
 
@@ -203,7 +173,6 @@ describe('GET /api/v1/admin/event-log parameter-binding invariants', () => {
 
       const res = await app.request('/api/v1/admin/event-log', {
         method: 'GET',
-        // no Authorization header
       });
 
       expect(res.status).toBe(401);

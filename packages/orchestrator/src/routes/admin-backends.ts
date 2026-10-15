@@ -1,12 +1,7 @@
 /**
- * Admin API routes for secret backend management.
- *
- * Provides CRUD, connectivity testing, and sync endpoints for managing
- * secret backends (PG, Vault) through the admin API. Backend credentials
- * are stored encrypted at rest and never exposed in API responses.
- *
- * All routes are mounted under /api/v1/admin/backends and protected by
- * the admin auth middleware in admin.ts.
+ * Admin API CRUD, connectivity test and sync for secret backends (PG, Vault).
+ * Backend credentials are encrypted at rest and never exposed in responses.
+ * Mounted under /api/v1/admin/backends behind the admin auth middleware in admin.ts.
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
@@ -34,21 +29,14 @@ interface BackendRouteDeps {
   syncManager?: BackendSyncManager;
 }
 
-/**
- * Create admin API routes for secret backend management.
- *
- * @param deps - Backend route dependencies (registry, health checker, sync manager)
- * @returns Hono app with backend routes
- */
 export function createBackendRoutes(deps: BackendRouteDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
 
-  // Secret-backend management is orchestrator-wide; routing-key tokens
-  // are refused at the router level.
+  // Orchestrator-wide; routing-key tokens are refused at the router level.
   app.use('/backends', requireUnscoped);
   app.use('/backends/*', requireUnscoped);
 
-  // ── Static POST routes (must be before parameterized :name routes) ──
+  // Static POST routes must precede the parameterized :name routes.
 
   app.post('/backends', async (c) => {
     const body = await c.req.json();
@@ -106,7 +94,7 @@ export function createBackendRoutes(deps: BackendRouteDeps): Hono<AdminEnv> {
   app.delete('/backends/:name', async (c) => {
     const name = c.req.param('name');
 
-    // Get scope count before removal for response
+    // Read before removal: the response reports its scope count.
     const backend = await deps.registry.getBackend(name);
     if (!backend) {
       return c.json({ error: 'Backend not found' }, 404);
@@ -187,9 +175,6 @@ export function createBackendRoutes(deps: BackendRouteDeps): Hono<AdminEnv> {
   return app;
 }
 
-/**
- * Convert a BackendDescriptor to a JSON-safe object.
- */
 function descriptorToJson(d: BackendDescriptor): Record<string, unknown> {
   return {
     id: d.id,

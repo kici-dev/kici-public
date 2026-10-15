@@ -1,10 +1,8 @@
 /**
- * Agent fleet mini-bundle assembler.
- *
- * Builds an in-memory ZIP of the agent's recent logs, system info, redacted
- * config, and current Prometheus metrics text, streamed to the orchestrator on
- * a fleet.logs.request. No diagnostics runner exists agent-side, so this is a
- * lean subset of the orchestrator's createDebugBundle.
+ * In-memory ZIP of the agent's recent logs, system info, redacted config and
+ * Prometheus metrics, streamed to the orchestrator on a fleet.logs.request: a
+ * lean subset of the orchestrator's createDebugBundle, as the agent has no
+ * diagnostics runner.
  */
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -57,11 +55,8 @@ export async function buildAgentMiniBundle(opts: AgentMiniBundleOptions): Promis
     { name: 'system/info.json' },
   );
   if (opts.metricsText) archive.append(opts.metricsText, { name: 'system/metrics.txt' });
-  // Guard on existence (mirrors the orchestrator's createDebugBundle): a
-  // set-but-missing KICI_LOG_DIR would otherwise make addLogsToArchive's
-  // readdirSync throw and abort the whole bundle, so the operator would get a
-  // fleet.bundle.error instead of the manifest/config/system/metrics already
-  // collected — exactly when a diagnostics bundle is most needed.
+  // As in createDebugBundle: a set-but-missing KICI_LOG_DIR would throw in
+  // addLogsToArchive and turn the whole bundle into a fleet.bundle.error.
   if (opts.logDir && fs.existsSync(opts.logDir)) {
     await addLogsToArchive(archive, opts.logDir, opts.logWindowHours);
   }

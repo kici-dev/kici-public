@@ -5,8 +5,7 @@ import type { Database, NewScalerPendingClaimRow, ScalerSpawningAgentRow } from 
 import type { ScalerEvent } from './types.js';
 
 /**
- * Snapshot of a spawning-agent record. Mirrors the row shape in
- * `scaler_spawning_agents`.
+ * A `scaler_spawning_agents` row.
  *
  * The ownership and self-describing fields are optional: a row written before a
  * coordinator instance id was known carries none of them, and an absent
@@ -24,19 +23,15 @@ export interface SpawningAgentSnapshot {
   ownerInstanceId?: string;
   /** The coordinator the agent actually reached when it registered. */
   adoptedBy?: string;
-  /** When the adopting coordinator claimed the agent. */
   adoptedAt?: Date;
-  /** The scaler's mandatory labels, copied onto the row at spawn time. */
+  /** Copied from the scaler at spawn time, as are `provisioningTargets` and `roles`. */
   mandatoryLabels?: string[];
-  /** The scaler's provisioning targets, copied onto the row at spawn time. */
   provisioningTargets?: string[];
-  /** The scaler's roles, copied onto the row at spawn time. */
   roles?: string[];
-  /** The scaler backend that spawned the agent. */
   backendType?: string;
 }
 
-/** A pending provisioning claim, as written by the event scaler's claim store. */
+/** Written by the event scaler's claim store. */
 export interface PendingClaimRow {
   claimHash: string;
   claimPrefix: string;
@@ -48,7 +43,6 @@ export interface PendingClaimRow {
   expiresAt: Date;
 }
 
-/** What a successful `redeemClaim` returns. */
 export interface RedeemedClaim {
   agentId: string;
   labels: string[];
@@ -62,21 +56,21 @@ export interface RedeemedClaim {
  */
 export interface ScalerCapSlot {
   /**
-   * Live event-scaler spawn rows for this scaler across every coordinator.
-   * Read inside the advisory-locked transaction, so no other holder of the
-   * lock can change it while the caller decides.
+   * Live event-scaler spawn rows for this scaler across every coordinator,
+   * read inside the advisory-locked transaction so no other lock holder can
+   * change it while the caller decides.
    */
   clusterActiveCount: number;
   /**
    * Claim a slot by writing the spawn row in the same transaction the count
-   * was read in. Counting without claiming here bounds nothing: the spawn row
-   * is otherwise written well after the check, so every coordinator arriving
-   * in that window reads the same pre-spawn count and admits.
+   * was read in. Counting without claiming bounds nothing: the spawn row is
+   * otherwise written well after the check, so every coordinator arriving in
+   * that window reads the same pre-spawn count and admits.
    */
   reserve(snapshot: SpawningAgentSnapshot): Promise<void>;
   /**
-   * Whether this scaler already holds a spawn row bound to `jobId` on any
-   * coordinator. Read inside the same locked transaction as the claim.
+   * Whether this scaler holds a spawn row bound to `jobId` on any coordinator,
+   * read inside the same locked transaction as the claim.
    */
   hasProvisionForJob(jobId: string): Promise<boolean>;
 }
@@ -89,76 +83,63 @@ export interface ReapCandidate {
   ownerInstanceId?: string;
   adoptedBy?: string;
   /**
-   * When the provision was requested. The reaper ages every row on this and
-   * never on `adopted_at`: a coordinator that re-adopts its own agent refreshes
-   * `adopted_at`, so a restart loop on the adopter would keep resetting the
-   * clock on its own stranded provision and the row would never age out.
+   * The reaper ages every row on this, never on `adopted_at`: a coordinator
+   * that re-adopts its own agent refreshes `adopted_at`, so a restart loop on
+   * the adopter would keep resetting the clock and the row would never age out.
    */
   spawnedAt: Date;
   /**
-   * The run this provision was spawned for, when it was job-bound. Carried so a
-   * teardown for a provision that never registered can be attributed back to the
-   * job that is still waiting on it — the reaper is leader-gated, so the
-   * coordinator that condemns the row is often not the one that spawned it and
-   * has no in-memory spawning entry to read the identity from.
+   * Set when job-bound, so a teardown of a never-registered provision can be
+   * attributed to the waiting job: the reaper is leader-gated, so the
+   * condemning coordinator often did not spawn the row and has no in-memory
+   * spawning entry to read the identity from.
    */
   runId?: string;
-  /** The queued job this provision was spawned for. Absent for a warm fill. */
+  /** Absent for a warm fill. */
   boundJobId?: string;
 }
 
-/**
- * Snapshot of an agent-job correlation. Mirrors the row shape in
- * `scaler_agent_jobs`.
- */
+/** A `scaler_agent_jobs` row. */
 export interface AgentJobCorrelationSnapshot {
   agentId: string;
   runId: string;
   jobId: string;
 }
 
-/**
- * Snapshot of a resource reservation. Mirrors the row shape in
- * `scaler_reservations`.
- */
+/** A `scaler_reservations` row. */
 export interface ReservationSnapshot {
   agentId: string;
   scalerName: string;
   cpus: number;
   memBytes: number;
-  /**
-   * The coordinator instance holding the reservation. Absent means "unknown
-   * owner", never "held by someone else".
-   */
+  /** Absent means "unknown owner", never "held by someone else". */
   ownerInstanceId?: string;
 }
 
 /**
  * DB persistence for `ScalerManager` HA-critical state.
  *
- * Backed by four tables — `scaler_spawning_agents`, `scaler_agent_jobs`,
- * `scaler_reservations`, `scaler_pending_claims` — so a Raft leader switch /
- * coord crash no longer:
+ * Backed by `scaler_spawning_agents`, `scaler_agent_jobs`,
+ * `scaler_reservations` and `scaler_pending_claims`, so a Raft leader switch
+ * or coord crash does not:
  *
- *  - orphans an agent that is mid-spawn (lost `boundJobId` → eager
- *    dispatch silently downgraded to a generic queue drain),
- *  - strands a reservation (resource counted as used until the agent's
- *    backend GC eventually disconnects, minutes later),
- *  - drops the agent → run/job correlation (execution-tracker loses
+ *  - orphan a mid-spawn agent (lost `boundJobId` → eager dispatch silently
+ *    downgraded to a generic queue drain),
+ *  - strand a reservation (counted as used until the backend GC disconnects
+ *    the agent, minutes later),
+ *  - drop the agent → run/job correlation (execution-tracker loses
  *    scaler-lifecycle events emitted by the new coord).
  *
- * The consumer keeps the in-memory Maps as L1 caches. On boot /
- * become-leader the caches are hydrated via `recoverState()`.
+ * The consumer keeps in-memory Maps as L1 caches, hydrated via `recoverState()`
+ * on boot / become-leader.
  *
- * `perScalerUsage` / `globalUsage` are NOT stored — they are derived
- * state recomputed from `SUM(...) FROM scaler_reservations` on
- * recovery, which means the on-disk reservation rows are the single
- * source of truth for the cap-check critical section.
+ * `perScalerUsage` / `globalUsage` are NOT stored: they are recomputed from
+ * `SUM(...) FROM scaler_reservations` on recovery, so the reservation rows are
+ * the single source of truth for the cap-check critical section.
  *
- * The `eventBuffer` Map is also not persisted: events emitted before
- * correlation are observability, not correctness. A coord crash before
- * `correlateAgentToJob()` runs accepts losing those events (they are
- * observability, not correctness: nothing downstream waits on them).
+ * The `eventBuffer` Map is not persisted: a coord crash before
+ * `correlateAgentToJob()` loses those events, which are observability, not
+ * correctness — nothing downstream waits on them.
  *
  * Ownership columns (`owner_instance_id`, `adopted_by`) let several
  * coordinators behind one shared endpoint divide the same tables between them.
@@ -166,21 +147,17 @@ export interface ReservationSnapshot {
  * instance", so no query may read a NULL owner as somebody else's row.
  */
 /**
- * Postgres `lock_not_available`. Raised when the `lock_timeout` the cap
- * transaction sets expires with the advisory lock still held elsewhere —
- * a contended lock on a healthy database, which reads very differently from a
- * database that could not be reached at all.
+ * Postgres `lock_not_available`: the cap transaction's `lock_timeout` expired
+ * with the advisory lock held elsewhere — a contended lock on a healthy
+ * database, unlike a database that could not be reached at all.
  */
 export const PG_LOCK_NOT_AVAILABLE = '55P03';
 
 export class ScalerStateStore {
   /**
-   * `lockWaitMs` bounds how long `withScalerCapLock` waits to acquire the
-   * advisory lock. It is the orchestrator's existing `dbPoolAcquireTimeoutMs`
-   * — the same answer to "how long may a caller block waiting to get hold of a
-   * database resource before we fail" — not a timeout of its own. Omitted, the
-   * wait is unbounded except by `statement_timeout`, which is the behaviour a
-   * store built without it has always had.
+   * `lockWaitMs` bounds how long `withScalerCapLock` waits for the advisory
+   * lock. It is the orchestrator's `dbPoolAcquireTimeoutMs`, not a timeout of
+   * its own. Omitted, the wait is bounded only by `statement_timeout`.
    */
   constructor(
     private readonly db: Kysely<Database>,
@@ -197,30 +174,25 @@ export class ScalerStateStore {
    * Run a cap check plus its slot claim for one scaler under a cluster-wide
    * lock.
    *
-   * `runWithReservationLock` in the manager is an in-process promise chain:
-   * correct within an instance, blind across them. For an event scaler that
-   * means N coordinators each provision up to `maxAgents` cloud instances, so
-   * the number an operator writes is not the number they are billed for. The
-   * advisory lock is transaction-scoped, so it releases on commit or rollback
-   * with no unlock path to leak.
+   * The manager's `runWithReservationLock` is an in-process promise chain,
+   * blind across instances: N coordinators would each provision up to
+   * `maxAgents` cloud instances. The advisory lock is transaction-scoped, so it
+   * releases on commit or rollback with no unlock path to leak.
    *
-   * The count and the claim share the transaction on purpose — see
-   * `ScalerCapSlot.reserve`. `fn` therefore runs inside an open transaction:
-   * keep it short, and never await anything outside the database in it.
+   * The count and the claim share the transaction (see `ScalerCapSlot.reserve`),
+   * so `fn` runs inside an open transaction: keep it short, and never await
+   * anything outside the database in it.
    *
-   * READ COMMITTED is pinned rather than inherited. The lock is taken first
-   * and the count read second, so each statement needs its own snapshot for
-   * the second holder to see the first one's committed row. Under REPEATABLE
-   * READ the snapshot is taken at the FIRST statement — before the lock is
-   * granted — so both coordinators would read the same pre-claim count and
-   * both admit, reintroducing the exact defect this exists to close. Pinning
-   * it means a server-side `default_transaction_isolation` change cannot do
-   * that silently.
+   * READ COMMITTED is pinned, not inherited: the lock is taken before the count
+   * is read, so each statement needs its own snapshot to see the previous
+   * holder's committed row. Under REPEATABLE READ the snapshot is taken at the
+   * FIRST statement, before the lock is granted, so both coordinators would
+   * read the same pre-claim count and admit. Pinning it means a server-side
+   * `default_transaction_isolation` change cannot do that silently.
    *
    * A caller that cannot get the lock within `lockWaitMs` fails rather than
    * queuing: the manager holds its process-wide reservation lock across this
-   * call, so an unbounded wait here stalls every other backend's scale
-   * request too.
+   * call, so an unbounded wait would stall every other backend's scale request.
    */
   async withScalerCapLock<T>(
     scalerName: string,
@@ -230,19 +202,16 @@ export class ScalerStateStore {
       .transaction()
       .setIsolationLevel('read committed')
       .execute(async (trx) => {
-        // `SET LOCAL` takes no bind parameter, so the value is inlined. The
-        // normalisation is an availability guard, not an injection one:
-        // `sql.lit` already escapes whatever it is given into a single literal
-        // that Postgres rejects as a value, but a NaN or Infinity would render
-        // as a well-formed literal Postgres cannot parse as an interval — and
-        // since this is the FIRST statement in every cap transaction, that
-        // would turn every event spawn into a permanent fail-closed refusal.
-        // Postgres reads 0 as "no timeout", which is the operator's own escape
-        // hatch on the same knob.
+        // `SET LOCAL` takes no bind parameter, so the value is inlined.
+        // Normalising is an availability guard, not an injection one (`sql.lit`
+        // already escapes): a NaN or Infinity renders a literal Postgres cannot
+        // parse as an interval, and as the FIRST statement of every cap
+        // transaction it would fail-close every event spawn. Postgres reads 0
+        // as "no timeout", the operator's escape hatch on the same knob.
         const lockWait = normalizeLockWaitMs(this.lockWaitMs);
         if (lockWait !== undefined) {
-          // `SET LOCAL` so it reverts on commit or rollback rather than
-          // riding the pooled connection into whatever runs next on it.
+          // `SET LOCAL` reverts on commit or rollback, so it never rides the
+          // pooled connection into whatever runs next.
           await sql`SET LOCAL lock_timeout = ${sql.lit(`${lockWait}ms`)}`.execute(trx);
         }
         await sql`SELECT pg_advisory_xact_lock(hashtext(${`kici:scaler:cap|${scalerName}`}))`.execute(
@@ -277,12 +246,10 @@ export class ScalerStateStore {
    * Delete a spawning-agent row only while no instance has adopted it.
    *
    * The spawning instance is never told that a peer adopted its agent, so its
-   * in-memory entry survives adoption and its stale-entry prune fires five
-   * minutes later. An unconditional delete there would drop the row whose
-   * `adopted_by` is the only durable record of a live provision — and an
-   * adopted event agent legitimately runs for hours, so the reaper would find
-   * nothing to tear down if the adopting instance then died. The
-   * `adopted_by IS NULL` predicate keeps the prune to rows nobody claimed.
+   * stale-entry prune fires five minutes later regardless. An unconditional
+   * delete would drop the row whose `adopted_by` is the only durable record of
+   * a live provision; an adopted event agent can run for hours, so the reaper
+   * would find nothing to tear down if the adopting instance then died.
    */
   async deleteUnadoptedSpawningAgent(agentId: string): Promise<void> {
     await this.db
@@ -295,20 +262,17 @@ export class ScalerStateStore {
   /**
    * The instance that adopted a provision, or null while nobody has.
    *
-   * The counterpart read to `deleteUnadoptedSpawningAgent`'s predicate, for the
-   * caller that must not act rather than must not delete: the spawning instance
-   * is never told that a peer adopted its agent, so a stale in-memory entry is
-   * no evidence the provision failed.
+   * The read counterpart of `deleteUnadoptedSpawningAgent`'s predicate, for a
+   * caller that must not act: a stale in-memory entry on the spawning instance
+   * is no evidence the provision failed.
    *
-   * Reads the LIVE spawn row first and the durable outcome second, because the
-   * spawn row is deleted on teardown and its absence is ambiguous — it is both
-   * "never adopted" and "adopted, then torn down". The outcome row survives the
-   * delete and answers the second case positively.
+   * Reads the LIVE spawn row first, then the durable outcome: the spawn row is
+   * deleted on teardown, so its absence means either "never adopted" or
+   * "adopted, then torn down", and the outcome row answers the second case.
    *
-   * A provision with neither row still answers null, and the prune treats that
-   * as "no evidence" and reports — which is what a single coordinator wants and
-   * what keeps every coordinator backing off on a real provisioning outage. See
-   * `ScalerManager.reportPrunedProvisionFailure`.
+   * Neither row answers null; the prune treats that as "no evidence" and
+   * reports, which keeps every coordinator backing off on a real provisioning
+   * outage. See `ScalerManager.reportPrunedProvisionFailure`.
    */
   async provisionAdopter(agentId: string): Promise<string | null> {
     const row = await this.db
@@ -326,10 +290,9 @@ export class ScalerStateStore {
   }
 
   /**
-   * Every spawning-agent row in the table, whoever owns it. Not for recovery —
-   * hydrating a peer's in-flight spawns as our own lets the spawn-timeout
-   * reaper destroy agents that peer is still waiting on. Recovery uses
-   * `listSpawningAgentsForOwner`.
+   * Every row, whoever owns it. Not for recovery (use
+   * `listSpawningAgentsForOwner`): hydrating a peer's in-flight spawns as our
+   * own lets the spawn-timeout reaper destroy agents that peer still awaits.
    */
   async listSpawningAgents(): Promise<SpawningAgentSnapshot[]> {
     const rows = await this.db.selectFrom('scaler_spawning_agents').selectAll().execute();
@@ -344,21 +307,17 @@ export class ScalerStateStore {
    * itself still resolves. Without the second arm a restart is a silent leak:
    * recovery rehydrates the row, the stale-spawn prune drops the in-memory
    * entry but spares the row, and the still-live agent's next registration
-   * finds neither — it reads as a static agent, so no `scale-down` is ever
-   * emitted and the reaper spares it because the agent is registered and its
-   * adopter is alive. Gated on `backend_type = 'event'`: a local-backend
-   * agent's compute is pinned to another host, so adopting its bookkeeping
-   * would be a lie.
+   * finds neither — it reads as a static agent, so no `scale-down` is emitted
+   * and the reaper spares it (registered, adopter alive). Gated on
+   * `backend_type = 'event'`: a local-backend agent's compute is pinned to
+   * another host, so adopting its bookkeeping would be a lie.
    *
    * The adoption is also recorded in `scaler_provision_outcomes`, in the SAME
-   * transaction as the stamp. The spawn row is deleted on teardown, so its
-   * `adopted_by` is not a durable answer to "was this provision ever adopted?"
-   * — and the stale-spawn prune needs exactly that answer to tell a dead
-   * external provision from a healthy one it was not told about. Writing
-   * it here rather than at the two call sites is deliberate: this method is the
-   * single writer of `adopted_by`, so no adoption path can miss the record.
-   * Splitting the two writes would let a crash leave an adopted row whose
-   * adoption the prune cannot see, which is the very ambiguity being removed.
+   * transaction: the spawn row is deleted on teardown, and the stale-spawn
+   * prune needs a durable "was this ever adopted?" to tell a dead external
+   * provision from a healthy one it was not told about. This method is the
+   * single writer of `adopted_by`, so no adoption path can miss the record;
+   * splitting the writes would let a crash hide an adoption from the prune.
    */
   async adoptSpawningAgent(
     agentId: string,
@@ -386,14 +345,11 @@ export class ScalerStateStore {
         })
         .onConflict((oc) =>
           oc.column('agent_id').doUpdateSet({
-            // First adoption wins. `adoptSpawningAgent` also succeeds when the
-            // SAME instance re-adopts after a restart, and `adopted_*` record
-            // when the provision was FIRST adopted and by whom — a historical
-            // fact, not a last-touched stamp — so a re-adopt must not rewrite
-            // them. `updated_at` below is the opposite kind of column and is
-            // refreshed every time: it is the purge's retention clock, and it
-            // cannot be held open by a re-adopt loop because adoption needs the
-            // spawn row, whose presence already blocks the purge outright.
+            // First adoption wins: `adopted_*` record the FIRST adoption, so a
+            // same-instance re-adopt after a restart must not rewrite them.
+            // `updated_at` is refreshed every time as the purge's retention
+            // clock; a re-adopt loop cannot hold it open, because adoption needs
+            // the spawn row, whose presence already blocks the purge.
             adopted_by: sql`COALESCE(scaler_provision_outcomes.adopted_by, EXCLUDED.adopted_by)`,
             adopted_at: sql`COALESCE(scaler_provision_outcomes.adopted_at, EXCLUDED.adopted_at)`,
             updated_at: adoptedAt,
@@ -405,9 +361,8 @@ export class ScalerStateStore {
   }
 
   /**
-   * Every spawning-agent row this instance owns. Scopes recovery so an instance
-   * rehydrates only its own bookkeeping. A row with a NULL `owner_instance_id`
-   * has an unknown owner and is deliberately not returned to anybody.
+   * Scopes recovery to this instance's own bookkeeping. A NULL-owner row is
+   * deliberately returned to nobody.
    */
   async listSpawningAgentsForOwner(instanceId: string): Promise<SpawningAgentSnapshot[]> {
     const rows = await this.db
@@ -419,10 +374,10 @@ export class ScalerStateStore {
   }
 
   /**
-   * Whether `instanceId` adopted an event provision whose spawn row is still
-   * live: one of the rows `listReapCandidates` returns that the reaper judges
-   * by its adopter's liveness rather than by its own deadline. `peer forget`
-   * reads it, so forgetting such an adopter never cuts the reaper's grace short.
+   * Whether `instanceId` adopted an event provision whose spawn row is live —
+   * a row the reaper judges by its adopter's liveness, not its deadline.
+   * `peer forget` reads it, so forgetting such an adopter never cuts the
+   * reaper's grace short.
    */
   async hasAdoptedProvisions(instanceId: string): Promise<boolean> {
     const row = await this.db
@@ -436,10 +391,9 @@ export class ScalerStateStore {
   }
 
   /**
-   * Every event row that is either past its spawn deadline without ever being
-   * adopted, or adopted by some instance. The reaper decides which to tear down;
-   * this only narrows the scan. Deliberately NOT a blanket `spawned_at < cutoff`
-   * delete: an adopted event agent legitimately runs for hours.
+   * Event rows either adopted, or past the spawn deadline unadopted. The reaper
+   * decides what to tear down; this only narrows the scan. NOT a blanket
+   * `spawned_at < cutoff` delete: an adopted event agent can run for hours.
    */
   async listReapCandidates(spawnCutoff: Date): Promise<ReapCandidate[]> {
     const rows = await this.db
@@ -528,9 +482,9 @@ export class ScalerStateStore {
   }
 
   /**
-   * Every reservation row in the table, whoever holds it. Not for recovery —
-   * counting a peer's reservations against our own caps double-books the
-   * cluster. Recovery uses `listReservationsForOwner`.
+   * Every row, whoever holds it. Not for recovery (use
+   * `listReservationsForOwner`): counting a peer's reservations against our
+   * own caps double-books the cluster.
    */
   async listReservations(): Promise<ReservationSnapshot[]> {
     const rows = await this.db
@@ -546,9 +500,8 @@ export class ScalerStateStore {
   }
 
   /**
-   * Every reservation this instance holds. Scopes recovery so an instance
-   * rehydrates only its own usage. A row with a NULL `owner_instance_id` has an
-   * unknown owner and is deliberately not returned to anybody.
+   * Scopes recovery to this instance's own usage. A NULL-owner row is
+   * deliberately returned to nobody.
    */
   async listReservationsForOwner(instanceId: string): Promise<ReservationSnapshot[]> {
     const rows = await this.db
@@ -583,10 +536,9 @@ export class ScalerStateStore {
   }
 
   /**
-   * Consume a claim and return its spec, or null when the code is unknown,
-   * already consumed, or expired. The UPDATE is the consumption: it commits
-   * before any mint is attempted, so two concurrent claims of one code — on the
-   * same instance or on different ones — can never both mint.
+   * Null when the code is unknown, consumed or expired. The UPDATE is the
+   * consumption and commits before any mint, so two concurrent claims of one
+   * code, on one instance or several, can never both mint.
    */
   async redeemClaim(claimHash: string): Promise<RedeemedClaim | null> {
     const row = await this.db
@@ -607,10 +559,7 @@ export class ScalerStateStore {
     };
   }
 
-  /**
-   * Why a redeem failed. Called ONLY on the failure path, so the happy path
-   * stays one round trip.
-   */
+  /** Why a redeem failed; called ONLY on failure, so the happy path stays one round trip. */
   async describeClaim(claimHash: string): Promise<{ consumed: boolean; expired: boolean } | null> {
     const row = await this.db
       .selectFrom('scaler_pending_claims')
@@ -629,16 +578,13 @@ export class ScalerStateStore {
   }
 
   /**
-   * Delete every claim whose `expires_at` passed before `cutoff`. Returns how
-   * many rows went.
+   * Delete every claim whose `expires_at` is before `cutoff`; returns rows deleted.
    *
    * Nothing else removes a claim on a timer: `redeemClaim` only marks
    * `consumed_at`, and `invalidateClaimsForAgent` runs on a teardown path a
-   * stranded provision never reaches. So a claim outlives its agent whenever a
-   * registration unwinds after the claim was written, or whenever the
-   * coordinator that would have torn the agent down crashed first — and the row
-   * then sits in the table forever. Purging on `expires_at` covers both,
-   * consumed or not, because an expired claim can never be redeemed again.
+   * stranded provision never reaches (a registration unwound after the claim
+   * was written, or the tearing-down coordinator crashed first). An expired
+   * claim can never be redeemed, so purging covers both, consumed or not.
    *
    * The caller subtracts a retention grace from now, so `describeClaim` can
    * still tell a late redeemer "expired" rather than "unknown code" for a while
@@ -657,22 +603,16 @@ export class ScalerStateStore {
   /**
    * Record the reaper's teardown verdict for one provision.
    *
-   * Deliberately additive: it writes only the `condemned_*` columns. A
-   * `heartbeat-timeout` condemns a provision that WAS adopted, so clearing the
-   * adoption here would put the stale-spawn prune straight back to reporting a
-   * healthy provision as a failed one — the exact misattribution this table
-   * exists to remove.
+   * Writes only the `condemned_*` columns: a `heartbeat-timeout` condemns a
+   * provision that WAS adopted, and clearing the adoption would make the
+   * stale-spawn prune report a healthy provision as failed.
    *
-   * Called only once the teardown was actually delivered. An emit that reached
-   * nobody leaves the spawn row in place for the reaper to retry, so there is
-   * no verdict yet to record.
+   * Called only once the teardown was delivered; an emit that reached nobody
+   * leaves the spawn row for the reaper to retry, so there is no verdict yet.
    *
-   * The `condemned_*` half is the forensic side of the record and has no
-   * production reader: `provisionAdopter` answers from `adopted_by` alone, so
-   * the prune's verdict does not depend on it. It is written because the row
-   * is the only surviving account of what became of a provision once the spawn
-   * row is gone — which is what an operator investigating a torn-down
-   * provision reads it for.
+   * `condemned_*` is forensic, with no production reader (`provisionAdopter`
+   * reads `adopted_by` alone): once the spawn row is gone, this row is the only
+   * account an operator has of what became of a torn-down provision.
    */
   async recordProvisionCondemned(
     agentId: string,
@@ -702,13 +642,11 @@ export class ScalerStateStore {
   /**
    * Delete outcome rows that can no longer be asked about; returns rows deleted.
    *
-   * Two predicates, and the second is the load-bearing one. The cutoff alone is
-   * not safe: recovery rehydrates an in-memory spawning entry from
-   * `scaler_spawning_agents`, and a rehydrated entry is immediately stale, so
-   * it asks about its provision on the very next prune however old the
-   * provision is. While the spawn row exists the outcome must stay. Once the
-   * spawn row is gone, nothing can rehydrate an entry for it, and the caller's
-   * retention floor covers the one prune window still in flight.
+   * The cutoff alone is not safe: a spawning entry rehydrated by recovery is
+   * immediately stale, so it asks about its provision on the next prune however
+   * old the provision is. So the outcome stays while the spawn row exists; once
+   * it is gone nothing can rehydrate an entry, and the caller's retention floor
+   * covers the one prune window still in flight.
    *
    * Backed by `idx_scaler_provision_outcomes_updated_at`.
    */
@@ -736,12 +674,9 @@ export class ScalerStateStore {
 }
 
 /**
- * Coerce a configured lock wait to a whole non-negative millisecond count, or
- * `undefined` when there is nothing usable to set.
- *
- * A non-finite value would render as a literal Postgres cannot read as an
- * interval, failing the first statement of every cap transaction — so an
- * unusable setting is dropped rather than sent.
+ * Coerce a lock wait to whole non-negative milliseconds. A non-finite value is
+ * dropped (`undefined`): Postgres cannot read it as an interval, so it would
+ * fail the first statement of every cap transaction.
  */
 function normalizeLockWaitMs(value: number | undefined): number | undefined {
   if (value === undefined || !Number.isFinite(value)) return undefined;
@@ -749,12 +684,9 @@ function normalizeLockWaitMs(value: number | undefined): number | undefined {
 }
 
 /**
- * Write a spawning-agent row on the given executor.
- *
- * Takes the executor rather than reading `this.db` so the same write serves the
- * ordinary fire-and-forget path and the claim inside `withScalerCapLock`'s
- * transaction — a `Transaction` is a `Kysely`, and one writer means the two can
- * never disagree about which columns a spawn row carries.
+ * Takes the executor so one writer serves both the fire-and-forget path and
+ * the claim inside `withScalerCapLock`'s transaction, and the two never
+ * disagree about which columns a spawn row carries.
  */
 async function upsertSpawningAgentOn(
   db: Kysely<Database>,
@@ -769,9 +701,8 @@ async function upsertSpawningAgentOn(
     run_id: snapshot.runId ?? null,
     job_id: snapshot.jobId ?? null,
     bound_job_id: snapshot.boundJobId ?? null,
-    // Each ownership column is written only when the caller supplied it, so a
-    // caller that knows nothing about instance ownership cannot null out a
-    // value some other write already established.
+    // Ownership columns are written only when supplied, so a caller unaware of
+    // ownership cannot null out a value another write established.
     ...(snapshot.ownerInstanceId !== undefined && {
       owner_instance_id: snapshot.ownerInstanceId,
     }),
@@ -791,11 +722,7 @@ async function upsertSpawningAgentOn(
     .execute();
 }
 
-/**
- * Map a `scaler_spawning_agents` row to its snapshot, self-describing fields
- * included. Shared by the plain listing, the owner-scoped listing, and the
- * adoption path so the three cannot drift.
- */
+/** Shared by both listings and the adoption path so they cannot drift. */
 function toSpawningSnapshot(row: ScalerSpawningAgentRow): SpawningAgentSnapshot {
   const snapshot: SpawningAgentSnapshot = {
     agentId: row.agent_id,
@@ -819,9 +746,8 @@ function toSpawningSnapshot(row: ScalerSpawningAgentRow): SpawningAgentSnapshot 
 }
 
 /**
- * Decode a jsonb string-array column. pg's jsonb columns arrive parsed when
- * the schema-aware driver is in play; defensive string handling keeps
- * mock-DB tests (and any future minimally-typed driver) honest.
+ * Decode a jsonb string-array column. pg delivers jsonb parsed; the string
+ * branch serves mock-DB tests and any minimally-typed driver.
  */
 function parseLabelSet(value: unknown): string[] {
   if (Array.isArray(value)) return value as string[];
@@ -837,35 +763,29 @@ function parseLabelSet(value: unknown): string[] {
 }
 
 /**
- * Aggregate event surface for "the scaler manager fully replayed its
- * state from the DB after a leader switch". Kept here (vs in
- * manager.ts) so `ScalerManager.recoverState()` can declare a clean
- * return type. `bufferedEventsLost` always returns 0 today — the
- * `eventBuffer` Map is intentionally not persisted — but the field
- * exists so a future buffer-table addition is type-compatible.
+ * Kept here, not in manager.ts, so `recoverState()` can declare a clean return
+ * type. Result of `ScalerManager.recoverState()` replaying state from the DB after a
+ * leader switch. `bufferedEventsLost` is always 0 (the `eventBuffer` Map is not
+ * persisted); the field keeps a future buffer table type-compatible.
  */
 export interface ScalerStateRecovery {
   spawningAgentsRehydrated: number;
   /**
    * Spawn rows released during recovery because their backend is local
    * (container / firecracker / bare-metal): such a spawn cannot outlive the
-   * process that started it, so nothing could ever register against it, and
-   * rehydrating it would hold its reservation until the stale prune.
+   * process that started it, and rehydrating it would hold its reservation
+   * until the stale prune.
    */
   spawningDropped: number;
   agentJobsRehydrated: number;
   reservationsRehydrated: number;
   /**
-   * Reservation rows discarded during recovery because no rehydrated spawn
-   * backs them. Counted separately from `reservationsRehydrated` so a
-   * deployment carrying orphaned rows says so on every boot until it is clean.
+   * Reservation rows no rehydrated spawn backs, discarded during recovery;
+   * counted apart so a deployment with orphaned rows says so on every boot.
    */
   reservationsDropped: number;
   bufferedEventsLost: number;
 }
 
-/**
- * Re-export for the buffered-events note above; sole reason
- * `ScalerEvent` is imported is to keep that comment compile-checked.
- */
+/** Keeps the `ScalerEvent` import, and the buffered-events note, compile-checked. */
 export type { ScalerEvent };

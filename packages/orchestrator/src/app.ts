@@ -178,9 +178,6 @@ const logger = createLogger({ prefix: 'app' });
 declare const KICI_PKG_VERSION: string;
 const ORCHESTRATOR_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.1';
 
-/**
- * All dependencies needed to create the orchestrator Hono app.
- */
 export interface AppDependencies {
   config: AppConfig;
   db: Kysely<Database>;
@@ -511,7 +508,6 @@ export class SourceLocationStore {
   get(workflowName: string, jobName: string): SourceLocationData[] | undefined {
     const locs = this.cache.get(this.key(workflowName, jobName));
     if (!locs) return undefined;
-    // Filter out undefined entries and return as SourceLocationData[]
     return locs.filter((l): l is SourceLocationData => l !== undefined);
   }
 }
@@ -542,7 +538,6 @@ export function createApp(deps: AppDependencies) {
   // helper so it can be unit-tested without spinning up createApp.
   configureSecureWsServer(wss);
 
-  // Agent metrics aggregator for collecting pushed metrics from agents.
   // Reuse the subsystem-built instance when provided so the WS push to
   // Platform (and from there to Mimir per-org) sees the same data the
   // local /metrics scrape exposes. Fallback construction keeps existing
@@ -868,7 +863,6 @@ export function createApp(deps: AppDependencies) {
     }),
   });
 
-  // Mount WebSocket route for agent connections
   app.get(
     '/ws',
     upgradeWebSocket(() =>
@@ -908,7 +902,6 @@ export function createApp(deps: AppDependencies) {
                   { jobId: msg.jobId, state: msg.state, data: msg.data },
                 );
 
-                // Update execution tracker
                 deps.executionTracker
                   ?.onJobStatus(msg.runId, msg.jobId, msg.state, msg.timestamp, _agentId, msg.data)
                   .catch((err) => {
@@ -992,7 +985,6 @@ export function createApp(deps: AppDependencies) {
             );
           }
 
-          // Update step progress on check run (live progress updates)
           if (deps.checkRunReporter && deps.executionTracker) {
             const execContext = deps.executionTracker.getExecutionContext(msg.runId);
             if (execContext) {
@@ -1182,12 +1174,10 @@ export function createApp(deps: AppDependencies) {
               };
 
               if (concurrencyConfig.cancelInProgress) {
-                // Cancel older runs in the same group
                 const activeRuns = await queueManager.getActiveRuns(msg.group, routingKey);
                 const supersededRunIds: string[] = [];
                 for (const oldRunId of activeRuns) {
                   if (oldRunId === msg.runId) continue;
-                  // Send job.cancel to old run's agents
                   const oldJobIds = await deps.jobQueue.getDispatchedJobIdsByRunId(oldRunId);
                   for (const oldJobId of oldJobIds) {
                     const oldAgentId = deps.dispatcher.getAgentIdForJob(oldJobId);
@@ -1209,7 +1199,6 @@ export function createApp(deps: AppDependencies) {
                   await queueManager.releaseSlot(msg.group, routingKey, oldRunId);
                   supersededRunIds.push(oldRunId);
                 }
-                // Acquire slot for current run.
                 await queueManager.acquireSlot(msg.group, routingKey, msg.runId, msg.jobId, {
                   max: concurrencyConfig.max,
                 });
@@ -1287,7 +1276,6 @@ export function createApp(deps: AppDependencies) {
           : undefined,
         onJobContext: deps.platformClient
           ? (_agentId, msg) => {
-              // Enrich with scaler-specific configuration metadata
               const scalerContext = deps.scalerManager?.getScalerContextForAgent(_agentId);
               const enrichedContext = scalerContext
                 ? { ...msg.context, scalerContext }
@@ -1305,14 +1293,12 @@ export function createApp(deps: AppDependencies) {
     ),
   );
 
-  // Global middleware: X-Request-ID generation
   app.use('*', async (c, next) => {
     const requestId = c.req.header('X-Request-ID') || randomUUID();
     c.header('X-Request-ID', requestId);
     await next();
   });
 
-  // Global middleware: Request logging
   app.use('*', async (c, next) => {
     const start = Date.now();
     const method = c.req.method;
@@ -1412,7 +1398,6 @@ export function createApp(deps: AppDependencies) {
     }
 
     try {
-      // Parse optional force flag from request body
       let force = false;
       try {
         const body = await c.req.json();
@@ -1423,7 +1408,6 @@ export function createApp(deps: AppDependencies) {
         // No body or invalid JSON -- default to graceful cancel
       }
 
-      // Check if run exists and is not already terminal
       const runRow = await deps.db
         .selectFrom('execution_runs')
         .select(['status', 'cancelled_by'])
@@ -1900,7 +1884,6 @@ export function createApp(deps: AppDependencies) {
   // Cluster health routes (always mounted -- cluster always on)
   app.route('/', deps.clusterHealthRoutes);
 
-  // Diagnostic health check endpoint
   app.route(
     '/',
     createDiagnosticsRoutes({
@@ -1931,7 +1914,6 @@ export function createApp(deps: AppDependencies) {
 
         return {
           onOpen: (_event, ws) => {
-            // Create a WsLike adapter from the Hono WSContext
             const wsLike = {
               send: (data: string) => ws.send(data),
               close: (code?: number, reason?: string) => ws.close(code, reason),
@@ -1946,9 +1928,7 @@ export function createApp(deps: AppDependencies) {
               },
               readyState: 1, // OPEN
             };
-            // Store the wsLike adapter on the ws context for message routing
             (ws as any).__peerWsLike = wsLike;
-            // Collect event handlers from the peer handler
             const handlers: {
               onMessage?: (data: unknown) => void;
               onClose?: () => void;
@@ -1990,7 +1970,6 @@ export function createApp(deps: AppDependencies) {
     app.route('/', createClusterJoinRoutes(deps.onJoinRequest));
   }
 
-  // Health and readiness routes
   app.route(
     '/',
     createHealthRoutes({
@@ -2066,7 +2045,6 @@ export function createApp(deps: AppDependencies) {
           exporter.getMetricsRequestHandler({} as any, mockRes as any);
         });
 
-        // Append aggregated agent metrics to the orchestrator's own metrics
         const agentMetricsText = agentMetricsAggregator.getPrometheusText();
         if (agentMetricsText) {
           otelResult.body = otelResult.body + '\n' + agentMetricsText;

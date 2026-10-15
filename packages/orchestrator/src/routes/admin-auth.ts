@@ -1,24 +1,21 @@
 /**
  * Shared Bearer-token auth middleware for the orchestrator's admin routes.
  *
- * One factory serves every DB-backed admin router, which is what makes the
- * error boundary universal: a router that forgets to wrap `validate()` cannot
- * exist, because no router writes that call itself.
+ * One factory serves every DB-backed admin router, so the error boundary is
+ * universal: no router calls `validate()` itself, so none can forget to wrap it.
  *
- * Three outcomes, deliberately distinct:
+ * Deliberately distinct outcomes:
  *   - header absent / not `Bearer <token>`   -> 401 AUTH_ERROR.missing
  *   - token unknown / revoked / expired      -> 401 AUTH_ERROR.invalid
  *   - validation could not be completed      -> 503 AUTH_ERROR.unavailable
  *
- * The third is the reason this file exists. `validate()` returns `null` for a
- * bad credential, so it only throws when the lookup itself fails (unreachable
- * DB, exhausted pool, failover). That is not the caller's fault and is not a
- * bug in this request: the server cannot authenticate anyone right now, which
- * is what 503 means. It also keeps a DB blip out of the 5xx error-rate signal
- * that alerting reads as an application outage.
+ * `validate()` returns `null` for a bad credential, so it throws only when the
+ * lookup fails (unreachable DB, exhausted pool, failover): not the caller's
+ * fault, the server cannot authenticate anyone right now — 503. That also keeps
+ * a DB blip out of the 5xx error-rate signal alerting reads as an outage.
  *
- * The boundary fails closed: an unresolvable auth decision is a rejection with
- * a 5xx, never a fall-through to the protected handler.
+ * Fails closed: an unresolvable auth decision is a rejection, never a
+ * fall-through to the protected handler.
  */
 import type { Context, MiddlewareHandler } from 'hono';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -27,11 +24,8 @@ import type { Role } from '../secrets/rbac.js';
 const defaultLogger = createLogger({ prefix: 'admin-auth' });
 
 /**
- * The three admin-auth response bodies.
- *
- * A single map rather than string literals repeated across every admin router:
- * the 401 wordings are observed by operators and asserted on by tests, so they
- * are pinned in exactly one place.
+ * Admin-auth response bodies, pinned in one place: operators observe the 401
+ * wordings and tests assert on them.
  */
 export const AUTH_ERROR = {
   missing: 'Missing authorization',
@@ -39,7 +33,6 @@ export const AUTH_ERROR = {
   unavailable: 'Authentication unavailable',
 } as const;
 
-/** What a successful admin-token validation yields. */
 export interface AuthTokenInfo {
   id: string;
   role: Role;
@@ -49,17 +42,14 @@ export interface AuthTokenInfo {
   subject?: string | null;
 }
 
-/** The slice of TokenManager this middleware needs (keeps tests trivial to fake). */
+/** The TokenManager slice this middleware needs (keeps tests trivial to fake). */
 export interface AuthTokenValidator {
   validate(token: string): Promise<AuthTokenInfo | null>;
 }
 
 /**
- * The result of resolving one `Authorization` header.
- *
- * Failures carry the status and body rather than a `Response` so a caller that
- * is not a middleware (the inline run-cancel route on the coordinator app) can
- * answer with the identical shape.
+ * Failures carry status and body, not a `Response`, so a non-middleware caller
+ * (the inline run-cancel route on the coordinator app) answers with the same shape.
  */
 export type BearerAuthOutcome =
   { ok: true; tokenInfo: AuthTokenInfo } | { ok: false; status: 401 | 503; error: string };
@@ -73,13 +63,8 @@ export interface BearerAuthDeps {
 }
 
 /**
- * Resolve one request's `Authorization` header into an authenticated token or
- * a rejection. This is the boundary itself; the middleware below is a thin
- * wrapper so a route that needs the token info inline can share it.
- *
- * @param c - The request context (only the header, method, and path are read).
- * @param deps - Token validator, a scope label for logs, and an optional logger.
- * @returns The token info, or the status + body to answer with.
+ * The auth boundary itself; the middleware below is a thin wrapper, so a route
+ * that needs the token info inline shares it. Reads only the header, method and path.
  */
 export async function resolveBearerAuth(
   c: Context<any>,
@@ -97,9 +82,9 @@ export async function resolveBearerAuth(
   try {
     tokenInfo = await deps.tokenManager.validate(token);
   } catch (err) {
-    // NEVER include any part of `token` here -- not a prefix, not a hash. The
-    // credential contributes nothing to diagnosing a lookup failure, and a
-    // prefix is enough to correlate a stolen credential across log stores.
+    // NEVER log any part of `token` -- not a prefix, not a hash: it does not help
+    // diagnose a lookup failure, and a prefix correlates a stolen credential
+    // across log stores.
     logger.error('Admin auth validation failed', {
       scope: deps.scope,
       method: c.req.method,
@@ -115,13 +100,7 @@ export async function resolveBearerAuth(
   return { ok: true, tokenInfo };
 }
 
-/**
- * Build the bearer-auth middleware for one admin route family.
- *
- * @param deps - Token validator, a scope label for logs, and an optional logger.
- * @returns A Hono middleware that authenticates or rejects; it never calls
- *   `next()` on an unresolved credential.
- */
+/** Bearer-auth middleware for one admin route family; never `next()`s an unresolved credential. */
 export function createBearerAuthMiddleware(deps: BearerAuthDeps): MiddlewareHandler<any> {
   return async (c, next) => {
     const outcome = await resolveBearerAuth(c, deps);

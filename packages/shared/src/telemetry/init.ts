@@ -17,10 +17,9 @@ export interface TelemetryConfig {
 let _prometheusExporter: PrometheusExporter | undefined;
 
 /**
- * Initialize the OpenTelemetry SDK with Prometheus metrics and optional OTLP trace export.
- *
- * Call once at service startup. The Prometheus exporter is configured with
- * preventServerStart: true -- metrics are served via the existing /metrics route.
+ * Initialize the OpenTelemetry SDK with Prometheus metrics and optional OTLP
+ * trace export. Call once at service startup. The exporter starts no server:
+ * metrics are served via the existing /metrics route.
  */
 export function initTelemetry(config: TelemetryConfig): NodeSDK {
   const resource = resourceFromAttributes({
@@ -62,11 +61,10 @@ interface RuntimeMetricDescriptor {
 }
 
 /**
- * Boot `RuntimeNodeInstrumentation` standalone, exercise the event loop and
- * garbage collector, collect once, and return one descriptor per instrument it
- * emitted. It deliberately does NOT touch the singleton `_prometheusExporter` —
- * it spins up an isolated SDK so it can be called from tooling without
- * affecting a running service's telemetry.
+ * Boot `RuntimeNodeInstrumentation` in an isolated SDK, exercise the event loop
+ * and GC, and return one descriptor per instrument emitted. It never touches
+ * `_prometheusExporter`, so tooling can call it without affecting a running
+ * service's telemetry.
  */
 async function probeRuntimeInstruments(): Promise<RuntimeMetricDescriptor[]> {
   const exporter = new PrometheusExporter({ preventServerStart: true });
@@ -77,8 +75,7 @@ async function probeRuntimeInstruments(): Promise<RuntimeMetricDescriptor[]> {
   });
   sdk.start();
 
-  // Generate event-loop activity and garbage so every gauge/counter/histogram
-  // the instrumentation tracks registers at least one data point.
+  // Event-loop activity and garbage make every instrument register a data point.
   for (let round = 0; round < 5; round++) {
     const junk: number[][] = [];
     for (let i = 0; i < 100; i++) junk.push(new Array(10_000).fill(i));
@@ -109,9 +106,8 @@ async function probeRuntimeInstruments(): Promise<RuntimeMetricDescriptor[]> {
 }
 
 /**
- * The sorted set of dotted instrument names `RuntimeNodeInstrumentation`
- * emits. This is the ground truth for the curated runtime-metrics catalog
- * drift guard.
+ * Sorted dotted instrument names `RuntimeNodeInstrumentation` emits: ground
+ * truth for the curated runtime-metrics catalog drift guard.
  */
 export async function collectRuntimeMetricNames(): Promise<string[]> {
   const descriptors = await probeRuntimeInstruments();
@@ -119,12 +115,10 @@ export async function collectRuntimeMetricNames(): Promise<string[]> {
 }
 
 /**
- * Like `collectRuntimeMetricNames`, but also returns each instrument's
- * descriptor type and monotonicity — the facts that decide the wire kind the
- * Platform admits it as. Ground truth for the drift guard's kind check.
- *
- * Deliberately not exported from the package barrel: it is tooling ground truth,
- * and `@kici-dev/shared` is a published surface.
+ * Like `collectRuntimeMetricNames`, plus each instrument's descriptor type and
+ * monotonicity, which decide the wire kind the Platform admits it as. Ground
+ * truth for the drift guard's kind check; kept off the package barrel because
+ * `@kici-dev/shared` is a published surface.
  */
 export async function collectRuntimeMetricDescriptors(): Promise<RuntimeMetricDescriptor[]> {
   const descriptors = await probeRuntimeInstruments();

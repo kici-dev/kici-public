@@ -20,56 +20,45 @@ export type Resource =
   | 'event_log'
   | 'event_dlq'
   /**
-   * `support` gates the `manage_support_access` capability: enabling /
-   * disabling KiCI support sessions for the org (the `support_sessions_enabled`
-   * org flag). Checked at `admin` level (`requirePermission(db, 'support',
-   * 'admin')`) — managing whether KiCI staff may open a read session is an
-   * owner-tier operation, so members get `none`.
+   * Gates `manage_support_access`: enabling or disabling KiCI support sessions
+   * for the org (the `support_sessions_enabled` flag). Checked at `admin` level
+   * (`requirePermission(db, 'support', 'admin')`) because deciding whether KiCI
+   * staff may open a read session is owner-tier, so members get `none`.
    */
   | 'support'
   /**
-   * `teams` gates managing operator-defined teams: creating / renaming /
-   * deleting teams, editing membership, and attaching / detaching team-role
-   * grants. `teams:admin` to manage; `teams:read` to view. Owners get `admin`,
-   * members get `read` by default.
+   * Gates operator-defined teams: create, rename, delete, edit membership, and
+   * attach or detach team-role grants. `admin` manages, `read` views. Owners
+   * get `admin`, members get `read` by default.
    */
   | 'teams'
   /**
-   * `fleet` gates fleet-management: viewing the host roster, declaring /
-   * removing hosts, and agent control. `fleet:read` to view, `fleet:write`
-   * to mutate. Owners get `write`, members get `none` by default.
+   * Gates fleet management: viewing the host roster, declaring or removing
+   * hosts, and agent control. `read` views, `write` mutates. Owners get
+   * `write`, members get `none` by default.
    */
   | 'fleet'
   /**
-   * `notifications` gates execution-notification config: connecting the Slack
-   * app, managing channels, and creating subscriptions. `notifications:admin`
-   * to manage; `notifications:read` to view. Owners get `admin`, members get
-   * `read` by default. Not repo-scoped.
+   * Gates execution-notification config: connecting the Slack app, managing
+   * channels, and creating subscriptions. `admin` manages, `read` views.
+   * Owners get `admin`, members get `read` by default. Not repo-scoped.
    */
   | 'notifications';
 
 /**
  * Permission levels ordered by privilege.
  *
- * `read_payload` is a special level used ONLY for the `event_log` resource.
- * It sits between `read` and `write`: holders can fetch the raw webhook
- * payload bodies, which may carry PII (commit messages, PR bodies, sender
- * emails, accidentally-echoed tokens). Listing the metadata rows is gated
- * by plain `read`; the payload body is gated by `read_payload` (or higher).
- *
- * For all other resources, `read_payload` is treated equivalently to `read`
- * by the hierarchy.
+ * `read_payload` is used ONLY for the `event_log` resource. It sits between
+ * `read` and `write`: plain `read` lists the metadata rows, and `read_payload`
+ * (or higher) fetches the raw webhook payload bodies, which may carry PII
+ * (commit messages, PR bodies, sender emails, accidentally-echoed tokens).
+ * For every other resource the hierarchy treats `read_payload` as `read`.
  */
 export type PermissionLevel = 'none' | 'read' | 'read_payload' | 'write' | 'admin';
 
-/**
- * Permission matrix mapping each resource to a permission level.
- */
 export type Permissions = Record<Resource, PermissionLevel>;
 
-/**
- * Numeric hierarchy for comparing permission levels.
- */
+/** Numeric rank used to compare permission levels. */
 export const PERMISSION_HIERARCHY: Record<PermissionLevel, number> = {
   none: 0,
   read: 1,
@@ -78,9 +67,6 @@ export const PERMISSION_HIERARCHY: Record<PermissionLevel, number> = {
   admin: 4,
 };
 
-/**
- * All resources in the system.
- */
 export const ALL_RESOURCES: Resource[] = [
   'runs',
   'api_keys',
@@ -103,12 +89,8 @@ export const ALL_RESOURCES: Resource[] = [
 ];
 
 /**
- * Check if a permissions object grants sufficient access to a resource.
- *
- * @param permissions - The permission matrix to check
- * @param resource - The resource being accessed
- * @param required - The minimum permission level required
- * @returns true if the permission level for the resource is >= required
+ * @returns true when the level granted for `resource` is at or above
+ *   `required`; a missing entry counts as `none`.
  */
 export function hasPermission(
   permissions: Permissions,

@@ -1,13 +1,10 @@
 /**
- * Orchestrator-side correlation for fleet.logs.request -> chunked response.
- *
- * No orchestrator->agent request/response primitive existed before fleet
- * collection; this is it. One instance per orchestrator, keyed by requestId.
- * Pending requests reject on timeout, on a fleet.bundle.error, or when the
- * owning agent disconnects. A thin wrapper over the shared ChunkRequestWaiter
- * so the agent channel and the peer channel share one correlation core; the
- * requestId->agentId map lets a single agent's disconnect reject only that
- * agent's in-flight requests rather than every concurrent collection.
+ * Orchestrator-side correlation for fleet.logs.request -> chunked response: the
+ * orchestrator->agent request/response primitive. One instance per orchestrator, keyed
+ * by requestId. Pending requests reject on timeout, on a fleet.bundle.error, or when the
+ * owning agent disconnects. Wraps the shared ChunkRequestWaiter so the agent and peer
+ * channels share one correlation core; the requestId->agentId map lets one agent's
+ * disconnect reject only its in-flight requests, not every concurrent collection.
  */
 import { ChunkRequestWaiter } from '@kici-dev/shared';
 
@@ -17,16 +14,11 @@ export interface FleetAgentCollectorOptions {
 
 export class FleetAgentCollector {
   private readonly waiter = new ChunkRequestWaiter();
-  /** requestId -> owning agentId, so a disconnect rejects only that agent's requests. */
   private readonly requestAgent = new Map<string, string>();
 
   constructor(private readonly opts: FleetAgentCollectorOptions) {}
 
-  /**
-   * Register the pending request `requestId` (owned by `agentId`), invoke
-   * `send` to dispatch the fleet.logs.request envelope, and await the
-   * reassembled bundle Buffer.
-   */
+  /** Registers `requestId` before `send` dispatches the envelope; resolves to the bundle. */
   request(requestId: string, agentId: string, send: () => void): Promise<Buffer> {
     this.requestAgent.set(requestId, agentId);
     const promise = this.waiter.add(requestId, this.opts.timeoutMs).finally(() => {
@@ -41,10 +33,9 @@ export class FleetAgentCollector {
   }
 
   /**
-   * Whether `requestId` is a collection this orchestrator asked `agentId` for
-   * and is still waiting on. The agent handler consults this before rate
-   * limiting a `fleet.bundle.chunk`: a solicited transfer is exempt, an
-   * unsolicited one is not.
+   * Whether this orchestrator still awaits `requestId` from `agentId`. The agent handler
+   * checks it before rate limiting a `fleet.bundle.chunk`: a solicited transfer is exempt,
+   * an unsolicited one is not.
    */
   isPendingFor(requestId: string, agentId: string): boolean {
     return this.requestAgent.get(requestId) === agentId;
@@ -54,14 +45,14 @@ export class FleetAgentCollector {
     this.waiter.onError(requestId, message);
   }
 
-  /** Reject every pending request owned by `agentId` (called on its disconnect). */
+  /** Called on the agent's disconnect. */
   rejectAgent(agentId: string, reason: string): void {
     for (const [requestId, owner] of this.requestAgent) {
       if (owner === agentId) this.waiter.onError(requestId, reason);
     }
   }
 
-  /** Reject every pending request regardless of owner (orchestrator shutdown). */
+  /** Orchestrator shutdown: rejects regardless of owner. */
   rejectAll(reason: string): void {
     this.waiter.rejectAll(reason);
   }

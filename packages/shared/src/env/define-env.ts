@@ -1,29 +1,20 @@
 /**
- * defineEnv — small helper that ties a Zod schema to its env-var mapping so
- * services can:
- *   1. parse process.env into a typed config (the existing pattern, just
- *      centralised),
- *   2. reject unknown KICI_* env vars (typo catcher),
- *   3. emit machine-readable field metadata for docs/operator/env-reference.md.
+ * defineEnv ties a Zod schema to its env-var mapping so a service can parse
+ * process.env into a typed config, reject unknown KICI_* env vars (typo
+ * catcher), and emit field metadata for docs/operator/env-reference.md.
  *
- * The helper deliberately stays small. Each service still owns its schema
- * (defaults, refinements, cross-field rules); we only standardise the boring
- * env-name <-> field-name plumbing and the "did you mean ...?" UX.
+ * Each service still owns its schema (defaults, refinements, cross-field
+ * rules); this only standardises the env-name <-> field-name plumbing and the
+ * "did you mean ...?" UX.
  *
  * `envMap` accepts:
- *   - a string: the single env var that backs this top-level field, OR
- *   - a string[]: multiple aliases, first non-undefined wins (legacy
- *     pattern; the only historical user was the agent's
- *     KICI_JOB_HEARTBEAT_INTERVAL_MS alias, collapsed in P3 of the
- *     env-var standardization plan). OR
- *   - an object: nested map for fields that are themselves z.object(...)
- *     (orchestrator's `cluster: { instanceId: '...', ... }`). Nested objects
- *     can recurse arbitrarily, but in practice we only need one level.
+ *   - a string: the single env var backing a top-level field;
+ *   - a string[]: aliases, first non-undefined wins (legacy; no current user);
+ *   - an object: a nested map for z.object(...) fields (orchestrator's
+ *     `cluster: { instanceId: '...', ... }`), recursing arbitrarily.
  *
- * The schema may be a plain z.object(...) OR a `.superRefine`'d composition
- * built on top of one (orchestrator does this for cross-field rules). We keep
- * the input type as `z.ZodType` so both shapes are accepted; we reach into
- * `.shape` only when the caller asks for `describe()` output.
+ * The parser may be a plain z.object(...) or a `.superRefine`'d composition;
+ * `.shape` is read only for `describe()`.
  */
 
 import { z } from 'zod';
@@ -56,10 +47,8 @@ export interface DefineEnvOptions<TShape extends z.ZodRawShape> {
   /** Service identifier (free-form, used for docs grouping + error messages). */
   service: string;
   /**
-   * The Zod object schema. Pass the underlying ZodObject before any
-   * `.superRefine(...)` chain so we can walk `.shape` for docs metadata. The
-   * returned `parse()` runs the full schema (with refinements) — pass that as
-   * the `parser`.
+   * The underlying ZodObject, before any `.superRefine(...)`, walked for docs
+   * metadata. Pass the refined schema as `parser` for `parse()` to run it.
    */
   schema: z.ZodObject<TShape>;
   /** Optional outer schema (e.g., `schema.superRefine(...)` for cross-field). */
@@ -73,11 +62,8 @@ export interface DefineEnvOptions<TShape extends z.ZodRawShape> {
 export interface DefineEnvResult<T> {
   /**
    * Parse `env` (defaults to `process.env`) into a typed config.
-   *
-   * `parserOverride` is an optional per-call parser (e.g. a scope-narrowed
-   * `.superRefine`) that replaces the default parser for this parse only —
-   * used to validate the same env map under a looser/stricter cross-field
-   * rule set without duplicating the envMap.
+   * `parserOverride` replaces the parser for this call only, to validate the
+   * same env map under a different cross-field rule set.
    */
   parse(env?: NodeJS.ProcessEnv, parserOverride?: z.ZodType): T;
   /** Machine-readable field specs for docs generation. */
@@ -98,7 +84,6 @@ function readEnv(envMap: EnvMapValue, env: NodeJS.ProcessEnv): unknown {
     }
     return undefined;
   }
-  // Nested object — recurse into each child.
   const result: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(envMap)) {
     result[k] = readEnv(v, env);
@@ -120,9 +105,8 @@ function* walkEnvNames(envMap: EnvMap): Generator<string> {
 }
 
 /**
- * In zod 4, `z.ZodRawShape` values are typed as the internal `$ZodType`,
- * which is structurally narrower than `z.ZodType`. We only ever read `.def`
- * and `.shape` off these values, so `unknown` is the honest signature.
+ * zod 4 types `z.ZodRawShape` values as the internal `$ZodType`, narrower than
+ * `z.ZodType`; only `.def` and `.shape` are read, so `unknown` is honest.
  */
 type ZodLike = unknown;
 
@@ -199,19 +183,16 @@ function extractDefault(field: ZodLike): string | undefined {
     ).def;
     if (!def) return undefined;
     if (def.type === 'default' && def.defaultValue !== undefined) {
-      // Zod 4 exposes function-based defaults (`.default(() => randomUUID())`)
-      // through a getter that invokes the function on every access. Two
-      // consecutive reads returning different values is the reliable
-      // signal that the default is computed; rendering the actual value
-      // would make the generated docs non-deterministic. `typeof === 'function'`
-      // (the Zod 3 shape) is also kept as a belt-and-braces signal.
+      // Zod 4 exposes a function default (`.default(() => randomUUID())`) as a
+      // getter that calls it on every access, so two differing reads mark a
+      // computed default; rendering it would make the docs non-deterministic.
+      // `typeof === 'function'` covers the Zod 3 shape.
       const probe1 = def.defaultValue;
       const probe2 = def.defaultValue;
       if (typeof probe1 === 'function' || probe1 !== probe2) return '"<computed>"';
       if (probe1 === '' || probe1 === undefined) return undefined;
       return JSON.stringify(probe1);
     }
-    // Walk through pipe / transform / optional / nullable to find an inner default.
     if (def.in) {
       t = def.in;
       continue;
@@ -245,11 +226,10 @@ function isOptional(field: ZodLike): boolean {
 }
 
 /**
- * Walk through `.optional()` / `.default(...)` / `.prefault(...)` wrappers to
- * find a nested ZodObject's `.shape`. Returns undefined if `field` does not
- * (eventually) wrap a ZodObject. Mirrors the unwrap loop in
- * `extractDefault` / `isOptional` so that a nested object can be wrapped in
- * any of the common compositional modifiers and still be walked for docs.
+ * Unwrap `.optional()` / `.default(...)` / `.prefault(...)` to a nested
+ * ZodObject's `.shape`, or undefined when there is none, so a wrapped nested
+ * object is still walked for docs. Mirrors the unwrap loop in `extractDefault`
+ * / `isOptional`.
  */
 function findInnerShape(field: ZodLike): z.ZodRawShape | undefined {
   let t: ZodLike = field;
@@ -296,10 +276,7 @@ function describeFieldRecursive(
         description: explicitDesc ?? zodDesc ?? def2?.description,
       });
     } else {
-      // Nested object — recurse if the field is (or wraps) a ZodObject.
-      // findInnerShape unwraps `.optional()`, `.default(...)`, and
-      // `.prefault(...)` modifiers so the cluster-style
-      // `z.object({...}).prefault({})` pattern still emits its inner fields.
+      // Unwrapping keeps the `z.object({...}).prefault({})` pattern emitting its fields.
       const innerShape = findInnerShape(field);
       if (innerShape) {
         describeFieldRecursive(innerShape, mapping, path, descriptions, out);
@@ -358,11 +335,7 @@ export function defineEnv<TShape extends z.ZodRawShape>(
   return { parse, describe, listKnownEnvVars, listKnownKiciVars };
 }
 
-/**
- * Levenshtein distance between two strings. Small + dependency-free; we only
- * use it to suggest alternates for unknown KICI_* env vars at boot. O(n*m) is
- * fine because both strings are short env var names.
- */
+/** Levenshtein distance; O(n*m) is fine for short env var names. */
 function levenshtein(a: string, b: string): number {
   if (a === b) return 0;
   if (!a.length) return b.length;
@@ -387,44 +360,34 @@ function suggestClosest(name: string, candidates: string[]): string | undefined 
     const d = levenshtein(name, c);
     if (best === undefined || d < best.dist) best = { name: c, dist: d };
   }
-  // Suggest only if the distance is small relative to the name length —
-  // otherwise the suggestion is noise.
+  // A distance large relative to the name length is noise.
   if (best && best.dist <= Math.max(2, Math.floor(name.length / 4))) return best.name;
   return undefined;
 }
 
 /**
- * `KICI_*` env vars that are NOT part of any service's config schema but are
- * legitimately set by packaging / tooling / dev shims. The scanner always
- * allowlists these so the typo-catcher doesn't false-positive on them.
+ * `KICI_*` env vars outside every service schema but legitimately set by
+ * packaging, tooling or dev shims, so the typo-catcher always allows them.
  *
- * - `KICI_CACHE`: set by the packaged CLI shim (packages/… .cmd and the
- *   POSIX equivalent emitted by scripts/package.mjs) to point at the cached
- *   Node.js binary. Inherited by the orchestrator/agent process on Windows
- *   (on POSIX it's a shell-local var that doesn't leak).
- * - `KICI_DEV`: the dev-mode toggle itself — read by the scanner to flip
- *   to warn-only, so it must not trip the scanner.
- * - `KICI_BUILD_COUNTER_NO_COMMIT`: a build-tooling flag read only by the
- *   repository's build counter (skip the per-build `.build-counter` commit on
- *   a force-synced checkout). Set in the ambient shell for `pnpm build`; the
- *   native orchestrator spawn inherits it.
- * - `KICI_CONFIG_DIR`: the isolated, empty config directory the vitest harness
- *   sets at config-eval time (`hack/lib/vitest-isolation.ts`) so the CLI's `getConfigDir` reads a
- *   throwaway dir instead of the developer machine's ambient `~/.kici`. It is a
- *   real CLI var (not a config typo) inherited by every service a test spawns —
- *   which do not read it — same leak-by-inheritance shape as the `KICI_E2E_`
- *   prefix below.
+ * - `KICI_CACHE`: set by the packaged CLI shim (packages/… .cmd and the POSIX
+ *   equivalent from scripts/package.mjs) to the cached Node.js binary;
+ *   inherited by the orchestrator/agent on Windows (shell-local on POSIX).
+ * - `KICI_DEV`: the dev-mode toggle the scanner itself reads to go warn-only.
+ * - `KICI_BUILD_COUNTER_NO_COMMIT`: read only by the build counter (skip the
+ *   per-build `.build-counter` commit on a force-synced checkout); set in the
+ *   shell for `pnpm build` and inherited by a native orchestrator spawn.
+ * - `KICI_CONFIG_DIR`: the empty config dir the vitest harness sets
+ *   (`hack/lib/vitest-isolation.ts`) so the CLI's `getConfigDir` avoids the
+ *   ambient `~/.kici`; a real CLI var every test-spawned service inherits
+ *   without reading it.
  * - `KICI_ORCHESTRATOR_TOKEN`: the `kici` CLI's credential for a direct
- *   orchestrator target, exported in a developer's shell or a CI job next to
- *   `KICI_ORCHESTRATOR_URL`. No service reads it, and an orchestrator or agent
- *   started from that same shell inherits it — the `KICI_CONFIG_DIR` shape.
+ *   orchestrator target, exported beside `KICI_ORCHESTRATOR_URL`; no service
+ *   reads it, but a service started from that shell inherits it.
  *
- * Keep this list small and well-justified. Every addition is a typo we can
- * no longer catch, so only list things that are (a) actually set in the
- * wild by our own tooling and (b) could never be a config typo. A variable
- * only one service reads belongs in that service's `extraKnown` instead —
- * `KICI_CONFIG` is the reference case, allowlisted at the orchestrator's own
- * call site so the agent and Platform catchers still reject it.
+ * Every addition is a typo we can no longer catch: list only names (a) our own
+ * tooling sets in the wild and (b) that could never be a config typo. A var one
+ * service reads belongs in that service's `extraKnown` — as `KICI_CONFIG` is at
+ * the orchestrator's call site, so the agent and Platform still reject it.
  */
 export const RESERVED_NON_SCHEMA_KICI_VARS: readonly string[] = [
   'KICI_CACHE',
@@ -435,24 +398,16 @@ export const RESERVED_NON_SCHEMA_KICI_VARS: readonly string[] = [
 ];
 
 /**
- * `KICI_*` prefixes that are entirely outside the service-config namespace —
- * usually set by test or development tooling and inherited into a child
- * orchestrator/agent/platform process by mistake of inheritance rather than
- * design. Any env var starting with one of these prefixes is treated as
- * known, regardless of the specific suffix.
+ * `KICI_*` prefixes outside the service-config namespace; any var starting with
+ * one is known, whatever its suffix. Keep this short: each prefix widens the
+ * set of uncatchable typos.
  *
- * - `KICI_E2E_`: reserved for a test harness's own toggles
- *   (`KICI_E2E_PROVIDER`, `KICI_E2E_MODE`, …). An orchestrator a harness
- *   spawns natively inherits the harness's process.env, so these leak in.
- * - `KICI_AGENT_ENV_`: the agent-env forwarding namespace (see
- *   `@kici-dev/engine` → `KICI_AGENT_ENV_PREFIX`). Any env var set on the
- *   orchestrator process with this prefix is stripped and forwarded into
- *   the spawned agent (bare-metal, container, or Firecracker MMDS). The
- *   suffix is by design arbitrary and user-controlled, so it cannot be
- *   enumerated in the schema.
- *
- * As with RESERVED_NON_SCHEMA_KICI_VARS, keep this short — each prefix
- * widens the set of names we can no longer catch as typos.
+ * - `KICI_E2E_`: a test harness's own toggles (`KICI_E2E_PROVIDER`, …), which
+ *   leak into an orchestrator the harness spawns natively.
+ * - `KICI_AGENT_ENV_`: the agent-env forwarding namespace (`@kici-dev/engine`
+ *   → `KICI_AGENT_ENV_PREFIX`): stripped from the orchestrator's env and
+ *   forwarded into the spawned agent (bare-metal, container, or Firecracker
+ *   MMDS). The suffix is user-controlled, so the schema cannot enumerate it.
  */
 export const RESERVED_NON_SCHEMA_KICI_PREFIXES: readonly string[] = [
   'KICI_E2E_',
@@ -460,22 +415,14 @@ export const RESERVED_NON_SCHEMA_KICI_PREFIXES: readonly string[] = [
 ];
 
 /**
- * `KICI_*` suffix patterns that mark vars outside the service-config namespace.
- * A var is treated as known when its name ends with any listed suffix
- * (or the suffix appears as a boundary segment — matching
- * `${suffix}$|${suffix}_`, same rule as the agent's probe collector).
+ * `KICI_*` suffixes outside the service-config namespace, matched as
+ * `${suffix}$|${suffix}_` like the agent's probe collector. Keep this short:
+ * each suffix widens the set of uncatchable typos.
  *
- * - `_ENV_PROBE`: diagnostic probe vars (see `packages/agent/src/server.ts` —
- *   the agent collects every `KICI_*_ENV_PROBE` var and logs its value in
- *   "Agent startup env probes (diagnostic)"). A probe set on the orchestrator
- *   as `KICI_AGENT_ENV_KICI_FC_ENV_PROBE=fc-probe-value` flows through the
- *   scaler's env-forwarding path and lands in the agent's process.env as
- *   `KICI_FC_ENV_PROBE`. Without this suffix allowlist the validator rejects
- *   it as an unknown KICI_* var and the agent refuses to start — defeating
- *   the probe's entire purpose.
- *
- * As with RESERVED_NON_SCHEMA_KICI_VARS / _PREFIXES, keep this short. Every
- * suffix widens the set of names we can no longer catch as typos.
+ * - `_ENV_PROBE`: diagnostic probe vars the agent logs at startup
+ *   (`packages/agent/src/server.ts`). `KICI_AGENT_ENV_KICI_FC_ENV_PROBE` set on
+ *   the orchestrator reaches the agent as `KICI_FC_ENV_PROBE`; without this
+ *   entry the agent would refuse to start on its own probe.
  */
 const RESERVED_NON_SCHEMA_KICI_SUFFIXES: readonly string[] = ['_ENV_PROBE'];
 
@@ -490,25 +437,19 @@ export interface ValidateUnknownKiciVarsOptions {
   /** Logger callback for warn-mode (defaults to `console.warn`). */
   onWarn?: (msg: string) => void;
   /**
-   * Advice text for names the caller recognises but does not accept — a
-   * documented variable that belongs to some other layer. A rejected name
-   * found here is reported with its advice instead of a Levenshtein guess,
-   * which finds nothing for exactly these names because they are not near
-   * misses of a schema name.
-   *
-   * This changes the message only. A name listed here is still rejected.
+   * Advice for names the caller recognises but does not accept (a documented
+   * variable of another layer), reported instead of a Levenshtein guess, which
+   * finds nothing for them. Changes the message only: the name is still rejected.
    */
   notStartupVars?: Record<string, string>;
 }
 
 /**
- * Inspect `env` for KICI_* keys that are not in `known`. Throws (or warns,
- * see options) with a single combined message listing every unknown var and
- * its closest legitimate match (when the Levenshtein distance is small).
+ * Reject KICI_* keys in `env` that are not in `known`, with one message listing
+ * each unknown var and its closest match when the distance is small.
  *
- * Production mode (the default): throws — a deployment should never reach
- * runtime with a typo'd KICI_* variable. Set `KICI_DEV=true` (or pass
- * `warnOnly: true`) to downgrade to a warning during local development.
+ * Throws by default: a deployment never reaches runtime with a typo'd KICI_*
+ * var. `KICI_DEV=true` (or `warnOnly: true`) downgrades it to a warning.
  */
 export function validateUnknownKiciVars(
   known: string[],

@@ -6,14 +6,13 @@ import { PendingDynamicTracker } from './pending-dynamics.js';
 import { PendingGlobalEvalTracker } from './pending-global-evals.js';
 import { PendingInitTracker } from './pending-inits.js';
 import { extractPrecursorResult, settlePendingPrecursor } from './precursor-result.js';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
-const lockJob = (name: string): LockJob => ({
-  _type: 'static',
-  name,
-  runsOn: [{ kind: 'exact', value: 'linux' }],
-  needs: [],
-  steps: [{ name: 'step-1', hasOutputs: false }],
-});
+const lockJob = (name: string): LockJob =>
+  staticJob({
+    name,
+    steps: [{ name: 'step-1', hasOutputs: false }],
+  });
 
 describe('extractPrecursorResult', () => {
   it('returns null for an ordinary job frame', () => {

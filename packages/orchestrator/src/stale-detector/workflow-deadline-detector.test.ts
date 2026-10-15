@@ -10,11 +10,7 @@ import { TimeoutReason } from '@kici-dev/engine';
 
 // ── Chainable mock DB ───────────────────────────────────────────
 
-/**
- * Build a mock that mimics Kysely's chained query builder. Each call to
- * selectFrom/updateTable returns an independent chain resolving to a
- * pre-configured result.
- */
+/** A Kysely-style chain resolving to a pre-configured result; each call gets its own chain. */
 function createChainableMock(opts: {
   executeResult?: unknown[];
   executeTakeFirstResult?: unknown;
@@ -28,10 +24,7 @@ function createChainableMock(opts: {
   return chain;
 }
 
-/**
- * Build a mock Kysely DB where selectFrom and updateTable calls can be
- * configured per-call-index.
- */
+/** A mock Kysely DB whose selectFrom / updateTable results are configured per call index. */
 function createSequentialDb(config: {
   selects: Array<{ executeResult?: unknown[]; executeTakeFirstResult?: unknown }>;
   updates?: Array<{ executeTakeFirstResult?: unknown }>;
@@ -102,10 +95,9 @@ describe('WorkflowDeadlineDetector', () => {
     const detector = new WorkflowDeadlineDetector(makeDeps(db, mocks));
     await detector.scan();
 
-    // Queued dispatch rows cancelled.
     expect(mocks.cancelByRunId).toHaveBeenCalledWith('run-overdue');
 
-    // Canonical cancel path invoked with a reason carrying the distinct enum.
+    // The canonical cancel path, with a reason carrying the distinct enum.
     expect(mocks.cancelRunWithReason).toHaveBeenCalledTimes(1);
     const [runId, reason] = mocks.cancelRunWithReason.mock.calls[0];
     expect(runId).toBe('run-overdue');
@@ -225,14 +217,11 @@ describe('WorkflowDeadlineDetector', () => {
 
 // ── Scan predicate: deadline-recency bound (the ≥24h-timeout regression) ──────
 //
-// The mock DB above stubs `.where()` as a no-op, so it can NEVER prove which
-// runs the SQL predicate keeps. This block instead compiles the exact query
-// scan() runs (Kysely `.compile()`, no live DB) and asserts the boundary math
-// that governs whether a long-timeout run is found. This is the unit-level proof
-// of the bug fix: the scan must bound the run's DEADLINE recency, not its
-// `started_at`. A `started_at > (now - 24h)` guard silently excluded every run
-// whose declared workflow timeout was >= 24h (its deadline only lapses once
-// started_at has already aged past 24h), so those runs hung forever.
+// The mock DB above stubs `.where()` as a no-op, so it can NEVER prove which runs the
+// predicate keeps; this block compiles the exact query scan() runs (Kysely `.compile()`, no
+// live DB). The scan must bound the DEADLINE's recency, not `started_at`: a
+// `started_at > (now - 24h)` guard excludes every run whose workflow timeout is >= 24h (its
+// deadline lapses only after started_at has aged past 24h), so those runs hang forever.
 describe('WorkflowDeadlineDetector — scan predicate (deadline-recency bound)', () => {
   const DEADLINE_EXPR = "started_at + (workflow_timeout_ms * interval '1 millisecond')";
 
@@ -257,20 +246,17 @@ describe('WorkflowDeadlineDetector — scan predicate (deadline-recency bound)',
   it('bounds recency on the DEADLINE, not started_at, so a >=24h-timeout run stays in scope once overdue', () => {
     const compiled = compileScanSql();
 
-    // Overdue predicate: deadline < now().
     expect(compiled.sql).toContain(`${DEADLINE_EXPR} < now()`);
 
-    // Recency predicate is on the DEADLINE (deadline > now() - window) — the fix.
-    // A run with started_at = now-25h and workflow_timeout_ms = 24h has a deadline
-    // ~1h ago, which satisfies BOTH `deadline < now()` and `deadline > now()-24h`,
-    // so it is found and cancelled. The old guard bounded started_at instead, which
-    // excluded exactly this row.
+    // Recency is on the DEADLINE. A run with started_at = now-25h and a 24h timeout has a
+    // deadline ~1h ago, which satisfies BOTH `deadline < now()` and `deadline > now()-24h`,
+    // so it is found and cancelled; a started_at bound excludes exactly this row.
     expect(compiled.sql).toContain(`${DEADLINE_EXPR} > now() -`);
 
-    // The removed bug: there must be NO lower bound on started_at itself.
+    // NO lower bound on started_at itself.
     expect(compiled.sql).not.toContain('"started_at" >');
 
-    // The recency window is the exported 24h constant, bound as a parameter.
+    // The exported 24h constant, bound as a parameter.
     expect(compiled.parameters).toContain(DEADLINE_RECENCY_WINDOW_MS);
     expect(DEADLINE_RECENCY_WINDOW_MS).toBe(24 * 60 * 60 * 1000);
   });
@@ -280,9 +266,8 @@ describe('WorkflowDeadlineDetector — scan predicate (deadline-recency bound)',
 
     expect(compiled.sql).toContain('"status" in');
     expect(compiled.sql).toContain('"workflow_timeout_ms" is not null');
-    // A short-timeout recent run (e.g. 1s timeout, started 10s ago → deadline 9s ago)
-    // still matches deadline < now() AND deadline > now()-24h, so the existing
-    // short-timeout behavior is preserved by the same predicate pair.
+    // A short-timeout recent run (1s timeout, started 10s ago → deadline 9s ago) still
+    // matches deadline < now() AND deadline > now()-24h.
     expect(compiled.parameters).toContain('pending');
     expect(compiled.parameters).toContain('running');
     expect(compiled.parameters).toContain('cancelling');

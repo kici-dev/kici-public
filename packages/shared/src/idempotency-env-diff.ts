@@ -1,22 +1,16 @@
 /**
- * Env-file semantic diff for the idempotent-step preview path.
+ * Env-file semantic diff for the idempotent-step preview path: two raw env
+ * files (local generated, remote) in, one sorted entry per key out.
  *
- * Inputs are the raw byte strings of two env files (local generated +
- * remote-cat'd). Output is a sorted list of `EnvDiffEntry` records — one
- * per key that was added, removed, or changed (plus an unchanged count).
- *
- * The renderer masks every value by default: an env file is sops-derived
- * credential material in the deploy-prod context, and the confirm prompt
- * is tee'd to `release-prod.log.<ts>`. Operators who need to see the
- * actual values pass `--reveal-env-values` end-to-end (CLI flag → env var
- * `KICI_REVEAL_ENV_VALUES=1` → `reveal: true` on this renderer). Without
- * the flag the rendered output carries only the key name + classification.
+ * The renderer masks every value by default: in deploy-prod an env file is
+ * sops-derived credential material, and the confirm prompt is tee'd to
+ * `release-prod.log.<ts>`. `--reveal-env-values` (→ `KICI_REVEAL_ENV_VALUES=1`
+ * → `reveal: true`) shows the values.
  */
 
-// Hardcoded ANSI escapes, same convention as `idempotency-files.ts`: keep
-// the rendered output stable regardless of the host terminal's color probe
-// and let the operator strip via `sed 's/\x1b\[[0-9;]*m//g'` if they want
-// plain text.
+// Hardcoded ANSI escapes, as in `idempotency-files.ts`: output stays stable
+// whatever the terminal's color probe says; strip with
+// `sed 's/\x1b\[[0-9;]*m//g'`.
 const ANSI_RED = '\x1b[31m';
 const ANSI_GREEN = '\x1b[32m';
 const ANSI_CYAN = '\x1b[36m';
@@ -34,16 +28,14 @@ export interface EnvDiffEntry {
 }
 
 /**
- * Parse an env-file body into a `Map<string, string>`. The shape matches
- * what Docker / systemd `EnvironmentFile=` / Keycloak's env loader consume:
+ * Parse an env-file body the way Docker / systemd `EnvironmentFile=` /
+ * Keycloak's env loader do:
  *
- *   - Blank lines and `#`-prefixed comments are skipped.
- *   - The first `=` splits key and value; values may contain further `=`.
- *   - Surrounding single or double quotes on the value are stripped when
- *     they are balanced; otherwise the literal bytes are preserved.
+ *   - Blank lines and `#` comments are skipped.
+ *   - The first `=` splits key and value.
+ *   - Balanced surrounding single or double quotes are stripped.
  *   - Duplicate keys: last write wins (POSIX shell semantics).
- *   - Whitespace is stripped from the key only — values keep their bytes
- *     verbatim so a trailing space in a credential is detected as drift.
+ *   - Only the key is trimmed, so a trailing space in a credential is drift.
  */
 export function parseEnvLines(content: string): Map<string, string> {
   const out = new Map<string, string>();
@@ -70,14 +62,11 @@ export function parseEnvLines(content: string): Map<string, string> {
 }
 
 /**
- * Diff two env-file bodies. Returns one entry per key in the union of
- * both inputs. Entry order: `added`, `changed`, `removed`, `unchanged`,
- * alphabetically inside each group.
+ * Diff two env-file bodies: one entry per key in either, ordered `added`,
+ * `changed`, `removed`, `unchanged`, alphabetical within each group.
  *
- * `local` is the new-side bytes (what the deploy would ship), `remote`
- * is the old-side bytes (what's currently on the box). The convention
- * matches `previewRsyncFileToBox`'s `localContent` / `remoteContent`
- * field names.
+ * `local` is the new side (what the deploy ships), `remote` the old side (on
+ * the box), as in `previewRsyncFileToBox`.
  */
 export function diffEnvFiles(local: string, remote: string): EnvDiffEntry[] {
   const localMap = parseEnvLines(local);
@@ -120,9 +109,8 @@ export interface EnvDiffRenderOpts {
 }
 
 /**
- * Render the env-semantic diff body lines. The returned array carries
- * NO surrounding indentation — the caller (e.g. `renderFileDrifts`)
- * decides how to nest each line under its containing per-file row.
+ * Render the env diff body lines, unindented: the caller (e.g.
+ * `renderFileDrifts`) nests them.
  *
  * Masked layout (default):
  *
@@ -142,10 +130,8 @@ export interface EnvDiffRenderOpts {
  *     - old=zzz
  *   3 other key(s) unchanged
  *
- * When there are no changed / added / removed entries (every key matches
- * byte-for-byte), the function returns a single "N key(s) unchanged"
- * line so the operator gets a positive "in sync at the env level"
- * confirmation rather than an empty body.
+ * With no drift the body is never empty: one unchanged-count line confirms
+ * the env is in sync.
  */
 export function renderEnvDiff(entries: EnvDiffEntry[], opts: EnvDiffRenderOpts = {}): string[] {
   const reveal = opts.reveal ?? false;

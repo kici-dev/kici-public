@@ -1,14 +1,10 @@
 /**
- * Binds the orchestrator upgrade's pre-stop capabilities to the admin API and
- * to `pg_dump`.
+ * Binds the orchestrator upgrade's pre-stop hooks to the admin API and
+ * `pg_dump`. Kept apart from `upgrade-safety.ts` (pure decision logic) and
+ * `versioned-upgrade.ts` (the agent upgrade passes no hooks).
  *
- * Kept apart from `upgrade-safety.ts` so the decision logic there stays pure
- * and unit-testable, and apart from `versioned-upgrade.ts` so the agent upgrade
- * — which passes no hooks — carries none of this.
- *
- * Every hook runs while the service is still up. That is load-bearing for two
- * of them: the schema revert needs the newer binary's own migration provider,
- * and the drain needs a live admin API.
+ * Every hook runs while the service is up: the schema revert needs the newer
+ * binary's migration provider, and the drain needs a live admin API.
  */
 import { readFileSync } from 'node:fs';
 import { createDb, createPool } from '../../../db/client.js';
@@ -21,12 +17,9 @@ import type { UpgradeHooks } from './versioned-upgrade.js';
 const DRAIN_POLL_INTERVAL_MS = 2_000;
 
 /**
- * Resolve the database URL the pre-upgrade dump connects with.
- *
- * The instance's env file is the authority — the same file the service itself
- * is started from — so the dump is taken against exactly the database the
- * running orchestrator uses, not whatever the operator's shell happens to
- * export.
+ * The pre-upgrade dump's database URL. The service's own env file is the
+ * authority, so the dump hits the database the orchestrator uses, not
+ * whatever the operator's shell exports.
  */
 export function readDatabaseUrlFromEnvFile(contents: string): string | null {
   for (const raw of contents.split('\n')) {
@@ -53,10 +46,8 @@ export interface BuildUpgradeHooksIo {
 }
 
 /**
- * Build the hook set for an orchestrator upgrade.
- *
- * `instanceDir` is resolved lazily, at the moment a hook runs, because the
- * upgrade resolves its target after the command is registered.
+ * `instanceDir` resolves lazily, when a hook runs: the upgrade resolves its
+ * target after the command is registered.
  */
 export function buildUpgradeHooks(
   tryGetClient: () => AdminApiClient | null,
@@ -65,12 +56,9 @@ export function buildUpgradeHooks(
   const readFile = io?.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
 
   /**
-   * The admin API, or a descriptive throw when no credentials are configured.
-   *
-   * Throwing rather than exiting is the whole point: each caller already
-   * degrades — the schema guard reads "could not be reached" and the drain
-   * warns and continues — and `getClient` would have exited the process
-   * instead, taking a working upgrade down with it.
+   * Throws, not exits, without credentials: each caller degrades (the schema
+   * guard reads "could not be reached", the drain warns and continues), while
+   * `getClient` would exit and take a working upgrade down.
    */
   const requireClient = (action: string): AdminApiClient => {
     const client = tryGetClient();
@@ -84,8 +72,7 @@ export function buildUpgradeHooks(
   };
 
   return {
-    // async, so a missing token rejects rather than throwing synchronously —
-    // every caller awaits, and a rejection is the contract they handle.
+    // async: a missing token rejects, the contract every awaiting caller handles.
     migrationStatus: async () =>
       requireClient('reading the migration ledger').get<{
         migrations: MigrationStatusRow[];
@@ -127,12 +114,8 @@ export function buildUpgradeHooks(
 }
 
 /**
- * Read `KICI_DATABASE_URL` from the instance env file, falling back to the
- * process environment.
- *
- * Throws rather than returning null: an upgrade that cannot find the database
- * must refuse loudly, since a silent skip is exactly the failure this hook
- * exists to prevent.
+ * From the env file, else the process environment. Throws rather than
+ * returning null: a silent skip is the failure this hook exists to prevent.
  */
 export function resolveDatabaseUrl(envFilePath: string, readFile: (p: string) => string): string {
   let fromFile: string | null = null;

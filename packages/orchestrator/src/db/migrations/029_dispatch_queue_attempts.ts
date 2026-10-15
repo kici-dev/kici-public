@@ -1,16 +1,10 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `dispatch_queue.dispatch_attempts INT NOT NULL DEFAULT 0`.
- *
- * Counts how many times a job has been returned to `pending` for
- * re-dispatch after a failed delivery attempt (agent sent job.reject, or
- * a scaler-managed agent disconnected before the job started). The
- * dispatcher fails the job permanently once the counter reaches
- * MAX_DISPATCH_ATTEMPTS, bounding requeue loops; `expires_at` remains the
- * time-based backstop.
- *
- * Idempotent: re-running on a DB that already has the column is a no-op.
+ * Add `dispatch_queue.dispatch_attempts`: how often a job returned to `pending` after a failed
+ * delivery (job.reject, or a scaler-managed agent disconnecting before start). The dispatcher
+ * fails the job at MAX_DISPATCH_ATTEMPTS, bounding requeue loops; `expires_at` stays the
+ * time-based backstop. Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const result = await sql<{ exists: boolean }>`

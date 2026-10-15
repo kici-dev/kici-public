@@ -37,7 +37,7 @@ describe('heartbeat-health policy', () => {
 
   it('keeps the orphan-sweeper cutoff at twice the close threshold', () => {
     // orphan-sweeper.ts documents the sweeper cutoff as 2x the teardown close;
-    // pin it now that both constants live in this module.
+    // both constants live in this module, so pin it here.
     expect(HEARTBEAT_STALE_THRESHOLD_SECONDS * 1000).toBe(2 * HEARTBEAT_CLOSE_MS);
   });
 

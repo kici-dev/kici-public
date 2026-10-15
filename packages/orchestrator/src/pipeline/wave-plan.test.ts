@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { VariantKind } from '@kici-dev/engine';
 import type { LockJob, MaterializedJob } from '@kici-dev/engine';
 import { computeWavePlan } from './dispatch-matched-workflow.js';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 /** Build the N fan-out children of a base with the given wave knobs. */
 function hostFanout(
@@ -80,15 +81,12 @@ describe('computeWavePlan', () => {
   });
 
   it('is fan-out-generic: a matrix base composes the same way', () => {
-    const lockJob = {
-      _type: 'static',
-      name: 'build',
+    const lockJob = staticJob({
       runsOn: 'linux',
-      needs: [],
       steps: [],
       matrix: { os: ['a', 'b', 'c'] },
       maxParallel: 1,
-    } as unknown as LockJob;
+    });
     const jobs: MaterializedJob[] = ['a', 'b', 'c'].map((v) => ({
       lockJob,
       baseName: 'build',

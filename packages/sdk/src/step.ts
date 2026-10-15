@@ -29,27 +29,24 @@ function normalizeRetry(retry: number | RetryConfig | undefined): NormalizedRetr
 }
 
 /**
- * Capture the call-site source location of step() using the V8 stack trace API.
- * Uses Error.captureStackTrace with the `step` function as the constructor argument
- * so the stack starts from step()'s caller.
+ * Capture the call-site source location of step() from the V8 stack trace.
  *
- * @returns SourceLocation or undefined if parsing fails
+ * @returns undefined if parsing fails
  */
 function captureCallSite(): SourceLocation | undefined {
   const originalLimit = Error.stackTraceLimit;
   try {
     Error.stackTraceLimit = 4;
     const err: { stack?: string } = {};
-    // Use captureCallSite as the constructor function so the stack starts at step() (its caller).
-    // Frame 0 = step(), Frame 1 = step()'s caller (the actual call site we want).
+    // captureCallSite as the constructor argument starts the stack at step():
+    // frame 0 = step(), frame 1 = step()'s caller (the call site we want).
     Error.captureStackTrace(err, captureCallSite);
     const stack = err.stack;
     if (!stack) return undefined;
 
     // Stack: "Error\n    at step (...)\n    at callSite (...)\n..."
-    // Skip lines[0] ("Error") and lines[1] (step() frame), parse lines[2] (call site).
+    // Skip lines[0] ("Error") and lines[1] (step() frame).
     const lines = stack.split('\n');
-    // Start at index 2 to skip "Error" header and the step() frame
     for (let i = 2; i < lines.length; i++) {
       const line = lines[i].trim();
       const match = line.match(/\((.+):(\d+):(\d+)\)$/) || line.match(/^at (.+):(\d+):(\d+)$/);
@@ -58,9 +55,8 @@ function captureCallSite(): SourceLocation | undefined {
         if (file.startsWith('file://')) {
           file = file.slice(7);
         }
-        // Strip any loader cache-buster query (e.g. the compiler imports modules
-        // as `file://…/ci.ts?t=<epoch>`); a real filesystem path never carries a
-        // `?query`, so the captured location must be a clean path.
+        // Strip a loader cache-buster query (the compiler imports modules as
+        // `file://…/ci.ts?t=<epoch>`); a filesystem path never carries one.
         const queryIndex = file.indexOf('?');
         if (queryIndex !== -1) {
           file = file.slice(0, queryIndex);
@@ -167,7 +163,7 @@ export function step<TResult = void, TDrift = unknown>(
 /**
  * Implementation of step() factory.
  * Discriminates overloads by first arg type:
- * - string => named variant (existing)
+ * - string => named variant
  * - function => id-less simple (wrap as { run: fn }, name = '')
  * - object => id-less full options (name = '')
  */
@@ -223,11 +219,9 @@ export function step<TResult = void, TDrift = unknown>(
 
   const retry = normalizeRetry(options.retry);
 
-  // Build the step object first, then attach the output proxy with a
-  // self-reference so the proxy reads `stepObj.name` lazily at access time.
-  // Id-less steps start with `name === ''`; the runner assigns `step-N` onto
-  // this same object before execution, so `.result` resolves under the final
-  // name (see createStepOutputProxy).
+  // The output proxy reads `stepObj.name` lazily: the runner assigns `step-N`
+  // onto an id-less step before execution, so `.result` resolves under the
+  // final name (see createStepOutputProxy).
   const stepObj = {
     _tag: 'Step' as const,
     name,

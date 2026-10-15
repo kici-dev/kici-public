@@ -111,7 +111,7 @@ describe('validateDag()', () => {
     if (result.valid === false && result.error === 'cycle') {
       expect(result.nodesInCycle).toContain('D');
       expect(result.nodesInCycle).toContain('E');
-      // A, B, C should NOT be in cycle (they'll be processed successfully)
+      // A, B, C are sorted before the cycle and are not part of it.
       expect(result.nodesInCycle).not.toContain('A');
       expect(result.nodesInCycle).not.toContain('B');
       expect(result.nodesInCycle).not.toContain('C');
@@ -188,7 +188,7 @@ describe('validateDag()', () => {
     const result = validateDag(nodes);
     expect(result.valid).toBe(true);
     if (result.valid) {
-      // A before B, X before Y (but A/B independent of X/Y)
+      // A/B and X/Y are independent chains.
       expect(result.sortedOrder.indexOf('A')).toBeLessThan(result.sortedOrder.indexOf('B'));
       expect(result.sortedOrder.indexOf('X')).toBeLessThan(result.sortedOrder.indexOf('Y'));
     }

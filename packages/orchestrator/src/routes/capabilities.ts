@@ -1,15 +1,11 @@
 /**
- * Orchestrator capability manifest exposed to REST clients (the CLI).
+ * `/capabilities`: a versioned manifest the CLI reads to format actionable
+ * errors on a feature gap (e.g. `kici status --logs` against an orchestrator
+ * without the logs endpoint). See `docs/architecture/coordinator-worker.md`
+ * for the minimum-version semantics this mirrors for the WS connections.
  *
- * The `/capabilities` endpoint returns a small versioned manifest the CLI can
- * read on demand to format actionable errors when it detects a feature gap
- * (e.g. `kici status --logs` against an orchestrator that lacks the logs
- * endpoint). See `docs/architecture/coordinator-worker.md` for the minimum-
- * version semantics this mirrors for the WS connections.
- *
- * Public (no auth) — same security posture as `/health`, which already exposes
- * the orchestrator's version. Version info must be reachable without a token
- * so the CLI can fetch it even when authenticated calls fail with 404/401.
+ * Public (no auth), like `/health`, which already exposes the version: the CLI
+ * must reach it even when authenticated calls fail with 404/401.
  */
 
 import { Hono } from 'hono';
@@ -18,11 +14,10 @@ import { PROTOCOL_VERSION, MIN_PROTOCOL_VERSION } from '@kici-dev/engine';
 declare const KICI_PKG_VERSION: string;
 
 export interface CapabilitiesManifest {
-  /** Orchestrator package version (injected at build time). */
+  /** Injected at build time. */
   orchestratorVersion: string;
-  /** Protocol version the orchestrator speaks. */
   protocolVersion: number;
-  /** Minimum protocol version the orchestrator accepts from peers/clients. */
+  /** Minimum protocol version accepted from peers/clients. */
   minProtocolVersion: number;
 }
 

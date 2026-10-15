@@ -3,11 +3,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-// Replace the shared logger with a stable spy so the eviction tests can assert
-// the structured `logger.info('user-cache eviction ...')` line is emitted (the
-// Loki-queryable observability surface). vi.hoisted is required because
-// vi.mock() is hoisted above all imports, so the captured logger must exist
-// before the mock factory runs.
+// A stable logger spy, so the eviction tests can assert the Loki-queryable
+// `logger.info('user-cache eviction ...')` line. vi.hoisted: vi.mock() is hoisted
+// above all imports, so the logger must exist before the mock factory runs.
 const { mockLogger } = vi.hoisted(() => ({
   mockLogger: {
     info: vi.fn(),
@@ -35,15 +33,13 @@ import { generateSigningSecret } from '../storage/sign-url.js';
  * In-memory CacheStorage stub implementing the full interface (incl. list/copy).
  *
  * `getUrl` returns `mem://<key>` for present keys; `getUploadUrl` returns
- * `put://<key>`. Each stored object carries a monotonically-increasing
- * `created` counter so `list()` can return newest-first deterministically
- * without relying on wall-clock resolution.
+ * `put://<key>`. A monotonic `created` counter lets `list()` return newest-first
+ * deterministically, independent of wall-clock resolution.
  *
- * TTL: the stub honors a constructor `ttlMs` against a controllable `clock`
- * (advanced by tests via `advance()`), recording each object's logical
- * creation tick. `getUrl`/`has`/`get` lazily delete and report a miss once
- * `clock - createdTick > ttlMs`, mirroring the real S3/filesystem backends'
- * lazy expiry-on-access (touch refreshes the tick like `lastAccessedAt`).
+ * TTL: `getUrl`/`has`/`get` lazily delete and miss once
+ * `clock - createdTick > ttlMs` on the logical `clock`, mirroring the real
+ * S3/filesystem backends' lazy expiry-on-access (touch refreshes the tick like
+ * `lastAccessedAt`).
  */
 class FakeStorage implements CacheStorage {
   private readonly data = new Map<string, Buffer>();
@@ -364,7 +360,6 @@ describe('UserCache', () => {
   it('atomic write: a presigned upload lands in a temp key; commit copies to final + removes temp', async () => {
     const begin = await cache.beginSave({ org, repo, scope: 'shared', key: 'k1' });
     expect(begin.uploadUrl).toContain('.tmp-'); // temp key, not the final key
-    // simulate the agent PUT landing the temp object:
     storage.simulateUpload(begin.tempKey!, Buffer.from('TARDATA'));
     await cache.commitSave({
       org,
@@ -375,7 +370,6 @@ describe('UserCache', () => {
       sizeBytes: 7,
       tempKey: begin.tempKey,
     });
-    // final exists, temp gone:
     const r = await cache.restore({ org, repo, scope: 'shared', key: 'k1' });
     expect(r.hit).toBe(true);
     expect(await storage.has(begin.tempKey!)).toBe(false);
@@ -424,7 +418,6 @@ describe('UserCache', () => {
   });
 
   it('ref-scope write isolation: an isolated-scope save never lands in shared, but reads shared as fallback', async () => {
-    // shared base entry exists:
     await cache.commitSave({
       org,
       repo,
@@ -434,7 +427,7 @@ describe('UserCache', () => {
       sizeBytes: 10,
       runId: 'r0',
     });
-    // isolated (fork PR) restore can read the shared base:
+    // isolated = fork PR
     const fallback = await cache.restore({
       org,
       repo,
@@ -444,7 +437,7 @@ describe('UserCache', () => {
       runId: 'r1',
     });
     expect(fallback.hit).toBe(true);
-    // isolated save lands in the run-scoped isolated namespace, NOT shared:
+    // Lands in the run-scoped isolated namespace, NOT shared.
     await cache.commitSave({
       org,
       repo,
@@ -501,11 +494,9 @@ describe('UserCache', () => {
     await cache.commitSave({ org, repo, scope: 'shared', key: 'a', tarHash: 'h', sizeBytes: 10 });
     await cache.commitSave({ org, repo, scope: 'shared', key: 'b', tarHash: 'h', sizeBytes: 10 });
     await cache.commitSave({ org, repo, scope: 'shared', key: 'c', tarHash: 'h', sizeBytes: 10 }); // total 30 > 25
-    // oldest (a) evicted:
     expect((await cache.restore({ org, repo, scope: 'shared', key: 'a' })).hit).toBe(false);
     expect((await cache.restore({ org, repo, scope: 'shared', key: 'c' })).hit).toBe(true);
-    // The eviction is surfaced as a structured, Loki-queryable log line with
-    // the org, evicted key, and freed bytes.
+    // Structured log line with the org, evicted key, and freed bytes.
     const evictionLogs = mockLogger.info.mock.calls.filter(
       ([msg]) => msg === 'user-cache eviction (org over quota)',
     );
@@ -570,15 +561,11 @@ describe('UserCache', () => {
     storage = new FakeStorage({ ttlMs: 1000 });
     cache = new UserCache({ storage, quotaBytes: 1_000_000, ttlMs: 1000 });
     await cache.commitSave({ org, repo, scope: 'shared', key: 'k1', tarHash: 'h', sizeBytes: 10 });
-    // Fresh: still a hit.
     expect((await cache.restore({ org, repo, scope: 'shared', key: 'k1' })).hit).toBe(true);
-    // Advance the logical clock past the TTL window.
     storage.advance(5000);
-    // Lazy TTL eviction: restore misses...
     expect((await cache.restore({ org, repo, scope: 'shared', key: 'k1' })).hit).toBe(false);
-    // ...and the underlying object was deleted on access. Name the discriminated
-    // key: asserting the bare `k1.tar.gz` would pass vacuously, since no object
-    // is ever stored under that name.
+    // Deleted on access. Name the discriminated key: the bare `k1.tar.gz` would
+    // pass vacuously, since no object is ever stored under that name.
     const prefix = 'cache/org-1/owner_repo/shared/';
     expect(await storage.has(`${prefix}k1-${keyDiscriminator('k1')}.tar.gz`)).toBe(false);
   });

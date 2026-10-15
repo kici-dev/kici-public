@@ -22,10 +22,7 @@ vi.mock('@kici-dev/shared/net', async (importOriginal) => ({
   readInputChain: (...a: unknown[]) => mockReadInputChain(...a),
 }));
 
-/**
- * A `forward` chain already carrying the subnet drop set, as `nft -a list
- * chain` prints it. Verbatim nft output, because the presence check parses it.
- */
+/** A `forward` chain carrying the subnet drop set, verbatim `nft -a list chain` output (parsed). */
 const CHAIN_WITH_SUBNET_RULES = [
   'table ip kici {',
   '\tchain forward {',
@@ -87,9 +84,8 @@ describe('job-network', () => {
       'saddr',
     );
 
-    // Ordering is the property under test. The rules must be in the chain
-    // before anything can join the bridge, so they land before the bridge is
-    // even created — and a container can only ever be created after that.
+    // Ordering is the property under test: the rules land before the bridge exists,
+    // so no container can ever join it unfiltered.
     const createNetwork = docker.createNetwork as ReturnType<typeof vi.fn>;
     expect(mockAddRules.mock.invocationCallOrder[0]).toBeLessThan(
       createNetwork.mock.invocationCallOrder[0],
@@ -97,10 +93,8 @@ describe('job-network', () => {
   });
 
   it('installs the drop set when the forward chain does not exist yet', async () => {
-    // `readForwardChain` answers null for a table whose chain nft has not
-    // created. "No chain" means no rules are installed, so the drops must go
-    // in — reading it as "already covered" would put every job container on
-    // the bridge unfiltered.
+    // `readForwardChain` answers null when nft has not created the chain: no rules,
+    // so the drops must go in, never read as "already covered".
     const { ensureJobNetwork, JOB_NETWORK_SUBNET, JOB_NETWORK_GATEWAY } =
       await import('./job-network.js');
     mockReadChain.mockResolvedValue(null);
@@ -120,17 +114,14 @@ describe('job-network', () => {
     const { ensureJobNetwork } = await import('./job-network.js');
 
     expect(await ensureJobNetwork(fakeDocker())).toBe(true);
-    // ensureJobNetwork runs once per job, so an unconditional install would
-    // leak a whole rule set per job.
+    // ensureJobNetwork runs once per job; an unconditional install leaks a rule set per job.
     expect(mockAddRules).not.toHaveBeenCalled();
   });
 
   it('reinstalls the drop set when the chain carries only part of it', async () => {
-    // The install is five separate `nft insert` calls, so a failure or a kill
-    // part-way through leaves exactly this: the gateway accept and the metadata
-    // drop landed, the three RFC1918 drops did not. Skipping on the first match
-    // would leave every later job on the host behind partial filtering, with
-    // 10.0.0.0/8 reachable and nothing to heal it.
+    // The install is five separate `nft insert` calls, so a kill part-way leaves exactly
+    // this: gateway accept and metadata drop landed, the three RFC1918 drops did not.
+    // Skipping on the first match leaves 10.0.0.0/8 reachable for every later job, unhealed.
     mockReadChain.mockResolvedValue(
       [
         'table ip kici {',
@@ -154,11 +145,9 @@ describe('job-network', () => {
   });
 
   it('installs the drop set even when the chain only mentions the subnet elsewhere', async () => {
-    // Neither line covers the job subnet as a SOURCE, and the scaler writes
-    // both shapes into this same chain: a per-container rule whose address
-    // shares the subnet's text prefix, and an operator allowlist naming the
-    // subnet as a destination. A looser presence check reads either as "already
-    // covered" and leaves every job container unfiltered.
+    // Neither line covers the job subnet as a SOURCE, yet the scaler writes both into this
+    // chain: a per-container rule sharing the subnet's text prefix, and an operator
+    // allowlist naming the subnet as destination. A looser check reads either as covered.
     mockReadChain.mockResolvedValue(
       [
         'table ip kici {',
@@ -212,10 +201,8 @@ describe('job-network', () => {
 
   it('keys the drops on an existing network’s own subnet when it differs', async () => {
     const { ensureJobNetwork } = await import('./job-network.js');
-    // A `kici-jobs` bridge somebody else made. A container on it gets a
-    // 10.77.x address, which the canonical 172.31.0.0/16 set never matches —
-    // so keying only on the constant would leave the whole bridge unfiltered
-    // and reopen the pre-start window this module exists to close.
+    // A foreign `kici-jobs` bridge hands out 10.77.x addresses the canonical 172.31.0.0/16
+    // set never matches; keying on the constant reopens the pre-start window.
     const docker = fakeDocker({
       listNetworks: vi.fn().mockResolvedValue([
         {
@@ -326,9 +313,8 @@ describe('job-container host boundary', () => {
   });
 
   it('emits the DNS accept above the terminal drop, and no accept for any other port', async () => {
-    // The rule text is what the boundary IS, so it is asserted rather than the
-    // fact that some call happened. An agent WS port on a host address matches
-    // no accept and falls through to the drop.
+    // The rule text IS the boundary, so assert it, not that a call happened. An agent WS
+    // port on a host address matches no accept and falls through to the drop.
     const { resolveJobHostAccess } = await import('./job-network.js');
     const { buildHostAccessRuleOps } = await import('@kici-dev/shared/net');
     const rules = buildHostAccessRuleOps(['ip', 'saddr', '172.31.0.0/16'], resolveJobHostAccess());
@@ -343,11 +329,9 @@ describe('job-container host boundary', () => {
   });
 
   it('ignores a hostAccess on the policy it is handed, so no caller can widen the host boundary', async () => {
-    // The check that fails if the resolution ever reads its caller: the policy
-    // below asks for every port on every host address, which is the whole
-    // boundary. `resolveJobHostAccess` takes no policy at all, so the agent
-    // default is what lands — assert it through the real call path, since that
-    // is where a future per-job policy would arrive.
+    // Fails if the resolution ever reads its caller: the policy asks for the whole
+    // boundary, `resolveJobHostAccess` takes no policy, so the agent default must land.
+    // Asserted through the real call path, where a future per-job policy would arrive.
     const { applyJobEgressRules } = await import('./job-network.js');
     await applyJobEgressRules(fakeDocker(), 'c1', {
       hostAccess: ['*'],

@@ -15,12 +15,10 @@ import type { JobQueue } from '../queue/job-queue.js';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 
 /**
- * `onAgentAvailable` returns without dispatching on five distinct paths and
- * used to log on none of them. That is what made a pinned, label-matching
- * queued job sitting undrained for a full minute after a host reconnect
- * indistinguishable from an idle orchestrator: the observable behaviour is
- * identical, and an orchestrator logging at `info` would not have shown a
- * `debug` line either.
+ * `onAgentAvailable` returns without dispatching on five distinct paths. An
+ * unlogged decline makes a pinned, label-matching job sitting undrained after a
+ * host reconnect indistinguishable from an idle orchestrator, and a `debug`
+ * line is invisible at `info`.
  */
 function mockQueue(depth: number): JobQueue {
   return {
@@ -106,8 +104,7 @@ describe('Dispatcher drain-decline reporting', () => {
   });
 
   it('stays quiet when the queue is empty', async () => {
-    // The steady state. A line per idle drain would be the loudest thing in
-    // the stream and would bury the one occurrence that matters.
+    // The steady state: a line per idle drain would bury the one that matters.
     registry.register('a1', mockWs(), ['linux']);
     const dispatcher = new Dispatcher({
       registry,

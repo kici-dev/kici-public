@@ -1,10 +1,4 @@
-/**
- * Orchestrator-side cold-store.
- *
- * Extends BaseColdStore with orchestrator-specific table adapters:
- * execution_runs / execution_jobs / execution_steps, secret_audit_log,
- * access_log and event_log.
- */
+/** Orchestrator cold-store: BaseColdStore plus the orchestrator table adapters. */
 import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import {
@@ -37,10 +31,8 @@ export class OrchestratorColdStore extends BaseColdStore {
   constructor(deps: OrchestratorColdStoreDeps) {
     super({ ...deps, db: 'orchestrator' });
     this.kdb = deps.kdb;
-    // Register steps → jobs → runs so the FK
-    // `execution_jobs.run_id → execution_runs(run_id)` doesn't fire on
-    // DELETE. The adapters' eligibility predicates also enforce this
-    // ordering across cycle interruptions.
+    // Steps → jobs → runs, so the FK `execution_jobs.run_id → execution_runs(run_id)` does not
+    // fire on DELETE. The adapters' eligibility predicates keep this order across interruptions.
     this.registerAdapter(
       new ExecutionStepsAdapter(deps.kdb, deps.instanceId, {
         overrides: deps.config.tables.execution_steps ?? deps.config.tables['execution_steps'],
@@ -56,13 +48,9 @@ export class OrchestratorColdStore extends BaseColdStore {
         overrides: deps.config.tables.execution_runs ?? deps.config.tables['execution_runs'],
       }),
     );
-    // secret_audit_log + access_log. Both are independent of
-    // execution_* (no FKs); order is irrelevant. Access_log goes last
-    // because the run/job/step archives in this same cycle write
-    // recursive access_log rows — letting access_log archive last
-    // means those new rows are picked up next cycle, not this one
-    // (which would otherwise read-after-write within the same tx
-    // boundary spanning multiple adapters).
+    // No FKs to execution_*. access_log goes last: the run/job/step archives in this cycle write
+    // recursive access_log rows, which then archive next cycle instead of read-after-write
+    // within a tx boundary spanning several adapters.
     this.registerAdapter(
       new SecretAuditLogAdapter(deps.kdb, deps.instanceId, {
         overrides: deps.config.tables.secret_audit_log ?? deps.config.tables['secret_audit_log'],
@@ -73,10 +61,8 @@ export class OrchestratorColdStore extends BaseColdStore {
         overrides: deps.config.tables.access_log ?? deps.config.tables['access_log'],
       }),
     );
-    // event_log. Independent of every other adapter (no FKs).
-    // Registered after access_log so that the recursive access_log row
-    // emitted by markArchivedAndDelete is processed in the next cycle
-    // — same reasoning as access_log's own placement.
+    // No FKs. After access_log, so the recursive access_log row from markArchivedAndDelete
+    // archives next cycle.
     this.registerAdapter(
       new EventLogAdapter(deps.kdb, deps.instanceId, {
         overrides: deps.config.tables.event_log ?? deps.config.tables['event_log'],
@@ -84,11 +70,7 @@ export class OrchestratorColdStore extends BaseColdStore {
     );
   }
 
-  /**
-   * Query the orchestrator's `cold_store_chunks` table for
-   * chunks past their per-row cold-retention horizon. See the matching
-   * Platform-side method for the full rationale.
-   */
+  /** Chunks past their per-row cold-retention horizon; rationale on the Platform-side method. */
   protected override async listPurgeableChunks(opts: {
     tableFilter?: string;
     bucketFilter?: string;
@@ -133,10 +115,7 @@ export class OrchestratorColdStore extends BaseColdStore {
     }));
   }
 
-  /**
-   * Per-chunk advisory lock keyed on
-   * `hashtext('cold-store-purge|orchestrator|<table>|<chunkId>')`.
-   */
+  /** Per-chunk advisory lock on `hashtext('cold-store-purge|orchestrator|<table>|<chunkId>')`. */
   protected override async withPurgeLock<T>(
     args: { table: string; chunkId: string },
     fn: () => Promise<T>,
@@ -158,10 +137,8 @@ export class OrchestratorColdStore extends BaseColdStore {
 }
 
 /**
- * Build the orchestrator cold-store config from env vars. Reads
- * `KICI_COLD_STORE_*` vars mirrored with the Platform side. The
- * orchestrator config schema has no `coldStore` section, so env vars are
- * the only input.
+ * Reads the `KICI_COLD_STORE_*` env vars (mirrored with the Platform side). The orchestrator
+ * config schema has no `coldStore` section, so env vars are the only input.
  */
 export function readOrchestratorColdStoreConfig(
   env: NodeJS.ProcessEnv = process.env,
@@ -188,8 +165,7 @@ export function readOrchestratorColdStoreConfig(
 }
 
 /**
- * Per-table tuning overrides from env. Mirrors the Platform pattern in
- * `platform-cold-store.ts`. Pattern:
+ * Per-table env overrides; mirrors the Platform pattern in `platform-cold-store.ts`:
  *
  *   KICI_COLD_STORE_<TABLE>_WARM_TTL_DAYS
  *   KICI_COLD_STORE_<TABLE>_MIN_WARM_TENANT_BYTES
@@ -242,9 +218,8 @@ function parseNumber(raw: string | undefined, fallback: number): number {
 }
 
 /**
- * Build the cold-store-archive scheduled-job handler for the
- * orchestrator. Re-reads env vars on every tick so SIGHUP-driven
- * config reload picks up new bucket/prefix values without a restart.
+ * Re-reads env vars on every tick, so a SIGHUP config reload picks up new bucket/prefix
+ * values without a restart.
  */
 export function createColdStoreArchiveHandler(
   instanceId: string,
@@ -272,11 +247,7 @@ export function createColdStoreArchiveHandler(
   };
 }
 
-/**
- * Build the cold-store-purge scheduled-job handler. Same
- * env-var re-read pattern as the archive handler so SIGHUP picks up
- * config changes mid-run.
- */
+/** Re-reads env vars on every tick, like the archive handler. */
 export function createColdStorePurgeHandler(
   instanceId: string,
   kdb: Kysely<Database>,

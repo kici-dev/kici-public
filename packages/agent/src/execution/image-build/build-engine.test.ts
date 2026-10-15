@@ -35,8 +35,7 @@ describe('resolveBuildCli', () => {
   });
 
   it('names both binaries when neither is installed', () => {
-    // The CLI is required — there is no socket fallback — so the failure has to
-    // say what to install rather than surfacing a bare ENOENT mid-job.
+    // No socket fallback exists, so the failure must say what to install, not ENOENT.
     expect(() => resolveBuildCli({ onPath: () => false })).toThrow(/docker.*podman/s);
   });
 
@@ -118,9 +117,8 @@ describe('makeLineSplitter', () => {
   });
 
   it('flushes a final line that has no trailing newline', () => {
-    // A builder's dying words are written just before exit and usually carry no
-    // newline. Without the flush, the one line the author most needs is the one
-    // that never reaches the run log.
+    // A builder's last line usually lacks a newline; without the flush it never
+    // reaches the run log.
     const lines: string[] = [];
     const s = makeLineSplitter((l) => lines.push(l));
     s.write(Buffer.from('ERROR: failed to solve'));
@@ -140,9 +138,8 @@ describe('makeLineSplitter', () => {
 
 describe('buildJobImage abort', () => {
   it('refuses before spawning when the signal is already aborted', async () => {
-    // A job cancelled while it was still cloning would otherwise run its whole
-    // build to completion: an already-aborted signal never fires the listener
-    // the spawn installs.
+    // An already-aborted signal (cancelled during clone) never fires the spawn's
+    // listener, so the whole build would run.
     const ac = new AbortController();
     ac.abort(new Error('job cancelled'));
     await expect(

@@ -10,8 +10,6 @@ function closedWs(): ObserverWsLike {
   };
 }
 
-// ── Tests ───────────────────────────────────────────────────────
-
 describe('ObserverRegistry', () => {
   let registry: ObserverRegistry;
 
@@ -250,13 +248,10 @@ describe('ObserverRegistry', () => {
     it('schedules buffer cleanup after 5 minutes', () => {
       registry.broadcastComplete('run-1', 'success', { totalDurationMs: 0, jobs: [] });
 
-      // Buffer should still exist
       expect(registry.getBufferSize('run-1')).toBe(1);
 
-      // Advance time by 5 minutes
       vi.advanceTimersByTime(5 * 60 * 1000);
 
-      // Buffer should be cleaned up
       expect(registry.getBufferSize('run-1')).toBe(0);
       expect(registry.getCurrentSequence('run-1')).toBe(0);
     });
@@ -267,20 +262,17 @@ describe('ObserverRegistry', () => {
       const ws1 = mockWs();
       registry.subscribe('run-1', ws1);
 
-      // Send 5 messages
       for (let i = 0; i < 5; i++) {
         registry.broadcast('run-1', { type: 'msg', index: i });
       }
       expect((ws1.send as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(5);
 
-      // Disconnect ws1
       registry.unsubscribe('run-1', ws1);
 
       // Reconnect with lastSeenSequence=3 (should replay messages 4 and 5)
       const ws2 = mockWs();
       registry.subscribe('run-1', ws2, 3);
 
-      // ws2 should have received 2 backfill messages
       expect((ws2.send as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(2);
 
       const msg4 = JSON.parse((ws2.send as ReturnType<typeof vi.fn>).mock.calls[0][0]);
@@ -323,7 +315,6 @@ describe('ObserverRegistry', () => {
       const ws = mockWs();
       registry.subscribe('run-1', ws);
 
-      // Broadcast 1100 messages
       for (let i = 0; i < 1100; i++) {
         registry.broadcast('run-1', { type: 'msg', index: i });
       }

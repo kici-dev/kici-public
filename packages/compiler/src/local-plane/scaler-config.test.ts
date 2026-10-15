@@ -71,7 +71,7 @@ describe('local-plane scaler-config', () => {
     expect(sandboxed).toBeDefined();
     expect(sandboxed!.type).toBe('bare-metal');
     expect(sandboxed!.orchestratorUrl).toBe('ws://127.0.0.1:4319/ws');
-    // Sandboxed pool: exactly the default label set, no trusted env, no taint.
+    // Exactly the default label set, no trusted env, no taint.
     expect(sandboxed!.labelSets).toHaveLength(1);
     expect(sandboxed!.labelSets[0].labels).toEqual(['default']);
     expect(sandboxed!.labelSets[0].binaryPath).toBe(planePaths().agentWrapperFile);
@@ -101,8 +101,7 @@ describe('local-plane scaler-config', () => {
       KICI_IN_PLACE: 'true',
     });
 
-    // Every trusted label set carries the mandatory taint label (validator
-    // invariant: a mandatory label must appear in every label set of its scaler).
+    // Validator invariant: a mandatory label is in every label set of its scaler.
     for (const ls of trusted!.labelSets) {
       expect(ls.labels).toContain(TRUSTED_ROUTING_LABEL);
     }
@@ -115,12 +114,10 @@ describe('local-plane scaler-config', () => {
     }
   });
 
-  // Security invariant (regression guard for the non-trusted ambient-env leak):
-  // a bare `default` run must be UNABLE to reach any trusted label set. Every
-  // pool whose label-set env sets KICI_TRUSTED_ENV=true MUST be tainted with a
-  // mandatoryLabel that `['default']` does not satisfy — so the orchestrator's
-  // agent-registry gate (and the scaler spawn matcher) both keep a sandboxed
-  // job off every trusted agent, even a lingering idle one.
+  // Security invariant: a bare `default` run must be UNABLE to reach a trusted
+  // label set. Every KICI_TRUSTED_ENV=true pool MUST carry a mandatoryLabel
+  // `['default']` does not satisfy, so the agent-registry gate and the scaler
+  // spawn matcher keep a sandboxed job off every trusted agent, idle ones too.
   it('every trusted (KICI_TRUSTED_ENV=true) pool is tainted against a bare default job', () => {
     freshRoot();
     const scalers = parseScalers();
@@ -133,8 +130,7 @@ describe('local-plane scaler-config', () => {
       trustedPools++;
       const mandatory = scaler.mandatoryLabels ?? [];
       expect(mandatory.length).toBeGreaterThan(0);
-      // The taint gate: at least one mandatory label is absent from a default
-      // run's runsOn, so the gate rejects it.
+      // At least one mandatory label is absent from a default run's runsOn.
       const gatePasses = mandatory.every((m) =>
         defaultRunLabels.map((l) => l.toLowerCase()).includes(m.toLowerCase()),
       );

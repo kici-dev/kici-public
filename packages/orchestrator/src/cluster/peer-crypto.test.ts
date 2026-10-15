@@ -104,7 +104,6 @@ describe('encryptMessage / decryptMessage', () => {
     const sessionKey = deriveSessionKey(pairA.privateKey, pairB.publicKey, nonce);
 
     const encrypted = encryptMessage('secret data', sessionKey);
-    // Tamper with the ciphertext (flip a byte in the middle of the base64)
     const packed = Buffer.from(encrypted, 'base64');
     packed[packed.length - 1] ^= 0xff; // flip last byte
     const tampered = packed.toString('base64');

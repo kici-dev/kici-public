@@ -90,21 +90,16 @@ The preferred method is through the KiCI dashboard:
 1. Navigate to your organization's **Settings** page
 2. Select the **Orchestrator keys** tab
 3. Click **Create orchestrator key**
-4. Enter a name (e.g., `prod-orchestrator`) and optionally add routing patterns
+4. Enter a name (e.g., `prod-orchestrator`) and an optional description
 5. Copy the generated key immediately -- it is shown only once
 
-The dashboard also supports managing routing permissions (add/remove patterns) and revoking keys.
-
-### Routing key permissions
-
-Routing key patterns control which webhook sources the orchestrator is allowed to receive. Patterns use the format `provider:id` (e.g., `github:12345` for a specific GitHub App, or `github:*` for all GitHub Apps). If no routing patterns are specified, the orchestrator can receive webhooks from all sources in its organization.
+The dashboard also lets you clone and revoke keys.
 
 ### Key characteristics
 
 - Orchestrator API keys have **no role or permission matrix** — they are simple bearer tokens scoped to an organization
-- Keys can be optionally restricted to specific routing key patterns
 - Keys are soft-revoked via `revoked_at` timestamp (not deleted)
-- Key prefix (first 16 characters) is stored for identification in listings
+- Key prefix (the first 14 characters: `kici_ok_` plus six more) is stored for identification in listings
 
 ## Quick start
 

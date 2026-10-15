@@ -16,10 +16,9 @@ import { DispatchQueueStatus, type JobQueue, type QueuedJob } from '../queue/job
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 
 /**
- * The connected-agent re-drive logs how many pending jobs it placed. A job it
- * claims whose dispatch is then refused, or put back because its sealed secrets
- * cannot be opened here, is not a placement, so it must not be counted or
- * logged as one.
+ * The connected-agent re-drive logs how many pending jobs it placed. A claimed
+ * job whose dispatch is refused, or put back because its sealed secrets cannot
+ * be opened here, is not a placement and must not be counted or logged as one.
  */
 const REFUSED_JOB = 'refused-job';
 

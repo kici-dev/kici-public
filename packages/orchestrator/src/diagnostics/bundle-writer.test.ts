@@ -1,6 +1,4 @@
-/**
- * Tests for bundle-writer: debug bundle creation with secret redaction.
- */
+/** Debug bundle creation with secret redaction. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createDebugBundle, type BundleOptions } from './bundle-writer.js';
@@ -53,7 +51,6 @@ describe('createDebugBundle', () => {
     expect(result).toBe(outputPath);
     expect(fs.existsSync(outputPath)).toBe(true);
 
-    // Verify it's a valid ZIP
     const zipData = fs.readFileSync(outputPath);
     const zip = await JSZip.loadAsync(zipData);
     expect(Object.keys(zip.files).length).toBeGreaterThan(0);
@@ -83,7 +80,6 @@ describe('createDebugBundle', () => {
     const zip = await JSZip.loadAsync(zipData);
     const config = JSON.parse(await zip.file('config/config.json')!.async('text'));
 
-    // Safe fields should be preserved
     expect(config.mode).toBe('platform');
     expect(config.host).toBe('0.0.0.0');
     expect(config.port).toBe(8080);
@@ -98,14 +94,13 @@ describe('createDebugBundle', () => {
     const zip = await JSZip.loadAsync(zipData);
     const config = JSON.parse(await zip.file('config/config.json')!.async('text'));
 
-    // Sensitive fields should be redacted
     expect(config.dbUrl).toBe('****');
     expect(config.apiToken).toBe('****');
     expect(config.webhookSecret).toBe('****');
     expect(config.oidcSecret).toBe('****');
     expect(config.privateKey).toBe('****');
 
-    // Nested unknown string fields redacted too
+    // Nested unknown string fields too
     expect(config.nested.password).toBe('****');
   });
 
@@ -167,7 +162,6 @@ describe('createDebugBundle', () => {
   });
 
   it('handles logs directory with recent log files', async () => {
-    // Create a mock log directory with files
     const logDir = path.join(tmpDir, 'logs');
     fs.mkdirSync(logDir);
     fs.writeFileSync(path.join(logDir, 'app.log'), 'line 1\nline 2\nERROR something\n');
@@ -178,7 +172,6 @@ describe('createDebugBundle', () => {
     const zipData = fs.readFileSync(outputPath);
     const zip = await JSZip.loadAsync(zipData);
 
-    // Should contain logs directory
     const logFiles = Object.keys(zip.files).filter((f) => f.startsWith('logs/'));
     expect(logFiles.length).toBeGreaterThan(0);
   });
@@ -187,14 +180,12 @@ describe('createDebugBundle', () => {
     const logDir = path.join(tmpDir, 'logs');
     fs.mkdirSync(logDir);
 
-    // Create old log (large, written first with older mtime)
+    // Older and larger than recent.log
     const oldPath = path.join(logDir, 'old.log');
     fs.writeFileSync(oldPath, 'old log line\n'.repeat(1000));
-    // Set mtime to 1 hour ago
     const oneHourAgo = new Date(Date.now() - 3600_000);
     fs.utimesSync(oldPath, oneHourAgo, oneHourAgo);
 
-    // Create recent log (smaller, written second with newer mtime)
     const recentPath = path.join(logDir, 'recent.log');
     fs.writeFileSync(recentPath, 'recent log line\n'.repeat(10));
 
@@ -204,7 +195,7 @@ describe('createDebugBundle', () => {
     const zipData = fs.readFileSync(outputPath);
     const zip = await JSZip.loadAsync(zipData);
 
-    // Both should be present (under cap), but recent.log should be in the bundle
+    // Both fit under the cap; recent.log must be in the bundle
     const recentFile = zip.file('logs/recent.log');
     expect(recentFile).not.toBeNull();
     const recentContent = await recentFile!.async('text');
@@ -215,28 +206,23 @@ describe('createDebugBundle', () => {
     const logDir = path.join(tmpDir, 'logs');
     fs.mkdirSync(logDir);
 
-    // Create a recent log (modified now)
     const recentPath = path.join(logDir, 'recent.log');
     fs.writeFileSync(recentPath, 'recent data\n');
 
-    // Create an old log (modified 10 hours ago)
     const oldPath = path.join(logDir, 'old.log');
     fs.writeFileSync(oldPath, 'old data\n');
     const tenHoursAgo = new Date(Date.now() - 10 * 3600_000);
     fs.utimesSync(oldPath, tenHoursAgo, tenHoursAgo);
 
-    // Use logWindow=2 so the old file is excluded
     const opts = { ...baseBundleOptions, outputPath, logDir, logWindow: 2 };
     await createDebugBundle(opts);
 
     const zipData = fs.readFileSync(outputPath);
     const zip = await JSZip.loadAsync(zipData);
 
-    // Recent log should be included
     expect(zip.file('logs/recent.log')).not.toBeNull();
-    // Old log should be excluded (outside 2-hour window)
+    // Outside the 2-hour window
     expect(zip.file('logs/old.log')).toBeNull();
-    // Summary should still exist
     expect(zip.file('logs/summary.json')).not.toBeNull();
   });
 
@@ -244,8 +230,7 @@ describe('createDebugBundle', () => {
     const logDir = path.join(tmpDir, 'logs');
     fs.mkdirSync(logDir);
 
-    // Create a "large" log file (we just test the logic with a smaller threshold in tests)
-    // The real cap is 50MB but we test the mechanism exists
+    // Only checks the bundle completes with the cap in place; the real cap is 50MB.
     const bigContent = 'x'.repeat(1024) + '\n';
     for (let i = 0; i < 10; i++) {
       fs.writeFileSync(path.join(logDir, `app-${i}.log`), bigContent.repeat(100));
@@ -254,7 +239,6 @@ describe('createDebugBundle', () => {
     const opts = { ...baseBundleOptions, outputPath, logDir };
     await createDebugBundle(opts);
 
-    // Should complete without error (cap is enforced internally)
     expect(fs.existsSync(outputPath)).toBe(true);
   });
 });
@@ -273,7 +257,6 @@ describe('readDebugBundle', () => {
   });
 
   it('parses a bundle ZIP and returns structured summary', async () => {
-    // First create a bundle
     await createDebugBundle({
       outputPath,
       orchestratorId: 'orch-reader-test',

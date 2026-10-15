@@ -1,10 +1,7 @@
 /**
- * Firecracker REST API client over Unix domain sockets.
+ * Firecracker REST API client over a Unix domain socket (`http` with `socketPath`).
  *
- * Provides a thin wrapper around Node.js built-in `http` module for communicating
- * with Firecracker's REST API. Uses the `socketPath` option for HTTP-over-Unix-socket.
- *
- * Only used for post-boot operations:
+ * Post-boot operations only:
  * - MMDS data injection (passing agent config to the guest VM)
  * - Graceful shutdown via SendCtrlAltDel (x86_64 only)
  * - Socket readiness polling after jailer invocation
@@ -17,16 +14,11 @@
 
 import http from 'node:http';
 
-/**
- * Error thrown when the Firecracker API returns a non-2xx status code
- * or a network-level error occurs.
- */
+/** A non-2xx Firecracker API response, or a network-level error. */
 export class FirecrackerApiError extends Error {
-  /** HTTP status code from the Firecracker API (undefined for network errors) */
+  /** Undefined for a network error. */
   readonly statusCode: number | undefined;
-  /** The API path that was requested */
   readonly path: string;
-  /** The response body from the Firecracker API */
   readonly responseBody: string;
 
   constructor(message: string, path: string, statusCode?: number, responseBody?: string) {
@@ -38,19 +30,10 @@ export class FirecrackerApiError extends Error {
   }
 }
 
-/**
- * Thin REST client for the Firecracker API over Unix domain sockets.
- *
- * No external dependencies -- uses Node.js built-in `http` module with
- * the `socketPath` option for HTTP-over-Unix-socket communication.
- */
 export class FirecrackerApi {
   /**
-   * Aborts every in-flight and subsequent request on this client.
-   *
-   * Set by the spawn path so a spawn deadline actually stops the VM
-   * provisioning calls, rather than leaving them running against a VM the
-   * manager has already given up on.
+   * Aborts every in-flight and later request. The spawn path sets it so a spawn
+   * deadline stops the provisioning calls against a VM the manager gave up on.
    */
   private signal: AbortSignal | undefined;
 
@@ -61,15 +44,7 @@ export class FirecrackerApi {
     this.signal = signal;
   }
 
-  /**
-   * Send an HTTP request to the Firecracker API.
-   *
-   * @param method - HTTP method (GET, PUT, PATCH)
-   * @param path - API path (e.g., '/mmds', '/actions', '/')
-   * @param body - Optional JSON body for PUT/PATCH requests
-   * @returns Response with statusCode and body
-   * @throws FirecrackerApiError on non-2xx status or network error
-   */
+  /** @throws FirecrackerApiError on a non-2xx status or a network error */
   private request(
     method: string,
     path: string,
@@ -135,15 +110,10 @@ export class FirecrackerApi {
   }
 
   /**
-   * Inject MMDS (Micro VM Metadata Service) data into a running VM.
+   * Inject MMDS (Micro VM Metadata Service) v2 data into a running VM, shaped
+   * `{ latest: { 'meta-data': { ... } } }`. The guest reads it from
+   * http://169.254.169.254/latest/meta-data/ with a token-based session.
    *
-   * Uses MMDS v2 data injection endpoint. The data should follow the structure:
-   * `{ latest: { 'meta-data': { ... } } }`
-   *
-   * The guest VM reads this data from http://169.254.169.254/latest/meta-data/
-   * using a token-based session (MMDS v2).
-   *
-   * @param data - Metadata object to inject
    * @see https://github.com/firecracker-microvm/firecracker/blob/main/docs/mmds/mmds-user-guide.md
    */
   async putMmds(data: Record<string, unknown>): Promise<void> {
@@ -151,9 +121,8 @@ export class FirecrackerApi {
   }
 
   /**
-   * Clear MMDS data after agent has received config via WS.
-   * Replaces the MMDS data with an empty meta-data object.
-   * Called after receiving config.ack from the agent.
+   * Replace the MMDS data with an empty meta-data object once the agent's
+   * config.ack confirms it received its config over WS.
    */
   async clearMmds(): Promise<void> {
     await this.request('PUT', '/mmds', {
@@ -162,14 +131,9 @@ export class FirecrackerApi {
   }
 
   /**
-   * Send a SendCtrlAltDel action for graceful x86_64 shutdown.
-   *
-   * This simulates pressing Ctrl+Alt+Del on the virtual keyboard,
-   * which triggers a clean shutdown in most Linux distributions.
-   *
-   * Note: Only works on x86_64. On arm64, the i8042 keyboard controller
-   * is not available, so this action is not supported. Use process kill
-   * as fallback on arm64.
+   * Graceful shutdown: Ctrl+Alt+Del on the virtual keyboard, which most Linux
+   * distributions answer with a clean shutdown. x86_64 only: arm64 has no i8042
+   * keyboard controller, so kill the process there instead.
    *
    * @see https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md
    */
@@ -178,10 +142,8 @@ export class FirecrackerApi {
   }
 
   /**
-   * Get instance info from the Firecracker API root endpoint.
-   *
-   * Used to check if the API socket is reachable and the VM is running.
-   * Returns the parsed JSON response with instance information.
+   * Instance info from the API root, parsed. Doubles as the check that the API
+   * socket is reachable and the VM is running.
    */
   async getInstanceInfo(): Promise<Record<string, unknown>> {
     const response = await this.request('GET', '/');
@@ -189,14 +151,8 @@ export class FirecrackerApi {
   }
 
   /**
-   * Poll the Firecracker API socket until it becomes reachable or timeout expires.
-   *
-   * Used after jailer invocation to wait for Firecracker to create the API socket
-   * and become ready to accept requests.
-   *
-   * @param timeoutMs - Maximum time to wait in milliseconds (default: 5000)
-   * @param intervalMs - Polling interval in milliseconds (default: 100)
-   * @returns true if socket became reachable, false on timeout
+   * Poll the API socket after the jailer starts, until Firecracker accepts
+   * requests (true) or `timeoutMs` passes (false). Both arguments are in ms.
    */
   async waitForSocket(timeoutMs: number = 5000, intervalMs: number = 100): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
@@ -206,7 +162,6 @@ export class FirecrackerApi {
         await this.getInstanceInfo();
         return true;
       } catch {
-        // Socket not ready yet, wait and retry
         await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
       }
     }

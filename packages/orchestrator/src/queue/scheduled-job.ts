@@ -1,18 +1,15 @@
 /**
- * Orchestrator scheduled-job wrapper.
+ * Orchestrator scheduled-job wrapper. Mirrors the Platform's wrapper in
+ * observable surface (the Prometheus metrics, structured logs, an audit row on
+ * failure) but uses `setInterval`: the orchestrator deliberately takes no
+ * pg-boss dependency.
  *
- * Mirrors the Platform's scheduled-job wrapper in observable
- * surface (5 Prometheus metrics + structured logs + audit row on
- * failure) but uses `setInterval` instead of pg-boss — the orchestrator
- * has no pg-boss dependency and we're not adding one.
+ * Every orchestrator periodic job MUST use this wrapper, as the cleanup jobs
+ * in queue/cleanup.ts and secrets/cleanup.ts do.
  *
- * Every orchestrator periodic job MUST use this wrapper, as the cleanup
- * jobs in queue/cleanup.ts and secrets/cleanup.ts do.
- *
- * `triggerNow()` on the returned handle forces one off-cadence tick
- * (used by the admin `/api/v1/admin/scheduled-jobs/:name/trigger`
- * endpoint and by tests). It does NOT reset the interval
- * timer — a real tick still fires at the scheduled cadence after.
+ * `triggerNow()` forces one off-cadence tick (for the admin
+ * `/api/v1/admin/scheduled-jobs/:name/trigger` endpoint and tests). It does
+ * NOT reset the interval timer.
  */
 import { z } from 'zod';
 import type { Kysely } from 'kysely';
@@ -29,10 +26,7 @@ import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'scheduled-job' });
 
-/**
- * All registered orchestrator scheduled-job names. Adding a new
- * periodic job MUST add its name here before it can register.
- */
+/** Every orchestrator scheduled-job name; a new periodic job MUST be added here. */
 export const OrchestratorScheduledJobName = z.enum([
   'cleanup',
   'orphan-secret-cleanup',
@@ -43,7 +37,7 @@ export const OrchestratorScheduledJobName = z.enum([
 ]);
 export type OrchestratorScheduledJobName = z.infer<typeof OrchestratorScheduledJobName>;
 
-/** Access-log action for a scheduled job tick failure. */
+/** Access-log action for a tick failure. */
 const ACCESS_LOG_ACTION_TICK_FAILURE = 'scheduled_job.tick';
 /** Access-log action for a manually triggered off-cadence tick. */
 export const ACCESS_LOG_ACTION_TRIGGER = 'scheduled_job.trigger';
@@ -52,14 +46,11 @@ export interface OrchestratorScheduledJobOptions {
   name: OrchestratorScheduledJobName;
   /** Tick cadence. Must be > 0. */
   intervalMs: number;
-  /** Handler called per tick. Exceptions are caught and metered. */
+  /** Called per tick; exceptions are caught and metered. */
   handler: () => Promise<void>;
-  /**
-   * Orchestrator instance ID — appears on failure access-log rows as
-   * `actor_id` alongside `actor_type='system'`.
-   */
+  /** The `actor_id` (with `actor_type='system'`) on failure access-log rows. */
   instanceId: string;
-  /** DB used for failure audit rows. If omitted, failures are logs-only. */
+  /** For failure audit rows; without it, failures are logs-only. */
   db?: Kysely<Database>;
   /** Routing key for failure access-log partitioning (null = not scoped). */
   routingKey?: string;
@@ -73,10 +64,7 @@ export interface OrchestratorScheduledJobHandle {
   readonly name: OrchestratorScheduledJobName;
   /** Clears the interval. Safe to call multiple times. */
   stop(): void;
-  /**
-   * Force one off-cadence tick and await it (success or failure).
-   * Returns the tick's outcome so callers such as the admin route can report it.
-   */
+  /** Force one off-cadence tick and return its outcome, success or failure. */
   triggerNow(): Promise<{ ok: boolean; durationMs: number; error?: string }>;
 }
 
@@ -90,10 +78,7 @@ interface JobMetricEntry {
 const jobMetricState = new Map<string, JobMetricEntry>();
 const handleRegistry = new Map<OrchestratorScheduledJobName, OrchestratorScheduledJobHandle>();
 
-/**
- * Readonly snapshot of per-job metric state. Used by the admin
- * `/api/v1/admin/scheduled-jobs` route to surface last-run info.
- */
+/** Per-job metric state, for the admin `/api/v1/admin/scheduled-jobs` route. */
 export function getOrchestratorJobMetricState(): ReadonlyMap<
   string,
   { consecutiveFailures: number; lastSuccessAt: Date | null; lastFailureAt: Date | null }
@@ -101,21 +86,14 @@ export function getOrchestratorJobMetricState(): ReadonlyMap<
   return jobMetricState;
 }
 
-/**
- * Look up a registered scheduled job's handle by name. Returns
- * `undefined` if the job isn't registered on this instance. Used by
- * the admin trigger-now endpoint.
- */
+/** For the admin trigger-now endpoint; `undefined` when not registered here. */
 export function findOrchestratorScheduledJob(
   name: OrchestratorScheduledJobName,
 ): OrchestratorScheduledJobHandle | undefined {
   return handleRegistry.get(name);
 }
 
-/**
- * Clear the scheduled-job registry. Intended for tests only —
- * production code should keep a stable set of registered jobs.
- */
+/** Tests only: production keeps a stable set of registered jobs. */
 export function __resetOrchestratorScheduledJobsForTesting(): void {
   for (const handle of handleRegistry.values()) {
     handle.stop();
@@ -146,7 +124,7 @@ export function registerOrchestratorScheduledJob(
   let stopped = false;
 
   async function runOnce(): Promise<{ ok: boolean; durationMs: number; error?: string }> {
-    // Single-flight per handle — if one is in progress, reuse it.
+    // Single-flight per handle: a tick in progress is reused.
     if (inFlight) return inFlight;
     inFlight = (async () => {
       const startedAt = Date.now();

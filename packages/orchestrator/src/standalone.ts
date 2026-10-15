@@ -165,7 +165,6 @@ await guardStartup(logger, async () => {
           : coordinatorRejectionCorroborator({ db: sub.db, instanceId: config.instanceId }),
       });
 
-      // Create PeerClient instances for statically configured peers
       for (const peerAddr of config.cluster.peers) {
         const peerUrl = peerAddr.replace(/^https?:\/\//, 'ws://') + '/ws/peer';
         const client = new PeerClient({

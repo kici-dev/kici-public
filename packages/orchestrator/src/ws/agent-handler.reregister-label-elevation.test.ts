@@ -1,27 +1,18 @@
 /**
- * regression: agent re-register-time label scope is bounded by the
- * token's `agent_tokens.labels` authorization scope, just like the
- * initial-register-time check.
+ * Re-register-time labels are bounded by the token's `agent_tokens.labels`
+ * scope, like the initial register.
  *
- * Trust model (must hold):
- *   The token-scope subset enforcement that runs at the FIRST
- *   `agent.register` (Phase 2 / pendingRegistration block in
- *   `agent-handler.ts`) MUST also run on every subsequent
- *   `agent.register` arriving on the same registered WS connection
- *   (the re-register branch inside the post-register switch). Without
- *   this, an authenticated agent with a `[ci, build]`-scoped token can
- *   register cleanly with `[ci, build]`, then send a second
- *   `agent.register` with `[ci, build, prod, secret-vault]` on the same
- *   WS — the re-register branch calls `registry.register(...)` with the
- *   wire-supplied labels directly, silently overwriting the previously
- *   authorized label set. The agent then receives prod-scoped secrets
- *   in the next `job.dispatch.secrets` envelope.
+ * Trust model (must hold): the token-scope subset check of the FIRST
+ * `agent.register` (Phase 2 / pendingRegistration block in `agent-handler.ts`)
+ * MUST also run on every later `agent.register` on the same WS (the
+ * re-register branch of the post-register switch). Otherwise a
+ * `[ci, build]`-scoped agent re-registers with `[ci, build, prod, secret-vault]`,
+ * `registry.register(...)` overwrites the authorized set with the wire labels,
+ * and the next `job.dispatch.secrets` envelope carries prod-scoped secrets.
  *
- *   The re-register path also re-runs (a) the ephemeral identity-binding
- *   check (`tokenCreatedBy === agentId` for ephemeral tokens) and
- *   (b) the static-token agentId-collision check. Without them, a
- *   re-register could supply any `msg.agentId` and rebind the WS to it
- *   without re-validation.
+ * Re-register also re-runs (a) the ephemeral identity binding
+ * (`tokenCreatedBy === agentId`) and (b) the static-token agentId-collision
+ * check; otherwise it could rebind the WS to any `msg.agentId` unvalidated.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PROTOCOL_VERSION, WS_CLOSE_AGENT_AUTH_FAILED } from '@kici-dev/engine';
@@ -29,7 +20,7 @@ import { createAgentWsHandler } from './agent-handler.js';
 import { AgentRegistry } from '../agent/registry.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
-import { mockWs } from '../__test-helpers__/mock-ws.js';
+import { mockWs, makeMessageEvent } from '../__test-helpers__/mock-ws.js';
 
 function mockDispatcher(): Dispatcher {
   return {
@@ -39,10 +30,6 @@ function mockDispatcher(): Dispatcher {
     onJobComplete: vi.fn(),
     releaseRebootPending: vi.fn().mockResolvedValue(undefined),
   } as unknown as Dispatcher;
-}
-
-function makeMessageEvent(data: unknown): MessageEvent {
-  return { data: JSON.stringify(data) } as MessageEvent;
 }
 
 function authRequestMsg(token = 'kat_' + 'a'.repeat(64)) {
@@ -63,8 +50,7 @@ function registerMsg(opts: { messageId?: string; agentId: string; labels: string
 }
 
 /**
- * Build a token store whose `validate()` returns a token row matching the
- * production storage shape: `labels` is JSON-encoded `string[]` or `null`.
+ * Production storage shape: `labels` is JSON-encoded `string[]` or `null`.
  * Mirrors the helper in `agent-handler.label-elevation.test.ts`.
  */
 function tokenStoreWithLabels(
@@ -132,9 +118,7 @@ describe('agent re-register-time label-scope enforcement', () => {
     expect(afterFirst).toBeDefined();
     expect(afterFirst!.labels).toEqual(new Set(['ci', 'build']));
 
-    // Second register on the SAME WS attempts label elevation. The
-    // re-register branch in agent-handler.ts must re-run the same
-    // token-scope check that the initial-register Phase 2 block runs.
+    // Second register on the SAME WS attempts label elevation.
     await handler.onMessage!(
       makeMessageEvent(
         registerMsg({
@@ -146,9 +130,7 @@ describe('agent re-register-time label-scope enforcement', () => {
       ws as any,
     );
 
-    // Registry's labels MUST stay bounded by the token scope after the
-    // elevation attempt — the re-register branch re-runs the same
-    // token-scope subset gate the first register ran.
+    // The registry's labels MUST stay bounded by the token scope.
     const afterReregister = registry.get('agent-1');
     expect(afterReregister).toBeDefined();
     expect(afterReregister!.labels).toEqual(new Set(['ci', 'build']));
@@ -187,10 +169,8 @@ describe('agent re-register-time label-scope enforcement', () => {
       ws as any,
     );
 
-    // Re-register elevation is loud — the WS is closed with the
-    // auth-failed close code rather than silently overwriting the
-    // registry entry on what would otherwise look like a normal
-    // reconnect.
+    // Elevation is loud: the auth-failed close code, never a silent registry
+    // overwrite that looks like a normal reconnect.
     expect(ws.close).toHaveBeenCalledWith(
       WS_CLOSE_AGENT_AUTH_FAILED,
       expect.stringContaining('exceed token-bound scope'),
@@ -198,10 +178,9 @@ describe('agent re-register-time label-scope enforcement', () => {
   });
 
   it('accepts a strict-subset re-register (voluntary scope-narrowing remains legitimate)', async () => {
-    // Positive control: an agent that voluntarily narrows its label set on
-    // re-register (e.g. a scaler-managed agent dropping a transient label
-    // before draining) MUST continue to be accepted. The check is
-    // subset, not equality.
+    // Positive control: narrowing on re-register (e.g. a scaler-managed agent
+    // dropping a transient label before draining) MUST be accepted — the check
+    // is subset, not equality.
     const tokenStore = tokenStoreWithLabels(['ci', 'build', 'prod']);
     const handler = createAgentWsHandler({
       registry,
@@ -232,10 +211,8 @@ describe('agent re-register-time label-scope enforcement', () => {
   });
 
   it('accepts re-register wire labels verbatim when the token has no authorized-labels constraint (labels: null)', async () => {
-    // Back-compat carve-out: tokens issued before `agent_tokens.labels`
-    // became an enforced authorization signal (column value `null`)
-    // continue to accept any wire labels at register AND re-register
-    // time. The check preserves this exception for both paths.
+    // Back-compat carve-out: a `null` `agent_tokens.labels` (tokens issued before
+    // it was enforced) accepts any wire labels at register AND re-register.
     const tokenStore = tokenStoreWithLabels(null);
     const handler = createAgentWsHandler({
       registry,
@@ -270,12 +247,9 @@ describe('agent re-register-time label-scope enforcement', () => {
   });
 
   it('rejects re-register with a different agentId for ephemeral tokens (tokenCreatedBy binding)', async () => {
-    // The ephemeral identity-binding check from Phase 2
-    // (`tokenCreatedBy === agentId`) also runs on re-register. Without it,
-    // a compromised agent holding a leaked ephemeral token bound to agentId
-    // 'agent-original' could re-register as a different agentId on the
-    // same WS. The re-register branch re-runs the identity-binding check
-    // and closes the WS with auth-failed.
+    // The ephemeral identity binding from Phase 2 (`tokenCreatedBy === agentId`)
+    // also runs on re-register; otherwise a leaked ephemeral token bound to
+    // 'agent-original' could re-register as another agentId on the same WS.
     const tokenStore = tokenStoreWithLabels(null, {
       agent_type: 'ephemeral',
       created_by: 'agent-original',
@@ -309,9 +283,7 @@ describe('agent re-register-time label-scope enforcement', () => {
       ws as any,
     );
 
-    // The re-register is rejected and the impersonated agentId never
-    // enters the registry — the re-register branch re-runs the same
-    // ephemeral identity-binding gate the first register ran.
+    // Rejected: the impersonated agentId never enters the registry.
     expect(registry.get('agent-impersonated')).toBeUndefined();
     expect(ws.close).toHaveBeenCalledWith(
       WS_CLOSE_AGENT_AUTH_FAILED,

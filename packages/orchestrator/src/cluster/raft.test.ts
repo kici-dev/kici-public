@@ -279,7 +279,6 @@ describe('RaftNode', () => {
       const { raft } = createRaftNode();
       await raft.start();
 
-      // Should not throw
       await vi.advanceTimersByTimeAsync(300);
 
       expect(raft.isLeader()).toBe(true);
@@ -297,7 +296,6 @@ describe('RaftNode', () => {
         electionTimeoutMaxMs: 600,
       });
 
-      // Add a connected peer
       peerRegistry.addPeer({
         instanceId: 'orch-2',
         connectionId: 'conn-2',
@@ -323,7 +321,7 @@ describe('RaftNode', () => {
 
     it('should become leader when receiving majority of votes', async () => {
       const { raft, peerRegistry, onBecomeLeader } = createRaftNode({
-        // Use longer timeout to avoid multiple elections firing
+        // A longer timeout keeps a second election from firing.
         electionTimeoutMinMs: 500,
         electionTimeoutMaxMs: 600,
       });
@@ -421,7 +419,6 @@ describe('RaftNode', () => {
       const { raft } = createRaftNode();
       await raft.start();
 
-      // Vote for orch-2
       raft.handleVoteRequest({
         type: 'raft.vote.request',
         term: 1,
@@ -581,7 +578,6 @@ describe('RaftNode', () => {
       // Clear broadcasts from election
       broadcastToPeers.mockClear();
 
-      // Advance by heartbeat interval
       await vi.advanceTimersByTimeAsync(50);
 
       expect(broadcastToPeers).toHaveBeenCalledWith(
@@ -810,9 +806,7 @@ describe('RaftNode', () => {
         // no electionTimeoutMinMs/Max overrides
       });
 
-      // We can verify the defaults by starting and checking behavior.
-      // The constructor defaults are 5000/10000 -- verified by code inspection
-      // and exercised indirectly through the timeout behavior.
+      // Constructor defaults are 5000/10000 ms, exercised indirectly by the timeout tests.
       expect(raft).toBeDefined();
     });
   });
@@ -891,7 +885,6 @@ describe('RaftNode', () => {
 
       await raft.start();
 
-      // Remove peer — triggers onPeerDisconnected
       peerRegistry.removePeer('orch-2');
       raft.onPeerDisconnected();
 
@@ -923,8 +916,8 @@ describe('RaftNode', () => {
         electionTimeoutMaxMs: ELECTION_INTERVAL_MS,
       });
 
-      // Add a "connected" coordinator peer that never responds to votes
-      // (simulates a dead peer whose WebSocket close hasn't been detected)
+      // A "connected" coordinator that never votes: a dead peer whose WebSocket
+      // close is not yet detected.
       peerRegistry.addPeer({
         instanceId: 'orch-2',
         connectionId: 'conn-2',
@@ -1007,7 +1000,6 @@ describe('RaftNode', () => {
         electionTimeoutMaxMs: 6000,
       });
 
-      // Add a coordinator peer and a worker peer
       peerRegistry.addPeer({
         instanceId: 'orch-2',
         connectionId: 'conn-2',
@@ -1049,7 +1041,6 @@ describe('RaftNode', () => {
         electionTimeoutMaxMs: 6000,
       });
 
-      // Add a coordinator peer
       peerRegistry.addPeer({
         instanceId: 'orch-2',
         connectionId: 'conn-2',
@@ -1093,7 +1084,6 @@ describe('RaftNode', () => {
         electionTimeoutMaxMs: 6000,
       });
 
-      // Add two coordinator peers
       peerRegistry.addPeer({
         instanceId: 'orch-2',
         connectionId: 'conn-2',

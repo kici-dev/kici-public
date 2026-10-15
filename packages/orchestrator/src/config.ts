@@ -727,7 +727,6 @@ const baseSchema = z.object({
       joinToken: z.string().optional(),
       /** Path to peer credential file. */
       credentialFile: z.string().default('~/.kici/peer-credential'),
-      /** Auto-rotate credentials. */
       autoRotateCredentials: z.boolean().default(false),
       /** Static peer addresses for independent mode. Comma-separated URLs. */
       peers: z
@@ -1318,7 +1317,6 @@ export function loadConfig(scope: ConfigScope = ConfigScope.enum.runtime): AppCo
     );
   }
 
-  // Use cluster instanceId if provided, otherwise generate one
   const instanceId = data.cluster.instanceId || `${hostname()}-${randomUUID().slice(0, 8)}`;
 
   // Bridge KICI_STORAGE_* env vars into storage field. User-cache quota/TTL are

@@ -55,10 +55,10 @@ export type Permission =
 /**
  * Role-to-permission mapping.
  * owner gets everything, admin gets context/secret/audit + attestation.retry +
- * orchestrator.drain, auditor gets context.read + audit.read + run.read
- * (read-only — no attestation.retry and no orchestrator.drain, so a read-only
- * role can never drain the coordinator or re-arm the deferred-attestation
- * outbox).
+ * orchestrator.drain, auditor gets read permissions only (context, audit,
+ * run, event log, access log, event DLQ, scaler, test run; read-only — no
+ * attestation.retry and no orchestrator.drain, so a read-only role can never
+ * drain the coordinator or re-arm the deferred-attestation outbox).
  *
  * `ci_trust.read` / `ci_trust.admin` are held by owner + admin only. The trust
  * policy decides whether a fork PR runs at all, so it is not a read-only-role
@@ -147,9 +147,6 @@ const ROLE_PERMISSIONS: Record<Role, ReadonlySet<Permission>> = {
   ]),
 };
 
-/**
- * Error thrown when a role lacks the required permission.
- */
 export class PermissionDeniedError extends Error {
   constructor(
     public readonly role: Role,
@@ -167,9 +164,6 @@ export class PermissionDeniedError extends Error {
  * No database or external state -- purely in-memory evaluation.
  */
 export class RbacEnforcer {
-  /**
-   * Check whether a role has a specific permission.
-   */
   hasPermission(role: Role, permission: Permission): boolean {
     const perms = ROLE_PERMISSIONS[role];
     return perms ? perms.has(permission) : false;

@@ -4,16 +4,13 @@ import { type Kysely, sql } from 'kysely';
  * Add `org_settings.user_cache_quota_bytes bigint` and
  * `org_settings.user_cache_ttl_ms bigint`, both NULLABLE.
  *
- * These make the user-facing cache per-org byte quota and per-entry TTL
- * cluster-configurable (runtime-editable per `customer_id` via the admin
- * route + `kici-admin org-settings user-cache` CLI). A NULL value means
- * "use the cluster-wide default" — the `KICI_USER_CACHE_QUOTA_BYTES` /
- * `KICI_USER_CACHE_TTL_MS` env vars (5 GiB / 7 days) resolved in config.ts.
+ * The user cache's per-org byte quota and per-entry TTL, editable at runtime
+ * per `customer_id` via the admin route and `kici-admin org-settings user-cache`.
+ * NULL means the cluster default: `KICI_USER_CACHE_QUOTA_BYTES` /
+ * `KICI_USER_CACHE_TTL_MS` (5 GiB / 7 days), resolved in config.ts.
  *
- * BIGINT because a quota in bytes (5 GiB = 5_368_709_120) and a TTL in ms
- * (7 days = 604_800_000) both exceed the safe range only at extreme values,
- * but a quota can legitimately reach tens of GiB; BIGINT keeps headroom and
- * matches the sibling `log_bytes` bigint columns.
+ * BIGINT because a quota can reach tens of GiB (5 GiB = 5_368_709_120); it
+ * keeps headroom and matches the sibling `log_bytes` bigint columns.
  *
  * Idempotent: a re-run on a DB that already has either column skips it.
  */

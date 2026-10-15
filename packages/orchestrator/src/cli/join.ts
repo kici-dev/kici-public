@@ -1,11 +1,8 @@
 /**
- * `kici-admin join` command.
+ * `kici-admin join`: bootstrap an orchestrator from an existing cluster, via
+ * Platform relay or a direct peer, by receiving the configuration bundle sealed
+ * to this host and writing the env file it boots from.
  *
- * Bootstraps a new orchestrator by connecting to an existing cluster via
- * Platform relay or direct peer, receiving the configuration bundle sealed to
- * this host, and writing an env file the orchestrator boots from.
- *
- * Usage:
  *   kici-admin join --token kici_join_v1.xxx.yyy --platform wss://api.kici.dev/ws --api-key KEY
  *   kici-admin join --token kici_join_v1.xxx.yyy --peer https://orch-1:8080
  */

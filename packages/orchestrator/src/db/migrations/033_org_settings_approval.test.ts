@@ -3,17 +3,12 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m033 from './033_org_settings_approval.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 033.
- *
- * Creates a uniquely-named throwaway database, applies migrations 001..033
- * via the production migration provider, and asserts the two approval columns
- * exist with the right defaults. The throwaway database is dropped in teardown.
- *
- * Gated on `KICI_TEST_ADMIN_DATABASE_URL`: skips when unset, fails loudly when
- * set but unreachable.
+ * Real-Postgres test for migration 033: the approval columns and their defaults, on a
+ * throwaway database dropped in teardown. Gated on `KICI_TEST_ADMIN_DATABASE_URL`: skips when
+ * unset, fails loudly when set but unreachable.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;

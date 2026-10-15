@@ -1,12 +1,8 @@
 /**
- * `kici-admin api-key` — deprecated.
- *
- * The group targeted `/api/v1/api-keys`, which no KiCI server serves, so it
- * never worked. Both subcommands stay registered until v1.0.0 and exit with a
- * message that points at `kici-admin token create`, the per-person
- * orchestrator token a developer passes to `kici connect`.
- *
- *   api-key create, add-routing-key
+ * `kici-admin api-key` — deprecated. It targeted `/api/v1/api-keys`, which no
+ * KiCI server serves, so it never worked. `create` and `add-routing-key` stay
+ * registered until v1.0.0 and exit pointing at `kici-admin token create`, the
+ * per-person orchestrator token a developer passes to `kici connect`.
  */
 
 import type { Command } from 'commander';
@@ -20,10 +16,7 @@ export const API_KEY_DEPRECATED_MESSAGE =
 
 const DEPRECATED_DESCRIPTION = 'Deprecated: use kici-admin token create (removed in v1.0.0)';
 
-/**
- * Register the deprecated `api-key` group. `getClient` is accepted for the
- * registration signature every command group shares and is never called.
- */
+/** `_getClient` fits the shared registration signature and is never called. */
 export function registerApiKeyCommands(program: Command, _getClient: () => AdminApiClient): void {
   const apiKey = program.command('api-key').description(DEPRECATED_DESCRIPTION);
 

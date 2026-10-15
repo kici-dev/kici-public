@@ -1,3 +1,4 @@
+import '../../__test-helpers__/shared-mocks.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type Docker from 'dockerode';
 import { link, mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
@@ -5,29 +6,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { x as tarExtract } from 'tar';
 
-// Mock the logger so setup() doesn't touch the filesystem.
-vi.mock('@kici-dev/shared', () => ({
-  createLogger: vi.fn(() => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  })),
-  toErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
-}));
-
-// Mock the runtime materializer: it drives a real container runtime, and what
-// these cases assert is which runtime the sandbox MOUNTS, not how the volume is
-// populated (that is covered in @kici-dev/shared).
+// The cases assert which runtime the sandbox MOUNTS, not how the volume is
+// populated (covered in @kici-dev/shared).
 const ensureRuntimeVolumeMock = vi.hoisted(() => vi.fn(async () => 'kici-runtime-node-abc123'));
 vi.mock('@kici-dev/shared/container-runtime', () => ({
   ensureRuntimeVolume: ensureRuntimeVolumeMock,
   RuntimeSubtree: { enum: { all: 'all', node: 'node' } },
 }));
 
-// Mock node:fs so the host name-resolution bind (host-network parity) is
-// deterministic regardless of the test host's /etc layout: both files "exist".
-// The rest of the module stays real: the workspace copy-in walks a real tree.
+// Both name-resolution files "exist", whatever the test host's /etc layout;
+// the rest stays real because the workspace copy-in walks a real tree.
 vi.mock('node:fs', async (importOriginal) => ({
   ...(await importOriginal<typeof import('node:fs')>()),
   existsSync: vi.fn(() => true),
@@ -41,7 +29,6 @@ import {
   type SandboxHardeningOptions,
 } from './container-hardening.js';
 
-/** Hardened-by-default option baseline. */
 function hardening(overrides: Partial<SandboxHardeningOptions> = {}): SandboxHardeningOptions {
   return {
     hardened: true,
@@ -54,15 +41,14 @@ function hardening(overrides: Partial<SandboxHardeningOptions> = {}): SandboxHar
   };
 }
 
-/** Build a minimal dockerode mock capturing the createContainer arg.
- *  `imagePresent: false` makes the image-inspect reject, exercising the pull path. */
+/** Dockerode mock capturing the createContainer arg; `imagePresent: false`
+ *  rejects image-inspect to exercise the pull path. */
 function mockDocker(opts: { imagePresent?: boolean } = {}) {
   const start = vi.fn().mockResolvedValue(undefined);
   const stop = vi.fn().mockResolvedValue(undefined);
   const remove = vi.fn().mockResolvedValue(undefined);
-  // The image preflight stats these paths through a created-but-unstarted
-  // container. Default the double to a glibc image with a shell so existing
-  // cases are unaffected; a case that wants a rejection overrides it.
+  // The image preflight stats these through an unstarted container. Default:
+  // a glibc image with a shell; a case wanting a rejection overrides it.
   const infoArchive = vi.fn(async ({ path }: { path: string }) =>
     ['/lib64/ld-linux-x86-64.so.2', '/bin/sh'].includes(path)
       ? { name: path }
@@ -121,9 +107,8 @@ describe('ContainerSandbox.setup hardening', () => {
     expect(hc.Memory).toBe(DEFAULT_MEMORY_BYTES);
     expect(hc.NanoCpus).toBe(DEFAULT_NANO_CPUS);
     expect(hc.Tmpfs).toEqual({ '/tmp': 'rw,exec,nosuid,nodev' });
-    // The container owns its /workspace (an anonymous volume) — the host workDir
-    // is NOT bind-mounted read-write. Only the runner :ro bind remains alongside
-    // the hardening fields.
+    // The container owns /workspace (an anonymous volume); the host workDir is
+    // NOT bind-mounted, only the runner :ro binds.
     expect(arg.Volumes).toEqual({ '/workspace': {} });
     expect(hc.Binds).toEqual([
       '/host/runner.js:/opt/kici/workflow-runner.js:ro',
@@ -206,8 +191,7 @@ describe('ContainerSandbox.setup hardening', () => {
     expect(hc.SecurityOpt).toBeUndefined();
     expect(hc.PidsLimit).toBeUndefined();
     expect(hc.Memory).toBeUndefined();
-    // The container-owned /workspace volume + runner bind are not part of the
-    // hardening posture, so they are present regardless of the rollback flag.
+    // The /workspace volume and runner binds are outside the hardening posture.
     expect(arg.Volumes).toEqual({ '/workspace': {} });
     expect(hc.Binds).toEqual([
       '/host/runner.js:/opt/kici/workflow-runner.js:ro',
@@ -244,7 +228,7 @@ describe('ContainerSandbox.setup binds (bwrap parity)', () => {
       runnerPath: '/host/runner.js',
       env: {},
       jobId: 'job-default',
-      // Default network posture ('default' = bridge) — the production default.
+      // 'default' = bridge, the production default.
       hardening: hardening({ networkMode: 'default' }),
     });
 
@@ -252,9 +236,7 @@ describe('ContainerSandbox.setup binds (bwrap parity)', () => {
 
     const arg = createContainer.mock.calls[0][0] as Docker.ContainerCreateOptions;
     const hc = arg.HostConfig!;
-    // Unchanged default: the container-owned /workspace volume + the runner
-    // bind and the loader-hook bind, no /etc/hosts, and NetworkMode left unset
-    // (runtime bridge).
+    // No /etc/hosts bind, and NetworkMode unset (runtime bridge).
     expect(arg.Volumes).toEqual({ '/workspace': {} });
     expect(hc.Binds).toEqual([
       '/host/runner.js:/opt/kici/workflow-runner.js:ro',
@@ -311,10 +293,8 @@ describe('ContainerSandbox.setup binds (bwrap parity)', () => {
     const arg = createContainer.mock.calls[0][0] as Docker.ContainerCreateOptions;
     const hc = arg.HostConfig!;
     expect(hc.NetworkMode).toBe('host');
-    // Source bind AND the host /etc/hosts + nsswitch RO binds (node:fs.existsSync
-    // is mocked true) — bwrap `--ro-bind /etc/hosts` parity so an /etc/hosts-only
-    // registry name resolves inside the container. The container-owned /workspace
-    // volume replaces the host workDir bind.
+    // The /etc/hosts + nsswitch RO binds (existsSync mocked true) give bwrap
+    // `--ro-bind /etc/hosts` parity, so an /etc/hosts-only registry name resolves.
     expect(arg.Volumes).toEqual({ '/workspace': {} });
     expect(hc.Binds).toEqual([
       '/host/runner.js:/opt/kici/workflow-runner.js:ro',
@@ -327,9 +307,8 @@ describe('ContainerSandbox.setup binds (bwrap parity)', () => {
 
   it('mounts exactly the supplied runner path — the container backend passes the self-contained bundle', async () => {
     const { docker, createContainer } = mockDocker();
-    // job-runner passes the bundle sibling here (resolveRunnerBundlePath); the
-    // sandbox mounts whatever runner path it is given at runnerMountPath, so a
-    // bundle path lands as the single-file runner mount the job container runs.
+    // job-runner passes the bundle (resolveRunnerBundlePath); the sandbox mounts
+    // whatever path it gets at runnerMountPath.
     const sandbox = new ContainerSandbox({
       docker,
       image: 'node:20-alpine',
@@ -371,10 +350,8 @@ describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
     expect(arg.HostConfig!.Binds).toContain(
       '/x/dist/container-ts-loader-hook.js:/opt/kici/ts-loader-hook.js:ro',
     );
-    // Agent-internal env: points the in-container runner at the mounted hook, and
-    // routes runner-internal Winston logs to stderr so they cannot corrupt the
-    // fd1 IPC channel. (The logger lever's stderr routing itself is covered by
-    // @kici-dev/core's logger.test.ts 'KICI_LOG_STDERR routing'.)
+    // KICI_LOG_STDERR keeps runner Winston logs off the fd1 IPC channel
+    // (routing itself: @kici-dev/core logger.test.ts 'KICI_LOG_STDERR routing').
     expect(arg.Env).toContain('KICI_TS_LOADER_HOOK_PATH=/opt/kici/ts-loader-hook.js');
     expect(arg.Env).toContain('KICI_LOG_STDERR=1');
   });
@@ -396,12 +373,10 @@ describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
     });
 
     await sandbox.setup({ workDir: '/work', env: {} });
-    // Kick off executeJob far enough to build the exec (it will not complete —
-    // the mocked stream never emits job.complete — but the exec is created
-    // synchronously with the env we assert, then we abort).
+    // executeJob never completes (the mock never emits job.complete), but the
+    // exec is created with the asserted env before the abort.
     const ac = new AbortController();
     const jobPromise = sandbox.executeJob({ signal: ac.signal } as never).catch(() => undefined);
-    // Give the microtask queue a tick so attachExecStream runs.
     await new Promise((r) => setTimeout(r, 0));
     ac.abort();
     await jobPromise;
@@ -436,15 +411,13 @@ describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
     ac.abort();
     await jobPromise;
 
-    // A bare `node` would resolve from the image's PATH — and the whole point
-    // is that the image need not ship Node at all (python:3.12-slim does not).
+    // A bare `node` would resolve from the image's PATH, and the image need not
+    // ship Node (python:3.12-slim does not).
     const execArg = exec.mock.calls[0][0] as { Cmd: string[] };
     expect(execArg.Cmd).toEqual(['/opt/kici/node/bin/node', '/opt/kici/workflow-runner.js']);
 
-    // The runtime must be mounted read-only — a job that could rewrite
-    // /opt/kici/node would control the interpreter of every later step.
-    // The preflight creates a scratch probe container first, so pick the call
-    // that actually configures the job container rather than assuming index 0.
+    // Read-only, or a job could rewrite the interpreter of every later step.
+    // The preflight's probe container comes first, so find the job's create call.
     const createCalls = (docker.createContainer as unknown as { mock: { calls: unknown[][] } }).mock
       .calls as Array<[{ HostConfig?: { Binds?: string[] } }]>;
     const jobCreate = createCalls.find((c) => c[0]?.HostConfig?.Binds)?.[0];
@@ -474,8 +447,7 @@ describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
     ac.abort();
     await jobPromise;
 
-    // The historical contract, kept working until every spawn path provisions
-    // the runtime.
+    // Legacy contract, kept until every spawn path provisions the runtime.
     const execArg = exec.mock.calls[0][0] as { Cmd: string[] };
     expect(execArg.Cmd).toEqual(['node', '/opt/kici/workflow-runner.js']);
     const createCalls2 = (docker.createContainer as unknown as { mock: { calls: unknown[][] } })
@@ -536,8 +508,7 @@ describe('ContainerSandbox authenticated image pull', () => {
 
     await sandbox.setup({ workDir: '/work', env: {} });
 
-    // The probe creates a container from the image; doing that before the pull
-    // fails with "no such image" on any host that has not cached it.
+    // Probing before the pull fails with "no such image" on an uncached host.
     expect(pull).toHaveBeenCalled();
     expect(pull.mock.invocationCallOrder[0]).toBeLessThan(
       createContainer.mock.invocationCallOrder[0],
@@ -585,9 +556,9 @@ describe('ContainerSandbox workspace copy-in', () => {
     });
     (container as unknown as { putArchive: typeof putArchive }).putArchive = putArchive;
 
-    // pnpm hard-links identical files to one inode in its store, outside the
-    // workdir; this order (plain, link, plain, plain, link, plain) is the one
-    // that stops node-tar's own hard-link handling for good.
+    // pnpm hard-links identical files to one store inode outside the workdir;
+    // this order (plain, link, plain, plain, link, plain) stalls node-tar's own
+    // hard-link handling for good.
     const dir = await mkdtemp(join(tmpdir(), 'kici-copyin-'));
     const store = await mkdtemp(join(tmpdir(), 'kici-copyin-store-'));
     const pkg = join(dir, 'node_modules', '.pnpm', 'p@1.0.0', 'node_modules', 'p');
@@ -647,8 +618,7 @@ describe('ContainerSandbox workspace copy-in', () => {
 
   it('fails setup loudly when the copy-in does not land', async () => {
     const { docker, container } = mockDocker();
-    // A silent failure here would start the job against an EMPTY workspace and
-    // surface as a confusing "file not found" in the first step.
+    // Silently continuing would run the job on an EMPTY workspace.
     (container as unknown as { putArchive: unknown }).putArchive = vi
       .fn()
       .mockRejectedValue(new Error('no space left on device'));
@@ -705,11 +675,9 @@ describe('ContainerSandbox.teardown workspace volume', () => {
     });
 
     await sandbox.setup({ workDir: '/work', env: {} });
-    // Simulate a failed job so the keepFailed early-return path is taken.
     (sandbox as unknown as { jobFailed: boolean }).jobFailed = true;
     await sandbox.teardown();
 
-    // The failed container (and its volume) are retained for debugging.
     expect(remove).not.toHaveBeenCalled();
   });
 });
@@ -734,18 +702,15 @@ describe('ContainerSandbox runtime injection', () => {
 
     await sandbox.setup({ workDir: '/tmp/wd', env: {} });
 
-    // Only the node tree: the runner bundle and loader hook are bound from this
-    // agent's own build at fixed paths under /opt/kici, and a whole-tree mount
-    // there would put those binds inside a read-only mount.
+    // Only the node tree: the runner bundle and loader hook bind at fixed paths
+    // under /opt/kici, which a whole-tree mount would make read-only.
     expect(ensureRuntimeVolumeMock).toHaveBeenCalledWith(
       expect.objectContaining({ agentImage: 'quay.io/kici-dev/kici-agent:1.2.3', subtree: 'node' }),
     );
-    // The preflight creates a scratch probe container first, so the job's own
-    // create is the LAST call, not the first.
+    // The preflight's probe container comes first; the job's create is LAST.
     const binds = (createContainer.mock.calls.at(-1)![0] as { HostConfig: { Binds: string[] } })
       .HostConfig.Binds;
-    // Writable would let the job rewrite the interpreter its own later steps
-    // run under.
+    // Writable would let the job rewrite its later steps' interpreter.
     expect(binds).toContain('kici-runtime-node-abc123:/opt/kici/node:ro');
   });
 
@@ -765,8 +730,7 @@ describe('ContainerSandbox runtime injection', () => {
     await sandbox.setup({ workDir: '/tmp/wd', env: {} });
 
     expect(ensureRuntimeVolumeMock).not.toHaveBeenCalled();
-    // The preflight creates a scratch probe container first, so the job's own
-    // create is the LAST call, not the first.
+    // The preflight's probe container comes first; the job's create is LAST.
     const binds = (createContainer.mock.calls.at(-1)![0] as { HostConfig: { Binds: string[] } })
       .HostConfig.Binds;
     expect(binds).toContain('/host/opt/kici/node:/opt/kici/node:ro');
@@ -785,10 +749,9 @@ describe('ContainerSandbox runtime injection', () => {
 
     await sandbox.setup({ workDir: '/tmp/wd', env: {} });
 
-    // The historical contract, still correct for an image that ships Node.
+    // Legacy contract, still correct for an image that ships Node.
     expect(ensureRuntimeVolumeMock).not.toHaveBeenCalled();
-    // The preflight creates a scratch probe container first, so the job's own
-    // create is the LAST call, not the first.
+    // The preflight's probe container comes first; the job's create is LAST.
     const binds = (createContainer.mock.calls.at(-1)![0] as { HostConfig: { Binds: string[] } })
       .HostConfig.Binds;
     expect(binds.some((b) => b.includes('/opt/kici/node'))).toBe(false);
@@ -807,8 +770,7 @@ describe('ContainerSandbox runtime injection', () => {
       hardening: hardening(),
     });
 
-    // Continuing would start the job against an image nobody claimed ships
-    // Node, and the resulting "node: not found" names nothing.
+    // Continuing would fail later with a "node: not found" that names nothing.
     await expect(sandbox.setup({ workDir: '/tmp/wd', env: {} })).rejects.toThrow(/no space left/);
     expect(createContainer).not.toHaveBeenCalled();
   });
@@ -835,8 +797,7 @@ describe('ContainerSandbox built-image teardown', () => {
     await sandbox.setup({ workDir: '/tmp/wd', env: {} });
     await sandbox.teardown();
 
-    // The LAYER cache is not a tag and survives this, which is what keeps the
-    // next build fast.
+    // The LAYER cache is not a tag and survives, keeping the next build fast.
     expect(removeImage).toHaveBeenCalledWith({ force: true });
     expect(container.remove).toHaveBeenCalled();
   });
@@ -887,9 +848,8 @@ describe('ContainerSandbox built-image reclaim without a container', () => {
   beforeEach(() => vi.clearAllMocks());
 
   it('drops the built tag even when setup never created a container', async () => {
-    // A setup that fails AFTER the build — the image preflight rejecting a musl
-    // base, say — leaves a tag and no container. Without reclaiming it before
-    // the early return, that tag stays on the host forever.
+    // A setup failing AFTER the build (e.g. the preflight rejecting a musl base)
+    // leaves a tag and no container; unreclaimed, it stays on the host forever.
     const { docker, getImage } = mockDocker();
     const removeImage = vi.fn().mockResolvedValue(undefined);
     getImage.mockReturnValue({ inspect: vi.fn().mockResolvedValue({}), remove: removeImage });

@@ -1,16 +1,10 @@
 /**
- * Org-settings management commands for kici-admin.
+ * `kici-admin org-settings <group> <subcommand>`, against the orchestrator
+ * admin API directly (`routes/admin-org-settings.ts`), never the Platform
+ * proxy, so it works while the Platform is down.
  *
- * Subcommand namespace: `kici-admin org-settings global-workflows <subcommand>`
- * and `kici-admin org-settings dashboard-writes <subcommand>`.
- *
- * Talks to the orchestrator admin API directly (not the Platform dashboard
- * proxy), so the CLI stays operable even when Platform is unavailable. Backed
- * by `packages/orchestrator/src/routes/admin-org-settings.ts`.
- *
- * The settings row is org-scoped (one row per `customer_id`). Each pattern
- * entry can optionally pin a webhook source via `--source <routingKey>`.
- * Omitting `--source` stores the entry as "any source in the org".
+ * One settings row per `customer_id`. A pattern entry may pin a webhook source
+ * with `--source <routingKey>`; without it the entry matches any org source.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -315,10 +309,7 @@ interface IntOrgKnobSpec {
   resetDescription: string;
 }
 
-/**
- * The per-org integer overrides. A null value means the cluster-wide default
- * applies; `reset` clears the override back to null.
- */
+/** The per-org integer overrides; null (what `reset` writes) means the cluster default. */
 const INT_ORG_KNOBS = {
   // The dispatch-acknowledgment deadline (cluster default `KICI_DISPATCH_ACK_TIMEOUT_MS`).
   'dispatch-ack': {
@@ -497,15 +488,12 @@ export function registerOrgSettingsCommands(
 }
 
 /**
- * `kici-admin org-settings reroute <show|set|reset>`.
- *
- * The per-org cross-peer reroute tunables: the post-ACK spawn window
- * (`reroute_spawn_window_ms`), the reroute ACK timeout
- * (`reroute_ack_timeout_ms`), the max peer hops (`reroute_max_hops`), and the
- * spawn-retry budget a worker applies to a rerouted job
- * (`reroute_spawn_max_attempts`, `reroute_spawn_retry_backoff_ms`). A null
- * (unset) value means the cluster-wide config default applies. `set` flips one
- * or more; `reset` clears every reroute override the orchestrator reports.
+ * `kici-admin org-settings reroute <show|set|reset>`: the post-ACK spawn window
+ * (`reroute_spawn_window_ms`), ACK timeout (`reroute_ack_timeout_ms`), max peer
+ * hops (`reroute_max_hops`) and a worker's spawn-retry budget for a rerouted
+ * job (`reroute_spawn_max_attempts`, `reroute_spawn_retry_backoff_ms`). Null
+ * means the cluster default; `reset` clears every override the orchestrator
+ * reports.
  */
 function registerRerouteCommands(orgSettings: Command, getClient: () => AdminApiClient): void {
   const rr = orgSettings
@@ -598,13 +586,11 @@ function buildReroutePatch(
 }
 
 /**
- * `kici-admin org-settings approval <show|set-expiry|set-self-approval>`.
- *
- * The per-org held-approval policy: how long a held element waits before it
- * expires (`approval_expiry_seconds`, default 86400) and whether a run's
- * triggerer may approve its own held elements (`allow_self_approval`, default
- * true). Both have NOT NULL DB defaults, so there is no "reset to cluster
- * default" — set replaces the current value.
+ * `kici-admin org-settings approval <show|set-expiry|set-self-approval>`: how
+ * long a held element waits before it expires (`approval_expiry_seconds`,
+ * default 86400) and whether a run's triggerer may approve its own holds
+ * (`allow_self_approval`, default true). Both are NOT NULL with DB defaults,
+ * so there is no reset; set replaces the value.
  */
 function registerApprovalCommands(orgSettings: Command, getClient: () => AdminApiClient): void {
   const ap = orgSettings
@@ -630,13 +616,11 @@ function registerApprovalCommands(orgSettings: Command, getClient: () => AdminAp
 }
 
 /**
- * `kici-admin org-settings sandbox-allowlist <show|set-capabilities|allow-host-network|reset>`.
- *
- * The per-org container-sandbox escape-hatch allow-list. `set-capabilities`
- * replaces the allowed Linux capability list a workflow may request via the SDK
- * `sandbox: { capabilities }` field (comma-separated; empty = clear → deny all).
- * `allow-host-network` toggles whether a workflow may request
- * `sandbox: { network: 'host' }`. Empty / false is the safe deny-all default; a
+ * `kici-admin org-settings sandbox-allowlist <show|set-capabilities|allow-host-network|reset>`:
+ * the container-sandbox escape hatches. `set-capabilities` replaces the Linux
+ * capabilities a workflow may request via `sandbox: { capabilities }`
+ * (comma-separated; empty denies all); `allow-host-network` gates
+ * `sandbox: { network: 'host' }`. Empty / false is the deny-all default; a
  * non-allow-listed request FAILS the run at dispatch.
  */
 function registerSandboxAllowlistCommands(
@@ -680,11 +664,9 @@ function registerSandboxAllowlistCommands(
 }
 
 /**
- * `kici-admin org-settings user-cache <show|set-quota|set-ttl|reset-quota|reset-ttl>`.
- *
- * The per-org byte quota and per-entry TTL for the user-facing cache. A null
- * (unset) value means the cluster-wide default applies (the
- * `KICI_USER_CACHE_QUOTA_BYTES` / `KICI_USER_CACHE_TTL_MS` env vars).
+ * `kici-admin org-settings user-cache <show|set-quota|set-ttl|reset-quota|reset-ttl>`:
+ * the user cache's byte quota and per-entry TTL. Null means the cluster default
+ * (`KICI_USER_CACHE_QUOTA_BYTES` / `KICI_USER_CACHE_TTL_MS`).
  */
 function registerUserCacheCommands(orgSettings: Command, getClient: () => AdminApiClient): void {
   const uc = orgSettings
@@ -697,13 +679,10 @@ function registerUserCacheCommands(orgSettings: Command, getClient: () => AdminA
 
 /**
  * `kici-admin org-settings artifacts
- *   <show|set-quota|set-ttl|set-max-bytes|set-max-per-run|reset-*>`.
- *
- * The per-org byte quota, per-artifact TTL, per-artifact size cap, and per-run
- * artifact count cap for user-facing artifacts. A null (unset) value means the
- * cluster-wide default applies (the `KICI_ARTIFACT_QUOTA_BYTES` /
- * `KICI_ARTIFACT_TTL_MS` / `KICI_ARTIFACT_MAX_BYTES` /
- * `KICI_ARTIFACT_MAX_PER_RUN` env vars).
+ *   <show|set-quota|set-ttl|set-max-bytes|set-max-per-run|reset-*>`: the byte
+ * quota, per-artifact TTL and size cap, and per-run count cap. Null means the
+ * cluster default (`KICI_ARTIFACT_QUOTA_BYTES` / `KICI_ARTIFACT_TTL_MS` /
+ * `KICI_ARTIFACT_MAX_BYTES` / `KICI_ARTIFACT_MAX_PER_RUN`).
  */
 function registerArtifactCommands(orgSettings: Command, getClient: () => AdminApiClient): void {
   const art = orgSettings
@@ -726,8 +705,8 @@ function registerArtifactCommands(orgSettings: Command, getClient: () => AdminAp
 }
 
 /**
- * Register `set-<knob> <value>` (a positive integer) and `reset-<knob>` (null,
- * the cluster default) for one user-cache or artifact knob.
+ * `set-<knob> <value>` takes a positive integer; `reset-<knob>` writes null (the
+ * cluster default).
  */
 function registerPositiveIntKnob(
   group: Command,
@@ -848,20 +827,18 @@ interface DashboardWritesResponse {
   /** Tri-state posture per operation (permissive | encrypted | disabled). */
   states: Record<DashboardWriteOperation, DashboardWritePolicyState>;
   /**
-   * Whether a Platform is attached. Disabling a held-run write is a lockout
-   * there, because `kici-admin held-run approve` refuses in that mode.
+   * Platform attached: disabling a held-run write locks out, since
+   * `kici-admin held-run approve` refuses then.
    */
   platformManaged: boolean;
 }
 
 /**
- * Warn about a held-run write that is ALREADY disabled on a Platform-attached
- * orchestrator, where nothing can answer a context or reviewer hold any more.
- *
- * The write path refuses this combination now, so it can only be reached by a
- * policy set before that refusal existed — which is exactly the case that would
- * otherwise never surface. Reported here rather than repaired: re-enabling a
- * write an operator disabled deliberately is their call.
+ * Warns about a held-run write ALREADY disabled on a Platform-attached
+ * orchestrator, where nothing can answer a context or reviewer hold. The write
+ * path refuses this combination, so only a policy stored before that refusal
+ * reaches it, and nothing else surfaces it. Reported, not repaired: re-enabling
+ * a deliberately disabled write is the operator's call.
  */
 function heldRunLockoutWarning(response: DashboardWritesResponse): string[] {
   if (!response.platformManaged) return [];

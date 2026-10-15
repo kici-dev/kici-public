@@ -3,13 +3,10 @@
  * transports call them: the Platform relays the `test.relay.*` requests over
  * the authenticated dashboard-proxy WS connection, and the direct test-run
  * routes (`routes/test-direct.ts`, `/api/v1/test/*`) serve the same actions
- * over HTTP to a caller holding an orchestrator admin token. Each handler
- * performs the action by reusing the existing test pipeline / upload / cancel
- * internals and returns the response payload.
+ * over HTTP to a caller holding an orchestrator admin token.
  *
- * The control plane carries only small JSON. The overlay tarball never reaches
- * the Platform — `handleTestUploadsInit` returns a presigned URL the
- * developer PUTs to directly.
+ * The control plane carries only small JSON: the overlay tarball never reaches
+ * the Platform; the developer PUTs it to a presigned URL.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -41,26 +38,21 @@ import { runDetached } from '../helpers/run-detached.js';
 
 const logger = createLogger({ prefix: 'test-relay' });
 
-// `TERMINAL_RUN_STATES` for the relay status/logs `done` flag comes from the
-// engine, not a local copy: a hand-written duplicate of the terminal set is how
-// a newly-added terminal status silently leaves this relay reporting `done:
-// false` forever.
+// The `done` flag uses the engine's `TERMINAL_RUN_STATES`, never a local copy: a
+// duplicate misses a new terminal status and reports `done: false` forever.
 
-/** Dependencies shared by every test-relay handler. */
 export interface TestRelayHandlerDeps extends ProcessingDeps {
   db: Kysely<Database>;
-  /** Agent registry — required here: the cancel handler resolves the job's agent. */
+  /** Required: the cancel handler resolves the job's agent. */
   agentRegistry: NonNullable<ProcessingDeps['agentRegistry']>;
   cacheStorage?: CacheStorage;
   logStorage?: LogStorage;
-  // `logWriter` (with `drain` + `appendChunk`) is inherited from ProcessingDeps.
-  // The logs cursor handler drains its pending appends for a terminal run before
-  // computing the `done` flag, so the final (fire-and-forget) log chunk can't be
-  // lost to a race with the run-status transition.
+  // The inherited `logWriter` is drained for a terminal run before the logs
+  // handler computes `done`, so the final fire-and-forget chunk is never lost.
   accessLog?: AccessLogWriter;
-  /** Canonical org id this orchestrator is bound to (for access_log attribution). */
+  /** Canonical org id this orchestrator is bound to, for access_log attribution. */
   orgId?: string | null;
-  /** Routing key resolved for this orchestrator's bound org (for access_log attribution). */
+  /** Routing key resolved for the bound org, for access_log attribution. */
   routingKey?: string | null;
   /**
    * The transport recorded on access_log rows: `admin_http` for the direct
@@ -69,7 +61,6 @@ export interface TestRelayHandlerDeps extends ProcessingDeps {
   accessLogSource?: AccessLogSource;
 }
 
-/** Response payload for `test.relay.uploads.init.response` (minus envelope fields). */
 export interface TestUploadsInitPayload {
   uploadId: string;
   signedUrl: string;
@@ -78,9 +69,8 @@ export interface TestUploadsInitPayload {
 }
 
 /**
- * Mint an upload record + the developer-facing presigned PUT URL. The developer's PAT
- * identity (`msg.actor`) is recorded as the upload owner so the upload is
- * attributable.
+ * Mint an upload record + the presigned PUT URL. The developer's PAT identity
+ * (`msg.actor`) is recorded as the upload owner.
  */
 export async function handleTestUploadsInit(
   msg: TestRelayUploadsInitRequest,
@@ -98,7 +88,6 @@ export async function handleTestUploadsInit(
   );
 }
 
-/** Response payload for `test.relay.trigger.response` (minus envelope fields). */
 export interface TestTriggerPayload {
   runId: string;
   status: 'accepted' | 'rejected';
@@ -117,11 +106,9 @@ export async function handleTestTrigger(
   msg: TestRelayTriggerRequest,
   deps: TestRelayHandlerDeps,
 ): Promise<TestTriggerPayload> {
-  // The overlay tarball is decrypted with the CLI's ephemeral X25519 public key
-  // (`cliPublicKey`) paired with the upload record's stored private key. This is
-  // a distinct key from `encryptedSecretsKey` (which keys the optional secrets
-  // blob) — using the secrets key here would break runs with no secrets (no key
-  // at all) and corrupt decryption when secrets are present (wrong key).
+  // The overlay decrypts with the CLI's ephemeral X25519 `cliPublicKey` plus the
+  // upload's stored private key — never `encryptedSecretsKey`, which keys only
+  // the optional secrets blob and is absent on runs with no secrets.
   const cliPublicKey = msg.cliPublicKey;
   let resolvedOverlay:
     { tarballUrl: string; cliPublicKey: string; orchestratorPrivateKey: string } | undefined;
@@ -134,8 +121,7 @@ export async function handleTestTrigger(
       .executeTakeFirst();
 
     if (upload?.storage_key && upload.encryption_private_key) {
-      // Pre-signed uploads don't set S3 metadata — initialize it so getUrl()
-      // (which requires metadata) can mint a download URL.
+      // Presigned uploads set no S3 metadata, which getUrl() requires.
       await deps.cacheStorage.initMeta(upload.storage_key);
       const tarballUrl = await deps.cacheStorage.getUrl(upload.storage_key);
       if (tarballUrl) {
@@ -165,9 +151,7 @@ export async function handleTestTrigger(
       target: msg.target,
       dispatchInputs: msg.dispatchInputs,
       requestId: msg.requestId,
-      // Attribution, not authorization. The orchestrator records who the
-      // Platform says initiated the run; it does not gate on the answer — see
-      // the ownership note on `handleTestRunStatus` below.
+      // Attribution, not authorization: see `handleTestRunStatus`.
       actor: msg.actor,
     },
     deps,
@@ -200,7 +184,6 @@ export async function handleTestTrigger(
   };
 }
 
-/** Response payload for `test.relay.run.status.response` (minus envelope fields). */
 export interface TestRunStatusPayload {
   runId: string;
   status: string;
@@ -209,7 +192,7 @@ export interface TestRunStatusPayload {
     jobName: string;
     status: string;
     errorMessage?: string | null;
-    /** Wall-clock job duration once the job has finished; null while it runs. */
+    /** Wall-clock; null while the job runs. */
     durationMs?: number | null;
   }>;
   done: boolean;
@@ -218,37 +201,26 @@ export interface TestRunStatusPayload {
 /**
  * Snapshot a run's status + per-job status. `done` is true at a terminal run state.
  *
- * ## Why this does not check ownership, even though the run now records an owner
+ * ## Why this does not check ownership against `execution_runs.triggered_by`
  *
- * `handleTestTrigger` records the initiator on `execution_runs.triggered_by`,
- * so comparing `msg.actor` against it here looks like free defence in depth. It
- * is not, for three reasons that are worth writing down because the idea
- * recurs.
+ * The idea recurs; it is not free defence in depth:
  *
- * **The orchestrator cannot authenticate the actor.** It is asserted by the
- * Platform over the authenticated control-plane connection; nothing here can
- * verify it. A Platform that is lying can name any principal and pass the
- * check, so enforcing would defend only against a Platform that reports the
- * actor faithfully and forgets to check ownership — not against a hostile one.
+ * - **The orchestrator cannot authenticate the actor.** The Platform asserts it;
+ *   a lying Platform names any principal and passes, so the check stops only a
+ *   faithful Platform that forgot to check ownership.
+ * - **The two gates would disagree.** The Platform also admits a caller with
+ *   unrestricted repository scope (who can already read these runs on the
+ *   dashboard run plane). Only the actor reaches this tier, so an org owner
+ *   allowed there is refused here; fixing that needs the Platform to assert
+ *   "unrestricted", the first problem again.
+ * - **Version skew runs the wrong way.** This customer-deployed component
+ *   versions independently, so an upgrade that enforces refuses legitimate reads
+ *   against an unchanged Platform — a break we cannot roll back. Fail-closed is
+ *   right for a security control and wrong for a compatibility surface; this is
+ *   both.
  *
- * **The two gates would disagree.** The Platform deliberately admits a caller
- * with unrestricted repository scope alongside the creator, because such a
- * caller can already read these runs through the dashboard run plane. Repo
- * patterns do not exist on this tier — only the actor arrives — so an
- * organization owner reading a developer's run would be allowed there and
- * refused here. Closing that would mean the Platform asserting "this caller is
- * unrestricted", which is the first problem again with extra steps.
- *
- * **The version skew runs the wrong way.** This component is customer-deployed
- * and versions independently of the Platform, so an orchestrator upgraded to
- * enforce would start refusing legitimate reads against a Platform that has not
- * changed — a break the customer triggers and we cannot roll back. Fail-closed
- * is right for a security control and wrong for a compatibility surface, and
- * this is both.
- *
- * So the actor is recorded, not enforced. Enforcing here needs the caller's
- * effective authorization scope on the wire (so one policy is evaluated rather
- * than two), and an actor this tier can establish independently.
+ * Enforcing needs the caller's effective authorization scope on the wire (one
+ * policy, not two) and an actor this tier can establish independently.
  */
 export async function handleTestRunStatus(
   msg: TestRelayRunStatusRequest,
@@ -284,7 +256,6 @@ export async function handleTestRunStatus(
   };
 }
 
-/** Response payload for `test.relay.run.logs.response` (minus envelope fields). */
 export interface TestRunLogsPayload {
   lines: string[];
   nextCursor: number;
@@ -298,13 +269,11 @@ export interface TestRunLogsPayload {
 const LOG_PATH_RE = /job-([^/]+)\/step-(-?\d+)\.log$/;
 
 /**
- * Return the next chunk of a run's logs from a monotonic line-offset cursor
- * The orchestrator concatenates every log line in a deterministic
- * `(jobName ASC, stepIndex ASC, lineIndex ASC)` order; `cursor` is the count of
- * lines already delivered. `done` is true only when the run is terminal AND the
- * cursor has reached the end (the final tail-draining poll). A poll mid-step
- * returns the lines available so far with `done: false`, so no line is ever
- * dropped or skipped on a live run.
+ * Return the next chunk of a run's logs from a monotonic line-offset cursor:
+ * lines are concatenated in `(jobName ASC, stepIndex ASC, lineIndex ASC)` order
+ * and `cursor` counts lines already delivered. `done` is true only when the run
+ * is terminal AND the cursor reached the end, so a live or not-yet-drained poll
+ * returns what exists with `done: false` and no line is dropped.
  */
 export async function handleTestRunLogs(
   msg: TestRelayRunLogsRequest,
@@ -321,30 +290,21 @@ export async function handleTestRunLogs(
   }
 
   const terminal = TERMINAL_RUN_STATES.has(run.status);
-  // For a terminal run, drain any in-flight log appends before reading lines.
-  // Log chunks are persisted fire-and-forget from the agent WS handler, so the
-  // run status can flip terminal while the final chunk's write is still
-  // pending. Draining here guarantees the snapshot below contains every line
-  // the agent sent, so a `done: true` response never omits the last line.
+  // Chunks persist fire-and-forget, so a run can turn terminal with the last
+  // write pending; draining first means `done: true` never omits the last line.
   if (terminal) await deps.logWriter?.drain(msg.runId);
   const allLines = await collectRunLogLines(msg.runId, deps.logStorage);
 
   const cursor = Math.max(0, msg.cursor);
   const lines = allLines.slice(cursor);
   const nextCursor = cursor + lines.length;
-  // `done` only once the run is terminal AND we've drained the full stream — so
-  // a terminal-but-not-caught-up poll returns the tail with done:false and the
-  // CLI makes one final drain poll.
+  // A terminal-but-not-caught-up poll returns done:false; the CLI polls once more.
   const done = terminal && nextCursor >= allLines.length;
 
   return { lines, nextCursor, done };
 }
 
-/**
- * Build the ordered, flattened line stream for a run by reading every stored
- * step log under `executions/<runId>` and ordering by `(jobName, stepIndex,
- * lineIndex)`. Empty when no log storage is configured.
- */
+/** Reads every step log under `executions/<runId>`; empty with no log storage. */
 async function collectRunLogLines(
   runId: string,
   logStorage: LogStorage | undefined,
@@ -372,14 +332,13 @@ async function collectRunLogLines(
   return lines;
 }
 
-/** Response payload for `test.relay.cancel.response` (minus envelope fields). */
 export interface TestCancelPayload {
   cancelled: boolean;
 }
 
 /**
  * Cancel a running test run: signal cancellation to every dispatched agent,
- * mark still-pending dispatch queue entries cancelled, and mark the
+ * mark still-pending dispatch queue entries `expired`, and mark the
  * `execution_runs` row cancelled. Returns `{ cancelled }` — true when the run
  * existed, was a test run, and was not already terminal.
  */
@@ -470,11 +429,10 @@ export async function handleTestCancel(
 }
 
 /**
- * Route a parsed `test.relay.*` request to its handler and build the full
- * response envelope (`type` + `requestId` + payload) the caller relays back over
- * the WS connection via `sendRaw`. Errors and `{ error }` results are surfaced
- * on the response's `error` field; the wire stays a structured response so the
- * Platform can map it to an HTTP status.
+ * Build the full response envelope (`type` + `requestId` + payload) the caller
+ * relays via `sendRaw`. `{ error }` results ride the `error` field; a thrown error
+ * propagates, and the caller sends it on the same field. The Platform maps the
+ * structured response to an HTTP status.
  */
 export async function dispatchTestRelay(
   msg: TestRelayRequest,

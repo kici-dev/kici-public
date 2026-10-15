@@ -1,18 +1,12 @@
 /**
- * YAML-file semantic diff for the idempotent-step preview path. Parses
- * both sides with the `yaml` npm package, deep-walks the resulting JS
- * trees, and emits one `YamlDiffEntry` per leaf-level path that differs.
+ * YAML semantic diff for the idempotent-step preview: one `YamlDiffEntry` per
+ * differing leaf (string, number, boolean or null). Arrays compare by index;
+ * paths use JS-property notation (`Database.postgres.User.Password`,
+ * `clients[2].name`).
  *
- * "Leaf" means the smallest scalar inside the tree: a string, number,
- * boolean, or null. Arrays compare element-by-element by index; objects
- * recurse into their fields. The dotted path follows the JS-property
- * convention (`Database.postgres.User.Password`, `clients[2].name`).
- *
- * The renderer masks every entry whose path contains a sensitive
- * segment (`/password|passwd|secret|api[_-]?key|token|credentials?/i`)
- * unless the operator passes `reveal: true` via the
- * `--reveal-env-values` CLI flag. Non-sensitive entries print their
- * values inline so the operator can see config drift at a glance.
+ * The renderer masks entries whose path has a sensitive segment
+ * (`/password|passwd|secret|api[_-]?key|token|credentials?/i`) unless
+ * `--reveal-env-values` sets `reveal: true`; other values print inline.
  */
 
 import { parse as yamlParse } from 'yaml';
@@ -22,8 +16,7 @@ import {
   type RenderDriftOpts,
 } from './idempotency-files.js';
 
-// Hardcoded ANSI escapes, same convention as the other idempotency-*
-// modules — see the rationale in `idempotency-files.ts`.
+// Hardcoded ANSI escapes: rationale in `idempotency-files.ts`.
 const ANSI_RED = '\x1b[31m';
 const ANSI_GREEN = '\x1b[32m';
 const ANSI_CYAN = '\x1b[36m';
@@ -35,9 +28,9 @@ export interface YamlDiffEntry {
   /** Dotted path to the leaf, e.g. "Database.postgres.User.Password" or "auth.clients[0].secret". */
   path: string;
   kind: YamlDiffKind;
-  /** Populated for `changed` / `removed`. Scalar leaf value. */
+  /** Set for `changed` / `removed`. */
   oldValue?: unknown;
-  /** Populated for `added` / `changed`. Scalar leaf value. */
+  /** Set for `added` / `changed`. */
   newValue?: unknown;
   /** True when any segment in `path` matches the sensitive-keyword heuristic. */
   sensitive: boolean;
@@ -45,12 +38,7 @@ export interface YamlDiffEntry {
 
 const SENSITIVE_SEGMENT_RE = /^(password|passwd|secret|secrets|api[_-]?key|token|credentials?)$/i;
 
-/**
- * Returns true when any segment of the dotted path matches the
- * sensitive-keyword heuristic. Numeric array indices (`[0]`) are
- * stripped before the match so a path like `clients[3].token` still
- * matches via the `token` segment.
- */
+/** Numeric indices are stripped first, so `clients[3].token` matches on `token`. */
 export function isPathSensitive(dottedPath: string): boolean {
   const segments = dottedPath
     .split(/[.[\]]+/)
@@ -60,21 +48,13 @@ export function isPathSensitive(dottedPath: string): boolean {
 }
 
 /**
- * Deep-diff two YAML bodies. Both sides are parsed with the `yaml`
- * package, then a recursive walk emits one entry per leaf that differs.
- * Returns an empty array when the documents are structurally equivalent.
- *
- * Throws when either side fails to parse — the caller (the renderer
- * dispatch) catches and falls back to unified-text rendering on a parse
- * failure so a stray template tag in a yaml-by-suffix file doesn't lose
- * the operator's diff.
+ * Returns `[]` for structurally equal documents. Throws on a parse failure;
+ * the renderer dispatch then falls back to a unified-text diff, so a stray
+ * template tag in a yaml-by-suffix file does not lose the operator's diff.
  */
 export function diffYamlContent(local: string, remote: string): YamlDiffEntry[] {
-  // Empty body → treat as "no document" (undefined). The `yaml` package
-  // parses an empty string as `null`, which is structurally distinct from
-  // "missing" — we want the missing semantics so a whole-document add or
-  // remove collapses into a single `<root>` entry rather than a
-  // `<root>: changed` from null to something.
+  // `yaml` parses '' as `null`; treat it as missing instead, so a
+  // whole-document add or remove is one `<root>` entry, not `changed` from null.
   const localTree: unknown = local === '' ? undefined : yamlParse(local);
   const remoteTree: unknown = remote === '' ? undefined : yamlParse(remote);
   const entries: YamlDiffEntry[] = [];
@@ -90,14 +70,8 @@ export function diffYamlContent(local: string, remote: string): YamlDiffEntry[] 
 }
 
 /**
- * Recursive walk over `local` and `remote`. For each pair of values at
- * `path`:
- *   - Both undefined → emit nothing (key missing in both).
- *   - Only local defined → recurse / emit `added`.
- *   - Only remote defined → recurse / emit `removed`.
- *   - Both defined, structurally compatible (both objects / both arrays)
- *     → recurse into children.
- *   - Both defined, scalar or shape-mismatched → emit `changed`.
+ * Only local defined → `added`; only remote → `removed`; both objects or both
+ * arrays → recurse; otherwise (scalar or shape mismatch) → `changed`.
  */
 function walkDiff(path: string, local: unknown, remote: unknown, out: YamlDiffEntry[]): void {
   const lDefined = local !== undefined;
@@ -145,21 +119,14 @@ function walkDiff(path: string, local: unknown, remote: unknown, out: YamlDiffEn
   });
 }
 
-/**
- * When a whole subtree is added or removed, we collapse it into a
- * single entry rather than emitting one per descendant leaf. The
- * value is the entire subtree; the renderer prints it inline (masked
- * when the path is sensitive) or via a JSON one-liner.
- */
+/** A whole added or removed subtree collapses into one entry carrying the subtree. */
 function emitLeafOrTree(
   path: string,
   value: unknown,
   kind: 'added' | 'removed',
   out: YamlDiffEntry[],
 ): void {
-  // Empty path can only happen for top-level value (whole document
-  // added/removed). Emit at path '<root>' so the renderer prints
-  // something useful.
+  // An empty path means the whole document was added or removed.
   const reportedPath = path === '' ? '<root>' : path;
   if (kind === 'added') {
     out.push({ path: reportedPath, kind, newValue: value, sensitive: isPathSensitive(path) });
@@ -176,12 +143,9 @@ function isPlainObject(value: unknown): boolean {
 }
 
 /**
- * Cheap structural equality check. Only used as a tie-breaker for the
- * "neither object nor array" branch — scalar leaves go through
- * `===` after a JSON-stringify-equiv comparison. Functions / Dates /
- * other class instances fall back to `Object.is`, which is fine
- * because the `yaml` package only emits plain values for the tag set
- * we use (scalar, sequence, mapping).
+ * Cheap equality for the scalar / shape-mismatch branch. JSON comparison is
+ * safe: `yaml` emits only plain values for the scalar, sequence and mapping
+ * tags in use, never Dates or class instances.
  */
 function deepEqual(a: unknown, b: unknown): boolean {
   if (Object.is(a, b)) return true;
@@ -191,17 +155,13 @@ function deepEqual(a: unknown, b: unknown): boolean {
 export interface YamlDiffRenderOpts {
   /** When true, sensitive paths show their values inline; otherwise masked. */
   reveal?: boolean;
-  /** When true, color the kind label + values via ANSI escapes. */
+  /** ANSI-color the kind label and values. */
   color?: boolean;
 }
 
 /**
- * Render the yaml-semantic diff body. Returns one entry's worth of
- * lines per `YamlDiffEntry`, plus an empty-state fallback line when
- * there's nothing to show. No surrounding indent applied — the caller
- * decides nesting.
- *
- * Layout:
+ * Render the diff body with no outer indent (the caller nests it), or an
+ * empty-state line when nothing drifted. Layout:
  *
  *   Database.postgres.User.Password: changed (masked — pass --reveal-env-values to show)
  *   server.listen: changed
@@ -210,10 +170,8 @@ export interface YamlDiffRenderOpts {
  *   features.beta: added
  *     + new=true
  *
- * The CLI flag is named `--reveal-env-values` because the same flag
- * governs env-semantic + yaml-semantic value reveals; calling the flag
- * "env-values" reflects the most common case (sops-derived env files)
- * but it activates yaml-side reveal too.
+ * `--reveal-env-values` governs both env and yaml reveals; it is named for the
+ * common case (sops-derived env files).
  */
 export function renderYamlDiff(entries: YamlDiffEntry[], opts: YamlDiffRenderOpts = {}): string[] {
   const reveal = opts.reveal ?? false;
@@ -240,8 +198,7 @@ function formatValue(value: unknown): string {
   if (value === undefined) return 'undefined';
   if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  // Objects / arrays: one-line JSON for the operator's eye. Truncated
-  // at a reasonable cap so a massive subtree doesn't blow the terminal.
+  // One-line JSON, truncated so a massive subtree cannot flood the terminal.
   try {
     const json = JSON.stringify(value);
     if (json.length <= 240) return json;
@@ -269,15 +226,9 @@ function colorize(text: string, side: 'old' | 'new', color: boolean): string {
 }
 
 /**
- * Bridge between the FileDriftEntry / RenderDriftOpts API surface and
- * the yaml diff renderer. Registered at module load time via
- * `setYamlDiffRenderer` so `renderFileDriftBody` can dispatch yaml
- * entries without a hard dependency on the `yaml` package in
- * `idempotency-files.ts`.
- *
- * On a yaml-parse failure, the renderer returns a single explanatory
- * line and the dispatch falls through (caller-side) to the unified-text
- * body so the operator still sees something useful.
+ * Registered via `setYamlDiffRenderer` at load, so `idempotency-files.ts` has
+ * no hard `yaml` dependency. On a parse failure it returns one explanatory
+ * line and the caller falls through to the unified-text body.
  */
 function renderYamlDiffEntry(entry: FileDriftEntry, opts: RenderDriftOpts): string[] {
   const local = entry.localContent ?? '';

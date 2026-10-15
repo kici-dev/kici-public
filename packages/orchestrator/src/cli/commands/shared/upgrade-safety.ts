@@ -1,22 +1,15 @@
 /**
- * The three things an upgrade has to do before it stops the service.
+ * What an orchestrator upgrade does before it stops the service (an agent has
+ * no database and no drain):
  *
- * Each one existed as a capability the upgrade never called:
- *
- *   - **Drain.** The drain flag, the admin route, the CLI verb and a tested
- *     `waitForQuiesce` poller were all already here, and the upgrade went
- *     straight from "extracted" to `manager.stop()`. Every in-flight job died
- *     with the restart, and on an autoscaling cluster the shutdown tears the
- *     scaler down first, so scaler-managed agents die with their jobs.
- *   - **Backup.** `kici-admin db backup` existed and nothing scheduled it; the
- *     upgrade never took one. `checkBackupFreshness` has been reporting FAIL
- *     since install for a backup the product gave no way to produce.
- *   - **Schema guard.** Rolling back flips a symlink. The previous release's
- *     static migration provider does not carry the newer migrations' names, so
- *     Kysely throws `corrupted migrations` on boot and systemd restarts it
- *     forever — the documented recovery produces a second outage.
- *
- * All three are orchestrator-only. An agent has no database and no drain.
+ *   - **Drain.** A restart kills every in-flight job, and on an autoscaling
+ *     cluster the shutdown tears the scaler down first, so scaler-managed
+ *     agents die with their jobs.
+ *   - **Backup.** The pre-upgrade dump is the recovery path if the upgrade
+ *     goes wrong.
+ *   - **Schema guard.** A rollback flips a symlink, and the older release's
+ *     static migration provider lacks the newer migrations' names, so Kysely
+ *     throws `corrupted migrations` on boot and systemd restarts it forever.
  */
 import { toErrorMessage } from '@kici-dev/shared';
 import { sleep as defaultSleep } from '@kici-dev/engine';
@@ -35,10 +28,9 @@ export interface WaitOpts {
 }
 
 /**
- * Poll until no jobs are running, or the deadline passes.
- *
- * Extracted so the upgrade and `kici-admin orchestrator drain --wait` share one
- * implementation rather than two that can disagree about what quiesced means.
+ * Poll until no jobs are running, or the deadline passes. The upgrade and
+ * `kici-admin orchestrator drain --wait` share it so they agree on what
+ * quiesced means.
  */
 export async function waitForQuiesce(
   poll: () => Promise<DrainSnapshot>,
@@ -55,10 +47,7 @@ export async function waitForQuiesce(
   }
 }
 
-/**
- * What a version switch prints when it cannot read the live migration ledger,
- * so it could not compare the schema to the recorded head.
- */
+/** Printed when a version switch cannot read the live migration ledger. */
 export const SCHEMA_NOT_CHECKED =
   'The running service could not be reached, so the schema was not checked.';
 
@@ -69,10 +58,8 @@ export interface MigrationStatusRow {
 }
 
 /**
- * The last applied migration reported by a running service.
- *
- * Returns null when nothing has been applied — a fresh database — which the
- * caller must not confuse with "could not read it".
+ * The last applied migration. Null means a fresh database, which the caller
+ * must not confuse with "could not read it".
  */
 export function appliedHead(rows: readonly MigrationStatusRow[]): string | null {
   const applied = rows.filter((r) => r.status === 'applied');
@@ -92,15 +79,12 @@ export type SchemaGuardVerdict =
   | { kind: 'ahead'; extra: string[]; message: string };
 
 /**
- * Decide whether the version pointer may move.
- *
- * Three outcomes, and the middle one is the compatibility shim: an instance
- * installed before `migrationHeads` existed, or one whose upgrade away from the
- * target ran without admin access, has no recorded head, and refusing there
- * would break the documented `--rollback` on exactly those installs. So an
- * unknown head warns loudly and falls through to the existing confirmation
- * prompt; the map is populated at the next version change with admin access,
- * arming the guard one upgrade later.
+ * Decide whether the version pointer may move. `unknown-head` is a compat
+ * shim: an install from before `migrationHeads`, or whose upgrade away from
+ * the target ran without admin access, has no recorded head, and refusing
+ * would break its documented `--rollback`. It warns and falls through to the
+ * confirmation; the next version change with admin access records the head
+ * and arms the guard.
  */
 export function schemaGuardVerdict(input: {
   targetVersion: string;
@@ -161,20 +145,20 @@ export function mergeMigrationHead(
   return { ...(existing ?? {}), [version]: head };
 }
 
-/** Read the live applied head, returning null when the service cannot answer. */
+/**
+ * The live migration rows, or null when the service or admin API cannot
+ * answer: that is no evidence about the schema, so null means "cannot tell".
+ */
 export async function readLiveMigrationRows(
   fetchStatus: () => Promise<{ migrations: MigrationStatusRow[] }>,
 ): Promise<MigrationStatusRow[] | null> {
   try {
     return (await fetchStatus()).migrations;
   } catch {
-    // A service that is not running, or an admin API that is unreachable, is
-    // not evidence about the schema. The caller treats null as "cannot tell".
     return null;
   }
 }
 
-/** Format the reason a pre-upgrade backup could not be taken. */
 export function backupRefusalMessage(reason: string): string {
   return (
     `Error: the pre-upgrade backup could not be taken.\n` +
@@ -185,13 +169,9 @@ export function backupRefusalMessage(reason: string): string {
 }
 
 /**
- * Format the drain-timeout refusal.
- *
- * The refusal leaves the coordinator draining — deliberately, so the in-flight
- * jobs finish without new ones piling up behind them. But a drained
- * coordinator accepts nothing, so the message has to say so and name the way
- * back; an operator who reads only "wait and re-run" does not know their CI is
- * stalled meanwhile.
+ * The drain-timeout refusal. It leaves the coordinator draining on purpose so
+ * in-flight jobs finish without new ones piling up, and so must say that CI
+ * accepts nothing meanwhile and name the way back.
  */
 export function drainTimeoutMessage(jobsRunning: number, timeoutSeconds: number): string {
   return (
@@ -205,7 +185,7 @@ export function drainTimeoutMessage(jobsRunning: number, timeoutSeconds: number)
   );
 }
 
-/** Describe a failure to reach the admin API during the pre-stop phase. */
+/** A failure to reach the admin API during the pre-stop phase. */
 export function adminApiUnavailable(action: string, err: unknown): string {
   return `${action} could not be performed: ${toErrorMessage(err)}`;
 }

@@ -1,6 +1,6 @@
 /**
- * Lock file types for the trigger matching engine.
- * Single source of truth -- replaces local copies in @kici-dev/compiler and @kici-dev/orchestrator.
+ * Lock file types for the trigger matching engine, shared by @kici-dev/compiler
+ * and @kici-dev/orchestrator.
  *
  * Bump-history convention: every entry is annotated `additive` (older readers
  * tolerate the new lock because unknown fields are ignored) or `BREAKING` (an
@@ -57,22 +57,22 @@ import { isFailureStatus } from '../status/presentation.js';
 
 /**
  * Schema version the compiler emits into every lock file. Incremented on ANY
- * schema change (additive or breaking); the bump-history comment above records
- * which. See `BREAKING_FLOOR` for the compatibility-window semantics.
+ * schema change (additive or breaking); the bump history above records which.
+ * See `BREAKING_FLOOR` for the compatibility window.
  */
 export const SCHEMA_VERSION = 42 as const;
 
 /**
- * Oldest lock schema version this codebase can still read correctly — the lower
- * bound of the acceptance window.
+ * Oldest lock schema version this codebase reads correctly — the lower bound of
+ * the acceptance window.
  *
  * A lock at `schemaVersion >= BREAKING_FLOOR` parses correctly here even if it
  * is newer than `SCHEMA_VERSION` (additive bumps add fields this reader ignores).
- * A lock below the floor must be recompiled with a current SDK and is rejected.
+ * A lock below the floor is rejected and must be recompiled with a current SDK.
  *
  * Bump rule: move this to the current `SCHEMA_VERSION` in the commit that lands
- * a `BREAKING` schema change (see the bump-history convention above). An
- * additive bump leaves it in place, so locks compiled at the floor stay readable.
+ * a `BREAKING` schema change. An additive bump leaves it in place, so locks
+ * compiled at the floor stay readable.
  */
 export const BREAKING_FLOOR = 42 as const;
 
@@ -120,11 +120,10 @@ export interface LockBranchPattern {
  * execution-purity model.
  *
  * Every entry in a list is a CONJUNCT: `contains: [a, b]` means the text
- * contains `a` AND contains `b`. OR is expressed by declaring two triggers,
- * since a workflow's trigger list is already "first match wins".
+ * contains `a` AND contains `b`. Express OR by declaring two triggers, since a
+ * workflow's trigger list is already "first match wins".
  *
- * This is the SDK-facing shape a workflow author writes; the compiler
- * normalizes it to {@link LockTextMatch}.
+ * The SDK-facing shape; the compiler normalizes it to {@link LockTextMatch}.
  */
 export interface TextMatch {
   /** Literal substring(s). Every entry must be present. */
@@ -137,9 +136,8 @@ export interface TextMatch {
   readonly notMatches?: string | RegExp | readonly (string | RegExp)[];
   /**
    * Case-insensitive comparison for `contains`/`notContains` ONLY. Default false.
-   * It deliberately does not touch the regex keys: a regex already carries its
-   * own flags, and injecting `i` into a pattern whose author omitted it would
-   * silently change its meaning.
+   * The regex keys are untouched: a regex carries its own flags, and injecting
+   * `i` into a pattern whose author omitted it would silently change its meaning.
    */
   readonly ignoreCase?: boolean;
 }
@@ -174,9 +172,9 @@ export type ContentFormat = 'json' | 'yaml' | 'text' | 'auto';
  * AND-ed within an entry; `absent` is mutually exclusive with them and passes
  * only when the file is missing.
  *
- * This is the SDK-facing shape a workflow author writes, which accepts a scalar
- * or `RegExp` where the lock form ({@link LockContentRequirement}) carries a flat
- * array of `/pattern/flags` strings — the compiler normalizes one to the other.
+ * The SDK-facing shape accepts a scalar or `RegExp` where the lock form
+ * ({@link LockContentRequirement}) carries a flat array of `/pattern/flags`
+ * strings; the compiler normalizes one to the other.
  */
 export interface ContentRequirement {
   /** Repo-relative path of the file to query. */
@@ -227,10 +225,9 @@ export interface LockContentRequirement {
  * non-`auto` format is returned as-is; `auto` (or unset) is resolved by the file
  * extension: `.json` → json, `.yaml`/`.yml` → yaml, everything else text.
  *
- * Yaml-free (pure string logic) so it lives in the browser-safe barrel and is
- * the single source of truth for both the compiler's compile-time serializer and
- * the orchestrator's eval-time matcher — the two can never disagree about how a
- * file's format is picked.
+ * Yaml-free, so it lives in the browser-safe barrel and both the compiler's
+ * compile-time serializer and the orchestrator's eval-time matcher use it; the
+ * two never disagree about how a file's format is picked.
  */
 export function resolveContentFormat(
   file: string,
@@ -291,7 +288,7 @@ export interface LockTagTrigger {
 
 /**
  * Comment trigger in lock file.
- * Matches issue_comment and pull_request_review_comment events.
+ * Matches `comment` events (GitHub `issue_comment`, on an issue or a PR).
  */
 export interface LockCommentTrigger {
   readonly _type: 'comment';
@@ -722,11 +719,10 @@ const WHEN_TO_RUN_ON: Readonly<Record<NeedsWhen, readonly ExecutionJobStatus[]>>
   always: [...TERMINAL_JOB_STATES] as ExecutionJobStatus[],
   'on-skip': [ExecutionJobStatus.enum.success, ExecutionJobStatus.enum.skipped],
   // Derived, not listed: the terminal statuses that mean the workflow did not
-  // do what it declared. Reading the same classification the run roll-up reads
-  // is what stops the two from disagreeing — a drift-dropped job already makes
-  // its run fail, so a downstream error handler must run for it too.
-  // `cancelled` stays out (deliberately stopped, its own outcome) and so does
-  // `skipped` (never ran).
+  // do what it declared, read from the classification the run roll-up reads so
+  // the two never disagree — a drift-dropped job makes its run fail, so a
+  // downstream error handler must run for it too. `cancelled` (deliberately
+  // stopped, its own outcome) and `skipped` (never ran) stay out.
   'on-failure': ([...TERMINAL_JOB_STATES] as ExecutionJobStatus[]).filter(isFailureStatus),
 };
 
@@ -735,10 +731,9 @@ const WHEN_TO_RUN_ON: Readonly<Record<NeedsWhen, readonly ExecutionJobStatus[]>>
  * the normalized status-set. An unset `when` defaults to success-only — the
  * downstream runs only when the upstream succeeded.
  *
- * Always a fresh array. The keyword arm used to hand back the shared
- * `WHEN_TO_RUN_ON` entry itself, so every lock-file edge compiled from the same
- * keyword aliased one array and any caller that sorted or mutated its result
- * silently reordered the keyword's expansion for every other edge.
+ * Always a fresh array: returning the shared `WHEN_TO_RUN_ON` entry would alias
+ * one array across every edge compiled from the same keyword, so a caller that
+ * sorts or mutates its result would change every other edge's expansion.
  */
 export function resolveWhenToRunOn(
   when: NeedsWhen | ExecutionJobStatus[] | undefined,
@@ -911,9 +906,9 @@ export interface LockJob {
    * lock CAN carry material and a reader must not assume otherwise.
    *
    * `default` is used when a call names no credential; any other key is
-   * referenced by name. Additive: an older orchestrator that does not
-   * understand it passes it through in `jobConfig`, and an older agent
-   * ignores it (git falls back to its own mechanisms, exactly as before).
+   * referenced by name. Additive: an older orchestrator passes it through in
+   * `jobConfig`, and an older agent ignores it (git falls back to its own
+   * mechanisms).
    */
   readonly gitCredentials?: Readonly<Record<string, Readonly<Record<string, string>>>>;
   /**
@@ -1179,31 +1174,23 @@ export interface LockWorkflow {
 }
 
 /**
- * Complete lock file structure.
- * Schema version 11 - designed for fast orchestrator event matching.
+ * Complete lock file structure, designed for fast orchestrator event matching.
+ * Its version is `SCHEMA_VERSION`; the file header holds the bump history.
+ * Bumps not listed there:
  * v2 adds per-workflow contentHash and compileSchemaVersion.
  * v3 adds 13 new trigger types (tag, comment, review, release, dispatch, etc.).
- * v4 adds 4 internal event routing trigger types (kici_event, workflow_complete,
- * job_complete, generic_webhook).
  * v5 adds schedule, lifecycle triggers, generic webhook auth, and job-level contexts.
- * v6 replaces job-level contexts with environment/env/concurrencyGroup.
  * v7 adds hook flags, step rules, gracePeriod, and workflow concurrency config.
- * v8 adds runsOn polymorphic type (string | string[] | selector) and excludeLabels.
- * v9 adds repos/notRepos repo pattern fields to git-event triggers for global workflow matching.
- * v10 removes notRepos/notPaths fields; negative patterns use ! prefix in repos/paths arrays.
- * v11 added an inline-expression value shape for dynamic fields, which is no longer parsed.
  * v12 adds workflow-level registries and installEnv for private npm registry auth.
  * v13 adds job-level and workflow-level timeout.
- * v40 adds siblingsDigest — the in-repo `workspace:` sibling closure the deps
- * tarball carries, which no package-manager lock file moves. Additive.
  */
 export interface LockFile {
   readonly schemaVersion: typeof SCHEMA_VERSION;
   /**
-   * The oldest reader schema version that handles this lock correctly. The
-   * compiler stamps `BREAKING_FLOOR`. A reader whose
-   * own `SCHEMA_VERSION` is below this value would mis-handle the lock and must
-   * reject it. Required: a lock without it fails the reader's compatibility check.
+   * The oldest reader schema version that handles this lock correctly; the
+   * compiler stamps `BREAKING_FLOOR`. A reader whose own `SCHEMA_VERSION` is
+   * below it would mis-handle the lock and must reject it. Required: a lock
+   * without it fails the reader's compatibility check.
    */
   readonly minReaderVersion: number;
   readonly source: LockSource;
@@ -1222,9 +1209,9 @@ export interface LockFile {
    * `file:` / `link:` / `portal:` sibling package `.kici` depends on,
    * transitively.
    *
-   * The deps tarball carries those sibling directories WITH their built output,
-   * and `lockfileHash` alone names it — but editing a sibling's source moves no
-   * package-manager lock file, so a warm dep cache restored the sibling's STALE
+   * The deps tarball carries those sibling directories WITH their built output.
+   * Editing a sibling's source moves no package-manager lock file, so with
+   * `lockfileHash` alone a warm dep cache would restore the sibling's STALE
    * build over the fresh clone on every run. This enters the dep POINTER key
    * only; the immutable `{depsHash}.tar.gz` object keeps its own content
    * addressing, and `contentHash` is untouched (siblings ship in the deps
@@ -1250,7 +1237,7 @@ export function isLockDynamicJobFn(job: LockJobOrFactory): job is LockDynamicJob
 /**
  * Availability of the changed-files list for path-filter evaluation.
  *
- * Distinguishes three states that a bare `string[]` collapses into one:
+ * Distinguishes states that a bare `string[]` collapses into one:
  * - `skipped` — no trigger has path patterns, so the fetch never ran. Path
  *   filters are not evaluated (today's no-fetch fast path).
  * - `fetched` — the fetch succeeded and the list is authoritative; an empty
@@ -1263,11 +1250,8 @@ export const changedFilesStatusSchema = z.enum(['fetched', 'unavailable', 'skipp
 export type ChangedFilesStatus = z.infer<typeof changedFilesStatusSchema>;
 
 /**
- * Simulated event payload structure for trigger matching.
- *
- * Known event types: push, pull_request, tag, comment, review, review_comment,
- * dispatch, release, create, delete, status, workflow_run, fork, star, watch,
- * kici_event, workflow_complete, job_complete, generic_webhook, schedule, lifecycle
+ * Simulated event payload structure for trigger matching. Known `type` values:
+ * `TRIGGER_EVENT_TYPES` (`trigger-event-type.ts`).
  */
 export interface SimulatedEvent {
   type: string;
@@ -1304,11 +1288,10 @@ export interface SimulatedEvent {
   /** Sender username from the webhook payload (e.g. GitHub login). */
   senderUsername?: string;
   /**
-   * Immutable IDP-side numeric id of the sender (e.g. GitHub's `sender.id`).
-   * Mirrors Platform's `identity_links.provider_user_id`. The orchestrator
-   * trust resolver prefers this over `senderUsername` because GitHub logins
-   * are mutable and a recycled login can otherwise inherit trust granted
-   * to the previous owner.
+   * Immutable IDP-side numeric id of the sender (e.g. GitHub's `sender.id`),
+   * mirroring Platform's `identity_links.provider_user_id`. The orchestrator
+   * trust resolver prefers it over `senderUsername`: GitHub logins are mutable,
+   * and a recycled login could otherwise inherit the previous owner's trust.
    */
   senderUserId?: string;
   /**
@@ -1328,8 +1311,8 @@ export interface SimulatedEvent {
    *
    * Distinct from {@link SimulatedEvent.sourceRepo}, which is the repository the
    * event OCCURRED in (the base repository for a PR) and drives global-workflow
-   * repo pattern matching. Conflating the two is what let a fork PR present as
-   * a same-repo one.
+   * repo pattern matching. Conflating the two lets a fork PR present as a
+   * same-repo one.
    */
   headRepo?: string;
 }

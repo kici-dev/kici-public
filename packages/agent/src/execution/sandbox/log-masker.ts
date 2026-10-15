@@ -1,29 +1,18 @@
 /**
- * Secret value masking for log lines.
- *
- * Replaces all occurrences of registered secret values with '***' in log output.
- * Used by the workflow runner to prevent secret leaks in IPC log messages.
- *
- * Performance: Builds a single combined regex from all secret values, so each
- * log line is scanned in a single pass (not O(secrets * lines)).
+ * Replaces registered secret values with '***' in the workflow runner's IPC log
+ * messages. One combined regex scans each line in a single pass.
  */
 
 import type { JobExecutionRequest, RunnerToAgentMessage } from './ipc-protocol.js';
 
-/** Minimum length for a secret value to be maskable (avoids false positives). */
+/** Shorter values are not masked, to avoid false positives. */
 const MIN_MASK_LENGTH = 3;
 
-/**
- * Escape regex special characters in a string.
- */
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
- * Masks secret values in log lines.
- *
- * Usage:
  * ```ts
  * const masker = new LogMasker();
  * masker.registerSecrets({ TOKEN: 'abc123', SHORT: 'ab' });
@@ -37,39 +26,25 @@ export class LogMasker {
   private readonly values = new Set<string>();
 
   /**
-   * Register secret values to be masked in log output.
+   * Skips values under 3 characters. Also registers each value's base64 form
+   * (Authorization: Basic headers, base64 config values). Longer values match
+   * first, so a secret that is a substring of another never half-masks it.
    *
-   * Values shorter than 3 characters are skipped to avoid false positives.
-   * Base64-encoded variants of each qualifying secret are also registered,
-   * preventing leaks when secrets appear base64-encoded in logs (e.g.,
-   * Authorization: Basic headers, base64-encoded config values).
-   * Values are sorted by length descending so longer values are matched first
-   * (prevents partial masking when one secret is a substring of another).
+   * Log output is split into lines before masking, so a multi-line value (a PEM
+   * key, a kubeconfig) also registers each line. Deliberately, that masks short
+   * structural lines (a `---` YAML separator, a bare `{` of a service-account
+   * JSON) and PEM header/footer lines everywhere in the job's logs: safer than
+   * leaking the body, and no heuristic separates structural from body lines
+   * without risking the reverse mistake.
    *
-   * Multi-line values additionally register each of their individual lines.
-   * Log output is split into lines before it reaches the masker, so a value
-   * containing a newline can never match as a whole — a PEM private key or a
-   * kubeconfig would otherwise stream in clear text. Two consequences of the
-   * per-line registration are deliberate:
-   *
-   * - `MIN_MASK_LENGTH` is 3, so short structural lines of a structured secret
-   *   are registered too. A `---` YAML separator or a bare `{` from a
-   *   service-account JSON is masked wherever it appears in that job's logs.
-   * - PEM header and footer lines (`-----BEGIN OPENSSH PRIVATE KEY-----`) are
-   *   not secret on their own and are masked as a side effect.
-   *
-   * Both are strictly safer than leaking the body, and no heuristic separates a
-   * structural line from a body line without risking the reverse mistake.
-   *
-   * Registrations add up: a later call (a mounted file's content, an OIDC
-   * token) extends the set, and every value registered before stays masked.
+   * Registrations accumulate: a later call (a mounted file, an OIDC token)
+   * extends the set and earlier values stay masked.
    */
   registerSecrets(secrets: Record<string, string>): void {
     const add = (candidate: string): void => {
       if (candidate.length < MIN_MASK_LENGTH) return;
       this.values.add(candidate);
 
-      // Also register the base64-encoded variant
       const b64 = Buffer.from(candidate).toString('base64');
       if (b64.length >= MIN_MASK_LENGTH) this.values.add(b64);
     };
@@ -77,9 +52,7 @@ export class LogMasker {
     for (const value of Object.values(secrets)) {
       add(value);
 
-      // A multi-line value never matches a single log line, so register each of
-      // its lines as well. Trailing \r is stripped so a CRLF-delimited secret
-      // still matches the line the log carries.
+      // Trailing \r is stripped so a CRLF-delimited secret matches the log line.
       if (value.includes('\n')) {
         for (const rawLine of value.split('\n')) {
           add(rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine);
@@ -92,55 +65,39 @@ export class LogMasker {
       return;
     }
 
-    // Sort by length descending to mask longer values first
     const values = [...this.values].sort((a, b) => b.length - a.length);
 
-    // Build a single combined regex using alternation
     this.pattern = new RegExp(values.map((v) => escapeRegExp(v)).join('|'), 'g');
   }
 
-  /**
-   * Mask all registered secret values in a log line.
-   *
-   * Returns the line unchanged if no secrets are registered.
-   */
   mask(line: string): string {
     if (!this.pattern) {
       return line;
     }
-    // Reset lastIndex for global regex (stateful)
+    // A global regex is stateful.
     this.pattern.lastIndex = 0;
     return line.replace(this.pattern, '***');
   }
 
-  /**
-   * Returns true if any maskable secrets are registered.
-   */
   hasSecrets(): boolean {
     return this.pattern !== null;
   }
 }
 
 /**
- * Create a LogMasker initialized with all secret values from the request.
- *
- * Collects values from both flat secrets and all namespaced context secrets,
- * deduplicating before registration.
- *
- * Both the runner child and the agent-side fork runner build a masker from the
- * same request, so the crash tail the agent assembles from the child's stderr is
- * masked with the same value set the child used for its own log lines.
+ * A masker over the request's flat and namespaced secrets. The runner child and
+ * the agent-side fork runner both build one from the same request, so the crash
+ * tail the agent assembles from the child's stderr is masked with the child's
+ * value set.
  */
 export function createSecretMasker(request: JobExecutionRequest): LogMasker {
   const masker = new LogMasker();
   const allSecrets: Record<string, string> = {};
 
-  // Collect flat secrets
   if (request.secrets) {
     Object.assign(allSecrets, request.secrets);
   }
 
-  // Collect all namespaced secret values
   if (request.namespacedSecrets) {
     for (const contextSecrets of Object.values(request.namespacedSecrets)) {
       Object.assign(allSecrets, contextSecrets);
@@ -152,14 +109,10 @@ export function createSecretMasker(request: JobExecutionRequest): LogMasker {
 }
 
 /**
- * Mask every operator-visible text field of an outbound runner message.
- *
- * Each message type carrying free text is named here, so a new text-bearing
- * message type is a visible omission rather than a silent leak. `step.complete`
- * error text and the `job.complete` failure reason are persisted on the step and
- * run rows the dashboard renders, so they need the same masking `log.line` gets.
- *
- * Returns the message unchanged when no secrets are registered.
+ * Masks every operator-visible text field of an outbound runner message. Each
+ * text-bearing type is named here, so a new one is a visible omission rather
+ * than a silent leak; `step.complete` errors and the `job.complete` reason
+ * persist on the rows the dashboard renders.
  */
 export function maskMessageText(
   msg: RunnerToAgentMessage,

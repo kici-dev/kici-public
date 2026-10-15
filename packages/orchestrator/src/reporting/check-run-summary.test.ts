@@ -59,7 +59,7 @@ describe('buildCheckRunSummary', () => {
       },
     ];
 
-    // Add log lines for the failed step (index 1)
+    // Failed step is index 1.
     logBuffer.addLines({ runId, jobId, stepIndex: 1 }, [
       'Running test suite...',
       'FAIL src/app.test.ts',
@@ -144,7 +144,7 @@ describe('buildCheckRunSummary', () => {
       { name: 'Test', status: 'failed', error: 'Failed', exitCode: 1 },
     ];
 
-    // Add 30 lines (default maxLines = 20)
+    // Default maxLines = 20.
     const lines = Array.from({ length: 30 }, (_, i) => `log line ${i + 1}`);
     logBuffer.addLines({ runId, jobId, stepIndex: 0 }, lines);
 
@@ -204,7 +204,7 @@ describe('buildCheckRunSummary', () => {
       { name: 'Test', status: 'failed', error: 'Lots of output', exitCode: 1 },
     ];
 
-    // Add 20 very long lines (3000 chars each = 60KB just in logs)
+    // 3000 chars each = 60KB just in logs.
     const longLines = Array.from({ length: 20 }, (_, i) => `line ${i}: ${'x'.repeat(3000)}`);
     logBuffer.addLines({ runId, jobId, stepIndex: 0 }, longLines);
 
@@ -334,7 +334,6 @@ describe('buildAnnotations', () => {
       { name: 'Test 1', status: 'failed', error: 'Error 1' },
       { name: 'Test 2', status: 'failed', error: 'Error 2' },
     ];
-    // Only provide source location for step 1 (index 1)
     const sourceLocations = new Map([[1, { file: '.kici/workflows/ci.ts', line: 20, column: 1 }]]);
 
     const { annotations } = buildAnnotations({ stepResults, sourceLocations });
@@ -432,12 +431,10 @@ describe('buildProgressText', () => {
 
 describe('the summary byte budget', () => {
   /**
-   * Step results whose rendered summary lands just under the cap — 64751 bytes,
-   * 784 of headroom. That is the only band where a caller's own bytes decide
-   * whether the update is accepted, so it is the band the reservation governs.
-   * The fixture carries no log lines, so every truncation tier renders the same
-   * string: a reservation the builder honours can only be met by falling
-   * through to the minimal summary, which is exactly what the assertions read.
+   * Renders just under the cap — 64751 bytes, 784 of headroom: the only band where a caller's
+   * own bytes decide acceptance, so the band the reservation governs. No log lines, so every
+   * truncation tier renders the same string, and an honoured reservation can only be met by
+   * falling through to the minimal summary — what the assertions read.
    */
   function nearCapSteps(): StepResultData[] {
     return Array.from({ length: 32 }, (_, i) => ({
@@ -458,9 +455,8 @@ describe('the summary byte budget', () => {
   it('spends the whole cap when nothing is reserved', () => {
     const summary = buildCheckRunSummary({ ...base, stepResults: nearCapSteps() });
     const size = Buffer.byteLength(summary, 'utf-8');
-    // Non-vacuity for the reservation case below: without a reservation the
-    // builder really does return something inside the last kilobyte of the
-    // cap, which is the only band where reserving changes the answer.
+    // Non-vacuity for the reservation case below: unreserved, the result really lands in the
+    // cap's last kilobyte, the only band where reserving changes the answer.
     expect(size).toBeLessThanOrEqual(SUMMARY_BYTE_LIMIT);
     expect(size).toBeGreaterThan(SUMMARY_BYTE_LIMIT - 1024);
   });
@@ -490,13 +486,9 @@ describe('clampSummaryToLimit', () => {
   });
 
   it('does not leave a replacement character from a split multi-byte sequence', () => {
-    // A cut through a 4-byte emoji yields U+FFFD, which is both wrong to show
-    // and larger than the bytes it replaced — so it can put the result back
-    // over the very cap it was cut to fit.
-    // The truncation notice is 41 bytes, so a limit of 43 leaves two bytes of
-    // head — landing inside a 4-byte emoji. Node renders each orphaned byte as
-    // its own 3-byte U+FFFD, so an untrimmed head would be 6 bytes and the
-    // result 47: over the 43 it was cut to fit.
+    // A cut through a 4-byte emoji yields U+FFFD, wrong to show and larger than what it
+    // replaced. The notice is 41 bytes, so limit 43 leaves a 2-byte head inside the emoji; Node
+    // renders each orphaned byte as a 3-byte U+FFFD, so an untrimmed result would be 47 — over 43.
     const clamped = clampSummaryToLimit('🙂'.repeat(40), 43);
     expect(Buffer.byteLength(clamped, 'utf-8')).toBeLessThanOrEqual(43);
     expect(clamped).not.toContain('\uFFFD');

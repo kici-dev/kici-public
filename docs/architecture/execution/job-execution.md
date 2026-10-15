@@ -227,7 +227,7 @@ Every captured line carries the stream it came from (`stdout` or `stderr`) from 
 
 All three paths converge in the agent's per-step `LogStreamer`. Hooks (`beforeStep`, `afterStep`, `onSuccess`, `onFailure`, `onCancel`, `cleanup`) also run under `captureStepIndex` — per-step hooks reuse the step index and land in the step's log; post-loop and cancel-path hooks allocate their own indices above `steps.length` and appear as dedicated step rows in the dashboard.
 
-**What gets captured inside an in-process agent job (`__init__` / `__build__` / `__dynamic__`):** these jobs don't use the sandbox child process; they run in the agent itself. A second capture primitive — `AsyncLocalStorage`-scoped `console.*` patching in `packages/agent/src/execution/console-capture.ts` — routes user-supplied output to a per-job synthetic step-0 `LogStreamer`.
+**What gets captured inside an evaluation job (`__init__` / `__build__` / `__dynamic__`, and a global eval round):** these jobs don't use the step sandbox. Their module load and evaluation run in the eval child. A second capture primitive — `AsyncLocalStorage`-scoped `console.*` patching in `packages/agent/src/execution/console-capture.ts` — routes user-supplied output over IPC to a per-job synthetic step-0 `LogStreamer` in the agent.
 
 The captured surfaces are:
 
@@ -244,8 +244,8 @@ The patch targets only `console.*` methods (not `process.stdout.write`) because 
 
 **What is still not captured:**
 
-- **Direct `process.stdout.write` or `printf` inside in-process jobs** — use `console.*` or the provided `log` parameter instead.
-- **Output outside a capture scope** — in the sandbox this means any IPC or setup code that runs before `installOutputCapture()` returns; in the agent this means anything on an async stack not descended from a `runCaptured(...)` call.
+- **Direct `process.stdout.write` or `printf` inside evaluation jobs** — use `console.*` or the provided `log` parameter instead.
+- **Output outside a capture scope** — in the sandbox this means any IPC or setup code that runs before `installOutputCapture()` returns; in the eval child this means anything on an async stack not descended from a `runCaptured(...)` call.
 
 **Flush triggers:**
 

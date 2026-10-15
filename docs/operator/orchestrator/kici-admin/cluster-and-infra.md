@@ -85,7 +85,7 @@ Reads and writes the cluster-global tunables — one row shared by every orchest
 - `set` requires at least one knob flag and takes several in a single call. Each numeric knob enforces a floor (the same floor the admin route validates against), so a value below it is rejected rather than silently clamped.
 - `reset` clears the named knobs back to `null` (the configured default). Passing no knob flag clears **every** knob at once.
 
-Changing a knob takes effect on the running cluster without a restart — the orchestrator reads these values live at each operation. The exception is the six cache-sizing knobs (`--lockfile-cache-*` and `--content-cache-*`): those bounds are structural to caches built once at boot, so a change to one **applies at the next orchestrator restart**. See [Cluster settings](../cluster-settings.md) for the full per-knob table, including what each one governs and its default.
+Changing a knob takes effect on the running cluster without a restart — the orchestrator reads these values live at each operation. The exception is the cache-sizing knobs (`--lockfile-cache-*`, `--content-cache-*` and `--global-eval-cache-max`): those bounds are structural to caches built once at boot, so a change to one **applies at the next orchestrator restart**. See [Cluster settings](../cluster-settings.md) for the full per-knob table, including what each one governs and its default.
 
 ### scaler -- scaler maintenance
 
@@ -528,29 +528,30 @@ Synopsis: `kici-admin orchestrator upgrade [options]`
 
 **Options**
 
-| Option                             | Default | Description                                                                                                                                   |
-| ---------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--platform <type>`                |         | Force the service platform (systemd, launchd, windows, compose). Default: the platform in the install manifest                                |
-| `--instance-dir <path>`            |         | Deploy folder of the instance to upgrade                                                                                                      |
-| `--name <name>`                    |         | Service name (no default — must resolve via flag/CWD)                                                                                         |
-| `--from <path>`                    |         | Path to package archive (.tar.gz or .zip)                                                                                                     |
-| `--url <url>`                      |         | URL to download package archive from                                                                                                          |
-| `--version <version>`              |         | Target version string (e.g., 0.3.0)                                                                                                           |
-| `--yes`                            |         | Skip confirmation prompt                                                                                                                      |
-| `--force`                          |         | Overwrite existing versioned directory                                                                                                        |
-| `--cleanup`                        |         | Remove old versions (keeps current and previous)                                                                                              |
-| `--rollback`                       |         | Roll back to the previous version                                                                                                             |
-| `--pick`                           |         | Interactively pick an installed version to activate                                                                                           |
-| `--restart-only`                   |         | Restart the already-installed package without installing (skip self-drive)                                                                    |
-| `--no-agent-packages`              |         | Skip auto-producing + uploading the fleet agent payloads for the new version                                                                  |
-| `--agent-package-platforms <list>` |         | Override the fleet platform set to (re)package: single \| CSV \| all (default: discover from the cache bucket)                                |
-| `--skip-backup`                    |         | Skip the pre-upgrade database dump (loud; no recovery path)                                                                                   |
-| `--backup-dir <path>`              |         | Where the pre-upgrade dump goes (default <instanceDir>/backups)                                                                               |
-| `--no-drain`                       |         | Do not quiesce the coordinator first; in-flight jobs will fail                                                                                |
-| `--drain-timeout <seconds>`        | `300`   | Seconds to wait for in-flight jobs to finish                                                                                                  |
-| `--migrate-down`                   |         | On a rollback whose database is ahead, revert the schema to the target version's recorded head first, through the still-running newer service |
-| `--node-mirror <url>`              |         | nodejs.org mirror override for the agent package build                                                                                        |
-| `--npm-registry <url>`             |         | npm registry override for the agent package build                                                                                             |
+| Option                             | Default | Description                                                                                                                                                                                   |
+| ---------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--platform <type>`                |         | Force the service platform (systemd, launchd, windows, compose). Default: the platform in the install manifest                                                                                |
+| `--instance-dir <path>`            |         | Deploy folder of the instance to upgrade                                                                                                                                                      |
+| `--name <name>`                    |         | Service name (no default — must resolve via flag/CWD)                                                                                                                                         |
+| `--from <path>`                    |         | Path to package archive (.tar.gz or .zip)                                                                                                                                                     |
+| `--url <url>`                      |         | URL to download package archive from                                                                                                                                                          |
+| `--version <version>`              |         | Target version string (e.g., 0.3.0)                                                                                                                                                           |
+| `--yes`                            |         | Skip confirmation prompt                                                                                                                                                                      |
+| `--force`                          |         | Overwrite existing versioned directory                                                                                                                                                        |
+| `--cleanup`                        |         | Remove old versions (keeps current and previous)                                                                                                                                              |
+| `--rollback`                       |         | Roll back to the previous version                                                                                                                                                             |
+| `--pick`                           |         | Interactively pick an installed version to activate                                                                                                                                           |
+| `--restart-only`                   |         | Restart the already-installed package without installing (skip self-drive)                                                                                                                    |
+| `--no-agent-packages`              |         | Skip auto-producing + uploading the fleet agent payloads for the new version                                                                                                                  |
+| `--agent-package-platforms <list>` |         | Override the fleet platform set to (re)package: single \| CSV \| all (default: discover from the cache bucket)                                                                                |
+| `--skip-backup`                    |         | Skip the pre-upgrade database dump (loud; no recovery path)                                                                                                                                   |
+| `--backup-dir <path>`              |         | Where the pre-upgrade dump goes (default <instanceDir>/backups)                                                                                                                               |
+| `--no-drain`                       |         | Do not quiesce the coordinator first; in-flight jobs will fail                                                                                                                                |
+| `--drain-timeout <seconds>`        | `300`   | Seconds to wait for in-flight jobs to finish                                                                                                                                                  |
+| `--migrate-down`                   |         | On a rollback whose database is ahead, revert the schema to the target version's recorded head first, through the still-running newer service                                                 |
+| `--skip-binary-path-check`         |         | Upgrade even when a bare-metal scaler binaryPath is not an executable kici-agent (missing, not executable, or a version-manager shim); the restarted service will not start until it is fixed |
+| `--node-mirror <url>`              |         | nodejs.org mirror override for the agent package build                                                                                                                                        |
+| `--npm-registry <url>`             |         | npm registry override for the agent package build                                                                                                                                             |
 
 ### `kici-admin scaler`
 

@@ -7,10 +7,7 @@ import {
   type VerifiedIssuerReader,
 } from './verified-issuer.js';
 
-/**
- * Records the (column, fallback) pair so the test can assert no fallback is
- * passed, and the columns `tryGetString` was asked for separately.
- */
+/** Records each (column, fallback) pair and each `tryGetString` column. */
 function readerReturning(value: string | null): {
   reader: VerifiedIssuerReader;
   calls: Array<[string, string | null]>;
@@ -79,11 +76,9 @@ describe('tryResolveVerifiedIssuer', () => {
 describe('verifiedIssuerCapabilityUpdate', () => {
   it('OMITS the key when the issuer is unknown', () => {
     const update = verifiedIssuerCapabilityUpdate({ ok: false });
-    // `in`, not toEqual: vitest's toEqual ignores an explicitly-undefined
-    // property, so `{ dashboardVerifiedIssuer: undefined }` would pass a
-    // `toEqual({})` assertion — and spreading THAT into the merged capability
-    // set overwrites the last known issuer with undefined, which is the exact
-    // downgrade this helper exists to prevent.
+    // `in`, not toEqual: toEqual ignores an explicitly-undefined property, yet
+    // spreading `{ dashboardVerifiedIssuer: undefined }` into the capability set
+    // overwrites the last known issuer — the downgrade this helper prevents.
     expect('dashboardVerifiedIssuer' in update).toBe(false);
     expect(Object.keys(update)).toEqual([]);
   });
@@ -101,9 +96,8 @@ describe('verifiedIssuerCapabilityUpdate', () => {
   });
 
   it('holds the last known issuer through an unreadable tick, and clears on a real opt-out', () => {
-    // The mechanism, pinned directly: broadcastCapabilities merges its argument
-    // into the stored set (`{ ...stored, ...updates }`), so an omitted key means
-    // "unchanged" and a present null means "cleared".
+    // broadcastCapabilities merges `{ ...stored, ...updates }`: an omitted key
+    // means "unchanged" and a present null means "cleared".
     const stored = { dashboardVerifiedIssuer: 'https://orch.example.com' as string | null };
     expect({ ...stored, ...verifiedIssuerCapabilityUpdate({ ok: false }) }).toEqual({
       dashboardVerifiedIssuer: 'https://orch.example.com',

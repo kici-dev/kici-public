@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { Command } from 'commander';
+import { runCli } from '../../__test-helpers__/cli.js';
 
 const mockListQueueDirect = vi.fn();
 const mockShowQueueEntryDirect = vi.fn();
@@ -27,41 +27,7 @@ async function runCommand(
   args: string[],
   client: MockClient = makeMockClient(),
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null; client: MockClient }> {
-  const program = new Command();
-  program.exitOverride();
-  registerQueueCommands(program, () => client as any);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:') && !err.code?.startsWith('commander.')) {
-      console.log = origLog;
-      console.error = origError;
-      process.exit = origExit;
-      throw err;
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode, client };
+  return { ...(await runCli((p) => registerQueueCommands(p, () => client as any), args)), client };
 }
 
 describe('kici-admin queue CLI', () => {

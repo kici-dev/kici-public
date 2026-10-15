@@ -1,10 +1,7 @@
 /**
- * Single-variable upsert for service env-file content.
- *
- * The sibling {@link ./deploy-env.js} upserts a whole `KICI_DEPLOY_*` block by
- * stripping the prefix and re-appending it. A variable an operator may also
- * have set by hand needs the narrower shape: replace the assignment where it
- * already sits, so the comment above it still describes the value below it.
+ * Single-variable env-file upsert. Unlike {@link ./deploy-env.js}, which
+ * re-appends a whole `KICI_DEPLOY_*` block, it replaces a hand-settable
+ * variable in place, so the comment above still describes the value below.
  */
 
 /** Matches an uncommented `NAME=` assignment, the same shape startup reads. */
@@ -12,22 +9,14 @@ function assignmentPattern(name: string): RegExp {
   return new RegExp(`^[ \\t]*${name}[ \\t]*=`);
 }
 
-/**
- * Whether `content` carries an uncommented assignment of `name`.
- *
- * A `#`-prefixed mention does not count: it is documentation, and the readers
- * that matter (systemd's `EnvironmentFile=`, `selectServerEntry`) skip it.
- */
+/** A `#` mention does not count: systemd's `EnvironmentFile=` and `selectServerEntry` skip it. */
 export function hasEnvAssignment(content: string, name: string): boolean {
   return content.split('\n').some((line) => assignmentPattern(name).test(line));
 }
 
 /**
- * Return `content` with `name` assigned `value`.
- *
- * Every uncommented assignment of `name` is rewritten in place; a file that
- * declares it nowhere gains the assignment on its last line. Commented lines
- * are left alone, so a stub's explanatory `# KICI_MODE=...` survives.
+ * Rewrites every uncommented assignment of `name` in place, or appends one.
+ * Commented lines survive, such as a stub's `# KICI_MODE=...`.
  */
 export function upsertEnvAssignment(content: string, name: string, value: string): string {
   const pattern = assignmentPattern(name);

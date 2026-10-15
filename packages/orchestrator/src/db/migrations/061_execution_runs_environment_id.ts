@@ -1,28 +1,20 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `environment_id` to `execution_runs` so environment run-history can be
- * queried by the matched environment's id.
+ * `execution_runs.environment_id`, so environment run-history keys off the matched
+ * environment's id.
  *
- * The `environment` column stores the job-declared environment name. For a
- * glob environment that is the concrete instance string (e.g. `review/PR-123`),
- * which never equals the environment row's label, so a name-keyed history query
- * always misses. Recording the matched environment id lets the History tab key
- * off a stable id instead. The `environment` name column is untouched (it
- * doubles as the concurrency-group key and the concrete-instance label).
+ * For a glob environment, the `environment` name column holds the concrete instance (e.g.
+ * `review/PR-123`), which never equals the environment row's label, so a name-keyed query
+ * misses. That column stays: it is also the concurrency-group key and the instance label.
  *
  * `ON DELETE SET NULL`: deleting an environment must not delete its run rows.
  *
- * Backfill: `execution_runs` has no `org_id`, so a name match is only safe when
- * exactly one fixed environment carries that name across the whole table. That
- * backfills 100% of fixed-env history on a single-tenant orchestrator and the
- * unambiguous majority on a shared one, never mis-attributing across tenants.
- * Glob-named rows stay null (they never appeared in history before — that is
- * the bug being fixed — so nothing regresses).
+ * Backfill: `execution_runs` has no `org_id`, so a name match is safe only when exactly one
+ * fixed environment carries that name table-wide; that never mis-attributes across tenants.
+ * Glob-named rows stay NULL (they were never in history, so nothing regresses).
  *
- * Idempotent: guarded on the `environment_id` column's existence; the index and
- * backfill use `IF NOT EXISTS` / `WHERE environment_id IS NULL` so re-running is
- * a no-op.
+ * Idempotent: column-exists guarded, `IF NOT EXISTS` index, `WHERE environment_id IS NULL`.
  */
 async function colExists(db: Kysely<unknown>, table: string, name: string): Promise<boolean> {
   const result = await sql<{ exists: boolean }>`

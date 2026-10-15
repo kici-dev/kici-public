@@ -37,7 +37,6 @@ describe('LogStreamer', () => {
     // No flush yet - below threshold and timer hasn't fired
     expect(send).not.toHaveBeenCalled();
 
-    // Advance timer to trigger flush
     vi.advanceTimersByTime(100);
 
     expect(send).toHaveBeenCalledTimes(1);
@@ -99,10 +98,8 @@ describe('LogStreamer', () => {
     smallStreamer.addLine('this should be dropped');
     smallStreamer.addLine('this should also be dropped');
 
-    // Flush and check
     smallStreamer.destroy();
 
-    // Find the truncation message
     const allLines = send.mock.calls.flatMap((call) => call[0].lines);
     const truncationLine = allLines.find((l: string) => l.includes('[TRUNCATED:'));
     expect(truncationLine).toBeDefined();
@@ -124,14 +121,12 @@ describe('LogStreamer', () => {
   });
 
   it('multiple flushes produce separate messages (buffer empties after each)', () => {
-    // First batch
     for (let i = 0; i < 50; i++) {
       streamer.addLine(`batch1-${i}`);
     }
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0][0].lines).toHaveLength(50);
 
-    // Second batch
     for (let i = 0; i < 50; i++) {
       streamer.addLine(`batch2-${i}`);
     }
@@ -179,7 +174,6 @@ describe('LogStreamer', () => {
       stepIndex: 0,
     });
 
-    // Should not throw and use defaults
     defaultStreamer.addLine('test');
     defaultStreamer.destroy();
 
@@ -360,7 +354,6 @@ describe('LogStreamer backpressure', () => {
         onWsDrain,
       });
 
-      // Trigger backpressure
       for (let i = 0; i < 5; i++) {
         streamer.addLine(`line ${i}`);
       }
@@ -396,7 +389,6 @@ describe('LogStreamer backpressure', () => {
         onWsDrain,
       });
 
-      // Trigger backpressure
       for (let i = 0; i < 5; i++) {
         streamer.addLine(`line ${i}`);
       }

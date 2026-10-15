@@ -1,21 +1,8 @@
-/**
- * JUnit XML output formatter for CI integration.
- *
- * Used with `--junit` flag to produce standard JUnit XML output that
- * can be consumed by CI systems (Jenkins, GitLab, etc.).
- *
- * Each fixture maps to a <testsuite>, each job maps to a <testcase>.
- */
+/** `--junit` output for CI systems: each fixture is a <testsuite>, each job a <testcase>. */
 
 import type { RunResult } from './summary.js';
 
-/**
- * Format run results as JUnit XML following the standard schema.
- *
- * @param results The run results to format.
- * @param failureMessages Optional map of jobKey -> last lines of output for failure details.
- * @returns Valid JUnit XML string.
- */
+/** @param failureMessages `fixtureId:jobName` -> last lines of output, for failure details. */
 export function formatJunitResult(
   results: RunResult[],
   failureMessages?: Map<string, string>,
@@ -75,9 +62,6 @@ export function formatJunitResult(
   return lines.join('\n');
 }
 
-/**
- * Escape special XML characters in a string.
- */
 function escapeXml(text: string): string {
   return text
     .replace(/&/g, '&amp;')

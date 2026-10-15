@@ -10,10 +10,9 @@ import {
 import { encryptSecretOutputs, type EncryptedSecretOutput } from './secret-encryption.js';
 
 /**
- * Decrypt an encrypted secret output envelope (mirrors orchestrator's decryptSecretOutput).
- *
- * This is the "other side" of the ECDH -- uses the run's private key
- * and the agent's public key to derive the same shared secret.
+ * Mirrors the orchestrator's decryptSecretOutput: the other side of the ECDH,
+ * deriving the shared secret from the run's private key and the agent's public
+ * key.
  */
 function decryptEnvelope(envelope: EncryptedSecretOutput, runPrivateKeyDer: Buffer): string {
   const agentPublicKeyDer = Buffer.from(envelope.agentPublicKey, 'base64');
@@ -50,7 +49,7 @@ function decryptEnvelope(envelope: EncryptedSecretOutput, runPrivateKeyDer: Buff
   return decrypted.toString('utf-8');
 }
 
-/** Generate a run X25519 key pair (simulates orchestrator side). */
+/** The orchestrator side's run X25519 key pair. */
 function generateRunKeyPair(): { publicKeyBase64: string; privateKeyDer: Buffer } {
   const { publicKey, privateKey } = generateKeyPairSync('x25519', {
     publicKeyEncoding: { type: 'spki', format: 'der' },
@@ -94,11 +93,10 @@ describe('encryptSecretOutputs', () => {
 
     const encrypted = encryptSecretOutputs(outputs, publicKeyBase64);
 
-    // All outputs should share the same agent public key (one ECDH derivation)
+    // One ECDH derivation: every output shares the agent public key.
     const agentKeys = new Set(Object.values(encrypted).map((e) => e.agentPublicKey));
     expect(agentKeys.size).toBe(1);
 
-    // Each should decrypt correctly
     expect(decryptEnvelope(encrypted.DB_PASSWORD, privateKeyDer)).toBe('pg-secret-123');
     expect(decryptEnvelope(encrypted.API_TOKEN, privateKeyDer)).toBe('tok_abc');
     expect(decryptEnvelope(encrypted.SIGNING_KEY, privateKeyDer)).toBe('hmac-key-xyz');
@@ -121,7 +119,6 @@ describe('encryptSecretOutputs', () => {
     const outputs = { SECRET_A: 'same-value', SECRET_B: 'same-value' };
     const encrypted = encryptSecretOutputs(outputs, publicKeyBase64);
 
-    // Same plaintext should produce different ciphertexts due to unique IVs
     expect(encrypted.SECRET_A.encrypted).not.toBe(encrypted.SECRET_B.encrypted);
   });
 
@@ -131,7 +128,6 @@ describe('encryptSecretOutputs', () => {
     const encrypted1 = encryptSecretOutputs({ KEY: 'val1' }, publicKeyBase64);
     const encrypted2 = encryptSecretOutputs({ KEY: 'val2' }, publicKeyBase64);
 
-    // Different calls should use different ephemeral key pairs
     expect(encrypted1.KEY.agentPublicKey).not.toBe(encrypted2.KEY.agentPublicKey);
   });
 });

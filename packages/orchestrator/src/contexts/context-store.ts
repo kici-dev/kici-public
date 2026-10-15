@@ -269,8 +269,6 @@ export class ContextStore {
   }
 
   /**
-   * Delete a context.
-   *
    * Bindings, variables, and source overrides cascade away via their FK.
    * Terminal held-run history survives with a null `context_id` (the FK
    * uses ON DELETE SET NULL). Pending held runs still reference the
@@ -310,7 +308,6 @@ export class ContextStore {
    * deterministic across dispatches. Returns the matching context or null.
    */
   async matchContext(orgId: string, name: string): Promise<Context | null> {
-    // Try exact match first
     const exact = await this.getByName(orgId, name);
     if (exact) return exact;
 

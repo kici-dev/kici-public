@@ -5,6 +5,7 @@ import { DashboardFleetWriteHandler } from './dashboard-fleet-write-handler.js';
 import { invalidateDashboardWritePolicyCache } from '../policy/dashboard-write-policy.js';
 import type { HostRosterStore } from '../agent/host-roster.js';
 import type { Database } from '../db/types.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 /**
  * Build a handler with a stubbed `db` whose `org_settings.dashboard_write_policy`
@@ -19,16 +20,11 @@ function buildHandler(policy: DashboardWritePolicyMap | undefined): {
   const sent: unknown[] = [];
   const declareStatic = vi.fn().mockResolvedValue({ created: true });
   const removeStatic = vi.fn().mockResolvedValue(1);
-  const db = {
-    selectFrom: vi.fn().mockReturnThis(),
-    select: vi.fn().mockReturnThis(),
-    where: vi.fn().mockReturnThis(),
-    executeTakeFirst: vi
-      .fn()
-      .mockResolvedValue(policy === undefined ? undefined : { dashboard_write_policy: policy }),
-  };
+  const { db } = createMockDb({
+    selectFirstRow: policy === undefined ? undefined : { dashboard_write_policy: policy },
+  });
   const handler = new DashboardFleetWriteHandler({
-    db: db as unknown as Kysely<Database>,
+    db: db as Kysely<Database>,
     rosterStore: { declareStatic, removeStatic } as unknown as HostRosterStore,
     send: (msg) => sent.push(msg),
     orgId: 'cust-1',

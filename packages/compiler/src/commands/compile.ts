@@ -24,30 +24,24 @@ import type { GlobalConfig } from '../remote/config.js';
 import { resolveRunTarget } from '../remote/target.js';
 import { hasLocalSecretFiles } from '../remote/types-sources.js';
 
-/** Options for the compile command */
 export interface CompileOptions {
-  /** Path to .kici directory (defaults to .kici) */
+  /** Defaults to .kici */
   kiciDir?: string;
-  /** Validate only, don't write lock file */
+  /** Validate only; no lock file is written. */
   check: boolean;
-  /** Verbose output */
   verbose: boolean;
   /**
-   * Suppress the success line on stdout (and the auto-types success line) so a
-   * caller emitting machine-readable output keeps stdout pure. Validation
-   * errors are still reported.
+   * Suppresses the success lines on stdout, so a caller emitting
+   * machine-readable output keeps stdout pure; validation errors still print.
    */
   quiet?: boolean;
   /**
-   * The `--orchestrator-url` of the command that compiles first (`kici run
-   * remote`), so the types refresh reads the same orchestrator the run goes to.
+   * From `kici run remote`, so the types refresh reads the orchestrator the run
+   * goes to.
    */
   orchestratorUrl?: string;
 }
 
-/**
- * Read the existing lock file and return its lockfileHash, if present.
- */
 async function readExistingLockfileHash(lockPath: string): Promise<string | undefined> {
   try {
     const content = await fs.readFile(lockPath, 'utf-8');
@@ -59,12 +53,8 @@ async function readExistingLockfileHash(lockPath: string): Promise<string | unde
 }
 
 /**
- * Reinstall dependencies in .kici/ using the project's package manager.
- *
- * Detects the manager from `.kici/` (pnpm-lock.yaml / yarn.lock /
- * package-lock.json) so a standalone-pnpm or -yarn `.kici` is reinstalled with
- * the right tool — running `npm ci` against a pnpm lock fails, and against a
- * stale npm lock left beside a pnpm lock it fails even harder.
+ * Detects the package manager from `.kici/`'s lock file: `npm ci` fails against
+ * a pnpm lock, and worse against a stale npm lock left beside one.
  */
 async function reinstallDeps(kiciDir: string): Promise<void> {
   const pm = detectPackageManagerSync(kiciDir);
@@ -80,12 +70,6 @@ async function reinstallDeps(kiciDir: string): Promise<void> {
   execSync(command, { cwd: kiciDir, stdio: 'inherit' });
 }
 
-/**
- * Execute the compile command.
- *
- * @param options - Command options
- * @returns true if successful, false if errors
- */
 export async function compileCommand(options: CompileOptions): Promise<boolean> {
   const kiciDir = options.kiciDir ?? '.kici';
   const absoluteKiciDir = resolveKiciDir(kiciDir);
@@ -97,12 +81,9 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
   try {
     const lockPath = path.join(absoluteKiciDir, 'kici.lock.json');
 
-    // 0. Check if deps changed since last compile — reinstall if so. Skip when
-    // `.kici/package.json` is absent: that signals an externally-managed dep
-    // graph (pnpm/yarn workspace member where deps install at the repo root),
-    // so there is nothing to reinstall under `.kici/`. Running `npm install`
-    // here would walk up and try to install the root workspace's
-    // `workspace:*` refs with npm, which npm cannot resolve.
+    // Reinstall when deps changed. A missing `.kici/package.json` means a
+    // workspace member whose deps install at the repo root: `npm install` here
+    // would walk up to `workspace:*` refs npm cannot resolve.
     if (existsSync(path.join(absoluteKiciDir, 'package.json'))) {
       const existingHash = await readExistingLockfileHash(lockPath);
       if (existingHash) {
@@ -115,7 +96,6 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
       }
     }
 
-    // 1. Discover workflows from .kici/workflows/
     const { workflows: workflowsWithSource, workflowDir } =
       await discoverWorkflows(absoluteKiciDir);
 
@@ -123,11 +103,10 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
       logger.debug(pc.dim(`Found ${workflowsWithSource.length} workflow(s) in ${workflowDir}`));
     }
 
-    // 2. Validate the workflows (source-carrying, for real error locations)
+    // Source-carrying, for real error locations.
     const validation = validateConfig(workflowsWithSource);
 
     if (!validation.valid) {
-      // Print all errors
       for (const error of validation.errors) {
         logger.error(formatError(error));
       }
@@ -138,39 +117,32 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
       logger.debug(pc.dim('Validation passed'));
     }
 
-    // 3. Generate lock file (with source tracking for better references)
     const lockFile = generateLockFile(workflowsWithSource);
     const lockJson = serializeLockFile(lockFile);
 
-    // Informational: when this lock's minReaderVersion reaches SCHEMA_VERSION
-    // (see schemaWindowWarning), warn that older orchestrators cannot read it.
-    // Silent otherwise (older orchestrators down to the lock's minReaderVersion
-    // still read it).
+    // Warns only when minReaderVersion reaches SCHEMA_VERSION, so older
+    // orchestrators cannot read the lock.
     const windowWarning = schemaWindowWarning(lockFile.minReaderVersion, SCHEMA_VERSION);
     if (windowWarning) {
       logger.warn(pc.yellow(windowWarning));
     }
 
-    // A hand-written `.kici/.kiciignore` REPLACES the defaults, so a short one
-    // silently re-includes a path the agent rewrites mid-run — after which the
-    // contentHash moves on every run with nothing naming why. Warn rather than
-    // fail: the customer keeps control, the failure stops being mysterious.
+    // A hand-written `.kici/.kiciignore` REPLACES the defaults, so a short one can
+    // re-include a path the agent rewrites mid-run and move the contentHash every
+    // run. Warn, not fail: the customer keeps control.
     const ignoreRules = await loadKiciIgnoreRules(absoluteKiciDir);
     for (const warning of ignoreRules.warnings) {
       logger.warn(pc.yellow(warning));
     }
 
-    // The check above interrogates the patterns; this one walks the tree. A
-    // hashed member the tarball omits or extraction rewrites — a symlinked
-    // dependency tree, a link pointing outside `.kici/` — produces a lock the
-    // agent can never verify, and the drift error it raises prescribes the one
-    // remedy that cannot work. Naming it here is what keeps the lock from being
-    // committed in that state.
+    // This walks the tree. A hashed member the tarball omits or extraction
+    // rewrites (a symlinked dependency tree, a link outside `.kici/`) yields a
+    // lock the agent can never verify, whose drift error prescribes a remedy that
+    // cannot work; warning here keeps it from being committed.
     for (const warning of await findDigestReproducibilityWarnings(absoluteKiciDir, ignoreRules)) {
       logger.warn(pc.yellow(warning));
     }
 
-    // 4. Write lock file (unless --check)
     if (!options.check) {
       await fs.writeFile(lockPath, lockJson, 'utf-8');
 
@@ -184,9 +156,7 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
         );
       }
 
-      // Auto-regenerate types (non-blocking) whenever `kici types` has a
-      // source: a direct orchestrator target, a Platform login with an active
-      // org, or local secret files.
+      // Non-blocking types refresh.
       try {
         const { loadGlobalConfig } = await import('../remote/config.js');
         const config = await loadGlobalConfig();
@@ -194,10 +164,8 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
           await shouldRefreshTypes(config, absoluteKiciDir, process.env, options.orchestratorUrl)
         ) {
           const { typesCommand } = await import('./types.js');
-          // The directory this compile actually read, not the raw option. The
-          // declarations land in the same tree the lock file's `contentHash`
-          // covers, so they must be written where that tree's exclusion can
-          // see them.
+          // The resolved directory, not the raw option: the declarations must
+          // land where the `contentHash` tree's exclusion sees them.
           await typesCommand({
             kiciDir: absoluteKiciDir,
             quiet: options.quiet,
@@ -205,12 +173,10 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
           });
         }
       } catch {
-        // Non-blocking -- warn and continue
         logger.warn(pc.yellow('Could not refresh types. Compilation succeeded.'));
       }
     } else {
-      // --check: additionally run a tsc --noEmit type-check over the workflow
-      // sources so type-broken workflows surface their errors at compile time.
+      // --check also runs a tsc --noEmit type-check over the workflow sources.
       const tc = await runTypecheck(absoluteKiciDir);
       if (tc.errors.length > 0) {
         for (const error of tc.errors) logger.error(formatError(error));
@@ -235,7 +201,6 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
     if (isCompilerError(error)) {
       logger.error(formatError(error));
     } else {
-      // Unexpected error
       logger.error(pc.red('error') + `: ${toErrorMessage(error)}`);
     }
     return false;
@@ -243,9 +208,8 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
 }
 
 /**
- * Whether `kici compile` refreshes the secret type declarations: when a
- * direct orchestrator target, a Platform login with an active organization,
- * or a local secret file exists. A bare checkout with none of these skips it.
+ * True for a direct orchestrator target, a Platform login with an active
+ * organization, or a local secret file; a bare checkout skips the refresh.
  */
 export async function shouldRefreshTypes(
   config: GlobalConfig,

@@ -1,18 +1,16 @@
 /**
- * Congruence guard: the `kici` CLI command tree must be a SUPERSET of the
- * developer-ops registry. Every `entrypoints.cli` op in `DEVELOPER_OPERATIONS`
- * (`@kici-dev/engine`) must map to a registered commander command. The registry
- * is the apex contract; this test walks the real `buildProgram()` command tree
- * and fails the build if a `cli:true` op has no command (or the op-id →
- * command-path table forgot a mapping for a new op). Same producer/consumer
- * drift-is-a-bug discipline as the MCP and HTTP congruence guards.
+ * The `kici` command tree must be a SUPERSET of the developer-ops registry
+ * (the apex contract): every `entrypoints.cli` op in `DEVELOPER_OPERATIONS`
+ * maps to a command in the real `buildProgram()` tree, and the op-id →
+ * command-path table maps every new op. Same discipline as the MCP and HTTP
+ * congruence guards.
  */
 import { describe, it, expect } from 'vitest';
 import type { Command } from 'commander';
 import { developerOpsForEntrypoint } from '@kici-dev/engine';
 import { buildProgram } from './cli.js';
 
-/** Op id → its command path in the `kici` tree (space-separated segments). */
+/** Space-separated command path segments. */
 const CLI_COMMAND: Record<string, string[]> = {
   'runs.list': ['runs', 'list'],
   'runs.get': ['runs', 'show'],

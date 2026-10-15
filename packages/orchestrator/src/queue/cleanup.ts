@@ -36,15 +36,11 @@ export interface CleanupExtras {
   db: Kysely<Database>;
   executionTracker: ExecutionTracker;
   /**
-   * Resolves each expired job's check run to a terminal conclusion.
-   *
-   * Required for correctness, not decoration: this sweep settles a job by
-   * writing `execution_jobs` directly rather than through
-   * `ExecutionTracker.onJobStatus`, so the tracker's terminal-job hook — the
-   * funnel a tracker-driven terminal status reaches the check-run reporter
-   * through — never fires here. Absent, the check run created at trigger match
-   * stays `queued` on the commit forever, which no branch-protection rule
-   * requiring it can ever be satisfied by.
+   * Resolves each expired job's check run to a terminal conclusion. Required for
+   * correctness: this sweep writes `execution_jobs` directly, not through
+   * `ExecutionTracker.onJobStatus`, so the tracker's terminal-job hook to the
+   * check-run reporter never fires. Absent, the check run stays `queued` on the
+   * commit forever, and no branch-protection rule requiring it is ever satisfied.
    */
   checkRunReporter?: Pick<CheckRunReporter, 'updateJobStatus'>;
   /** Terminal dispatch_queue row retention (days); 0 disables. Default 30. */
@@ -53,15 +49,11 @@ export interface CleanupExtras {
   stepLogTtlDays?: number;
   /** Store for `check_run_tracking`; the retention sweep runs only when wired. */
   checkRunTrackingStore?: CheckRunTrackingStore;
-  /**
-   * Database-side retention windows, in days. Absent leaves the history sweep
-   * off entirely, which is what a caller that has not wired it gets.
-   */
+  /** Database-side retention windows, in days. Absent leaves the history sweep off. */
   retentionWindows?: RetentionWindows;
   /**
-   * True when the cold store is configured. Its archivers then own the tables
-   * they register and the history sweep leaves those alone — one owner per
-   * table.
+   * True when the cold store is configured: its archivers own the tables they
+   * register and the history sweep leaves those alone — one owner per table.
    */
   coldStoreEnabled?: boolean;
   /** Live cluster-settings reader; absent ⇒ the config default is used as-is. */
@@ -75,27 +67,23 @@ export interface CleanupExtras {
   logStorageIsS3?: boolean;
   /**
    * Whether ANYTHING could ever have run a job with these selectors — a
-   * registered agent (regardless of capacity) or a scaler backend able to spawn
-   * one.
+   * registered agent (regardless of capacity) or a scaler backend able to spawn one.
    *
-   * Read once per expired job to split the two reasons a queued job never ran:
-   * nothing in the fleet matched its `runsOn` (`unroutable` — a label/fleet
-   * problem an operator has to fix) versus something matched but never produced
-   * a usable agent (`timed_out_stale` — a capacity or provisioning problem).
-   * Both halves are load-bearing: a scaler-managed pool at zero has no
-   * registered agent yet still routes perfectly well, so asking only the agent
-   * registry would report every failed spawn as a bad `runsOn`.
+   * Splits why a queued job never ran: nothing matched its `runsOn`
+   * (`unroutable` — a label/fleet problem for the operator) versus something
+   * matched but never produced a usable agent (`timed_out_stale` — capacity or
+   * provisioning). Both halves are load-bearing: a scaler pool at zero has no
+   * registered agent yet routes fine, so asking only the agent registry would
+   * report every failed spawn as a bad `runsOn`.
    *
-   * Asked both on the unroutable probe's short tick (where a grace window
-   * absorbs a label satisfied moments later by an autoscaled agent) and again
-   * at expiry, which stays the backstop when fast-fail is disabled. Absent →
-   * every expiry stays `timed_out_stale`, the behaviour before the split
-   * existed.
+   * Asked on the unroutable probe's short tick (a grace window absorbs a label an
+   * autoscaled agent satisfies moments later) and again at expiry, the backstop
+   * when fast-fail is disabled. Absent → every expiry stays `timed_out_stale`.
    *
-   * The predicate is allowed to answer "routable" conservatively (the scaler
-   * half matches exact labels only, so a pattern-only `runsOn` reads routable on
-   * a scaler-configured orchestrator). That costs precision on the status, never
-   * safety: the job is terminal either way and the run fails either way.
+   * It may answer "routable" conservatively (the scaler half matches exact labels
+   * only, so a pattern-only `runsOn` reads routable on a scaler-configured
+   * orchestrator). That costs status precision, never safety: the job is terminal
+   * and the run fails either way.
    */
   canRouteLabels?: CanRouteLabels;
   /**
@@ -107,18 +95,12 @@ export interface CleanupExtras {
 }
 
 /**
- * Run a single cleanup pass: remove expired dedup_cache entries and
- * mark expired dispatch_queue entries.
+ * One cleanup pass: remove expired dedup_cache entries and mark expired
+ * dispatch_queue entries. With `extras`, expired jobs are also forwarded to the
+ * Platform as terminal status so its execution_jobs projection stays in sync.
  *
- * When `extras` is provided, expired jobs are also forwarded to Platform
- * as terminal status updates so the Platform execution_jobs projection
- * stays in sync.
- *
- * Event-log row + payload retention is not here: event_log rows are
- * archived to cold-store and then deleted
- * (see `packages/orchestrator/src/cold-store/tables/event-log.ts`).
- *
- * @returns Counts of cleaned entries.
+ * Event-log retention is not here: event_log rows are archived to cold-store and
+ * then deleted (see `packages/orchestrator/src/cold-store/tables/event-log.ts`).
  */
 export async function runCleanup(
   dedup: { cleanup(): Promise<number> },
@@ -132,10 +114,9 @@ export async function runCleanup(
   checkRunRowsPruned: number;
   historyRowsPruned: number;
 }> {
-  // 1. Delete expired dedup_cache entries (also trims in-memory cache)
+  // Also trims the in-memory dedup cache.
   const dedupDeleted = await dedup.cleanup();
 
-  // 2. Mark expired dispatch_queue entries and get details
   const expiredJobs = await queue.markExpired();
   const queueExpired = expiredJobs.length;
 
@@ -144,8 +125,8 @@ export async function runCleanup(
   let checkRunRowsPruned = 0;
   let historyRowsPruned = 0;
 
-  // 2b. Prune stale request idempotency claims (>1h; the request budget is
-  // ~10s, so a claimed requestId is never re-sent after an hour).
+  // Request idempotency claims older than 1h: the request budget is ~10s, so a
+  // claimed requestId is never re-sent after an hour.
   if (extras) {
     try {
       const pruned = await pruneRequestIdempotency(extras.db);
@@ -154,9 +135,8 @@ export async function runCleanup(
       logger.error('Failed to prune request idempotency claims', { error: toErrorMessage(err) });
     }
 
-    // 2c. Prune terminal dispatch_queue rows past the retention window. Only
-    // completed/failed/expired rows older than the window go — a still-active
-    // run keeps all of its rows.
+    // Only completed/failed/expired rows past the window go — an active run
+    // keeps all of its rows.
     const ttlDays = extras.dispatchQueueTtlDays ?? 30;
     try {
       dispatchRowsPruned = await queue.pruneTerminalDispatchRows(ttlDays);
@@ -170,8 +150,7 @@ export async function runCleanup(
       });
     }
 
-    // 2c'. Drop the sealed secrets of terminal dispatch_queue rows: nothing
-    // dispatches a terminal row again, so they have no reader left.
+    // Nothing dispatches a terminal row again, so its sealed secrets have no reader.
     try {
       const scrubbed = await queue.scrubTerminalSealedSecrets();
       if (scrubbed > 0)
@@ -182,8 +161,7 @@ export async function runCleanup(
       });
     }
 
-    // 2d. Prune expired step-log objects (S3 backend only; the filesystem
-    // backend's lifecycle is customer-managed).
+    // S3 backend only; the filesystem backend's lifecycle is customer-managed.
     if (extras.logStorage && extras.logStorageIsS3) {
       try {
         logObjectsPruned = await pruneExpiredLogs(extras.logStorage, extras.stepLogTtlDays ?? 90);
@@ -198,18 +176,14 @@ export async function runCleanup(
       }
     }
 
-    // 2e. Prune stale check_run_tracking rows. Age-based rather than keyed to
-    // run completion: every upsert bumps `updated_at`, so a run still emitting
-    // check-run traffic keeps its rows fresh, and a late check-run status
-    // update can still resolve its check-run ID from the row. Age is measured
-    // on check-run writes rather than on run liveness; `pruneStale` documents
-    // what that costs.
+    // check_run_tracking is pruned by age, not run completion: every upsert bumps
+    // `updated_at`, so a run still emitting check-run traffic keeps its rows and
+    // a late status update can still resolve its check-run ID. Age tracks
+    // check-run writes, not run liveness; `pruneStale` documents the cost.
     if (extras.checkRunTrackingStore) {
       const checkRunTtlDefault = extras.checkRunTrackingTtlDays ?? 7;
       try {
-        // `getNumber` returns a genuine 0 when the operator set the knob to 0,
-        // which is the documented way to disable the sweep — so this must stay
-        // a null-coalescing read, never `||`.
+        // A genuine 0 disables the sweep, so this stays null-coalescing, never `||`.
         const ttlDays = extras.clusterSettings
           ? await extras.clusterSettings.getNumber(
               'check_run_tracking_ttl_days',
@@ -228,14 +202,12 @@ export async function runCleanup(
       }
     }
 
-    // 2f. Prune expired run history, audit logs, provenance and terminal
-    // held-runs directly from the database. This is the tier that covers an
-    // install with no object store — with the cold store on, its archivers
-    // keep sole ownership of the tables they register.
+    // Run history, audit logs, provenance and terminal held-runs, pruned in the
+    // database: the tier for an install with no object store. With the cold
+    // store on, its archivers keep sole ownership of the tables they register.
     if (extras.retentionWindows) {
-      // A live cluster_settings value wins over the configured default, and a
-      // genuine 0 there is the documented way to disable a window — so each
-      // read stays null-coalescing, never `||`.
+      // A live cluster_settings value wins over the default; a genuine 0
+      // disables a window, so each read stays null-coalescing, never `||`.
       const windows = await resolveRetentionWindows(
         extras.retentionWindows,
         extras.clusterSettings,
@@ -249,7 +221,6 @@ export async function runCleanup(
     }
   }
 
-  // 3. Forward terminal status to Platform for each expired job
   if (extras && expiredJobs.length > 0) {
     const affectedRunIds = new Set<string>();
 
@@ -267,7 +238,6 @@ export async function runCleanup(
       if (runId) affectedRunIds.add(runId);
     }
 
-    // Check run completion for all affected runs
     for (const runId of affectedRunIds) {
       try {
         await extras.executionTracker.completeRunIfAllJobsTerminal(runId);
@@ -309,11 +279,8 @@ export async function runCleanup(
 }
 
 /**
- * Build a per-tick handler for the queue-cleanup scheduled job.
- *
- * The cadence (`intervalMs`) and the periodic wrapper itself live in
- * `packages/orchestrator/src/queue/scheduled-job.ts` — this factory
- * just produces the tick function. `runCleanup` is unchanged.
+ * Per-tick handler for the queue-cleanup scheduled job; the cadence and periodic
+ * wrapper live in `packages/orchestrator/src/queue/scheduled-job.ts`.
  */
 export function createCleanupHandler(
   dedup: { cleanup(): Promise<number> },

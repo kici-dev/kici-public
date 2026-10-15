@@ -2,20 +2,16 @@
  * Structural guard: the trust-policy decision reaching the dispatch gate must
  * come from `evaluateSecurityPolicy`, not from a literal.
  *
- * The behavioral tests structurally cannot see this failure:
- * `dispatch-matched-workflow.test.ts` sets `ctx.securityDecision` by hand and
- * `evaluate-security-policy.test.ts` calls the evaluator directly, so both stay
- * green when the single call site in `process-webhook.ts` is replaced by a
- * `{ action: 'pass' }` literal — a policy that is read, logged, and then not
- * consulted, which is the defect this feature exists to remove.
+ * The behavioral tests cannot see this: `dispatch-matched-workflow.test.ts` sets
+ * `ctx.securityDecision` by hand and `evaluate-security-policy.test.ts` calls
+ * the evaluator directly, so both stay green if the call site in
+ * `process-webhook.ts` becomes a `{ action: 'pass' }` literal — a policy read,
+ * logged and never consulted.
  *
- * Assertions about call arguments are scoped to the specific call block (see
- * `callBlock`), because a whole-file regex matches identical argument text at
- * other call sites and therefore proves nothing about this one.
+ * Argument assertions are scoped to one call block (`callBlock`): a whole-file
+ * regex matches identical text at other call sites.
  *
- * Same shape as `src/db/migration-test-targets.test.ts`, which asserts over
- * migration-test source text that every per-migration test calls
- * `migrateToOwnMigration` rather than `migrateToLatest`.
+ * Same shape as `src/db/migration-test-targets.test.ts`.
  */
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -34,8 +30,7 @@ function stripComments(src: string): string {
 const CODE = stripComments(SOURCE);
 
 // `stripComments` is lexer-free, so a `/*` inside a string or regex literal
-// could eat arbitrary code and silently weaken every assertion below. A gross
-// size floor catches that without a real parser.
+// could eat code and weaken every assertion; a size floor catches that.
 if (CODE.length < SOURCE.length * 0.5) {
   throw new Error(
     'stripComments removed more than half of process-webhook.ts — check for a false comment start',
@@ -43,11 +38,9 @@ if (CODE.length < SOURCE.length * 0.5) {
 }
 
 /**
- * The text of a single `name({ ... })` call, from the call to its matching
- * close. Assertions about the arguments MUST run against this slice, not the
- * whole file: `isForkPR: event.isForkPR ?? false` and
- * `trustResolution: trust.trustResolution` each occur at other call sites, so a
- * whole-file regex stays green even when the real call site is neutered.
+ * The text of one `name({ ... })` call through its matching close. Argument
+ * assertions MUST use this slice: `isForkPR: event.isForkPR ?? false` and
+ * `trustResolution: trust.trustResolution` occur at other call sites too.
  */
 function callBlock(code: string, opening: string): string {
   const start = code.indexOf(opening);
@@ -66,12 +59,8 @@ function callBlock(code: string, opening: string): string {
 
 /**
  * The text of a top-level function, signature through its closing brace.
- *
- * `callBlock` cannot be reused for this: a signature whose parameters contain
- * an object type (`opts: { reuseRunId?: string | false }`) makes its first `{`
- * the parameter's, so brace matching would return the parameter type instead of
- * the body. Every brace inside a top-level function is indented, so the first
- * `\n}` after the signature is the function's own terminator.
+ * Not `callBlock`: an object-typed parameter owns the first `{`. Inner braces
+ * are indented, so the first `\n}` after the signature ends the function.
  */
 function functionBody(code: string, signature: string): string {
   const start = code.indexOf(signature);
@@ -90,24 +79,20 @@ describe('trust-policy gate wiring', () => {
   });
 
   it('threads that binding into the dispatch call, not a fresh literal', () => {
-    // Scoped to the dispatch call itself: the shorthand also appears in the
-    // parameter destructuring of two helper functions.
+    // Scoped to the call: the shorthand also appears in helper destructuring.
     expect(DISPATCH_CALL).toMatch(/^\s*securityDecision,\s*$/m);
     expect(DISPATCH_CALL).not.toMatch(/securityDecision:/);
   });
 
   it('passes the real per-PR signals rather than constants', () => {
-    // Each signal must come from the pipeline's own state. A hardcoded `false`
-    // here would silently disable the switch while leaving every test green —
-    // which is exactly what a whole-file regex failed to catch.
+    // A hardcoded `false` would silently disable the switch with every test green.
     expect(EVAL_CALL).toMatch(/isForkPR:\s*event\.isForkPR\s*\?\?\s*false/);
     expect(EVAL_CALL).toMatch(/trustResolution:\s*trust\.trustResolution/);
   });
 
   it('drops an ignored event before the lock-file fetch', () => {
-    // The whole point of `ignore`: no run row, no check status, no clone token.
-    // Every one of those is created at or after the lock-file fetch, so the
-    // drop has to precede that call in source order.
+    // `ignore` means no run row, check status or clone token, all created at or
+    // after the lock-file fetch, so the drop precedes it in source order.
     const drop = CODE.indexOf("securityDecision.action === 'ignore'");
     const lockFetch = CODE.indexOf('await fetchLockFileWithFallbackPhase(');
     expect(drop).toBeGreaterThan(-1);
@@ -120,17 +105,15 @@ describe('trust-policy gate wiring', () => {
   });
 
   it('evaluates the policy exactly once per delivery in the per-repo pipeline', () => {
-    // Two evaluations of the same signals would double-count the decision
-    // metric and open a TOCTOU window between the drop and the dispatch gate.
-    // The cross-source path has its own call against a registration's bundle,
-    // so the count here is per call SHAPE, not a whole-file total.
+    // Two evaluations would double-count the decision metric and open a TOCTOU
+    // window between drop and gate. Counted per call SHAPE: the cross-source
+    // path has its own call.
     const perRepo = CODE.match(/const securityDecision = await evaluateSecurityPolicy\(/g) ?? [];
     expect(perRepo).toHaveLength(1);
   });
 
   it('defaults the orchestrator mode to the fail-closed side', () => {
-    // `deps.orchestratorMode ?? 'platform'` — defaulting to 'independent'
-    // would silently open the gate for any deps object built without a mode.
+    // 'independent' would silently open the gate for deps built without a mode.
     expect(EVAL_CALL).toMatch(/mode:\s*deps\.orchestratorMode\s*\?\?\s*'platform'/);
     expect(EVAL_CALL).not.toMatch(/mode:\s*deps\.orchestratorMode\s*\?\?\s*'independent'/);
   });
@@ -145,37 +128,29 @@ describe('trust-policy gate wiring', () => {
     );
     const gate = functionBody(gateCode, 'async function applyTrustPolicyGate(');
 
-    // The gate must bail early on exactly one thing — a resume re-entry. Any
-    // extra conjunct (`false &&`, a feature flag) would disable enforcement
-    // while every behavioral test still passes.
+    // The gate bails early only on a resume re-entry; any extra conjunct
+    // (`false &&`, a feature flag) would disable enforcement unnoticed.
     expect(gate).toMatch(/if \(opts\.reuseRunId\) return null;/);
 
-    // The verdict is dispatched on exhaustively. A `switch` (rather than a
-    // chain of ifs) is what lets the `default` arm exist at all.
+    // Exhaustive `switch`, so a `default` arm exists.
     expect(gate).toMatch(
       /const decision = ctx\.securityDecision;\s*switch \(decision\.action\) \{/,
     );
 
-    // THE REGRESSION GUARD. `securityDecision` is required, so a falsy check on
-    // it can only be reintroduced by someone making it optional again — which
-    // is precisely the fail-open-by-omission this feature removed: forgetting
-    // to thread a decision meant the run passed the security gate.
+    // THE REGRESSION GUARD. `securityDecision` is required; a falsy check on it
+    // means it went optional, so an unthreaded decision fails open.
     expect(gate).not.toMatch(/!\s*decision/);
     expect(gate).not.toMatch(/decision\s*\?\?/);
 
-    // An unrecognised verdict must DENY, not fall through. The policy columns
-    // are plain TEXT, so a newer Platform can emit a verdict this build has
-    // never seen; reaching the end of the switch without acting would dispatch
+    // An unrecognised verdict must DENY: the policy columns are plain TEXT, so a
+    // newer Platform can emit an unknown verdict, and falling through dispatches
     // untrusted code.
     expect(gate).toMatch(/default: \{[\s\S]*rejectRunForSecurityPolicy\(/);
 
-    // The `ignore` arm must survive a dead-code sweep. `declineIgnoredDispatch`
-    // answers that verdict before the gate is reached, so this arm is
-    // unreachable from the dispatch path — and because a `default` arm exists,
-    // the compiler does NOT flag its removal. Deleting it would therefore turn
-    // an `ignore` that ever reached here into the visible failed run that
-    // `default` writes, the exact artifact `ignore` exists to withhold, with no
-    // test objecting.
+    // The `ignore` arm must survive a dead-code sweep: `declineIgnoredDispatch`
+    // answers it first, so it is unreachable, and with a `default` arm the
+    // compiler does not flag its removal. Without it an `ignore` reaching here
+    // becomes the visible failed run `default` writes.
     expect(gate).toMatch(/case 'ignore':/);
 
     // …and dispatch must actually invoke the gate and honour its result.
@@ -185,10 +160,9 @@ describe('trust-policy gate wiring', () => {
 });
 
 /**
- * Which pushed policy fields reach a decision site. The field list is derived
- * from the wire schema rather than written out here, so a field ADDED to
- * `trustPolicySchema` is unaccounted for and fails loudly instead of shipping
- * as an inert setting nothing reads.
+ * Which pushed policy fields reach a decision site. Fields derive from the wire
+ * schema, so one ADDED to `trustPolicySchema` fails here instead of shipping as
+ * an inert setting.
  */
 describe('policy fields reach the decision sites they claim to', () => {
   const GATE = stripComments(
@@ -204,9 +178,7 @@ describe('policy fields reach the decision sites they claim to', () => {
   const FIELDS = Object.keys(trustPolicySchema.shape);
 
   it('enumerates the wire fields it is guarding', () => {
-    // Positive control: if the schema import ever resolves to something without
-    // a shape, every per-field case below would vacuously pass over an empty
-    // list. Pin the membership so a silently-empty enumeration fails loudly.
+    // Positive control: an empty enumeration would make every case vacuous.
     expect(FIELDS.length).toBeGreaterThanOrEqual(2);
     expect(FIELDS).toContain('forkPolicy');
     expect(FIELDS).toContain('approvalExpirySeconds');
@@ -218,22 +190,18 @@ describe('policy fields reach the decision sites they claim to', () => {
   });
 
   it('routes forkPolicy into the evaluator switch', () => {
-    // The switch subject specifically, not merely a mention: a `switch` over a
-    // literal would leave `policy.forkPolicy` referenced elsewhere in the
-    // function while deciding nothing.
+    // The switch subject, not a mere mention elsewhere that decides nothing.
     expect(EVALUATOR).toMatch(/switch \(policy\.forkPolicy\) \{/);
   });
 
   it('routes the expiry window into the hold-expiry calculation', () => {
-    // Not an arm: the window rides the hold outcome into the expiry
-    // calculation, and dispatch reads the field the gate copied from the policy.
+    // The window rides the hold outcome; dispatch reads the field the gate copied.
     expect(HOLD_FOR_FORK).toMatch(/approvalExpirySeconds:\s*policy\.approvalExpirySeconds/);
     expect(DISPATCH).toMatch(/decision\.approvalExpirySeconds\s*\?\?/);
   });
 
   it('accounts for every wire field', () => {
-    // A field added to the schema is neither the fork switch nor the expiry —
-    // so it fails here until someone routes it to a decision site.
+    // A new schema field fails here until routed to a decision site.
     const accounted = new Set(['forkPolicy', 'approvalExpirySeconds']);
     expect(FIELDS.filter((f) => !accounted.has(f))).toEqual([]);
   });

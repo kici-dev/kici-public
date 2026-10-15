@@ -1,7 +1,4 @@
-/**
- * Trigger types and interfaces for pr() and push() trigger helpers.
- * Supports both glob patterns and regex patterns for branch/path matching.
- */
+/** Trigger configuration types; branch and path filters accept glob or regex patterns. */
 
 import type { z } from 'zod';
 import type { ContentRequirement, TextMatch } from '@kici-dev/engine';
@@ -17,17 +14,12 @@ export type { ContentRequirement, ContentFormat, TextMatch } from '@kici-dev/eng
  */
 export type DispatchInputsMap = Record<string, z.ZodType>;
 
-/**
- * Branch pattern - discriminated union supporting both glob and regex patterns.
- * Glob patterns use micromatch syntax, regex patterns use standard JS regex.
- */
+/** Branch pattern: glob (micromatch syntax) or regex (standard JS regex). */
 export type BranchPattern =
   | { readonly type: 'glob'; readonly pattern: string }
   | { readonly type: 'regex'; readonly pattern: string; readonly flags?: string };
 
-/**
- * All supported GitHub PR event types.
- */
+/** GitHub PR event types. */
 export type PrEvent =
   | 'opened'
   | 'synchronize'
@@ -47,9 +39,7 @@ export type PrEvent =
   | 'auto_merge_enabled'
   | 'auto_merge_disabled';
 
-/**
- * Default PR events when pr() is called without explicit events.
- */
+/** Default PR events when `pr()` is called without `events`. */
 export const DEFAULT_PR_EVENTS: readonly PrEvent[] = [
   'opened',
   'synchronize',
@@ -57,14 +47,8 @@ export const DEFAULT_PR_EVENTS: readonly PrEvent[] = [
   'closed',
 ] as const;
 
-/**
- * Push event type (currently only 'push').
- */
 export type PushEvent = 'push';
 
-/**
- * Configuration for a PR trigger.
- */
 export interface PrTriggerConfig {
   readonly _tag: 'PrTrigger';
   readonly events: readonly PrEvent[];
@@ -79,9 +63,6 @@ export interface PrTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Configuration for a push trigger.
- */
 export interface PushTriggerConfig {
   readonly _tag: 'PushTrigger';
   readonly branches: readonly BranchPattern[];
@@ -97,9 +78,6 @@ export interface PushTriggerConfig {
 
 // --- Tag trigger ---
 
-/**
- * Configuration for a tag trigger.
- */
 export interface TagTriggerConfig {
   readonly _tag: 'TagTrigger';
   readonly patterns: readonly BranchPattern[];
@@ -111,9 +89,7 @@ export interface TagTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for tag() factory function.
- */
+/** Input for `tag()`. */
 export interface TagConfigInput {
   readonly patterns?: string | RegExp | (string | RegExp)[];
   readonly repos?: string | RegExp | (string | RegExp)[];
@@ -130,16 +106,12 @@ export type CommentAction = 'created' | 'edited' | 'deleted';
 
 export type CommentSource = 'issue' | 'pr';
 
-/**
- * Serialized body match pattern for comment triggers.
- */
+/** Serialized comment-trigger body match pattern. */
 export type BodyMatchPattern =
   | { readonly type: 'glob'; readonly pattern: string }
   | { readonly type: 'regex'; readonly pattern: string; readonly flags?: string };
 
-/**
- * Configuration for a comment trigger (issue_comment / PR review comment).
- */
+/** Comment trigger config (issue_comment / PR review comment). */
 export interface CommentTriggerConfig {
   readonly _tag: 'CommentTrigger';
   readonly actions: readonly CommentAction[];
@@ -149,9 +121,7 @@ export interface CommentTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for comment() factory function.
- */
+/** Input for `comment()`. */
 export interface CommentConfigInput {
   readonly actions?: CommentAction[];
   readonly source?: CommentSource;
@@ -165,9 +135,6 @@ export interface CommentConfigInput {
 export type ReviewAction = 'submitted' | 'edited' | 'dismissed';
 export type ReviewState = 'approved' | 'changes_requested' | 'commented' | 'dismissed';
 
-/**
- * Configuration for a pull request review trigger.
- */
 export interface ReviewTriggerConfig {
   readonly _tag: 'ReviewTrigger';
   readonly actions: readonly ReviewAction[];
@@ -177,9 +144,7 @@ export interface ReviewTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for review() factory function.
- */
+/** Input for `review()`. */
 export interface ReviewConfigInput {
   readonly actions?: ReviewAction[];
   readonly states?: ReviewState[];
@@ -192,9 +157,6 @@ export interface ReviewConfigInput {
 
 export type ReviewCommentAction = 'created' | 'edited' | 'deleted';
 
-/**
- * Configuration for a pull request review comment trigger.
- */
 export interface ReviewCommentTriggerConfig {
   readonly _tag: 'ReviewCommentTrigger';
   readonly actions: readonly ReviewCommentAction[];
@@ -203,9 +165,7 @@ export interface ReviewCommentTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for reviewComment() factory function.
- */
+/** Input for `reviewComment()`. */
 export interface ReviewCommentConfigInput {
   readonly actions?: ReviewCommentAction[];
   readonly repos?: string | RegExp | (string | RegExp)[];
@@ -218,9 +178,6 @@ export interface ReviewCommentConfigInput {
 export type ReleaseAction =
   'published' | 'unpublished' | 'created' | 'edited' | 'deleted' | 'prereleased' | 'released';
 
-/**
- * Configuration for a release trigger.
- */
 export interface ReleaseTriggerConfig {
   readonly _tag: 'ReleaseTrigger';
   readonly actions: readonly ReleaseAction[];
@@ -229,9 +186,7 @@ export interface ReleaseTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for release() factory function.
- */
+/** Input for `release()`. */
 export interface ReleaseConfigInput {
   readonly actions?: ReleaseAction[];
   readonly repos?: string | RegExp | (string | RegExp)[];
@@ -241,9 +196,7 @@ export interface ReleaseConfigInput {
 
 // --- Dispatch trigger ---
 
-/**
- * Configuration for a repository_dispatch trigger.
- */
+/** repository_dispatch trigger config. */
 export interface DispatchTriggerConfig {
   readonly _tag: 'DispatchTrigger';
   readonly types: readonly string[];
@@ -254,9 +207,7 @@ export interface DispatchTriggerConfig {
   readonly inputs?: DispatchInputsMap;
 }
 
-/**
- * Input configuration for dispatch() factory function.
- */
+/** Input for `dispatch()`. */
 export interface DispatchConfigInput {
   readonly types?: string[];
   readonly repos?: string | RegExp | (string | RegExp)[];
@@ -276,9 +227,7 @@ export interface DispatchConfigInput {
 
 export type RefType = 'branch' | 'tag';
 
-/**
- * Configuration for a create ref trigger.
- */
+/** Create-ref trigger config. */
 export interface CreateTriggerConfig {
   readonly _tag: 'CreateTrigger';
   readonly refTypes: readonly RefType[];
@@ -288,9 +237,7 @@ export interface CreateTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for create() factory function.
- */
+/** Input for `create()`. */
 export interface CreateConfigInput {
   readonly refTypes?: RefType[];
   readonly patterns?: string | RegExp | (string | RegExp)[];
@@ -301,9 +248,7 @@ export interface CreateConfigInput {
 
 // --- Delete trigger ---
 
-/**
- * Configuration for a delete ref trigger.
- */
+/** Delete-ref trigger config. */
 export interface DeleteTriggerConfig {
   readonly _tag: 'DeleteTrigger';
   readonly refTypes: readonly RefType[];
@@ -313,9 +258,7 @@ export interface DeleteTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for delete() factory function.
- */
+/** Input for `delete()`. */
 export interface DeleteConfigInput {
   readonly refTypes?: RefType[];
   readonly patterns?: string | RegExp | (string | RegExp)[];
@@ -328,9 +271,7 @@ export interface DeleteConfigInput {
 
 export type StatusState = 'error' | 'failure' | 'pending' | 'success';
 
-/**
- * Configuration for a commit status trigger.
- */
+/** Commit status trigger config. */
 export interface StatusTriggerConfig {
   readonly _tag: 'StatusTrigger';
   readonly contexts: readonly string[];
@@ -340,9 +281,7 @@ export interface StatusTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for status() factory function.
- */
+/** Input for `status()`. */
 export interface StatusConfigInput {
   readonly contexts?: string[];
   readonly states?: StatusState[];
@@ -355,9 +294,7 @@ export interface StatusConfigInput {
 
 export type WorkflowRunAction = 'requested' | 'completed' | 'in_progress';
 
-/**
- * Configuration for a workflow_run trigger.
- */
+/** workflow_run trigger config. */
 export interface WorkflowRunTriggerConfig {
   readonly _tag: 'WorkflowRunTrigger';
   readonly actions: readonly WorkflowRunAction[];
@@ -368,9 +305,7 @@ export interface WorkflowRunTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for workflowRun() factory function.
- */
+/** Input for `workflowRun()`. */
 export interface WorkflowRunConfigInput {
   readonly actions?: WorkflowRunAction[];
   readonly workflows?: string[];
@@ -382,9 +317,7 @@ export interface WorkflowRunConfigInput {
 
 // --- Fork trigger ---
 
-/**
- * Configuration for a fork trigger. No filter fields.
- */
+/** Fork trigger config; it has no filter fields. */
 export interface ForkTriggerConfig {
   readonly _tag: 'ForkTrigger';
   readonly repos: readonly BranchPattern[];
@@ -392,9 +325,7 @@ export interface ForkTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for fork() factory function.
- */
+/** Input for `fork()`. */
 export interface ForkConfigInput {
   readonly repos?: string | RegExp | (string | RegExp)[];
 
@@ -405,9 +336,6 @@ export interface ForkConfigInput {
 
 export type StarAction = 'created' | 'deleted';
 
-/**
- * Configuration for a star trigger.
- */
 export interface StarTriggerConfig {
   readonly _tag: 'StarTrigger';
   readonly actions: readonly StarAction[];
@@ -416,9 +344,7 @@ export interface StarTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for star() factory function.
- */
+/** Input for `star()`. */
 export interface StarConfigInput {
   readonly actions?: StarAction[];
   readonly repos?: string | RegExp | (string | RegExp)[];
@@ -430,9 +356,6 @@ export interface StarConfigInput {
 
 export type WatchAction = 'started';
 
-/**
- * Configuration for a watch trigger.
- */
 export interface WatchTriggerConfig {
   readonly _tag: 'WatchTrigger';
   readonly actions: readonly WatchAction[];
@@ -441,9 +364,7 @@ export interface WatchTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for watch() factory function.
- */
+/** Input for `watch()`. */
 export interface WatchConfigInput {
   readonly actions?: WatchAction[];
   readonly repos?: string | RegExp | (string | RegExp)[];
@@ -453,10 +374,7 @@ export interface WatchConfigInput {
 
 // --- KiCI event trigger ---
 
-/**
- * Input configuration for kiciEvent() factory function.
- * `name` is required -- identifies the custom event to listen for.
- */
+/** Input for `kiciEvent()`. `name` is required: identifies the custom event to listen for. */
 export interface KiciEventConfigInput {
   readonly name: string;
   readonly match?: Record<string, unknown>;
@@ -465,9 +383,6 @@ export interface KiciEventConfigInput {
   readonly description?: string;
 }
 
-/**
- * Configuration for a KiCI custom event trigger.
- */
 export interface KiciEventTriggerConfig {
   readonly _tag: 'KiciEventTrigger';
   readonly name: string;
@@ -479,14 +394,9 @@ export interface KiciEventTriggerConfig {
 
 // --- Workflow complete trigger ---
 
-/**
- * Valid workflow completion statuses.
- */
 export type WorkflowCompleteStatus = 'success' | 'failed' | 'cancelled';
 
-/**
- * Input configuration for workflowComplete() factory function.
- */
+/** Input for `workflowComplete()`. */
 export interface WorkflowCompleteConfigInput {
   readonly name?: string;
   readonly status?: WorkflowCompleteStatus[];
@@ -494,9 +404,6 @@ export interface WorkflowCompleteConfigInput {
   readonly description?: string;
 }
 
-/**
- * Configuration for a workflow completion trigger.
- */
 export interface WorkflowCompleteTriggerConfig {
   readonly _tag: 'WorkflowCompleteTrigger';
   readonly name?: string;
@@ -507,10 +414,7 @@ export interface WorkflowCompleteTriggerConfig {
 
 // --- Workflows failed batch trigger ---
 
-/**
- * Input configuration for workflowsFailedBatch() factory function.
- * Accumulate failed workflow completions over a window, notify once.
- */
+/** Input for `workflowsFailedBatch()`: accumulate failed workflow completions over a window, notify once. */
 export interface WorkflowsFailedBatchConfigInput {
   /** Accumulation window in milliseconds; the window opens on the first failure. */
   readonly accumulateFor: number;
@@ -519,9 +423,6 @@ export interface WorkflowsFailedBatchConfigInput {
   readonly description?: string;
 }
 
-/**
- * Configuration for a workflows-failed-batch trigger.
- */
 export interface WorkflowsFailedBatchTriggerConfig {
   readonly _tag: 'WorkflowsFailedBatchTrigger';
   /** Accumulation window in milliseconds; the window opens on the first failure. */
@@ -533,14 +434,9 @@ export interface WorkflowsFailedBatchTriggerConfig {
 
 // --- Job complete trigger ---
 
-/**
- * Valid job completion statuses.
- */
 export type JobCompleteStatus = 'success' | 'failed' | 'cancelled' | 'skipped';
 
-/**
- * Input configuration for jobComplete() factory function.
- */
+/** Input for `jobComplete()`. */
 export interface JobCompleteConfigInput {
   readonly workflow?: string;
   readonly job?: string;
@@ -549,9 +445,6 @@ export interface JobCompleteConfigInput {
   readonly description?: string;
 }
 
-/**
- * Configuration for a job completion trigger.
- */
 export interface JobCompleteTriggerConfig {
   readonly _tag: 'JobCompleteTrigger';
   readonly workflow?: string;
@@ -563,14 +456,9 @@ export interface JobCompleteTriggerConfig {
 
 // --- Generic webhook trigger ---
 
-/**
- * Auth method for generic webhook verification.
- */
+/** Generic webhook verification method. */
 export type GenericWebhookAuthMethod = 'hmac-sha256' | 'api-key';
 
-/**
- * HMAC-SHA256 auth config for generic webhooks.
- */
 export interface GenericWebhookHmacAuth {
   readonly method: 'hmac-sha256';
   /** Name of the secret containing the HMAC signing key */
@@ -579,9 +467,6 @@ export interface GenericWebhookHmacAuth {
   readonly signatureHeader: string;
 }
 
-/**
- * API key auth config for generic webhooks.
- */
 export interface GenericWebhookApiKeyAuth {
   readonly method: 'api-key';
   /** Name of the secret containing the API key value */
@@ -590,30 +475,20 @@ export interface GenericWebhookApiKeyAuth {
   readonly header?: string;
 }
 
-/**
- * Union of generic webhook auth configurations.
- */
 export type GenericWebhookAuth = GenericWebhookHmacAuth | GenericWebhookApiKeyAuth;
 
-/**
- * Input configuration for genericWebhook() factory function.
- * `source` is required -- identifies the webhook source.
- */
+/** Input for `genericWebhook()`. `source` is required: identifies the webhook source. */
 export interface GenericWebhookConfigInput {
   readonly source: string;
   readonly events?: string[];
   readonly match?: Record<string, unknown>;
   readonly not?: Record<string, unknown>;
-  /** Auth configuration for webhook verification */
   readonly auth?: GenericWebhookAuth;
   /** URL path pattern (replaces source for URL matching; source becomes alias for path) */
   readonly path?: string;
   readonly description?: string;
 }
 
-/**
- * Configuration for a generic webhook trigger.
- */
 export interface GenericWebhookTriggerConfig {
   readonly _tag: 'GenericWebhookTrigger';
   readonly source: string;
@@ -627,9 +502,7 @@ export interface GenericWebhookTriggerConfig {
 
 // --- Schedule trigger ---
 
-/**
- * Input configuration for schedule() factory function.
- */
+/** Input for `schedule()`. */
 export interface ScheduleConfigInput {
   readonly cron: string;
   readonly timezone?: string;
@@ -644,9 +517,6 @@ export interface ScheduleConfigInput {
     DispatchInputsMap | { readonly __kiciDispatchInputs: true; readonly map: DispatchInputsMap };
 }
 
-/**
- * Configuration for a schedule trigger.
- */
 export interface ScheduleTriggerConfig {
   readonly _tag: 'ScheduleTrigger';
   readonly cron: string;
@@ -658,24 +528,17 @@ export interface ScheduleTriggerConfig {
 
 // --- Lifecycle trigger ---
 
-/**
- * Lifecycle event types for cross-workflow orchestration.
- */
+/** Lifecycle events for cross-workflow orchestration. */
 export type LifecycleEvent =
   'workflow_complete' | 'job_complete' | 'job_failed' | 'registration_updated';
 
-/**
- * Input configuration for lifecycle() factory function.
- */
+/** Input for `lifecycle()`. */
 export interface LifecycleConfigInput {
   readonly events: LifecycleEvent[];
   readonly sources?: string[];
   readonly description?: string;
 }
 
-/**
- * Configuration for a lifecycle trigger.
- */
 export interface LifecycleTriggerConfig {
   readonly _tag: 'LifecycleTrigger';
   readonly events: readonly LifecycleEvent[];
@@ -685,9 +548,6 @@ export interface LifecycleTriggerConfig {
 
 // --- Webhook (catch-all) trigger ---
 
-/**
- * Configuration for a catch-all webhook trigger.
- */
 export interface WebhookTriggerConfig {
   readonly _tag: 'WebhookTrigger';
   readonly events: readonly string[];
@@ -697,10 +557,7 @@ export interface WebhookTriggerConfig {
   readonly description?: string;
 }
 
-/**
- * Input configuration for webhook() factory function.
- * `events` is required -- catch-all must specify what to catch.
- */
+/** Input for `webhook()`. `events` is required: catch-all must specify what to catch. */
 export interface WebhookConfigInput {
   readonly events: string[];
   readonly actions?: string[];
@@ -711,9 +568,7 @@ export interface WebhookConfigInput {
 
 // --- Union types ---
 
-/**
- * Union type for all trigger configurations (21 types).
- */
+/** Union of every trigger configuration. */
 export type TriggerConfig =
   | PrTriggerConfig
   | PushTriggerConfig
@@ -739,10 +594,7 @@ export type TriggerConfig =
   | ScheduleTriggerConfig
   | LifecycleTriggerConfig;
 
-/**
- * Input configuration for pr() factory function.
- * All fields optional - sensible defaults applied.
- */
+/** Input for `pr()`; every field is optional and has a default. */
 export interface PrConfigInput {
   readonly events?: PrEvent[];
   readonly target?: string | RegExp | (string | RegExp)[];
@@ -759,10 +611,7 @@ export interface PrConfigInput {
   readonly description?: string;
 }
 
-/**
- * Input configuration for push() factory function.
- * All fields optional - sensible defaults applied.
- */
+/** Input for `push()`; every field is optional and has a default. */
 export interface PushConfigInput {
   readonly branches?: string | RegExp | (string | RegExp)[];
   readonly tags?: string | RegExp | (string | RegExp)[];
@@ -779,7 +628,6 @@ export interface PushConfigInput {
 }
 
 /**
- * Convert a string or RegExp to a BranchPattern.
  * Strings become glob patterns, RegExp becomes regex patterns.
  *
  * `g` and `y` are dropped from the author's flags: the matcher memoizes one
@@ -801,9 +649,7 @@ export function toBranchPattern(input: string | RegExp): BranchPattern {
   };
 }
 
-/**
- * Helper to normalize single value or array to array.
- */
+/** Normalize a single value or an array to an array. */
 export function asArray<T>(value: T | T[]): T[] {
   return Array.isArray(value) ? value : [value];
 }

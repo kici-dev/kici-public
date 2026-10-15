@@ -101,7 +101,6 @@ describe('runRoutedCommand', () => {
       quiet: true,
     });
     expect(ok).toBe(true);
-    // Triggered with the resolved workdir's git coordinates + the seeded source.
     expect(triggerRun).toHaveBeenCalledWith(
       'http://127.0.0.1:4319',
       'kici-local-tok',
@@ -116,12 +115,10 @@ describe('runRoutedCommand', () => {
         // The snapshot's parent, so the run has a real before..sha diff.
         before: 'cafebabe',
       }),
-      // The timeout diagnosis needs the workdir the source points at.
       // fails-when: run-routed stops threading repoBasePath, so a lock-file
       // timeout can no longer say WHERE the lock file was missing.
       expect.objectContaining({ repoBasePath: '/tmp/clone-x' }),
     );
-    // The isolated workdir cleanup runs.
     const wd = await (resolveWorkdir as ReturnType<typeof vi.fn>).mock.results[0].value;
     expect(wd.cleanup).toHaveBeenCalled();
   });
@@ -181,12 +178,11 @@ describe('runRoutedCommand', () => {
       quiet: true,
     });
     expect(ok).toBe(true);
-    // Patches the workdir lock (resolveWorkdir mock returns dir '/tmp/clone-x').
     expect(injectRunsOnLabel).toHaveBeenCalledWith(
       '/tmp/clone-x/.kici/kici.lock.json',
       'self-hosted',
     );
-    // restore() fires in the finally so an in-place tree is left clean.
+    // restore() runs in the finally, so an in-place tree is left clean.
     expect(restoreLock).toHaveBeenCalledTimes(1);
   });
 
@@ -206,7 +202,6 @@ describe('runRoutedCommand', () => {
       'self-hosted',
     );
     expect(injectRunsOnLabel).toHaveBeenCalledWith('/tmp/clone-x/.kici/kici.lock.json', 'in-place');
-    // Both label injections' restores fire in the finally.
     expect(restoreLock).toHaveBeenCalledTimes(2);
   });
 

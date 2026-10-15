@@ -17,7 +17,6 @@ describe('TokenBucket', () => {
 
   it('should reject consumption over capacity', () => {
     const bucket = new TokenBucket(10, 5);
-    // Consume all tokens
     bucket.consume(10);
     const result = bucket.consume(1);
     expect(result.allowed).toBe(false);
@@ -51,26 +50,22 @@ describe('TokenBucket', () => {
     // Advance time by 1 second -> refill 100 tokens but capped at capacity 10
     vi.advanceTimersByTime(1000);
 
-    // Should have full capacity: consume 10 should succeed
     const result = bucket.consume(10);
     expect(result.allowed).toBe(true);
 
-    // But 1 more should fail
     const result2 = bucket.consume(1);
     expect(result2.allowed).toBe(false);
   });
 
   it('should not consume tokens on peek', () => {
     const bucket = new TokenBucket(5, 1);
-    // Peek should report available without consuming
     const peekResult = bucket.peek(3);
     expect(peekResult.allowed).toBe(true);
 
-    // Tokens should still be there — consume 5 should succeed
+    // Peek consumed nothing, so all 5 remain.
     const consumeResult = bucket.consume(5);
     expect(consumeResult.allowed).toBe(true);
 
-    // Now bucket is exhausted
     const exhausted = bucket.consume(1);
     expect(exhausted.allowed).toBe(false);
   });
@@ -109,7 +104,6 @@ describe('WsRateLimiter', () => {
   });
 
   it('should always allow heartbeats even when rate limited', () => {
-    // Create a limiter with very small capacity to easily exhaust it
     const limiter = new WsRateLimiter({
       messageCapacity: 1,
       messageRefillRate: 1,
@@ -117,12 +111,10 @@ describe('WsRateLimiter', () => {
       bytesRefillRate: 10,
     });
 
-    // Exhaust the limiter
     limiter.check(50, false);
     const limited = limiter.check(50, false);
     expect(limited.allowed).toBe(false);
 
-    // Heartbeat should still be allowed
     const heartbeat = limiter.check(100, true);
     expect(heartbeat.allowed).toBe(true);
     expect(heartbeat.action).toBe('allow');
@@ -157,18 +149,16 @@ describe('WsRateLimiter', () => {
       maxMessageSize: 5000,
     });
 
-    // Message within byte capacity -- allowed
     const ok = limiter.check(500, false);
     expect(ok.allowed).toBe(true);
 
-    // Message between bytesCapacity and maxMessageSize -- immediate disconnect
-    // (previously this would enter a misleading warn/retry loop)
+    // Between bytesCapacity and maxMessageSize: immediate disconnect, not warn/retry.
     const overCapacity = limiter.check(1500, false);
     expect(overCapacity.allowed).toBe(false);
     expect(overCapacity.action).toBe('disconnect');
     expect(overCapacity.reason).toBe('Message exceeds byte burst capacity');
 
-    // Exactly at bytesCapacity boundary -- should be allowed (if tokens available)
+    // Exactly at bytesCapacity is allowed.
     const limiter2 = new WsRateLimiter({
       bytesCapacity: 1000,
       maxMessageSize: 5000,
@@ -185,7 +175,6 @@ describe('WsRateLimiter', () => {
 
     limiter.check(10, false);
     limiter.check(10, false);
-    // Third message exceeds capacity
     const result = limiter.check(10, false);
     expect(result.allowed).toBe(false);
     expect(result.action).toBe('warn');
@@ -199,17 +188,13 @@ describe('WsRateLimiter', () => {
       disconnectAfterMs: 100,
     });
 
-    // First message -- allowed
     limiter.check(10, false);
 
-    // Second message -- warn
     const warn = limiter.check(10, false);
     expect(warn.action).toBe('warn');
 
-    // Advance time past disconnectAfterMs
     vi.advanceTimersByTime(150);
 
-    // Still rate limited, and now past threshold
     const result = limiter.check(10, false);
     expect(result.allowed).toBe(false);
     expect(result.action).toBe('disconnect');
@@ -223,12 +208,10 @@ describe('WsRateLimiter', () => {
       disconnectAfterMs: 500,
     });
 
-    // Use up capacity
     limiter.check(10, false);
     limiter.check(10, false);
     limiter.check(10, false);
 
-    // Violation starts
     const warn = limiter.check(10, false);
     expect(warn.action).toBe('warn');
 
@@ -248,11 +231,10 @@ describe('WsRateLimiter', () => {
       bytesRefillRate: 10,
     });
 
-    // First message with 100 bytes -- allowed
     const result1 = limiter.check(100, false);
     expect(result1.allowed).toBe(true);
 
-    // Second message with 50 bytes -- byte bucket exhausted
+    // The first 100 bytes emptied the byte bucket, so 50 more is denied.
     const result2 = limiter.check(50, false);
     expect(result2.allowed).toBe(false);
     expect(result2.action).toBe('warn');
@@ -272,13 +254,11 @@ describe('WsRateLimiter', () => {
     const r1 = limiter.check(50, false);
     expect(r1.allowed).toBe(true);
 
-    // Now byte bucket is empty. Send another message — should be denied.
+    // Byte bucket is empty: denied.
     const r2 = limiter.check(10, false);
     expect(r2.allowed).toBe(false);
 
-    // The message bucket should NOT have been debited for the denied message.
-    // We used 1 message token for the first allowed message, so 4 remain.
-    // Wait for byte bucket to refill, then send 4 tiny messages — all should pass.
+    // The denied message must not debit the message bucket: 4 tokens remain.
     vi.advanceTimersByTime(2000); // refill bytes (50/sec * 2s = 100 tokens, capped at 50)
 
     for (let i = 0; i < 4; i++) {
@@ -301,11 +281,9 @@ describe('WsRateLimiter', () => {
       disconnectAfterMs: 10000,
     });
 
-    // Under max message size -- allowed (within byte capacity too)
     const result = limiter.check(100, false);
     expect(result.allowed).toBe(true);
 
-    // Over custom max message size -- disconnect
     const result2 = limiter.check(2001, false);
     expect(result2.allowed).toBe(false);
     expect(result2.action).toBe('disconnect');

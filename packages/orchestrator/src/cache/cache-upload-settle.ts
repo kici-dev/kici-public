@@ -1,16 +1,16 @@
 /**
- * Holding a build job's success until the cache publish its agent reported
- * just before it has finished.
+ * Holds a build job's success until the cache publish its agent reported just
+ * before it has finished.
  *
- * A build agent sends `cache.upload.complete` and then, moments later, the
- * build's terminal `job.status success`. The agent WebSocket handler runs
- * frames concurrently, so without this record the success can release the
- * jobs that wait on the build while the pointer naming the uploaded tarball is
- * still being written — and they dispatch without the cache URL.
+ * A build agent sends `cache.upload.complete`, then moments later the terminal
+ * `job.status success`. The agent WebSocket handler runs frames concurrently, so
+ * without this record the success can release the jobs waiting on the build while
+ * the pointer naming the uploaded tarball is still being written, and they
+ * dispatch without the cache URL.
  *
- * The upload frame registers here before its first `await`. Frames enter the
- * handler in wire order, so the registration is in place by the time the
- * success frame is handled. The success then waits, bounded by the org's
+ * The upload frame registers here before its first `await`; frames enter the
+ * handler in wire order, so the registration exists when the success frame is
+ * handled. The success then waits, bounded by the org's
  * `cache_upload_settle_timeout_ms` (cluster default
  * `KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS`).
  */
@@ -66,7 +66,7 @@ export class InFlightCacheUploads {
     return this.inFlight.has(jobId);
   }
 
-  /** Number of jobs with a publish in flight. */
+  /** Jobs with a publish in flight. */
   get size(): number {
     return this.inFlight.size;
   }

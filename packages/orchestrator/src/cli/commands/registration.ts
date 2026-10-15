@@ -6,15 +6,11 @@
  *   registration disable <id> | enable <id>
  *   registration delete <id> [--yes]
  *
- * A distinct namespace from `workflow list` — `workflow` is workflow-code,
- * `registration` is the registered-workflow-instance row in
- * workflow_registrations. Both coexist.
+ * `workflow` is workflow code; `registration` is a workflow_registrations row.
  *
- * `list` and `show` are dual-mode: HTTP (via AdminApiClient on the
- * /api/v1/admin/registrations admin API) or `--database-url` (direct DB).
- * `disable`, `enable` and `delete` are HTTP only: they are the operator path
- * for the dashboard's registration writes, and the admin route bumps the
- * registry version so every peer reloads.
+ * `list` and `show` use the admin API or `--database-url`. `disable`,
+ * `enable` and `delete` are HTTP only: they back the dashboard's registration
+ * writes, and the admin route bumps the registry version so every peer reloads.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -111,8 +107,7 @@ export function registerRegistrationCommands(
           if (opts.repo) params.set('repoIdentifier', opts.repo);
           if (opts.triggerType) params.set('triggerType', opts.triggerType);
           const qs = params.toString();
-          // The existing admin-registrations route returns { registrations, total }.
-          // Shape it into our { registrations } so callers get the same surface.
+          // The route returns { registrations, total }; keep the shared { registrations } surface.
           const result = await getClient().get<{
             registrations: WorkflowRegistrationRow[];
             total?: number;
@@ -149,11 +144,7 @@ interface DisableResult {
   registryVersion: number;
 }
 
-/**
- * `registration disable|enable|delete` — the operator path for the dashboard's
- * `registration.disable` / `registration.delete` writes. `enable` is the same
- * admin route as `disable`, with the flag cleared.
- */
+/** `enable` uses the `disable` admin route with the flag cleared. */
 function registerRegistrationWriteCommands(reg: Command, getClient: () => AdminApiClient): void {
   const setDisabled = async (id: string, disabled: boolean, json?: boolean): Promise<void> => {
     try {

@@ -5,16 +5,13 @@ import { type Kysely, sql } from 'kysely';
  * tarball's own bytes, so the agent can verify what it downloaded before
  * extracting it.
  *
- * The neighbouring `source_tar_hash` column carries the workflow `contentHash`
- * despite its name, which is why the agent's restore path verified nothing: it
- * had no value to compare the bytes against. `deps_hash` next door has always
- * held its tarball's real digest, and this column is its source-side sibling.
+ * Despite its name, `source_tar_hash` carries the workflow `contentHash`, so the
+ * agent had no digest to check the bytes against. This is the source-side
+ * sibling of `deps_hash`, which holds its tarball's real digest.
  *
- * Nullable, with no default: NULL means "no digest known for this row", which
- * is true of every row written before the column existed and of any dispatch
- * whose source came from somewhere other than the content-addressed cache. The
- * agent treats NULL as "nothing to verify against" and restores unverified,
- * exactly as it did before — so an in-flight queue survives the upgrade.
+ * Nullable, no default: NULL means no digest is known (every older row, and any
+ * source not from the content-addressed cache). The agent then restores
+ * unverified, so an in-flight queue survives the upgrade.
  *
  * Idempotent: the add is guarded on existence and the drop uses IF EXISTS, so a
  * re-run is a no-op.

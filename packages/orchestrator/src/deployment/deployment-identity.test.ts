@@ -62,10 +62,9 @@ describe('readDeploymentIdentity', () => {
   });
 
   it('reads a mode surrounded by whitespace', () => {
-    // A hand-edited env file, or one written by a tool that does not strip the
-    // trailing byte, hands the value over with the whitespace attached. The
-    // shape is known, so reporting `unknown` (and dropping the pinned
-    // invocation with it) would throw away an answer we have.
+    // A hand-edited or tool-written env file can keep surrounding whitespace;
+    // reporting `unknown` (and dropping the pinned invocation) would discard a
+    // known mode.
     expect(
       readDeploymentIdentity({ KICI_DEPLOY_MODE: 'systemd ' }, NODE, undefined, anyPathExists),
     ).toEqual({
@@ -96,9 +95,7 @@ describe('readDeploymentIdentity', () => {
   });
 
   it('still reports unknown for a blank or unrecognised mode after trimming', () => {
-    // Trimming widens what is accepted; it must not turn a value that is not a
-    // mode into one. A whitespace-only value trims to the empty string, which
-    // is not a member of the enum.
+    // Trimming must not turn a non-mode into a mode: whitespace-only trims to ''.
     expect(readDeploymentIdentity({ KICI_DEPLOY_MODE: '   ' })).toEqual({ mode: 'unknown' });
     expect(readDeploymentIdentity({ KICI_DEPLOY_MODE: ' k8s ' })).toEqual({ mode: 'unknown' });
   });
@@ -212,9 +209,8 @@ describe('resolveAdminInvocation', () => {
   });
 
   it('leaves an ordinary install path unquoted', () => {
-    // Quoting is conditional so the common case reads (and parses) exactly as
-    // before — the field is consumed as a display string by the dashboard and
-    // parsed by tools that run the printed command.
+    // Quoting is conditional: the dashboard displays the field, and tools parse
+    // and run the printed command.
     expect(resolveAdminInvocation(NODE_BIN, GLOBAL_ENTRY, (p) => p === GLOBAL_SHIM)).toBe(
       `${NODE_BIN} ${GLOBAL_SHIM}`,
     );
@@ -302,12 +298,10 @@ describe('resolveWindowsAdminPath', () => {
   });
 
   it('rejects a drive-relative candidate directory', () => {
-    // `path.win32.dirname('C:node.exe')` is the drive-relative `'C:'` — "the
-    // current directory of drive C:", which is not knowable from here. Joining
-    // it does NOT preserve that: `path.win32.join('C:', 'kici-admin.cmd')`
-    // yields the ABSOLUTE `'C:\kici-admin.cmd'` (node v24), a different
-    // location. So the resolver has to reject the DIRECTORY; a check on the
-    // joined path would pass and pin the root of C:.
+    // `path.win32.dirname('C:node.exe')` is the drive-relative `'C:'` (unknowable
+    // current directory of drive C:), but `path.win32.join('C:', 'kici-admin.cmd')`
+    // yields the ABSOLUTE `'C:\kici-admin.cmd'` (node v24). So the resolver must
+    // reject the DIRECTORY; a check on the joined path would pin the root of C:.
     expect(resolveWindowsAdminPath('C:node.exe', undefined, () => true)).toBeUndefined();
     // The premise, asserted so a future node changing `join` fails here loudly
     // rather than silently re-opening the hole.
@@ -382,11 +376,9 @@ describe('readDeploymentIdentity admin-invocation resolution', () => {
   });
 
   it('resolves a real split-prefix layout on disk with the default stat', () => {
-    // The defect this guards, materialised on a real filesystem rather than a
-    // stub: the npm global prefix holds the shim while the node install prefix
-    // does not, so the sibling derivation names a file that is not there. The
-    // default `fileExists` is exercised — no stub — so the wiring is covered
-    // too, not just the pure resolver.
+    // On a real filesystem with the default `fileExists`: the npm global prefix
+    // holds the shim and the node install prefix does not, so the sibling
+    // derivation names a missing file. Covers the wiring, not just the resolver.
     const root = mkdtempSync(path.join(tmpdir(), 'kici-admin-shim-'));
     try {
       const prefix = path.join(root, 'npm-global');

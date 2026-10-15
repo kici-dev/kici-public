@@ -25,9 +25,8 @@ function makeWorkflow(overrides: Partial<Workflow> & { name: string }): Workflow
 }
 
 /**
- * Build the round args around a set of workflows, each keyed by the source file
- * it "lives in". The module loader seam replaces the real filesystem import, so
- * these tests exercise the round's own logic without a checkout.
+ * Workflows keyed by the source file they "live in"; the module loader seam
+ * replaces the filesystem import, so no checkout is needed.
  */
 function argsFor(
   modules: Record<string, Workflow[]>,
@@ -463,11 +462,10 @@ describe('runGlobalEvalRound', () => {
   });
 
   it('restores process.env after the round, so a later non-global evaluation sees a clean world', async () => {
-    // The agent process is long-lived and serves many dispatches from one
-    // JobRunner. A leaked KICI_IS_GLOBAL_WORKFLOW / stale KICI_SOURCE_REPO_PATH
-    // would reach the NEXT job's generator (whose `env` is process.env) while
-    // that job's own sandbox re-evaluation sees neither — the same two-worlds
-    // determinism failure, injected into an unrelated job.
+    // The long-lived agent serves many dispatches: a leaked
+    // KICI_IS_GLOBAL_WORKFLOW / KICI_SOURCE_REPO_PATH would reach the NEXT job's
+    // generator but not its sandbox re-evaluation — the two-worlds determinism
+    // failure, injected into an unrelated job.
     const wf = makeWorkflow({ name: 'a', filter: () => true });
     const before = GLOBAL_ENV_KEYS.map((k) => process.env[k]);
 
@@ -512,10 +510,9 @@ describe('runGlobalEvalRound', () => {
   });
 
   it('restores process.env even when round-state construction throws', async () => {
-    // `applyGlobalWorkflowEnv` reads only `args.repos`, so it sets the seven
-    // KICI_* keys before `buildRoundState` ever touches `args.$`. A throwing
-    // `$` getter therefore fails inside round-state construction, after the
-    // env is dirtied — the exact window the restore must still cover.
+    // `applyGlobalWorkflowEnv` sets the KICI_* keys before `buildRoundState`
+    // touches `args.$`, so a throwing `$` getter fails after the env is
+    // dirtied — the window the restore must still cover.
     const wf = makeWorkflow({ name: 'ok' });
     const args = argsFor({ 'o.ts': [wf] }, [
       { workflowName: 'ok', sourceFile: 'o.ts', hasFilter: false },
@@ -556,10 +553,8 @@ describe('runGlobalEvalRound', () => {
   });
 
   it('stops starting candidates once the round deadline has passed', async () => {
-    // `withTimeout` races rather than cancels, so without a deadline check the
-    // loop would keep launching every remaining candidate — each up to
-    // candidateTimeoutMs — into a workdir the job already reported on and whose
-    // cleanup already deleted it.
+    // Without the deadline check the loop would keep launching candidates into
+    // a workdir already cleaned up (see `evaluateAllCandidates`).
     const started: string[] = [];
     const make = (name: string) =>
       makeWorkflow({
@@ -624,12 +619,11 @@ describe('runGlobalEvalRound', () => {
   });
 
   it('lets a filter that SHELLS OUT read the KICI_* keys, matching the sandbox', async () => {
-    // The composition the handler performs: `buildEvalShell` is created BEFORE
-    // `runGlobalEvalRound` applies the seven keys. A `{ ...process.env }` spread
-    // would snapshot at build time, so a subprocess would read nothing here
-    // while the sandbox re-evaluation's ambient `$` — which resolves
-    // `process.env` at spawn, after `setupGlobalWorkflowEnv` ran — reads the
-    // value. Same two-worlds determinism failure as the cwd, one layer down.
+    // As in the handler, `buildEvalShell` is created BEFORE `runGlobalEvalRound`
+    // applies the keys. A `{ ...process.env }` spread would snapshot at build
+    // time, so a subprocess here would read nothing while the sandbox's ambient
+    // `$` (resolving `process.env` at spawn) reads the value — the two-worlds
+    // determinism failure, one layer down.
     let viaSubprocess: string | undefined;
     let viaProcessEnv: string | undefined;
     const wf = makeWorkflow({

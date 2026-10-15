@@ -319,9 +319,8 @@ describe('runsLogsCommand unwraps stored log envelopes', () => {
     '{"ts":"2026-09-12T09:30:49.325Z","level":"stdout","msg":"smoke test passed","meta":{}}';
 
   it('prints the text of each envelope, not the envelope', async () => {
-    // fails-when: the text mode prints `logs.lines` verbatim — the shape that
-    // shipped — so a developer reading `kici runs logs` sees the store's
-    // {"ts":…,"level":"stdout","msg":…} for every line the job printed.
+    // fails-when: the text mode prints `logs.lines` verbatim, so `kici runs logs`
+    // shows the store's {"ts":…,"level":"stdout","msg":…} for every line.
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
       getRunDetail: async () => ({

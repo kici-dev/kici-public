@@ -30,13 +30,11 @@ describe('reportJobCheckRunCompletion', () => {
   });
 
   it('completes the check run for EVERY terminal job status', () => {
-    // The defect this guards: a job that ends `skipped` or `drift_dropped`
-    // used to leave its check run `queued` forever, so branch protection
-    // requiring it could never be satisfied.
+    // Guards a job ending `skipped` or `drift_dropped` leaving its check run
+    // `queued` forever, which branch protection requiring it never accepts.
     //
-    // The loop below is the whole assertion, so an empty (or shrunken) set
-    // would make this test pass while proving nothing. Pin the floor at the
-    // statuses that motivated the fix plus the three the agent reports.
+    // The loop below is the whole assertion, so an empty or shrunken set would
+    // pass vacuously: pin the floor at those statuses plus the three the agent reports.
     expect(TERMINAL_JOB_STATES.size).toBeGreaterThanOrEqual(5);
     expect([...TERMINAL_JOB_STATES]).toEqual(
       expect.arrayContaining([
@@ -173,11 +171,10 @@ describe('reportJobCheckRunCompletion', () => {
   });
 
   it('contains a throw raised while building the report', () => {
-    // The tracker calls this from `onJobStatus`, BEFORE it emits job-complete
-    // and runs the needs/wave scheduler hooks. `buildJobFailureDescription`
-    // reads the agent-supplied payload, so a malformed `stepResults` entry
-    // raises here — and an escaping throw would abort the rest of that status
-    // application, stranding every downstream job of a failed one.
+    // The tracker calls this from `onJobStatus` BEFORE it emits job-complete and
+    // runs the needs/wave scheduler hooks. A malformed agent-supplied `stepResults`
+    // entry raises in `buildJobFailureDescription`; an escaping throw would abort
+    // that status application, stranding every downstream job of a failed one.
     const updateJobStatus = vi.fn();
     const deps = {
       checkRunReporter: { updateJobStatus },

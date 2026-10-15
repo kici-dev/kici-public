@@ -10,18 +10,16 @@ describe('compiler integration', () => {
   let tempDir: string;
 
   beforeEach(async () => {
-    // Create temp directory in the package directory so node_modules is accessible
+    // Inside the package directory, so node_modules resolves.
     const packageDir = path.resolve(import.meta.dirname, '..');
     tempDir = await fs.mkdtemp(path.join(packageDir, '.test-'));
   });
 
   afterEach(async () => {
-    // Clean up temp directory
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
   it('compiles a simple workflow config', async () => {
-    // Write a test config
     const configPath = path.join(tempDir, 'workflow.ts');
     await fs.writeFile(
       configPath,
@@ -44,18 +42,15 @@ describe('compiler integration', () => {
       'utf-8',
     );
 
-    // Execute config
     const { workflows: workflowsWithSource } = await executeConfig(configPath);
 
     expect(workflowsWithSource).toHaveLength(1);
     expect(workflowsWithSource[0].workflow.name).toBe('ci');
     expect(workflowsWithSource[0].workflow.jobs).toHaveLength(1);
 
-    // Validate
     const validation = validateConfig(workflowsWithSource);
     expect(validation.valid).toBe(true);
 
-    // Generate lock file with source tracking
     const lockFile = generateLockFile(workflowsWithSource);
 
     expect(lockFile.schemaVersion).toBe(SCHEMA_VERSION);
@@ -64,11 +59,9 @@ describe('compiler integration', () => {
     expect(lockFile.workflows[0].jobs).toHaveLength(1);
     expect(lockFile.workflows[0].jobs[0]._type).toBe('static');
 
-    // Verify source tracking
     expect(lockFile.source.file).toContain('workflow.ts');
     expect(lockFile.source.export).toBe('#default');
 
-    // Serialize
     const json = serializeLockFile(lockFile);
     const parsed = JSON.parse(json);
     expect(parsed.schemaVersion).toBe(SCHEMA_VERSION);

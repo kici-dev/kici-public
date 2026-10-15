@@ -1,9 +1,4 @@
-/**
- * TLS certificate expiry diagnostic check.
- *
- * Reads a TLS certificate from the configured path and checks
- * the not-after date. Warns if expiring within 30 days, fails if expired.
- */
+/** TLS certificate expiry check: warns within 30 days of not-after, fails once expired. */
 
 import { readFile } from 'node:fs/promises';
 import { X509Certificate } from 'node:crypto';

@@ -82,8 +82,7 @@ describe('canApprove', () => {
   const r = req([{ team: 'leads' }, { user: 'u-bob' }]);
 
   it('false when the actor is eligible for no unsatisfied clause', () => {
-    // u-alice satisfies the leads clause already; the only open clause is
-    // {user: u-bob}, for which u-alice is not eligible.
+    // Only {user: u-bob} is open, and u-alice is not eligible for it.
     expect(
       canApprove('u-alice', r, [approve('u-alice')], lookup, {
         triggererSub: 'u-trigger',

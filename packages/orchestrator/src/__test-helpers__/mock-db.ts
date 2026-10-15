@@ -36,8 +36,8 @@
  * - **`executeTakeFirstOrThrow` yields `{}`** when the configured row does not
  *   satisfy the query, rather than throwing as Kysely would.
  *
- * `mock-db-query.ts` holds the evaluator and states the same contract with its
- * reasoning; `mock-db-query.test.ts` tests it directly.
+ * `@kici-dev/test-support/mock-db-query` holds the evaluator and states the same
+ * contract with its reasoning; its own tests exercise it directly.
  */
 import { type Mock, vi } from 'vitest';
 import {
@@ -49,7 +49,7 @@ import {
   projectRow,
   projectRows,
   rowMatches,
-} from './mock-db-query.js';
+} from '@kici-dev/test-support/mock-db-query';
 
 // ── Options ──────────────────────────────────────────────────────
 
@@ -121,6 +121,12 @@ export interface MockDbMocks {
    *  column() and columns() shapes, so a test can assert what an existing row
    *  is actually updated with. */
   doUpdateSet: ReturnType<typeof vi.fn>;
+  /** The upsert's ON CONFLICT DO NOTHING arm — one spy across the column() and
+   *  columns() shapes, so a test can assert which arm the code chose. */
+  doNothing: ReturnType<typeof vi.fn>;
+  /** The `.execute()` of `insertValues().onConflict(cb)` — the terminal an
+   *  upsert runs, so a test can assert it ran or make it reject. */
+  onConflictExecute: ReturnType<typeof vi.fn>;
 
   // Update chain
   updateTable: ReturnType<typeof vi.fn>;
@@ -432,28 +438,21 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
   } as Record<string, any>;
   conflictTerminal.where = vi.fn().mockReturnValue(conflictTerminal);
   doUpdateSet.mockReturnValue(conflictTerminal);
+  const doNothing = vi.fn().mockReturnValue({
+    returning: insertReturningFn,
+    executeTakeFirstOrThrow: insertExecuteTakeFirstOrThrow,
+  });
+  const onConflictExecute = vi.fn().mockResolvedValue(undefined);
 
   const onConflict = vi.fn().mockImplementation((cb: Function) => {
     if (typeof cb === 'function') {
       cb({
-        column: vi.fn().mockReturnValue({
-          doUpdateSet,
-          doNothing: vi.fn().mockReturnValue({
-            returning: insertReturningFn,
-            executeTakeFirstOrThrow: insertExecuteTakeFirstOrThrow,
-          }),
-        }),
-        columns: vi.fn().mockReturnValue({
-          doUpdateSet,
-          doNothing: vi.fn().mockReturnValue({
-            returning: insertReturningFn,
-            executeTakeFirstOrThrow: insertExecuteTakeFirstOrThrow,
-          }),
-        }),
+        column: vi.fn().mockReturnValue({ doUpdateSet, doNothing }),
+        columns: vi.fn().mockReturnValue({ doUpdateSet, doNothing }),
       });
     }
     return {
-      execute: vi.fn().mockResolvedValue(undefined),
+      execute: onConflictExecute,
       executeTakeFirst: insertExecuteTakeFirst,
       returning: insertReturningFn,
     };
@@ -537,6 +536,8 @@ export function createMockDb(options: MockDbOptions = {}): MockDb {
     insertExecuteTakeFirstOrThrow,
     onConflict,
     doUpdateSet,
+    doNothing,
+    onConflictExecute,
 
     updateTable,
     updateSet,

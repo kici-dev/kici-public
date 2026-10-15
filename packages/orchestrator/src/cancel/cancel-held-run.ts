@@ -1,14 +1,12 @@
 /**
  * Cancel a run that sits `held` behind an approval request.
  *
- * A held run has no job and no dispatch yet: what it has is a pending
- * `held_runs` row, the pending `KiCI Security` check a security hold posted,
- * and the stored dispatch context an approve would replay. Cancelling it has to
- * settle all three, or a later approve still finds its hold pending, replays
- * the stored dispatch, and closes the check as approved for a run that was
- * cancelled. So a cancel withdraws the approval request through the path a
- * reject takes: each pending hold of the run is flipped `rejected` with the
- * cancel reason, then handed to the workflow-hold rejection
+ * A held run has no job or dispatch yet, only a pending `held_runs` row, the
+ * pending `KiCI Security` check a security hold posted, and the stored dispatch
+ * context an approve would replay. A cancel must settle all three, or a later
+ * approve replays the dispatch and closes the check as approved for a
+ * cancelled run. So a cancel takes the reject path: each pending hold flips
+ * `rejected` with the cancel reason, then goes to the workflow-hold rejection
  * (`rejectWorkflow`), which cancels the run, completes the checks the held
  * dispatch posted, settles the security check, and drops the stored context.
  */
@@ -49,10 +47,10 @@ export interface RejectHeldWorkflowOptions {
 /** Options for {@link cancelHeldRunWithReason}. */
 export interface CancelHeldRunOptions {
   /**
-   * False when the caller ends the run itself — a cancel of a run that is not
-   * `held`, whose jobs are cancelled next. The holds are still rejected and
-   * the checks settled, but no held-run terminal write is attempted: it would
-   * match no row and only report a missing held run. Defaults to true.
+   * False when the caller ends the run itself (a non-`held` run whose jobs are
+   * cancelled next). Holds are still rejected and checks settled, but no
+   * held-run terminal write is attempted: it would match no row and only report
+   * a missing held run. Defaults to true.
    */
   terminalWrite?: boolean;
 }
@@ -72,10 +70,9 @@ export interface CancelHeldRunDeps {
 
 /**
  * Withdraw every pending approval request of a held run and cancel the run.
- * Returns {@link HeldRunWithdrawal.Withdrawn} when this call withdrew the run.
- * Otherwise a decision reached every hold first — an approve, a reject or an
- * expiry, which the result names — the call writes nothing, and the caller
- * refuses the cancel.
+ * Returns {@link HeldRunWithdrawal.Withdrawn} when this call withdrew the run;
+ * otherwise a decision (named by the result) reached every hold first, the
+ * call writes nothing, and the caller refuses the cancel.
  */
 export async function cancelHeldRunWithReason(
   deps: CancelHeldRunDeps,

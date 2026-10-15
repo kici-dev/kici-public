@@ -1,12 +1,11 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `cluster_settings.reroute_flap_grace_ms` (nullable BIGINT).
+ * Fleet-wide grace window (ms) in which the recovery sweepers defer a rerouted job while its
+ * worker peer flaps. NULL → cluster default (`config.rerouteFlapGraceMs`,
+ * `KICI_REROUTE_FLAP_GRACE_MS`).
  *
- * Fleet-wide grace window (ms) during which a rerouted job stays deferred from the recovery sweepers while its worker peer momentarily flaps. NULL → cluster default (`config.rerouteFlapGraceMs`, `KICI_REROUTE_FLAP_GRACE_MS`).
- *
- * Idempotent: guarded on column existence; a re-run on a DB that already has
- * the column is a no-op.
+ * Idempotent: guarded on column existence.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

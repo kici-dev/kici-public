@@ -4,12 +4,11 @@ import type { AddressInfo } from 'node:net';
 import { downloadUrl, uploadToPresignedUrl, UPLOAD_MAX_RETRIES } from './download.js';
 
 /**
- * Object-storage backends answer an overload with a retryable 5xx — S3
- * documents 500 and 503 (`SlowDown`) as "retry with backoff" — so a single
- * transient blip must not fail a customer's build. These tests drive
- * {@link uploadToPresignedUrl} against a real loopback HTTP server rather than
- * a stubbed `http.request`, because the retry has to survive the whole
- * request/response cycle (headers written, body streamed, socket reused).
+ * Object stores answer an overload with a retryable 5xx (S3 documents 500 and
+ * 503 `SlowDown` as "retry with backoff"), so one transient blip must not fail
+ * a build. These tests use a real loopback HTTP server, not a stubbed
+ * `http.request`, because the retry must survive the whole request/response
+ * cycle (headers written, body streamed, socket reused).
  */
 
 interface Recorded {
@@ -116,13 +115,12 @@ describe('uploadToPresignedUrl', () => {
 });
 
 describe('uploadToPresignedUrl — stalled socket', () => {
-  /** Spin a server that accepts the body and then never answers. */
+  /** Accepts the body, then never answers. */
   async function serverThatNeverAnswers(): Promise<{ url: string; close: () => Promise<void> }> {
     const sockets: import('node:net').Socket[] = [];
     const server = http.createServer((req) => {
       req.resume();
-      // Deliberately no `res.end()` — the client is left waiting on a socket
-      // that will never carry a response, which is the wedged-upload shape.
+      // Deliberately no `res.end()`: the wedged-upload shape.
     });
     server.on('connection', (s) => sockets.push(s));
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -138,10 +136,9 @@ describe('uploadToPresignedUrl — stalled socket', () => {
   }
 
   it('gives up on a socket that never answers instead of hanging forever', async () => {
-    // Without a timeout the PUT hangs until the whole job's timeout kills the
-    // step, and the failure reads as "the job timed out" rather than "the
-    // upload stalled". The timeout is also what makes the retry ladder
-    // reachable for this failure mode at all.
+    // Without a timeout the PUT hangs until the job timeout kills the step, and
+    // the failure reads "the job timed out", not "the upload stalled". The
+    // timeout is also what makes the retry ladder reachable here at all.
     const s = await serverThatNeverAnswers();
     closers.push(s.close);
 

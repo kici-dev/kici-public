@@ -19,18 +19,14 @@ import type { PeerRegistry } from './peer-registry.js';
 export const DEFAULT_REROUTE_FLAP_GRACE_MS = 120_000;
 
 /**
- * A non-terminal job that was rerouted to a remote worker peer must NOT be
- * force-failed by the run-recovery sweepers (OrphanRecovery, StaleRunDetector)
- * while that worker peer can still replay the job's terminal status from its
- * durable outbox.
+ * Whether the run-recovery sweepers (OrphanRecovery, StaleRunDetector) must defer
+ * force-failing a non-terminal rerouted job, because its worker peer can still
+ * replay the terminal status from its durable outbox.
  *
- * Returns `true` (defer the sweeper's force-fail) when the job carries a
- * `rerouted_to_peer` marker AND its peer is either currently connected OR was
- * last seen within the flap-grace window (a transient peer-WS reconnect during
- * a coordinator restart / leadership transition). A rerouted job whose peer has
- * been gone longer than the grace window — or is no longer tracked at all — is
- * NOT deferred, so a dead worker's job is still failed and cannot hang forever.
- * Local (non-rerouted) jobs — `rerouted_to_peer === null` — are never deferred.
+ * True when the job has a `rerouted_to_peer` AND that peer is connected or was
+ * last seen within the flap grace. A peer gone longer than the grace, or no
+ * longer tracked, is not deferred, so a dead worker cannot hang a run. Local
+ * jobs (`rerouted_to_peer === null`) are never deferred.
  */
 export function shouldDeferReroutedJob(
   job: { rerouted_to_peer: string | null },
@@ -41,9 +37,7 @@ export function shouldDeferReroutedJob(
   const peer = peerRegistry.getPeer(job.rerouted_to_peer);
   if (!peer) return false;
   if (peer.connected) return true;
-  // Momentarily disconnected: defer only while the last heartbeat is recent,
-  // giving the worker's durable outbox time to reconnect and replay the
-  // buffered terminal status before the sweeper force-fails the run.
+  // Momentarily disconnected: defer while the last heartbeat is within the grace.
   const nowMs = opts?.nowMs ?? Date.now();
   const flapGraceMs = opts?.flapGraceMs ?? DEFAULT_REROUTE_FLAP_GRACE_MS;
   return nowMs - peer.lastHeartbeatAt <= flapGraceMs;

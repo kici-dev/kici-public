@@ -32,8 +32,7 @@ describe('startManifestLoopback', () => {
       manifestJson: '{}',
       createUrl: 'https://github.com/settings/apps/new',
     });
-    // Attach the rejection handler before firing the request so the rejection
-    // never sits unhandled in the microtask window between request + await.
+    // Attached before the request, so the rejection is never briefly unhandled.
     const assertion = expect(lb.waitForCode(5_000)).rejects.toThrow(/state/i);
     await fetch(`${lb.redirectUrl}?code=tmp&state=WRONG`);
     await assertion;

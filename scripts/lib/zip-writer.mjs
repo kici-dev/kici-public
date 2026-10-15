@@ -2,8 +2,9 @@
  * Write a directory tree as a classic (non-ZIP64) zip archive, in Node alone.
  *
  * `scripts/package.mjs` produces the Windows packages as `.zip`, and a build host
- * need not have an Info-ZIP `zip` binary, so the archive is written here: deflate from `node:zlib`, CRC-32 from `zlib.crc32`, and the
- * local headers, central directory and end record laid out by hand.
+ * need not have an Info-ZIP `zip` binary: deflate comes from `node:zlib`, CRC-32
+ * from `zlib.crc32`, and the local headers, central directory and end record are
+ * laid out by hand.
  *
  * Entry names carry the directory's own name as their first segment
  * (`<dirName>/lib/app.cjs`), the shape `zip -r <out> <dirName>` produces, so

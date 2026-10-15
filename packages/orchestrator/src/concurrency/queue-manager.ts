@@ -1,13 +1,11 @@
 /**
  * The arbiter of `concurrency: { group, max }`.
  *
- * Every decision is a transaction against `concurrency_groups`, which is what
- * makes `max` mean the same thing across a restart and across every coordinator
- * in a cluster. A process-local map cannot: a restart came back with an empty
- * map and let a second run deploy alongside the one already deploying, and two
- * coordinators each held their own map so `max: 1` was never cluster-wide.
- * `concurrency: { group, max: 1 }` is the guard customers use to serialise
- * deploys and migrations, so "usually right" is not a useful guarantee.
+ * Every decision is a transaction against `concurrency_groups`, so `max` holds
+ * across a restart and across every coordinator in a cluster. A process-local
+ * map cannot: a restart empties it and lets a second run deploy alongside the
+ * first, and each coordinator would hold its own map. Customers use
+ * `max: 1` to serialise deploys and migrations, so "usually right" is not enough.
  */
 
 import { sql, type Kysely, type Transaction } from 'kysely';
@@ -50,13 +48,10 @@ export class ConcurrencyQueueManager {
   }
 
   /**
-   * Serialise every arbitration for one (routingKey, groupKey) scope.
-   *
-   * A transaction-scoped advisory lock, so it is released on commit or
-   * rollback with no cleanup path to get wrong. Counting active rows and
-   * inserting one are two statements, and without the lock two coordinators
-   * both read `count < max` and both insert — which is exactly the
-   * double-deploy the cap exists to prevent.
+   * Serialise every arbitration for one (routingKey, groupKey) scope. A
+   * transaction-scoped advisory lock, released on commit or rollback with no
+   * cleanup path. Without it two coordinators both read `count < max` and both
+   * insert — the double-deploy the cap exists to prevent.
    */
   private static async lockScope(
     trx: Transaction<Database>,
@@ -67,12 +62,9 @@ export class ConcurrencyQueueManager {
   }
 
   /**
-   * Try to take a slot in a concurrency group.
-   *
-   * Idempotent: a run that already holds an active slot re-acquires it without
-   * consuming a second one, which the partial unique index on
-   * `(routing_key, group_key, run_id) WHERE status = 'active'` also enforces at
-   * the DB level.
+   * Idempotent: a run already holding an active slot re-acquires it without
+   * consuming a second, also enforced by the partial unique index on
+   * `(routing_key, group_key, run_id) WHERE status = 'active'`.
    *
    * @returns whether this run holds a slot afterwards.
    */
@@ -119,13 +111,10 @@ export class ConcurrencyQueueManager {
   }
 
   /**
-   * The runs holding an active slot, oldest first.
-   *
-   * A run whose `execution_runs` row is already terminal is excluded and its
-   * slot is released in the same transaction. A slot outlives its run whenever
-   * the release path did not run — a coordinator crash between "the run
-   * finished" and "the slot was released" — and a leaked slot on a `max: 1`
-   * deploy gate blocks every later deploy forever.
+   * The runs holding an active slot, oldest first. A run whose `execution_runs`
+   * row is terminal is excluded and its slot released in the same transaction:
+   * a coordinator crash between run finish and slot release leaks the slot, and
+   * on a `max: 1` deploy gate that blocks every later deploy forever.
    */
   async getActiveRuns(groupKey: string, routingKey: string): Promise<string[]> {
     return this.db.transaction().execute(async (trx) => {
@@ -140,10 +129,7 @@ export class ConcurrencyQueueManager {
     return active[0] ?? null;
   }
 
-  /**
-   * Active run ids for a scope, reconciled against `execution_runs`. Must be
-   * called with the scope lock already held.
-   */
+  /** Active run ids reconciled against `execution_runs`. Caller holds the scope lock. */
   private static async activeRunIds(
     trx: Transaction<Database>,
     groupKey: string,
@@ -190,10 +176,6 @@ export class ConcurrencyQueueManager {
     return rows.filter((r) => !stale.has(r.run_id)).map((r) => r.run_id);
   }
 
-  /**
-   * Enqueue a job that is waiting for a concurrency slot.
-   * Inserts a row with status='queued' into concurrency_groups.
-   */
   async enqueue(opts: EnqueueOptions): Promise<void> {
     await this.db
       .insertInto('concurrency_groups')
@@ -214,24 +196,17 @@ export class ConcurrencyQueueManager {
     });
   }
 
-  /**
-   * Dequeue the oldest queued job for a concurrency group.
-   * Returns null if no queued jobs exist.
-   */
+  /** Promote the oldest queued job of a group to active; null when none is queued. */
   async dequeueNext(groupKey: string, routingKey: string): Promise<QueuedJob | null> {
     return this.db.transaction().execute(async (trx) => {
-      // Same scope lock every other arbitration takes. Promoting a waiter is a
-      // write to the active set, so it has to serialize against `acquireSlot`
-      // or an acquire can count the active rows in the middle of a promotion.
+      // Promotion writes the active set, so it serialises against `acquireSlot`,
+      // which could otherwise count the active rows mid-promotion.
       await ConcurrencyQueueManager.lockScope(trx, groupKey, routingKey);
       return ConcurrencyQueueManager.promoteOldestQueued(trx, groupKey, routingKey);
     });
   }
 
-  /**
-   * Promote the oldest queued waiter to `active`. Must be called with the scope
-   * lock already held.
-   */
+  /** Promote the oldest queued waiter to `active`. Caller holds the scope lock. */
   private static async promoteOldestQueued(
     trx: Transaction<Database>,
     groupKey: string,
@@ -252,7 +227,6 @@ export class ConcurrencyQueueManager {
 
       if (!row) return null;
 
-      // Update status to active within the same transaction
       await trx
         .updateTable('concurrency_groups')
         .set({ status: ConcurrencySlotStatus.Active })
@@ -269,10 +243,6 @@ export class ConcurrencyQueueManager {
     }
   }
 
-  /**
-   * Cancel all queued entries for a run.
-   * Marks them as 'cancelled' with a completion timestamp.
-   */
   async cancelQueued(runId: string): Promise<void> {
     await this.db
       .updateTable('concurrency_groups')
@@ -287,10 +257,7 @@ export class ConcurrencyQueueManager {
     logger.info('Cancelled queued concurrency entries', { runId });
   }
 
-  /**
-   * Mark a concurrency group entry as completed.
-   * Called when a job finishes (success/failed/cancelled).
-   */
+  /** Called when a job finishes (success/failed/cancelled). */
   async markCompleted(runId: string, groupKey: string, routingKey: string): Promise<void> {
     await this.db
       .updateTable('concurrency_groups')
@@ -306,9 +273,8 @@ export class ConcurrencyQueueManager {
   }
 
   /**
-   * Handle job completion: mark completed and return next queued job if any.
-   * This is the main coordination point: when a slot opens, the next
-   * queued job should be dispatched.
+   * Release the run's slot and return the promoted next queued job, if any —
+   * the caller dispatches it.
    */
   async onJobComplete(
     groupKey: string,
@@ -318,14 +284,11 @@ export class ConcurrencyQueueManager {
     return this.db.transaction().execute(async (trx) => {
       await ConcurrencyQueueManager.lockScope(trx, groupKey, routingKey);
 
-      // Release and promote in ONE locked transaction. As two transactions the
-      // pair is not net-zero on the active set: between them a third run's
-      // `acquireSlot` takes the lock, counts the freed slot as available and
-      // inserts, and the promotion below then adds a second active row under
-      // `max: 1`. Held together under the lock, a concurrent acquire sees the
-      // active count either wholly before or wholly after, and it is the same
-      // number both times. It also closes the crash window — a coordinator that
-      // dies mid-release cannot leave the slot freed but unassigned.
+      // Release and promote in ONE locked transaction. Split in two, a third
+      // run's `acquireSlot` can take the freed slot between them, and the
+      // promotion then adds a second active row under `max: 1`. Together, a
+      // concurrent acquire sees the same active count before and after, and a
+      // coordinator dying mid-release cannot leave the slot freed but unassigned.
       await trx
         .updateTable('concurrency_groups')
         .set({ status: ConcurrencySlotStatus.Completed, completed_at: new Date() })

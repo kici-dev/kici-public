@@ -1,15 +1,11 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `pr_number INTEGER NULL` to `execution_runs`.
+ * `execution_runs.pr_number` lets `/kici approve|reject` scope hold selection to the comment's
+ * PR (and repo) instead of every pending security hold in the org. Non-PR runs leave it NULL;
+ * they are never security-held, and NULL never matches the PR-scoped hold query (fail-closed).
  *
- * PR-triggered runs record the pull-request number they belong to, so
- * `/kici approve|reject` comment commands can scope hold selection to the
- * comment's PR (and repo) instead of releasing every pending security hold in
- * the org. Non-PR runs leave it NULL; such runs are never security-held, and a
- * NULL `pr_number` never matches the PR-scoped hold query (fail-closed).
- *
- * Idempotent: a re-run on a DB that already has the column is a no-op.
+ * Idempotent.
  */
 async function columnExists(db: Kysely<unknown>, column: string): Promise<boolean> {
   const check = await sql<{ exists: boolean }>`

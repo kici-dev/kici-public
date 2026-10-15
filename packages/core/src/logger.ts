@@ -17,13 +17,10 @@ const TRACE_CONTEXT_FIELDS = [
 ] as const satisfies readonly (keyof RequestContext)[];
 
 /**
- * Node error codes that are expected when the process that consumes our
- * stdout/stderr pipe goes away during shutdown (e.g. the Windows Service
- * Control Manager closing the inherited stdout handle while a `console.log`
- * write is still in flight). These are not real failures — they only happen
- * when the consuming pipe is already gone — so we swallow them rather than let
- * them surface as an uncaught exception at error level. Any other error code
- * is a genuine stdout/stderr failure and is re-thrown.
+ * Error codes raised when the reader of our stdout/stderr pipe goes away during
+ * shutdown (e.g. the Windows Service Control Manager closing the inherited
+ * stdout handle mid-write). They are swallowed, not raised as uncaught
+ * exceptions; any other code is a real failure and is re-thrown.
  */
 const SWALLOWED_STREAM_ERROR_CODES: ReadonlySet<string> = new Set([
   'EPIPE',
@@ -34,16 +31,11 @@ const SWALLOWED_STREAM_ERROR_CODES: ReadonlySet<string> = new Set([
 let _streamErrorHandlersInstalled = false;
 
 /**
- * Install a once-only 'error' listener on `process.stdout` and
- * `process.stderr` that swallows the pipe-teardown errors in
- * {@link SWALLOWED_STREAM_ERROR_CODES} and re-throws anything else.
- *
- * Without this, an in-flight synchronous write to stdout/stderr (winston's
- * Console transport) racing the pipe closing at shutdown propagates EPIPE as an
- * uncaught exception — which pollutes error dashboards and can perturb the
- * process exit code a service manager observes. The handler is installed once
- * at module load; `createLogger()` does not attach per-instance listeners, so
- * no listener leak / MaxListenersExceededWarning can occur.
+ * Swallow {@link SWALLOWED_STREAM_ERROR_CODES} on stdout/stderr. Without it, a
+ * Console-transport write racing the pipe close at shutdown raises EPIPE as an
+ * uncaught exception, polluting error dashboards and perturbing the exit code a
+ * service manager sees. Installed once at module load, never per logger, so no
+ * MaxListenersExceededWarning.
  */
 export function installStreamErrorHandlers(): void {
   if (_streamErrorHandlersInstalled) return;
@@ -78,13 +70,10 @@ const traceContextFormat = winston.format((info) => {
 });
 
 /**
- * Tracked set of loggers still waiting for the service name so they can
- * add their rotated-file transport with the right filename. Module-level
- * `createLogger()` calls resolve before the service's `setServiceName()`
- * runs; if we built the file transport eagerly, every such logger would
- * write to `kici-<instanceId>-*.log` (undefined service name) instead of
- * `<service>-<instanceId>-*.log`. Holding them here lets setServiceName
- * attach the correct transport once, in one place.
+ * Loggers waiting for the service name before adding their rotated-file
+ * transport. Module-level `createLogger()` calls run before `setServiceName()`;
+ * an eager transport would write `kici-<instanceId>-*.log` instead of
+ * `<service>-<instanceId>-*.log`.
  */
 const _pendingFileTransportLoggers: Set<winston.Logger> = new Set();
 
@@ -95,9 +84,8 @@ const _fileTransports: Set<DailyRotateFile> = new Set();
 let _flushInFlight: Promise<void> | null = null;
 
 function buildFileTransport(): DailyRotateFile | undefined {
-  // Defensive: `process.env.KICI_LOG_DIR = undefined` coerces to the literal
-  // string "undefined", which would create an `undefined/` directory at the
-  // cwd. Treat that as unset to match operator intent.
+  // `process.env.KICI_LOG_DIR = undefined` stores the string "undefined"; treat
+  // it as unset rather than create an `undefined/` directory.
   const dir = process.env.KICI_LOG_DIR;
   if (!dir || dir === 'undefined') return undefined;
   const transport = new DailyRotateFile({
@@ -118,13 +106,11 @@ function buildFileTransport(): DailyRotateFile | undefined {
 }
 
 /**
- * Write every line already logged to the rotated log files, then stop writing
- * to them. A shutdown calls it right before process.exit(): the file transport
- * writes through an asynchronous stream, and an exit that does not wait for it
- * loses the last lines, which stdout (written synchronously) still has. Lines
- * logged after the flush reach the other transports only. A caller that
- * arrives while a flush runs waits for that flush. Resolves within
- * `timeoutMs`.
+ * Write every logged line to the rotated log files, then stop writing to them.
+ * Call it right before process.exit(): the file transport writes through an
+ * async stream, so an exit that does not wait loses the last lines (stdout,
+ * written synchronously, keeps them). Later lines reach the other transports
+ * only. Concurrent callers share one flush. Resolves within `timeoutMs`.
  */
 export function flushLogFiles(timeoutMs = 2_000): Promise<void> {
   if (_flushInFlight) return _flushInFlight;
@@ -166,8 +152,6 @@ async function closeFileTransports(timeoutMs: number): Promise<void> {
 /** Set the service name for all loggers in this process. Call once at startup. */
 export function setServiceName(name: 'platform' | 'orchestrator' | 'agent'): void {
   _serviceName = name;
-  // Now that the service name is known, attach the file-rotation transport
-  // to every logger that opted in while the name was still undefined.
   for (const logger of _pendingFileTransportLoggers) {
     const transport = buildFileTransport();
     if (transport) logger.add(transport);
@@ -175,19 +159,16 @@ export function setServiceName(name: 'platform' | 'orchestrator' | 'agent'): voi
   _pendingFileTransportLoggers.clear();
 }
 
-/** Get the current service name (for testing/inspection). */
+/** For testing and inspection. */
 export function getServiceName(): string | undefined {
   return _serviceName;
 }
 
 /**
- * Build the rotated log filename. When a stable instance ID is available in the
- * environment, append it so multiple processes (e.g. several orchestrators or
- * agents) can safely share one KICI_LOG_DIR without racing on the same file.
- *
- * Precedence matches the tier that owns each variable:
- * orchestrator (KICI_CLUSTER_INSTANCE_ID) > agent (KICI_AGENT_ID) > platform
- * (KICI_PLATFORM_INSTANCE_ID). Sanitize defensively to filesystem-safe characters.
+ * Rotated log filename. A stable instance ID, when set, is appended (sanitized
+ * to filesystem-safe characters) so several processes can share one
+ * KICI_LOG_DIR without racing on a file. Precedence: KICI_CLUSTER_INSTANCE_ID
+ * (orchestrator) > KICI_AGENT_ID (agent) > KICI_PLATFORM_INSTANCE_ID (platform).
  */
 export function buildLogFilename(serviceName: string | undefined): string {
   const base = serviceName ?? 'kici';
@@ -200,7 +181,6 @@ export function buildLogFilename(serviceName: string | undefined): string {
   return suffix ? `${base}-${suffix}-%DATE%.log` : `${base}-%DATE%.log`;
 }
 
-/** Log level type */
 export type LogLevel = 'error' | 'warn' | 'info' | 'debug';
 
 /** Minimal logger interface for dependency injection (avoids coupling to winston). */
@@ -210,25 +190,22 @@ export interface Logger {
   error(message: string, meta?: Record<string, unknown>): void;
 }
 
-/** Logger creation options */
 interface LoggerOptions {
   /**
    * Use JSON format (default: auto-detected from KICI_LOG_FORMAT env var, with
    * a TTY fallback). Passing an explicit boolean wins over the env var.
    */
   json?: boolean;
-  /** Log level (default: 'info') */
+  /** Default: 'info'. */
   level?: LogLevel;
-  /** Optional prefix for all messages */
+  /** Prefix for every message. */
   prefix?: string;
 }
 
 /**
- * Pick the default JSON-vs-plain selection for `createLogger` callers that do
- * not pass an explicit `json` option. Honours the operator-controlled
- * `KICI_LOG_FORMAT` env var (`json` / `plain` / `auto`); anything else
- * (including typos and unset) falls back to TTY detection so a piped CLI
- * still produces machine-readable JSON.
+ * Default for `json`: `KICI_LOG_FORMAT` (`json` / `plain` / `auto`); any other
+ * value, unset included, falls back to TTY detection so a piped CLI still emits
+ * JSON.
  */
 function pickJsonDefault(): boolean {
   const envFormat = process.env.KICI_LOG_FORMAT;
@@ -237,16 +214,10 @@ function pickJsonDefault(): boolean {
   return !process.stdout.isTTY;
 }
 
-/**
- * Create a winston logger instance.
- *
- * @param options - Logger configuration options
- * @returns Configured winston logger
- */
 export function createLogger(options: LoggerOptions = {}): winston.Logger {
   const { json = pickJsonDefault(), level = 'info', prefix } = options;
 
-  // Token masking format: replaces kat_ agent tokens in log output
+  // Masks kat_ agent tokens.
   const TOKEN_MASK_RE = /kat_[0-9a-f]{64}/gi;
   const maskTokens = (value: unknown): unknown => {
     if (typeof value === 'string') {
@@ -268,7 +239,6 @@ export function createLogger(options: LoggerOptions = {}): winston.Logger {
     if (typeof info.message === 'string') {
       info.message = info.message.replace(TOKEN_MASK_RE, 'kat_***');
     }
-    // Mask token values in metadata fields
     for (const key of Object.keys(info)) {
       if (key === 'level' || key === 'message') continue;
       info[key] = maskTokens(info[key]);
@@ -276,11 +246,9 @@ export function createLogger(options: LoggerOptions = {}): winston.Logger {
     return info;
   });
 
-  // Pretty format for CLI / TTY use. Info lines render as just the message
-  // (the call site already provides colour where it wants it); warn/error/debug
-  // get a coloured level prefix so abnormal output stands out. No timestamp —
-  // humans don't need it, and JSON pipeline retains structured timestamps for
-  // Loki ingestion.
+  // Info lines render as the bare message (call sites colour it themselves);
+  // warn/error/debug get a coloured level prefix. No timestamp: the JSON
+  // pipeline keeps it for Loki.
   const prettyFormat = winston.format.printf(({ level, message, requestId }) => {
     const traceStr =
       typeof requestId === 'string' ? `${pc.dim(`[${requestId.slice(0, 8)}]`)} ` : '';
@@ -307,7 +275,6 @@ export function createLogger(options: LoggerOptions = {}): winston.Logger {
     return `${traceStr}${coloredLevel}: ${prefixStr}${message}`;
   });
 
-  // JSON format for backend services: timestamp -> trace context -> mask tokens -> json
   const jsonFormat = winston.format.combine(
     winston.format.timestamp(),
     traceContextFormat(),
@@ -315,21 +282,15 @@ export function createLogger(options: LoggerOptions = {}): winston.Logger {
     winston.format.json(),
   );
 
-  // Pretty format pipeline: trace context -> mask tokens -> pretty printer.
-  // No timestamp stage — the plain printer intentionally drops it for human
-  // readability.
   const prettyPipeline = winston.format.combine(
     traceContextFormat(),
     tokenMaskFormat(),
     prettyFormat,
   );
 
-  // When KICI_LOG_STDERR is set, route every log level to stderr instead of
-  // stdout. Short-lived CLIs (kici-admin) emit structured data on stdout (e.g.
-  // `--json` output); keeping diagnostic logs off stdout keeps that data
-  // machine-parseable. Long-running services leave this unset so their logs
-  // stay on stdout for the log shipper. `stderrLevels` covering every npm level
-  // sends all output to stderr.
+  // KICI_LOG_STDERR sends every level to stderr so a CLI's stdout data (e.g.
+  // `kici-admin --json`) stays parseable; services leave it unset so the log
+  // shipper reads stdout.
   const stderrTransport = Boolean(process.env.KICI_LOG_STDERR);
   const loggerInstance = winston.createLogger({
     level,
@@ -343,9 +304,8 @@ export function createLogger(options: LoggerOptions = {}): winston.Logger {
     ],
   });
 
-  // Add file rotation transport when KICI_LOG_DIR is set (for bare-metal operators).
-  // If the service name hasn't been decided yet, defer attachment until
-  // setServiceName() is called so the filename carries the right prefix.
+  // KICI_LOG_DIR (bare-metal operators) adds file rotation, deferred until
+  // setServiceName() when the service name is still unknown.
   if (process.env.KICI_LOG_DIR) {
     if (_serviceName) {
       const transport = buildFileTransport();
@@ -359,20 +319,15 @@ export function createLogger(options: LoggerOptions = {}): winston.Logger {
 }
 
 /**
- * Default singleton logger instance for simple use cases. If KICI_LOG_DIR is
- * set but setServiceName() hasn't been called yet (CLI tools, scripts),
- * the file transport stays deferred and is attached only once a service
- * name is known — protecting against writing to `kici-<instanceId>-*.log`.
+ * Default singleton logger. Its file transport stays deferred until
+ * setServiceName() runs (CLI tools and scripts may never call it).
  */
 export const logger = createLogger();
 
 /**
- * Wrap an async startup function so that any thrown error is logged
- * through the structured (JSON-aware) logger before the process exits.
- *
- * Without this guard, a top-level `await` rejection in an ESM entry
- * point is printed by Node.js's default handler (multi-line, not JSON),
- * which breaks log aggregators like ELK.
+ * Log a startup function's thrown error through the structured logger before
+ * the process exits. Node's default handler prints a top-level `await`
+ * rejection as multi-line text, which breaks log aggregators.
  */
 export async function guardStartup(log: winston.Logger, fn: () => Promise<void>): Promise<void> {
   try {

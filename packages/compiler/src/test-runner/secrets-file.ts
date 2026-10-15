@@ -7,16 +7,14 @@ export interface ParsedSecrets {
 }
 
 /**
- * Parse an INI-style secrets file content.
- *
- * Format:
- *   # Comments start with #
+ * Parse an INI-style secrets file:
+ *   # comment
  *   KEY=VALUE             -> flat secrets (before any section)
  *   [sectionName]         -> starts a context section
  *   KEY=VALUE             -> context secrets (within a section)
  *
- * Keys are trimmed. Values are everything after the first `=`, trimmed.
- * Section names may contain hyphens, underscores, etc.
+ * Values are everything after the first `=`, trimmed. Section names may contain
+ * hyphens, underscores, etc. Lines without `=` are ignored.
  */
 export function parseSecretsFile(content: string): ParsedSecrets {
   const flat: Record<string, string> = {};
@@ -26,12 +24,10 @@ export function parseSecretsFile(content: string): ParsedSecrets {
   for (const rawLine of content.split('\n')) {
     const line = rawLine.trim();
 
-    // Skip empty lines and comments
     if (line === '' || line.startsWith('#')) {
       continue;
     }
 
-    // Section header: [sectionName]
     const sectionMatch = line.match(/^\[([^\]]+)\]$/);
     if (sectionMatch) {
       currentSection = sectionMatch[1].trim();
@@ -41,10 +37,8 @@ export function parseSecretsFile(content: string): ParsedSecrets {
       continue;
     }
 
-    // KEY=VALUE line
     const eqIndex = line.indexOf('=');
     if (eqIndex === -1) {
-      // Lines without = are ignored
       continue;
     }
 
@@ -61,11 +55,7 @@ export function parseSecretsFile(content: string): ParsedSecrets {
   return { flat, contexts };
 }
 
-/**
- * Load and parse a .kici/.secrets file.
- *
- * Returns empty secrets if the file does not exist.
- */
+/** Load `.kici/.secrets`; empty secrets when the file does not exist. */
 export async function loadSecretsFile(kiciDir: string): Promise<ParsedSecrets> {
   const secretsPath = path.join(kiciDir, '.secrets');
   try {

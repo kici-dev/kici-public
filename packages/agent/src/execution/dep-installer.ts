@@ -1,29 +1,19 @@
 /**
- * Inline dependency installation for graceful degradation.
+ * Inline `.kici/` dependency install with the repo's package manager, used when
+ * the dep cache is unavailable or a download fails. `.kici/package.json` signals
+ * that deps exist.
  *
- * When the dep cache is unavailable or a download fails, the agent installs
- * `.kici/` dependencies directly with the repository's package manager.
+ * npm is the default. pnpm runs for a pnpm workspace, so a `.kici/` member
+ * resolves in-repo `workspace:` siblings. yarn classic reads `.kici/.npmrc` for
+ * auth and links version-range siblings; yarn berry reads a synthesized
+ * `.kici/.yarnrc.yml` with a forced `nodeLinker: node-modules` (so the runner's
+ * plain node resolution holds) and resolves `workspace:`/`portal:` siblings.
+ * No manager builds a linked sibling, so the agent builds the in-repo closure.
  *
- * The package manager is detected from the cloned repo (npm / pnpm / yarn); the
- * presence of `.kici/package.json` signals that deps should be installed. npm
- * is the default and ships with every Node.js install; pnpm is used when the
- * repo is a pnpm workspace so a `.kici/` member can resolve in-repo
- * `workspace:` siblings. yarn is supported in both flavors: classic (v1) reads
- * `.kici/.npmrc` for registry auth and links version-range workspace siblings;
- * berry (v2+) reads a synthesized `.kici/.yarnrc.yml` for auth, runs with a
- * forced `nodeLinker: node-modules` (so the resulting tree matches classic/npm
- * and the runner's plain node resolution holds), and resolves
- * `workspace:`/`portal:` siblings. Either flavor links the sibling but does not
- * build it, so the agent builds the in-repo closure after install.
- *
- * Security: the install runs with an isolated per-invocation cache/store
- * directory to prevent cache poisoning across build jobs — a malicious
- * package.json in one repo cannot taint the cache used by subsequent builds.
- * The install runs with `--ignore-scripts` for every package manager. A
- * lifecycle script in a committed `package.json` is customer code the agent
- * never agreed to execute: it would run wherever the install runs, which for a
- * step-child install is the process holding the job's secrets. Operators who
- * genuinely need it set `KICI_ALLOW_INSTALL_SCRIPTS=true` on the agent.
+ * Security: a per-invocation cache/store dir stops one repo's package.json
+ * poisoning later builds. `--ignore-scripts` applies to every manager: a
+ * lifecycle script is customer code, and a step-child install runs it in the
+ * process holding the job's secrets. `KICI_ALLOW_INSTALL_SCRIPTS=true` opts out.
  */
 
 import { execFile } from 'node:child_process';
@@ -65,7 +55,7 @@ export interface InstallDepsOptions {
   npmRegistries?: readonly NpmRegistrySpec[];
   /** Bare-name secrets to project as install-subprocess env vars. */
   installEnvSecrets?: Record<string, string>;
-  /** Short job-scoped nonce — used as suffix on synthesized env-var names. */
+  /** Job-scoped nonce suffixed onto synthesized env-var names. */
   jobIdShort?: string;
   /**
    * Clone root (repo root). Package-manager detection runs against it first,
@@ -74,30 +64,24 @@ export interface InstallDepsOptions {
   repoRoot?: string;
   /**
    * Base environment for every install and workspace-build subprocess.
-   *
-   * Defaults to `process.env`, which is correct inside the runner child, where
-   * `process.env` is already the sanitized job environment carrying the
-   * orchestrator's `KICI_*` system vars, org context vars and the job's own
-   * `env`. An agent-process caller MUST pass a sanitized base instead —
-   * `buildSanitizedEnv({}, { trustedEnv })` — or the install inherits the
+   * Defaults to `process.env`, which inside the runner child is already the
+   * sanitized job environment. An agent-process caller MUST pass a sanitized
+   * base (`buildSanitizedEnv({}, { trustedEnv })`), or the install inherits the
    * agent's credentials.
    */
   baseEnv?: NodeJS.ProcessEnv;
   /**
    * Operator opt-out from `--ignore-scripts` (`KICI_ALLOW_INSTALL_SCRIPTS`).
-   * Read only from agent config, never from a dispatch payload or a workflow,
-   * so a pull request cannot re-enable lifecycle scripts for itself.
+   * Read only from agent config, never from a dispatch payload or workflow, so
+   * a pull request cannot re-enable lifecycle scripts for itself.
    */
   allowInstallScripts?: boolean;
 }
 
 /**
- * Detect the package manager for the cloned repo from its committed manifests.
- * A pnpm workspace's `packageManager` field + `pnpm-lock.yaml` live at the repo
- * root, so check there first; fall back to `.kici/` for a standalone
- * (non-workspace) project that carries its own lockfile; default to npm when
- * neither carries a signal. Uses the manifests-only detector so the agent's own
- * launch env (`npm_config_user_agent`) never leaks into the decision.
+ * Repo root first (a pnpm workspace's signals live there), then `.kici/` for a
+ * standalone project, then npm. Manifests only, so the agent's own
+ * `npm_config_user_agent` never leaks into the decision.
  */
 async function detectKiciPackageManager(
   repoRoot: string,
@@ -110,35 +94,25 @@ async function detectKiciPackageManager(
   );
 }
 
-/**
- * Detect the yarn flavor (classic vs berry) for the cloned repo. Mirrors
- * `detectKiciPackageManager`: probe the repo root first, then `.kici/` for a
- * standalone project. Only called when the detected manager is `Yarn`.
- */
+/** Repo root first, then `.kici/` for a standalone project. Yarn repos only. */
 async function detectKiciYarnFlavor(repoRoot: string, kiciDir: string): Promise<YarnFlavor> {
-  // The repo-root signal wins; fall back to .kici/ for a standalone project.
   const rootFlavor = await detectYarnFlavor(repoRoot);
   if (rootFlavor === YarnFlavor.Berry) return YarnFlavor.Berry;
   return detectYarnFlavor(kiciDir);
 }
 
 /**
- * Install `.kici/` dependencies inline with the repo's package manager.
+ * Install `.kici/` dependencies inline with the repo's package manager, the
+ * fallback when the dep cache is unavailable or a download fails.
  *
- * Falls back to this when the dep cache is unavailable or a download fails.
- * The install runs with an isolated cache/store directory (allocated under the
- * global temp base, which honors `KICI_TMPDIR`) to prevent cache poisoning
- * between build jobs; the directory is removed after installation.
- *
- * If `opts.npmRegistries` / `opts.installEnvSecrets` is provided, a job-scoped
- * `.kici/.npmrc` overlay is synthesized for the install and restored in
- * `finally`.
- *
- * Lifecycle scripts are disabled for every package manager unless the operator
- * set `opts.allowInstallScripts`.
+ * The install uses an isolated cache/store directory under the global temp base
+ * (which honors `KICI_TMPDIR`), removed afterwards, to prevent cache poisoning
+ * between build jobs. With `opts.npmRegistries` / `opts.installEnvSecrets`, a
+ * job-scoped `.kici/.npmrc` overlay is synthesized and restored afterwards.
+ * Lifecycle scripts are disabled for every package manager unless
+ * `opts.allowInstallScripts` is set.
  *
  * @param kiciDir - Path to the `.kici/` directory containing package.json.
- * @param opts    - Optional registry / installEnv / repoRoot configuration.
  */
 export async function installDeps(kiciDir: string, opts: InstallDepsOptions = {}): Promise<void> {
   const repoRoot = opts.repoRoot ?? dirname(kiciDir);
@@ -152,16 +126,13 @@ export async function installDeps(kiciDir: string, opts: InstallDepsOptions = {}
     `[dep-installer:trace] starting install: pm=${packageManager}, flavor=${yarnFlavor}, cwd=${kiciDir}\n`,
   );
 
-  // Fail fast on dependency specifiers the detected package manager cannot
-  // resolve from the single cloned repo, so the job fails with an actionable
-  // message instead of a raw install error.
+  // Fail fast, with an actionable message, on specifiers the single cloned repo
+  // cannot resolve.
   await assertResolvableDeps({ kiciDir, repoRoot, packageManager, yarnFlavor });
 
   const startTime = Date.now();
-  // Unconditional by default: a lifecycle script runs customer code in whichever
-  // process performs the install, and `--ignore-scripts` was previously gated on
-  // a private registry, so the default public-registry path executed a
-  // `postinstall` from a pull request with the caller's full environment.
+  // Never gated on a private registry: a public-registry install would run a
+  // pull request's `postinstall` with the caller's full environment.
   const ignoreScripts = opts.allowInstallScripts !== true;
   const baseEnv = opts.baseEnv ?? process.env;
 
@@ -193,8 +164,8 @@ export async function installDeps(kiciDir: string, opts: InstallDepsOptions = {}
       await runNpmInstall({ kiciDir, ignoreScripts, registryConfig, baseEnv });
     }
   } catch (e) {
-    // The rethrown message is what reaches the job error and the run log, so it
-    // carries the exit code and the redacted end of the installer's output.
+    // The rethrown message reaches the job error and run log, so it carries the
+    // exit code and the redacted tail of the installer output.
     // fails-when: the raw execFile error is rethrown — its message is the
     // command line plus stderr only, and stderr can be empty.
     const description = describeInstallFailure(e, registryConfig.tokensForRedaction);
@@ -204,19 +175,12 @@ export async function installDeps(kiciDir: string, opts: InstallDepsOptions = {}
     await registryConfig.cleanup();
   }
 
-  // pnpm `workspace:` siblings (e.g. a locally-developed action package) emit
-  // build output the workflow imports at load time. `pnpm install` links the
-  // sibling but does not build it, so build the in-repo dependency closure of
-  // `.kici/` here — after registry cleanup, so the build subprocess never sees
-  // the synthesized token env vars.
+  // Build linked siblings the workflow imports at load time — after registry
+  // cleanup, so the build never sees the synthesized token env vars.
   if (packageManager === PackageManager.Pnpm && (await kiciHasLocalProtocolDeps(kiciDir))) {
     await buildWorkspaceClosure(repoRoot, baseEnv);
   }
 
-  // yarn links a workspace sibling (classic by version range, berry via
-  // `workspace:`/`portal:`) but does not build it. Build the in-repo dependency
-  // closure of `.kici/` here — after registry cleanup, so the build subprocess
-  // never sees the synthesized token env vars.
   if (packageManager === PackageManager.Yarn) {
     await buildYarnWorkspaceClosure(repoRoot, kiciDir, yarnFlavor, baseEnv);
   }
@@ -227,20 +191,16 @@ export async function installDeps(kiciDir: string, opts: InstallDepsOptions = {}
 }
 
 /**
- * Build the Node binary directory onto PATH so spawned tools find `node`.
- *
- * `baseEnv` is the caller's declared environment for the subprocess. It
- * defaults to `process.env` because inside the runner child that IS the
- * sanitized job environment; an agent-process caller passes a sanitized base.
+ * Prepend the Node binary dir to PATH so spawned tools find `node`. `baseEnv`
+ * defaults to `process.env`, the sanitized job env inside the runner child.
  */
 function envWithNodeOnPath(
   extraEnv: Record<string, string>,
   nodeDir: string,
   baseEnv: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  // npm/pnpm skip devDependencies when NODE_ENV=production. Workflow bundles
-  // externalize @kici-dev/sdk (a devDependency), so it must always be
-  // installed — remove NODE_ENV so all dependencies install.
+  // Drop NODE_ENV: production skips devDependencies, and workflow bundles
+  // externalize @kici-dev/sdk, a devDependency.
   const { NODE_ENV: _NODE_ENV, ...restEnv } = baseEnv;
   return {
     ...restEnv,
@@ -260,12 +220,10 @@ async function runNpmInstall(args: {
   const { path: cacheDir, cleanup } = await makeTempDir('npm-cache');
   const env = envWithNodeOnPath(args.registryConfig.extraEnv, nodeDir, args.baseEnv);
 
-  // Always `npm install` (not `npm ci`): `npm ci` uses resolved URLs baked into
-  // package-lock.json, which may point at a different registry than .npmrc
-  // (e.g. localhost tunnel vs direct IP). `--no-audit`/`--no-fund` are
-  // unconditional: the agent installs deps, it does not advise on CVEs/funding,
-  // and npm's post-install audit POST interacts with the tarball fetch pool to
-  // balloon cold-cache installs from ~7s to ~2min on flaky egress.
+  // Not `npm ci`: its lockfile URLs may name a different registry than .npmrc
+  // (localhost tunnel vs direct IP). `--no-audit` because npm's audit POST
+  // competes with the tarball fetch pool and stretches cold installs from ~7s to
+  // ~2min on flaky egress.
   const buildArgs = (...prefix: string[]): string[] => {
     const a = [...prefix, 'install', '--cache', cacheDir, '--no-audit', '--no-fund'];
     if (args.ignoreScripts) a.push('--ignore-scripts');
@@ -292,12 +250,11 @@ async function runNpmInstall(args: {
 }
 
 /**
- * Run `pnpm install` from `.kici/`. pnpm walks up to the workspace root, so a
- * `workspace:` sibling in the same cloned repo resolves. Uses an isolated store
- * (`--config.store-dir`) for cross-job isolation, `package-import-method=copy`
- * so the on-disk store is a self-contained tree of real files (a later dep
- * cache tars it), and disables interactive purge prompts + the side-effects
- * cache for deterministic, non-interactive runs.
+ * pnpm walks up to the workspace root, so in-repo `workspace:` siblings resolve.
+ * A per-install temp store (`--config.store-dir`) isolates jobs from each other;
+ * `package-import-method=copy` keeps real files for the dep cache to tar; the
+ * purge prompt and side-effects cache are off for non-interactive, deterministic
+ * runs.
  */
 async function runPnpmInstall(args: {
   kiciDir: string;
@@ -316,10 +273,8 @@ async function runPnpmInstall(args: {
     '--config.package-import-method=copy',
     '--config.confirm-modules-purge=false',
     '--config.side-effects-cache=false',
-    // A `.kici/` package pulls dependencies with build scripts (protobufjs, via
-    // the OpenTelemetry gRPC exporters in `@kici-dev/shared`); pnpm 10+ would
-    // otherwise exit non-zero on the unapproved build even though the install
-    // succeeded. The workflow package never needs those build scripts.
+    // pnpm 10+ exits non-zero on unapproved build scripts (protobufjs via the
+    // OTel gRPC exporters in `@kici-dev/shared`) the workflow never needs.
     PNPM_IGNORE_BUILD_GATE_ARG,
   ];
   if (args.ignoreScripts) argv.push('--ignore-scripts');
@@ -345,12 +300,9 @@ export function buildYarnInstallArgs(cacheDir: string, ignoreScripts: boolean): 
 }
 
 /**
- * Run `yarn install` from `.kici/` with an isolated cache folder. yarn classic
- * reads the synthesized `.kici/.npmrc` (registry + `${VAR}` token expansion) for
- * private-registry auth. A workspace member hoists deps to the repo-root
- * node_modules; a standalone `.kici` gets `.kici/node_modules`. Not
- * `--frozen-lockfile` (resolved URLs in the lockfile may point at a different
- * registry than the synthesized `.npmrc`, e.g. localhost tunnel vs direct IP).
+ * yarn classic reads the synthesized `.kici/.npmrc` (`${VAR}` token expansion)
+ * for auth. A workspace member hoists deps to the repo-root node_modules. Not
+ * `--frozen-lockfile`: lockfile URLs may name a different registry than `.npmrc`.
  */
 async function runYarnInstall(args: {
   kiciDir: string;
@@ -377,19 +329,17 @@ async function runYarnInstall(args: {
   }
 }
 
-/** Pure: argv for a berry `yarn install`. Cache + linker live in .yarnrc.yml. */
+/** Cache + linker live in .yarnrc.yml. */
 export function buildYarnBerryInstallArgs(): string[] {
   return ['install'];
 }
 
 /**
- * Run a berry `yarn install` from `.kici/`. The synthesized `.kici/.yarnrc.yml`
- * (applied by `applyYarnrcBerryConfig`) forces `nodeLinker: node-modules`, an
- * isolated `cacheFolder`, and — when a private registry is configured —
- * `enableScripts: false` + `npmScopes`/`npmRegistryServer` auth. corepack
- * provisions the repo-pinned berry version; `COREPACK_ENABLE_DOWNLOAD_PROMPT=0`
- * makes that non-interactive. Not `--immutable` (resolved URLs in the lockfile
- * may point at a different registry than the synthesized config).
+ * The synthesized `.kici/.yarnrc.yml` (`applyYarnrcBerryConfig`) forces
+ * `nodeLinker: node-modules`, an isolated `cacheFolder` and `enableScripts:
+ * false` (unless scripts are allowed), plus `npmScopes`/`npmRegistryServer`
+ * auth for a private registry. corepack provisions the pinned berry
+ * non-interactively. Not `--immutable`: lockfile URLs may name another registry.
  */
 async function runYarnBerryInstall(args: {
   kiciDir: string;
@@ -415,10 +365,8 @@ async function runYarnBerryInstall(args: {
 /** Throw an actionable error when the repo needs yarn but it is not installed. */
 async function assertYarnAvailable(): Promise<void> {
   try {
-    // Probe from a neutral cwd (no enclosing `packageManager` field). When the
-    // agent runs from a tree whose package.json pins a different manager via
-    // corepack, the `yarn` shim refuses with "configured to use <other>" — that
-    // is a false negative, not a missing yarn.
+    // Neutral cwd: under a package.json pinning another manager, the corepack
+    // shim refuses ("configured to use <other>") although yarn exists.
     await execFileAsync('yarn', ['--version'], { timeout: 30_000, cwd: tmpdir() });
   } catch (e) {
     throw new Error(
@@ -430,12 +378,9 @@ async function assertYarnAvailable(): Promise<void> {
 }
 
 /**
- * Build the in-repo workspace siblings `.kici` depends on (yarn links them on
- * install but does not build them). Walks siblings from the resolved
- * node_modules root and runs each sibling's `build` script in leaf-first
- * (reverse-discovery) order with a clean env (no synthesized registry tokens).
- * Deep cross-sibling build chains may build out of strict topological order —
- * real `.kici` closures are shallow.
+ * Run each linked sibling's `build` script leaf-first (reverse discovery), with
+ * no registry tokens in the env. Deep sibling chains may build out of strict
+ * topological order; real `.kici` closures are shallow.
  */
 async function buildYarnWorkspaceClosure(
   repoRoot: string,
@@ -451,8 +396,7 @@ async function buildYarnWorkspaceClosure(
   for (const rel of [...siblings].reverse()) {
     const sibDir = join(repoRoot, rel);
     if (!(await siblingHasBuildScript(sibDir))) continue;
-    // classic supports the global `--cwd` flag; berry dropped it, so run from
-    // the member dir instead. Both build that single member's `build` script.
+    // Berry dropped classic's global `--cwd`, so it runs from the member dir.
     const [argv, cwd]: [string[], string] =
       yarnFlavor === YarnFlavor.Berry
         ? [['run', 'build'], sibDir]
@@ -489,16 +433,10 @@ async function siblingHasBuildScript(sibDir: string): Promise<boolean> {
 }
 
 /**
- * Build the in-repo dependency closure of the `.kici/` package so a
- * `workspace:` sibling's build output exists before the workflow that imports
- * it loads. `--filter "{.kici}^..."` selects only `.kici`'s dependencies (not
- * `.kici` itself); `run --if-present build` skips siblings without a build
- * script. The `--if-present` flag MUST precede the script name: pnpm forwards
- * everything after the script name to the script itself, so `run build
- * --if-present` would pass `--if-present` to the build command (e.g. `tsc`)
- * and fail. Runs with a clean env (no synthesized registry tokens). On failure
- * the subprocess stderr/stdout is folded into the thrown error so the job's
- * failure message names the real cause instead of a bare "Command failed".
+ * Build `.kici`'s in-repo dependencies (`{.kici}^...` excludes `.kici` itself)
+ * with no registry tokens in the env. `--if-present` MUST precede the script
+ * name: pnpm forwards later args to the script (e.g. `tsc`), which then fails.
+ * The thrown error carries the subprocess output, not a bare "Command failed".
  */
 async function buildWorkspaceClosure(repoRoot: string, baseEnv: NodeJS.ProcessEnv): Promise<void> {
   const { nodeDir } = resolveNpm();
@@ -520,7 +458,7 @@ async function buildWorkspaceClosure(repoRoot: string, baseEnv: NodeJS.ProcessEn
   }
 }
 
-/** Build a single-line cause from an exec error's stderr/stdout, falling back to its message. */
+/** The exec error's stderr, else stdout, else message; capped at 2000 chars. */
 function describeExecError(e: unknown): string {
   const pick = (k: 'stderr' | 'stdout'): string =>
     e && typeof e === 'object' && k in e ? String((e as Record<string, unknown>)[k]).trim() : '';
@@ -531,8 +469,7 @@ function describeExecError(e: unknown): string {
 /** Throw an actionable error when the repo needs pnpm but it is not installed. */
 async function assertPnpmAvailable(): Promise<void> {
   try {
-    // Probe from a neutral cwd — see the note in assertYarnAvailable: an
-    // enclosing `packageManager` field would make the corepack shim refuse.
+    // Neutral cwd: see assertYarnAvailable.
     await execFileAsync('pnpm', ['--version'], { timeout: 30_000, cwd: tmpdir() });
   } catch (e) {
     throw new Error(

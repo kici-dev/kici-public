@@ -1,9 +1,6 @@
 import type { OutputProxy, SourceLocation } from './types.js';
 
-/**
- * Well-known string property names that should delegate to Reflect rather than throwing.
- * These are accessed by built-in operations like JSON.stringify, console.log, iteration, etc.
- */
+/** Properties built-ins (JSON.stringify, console.log, iteration, …) probe; they delegate to Reflect instead of throwing. */
 const WELL_KNOWN_STRING_PROPS = new Set([
   'constructor',
   'toString',
@@ -19,83 +16,54 @@ const WELL_KNOWN_STRING_PROPS = new Set([
   '_tag',
 ]);
 
-/**
- * Shared mutable map that steps write their outputs to and proxies read from.
- * Keys are step/job names, values are the outputs records.
- */
+/** Step/job name → outputs; steps write it and proxies read it. */
 export type OutputsMap = Map<string, Record<string, unknown>>;
 
-/**
- * WeakMap for mapping bare function references to step names.
- * Populated when the job normalizes bare functions into internal Step objects.
- */
+/** Bare function → step name, filled when the job normalizes bare functions into Step objects. */
 export type StepRefMap = WeakMap<Function, string>;
 
-/**
- * Structural type for step references used in resolveStepOutputs.
- * Avoids circular dependency with types.ts.
- */
+/** Structural step type; avoids a circular import of types.ts. */
 interface StepLike {
   readonly _tag: 'Step';
   readonly name: string;
 }
 
-/**
- * Module-global outputs maps. Runners inject fresh maps at execution time
- * via setStepOutputsMap() / setJobOutputsMap().
- */
+/** Module-global maps; runners inject fresh ones per execution via the setters below. */
 let _stepOutputsMap: OutputsMap = new Map();
 let _jobOutputsMap: OutputsMap = new Map();
 let _stepRefMap: StepRefMap = new WeakMap();
 
-/**
- * Inject a fresh step outputs map for a new execution.
- * Called by workflow runners (compiler test runner, agent sandbox) before execution.
- */
+/** Called by workflow runners (compiler test runner, agent sandbox) before execution. */
 export function setStepOutputsMap(map: OutputsMap): void {
   _stepOutputsMap = map;
 }
 
-/**
- * Inject a fresh job outputs map for a new execution.
- */
 export function setJobOutputsMap(map: OutputsMap): void {
   _jobOutputsMap = map;
 }
 
-/**
- * Inject a fresh step-ref map for bare function -> step name resolution.
- */
 export function setStepRefMap(map: StepRefMap): void {
   _stepRefMap = map;
 }
 
-/**
- * Get the current step outputs map (for runners to populate).
- */
+/** Runners populate this map. */
 export function getStepOutputsMap(): OutputsMap {
   return _stepOutputsMap;
 }
 
-/**
- * Get the current job outputs map (for runners to populate).
- */
+/** Runners populate this map. */
 export function getJobOutputsMap(): OutputsMap {
   return _jobOutputsMap;
 }
 
-/**
- * Get the current step ref map.
- */
 export function getStepRefMap(): StepRefMap {
   return _stepRefMap;
 }
 
 /**
- * Minimal shape the step output proxy needs from a step: a name that may be
- * assigned after the proxy is created (id-less steps are named `step-N` when the
- * job's steps are enumerated at execution start), plus the optional source
- * location for a helpful error when the name is still unresolved.
+ * What the step output proxy needs: a name that may be assigned after the proxy
+ * exists (id-less steps become `step-N` at execution start), and a source
+ * location for the error when it is still unresolved.
  */
 export interface StepNameRef {
   readonly name: string;
@@ -103,16 +71,9 @@ export interface StepNameRef {
 }
 
 /**
- * Create a Proxy over step outputs that resolves property access lazily
- * against the module-global step outputs map.
- *
- * The proxy reads `stepRef.name` at ACCESS time rather than capturing the name
- * string at creation. Id-less steps have `name === ''` when the proxy is built;
- * the runner assigns `step-N` onto the same step object before any run function
- * executes, so `.result` resolves under the final name by the time it is used.
- *
- * @param stepRef - The step whose (possibly later-assigned) name identifies its outputs
- * @returns A Proxy that resolves property access at runtime
+ * Lazy proxy over the module-global step outputs map. It reads `stepRef.name` at
+ * ACCESS time: id-less steps have `name === ''` when the proxy is built, and the
+ * runner assigns `step-N` to the same object before any run function executes.
  */
 export function createStepOutputProxy<T>(stepRef: StepNameRef): OutputProxy<T> {
   const unresolvedError = (): Error => {
@@ -126,12 +87,10 @@ export function createStepOutputProxy<T>(stepRef: StepNameRef): OutputProxy<T> {
 
   return new Proxy({} as OutputProxy<T>, {
     get(_target, prop, receiver) {
-      // Symbol properties: delegate to Reflect (JSON.stringify, iteration, etc.)
       if (typeof prop === 'symbol') {
         return Reflect.get(_target, prop, receiver);
       }
 
-      // Well-known string properties: delegate to Reflect
       if (WELL_KNOWN_STRING_PROPS.has(prop)) {
         return Reflect.get(_target, prop, receiver);
       }
@@ -175,24 +134,16 @@ export function createStepOutputProxy<T>(stepRef: StepNameRef): OutputProxy<T> {
 }
 
 /**
- * Create a Proxy over job outputs that resolves property access lazily
- * against the module-global job outputs map.
- *
- * For multi-step jobs: job.result.stepName.field
- * For single-step (run shorthand) jobs: job.result.field
- *
- * @param jobName - The name of the job whose outputs to proxy
- * @returns A Proxy that resolves property access at runtime
+ * Lazy proxy over the module-global job outputs map. Multi-step jobs:
+ * `job.result.stepName.field`; single-step (run shorthand) jobs: `job.result.field`.
  */
 export function createJobOutputProxy<TOutputs = any>(jobName: string): OutputProxy<TOutputs> {
   return new Proxy({} as OutputProxy<TOutputs>, {
     get(_target, prop, receiver) {
-      // Symbol properties: delegate to Reflect
       if (typeof prop === 'symbol') {
         return Reflect.get(_target, prop, receiver);
       }
 
-      // Well-known string properties: delegate to Reflect
       if (WELL_KNOWN_STRING_PROPS.has(prop)) {
         return Reflect.get(_target, prop, receiver);
       }
@@ -232,15 +183,12 @@ export function createJobOutputProxy<TOutputs = any>(jobName: string): OutputPro
 }
 
 /**
- * Output proxy bound to a specific outputs object (not the module-global map).
+ * Proxy over a fixed outputs object: the frozen upstream-job snapshot exposed as
+ * `ctx.needs.<job>.result` to result-aware dynamic generators. The snapshot is
+ * captured once at eval and replayed unchanged on re-eval.
  *
- * Used to expose a frozen upstream-job snapshot as `ctx.needs.<job>.result` for
- * result-aware dynamic generators. The snapshot is captured once at eval and
- * replayed unchanged on re-eval, so the proxy reads a fixed `outputs` object
- * rather than the live module-global job-outputs map.
- *
- * @param jobName - The upstream job whose outputs to proxy (used in error text)
- * @param outputs - The frozen outputs object, or undefined if the job produced none
+ * @param jobName - Used in error text
+ * @param outputs - Undefined if the job produced none
  */
 export function createSnapshotOutputProxy(
   jobName: string,
@@ -277,15 +225,7 @@ export function createSnapshotOutputProxy(
   });
 }
 
-/**
- * Resolve step outputs by step reference (Step object or bare function).
- * Used by ctx.outputsOf() implementation.
- *
- * @param ref - Step object (with _tag: 'Step') or bare function reference
- * @param outputsMap - The outputs map to resolve against (defaults to module-global)
- * @param refMap - The ref map for bare function -> name resolution (defaults to module-global)
- * @returns The step's outputs
- */
+/** Backs `ctx.outputsOf()`; both maps default to the module-global ones. */
 export function resolveStepOutputs<T>(
   ref: StepLike | Function,
   outputsMap?: OutputsMap,
@@ -297,7 +237,6 @@ export function resolveStepOutputs<T>(
   let stepName: string | undefined;
 
   if (typeof ref === 'function') {
-    // Bare function reference -- look up in ref map
     stepName = rMap.get(ref);
     if (!stepName) {
       throw new Error(
@@ -317,14 +256,7 @@ export function resolveStepOutputs<T>(
   return outputs as T;
 }
 
-/**
- * Resolve job outputs by job reference.
- * Used by ctx.jobOutputs() implementation.
- *
- * @param ref - Job object reference (needs .name property)
- * @param outputsMap - The outputs map to resolve against (defaults to module-global)
- * @returns The job's outputs
- */
+/** Backs `ctx.jobOutputs()`; `outputsMap` defaults to the module-global one. */
 export function resolveJobOutputs(
   ref: { name: string },
   outputsMap?: OutputsMap,

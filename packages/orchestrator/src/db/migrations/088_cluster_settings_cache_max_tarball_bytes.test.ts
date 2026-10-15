@@ -3,12 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './088_cluster_settings_cache_max_tarball_bytes.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 088: asserts `cluster_settings.cache_max_tarball_bytes`
- * exists and is nullable after migrations 001..088, and that up/down are
- * idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 088: `cluster_settings.cache_max_tarball_bytes` exists and is
+ * nullable, and up/down are idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;

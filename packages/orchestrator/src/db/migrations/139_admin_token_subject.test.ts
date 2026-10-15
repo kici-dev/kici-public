@@ -3,18 +3,16 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './139_admin_token_subject.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
  * Real-Postgres test for migration 139: asserts `subject` exists on
  * `admin_tokens` as a nullable text column with no default, that up/down are
  * idempotent, and that the migration backfills nothing.
  *
- * The absence of a backfill is the load-bearing part. NULL is the `unlinked`
- * finding the RBAC drift report exists to surface — a token nobody can attach
- * to a person. Every token minted before this column existed genuinely has no
- * recorded holder, so filling one in would hide the exact condition an
- * operator needs to see.
+ * No backfill is the load-bearing part: NULL is the `unlinked` finding the RBAC
+ * drift report surfaces (a token tied to no person), and every older token
+ * genuinely has no recorded holder, so a backfill would hide it.
  *
  * Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */

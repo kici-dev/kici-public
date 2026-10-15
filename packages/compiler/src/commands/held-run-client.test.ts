@@ -63,9 +63,8 @@ describe('resolveHeldRunContext', () => {
 
     it(`stays silent under quiet — ${label}`, async () => {
       mockedLoadConfig.mockResolvedValue(config as never);
-      // `kici runs show` reads holds as optional detail on a run it can already
-      // display, so an unresolvable context must not make it print an
-      // authentication error for a command that worked.
+      // `kici runs show` treats holds as optional detail, so it must not print
+      // an authentication error for a command that worked.
       expect(await resolveHeldRunContext({ quiet: true })).toBeNull();
       expect(errorOutput).toEqual([]);
     });
@@ -80,8 +79,8 @@ describe('listHeldRunsForRun', () => {
       'fetch',
       vi.fn(async () => new Response(JSON.stringify({ error: 'nope' }), { status: 403 })),
     );
-    // The status is what lets `kici runs show` tell a caller who will never
-    // have the data from one whose request merely failed this time.
+    // The status separates a caller who will never have the data from a
+    // transient failure.
     const err = await listHeldRunsForRun(ctx, 'r1').catch((e: unknown) => e);
     expect(err).toBeInstanceOf(HeldRunRequestError);
     expect((err as HeldRunRequestError).status).toBe(403);

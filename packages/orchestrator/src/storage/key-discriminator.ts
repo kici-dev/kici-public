@@ -1,23 +1,21 @@
 import { createHash } from 'node:crypto';
 
 /**
- * Width of the object-key discriminator, in hex characters.
+ * Width of the object-key discriminator, in hex characters (32 = 128 bits).
  *
- * 32 hex chars is 128 bits, and the width is a security property rather than a
- * formatting choice: on a case-insensitive namespace the discriminator is the
- * only thing separating object names chosen by untrusted workflow code. A
- * narrower value would let that code search case variants for a colliding pair
- * and land two different payloads on one object.
+ * A security property: on a case-insensitive namespace the discriminator alone
+ * separates object names chosen by untrusted workflow code, and a narrower one
+ * would let that code search case variants for a collision and land two
+ * payloads on one object.
  */
 export const KEY_DISCRIMINATOR_LENGTH = 32;
 
 /**
  * A collision-resistant discriminator for a user-supplied object-key segment.
  *
- * Hashes the **exact** name, before any sanitization. Sanitizing is many-to-one
- * — `seg()` maps both `/` and `_` to `_`, so `a/b` and `a_b` collapse to one
- * segment — and a case-insensitive backend folds `build` onto `Build`. Hashing
- * the pre-sanitization name is what keeps each of those pairs two objects.
+ * Hashes the **exact** pre-sanitization name: `seg()` maps both `/` and `_` to
+ * `_` (`a/b` and `a_b` collapse), and a case-insensitive backend folds `build`
+ * onto `Build`, so only the hash keeps each pair two objects.
  */
 export function keyDiscriminator(exact: string): string {
   return createHash('sha256')

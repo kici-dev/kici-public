@@ -293,7 +293,7 @@ export async function assertDashboardWriteAllowed(
  * Merge `updates` into the persisted policy and persist the result.
  * Unknown keys in `updates` are rejected at the Zod schema layer
  * before this function runs (kici-admin already validates). Any
- * operation explicitly set to `true` is normalized away — the
+ * operation explicitly set to `'permissive'` is normalized away — the
  * permissive default lives in the absence of the key, keeping the
  * JSONB shape minimal.
  *

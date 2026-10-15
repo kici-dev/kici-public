@@ -5,22 +5,17 @@ import { type Kysely, sql } from 'kysely';
  * revoked_at IS NULL` so two ACTIVE rows for the same `instance_id` become a
  * database-level impossibility.
  *
- * Background: `PeerCredentialStore.save()` historically ran an `UPDATE …
- * SET revoked_at = NOW()` followed by an `INSERT` without a transaction or
- * unique constraint. When a joining peer fanned out N peer-clients in
- * parallel (one per coordinator), each coordinator's `save()` could run its
- * `UPDATE` before the others' `INSERT`s committed — both `UPDATE`s revoked
- * nothing and both `INSERT`s succeeded, leaving 2+ ACTIVE rows for the same
- * `instance_id`. The peer's local credential file then ended up holding a
- * hash that a later concurrent `save()` had revoked, causing an endless
- * "Peer HMAC proof invalid" loop.
+ * Why: `PeerCredentialStore.save()` ran an unguarded `UPDATE … SET revoked_at
+ * = NOW()` then `INSERT` (no transaction, no constraint), which races when a
+ * joining peer fans out one peer-client per coordinator: both `UPDATE`s revoke
+ * nothing, both `INSERT`s land, and the peer's credential file can hold a hash
+ * a concurrent `save()` revoked — an endless "Peer HMAC proof invalid" loop.
  *
- * The `up()` first dedupes any pre-existing duplicates (revoke all but the
- * newest active row per `instance_id`) — required because earlier migrations
- * predate the constraint and existing databases may already hold the dupes.
+ * `up()` first dedupes existing duplicates (revokes all but the newest active
+ * row per `instance_id`), which databases from before the constraint may hold.
  *
- * `down()` only drops the index; it does NOT undo the dedupe (there's no
- * safe way to recreate revoked rows, and the dedupe is monotonic).
+ * `down()` only drops the index; it does NOT undo the dedupe (revoked rows
+ * cannot be safely recreated, and the dedupe is monotonic).
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`

@@ -143,8 +143,7 @@ describe('checkStep (check-facet Step factory)', () => {
     });
     expect(s._tag).toBe('Step');
     expect(s.name).toBe('ensure-x');
-    // The presence of a check facet is what distinguishes it from idempotentStep
-    // (which builds a plain run-only step that always applies).
+    // The check facet distinguishes it from idempotentStep's run-only, always-apply step.
     expect(typeof s.check).toBe('function');
     expect(typeof s.run).toBe('function');
     expect(s.summarize?.({ reason: 'missing' } as Drift)).toBe('will fix: missing');

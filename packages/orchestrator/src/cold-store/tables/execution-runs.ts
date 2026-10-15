@@ -130,23 +130,18 @@ export class ExecutionRunsAdapter
   }
 
   /**
-   * Natural-key extractor used by `replayRow` so callers
-   * (the rerun pipeline) can locate the chunk holding a given UUID
-   * `run_id` without knowing the internal SERIAL `id` returned by
-   * `rowId()`.
+   * Natural key for `replayRow`, so the rerun pipeline finds the chunk holding
+   * a UUID `run_id` without the internal SERIAL `id` from `rowId()`.
    */
   replayLookupKey(row: ExecutionRunRow): string {
     return row.run_id;
   }
 
   /**
-   * Replay a chunk's `execution_runs` rows back into
-   * Orchestrator PG. Mirrors the Platform-side replayInsert; the
-   * audit row goes to `access_log` (not `audit_log`) because the
-   * orchestrator's audit surface is access_log.
-   *
-   * Idempotent on duplicate replays via `ON CONFLICT (run_id) DO
-   * NOTHING`. Decrements `cold_store_chunk_counts` (floored at 0).
+   * Replay a chunk's `execution_runs` rows into Orchestrator PG, mirroring the
+   * Platform-side replayInsert. The audit row goes to `access_log`, the
+   * orchestrator's audit surface. Idempotent via `ON CONFLICT (run_id) DO
+   * NOTHING`; decrements `cold_store_chunk_counts` (floored at 0).
    */
   async replayInsert(args: {
     rows: ReadonlyArray<ExecutionRunRow>;

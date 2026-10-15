@@ -3,10 +3,10 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './109_cluster_settings_cache_knobs.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 109: asserts the six cache-knob columns
+ * Real-Postgres test for migration 109: asserts the cache-knob columns
  * exist on `cluster_settings` as nullable BIGINTs after migrations 001..109,
  * and that up/down are idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */

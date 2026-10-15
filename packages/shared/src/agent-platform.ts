@@ -5,11 +5,11 @@ export const AgentPlatform = z.enum(['linux-x64', 'linux-arm64']);
 export type AgentPlatform = z.infer<typeof AgentPlatform>;
 
 /**
- * How a fresh-box agent payload is delivered to the target during bring-up.
- * `s3-direct`: the box pulls the payload from the orchestrator cache bucket via
- * a presigned URL (no 50 MB through the ops agent). `ssh-push`: the ops agent
- * fetches the payload and streams it to the box over a binary-safe scp (the
- * fallback for a box that cannot reach object storage).
+ * How a fresh-box agent payload reaches the target during bring-up.
+ * `s3-direct`: the box pulls it from the orchestrator cache bucket via a
+ * presigned URL (no 50 MB through the ops agent). `ssh-push`: the ops agent
+ * streams it to the box over a binary-safe scp, for a box that cannot reach
+ * object storage.
  */
 export const AgentDeliveryMode = z.enum(['ssh-push', 's3-direct']);
 export type AgentDeliveryMode = z.infer<typeof AgentDeliveryMode>;

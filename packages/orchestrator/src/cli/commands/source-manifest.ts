@@ -1,14 +1,12 @@
 /**
- * `kici-admin source add github --manifest` — the one-click GitHub App setup
- * flow. Drives GitHub's App Manifest flow end-to-end: builds a pre-configured
- * manifest (KiCI's exact permissions/events/webhook URL), hands it to GitHub via
- * an auto-submitting form, catches the returned short-lived setup code over a
- * localhost loopback (or copy-paste in --no-browser mode), exchanges it for the
- * App's id + private key + webhook secret, then reuses the existing source
- * storage + Platform-registration path.
+ * `kici-admin source add github --manifest`: GitHub's App Manifest flow end to
+ * end. The pre-configured manifest goes to GitHub through an auto-submitting
+ * form; the short-lived setup code comes back over a localhost loopback (or is
+ * pasted with --no-browser) and is exchanged for the App's id, private key and
+ * webhook secret, which take the normal source storage and registration path.
  *
- * The private-key-bearing conversion happens entirely here on the orchestrator
- * host — it never transits the Platform (sovereignty invariant).
+ * The private-key-bearing conversion runs only on the orchestrator host and
+ * never transits the Platform (sovereignty invariant).
  */
 
 import { randomBytes } from 'node:crypto';
@@ -44,11 +42,10 @@ export interface ManifestSetupOptions {
   noBrowser?: boolean;
   githubOrg?: string;
   /**
-   * Self-hosted webhook URL override. When set, it is baked verbatim into the
-   * App manifest's `hook_attributes.url` instead of the URL the orchestrator
-   * resolves for its mode — so the flow works even where that URL is
-   * unavailable. KiCI adds no ingress at this URL; the operator
-   * owns delivery. Advanced/self-hosted only.
+   * Self-hosted webhook URL override, written verbatim into the manifest's
+   * `hook_attributes.url` instead of the URL the orchestrator resolves for its
+   * mode, so the flow works where that URL is unavailable. KiCI adds no ingress
+   * at this URL; the operator owns delivery. Advanced/self-hosted only.
    */
   webhookUrl?: string;
 }
@@ -147,8 +144,8 @@ async function storeAndRegister(
   creds: GithubAppCredentials,
 ): Promise<{ routingKey: string }> {
   try {
-    // GitHub is the source of truth for the stored name + slug — the conversion
-    // response carries both. `opts.name` was only the *requested* manifest name.
+    // GitHub's conversion response is the source of truth for name and slug;
+    // `opts.name` is only the *requested* name.
     return await client.post<{ routingKey: string; name: string }>('/api/v1/admin/sources', {
       provider: 'github',
       name: creds.name,
@@ -177,19 +174,16 @@ export async function runGithubManifestSetup(
   client: AdminApiClient,
   deps: ManifestSetupDeps = realManifestSetupDeps,
 ): Promise<void> {
-  // 1. Resolve the webhook URL BEFORE creating anything on GitHub. An explicit
-  //    --webhook-url is the operator asserting "I own delivery": it is used
-  //    verbatim instead of the URL the orchestrator resolves for its mode (so it
-  //    works even where that URL is unavailable).
+  // Resolve the webhook URL BEFORE creating anything on GitHub. An explicit
+  // --webhook-url means the operator owns delivery and is used verbatim.
   const webhookUrl = opts.webhookUrl
     ? validateWebhookUrl(opts.webhookUrl)
     : await resolveWebhookUrl(client);
 
-  // 2. Generate the CSRF state. (GitHub generates the webhook secret itself.)
+  // CSRF state; GitHub generates the webhook secret itself.
   const state = randomBytes(16).toString('hex');
   const createUrl = manifestCreateUrl(opts.githubOrg);
 
-  // 3. Start the loopback server (also serves the auto-submitting form).
   const loopback = await deps.startLoopback({
     state,
     manifestJson: '{}', // replaced below once redirectUrl is known
@@ -203,12 +197,10 @@ export async function runGithubManifestSetup(
     });
     const manifestJson = JSON.stringify(manifest);
 
-    // For browser mode the loopback re-serves the form with the real manifest;
-    // restart it carrying the manifest so the served form posts the right body.
+    // Restart the loopback with the real manifest so its form posts the right body.
     loopback.close();
     const lb = await deps.startLoopback({ state, manifestJson, createUrl });
     try {
-      // 4–5. Capture the setup code.
       const code = await captureCode(
         opts,
         deps,
@@ -219,20 +211,17 @@ export async function runGithubManifestSetup(
         lb,
       );
 
-      // 6. Exchange code → credentials (private key stays on this host).
+      // The private key stays on this host.
       const creds = await deps.convert(code);
       console.log(`→ ✓ App created (id ${creds.appId}), credentials captured`);
 
-      // 7. Store + register (orphan-safe).
       const stored = await storeAndRegister(opts, client, deps, creds);
       console.log(`→ ✓ Stored on orchestrator (encrypted), registered as ${stored.routingKey}`);
 
-      // 8. Guide installation.
       const installUrl = `https://github.com/apps/${creds.slug}/installations/new`;
       console.log(`→ Install the App on your repos: ${installUrl}`);
       if (!opts.noBrowser) await deps.openBrowser(installUrl);
 
-      // 9. Verify install + credentials.
       const { installationId, accountLogin } = await deps.waitForInstallation(creds, {
         timeoutMs: INSTALL_TIMEOUT_MS,
         pollMs: INSTALL_POLL_MS,
@@ -241,7 +230,6 @@ export async function runGithubManifestSetup(
       const { repoCount } = await deps.verifyRepoAccess(creds, installationId);
       console.log(`→ ✓ Credentials verified (${repoCount} repositories reachable)`);
 
-      // 10. Done.
       console.log('');
       console.log(`GitHub App "${opts.name}" is live.`);
       console.log(`  Webhook: ${webhookUrl}`);
@@ -249,7 +237,7 @@ export async function runGithubManifestSetup(
       lb.close();
     }
   } finally {
-    // loopback was already closed above, but closing twice is harmless.
+    // Already closed above; a second close is harmless.
     loopback.close();
   }
 }

@@ -1,13 +1,10 @@
 /**
- * Admin API routes for org-level global workflow settings.
+ * GET / PATCH `/api/v1/admin/org-settings/global-workflows`: lets `kici-admin`
+ * read and write the per-org `org_settings` row without the Platform dashboard
+ * proxy, so the CLI stays operable when the Platform is unavailable.
  *
- * Exposes GET / PATCH `/api/v1/admin/org-settings/global-workflows` so
- * `kici-admin` can read and write the per-org row in `org_settings`
- * without going through the Platform dashboard proxy — the CLI stays
- * operable even when Platform is unavailable.
- *
- * Mutations require the `secret.write` RBAC capability (already granted to
- * admin / owner roles), matching the gating posture used by source admin.
+ * Mutations require `secret.write` (granted to admin / owner), matching the
+ * gating used by source admin.
  */
 import { Hono } from 'hono';
 import { sql, type Kysely } from 'kysely';
@@ -55,18 +52,15 @@ interface OrgSettingsRouteDeps {
    */
   globalWorkflowsEnabledDefault: boolean;
   /**
-   * This orchestrator's mode.
-   *
    * The dashboard-write policy needs it: disabling `held_runs.approve` /
    * `held_runs.reject` is coherent only where `kici-admin held-run` can still
    * answer a hold, which is independent mode alone.
    */
   mode: OrchestratorMode;
   /**
-   * Optional — when wired, each `dashboard_write_policy` flip emits one
-   * `access_log` row (`org_settings.dashboard_write_policy.update`)
-   * carrying the operation name + prior/next state in `actor_meta`.
-   * Reset calls additionally stamp `reset: true`.
+   * When wired, each `dashboard_write_policy` flip emits one `access_log` row
+   * (`org_settings.dashboard_write_policy.update`) carrying the operation name
+   * + prior/next state in `actor_meta`; reset calls also stamp `reset: true`.
    */
   accessLog?: AccessLogWriter;
 }
@@ -96,49 +90,43 @@ const updateSchema = z
     deniedRepos: validatedPatternList.nullable().optional(),
     allowHttpNpmRegistries: z.boolean().optional(),
     allowUntrustedDockerfileBuilds: z.boolean().optional(),
-    // null clears the per-org override and falls back to the cluster-wide
-    // default; a positive integer sets a per-org value.
+    // For every nullable tunable from here through cacheUploadSettleTimeoutMs, null
+    // clears the per-org override and falls back to the cluster-wide default; a
+    // value sets a per-org override.
     userCacheQuotaBytes: z.number().int().positive().nullable().optional(),
     userCacheTtlMs: z.number().int().positive().nullable().optional(),
     artifactQuotaBytes: z.number().int().positive().nullable().optional(),
     artifactTtlMs: z.number().int().positive().nullable().optional(),
-    // Per-org per-artifact size cap (bytes) + per-run artifact count cap. null
-    // clears the override → cluster-wide default; a positive integer sets it.
+    // Per-artifact size cap (bytes) and per-run artifact count cap.
     artifactMaxBytes: z.number().int().positive().nullable().optional(),
     artifactMaxPerRun: z.number().int().positive().nullable().optional(),
     dispatchAckTimeoutMs: z.number().int().min(1000).nullable().optional(),
-    // Per-org webhook-ingest concurrency cap. null clears the override (fall back
-    // to the cluster-wide default); a positive integer sets a per-org value.
+    // Webhook-ingest concurrency cap.
     ingestMaxConcurrency: z.number().int().min(1).nullable().optional(),
-    // Per-org scaler spawn deadline (ms). null clears the override → cluster
-    // default; a value >= 1000 sets a per-org override.
+    // Scaler spawn deadline (ms).
     scalerSpawnTimeoutMs: z.number().int().min(1000).nullable().optional(),
-    // Reroute tunables. null clears the per-org override (fall back to the
-    // cluster-wide config default); a positive value sets a per-org override.
     rerouteSpawnWindowMs: z.number().int().min(1000).nullable().optional(),
     rerouteAckTimeoutMs: z.number().int().min(1000).nullable().optional(),
     rerouteMaxHops: z.number().int().min(1).nullable().optional(),
     // A worker's spawn-retry budget for a rerouted job: attempts (>= 1) and the
-    // wait after a failed attempt (ms, >= 0). null clears the per-org override.
+    // wait after a failed attempt (ms, >= 0).
     rerouteSpawnMaxAttempts: z.number().int().min(1).nullable().optional(),
     rerouteSpawnRetryBackoffMs: z.number().int().min(0).nullable().optional(),
-    // Per-org DB-backup freshness WARN threshold (hours). null clears the
-    // override (fall back to the cluster-wide config default).
+    // DB-backup freshness WARN threshold (hours).
     backupStalenessWarnHours: z.number().int().min(1).nullable().optional(),
-    // Per-org dispatch-queue job timeout (ms). null clears the override → cluster
-    // default (config.queueTimeoutMs). 0 = indefinite (no expiry).
+    // Dispatch-queue job timeout (ms); cluster default is config.queueTimeoutMs.
+    // 0 = indefinite (no expiry).
     queueTimeoutMs: z.number().int().min(0).nullable().optional(),
-    // Per-org bound (ms) on a build success's wait for its cache publish.
-    // null clears the override → cluster default; 0 turns the wait off.
+    // Bound (ms) on a build success's wait for its cache publish; 0 turns the
+    // wait off.
     cacheUploadSettleTimeoutMs: z.number().int().min(0).nullable().optional(),
-    // Approval policy. Both have NOT NULL defaults in the DB, so they are not
-    // nullable here — a value always replaces the current one.
+    // Approval policy: NOT NULL with DB defaults, so not nullable here.
     approvalExpirySeconds: z.number().int().min(1).optional(),
     allowSelfApproval: z.boolean().optional(),
     // Container-sandbox escape-hatch allow-list. null clears the override →
     // deny-all default; an array sets the allowed Linux capabilities (each
-    // validated as a real capability and stored canonicalized). A boolean toggles
-    // whether a workflow may request `sandbox: { network: 'host' }`.
+    // validated and stored canonicalized). The boolean toggles whether a
+    // workflow may request `sandbox: { network: 'host' }`.
     sandboxAllowedCapabilities: z.array(z.string()).nullable().optional(),
     sandboxAllowHostNetwork: z.boolean().nullable().optional(),
   })
@@ -151,41 +139,38 @@ interface ProjectedSettings {
   deniedRepos: RepoPatternEntry[] | null;
   allowHttpNpmRegistries: boolean;
   allowUntrustedDockerfileBuilds: boolean;
-  /** Per-org user-cache byte quota; null = cluster-wide default. */
+  // For every nullable per-org tunable below, null = cluster-wide default.
   userCacheQuotaBytes: number | null;
-  /** Per-org user-cache entry TTL (ms); null = cluster-wide default. */
+  /** User-cache entry TTL (ms). */
   userCacheTtlMs: number | null;
-  /** Per-org artifact byte quota; null = cluster-wide default. */
   artifactQuotaBytes: number | null;
-  /** Per-org artifact TTL (ms); null = cluster-wide default. */
+  /** Artifact TTL (ms). */
   artifactTtlMs: number | null;
-  /** Per-org per-artifact size cap (bytes); null = cluster-wide default. */
+  /** Per-artifact size cap (bytes). */
   artifactMaxBytes: number | null;
-  /** Per-org per-run artifact count cap; null = cluster-wide default. */
+  /** Per-run artifact count cap. */
   artifactMaxPerRun: number | null;
-  /** Per-org dispatch-acknowledgment deadline (ms); null = cluster-wide default. */
+  /** Dispatch-acknowledgment deadline (ms). */
   dispatchAckTimeoutMs: number | null;
-  /** Per-org webhook-ingest concurrency cap; null = cluster-wide default. */
   ingestMaxConcurrency: number | null;
-  /** Per-org scaler spawn deadline (ms); null = cluster-wide default. */
+  /** Scaler spawn deadline (ms). */
   scalerSpawnTimeoutMs: number | null;
-  /** Per-org reroute spawn window (ms); null = cluster-wide default. */
+  /** Reroute spawn window (ms). */
   rerouteSpawnWindowMs: number | null;
-  /** Per-org reroute ACK timeout (ms); null = cluster-wide default. */
+  /** Reroute ACK timeout (ms). */
   rerouteAckTimeoutMs: number | null;
-  /** Per-org reroute max hops; null = cluster-wide default. */
   rerouteMaxHops: number | null;
-  /** Per-org spawn attempts a worker makes for a rerouted job; null = cluster default. */
+  /** Spawn attempts a worker makes for a rerouted job. */
   rerouteSpawnMaxAttempts: number | null;
-  /** Per-org wait (ms) after a rerouted job's failed spawn; null = cluster default. */
+  /** Wait (ms) after a rerouted job's failed spawn. */
   rerouteSpawnRetryBackoffMs: number | null;
-  /** Per-org backup-freshness WARN threshold (hours); null = cluster default. */
+  /** Backup-freshness WARN threshold (hours). */
   backupStalenessWarnHours: number | null;
-  /** Per-org dispatch-queue job timeout (ms); null = cluster default. */
+  /** Dispatch-queue job timeout (ms). */
   queueTimeoutMs: number | null;
-  /** Per-org build-cache publish settle bound (ms); null = cluster default. */
+  /** Build-cache publish settle bound (ms). */
   cacheUploadSettleTimeoutMs: number | null;
-  /** Per-org held-approval expiry (seconds). */
+  /** Held-approval expiry (seconds). */
   approvalExpirySeconds: number;
   /** Whether a run's triggerer may self-approve its held elements. */
   allowSelfApproval: boolean;
@@ -203,13 +188,11 @@ function bigintToNumber(v: string | null): number | null {
 }
 
 /**
- * The effective fleet-wide master switch.
- *
- * Read directly rather than through `ClusterSettingsReader`, whose 10s cache
- * would make `org-settings global-workflows show` disagree with a
- * `cluster-settings set` the operator just ran. This is a low-traffic admin
- * path, so the uncached read costs nothing and read-your-writes is worth more.
- * `admin-cluster-settings.ts` reads the same row the same way.
+ * The effective fleet-wide master switch, read directly rather than through
+ * `ClusterSettingsReader`, whose 10s cache would make `org-settings
+ * global-workflows show` disagree with a `cluster-settings set` the operator
+ * just ran. On this low-traffic admin path read-your-writes is worth more than
+ * the cache. `admin-cluster-settings.ts` reads the same row the same way.
  */
 async function readEffectiveEnabled(db: Kysely<Database>, fallback: boolean): Promise<boolean> {
   const row = await db
@@ -384,8 +367,7 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         allowHttpNpmRegistries = body.allowHttpNpmRegistries;
       if (body.allowUntrustedDockerfileBuilds !== undefined)
         allowUntrustedDockerfileBuilds = body.allowUntrustedDockerfileBuilds;
-      // null is a meaningful value here (clear the override → fall back to the
-      // cluster-wide default), so distinguish it from undefined (leave as-is).
+      // null clears the override; undefined leaves it as-is.
       if (body.userCacheQuotaBytes !== undefined) userCacheQuotaBytes = body.userCacheQuotaBytes;
       if (body.userCacheTtlMs !== undefined) userCacheTtlMs = body.userCacheTtlMs;
       if (body.artifactQuotaBytes !== undefined) artifactQuotaBytes = body.artifactQuotaBytes;
@@ -522,9 +504,9 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
       stored,
       effective: resolveFullPolicyView(stored),
       states: resolveFullPolicyStateView(stored),
-      // Lets the CLI render tell a held-run disable that merely routes the
-      // operation to `kici-admin` from one that leaves no answering surface
-      // at all. The render cannot infer it: the policy map is mode-blind.
+      // Lets the CLI tell a held-run disable that routes the operation to
+      // `kici-admin` from one that leaves no answering surface at all; the
+      // policy map is mode-blind, so the render cannot infer it.
       platformManaged: PLATFORM_CONNECTED_MODES.includes(deps.mode),
     });
   });
@@ -581,9 +563,8 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
         platformManaged: PLATFORM_CONNECTED_MODES.includes(deps.mode),
       });
     } catch (err) {
-      // A refused lockout is a coherent client-side conflict, not a server
-      // fault: surfaced verbatim so the CLI prints what the server said, and
-      // never logged at error level.
+      // A refused lockout is a client-side conflict, not a server fault:
+      // surfaced verbatim for the CLI and never logged at error level.
       if (err instanceof HeldRunLockoutRefusedError) {
         return c.json({ error: err.message, operations: err.operations }, 409);
       }
@@ -595,5 +576,5 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
   return app;
 }
 
-// Re-export to allow callers (tests) to type-narrow against the operation enum.
+// Re-exported so tests can type-narrow against the operation enum.
 export { DashboardWriteOperation };

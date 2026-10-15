@@ -1,15 +1,11 @@
 /**
  * CLI-secret overlay for `kici run` test dispatch.
  *
- * Wraps the orchestrator's context `SecretResolver` and overlays the
- * developer's CLI-uploaded local secrets on top of the env-resolved secrets,
- * with CLI winning on collision. Passed to the shared dispatch core via
- * `ProcessingDeps.secretResolver`, so the core's secret-resolution path is
- * unchanged and oblivious to "test secrets".
+ * Wraps the context `SecretResolver` and overlays the developer's CLI-uploaded
+ * secrets, passed as `ProcessingDeps.secretResolver` so the dispatch core stays
+ * oblivious to test secrets.
  *
- * Precedence: env-resolved secrets → CLI context for the requested context
- * → CLI flat. The CLI flat overlay is applied last so a CLI flat key always
- * wins.
+ * Precedence, lowest first: env-resolved → CLI context → CLI flat.
  */
 
 import type { HostFacts } from '@kici-dev/engine';
@@ -43,8 +39,7 @@ export class DecoratingSecretResolver implements SecretResolverApi {
     hostCtx?: HostFacts,
     attribution?: SecretResolutionAttribution,
   ): Promise<Record<string, string>> {
-    // Forward hostCtx so the wrapped resolver keeps per-host fan-out scoping;
-    // dropping it would silently degrade a per-host resolution to fleet-wide.
+    // Dropping hostCtx would silently widen a per-host resolution to fleet-wide.
     const envSecrets = await this.base.resolveForContext(orgId, context, hostCtx, attribution);
     // The CLI overlay is keyed by the name the job declared, not the matched row.
     return {

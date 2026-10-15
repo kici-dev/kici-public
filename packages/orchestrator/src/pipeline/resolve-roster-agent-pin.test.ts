@@ -113,17 +113,14 @@ describe('resolveRosterAgentPin', () => {
   });
 
   it('pins a host whose agent id carries capitals, taking the raw selector', async () => {
-    // The documented inventory fan-out pattern is `runsOn: [h.agentId]`, and an
-    // agent id is not a label: `host_roster.agent_id` is case-sensitive. So the
-    // pin reads `runsOnExactRaw`, not the folded routing labels beside it.
+    // The documented fan-out is `runsOn: [h.agentId]`, and `host_roster.agent_id`
+    // is case-sensitive, so the pin reads `runsOnExactRaw`, not the folded labels.
     const store = fakeStore({ 'Agent-EU-1': { connected_instance_id: 'orch-b' } });
     const sel = runsOnSelectorsForLockJob({
       runsOn: [{ kind: 'exact', value: 'Agent-EU-1' }],
     });
 
-    // The routing labels beside it ARE folded — both halves in one assertion,
-    // so a change that folded the raw values would break this test's premise
-    // rather than passing quietly.
+    // Assert both halves, so folding the raw values breaks the premise loudly.
     expect(sel.runsOnLabels).toEqual(['agent-eu-1']);
     expect(sel.runsOnExactRaw).toEqual(['Agent-EU-1']);
 

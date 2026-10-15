@@ -1,14 +1,8 @@
 /**
- * Config management commands for kici-admin.
- *
- * Provides subcommands for orchestrator configuration management:
- *   config seed, get, set, delete, export, validate, diff, history, rollback, reload, init
- *
- * All commands except `validate --offline` and `init` are thin clients over
- * the admin REST API at /admin/config/*.
- *
- * Provider configuration (GitHub Apps, etc.) is managed via the `sources` table
- * and the `kici-admin source` commands, not through config seed.
+ * `kici-admin config` subcommands. All except `validate --offline` and `init`
+ * are thin clients over the admin REST API at /admin/config/*. Provider
+ * configuration (GitHub Apps, etc.) lives in the `sources` table, managed by
+ * `kici-admin source`, not config seed.
  */
 
 import { readFile, writeFile } from 'node:fs/promises';
@@ -16,9 +10,6 @@ import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { cliAction } from './shared/cli-action.js';
 
-/**
- * YAML import helper. Uses the 'yaml' package (already a dependency of the orchestrator).
- */
 async function parseYaml(content: string): Promise<unknown> {
   const { parse } = await import('yaml');
   return parse(content);
@@ -30,37 +21,29 @@ async function stringifyYaml(obj: unknown): Promise<string> {
 }
 
 /**
- * Shared-config paths a running cluster genuinely consumes.
+ * Shared-config paths a running cluster consumes: `buildConfigBundle`
+ * (cluster/join-handler.ts) hands `storage` and `secrets.key` to a joining
+ * orchestrator. Nothing else reaches a process: startup parses the environment,
+ * and the reloader has no shared store.
  *
- * `buildConfigBundle` (cluster/join-handler.ts) reads `storage` and
- * `secrets.key` out of the shared document and hands them to a joining
- * orchestrator. Nothing else in the document reaches a process: startup parses
- * the environment, and the reloader is constructed with no shared store.
- *
- * `secrets` is deliberately absent. It is the parent of two siblings the bundle
- * does not carry — `secrets.keyFile` and `secrets.bootstrapAdminToken`, both
- * declared by `sharedConfigSchema` — so listing it silenced the warning on
- * exactly the inert writes this warning exists for.
+ * `secrets` is deliberately absent: its siblings `secrets.keyFile` and
+ * `secrets.bootstrapAdminToken` are not in the bundle, so listing it would
+ * silence the warning on exactly the inert writes it exists for.
  */
 const CONSUMED_SHARED_CONFIG_PATHS = ['storage', 'secrets.key'];
 
 /**
- * Whether a shared-config path is one a joining orchestrator receives.
- *
- * True for the consumed paths themselves and for anything below them, so
- * `storage.bucket` counts and `storageQuota` does not.
+ * True for a consumed path and anything below it, so `storage.bucket` counts
+ * and `storageQuota` does not.
  */
 export function isConsumedSharedConfigPath(path: string): boolean {
   return CONSUMED_SHARED_CONFIG_PATHS.some((p) => path === p || path.startsWith(`${p}.`));
 }
 
 /**
- * Warning text for a `config set` on a path nothing reads back, or null when
- * the path is consumed.
- *
- * The write itself succeeds and is versioned — the operator is told which
- * mechanism actually changes a running orchestrator, so a stored-but-inert
- * value is not mistaken for an applied one.
+ * Null when the path is consumed. The write itself still succeeds and is
+ * versioned; the warning names the mechanism that changes a running
+ * orchestrator, so a stored-but-inert value is not mistaken for an applied one.
  */
 export function sharedConfigSetWarning(path: string): string | null {
   if (isConsumedSharedConfigPath(path)) return null;
@@ -74,15 +57,12 @@ export function sharedConfigSetWarning(path: string): string | null {
   ].join('\n');
 }
 
-/**
- * Format output according to the --format option.
- */
 function formatOutput(data: unknown, format: string): string {
   switch (format) {
     case 'json':
       return JSON.stringify(data, null, 2);
     case 'yaml':
-      // Synchronous fallback: just use JSON for now; caller can use async version
+      // Synchronous fallback to JSON; the caller can use the async YAML version.
       return JSON.stringify(data, null, 2);
     case 'table':
     default:
@@ -93,9 +73,6 @@ function formatOutput(data: unknown, format: string): string {
   }
 }
 
-/**
- * Format an array of objects as a simple table.
- */
 function formatTable(rows: any[]): string {
   if (rows.length === 0) return 'No results.';
 
@@ -106,9 +83,6 @@ function formatTable(rows: any[]): string {
   return [header, sep, ...lines].join('\n');
 }
 
-/**
- * Format diff results as a table.
- */
 function formatDiffTable(differences: any[]): string {
   if (differences.length === 0) return 'No differences found.';
 
@@ -122,9 +96,6 @@ function formatDiffTable(differences: any[]): string {
   return [header, sep, ...rows].join('\n');
 }
 
-/**
- * Format version history as a table.
- */
 function formatHistoryTable(versions: any[]): string {
   if (versions.length === 0) return 'No config versions found.';
 
@@ -157,7 +128,6 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
           process.exit(1);
         }
 
-        // Inject sensitive values from env vars
         const injected = injectSecretsFromEnv(config);
         if (injected.length > 0) {
           console.error('Injected sensitive fields from environment variables:');
@@ -197,7 +167,6 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
     .action(
       cliAction(
         async (path: string, value: string, opts: { description?: string; format: string }) => {
-          // Try to parse value as JSON, fall back to string
           let parsedValue: unknown;
           try {
             parsedValue = JSON.parse(value);
@@ -263,7 +232,6 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
         }
 
         if (opts.offline) {
-          // Offline validation: import schemas directly
           const schemas = await import('../../config/schema.js');
           let schema;
           switch (opts.type) {
@@ -294,7 +262,6 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
             process.exit(1);
           }
         } else {
-          // Online validation via API
           const result = await getClient().configValidate(config as object, opts.type);
           console.log(formatOutput(result, opts.format));
           if (!result.valid) process.exit(1);
@@ -390,16 +357,12 @@ export function registerConfigCommands(program: Command, getClient: () => AdminA
 }
 
 /**
- * Inject sensitive values from environment variables into the config object.
- * Returns a list of paths that were injected.
- *
- * Note: Provider secrets (GitHub private keys, webhook secrets) are now
- * managed via the sources table and `kici-admin source add`, not config seed.
+ * Returns the injected paths. Provider secrets (GitHub private keys, webhook
+ * secrets) live in the sources table via `kici-admin source add`, not here.
  */
 function injectSecretsFromEnv(config: Record<string, unknown>): string[] {
   const injected: string[] = [];
 
-  // Check for other sensitive env vars
   const platformToken = process.env.KICI_PLATFORM_TOKEN;
   if (platformToken) {
     if (!config.platform) config.platform = {};
@@ -431,9 +394,6 @@ function injectSecretsFromEnv(config: Record<string, unknown>): string[] {
   return injected;
 }
 
-/**
- * Generate a well-commented starter orchestrator.yaml template.
- */
 function generateConfigTemplate(): string {
   return `# KiCI Orchestrator Configuration
 # ================================

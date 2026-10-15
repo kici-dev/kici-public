@@ -144,11 +144,9 @@ describe('defineEnv', () => {
   });
 
   it('describe() walks nested ZodObjects wrapped in optional/default/prefault', () => {
-    // Orchestrator's cluster pattern: z.object({...}).prefault({}). Earlier
-    // describe() only handled bare z.object(...) and silently dropped every
-    // inner field of a wrapped nested object — losing 16 KICI_CLUSTER_* vars
-    // from the operator env reference. Three wrappers exercised here:
-    // .optional(), .default({}), .prefault({}).
+    // The orchestrator's cluster pattern, z.object({...}).prefault({}): a
+    // wrapped nested object must not drop its inner fields from the operator
+    // env reference.
     const schema = z.object({
       optionalGroup: z
         .object({
@@ -180,11 +178,8 @@ describe('defineEnv', () => {
   });
 
   it('describe() renders function-based defaults as <computed> for deterministic docs', () => {
-    // Zod 4 exposes `.default(() => randomUUID())` through a getter that
-    // invokes the function on every access — left unhandled, the docs
-    // generator would emit a different UUID per run and pnpm docs:env:check
-    // would fail immediately after pnpm docs:env. The orchestrator's
-    // cluster.instanceId uses exactly this pattern.
+    // A rendered UUID would differ per run, so pnpm docs:env:check would fail
+    // right after pnpm docs:env (the orchestrator's cluster.instanceId pattern).
     const schema = z.object({
       runId: z
         .string()
@@ -302,9 +297,7 @@ describe('validateUnknownKiciVars', () => {
   });
 
   it('allowlists RESERVED_NON_SCHEMA_KICI_VARS (shim/dev env vars)', () => {
-    // KICI_CACHE is set by the Windows CMD shim (packages/… .cmd via
-    // scripts/package.mjs) to locate the cached Node binary. It's not a
-    // config typo — must not trip the scanner.
+    // KICI_CACHE: set by the Windows CMD shim (see RESERVED_NON_SCHEMA_KICI_VARS).
     expect(() =>
       validateUnknownKiciVars(
         ['KICI_SECRET_KEY'],
@@ -315,10 +308,8 @@ describe('validateUnknownKiciVars', () => {
   });
 
   it('allowlists KICI_CONFIG_DIR (the vitest config-isolation dir)', () => {
-    // Every vitest config in this repo sets KICI_CONFIG_DIR to an isolated dir
-    // at config-eval time (hack/lib/vitest-isolation.ts), and every service a
-    // test spawns inherits it. It is a real CLI var, not a config typo — it
-    // must not trip the scanner.
+    // Set by every vitest config (hack/lib/vitest-isolation.ts) and inherited
+    // by every test-spawned service.
     expect(() =>
       validateUnknownKiciVars(
         ['KICI_SECRET_KEY'],
@@ -343,11 +334,9 @@ describe('validateUnknownKiciVars', () => {
   });
 
   it('leaves KICI_CONFIG to the one service that reads it', () => {
-    // KICI_CONFIG picks which local YAML file the reload path and
-    // `kici-admin scaler` read, and only the orchestrator reads either. It is
-    // therefore allowlisted at the orchestrator's own call site, not here —
-    // the workspace-wide list would have made the agent's and Platform's
-    // catchers accept a name neither service reads.
+    // KICI_CONFIG picks the local YAML the reload path and `kici-admin scaler`
+    // read; only the orchestrator reads it, so only its call site allows it —
+    // the agent's and Platform's catchers must still reject it.
     // fails-when: 'KICI_CONFIG' is put back into RESERVED_NON_SCHEMA_KICI_VARS.
     const env = { KICI_SECRET_KEY: 'x', KICI_CONFIG: '/etc/kici/other.yaml' };
     expect(() => validateUnknownKiciVars(['KICI_SECRET_KEY'], {}, env)).toThrow(/KICI_CONFIG/);
@@ -415,9 +404,7 @@ describe('validateUnknownKiciVars', () => {
   });
 
   it('allowlists RESERVED_NON_SCHEMA_KICI_PREFIXES (test-framework namespace)', () => {
-    // A test harness may set KICI_E2E_* variables, which leak into a spawned
-    // orchestrator through the inherited process.env. Not a config typo — the
-    // whole KICI_E2E_ prefix is test-framework namespace.
+    // A harness's KICI_E2E_* vars leak into an orchestrator it spawns.
     expect(() =>
       validateUnknownKiciVars(
         ['KICI_SECRET_KEY'],
@@ -432,9 +419,7 @@ describe('validateUnknownKiciVars', () => {
   });
 
   it('allowlists KICI_AGENT_ENV_* (agent-env forwarding namespace)', () => {
-    // KICI_AGENT_ENV_* is the orchestrator's passthrough prefix for env vars
-    // forwarded into spawned agents (bare-metal, container, Firecracker MMDS).
-    // The suffix is user-controlled, so it cannot be enumerated in any schema.
+    // The forwarding prefix's suffix is user-controlled, so no schema lists it.
     expect(() =>
       validateUnknownKiciVars(
         ['KICI_SECRET_KEY'],
@@ -449,13 +434,9 @@ describe('validateUnknownKiciVars', () => {
   });
 
   it('allowlists KICI_*_ENV_PROBE (diagnostic probe suffix)', () => {
-    // When KICI_AGENT_ENV_KICI_FC_ENV_PROBE flows through /init's env-forward
-    // path, the KICI_AGENT_ENV_ prefix is stripped and the agent sees
-    // KICI_FC_ENV_PROBE directly. Without this suffix allowlist the validator
-    // would reject it and the agent refuses to start (breaking the
-    // firecracker-pipeline happy-path test). packages/agent/src/server.ts
-    // grabs these vars via the same /_ENV_PROBE$|_ENV_PROBE_/ pattern to log
-    // them in "Agent startup env probes (diagnostic)".
+    // The agent sees a forwarded KICI_AGENT_ENV_KICI_FC_ENV_PROBE as
+    // KICI_FC_ENV_PROBE; rejecting it would stop the agent starting and break
+    // the firecracker-pipeline happy-path test.
     expect(() =>
       validateUnknownKiciVars(
         ['KICI_SECRET_KEY'],

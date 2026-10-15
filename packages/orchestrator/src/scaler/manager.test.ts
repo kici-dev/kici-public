@@ -59,10 +59,8 @@ import {
 // is lifted above every import, and a plain `const` would not exist yet.
 const { mockLoggerError } = vi.hoisted(() => ({ mockLoggerError: vi.fn() }));
 
-// Partial mock: only `createLogger` is replaced, so `toErrorMessage`,
-// `normalizeLabelSet` and every other shared export the manager uses stay
-// real. The error fake is what the warm-pool boot cases assert on; the rest
-// are inert so the suite's log output stays quiet.
+// Partial mock: only `createLogger` is replaced; every other shared export stays real.
+// The warm-pool boot cases assert on the error fake; the rest are inert to keep logs quiet.
 vi.mock('@kici-dev/shared', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@kici-dev/shared')>()),
   createLogger: () => ({
@@ -83,9 +81,6 @@ vi.mock('../metrics/prometheus.js', async (importOriginal) => ({
   setWarmPoolGauges: vi.fn(),
 }));
 
-/**
- * Creates a mock ScalerBackend for testing.
- */
 function createMockBackend(
   overrides: Partial<ScalerBackend> & {
     type: ScalerBackend['type'];
@@ -175,11 +170,9 @@ function appliedPlan(buckets: Partial<ScalerReloadPlan>) {
 }
 
 /**
- * The bare-metal label set every warm-pool fixture uses, carrying a declared
- * shape. A pool whose label set declares no resources is refused, so both the
- * config entry and the backend that serves it have to name one — the backend
- * factory hands a backend the very label sets its config entry declared, so
- * the two can never disagree in production.
+ * The bare-metal label set every warm-pool fixture uses. It declares a shape because a pool
+ * with no declared resources is refused; config and backend share it, as in production, where
+ * the backend factory hands a backend its config entry's own label sets.
  */
 const WARM_GPU_LABEL_SET: LabelSetConfig = {
   labels: ['linux', 'gpu'],
@@ -191,9 +184,8 @@ const WARM_GPU_LABEL_SET: LabelSetConfig = {
 const WARM_GPU_USAGE = { cpus: 1, memBytes: 1024 * 1024 * 1024 };
 
 /**
- * `canAgentRunJob` for an agent as `manager` sees it, registered with `labels`.
- * The registry side is an agent that reports no version, so only the scaler's
- * record can make it refuse a job.
+ * `canAgentRunJob` for an agent `manager` registered with `labels`. The registry side reports
+ * no version, so only the scaler's record can make it refuse a job.
  */
 function serves(
   manager: ScalerManager,
@@ -226,17 +218,13 @@ function mayRefuse(manager: ScalerManager, agentId: string, labels: string[]): b
 const WARM_AGENT_LABELS = ['linux', 'gpu'];
 
 /**
- * Scaler-level defaults a warm-pool fixture declares when its label sets are
- * about something else (taints, gauge dimensions, durable rows). A warm pool is
- * refused unless its resolved shape is declared, and the scaler defaults are
- * the second of the two places that declaration may live.
+ * Scaler-level defaults a warm-pool fixture declares when its label sets are about something
+ * else (taints, gauge dimensions, durable rows): a warm pool needs a resolved shape, and the
+ * scaler defaults are the second place one may be declared.
  */
 const WARM_POOL_DEFAULTS = { resources: { requests: { cpus: 1, memory: '1g' } } };
 
-/**
- * A config whose single (bare-metal) scaler runs a warm pool at a declared
- * shape.
- */
+/** A config whose single (bare-metal) scaler runs a warm pool at a declared shape. */
 function warmConfigWithResources(resourceCap?: { maxCpu?: number; maxMemoryBytes?: number }) {
   const cfg = createDefaultConfig();
   return {
@@ -270,12 +258,11 @@ function claimedForJob(calls: unknown[][], jobId: string): boolean {
 }
 
 /**
- * Seed a store double's cluster-wide spawn count with `seedCount` rows a peer
- * already holds, and make it grow with every slot claimed through the lock.
+ * Seed a store double's cluster-wide spawn count with `seedCount` peer rows, growing with
+ * every slot claimed through the lock.
  *
- * A constant count would let a manager that checks the cap but never claims
- * its slot pass a test about the cap bounding a cluster — which is the whole
- * defect: the spawn row is what the next holder of the lock counts.
+ * A constant count would let a manager that checks the cap but never claims its slot pass
+ * a cap test — the very defect, since the spawn row is what the next lock holder counts.
  */
 function seedClusterCount<T extends ReturnType<typeof fakeStateStore>>(
   store: T,
@@ -293,26 +280,21 @@ function seedClusterCount<T extends ReturnType<typeof fakeStateStore>>(
 }
 
 /**
- * A `ScalerStateStore` double built from spies, for asserting WHICH calls the
- * manager made. Every method resolves to an inert value by default.
+ * A `ScalerStateStore` double built from spies, for asserting WHICH calls the manager made.
+ * Every method resolves to an inert value by default.
  *
- * This is deliberately not the behavioural fake in
- * `__test-helpers__/fake-scaler-state-store.ts`: that one reproduces the real
- * consume-once / TTL / invalidation semantics of `scaler_pending_claims` and is
- * what a test drives when it wants those properties executed. Use this one to
- * observe calls, that one to exercise behaviour — and where a test needs both,
- * spread the behavioural fake's claim methods over this one.
+ * The behavioural fake in `__test-helpers__/fake-scaler-state-store.ts` reproduces the real
+ * consume-once / TTL / invalidation semantics of `scaler_pending_claims`. Use this one to
+ * observe calls, that one to exercise behaviour; to need both, spread the fake's claim
+ * methods over this one.
  *
- * `overrides` is checked at runtime against the base shape: a typo'd key
- * (`redeemClam`) would otherwise apply nothing and leave the permissive default
- * in place, and nothing else can catch it — this repo neither lints nor
- * typechecks test files, and the parameter is deliberately untyped so a store
- * method added in a later change is accepted without editing this signature.
+ * `overrides` is checked at runtime against the base shape: a typo'd key (`redeemClam`)
+ * would silently keep the permissive default, and this repo neither lints nor typechecks
+ * test files. The parameter is untyped so a new store method needs no signature edit.
  *
- * Every spawn-row write lands on the `upsertSpawningAgent` spy, the cap lock's
- * in-transaction claim included: the real store has one writer for that row, so
- * a double with two would let a test assert against a writer the manager no
- * longer uses and still pass.
+ * Every spawn-row write, the cap lock's in-transaction claim included, lands on the
+ * `upsertSpawningAgent` spy: the real store has one writer for that row, and a double with
+ * two would let a test pass against a writer the manager no longer uses.
  */
 function fakeStateStore(overrides: Record<string, unknown> = {}) {
   const upsertSpawningAgent = vi.fn().mockResolvedValue(undefined);
@@ -358,23 +340,19 @@ function fakeStateStore(overrides: Record<string, unknown> = {}) {
 }
 
 /**
- * In-memory stand-in for the `scaler_spawning_agents` table.
- *
- * Spread its `overrides` into a `fakeStateStore` and a test can assert what
- * durably **survives** rather than which method was called — which is the whole
- * question for a row that is the only record of a running cloud instance. Every
- * method mirrors the real SQL predicate, `adoptSpawningAgent`'s
- * `(adopted_by IS NULL OR adopted_by = $instanceId) AND backend_type = 'event'`
- * included: a fake that dropped the backend-type half would adopt rows Postgres
- * refuses to, and one that dropped the self-arm would refuse rows Postgres
- * accepts.
+ * In-memory stand-in for the `scaler_spawning_agents` table. Spread its `overrides` into a
+ * `fakeStateStore` to assert what durably **survives** — the only record of a running cloud
+ * instance — rather than which method was called. Every method mirrors the real SQL
+ * predicate, `adoptSpawningAgent`'s
+ * `(adopted_by IS NULL OR adopted_by = $instanceId) AND backend_type = 'event'` included:
+ * dropping the backend-type half would adopt rows Postgres refuses, and dropping the
+ * self-arm would refuse rows Postgres accepts.
  */
 function spawningRowTable() {
   const rows = new Map<string, Record<string, unknown> & { adoptedBy: string | null }>();
   /**
-   * The `scaler_provision_outcomes` half. Separate from `rows` on purpose: the
-   * whole point of the real table is that it OUTLIVES the spawn row, so a fake
-   * that stored the verdict on the spawn row could not reproduce the bug at all.
+   * The `scaler_provision_outcomes` half, apart from `rows` because the real table OUTLIVES
+   * the spawn row; a verdict stored on the spawn row could not reproduce the bug.
    */
   const outcomes = new Map<string, { adoptedBy: string | null; condemnedReason: string | null }>();
   const writeRow = async (snapshot: ClaimedSnapshot): Promise<void> => {
@@ -384,11 +362,9 @@ function spawningRowTable() {
   };
   const overrides = {
     upsertSpawningAgent: vi.fn(writeRow),
-    // The cap lock's claim writes the same row the plain upsert does — in the
-    // real store both are one `INSERT … ON CONFLICT` against
-    // `scaler_spawning_agents`. A fake that let the claim land anywhere else
-    // would make every spawn through an event backend invisible to this table,
-    // and its count would never reflect what the cluster already holds.
+    // The cap lock's claim writes the same row as the plain upsert (one
+    // `INSERT … ON CONFLICT` in the real store); a claim landing elsewhere would hide every
+    // event-backend spawn from this table and from the cluster count.
     withScalerCapLock: vi.fn(async (scalerName: string, fn: (slot: FakeCapSlot) => unknown) =>
       fn({
         clusterActiveCount: [...rows.values()].filter(
@@ -424,10 +400,9 @@ function spawningRowTable() {
       if (!row || row.backendType !== ScalerBackendType.enum.event) return null;
       if (row.adoptedBy !== null && row.adoptedBy !== instanceId) return null;
       row.adoptedBy = instanceId;
-      // Mirrors the real store, which writes the outcome in the same
-      // transaction as the stamp — a fake that skipped it would let every
-      // adopted-then-reaped assertion pass for the wrong reason. First
-      // adoption wins, as the real ON CONFLICT's COALESCE does.
+      // Like the real store, the outcome is written in the stamp's transaction — skipping it
+      // would let adopted-then-reaped assertions pass for the wrong reason. First adoption
+      // wins, as the real ON CONFLICT's COALESCE does.
       const existing = outcomes.get(agentId);
       outcomes.set(agentId, {
         adoptedBy: existing?.adoptedBy ?? instanceId,
@@ -455,9 +430,8 @@ function fakeEmitter() {
 }
 
 /**
- * The `github-actions` event-scaler entry the event harness is built around.
- * A fresh object per call: the backend keeps a reference to `labelSets`, so a
- * shared literal would let one test's `reload` bleed into the next.
+ * The `github-actions` event-scaler entry of the event harness. A fresh object per call: the
+ * backend keeps a reference to `labelSets`, so a shared literal would leak one test's `reload`.
  */
 function eventScalerEntry(): ScalerEntry {
   return {
@@ -472,15 +446,10 @@ function eventScalerEntry(): ScalerEntry {
 }
 
 /**
- * A **real** `EventScalerBackend` over the doubles above.
- *
- * It has to be the real class, not a `createMockBackend` look-alike: the
- * manager reaches the event-only lifecycle calls through
- * `instanceof EventScalerBackend`, and a structural stand-in makes that branch
- * silently unreachable — every test built on it would pass without ever
- * entering the code it claims to cover. Building the real thing costs four
- * constructor arguments and additionally exercises the true claim-registration
- * and event-emission paths instead of a spy standing in for them.
+ * A **real** `EventScalerBackend` over the doubles above. The manager reaches the event-only
+ * lifecycle calls through `instanceof EventScalerBackend`, so a `createMockBackend`
+ * look-alike would leave that branch silently unreachable; the real class also exercises the
+ * true claim-registration and event-emission paths.
  */
 function makeEventBackend(
   opts: {
@@ -518,12 +487,9 @@ interface ManagerHarnessOptions {
   claimStore?: { claim: (code: string) => Promise<unknown> };
   config?: ScalerConfig;
   /**
-   * Override the event backend `makeManagerWithEventBackend` would build.
-   *
-   * Typed as the concrete class, not `ScalerBackend`: the manager reaches the
-   * event-only lifecycle calls through `instanceof EventScalerBackend`, so a
-   * structural stand-in accepted here would make every one of those branches
-   * silently unreachable in the test that injected it.
+   * Override the event backend `makeManagerWithEventBackend` would build. Typed as the
+   * concrete class: a structural stand-in would make every `instanceof EventScalerBackend`
+   * branch silently unreachable in the test that injected it.
    */
   eventBackend?: EventScalerBackend;
   /** Passed straight through, so a test can configure `machinePools`. */
@@ -531,9 +497,8 @@ interface ManagerHarnessOptions {
   /** The cluster-wide spawn deadline, which also floors the stale-entry prune. */
   spawnTimeoutMs?: number;
   /**
-   * Read-only agent-registry view. Omitted by default, which is what a host
-   * with no registry looks like: the warm pool then sees zero ready agents and
-   * nothing idle to reap.
+   * Read-only agent-registry view. Omitted by default, as on a host with no registry: the warm
+   * pool then sees zero ready agents and nothing idle to reap.
    */
   agentRegistry?: ScalerManagerDeps['agentRegistry'];
   /** Relay for attributed scaler events. Defaults to a bare spy. */
@@ -544,7 +509,6 @@ interface ManagerHarnessOptions {
   readJobStatuses?: ScalerManagerDeps['readJobStatuses'];
 }
 
-/** Build a `ScalerManager` with the doubles above. */
 /**
  * The narrow registry view the manager consumes. `markDraining` returns the
  * agent's `activeJobs` so the caller can back out of a destroy for an agent
@@ -597,11 +561,9 @@ function makeManagerWithNoBackends(opts: ManagerHarnessOptions = {}) {
 }
 
 /**
- * Manager whose single backend is a real event backend serving
- * `github-actions`. The manager's config carries the very same entry object, so
- * the name-keyed lookups it makes (`mandatoryLabels`, `roles`) resolve rather
- * than silently falling back to empty, and the backend's own view of the entry
- * can never drift from the manager's.
+ * Manager whose single backend is a real event backend serving `github-actions`. The config
+ * carries the very same entry object, so name-keyed lookups (`mandatoryLabels`, `roles`)
+ * resolve instead of silently falling back to empty, and the backend's view never drifts.
  */
 function makeManagerWithEventBackend(opts: ManagerHarnessOptions = {}) {
   const stateStore = opts.stateStore ?? fakeStateStore();
@@ -994,11 +956,9 @@ describe('ScalerManager', () => {
     });
 
     it('admits exactly one of two concurrent requests against globalMaxAgents: 1', async () => {
-      // The real timing: `requestScale` fires the spawn asynchronously AFTER
-      // the reservation lock is released, so `getActiveCount()` still reads 0
-      // while the agent waits in the spawn semaphore. A count cap reading only
-      // the backend's ledger therefore admits every request in a redrive
-      // batch — ten agents against a cap of one.
+      // `requestScale` fires the spawn asynchronously AFTER releasing the reservation lock, so
+      // `getActiveCount()` still reads 0 while the agent waits in the spawn semaphore. A cap on
+      // the backend's ledger alone admits a whole redrive batch — ten agents against a cap of one.
       const backend = createMockBackend({
         type: 'container',
         labelSets: [{ labels: ['linux', 'docker'], image: 'agent:latest' }],
@@ -1095,11 +1055,9 @@ describe('ScalerManager', () => {
     });
 
     it('counts spawning agents toward per-backend capacity via backend.getActiveCount()', async () => {
-      // Real backends (container, bare-metal, firecracker) add to their internal
-      // agents map synchronously at the start of spawn(). This means getActiveCount()
-      // reflects spawning agents immediately, before the spawn promise resolves.
-      // The manager relies solely on backend.getActiveCount() for capacity checks
-      // and does NOT separately count spawningAgents to avoid double-counting.
+      // Real backends (container, bare-metal, firecracker) add to their agents map
+      // synchronously at the start of spawn(), so getActiveCount() already counts spawning
+      // agents; the manager relies on it alone and does NOT add spawningAgents (double count).
       let activeCount = 4;
       const slowBackend = createMockBackend({
         type: 'container',
@@ -1304,10 +1262,9 @@ describe('ScalerManager', () => {
       expect(poolCount(manager)).toBe(0);
     });
 
-    // The config schema types `memory` as a plain string, so a value like the
-    // Kubernetes-style `4Gi` reaches the shape check unvalidated. Constructing
-    // at all is the assertion: an unguarded parse throws out of the constructor
-    // and takes orchestrator startup with it.
+    // The schema types `memory` as a plain string, so a Kubernetes-style `4Gi` reaches the
+    // shape check unvalidated. Constructing at all is the assertion: an unguarded parse throws
+    // out of the constructor and takes orchestrator startup with it.
     it('refuses a warm pool whose declared memory cannot be parsed', () => {
       const cfg = createDefaultConfig();
       const manager = createManager(
@@ -1365,11 +1322,9 @@ describe('ScalerManager', () => {
     it('starts the warm agent at the shape it reserved', async () => {
       const { spawn } = await fillWarmPool();
 
-      // The 5th argument is `effectiveLimits`. It is the only carrier of the
-      // shape for an event backend (its `scale-up` payload builds `resources`
-      // from this and nothing else), so a pre-spawn that reserved a shape and
-      // passed `undefined` here would provision an agent of some other size and
-      // then match jobs against the reservation.
+      // The 5th argument, `effectiveLimits`, is an event backend's only carrier of the shape
+      // (its `scale-up` payload builds `resources` from it alone): passing `undefined` would
+      // provision an agent of another size, then match jobs against the reservation.
       expect(spawn.mock.calls[0][4]).toEqual({
         cpus: WARM_GPU_USAGE.cpus,
         memBytes: WARM_GPU_USAGE.memBytes,
@@ -1697,10 +1652,9 @@ describe('ScalerManager', () => {
     });
 
     it('does not re-destroy a warm agent whose teardown is still in flight', async () => {
-      // A backend whose destroy outlives a tick. The agent stays idle-listed
-      // until the teardown settles, so the next reap pass selects it again —
-      // and without the in-flight guard the backend is handed a second destroy
-      // and the reaped counter advances twice for one agent.
+      // A destroy that outlives a tick keeps the agent idle-listed, so the next reap selects
+      // it again; without the in-flight guard the backend gets a second destroy and the
+      // reaped counter advances twice for one agent.
       let settle!: () => void;
       const destroy = vi.fn(
         () =>
@@ -1741,11 +1695,9 @@ describe('ScalerManager', () => {
     });
 
     it('fills a pool whose taint is not on its declared label set', async () => {
-      // A bare-metal pool declaring a structured windows platform without also
-      // declaring `windows` as a label. The taint lands on every agent's
-      // mandatoryLabels gate, so the readiness query has to carry it too — and
-      // the agent has to register with it. Both now hold, so the pool fills
-      // instead of being refused as unfillable.
+      // A bare-metal pool declaring a structured windows platform but no `windows` label. The
+      // taint lands on every agent's mandatoryLabels gate, so the readiness query and the
+      // agent's registration both carry it, and the pool fills instead of being refused.
       const backend = createMockBackend({
         type: 'bare-metal',
         labelSets: [{ labels: ['windows-2022'], binaryPath: '/kici-agent.exe' }],
@@ -1870,9 +1822,8 @@ describe('ScalerManager', () => {
         manager as unknown as { warmPool: { getStats(): WarmPoolStats[] } }
       ).warmPool.getStats();
 
-      // The pool used to be refused outright: its agents' gate carries `arm64`,
-      // which the readiness query built from the declared labels alone never
-      // contained.
+      // Its agents' gate carries `arm64`, which a readiness query built from the declared
+      // labels alone would never contain, so the pool would be refused outright.
       expect(stats).toHaveLength(1);
       expect(stats[0].labels).toContain('arm64');
       expect(stats[0].labels).toEqual(expect.arrayContaining(['linux', 'gpu']));
@@ -1910,11 +1861,9 @@ describe('ScalerManager', () => {
     });
 
     it('asks a tainted pool for a label set its backend actually has configured', async () => {
-      // Every real backend resolves the image / binary / VM config by matching
-      // the requested set against its own `labelSets` and throws on anything
-      // else, so a request widened by the pool's taint is a spawn that can never
-      // succeed. This backend enforces that contract, so a widened request fails
-      // the test instead of being silently accepted by a permissive double.
+      // Every real backend resolves its image / binary / VM config by matching the requested
+      // set against its own `labelSets` and throws otherwise, so a taint-widened request can
+      // never spawn. This backend enforces that contract instead of accepting it silently.
       const cfg = createDefaultConfig();
       const declared = cfg.scalers[1].labelSets[0].labels;
       const refused: string[][] = [];
@@ -1958,12 +1907,10 @@ describe('ScalerManager', () => {
     });
 
     it('gives each pool of a tainted scaler its own gauge series', async () => {
-      // Two label sets on one tainted scaler can widen to the SAME readiness
-      // query — here `[linux, gpu]` gains `arm64` from the taint, which the
-      // other set already declares. They are still two pools with their own
-      // target and fill, so the gauge dimension has to key on the pool rather
-      // than on the widened query: an identical dimension makes the second row
-      // overwrite the first and a whole pool vanishes from the gauges.
+      // Two label sets on one tainted scaler can widen to the SAME readiness query:
+      // `[linux, gpu]` gains `arm64`, which the other set already declares. They are still two
+      // pools, so the gauge dimension keys on the pool; an identical dimension would let the
+      // second row overwrite the first and a whole pool vanish from the gauges.
       const labelSets = [
         {
           labels: ['linux', 'gpu'],
@@ -2320,9 +2267,8 @@ describe('ScalerManager', () => {
     });
 
     it('does not prune spawns still queued behind the semaphore, only started-and-stale ones', async () => {
-      // Fake timers (the suite default) so we can advance past the 5-min
-      // stale-prune threshold. One slot, a spawn that never resolves — it holds
-      // the slot so the other two requests stay queued.
+      // Fake timers (the suite default) to advance past the 5-min stale-prune threshold. One
+      // slot, held by a spawn that never resolves, so the other two requests stay queued.
       const spawn = vi.fn(() => new Promise<ManagedAgent>(() => {}));
       const backend = createMockBackend({
         type: 'container',
@@ -2409,11 +2355,10 @@ describe('ScalerManager', () => {
     });
 
     it('drops the buffered failure of a pruned spawn, whose correlation can never arrive', async () => {
-      // A warm spawn's `scaler.failed` resolves to no run/job, so it is parked
-      // waiting for a correlation. The prune is the moment that wait becomes
-      // provably futile — the same reasoning that makes the prune the only
-      // place the reservation can be freed — so the entry has to go with it, or
-      // the buffer keeps one dead event per pruned warm spawn forever.
+      // A warm spawn's `scaler.failed` resolves to no run/job, so it is parked awaiting a
+      // correlation. The prune makes that wait provably futile (the same reason it is the only
+      // place the reservation is freed), so the entry goes with it, or the buffer keeps one
+      // dead event per pruned warm spawn forever.
       const onScalerEvent = vi.fn();
       const manager = createManager(undefined, undefined, onScalerEvent);
 
@@ -2464,20 +2409,15 @@ describe('ScalerManager', () => {
     it('correlates spawned agent to tracking entry', async () => {
       const manager = createManager();
 
-      // Trigger a spawn
       await manager.requestScale(['linux', 'docker'], 'job-1', 'run-test');
 
-      // Get the agentId from the spawn call
       const spawnCall = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock.calls[0];
       const agentId = spawnCall[1] as string;
 
-      // Let spawn complete
       await vi.advanceTimersToNextTimerAsync();
 
-      // Register the agent
       manager.onAgentRegistered(agentId, ['linux', 'docker']);
 
-      // Verify agent is now in managedAgentIndex (check via getStatus)
       const status = manager.getStatus();
       expect(status.spawningCount).toBe(0);
     });
@@ -2485,7 +2425,6 @@ describe('ScalerManager', () => {
     it('returns the bound jobId so the orchestrator can eager-dispatch it', async () => {
       const manager = createManager();
 
-      // Trigger a spawn for a specific queued jobId
       await manager.requestScale(['linux', 'docker'], 'queued-job-42', 'run-test');
 
       const agentId = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock
@@ -2543,13 +2482,11 @@ describe('ScalerManager', () => {
       await manager.requestScale(['linux', 'docker'], 'job-1', 'run-test');
       const agentId = (slowBackend.spawn as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
 
-      // Before registration, spawning count = 1
       expect(manager.getStatus().spawningCount).toBe(1);
 
       // Agent registers (before spawn promise resolves)
       manager.onAgentRegistered(agentId, ['linux', 'docker']);
 
-      // Spawning count should be 0
       expect(manager.getStatus().spawningCount).toBe(0);
     });
 
@@ -2559,7 +2496,6 @@ describe('ScalerManager', () => {
       // This should not throw
       manager.onAgentRegistered('static-agent-1', ['linux', 'docker']);
 
-      // Status should show 0 spawning
       expect(manager.getStatus().spawningCount).toBe(0);
     });
   });
@@ -2582,12 +2518,10 @@ describe('ScalerManager', () => {
     }
 
     it('stamps the ownership columns onto the spawn row, or nothing can adopt it', async () => {
-      // `adoptSpawningAgent` matches on `backend_type = 'event'`, so a row
-      // written without it is unadoptable by every instance — including the one
-      // that spawned it — and the whole path below is inert. `mandatory_labels`
-      // is likewise the only source of the taint for a coordinator that has no
-      // config entry for this scaler, and `owner_instance_id` is what scopes
-      // recovery to the spawner.
+      // `adoptSpawningAgent` matches on `backend_type = 'event'`, so a row without it is
+      // unadoptable by every instance, the spawner included. `mandatory_labels` is the only
+      // taint source for a coordinator with no config entry for this scaler, and
+      // `owner_instance_id` scopes recovery to the spawner.
       const stateStore = fakeStateStore();
       const manager = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-a' });
 
@@ -2604,11 +2538,10 @@ describe('ScalerManager', () => {
     });
 
     it('stamps the run id onto the spawn row, or a failure has nothing to attribute to', async () => {
-      // The reaper is leader-gated, so the coordinator that condemns a stranded
-      // provision is routinely not the one that spawned it and has no in-memory
-      // spawning entry to read the identity from. `onScalerEvent` needs BOTH
-      // halves, so a row missing the run id leaves the waiting job with a
-      // label-mismatch message instead of the provisioning cause.
+      // The reaper is leader-gated, so the coordinator condemning a stranded provision often
+      // did not spawn it and has no in-memory entry to read the identity from. `onScalerEvent`
+      // needs BOTH halves: without the run id the waiting job gets a label-mismatch message
+      // instead of the provisioning cause.
       const stateStore = fakeStateStore();
       const manager = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-a' });
 
@@ -2722,10 +2655,9 @@ describe('ScalerManager', () => {
     });
 
     it('keeps the durable row when an event agent registers on its own spawner', async () => {
-      // The single-coordinator shape: spawn and register on the same instance.
-      // The row is the only pointer to the customer's cloud instance, so it must
-      // survive registration — stamped as adopted here — rather than being
-      // deleted the way a local-backend row is.
+      // Single-coordinator shape: spawn and register on one instance. The row is the only
+      // pointer to the customer's cloud instance, so it survives registration, stamped as
+      // adopted, rather than being deleted like a local-backend row.
       const table = spawningRowTable();
       const stateStore = fakeStateStore(table.overrides);
       const manager = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-a' });
@@ -2745,13 +2677,11 @@ describe('ScalerManager', () => {
     });
 
     it('spares a self-adopted row when a restart rehydrates it into the prune', async () => {
-      // The only shape in which the prune can reach a registered agent at all:
-      // `completeLocalRegistration` drops the in-memory entry first, so the
-      // prune loop skips the agent entirely while this process lives. A restart
-      // rehydrates the row — already stale, because `recoverState` measures
-      // staleness from the persisted enqueue time — and the next `requestScale`
-      // genuinely prunes it. Only the `adopted_by IS NULL` predicate saves the
-      // row, and with it the pointer to the customer's running instance.
+      // The only shape in which the prune reaches a registered agent: while this process lives,
+      // `completeLocalRegistration` drops the in-memory entry first, so the loop skips it. A
+      // restart rehydrates the row already stale (`recoverState` measures staleness from the
+      // persisted enqueue time), the next `requestScale` prunes it, and only the
+      // `adopted_by IS NULL` predicate saves the row: the pointer to the running instance.
       const { rows, overrides } = spawningRowTable();
       const stateStore = fakeStateStore(overrides);
       const spawner = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-a' });
@@ -2779,12 +2709,10 @@ describe('ScalerManager', () => {
     });
 
     it('spares a stale event row whose scaler is no longer configured here', async () => {
-      // Removing an event scaler from the config leaves its in-flight rows
-      // behind, and `recoverState` rehydrates every row this instance owns
-      // whether or not the scaler still exists. Reading "no backend configured"
-      // as "not an event scaler" would delete each one on the first prune after
-      // the restart — and with the row goes the only pointer at the customer's
-      // running cloud instance, so nothing ever tears it down.
+      // Removing an event scaler from the config leaves its in-flight rows, and `recoverState`
+      // rehydrates every owned row whether or not the scaler exists. Reading "no backend
+      // configured" as "not an event scaler" would delete each on the first prune after the
+      // restart, losing the only pointer at the customer's running instance.
       const { rows, overrides } = spawningRowTable();
       const stateStore = fakeStateStore(overrides);
       const spawner = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-a' });
@@ -2842,12 +2770,10 @@ describe('ScalerManager', () => {
       const emitter = fakeEmitter();
       const entry: ScalerEntry = {
         ...eventScalerEntry(),
-        // A validated config can never gate on a `kici:` label (they are reserved
-        // in both `labelSets` and `mandatoryLabels`), and every configured gate
-        // label must appear in every label set. The shared fixture's
-        // `kici:os:linux` gate satisfies neither, and a warm pool whose gate
-        // escapes its label set is refused as unfillable — correctly, since the
-        // readiness query could never see its own agents.
+        // A validated config never gates on a `kici:` label (reserved in both `labelSets` and
+        // `mandatoryLabels`), and every gate label must appear in every label set. The shared
+        // fixture's `kici:os:linux` gate fails both, and a pool whose gate escapes its label set
+        // is refused as unfillable: its readiness query could never see its own agents.
         mandatoryLabels: ['github-actions'],
         // A warm pool needs a declared shape: it starts an agent before any job
         // exists, so its cpu/memory can come from nowhere else.
@@ -2886,16 +2812,14 @@ describe('ScalerManager', () => {
     });
 
     it('answers from the local spawning entry, not from the store reply', async () => {
-      // The store is still touched on this path — `markSpawningAgentAdopted`
-      // stamps the row as owned here — but its reply is ignored. The default
-      // fake resolves `adoptSpawningAgent` to null, so a non-null result can
-      // only have come from the in-memory entry.
+      // The store is still touched (`markSpawningAgentAdopted` stamps the row as owned here)
+      // but its reply is ignored: the default fake resolves `adoptSpawningAgent` to null, so a
+      // non-null result can only come from the in-memory entry.
       const stateStore = fakeStateStore();
       const manager = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-a' });
-      // Drive a real spawn so the agent lands in the local spawning map, rather
-      // than reaching into private state.
-      // `kici:os:linux` is the scaler's mandatory (taint) label, so the request
-      // has to tolerate it for the label matcher to route here at all.
+      // Drive a real spawn into the local spawning map instead of reaching into private state.
+      // `kici:os:linux` is the scaler's mandatory (taint) label, so the request has to
+      // tolerate it for the label matcher to route here at all.
       const scaled = await manager.requestScale(
         ['github-actions', 'kici:os:linux'],
         'job-1',
@@ -2911,17 +2835,14 @@ describe('ScalerManager', () => {
     });
 
     it('re-adopts its own row after a restart, while still refusing a peer', async () => {
-      // The silent-leak shape. A restart rehydrates the row, the stale prune
-      // drops the in-memory entry but spares the row, and the still-live agent's
-      // next registration therefore has only the adoption path left. An
-      // `adopted_by IS NULL`-only predicate refuses it — because `adopted_by` is
-      // already this very instance — so the agent reads as static: no
-      // `scale-down` on disconnect, and the reaper spares it because the agent
-      // is registered and its adopter is alive.
+      // The silent-leak shape: a restart rehydrates the row, the stale prune drops the
+      // in-memory entry but spares the row, so the live agent's next registration has only the
+      // adoption path. An `adopted_by IS NULL`-only predicate refuses it (`adopted_by` is
+      // already this instance), so the agent reads as static: no `scale-down` on disconnect,
+      // and the reaper spares it because it is registered and its adopter is alive.
       //
-      // The SQL predicate itself is pinned in `scaler-state-store.test.ts`; this
-      // covers the consequence the manager draws once the store answers, which
-      // is the half a reader of the store test cannot see.
+      // `scaler-state-store.test.ts` pins the SQL predicate; this covers the consequence the
+      // manager draws from the store's answer.
       const { rows, overrides } = spawningRowTable();
       const stateStore = fakeStateStore(overrides);
       const emitter = fakeEmitter();
@@ -2943,10 +2864,9 @@ describe('ScalerManager', () => {
       expect(rows.has(agentId)).toBe(true);
       expect(stateStore.deleteUnadoptedSpawningAgent).not.toHaveBeenCalled();
 
-      // The negative control, run first so it cannot be a leftover of the
-      // positive one: a peer is still refused a row this instance holds. The
-      // refusal is now a throw rather than a `null`, because `null` means
-      // "register as static" and this id is scaler-minted.
+      // Negative control, run first so it cannot be a leftover of the positive one: a peer is
+      // still refused a row this instance holds — by a throw, since `null` means "register as
+      // static" and this id is scaler-minted.
       const peer = makeManagerWithNoBackends({ stateStore, instanceId: 'orch-b' });
       await expect(peer.onAgentRegistered(agentId, ['github-actions'])).rejects.toThrow(
         /no spawn record/,
@@ -2972,13 +2892,12 @@ describe('ScalerManager', () => {
 
   describe('registration seeds the backend map', () => {
     it('lets a locally re-registered agent be torn down after a restart', async () => {
-      // `recoverState` rehydrates `spawningAgents` but not the backend's own
-      // agent map, so a restarted coordinator answers the re-registration from
-      // memory (`completeLocalRegistration`, not the adoption path). Without a
-      // seed there, `EventScalerBackend.destroy()` opens with
-      // `if (!this.agents.has(id)) return;` and silently no-ops on disconnect
-      // while the `.then()` still deletes the row — the customer's instance
-      // runs forever with nothing left pointing at it.
+      // `recoverState` rehydrates `spawningAgents` but not the backend's agent map, so a
+      // restarted coordinator answers re-registration through `completeLocalRegistration`, not
+      // adoption. Unseeded, `EventScalerBackend.destroy()` opens with
+      // `if (!this.agents.has(id)) return;` and silently no-ops on disconnect while the
+      // `.then()` still deletes the row: the customer's instance runs on with nothing pointing
+      // at it.
       const { rows, overrides } = spawningRowTable();
       const stateStore = fakeStateStore(overrides);
       const emitter = fakeEmitter();
@@ -3013,12 +2932,10 @@ describe('ScalerManager', () => {
 
   describe('teardown addressing', () => {
     it('delivers to the spawn-time targets when this coordinator also holds the agent', async () => {
-      // The local path: one coordinator spawned the agent AND holds it, so no
-      // adoption is involved and the in-memory spawn entry is the only record of
-      // where the teardown goes. Falling back to live config here makes the
-      // "which coordinator the agent reached is invisible" promise conditional
-      // on the deployment — and wrong on every single-coordinator one, where the
-      // local path is the ONLY path.
+      // The local path: one coordinator spawned AND holds the agent, so the in-memory spawn
+      // entry is the only record of where the teardown goes. Falling back to live config would
+      // break the "which coordinator the agent reached is invisible" promise on every
+      // single-coordinator deployment, where this is the ONLY path.
       const { rows, overrides } = spawningRowTable();
       const entry = { ...eventScalerEntry(), provisioningTargets: ['org/at-spawn-time'] };
       const emitter = fakeEmitter();
@@ -3114,14 +3031,12 @@ describe('ScalerManager', () => {
 
   describe('adoption lookup failure', () => {
     it('refuses a scaler-minted agent id rather than registering it ungated', async () => {
-      // Registering it as static drops its `mandatoryLabels` gate for the
-      // agent's whole life, so a queued job whose `runsOn` omits the platform
-      // taint can land on it. Refusing costs the agent a reconnect.
+      // Registering it as static drops its `mandatoryLabels` gate for life, so a queued job
+      // whose `runsOn` omits the platform taint can land on it; refusing costs a reconnect.
       //
-      // The id under test is the one the manager actually mints, read back off
-      // the spawn row — not a hand-written look-alike. A hand-written id keeps
-      // this test green while the minting prefix drifts away from the constant
-      // the guard matches on, which is exactly how the guard would go inert.
+      // The id under test is the one the manager mints, read back off the spawn row: a
+      // hand-written look-alike stays green while the minting prefix drifts from the constant
+      // the guard matches on, which is how the guard would go inert.
       const { rows, overrides } = spawningRowTable();
       const spawner = makeManagerWithEventBackend({
         stateStore: fakeStateStore(overrides),
@@ -3156,17 +3071,14 @@ describe('ScalerManager', () => {
 
   describe('no spawn record for a scaler-minted id', () => {
     it('refuses a scaler-minted agent id rather than registering it as static', async () => {
-      // `completeLocalRegistration` deletes a local-backend spawn row at
-      // registration, so after an orchestrator restart a still-running scaler
-      // agent re-registers with nothing left to adopt. Returning `null` there
-      // registers it as static and drops its `mandatoryLabels` gate for the
-      // rest of its life, so a queued job whose `runsOn` omits the platform
-      // taint can land on it. Refusing costs the agent a reconnect.
+      // `completeLocalRegistration` deletes a local-backend spawn row at registration, so after
+      // an orchestrator restart a still-running scaler agent re-registers with nothing to adopt.
+      // Returning `null` would register it as static and drop its `mandatoryLabels` gate for
+      // life, so a queued job whose `runsOn` omits the platform taint could land on it.
+      // Refusing costs a reconnect.
       //
-      // Same convention as the sibling lookup-failure block: the id under test
-      // is the one the manager actually mints, read back off the spawn row, so
-      // the test cannot stay green while the minting prefix drifts away from
-      // the constant the guard matches on.
+      // The id under test is minted by the manager and read back off the spawn row, as in the
+      // sibling lookup-failure block.
       const { rows, overrides } = spawningRowTable();
       const spawner = makeManagerWithEventBackend({
         stateStore: fakeStateStore(overrides),
@@ -3193,10 +3105,9 @@ describe('ScalerManager', () => {
     });
 
     it('still registers a genuinely static agent as static', async () => {
-      // The negative control, and the safe-direction proof: every static agent
-      // takes this branch on a memory miss, so failing the path closed would
-      // refuse them all. No agent gains capability from this change — an id
-      // without the prefix behaves exactly as it did before.
+      // Negative control and safe-direction proof: every static agent takes this branch on a
+      // memory miss, so failing closed would refuse them all. An id without the prefix behaves
+      // exactly as before, so no agent gains capability.
       const stateStore = fakeStateStore({
         adoptSpawningAgent: vi.fn().mockResolvedValue(null),
       });
@@ -3206,15 +3117,12 @@ describe('ScalerManager', () => {
     });
 
     it('refuses a scaler-minted id on a store-less manager too', async () => {
-      // Worker mode builds a manager with no state store, so its spawn records
-      // live in memory only and a restart erases every one of them. That memory
-      // miss is the same condition the adoption branch handles, reached with no
-      // store to ask — so without the guard it falls straight through to the
-      // static path and drops the gate exactly as an adoption miss would.
+      // Worker mode builds a manager with no state store, so a restart erases every in-memory
+      // spawn record — the adoption branch's memory miss with no store to ask. Without the
+      // guard it falls through to the static path and drops the gate.
       //
-      // The id is minted by a real spawn on a separate store-backed manager, so
-      // the assertion cannot stay green while the minting prefix drifts away
-      // from the constant the guard matches on.
+      // The id is minted by a real spawn on a separate store-backed manager, so the assertion
+      // cannot stay green while the minting prefix drifts from the guard's constant.
       const { rows, overrides } = spawningRowTable();
       const spawner = makeManagerWithEventBackend({
         stateStore: fakeStateStore(overrides),
@@ -3242,10 +3150,8 @@ describe('ScalerManager', () => {
 
   describe('reclaiming an agent refused for a missing spawn record', () => {
     /**
-     * Mint a real scaler agent id by spawning through an event backend, then
-     * read it back off the spawn row — the same convention the sibling refusal
-     * block uses, so these tests cannot stay green while the minting prefix
-     * drifts away from the constant the guard matches on.
+     * Mint a real scaler agent id through an event backend and read it back off the spawn row,
+     * as the sibling refusal block does, so the minting prefix cannot drift from the guard.
      */
     async function mintScalerAgentId(): Promise<string> {
       const { rows, overrides } = spawningRowTable();
@@ -3275,11 +3181,10 @@ describe('ScalerManager', () => {
     }
 
     it('reclaims the host-local compute of the agent it refuses', async () => {
-      // The leak this closes: refusing returns before registration, so
-      // `onAgentDisconnected` never runs — and could not help if it did, since
-      // `managedAgentIndex` is only written after this point. Without the
-      // reclaim the VM or host process keeps its RAM and its IP, the agent
-      // reconnects, is refused again, and loops until an operator intervenes.
+      // The leak: refusing returns before registration, so `onAgentDisconnected` never runs —
+      // and could not help, since `managedAgentIndex` is written only after this point. Without
+      // the reclaim the VM or host process keeps its RAM and IP, and the agent reconnects, is
+      // refused, and loops until an operator intervenes.
       const mintedAgentId = await mintScalerAgentId();
       const { backend, destroy, reapUnowned } = localBackend();
       const manager = makeManager({
@@ -3302,11 +3207,9 @@ describe('ScalerManager', () => {
     });
 
     it('never reclaims through an event backend, whose missing adoption is ambiguous', async () => {
-      // THE DANGEROUS DIRECTION. `adoptSpawningAgent` resolves `null` both when
-      // no row exists and when a PEER coordinator already holds the row, so an
-      // event agent that is alive and legitimately owned elsewhere reaches this
-      // very branch. Reclaiming there destroys a healthy provision the peer is
-      // still running jobs on.
+      // THE DANGEROUS DIRECTION. `adoptSpawningAgent` resolves `null` both for no row and for
+      // a row a PEER coordinator holds, so a live event agent owned elsewhere reaches this
+      // branch; reclaiming would destroy a healthy provision the peer still runs jobs on.
       const mintedAgentId = await mintScalerAgentId();
       const { backend, destroy, reapUnowned } = localBackend({ type: 'event' });
       const manager = makeManager({
@@ -3325,10 +3228,9 @@ describe('ScalerManager', () => {
     });
 
     it('does not reclaim when the adoption lookup merely failed', async () => {
-      // The second safe direction: a store that could not answer is not
-      // evidence the agent is unowned. Its spawn record may be intact behind a
-      // transient fault, so reclaiming would destroy a healthy provision over a
-      // DB hiccup. Same refusal, deliberately no teardown.
+      // The second safe direction: a store that could not answer is no evidence the agent is
+      // unowned; its spawn record may sit behind a transient fault. Same refusal, deliberately
+      // no teardown.
       const mintedAgentId = await mintScalerAgentId();
       const { backend, destroy, reapUnowned } = localBackend();
       const manager = makeManager({
@@ -3407,10 +3309,9 @@ describe('ScalerManager', () => {
     });
 
     it('leaves a peer-owned spawn row out of the map the reaper walks', async () => {
-      // The behavioural half: the scoped read is driven by the owner column the
-      // spawn write stamps, so a peer's row is invisible here while our own is
-      // rehydrated. Both directions in one run — a filter that returned nothing
-      // would fail the positive, one that returned everything the negative.
+      // Behavioural half: the scoped read keys on the owner column the spawn write stamps, so
+      // a peer's row is invisible and ours is rehydrated. Both directions in one run: a filter
+      // returning nothing fails the positive, one returning everything the negative.
       const { rows, overrides } = spawningRowTable();
       const stateStore = fakeStateStore(overrides);
       const peer = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-b' });
@@ -3440,10 +3341,9 @@ describe('ScalerManager', () => {
       expect(recovery.spawningAgentsRehydrated).toBe(1);
       expect(restarted.getStatus().spawningCount).toBe(1);
 
-      // Which row it was: the stale prune walks exactly the rehydrated entries
-      // and releases each one's backend entry, so seeding the backend with BOTH
-      // ids makes the survivor identifiable. Ours is pruned; the peer's was
-      // never in the map to begin with.
+      // The stale prune walks the rehydrated entries and releases each one's backend entry, so
+      // seeding the backend with BOTH ids identifies the survivor: ours is pruned, the peer's
+      // was never in the map.
       restartedBackend.adopt(ourAgentId!, ['github-actions']);
       restartedBackend.adopt(peerAgentId!, ['github-actions']);
       expect(restartedBackend.getActiveCount()).toBe(2);
@@ -3462,11 +3362,10 @@ describe('ScalerManager', () => {
       // bug it fixes: every instance would rehydrate zero reservations and
       // under-count its own caps forever.
       const reservations = new Map<string, Record<string, unknown>>();
-      // The spawn row has to be modelled too: recovery keeps a reservation only
-      // while a rehydrated spawn backs it, so a fake that dropped the row would
-      // exercise the orphan path and read as an owner-scoping failure. An event
-      // spawn, because a local one is released at recovery by design (its
-      // container cannot outlive the process) and would read the same way.
+      // The spawn row is modelled too: recovery keeps a reservation only while a rehydrated
+      // spawn backs it, so dropping the row would hit the orphan path and read as an
+      // owner-scoping failure. An event spawn, since a local one is released at recovery by
+      // design (its container cannot outlive the process).
       const { overrides } = spawningRowTable();
       const stateStore = fakeStateStore({
         ...overrides,
@@ -3495,10 +3394,9 @@ describe('ScalerManager', () => {
     });
 
     it('drops a reservation row no spawn backs, instead of billing it forever', async () => {
-      // A reservation is released by its spawn's lifecycle: the spawn fails, the
-      // agent disconnects, or `pruneStaleSpawningEntries` reaps it. All three
-      // read `spawningAgents`. So a reservation row whose spawning row is gone
-      // is reachable by NONE of them — `recoverState` rehydrates it on every
+      // A reservation is released by its spawn's lifecycle — spawn failure, disconnect, or the
+      // `pruneStaleSpawningEntries` reap — and all three read `spawningAgents`. A reservation
+      // row with no spawning row is reachable by none: `recoverState` rehydrates it on every
       // restart and it bills against the caps for the life of the deployment.
       const reservations = new Map<string, Record<string, unknown>>();
       const stateStore = fakeStateStore({
@@ -3566,11 +3464,10 @@ describe('ScalerManager', () => {
     });
 
     it('spawns again after a restart that inherited only orphaned reservations', async () => {
-      // The behavioural statement of the wedge. `reserveForSpawn` compares
-      // `Math.max(activeCount, reserved)` against the caps at both levels, so
-      // orphan rows past either one refuse every request — silently, since an
-      // at-capacity verdict leaves the job queued and logs nothing. 40 rows on
-      // one scaler clears the harness's `maxAgents: 5` many times over.
+      // The behavioural wedge: `reserveForSpawn` compares `Math.max(activeCount, reserved)`
+      // against the caps at both levels, so orphan rows past either refuse every request,
+      // silently (an at-capacity verdict leaves the job queued and logs nothing). 40 rows on
+      // one scaler clear the harness's `maxAgents: 5` many times over.
       const reservations = new Map<string, Record<string, unknown>>();
       const stateStore = fakeStateStore({
         listReservationsForOwner: vi.fn(async () => [...reservations.values()]),
@@ -3596,12 +3493,10 @@ describe('ScalerManager', () => {
     });
 
     it('releases a recovered local-backend spawn instead of holding its reservation', async () => {
-      // A container spawn cannot outlive the process that started it — the
-      // restart's orphan cleanup removes the container and `adoptSpawningAgent`
-      // adopts event rows only — so rehydrating it held a slot for nothing.
-      // The shape from the field: the previous life had filled a five-slot
-      // scaler when it died, and the restarted one refused every request as
-      // reserved capacity nothing accounted for until the stale prune.
+      // A container spawn cannot outlive its process (restart orphan cleanup removes the
+      // container, and `adoptSpawningAgent` adopts event rows only), so rehydrating it would
+      // hold a slot for nothing. Field shape: the previous life filled a five-slot scaler, and
+      // the restarted one refuses every request until the stale prune.
       const { rows, overrides } = spawningRowTable();
       const reservations = new Map<string, Record<string, unknown>>();
       const stateStore = fakeStateStore({
@@ -3691,14 +3586,12 @@ describe('ScalerManager', () => {
     it('triggers destroy on agent disconnect', async () => {
       const manager = createManager();
 
-      // Spawn and register an agent
       await manager.requestScale(['linux', 'docker'], 'job-1', 'run-test');
       const agentId = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock
         .calls[0][1] as string;
       await vi.advanceTimersToNextTimerAsync();
       manager.onAgentRegistered(agentId, ['linux', 'docker']);
 
-      // Disconnect
       manager.onAgentDisconnected(agentId);
 
       // The second argument is the teardown context: the scale-down reason, and
@@ -3774,10 +3667,9 @@ describe('ScalerManager', () => {
     }
 
     /**
-     * The flush both emit-outcome tests below share. The resolving case asserts
-     * a delete *did* land after exactly this much settling, which is what pins
-     * the rejecting case's "no delete" as a real absence rather than an
-     * under-flush.
+     * The flush both emit-outcome tests below share. The resolving case asserts a delete did
+     * land after this much settling, so the rejecting case's "no delete" is a real absence,
+     * not an under-flush.
      */
     async function settleTeardown(): Promise<void> {
       await vi.advanceTimersByTimeAsync(1);
@@ -3866,11 +3758,9 @@ describe('ScalerManager', () => {
     });
 
     it("carries the spawner's provisioning targets to an instance that lacks the scaler", async () => {
-      // The whole cross-instance chain in one pass: orch-a writes the row,
-      // orch-b (empty scalers.yaml) adopts it and tears it down. The targets can
-      // only have come off the row — orch-b has no config entry to read them
-      // from — and an emit to an empty target list reaches no subscriber, so
-      // the customer's instance would bill forever.
+      // The whole cross-instance chain: orch-a writes the row, orch-b (empty scalers.yaml)
+      // adopts and tears it down. The targets can only come off the row, and an emit to an empty
+      // target list reaches no subscriber, so the customer's instance would bill forever.
       const { rows, overrides } = spawningRowTable();
       const stateStore = fakeStateStore(overrides);
       const spawner = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-a' });
@@ -3971,11 +3861,10 @@ describe('ScalerManager', () => {
     });
 
     it('falls back to local config for a row that recorded no targets', async () => {
-      // A row written by a coordinator that never recorded its targets. This
-      // instance has no *backend* for the scaler but does carry its config
-      // entry, so the teardown is still deliverable — and this is the only way
-      // such a row ever clears, since the reaper funnels back through the same
-      // resolution.
+      // A row from a coordinator that never recorded its targets. This instance has no
+      // *backend* for the scaler but does carry its config entry, so the teardown is still
+      // deliverable — the only way such a row ever clears, since the reaper funnels back
+      // through the same resolution.
       const stateStore = fakeStateStore({
         adoptSpawningAgent: vi.fn().mockResolvedValue(adoptedRow({ provisioningTargets: [] })),
       });
@@ -3999,12 +3888,11 @@ describe('ScalerManager', () => {
     });
 
     it('emits nothing and keeps the row when neither the row nor config names a target', async () => {
-      // The complement of the test above, over the identical row: here the
-      // instance has no config entry for `github-actions` either (the default
-      // harness config carries only the container / bare-metal scalers), so
-      // there is nowhere to deliver the teardown. An emit with an empty target
-      // list reaches no subscriber, so reporting a scale-down and dropping the
-      // row would erase the only pointer left at a still-running instance.
+      // The complement, over the identical row: this instance has no `github-actions` config
+      // entry either (the default harness config carries only container / bare-metal), so the
+      // teardown has nowhere to go. An emit to an empty target list reaches no subscriber, so
+      // reporting a scale-down and dropping the row would erase the only pointer left at a
+      // still-running instance.
       const stateStore = fakeStateStore({
         adoptSpawningAgent: vi.fn().mockResolvedValue(adoptedRow({ provisioningTargets: [] })),
       });
@@ -4121,10 +4009,8 @@ describe('ScalerManager', () => {
         expect(incScalerExternalProvisionTimeout).not.toHaveBeenCalled();
       });
 
-      // The metric must count teardowns, not attempts. This row names nowhere
-      // to deliver to, so it keeps its record and the reaper retries it every
-      // re-attempt window — counting the attempt would inflate the counter
-      // forever off one permanently undeliverable provision.
+      // Count teardowns, not attempts: this undeliverable row keeps its record and the reaper
+      // retries it every re-attempt window, so counting attempts inflates the counter forever.
       it('does not count the timeout when the teardown could not be emitted', async () => {
         const stateStore = fakeStateStore();
         const emitter = fakeEmitter();
@@ -4154,11 +4040,10 @@ describe('ScalerManager', () => {
         expect(stateStore.deleteSpawningAgent).not.toHaveBeenCalled();
         expect(incScalerExternalProvisionTimeout).not.toHaveBeenCalled();
       });
-      // An event scaler's `spawn()` succeeds the moment the scale-up is
-      // emitted, so a failed external provision is only observable as "the
-      // agent never registered" — this verdict. Reporting it as a
-      // `scaler.failed` is what gives the job the provisioning cause instead of
-      // a label-mismatch complaint about a `runsOn` that is already correct.
+      // An event scaler's `spawn()` succeeds once the scale-up is emitted, so a failed external
+      // provision shows only as "the agent never registered" (this verdict). Reporting it as
+      // `scaler.failed` gives the job the provisioning cause, not a label-mismatch complaint
+      // about a `runsOn` that is already correct.
       it('reports the stranded provision as a spawn failure attributed to its job', async () => {
         const onScalerEvent = vi.fn();
         const emitter = fakeEmitter();
@@ -4183,8 +4068,8 @@ describe('ScalerManager', () => {
         expect(event.detail).toContain('github-actions');
         expect(event.detail).toContain('never registered');
 
-        // The operator's first-line tool reads this. Before the event existed,
-        // `diagnose scaler` was empty for the one backend that was failing.
+        // The operator's first-line tool reads this; without the event, `diagnose scaler` is
+        // empty for the one backend that is failing.
         const failures = manager.recentSpawnFailures(60_000, Date.now());
         expect(failures.get('github-actions')).toMatchObject({
           backendType: ScalerBackendType.enum.event,
@@ -4257,13 +4142,11 @@ describe('ScalerManager', () => {
         );
       });
 
-      // The unattributed branch of `handleScalerEvent` parks the event for a
-      // correlation, and the only two things that ever clear that park —
-      // `correlateAgentToJob` and `onAgentDisconnected` — both require the
-      // agent to have connected, which is the one thing this provision did not
-      // do. Left alone the buffer keeps a dead entry per condemned warm
-      // provision for the life of the process, and hands the stale failure to
-      // whatever correlation does eventually name the id.
+      // The unattributed branch of `handleScalerEvent` parks the event for a correlation, and
+      // both things that clear the park — `correlateAgentToJob` and `onAgentDisconnected` —
+      // need the agent to have connected, which this provision never did. Left alone, the
+      // buffer keeps a dead entry per condemned warm provision for the process's life and hands
+      // the stale failure to whatever correlation later names the id.
       it('does not park the unbound failure waiting for a correlation that cannot arrive', async () => {
         const onScalerEvent = vi.fn();
         const manager = makeManagerWithNoBackends({
@@ -4281,22 +4164,19 @@ describe('ScalerManager', () => {
     });
 
     it('deletes the durable row when the warm pool reaps an idle event agent', async () => {
-      // The other door onto a live event row. A warm-pool spawn persists a row
-      // and an event row survives registration, so an idle reap that skipped
-      // the delete would leave a permanent row per reaped agent — rehydrated by
-      // `recoverState` on every restart and spared by the stale-spawn prune.
-      // The pool is driven directly, the way `warm-pool.test.ts` drives it.
+      // The other door onto a live event row. A warm-pool spawn persists a row that survives
+      // registration, so an idle reap skipping the delete would leave a permanent row per
+      // reaped agent, rehydrated on every restart and spared by the stale-spawn prune. The
+      // pool is driven directly, as `warm-pool.test.ts` does.
       const { rows, overrides } = spawningRowTable();
       const stateStore = fakeStateStore(overrides);
       const emitter = fakeEmitter();
       const entry: ScalerEntry = {
         ...eventScalerEntry(),
-        // A validated config can never gate on a `kici:` label (they are reserved
-        // in both `labelSets` and `mandatoryLabels`), and every configured gate
-        // label must appear in every label set. The shared fixture's
-        // `kici:os:linux` gate satisfies neither, and a warm pool whose gate
-        // escapes its label set is refused as unfillable — correctly, since the
-        // readiness query could never see its own agents.
+        // A validated config never gates on a `kici:` label (reserved in both `labelSets` and
+        // `mandatoryLabels`), and every gate label must appear in every label set. The shared
+        // fixture's `kici:os:linux` gate fails both, and a pool whose gate escapes its label set
+        // is refused as unfillable: its readiness query could never see its own agents.
         mandatoryLabels: ['github-actions'],
         // A warm pool needs a declared shape: it starts an agent before any job
         // exists, so its cpu/memory can come from nowhere else.
@@ -4322,10 +4202,9 @@ describe('ScalerManager', () => {
         }
       ).warmPool;
 
-      // Two passes with a registration between them, so the pool ends up
-      // holding two agents against a target of 1. The reaper only ever takes
-      // surplus — an agent that IS the pool is never destroyed, or a quiet pool
-      // would churn forever — so one agent alone would be reaped by nothing.
+      // Two passes with a registration between them leave two agents against a target of 1.
+      // The reaper only takes surplus (destroying the pool's only agent would churn a quiet
+      // pool forever), so one agent alone would never be reaped.
       pool.evaluate();
       await vi.advanceTimersByTimeAsync(0);
       const agentId = [...rows.keys()][0]!;
@@ -4523,7 +4402,6 @@ describe('ScalerManager', () => {
         labelSets: [{ labels: ['linux', 'vm'], rootfsPath: '/rootfs.ext4' }],
         maxAgents: 5,
       });
-      // Add clearAgentMmds to the mock
       (firecrackerBackend as any).clearAgentMmds = clearAgentMmds;
 
       const manager = createManager(
@@ -4540,14 +4418,12 @@ describe('ScalerManager', () => {
         [{ name: 'fc-prod', backend: firecrackerBackend }],
       );
 
-      // Spawn and register an agent
       await manager.requestScale(['linux', 'vm'], 'job-1', 'run-test');
       const agentId = (firecrackerBackend.spawn as ReturnType<typeof vi.fn>).mock
         .calls[0][1] as string;
       await vi.advanceTimersToNextTimerAsync();
       manager.onAgentRegistered(agentId, ['linux', 'vm']);
 
-      // Send config.ack
       manager.onConfigAck(agentId);
 
       expect(clearAgentMmds).toHaveBeenCalledWith(agentId);
@@ -4556,17 +4432,15 @@ describe('ScalerManager', () => {
     it('does not call clearAgentMmds on non-Firecracker backends', async () => {
       const manager = createManager();
 
-      // Spawn and register a container agent
       await manager.requestScale(['linux', 'docker'], 'job-1', 'run-test');
       const agentId = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock
         .calls[0][1] as string;
       await vi.advanceTimersToNextTimerAsync();
       manager.onAgentRegistered(agentId, ['linux', 'docker']);
 
-      // Send config.ack -- should not throw
+      // Should not throw.
       manager.onConfigAck(agentId);
 
-      // No clearAgentMmds should exist on container backend
       expect((containerBackend as any).clearAgentMmds).toBeUndefined();
     });
 
@@ -4601,10 +4475,9 @@ describe('ScalerManager', () => {
 
   describe('getGlobalActiveCount()', () => {
     it('sums all backends active counts without double-counting spawning', async () => {
-      // Realistic mock: getActiveCount reflects spawning agents (like real backends).
-      // Real backends (container, bare-metal, firecracker) add to their internal agents
-      // map synchronously at the start of spawn(), so getActiveCount() already includes
-      // spawning agents. The manager must NOT add spawningAgents.size on top.
+      // Realistic mock: like real backends (container, bare-metal, firecracker), spawn()
+      // synchronously adds to the agents map, so getActiveCount() already includes spawning
+      // agents and the manager must NOT add spawningAgents.size on top.
       let dockerActive = 2;
       let bmActive = 1;
 
@@ -4713,14 +4586,12 @@ describe('ScalerManager', () => {
     });
 
     it('leaves every event spawn row for the reaper, adopted or not', async () => {
-      // Nothing tells the spawning instance that a peer adopted its agent, so
-      // both entries are still in its in-memory map when the prune fires. The
-      // row must survive either way. An adopted event agent runs for hours and
-      // its row is the only durable record of a live provision. An UNADOPTED
-      // one is precisely the reaper's `spawn-timeout` candidate: the reaper
-      // cannot condemn it until the flap grace has also elapsed, so a prune
-      // that deleted it would win by minutes on any coordinator serving jobs
-      // and the teardown the row exists to trigger would never be emitted.
+      // Nothing tells the spawner that a peer adopted its agent, so both entries are still in
+      // its map when the prune fires, and both rows must survive. An adopted event agent runs
+      // for hours and its row is the only durable record of a live provision. An UNADOPTED one
+      // is the reaper's `spawn-timeout` candidate, condemned only after the flap grace, so a
+      // deleting prune would win by minutes on any coordinator serving jobs and the teardown
+      // the row exists to trigger would never be emitted.
       const { rows, overrides } = spawningRowTable();
       const stateStore = fakeStateStore(overrides);
       const manager = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-a' });
@@ -4753,11 +4624,10 @@ describe('ScalerManager', () => {
     });
 
     it('releases the backend entry for a pruned spawn, so the global count stops ratcheting', async () => {
-      // The spawning coordinator is never told that a peer adopted its agent,
-      // so without an explicit release its `EventScalerBackend.agents` entry is
-      // immortal: `getGlobalActiveCount` sums it against `globalMaxAgents` on
-      // EVERY requestScale for EVERY backend, so a coordinator behind a shared
-      // endpoint eventually refuses every spawn it is asked for.
+      // The spawner is never told a peer adopted its agent, so without an explicit release its
+      // `EventScalerBackend.agents` entry is immortal; `getGlobalActiveCount` sums it against
+      // `globalMaxAgents` on EVERY requestScale for EVERY backend, so a coordinator behind a
+      // shared endpoint eventually refuses every spawn.
       const { rows, overrides } = spawningRowTable();
       const stateStore = fakeStateStore(overrides);
       const backend = makeEventBackend();
@@ -4827,7 +4697,7 @@ describe('ScalerManager', () => {
       await vi.advanceTimersByTimeAsync(301_000);
       await manager.requestScale(['nothing-matches-this'], 'job-2', 'run-2');
       await vi.advanceTimersByTimeAsync(0);
-      // Past the historical five-minute literal, inside the configured deadline.
+      // Past five minutes, inside the configured deadline.
       expect(manager.getStatus().spawningCount).toBe(1);
 
       // Past the configured deadline: now it prunes.
@@ -4842,10 +4712,9 @@ describe('ScalerManager', () => {
 
   describe('shutdownAll()', () => {
     it('emits no scale-down for an event provision', async () => {
-      // The backend map carries provisions a peer has already adopted — the
-      // spawner is never told — so emitting on shutdown makes a routine
-      // coordinator restart tear down a peer's running customer instances.
-      // Teardown belongs to whichever coordinator holds the agent, and to the
+      // The backend map holds provisions a peer already adopted (the spawner is never told),
+      // so emitting on shutdown would make a routine restart tear down a peer's running
+      // instances. Teardown belongs to the coordinator holding the agent, and to the
       // leader-gated reaper for one that reaches nobody.
       const { overrides } = spawningRowTable();
       const stateStore = fakeStateStore(overrides);
@@ -4866,8 +4735,8 @@ describe('ScalerManager', () => {
     it('stops warm pool and shuts down all backends', async () => {
       const manager = createManager();
       manager.start();
-      // `start()` no longer arms the pool tick; without this the "stops warm
-      // pool" half of the claim would pass against a pool that never ran.
+      // `start()` does not arm the pool tick; without this the "stops warm pool" half of the
+      // claim would pass against a pool that never ran.
       manager.startWarmPools();
       // Positive control: the pool tick (and the retirement sweep) really are
       // armed, so the zero below is a teardown, not a pool that never ran.
@@ -4882,14 +4751,12 @@ describe('ScalerManager', () => {
       // backends that were just shut down.
       expect(vi.getTimerCount()).toBe(0);
 
-      // Status should show 0 spawning after shutdown
       expect(manager.getStatus().spawningCount).toBe(0);
     });
 
     it('clears all tracking maps', async () => {
       const manager = createManager();
 
-      // Spawn an agent
       await manager.requestScale(['linux', 'docker'], 'job-1', 'run-test');
 
       await manager.shutdownAll();
@@ -5425,10 +5292,9 @@ describe('ScalerManager', () => {
     });
 
     it('keeps a removed scaler alive while a spawn is still in flight', async () => {
-      // A spawn the manager started but that has not reached `backend.spawn`
-      // yet (or is mid-create) leaves the backend reporting zero active agents.
-      // Tearing it down on that zero orphans the agent the spawn is about to
-      // land: nothing would be left to destroy its process/container.
+      // A spawn not yet at `backend.spawn` (or mid-create) leaves the backend reporting zero
+      // active agents; tearing down on that zero orphans the agent the spawn is about to land,
+      // with nothing left to destroy its process/container.
       bareMetalBackend = createMockBackend({
         type: 'bare-metal',
         labelSets: [{ labels: ['linux', 'gpu'], binaryPath: '/usr/local/bin/kici-agent' }],
@@ -5955,7 +5821,6 @@ describe('ScalerManager', () => {
       });
       expect(r2.action).toBe('at-capacity');
 
-      // Find the spawn'd agent's id and call onAgentDisconnected.
       const spawnArgs = vi.mocked(containerBackend.spawn).mock.calls;
       const spawnedAgentId = spawnArgs[0][1] as string;
       // Simulate registration to populate managedAgentIndex (so the destroy path runs).
@@ -5970,13 +5835,11 @@ describe('ScalerManager', () => {
     });
 
     it('releases the reservation when a stale spawning entry is pruned', async () => {
-      // A spawn that never resolves models an agent that was created but never
-      // registered its WS — so neither the spawn-failure path nor
-      // onAgentDisconnected ever fires. The only cleanup is the stale-entry
-      // prune, which must release the held reservation or the per-scaler cap
-      // leaks capacity forever (a long-lived orchestrator DB then accumulates
-      // orphaned scaler_reservations and every requestScale is rejected
-      // at-capacity with zero agents).
+      // A never-resolving spawn models an agent created but never WS-registered, so neither
+      // the spawn-failure path nor onAgentDisconnected fires. Only the stale-entry prune cleans
+      // up, and it must release the held reservation, or the per-scaler cap leaks forever: the
+      // DB accumulates orphaned scaler_reservations and every requestScale is rejected
+      // at-capacity with zero agents.
       const slowBackend = createMockBackend({
         type: 'container',
         labelSets: [{ labels: ['linux', 'docker'], image: 'agent:latest' }],
@@ -6050,10 +5913,9 @@ describe('ScalerManager', () => {
 
   describe('handleScalerEvent() — failure attribution', () => {
     /**
-     * Pull the per-agent event emitter the manager handed to backend.spawn().
-     * The closure ignores the agentId it captured and routes whatever event it
-     * receives through handleScalerEvent(), so a single captured emitter can
-     * synthesize an event for any agentId.
+     * Pull the per-agent event emitter the manager handed to backend.spawn(). The closure
+     * ignores its captured agentId and routes any event through handleScalerEvent(), so one
+     * captured emitter can synthesize an event for any agentId.
      */
     function captureOnEvent(backend: ScalerBackend): (event: ScalerEvent) => void {
       const call = (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[0];
@@ -6112,10 +5974,9 @@ describe('ScalerManager', () => {
       const onScalerEvent = vi.fn();
       const manager = createManager(undefined, undefined, onScalerEvent);
 
-      // Spawn an agent, then register it: registration deletes the spawning
-      // entry and records the backend in managedAgentIndex, mimicking the state
-      // a long-lived bare-metal child 'error' listener sees if it fires after
-      // the agent has already connected via WS.
+      // Spawn then register: registration deletes the spawning entry and records the backend
+      // in managedAgentIndex — the state a long-lived bare-metal child 'error' listener sees
+      // if it fires after the agent connected via WS.
       await manager.requestScale(['linux', 'docker'], undefined, undefined);
       const agentId = (containerBackend.spawn as ReturnType<typeof vi.fn>).mock
         .calls[0][1] as string;
@@ -6653,11 +6514,10 @@ describe('ScalerManager', () => {
     });
 
     it('holds the in-process lock across the whole cap round trip', async () => {
-      // The cluster-wide check is the first `await` inside the reservation
-      // lock's critical section, and a critical section is only critical if the
-      // lock outlives it. With one slot left, a second request that slipped in
-      // while the first was still at the database would read the same count and
-      // admit too.
+      // The cluster-wide check is the first `await` inside the reservation lock's critical
+      // section, which is only critical if the lock outlives it: with one slot left, a second
+      // request slipping in while the first was at the database would read the same count
+      // and admit too.
       const stateStore = fakeStateStore();
       let capLockCalls = 0;
       let openGate!: () => void;
@@ -6774,11 +6634,9 @@ describe('ScalerManager', () => {
     });
 
     it('releases the claimed cluster slot when the machine ledger refuses', async () => {
-      // The cross-process pool reservation runs AFTER the slot is claimed, so a
-      // refusal there is the other path that can leave a row counting against
-      // every coordinator's cap for an agent that never spawned. The ledger's
-      // own arithmetic is covered in machine-ledger.test.ts; what matters here
-      // is only that the manager unwinds its claim when the answer is no.
+      // The cross-process pool reservation runs AFTER the slot is claimed, so a refusal there
+      // can also leave a row counting against every cap for an agent that never spawned. The
+      // ledger's arithmetic is in machine-ledger.test.ts; here only the claim unwind matters.
       const tryReserve = vi
         .spyOn(MachineLedger.prototype, 'tryReserve')
         .mockResolvedValue(false as never);
@@ -6843,12 +6701,10 @@ describe('ScalerManager', () => {
 
   describe('test harness', () => {
     it('gives the manager a real EventScalerBackend, not a look-alike', async () => {
-      // The manager branches on `instanceof EventScalerBackend` to reach the
-      // event-only lifecycle calls (claim registration, scale-up/scale-down
-      // emission, adoption). A structural look-alike fails that check silently,
-      // so every test built on this helper would pass while never entering the
-      // branch. Assert through the manager's own public path: only a real event
-      // backend registers a claim row and emits a scale-up.
+      // The manager reaches the event-only lifecycle calls (claim registration, scale-up/down
+      // emission, adoption) through `instanceof EventScalerBackend`; a structural look-alike
+      // fails it silently. Only a real event backend registers a claim row and emits a
+      // scale-up, so assert through the manager's public path.
       const stateStore = fakeStateStore();
       const emitter = fakeEmitter();
       const manager = makeManagerWithEventBackend({ stateStore, emitter });
@@ -6928,8 +6784,8 @@ describe('ScalerManager', () => {
     });
 
     it('refuses when the instance carries no claim store, even with an event scaler configured', async () => {
-      // A configured event backend is not itself a redemption path any more:
-      // without the shared claim table this instance can mint nothing.
+      // A configured event backend is not itself a redemption path: without the shared claim
+      // table this instance can mint nothing.
       const manager = makeManagerWithEventBackend();
 
       const creds = await manager.claimScalerCredentials('some-code');
@@ -7002,9 +6858,8 @@ describe('ScalerManager', () => {
 
 describe('external-provision backoff', () => {
   /**
-   * Drive one reaper spawn-timeout verdict through the manager, which is the
-   * only thing that records an external-provision failure. Returns nothing —
-   * the state it changes is read back through `requestScale`.
+   * Drive one reaper spawn-timeout verdict through the manager, the only thing that records
+   * an external-provision failure. The state it changes is read back through `requestScale`.
    */
   async function failProvision(
     manager: ScalerManager,
@@ -7166,12 +7021,10 @@ describe('external-provision backoff', () => {
   });
 
   it('defers on a coordinator that never held leadership, from its own pruned spawn', async () => {
-    // The reaper is leader-gated and `provisionFailures` is per-instance, so a
-    // backoff armed only from the reaper leaves every non-leader dispatching at
-    // the un-deferred cadence for the whole outage. The local stale-spawn prune
-    // is the observation every coordinator does have: it asked for a provision
-    // and no agent registered. `emitOrphanScaleDown` is deliberately never
-    // called here — this manager is a follower.
+    // The reaper is leader-gated and `provisionFailures` is per-instance, so a reaper-only
+    // backoff leaves every non-leader dispatching un-deferred for the whole outage. The local
+    // stale-spawn prune is the observation every coordinator has: it asked for a provision and
+    // no agent registered. `emitOrphanScaleDown` is never called here — this is a follower.
     const manager = makeManagerWithEventBackend({
       instanceId: 'orch-follower',
       resolveProvisionBackoff: backoff(),
@@ -7234,12 +7087,9 @@ describe('external-provision backoff', () => {
   });
 
   it('records the failure for diagnose on a coordinator that never held leadership', async () => {
-    // The failure mode: `kici-admin diagnose scaler` was empty for
-    // the one backend that was failing. `ScalerFailureTracker` is per-process
-    // and the reaper is leader-gated, so a reaper-only report leaves an
-    // operator running diagnose against any non-leader reading "0 spawn
-    // failures" for a scaler failing fleet-wide — the wrong answer this
-    // test stops.
+    // The failure mode: `kici-admin diagnose scaler` empty for the one failing backend.
+    // `ScalerFailureTracker` is per-process and the reaper leader-gated, so a reaper-only
+    // report shows "0 spawn failures" on any non-leader for a scaler failing fleet-wide.
     const onScalerEvent = vi.fn();
     const manager = makeManagerWithEventBackend({
       instanceId: 'orch-follower',
@@ -7269,11 +7119,10 @@ describe('external-provision backoff', () => {
   });
 
   it('does not report a pruned spawn a peer adopted as a failed provision', async () => {
-    // Nothing tells the spawning coordinator that its agent registered on a
-    // peer, so the entry survives adoption and reaches the stale-spawn prune
-    // next to a perfectly live agent. Reading that as a dead provision tells
-    // the operator the exact opposite of what happened — and the reaper already
-    // applies this test, returning `spawn-timeout` only for an unadopted row.
+    // The spawner is never told its agent registered on a peer, so the entry survives
+    // adoption and reaches the stale-spawn prune beside a live agent. Reading that as a dead
+    // provision tells the operator the opposite of what happened; the reaper already applies
+    // this test, returning `spawn-timeout` only for an unadopted row.
     const emitter = fakeEmitter();
     const onScalerEvent = vi.fn();
     const table = spawningRowTable();
@@ -7431,14 +7280,11 @@ describe('external-provision backoff', () => {
   });
 
   it('keeps a deferred scaler routable, so a job waiting it out is not called unroutable', async () => {
-    // This backoff exists because a job whose provisioning
-    // failed was told its `runsOn` matched nothing. The deferral opens a new
-    // window in which a job can expire without ever being attempted, so the
-    // property has to be pinned rather than assumed: `classifyUnroutable` calls
-    // `unroutable` only when NOTHING can route the labels, and it reads that
-    // through `hasBackendForLabels` — which matches on labels alone. A deferred
-    // scaler therefore still routes, and such a job settles `timed_out_stale`
-    // with a truthful timeout message instead of a false labels complaint.
+    // This backoff exists because a job whose provisioning failed was told its `runsOn`
+    // matched nothing. The deferral opens a window in which a job can expire unattempted, so
+    // pin that `classifyUnroutable` says `unroutable` only when NOTHING routes the labels, via
+    // the label-only `hasBackendForLabels`: a deferred scaler still routes, and such a job
+    // settles `timed_out_stale` with a truthful timeout message, not a false labels complaint.
     const manager = makeManagerWithEventBackend({
       instanceId: 'orch-a',
       resolveProvisionBackoff: backoff(),
@@ -7508,12 +7354,10 @@ describe('warm pool first fill on an event backend', () => {
   });
 
   /**
-   * The coordinator's wiring, in miniature. The backend is built while the
-   * emitter is still unassigned and reaches it through a late-bound provider
-   * that throws until `wire()` runs — the same wrapper of plain functions the
-   * backend factory builds around the coordinator's provider — so a warm fill
-   * that runs too early reaches the throwing provider on the exact path the
-   * real spawn takes, rather than a `fakeEmitter()` that would swallow it.
+   * The coordinator's wiring in miniature: the backend is built before the emitter is assigned
+   * and reaches it through a late-bound provider that throws until `wire()` runs — the
+   * factory's own wrapper shape — so a too-early warm fill hits the throwing provider on the
+   * real spawn path instead of a swallowing `fakeEmitter()`.
    */
   function lateBoundHarness() {
     let emitter: ReturnType<typeof fakeEmitter> | null = null;
@@ -7523,10 +7367,9 @@ describe('warm pool first fill on an event backend', () => {
     };
     const entry: ScalerEntry = {
       ...eventScalerEntry(),
-      // The gate label must appear inside the label set or the pool is refused
-      // as unfillable, and the set must declare a shape or it is refused as
-      // undeclared — either refusal would leave `startWarmPools()` with
-      // nothing to spawn and turn the first case into a false green.
+      // The gate label must sit inside the label set (else refused as unfillable) and the set
+      // must declare a shape (else refused as undeclared); either refusal would leave
+      // `startWarmPools()` nothing to spawn and turn the first case into a false green.
       mandatoryLabels: ['github-actions'],
       labelSets: [
         { labels: ['github-actions'], resources: { requests: { cpus: 1, memory: '1g' } } },

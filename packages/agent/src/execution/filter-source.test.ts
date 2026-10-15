@@ -1,12 +1,9 @@
 /**
- * Tests for the source tree a same-repo workflow's `filter` is evaluated
- * against.
+ * The source tree a same-repo workflow's `filter` is evaluated against.
  *
- * These live in their own file rather than in `job-runner.test.ts` because that
- * suite globally mocks `../checkout/git-clone.js` and `node:fs/promises` — the
- * two things these tests need to be real. A mocked clone would prove only that
- * the function calls a stub; the whole point here is that a real tree lands on
- * disk where the filter looks for it.
+ * Kept out of `job-runner.test.ts`, which globally mocks
+ * `../checkout/git-clone.js` and `node:fs/promises`: these tests need a real
+ * tree to land on disk where the filter looks.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
@@ -68,9 +65,8 @@ afterEach(async () => {
 
 describe('ensureFilterSourceDir', () => {
   it('reuses workDir when no source tarball was attached', async () => {
-    // The job already cloned the whole repo into workDir on that path. A repoUrl
-    // is present here, so an implementation that cloned unconditionally would
-    // fail against this unreachable url instead of returning.
+    // The job already cloned into workDir. The repoUrl is unreachable, so an
+    // unconditional clone would fail instead of returning.
     const workDir = await tempDir('kici-filter-work-');
     const resolved = await ensureFilterSourceDir(
       dispatchStub({ repoUrl: 'file:///nonexistent-must-not-be-cloned' }),
@@ -82,8 +78,7 @@ describe('ensureFilterSourceDir', () => {
   it('clones the source repo into a sibling dir when only .kici/ was restored', async () => {
     const repo = await makeSourceRepo();
     const workDir = await makeTarballWorkDir();
-    // Positive control: the file a filter would read is genuinely absent from
-    // workDir, so finding it below cannot be explained by it having been there.
+    // Positive control: the file a filter reads is genuinely absent from workDir.
     expect(existsSync(join(workDir, 'Dockerfile'))).toBe(false);
 
     const resolved = await ensureFilterSourceDir(
@@ -96,9 +91,8 @@ describe('ensureFilterSourceDir', () => {
   });
 
   it('throws rather than handing the filter a directory with no repo in it', async () => {
-    // A source-cache hit with no repo url (a bundle-less run): workDir holds
-    // `.kici/` alone and there is nothing to clone from. Returning it would make
-    // every path test the filter runs answer "absent" — a confident wrong false.
+    // A source-cache hit with no repo url: workDir holds `.kici/` alone, so
+    // returning it would make every filter path test a confident wrong "absent".
     const workDir = await makeTarballWorkDir();
     await expect(
       ensureFilterSourceDir(
@@ -126,17 +120,14 @@ describe('buildInitFilterInput', () => {
       () => {},
     );
 
-    // Same repo on both sides — that is what "non-global" means.
     expect(input.sourceRepo).toEqual(input.workflowRepo);
-    // …but two objects. Handing the author one under two names would let a
-    // filter mutating `sourceRepo` silently change `workflowRepo`, which
-    // happens on no other path.
+    // …but two objects, so a filter mutating `sourceRepo` cannot change `workflowRepo`.
     expect(input.sourceRepo).not.toBe(input.workflowRepo);
     expect(input.sourceRepo.ref).toBe('main');
     expect(input.sourceRepo.sha).toBe(repo.sha);
     // The path is the clone, not the `.kici`-only workDir.
     expect(existsSync(join(input.sourceRepo.path, 'Dockerfile'))).toBe(true);
-    // The orchestrator's already-fetched diff is taken as the fast path.
+    // The orchestrator's already-fetched diff is the fast path.
     expect(input.changedFilesStatus).toBe('fetched');
     expect(input.changedFiles).toEqual(['a.ts']);
     // The shell a filter shells out through is rooted at that same tree.
@@ -161,9 +152,8 @@ describe('buildInitFilterInput', () => {
       () => {},
     );
 
-    // `unavailable` is what makes `ctx.changedFiles` throw instead of reading as
-    // an empty diff — the difference between a loud failure and a workflow
-    // silently suppressed by a path filter that matched nothing.
+    // `unavailable` makes `ctx.changedFiles` throw instead of reading as empty,
+    // so a path filter cannot silently suppress the workflow.
     expect(input.changedFilesStatus).toBe('unavailable');
     expect(input.changedFiles).toEqual([]);
   });

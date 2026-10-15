@@ -1,7 +1,7 @@
 /**
  * Relay glue between the worker's in-memory execution tracker and the durable
- * peer outbox. Extracted so the mapping/replay logic is unit-testable and so
- * the worker bootstrap stays under the function-length cap.
+ * peer outbox, kept separate so it is unit-testable and the worker bootstrap
+ * stays under the function-length cap.
  */
 
 import { createLogger } from '@kici-dev/shared';

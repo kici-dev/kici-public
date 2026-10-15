@@ -87,10 +87,9 @@ describeDb('migration 096_multi_schedule_cron_last_fired', () => {
   });
 
   it('down() collapses tied last_fired_at rows and restores the single-column PK', async () => {
-    // Two schedules of one registration can share an identical last_fired_at
-    // (coinciding cron instants). The down() dedup must break the tie so
-    // recreating PRIMARY KEY (registration_id) does not fail with a
-    // duplicate-key error.
+    // Two schedules of one registration can share last_fired_at (coinciding cron
+    // instants); down()'s dedup must break the tie so recreating PRIMARY KEY
+    // (registration_id) does not hit a duplicate key.
     const tieReg = '22222222-2222-2222-2222-222222222222';
     const fixed = '2026-01-01 09:00:00+00';
     await sql`

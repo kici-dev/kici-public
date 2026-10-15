@@ -1,13 +1,10 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Normalize degenerate context concurrency limits. A `concurrency_limit` of 0
- * (or any non-positive value) is meaningless — it wedged the workflow-install
- * gate into an unreleasable concurrency hold. The write boundary now rejects it
- * and the gate treats it as unlimited; this migration cleans up any pre-existing
- * rows so the column only ever holds NULL (unlimited) or a positive integer.
- * Idempotent; down() is a no-op (a normalized 0 cannot — and should not — be
- * restored).
+ * Normalize non-positive `concurrency_limit` values, which wedge the workflow-install gate in
+ * an unreleasable hold, to NULL, so the column holds only NULL (unlimited) or a positive
+ * integer. The write boundary rejects them and the gate treats them as unlimited.
+ * Idempotent; down() is a no-op.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`UPDATE public.contexts SET concurrency_limit = NULL WHERE concurrency_limit <= 0`.execute(

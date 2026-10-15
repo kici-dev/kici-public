@@ -1,27 +1,19 @@
 /**
- * Tests for the `kici-admin db` namespace.
+ * `kici-admin db` tests, on two axes:
  *
- * Two axes live here:
- *
- * 1. Command registration and the audit-log wiring — which db subcommands
- *    record an access-log entry and which must not. The DDL side-effects are
- *    stubbed so the actions run without a live database, while the URL helpers
- *    stay real.
- * 2. `db backup --install-timer` / `--uninstall-timer`. The scheduled backup is
- *    written for one installed orchestrator, so both the driver it resolves
- *    through and the platform it renders a unit for come from that install's
- *    manifest. On a systemd host holding a compose install, the refusal
- *    `unsupportedPlatformMessage` exists for must fire — the timer would
- *    otherwise be a systemd unit pointed at a container KiCI cannot reach. The
- *    timer module is loaded for real and driven through an in-memory TimerIo,
- *    so the refusal under test is the shipped one and no unit file reaches the
- *    host's systemd directory.
+ * 1. Registration and audit-log wiring: which subcommands record an
+ *    access-log entry and which must not.
+ * 2. `db backup --install-timer` / `--uninstall-timer`. The driver and the
+ *    unit's platform come from the install's manifest, so on a systemd host
+ *    with a compose install `unsupportedPlatformMessage` must fire, not render
+ *    a systemd unit aimed at an unreachable container. The real timer module
+ *    runs through an in-memory TimerIo, so no unit file reaches the host.
  */
 
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { makeTempDir } from '@kici-dev/test-support/tmp';
 import { Command } from 'commander';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import type { DiscoveredInstance, ServiceManager, ServicePlatform } from '../service/types.js';
 
@@ -32,8 +24,7 @@ vi.mock('./shared/admin-cli-access-log.js', () => ({
   recordAdminCliAccess: (...a: unknown[]) => mockRecord(...a),
 }));
 
-// Keep the URL helpers real (parseDatabaseUrl / maskDatabaseUrl / toErrorMessage)
-// and stub only the DDL side-effects so the actions run without a live DB.
+// The URL helpers stay real; only DDL side-effects are stubbed, so no live DB is needed.
 const mockDropAndCreate = vi.fn(async () => undefined);
 const mockEnsureDatabase = vi.fn(async () => 'created');
 const mockCreateDbRole = vi.fn(async () => 'created');
@@ -108,17 +99,15 @@ vi.mock('../service/index.js', async () => {
     resolveUserLevel: vi.fn().mockReturnValue(true),
     kiciConfigRoot: vi.fn(() => mockKiciRoot),
     createServiceManager: vi.fn(async (platform: ServicePlatform) => makeManager(platform)),
-    // Manager selection lives in the seam, so the real one runs here with the
-    // driver factory injected.
+    // The real manager selection runs, with the driver factory injected.
     resolveInstanceTarget: (args: Parameters<typeof actual.resolveInstanceTarget>[0]) =>
       actual.resolveInstanceTarget({ ...args, createManager: async (p) => makeManager(p) }),
   };
 });
 
-// The real resolveInstanceTarget above imports detectPlatform from
-// platform-detect.js itself, so the barrel's detectPlatform mock never reaches
-// discovery. Pin the host here as well (as service/instance/resolve.test.ts
-// does), so "a systemd host" holds on a host without systemd.
+// The real resolveInstanceTarget imports detectPlatform from platform-detect.js
+// directly, past the barrel mock; pin it here too (as resolve.test.ts does) so
+// "a systemd host" holds on any host.
 vi.mock('../service/platform-detect.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../service/platform-detect.js')>();
   return { ...actual, detectPlatform: vi.fn((): ServicePlatform => 'systemd') };
@@ -128,8 +117,7 @@ vi.mock('../service/backup-timer.js', async () => {
   const actual = await vi.importActual<typeof import('../service/backup-timer.js')>(
     '../service/backup-timer.js',
   );
-  // In-memory IO: the shipped install/uninstall bodies run, including their
-  // platform assertion, but nothing is written to the host.
+  // The shipped bodies and their platform assertion run; nothing reaches the host.
   const io = {
     mkdirp: vi.fn(),
     writeFile: vi.fn(),
@@ -171,7 +159,7 @@ function buildDbCommand(): Command {
   return program.commands.find((c) => c.name() === 'db')!;
 }
 
-/** Execute a db subcommand through a fresh program, capturing exit code. */
+/** Runs a db subcommand through a fresh program. */
 async function runDb(args: string[]): Promise<{ exitCode: number | null; stdout: string }> {
   const program = new Command();
   program.exitOverride();
@@ -361,8 +349,7 @@ describe('db subcommands access-log', () => {
     expect(mockRecord).toHaveBeenCalledTimes(1);
     expect(mockRecord.mock.calls[0][0].action).toBe('db.create_readonly_user');
     expect(mockRecord.mock.calls[0][0].target).toEqual({ type: 'database', id: 'ro' });
-    // Records against the operated DB URL (which owns access_log), not the
-    // KICI_DATABASE_URL fallback used by the bootstrap-DB provisioning commands.
+    // The operated DB owns access_log, not the bootstrap commands' KICI_DATABASE_URL.
     expect(mockRecord.mock.calls[0][1]).toBe('postgres://u:p@h:5432/kici');
   });
 
@@ -434,10 +421,6 @@ describe('kici-admin db schema-diff', () => {
   });
 });
 
-function mkTmp(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-
 function makeManifest(overrides: Partial<InstanceManifest> = {}): InstanceManifest {
   return {
     component: 'orchestrator',
@@ -462,8 +445,8 @@ describe('db backup --install-timer — the timer follows the install, not the h
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    tmpInstanceDir = mkTmp('kici-db-timer-i-');
-    tmpConfigRoot = mkTmp('kici-db-timer-c-');
+    tmpInstanceDir = makeTempDir('kici-db-timer-i-');
+    tmpConfigRoot = makeTempDir('kici-db-timer-c-');
 
     mockListByPlatform = {};
     timerPlatforms.length = 0;
@@ -492,10 +475,9 @@ describe('db backup --install-timer — the timer follows the install, not the h
     return consoleErrorSpy.mock.calls.map((c: unknown[]) => c.join(' ')).join('\n');
   }
 
-  // fails-when: the platform comes from detectPlatform(), which the module mock
-  // pins to 'systemd'. The compose refusal then never fires and the command
-  // writes a systemd .service/.timer pair for a container it cannot reach —
-  // exactly the state this test exists to make impossible.
+  // fails-when: the platform comes from detectPlatform() (mocked to 'systemd'):
+  // the refusal never fires and a systemd .service/.timer pair targets an
+  // unreachable container.
   it('refuses to install a timer for a compose install on a systemd host', async () => {
     writeManifest(tmpInstanceDir, makeManifest({ platform: 'compose' }));
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
@@ -524,8 +506,8 @@ describe('db backup --install-timer — the timer follows the install, not the h
     }
   });
 
-  // breaks-if-wrong: the supported case must still install. A refusal that fired
-  // for every install would "fix" the compose case by breaking the common one.
+  // breaks-if-wrong: the supported case must still install; a refusal for every
+  // install would break the common case.
   it('installs the timer for a systemd install', async () => {
     writeManifest(tmpInstanceDir, makeManifest({ platform: 'systemd' }));
 
@@ -545,8 +527,7 @@ describe('db backup --install-timer — the timer follows the install, not the h
     expect(logs).toContain('installed scheduled backup "kici-test-db-backup"');
   });
 
-  // The same manifest-not-host rule on the removal path: a compose install must
-  // not be told KiCI removed a timer it never installed.
+  // Manifest, not host, on removal too: no reported removal of a never-installed timer.
   // fails-when: the platform comes from the host — the refusal is skipped and
   // the command reports a removal.
   it('refuses to uninstall a timer for a compose install on a systemd host', async () => {
@@ -575,8 +556,7 @@ describe('db backup --install-timer — the timer follows the install, not the h
     }
   });
 
-  // The name path has to reach the compose install too: discovery scans every
-  // candidate driver, so a compose-only instance resolves on a systemd host.
+  // Discovery scans every candidate driver, so a compose-only instance resolves on a systemd host.
   // fails-when: discovery runs a single host-derived driver — the compose row is
   // never listed and the command exits with "not found".
   it('resolves a compose-only instance by --name on a systemd host', async () => {
@@ -609,8 +589,7 @@ describe('db backup --install-timer — the timer follows the install, not the h
         ]),
       ).rejects.toThrow('process.exit called');
 
-      // It resolved (it reached the timer installer) and then refused for the
-      // right reason — not for "instance not found".
+      // Resolved, then refused for the right reason, not "instance not found".
       expect(scannedPlatforms).toEqual(['systemd', 'compose']);
       // fails-when: the mock above is inert (a wrong module id), so discovery
       // reads the real host; `toHaveBeenCalled` throws on a non-spy.

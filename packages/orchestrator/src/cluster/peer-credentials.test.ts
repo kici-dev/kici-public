@@ -9,7 +9,6 @@ import {
   type CredentialFileData,
 } from './peer-credentials.js';
 
-// --- File I/O tests ---
 // The end-to-end suite covers the DB paths.
 
 describe('credential file I/O', () => {
@@ -55,7 +54,6 @@ describe('credential file I/O', () => {
     await writeCredentialFile(filePath, sampleData);
 
     const st = await stat(filePath);
-    // Mask to get permission bits only (lower 9 bits)
     const perms = st.mode & 0o777;
     expect(perms).toBe(0o600);
   });

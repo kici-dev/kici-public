@@ -1,13 +1,10 @@
 /**
- * Guard: every dashboard-write `cliEquivalent` names a `kici-admin` command
- * that exists.
- *
- * The dashboard, the Platform's policy 403 and `kici-admin org-settings
- * dashboard-writes show` all print an operation's `cliEquivalent` as the
- * command an operator runs once the dashboard write is disabled. The string is
- * free-form in the engine registry, so this test walks the real `buildProgram()`
- * tree and resolves each one: the command path, every `--flag`, and every
- * `<arg>` / `[arg]` placeholder must exist on the command it names.
+ * Guard: every dashboard-write `cliEquivalent` names an existing `kici-admin`
+ * command. The dashboard, the Platform's policy 403 and `kici-admin
+ * org-settings dashboard-writes show` print it as the command to run once the
+ * dashboard write is disabled. The string is free-form in the engine registry,
+ * so this walks the real `buildProgram()` tree: the command path, every
+ * `--flag` and every `<arg>` / `[arg]` placeholder must exist.
  */
 import { describe, it, expect } from 'vitest';
 import type { Command } from 'commander';
@@ -26,12 +23,7 @@ function findOption(cmd: Command, flag: string) {
   return cmd.options.find((o) => o.long === flag || o.short === flag);
 }
 
-/**
- * Resolve one `cliEquivalent` string against a Commander program.
- *
- * Returns one message per problem; an empty array means the string names a
- * command path, flags and argument placeholders that all exist.
- */
+/** Returns one message per problem; empty when everything the string names exists. */
 function checkCliEquivalent(program: Command, cliEquivalent: string): string[] {
   const tokens = cliEquivalent.trim().split(/\s+/);
   if (tokens[0] !== BINARY) {

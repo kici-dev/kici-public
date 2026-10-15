@@ -4,7 +4,7 @@
  * vocabulary and the 0/1/2 exit-code mapping.
  */
 
-/** The per-check status vocabulary. Single source of truth. */
+/** The per-check status vocabulary. */
 export const DIAGNOSE_STATUSES = ['pass', 'warn', 'fail'] as const;
 export type DiagnoseStatus = (typeof DIAGNOSE_STATUSES)[number];
 

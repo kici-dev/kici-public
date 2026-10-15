@@ -1,9 +1,6 @@
 /**
- * Step loop -- extracted step execution logic with hook integration and step rules.
- *
- * This module contains the core step execution loop that the workflow-runner calls.
- * Extracted for testability: the workflow-runner's main() handles IPC, clone, deps,
- * module loading, and calls this loop for step execution with hooks.
+ * Step execution loop with hooks and step rules, kept apart from the
+ * workflow-runner's main() (IPC, clone, deps, module loading) for testability.
  */
 
 import type {
@@ -30,10 +27,9 @@ import { restoreCacheSpecs, saveCacheSpecs, type CachePhaseDeps } from '../cache
 import { runParallelGroup } from './parallel-scheduler.js';
 
 /**
- * Thrown inside the step race when a step's own per-task abort controller fires
- * (parallel fail-fast cancels an in-flight sibling). Distinguished from a
- * timeout/job-deadline reject so the loop reports the step as `cancelled`
- * (which is NOT a failure) rather than `failed`.
+ * Thrown in the step race when parallel fail-fast aborts the step's own
+ * controller, so the loop reports `cancelled` (not a failure) instead of the
+ * `failed` a timeout or job-deadline reject produces.
  */
 export class StepCancelledError extends Error {
   readonly name = 'StepCancelledError';
@@ -44,9 +40,8 @@ export class StepCancelledError extends Error {
 }
 
 /**
- * A node in the concurrency-aware step walk. A `sequential` node is one ordinary
- * step; a `parallel` node is a `parallel()` group whose children each carry their
- * own flat `stepIndex` (the group wrapper consumes no index).
+ * A node in the step walk: one step, or a `parallel()` group whose children each
+ * carry their own flat `stepIndex` (the group wrapper consumes no index).
  */
 export type StepNode =
   | { kind: 'sequential'; step: Step; stepIndex: number }
@@ -59,7 +54,6 @@ export type StepNode =
       children: { step: Step; stepIndex: number }[];
     };
 
-/** Job-level hooks passed to the step loop. */
 export interface JobHooks {
   beforeStep?: HookInput;
   afterStep?: HookInput;
@@ -69,135 +63,108 @@ export interface JobHooks {
   cleanup?: HookInput;
 }
 
-/** Options for the step execution loop. */
 export interface StepLoopOptions {
   /**
-   * Flat list of every executable step (sequential steps + parallel-group
-   * children inlined in flat-stepIndex order). `steps.length` is the flat step
-   * count used to derive hook pseudo-indices. The structural walk order (which
-   * entries are grouped) is carried separately by `stepNodes`.
+   * Every executable step (parallel-group children inlined) in flat-stepIndex
+   * order; `steps.length` derives the hook pseudo-indices. Grouping lives in
+   * `stepNodes`.
    */
   steps: Step[];
   /**
-   * Structural walk order: sequential steps and parallel groups in array order.
-   * When present, the loop walks these nodes (dispatching parallel groups to the
-   * concurrency-aware scheduler); when absent, it walks `steps` sequentially with
-   * the array index as the stepIndex (unit-harness back-compat).
+   * Structural walk order; parallel groups go to the concurrency-aware
+   * scheduler. Absent: walk `steps` with the array index as stepIndex (unit
+   * harnesses).
    */
   stepNodes?: StepNode[];
   /**
-   * Abort the per-task controller for `stepIndex` (parallel fail-fast). Wired to
-   * the workflow-runner's `stepAbortControllers` map so an aborted sibling's
-   * `ctx.signal` fires and its step race rejects with {@link StepCancelledError}.
+   * Parallel fail-fast: aborts the workflow-runner's per-task controller, so the
+   * sibling's `ctx.signal` fires and its race rejects with {@link StepCancelledError}.
    */
   abortStep?: (stepIndex: number) => void;
   /**
-   * Returns the per-task abort signal for `stepIndex` (the same controller
-   * `abortStep` triggers). The step race watches it so a fail-fast abort
-   * interrupts an in-flight step even if its body ignores `ctx.signal`.
+   * The controller `abortStep` triggers; the step race watches it so fail-fast
+   * interrupts a step whose body ignores `ctx.signal`.
    */
   getStepAbortSignal?: (stepIndex: number) => AbortSignal | undefined;
   /**
-   * Run mode for idempotent steps. `apply` (default) converges; `check` /
-   * `check-fail-on-drift` preview drift and never invoke a checked step's apply.
+   * `apply` (default) converges; `check` / `check-fail-on-drift` preview drift
+   * and never invoke a checked step's apply.
    */
   checkMode?: CheckMode;
-  /** Factory that creates a StepContext for a given step index and name. */
   createStepContext: (stepIndex: number, stepName: string) => StepContext;
   /**
-   * Run `fn` inside the step's console-capture scope so any console output it
-   * (or its hooks) produces attributes to `stepIndex`. Defaults to calling `fn`
-   * directly when absent (unit harnesses without capture wiring).
+   * Runs `fn` in the step's console-capture scope so its (and its hooks')
+   * output attributes to `stepIndex`. Absent: calls `fn` directly (unit harnesses).
    */
   runWithStepCapture?: <T>(stepIndex: number, fn: () => Promise<T>) => Promise<T>;
   sendIpc: (msg: RunnerToAgentMessage) => void;
   defaultTimeoutMs: number;
   outputsMap: OutputsMap;
-  /** Event payload for rule context. */
   event: Record<string, unknown>;
-  /** Environment variables for rule context. */
   env: Record<string, string | undefined>;
-  /** Operator dispatch inputs for the rule context (`ctx.dispatchInputs`). */
   dispatchInputs?: Readonly<Record<string, string | number | boolean | null>>;
-  /** Fan-out position for the rule context (`ctx.fanout`); undefined on a non-fan-out job. */
+  /** Undefined on a non-fan-out job. */
   fanout?: FanoutPosition;
   /**
-   * The repo whose event triggered this run, for the step rule context
-   * (`ctx.sourceRepo`). Present for a global workflow, absent otherwise — a
-   * step rule reads the source tree through `.path` the same way a job rule
+   * The repo whose event triggered the run (`ctx.sourceRepo`); present only for
+   * a global workflow. A step rule reads its tree through `.path`, as a job rule
    * and a generator do.
    */
   sourceRepo?: RepoInfo;
-  /** The repo that registered the workflow, for the step rule context (`ctx.workflowRepo`). */
+  /** The repo that registered the workflow (`ctx.workflowRepo`). */
   workflowRepo?: RepoInfo;
-  /** Job-level hooks. */
   jobHooks?: JobHooks;
   /**
-   * Force the completion-hook sequence down the failed path (run `onFailure`
-   * then `cleanup`, not `onSuccess`) regardless of step outcomes. Set by the
-   * between-jobs out-of-band cleanup re-run, which runs no steps but must drive
-   * the declared cleanup as if the job had failed.
+   * Drives the completion hooks down the failed path (`onFailure` then
+   * `cleanup`) whatever the step outcomes. Set by the between-jobs out-of-band
+   * cleanup re-run, which runs no steps.
    */
   forceInitialFailure?: boolean;
   /**
-   * Declarative cache phase dependencies (cache API + IPC + pseudo-step index
-   * allocator). When set, each step's own `cache` specs are restored before the
-   * step's `run` and saved after (on an exact-key miss), surfacing as
-   * `cache:restore` / `cache:save` pseudo-steps. Absent ⇒ no step-level cache.
+   * When set, each step's own `cache` specs are restored before its `run` and
+   * saved after (on an exact-key miss), as `cache:restore` / `cache:save`
+   * pseudo-steps. Absent ⇒ no step-level cache.
    */
   cachePhaseDeps?: CachePhaseDeps;
-  /** Abort check callback. Returns true if job was aborted. */
   isAborted?: () => boolean;
   /**
-   * Aborted when the job-level wall-clock deadline (the lock job's `timeout`)
-   * is breached. Threaded into each step's run race so an in-flight step is
-   * interrupted immediately on breach — the between-steps `isAborted()` check
-   * alone cannot unwind a single long-running step that has no per-step
-   * `timeout`. When the signal fires, the step rejects with a job_timeout
-   * error and the loop stops.
+   * Aborted on breach of the job wall-clock deadline (the lock job's
+   * `timeout`). Each step's race watches it, because the between-steps
+   * `isAborted()` check cannot unwind one long step with no per-step `timeout`;
+   * the step rejects with a job_timeout error and the loop stops.
    */
   jobDeadlineSignal?: AbortSignal;
-  /** Job start time (epoch ms) for outcome metadata duration. */
+  /** Epoch ms, for outcome metadata duration. */
   startTime?: number;
-  /**
-   * Returns the secret key names accessed by the step context created for
-   * `stepIndex`. Called after each step completes to include in step.complete
-   * IPC messages.
-   */
+  /** Secret key names the step's context accessed, reported on `step.complete`. */
   getSecretsAccessLog?: (stepIndex: number) => string[];
   /**
-   * Tear down per-step state created by the `createStepContext` call for
-   * `stepIndex`. Invoked from the step-loop's `finally` after the step completes
-   * (success, failure, rule-skip, or timeout) so resources like the
-   * `ctx.secrets.mountFile` tmpdir get removed even on the failure paths.
-   * Never throws -- errors are logged by the wired implementation.
+   * Tears down the step's context state (e.g. the `ctx.secrets.mountFile`
+   * tmpdir) after the step completes — success, failure, rule-skip or timeout.
+   * Never throws; the wired implementation logs errors.
    */
   disposeStepResources?: (stepIndex: number) => Promise<void>;
   /**
-   * Returns the IPC `step.secret_mount` records collected by the step context
-   * created for `stepIndex`. Emitted on step completion so the orchestrator can
-   * persist the audit trail alongside `secretsAccessed`.
+   * `step.secret_mount` records, emitted on completion so the orchestrator
+   * persists the audit trail alongside `secretsAccessed`.
    */
   getSecretMountRecords?: (stepIndex: number) => StepSecretMountRecord[];
   /**
-   * Before a step's run function executes, point KICI_ENV / KICI_PATH at fresh
-   * temp files for this step (keyed by `stepIndex` so concurrent steps never
-   * share a delta file). Invoked once per executed step (NOT for rule-skipped
-   * steps). The workflow-runner owns the file lifecycle.
+   * Points KICI_ENV / KICI_PATH at fresh temp files keyed by `stepIndex`, so
+   * concurrent steps never share a delta file. Not called for rule-skipped
+   * steps; the workflow-runner owns the file lifecycle.
    */
   beforeStepEnvFiles?: (stepIndex: number) => Promise<void>;
   /**
-   * After a step's run function completes (success OR failure), read this
-   * step's KICI_ENV / KICI_PATH files, apply the delta via applyEnvDelta, and
-   * release them. Never throws -- errors are logged by the wired impl.
+   * After the run (success or failure), applies the step's KICI_ENV / KICI_PATH
+   * delta via applyEnvDelta and releases the files. Never throws; the wired
+   * implementation logs errors.
    */
   afterStepApplyEnvFiles?: (stepIndex: number) => Promise<void>;
   /**
-   * Block an `approval` step (`when: 'always'`) pending an orchestrator-side
-   * approval hold. The runner sends the normalized requirement and awaits the
-   * resolution; the agent keeps job heartbeats flowing during the wait so the
-   * agent isn't reaped. Absent ⇒ approvals are not gated (CT / unit harnesses)
-   * and steps run unconditionally.
+   * Blocks a `when: 'always'` approval step on an orchestrator-side hold; the
+   * agent keeps job heartbeats flowing meanwhile so it is not reaped. Absent ⇒
+   * approvals are not gated (CT / unit harnesses).
    */
   awaitStepApproval?: (req: {
     stepIndex: number;
@@ -207,11 +174,10 @@ export interface StepLoopOptions {
     timeoutSeconds?: number;
   }) => Promise<StepApprovalResolution>;
   /**
-   * Block an `approval: { when: 'drift' }` step mid-execution: after `check()`
-   * returns drift in apply mode, send a payload-bearing step-approval and await
-   * the resolution. The payload carries the computed drift (`summaryMarkdown` +
-   * structured `drift`) so the operator approves the actual diff. Absent ⇒ the
-   * drift gate is not enforced (CT / unit harnesses) and the step applies.
+   * Blocks an `approval: { when: 'drift' }` step after `check()` returns drift
+   * in apply mode; the payload carries the drift (`summaryMarkdown` + structured
+   * `drift`) so the operator approves the actual diff. Absent ⇒ no drift gate
+   * (CT / unit harnesses) and the step applies.
    */
   awaitStepApprovalWithPayload?: (req: {
     stepIndex: number;
@@ -223,45 +189,36 @@ export interface StepLoopOptions {
   }) => Promise<StepApprovalResolution>;
 }
 
-/** Outcome of an awaited step-level approval hold. */
 export interface StepApprovalResolution {
   outcome: 'approved' | 'rejected' | 'expired';
   reason?: string;
 }
 
-/**
- * Resolve the capture-scope wrapper from options, falling back to a direct call
- * when no capture wiring is present (unit harnesses).
- */
+/** The capture-scope wrapper, or a direct call without capture wiring. */
 function captureWrap(
   opts: StepLoopOptions,
 ): <T>(stepIndex: number, fn: () => Promise<T>) => Promise<T> {
   return opts.runWithStepCapture ?? ((_stepIndex, fn) => fn());
 }
 
-/** Result of the step execution loop. */
 interface StepLoopResult {
   status: 'success' | 'failed' | 'aborted';
   stepResults: SandboxStepResult[];
   failureReason?: string;
 }
 
-/** Structured result of running a step under a given check mode. */
 interface CheckPhaseResult {
-  /** Idempotent outcome, set only when the run carried a non-default check mode
-   *  or the step has a check facet. Undefined for the plain apply-mode path. */
+  /** Set only for a non-default check mode or a step with a check facet. */
   checkOutcome?: CheckStepOutcome;
-  /** Step status mapped from the outcome (or the plain success path). */
   status: 'success' | 'skipped';
-  /** Step outputs (from run / whenInSync). Undefined when nothing executed. */
+  /** From run / whenInSync; undefined when nothing executed. */
   outputs: unknown;
-  /** Drift summary (`summarize(drift)`), present when drift was detected. */
+  /** `summarize(drift)`, present when drift was detected. */
   driftSummary?: string;
-  /** Structured drift value, present when drift was detected. */
   drift?: unknown;
 }
 
-/** Result of a rejected drift gate: the run was declined by a reviewer. */
+/** A reviewer rejected the drift gate. */
 class DriftGateRejectedError extends Error {
   constructor(reason?: string) {
     super(reason ? `approval rejected: ${reason}` : 'approval rejected');
@@ -270,17 +227,15 @@ class DriftGateRejectedError extends Error {
 }
 
 /**
- * Run one step honoring the run-level {@link CheckMode}, reusing the
- * `runIdempotentStep` primitive for checked steps (never hand-rolled branching).
+ * Runs one step under the run-level {@link CheckMode}, driving checked steps
+ * through `runIdempotentStep` (never hand-rolled branching).
  *
- * - Plain step (no `check`): in apply mode, runs as today; in any check mode it
- *   is skipped with `no_check` (a side-effecting step can't be safely previewed).
- * - Checked step: adapted into an `IdempotentStep` and driven by the primitive
- *   with `dryRun` set in check mode (so `apply`/`run` never fires). On drift the
- *   summary is emitted as a log line. A `approval: { when: 'drift' }` step in
- *   apply mode passes a `confirm` callback that round-trips a payload-bearing
- *   step-approval; on reject the gate throws (fail-stop). Any other apply-mode
- *   step uses `yes: true`.
+ * - Plain step (no `check`): runs in apply mode; any check mode skips it with
+ *   `no_check`, since a side-effecting step cannot be safely previewed.
+ * - Checked step: `dryRun` in check mode, so `apply`/`run` never fires; drift
+ *   is logged as its summary. An `approval: { when: 'drift' }` step in apply
+ *   mode confirms through a payload-bearing step-approval and throws on reject
+ *   (fail-stop); any other apply-mode step uses `yes: true`.
  */
 async function runStepWithCheckMode(
   step: Step,
@@ -298,12 +253,11 @@ async function runStepWithCheckMode(
         outputs: undefined,
       };
     }
-    // Unchanged plain-step apply path: run with only the context, no outcome tag.
     return { status: 'success', outputs: await step.run(ctx) };
   }
 
-  // Capture the structured drift the primitive computes so the payload carries
-  // it (the primitive's confirm/summarize see only the summary string).
+  // The primitive's confirm/summarize see only the summary string; keep the
+  // structured drift for the approval payload.
   let lastDrift: unknown = null;
   const adapted: IdempotentStep<unknown, unknown, unknown> = {
     name: step.name,
@@ -326,9 +280,9 @@ async function runStepWithCheckMode(
     dryRun: checkMode !== CheckMode.enum.apply,
     ...(driftGate
       ? {
-          // The primitive calls confirm() only on non-null drift, which is
-          // exactly "gate on drift". It passes its own prompt string; the
-          // author-rendered summary comes from summarize(lastDrift).
+          // confirm() runs only on non-null drift, which is exactly "gate on
+          // drift"; the author's summary comes from summarize(lastDrift), not
+          // the primitive's prompt string.
           confirm: async () => {
             const norm = normalizeApproval(step.approval!);
             const summaryMarkdown = step.summarize!(lastDrift);
@@ -341,7 +295,7 @@ async function runStepWithCheckMode(
               payload: { summaryMarkdown, drift: lastDrift },
             });
             if (resolution.outcome === 'approved') return true;
-            // Reject / expire is a fail-stop: surface a clear error to the loop.
+            // Reject / expire is a fail-stop.
             throw new DriftGateRejectedError(
               resolution.outcome === 'expired' ? 'approval expired' : resolution.reason,
             );
@@ -353,7 +307,7 @@ async function runStepWithCheckMode(
 
   const driftSummary = res.drift != null ? step.summarize!(res.drift) : undefined;
   const status = res.outcome === CheckStepOutcome.enum.applied ? 'success' : 'skipped';
-  // dry-run is a successful preview (status success), distinct from in-sync skip.
+  // dry-run is a successful preview, distinct from an in-sync skip.
   const mappedStatus = res.outcome === CheckStepOutcome.enum['dry-run'] ? 'success' : status;
   return {
     checkOutcome: res.outcome as CheckStepOutcome,
@@ -370,32 +324,23 @@ export const STEP_FAILURE_LOG_MAX_LINES = 100;
 export const STEP_FAILURE_LOG_MAX_CHARS = 8192;
 
 /**
- * Emit a failing step's error message into the step's own log stream.
+ * Writes a failing step's error message into its own log stream (as `stderr`).
  *
- * A step failure is otherwise reported only on `step.complete` (which persists
- * to the step row), so a reader of the run log sees a step go red with nothing
- * explaining why. Subprocess wrappers routinely pack the real diagnosis —
- * captured stderr, exit code, kill signal — into the thrown error's message, so
- * that message is the diagnosis and it belongs in the log.
+ * Otherwise the failure reaches only `step.complete` (the step row), and the run
+ * log shows a red step with no reason; subprocess wrappers pack the diagnosis —
+ * stderr, exit code, kill signal — into the error message.
  *
- * Tagged `stderr`: it is a failure, not progress. Bounded to
- * {@link STEP_FAILURE_LOG_MAX_LINES} lines / {@link STEP_FAILURE_LOG_MAX_CHARS}
- * characters, because a wrapped process error can carry a subprocess's entire
- * output; what is dropped is stated in the log rather than silently cut. The
- * full untruncated message still travels on `step.complete`.
+ * Bounded to {@link STEP_FAILURE_LOG_MAX_LINES} lines /
+ * {@link STEP_FAILURE_LOG_MAX_CHARS} characters, because a wrapped process error
+ * can carry a subprocess's entire output; the log states what was dropped, and
+ * `step.complete` keeps the full message.
  *
- * Goes through the same `sendFn` as every other log line, so the runner's
- * secret masking applies exactly as it does to the step's ordinary output.
- *
- * One consequence to know: a `$({ quiet: true })` command's output is kept out
- * of the log by the `verbose` gate in `streaming-zx-log.ts`, but when such a
- * command FAILS, zx packs its captured output into the thrown error's message —
- * which this function then writes to the log. Surfacing it is the whole point:
- * a quiet command that fails is exactly the failure an operator cannot
- * otherwise diagnose. The same text also travels on `step.complete` for the step
- * row the dashboard renders, and both copies pass the masker — `maskMessageText`
- * masks `step.complete.error.message` alongside `log.line`. Registered secret
- * values are masked; anything the masker has never been told about is not.
+ * It goes through `sendFn`, so the runner's secret masking applies as to
+ * ordinary output. A failing `$({ quiet: true })` command's captured output
+ * (otherwise kept out by the `verbose` gate in `streaming-zx-log.ts`) is in the
+ * zx error message and so reaches the log — deliberately, since that failure is
+ * otherwise undiagnosable. `maskMessageText` masks `step.complete.error.message`
+ * too; registered secret values are masked, anything unregistered is not.
  */
 function emitStepFailureLog(
   stepName: string,
@@ -414,15 +359,11 @@ function emitStepFailureLog(
     if (line) sendFn({ type: 'log.line', stepIndex, line, stream: LogStream.enum.stderr });
   }
 
-  // Both counts are measured against the ORIGINAL message, never against the
-  // char-capped copy: a char cap landing mid-message also drops every line
-  // after the cut, and a line cap trimming the tail also drops that tail's
-  // characters. Counting either from the capped copy reports "0 more" for a cap
-  // that did fire, which reads as "nothing else was lost".
-  //
-  // `kept.join('\n')` reconstructs exactly the emitted prefix of `prefix +
-  // capped`, so subtracting the prefix gives the message characters that got
-  // out; the remaining newlines in `message` are the lines that did not.
+  // Count against the ORIGINAL message, never the char-capped copy: each cap
+  // also drops what the other measures, so counting from the copy reports
+  // "0 more" for a cap that fired. `kept.join('\n')` is exactly the emitted
+  // prefix of `prefix + capped`, so minus `prefix` it is the message
+  // characters that got out; newlines after that are the lines that did not.
   const emittedChars = Math.max(0, kept.join('\n').length - prefix.length);
   const omittedChars = message.length - emittedChars;
   if (omittedChars > 0) {
@@ -441,11 +382,7 @@ function emitStepFailureLog(
   }
 }
 
-/**
- * Execute a single step with timeout enforcement.
- *
- * Timeout pattern using Promise.race + AbortController, with IPC status reporting.
- */
+/** One step attempt, raced against its timeout, the job deadline and fail-fast. */
 async function executeStepInLoop(
   step: Step,
   stepIndex: number,
@@ -463,26 +400,22 @@ async function executeStepInLoop(
 
   const startTime = Date.now();
   const abortController = new AbortController();
-  // `timedOut` marks the step's own abort as self-inflicted. The timeout aborts
-  // `ctx.signal` through `opts.abortStep`, which is the same controller the
-  // fail-fast path uses, so without this flag the step would report `cancelled`
-  // instead of the timeout message the loop expects.
+  // The timeout aborts `ctx.signal` through `opts.abortStep`, the fail-fast
+  // controller; this flag keeps that self-inflicted abort from reporting
+  // `cancelled` instead of the timeout message.
   let timedOut = false;
-  // The race's timeout branch, rejected explicitly rather than through an abort
-  // listener. A step body that resolves when it observes `ctx.signal` settles in
-  // the same turn as the abort, so leaving the two to race by listener order
-  // would sometimes report a timed-out step as successful.
+  // Rejected explicitly, not via an abort listener: a body that resolves on
+  // `ctx.signal` settles in the same turn, so listener order would sometimes
+  // report a timed-out step as successful.
   let rejectTimeout: (error: Error) => void = () => {};
   const timeoutRace = new Promise<never>((_, reject) => {
     rejectTimeout = reject;
   });
   const timeoutId = setTimeout(() => {
     timedOut = true;
-    // Fix the verdict first, then signal the abort in the same turn so `ctx.$`
-    // kills its subprocess and awaited `fetch(..., { signal: ctx.signal })`
-    // calls reject. Without the abort the step is only marked failed: the
-    // command it timed out on keeps running, and `onFailure` rolls back
-    // underneath a live process.
+    // Fix the verdict, then abort in the same turn so `ctx.$` kills its
+    // subprocess and `fetch(..., { signal: ctx.signal })` rejects; otherwise
+    // the timed-out command keeps running under `onFailure`'s rollback.
     rejectTimeout(new Error(`Step '${step.name}' timed out after ${timeoutMs}ms`));
     abortController.abort();
     opts.abortStep?.(stepIndex);
@@ -490,8 +423,8 @@ async function executeStepInLoop(
   const stepAbortSignal = opts.getStepAbortSignal?.(stepIndex);
 
   const stepPromise = runStepWithCheckMode(step, stepIndex, ctx, checkMode, sendFn, opts);
-  // Settlement tracker. `.then` with both handlers always fulfils, so it never
-  // produces an unhandled rejection; `stepPromise` itself is handled by the race.
+  // `.then` with both handlers always fulfils, so no unhandled rejection; the
+  // race handles `stepPromise` itself.
   let stepSettled = false;
   const stepSettledPromise = stepPromise.then(
     () => {
@@ -506,9 +439,8 @@ async function executeStepInLoop(
     const phase = await Promise.race([
       stepPromise,
       timeoutRace,
-      // Job-level deadline: interrupt an in-flight step the instant the job
-      // wall-clock timeout fires, rather than waiting for the step's own
-      // (possibly 30-min default) timeout to elapse.
+      // Job deadline: interrupt at once, not after the step's own (possibly
+      // 30-min default) timeout.
       new Promise<never>((_, reject) => {
         if (!jobDeadlineSignal) return;
         if (jobDeadlineSignal.aborted) {
@@ -519,9 +451,8 @@ async function executeStepInLoop(
           reject(new Error(`Step '${step.name}' aborted: job timeout exceeded`));
         });
       }),
-      // Per-task fail-fast: a parallel sibling failed and aborted this step's
-      // own controller. Reject with StepCancelledError so the catch reports
-      // `cancelled` (not `failed`) — a cancelled sibling is not a failure.
+      // Fail-fast: a failed parallel sibling aborted this step; it reports
+      // `cancelled`, not `failed`.
       new Promise<never>((_, reject) => {
         if (!stepAbortSignal) return;
         if (stepAbortSignal.aborted) {
@@ -529,8 +460,7 @@ async function executeStepInLoop(
           return;
         }
         stepAbortSignal.addEventListener('abort', () => {
-          // A self-inflicted abort from this step's own timeout is reported by
-          // the timeout branch above, which carries the message the loop expects.
+          // The timeout branch reports this step's own timeout abort.
           if (timedOut) return;
           reject(new StepCancelledError(step.name));
         });
@@ -578,12 +508,9 @@ async function executeStepInLoop(
     const durationMs = Date.now() - startTime;
     const error = e instanceof Error ? e : new Error(String(e));
 
-    // The timeout aborted `ctx.signal` before rejecting the race. Give the step
-    // body a bounded moment to unwind so its subprocess is gone before the loop
-    // runs `onFailure` — a rollback that starts while the timed-out command still
-    // holds its lock is the failure this abort exists to prevent. A body that
-    // ignores `ctx.signal` is named in the log, so an operator can tell
-    // "we stopped it" from "we gave up on it".
+    // Give the aborted body a bounded moment to unwind, so `onFailure` does not
+    // roll back while the timed-out command holds its lock. A body ignoring
+    // `ctx.signal` is named in the log ("gave up on it", not "stopped it").
     if (timedOut && !stepSettled) {
       await Promise.race([stepSettledPromise, delayUnref(STEP_ABORT_GRACE_MS)]);
       if (!stepSettled) {
@@ -596,7 +523,6 @@ async function executeStepInLoop(
       }
     }
 
-    // A fail-fast cancellation is a terminal `cancelled` step, not a failure.
     if (e instanceof StepCancelledError) {
       const secretsAccessed = getSecretsAccessLog?.(stepIndex);
       emitSecretMountEvents(getSecretMountRecords?.(stepIndex), stepIndex, sendFn);
@@ -618,12 +544,10 @@ async function executeStepInLoop(
     const exitCode = extractExitCode(e);
     const signal = extractSignal(e);
 
-    // Emit the failure into the step's log stream BEFORE `step.complete`, so
-    // the line is ordered ahead of the terminal status on the runner->agent IPC
-    // channel and lands in the step's log rather than leaving a bare red step.
-    // The agent batches log lines through its LogStreamer while step statuses
-    // go out immediately, so the enclosing log chunk can still reach the
-    // orchestrator after the terminal status; the ordering guarantee is IPC-level.
+    // Before `step.complete`, so the line precedes the terminal status on the
+    // runner->agent IPC channel. Only IPC order is guaranteed: the agent's
+    // LogStreamer batches lines while statuses go out at once, so the chunk can
+    // reach the orchestrator after the status.
     emitStepFailureLog(step.name, stepIndex, error.message, sendFn);
 
     const secretsAccessed = getSecretsAccessLog?.(stepIndex);
@@ -656,10 +580,7 @@ async function executeStepInLoop(
   }
 }
 
-/**
- * How long a timed-out step is given to unwind after its abort signal fires,
- * before the loop reports that the step ignored it and moves on.
- */
+/** Unwind time a timed-out step gets after its abort before the loop moves on. */
 const STEP_ABORT_GRACE_MS = 2000;
 
 /** A timer-backed delay that never keeps the process alive on its own. */
@@ -671,9 +592,8 @@ function delayUnref(ms: number): Promise<void> {
 }
 
 /**
- * Emit one `step.secret_mount` IPC event per `mountFile` / `exposeFile` call
- * the step performed. Called from both the success and failure paths so the
- * orchestrator's audit trail records every mount regardless of step outcome.
+ * One `step.secret_mount` event per `mountFile` / `exposeFile` call, on every
+ * outcome path so the audit trail records every mount.
  */
 function emitSecretMountEvents(
   records: StepSecretMountRecord[] | undefined,
@@ -717,27 +637,18 @@ function extractSignal(error: unknown): string | undefined {
   return undefined;
 }
 
-/**
- * Per-step iteration outcome returned by `runStepIteration`.
- */
 export interface StepIterationOutcome {
-  /** The result to append to the running stepResults list. */
   result: SandboxStepResult;
-  /** When true, the loop must break (failed step without continueOnError). */
+  /** A failed step without continueOnError. */
   shouldBreak: boolean;
-  /** Set when the step failed; carried into completion-hook outcome metadata. */
+  /** Carried into the completion-hook outcome metadata. */
   failedStepName?: string;
 }
 
 /**
- * Evaluate step-level rules. Returns null when the step should run normally.
- * Otherwise returns a terminal `StepIterationOutcome`:
- *
- * - a rule's `check()` **threw** (`evaluationError`) → FAIL the step (`failed`
- *   status + error surfaced, `shouldBreak: true`): the gate could not be
- *   evaluated, so silently skipping would be a false green.
- * - a rule cleanly returned `false` → clean skip (`skipped` status,
- *   `shouldBreak: false`), the loop continues to the next step (unchanged).
+ * Null when the step should run. A rule whose `check()` threw fails the step
+ * and breaks the loop — the gate could not be evaluated, so a skip would be a
+ * false green; a rule returning `false` skips it and the loop continues.
  */
 async function evaluateStepRulesAndMaybeSkip(
   step: Step,
@@ -764,7 +675,6 @@ async function evaluateStepRulesAndMaybeSkip(
   const ruleResult = await evaluateRules(step.rules, ruleCtx, step.name);
   if (ruleResult.allPassed) return null;
 
-  // A rule's check() threw -- fail the step, never a silent skip.
   if (ruleResult.evaluationError) {
     const message = `rule '${ruleResult.evaluationError.label}' errored: ${ruleResult.evaluationError.message}`;
     opts.sendIpc({ type: 'step.start', stepIndex, stepName: step.name });
@@ -794,12 +704,11 @@ async function evaluateStepRulesAndMaybeSkip(
     };
   }
 
-  // A rule cleanly returned false -- legitimate skip.
   opts.sendIpc({ type: 'step.start', stepIndex, stepName: step.name });
   opts.sendIpc({
     type: 'step.complete',
     stepIndex,
-    status: ExecutionStepStatus.enum.failed, // IPC doesn't have 'skipped' -- use metadata
+    status: ExecutionStepStatus.enum.failed, // IPC says failed; the returned result says skipped
     durationMs: 0,
   });
   opts.sendIpc({
@@ -819,12 +728,9 @@ async function evaluateStepRulesAndMaybeSkip(
 }
 
 /**
- * Pre-step manual approval gate. When the step declares `approval` with
- * `when: 'always'` and the harness wired `awaitStepApproval`, block until the
- * orchestrator resolves the hold. A `when: 'drift'` gate is NOT handled here —
- * it fires mid-execution inside `runStepWithCheckMode` once `check()` returns
- * drift. Returns a failed `StepIterationOutcome` (breaking the loop) on
- * reject/expired; returns null when approved or when no gate applies.
+ * Pre-step `when: 'always'` approval gate; a `when: 'drift'` gate fires inside
+ * `runStepWithCheckMode` instead. Null when approved or ungated; a failed,
+ * loop-breaking outcome on reject/expiry.
  */
 async function maybeGateStepApproval(
   step: Step,
@@ -834,7 +740,6 @@ async function maybeGateStepApproval(
   if (step.approval === undefined || !opts.awaitStepApproval) return null;
 
   const normalized = normalizeApproval(step.approval);
-  // Drift gates fire between check and run, not before the step.
   if (normalized.when === 'drift') return null;
   opts.sendIpc({
     type: 'log.line',
@@ -886,11 +791,7 @@ async function maybeGateStepApproval(
   };
 }
 
-/**
- * Run a single observer hook (beforeStep / afterStep). Failures only emit a
- * log line — they never change job status. Centralises the per-call boilerplate
- * so the per-step body can stay flat.
- */
+/** A beforeStep / afterStep observer hook; a failure only logs, never changes job status. */
 async function runObserverHook(args: {
   hook: HookInput;
   hookType: 'beforeStep' | 'afterStep';
@@ -932,23 +833,10 @@ async function runObserverHook(args: {
 }
 
 /**
- * Execute one iteration of the step loop: step rules → beforeStep → execute →
- * afterStep → failure-handling. Returns a typed outcome the loop uses to
- * accumulate results, decide whether to break, and remember the failed step.
- *
- * Wraps the per-step lifecycle in a `try / finally` that calls
- * `opts.disposeStepResources()` so per-step state (the
- * `ctx.secrets.mountFile` tmpdir, any env vars set via `exposeFile`) is
- * removed even when the step throws, times out, or rule-skips.
- */
-/**
- * Run a step through its retry policy. Each call to `executeStepInLoop` is one
- * attempt: it sets up its own per-attempt timeout from `step.timeout` and returns
- * a `SandboxStepResult` (it never throws — a failed attempt is reported as a
- * `failed` status with an `error`). A failed attempt is retried while attempts
- * remain AND `retryIf(reconstructedError)` is true; backoff sleeps between
- * attempts. The retry loop runs to completion BEFORE the caller applies
- * `continueOnError` to the final outcome.
+ * Runs a step through its retry policy. Each `executeStepInLoop` call is one
+ * attempt with its own `step.timeout`, and never throws. A failed attempt
+ * retries while attempts remain and `retryIf(reconstructedError)` is true, with
+ * backoff between attempts; the caller applies `continueOnError` afterwards.
  */
 async function runStepWithRetry(
   step: Step,
@@ -995,6 +883,11 @@ async function runStepWithRetry(
   return result;
 }
 
+/**
+ * One loop iteration: step rules → approval → beforeStep → execute → afterStep.
+ * Per-step state (the `ctx.secrets.mountFile` tmpdir, env vars set via
+ * `exposeFile`) is disposed even when the step throws, times out or rule-skips.
+ */
 export async function runStepIteration(
   step: Step,
   stepIndex: number,
@@ -1002,18 +895,12 @@ export async function runStepIteration(
 ): Promise<StepIterationOutcome> {
   const ruleOutcome = await evaluateStepRulesAndMaybeSkip(step, stepIndex, opts);
   if (ruleOutcome) {
-    // A rule short-circuited the step (clean skip or a throwing-rule failure).
-    // Even a rule-skipped step may have allocated context state via a prior
-    // `createStepContext` call (when `getSecretMountRecords` is wired the
-    // outer caller may have pre-allocated the secrets handle). Dispose to be
-    // safe.
+    // The outer caller may already have allocated context state (the secrets
+    // handle, when `getSecretMountRecords` is wired).
     await opts.disposeStepResources?.(stepIndex);
     return ruleOutcome;
   }
 
-  // Manual approval gate: block this step until the orchestrator resolves an
-  // approval hold. A rejected/expired hold fails the job; an approved hold
-  // falls through to normal execution.
   const gate = await maybeGateStepApproval(step, stepIndex, opts);
   if (gate) {
     return gate;
@@ -1030,7 +917,6 @@ export async function runStepIteration(
     });
   }
 
-  // Step-level declarative cache: restore this step's specs BEFORE its run.
   const stepCacheSpecs: CacheSpec[] = opts.cachePhaseDeps ? normalizeCacheSpecs(step.cache) : [];
   const stepCacheRestore =
     stepCacheSpecs.length > 0 && opts.cachePhaseDeps
@@ -1050,8 +936,7 @@ export async function runStepIteration(
       await opts.afterStepApplyEnvFiles?.(stepIndex);
     }
 
-    // Step-level declarative cache: save AFTER the step succeeds (on exact-key
-    // miss). A failed step does not save — the cached artifacts may be partial.
+    // A failed step does not save: its artifacts may be partial.
     if (
       stepCacheSpecs.length > 0 &&
       opts.cachePhaseDeps &&
@@ -1085,22 +970,13 @@ export async function runStepIteration(
   }
 }
 
-/**
- * Mutable accumulator passed to `runJobCompletionHooks` so completion-hook
- * failures can promote the job to failed and append to `failureReason`.
- */
 interface CompletionState {
   failed: boolean;
   failedStepName?: string;
   failureReason?: string;
 }
 
-/**
- * Execute one named completion hook (onSuccess / onFailure / cleanup) and
- * return the updated `CompletionState`. Treated as the single source of truth
- * for the "promote to failed + concat reason" pattern that the three completion
- * hooks share.
- */
+/** One completion hook; a failure appends to `failureReason` and may promote the job to failed. */
 async function runCompletionHook(args: {
   hook: HookInput;
   hookType: 'onSuccess' | 'onFailure' | 'cleanup';
@@ -1147,9 +1023,8 @@ async function runCompletionHook(args: {
 }
 
 /**
- * Run the job-completion hook sequence after the per-step loop ends:
- * onSuccess (or onFailure), then cleanup (always). The cleanup outcome is
- * recomputed so it reflects any failures introduced by onSuccess/onFailure.
+ * onSuccess or onFailure, then cleanup (always), whose outcome is recomputed to
+ * include onSuccess/onFailure failures.
  */
 async function runJobCompletionHooks(
   opts: StepLoopOptions,
@@ -1217,33 +1092,23 @@ async function runJobCompletionHooks(
     });
   }
 
-  // Signal the supervisor that completion hooks ran, so it does not re-run them
-  // out-of-band. Emitted whether or not a hook failed — a failed hook still ran;
-  // the promote-to-failed status already carries the failure.
+  // Tells the supervisor not to re-run the hooks out-of-band; sent even when a
+  // hook failed, since the job status already carries the failure.
   opts.sendIpc({ type: 'completion-hooks-done' });
 
   return state;
 }
 
 /**
- * Execute the step loop with hook integration and step-level rule evaluation.
- *
- * Hook execution order:
- * - beforeStep -> step -> afterStep (per step)
- * - onSuccess or onFailure (after all steps)
- * - cleanup (always, after onSuccess/onFailure)
- *
- * Hooks are observers: beforeStep/afterStep failures do NOT affect step execution.
- * Only completion hooks (onSuccess/onFailure/cleanup) can change job status to failed.
+ * Hook order: beforeStep -> step -> afterStep per step, then onSuccess or
+ * onFailure, then cleanup (always). beforeStep/afterStep failures do not affect
+ * execution; only completion hooks can change the job status to failed.
  */
 export async function executeStepLoop(opts: StepLoopOptions): Promise<StepLoopResult> {
   const startTime = opts.startTime ?? Date.now();
   const stepResults: SandboxStepResult[] = [];
   const state: CompletionState = { failed: opts.forceInitialFailure === true };
 
-  // Walk the structural node list when present (sequential steps + parallel
-  // groups); otherwise fall back to the flat `steps` list (unit-harness path)
-  // with the array index as the stepIndex.
   const nodes: StepNode[] =
     opts.stepNodes ?? opts.steps.map((step, i) => ({ kind: 'sequential', step, stepIndex: i }));
 
@@ -1268,8 +1133,8 @@ export async function executeStepLoop(opts: StepLoopOptions): Promise<StepLoopRe
     if (outcome.shouldBreak) break;
   }
 
-  // If aborted between steps, skip completion hooks — the workflow-runner's
-  // cancel-path will handle onCancel + cleanup to avoid double execution.
+  // The workflow-runner's cancel path runs onCancel + cleanup; running the
+  // completion hooks here too would double-execute them.
   if (opts.isAborted?.()) {
     return {
       status: 'aborted',

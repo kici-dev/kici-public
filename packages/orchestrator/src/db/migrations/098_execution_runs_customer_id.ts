@@ -35,8 +35,6 @@ export async function up(db: Kysely<unknown>): Promise<void> {
         ADD COLUMN customer_id TEXT NOT NULL DEFAULT '__default__'
     `.execute(db);
 
-    // Backfill from the source tables by routing_key; unmatched / null keys
-    // keep the '__default__' column default.
     await sql`
       UPDATE public.execution_runs er
       SET customer_id = COALESCE(

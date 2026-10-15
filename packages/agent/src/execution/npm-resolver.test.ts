@@ -19,26 +19,23 @@ describe('resolveNpm', () => {
 
   it('finds npm-cli.js in standard Node.js layout', () => {
     const result = resolveNpm();
-    // In a normal Node.js installation, npm should be found
-    // (either via the standard path or undefined for non-standard layouts)
+    // Either the standard path, or undefined for a non-standard layout.
     expect(typeof result.npmCliPath === 'string' || result.npmCliPath === undefined).toBe(true);
   });
 });
 
 describe('verifyNpmAvailable', () => {
   it('returns npm version string when npm is available', () => {
-    // In test environments, npm is always available (we're running in Node.js)
     const version = verifyNpmAvailable();
     expect(version).toMatch(/^\d+\.\d+\.\d+/);
   });
 
   it('throws descriptive error when npm is not available', () => {
-    // Temporarily override process.execPath to a non-existent binary
     const originalExecPath = process.execPath;
     const originalPath = process.env.PATH;
 
     try {
-      // Point to a fake node binary with no npm alongside it and clear PATH
+      // A fake node binary with no npm beside it, and an empty PATH.
       Object.defineProperty(process, 'execPath', {
         value: '/tmp/fake-node-binary',
         writable: true,
@@ -68,8 +65,8 @@ async function writeStubModule(nodeModules: string, id: string): Promise<void> {
 }
 
 /**
- * Write an npm package at `root`: `bin/npm-cli.js`, a `package.json` naming it,
- * and, unless `modules` is false, its own copies of the modules the agent loads.
+ * Write an npm package at `root` (`bin/npm-cli.js`, a `package.json` naming it,
+ * and, unless `modules` is false, its own copies of the agent-loaded modules).
  * Returns the CLI path.
  */
 async function writeNpm(
@@ -195,9 +192,8 @@ describe('lookupHostNpm', () => {
   });
 
   it('skips a PATH npm that is a launcher script', async () => {
-    // A version-manager shim: a script named npm that is not npm's own CLI,
-    // placed in a valid npm package's own bin/, so only the launcher-name
-    // check refuses it.
+    // A version-manager shim: a non-npm script named npm in a valid npm
+    // package's bin/, so only the launcher-name check refuses it.
     const pkg = join(base, 'shim-pkg');
     await writeNpm(pkg, '12.0.0');
     await writeFile(join(pkg, 'bin', 'npm'), '#!/bin/sh\nexec npm "$@"\n', { mode: 0o755 });
@@ -223,9 +219,8 @@ describe('lookupHostNpm', () => {
   });
 
   it('refuses an npm whose modules resolve outside its install', async () => {
-    // npm at <base>/x/share/nodejs/npm without its own modules; the modules sit
-    // in <base>/x/node_modules, which Node's resolution reaches by walking up,
-    // outside <base>/x/share/nodejs.
+    // npm at <base>/x/share/nodejs/npm without its own modules; Node's walk-up
+    // resolution finds them in <base>/x/node_modules, outside share/nodejs.
     const root = join(base, 'x', 'share', 'nodejs', 'npm');
     const cli = await writeNpm(root, '12.0.0', { modules: false });
     for (const id of NPM_MODULE_IDS) await writeStubModule(join(base, 'x', 'node_modules'), id);

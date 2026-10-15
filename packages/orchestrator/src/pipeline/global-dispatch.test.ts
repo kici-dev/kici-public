@@ -13,6 +13,7 @@ import type { QueuedJobInput } from '../queue/job-queue.js';
 import type { RegisteredWorkflow } from '../registration/registration-index.js';
 import type { DepCacheKey } from '@kici-dev/shared';
 import type { WebhookInfo } from '../webhook/handler.js';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 const WORKFLOW_REPO = 'org/ci';
 const SOURCE_REPO = 'org/app';
@@ -39,9 +40,8 @@ const IDENTITY_FIELDS = new Set([
 ]);
 
 /**
- * Top-level `QueuedJobInput` fields that name the checkout (the source
- * repository and its credentials) or the run. `jobConfig` is compared on its
- * own, field by field.
+ * Top-level `QueuedJobInput` fields naming the checkout (source repo and its
+ * credentials) or the run. `jobConfig` is compared separately, field by field.
  */
 const INPUT_IDENTITY_FIELDS = new Set([
   'repoUrl',
@@ -52,9 +52,8 @@ const INPUT_IDENTITY_FIELDS = new Set([
 ]);
 
 /**
- * A job config with its identity fields removed. The event envelope stays in
- * the comparison except for `sourceRepo`, which names the repository the event
- * came from and so differs by design.
+ * A job config without identity fields. The event envelope stays compared except
+ * `sourceRepo`, which differs by design.
  */
 function comparableJobConfig(jobConfig: Record<string, unknown>): Record<string, unknown> {
   const rest = omit(jobConfig, IDENTITY_FIELDS);
@@ -63,9 +62,8 @@ function comparableJobConfig(jobConfig: Record<string, unknown>): Record<string,
 }
 
 /**
- * Positional `onExecutionStarted` arguments that name the run or its source
- * repository: the run id and the source repository. The workflow-repository
- * provenance argument is located by its shape.
+ * Positional `onExecutionStarted` arguments for the run id and source repository.
+ * The provenance argument is located by its shape.
  */
 const RUN_ROW_IDENTITY_ARGS = new Set([0, 3]);
 
@@ -97,12 +95,9 @@ function makeBundle(label: string) {
  * gitCredentials and needs. No approval, so nothing is held.
  */
 function richGlobalLockEntry(): LockWorkflow {
-  const publish: LockJob = {
-    _type: 'static',
+  const publish: LockJob = staticJob({
     name: 'publish',
-    runsOn: [{ kind: 'exact', value: 'linux' }],
     runsOnPick: 'any',
-    needs: [],
     steps: [{ name: 'publish', run: 'npm publish' }],
     contexts: [{ value: CONTEXT_NAME, dynamic: false }],
     env: { STAGE: 'prod' },
@@ -111,14 +106,11 @@ function richGlobalLockEntry(): LockWorkflow {
     container: { image: 'node:22' },
     gitCredentials: { default: { tokenSecret: `${CONTEXT_NAME}:GIT_TOKEN` } },
     matrix: { _type: 'static', values: { node: ['20', '22'] } },
-  } as unknown as LockJob;
-  const test: LockJob = {
-    _type: 'static',
+  });
+  const test: LockJob = staticJob({
     name: 'test',
-    runsOn: [{ kind: 'exact', value: 'linux' }],
-    needs: [],
     steps: [{ name: 'test', run: 'npm test' }],
-  } as unknown as LockJob;
+  });
   return {
     name: 'release',
     source: { file: '.kici/workflows/release.ts', export: '#default' },
@@ -313,8 +305,8 @@ describe('dispatchGlobalCandidateViaPipeline', () => {
     const lockEntry = richGlobalLockEntry();
     const sameRepo = await dispatchSameRepo(lockEntry);
     const crossRepo = await dispatchCrossRepo(lockEntry);
-    // Positive control: the rich entry fans out and binds its context on both sides, so the
-    // comparison below runs over populated configs rather than two empty lists.
+    // Positive control: both sides fan out and bind a context, so the comparison is not
+    // over two empty lists.
     expect(sameRepo.dispatched.map((j) => j.jobName)).toHaveLength(3);
     expect(sameRepo.dispatched.some((j) => j.jobConfig.secrets)).toBe(true);
     expect(crossRepo.dispatched.map((j) => j.jobName)).toEqual(
@@ -544,11 +536,9 @@ describe('globalRunLockFile', () => {
 });
 
 /**
- * An evaluation job (a deferred init job, a generator evaluation) of a global run
- * checks out the workflow repository and the source repository in the global
- * layout, and restores its dependencies into the workflow repository's checkout.
- * A global run's dependencies are the workflow repository's, so they reach that
- * job with or without the workflow repository's source pack.
+ * A global run's evaluation job (deferred init, generator evaluation) checks out
+ * both repositories in the global layout and restores the workflow repository's
+ * dependencies into its checkout, with or without that repository's source pack.
  */
 describe('the dependency tarball of a global evaluation job', () => {
   /** A global workflow whose one job has a dynamic env, so it dispatches through an init job. */
@@ -559,14 +549,11 @@ describe('the dependency tarball of a global evaluation job', () => {
       contentHash: 'wf-hash',
       triggers: [],
       jobs: [
-        {
-          _type: 'static',
+        staticJob({
           name: 'deploy',
-          runsOn: [{ kind: 'exact', value: 'linux' }],
-          needs: [],
           steps: [{ name: 'deploy', run: 'true' }],
           dynamicEnv: true,
-        },
+        }),
       ],
     } as unknown as LockWorkflow;
   }

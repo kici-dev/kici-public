@@ -55,7 +55,7 @@ import {
 import { EVENT_CATCHUP_BATCH_SIZE, type EventStore } from './event-store.js';
 import type { EventCircuitBreaker } from './circuit-breaker.js';
 import type { TrustStore } from './trust-store.js';
-import type { LockFile, LockWorkflow, WorkflowDecision } from '@kici-dev/engine';
+import type { LockFile, LockWorkflow } from '@kici-dev/engine';
 import type { RegistrationIndex, RegisteredWorkflow } from '../registration/registration-index.js';
 
 // ── Mock helpers ────────────────────────────────────────────────
@@ -117,12 +117,11 @@ function makeSystemEvent(type: '__workflow_complete' | '__job_complete'): Stored
 }
 
 function makeLockFile(workflows: LockWorkflow[]): LockFile {
-  return {
+  return lockFileFixture({
     schemaVersion: 4,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
     contentHash: 'abc123',
     workflows,
-  };
+  });
 }
 
 function makeKiciEventWorkflow(name: string, eventName: string): LockWorkflow {
@@ -253,20 +252,8 @@ function createMockPool() {
   return { pool: pool as unknown as import('pg').Pool, client };
 }
 
-import { createMockDb as _createSharedMockDb } from '../__test-helpers__/mock-db.js';
-
-function createMockDb() {
-  const { db } = _createSharedMockDb();
-  // EventRouter.emit() now wraps writeWith + pg_notify in a tx via
-  // db.transaction().execute(fn). The mock just runs the callback
-  // synchronously with a stub tx so the assertions on writeWith /
-  // pg_notify still see the calls.
-  const tx = {} as any;
-  (db as any).transaction = vi.fn().mockReturnValue({
-    execute: vi.fn().mockImplementation((fn: (tx: any) => Promise<unknown>) => fn(tx)),
-  });
-  return db;
-}
+import { createMockDb } from '../__test-helpers__/mock-db.js';
+import { lockFileFixture } from '../__test-helpers__/lock-fixtures.js';
 
 function createMockRegistrationIndex(registrations: RegisteredWorkflow[] = []): RegistrationIndex {
   return {
@@ -328,7 +315,7 @@ function createRouterOptions(
   const mockPool = createMockPool();
   const config: EventRouterConfig = { ...DEFAULT_EVENT_ROUTER_CONFIG };
   return {
-    db: createMockDb(),
+    db: createMockDb().db,
     pool: mockPool.pool,
     eventStore: createMockEventStore(),
     circuitBreaker: createMockCircuitBreaker(),
@@ -358,7 +345,6 @@ function simulateNotification(
 
   notificationHandler({ channel, payload });
 
-  // Flush microtask queue to let the fire-and-forget promise settle
   return new Promise((resolve) => setTimeout(resolve, 10));
 }
 
@@ -566,11 +552,8 @@ describe('EventRouter', () => {
 
       await router.start();
 
-      // Should set up LISTEN
       expect(opts.mockPool.client.query).toHaveBeenCalledWith('LISTEN kici_event_channel');
-      // Should register notification handler
       expect(opts.mockPool.client.on).toHaveBeenCalledWith('notification', expect.any(Function));
-      // Should run catch-up (getUnprocessedSince called)
       expect(eventStore.getUnprocessedSince).toHaveBeenCalledWith(null, EVENT_CATCHUP_BATCH_SIZE);
     });
 
@@ -581,7 +564,6 @@ describe('EventRouter', () => {
 
       await router.start();
 
-      // Notification handler should be registered
       expect(opts.mockPool.client.on).toHaveBeenCalledWith('notification', expect.any(Function));
     });
 
@@ -929,7 +911,6 @@ describe('EventRouter', () => {
       expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledTimes(2);
       expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith('evt-missed-1', 'test-node-A');
       expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith('evt-missed-2', 'test-node-A');
-      // onEventMatched called for each matched event
       expect(onEventMatched).toHaveBeenCalledTimes(2);
     });
 
@@ -1219,7 +1200,6 @@ describe('EventRouter', () => {
       expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledTimes(total);
       expect(eventStore.markProcessed).toHaveBeenCalledTimes(total);
       expect(onEventMatched).toHaveBeenCalledTimes(total);
-      // First and last events both came through.
       expect(eventStore.tryLeaseForProcessing).toHaveBeenCalledWith(
         'evt-missed-0000',
         'test-node-A',
@@ -1731,7 +1711,6 @@ describe('EventRouter', () => {
       await router.start();
       await simulateNotification(opts.mockPool, 'kici_event_channel', 'evt-fi-1');
 
-      // Real dispatch should NOT have been invoked.
       expect(onEventMatched).not.toHaveBeenCalled();
       // The synthetic error should have driven the retry path (attempts=1 <
       // maxDispatchAttempts default 5).
@@ -1948,13 +1927,10 @@ describe('EventRouter', () => {
     it('self-excludes a failed run dispatched by a failure-lifecycle trigger', async () => {
       const event = makeFailedCompletionEvent();
       const onEventMatched = vi.fn().mockResolvedValue(undefined);
-      const { db } = _createSharedMockDb({
+      const { db } = createMockDb({
         selectFirstRow: {
           trigger_decision: JSON.stringify({ matched: true, dispatchedByFailureLifecycle: true }),
         },
-      });
-      (db as any).transaction = vi.fn().mockReturnValue({
-        execute: vi.fn().mockImplementation((fn: (tx: any) => Promise<unknown>) => fn({})),
       });
       const eventStore = createMockEventStore({ events: [event] });
       const opts = createRouterOptions({

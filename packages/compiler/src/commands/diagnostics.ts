@@ -60,13 +60,7 @@ function printSummary(s: DiagnosticsSummaryResponse): void {
   );
 }
 
-/**
- * Alert colour per known severity.
- *
- * Typed `Record<InfraAlertSeverity, …>`: adding a severity to the engine enum
- * without colouring it fails `pnpm typecheck` instead of silently inheriting
- * the warning colour.
- */
+/** Exhaustive: an uncoloured new engine severity fails `pnpm typecheck` instead of silently turning yellow. */
 const ALERT_SEVERITY_COLOR: Record<InfraAlertSeverity, (text: string) => string> = {
   [InfraAlertSeverity.enum.warning]: pc.yellow,
   [InfraAlertSeverity.enum.critical]: pc.red,
@@ -74,10 +68,8 @@ const ALERT_SEVERITY_COLOR: Record<InfraAlertSeverity, (text: string) => string>
 
 function printAlerts(alerts: DiagnosticsInfraAlert[]): void {
   for (const a of alerts) {
-    // The severity arrives as an unvalidated string from a Platform that may be
-    // newer than this CLI, so it is resolved against the known vocabulary
-    // rather than compared directly — an unrecognised value escalates instead
-    // of printing as a yellow warning.
+    // An unvalidated string from a possibly newer Platform: an unrecognised
+    // value escalates instead of printing as a yellow warning.
     const color = ALERT_SEVERITY_COLOR[normalizeInfraAlertSeverity(a.severity)];
     console.log(color(`  ! [${a.type}] ${a.message}`));
   }

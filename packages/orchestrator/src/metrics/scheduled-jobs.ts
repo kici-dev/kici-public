@@ -1,24 +1,16 @@
 /**
  * Scheduled-job observability metrics for the orchestrator.
  *
- * Mirrors the 5-metric surface exposed by other KiCI services'
- * scheduled-job wrappers, with names prefixed `kici_orch_` so
- * Prometheus can address multiple KiCI services from one dashboard.
- * The orchestrator runs setInterval-driven schedulers (no pg-boss
- * dependency) but the outward observability shape is identical.
+ * Mirrors the 5-metric surface of other KiCI services' scheduled-job wrappers, prefixed
+ * `kici_orch_` so one Prometheus dashboard addresses several KiCI services. The schedulers
+ * are setInterval-driven (no pg-boss), but the outward shape is identical.
  *
- * Lazy meter + instrument initialization: the `@kici-dev/shared` barrel
- * is imported statically at the top of the orchestrator entry points
- * (server.ts, standalone.ts), which evaluates this module BEFORE
- * `initTelemetry()` sets the global MeterProvider. Creating the meter or
- * any instrument at module-eval time would bind it to the no-op provider,
- * so its samples never reach the Prometheus exporter (the `/metrics`
- * scrape) or the Platform push. We therefore resolve the meter and every
- * instrument on first use — counters/histograms on first `.add()` /
- * `.record()`, observable gauges on first `.set()` — all of which happen
- * at job-run time, long after telemetry is wired up. Same hazard, same
- * fix as `prometheus.ts` and `@kici-dev/shared`'s cold-store metrics
- * module.
+ * The meter and every instrument resolve on first use (`.add()` / `.record()` / `.set()`, all
+ * at job-run time). The entry points (server.ts, standalone.ts) import the `@kici-dev/shared`
+ * barrel statically, which evaluates this module BEFORE `initTelemetry()` sets the global
+ * MeterProvider; an instrument created at module eval binds to the no-op provider, so its
+ * samples never reach the `/metrics` scrape or the Platform push. Same hazard, same fix as
+ * `prometheus.ts` and `@kici-dev/shared`'s cold-store metrics module.
  */
 import { createMeter } from '@kici-dev/shared';
 
@@ -34,22 +26,14 @@ function meter(): OrchMeter {
   return _meter;
 }
 
-/**
- * A counter whose real OTel instrument is created on first `.add()` —
- * after `initTelemetry()` has registered the global MeterProvider. The
- * returned value satisfies the OTel `Counter` interface, so call sites
- * are unchanged.
- */
+/** A counter whose OTel instrument is created on first `.add()`, after `initTelemetry()`. */
 function lazyCounter(name: string, description: string): Pick<Counter, 'add'> {
   let inst: Counter | undefined;
   const get = (): Counter => (inst ??= meter().createCounter(name, { description }));
   return { add: (...args: Parameters<Counter['add']>) => get().add(...args) };
 }
 
-/**
- * A histogram whose real OTel instrument is created on first `.record()` —
- * after `initTelemetry()`. Satisfies the OTel `Histogram` interface.
- */
+/** A histogram whose OTel instrument is created on first `.record()`, after `initTelemetry()`. */
 function lazyHistogram(
   name: string,
   description: string,
@@ -62,10 +46,9 @@ function lazyHistogram(
 }
 
 /**
- * An observable gauge backed by per-label state. The underlying OTel
- * instrument + scrape callback are created on first `.set()`, so the
- * gauge binds to the real MeterProvider rather than the no-op one. The
- * callback reads the latest per-label value on each Prometheus scrape.
+ * An observable gauge backed by per-label state. The OTel instrument and scrape callback are
+ * created on first `.set()`, so they bind to the real MeterProvider, not the no-op one; each
+ * scrape reads the latest per-label value.
  */
 function createGaugeWithState(name: string, description: string) {
   const state = new Map<string, { attributes: Record<string, string>; value: number }>();

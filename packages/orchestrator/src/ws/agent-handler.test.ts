@@ -1,9 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-// Capture every module logger so the artifact tests can assert that the raw
-// exception a failed commit must NOT put on the wire is still recorded
-// server-side. Stripping the disclosure without keeping the log line would
-// trade a leak for an observability regression, so both halves are asserted.
+// Capture every module logger so the artifact tests can assert that the raw exception a
+// failed commit must NOT put on the wire is still logged server-side: dropping the log
+// line would trade a leak for an observability regression.
 const mockLogError = vi.hoisted(() => vi.fn());
 vi.mock('@kici-dev/shared', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@kici-dev/shared')>();
@@ -39,7 +38,7 @@ import {
   WS_CLOSE_PROTOCOL_ERROR,
   WS_CLOSE_INTERNAL_ERROR,
 } from '@kici-dev/engine';
-import { mockWs } from '../__test-helpers__/mock-ws.js';
+import { mockWs, makeMessageEvent } from '../__test-helpers__/mock-ws.js';
 import { DispatchCacheRefTracker } from '../cache/dispatch-cache-ref-tracker.js';
 import { InFlightCacheUploads } from '../cache/cache-upload-settle.js';
 import type { UserCache } from '../cache/user-cache.js';
@@ -65,7 +64,6 @@ import { LogWriter } from '../reporting/log-writer.js';
 import type { LogStorage } from '../reporting/log-storage.js';
 import { createLogChunkSink } from '../reporting/log-chunk-sink.js';
 
-/** Create a mock Dispatcher with controllable methods. */
 function mockDispatcher(): Dispatcher {
   return {
     dispatch: vi.fn().mockResolvedValue({ status: 'queued', jobId: 'test' }),
@@ -78,7 +76,6 @@ function mockDispatcher(): Dispatcher {
   } as unknown as Dispatcher;
 }
 
-/** Create a mock AgentTokenStore. */
 function mockTokenStore(
   overrides: Partial<{
     validate: ReturnType<typeof vi.fn>;
@@ -109,12 +106,6 @@ function mockTokenStore(
   } as unknown as AgentTokenStore;
 }
 
-/** Create a MessageEvent-like object for testing. */
-function makeMessageEvent(data: unknown): MessageEvent {
-  return { data: JSON.stringify(data) } as MessageEvent;
-}
-
-/** Create a well-formed agent.register message. */
 function registerMsg(overrides: Partial<{ agentId: string; labels: string[] }> = {}) {
   return {
     type: 'agent.register' as const,
@@ -124,7 +115,6 @@ function registerMsg(overrides: Partial<{ agentId: string; labels: string[] }> =
   };
 }
 
-/** Create an auth.request message. */
 function authRequestMsg(token = 'kat_' + 'a'.repeat(64)) {
   return {
     type: 'auth.request' as const,
@@ -157,9 +147,8 @@ describe('createAgentWsHandler', () => {
   // ── Fleet bundle chunks vs the per-connection rate limiter ────
 
   describe('fleet.bundle.chunk against the rate limiter', () => {
-    // A limiter small enough that a handful of chunks exhausts it: the real
-    // defaults are 2 MiB / 200 messages, and the agent's mini-bundle can
-    // legitimately be 25× the byte burst. Two chunks fit, the third does not.
+    // A handful of chunks exhausts this limiter. The real defaults are 2 MiB / 200
+    // messages, and the agent's mini-bundle can legitimately be 25× the byte burst.
     const chunkBytes = 1000;
     const rateLimiterConfig = {
       messageCapacity: 100,
@@ -206,7 +195,6 @@ describe('createAgentWsHandler', () => {
       const collector = new FleetAgentCollector({ timeoutMs: 10_000 });
       const { handler, ws } = await registeredHandler(collector);
 
-      // The orchestrator asks; the collector now holds the request for agent-1.
       const requestId = 'req-solicited';
       const bundle = collector.request(requestId, 'agent-1', () => {});
 
@@ -272,9 +260,8 @@ describe('createAgentWsHandler', () => {
     });
 
     it('folds the wire labels before the scaler correlates them', async () => {
-      // The scaler matches an agent against its own label sets, which the
-      // scaler config load already folded. An agent advertising `Docker` must
-      // therefore arrive as `docker` or it correlates against no pool at all.
+      // The scaler matches against label sets its config load already folded, so an
+      // agent advertising `Docker` must arrive as `docker` or it matches no pool.
       const onScalerAgentRegistered = vi.fn().mockResolvedValue({ mandatoryLabels: [] });
       const handler = createHandler({ onScalerAgentRegistered });
       const ws = mockWs();
@@ -289,9 +276,9 @@ describe('createAgentWsHandler', () => {
     });
 
     it('a scaler-supplied gate reaches the entry folded and gates on a lowercase runsOn', async () => {
-      // End to end for the taint: the scaler config folds `mandatoryLabels` at
-      // load, but an ADOPTED spawn record returns whatever was persisted, so
-      // the fold is asserted where the gate is actually read — the AgentEntry.
+      // The scaler config folds `mandatoryLabels` at load, but an ADOPTED spawn record
+      // returns whatever was persisted, so the fold is asserted where the gate reads it:
+      // the AgentEntry.
       const onScalerAgentRegistered = vi.fn().mockResolvedValue({ mandatoryLabels: ['GPU'] });
       const handler = createHandler({ onScalerAgentRegistered });
       const ws = mockWs();
@@ -378,11 +365,10 @@ describe('createAgentWsHandler', () => {
       );
     });
 
-    // An agent cannot tell which auth mode the orchestrator runs, so one that
-    // carries a token — a static `KICI_AGENT_TOKEN`, or the ephemeral one a
-    // claim-code self-bootstrap just minted — opens with `auth.request` and
-    // waits for `auth.success` before it registers. Refusing that frame strands
-    // every such agent in a permanent reconnect loop it can never escape.
+    // An agent cannot tell the orchestrator's auth mode, so one carrying a token (a
+    // static `KICI_AGENT_TOKEN`, or the ephemeral one a claim-code self-bootstrap
+    // minted) opens with `auth.request` and waits for `auth.success`. Refusing that
+    // frame strands every such agent in a permanent reconnect loop.
     it('answers a pre-registration auth.request with auth.success, then registers', async () => {
       const handler = createHandler();
       const ws = mockWs();
@@ -405,9 +391,8 @@ describe('createAgentWsHandler', () => {
       expect(dispatcher.onAgentAvailable).toHaveBeenCalledWith('agent-selfboot');
     });
 
-    // Auth is disabled, so the frame is tolerated and the token ignored. Reading
-    // it would refuse an agent whose token is expired in a mode that accepts a
-    // tokenless one — a regression dressed as a hardening.
+    // Auth is disabled, so the token is ignored: reading it would refuse an agent with
+    // an expired token in a mode that accepts a tokenless one.
     it('ignores the token on a pre-registration auth.request', async () => {
       const tokenStore = mockTokenStore();
       const handler = createHandler({ tokenStore });
@@ -419,9 +404,8 @@ describe('createAgentWsHandler', () => {
       expect(tokenStore.validate).not.toHaveBeenCalled();
     });
 
-    // The registration timer is deliberately left running across the tolerated
-    // auth.request, so an agent that authenticates and then goes quiet is still
-    // bounded rather than holding the connection open forever.
+    // The registration timer deliberately keeps running across the tolerated
+    // auth.request, so an agent that authenticates and goes quiet is still bounded.
     it('keeps the registration timeout running across the tolerated auth.request', async () => {
       const handler = createHandler();
       const ws = mockWs();
@@ -478,10 +462,8 @@ describe('createAgentWsHandler', () => {
 
       handler.onOpen!(new Event('open'), ws as any);
 
-      // Send auth.request
       await handler.onMessage!(makeMessageEvent(authRequestMsg()), ws as any);
 
-      // Check auth.success was sent
       const sentAfterAuth = (ws.send as ReturnType<typeof vi.fn>).mock.calls;
       const authSuccess = sentAfterAuth
         .map((call: unknown[]) => JSON.parse(call[0] as string))
@@ -489,14 +471,11 @@ describe('createAgentWsHandler', () => {
       expect(authSuccess).toBeDefined();
       expect(authSuccess!.connectionId).toBeDefined();
 
-      // Send agent.register
       await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
 
-      // Check agent is registered
       const entry = registry.get('agent-1');
       expect(entry).toBeDefined();
 
-      // Check register.ack was sent
       const sentAfterReg = (ws.send as ReturnType<typeof vi.fn>).mock.calls;
       const registerAck = sentAfterReg
         .map((call: unknown[]) => JSON.parse(call[0] as string))
@@ -506,10 +485,9 @@ describe('createAgentWsHandler', () => {
     });
 
     it('self-bootstrap: token-mode connection claims BEFORE auth, then auth.request proceeds', async () => {
-      // A scaler-managed agent runs against a token-mode orchestrator, so a
-      // fresh connection is in pendingAuth (Phase 1). It redeems its claim code
-      // FIRST, then authenticates with the minted token. The claim must be
-      // admitted in pendingAuth without breaking the follow-up auth.request.
+      // On a token-mode orchestrator a fresh scaler-managed connection is in pendingAuth
+      // (Phase 1). It redeems its claim code FIRST, then authenticates with the minted
+      // token; the claim must not break the follow-up auth.request.
       const credentials = {
         agentToken: 'kat_' + 'b'.repeat(64),
         agentId: 'fresh-1',
@@ -745,10 +723,9 @@ describe('createAgentWsHandler', () => {
 
       handler.onOpen!(new Event('open'), ws as any);
 
-      // Send agent.register directly (should fail because auth.request is expected)
       await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
 
-      // Should be rejected because auth.request was not received first
+      // Rejected: auth.request must come first.
       const sentCalls = (ws.send as ReturnType<typeof vi.fn>).mock.calls;
       const authFailure = sentCalls
         .map((call: unknown[]) => JSON.parse(call[0] as string))
@@ -850,14 +827,12 @@ describe('createAgentWsHandler', () => {
     });
 
     it('a concurrent second agent.register on one socket adopts at most once', async () => {
-      // Awaiting the adoption lookup opens a yield point between
-      // `pendingRegistration.delete(ws)` and `registry.register(...)`. WS
-      // message handlers are not serialized, so prove a second frame cannot
-      // slip through it.
+      // The adoption lookup's await is a yield point between
+      // `pendingRegistration.delete(ws)` and `registry.register(...)`, and WS message
+      // handlers are not serialized: prove a second frame cannot slip through it.
       //
-      // The gate is a manually-released deferred rather than a timer: this
-      // suite runs on fake timers, so a `setTimeout` inside the callback would
-      // never fire and both frames would hang.
+      // The gate is a manually-released deferred: under fake timers a `setTimeout`
+      // would never fire and both frames would hang.
       let releaseAdoption!: () => void;
       const adoptionGate = new Promise<void>((resolve) => {
         releaseAdoption = resolve;
@@ -889,11 +864,9 @@ describe('createAgentWsHandler', () => {
     });
 
     it('a close arriving mid-registration leaves no entry for the dead socket', async () => {
-      // The socket has left `pendingRegistration` and has not reached
-      // `wsToAgentId`, so `onClose` matches none of its usual branches.
-      // Registering anyway would put a dead WS in the registry with no close
-      // event left to remove it — its jobs would never fail over and, for a
-      // scaler agent, its provisioned instance would never be torn down.
+      // The socket is in neither `pendingRegistration` nor `wsToAgentId`, so `onClose`
+      // matches no usual branch. Registering anyway leaves a dead WS no close event can
+      // remove: its jobs never fail over and a scaler agent's instance is never torn down.
       let releaseAdoption!: () => void;
       const adoptionGate = new Promise<void>((resolve) => {
         releaseAdoption = resolve;
@@ -924,10 +897,9 @@ describe('createAgentWsHandler', () => {
     });
 
     it('refuses the registration when the scaler lookup throws', async () => {
-      // The scaler could not read this agent's spawn record. Registering it
-      // anyway makes it static for its whole life, with no `mandatoryLabels`
-      // gate, so a queued job whose `runsOn` omits the platform taint can land
-      // on it. Refusing costs the agent a reconnect.
+      // The scaler could not read this agent's spawn record. Registering it anyway makes
+      // it static for life with no `mandatoryLabels` gate, so a job whose `runsOn` omits
+      // the platform taint can land on it. Refusing costs only a reconnect.
       const onScalerAgentRegistered = vi
         .fn()
         .mockRejectedValue(new Error('scaler adoption lookup failed for agent agent-1'));
@@ -1164,11 +1136,9 @@ describe('createAgentWsHandler', () => {
 
   describe('provenance.upload.complete', () => {
     it('initializes the bundle metadata sidecar before recording the attestation', async () => {
-      // The agent uploads the bundle via a presigned PUT (data object only).
-      // CacheStorage.get is metadata-gated, so the handler MUST write the
-      // metadata sidecar via initMeta(key) before the dashboard read can inline
-      // the bundle — otherwise the dashboard attestations read gets it back as
-      // missing and returns an empty list despite a recorded DB row.
+      // The presigned PUT writes the data object only, and CacheStorage.get is
+      // metadata-gated, so the handler MUST write the sidecar via initMeta(key), or the
+      // dashboard attestations read returns an empty list despite a recorded DB row.
       const dispatchCacheRefs = new DispatchCacheRefTracker();
       dispatchCacheRefs.record('job-prov', { runId: 'run-prov' });
 
@@ -1404,7 +1374,6 @@ describe('createAgentWsHandler', () => {
       await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
       handler.onClose!(new CloseEvent('close'), ws as any);
 
-      // Wait for the async onAgentDisconnect to resolve
       await vi.waitFor(() => {
         expect(disconnectDispatcher.onAgentDisconnect).toHaveBeenCalledWith('agent-1');
       });
@@ -1446,11 +1415,10 @@ describe('createAgentWsHandler', () => {
     });
 
     it('a stale socket closing does not tear down the registration that replaced it', async () => {
-      // A half-open connection can outlive the reconnect that replaced it. Its
-      // close carries the same agent id, so without the socket-identity guard
-      // the teardown runs against the live registration: the agent is
-      // unregistered, its running jobs are failed, and a scaler-managed agent
-      // is destroyed while it is still streaming on the new socket.
+      // A half-open connection can outlive the reconnect that replaced it, and its close
+      // carries the same agent id. Without the socket-identity guard the teardown hits the
+      // live registration: the agent is unregistered, its running jobs fail, and a
+      // scaler-managed agent is destroyed while streaming on the new socket.
       const onScalerAgentDisconnected = vi.fn();
       const handler = createAgentWsHandler({
         registry,
@@ -2049,10 +2017,8 @@ describe('createAgentWsHandler', () => {
     });
 
     it('without the settle dependency nothing registers and the success is not held', async () => {
-      // The same frames as the ordering race, minus the dependency (a worker,
-      // which has no cache storage). Pins that the ordering race above holds
-      // the success because of the wait, not because of how the test drives
-      // the frames.
+      // The ordering race's frames minus the dependency (a worker has no cache storage):
+      // pins that the race holds the success because of the wait, not the frame driving.
       const publish = deferred();
       const { deps } = setup({
         publish: () => publish.promise,
@@ -2202,7 +2168,7 @@ describe('createAgentWsHandler', () => {
       } as unknown as UserCache;
     }
 
-    /** Build a handler with an owning ownership-tracker + a populated dispatch-cache-ref tracker. */
+    /** With an owning ownership-tracker + a populated dispatch-cache-ref tracker. */
     function setup(
       opts: {
         owned?: boolean;
@@ -2211,10 +2177,8 @@ describe('createAgentWsHandler', () => {
         dispatchCacheRefs?: DispatchCacheRefTracker;
         recordRef?: boolean;
         /**
-         * Verdict the database-backed fallback returns. Present ⇒ the tracker is
-         * built with a fallback, which is what a coordinator that never saw the
-         * dispatch looks like: the synchronous check cannot decide, so the
-         * database has to.
+         * The database-backed fallback's verdict. Present ⇒ the tracker has a fallback,
+         * like a coordinator that never saw the dispatch: the database decides.
          */
         ownershipDb?: OwnershipDbResult;
       } = {},
@@ -2641,9 +2605,8 @@ describe('createAgentWsHandler', () => {
     }
 
     it('artifacts.upload.request relays a non-conforming-name rejection from the store', async () => {
-      // The store refuses the name before any gate; the handler must forward its
-      // free-text detail so the author is told the name is the problem, rather
-      // than falling back to the generic "upload was rejected".
+      // The store refuses the name before any gate; the handler forwards its detail so
+      // the author learns the name is the problem, not a generic "upload was rejected".
       const beginUpload = vi.fn().mockResolvedValue({
         outcome: 'rejected',
         error: artifactInvalidNameError('artifact name may only contain letters'),
@@ -2722,10 +2685,9 @@ describe('createAgentWsHandler', () => {
     });
 
     it('artifacts.upload.complete acks failed after the retries exhaust', async () => {
-      // Infrastructure-shaped text: the assertions below are that NONE of this
-      // reaches the agent, which runs untrusted workflow code. Asserting only
-      // the safe literal would still pass if the send site went back to
-      // forwarding the raw exception and its text happened to match.
+      // Infrastructure-shaped text that must NOT reach the agent, which runs untrusted
+      // workflow code. Asserting only the safe literal would pass if the send site
+      // forwarded the raw exception and its text happened to match.
       const raw = 'connect ECONNREFUSED 10.1.2.3:5432 relation "artifacts" violates constraint';
       const completeUpload = vi.fn().mockRejectedValue(new Error(raw));
       const { handler } = setup({ artifactStore: mockArtifactStore({ completeUpload }) });
@@ -2785,9 +2747,8 @@ describe('createAgentWsHandler', () => {
       const ws = mockWs();
       await register(handler, ws);
 
-      // Advance the retry backoff even though a terminal failure should never
-      // arm it: if the terminal classification regressed, the retries run and
-      // the call-count assertion fails instead of the promise hanging.
+      // Advance the backoff a terminal failure never arms: a regressed classification
+      // then fails the call-count assertion instead of hanging.
       const done = handler.onMessage!(makeMessageEvent(completeMsg()), ws as any);
       await vi.advanceTimersByTimeAsync(1_000);
       await done;
@@ -2820,9 +2781,8 @@ describe('createAgentWsHandler', () => {
 
       // The name is fixed for the life of the request — retrying cannot help.
       expect(completeUpload).toHaveBeenCalledTimes(1);
-      // Safe by construction: the detail is one of the schema's own fixed
-      // messages, so it passes through and the author still learns what was
-      // wrong with the name.
+      // Safe by construction: the detail is one of the schema's fixed messages, so it
+      // passes through and the author learns what was wrong with the name.
       const reason = sentAck(ws)!.reason as string;
       expect(reason).toContain(ARTIFACT_INVALID_NAME_PREFIX);
       expect(reason).toContain('artifact name may only contain letters');
@@ -2851,9 +2811,8 @@ describe('createAgentWsHandler', () => {
     });
 
     it('artifacts.upload.complete acks not-configured when there is no artifact store', async () => {
-      // The guard covers two distinct operator problems and keeps them apart:
-      // storage that was never configured (here), and a run the orchestrator
-      // could not resolve (the test above).
+      // The guard keeps two operator problems apart: storage never configured (here),
+      // and an unresolvable run (the test above).
       const { handler } = setup({});
       const ws = mockWs();
       await register(handler, ws);
@@ -2887,9 +2846,8 @@ describe('createAgentWsHandler', () => {
     });
 
     it('artifacts.upload.complete on a cold coordinator commits once the database confirms ownership', async () => {
-      // The failover shape: the in-memory map is empty on the newly-elected
-      // leader, so only the database can answer. The frame must be handled,
-      // not dropped for want of a synchronous hit.
+      // Failover: the new leader's in-memory map is empty, so only the database can
+      // answer; the frame must be handled, not dropped for want of a synchronous hit.
       const completeUpload = vi.fn().mockResolvedValue(undefined);
       const { handler } = setup({
         owned: false,
@@ -3411,7 +3369,7 @@ describe('createAgentWsHandler', () => {
     });
 
     it('grace window: message accepted during grace period', async () => {
-      // Use a dynamic ownership check that starts false then becomes true
+      // isJobOwnedByAgent covers the grace window: a true answer accepts the frame.
       const isJobOwnedByAgent = vi.fn().mockReturnValue(true);
       const onDisconnect = vi.fn();
       const tracker = new OwnershipTracker({ isJobOwnedByAgent, onDisconnect });
@@ -3427,7 +3385,6 @@ describe('createAgentWsHandler', () => {
       handler.onOpen!(new Event('open'), ws as any);
       await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
 
-      // Send job.status for a job that passes ownership check (simulating grace window)
       await handler.onMessage!(
         makeMessageEvent({
           type: 'job.status',
@@ -3489,10 +3446,9 @@ describe('createAgentWsHandler', () => {
         ws as any,
       );
 
-      // Disconnect (should cleanup violations)
+      // Disconnect cleans up violations.
       handler.onClose!(new CloseEvent('close'), ws as any);
 
-      // Verify cleanup was called (dispatcher.onAgentDisconnect is called)
       expect(dispatcher.onAgentDisconnect).toHaveBeenCalledWith('agent-1');
     });
 
@@ -3528,8 +3484,7 @@ describe('createAgentWsHandler', () => {
         ws as any,
       );
 
-      // onSecretOutputs should have been called with the right args
-      // (fire-and-forget, so we need to wait a tick for the promise)
+      // onSecretOutputs is fire-and-forget, so wait for it.
       await vi.waitFor(() => {
         expect(onSecretOutputs).toHaveBeenCalledTimes(1);
       });
@@ -3646,13 +3601,12 @@ describe('createAgentWsHandler', () => {
     });
 
     it('no ownership tracker: messages pass through unchanged', async () => {
-      // Without ownershipTracker, handler should work normally (backward compat)
+      // Backward compat: works without an ownershipTracker.
       const handler = createAgentWsHandler({
         registry,
         dispatcher,
         agentAuthMode: 'none',
         onJobStatus,
-        // No ownershipTracker
       });
       const ws = mockWs();
 
@@ -3932,17 +3886,14 @@ describe('createAgentWsHandler', () => {
     });
 
     /**
-     * The authoritative half of the `__` reservation. The SDK refuses it first,
-     * but the SDK runs inside the job — an attacker controls that side entirely,
-     * so this handler is what actually holds the boundary.
+     * The authoritative half of the `__` reservation. The SDK refuses it first, but the
+     * SDK runs inside the attacker-controlled job, so this handler holds the boundary.
      *
-     * Why it is a boundary and not a namespace: every name under the prefix is
-     * exempt from the event-storm rate limiter, and `__schedule_fire` is
-     * additionally dispatched as a TRUSTED ref (shared user-cache writes, the
-     * Dockerfile build gate) because no run causes it. An untrusted fork-PR job
-     * that could emit `__schedule_fire` would hand itself both. The lifecycle
-     * names inherit the tier of the run behind them, so forging one buys the
-     * rate-limiter exemption rather than the trusted ref — still a boundary.
+     * A boundary, not a namespace: every name under the prefix is exempt from the
+     * event-storm rate limiter, and `__schedule_fire` is dispatched as a TRUSTED ref
+     * (shared user-cache writes, the Dockerfile build gate) because no run causes it.
+     * An untrusted fork-PR job emitting it would gain both. The lifecycle names inherit
+     * their run's tier, so forging one buys only the rate-limiter exemption.
      */
     it.each([
       ['__schedule_fire'],
@@ -3978,9 +3929,8 @@ describe('createAgentWsHandler', () => {
     });
 
     it('still admits an ordinary custom event name', async () => {
-      // The control for the two rejection suites above: the same handler, the
-      // same message shape, an unreserved name — and the emit goes through. A
-      // guard that refused everything would pass both suites.
+      // Control for the rejection suites above: an unreserved name goes through, so a
+      // guard that refused everything fails here.
       const onEventEmit = vi.fn().mockResolvedValue({ deliveryId: 'd1' });
       const handler = setup({ onEventEmit });
       const ws = mockWs();
@@ -4084,10 +4034,9 @@ describe('createAgentWsHandler', () => {
       const handler = setup({ onClaimCredentials });
       const ws = mockWs();
 
-      // Open the connection but do NOT register: a fresh, not-yet-registered
-      // agent redeems its single-use claim code to self-bootstrap. The claim
-      // code is the authorization, so minting ignores the caller's agent id
-      // (empty here).
+      // Do NOT register: a fresh agent redeems its single-use claim code to
+      // self-bootstrap. The claim code is the authorization, so minting ignores the
+      // caller's agent id (empty here).
       handler.onOpen!(new Event('open'), ws as any);
 
       await handler.onMessage!(

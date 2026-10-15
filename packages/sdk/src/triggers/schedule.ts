@@ -1,7 +1,4 @@
-/**
- * Schedule trigger helper - creates triggers for cron-based workflow execution.
- * Returns a frozen ScheduleTriggerConfig directly.
- */
+/** Schedule trigger helper for cron-based workflow execution; returns a frozen config. */
 
 import type { DispatchInputsMap, ScheduleConfigInput, ScheduleTriggerConfig } from './types.js';
 

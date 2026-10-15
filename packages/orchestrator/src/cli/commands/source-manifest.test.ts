@@ -56,8 +56,7 @@ describe('runGithubManifestSetup', () => {
     expect(deps.startLoopback).toHaveBeenCalled();
     expect(deps.openBrowser).toHaveBeenCalledWith('http://127.0.0.1:1/');
     expect(deps.convert).toHaveBeenCalledWith('c');
-    // GitHub is the source of truth for the stored name + slug, so the POST
-    // body carries the conversion response's name/slug, not the CLI `--name`.
+    // The POST carries the conversion response's name/slug, not the CLI `--name`.
     expect(client.post).toHaveBeenCalledWith(
       '/api/v1/admin/sources',
       expect.objectContaining({
@@ -162,7 +161,7 @@ describe('runGithubManifestSetup', () => {
       deps,
     );
 
-    // The pre-flight GET (the URL the orchestrator resolves for its mode) was bypassed entirely.
+    // The pre-flight GET was bypassed.
     expect(get).not.toHaveBeenCalled();
     // The override URL is baked into the served manifest verbatim.
     const secondCall = startLoopback.mock.calls[1]?.[0] as { manifestJson: string };

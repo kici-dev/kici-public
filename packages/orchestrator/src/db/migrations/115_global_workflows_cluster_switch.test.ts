@@ -3,7 +3,7 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './115_global_workflows_cluster_switch.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
  * Real-Postgres test for migration 115: the global-workflows master switch
@@ -94,9 +94,8 @@ describeDb('migration 115_global_workflows_cluster_switch', () => {
   });
 
   it('does NOT back-fill: an org row with the flag on leaves the cluster column NULL', async () => {
-    // down() restores org_settings.global_workflows_enabled and drops the
-    // cluster column. Seed a permissive org row BEFORE re-running up(): if up()
-    // ever grows a back-fill, the cluster column would come back `true` here.
+    // Seed a permissive org row BEFORE re-running up(): a back-fill in up()
+    // would bring the cluster column back `true`.
     await down(db);
     expect((await columnState('org_settings', 'global_workflows_enabled')).exists).toBe(true);
     expect((await columnState('cluster_settings', 'global_workflows_enabled')).exists).toBe(false);
@@ -110,8 +109,7 @@ describeDb('migration 115_global_workflows_cluster_switch', () => {
     await up(db);
     await up(db); // idempotent
 
-    // The org column is gone again, and the cluster column is NULL — the org
-    // opt-in was NOT carried forward.
+    // The org opt-in was NOT carried forward.
     expect((await columnState('org_settings', 'global_workflows_enabled')).exists).toBe(false);
     const r = await sql<{ global_workflows_enabled: boolean | null }>`
       SELECT global_workflows_enabled FROM public.cluster_settings WHERE id = 'default'

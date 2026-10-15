@@ -1,10 +1,7 @@
 /**
- * The `approve_run` / `reject_run` argument schemas.
- *
- * The MCP transport validates a tool call against its `inputSchema` before the
- * handler runs, so an argument the schema does not declare never reaches the
- * handler at all — the plumbing behind it is unreachable. These schemas are
- * what make the hold disambiguators callable.
+ * The MCP transport validates a call against its `inputSchema` before the
+ * handler runs, so an undeclared argument never reaches the handler: these
+ * schemas are what make the hold disambiguators callable.
  */
 import { describe, expect, it } from 'vitest';
 import { z } from 'zod';

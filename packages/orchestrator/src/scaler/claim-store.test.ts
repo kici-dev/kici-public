@@ -208,9 +208,8 @@ describe('ClaimStore', () => {
 
 /**
  * Round trips against `makeFakeScalerStateStore`, which enforces single-use
- * consumption and the TTL the way the real table does. These execute the
- * properties the design rests on, rather than hand-feeding a `describeClaim`
- * answer to a stub.
+ * consumption and the TTL the way the real table does, rather than
+ * hand-feeding a `describeClaim` answer to a stub.
  */
 describe('ClaimStore round trips against a shared pending-claim store', () => {
   function makeStore(
@@ -281,11 +280,10 @@ describe('ClaimStore round trips against a shared pending-claim store', () => {
   });
 
   it('redeems on a different instance than the one that registered the claim', async () => {
-    // The property this whole change exists for: behind one shared endpoint the
-    // redemption lands on whichever coordinator the provisioning workflow
-    // reaches, which is not the one that minted the code. Near-tautological
-    // while ClaimStore holds no state — and that is the point: it goes red the
-    // day an instance-local cache comes back.
+    // Behind one shared endpoint the redemption lands on whichever coordinator
+    // the provisioning workflow reaches, not the one that minted the code.
+    // Near-tautological while ClaimStore holds no state; it goes red if an
+    // instance-local cache is added.
     const now = () => 1000;
     const stateStore = makeFakeScalerStateStore(now);
     const mintA = vi.fn().mockResolvedValue('kat_a');

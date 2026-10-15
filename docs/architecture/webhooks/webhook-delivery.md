@@ -127,6 +127,7 @@ The orchestrator reassembles the body from the chunked stream and asks its inges
 13. **Content-requirements filter:** For each matched trigger that declares `requires`, read the named source files at the event's ref via the provider's `FileContentsFetcher` (deduplicated per `(repo, sha, path)` by an LRU cache) and evaluate the declarative requirement. A candidate that fails, or that cannot be evaluated at all (unreadable or oversize content, a fetch error, no fetcher wired), is dropped before dispatch with the concrete reason logged -- an indeterminate file never passes silently. No workflow code runs here; `requires` is data the orchestrator interprets. Skipped entirely when no matched trigger declares `requires`
 14. **Source and dep cache check:** For each surviving workflow, check the source tarball cache by `contentHash` and dep cache by `lockfileHash` (see [Source tarball caching flow](#source-tarball-caching-flow) below)
 15. **Job dispatch:** For each surviving workflow, dispatch static jobs to agents via the agent dispatcher (with `sourceTarUrl`/`depsUrl` if cache hit)
+16. **Organization-wide workflows:** Dispatch the workflows from other repositories in the org whose `repos` patterns match this event, through the same dispatch pipeline. A repository with no lock file skips steps 8–15 and still runs this pass. See [Global workflows](../global-workflows.md)
 
 > Source: `packages/orchestrator/src/pipeline/process-webhook.ts` -- `processWebhook()`
 

@@ -4,7 +4,7 @@ import pg from 'pg';
 import { ExecutionRunStatus, HoldType } from '@kici-dev/engine';
 import { migrateToOwnMigration, migrateToPreviousMigration } from '../migration-test-harness.js';
 import { down, up } from './158_normalize_legacy_values.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
  * Real-Postgres test for migration 158. Seeds every legacy spelling BEFORE the

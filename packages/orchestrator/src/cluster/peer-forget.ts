@@ -27,7 +27,6 @@ const logger = createLogger({ prefix: 'peer-forget' });
 
 /** What forgetting did on one coordinator. */
 export interface PeerForgetResult {
-  /** The coordinator that answered. */
   coordinator: string;
   outcome: PeerForgetOutcome;
   detail: string;
@@ -208,8 +207,9 @@ function forgetReArmsBackstop(
  * Drop `instanceId` from `registry` when it names a peer that left the
  * cluster. Kept, with the reason: a connected peer (its next heartbeat would
  * register it again), a peer heard from inside its liveness window (it may be
- * partitioned rather than gone; see `peerLivenessWindow`), and a peer whose removal would switch the
- * event-provision backstop back on, unless the request acknowledged that.
+ * partitioned rather than gone; see `peerLivenessWindow`), and a peer whose
+ * removal would switch the event-provision backstop back on, unless the request
+ * acknowledged that.
  */
 export function forgetDepartedPeer(
   registry: PeerRegistry,

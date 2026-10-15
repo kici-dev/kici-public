@@ -7,10 +7,8 @@
  *   - warm TTL: `minSecretAuditLogWarmDays()` table-wide, tightened per row
  *     by `secretAuditLogWarmSqlCase()`
  *
- * Synthetic tenant: rows without `routing_key` (e.g. orchestrator-level
- * key rotations done before any source is bound) collapse to a single
- * synthetic prefix `__orchestrator__`. Mirrors the same pattern already
- * used for `event_log` payload keys when the routing key is missing.
+ * Rows without `routing_key` (e.g. key rotations before any source is bound) collapse to the
+ * synthetic prefix `__orchestrator__`, the pattern `event_log` payload keys use too.
  */
 import { sql, type Kysely } from 'kysely';
 import {
@@ -36,12 +34,10 @@ const ADVISORY_LOCK_NAMESPACE = 'cold-store|orchestrator|secret_audit_log';
 const APPROX_ROW_BYTES = 400;
 
 /**
- * Per-table defaults. `warmTtlDays` MUST equal `minSecretAuditLogWarmDays()`
- * so the framework's index-friendly partition scan doesn't pre-filter out
- * rows the per-row CASE in `secretAuditLogWarmSqlCase()` would consider
- * eligible. The CASE further tightens eligibility per row based on action /
- * outcome — sampled `resolve` / `resolve_named` rows can archive at 30d
- * (matching the post-sampling 1% volume), while mutations stay 365d.
+ * `warmTtlDays` MUST equal `minSecretAuditLogWarmDays()`, so the index-friendly partition scan
+ * does not pre-filter rows the per-row CASE in `secretAuditLogWarmSqlCase()` deems eligible.
+ * The CASE tightens per action / outcome: sampled `resolve` / `resolve_named` rows archive at
+ * 30d (the post-sampling 1% volume), mutations stay 365d.
  */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: minSecretAuditLogWarmDays(),
@@ -74,18 +70,12 @@ export class SecretAuditLogAdapter
   }
 
   async *listEligiblePartitions(args: { warmCutoff: Date }): AsyncIterable<EligiblePartition> {
-    // `idx_secret_audit_log_routing_timestamp` (migration 007) makes
-    // this scan cheap. COALESCE folds NULL routing_key into the
-    // synthetic tenant. `sql.lit` produces an inline literal so PG
-    // sees the SELECT and GROUP BY expressions as identical (a
-    // parameter binding would create two distinct $N placeholders and
-    // PG would reject the SELECT as referencing routing_key without it
-    // appearing in the GROUP BY).
+    // `idx_secret_audit_log_routing_timestamp` (migration 007) makes this scan cheap. `sql.lit`
+    // inlines the synthetic tenant so SELECT and GROUP BY are identical expressions: two bound
+    // $N placeholders would make PG reject routing_key as missing from the GROUP BY.
     //
-    // The per-row `retentionCase` (engine-generated CASE) further tightens
-    // the index-friendly `< warmCutoff` predicate so partitions whose only
-    // rows are mutations (365d) aren't yielded just because the framework's
-    // 30d minimum cutoff has passed.
+    // `retentionCase` tightens `< warmCutoff`, so mutation-only (365d) partitions are not
+    // yielded once the 30d minimum cutoff passes.
     const synthetic = sql.lit(SYNTHETIC_ORCH_TENANT);
     const retentionCase = sql.raw(secretAuditLogWarmSqlCase());
     const rows = await sql<{ tenant_id: string; partition_date: string }>`
@@ -181,14 +171,9 @@ export class SecretAuditLogAdapter
   }
 
   /**
-   * Per-row cold-retention TTL. Sampled `resolve` /
-   * `resolve_named` rows get 180d cold; mutations get `'forever'`. The
-   * denied-outcome override promotes to 730d (forensic).
-   *
-   * `outcome` is a free-form string in PG but the engine helper only
-   * branches on `outcome !== 'allowed'`, so any other value
-   * (`'denied'`, `'error'`, future categories) lands in the forensic
-   * bucket.
+   * Sampled `resolve` / `resolve_named` rows get 180d cold; mutations get `'forever'`; a
+   * denied outcome promotes to 730d (forensic). `outcome` is free-form in PG, so any value
+   * other than `'allowed'` (`'error'`, future categories) lands in the forensic bucket.
    */
   coldTtlDays(row: SecretAuditLogRow): ColdRetention {
     return getSecretAuditLogColdDays({
@@ -248,9 +233,8 @@ export class SecretAuditLogAdapter
           last_archived_at = now()
       `.execute(trx);
 
-      // Record the chunk in `cold_store_chunks` so the GC
-      // sweep can find purge candidates without S3 LIST. V1
-      // chunks omit `bucket` and are treated as `'forever'`.
+      // `cold_store_chunks` lets the GC sweep find purge candidates without S3 LIST. V1 chunks
+      // omit `bucket` and are treated as `'forever'`.
       if (args.chunkMeta.bucket !== undefined && args.chunkMeta.maxColdDays !== undefined) {
         const maxColdDaysSerialized = String(args.chunkMeta.maxColdDays);
         await trx
@@ -282,7 +266,6 @@ export class SecretAuditLogAdapter
     objectKey: string;
   }): Promise<void> {
     await this.kdb.transaction().execute(async (trx) => {
-      // 1. Drop the chunk-index row.
       await trx
         .deleteFrom('cold_store_chunks')
         .where('db', '=', 'orchestrator')
@@ -290,7 +273,7 @@ export class SecretAuditLogAdapter
         .where('chunk_id', '=', args.chunkId)
         .execute();
 
-      // 2. Decrement the per-(db, table, tenant) rollup; floor at 0.
+      // Floor the rollup at 0.
       await sql`
         UPDATE cold_store_chunk_counts
         SET chunk_count = GREATEST(chunk_count - 1, 0),
@@ -301,8 +284,6 @@ export class SecretAuditLogAdapter
           AND tenant_id = ${args.tenantId}
       `.execute(trx);
 
-      // 3. Audit the purge into access_log (orchestrator-side audit
-      //    surface — same as the archive_chunk row above).
       await trx
         .insertInto('access_log')
         .values({

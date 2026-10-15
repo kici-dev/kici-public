@@ -1,16 +1,12 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Hold the secret fields of a stored job encrypted under the orchestrator
- * master key, beside the plain JSON column that keeps every other field.
+ * `sealed_secrets` holds a stored job's secret fields under the orchestrator master key, beside
+ * the plain JSON column (`dispatch_queue.job_config`, `pending_job_contexts.job_input`,
+ * `pending_workflow_contexts.context`) that keeps every other field.
  *
- * Adds a nullable `sealed_secrets text` column to the three tables a job waits
- * in: `dispatch_queue` (its `job_config`), `pending_job_contexts` (its
- * `job_input`), and `pending_workflow_contexts` (its `context`).
- *
- * Nullable and unbackfilled: NULL on every row written before this column
- * existed, and on every row an orchestrator without a master key writes. Such
- * a row keeps its secret fields in the plain column and reads back unchanged.
+ * Nullable and unbackfilled: NULL on older rows and on rows an orchestrator without a master
+ * key writes; such a row keeps its secrets in the plain column and reads back unchanged.
  *
  * Idempotent: each column is added only when missing.
  */

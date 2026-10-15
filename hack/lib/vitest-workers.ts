@@ -55,7 +55,6 @@ export function share(total: number, claimants: number): number {
   return Math.min(whole, Math.max(1, Math.floor(whole / n)));
 }
 
-/** True when a process with this pid still exists. */
 export function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);

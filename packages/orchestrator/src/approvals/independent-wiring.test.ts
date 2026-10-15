@@ -1,16 +1,13 @@
 /**
  * The independent-mode approval composition.
  *
- * Every defect this closes is a MISSING FIELD, not a wrong algorithm — so the
- * assertions read the produced object rather than exercising a pipeline. The
- * one behavioural claim worth driving is laziness: the release callbacks must
- * read `buildProcessingDeps` when they fire, never when they are built, because
- * `createApp` populates it after the mode hook runs and reading it early
- * throws.
+ * Every defect this guards is a MISSING FIELD, not a wrong algorithm, so the
+ * assertions read the produced object rather than exercising a pipeline. The one
+ * behavioural claim driven is laziness: the release callbacks read
+ * `buildProcessingDeps` when they fire, never when built, because `createApp`
+ * populates it after the mode hook runs and reading it early throws.
  *
- * The last block is the seam: a factory nothing spreads is a factory that
- * changes nothing, and `standalone.ts` runs `guardStartup` at import time so no
- * test can construct it.
+ * The last block asserts the `standalone.ts` seam against the source (see there).
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';

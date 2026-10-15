@@ -1,10 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 
-/**
- * Mock the Node.js http module to simulate Unix domain socket communication.
- * Each test configures the mock response via setupMockResponse().
- */
+// A mocked `node:http` stands in for the Unix socket; each test sets its response
+// with setupMockResponse().
 let mockResponseStatusCode = 200;
 let mockResponseBody = '';
 let mockRequestError: Error | null = null;
@@ -39,9 +37,8 @@ class MockClientRequest extends EventEmitter {
       return;
     }
 
-    // Emit response asynchronously
     queueMicrotask(() => {
-      // The response callback was captured by vi.mock
+      // The vi.mock request() delivers the response.
     });
   }
 }
@@ -56,7 +53,7 @@ vi.mock('node:http', () => {
         const req = new MockClientRequest();
         lastMockRequest = req;
 
-        // Simulate async response delivery
+        // Deliver the response asynchronously, as a real socket does.
         const originalEnd = req.end.bind(req);
         req.end = () => {
           originalEnd();
@@ -65,7 +62,6 @@ vi.mock('node:http', () => {
             queueMicrotask(() => {
               const res = new MockIncomingMessage(mockResponseStatusCode);
               callback(res);
-              // Emit data and end
               if (mockResponseBody) {
                 res.emit('data', mockResponseBody);
               }
@@ -259,7 +255,6 @@ describe('FirecrackerApi', () => {
 
     it('returns false on timeout when socket never becomes available', async () => {
       vi.useRealTimers();
-      // Always fail
       setupMockError(new Error('connect ENOENT'));
       const api = new FirecrackerApi('/tmp/nonexistent.socket');
 
@@ -271,16 +266,14 @@ describe('FirecrackerApi', () => {
       vi.useRealTimers();
       let callCount = 0;
 
-      // Override the mock to fail first few times, then succeed
       const originalStatusCode = mockResponseStatusCode;
       const origError = mockRequestError;
 
-      // Start with errors
+      // Fail until the timer below makes the socket available.
       setupMockError(new Error('connect ENOENT'));
 
       const api = new FirecrackerApi('/tmp/firecracker.socket');
 
-      // After a short delay, make the socket available
       setTimeout(() => {
         mockRequestError = null;
         mockResponseStatusCode = 200;

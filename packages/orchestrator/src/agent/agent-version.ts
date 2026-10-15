@@ -1,26 +1,20 @@
 /**
- * Comparing a self-reported agent version against a feature's minimum.
+ * Compare a self-reported agent version against a feature's minimum.
  *
- * An agent reports its own package version in `agent.register`
- * (`agentRegisterSchema.version`), and the field is optional — an agent old
- * enough to omit it predates every feature this module gates on. The
- * orchestrator and the agent are deployed and upgraded independently,
- * so a feature the orchestrator ships is
- * routinely dispatched to a fleet that cannot run it, and the version is the
- * only fact the orchestrator has about what the fleet understands.
+ * The version comes from `agent.register` (`agentRegisterSchema.version`) and
+ * is optional; an agent that omits it predates every feature gated here.
+ * Orchestrator and agent upgrade independently, so the version is the only
+ * fact the orchestrator has about what the fleet can run.
  */
 
 /** A version's release triple, with any prerelease suffix dropped. */
 type VersionBase = [number, number, number];
 
 /**
- * Parse `MAJOR.MINOR.PATCH`, ignoring any `-prerelease` suffix, or `null` when
- * the string is not a version at all.
- *
- * The prerelease suffix is dropped rather than ordered because the suffixes in
- * play are build counters (`0.5.0-9159`), not semver release candidates. Strict
- * semver orders those BELOW `0.5.0`, which would read every agent on a
- * prerelease build as too old for a feature it in fact carries.
+ * Parse `MAJOR.MINOR.PATCH`, or `null` for a non-version. The `-prerelease`
+ * suffix is dropped rather than ordered: it is a build counter (`0.5.0-9159`),
+ * and strict semver would order it BELOW `0.5.0`, reading every prerelease
+ * agent as too old for a feature it carries.
  */
 export function parseVersionBase(version: string): VersionBase | null {
   const parts = version.trim().split('-')[0].split('.');
@@ -31,12 +25,9 @@ export function parseVersionBase(version: string): VersionBase | null {
 }
 
 /**
- * True when `version` is at least `minimum`, comparing release bases only.
- *
- * An absent or unparseable version returns `false`: the orchestrator learns
- * nothing from it, and a feature that needs a specific agent build must not
- * treat "we cannot tell" as "yes". Callers decide what an all-unknown fleet
- * means for them — this function only reports what the version proves.
+ * True when `version` is at least `minimum`, comparing release bases only. An
+ * absent or unparseable version is `false`: "cannot tell" must not read as
+ * "yes". Callers decide what an all-unknown fleet means.
  */
 export function agentVersionAtLeast(version: string | null | undefined, minimum: string): boolean {
   if (typeof version !== 'string' || version.length === 0) return false;

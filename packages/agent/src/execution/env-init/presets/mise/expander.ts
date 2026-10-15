@@ -7,13 +7,12 @@ import {
   type MiseWindowsArch,
 } from './windows-install.js';
 
-/** Arguments to expand the mise preset into a concrete generic init config. */
 export interface MiseExpandArgs {
   cloneRoot: string;
   config: MiseInitConfig;
-  /** Host platform (defaults to process.platform). Injected for tests. */
+  /** Defaults to process.platform; injected by tests. */
   platform?: NodeJS.Platform;
-  /** Windows asset resolver (defaults to the real GitHub lookup). Injected for tests. */
+  /** Defaults to the real GitHub lookup; injected by tests. */
   resolveWindowsAsset?: (arch: MiseWindowsArch) => Promise<string>;
 }
 
@@ -29,7 +28,7 @@ async function defaultCache(cloneRoot: string, paths: string[]): Promise<CacheSp
   return { key: await miseCacheKey(cloneRoot), paths, restoreKeys: ['mise-'] };
 }
 
-/** The mise preset expander: turns MiseInitConfig into an OS-correct GenericInitConfig. */
+/** Turns MiseInitConfig into an OS-correct GenericInitConfig. */
 export const miseExpander = {
   async expand(args: MiseExpandArgs): Promise<GenericInitConfig> {
     const platform = args.platform ?? process.platform;

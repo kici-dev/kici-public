@@ -9,7 +9,7 @@
  * including pnpm/yarn `workspace:` siblings).
  *
  * The {@link PackageManager} enum + pure helpers live in the node-free
- * `./package-manager-types.js` module and are re-exported here so existing
+ * `./package-manager-types.js` module and are re-exported here so
  * `@kici-dev/shared/package-manager` consumers keep one import site.
  */
 
@@ -74,8 +74,6 @@ const LOCKFILES: readonly [string, PackageManager][] = [
  *      `npx`); the leading `<name>/` segment names the manager.
  *   4. Default to npm when nothing matches, so we never guess wrong and emit a
  *      lockfile the user did not ask for.
- *
- * @param projectDir - The project root to inspect.
  */
 export async function detectPackageManager(projectDir: string): Promise<PackageManager> {
   const fromManifests = await detectPackageManagerFromManifests(projectDir);
@@ -150,7 +148,7 @@ function yarnLockIsBerry(head: string | null): boolean {
  *   1. `packageManager: "yarn@<major>"` field (>=2 => berry).
  *   2. a `.yarnrc.yml` file (classic uses `.yarnrc`, berry uses `.yarnrc.yml`).
  *   3. a `yarn.lock` whose head contains the berry `__metadata:` marker.
- *   4. default to classic (the already-shipped path; berry is opt-in).
+ *   4. default to classic (berry is opt-in).
  *
  * Only meaningful when {@link detectPackageManager} returned `Yarn`; callers
  * pass the same dir that yielded `Yarn`.
@@ -296,7 +294,6 @@ export async function detectWorkspaceRoot(startDir: string): Promise<WorkspaceRo
   for (;;) {
     const kind = await workspaceKindAt(dir);
     if (kind) return { root: dir, kind };
-    // Stop once we've inspected the repo root — do not climb past `.git`.
     if (await fileExists(path.join(dir, '.git'))) return null;
     const parent = path.dirname(dir);
     if (parent === dir) return null;

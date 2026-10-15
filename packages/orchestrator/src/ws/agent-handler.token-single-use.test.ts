@@ -1,33 +1,21 @@
 /**
- * regression: an ephemeral agent token must not be usable across distinct
- * agentIds (ghost-agent attack within the token's TTL + label-scope).
+ * An ephemeral agent token must not be usable across distinct agentIds (ghost-agent
+ * attack within the token's TTL + label-scope).
  *
- * Trust model the system claims to hold:
- *   The scaler issues an ephemeral agent token bound to ONE scaler-spawned
- *   agentId. `tokenStore.createEphemeral(agentId, labels, ttlMs)` records
- *   the bound agentId in the `created_by` column of `agent_tokens`. The
- *   ephemeral token is issued for that one agent's lifetime — by design,
- *   one token = one agent. Static tokens are exempt: an operator-managed
- *   static token is intentionally N-use (the same PSK can be distributed
- *   across many manually-registered agents).
+ * Trust model: the scaler issues an ephemeral token bound to ONE scaler-spawned
+ * agentId; `tokenStore.createEphemeral(agentId, labels, ttlMs)` records it in
+ * `agent_tokens.created_by`. One token = one agent, for that agent's lifetime. Static
+ * tokens are intentionally N-use (one operator PSK across many manually-registered
+ * agents).
  *
- *   The agentId-collision check only blocks "same agentId presents a
- *   different token", and the label-scope check only bounds which labels
- *   a token may claim. Without the register-time binding check
- *   (`tokenCreatedBy === agentId` for an ephemeral token), an attacker with
- *   a stolen ephemeral token could register a fresh `agent-ghost` and
- *   freely claim jobs (and receive the secrets dispatched with them) within
- *   the token's labels-scope.
+ * The agentId-collision check only blocks "same agentId presents a different token",
+ * and the label-scope check only bounds claimable labels. Without the register-time
+ * binding check (`tokenCreatedBy === agentId` for an ephemeral token), a leaked
+ * ephemeral token (env file on the scaler-spawned worker, memory dump, accidental
+ * commit, log line) lets an attacker register a parallel `agent-ghost` within the TTL
+ * and claim jobs, and the secrets dispatched with them, within the token's labels-scope.
  *
- *   A stolen-credential attack requires one ephemeral token leakage
- *   (env file read on the scaler-spawned VM/container/bare-metal worker,
- *   agent process memory dump, accidental commit, log line). Within the
- *   token's TTL, an attacker could then mint a parallel ghost agent that
- *   the orchestrator would treat as a peer of the legitimate one.
- *
- * Static-token N-use remains a covered counter-test: operators
- * deliberately distribute one static token across many agents, and that
- * path must keep working.
+ * Static-token N-use stays a covered counter-test.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PROTOCOL_VERSION, WS_CLOSE_AGENT_AUTH_FAILED } from '@kici-dev/engine';
@@ -35,7 +23,7 @@ import { createAgentWsHandler } from './agent-handler.js';
 import { AgentRegistry } from '../agent/registry.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
-import { mockWs } from '../__test-helpers__/mock-ws.js';
+import { mockWs, makeMessageEvent } from '../__test-helpers__/mock-ws.js';
 
 function mockDispatcher(): Dispatcher {
   return {
@@ -45,10 +33,6 @@ function mockDispatcher(): Dispatcher {
     onJobComplete: vi.fn(),
     releaseRebootPending: vi.fn().mockResolvedValue(undefined),
   } as unknown as Dispatcher;
-}
-
-function makeMessageEvent(data: unknown): MessageEvent {
-  return { data: JSON.stringify(data) } as MessageEvent;
 }
 
 function authRequestMsg(token = 'kat_' + 'a'.repeat(64)) {
@@ -69,10 +53,8 @@ function registerMsg(opts: { agentId: string; labels: string[] }) {
 }
 
 /**
- * Token store whose `validate(...)` returns a fixed token row with
- * `agent_type` and `created_by` populated to match the production
- * shape. The same row is returned for every `validate()` call (mirrors
- * the DB lookup: token_hash -> row).
+ * `validate()` always returns one fixed row with production-shaped `agent_type` and
+ * `created_by` (mirrors the token_hash -> row DB lookup).
  */
 function tokenStoreFor(opts: {
   agentType: 'ephemeral' | 'static';
@@ -136,14 +118,11 @@ describe('ephemeral-token single-use binding (created_by → agentId)', () => {
       wsReal as any,
     );
 
-    // Sanity: agent-real is registered.
     expect(registry.get('agent-real')).toBeDefined();
     expect(wsReal.close).not.toHaveBeenCalled();
 
-    // An attacker who stole the ephemeral token registers as a ghost
-    // agent under a different agentId. Same labels-scope (so the label-scope
-    // check doesn't catch it), same token (so the token validates), different
-    // agentId (so the agentId-collision check doesn't fire).
+    // Stolen token, ghost agentId: same labels-scope and token pass those checks, and a
+    // different agentId dodges the collision check.
     const wsGhost = mockWs();
     handler.onOpen!(new Event('open'), wsGhost as any);
     await handler.onMessage!(makeMessageEvent(authRequestMsg()), wsGhost as any);
@@ -152,8 +131,7 @@ describe('ephemeral-token single-use binding (created_by → agentId)', () => {
       wsGhost as any,
     );
 
-    // INVARIANT: an ephemeral token bound to `agent-real` MUST
-    // refuse to register `agent-ghost`.
+    // INVARIANT: an ephemeral token bound to `agent-real` MUST refuse `agent-ghost`.
     expect(registry.get('agent-ghost')).toBeUndefined();
     expect(wsGhost.close).toHaveBeenCalledWith(
       WS_CLOSE_AGENT_AUTH_FAILED,
@@ -166,10 +144,8 @@ describe('ephemeral-token single-use binding (created_by → agentId)', () => {
   });
 
   it('allows the bound agentId to reconnect with the same ephemeral token', async () => {
-    // Counter-test: the legitimate scaler-spawned agent-real disconnects
-    // (e.g. transient network blip) and reconnects within the token's
-    // TTL. Same token, same agentId. Must succeed — agent reconnect is a
-    // normal operational flow and the binding check MUST NOT break it.
+    // Counter-test: agent-real reconnects within the TTL with the same token and
+    // agentId (e.g. a network blip). The binding check MUST NOT break reconnect.
     const tokenStore = tokenStoreFor({
       agentType: 'ephemeral',
       createdBy: 'agent-real',
@@ -191,7 +167,6 @@ describe('ephemeral-token single-use binding (created_by → agentId)', () => {
     );
     expect(registry.get('agent-real')).toBeDefined();
 
-    // Same agentId reconnects on a fresh socket. Must be accepted.
     const wsReconnect = mockWs();
     handler.onOpen!(new Event('open'), wsReconnect as any);
     await handler.onMessage!(makeMessageEvent(authRequestMsg()), wsReconnect as any);
@@ -205,10 +180,9 @@ describe('ephemeral-token single-use binding (created_by → agentId)', () => {
   });
 
   it('allows an init-runner to register as its bare target id with a bootstrap token', async () => {
-    // A single-use bootstrap (init-runner) token stores its bound identity as
-    // `bootstrap:<targetAgentId>` (mintBootstrapToken). The init-runner boots on
-    // the fresh box and registers as the bare `<targetAgentId>` — Gate 2 must
-    // strip the `bootstrap:` prefix so this succeeds.
+    // A single-use bootstrap (init-runner) token binds `bootstrap:<targetAgentId>`
+    // (mintBootstrapToken); the init-runner registers as the bare `<targetAgentId>`, so
+    // Gate 2 must strip the `bootstrap:` prefix.
     const tokenStore = tokenStoreFor({
       agentType: 'ephemeral',
       createdBy: 'bootstrap:fresh-box-1',
@@ -264,9 +238,7 @@ describe('ephemeral-token single-use binding (created_by → agentId)', () => {
   });
 
   it('allows distinct agentIds to share a STATIC token (operator-issued N-use)', async () => {
-    // Counter-test: static tokens are intentionally N-use. The operator
-    // distributes one static PSK across many manually-registered agents.
-    // The binding check MUST NOT break this — only ephemeral tokens carry the
+    // Counter-test: static tokens are intentionally N-use; only ephemeral tokens carry the
     // agentId-binding invariant.
     const tokenStore = tokenStoreFor({
       agentType: 'static',

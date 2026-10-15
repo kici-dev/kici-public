@@ -3,11 +3,9 @@ import { Command } from 'commander';
 import { registerDashboardEncryptionKeyCommands } from './dashboard-encryption-key.js';
 
 /**
- * The `kici-admin dashboard-encryption-key` command tree wiring: show / list /
- * rotate are registered with the flags the operator runbook documents. The
- * DB-direct behavior (mint, activate, demote-prior-to-revoked, decrypt-after-revoke)
- * is covered by `dashboard-encryption-keys-repo.test.ts` and
- * `dashboard-encryption-key.test.ts` in `src/secrets/`.
+ * Command tree wiring with the runbook's flags. The DB-direct behavior is
+ * covered in `src/secrets/` (`dashboard-encryption-keys-repo.test.ts`,
+ * `dashboard-encryption-key.test.ts`).
  *
  * Surface ids exercised here (needled by the coverage gate):
  *   cli:kici-admin:dashboard-encryption-key

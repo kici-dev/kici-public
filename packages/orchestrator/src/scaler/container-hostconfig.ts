@@ -1,12 +1,9 @@
 /**
  * The `HostConfig` every KiCI agent container is created with.
  *
- * Two backends spawn an agent container — `ContainerScalerBackend` and the
- * bare-metal backend's container mode — and they had diverged into two
- * postures for one threat: the first applied resource limits, the second
- * applied none and dropped the limits the operator configured on the floor.
- * One builder is what keeps them from diverging again the next time either is
- * touched.
+ * Shared by both agent-container spawners — `ContainerScalerBackend` and the
+ * bare-metal backend's container mode — so they cannot diverge into two
+ * postures (one silently dropping the operator's resource limits).
  */
 
 import type Docker from 'dockerode';
@@ -28,18 +25,15 @@ export const AGENT_CONTAINER_PIDS_LIMIT = 4096;
  * Both spawn paths set `KICI_EXECUTION_MODE=bare-metal`, and bare-metal
  * container mode also sets `KICI_JOB_IMAGE_AGENT=1` — so unless the job
  * declares its own image, the workflow's steps run as host processes INSIDE
- * this container. It is a build execution environment, not a supervisor.
- * `CapDrop: ['ALL']` here would therefore land on customer build steps:
+ * this container. `CapDrop: ['ALL']` here would land on customer build steps:
  * `apt-get` and `dpkg` need CHOWN, DAC_OVERRIDE, FOWNER, SETUID and SETGID,
- * and `no-new-privileges` breaks `sudo` and every setuid binary. There is no
- * opt-out, so the break would be silent and total for `type: container`
- * scalers.
+ * and `no-new-privileges` breaks `sudo` and every setuid binary. With no
+ * opt-out, the break would be silent and total for `type: container` scalers.
  *
- * The hardening the operator docs promise already exists, one boundary in:
- * the agent applies `CapDrop: ['ALL']`, `no-new-privileges` and a tighter
- * `PidsLimit` to each nested JOB container
- * (`packages/agent/src/execution/sandbox/container-hardening.ts`). That is the
- * boundary that confines customer code; this one hosts it.
+ * The promised hardening lives one boundary in: the agent applies
+ * `CapDrop: ['ALL']`, `no-new-privileges` and a tighter `PidsLimit` to each
+ * nested JOB container (`packages/agent/src/execution/sandbox/container-hardening.ts`).
+ * That boundary confines customer code; this one hosts it.
  *
  * `PidsLimit` is the exception and stays: a fork-bomb ceiling costs a build
  * nothing at 4096.

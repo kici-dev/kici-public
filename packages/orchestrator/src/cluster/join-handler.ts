@@ -56,10 +56,7 @@ interface JoinHandlerDeps {
   secretKey?: string;
 }
 
-/**
- * Config bundle distributed to new orchestrators via join token.
- * Contains everything needed to configure and start an orchestrator instance.
- */
+/** Config bundle a join seals to a new orchestrator: everything it needs to start. */
 export interface ConfigBundle {
   databaseUrl: string;
   storage?: {
@@ -194,9 +191,8 @@ export class JoinHandler {
   }
 
   /**
-   * Build the config bundle from SharedConfig + local config. The secrets key is
-   * the shared configuration's `secrets.key`, else this orchestrator's own key, so
-   * a joined orchestrator decrypts what the cluster encrypted.
+   * The secrets key is the shared configuration's `secrets.key`, else this
+   * orchestrator's own key, so a joined orchestrator decrypts what the cluster encrypted.
    */
   async buildConfigBundle(): Promise<ConfigBundle> {
     const sharedResult = await this.deps.sharedConfigStore.getLatest();

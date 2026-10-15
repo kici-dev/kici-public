@@ -1,33 +1,27 @@
 /**
- * The pre-run global eval round.
+ * The pre-run global eval round: one per (event × workflow repo), on an agent
+ * that already holds both trees on disk. For each candidate global workflow it
+ * runs the `filter` (does the workflow apply to the source repo at all?) and,
+ * for a survivor, its needs-free `DynamicJobFn`s, so the orchestrator can
+ * dispatch generated jobs it could not otherwise see. The round precedes every
+ * run row: a `filter` returning `false` means no run is created.
  *
- * One round runs per (event × workflow repo), on an agent that already holds
- * both trees on disk. For each candidate global workflow it runs the workflow's
- * `filter` — deciding whether the workflow applies to the source repo at all —
- * and, for a survivor, its needs-free `DynamicJobFn`s, so the orchestrator can dispatch
- * generated jobs it could not otherwise see. The round precedes every run row:
- * a `filter` returning `false` means no run is created.
+ * Modelled on `init-runner.ts`: author code runs in the agent's ordinary module
+ * loader — no `vm`, no `new Function`, no dynamic `eval`.
  *
- * Shape is modelled on `init-runner.ts` — load the module, resolve the target,
- * evaluate under `withTimeout`, return a structured result. As there, author
- * code runs in the agent's ordinary module loader: no `vm`, no `new Function`,
- * no dynamic `eval`.
- *
- * Two properties are load-bearing and easy to lose:
+ * Load-bearing and easy to lose:
  *
  * - **One bad candidate never sinks the round.** A candidate whose filter or
  *   generator throws, or that blows its budget, comes back
  *   `{ run: false, indeterminate: true, reason }` while its siblings carry real
- *   verdicts. Several unrelated org-wide workflows share a round; a single
- *   broken filter suppressing all of them would be a silent outage.
- * - **Candidates are STARTED sequentially.** They share one checkout and one
- *   working directory, so a parallel `$` would race on cwd. This is a strict
- *   guarantee on the happy path and **best-effort past a timeout**: `withTimeout`
- *   races rather than cancels, so a candidate that blew its own budget is still
- *   running when the next one starts. Nothing can preempt user code mid-`await`,
- *   so the round bounds the damage rather than eliminating it — the loop stops
- *   at the round deadline (and on the caller's abort signal), which caps the
- *   overlap at one orphaned candidate instead of the whole remaining queue.
+ *   verdicts; one broken filter suppressing unrelated org-wide workflows would
+ *   be a silent outage.
+ * - **Candidates are STARTED sequentially.** They share one checkout and cwd, so
+ *   a parallel `$` would race. Strict on the happy path, **best-effort past a
+ *   timeout**: `withTimeout` races rather than cancels, and nothing can preempt
+ *   user code mid-`await`, so a timed-out candidate is still running when the
+ *   next starts. The loop stops at the round deadline (and on abort), capping
+ *   the overlap at one orphaned candidate instead of the whole remaining queue.
  */
 
 import type { Workflow, RepoInfo, DynamicJobContext, Logger } from '@kici-dev/sdk';
@@ -58,7 +52,6 @@ export interface GlobalEvalCandidate {
   deferredPaths?: string[][];
 }
 
-/** Arguments for {@link runGlobalEvalRound}. */
 export interface GlobalEvalRoundArgs {
   /** Absolute path of the workflow-repo checkout (modules are loaded from here). */
   workflowDir: string;
@@ -81,25 +74,20 @@ export interface GlobalEvalRoundArgs {
   /** Wall-clock budget for one candidate (its filter plus its generators). */
   candidateTimeoutMs: number;
   /**
-   * Caller's cancellation signal. The round stops starting new candidates once
-   * it fires; the one already in flight cannot be preempted (see the module
-   * doc comment) but its verdict is discarded.
+   * Once it fires the round starts no new candidates; the one in flight cannot
+   * be preempted (see the module doc) but its verdict is discarded.
    */
   signal?: AbortSignal;
-  /** zx shell handed to filters and generators. Defaults to the ambient `$`. */
+  /** For filters and generators. Defaults to the ambient `$`. */
   $?: typeof Shell;
-  /** Logger handed to generators. Defaults to a no-op. */
+  /** For generators. Defaults to a no-op. */
   log?: Logger;
-  /** KiCI API handed to generators. Defaults to one that rejects every call. */
+  /** For generators. Defaults to one that rejects every call. */
   kici?: DynamicJobContext['kici'];
-  /**
-   * Module loader seam. Defaults to `loadWorkflowSource` against `workflowDir`;
-   * a caller that already holds the modules (or a unit test) supplies its own.
-   */
+  /** Defaults to `loadWorkflowSource` against `workflowDir`. */
   loadModule?: (sourceFile: string) => Promise<Record<string, unknown>>;
 }
 
-/** Per-round state shared by every candidate helper. */
 interface RoundState {
   args: GlobalEvalRoundArgs;
   $: typeof Shell;
@@ -128,7 +116,7 @@ function buildRoundState(args: GlobalEvalRoundArgs): RoundState {
   };
 }
 
-/** Load a workflow, caching per source file so a shared module is imported once. */
+/** Caches per source file so a shared module is imported once. */
 async function loadWorkflowCached(
   shared: RoundState,
   sourceFile: string,
@@ -143,26 +131,19 @@ async function loadWorkflowCached(
 }
 
 /**
- * True for a generator the round runs: one declared without upstream `needs`.
- *
- * A generator declared with `needs` (a result-aware generator) is skipped: it
- * runs later on the run's deferred path, once its upstreams have produced the
- * outputs it reads. The test is the one the compiler uses to mark the lock
- * entry `resultAware`, so the round and the lock file cannot disagree about
- * which generators belong where.
+ * True for a generator declared without upstream `needs`. A result-aware
+ * generator (with `needs`) runs later on the run's deferred path, once its
+ * upstreams produced their outputs. The compiler uses this same test to mark
+ * the lock entry `resultAware`, so the round and the lock file cannot disagree.
  */
 export function isRoundGeneratorFn(generator: DynamicJobFn): boolean {
   return getDynamicJobNeeds(generator) === undefined;
 }
 
 /**
- * Run every needs-free `DynamicJobFn` the workflow declares and serialize the
- * result.
- *
- * The generator context is built through `buildGeneratorContext` with the same
- * repo pair the sandbox re-evaluation gets, so the two calls a generator
- * receives cannot drift apart. Returns `undefined` when the workflow declares
- * no needs-free generator, which keeps the `jobs` key off the wire entirely.
+ * The context comes from `buildGeneratorContext` with the same repo pair the
+ * sandbox re-evaluation gets, so a generator's two calls cannot drift apart.
+ * Returns `undefined` with no needs-free generator, keeping `jobs` off the wire.
  */
 async function generateDynamicJobs(
   workflow: Workflow,
@@ -202,11 +183,7 @@ async function generateDynamicJobs(
   return jobs;
 }
 
-/**
- * Evaluate one candidate to a verdict: decide its deferred `paths` from the
- * round's diff, run its `filter` if it declares one, then its generators if it
- * survives. A paths no-match returns before the module loads.
- */
+/** Deferred `paths`, then `filter`, then generators. A paths no-match returns before the module loads. */
 async function evaluateCandidateInner(
   candidate: GlobalEvalCandidate,
   shared: RoundState,
@@ -249,11 +226,7 @@ async function evaluateCandidateInner(
   return { workflowName: candidate.workflowName, run: true, ...(jobs && { jobs }) };
 }
 
-/**
- * Evaluate one candidate, never throwing. A failure — a throwing filter, a
- * broken generator, a blown per-candidate budget — becomes an indeterminate
- * verdict so the round's other candidates still get real answers.
- */
+/** Never throws: any failure, including a blown budget, becomes an indeterminate verdict. */
 async function evaluateCandidate(
   candidate: GlobalEvalCandidate,
   shared: RoundState,
@@ -275,20 +248,14 @@ async function evaluateCandidate(
 }
 
 /**
- * Evaluate candidates one at a time — they share one checkout and one working
- * directory, so a parallel `$` would race on cwd.
+ * Sequential (shared cwd). The deadline/abort check before each start keeps
+ * that meaningful past a timeout: `withTimeout` races rather than cancels, so
+ * without it the loop would launch every remaining candidate into a work
+ * directory the job already reported on and cleanup already deleted. With it,
+ * at most one candidate is in flight past the deadline.
  *
- * Stops before starting a candidate once the round deadline has passed or the
- * caller aborted. That check is what keeps the sequential guarantee meaningful
- * past a timeout: `withTimeout` races rather than cancels, so without it the
- * loop would keep launching every remaining candidate — each up to
- * `candidateTimeoutMs` — into a work directory the job has already reported on
- * and whose cleanup has already deleted. With it, at most one candidate is ever
- * in flight past the deadline.
- *
- * Results are appended to the caller's array as they land, so a round that
- * blows its own budget can still report the verdicts it did establish rather
- * than discarding the work.
+ * Results append to the caller's array as they land, so a round that blows its
+ * budget still reports the verdicts it established.
  */
 async function evaluateAllCandidates(
   shared: RoundState,
@@ -302,29 +269,21 @@ async function evaluateAllCandidates(
 }
 
 /**
- * Run one global eval round and return every candidate's verdict, in candidate
- * order. Never throws: a round that exceeds `roundTimeoutMs` reports whatever
- * it established and marks the rest indeterminate.
+ * Returns every verdict in candidate order. Never throws: a round past
+ * `roundTimeoutMs` reports what it established and marks the rest indeterminate.
  */
 export async function runGlobalEvalRound(
   args: GlobalEvalRoundArgs,
 ): Promise<GlobalEvalRoundResult> {
-  // Set the seven KICI_* keys BEFORE evaluating anything. `buildGeneratorContext`
-  // keeps the round's and the sandbox's generator contexts identical in shape,
-  // but the generator's `env` is `process.env` — a generator reading
-  // KICI_SOURCE_REPO_PATH here and in the sandbox must see the same value, or
-  // its two evaluations disagree and the job fails on a determinism check.
-  //
-  // The restorer is NOT optional here: this runs in the long-lived agent
-  // process, so leaving the keys set would hand the next job's non-global
-  // generator a stale global-workflow world its own sandbox re-evaluation
-  // never sees.
+  // Set the KICI_* keys BEFORE evaluating anything: the generator's `env` is
+  // `process.env`, and a generator reading KICI_SOURCE_REPO_PATH must see the
+  // same value here and in the sandbox, or the job fails a determinism check.
+  // The restore is NOT optional: in the long-lived agent process, leftover keys
+  // would hand the next job's non-global generator a stale global-workflow world.
   const restoreEnv = applyGlobalWorkflowEnv(args.repos);
 
-  // `withTimeout` races rather than cancels, so on a round timeout the loop may
-  // still be running and still appending. Copy out of `settled` instead of
-  // returning it, or the caller's result object would keep mutating after the
-  // round reported.
+  // On a round timeout the loop may still be appending (`withTimeout` does not
+  // cancel), so copy out of `settled` rather than return it.
   const settled: GlobalEvalCandidateResult[] = [];
   let stopReason: string | undefined;
   try {
@@ -340,8 +299,7 @@ export async function runGlobalEvalRound(
     restoreEnv();
   }
 
-  // The loop can also stop short WITHOUT throwing — its own deadline / abort
-  // check returns cleanly — so pad on both paths rather than only in `catch`.
+  // The loop can also stop short WITHOUT throwing (deadline / abort), so pad on both paths.
   const candidates = [...settled];
   const reason =
     stopReason ??

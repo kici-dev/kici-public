@@ -77,13 +77,10 @@ describe('EventScalerBackend', () => {
   });
 
   it('binds the ephemeral token AND the scale-up labels to the full scaler label set', async () => {
-    // Regression: the self-bootstrapping agent presents the scaler-assigned
-    // kici:agent:/kici:scaler:/kici:role: labels at registration. Binding the
-    // token to only the raw labelSet made the orchestrator reject the register
-    // with "labels exceed token-bound scope", so the bound job never ran. The
-    // token (and the KICI_LABELS the provisioning workflow derives from the
-    // event) must carry the full scalerAgentLabels() set — matching the
-    // container / bare-metal / firecracker backends.
+    // The agent presents the scaler-assigned kici:agent:/kici:scaler:/kici:role:
+    // labels at registration; a token bound to the raw labelSet is rejected with
+    // "labels exceed token-bound scope" and the bound job never runs. The token
+    // and the event's labels carry the full scalerAgentLabels() set.
     const createEphemeral = vi.fn().mockResolvedValue('kat_full');
     const now = () => 1000;
     const claimStore = new ClaimStore({
@@ -103,8 +100,7 @@ describe('EventScalerBackend', () => {
     });
 
     const expected = scalerAgentLabels(['cloud=hetzner'], 'event', entry.name, entry.roles);
-    // Sanity: the full set is a strict superset of the raw labelSet and carries
-    // the scaler-assigned labels the agent will self-report.
+    // A strict superset of the raw labelSet, with the self-reported labels.
     expect(expected).toEqual(expect.arrayContaining(['cloud=hetzner', 'kici:scaler:hetzner']));
     expect(expected.some((l) => l.startsWith('kici:role:'))).toBe(true);
 
@@ -204,10 +200,9 @@ describe('EventScalerBackend', () => {
   });
 
   it('emits scale-down even when invalidating the pending claim fails', async () => {
-    // The invalidate is a DB delete. Were it able to reject out of destroy, the
-    // agent would already be untracked, so the teardown event would never fire
-    // and a retried destroy would return at the idempotency guard — leaving the
-    // provisioned cloud instance running forever.
+    // Were the DB delete to reject out of destroy, the agent is already
+    // untracked: no teardown fires and a retry returns at the idempotency guard,
+    // leaving the cloud instance running forever.
     const { backend, claimStore, emitDown } = makeBackend();
     vi.spyOn(claimStore, 'invalidate').mockRejectedValue(new Error('db down'));
     await backend.spawn(['cloud=hetzner'], 'a1', 'wss://h/ws');

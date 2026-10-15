@@ -12,12 +12,59 @@ The bare-metal backend provisions agents as host child processes (`child_process
 - `binaryPath` — Filesystem path to the agent binary. The scaler spawns this
   process for each job. On Windows this is the `kici-agent.cmd` launcher that a
   Windows package or `npm install -g kici-admin` installs. See
-  [Windows launchers](#windows-launchers).
+  [Windows launchers](#windows-launchers) and
+  [Choosing the binaryPath](#choosing-the-binarypath).
 - `image` — A `kici-agent` container image. It has two uses, described in
   [Container jobs](#container-jobs) below.
 
 Every bare-metal label set needs at least one of the two. A set with only
 `binaryPath` spawns a host process, which is the classic bare-metal pool.
+
+## Choosing the binaryPath
+
+When you install the orchestrator with `npm install -g kici-admin`, use the
+`kici-agent` that the same install put next to the orchestrator's Node.js
+runtime. `kici-admin orchestrator status` prints it as the **Agent binary**
+line:
+
+```
+Agent binary:  /home/kici/.local/share/mise/installs/node/24.15.0/bin/kici-agent
+```
+
+Copy that path into `binaryPath`. `kici-admin orchestrator upgrade` installs
+the new release under the runtime of the service unit, so an agent at this path
+upgrades with the orchestrator. When `status` prints no **Agent binary** line,
+the service does not run from an npm install of `kici-admin`. Then use
+`$(npm prefix -g)/bin/kici-agent`, from a shell that uses the same Node.js
+runtime as the service.
+
+With a Node.js version manager, `command -v kici-agent` can print one of two
+paths that do not work:
+
+- **An alias**, such as the mise alias
+  `~/.local/share/mise/installs/node/24/bin/kici-agent`. When you install
+  another Node.js version, the alias moves to the new runtime, which has no
+  `kici-agent`. The orchestrator then does not start at its next restart.
+  `readlink -f` resolves an alias to a fixed path inside the package, such as
+  `…/node/24.15.0/lib/node_modules/kici-admin/bin/kici-agent.js`. That file is
+  the same agent as the **Agent binary** path, but the text differs.
+- **A shim**, such as `~/.local/share/mise/shims/kici-agent`. A mise shim links
+  to the `mise` executable, a Volta shim to `volta-shim`, and an asdf or
+  nodenv shim is a script. A shim runs the version manager, not the agent, and
+  `readlink -f` prints the version manager's own executable. The orchestrator
+  refuses a shim at startup. To find the file behind a shim, run
+  `mise which kici-agent`, `asdf which kici-agent`, `nodenv which kici-agent`
+  or `volta which kici-agent`.
+
+Before an upgrade installs anything, `kici-admin orchestrator upgrade` checks
+each bare-metal `binaryPath`. It stops when a `binaryPath` is not executable
+or is a shim, and it warns about an alias and about an agent from another
+runtime. `--rollback` and `--pick` run the same check, but only warn.
+See
+[The bare-metal binaryPath check](../../distribution/service-installation.md#the-bare-metal-binarypath-check).
+When the startup check fails, for a missing file or for a shim, the
+orchestrator log names the agent installed with its own runtime, when that file
+exists. A scaler config reload refuses a shim in the same way.
 
 ## Container jobs
 
@@ -92,7 +139,7 @@ Sometimes an agent never starts. Either the host refuses to start the agent proc
 - **Defers the scaler.** The next spawn for that scaler waits `scaler-provision-backoff-base-ms`. Each further consecutive failure doubles the wait, up to `scaler-provision-backoff-max-ms`. An agent that registers clears it. These are the cluster settings described in [Retry backoff](../event-scaler.md#retry-backoff).
 - **Frees the capacity.** Other scalers and other jobs are not held back.
 
-An agent that connected and stops later is not a launch failure. A missing binary is caught earlier: the orchestrator checks that `binaryPath` exists when it starts.
+An agent that connected and stops later is not a launch failure. A missing binary is caught earlier: the orchestrator checks that `binaryPath` is an executable file and not a version-manager shim when it starts.
 
 ## cgroup enforcement
 

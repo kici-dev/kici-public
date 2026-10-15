@@ -16,11 +16,10 @@ import { readKiciVersion } from '../service/instance/manifest.js';
 import { loadConfig } from '../../config.js';
 import { createCacheStorage } from '../../storage/index.js';
 
-// Baked into the bundled CLI at build time (scripts/build-service.mjs). The
-// runtime-file-read readKiciVersion() below only resolves correctly from source
-// (tsx); in the single-file bundle its relative package.json offset overshoots,
-// so the define is the authoritative version there and readKiciVersion is the
-// source/tsx fallback (matches the agent server's version-resolution pattern).
+// Baked in at build time (scripts/build-service.mjs). readKiciVersion() resolves
+// correctly only from source (tsx): in the single-file bundle its relative
+// package.json offset overshoots, so the define is authoritative there (the
+// agent server's version-resolution pattern).
 declare const KICI_PKG_VERSION: string;
 
 const ALL_PLATFORMS: AgentPlatformType[] = AgentPlatform.options;
@@ -55,11 +54,10 @@ interface PackageOptions {
   nodeVersion?: string;
 }
 
-/** Build the cache-bucket storage client from the orchestrator config (S3 only). */
+/** The cache-bucket storage client (S3 only). */
 export function resolveUploadStorage(): AgentPackageStorage {
-  // Packaging scope: this build-artifact operation reads only the object-storage
-  // config, so it must not require the runtime coordinator/platform env that the
-  // operator's upgrade shell does not carry.
+  // Packaging scope reads only the object-storage config, so it does not
+  // require the coordinator/platform env an operator's upgrade shell lacks.
   const config = loadConfig('packaging');
   if (config.storage?.type !== 's3') {
     throw new Error(
@@ -79,7 +77,6 @@ export function resolveUploadStorage(): AgentPackageStorage {
   });
 }
 
-/** Options for {@link runAgentPackageRefresh} (the auto-package-on-upgrade hook). */
 export interface AgentPackageRefreshOptions {
   platforms?: AgentPlatformType[];
   nodeMirror?: string;
@@ -88,14 +85,11 @@ export interface AgentPackageRefreshOptions {
 }
 
 /**
- * Auto-produce + upload the agent payloads for the orchestrator's current
- * version after a versioned upgrade (the C9 automation-completeness hook).
- *
- * Best-effort by design: a filesystem-cache orchestrator has no bucket to serve
- * payloads from, so it logs and skips rather than failing the upgrade; a
- * produce/upload error is reported but non-fatal to the (already-completed)
- * orchestrator upgrade. Idempotent — a version whose payloads already exist is
- * a no-op. Returns true when a refresh ran (S3 configured), false when skipped.
+ * Produce and upload the agent payloads for the current version after a
+ * versioned upgrade. Best-effort: a filesystem-cache orchestrator has no bucket,
+ * so it logs and skips; a produce/upload error is reported but does not fail
+ * the already-completed upgrade. Idempotent. Returns true when a refresh ran
+ * (S3 configured), false when skipped.
  */
 export async function runAgentPackageRefresh(
   opts: AgentPackageRefreshOptions = {},
@@ -132,11 +126,7 @@ export async function runAgentPackageRefresh(
   return true;
 }
 
-/**
- * Register the `kici-admin agent package` producer on the existing `agent`
- * command group. Must be called after registerAgentCommands (which creates the
- * group).
- */
+/** Must run after registerAgentCommands, which creates the `agent` group. */
 export function registerAgentPackage(program: Command): void {
   const agent = program.commands.find((cmd) => cmd.name() === 'agent');
   if (!agent) {
@@ -165,8 +155,7 @@ export function registerAgentPackage(program: Command): void {
         const version = resolveKiciVersion();
         const nodeVersion = opts.nodeVersion ?? process.version.replace(/^v/, '');
         const outDir = path.resolve(opts.out ?? 'dist/agent-packages');
-        // Resolve the upload storage once, up front, so a misconfiguration fails
-        // before any (slow) package build rather than after.
+        // Up front, so a misconfiguration fails before the slow package build.
         const storage = opts.upload ? resolveUploadStorage() : undefined;
         for (const platform of platforms) {
           console.log(`[agent package] ${platform} @ ${version} (node ${nodeVersion})`);

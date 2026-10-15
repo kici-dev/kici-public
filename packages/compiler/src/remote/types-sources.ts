@@ -1,13 +1,9 @@
 /**
- * Where `kici types` reads secret key names from, how the generated file
- * records it, and when a refresh may replace an existing file.
- *
- * The sources, in order: a direct orchestrator target, the Platform login,
- * then the local secret files `kici run --local` reads (`.kici/.secrets`,
- * `.kici/secrets.yaml`). A key set read from an orchestrator or the Platform
- * is never replaced by one built from local files or by the offline stub: an
- * offline laptop must not narrow a team's real key set to whatever happens to
- * be in its local files.
+ * Where `kici types` reads secret key names from, in order: a direct
+ * orchestrator target, the Platform login, then the local secret files
+ * `kici run --local` reads (`.kici/.secrets`, `.kici/secrets.yaml`). A key set
+ * from an orchestrator or the Platform is never replaced by local files or the
+ * offline stub: an offline laptop must not narrow a team's real key set.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -15,7 +11,7 @@ import path from 'node:path';
 export type TypesSource =
   { kind: 'orchestrator'; url: string } | { kind: 'platform'; orgId: string } | { kind: 'local' };
 
-/** The label the generated file's `// Source:` header carries. */
+/** The generated file's `// Source:` header label. */
 export function sourceHeaderLabel(source: TypesSource): string {
   switch (source.kind) {
     case 'orchestrator':
@@ -32,10 +28,9 @@ export type ExistingTypesSource = 'remote' | 'local' | 'offline' | 'none';
 const SOURCE_HEADER = /^\/\/ Source: (.*)$/m;
 
 /**
- * Classify an existing declaration file by its `// Source:` header. A file
- * with no recognizable header counts as remote, so a refresh never discards
- * content it cannot place; so does an older CLI's header, which named the
- * Platform URL.
+ * Classifies by the `// Source:` header. An unrecognized header, an older CLI's
+ * Platform-URL header included, counts as remote, so a refresh never discards
+ * content it cannot place.
  */
 export function existingTypesSource(content: string | null): ExistingTypesSource {
   if (content === null) return 'none';
@@ -60,14 +55,13 @@ export function mayReplace(
   }
 }
 
-/** Whether the project has a local secret file `kici types` can read. */
 export async function hasLocalSecretFiles(kiciDir: string): Promise<boolean> {
   for (const name of ['.secrets', 'secrets.yaml']) {
     try {
       await fs.access(path.join(kiciDir, name));
       return true;
     } catch {
-      // absent — try the next one
+      // Absent: try the next one.
     }
   }
   return false;

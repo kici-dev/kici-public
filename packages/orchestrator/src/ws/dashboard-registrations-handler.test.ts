@@ -238,9 +238,8 @@ describe('DashboardRegistrationsHandler', () => {
   });
 
   it('reports cron last-triggered from the grouped MAX across a registrations schedules', async () => {
-    // A workflow with two schedule() triggers has multiple cron_last_fired
-    // rows; the handler queries their per-registration MAX. Simulate the DB
-    // returning that grouped row and assert it surfaces as lastTriggeredAt.
+    // Two schedule() triggers mean several cron_last_fired rows; the handler
+    // reads their per-registration MAX as lastTriggeredAt.
     const row = makeRegistrationRow({
       lock_entry: makeLockWorkflow({
         triggers: [
@@ -297,7 +296,6 @@ describe('DashboardRegistrationsHandler', () => {
     });
     registrationStore.getAll.mockResolvedValue([row]);
 
-    // Mock DB queries
     const queryChain = {
       select: vi.fn().mockReturnThis(),
       selectAll: vi.fn().mockReturnThis(),
@@ -365,9 +363,8 @@ describe('DashboardRegistrationsHandler', () => {
   });
 
   it('surfaces isGlobal and renders repos globs into sourceRepos', async () => {
-    // A global workflow's only trigger is an ordinary push, so nothing else in
-    // the payload distinguishes it. Both fields below are what let the
-    // dashboard tell it apart from a same-repo push workflow.
+    // A global workflow's only trigger is an ordinary push: these fields are
+    // what let the dashboard tell it apart from a same-repo push workflow.
     registrationStore.getAll.mockResolvedValue([
       makeRegistrationRow({
         isGlobal: true,
@@ -409,8 +406,7 @@ describe('DashboardRegistrationsHandler', () => {
 
     const item = send.mock.calls[0][0].registrations[0];
     expect(item.isGlobal).toBe(true);
-    // The exclusion is carried through: which repos are carved out is as much
-    // part of the answer as which are matched.
+    // The exclusion is carried through, not only the matches.
     expect(item.sourceRepos).toEqual(['myorg/*', '!myorg/archived-*']);
   });
 
@@ -519,8 +515,7 @@ describe('DashboardRegistrationsHandler', () => {
           return selectChain;
         }),
         execute: vi.fn().mockResolvedValue([{ run_id: 'run-1' }]),
-        // The policy gate calls executeTakeFirst on the org_settings row;
-        // returning undefined makes the policy permissive (default).
+        // Policy gate reads the org_settings row; undefined = permissive.
         executeTakeFirst: vi.fn().mockResolvedValue(undefined),
       };
 
@@ -549,11 +544,8 @@ describe('DashboardRegistrationsHandler', () => {
         cancelActiveRuns: true,
       });
 
-      // Verify the status filter uses 'not in' with the canonical terminal
-      // run states. Asserted as an exact set against the engine enum rather
-      // than as a literal list: the previous literal also carried 'skipped',
-      // which is not an `ExecutionRunStatus` and which no site ever writes to
-      // `execution_runs`, so the list could drift from the enum unnoticed.
+      // Asserted as an exact set against the engine enum, not a literal list, so
+      // the filter cannot drift from `ExecutionRunStatus` unnoticed.
       const statusFilter = capturedWhereArgs.find((args) => args[0] === 'status');
       expect(statusFilter).toBeTruthy();
       expect(statusFilter![1]).toBe('not in');
@@ -562,9 +554,8 @@ describe('DashboardRegistrationsHandler', () => {
 
     /**
      * This arm terminalizes a run with a direct UPDATE, so it reaches neither
-     * `onExecutionComplete` nor `onRunTerminalCleanup` — the two places the
-     * pending job contexts are otherwise dropped. A cancelled run's needs-gated
-     * jobs are exactly the ones still holding a context.
+     * `onExecutionComplete` nor `onRunTerminalCleanup`, which otherwise drop
+     * the pending job contexts. A cancelled run's needs-gated jobs hold them.
      */
     it('drops the pending job contexts of every run it cancels', async () => {
       const reg = makeRegistrationRow({ id: 'reg-del-2' });
@@ -624,10 +615,9 @@ describe('DashboardRegistrationsHandler', () => {
   });
 
   describe('not-found results', () => {
-    // The `error` field on the *.result messages is the internal-error
-    // channel: the Platform maps any `error` to HTTP 500. A missing
-    // registration must answer `success: false` WITHOUT `error` so the
-    // Platform's `!success` → 404 branch serves the structured not-found.
+    // The Platform maps any `error` on a *.result to HTTP 500, so a missing
+    // registration answers `success: false` WITHOUT `error`, reaching the
+    // Platform's `!success` → 404 branch.
     let nfSend: ReturnType<typeof vi.fn>;
     let nfStore: any;
     let nfHandler: DashboardRegistrationsHandler;

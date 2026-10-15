@@ -1,26 +1,23 @@
 /**
  * Trigger an offline routed run against the local plane and discover its runId.
  *
- * A local repo has no forge to send a webhook, so this posts a GitHub-shaped
- * synthetic push to the plane's provider-agnostic generic webhook route (the
- * same wire shape the `kici-admin source trigger-local` path builds). The
- * webhook is unauthenticated (the edge accepts it and returns 202); the run is
- * created asynchronously, so this then polls the admin runs list — authenticated
- * with the plane's bootstrap admin token — to resolve the created runId.
+ * A local repo has no forge, so this posts a GitHub-shaped synthetic push to the
+ * plane's generic webhook route (the wire shape `kici-admin source trigger-local`
+ * builds). The webhook is unauthenticated (202) and the run is created
+ * asynchronously, so this polls the admin runs list with the plane's bootstrap
+ * admin token.
  *
- * The source's bundle hot-reload is debounced, so a first trigger can land
- * before the plane has registered the (re-pointed) local source. This resends
- * the webhook after a grace window until a run appears or the timeout elapses.
- * When the budget still runs out, the timeout is explained rather than merely
- * reported: the plane's own Raft role and its event-log record for this
- * delivery decide which cause is named.
+ * The source's bundle hot-reload is debounced, so a first trigger can land before
+ * the plane registers the (re-pointed) local source; while no delivery id has
+ * come back, this resends after a grace window until the timeout. A timeout is
+ * explained from the plane's Raft role and its event-log record for the delivery.
  */
 
 import { randomUUID } from 'node:crypto';
 import { AdminApiClient } from '@kici-dev/orchestrator';
 import { EventLogStatus, sleep } from '@kici-dev/engine';
 
-/** A minimal admin-read client (AdminApiClient.get) — injectable for tests. */
+/** AdminApiClient.get subset, injectable for tests. */
 export interface RunDiscoveryClient {
   get<T>(path: string): Promise<T>;
 }
@@ -33,15 +30,15 @@ export interface LocalTriggerInput {
   ref: string;
   sha: string;
   /**
-   * The commit before the run's snapshot. With it the changed files are
-   * `before..sha`; without it the push has no range.
+   * Commit before the run's snapshot: changed files are `before..sha`; without
+   * it the push has no range.
    */
   before?: string;
   defaultBranch: string;
   /**
-   * Dispatch event action (`dispatch()` `types` matcher key). Only used when
-   * `event === 'dispatch'`; the local normalizer reads it from `payload.action`,
-   * so exactly one `types`-filtered workflow matches.
+   * `dispatch()` `types` matcher key, used only when `event === 'dispatch'`; the
+   * local normalizer reads `payload.action`, so exactly one `types`-filtered
+   * workflow matches.
    */
   action?: string;
   /** Dispatch `client_payload` (steps read `ctx.rawPayload.client_payload`). */
@@ -55,16 +52,14 @@ export interface LocalTriggerRequest {
 }
 
 /**
- * Build the GitHub-shaped webhook request the plane's local provider normalizer
- * expects. Mirrors `buildLocalTriggerRequest` in the orchestrator's
- * `cli/commands/local-trigger.ts` (kept local, so the compiler imports no
- * orchestrator export for it).
+ * Mirrors `buildLocalTriggerRequest` in the orchestrator's
+ * `cli/commands/local-trigger.ts`, kept local so the compiler imports no
+ * orchestrator export for it.
  */
 export function buildLocalTriggerRequest(input: LocalTriggerInput): LocalTriggerRequest {
-  // A dispatch event carries `action` (the `types` matcher key) + `client_payload`
-  // alongside the GitHub-shaped ref/repository fields (kept for run provenance).
-  // The local normalizer reads `payload.action`, so a single `types`-filtered
-  // workflow matches. Push/PR events omit the dispatch-only fields.
+  // Dispatch adds `action` (the `types` matcher key the local normalizer reads from
+  // `payload.action`, so a `types`-filtered workflow matches) + `client_payload`;
+  // the ref/repository fields stay for run provenance.
   const body = JSON.stringify({
     ref: input.ref,
     ...(input.before && { before: input.before }),
@@ -86,14 +81,12 @@ export function buildLocalTriggerRequest(input: LocalTriggerInput): LocalTrigger
   };
 }
 
-/** Structured result of posting a local trigger to the plane. */
 export interface LocalTriggerResponse {
   status: number;
-  /** Routing-key-scoped delivery id echoed by the plane, or null if absent. */
+  /** Routing-key-scoped delivery id echoed by the plane. */
   deliveryId: string | null;
 }
 
-/** POST the trigger request to the plane. Returns the status + delivery id. */
 export async function sendLocalTrigger(
   planeUrl: string,
   req: LocalTriggerRequest,
@@ -108,7 +101,7 @@ export async function sendLocalTrigger(
     const parsed = (await res.json()) as { deliveryId?: unknown };
     if (typeof parsed.deliveryId === 'string') deliveryId = parsed.deliveryId;
   } catch {
-    // Non-JSON / bodyless response (e.g. a pre-registration 404) — no delivery id.
+    // Bodyless response (e.g. a pre-registration 404).
   }
   return { status: res.status, deliveryId };
 }
@@ -122,19 +115,17 @@ export interface TriggerRunOptions {
   pollIntervalMs?: number;
   resendAfterMs?: number;
   timeoutMs?: number;
-  /** Workdir the plane's local source points at — named in the lock-file diagnosis. */
+  /** Named in the lock-file diagnosis. */
   repoBasePath?: string;
-  /** Plane log path — named when nothing else explains the timeout. */
+  /** Plane log path, named when nothing else explains the timeout. */
   logPath?: string;
 }
 
-/** The `/cluster/health` fields the timeout diagnosis reads. */
 interface ClusterHealthResponse {
-  /** Raft role of this node: 'follower' | 'candidate' | 'leader'. */
+  /** 'follower' | 'candidate' | 'leader'. */
   role?: string;
 }
 
-/** The admin event-log list fields the timeout diagnosis reads. */
 interface EventLogListResponse {
   deliveries?: Array<{
     status?: string;
@@ -142,20 +133,18 @@ interface EventLogListResponse {
   }>;
 }
 
-/** What the diagnosis knows about the trigger that just timed out. */
 export interface TriggerTimeoutContext {
-  /** Routing-key-scoped delivery id, or null when the plane never accepted the webhook. */
+  /** Null when the plane never accepted the webhook. */
   deliveryId: string | null;
   orgId: string;
-  /** Commit the synthetic push carried (the workdir's overlay commit). */
+  /** The workdir's overlay commit. */
   sha: string;
   /** Absolute path the plane's local source points at — the run's workdir. */
   repoBasePath?: string;
-  /** Plane log path, named in the fallback so the developer has somewhere to look. */
   logPath?: string;
 }
 
-/** Raft role the plane reports, or null when `/cluster/health` cannot be read. */
+/** Null when `/cluster/health` cannot be read. */
 async function readPlaneRole(client: RunDiscoveryClient): Promise<string | null> {
   try {
     const health = await client.get<ClusterHealthResponse>('/cluster/health');
@@ -166,7 +155,6 @@ async function readPlaneRole(client: RunDiscoveryClient): Promise<string | null>
   }
 }
 
-/** The plane's own record of this delivery, or null when there is none to read. */
 async function readDelivery(
   client: RunDiscoveryClient,
   orgId: string,
@@ -182,12 +170,9 @@ async function readDelivery(
 }
 
 /**
- * Explain a trigger timeout in one line, from what the plane itself recorded.
- *
- * Ordered most-specific-first, and every branch is a fact read back off the
- * plane rather than an inference: the Raft role it reports, then the status it
- * wrote for THIS delivery, then the delivery id + log path so the developer has
- * a thread to pull even when neither surface answered.
+ * Explain a trigger timeout in one line, most specific first, from facts the
+ * plane recorded rather than inference: its Raft role, then the status it wrote
+ * for THIS delivery, then the delivery id + log path as a last thread to pull.
  */
 export async function diagnoseTriggerTimeout(
   client: RunDiscoveryClient,
@@ -227,12 +212,10 @@ export async function diagnoseTriggerTimeout(
 }
 
 /**
- * Trigger the run and resolve its runId. Sends the synthetic push, then polls
- * the admin runs list filtered by this webhook's routing-key-scoped delivery id
- * (`?deliveryId=`), resending the webhook past a grace window to absorb source
- * hot-reload latency. Correlating on the exact delivery id — rather than the
- * newest run in a time window — guarantees the follower attaches to the run
- * THIS invocation created, even when another local run lands concurrently.
+ * Send the synthetic push, then poll the admin runs list by this webhook's
+ * delivery id (`?deliveryId=`). Correlating on the exact delivery id, not the
+ * newest run in a time window, attaches the follower to the run THIS invocation
+ * created even when another local run lands concurrently.
  */
 export async function triggerRun(
   planeUrl: string,
@@ -246,10 +229,9 @@ export async function triggerRun(
   const timeoutMs = opts.timeoutMs ?? 60_000;
 
   const req = buildLocalTriggerRequest(input);
-  // The delivery id correlates the created run to THIS webhook. It is stable
-  // across resends (same x-delivery-id) and routing-key-scoped by the plane, so
-  // the client learns it only from the response body. Poll by it exactly — no
-  // "newest since" window, which would re-introduce the clock-skew collision.
+  // Stable across resends (same x-delivery-id) and routing-key-scoped by the
+  // plane, so the client learns it only from the response body. A "newest since"
+  // window would re-introduce the clock-skew collision.
   let deliveryId = (await sendLocalTrigger(planeUrl, req)).deliveryId;
 
   let lastSend = Date.now();
@@ -260,8 +242,8 @@ export async function triggerRun(
       if (runId) return runId;
     }
     if (Date.now() - lastSend > resendAfterMs) {
-      // Resend absorbs the source hot-reload debounce; capture the delivery id
-      // if the first send happened before the source was registered.
+      // Resends only while no delivery id came back (a send before the source
+      // registered), absorbing the hot-reload debounce.
       deliveryId ??= (await sendLocalTrigger(planeUrl, req)).deliveryId;
       lastSend = Date.now();
     }
@@ -277,7 +259,6 @@ export async function triggerRun(
   throw new Error(`offline run: ${cause}`);
 }
 
-/** Return the run created by this webhook delivery, or null when none yet. */
 async function findRunByDelivery(
   client: RunDiscoveryClient,
   deliveryId: string,

@@ -2,21 +2,19 @@ import { z } from 'zod';
 
 /**
  * What a context does with a run that arrives while its concurrency limit is
- * saturated. Single source of truth shared by the dashboard protection form, the
- * context domain type, the orchestrator's context store and protection
- * aggregate, and the concurrency gate.
+ * saturated. Shared by the dashboard protection form, the context domain type,
+ * the orchestrator's context store and protection aggregate, and the
+ * concurrency gate.
  *
- * - `queue` — hold the run until a slot frees. The strategy applied when a
- *   context sets a limit but no explicit strategy.
+ * - `queue` — hold the run until a slot frees. The default strategy.
  * - `cancel-pending` — drop the already-waiting run in favour of the new one.
  *
- * Not to be confused with the protection gates' `action` vocabulary
- * (`'hold' | 'wait' | 'queue'` on `ProtectionGateResult`), which shares the
- * `queue` spelling and means something else entirely.
+ * Unrelated to the `queue` in the protection gates' `action` vocabulary
+ * (`'hold' | 'wait' | 'queue'` on `ProtectionGateResult`).
  *
- * The orchestrator's `contexts.concurrency_strategy` column stays typed as
- * `string` so a row written by a different orchestrator version never fails to
- * map; this enum is the vocabulary every writer validates against.
+ * The orchestrator's `contexts.concurrency_strategy` column stays `string` so a
+ * row written by a different orchestrator version always maps; every writer
+ * validates against this enum.
  *
  * Pure Zod, no `node:*` imports — safe for the browser-facing engine barrel.
  */

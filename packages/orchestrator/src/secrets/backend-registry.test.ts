@@ -1,9 +1,3 @@
-/**
- * Tests for BackendRegistry.
- *
- * Verifies CRUD operations on secret_backends table, config encryption,
- * and SecretStore factory methods.
- */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { BackendRegistry } from './backend-registry.js';
 import { encrypt, decrypt, deriveKey } from '@kici-dev/shared';
@@ -130,10 +124,8 @@ describe('BackendRegistry', () => {
       expect(result.name).toBe('new-vault');
       expect(result.backendType).toBe('vault');
 
-      // Verify insertInto was called with secret_backends
       expect(mocks.insertInto).toHaveBeenCalledWith('secret_backends');
 
-      // Verify the values contain encrypted config (not plaintext)
       const insertCall = mocks.insertValues.mock.calls[0][0];
       expect(insertCall.config_encrypted).toBeDefined();
       expect(insertCall.config_encrypted).not.toContain('vaultUrl');

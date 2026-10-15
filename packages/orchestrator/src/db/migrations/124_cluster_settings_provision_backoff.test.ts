@@ -3,12 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './124_cluster_settings_provision_backoff.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 124: asserts the three external-provision
- * backoff columns exist on `cluster_settings` as nullable BIGINTs after
- * migrations 001..124, and that up/down are idempotent. Gated on
+ * Real-Postgres test for migration 124: the external-provision backoff columns are nullable
+ * BIGINTs on `cluster_settings`, and up/down are idempotent. Gated on
  * `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
@@ -76,11 +75,9 @@ describeDb('migration 124_cluster_settings_provision_backoff', () => {
     for (const column of BACKOFF_COLUMNS) {
       const state = await columnState('cluster_settings', column);
       expect(state.exists, `${column} should exist`).toBe(true);
-      // Nullable with no DEFAULT: NULL is the "operator never set this" signal
-      // the reader turns into the configured default.
+      // No DEFAULT: NULL means "never set", which the reader turns into the configured default.
       expect(state.nullable, `${column} should be nullable`).toBe(true);
-      // BIGINT, not INTEGER: a ceiling an operator widens to a day leaves
-      // INTEGER range.
+      // A ceiling widened to a day leaves INTEGER range.
       expect(state.dataType, `${column} should be bigint`).toBe('bigint');
     }
   });

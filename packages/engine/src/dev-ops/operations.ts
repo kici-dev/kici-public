@@ -1,25 +1,24 @@
 /**
- * The developer-operations API contract. One row per workflow-developer-core
+ * The developer-operations API contract: one row per workflow-developer-core
  * operation, declaring which entrypoints expose it — HTTP (the shared REST API
- * behind both the web UI and the `kici` CLI), MCP (the agent tool surface), and
- * a curated UI flag. The congruence tests assert each entrypoint's real surface
- * matches this registry, so a new route / CLI command / MCP tool that drifts
- * from the contract fails the build.
+ * behind both the web UI and the `kici` CLI), the CLI, MCP (the agent tool
+ * surface), and a curated UI flag. Congruence tests assert each entrypoint's
+ * real surface matches this registry, so a route / CLI command / MCP tool that
+ * drifts from the contract fails the build.
  *
- * Three row states, one honest ledger:
+ * Row states:
  *
- * - **Live everywhere it should be** — `entrypoints.mcp: true` with `mcpTool`
- *   set. The registered developer MCP tools land here; their booleans mirror the
- *   actual current surface so every harness passes on landing.
+ * - **Live** — `entrypoints.mcp: true` with `mcpTool` set. The booleans mirror
+ *   the actual current surface.
  * - **Planned MCP tool** — `mcpAppropriate: true` but `entrypoints.mcp: false`,
- *   `mcpTool: null`. An agent-appropriate op that exists in HTTP/CLI but is not
- *   yet an MCP tool. The consistency test permits this (`mcp ⟹ mcpAppropriate`,
- *   not the converse), so the row is a visible, testable to-do.
+ *   `mcpTool: null`: in HTTP/CLI, not yet an MCP tool. The consistency test
+ *   permits this (`mcp ⟹ mcpAppropriate`, not the converse), so the row is a
+ *   visible, testable to-do.
  * - **Never an MCP tool** — `mcpAppropriate: false`, `entrypoints.mcp: false`.
  *   Secret-value writes and destructive deletes: agent safety encoded in data.
  *
- * Browser-safe: data + TypeScript types only, no Node imports, so it lives in
- * the engine barrel importable by the web UI, the CLI, and the Platform.
+ * Browser-safe (no Node imports), so the web UI, the CLI and the Platform all
+ * import it from the engine barrel.
  */
 export type DeveloperOpDomain =
   | 'runs'
@@ -37,7 +36,7 @@ export type DeveloperOpDomain =
 
 export type DeveloperOpKind = 'read' | 'write';
 
-/** Which of the three entrypoints a developer op is (or should be) exposed on. */
+/** Which entrypoints a developer op is (or should be) exposed on. */
 export interface DeveloperOpEntrypoints {
   /** The shared Platform REST API (backs both the web UI and the `kici` CLI). */
   http: boolean;
@@ -62,10 +61,10 @@ export interface DeveloperOperation {
   mcpTool: string | null;
   /**
    * True when the op acts on a specific repository's resource and must honour
-   * the caller's repo glob patterns on EVERY entrypoint. Required on every row
-   * so a new op cannot compile without an explicit decision, and NOT derivable
-   * from `domain` — `workflows.list` is repo-scoped while `secrets.list`, whose
-   * rows are context-keyed with no repository to scope against, is not.
+   * the caller's repo glob patterns on EVERY entrypoint. Required, so a new op
+   * cannot compile without an explicit decision. Not derivable from `domain`:
+   * `workflows.list` is repo-scoped, while `secrets.list` (context-keyed, no
+   * repository to scope against) is not.
    */
   repoScoped: boolean;
 }
@@ -228,13 +227,12 @@ export const DEVELOPER_OPERATIONS: readonly DeveloperOperation[] = [
     false,
   ),
   // held-runs
-  // No `cli` / `mcp`: neither plane exposes listing holds as an operation of
-  // its own. `kici approve` / `kici reject` / `kici run` do read this route
-  // (`listHeldRunsForRun` in the compiler's `held-run-client.ts`), but only as
-  // an internal step of resolving the hold they are about to act on — there is
-  // no `kici held-runs list` command for the CLI congruence guard to bind. The
-  // MCP tools never reach the route at all: `approve_run` / `reject_run` relay
-  // through the private `resolveHeldRunForRun` path instead.
+  // No `cli` / `mcp`: neither exposes listing holds as its own operation.
+  // `kici approve` / `kici reject` / `kici run` read this route
+  // (`listHeldRunsForRun` in the compiler's `held-run-client.ts`) only to
+  // resolve the hold they act on; there is no `kici held-runs list` command for
+  // the CLI congruence guard to bind. `approve_run` / `reject_run` never reach
+  // the route: they relay through the private `resolveHeldRunForRun` path.
   op('held-runs.list', 'held-runs', 'read', { http: true, ui: true }, false, null, true),
   op(
     'held-runs.approve',

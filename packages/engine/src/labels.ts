@@ -1,14 +1,9 @@
 import { z } from 'zod';
 
 /**
- * Structured auto-labels with category prefixes.
- *
- * Auto-labels are injected into agent label sets so that workflows can target
- * specific platforms, architectures, scaler types, hosts, etc. without
- * requiring manual label configuration.
- *
- * All auto-labels use the `kici:` namespace prefix to distinguish them from
- * user-defined labels. Users cannot set labels with this prefix.
+ * Structured auto-labels, injected into agent label sets so workflows can target
+ * platforms, architectures, scaler types, hosts, etc. without manual label
+ * configuration. All use the `kici:` prefix, which users cannot set.
  *
  * Categories:
  *   kici:os:      — operating system (kici:os:linux, kici:os:macos, kici:os:windows)
@@ -81,8 +76,7 @@ export type ScalerArch = z.infer<typeof ScalerArch>;
 /**
  * Structured platform of a scaler pool: the single source of truth for both the
  * auto-injected `kici:os:*` / `kici:arch:*` labels and the mandatory platform
- * taint. Declaring it once removes the ambiguity of matching plain string
- * labels against a denylist.
+ * taint, instead of matching plain string labels against a denylist.
  */
 export const scalerPlatformSchema = z.object({ os: ScalerOs, arch: ScalerArch }).strict();
 export type ScalerPlatform = z.infer<typeof scalerPlatformSchema>;
@@ -110,10 +104,9 @@ export function platformToOsArchLabels(platform: ScalerPlatform): string[] {
 }
 
 /**
- * Derive the plain platform-taint labels for a declared structured platform.
- * Returns the canonical tokens (`macos`, `windows`, `arm64`) that a job's
+ * Derive the plain platform-taint tokens (`macos`, `windows`, `arm64`) a job's
  * `runsOn` must include to allocate on the pool. The linux/x64 default carries
- * no taint. It derives from the structured field, so a pool labeled
+ * no taint. Derived from the structured field, so a pool labeled
  * `windows-2022` still taints correctly.
  */
 export function platformToTaints(platform: ScalerPlatform): string[] {
@@ -152,9 +145,8 @@ export function nodeArchToScalerArch(nodeArch: string): ScalerArch | null {
 
 /**
  * Build a structured platform from the host's `os.platform()` / `os.arch()`.
- * Returns null when either component is not one of the supported enum values,
- * so a caller can fall back to the legacy host-label derivation for exotic
- * hosts.
+ * Returns null when either is unsupported, so a caller can fall back to the
+ * host-label derivation for exotic hosts.
  */
 export function hostToScalerPlatform(
   nodePlatform: string,
@@ -197,26 +189,18 @@ export function scalerLabel(backendName: string): string {
   return `kici:scaler:${backendName}`;
 }
 
-/**
- * Merges explicit labels with auto-derived structured labels.
- * Deduplicates the result.
- */
+/** Merge explicit labels with auto-derived structured labels, de-duplicated. */
 export function mergeAutoLabels(labels: string[], autoLabels: string[]): string[] {
   return [...new Set([...labels, ...autoLabels])];
 }
 
-/**
- * Normalized runsOn result with labels and exclude arrays.
- */
+/** Normalized `runsOn`. */
 export interface NormalizedRunsOn {
   labels: string[];
   exclude: string[];
 }
 
-/**
- * Normalize the polymorphic runsOn value into a consistent object form.
- * Accepts string, string[], or { labels, exclude? } object.
- */
+/** Normalize the polymorphic `runsOn` value into its object form. */
 export function normalizeRunsOn(
   runsOn: string | string[] | { labels: string | string[]; exclude?: string | string[] },
 ): NormalizedRunsOn {
@@ -240,16 +224,15 @@ export function normalizeRunsOn(
  */
 export const KNOWN_ROLES = ['builder', 'init-runner'] as const;
 
-/** Agent role type derived from KNOWN_ROLES. */
 export type AgentRole = (typeof KNOWN_ROLES)[number];
 
 /** Reserved label prefix — labels starting with this are system-managed. */
 export const RESERVED_LABEL_PREFIX = 'kici:';
 
 /**
- * Capability label prefix — `kici:capability:<name>` grants an agent a
- * privileged capability beyond plain execution. Distinct from `kici:role:`
- * (which gates which internal job kinds an agent runs).
+ * `kici:capability:<name>` grants an agent a privileged capability beyond plain
+ * execution. Distinct from `kici:role:`, which gates the internal job kinds an
+ * agent runs.
  */
 export const CAPABILITY_LABEL_PREFIX = 'kici:capability:';
 
@@ -259,24 +242,20 @@ export function capabilityLabel(name: string): string {
 }
 
 /**
- * The `ssh-transport` capability: an agent holding this may run the bootstrap
- * bring-up (`ctx.kici.bootstrap.ensureInitRunner` / `preBootSend`) — i.e. SSH
- * to a declared-but-un-agented host. The orchestrator refuses to run a
- * bring-up on an agent that lacks it. Prod-critical: such an agent custodies
- * the bootstrap SSH key.
+ * The `ssh-transport` capability: only an agent holding it may run the bootstrap
+ * bring-up (`ctx.kici.bootstrap.ensureInitRunner` / `preBootSend`), i.e. SSH to
+ * a declared-but-un-agented host. Prod-critical: such an agent custodies the
+ * bootstrap SSH key.
  */
 export const SSH_TRANSPORT_CAPABILITY = 'kici:capability:ssh-transport';
 
 /**
- * Runtime-fact label prefix — `kici:runtime:<name>` states something the AGENT
- * discovered about its own host.
+ * `kici:runtime:<name>` states something the AGENT discovered about its own host.
  *
- * Deliberately NOT `kici:capability:`. That prefix grants a privilege
- * (`ssh-transport` custodies the bootstrap SSH key), so it must stay
- * token-bound and an agent must never be able to self-assert it. A runtime fact
- * grants nothing: it reports what the host can do, the way `kici:os:` reports
- * what the host is, and it is self-reported for the same reason — the scaler
- * cannot predict it at token-mint time.
+ * Deliberately NOT `kici:capability:`, which grants a privilege and so stays
+ * token-bound, never self-asserted. A runtime fact grants nothing: it reports
+ * what the host can do, as `kici:os:` reports what it is, and is self-reported
+ * because the scaler cannot predict it at token-mint time.
  */
 export const RUNTIME_LABEL_PREFIX = 'kici:runtime:';
 
@@ -291,14 +270,13 @@ export function runtimeLabel(name: string): string {
  * - `docker` / `podman` — that container runtime's socket answered, so the
  *   agent can nest a job container.
  * - `container-build` — a `docker` / `podman` CLI is on PATH, so the agent can
- *   build a job's image from a Dockerfile. Distinct from the two above: a host
- *   reachable only through a mounted socket can RUN containers but not BUILD
- *   one, because the build shells out to the CLI.
+ *   build a job's image from a Dockerfile. A host reachable only through a
+ *   mounted socket can RUN containers but not BUILD one: the build shells out
+ *   to the CLI.
  * - `job-image` — the agent runs inside one job's own container image, started
- *   for that job. Any other job would run in an image it never declared, so the
- *   orchestrator gives such an agent no other work. The fact only ever
- *   restricts the agent reporting it, so taking it on the agent's word grants
- *   nothing.
+ *   for that job, so the orchestrator gives it no other work (any other job
+ *   would run in an image it never declared). It only restricts the agent
+ *   reporting it, so taking it on the agent's word grants nothing.
  */
 export const RuntimeFact = z.enum(['docker', 'podman', 'container-build', 'job-image']);
 export type RuntimeFact = z.infer<typeof RuntimeFact>;
@@ -310,10 +288,9 @@ export const CONTAINER_BUILD_RUNTIME_LABEL = runtimeLabel(RuntimeFact.enum['cont
 export const JOB_IMAGE_RUNTIME_LABEL = runtimeLabel(RuntimeFact.enum['job-image']);
 
 /**
- * Agent-feature label prefix — `kici:agent-feature:<name>` states a behaviour
- * the agent BUILD implements. Like `kici:runtime:`, it is a fact, not a
- * privilege: it lets the orchestrator route work that depends on the behaviour
- * to an agent that has it, and asserting it grants nothing.
+ * `kici:agent-feature:<name>` states a behaviour the agent BUILD implements.
+ * Like `kici:runtime:`, it is a fact, not a privilege: it routes work that
+ * depends on the behaviour to an agent that has it, and grants nothing.
  */
 export const AGENT_FEATURE_LABEL_PREFIX = 'kici:agent-feature:';
 
@@ -344,11 +321,10 @@ export const GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL = agentFeatureLabel(
 export const AGENT_FEATURE_LABELS: readonly string[] = AgentFeature.options.map(agentFeatureLabel);
 
 /**
- * The `kici:init` lifecycle label carried by a temporary init-runner agent
- * brought up on a fresh box for bootstrap. Marks it as ephemeral + privileged;
- * it dies on reboot and is reaped. Distinct from `kici:role:init-runner`
- * (which is the per-job `__init__` workspace-init capability — a different
- * concept entirely).
+ * The `kici:init` lifecycle label of a temporary init-runner agent brought up
+ * on a fresh box for bootstrap: ephemeral + privileged, it dies on reboot and
+ * is reaped. Unrelated to `kici:role:init-runner`, the per-job `__init__`
+ * workspace-init capability.
  */
 export const INIT_LABEL = 'kici:init';
 
@@ -358,22 +334,17 @@ export const INIT_LABEL = 'kici:init';
  */
 export const PRIVILEGED_ROOT_LABEL = 'kici:privileged:root';
 
-/** Role label prefix — used to generate role-specific labels. */
 export const ROLE_LABEL_PREFIX = 'kici:role:';
 
-/**
- * Convert a role name to its corresponding label.
- */
+/** Convert a role name to its label. */
 export function roleToLabel(role: AgentRole): string {
   return `${ROLE_LABEL_PREFIX}${role}`;
 }
 
 /**
- * The label every pre-run evaluation job routes to.
- *
- * Exported because three dispatch sites and the global eval round all target
- * it, and each had spelled the string out. Derived from {@link roleToLabel} so
- * it cannot drift from the prefix or from `KNOWN_ROLES`.
+ * The label every pre-run evaluation job routes to, shared by the dispatch
+ * sites and the global eval round. Derived from {@link roleToLabel} so it
+ * cannot drift from the prefix or from `KNOWN_ROLES`.
  */
 export const INIT_RUNNER_ROLE_LABEL = roleToLabel('init-runner');
 
@@ -396,28 +367,21 @@ export function resolveRoleLabels(roles: readonly string[] | undefined): string[
  * The full label set a scaler injects into an agent it spawns: the base label
  * set plus the scaler-assigned `kici:agent:`, `kici:scaler:`, `kici:role:`, and
  * platform-taint labels. This is exactly what the scaler writes into
- * `KICI_LABELS`, and it is the set an ephemeral agent token must be bound to —
- * the agent then adds only the self-reported platform facts (`kici:os:`,
- * `kici:arch:`, `kici:host:`) at registration, which the orchestrator's
- * register-time scope gate exempts (see `isSelfReportedLabel`). Keep this
- * aligned with the agent's wire-label construction in
- * `orchestrator-client.ts#sendAgentRegister`.
+ * `KICI_LABELS` and the set an ephemeral agent token must be bound to; the
+ * agent adds only self-reported facts at registration, which the
+ * orchestrator's register-time scope gate exempts (see `isSelfReportedLabel`).
+ * Keep this aligned with `orchestrator-client.ts#sendAgentRegister`.
  *
  * `platformTaints` are the plain tokens (`windows`, `macos`, `arm64`) derived
- * from the pool's resolved platform. A taint is a routing GRANT, not a host
- * fact: it is what a job's `runsOn` names to reach this pool, and the matcher
- * gates on it. So the orchestrator asserts it here — bound into the agent's
- * ephemeral token — rather than letting the agent self-report it. Adding these
- * prefixes to `SELF_REPORTED_LABEL_PREFIXES` instead would let any agent claim
- * any platform unchallenged, which is the opposite of a gate. The caller must
- * derive them from the same source the gate uses
- * (`ScalerManager.resolveScalerPlatform`) — deriving them twice is exactly the
- * defect this parameter closes.
+ * from the pool's resolved platform. A taint is a routing GRANT the matcher
+ * gates on, not a host fact, so the orchestrator binds it into the ephemeral
+ * token here; making it self-reported would let any agent claim any platform
+ * unchallenged. The caller must derive them from the same source the gate uses
+ * (`ScalerManager.resolveScalerPlatform`), never a second derivation.
  *
- * The result is de-duplicated in first-seen order: a warm pool measures its
- * readiness with a label set that already carries the taints, so it passes them
- * as `labelSet` AND as `platformTaints`, and a label repeated in the set an
- * ephemeral token is bound to is never meaningful.
+ * The result is de-duplicated in first-seen order: a warm pool measures
+ * readiness with a label set that already carries the taints, so it passes
+ * them as both `labelSet` and `platformTaints`.
  */
 export function scalerAgentLabels(
   labelSet: string[],
@@ -439,43 +403,36 @@ export function scalerAgentLabels(
 
 /**
  * Label-category prefixes the agent self-reports at registration from its own
- * host: operating system, CPU architecture, hostname, and runtime facts. They
- * are platform facts, not authorization grants, so the orchestrator's
- * register-time label-scope gate does not require an ephemeral token to be
- * bound to them.
+ * host or build: operating system, CPU architecture, hostname, runtime facts
+ * and agent features. They are facts, not authorization grants, so the
+ * orchestrator's register-time label-scope gate does not require an ephemeral
+ * token to be bound to them.
  *
- * Adding a prefix here lets any agent assert it unchallenged. That is correct
- * for a fact about the host and WRONG for anything that grants a privilege —
- * `kici:capability:` is absent from this list for exactly that reason.
+ * Any agent can assert a prefix listed here unchallenged: correct for a fact,
+ * WRONG for a privilege, which is why `kici:capability:` is absent.
  */
 export const SELF_REPORTED_LABEL_PREFIXES = [
   'kici:os:',
   'kici:arch:',
   'kici:host:',
-  // Runtime FACTS (what the host can do), never `kici:capability:` (which
-  // grants a privilege and stays token-bound). The scaler cannot know at
-  // token-mint time whether a host has a container runtime or a build CLI —
-  // that is the agent's own discovery, which is exactly why gating on an
-  // orchestrator-side probe stranded container jobs before.
+  // The scaler cannot know at token-mint time whether a host has a container
+  // runtime or a build CLI; gating on an orchestrator-side probe strands
+  // container jobs, so the agent's own discovery decides.
   RUNTIME_LABEL_PREFIX,
-  // Behaviour facts about the agent build (`kici:agent-feature:`), not a
-  // privilege: asserting one only routes to the agent work it claims to handle.
+  // Asserting a feature only routes to the agent work it claims to handle.
   AGENT_FEATURE_LABEL_PREFIX,
 ] as const;
 
 /**
- * True if a label is a self-reported platform fact (os/arch/host) rather than a
- * scaler-assigned, authorization-bearing label. Used by the agent register-time
- * scope gate to avoid flagging the agent's own platform labels as "elevated".
+ * True if a label carries a {@link SELF_REPORTED_LABEL_PREFIXES} prefix rather
+ * than being scaler-assigned and authorization-bearing. The agent
+ * register-time scope gate uses it to avoid flagging those labels as "elevated".
  */
 export function isSelfReportedLabel(label: string): boolean {
   return SELF_REPORTED_LABEL_PREFIXES.some((p) => label.startsWith(p));
 }
 
-/**
- * Validate that no labels use the reserved kici: prefix.
- * Throws if any reserved labels are found (case-insensitive check).
- */
+/** Throw if any label uses the reserved `kici:` prefix (case-insensitive). */
 export function validateNoReservedLabels(labels: string[], source: string): void {
   const reserved = labels.filter((l) => l.toLowerCase().startsWith(RESERVED_LABEL_PREFIX));
   if (reserved.length > 0) {
@@ -485,16 +442,12 @@ export function validateNoReservedLabels(labels: string[], source: string): void
   }
 }
 
-/**
- * Check if a label is an auto-generated system label (has the kici: prefix).
- */
+/** Whether a label is an auto-generated system label (`kici:` prefix, case-insensitive). */
 export function isAutoLabel(label: string): boolean {
   return label.toLowerCase().startsWith(RESERVED_LABEL_PREFIX);
 }
 
-/**
- * Separate labels into user-defined and auto-generated (kici: prefixed) groups.
- */
+/** Split labels into user-defined and auto-generated (`kici:`) groups. */
 export function separateLabels(labels: string[]): { userLabels: string[]; autoLabels: string[] } {
   const userLabels: string[] = [];
   const autoLabels: string[] = [];

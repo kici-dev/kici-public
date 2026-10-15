@@ -4,15 +4,13 @@
  * The event scaler performs no local compute: its `spawn()` / `destroy()` emit
  * reserved `kici.`-prefixed custom events (`kici.scaler.scale-up` /
  * `kici.scaler.scale-down`) that a customer-authored provisioning / teardown
- * workflow consumes via the `kiciEvent()` trigger. These schemas define the
- * event payloads and the single source of truth for the reserved event names.
+ * workflow consumes via the `kiciEvent()` trigger.
  *
  * They live here, not in the orchestrator, because both sides of the contract
  * need them: the orchestrator emits, and a workflow file — which may import
  * `@kici-dev/sdk` and nothing else — consumes. Engine is the only package both
- * the SDK and the orchestrator depend on, so it is the shared floor. The SDK
- * re-exports all four symbols; the orchestrator's `scaler/scaler-events.ts`
- * re-exports them for its own call sites.
+ * depend on. The SDK re-exports these symbols; the orchestrator's
+ * `scaler/scaler-events.ts` re-exports them for its own call sites.
  */
 
 import { z } from 'zod';

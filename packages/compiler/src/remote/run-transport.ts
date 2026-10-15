@@ -1,10 +1,7 @@
 /**
- * The one interface `kici run remote` drives a run through, whichever way it
- * reaches the orchestrator: relayed by the KiCI Platform, or direct.
- *
- * The run loop calls `initUpload` → `uploadTarball` → `trigger`, then polls
- * `status` and `logs`, cancels on Ctrl-C, and answers holds through `holds`.
- * Each adapter maps those calls onto its own client.
+ * The one interface `kici run remote` drives a run through, relayed by the KiCI
+ * Platform or direct. The run loop calls `initUpload` → `uploadTarball` →
+ * `trigger`, polls `status` and `logs`, cancels on Ctrl-C and answers `holds`.
  */
 import pc from 'picocolors';
 import { logger } from '@kici-dev/core';
@@ -30,7 +27,6 @@ import { HoldsUnavailableError, type DirectRunClient, type DirectWhoami } from '
 import { uploadTarball, type UploadResult } from './uploader.js';
 import { describeUploadFailure } from './upload-failure.js';
 
-/** How a run's holds are listed and answered on one transport. */
 interface RunHoldAccess {
   list(runId: string): Promise<HeldRunSummary[]>;
   /** The decision context, or null when holds cannot be answered from here. */
@@ -43,9 +39,9 @@ interface RunHoldAccess {
 
 export interface RunRemoteTransport {
   readonly kind: 'platform' | 'direct';
-  /** The base URL requests go to (Platform API or orchestrator). */
+  /** Platform API or orchestrator base URL. */
   readonly endpoint: string;
-  /** Lines printed before the run starts, naming where it goes. */
+  /** Printed before the run starts, naming where it goes. */
   readonly banner: string[];
   initUpload(body: PlatformUploadInitInput): Promise<PlatformUploadInitResponse>;
   uploadTarball(opts: {
@@ -60,7 +56,7 @@ export interface RunRemoteTransport {
   readonly holds: RunHoldAccess;
 }
 
-/** Upload the overlay, naming the address and setting when the PUT fails. */
+/** A failed PUT names the address and the setting to check. */
 async function uploadWithDiagnosis(opts: {
   tarballPath: string;
   signedUrl: string;
@@ -147,8 +143,7 @@ export function createDirectTransport(opts: {
         try {
           return await client.listHolds(orgId, runId);
         } catch (err) {
-          // A token without the trust-policy permissions, or an orchestrator
-          // without the routes: name the operator command that can answer.
+          // Missing trust-policy permissions or routes: name the operator command.
           if (err instanceof HoldsUnavailableError && err.status !== 409) {
             throw new HoldsUnavailableError(
               `${err.message}. An operator answers this run's holds with \`kici-admin held-run approve --org ${orgId} --run-id ${runId}\`.`,

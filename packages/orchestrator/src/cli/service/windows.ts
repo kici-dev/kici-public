@@ -1,10 +1,7 @@
 /**
- * Windows service manager using shawl + sc.exe.
- *
- * Uses shawl (https://github.com/mtkennerly/shawl) to wrap the KiCI
- * executable as a Windows service. Shawl is downloaded as a lazy
- * dependency on first use. Service configuration (auto-start, recovery)
- * is handled via sc.exe.
+ * Windows service manager: shawl (https://github.com/mtkennerly/shawl), a lazy
+ * dependency downloaded on first use, wraps the executable as a service, and
+ * sc.exe configures auto-start and recovery.
  */
 
 import { execSync } from 'node:child_process';
@@ -36,36 +33,22 @@ import {
 import { sleep } from '@kici-dev/engine';
 
 /**
- * How long a discovery-path probe of the service registry may run.
+ * How long a discovery-path probe of the service registry may run. Matches the
+ * compose driver's `RUNTIME_PROBE_TIMEOUT_MS` and `killSignal`: a discovery read
+ * must fail in seconds, not hang a `kici-admin` command, and a client blocked on
+ * an unresponsive service ignores SIGTERM.
  *
- * Matches the compose driver's `RUNTIME_PROBE_TIMEOUT_MS`, for the same reason
- * and with the same `killSignal`: a registry read on the discovery path must
- * fail in seconds rather than hang a `kici-admin` command indefinitely, and a
- * client blocked on an unresponsive service ignores a polite SIGTERM.
- *
- * Only the two discovery calls take it — `available()` and `list()`. The
- * lifecycle `sc.exe` calls are a deliberate exception: they act on ONE named
- * service the operator asked for, so a slow answer there is the operator's own
- * install/uninstall taking its time, not a scan silently reporting a shorter
- * host.
- *
- * The healthy cost is not quoted here, unlike compose's, because it cannot be
- * measured from this repo's Linux hosts — it is dominated by PowerShell
- * startup and is the same shape as `list()`'s own call.
+ * Only `available()` and `list()` take it. The lifecycle `sc.exe` calls act on
+ * ONE service the operator named, so a slow answer there is the operator's own
+ * install/uninstall, not a scan silently reporting a shorter host. Unlike
+ * compose's, the healthy cost is not quoted: it is dominated by PowerShell
+ * startup and cannot be measured from this repo's Linux hosts.
  */
 const SERVICE_REGISTRY_PROBE_TIMEOUT_MS = 10_000;
 
 /**
- * Map Windows service state codes to our ServiceState type.
- *
- * Windows sc.exe query output includes STATE codes:
- * - 1: STOPPED
- * - 2: START_PENDING
- * - 3: STOP_PENDING
- * - 4: RUNNING
- * - 5: CONTINUE_PENDING
- * - 6: PAUSE_PENDING
- * - 7: PAUSED
+ * sc.exe STATE codes: 1 STOPPED, 2 START_PENDING, 3 STOP_PENDING, 4 RUNNING,
+ * 5 CONTINUE_PENDING, 6 PAUSE_PENDING, 7 PAUSED.
  */
 function parseWindowsState(stateCode: number): ServiceState {
   switch (stateCode) {
@@ -84,10 +67,7 @@ function parseWindowsState(stateCode: number): ServiceState {
   }
 }
 
-/**
- * Parse the PID from sc.exe query output.
- * Looks for the PID line: "        PID                : 1234"
- */
+/** The PID from sc.exe query output (`PID : 1234`); 0 means no process. */
 function parsePid(output: string): number | undefined {
   const match = output.match(/PID\s*:\s*(\d+)/);
   if (match && match[1] !== '0') {
@@ -96,10 +76,7 @@ function parsePid(output: string): number | undefined {
   return undefined;
 }
 
-/**
- * Parse the STATE code from sc.exe query output.
- * Looks for: "        STATE              : 4  RUNNING"
- */
+/** The STATE code from sc.exe query output (`STATE : 4  RUNNING`). */
 function parseStateCode(output: string): number | undefined {
   const match = output.match(/STATE\s*:\s*(\d+)/);
   return match ? parseInt(match[1], 10) : undefined;
@@ -115,10 +92,7 @@ const ERROR_SERVICE_CANNOT_ACCEPT_CTRL = 1061;
 const SERVICE_USE = 'as a Windows service';
 const SERVICE_REMEDY = 'Install from a path without it.';
 
-/**
- * The command shawl registers for the service: the executable and its
- * arguments, with a batch file run through cmd.exe ({@link BATCH_WRAPPER_ARGS}).
- */
+/** The command shawl registers; a batch file runs through cmd.exe ({@link BATCH_WRAPPER_ARGS}). */
 function serviceCommand(config: ServiceConfig): string[] {
   const command = [config.executablePath, ...(config.args ?? [])];
   if (!isBatchFile(config.executablePath)) return command;
@@ -142,18 +116,12 @@ export class WindowsServiceManager implements ServiceManager {
   readonly platform = 'windows' as const;
 
   /**
-   * True when the service registry this driver reads actually answers.
-   *
-   * Probes the same subsystem `list()` reads — CIM's `Win32_Service` — with a
-   * filter that cannot match, so a healthy host answers with an empty result
-   * set and exits 0. It deliberately does NOT probe for the presence of
-   * `powershell` or `sc.exe`: a client-only probe is exactly the defect this
-   * driver's compose sibling had, where the client answered on a host whose
-   * registry was down and the empty scan then pruned live rows.
-   *
-   * A name filter rather than a well-known service name: no service is assumed
-   * to exist, and no display string is parsed, so the probe carries no locale
-   * or Windows-edition assumption.
+   * True when the service registry `list()` reads (CIM `Win32_Service`)
+   * answers: a filter that cannot match returns an empty set and exit 0.
+   * It does NOT probe for `powershell` or `sc.exe`: a client-only probe let the
+   * compose sibling answer while its registry was down, and the empty scan
+   * then pruned live rows. A name filter assumes no service exists and parses
+   * no display string, so the probe has no locale or edition assumption.
    */
   async available(): Promise<boolean> {
     try {
@@ -171,11 +139,7 @@ export class WindowsServiceManager implements ServiceManager {
     }
   }
 
-  /**
-   * Check whether a Windows service is currently registered.
-   * `sc.exe query` exits non-zero (execSync throws) when the service does
-   * not exist; exit 0 means it exists (possibly pending-delete).
-   */
+  /** `sc.exe query` exits 0 when the service exists, possibly pending-delete. */
   private serviceExists(name: string): boolean {
     try {
       execSync(`sc.exe query ${name}`, { stdio: 'pipe' });
@@ -207,42 +171,33 @@ export class WindowsServiceManager implements ServiceManager {
       );
     }
 
-    // Ensure env file directory exists
     const envDir = path.dirname(config.envFilePath);
     fs.mkdirSync(envDir, { recursive: true });
 
-    // Only LocalSystem and Administrators may read the folder that holds the
-    // env file; the log folder created below inherits the same ACL. This also
-    // restricts the folder of an instance an older CLI installed, which every
-    // archive upgrade registers again through this method. It runs while the
-    // installed service is still in place, so a failure leaves it registered.
-    // A user-level folder sits in the profile of its user, which no other
-    // account can read.
+    // Only LocalSystem and Administrators may read the env file's folder; the
+    // log folder below inherits the ACL. It also covers a folder an older CLI
+    // installed, since every archive upgrade re-registers through here. It runs
+    // before the uninstall, so a failure leaves the service registered. A
+    // user-level folder sits in its user's profile, which no other account reads.
     if (!config.isUserLevel) restrictEnvFileAccess(config.envFilePath);
 
-    // Idempotency: if the service is already registered (or pending-delete
-    // from a prior deploy whose stop/delete didn't cleanly finish), remove it
-    // first — reusing uninstall()'s stop → delete → poll-until-gone — so
-    // `shawl add` never hits `sc create` 1073 (ERROR_SERVICE_EXISTS). The
-    // existence guard is required: uninstall() runs `sc.exe delete`, which
-    // throws on a non-existent service, so a fresh box must skip it. Do NOT
-    // wrap uninstall() in try/catch — its clear hung-process error must
-    // propagate instead of surfacing later as a cryptic 1073.
+    // A registered or pending-delete service is removed first through
+    // uninstall()'s stop → delete → poll-until-gone, so `shawl add` never hits
+    // `sc create` 1073 (ERROR_SERVICE_EXISTS). The existence guard is required:
+    // `sc.exe delete` throws on a missing service. Do NOT wrap uninstall() in
+    // try/catch — its hung-process error must propagate, not become a later 1073.
     if (this.serviceExists(config.name)) {
       await this.uninstall(config);
     }
 
-    // Download shawl via lazy deps
     const depMeta = getDepMetadata('shawl');
     const cacheDir = getCacheDir();
     const depPath = await ensureDep(depMeta, cacheDir);
     const shawlExe = path.join(depPath, depMeta.extractPath);
 
-    // Register the service via shawl.
-    // Strip trailing backslash from paths to avoid escaping the closing quote
-    // on Windows (e.g., "C:\dir\" is parsed as "C:\dir" with escaped quote).
+    // A trailing backslash would escape the closing quote ("C:\dir\" parses as
+    // "C:\dir" plus an escaped quote).
     const cwd = config.workingDirectory.replace(/\\+$/, '');
-    // Create log directory for shawl to capture stdout/stderr
     const logDir = path.join(envDir, 'logs');
     fs.mkdirSync(logDir, { recursive: true });
     const cmdParts = [
@@ -254,29 +209,24 @@ export class WindowsServiceManager implements ServiceManager {
       `"${cwd}"`,
       '--log-dir',
       `"${logDir.replace(/\\+$/, '')}"`,
-      // How long shawl waits after the ctrl-C before it kills the process. Its
-      // default is shorter than the service's own graceful-shutdown budget.
+      // Wait after ctrl-C before the kill; shawl's default is shorter than the
+      // service's graceful-shutdown budget.
       '--stop-timeout',
       String(shutdownGraceSeconds(config) * 1000),
     ];
 
-    // The registration carries the env file's path, never its values: any
-    // local account reads a service's command line with `sc.exe qc`. The
-    // orchestrator and the agent load the file themselves when they start
-    // (`@kici-dev/shared/load-service-env-file`), so an edit to it takes
-    // effect at the next start.
+    // The env file's path, never its values: any local account reads the
+    // command line with `sc.exe qc`. The process loads the file at start
+    // (`@kici-dev/shared/load-service-env-file`), so an edit applies next start.
     cmdParts.push('--env', `"${SERVICE_ENV_FILE_VAR}=${config.envFilePath}"`);
     cmdParts.push('--', ...command.map((token) => `"${token}"`));
     const cmd = cmdParts.join(' ');
 
     execSync(cmd, { stdio: 'pipe' });
 
-    // Set the service description. When `config.component` is set, prefix the
-    // description with `[KiCI:<component>]` — marker decoded by list().
-    // Windows lacks first-class unit metadata; description is the anchor.
-    // When `config.instanceDir` is set, append a `[KiCI-DIR:<path>]` suffix so
-    // list() can recover the deploy folder straight from the description,
-    // making the instance index a rebuildable cache.
+    // Windows has no unit metadata, so the description carries list()'s
+    // markers: a `[KiCI:<component>]` prefix, and a `[KiCI-DIR:<path>]` suffix
+    // that makes the instance index a rebuildable cache.
     const dirSuffix =
       config.component && config.instanceDir ? ` [KiCI-DIR:${config.instanceDir}]` : '';
     const descText = config.component
@@ -286,10 +236,8 @@ export class WindowsServiceManager implements ServiceManager {
       stdio: 'pipe',
     });
 
-    // Configure auto-start
     execSync(`sc.exe config ${config.name} start= auto`, { stdio: 'pipe' });
 
-    // Configure failure recovery with backoff delays from restart policy
     const delays = config.restartPolicy.delays;
     const actions = delays.map((d) => `restart/${d * 1000}`).join('/');
     const resetSeconds = config.restartPolicy.windowSeconds;
@@ -301,12 +249,12 @@ export class WindowsServiceManager implements ServiceManager {
   async uninstall(config: ServiceConfig): Promise<void> {
     const waitSeconds = stopWaitSeconds(config);
 
-    // Stop first (ignore errors if already stopped), and let the process exit
-    // before the delete: shawl gives it the service's whole shutdown grace.
+    // Let the process exit before the delete: shawl gives it the whole
+    // shutdown grace.
     try {
       execSync(`sc.exe stop ${config.name}`, { stdio: 'pipe' });
     } catch {
-      // Service may already be stopped
+      // Already stopped.
     }
     const stopDeadline = Date.now() + waitSeconds * 1000;
     while (Date.now() < stopDeadline) {
@@ -315,9 +263,8 @@ export class WindowsServiceManager implements ServiceManager {
       await sleep(500);
     }
 
-    // Delete the service. If its process has not exited yet, sc.exe delete
-    // succeeds but the deletion is deferred until it does. Poll until the
-    // service is fully removed to avoid "service already exists" on re-install.
+    // sc.exe delete defers the deletion until the process exits; poll until it
+    // is gone, or a re-install hits "service already exists".
     execSync(`sc.exe delete ${config.name}`, { stdio: 'pipe' });
 
     const deadline = Date.now() + waitSeconds * 1000;
@@ -333,18 +280,14 @@ export class WindowsServiceManager implements ServiceManager {
   }
 
   async start(config: ServiceConfig): Promise<void> {
-    // Wait for the service to fully reach STOPPED state before starting —
-    // `sc.exe start` fails with error 1056 if the service is still in
-    // STOP_PENDING (code 3), which lasts until the process has shut down. If
-    // the service is already RUNNING (code 4), treat `start` as a no-op —
-    // calling `sc.exe start` on a running service fails with error 1056
-    // ("service already running").
+    // `sc.exe start` fails with 1056 in STOP_PENDING (3, until the process
+    // exits) and in RUNNING (4), so wait for STOPPED and treat RUNNING as a no-op.
     const deadline = Date.now() + stopWaitSeconds(config) * 1000;
     while (Date.now() < deadline) {
       // A query can fail transiently during state transitions; retry.
       const stateCode = this.queryStateCode(config.name);
-      if (stateCode === 4) return; // Already RUNNING — nothing to do
-      if (stateCode === 1) break; // STOPPED — proceed to start
+      if (stateCode === 4) return; // RUNNING
+      if (stateCode === 1) break; // STOPPED
       await sleep(500);
     }
 
@@ -355,11 +298,9 @@ export class WindowsServiceManager implements ServiceManager {
     try {
       execSync(`sc.exe stop ${config.name}`, { stdio: 'pipe' });
     } catch (err) {
-      // A service that is not running answers 1062, and one that is already
-      // stopping answers 1061. STOPPED is the state `stop` asks for, so either
-      // succeeds once the query confirms it; a stop still in progress is left
-      // to the wait below. Any other failure (access denied, no such service,
-      // a service that is starting) still surfaces.
+      // 1062 (not running) and 1061 (already stopping) succeed once the query
+      // confirms STOPPED; a stop in progress is left to the wait below. Any
+      // other failure (access denied, no such service, starting) surfaces.
       const status = (err as { status?: unknown })?.status;
       if (status !== ERROR_SERVICE_NOT_ACTIVE && status !== ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
         throw err;
@@ -369,12 +310,9 @@ export class WindowsServiceManager implements ServiceManager {
       if (status !== ERROR_SERVICE_CANNOT_ACCEPT_CTRL || stateCode !== 3) throw err;
     }
 
-    // Wait for the service to actually reach STOPPED state before returning.
-    // `sc.exe stop` returns immediately after sending the stop control — the
-    // service enters STOP_PENDING (code 3) and only reaches STOPPED (code 1)
-    // once its process has exited, which shawl allows the whole shutdown
-    // grace. A caller that immediately invokes `start` would otherwise hit
-    // error 1056.
+    // `sc.exe stop` returns at once in STOP_PENDING (3); STOPPED (1) follows
+    // the process exit, up to the whole shutdown grace. Return only at
+    // STOPPED, or an immediate `start` hits error 1056.
     const waitSeconds = stopWaitSeconds(config);
     const deadline = Date.now() + waitSeconds * 1000;
     while (Date.now() < deadline) {
@@ -429,23 +367,17 @@ export class WindowsServiceManager implements ServiceManager {
   }
 
   async list(isUserLevel: boolean): Promise<DiscoveredInstance[]> {
-    // Enumerate all kici-* services and their descriptions via WMI. The
-    // [KiCI:<component>] description prefix is the discriminator — Windows
-    // lacks first-class unit metadata, so the description is the anchor.
-    // `isUserLevel` is advisory: the Services Control Manager runs
-    // system-wide, but we record the caller's intent on each returned
-    // instance so the resolver knows what privilege scope was asked about.
-    // A failed registry read is NOT an empty registry. `listInstances` prunes
-    // this platform's index rows on the strength of an empty scan, so an `[]`
-    // here deletes every windows row on the host the first time WMI hiccups —
-    // the same defect the compose driver carried. Both failures are therefore
-    // thrown, and `scanDrivers` drops this driver from the scan exactly as it
-    // drops one whose `available()` said false.
+    // The `[KiCI:<component>]` description prefix marks a KiCI service.
+    // `isUserLevel` is advisory: the SCM is system-wide, but each instance
+    // records the scope the caller asked about.
+    // A failed registry read is NOT an empty registry: `listInstances` prunes
+    // this platform's index rows on an empty scan, so `[]` here would delete
+    // every windows row the first time WMI hiccups. Both failures throw, and
+    // `scanDrivers` drops this driver as if `available()` said false.
     let raw: string;
     try {
-      // execSync with no `encoding` returns a Buffer; coerce to string so
-      // tests that mock with `Buffer.from(...)` and real PowerShell stdout
-      // both flow through the same JSON.parse path.
+      // Coerced to string so a `Buffer.from(...)` mock and real stdout share
+      // one JSON.parse path.
       raw = execSync(
         'powershell -Command "Get-CimInstance Win32_Service -Filter \\"Name LIKE \'kici-%\'\\" | Select-Object Name,Description | ConvertTo-Json"',
         {
@@ -460,9 +392,7 @@ export class WindowsServiceManager implements ServiceManager {
         { cause: err },
       );
     }
-    // An empty answer is the one honest `[]`: `ConvertTo-Json` emits nothing
-    // when the query matches no service, so the registry answered and holds no
-    // KiCI services.
+    // The one honest `[]`: `ConvertTo-Json` emits nothing when no service matches.
     if (!raw.trim()) return [];
     let parsed: unknown;
     try {
@@ -473,8 +403,7 @@ export class WindowsServiceManager implements ServiceManager {
         { cause: err },
       );
     }
-    // PowerShell's ConvertTo-Json emits a bare object when a query returns
-    // a single row; wrap in [] so the iteration is uniform.
+    // `ConvertTo-Json` emits a bare object for a single row.
     const rows = Array.isArray(parsed) ? parsed : [parsed];
 
     const out: DiscoveredInstance[] = [];
@@ -498,14 +427,11 @@ export class WindowsServiceManager implements ServiceManager {
   }
 
   /**
-   * The command line a service is registered with.
-   *
-   * `sc.exe qc` answers most registrations, but it fails (error 1734) once the
-   * line is longer than about 4000 characters, as an older CLI's registration
-   * with every env-file value on it can be. It also prints in the console code
-   * page, so a path outside ASCII, such as one under the profile of a user
-   * named Jürgen, decodes to U+FFFD. In either case the registry value it reads
-   * (`ImagePath`) is read through PowerShell, printed as UTF-8.
+   * The registered command line. `sc.exe qc` fails (error 1734) past about
+   * 4000 characters, as an older CLI's registration with every env-file value
+   * can be, and prints in the console code page, so a non-ASCII path (a user
+   * named Jürgen) decodes to U+FFFD. Either case reads the `ImagePath`
+   * registry value through PowerShell as UTF-8.
    */
   private registeredCommandLine(name: string): string | null {
     try {
@@ -532,10 +458,9 @@ export class WindowsServiceManager implements ServiceManager {
   async readLaunchSpec(config: ServiceConfig): Promise<LaunchSpec | null> {
     const line = this.registeredCommandLine(config.name);
     if (line === null) return null;
-    // shawl registers `"shawl.exe" run --name <name> ... -- "<exec>" "<arg>" ...`;
-    // the real launch command is everything after the first unquoted `--`,
-    // which is where shawl itself splits it. A quoted value, such as a --cwd
-    // path or an --env value, may hold " -- ".
+    // shawl registers `"shawl.exe" run --name <name> ... -- "<exec>" "<arg>" ...`
+    // and splits at the first unquoted `--`; a quoted --cwd or --env value may
+    // hold " -- ".
     const parts = [...line.matchAll(/"([^"]*)"|(\S+)/g)].map((t) => ({
       text: t[1] ?? t[2]!,
       quoted: t[1] !== undefined,

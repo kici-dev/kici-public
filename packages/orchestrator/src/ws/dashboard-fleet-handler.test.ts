@@ -269,11 +269,10 @@ describe('handleFleetWorkflowsForHostRequest', () => {
   });
 
   it('a scaler-managed host lists NO fan-outs, though the same host otherwise would', async () => {
-    // The inverse of the preview must agree with it. `findFanoutTargets` keeps
-    // an auto-scaler-spawned agent out of the target set, so this host-centric
-    // view must not claim a workflow fans out to it. Asserting BOTH directions
-    // on one host + one registration is what makes this non-vacuous: the only
-    // difference between the two calls is `scaler_managed`.
+    // The inverse must agree with the preview: `findFanoutTargets` excludes an
+    // auto-scaler-spawned agent, so this view must not claim a fan-out to it. Both
+    // directions on one host + registration differ only in `scaler_managed`, which
+    // keeps this non-vacuous.
     const host = { ...entry('h1', 'ready'), labels: ['role:web'] };
     const regs = [reg('deploy-web', { include: [[exact('role:web')]], exclude: [] })];
 

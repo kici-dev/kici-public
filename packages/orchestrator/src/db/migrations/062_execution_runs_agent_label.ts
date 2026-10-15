@@ -1,17 +1,12 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the agent-provenance columns to `execution_runs`:
+ * Agent provenance on `execution_runs`: `triggered_by_agent_label` / `cancelled_by_agent_label`
+ * hold the human-set agent name when an agent-kind credential (user agent PAT or org agent API
+ * key) drove the trigger / cancel via the developer MCP server.
  *
- *  - `triggered_by_agent_label` — the human-set agent name when the run was
- *    triggered through an agent-kind credential (user agent PAT or org agent
- *    API key) via the developer MCP server.
- *  - `cancelled_by_agent_label` — likewise for a cancellation driven through an
- *    agent credential.
- *
- * The label is provenance only (the credential still inherits its principal's
- * permissions). NULL for ordinary human / webhook / system-driven runs.
- * Nullable, no backfill, idempotent.
+ * Provenance only: the credential still inherits its principal's permissions. NULL for human /
+ * webhook / system runs. Nullable, no backfill, idempotent.
  */
 async function colExists(db: Kysely<unknown>, table: string, name: string): Promise<boolean> {
   const result = await sql<{ exists: boolean }>`

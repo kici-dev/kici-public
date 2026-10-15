@@ -80,9 +80,8 @@ describe('retention-policy — access_log', () => {
   });
 
   it('outcome override wins over platform_operator override', () => {
-    // Both apply: outcome=denied (180d) should beat platform_operator (365d)
-    // because the outcome override is "more conservative for forensics"
-    // — this matches the policy file's order of precedence.
+    // Both apply; outcome=denied (180d) beats platform_operator (365d), per the
+    // policy file's precedence ("more conservative for forensics").
     expect(
       getAccessLogWarmDays({
         action: 'run.detail.read',
@@ -227,9 +226,9 @@ describe('retention-policy — SQL fragment generators', () => {
 
   it('accessLogWarmSqlCase emits the 30-day group in its own explicit WHEN clause, not the ELSE', () => {
     const sql = accessLogWarmSqlCase();
-    // Every 30-day action must appear inside an explicit `WHEN action IN (...)
-    // THEN INTERVAL '30 days'` clause — they must NOT silently fall through to
-    // the ELSE (which is now reserved for genuinely-unknown actions at 180d).
+    // Every 30-day action sits in an explicit `WHEN action IN (...) THEN
+    // INTERVAL '30 days'` clause, never in the ELSE, which is reserved for
+    // unknown actions at 180d.
     expect(sql).toMatch(/WHEN action IN \([^)]*\) THEN INTERVAL '30 days'/);
     const thirtyDayClause = sql.match(/WHEN action IN \(([^)]*)\) THEN INTERVAL '30 days'/);
     expect(thirtyDayClause).not.toBeNull();
@@ -247,8 +246,8 @@ describe('retention-policy — SQL fragment generators', () => {
 
   it('accessLogWarmSqlCase covers every known action in some explicit WHEN list (no ELSE reliance)', () => {
     const sql = accessLogWarmSqlCase();
-    // Now that the ELSE is reserved for unknown actions, EVERY known action
-    // (including the 30-day group) must appear in an explicit IN list.
+    // The ELSE is reserved for unknown actions, so EVERY known action (the
+    // 30-day group included) appears in an explicit IN list.
     for (const action of AccessLogAction.options) {
       expect(sql).toContain(`'${action}'`);
     }
@@ -269,7 +268,6 @@ describe('retention-policy — SQL fragment generators', () => {
 
   it('accessLogWarmSqlCase per-action clauses agree with getAccessLogWarmDays (30d, 180d, 365d)', () => {
     const sql = accessLogWarmSqlCase();
-    // A known 30-day action.
     const known30 = getAccessLogWarmDays({
       action: 'run.detail.read',
       outcome: 'allowed',
@@ -279,7 +277,6 @@ describe('retention-policy — SQL fragment generators', () => {
     expect(sql).toMatch(
       new RegExp(`WHEN action IN \\([^)]*'run\\.detail\\.read'[^)]*\\) THEN INTERVAL '30 days'`),
     );
-    // A known 180-day action.
     const known180 = getAccessLogWarmDays({
       action: 'run.cancel',
       outcome: 'allowed',
@@ -289,7 +286,6 @@ describe('retention-policy — SQL fragment generators', () => {
     expect(sql).toMatch(
       new RegExp(`WHEN action IN \\([^)]*'run\\.cancel'[^)]*\\) THEN INTERVAL '180 days'`),
     );
-    // A known 365-day action.
     const known365 = getAccessLogWarmDays({
       action: 'secret.set',
       outcome: 'allowed',
@@ -383,10 +379,9 @@ describe('retention-policy — cold retention', () => {
   });
 
   it('outcome override beats actorType override (more conservative wins for cold)', () => {
-    // denied gives 730, platform_operator gives forever — forever is the more
-    // conservative cold retention, so platform_operator wins ONLY if the row
-    // is `allowed`. A denied row from a platform_operator should still be
-    // 730 days because the outcome check fires first.
+    // denied gives 730, platform_operator gives forever. The outcome check
+    // fires first, so platform_operator's forever applies ONLY to an `allowed`
+    // row and a denied platform_operator row stays at 730 days.
     expect(
       getAccessLogColdDays({
         action: 'run.detail.read',
@@ -438,8 +433,8 @@ describe('retention-policy — cold retention', () => {
 
 describe('retention-policy — unknown-action fallback (defensive)', () => {
   it('getAccessLogWarmDays returns the conservative default for unknown actions', () => {
-    // Real-world drivers: synthetic test action names, future enum additions
-    // not yet in the deployed binary, post-rollback action strings.
+    // Sources: synthetic test action names, enum additions not yet in the
+    // deployed binary, post-rollback action strings.
     const warm = getAccessLogWarmDays({
       action: 'cold-store-e2e.access-action-7' as never,
       outcome: 'allowed',

@@ -46,8 +46,7 @@ import { PeerRegistry } from './peer-registry.js';
 const { mockInstances, mockConstructorArgs } = vi.hoisted(() => {
   return {
     mockInstances: [] as import('node:events').EventEmitter[],
-    // Each entry is the argv array a single `new WebSocket(...)` call received.
-    // Used by the compression-bomb-defense invariant test.
+    // The argv of each `new WebSocket(...)` call, for the compression-bomb test.
     mockConstructorArgs: [] as unknown[][],
   };
 });
@@ -141,8 +140,6 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   };
 });
 
-// ── Typed helpers ───────────────────────────────────────────────────
-
 interface MockWsInstance {
   readyState: number;
   sentMessages: string[];
@@ -162,9 +159,7 @@ function simulateOpen(mock: MockWsInstance): void {
   mock.emit('open');
 }
 
-// ── Test helpers ────────────────────────────────────────────────────
-
-/** A join token in the production format; the client parses it now. */
+/** A join token in the production format, which the client parses. */
 const TEST_TOKEN = makeTestJoinToken({
   orgId: 'org-1',
   routingKey: 'github:42',
@@ -378,8 +373,6 @@ async function authenticateClient(
   return { mock, sessionKey, handshakeKey: hs.sessionKey, hs };
 }
 
-// ── Setup / Teardown ────────────────────────────────────────────────
-
 beforeEach(() => {
   mockInstances.length = 0;
   mockConstructorArgs.length = 0;
@@ -394,8 +387,6 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-// ── Tests ───────────────────────────────────────────────────────────
-
 describe('PeerClient', () => {
   describe('ECDH handshake', () => {
     it('completes ECDH handshake and transitions to authenticating', async () => {
@@ -408,7 +399,6 @@ describe('PeerClient', () => {
 
       simulateServerHandshake(mock);
 
-      // Wait for async sendAuthRequest
       await vi.advanceTimersByTimeAsync(0);
 
       expect(client.state).toBe('authenticating');
@@ -422,7 +412,6 @@ describe('PeerClient', () => {
 
       simulateServerHandshake(mock);
 
-      // Find the hello response
       const helloResponse = mock.sentMessages
         .map((m) => {
           try {
@@ -448,13 +437,10 @@ describe('PeerClient', () => {
 
       const { sessionKey } = simulateServerHandshake(mock);
 
-      // Wait for async auth request
       await vi.advanceTimersByTimeAsync(0);
 
-      // Find the encrypted auth request (last message after hello.response)
       const lastMsg = mock.sentMessages[mock.sentMessages.length - 1];
 
-      // It should be encrypted
       const decrypted = JSON.parse(decryptMessage(lastMsg, sessionKey));
       expect(decrypted.type).toBe('peer.auth.request');
       expect(decrypted.instanceId).toBe('local-orch');
@@ -515,7 +501,6 @@ describe('PeerClient', () => {
 
   describe('credential-based authentication', () => {
     it('sends HMAC proof when credential file exists', async () => {
-      // Set up mock credential file
       mockReadCredentialFile.mockResolvedValue({
         instanceId: 'local-orch',
         credential: 'b'.repeat(64),
@@ -550,12 +535,9 @@ describe('PeerClient', () => {
     });
 
     it('reuses credential across different target peer URLs (identity-scoped, not URL-scoped)', async () => {
-      // 4-coordinator mesh regression: credential file is written
-      // once by the first successful peer-client. Sibling peer-clients on the
-      // same orchestrator connecting to DIFFERENT target URLs must still
-      // accept that credential, because the server-side verifies by
-      // instanceId, not by requester URL. The credential
-      // file no longer records `coordinatorUrl` at all — identity scope alone.
+      // The first successful peer-client writes the credential file; siblings
+      // dialing DIFFERENT URLs must reuse it, because the server verifies by
+      // instanceId, not requester URL. The file records no `coordinatorUrl`.
       mockReadCredentialFile.mockResolvedValue({
         instanceId: 'local-orch',
         credential: 'b'.repeat(64),
@@ -576,7 +558,6 @@ describe('PeerClient', () => {
 
       const decrypted = readAuthRequest(mock, hs.sessionKey);
       expect(decrypted.type).toBe('peer.auth.request');
-      // Should use credential-based auth, NOT fall back to token
       expect(decrypted.mode).toBe('credential');
       expect(decrypted.clientProof).toBe(
         refClientProof({
@@ -592,8 +573,7 @@ describe('PeerClient', () => {
     });
 
     it('falls back to token when credential file has different instanceId', async () => {
-      // Credential file was written by a DIFFERENT orchestrator (instanceId
-      // mismatch) — we must not try to use it. Fall back to join token.
+      // Written by a DIFFERENT orchestrator: never used.
       mockReadCredentialFile.mockResolvedValue({
         instanceId: 'some-other-orch',
         credential: 'b'.repeat(64),
@@ -618,15 +598,10 @@ describe('PeerClient', () => {
     });
 
     it('one credential file serves N peer-clients in a multi-coordinator mesh', async () => {
-      // Simulate the 4-coordinator mesh scenario: orchestrator "local-orch"
-      // has 3 peer-clients, each connecting to a different peer. They all
-      // share the same on-disk credential file. Only the first one uses the
-      // join token; the other two read the shared credential.
-      //
-      // Regression: peer-client B would see
-      // peer-client A's credential (written with A's coordinatorUrl), reject
-      // it due to URL mismatch, fall back to the token, and get permanently
-      // rejected because the token was already consumed.
+      // "local-orch" has peer-clients to different peers sharing one credential
+      // file. Only the first uses the join token; the rest read the credential.
+      // A sibling that rejected the file on a URL mismatch would fall back to the
+      // consumed token and be rejected for good.
 
       // Peer-client #1: no credential yet → uses join token → writes credential
       mockReadCredentialFile.mockResolvedValueOnce(null);
@@ -641,15 +616,12 @@ describe('PeerClient', () => {
       const hs1 = simulateServerHandshake(mock1);
       await vi.advanceTimersByTimeAsync(0);
 
-      // Verify client #1 sent token-based auth
       const auth1 = readAuthRequest(mock1, hs1.sessionKey);
       expect(auth1.mode).toBe('token');
       expect(auth1.tokenRouting).toBe(ONE_SHOT_TOKEN.routingB64);
 
-      // Server accepts and issues a sessionCredential. Client writes it.
       await acceptOn(mock1, hs1, { remoteInstanceId: 'peer-a', sessionCredential: 'c'.repeat(64) });
 
-      // Confirm the shared credential was written
       expect(mockWriteCredentialFile).toHaveBeenCalledWith(
         '/tmp/test-credential',
         expect.objectContaining({
@@ -658,8 +630,7 @@ describe('PeerClient', () => {
         }),
       );
 
-      // Peer-client #2 and #3 simulate reading that shared credential from disk
-      // (as if sendAuthRequest ran immediately after #1 wrote the file).
+      // #2 and #3 read the shared credential #1 just wrote.
       mockReadCredentialFile.mockResolvedValue({
         instanceId: 'local-orch',
         credential: 'c'.repeat(64),
@@ -681,7 +652,6 @@ describe('PeerClient', () => {
       const auth2 = JSON.parse(
         decryptMessage(mock2.sentMessages[mock2.sentMessages.length - 1], sk2),
       );
-      // Must be credential-based, NOT token fallback
       expect(auth2.mode).toBe('credential');
 
       // Peer-client #3 → peer-c (yet another URL)
@@ -712,7 +682,6 @@ describe('PeerClient', () => {
       const { sessionKey } = simulateServerHandshake(mock);
       await vi.advanceTimersByTimeAsync(0);
 
-      // Server sends encrypted auth rejection
       const authResponse = {
         type: 'peer.auth.response',
         accepted: false,
@@ -944,7 +913,6 @@ describe('PeerClient', () => {
       expect(result).toBe(true);
       expect(mock.sentMessages.length).toBe(countBefore + 1);
 
-      // Verify the message is encrypted
       const lastMsg = mock.sentMessages[mock.sentMessages.length - 1];
       const decrypted = JSON.parse(decryptMessage(lastMsg, sessionKey));
       expect(decrypted.type).toBe('peer.heartbeat');
@@ -1330,7 +1298,6 @@ describe('PeerClient', () => {
 
       const promise = client.sendCacheUploadRequest(req);
 
-      // Simulate coordinator response
       const response = {
         type: 'peer.cache.upload.response',
         messageId: 'cache-req-1',
@@ -1361,7 +1328,6 @@ describe('PeerClient', () => {
 
       const promise = client.sendCacheUploadRequest(req, 5000);
 
-      // Advance time past timeout
       vi.advanceTimersByTime(6000);
 
       await expect(promise).rejects.toThrow('Cache upload request timed out');
@@ -1379,7 +1345,6 @@ describe('PeerClient', () => {
       const { mock, sessionKey } = await authenticateClient(client);
       const countBefore = mock.sentMessages.length;
 
-      // Simulate coordinator-side request
       const reloadMsg = {
         type: 'peer.config.reload',
         messageId: 'rl-client-1',
@@ -1392,7 +1357,6 @@ describe('PeerClient', () => {
         expect.objectContaining({ type: 'peer.config.reload', messageId: 'rl-client-1' }),
       );
 
-      // Find the reply
       let response: any = null;
       for (const msg of mock.sentMessages.slice(countBefore)) {
         try {
@@ -1437,7 +1401,6 @@ describe('PeerClient', () => {
 
     it('sendConfigReloadAndWait returns null when not connected', async () => {
       const { client } = createPeerClient();
-      // Do not connect
       const result = await client.sendConfigReloadAndWait(
         { type: 'peer.config.reload', messageId: 'rl-disc' },
         500,

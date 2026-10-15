@@ -8,12 +8,11 @@ import {
 } from './scheduled-job.js';
 
 describe('OrchestratorScheduledJobName ↔ metric catalog parity', () => {
-  // The Platform's catalog filter gates the `job` label on every
-  // `kici_orch_job_*` metric against the engine's `ORCH_JOB_VALUES` enum,
-  // and a value outside it drops the ENTIRE series with
-  // `reason="bad_label_value"` — so a job name added here but not there
-  // silently loses all of its health metrics. The engine cannot import the
-  // orchestrator, so this direction is the only one that can assert it.
+  // The Platform's catalog filter checks the `job` label of every
+  // `kici_orch_job_*` metric against the engine's `ORCH_JOB_VALUES` and drops
+  // the ENTIRE series (`reason="bad_label_value"`) for a value outside it, so a
+  // job name added here but not there silently loses its health metrics. The
+  // engine cannot import the orchestrator, so only this side can assert it.
   it('every scheduled job name is an accepted metric label value', () => {
     expect([...ORCH_JOB_VALUES].sort()).toEqual([...OrchestratorScheduledJobName.options].sort());
   });

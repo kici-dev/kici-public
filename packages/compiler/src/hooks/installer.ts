@@ -8,13 +8,11 @@ import { getHookTemplate, hasKiciHook } from './templates.js';
 
 const execAsync = promisify(exec);
 
-/** Run a shell command in a directory. Returns stdout on success. */
 async function runCommand(cmd: string, cwd: string): Promise<string> {
   const { stdout } = await execAsync(cmd, { cwd, timeout: 30_000 });
   return stdout.trim();
 }
 
-/** Check if a directory exists */
 async function dirExists(dirPath: string): Promise<boolean> {
   try {
     const s = await stat(dirPath);
@@ -24,28 +22,24 @@ async function dirExists(dirPath: string): Promise<boolean> {
   }
 }
 
-/** Result of hook installation */
 export interface InstallResult {
   readonly success: boolean;
   readonly tool: HookToolName;
-  readonly path: string; // Path to modified file
+  readonly path: string; // the modified file
   readonly action: 'created' | 'updated' | 'skipped';
   readonly message: string;
 }
 
-/** Options for hook installation */
 export interface InstallOptions {
-  /** Working directory (defaults to process.cwd()) */
+  /** Defaults to process.cwd(). */
   cwd?: string;
-  /** Use @kici-dev/compiler from local Verdaccio instead of the public kici package */
+  /** Use @kici-dev/compiler from local Verdaccio instead of the public kici package. */
   useVerdaccio?: boolean;
 }
 
 /**
- * Install kici compile hook using the specified tool.
- *
- * Uses each tool's native CLI for initialization and git-hook wiring,
- * falling back to manual file creation only when the CLI is unavailable.
+ * Installs the kici compile hook through each tool's own CLI, writing the files
+ * by hand only when that CLI is unavailable.
  */
 export async function installHook(
   tool: HookToolName,
@@ -77,13 +71,8 @@ export async function installHook(
 }
 
 /**
- * Install hook for Husky.
- *
- * When .husky/ doesn't exist, runs `npx husky init` to properly initialize
- * (sets core.hooksPath, creates directory structure). Falls back to manual
- * setup if the CLI is unavailable.
- *
- * Then creates or appends our command to .husky/pre-commit.
+ * Initializes husky when `.husky/` is missing, then creates `.husky/pre-commit`
+ * or appends the command to it.
  */
 async function installHuskyHook(cwd: string, command: string): Promise<InstallResult> {
   const hookDir = path.join(cwd, '.husky');
@@ -91,7 +80,6 @@ async function installHuskyHook(cwd: string, command: string): Promise<InstallRe
   const template = getHookTemplate('husky');
 
   try {
-    // Initialize husky if not already set up
     const huskyReady = await dirExists(hookDir);
     let freshInit = false;
 
@@ -99,7 +87,6 @@ async function installHuskyHook(cwd: string, command: string): Promise<InstallRe
       freshInit = await initHusky(cwd, hookDir);
     }
 
-    // Read existing pre-commit hook
     let content = '';
     let action: 'created' | 'updated' = 'created';
 
@@ -117,16 +104,14 @@ async function installHuskyHook(cwd: string, command: string): Promise<InstallRe
       }
 
       if (freshInit) {
-        // Fresh husky init creates a default pre-commit — replace it entirely
+        // `husky init` writes a default pre-commit: replace it.
         content = template.getFullScript!(command);
         action = 'created';
       } else {
-        // Existing hook with user content — append
         content += template.getCommand(command);
         action = 'updated';
       }
     } catch {
-      // No pre-commit file — create from template
       content = template.getFullScript!(command);
     }
 
@@ -158,17 +143,13 @@ async function installHuskyHook(cwd: string, command: string): Promise<InstallRe
   }
 }
 
-/**
- * Initialize husky using its CLI, with manual fallback.
- * Returns true if this was a fresh initialization.
- */
+/** Returns true when this call initialized husky. */
 async function initHusky(cwd: string, hookDir: string): Promise<boolean> {
   try {
-    // npx husky init: creates .husky/, sets core.hooksPath, creates default pre-commit
+    // Creates .husky/ and a default pre-commit, and sets core.hooksPath.
     await runCommand('npx --yes husky init', cwd);
     return true;
   } catch {
-    // CLI not available — fall back to manual setup
     await mkdir(hookDir, { recursive: true });
     try {
       await runCommand('git config core.hooksPath .husky', cwd);
@@ -179,14 +160,8 @@ async function initHusky(cwd: string, hookDir: string): Promise<boolean> {
   }
 }
 
-/**
- * Install hook for Lefthook.
- *
- * Edits lefthook.yml to add the kici-compile command, then runs
- * `npx lefthook install` to wire up git hooks.
- */
+/** Adds the kici-compile command to the lefthook config, then runs `npx lefthook install`. */
 async function installLefthookHook(cwd: string, command: string): Promise<InstallResult> {
-  // Try each possible config file location
   const configFiles = ['lefthook.yml', '.lefthook.yml', '.config/lefthook.yml'];
   let configPath = '';
   let content = '';
@@ -198,12 +173,11 @@ async function installLefthookHook(cwd: string, command: string): Promise<Instal
       configPath = filePath;
       break;
     } catch {
-      // Continue to next file
+      // Try the next location.
     }
   }
 
   if (!configPath) {
-    // No lefthook config found, create default
     configPath = path.join(cwd, 'lefthook.yml');
     content = `# Lefthook configuration
 # https://lefthook.dev/configuration/
@@ -214,7 +188,6 @@ pre-commit:
 `;
   }
 
-  // Check if already installed
   if (hasKiciHook(content)) {
     return {
       success: true,
@@ -228,10 +201,9 @@ pre-commit:
   const template = getHookTemplate('lefthook');
   const hookConfig = template.getCommand(command);
 
-  // Find the pre-commit section and add command
   if (content.includes('pre-commit:')) {
-    // Extract just the pre-commit section (up to next top-level YAML key)
-    // to avoid matching commands: in other sections like commit-msg:
+    // Only the pre-commit section, up to the next top-level key: `commands:`
+    // under another hook such as commit-msg must not match.
     const preCommitIdx = content.indexOf('pre-commit:');
     const restAfterKey = content.slice(preCommitIdx + 'pre-commit:'.length);
     const nextTopLevelMatch = restAfterKey.match(/\n[a-zA-Z]/);
@@ -239,21 +211,17 @@ pre-commit:
     const preCommitSection = restAfterKey.slice(0, sectionEnd);
 
     if (preCommitSection.includes('commands:')) {
-      // Add after commands: within the pre-commit section
       content = content.replace(/(pre-commit:[\s\S]*?commands:)/, `$1\n${hookConfig}`);
     } else {
-      // Add commands section to pre-commit
       content = content.replace(/(pre-commit:.*)/, `$1\n  commands:\n${hookConfig}`);
     }
   } else {
-    // Add pre-commit section
     content += `\npre-commit:\n  parallel: true\n  commands:\n${hookConfig}\n`;
   }
 
   try {
     await writeFile(configPath, content, 'utf-8');
 
-    // Wire up git hooks via lefthook CLI
     try {
       await runCommand('npx lefthook install', cwd);
     } catch {
@@ -279,10 +247,8 @@ pre-commit:
 }
 
 /**
- * Install hook for pre-commit or prek.
- *
- * Both use .pre-commit-config.yaml format.
- * After editing the config, runs `pre-commit install` to wire up git hooks.
+ * Both tools read `.pre-commit-config.yaml`. After editing it, runs
+ * `pre-commit install` or `prek install`.
  */
 async function installPreCommitHook(
   cwd: string,
@@ -295,7 +261,6 @@ async function installPreCommitHook(
   try {
     content = await readFile(configPath, 'utf-8');
   } catch {
-    // Create new config
     content = `# pre-commit configuration
 # https://pre-commit.com/
 
@@ -303,7 +268,6 @@ repos:
 `;
   }
 
-  // Check if already installed
   if (hasKiciHook(content)) {
     return {
       success: true,
@@ -317,7 +281,6 @@ repos:
   const template = getHookTemplate(tool);
   const hookConfig = template.getCommand(command);
 
-  // Add to repos section
   if (content.includes('repos:')) {
     content = content.replace(/(repos:)/, `$1\n${hookConfig}`);
   } else {
@@ -327,7 +290,6 @@ repos:
   try {
     await writeFile(configPath, content, 'utf-8');
 
-    // Wire up git hooks via pre-commit CLI
     const installCmd = tool === 'prek' ? 'prek install' : 'pre-commit install';
     try {
       await runCommand(installCmd, cwd);
@@ -354,12 +316,8 @@ repos:
 }
 
 /**
- * Resolve the common git directory for hook installation.
- *
- * Git worktrees have a `commondir` file pointing to the shared git directory.
- * Hooks must be installed in the common directory (e.g., `.git/hooks/`) rather
- * than the worktree-specific directory (e.g., `.git/worktrees/<name>/hooks/`),
- * because git only looks for hooks in the common hooks directory.
+ * A worktree's `commondir` file names the shared git directory. Git reads hooks
+ * only from the common `hooks/`, never from `.git/worktrees/<name>/hooks/`.
  */
 async function resolveCommonGitDir(gitDir: string): Promise<string> {
   try {
@@ -367,16 +325,12 @@ async function resolveCommonGitDir(gitDir: string): Promise<string> {
     const commondir = (await readFile(commondirPath, 'utf-8')).trim();
     return path.resolve(gitDir, commondir);
   } catch {
-    // No commondir file — not a worktree, gitDir is already the common dir
+    // Not a worktree: gitDir is already the common dir.
     return gitDir;
   }
 }
 
-/**
- * Install raw git hook.
- * Creates or appends to .git/hooks/pre-commit.
- * Handles worktrees by resolving the common git directory for hooks.
- */
+/** Creates or appends to the common git directory's `hooks/pre-commit`. */
 async function installGitHook(cwd: string, command: string): Promise<InstallResult> {
   const gitDir = await findGitDir(cwd);
 
@@ -396,7 +350,6 @@ async function installGitHook(cwd: string, command: string): Promise<InstallResu
   const template = getHookTemplate('git');
 
   try {
-    // Ensure hooks directory exists
     await mkdir(hookDir, { recursive: true });
 
     let content = '';
@@ -406,7 +359,6 @@ async function installGitHook(cwd: string, command: string): Promise<InstallResu
       content = await readFile(hookPath, 'utf-8');
       action = 'updated';
 
-      // Check if already installed
       if (hasKiciHook(content)) {
         return {
           success: true,
@@ -417,7 +369,6 @@ async function installGitHook(cwd: string, command: string): Promise<InstallResu
         };
       }
     } catch {
-      // File doesn't exist, create new
       content = template.getFullScript!(command);
       await writeFile(hookPath, content, 'utf-8');
       await chmod(hookPath, 0o755);
@@ -431,7 +382,6 @@ async function installGitHook(cwd: string, command: string): Promise<InstallResu
       };
     }
 
-    // Append to existing hook
     content += template.getCommand(command);
     await writeFile(hookPath, content, 'utf-8');
     await chmod(hookPath, 0o755);

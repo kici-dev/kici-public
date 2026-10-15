@@ -85,19 +85,15 @@ describe('migrator', () => {
 
       await runMigrations({ db: createMockDb(), pool: mockPool as any });
 
-      // Verify lock was acquired
       expect(mockClient.query).toHaveBeenCalledWith('SELECT pg_advisory_lock($1)', [543210001]);
 
-      // Verify lock was released
       expect(mockClient.query).toHaveBeenCalledWith('SELECT pg_advisory_unlock($1)', [543210001]);
 
-      // Verify acquire happened before release
       const calls = mockClient.query.mock.calls.map((c: unknown[]) => c[0]);
       const lockIdx = calls.indexOf('SELECT pg_advisory_lock($1)');
       const unlockIdx = calls.indexOf('SELECT pg_advisory_unlock($1)');
       expect(lockIdx).toBeLessThan(unlockIdx);
 
-      // Verify client was released back to pool
       expect(mockClient.release).toHaveBeenCalled();
     });
 
@@ -171,9 +167,8 @@ describe('migrator', () => {
     });
 
     it('records the content hash even when no migrations are applied (warm DB)', async () => {
-      // Reproduces the bug: a warm DB whose migrations are all applied but
-      // whose _migration_content_hash row is absent must still get the hash
-      // written so `check-schema` reports current.
+      // A warm DB with every migration applied but no _migration_content_hash row must still
+      // get the hash written, so `check-schema` reports current.
       const { mockPool } = createMockPool();
       mockMigrateToLatest.mockResolvedValue({ results: [], error: undefined });
 
@@ -205,10 +200,8 @@ describe('migrator', () => {
     }
 
     it('hashes only the migrations the ledger still records after a revert', async () => {
-      // The stored hash is compared against a hash of the binary's WHOLE
-      // migration set, so hashing the whole set here would make
-      // `db check-schema` report "current" on a database deliberately rolled
-      // back to an earlier head.
+      // The stored hash is compared against the binary's WHOLE migration set, so hashing the
+      // whole set here would report "current" on a database rolled back to an earlier head.
       const { mockPool } = createMockPool();
       mockMigrateTo.mockResolvedValue({
         results: [

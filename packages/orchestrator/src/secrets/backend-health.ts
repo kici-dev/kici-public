@@ -107,9 +107,6 @@ export class BackendHealthChecker {
     return results;
   }
 
-  /**
-   * Start periodic health checks at the given interval.
-   */
   startPeriodicCheck(intervalMs = 60000): void {
     this.stopPeriodicCheck();
     this.intervalHandle = setInterval(() => {
@@ -128,9 +125,6 @@ export class BackendHealthChecker {
     }
   }
 
-  /**
-   * Stop periodic health checks.
-   */
   stopPeriodicCheck(): void {
     if (this.intervalHandle !== null) {
       clearInterval(this.intervalHandle);
@@ -159,9 +153,6 @@ export class BackendHealthChecker {
     }
   }
 
-  /**
-   * Probe a backend by type and return its health status.
-   */
   private async probeBackend(
     backendType: string,
     config: Record<string, unknown>,

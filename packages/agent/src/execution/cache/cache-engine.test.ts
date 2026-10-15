@@ -5,10 +5,9 @@ import { join } from 'node:path';
 import { packCachePaths, extractCacheTarball, resolveCachePath } from './cache-engine.js';
 
 /**
- * Find a directory on a filesystem distinct from the OS tmpdir (where the
- * workspace dirs below are created), so a KICI_TMPDIR pointed at it forces a
- * real cross-device move. Prefers KICI_EXDEV_TEST_BASE, then /dev/shm (tmpfs on
- * Linux). Returns null when no distinct-device base is available.
+ * A directory on a different filesystem from the OS tmpdir (where the workspace
+ * dirs are created), so KICI_TMPDIR there forces a real cross-device move.
+ * Prefers KICI_EXDEV_TEST_BASE, then /dev/shm (tmpfs on Linux); null if none.
  */
 async function findCrossDeviceBase(): Promise<string | null> {
   const tmpDev = (await stat(tmpdir())).dev;
@@ -17,7 +16,7 @@ async function findCrossDeviceBase(): Promise<string | null> {
     try {
       if ((await stat(base)).dev !== tmpDev) return base;
     } catch {
-      // candidate not present on this host; try the next
+      // not present on this host
     }
   }
   return null;

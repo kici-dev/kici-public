@@ -1,12 +1,10 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Mark runs that executed an uploaded local working tree (`kici run remote`):
- *
- * - `execution_runs.local_working_tree boolean NOT NULL DEFAULT false` — true
- *   for runs that ran a developer's local working tree from the CLI (inline
- *   lock file). The dashboard renders a "Local machine" badge for these runs
- *   and avoids building an external repository link from the repo identifier.
+ * Add `execution_runs.local_working_tree boolean NOT NULL DEFAULT false`: true
+ * for runs of a developer's uploaded local working tree (`kici run remote`,
+ * inline lock file). The dashboard shows a "Local machine" badge and builds no
+ * external repository link from the repo identifier.
  *
  * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive with a default, so existing
  * data is preserved.

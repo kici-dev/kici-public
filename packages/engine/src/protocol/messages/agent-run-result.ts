@@ -1,17 +1,15 @@
 /**
- * Agent-facing, provenance-tagged run-result schema.
+ * Agent-facing, provenance-tagged run-result schema: the typed job DAG, per-step
+ * exit codes, durations, statuses, and a coarse derived failure classification.
+ * Every field an agent could be tricked by — names, refs, error text, log lines,
+ * job outputs — is wrapped in an {@link untrusted} envelope so a consumer can
+ * keep user-controlled content out of an instruction channel. KiCI-generated
+ * values (ids, enum statuses, exit codes, durations, hashes, derived
+ * categories) stay plain (trusted).
  *
- * A machine-first read shape for a run: the typed job DAG, per-step exit codes,
- * durations, statuses, and a coarse derived failure classification. Every field
- * an agent could be tricked by — names, refs, error text, log lines, job outputs —
- * is wrapped in an {@link untrusted} envelope so a consumer can keep
- * user-controlled content out of an instruction channel. KiCI-generated values
- * (ids, enum statuses, exit codes, durations, hashes, derived categories) stay
- * plain (trusted).
- *
- * Read-only contract — produced by the orchestrator admin run API and consumed by
- * agents / the developer MCP server. Reuses the existing execution status enums;
- * never define a parallel status string.
+ * Read-only contract: the orchestrator admin run API produces it; agents and the
+ * developer MCP server consume it. Reuses the execution status enums; never
+ * define a parallel status string.
  */
 import { z } from 'zod';
 import {
@@ -25,10 +23,9 @@ import { CheckStepOutcome } from '../../check-mode.js';
 
 /**
  * Wrap a value KiCI does not vouch for — content from the user's repo, the
- * contributor, or a process's output. Trusted fields are left plain. The
- * envelope self-tags so the value survives reshaping / fencing: a renderer that
- * fences untrusted content just refuses to emit any `{ untrusted: true }` value
- * into an instruction channel.
+ * contributor, or a process's output. The envelope self-tags so the tag
+ * survives reshaping: a fencing renderer refuses to emit any
+ * `{ untrusted: true }` value into an instruction channel.
  */
 export const untrusted = <T extends z.ZodTypeAny>(v: T) =>
   z.object({ untrusted: z.literal(true), value: v });
@@ -141,12 +138,7 @@ export const agentStepLogsSchema = z.object({
 });
 export type AgentStepLogs = z.infer<typeof agentStepLogsSchema>;
 
-/**
- * Compact run-list row for the agent surface. KiCI ids/status/hashes are trusted
- * (plain); the workflow name, repo identifier, and ref are user-controlled and
- * wrapped untrusted so the fencing renderer keeps them out of the instruction
- * channel.
- */
+/** Compact run-list row for the agent surface. */
 export const agentRunListItemSchema = z.object({
   runId: z.string(),
   status: ExecutionRunStatus,
@@ -158,12 +150,7 @@ export const agentRunListItemSchema = z.object({
 });
 export type AgentRunListItem = z.infer<typeof agentRunListItemSchema>;
 
-/**
- * Agent-facing workflow registration summary. Ids, flags, the commit sha, the
- * KiCI trigger-type tags, and timestamps are trusted (plain); the workflow name,
- * repo identifier, source repos, source file path, and friendly source name are
- * user-controlled and wrapped untrusted.
- */
+/** Agent-facing workflow registration summary. */
 export const agentWorkflowSummarySchema = z.object({
   id: z.string(),
   workflowName: untrustedString,

@@ -1,14 +1,8 @@
 /**
- * Cross-OS host reboot for the workflow-level `restartHost()` step.
- *
- * The agent runs ON the host it executes jobs for, so a `restartHost()` step
- * reboots that host. `rebootCommandFor` is the pure OS→command mapping (kept
- * pure for unit-testing); `issueReboot` spawns it detached with a tiny grace so
- * the job's final flush completes before the box goes down.
- *
- * Rebooting needs host privilege (root/admin). If the primitive is denied, the
- * spawn fails and the caller clears the orchestrator's reboot-pending flag and
- * surfaces the error — the deadline sweep is the backstop.
+ * Cross-OS reboot of the agent's own host for the workflow-level `restartHost()`
+ * step; the caller issues it once the job is fully reported. Rebooting needs
+ * root/admin. If the spawn fails, the caller clears the orchestrator's
+ * reboot-pending flag and surfaces the error; the deadline sweep is the backstop.
  */
 
 import { spawn } from 'node:child_process';
@@ -16,7 +10,7 @@ import { createLogger } from '@kici-dev/shared';
 
 const logger = createLogger({ prefix: 'reboot' });
 
-/** The OS reboot primitive for a Node platform string. */
+/** The OS reboot primitive for a Node platform string; kept pure for unit-testing. */
 export function rebootCommandFor(platform: NodeJS.Platform): { cmd: string; args: string[] } {
   switch (platform) {
     case 'darwin':
@@ -24,20 +18,16 @@ export function rebootCommandFor(platform: NodeJS.Platform): { cmd: string; args
     case 'win32':
       return { cmd: 'shutdown', args: ['/r', '/t', '0'] };
     default:
-      // linux + the BSDs: systemctl is the modern path; on a host without
-      // systemd the operator must grant `shutdown -r`. We pick systemctl as the
-      // default and let a non-zero exit surface as a privilege/availability
-      // error the caller reports.
+      // linux + the BSDs. A host without systemd needs the operator to grant
+      // `shutdown -r`; a non-zero exit surfaces as a privilege/availability error.
       return { cmd: 'systemctl', args: ['reboot'] };
   }
 }
 
 /**
- * Issue the OS reboot detached. Resolves once the child has been spawned (the
- * box is going down; there is nothing to await). Rejects synchronously if the
- * spawn itself fails (e.g. the binary is missing). A privilege denial usually
- * surfaces as a non-zero exit AFTER spawn — logged, not thrown, because by then
- * the box may already be on its way down.
+ * Issue the OS reboot detached; resolves once spawned. Rejects when the spawn
+ * fails (e.g. a missing binary). A privilege denial usually shows as a non-zero
+ * exit AFTER spawn and is only logged: the box may already be going down.
  */
 export function issueReboot(platform: NodeJS.Platform = process.platform): Promise<void> {
   const { cmd, args } = rebootCommandFor(platform);

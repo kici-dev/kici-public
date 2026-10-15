@@ -1,20 +1,9 @@
 /**
  * Agent entry point.
  *
- * Startup sequence:
- * 1. Load config
- * 2. Create logger
- * 3. Create JobRunner with send callbacks
- * 4. Create OrchestratorClient with dispatch and cancel handlers
- * 5. Add WS log transport (if not scaler-managed)
- * 6. Connect OrchestratorClient
- * 7. Create Hono app with health routes
- * 8. Start HTTP server
- * 9. Register signal handlers
- *
  * Graceful shutdown:
  * - SIGTERM/SIGINT: 10s grace for running jobs, then force-kill
- * - SIGUSR1: Drain mode (stop accepting, finish current, exit)
+ * - SIGUSR1: drain mode (stop accepting, finish current, exit)
  */
 
 // First import: applies the env file a Windows service names in KICI_ENV_FILE
@@ -57,9 +46,8 @@ import { decideIdleShutdown } from './idle-shutdown.js';
 import { agentToolRequirements } from './required-tools.js';
 import { pidOneWarning } from './pid-one.js';
 
-// Build-time constants injected by Rolldown (scripts/build-service.mjs).
-// Workspace dep fingerprints power the SDK drift diagnostic: compare the agent's
-// baked sdkBundleHash against the orchestrator's at /health to catch drift in one grep.
+// Build-time constants injected by Rolldown (scripts/build-service.mjs). The SDK
+// drift diagnostic compares the baked sdkBundleHash against the orchestrator's /health.
 declare const KICI_PKG_VERSION: string;
 declare const KICI_SDK_VERSION: string;
 declare const KICI_SDK_BUNDLE_HASH: string;
@@ -79,18 +67,15 @@ const ENGINE_VERSION = typeof KICI_ENGINE_VERSION !== 'undefined' ? KICI_ENGINE_
 const ENGINE_BUNDLE_HASH =
   typeof KICI_ENGINE_BUNDLE_HASH !== 'undefined' ? KICI_ENGINE_BUNDLE_HASH : 'unknown';
 
-// Initialize OTel SDK BEFORE any metric-creating modules are imported.
-// ESM static imports are hoisted, so we must use dynamic imports for modules
-// that transitively create OTel meters (./metrics/prometheus.js, and
-// ./execution/job-runner.js which pulls log-streamer.ts → prometheus.ts).
-// Mirrors the same pattern in packages/orchestrator/src/server.ts.
+// OTel must initialize before any module that creates meters at load time. ESM
+// static imports are hoisted, so those modules (./metrics/prometheus.js, and
+// ./execution/job-runner.js via log-streamer.ts) are imported dynamically below.
+// Same pattern as packages/orchestrator/src/server.ts.
 initTelemetry({
   serviceName: 'kici-agent',
   otlpEndpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
 });
 
-// Dynamic imports: these modules create OTel meters at module load time,
-// so they must be imported after initTelemetry() sets up the MeterProvider.
 const { connectionStatus, jobsActive, jobsTotal } = await import('./metrics/prometheus.js');
 const { JobRunner } = await import('./execution/job-runner.js');
 const { BetweenJobsController } = await import('./execution/between-jobs-controller.js');
@@ -106,11 +91,9 @@ const logger = createLogger({ prefix: 'agent' });
 const RESET_FAILURE_DRAIN_THRESHOLD = 3;
 
 /**
- * Serialize the agent's current Prometheus metrics to text. The OTel
- * PrometheusExporter exposes no direct serialize method, so the metrics are
- * piped through its request handler with a mock ServerResponse. Returns an
- * empty string when no exporter is configured. Shared by the /metrics health
- * route and the fleet mini-bundle.
+ * Serialize current Prometheus metrics to text, or '' with no exporter. The
+ * PrometheusExporter has no serialize method, so this pipes its request handler
+ * into a mock ServerResponse.
  */
 async function serializeAgentMetrics(): Promise<string> {
   const exporter = getPrometheusExporter();
@@ -130,16 +113,14 @@ async function serializeAgentMetrics(): Promise<string> {
   });
 }
 
-// Install console.* capture so in-process jobs (__init__, __build__, __dynamic__)
-// can route user code's console.log output to the dashboard via AsyncLocalStorage.
-// See packages/agent/src/execution/console-capture.ts.
+// Routes console output of in-process jobs (__init__, __build__, __dynamic__)
+// to the dashboard via AsyncLocalStorage.
 installConsoleCapture();
 
 await guardStartup(logger, async () => {
-  // 1. Load configuration
   const config = loadConfig();
-  // The credentials now live in `config`; take them out of the environment so a
-  // job step cannot read them back out of /proc/<agent-pid>/environ.
+  // Credentials now live in `config`; scrub them so a job step cannot read
+  // them from /proc/<agent-pid>/environ.
   const scrubbedEnvVars = scrubCredentialEnv();
   const exposedPosture = describeExposedPosture(config);
   if (exposedPosture) logger.warn(exposedPosture);
@@ -152,15 +133,13 @@ await guardStartup(logger, async () => {
     port: config.port,
   });
 
-  // Collect temp dirs leaked by a previous hard death (SIGKILL/OOM) of this
-  // or an earlier agent on the host. Fire-and-forget: startup must not wait.
+  // Collect temp dirs leaked by an earlier hard death (SIGKILL/OOM) of an agent
+  // on this host. Fire-and-forget: startup must not wait.
   void gcStaleAgentTmpDirs();
 
-  // SDK drift diagnostic (see docs/operator/troubleshooting.md): the six hashes
-  // below answer "did this agent's bundle ship with the same @kici-dev/sdk as
-  // the orchestrator / host?". Comparing sdkBundleHash across services is the
-  // cheapest way to catch the 2026-04-08 / 2026-04-19 scaler-container failure
-  // class before the first workflow runs.
+  // SDK drift diagnostic (docs/operator/troubleshooting.md): comparing
+  // sdkBundleHash across services catches a bundle built with a different
+  // @kici-dev/sdk before the first workflow runs.
   logger.info('agent.build.info', {
     agentVersion: AGENT_VERSION,
     sdkVersion: SDK_VERSION,
@@ -171,14 +150,11 @@ await guardStartup(logger, async () => {
     engineBundleHash: ENGINE_BUNDLE_HASH,
   });
 
-  // 1b. Required tools startup check: verify external binaries are available.
   const toolErrors = validateRequiredTools(agentToolRequirements(process.platform));
   if (toolErrors.length > 0) {
-    // A job-image agent runs inside the customer's own image, so a missing tool
-    // is a property of THAT image, not of the host — and the operator reading
-    // this line has no reason to connect the two. Without the hint the symptom
-    // is a job that stays queued while the scaler respawns a container that
-    // exits at startup.
+    // A job-image agent runs inside the customer's image, so a missing tool is
+    // that image's fault, not the host's. Without the hint the symptom is a job
+    // stuck queued while the scaler respawns a container that exits at startup.
     const jobImageHint = config.jobImageAgent
       ? `\nThis agent runs inside the job's own container image, so that image must ` +
         `provide these tools. Either add them to the image, or run the job on a pool ` +
@@ -191,33 +167,28 @@ await guardStartup(logger, async () => {
     );
   }
 
-  // 1c. Builder role readiness check: verify npm is available.
-  // Builder agents run `npm install` to install .kici/ deps before compiling workflows.
-  // Without npm, build jobs will fail at runtime — better to fail fast at startup.
+  // Builder agents run `npm install` for .kici/ deps before compiling; fail fast
+  // at startup rather than in every build job when npm is missing.
   const hasBuilderRole = config.roles === undefined || config.roles.includes('builder');
   if (hasBuilderRole) {
     const npmVersion = verifyNpmAvailable();
     logger.info('Builder role: npm verified', { npmVersion });
   }
 
-  // 2. Drain and shutdown state
   let isDraining = false;
   let idleShutdownTimer: NodeJS.Timeout | undefined;
 
-  // Workflow-level host restart: a `restartHost()` step's `host.requestReboot`
-  // API call sets this intent (the orchestrator has already acked + set its
-  // reboot-pending flag). After the job completes, the post-job hook issues the
-  // OS reboot. Cleared after firing so a follow-up job does not re-reboot.
+  // Set by a `restartHost()` step's acked `host.requestReboot` call (the
+  // orchestrator already holds its reboot-pending flag); the post-job hook
+  // issues the OS reboot and clears it so a follow-up job does not re-reboot.
   let rebootIntent = false;
 
-  // 3. Create OrchestratorClient (declared early so JobRunner can reference it)
-  // We need a forward reference for the client since JobRunner and client reference each other.
+  // Forward reference: JobRunner and the client reference each other.
   let client: OrchestratorClient;
 
-  // Supervisor-owned between-jobs phase (reap the process tree, re-run declared
-  // cleanup out-of-band, delete the workdir, run the operator reset command).
-  // Held here so the job-completion handler can read its consecutive-reset-
-  // failure count and drain a persistently dirty host.
+  // Between-jobs phase: reap the process tree, re-run declared cleanup
+  // out-of-band, delete the workdir, run the operator reset command. Held here
+  // so job completion can read its consecutive-reset-failure count.
   const betweenJobsController = new BetweenJobsController({
     config: {
       betweenJobsResetCommand: config.betweenJobsResetCommand,
@@ -228,7 +199,6 @@ await guardStartup(logger, async () => {
     },
   });
 
-  // 4. Create JobRunner with send/upload callbacks wired to OrchestratorClient
   const jobRunner = new JobRunner({
     send: (msg) => client.send(msg),
     config,
@@ -237,19 +207,17 @@ await guardStartup(logger, async () => {
     sendUploadComplete: (jobId, cacheType, key) => client.sendUploadComplete(jobId, cacheType, key),
     sendEventEmit: (jobId, requestId, eventName, payload, target) =>
       client.sendEventEmit(jobId, requestId, eventName, payload, target),
-    // Backpressure wiring: LogStreamer checks WS buffer and drains via these callbacks
+    // LogStreamer backpressure: checks the WS buffer and waits for drain.
     getBufferedAmount: () => client.getBufferedAmount(),
     onDrain: (cb) => client.onDrain(cb),
-    // Run event tracking: agent lifecycle events forwarded to orchestrator -> Platform
+    // Lifecycle events forwarded to orchestrator -> Platform.
     sendJobContext: (runId, jobId, context) => client.sendJobContext(runId, jobId, context),
     sendRunEvent: (runId, eventType, opts) => client.sendRunEvent(runId, eventType, opts),
-    // Concurrency protocol: relay concurrency report to orchestrator and wait for ack
+    // Waits for the orchestrator's ack.
     sendConcurrencyReport: (runId, jobId, group) =>
       client.sendConcurrencyReport(runId, jobId, group),
-    // Agent private API: relay typed KiCI API calls to orchestrator via WS.
-    // host.requestReboot is special: refuse locally when co-located with the
-    // orchestrator, and record the reboot intent on a successful ack so the
-    // post-job hook can issue the OS reboot after the step completes.
+    // host.requestReboot is refused locally when co-located with the
+    // orchestrator, and records the reboot intent on a successful ack.
     sendApiRequest: async (method, params) => {
       if (method === 'host.requestReboot') {
         if (config.isOrchestratorHost) {
@@ -259,9 +227,8 @@ await guardStartup(logger, async () => {
         rebootIntent = true;
         return result;
       }
-      // scaler.claim-credentials rides its own dedicated WS message (the minted
-      // token must not travel the generic agent.api.* envelope / be logged), so
-      // divert it to the dedicated RPC and unwrap the credentials.
+      // The minted token must not travel the generic agent.api.* envelope or be
+      // logged, so scaler.claim-credentials uses its own dedicated WS message.
       if (method === 'scaler.claim-credentials') {
         const claimCode = String((params ?? {}).claimCode ?? '');
         const r = await client.sendClaimCredentials(claimCode);
@@ -272,18 +239,12 @@ await guardStartup(logger, async () => {
       }
       return client.sendApiRequest(method, params ?? {});
     },
-    // User-facing cache: relay ctx.cache restore/save to orchestrator via WS
     requestUserCache: (jobId, request) => client.requestUserCache(jobId, request),
-    // Provenance: relay ctx.attestProvenance bundle uploads to orchestrator via WS
     relayProvenance: (jobId, request) => client.relayProvenance(jobId, request),
-    // User-facing artifacts: relay ctx.artifacts upload/download to orchestrator via WS
     requestUserArtifact: (jobId, request) => client.requestUserArtifact(jobId, request),
-    // Step-level approvals: relay an approval step's hold to the
-    // orchestrator and await its resolution via WS.
     sendStepApproval: (runId, jobId, request) => client.sendStepApproval(runId, jobId, request),
   });
 
-  /** Build and send an agent.status message with dynamic OS metadata. */
   function sendAgentStatus(): void {
     client.sendDirect({
       type: 'agent.status',
@@ -296,16 +257,14 @@ await guardStartup(logger, async () => {
     });
   }
 
-  // 5. Create OrchestratorClient with concurrency-gated dispatch handler.
-  // Connection/identity fields (including the auth token) come from
-  // agentClientConnectionOptions so KICI_AGENT_TOKEN always reaches the client.
+  // agentClientConnectionOptions carries the auth token, so KICI_AGENT_TOKEN
+  // always reaches the client.
   client = new OrchestratorClient({
     ...agentClientConnectionOptions(config),
-    // Self-bootstrap: exchange a single-use claim code for ephemeral
-    // credentials before registering (ignored when a static token is set).
+    // Exchanged for ephemeral credentials before registering; ignored when a
+    // static token is set.
     scalerClaimCode: config.scalerClaimCode,
-    // Fleet log collection inputs: the agent's resolved config (redacted inside
-    // the bundle assembler), its log directory, and current Prometheus metrics.
+    // The config is redacted inside the bundle assembler.
     getFleetBundleInputs: async () => ({
       config: config as unknown as Record<string, unknown>,
       logDir: process.env.KICI_LOG_DIR,
@@ -320,7 +279,6 @@ await guardStartup(logger, async () => {
           jobId: dispatch.jobId,
         },
         () => {
-          // Drain mode check
           if (isDraining) {
             logger.info('Draining: rejecting job dispatch', { jobId: dispatch.jobId });
             client.sendDirect({
@@ -335,10 +293,9 @@ await guardStartup(logger, async () => {
             return;
           }
 
-          // Single-job enforcement: reject if already running a job.
-          // The explicit job.reject lets the orchestrator undo its dispatch
-          // accounting and requeue immediately — a silent drop would leave
-          // the job bound to this agent until disconnect.
+          // One job at a time. An explicit job.reject lets the orchestrator
+          // requeue immediately; a silent drop would leave the job bound to this
+          // agent until disconnect.
           if (jobRunner.activeJobs.size > 0) {
             logger.warn('Already running a job, rejecting dispatch', {
               jobId: dispatch.jobId,
@@ -356,15 +313,13 @@ await guardStartup(logger, async () => {
             return;
           }
 
-          // Cancel idle shutdown timer if a follow-up job arrives
           if (idleShutdownTimer) {
             clearTimeout(idleShutdownTimer);
             idleShutdownTimer = undefined;
           }
 
-          // Positive dispatch acknowledgment: resolves the orchestrator's ack
-          // deadline. Sent before execution starts so a slow clone cannot eat
-          // into the deadline.
+          // Resolves the orchestrator's ack deadline; sent before execution so a
+          // slow clone cannot eat into it.
           client.sendDirect({
             type: 'job.ack',
             messageId: randomUUID(),
@@ -373,7 +328,6 @@ await guardStartup(logger, async () => {
             timestamp: Date.now(),
           });
 
-          // Accept and execute
           logger.info('Accepting job dispatch', {
             jobId: dispatch.jobId,
             runId: dispatch.runId,
@@ -397,12 +351,10 @@ await guardStartup(logger, async () => {
             .finally(() => {
               jobsActive.add(-1);
 
-              // Send final metrics snapshot on job completion
               metricsReporter.collectAndSend().catch(() => {});
 
-              // Drain a persistently dirty host: after repeated consecutive
-              // between-jobs reset failures, stop accepting new jobs (same
-              // mechanism SIGUSR1 drain uses). Opt-in via KICI_AGENT_DRAIN_ON_RESET_FAILURE.
+              // Opt-in (KICI_AGENT_DRAIN_ON_RESET_FAILURE): drain a persistently
+              // dirty host, the same way SIGUSR1 drains.
               if (
                 config.drainOnResetFailure &&
                 !isDraining &&
@@ -414,15 +366,12 @@ await guardStartup(logger, async () => {
                 isDraining = true;
               }
 
-              // After job completes, send agent.status with updated counts
               sendAgentStatus();
 
-              // Workflow-level host restart: a `restartHost()` step recorded the
-              // intent (and the orchestrator already holds the pinned
-              // post-restart job). Now that the job is fully reported, issue the
-              // OS reboot. On failure (privilege denied), ask the orchestrator
-              // to clear its reboot-pending flag so the host is not stuck — the
-              // deadline sweep is the backstop.
+              // Reboot only once the job is fully reported (the orchestrator
+              // already holds the pinned post-restart job). On failure (privilege
+              // denied), ask it to clear its reboot-pending flag; the deadline
+              // sweep is the backstop.
               if (rebootIntent) {
                 rebootIntent = false;
                 issueReboot().catch((err) => {
@@ -435,12 +384,11 @@ await guardStartup(logger, async () => {
                 });
               }
 
-              // Scaler-managed agents auto-shutdown after all jobs complete.
-              // Brief idle timeout allows the orchestrator to dispatch follow-up jobs
-              // (e.g., sequential builds for multiple workflows triggered by the same commit).
+              // Scaler-managed agents shut down when idle. The idle timeout leaves
+              // room for follow-up jobs (e.g. sequential builds for several
+              // workflows triggered by the same commit).
               if (config.scalerManaged && jobRunner.activeJobs.size === 0) {
-                // Don't start idle timer when disconnected -- wait for reconnection first.
-                // The orchestrator may dispatch follow-up jobs after the agent reconnects.
+                // While disconnected, wait: follow-up jobs may arrive after reconnect.
                 if (client.state !== 'registered') {
                   logger.info(
                     'Scaler-managed agent idle but disconnected, deferring shutdown until reconnected',
@@ -471,8 +419,6 @@ await guardStartup(logger, async () => {
     roles: config.roles,
   });
 
-  // 5b. Helper: start the idle shutdown timer for scaler-managed agents.
-  // Extracted so both the .finally() handler and onRegistered callback can use it.
   function startIdleShutdownTimer(): void {
     const idleMs = config.scalerIdleTimeoutMs;
     if (idleShutdownTimer) clearTimeout(idleShutdownTimer);
@@ -490,24 +436,15 @@ await guardStartup(logger, async () => {
     }
   }
 
-  // 5c. Hook into onRegistered callback to re-evaluate idle shutdown after reconnection.
-  // When a scaler-managed agent reconnects, it should check if it's still idle and
-  // start the idle shutdown timer (the timer was deferred during disconnection).
-  //
-  // Two register.ack flags override that. `warmPool: true` means the agent was
-  // pre-spawned to wait for work rather than for a queued job: the
-  // orchestrator's warm-pool reaper owns its lifetime, so arming any timer here
-  // would kill it behind the reaper's back and cycle the pool.
-  // `pendingDispatch: true` means the orchestrator pre-bound a queued job and is
-  // preparing the dispatch.job message. That work (provider lookup, secret
-  // merging, upstream output resolution for jobs with `needs:`) can take several
-  // seconds — well past the default 5s scaler-idle timer — so arming the timer
-  // would race the dispatch and kill the agent before the job arrives. Defer to a
-  // much longer safety timeout instead; the actual dispatch.job cancels the timer
-  // (server.ts:165-168) when it arrives.
-  //
-  // The branch choice itself lives in `decideIdleShutdown` so it has one
-  // implementation rather than one here and a copy in the tests.
+  // On (re)registration, an idle scaler-managed agent arms the idle timer it
+  // deferred while disconnected. Two register.ack flags override that:
+  // - `warmPool`: the agent waits for work, not a queued job; the warm-pool
+  //   reaper owns its lifetime, so any timer here would cycle the pool.
+  // - `pendingDispatch`: the orchestrator pre-bound a queued job, and preparing
+  //   dispatch.job (provider lookup, secret merging, `needs:` outputs) can take
+  //   longer than the default 5s idle timer. A much longer safety timeout
+  //   applies instead; the dispatch handler cancels it when the job arrives.
+  // `decideIdleShutdown` holds the branch choice so tests share it.
   client.onRegistered = ({ pendingDispatch, warmPool }) => {
     const decision = decideIdleShutdown({
       scalerManaged: config.scalerManaged,
@@ -546,13 +483,10 @@ await guardStartup(logger, async () => {
     startIdleShutdownTimer();
   };
 
-  // 6. Add WS log transport for all agents.
-  // WS streaming is the authoritative path: it delivers structured JSON log lines to
-  // the orchestrator even when the agent's stdout is buffered or otherwise unreliable
-  // (e.g. Firecracker's serial-console path goes through Rust BufWriter + jailer uid
-  // drop, which can swallow short-lived diagnostic output). For scaler-managed agents
-  // on container / bare-metal backends this causes mild duplication with the
-  // orchestrator's LogCapture of stdout, which is acceptable — WS is canonical.
+  // WS log streaming is canonical for all agents: stdout can be unreliable (the
+  // Firecracker serial console goes through Rust BufWriter + jailer uid drop and
+  // can swallow short-lived output). Container / bare-metal backends get mild,
+  // accepted duplication with the orchestrator's stdout LogCapture.
   const wsTransport = new winston.transports.Stream({
     stream: new Writable({
       write(chunk, _encoding, callback) {
@@ -560,21 +494,17 @@ await guardStartup(logger, async () => {
         callback();
       },
     }),
-    // Use JSON format (always, regardless of TTY) for structured log forwarding
+    // Always JSON, regardless of TTY.
     format: winston.format.combine(winston.format.timestamp(), winston.format.json()),
   });
   logger.add(wsTransport);
 
-  // 6b. Diagnostic: forwarded-env probe. Operators can set
-  // KICI_AGENT_ENV_KICI_FC_ENV_PROBE (or any var matching the KICI_*_ENV_PROBE
-  // pattern) on the process that spawns agents; it flows through the scaler's
-  // env-forwarding path and lands in the agent's process.env. Logging it here
-  // — with the value redacted unless length <= 64 chars — proves end-to-end
-  // delivery. Emitted AFTER wsTransport is attached so the line is captured by
-  // the WS log path; pre-registration lines are buffered in LogBuffer and
-  // replayed on registration. Serial-console output (Firecracker) is block-
-  // buffered and unreliable for sparse writes, so WS is canonical. Intentionally
-  // allowlisted by the _ENV_PROBE suffix so this log never leaks real secrets.
+  // Forwarded-env probe: a var matching KICI_*_ENV_PROBE (e.g.
+  // KICI_AGENT_ENV_KICI_FC_ENV_PROBE) set on the spawning process reaches here
+  // through the scaler's env forwarding; logging it proves end-to-end delivery.
+  // Values over 64 chars are truncated. Logged after wsTransport is attached so
+  // the WS path carries it (pre-registration lines are buffered in LogBuffer and
+  // replayed). Only _ENV_PROBE-named vars are logged, so no real secret leaks.
   const envProbes: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v === undefined) continue;
@@ -590,18 +520,16 @@ await guardStartup(logger, async () => {
   const pidOne = pidOneWarning(process.pid);
   if (pidOne) logger.warn(pidOne);
 
-  // 7. Connect to orchestrator
   client.connect();
   connectionStatus.add(1);
 
-  // 7b. Start periodic metrics reporter (pushes OTel metrics to orchestrator every 30s)
+  // Pushes OTel metrics to the orchestrator every 30s.
   const metricsReporter = new MetricsReporter({
     agentId: config.agentId,
     send: (msg) => client.sendDirect(msg),
   });
   metricsReporter.start();
 
-  // 8. Create Hono app with health routes
   const app = new Hono();
 
   const healthRoutes = createHealthRoutes({
@@ -615,7 +543,6 @@ await guardStartup(logger, async () => {
 
   app.route('/', healthRoutes);
 
-  // 9. Start HTTP server
   const httpServer = applyProxyKeepAliveTimeouts(
     serve(
       {
@@ -637,13 +564,12 @@ await guardStartup(logger, async () => {
     logger,
     timeoutMs: 10_000,
     onForceExit: () => {
-      // Kill remaining child processes
       for (const job of jobRunner.activeJobs.values()) {
         job.abortController.abort();
       }
-      // Give 1s for abort handlers, then exit
+      // 1s for abort handlers, then exit.
       setTimeout(() => process.exit(1), 1000);
-      return true; // suppress default process.exit — we handle it after abort delay
+      return true; // suppress the default process.exit; exit after the abort delay
     },
     steps: [
       {
@@ -685,10 +611,9 @@ await guardStartup(logger, async () => {
           }),
       },
       {
-        // In Firecracker VMs the agent runs as PID 1. process.exit() triggers a
-        // kernel panic which kills the TCP stack before the WS close frame can be
-        // flushed to the host. A brief delay ensures the orchestrator receives the
-        // disconnect and doesn't dispatch new jobs to a dead agent.
+        // In Firecracker the agent is PID 1, so process.exit() panics the kernel
+        // and kills the TCP stack before the WS close frame flushes. The delay
+        // lets the orchestrator see the disconnect and stop dispatching here.
         name: 'Flushing network buffers',
         fn: async () => {
           if (config.scalerManaged) {
@@ -699,29 +624,20 @@ await guardStartup(logger, async () => {
     ],
   });
 
-  // -- Self-bootstrap claim failure --
-
-  // A one-shot self-bootstrap agent (KICI_SCALER_CLAIM_CODE set, no static
-  // token) whose claim exchange fails permanently — invalid, expired, or
-  // already-consumed code, or an errored/timed-out exchange — can never
-  // register. The claim can legitimately expire before a GitHub-hosted runner
-  // starts (scheduling latency > claim TTL). Without this the health HTTP
-  // server keeps the process alive and the run hangs until the job timeout, so
-  // exit non-zero through the graceful-shutdown path (logs flush, the health
-  // server closes).
+  // A self-bootstrap agent (KICI_SCALER_CLAIM_CODE set, no static token) whose
+  // claim fails permanently (invalid, expired or consumed code, or an
+  // errored/timed-out exchange) can never register; a claim can legitimately
+  // expire before a GitHub-hosted runner starts. Exit non-zero through graceful
+  // shutdown, or the health server keeps the run hanging until the job timeout.
   client.onClaimFailedPermanently = (reason) => {
     logger.error('Self-bootstrap claim failed permanently, shutting down', { reason });
     void gracefulShutdown('scaler-claim-failed', 1);
   };
 
-  // -- Permanent authentication failure --
-
-  // The client never reconnects after an auth.failure frame or an auth-failed
-  // close code (a revoked token, or an agent below the orchestrator's protocol
-  // floor). A process that can never register again must not sit behind a
-  // healthy-looking HTTP server: exit non-zero so a service manager reports it
-  // and a one-shot scaler runner is released instead of hanging until its job
-  // timeout.
+  // The client never reconnects after an auth.failure frame or auth-failed close
+  // code (revoked token, or an agent below the protocol floor). Exit non-zero so
+  // a service manager reports it and a one-shot scaler runner is released,
+  // rather than idling behind a healthy-looking HTTP server.
   client.onAuthFailedPermanently = (reason) => {
     logger.error('Authentication failed permanently, shutting down', { reason });
     void gracefulShutdown('auth-failed', 1);
@@ -733,14 +649,12 @@ await guardStartup(logger, async () => {
     logger.info('Received SIGUSR1, entering drain mode');
     isDraining = true;
 
-    // If no active jobs, shut down immediately
     if (jobRunner.activeJobs.size === 0) {
       logger.info('No active jobs, shutting down immediately');
       gracefulShutdown('SIGUSR1-drain');
       return;
     }
 
-    // Otherwise, poll until drained
     const checkDrained = setInterval(() => {
       if (jobRunner.activeJobs.size === 0) {
         clearInterval(checkDrained);

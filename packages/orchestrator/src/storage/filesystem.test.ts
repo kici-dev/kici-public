@@ -183,12 +183,9 @@ describe('FilesystemCacheStorage', () => {
     expect(await storage.list('nope/')).toEqual([]);
   });
 
-  // UserCache.restoreByPrefix lists on `${prefix}${seg(restoreKey)}` — a PARTIAL
-  // object name, not a directory. Treating that as a directory to readdir made
-  // the restoreKeys fallback silently never hit on this backend (ENOENT -> []),
-  // or throw outright (ENOTDIR) when a real file happened to carry that exact
-  // name. The S3 backend prefix-matches, so only the filesystem backend was
-  // affected and no FakeStorage-based unit test could see it.
+  // UserCache.restoreByPrefix lists on `${prefix}${seg(restoreKey)}`, a PARTIAL object name,
+  // not a directory: readdir-ing it silently misses (ENOENT -> []) or throws (ENOTDIR). S3
+  // prefix-matches, so only this backend is exposed, and no FakeStorage-based test sees it.
   describe('list() with a partial-name prefix (restoreKeys)', () => {
     it('matches objects whose key starts with the prefix', async () => {
       await storage.put('a/node-v1-aaa', 'x');
@@ -200,9 +197,8 @@ describe('FilesystemCacheStorage', () => {
       expect(listed.sort()).toEqual(['a/node-v1-aaa', 'a/node-v1-bbb']);
     });
 
-    it('returns [] rather than throwing when the prefix names an existing file', async () => {
-      // The ENOTDIR path: `a/node-v1` is itself an object, so readdir-ing it
-      // raised ENOTDIR, which the old not-found check did not treat as a miss.
+    it('lists the object itself rather than throwing when the prefix names an existing file', async () => {
+      // The ENOTDIR path: `a/node-v1` is itself an object, so readdir-ing it raises ENOTDIR.
       await storage.put('a/node-v1', 'x');
 
       const listed = await storage.list('a/node-v1');

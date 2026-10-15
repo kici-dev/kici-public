@@ -29,8 +29,6 @@ export class LocalRepoUrlBuilder implements RepoUrlBuilder {
   ) {}
 
   /**
-   * Build a clone URL for a repo.
-   *
    * If cloneUrlBase is set, uses it directly (for remote agents).
    * If repoIdentifier already starts with 'file://', returns it as-is.
    * Otherwise, prepends 'file://' and the repoBasePath.

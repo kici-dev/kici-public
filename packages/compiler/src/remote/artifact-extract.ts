@@ -1,11 +1,10 @@
 /**
  * CLI-side artifact extraction.
  *
- * Artifact tarballs are packed by the cache packer, so entries are anchored as
- * `__repo__/<rel>` (repo-root-relative) and `__home__/<rel>` (home-relative).
- * The in-workflow extractor restores those groups to the real repo root / home
- * dir; a CLI must NOT — that would scatter files across the user's filesystem.
- * This helper lands everything under a single destination dir instead:
+ * The cache packer anchors entries as `__repo__/<rel>` and `__home__/<rel>`.
+ * The in-workflow extractor restores them to the real repo root and home; a
+ * CLI must NOT, or files scatter across the user's filesystem. Everything lands
+ * under one destination dir instead:
  *
  *   `__repo__/<rel>` -> `<destDir>/<rel>`
  *   `__home__/<rel>` -> `<destDir>/~home/<rel>`  (kept separate so a
@@ -22,13 +21,8 @@ import { x as tarExtract } from 'tar';
 import { makeTempDir } from '@kici-dev/core/tmp';
 import { REPO_ANCHOR, HOME_ANCHOR } from '@kici-dev/core';
 
-/** Sub-directory of the destination that home-anchored entries land under. */
 export const HOME_SUBDIR = '~home';
 
-/**
- * Extract an artifact tarball under `destDir`, relocating the anchor groups so
- * nothing escapes the destination.
- */
 export async function extractArtifactTarball(tarball: Buffer, destDir: string): Promise<void> {
   const scratch = await makeTempDir('artifact-extract');
   try {
@@ -50,7 +44,7 @@ export async function extractArtifactTarball(tarball: Buffer, destDir: string): 
   }
 }
 
-/** Copy the contents of an anchor group dir into `into`, merging trees. */
+/** Merges trees. */
 async function relocateGroup(groupDir: string, into: string): Promise<void> {
   await mkdir(into, { recursive: true });
   for (const entry of await readdir(groupDir)) {

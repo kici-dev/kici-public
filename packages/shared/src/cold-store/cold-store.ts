@@ -1,29 +1,22 @@
 /**
- * BaseColdStore — the DB-agnostic framework class.
+ * BaseColdStore — the DB-agnostic framework class. Concrete subclasses
+ * (`PlatformColdStore`, `OrchestratorColdStore`) register their own adapters.
  *
- * Multiple concrete subclasses extend this one (e.g., `PlatformColdStore`,
- * `OrchestratorColdStore`). Each wires the adapter map with its
- * package-specific adapters.
- *
- * `runArchiveCycle()` drives the per-adapter archive loop.
  * `fetchRange` / `hasRange` / `countRange` resolve manifests via
  * `ListObjectsV2` and GET overlapping chunks through an in-process LRU.
  *
  * ## Advisory-lock namespace
  *
- * All Postgres advisory locks acquired by the cold-store framework use
- * keys derived from `hashtext('cold-store|...')`. The `cold-store|`
- * prefix is reserved — do NOT reuse it in pipeline or engine code
- * without coordinating to avoid collisions.
+ * Every framework advisory lock keys on `hashtext('cold-store|...')`. The
+ * `cold-store|` prefix is reserved: do NOT reuse it in pipeline or engine code.
  *
  * ## S3 bucket versioning caveat
  *
- * When the cold-store bucket has versioning ON (recommended default),
- * retried chunk PUTs produce new object versions at the same key.
- * Reconciliation (the `reconcile` CLI) MUST use `ListObjectVersions`,
- * not `ListObjects`, to detect orphaned objects correctly. The live
- * read-through uses `ListObjectsV2` because it only cares about the
- * current version of each manifest.
+ * With bucket versioning ON (the recommended default), a retried chunk PUT
+ * adds a new version at the same key. Reconciliation (the `reconcile` CLI)
+ * MUST use `ListObjectVersions`, not `ListObjects`, to find orphans. The live
+ * read-through uses `ListObjectsV2`: it reads only each manifest's current
+ * version.
  */
 import {
   type S3Client,
@@ -71,19 +64,16 @@ import type { ArchiveCycleSummary, ChunkManifest, ColdRetention } from './types.
 const CONTENT_HASH_META = 'content-hash';
 
 /**
- * Bound on the S3 GETs a single read-through keeps in flight. A read
- * over a tenant with one archived chunk per day used to issue one
- * manifest GET and one data GET per chunk, strictly one after the other:
- * 262 chunks cost 524 round trips and 34 s, and the
- * `kici-admin access-log list` client gave up at 30 s.
+ * Bound on the S3 GETs one read-through keeps in flight. Serial GETs (one
+ * manifest + one data GET per chunk) cost 34 s for 262 chunks, past the
+ * 30 s `kici-admin access-log list` client timeout.
  */
 const READ_THROUGH_CONCURRENCY = 16;
 
 /**
- * Budget for the in-process manifest cache. A manifest is immutable once
- * written (the chunk it describes is content-addressed), so caching it is
- * safe for the life of the process, and at ~600 bytes each this budget
- * holds well over ten thousand of them.
+ * Manifest cache budget. A manifest is immutable (its chunk is
+ * content-addressed), so caching it for the process lifetime is safe; at
+ * ~600 bytes each this holds over ten thousand.
  */
 const MANIFEST_CACHE_BYTES = 8 * 1024 * 1024;
 
@@ -119,20 +109,17 @@ export interface ColdStoreFetchRangeArgs<TRow> {
   tenantId: string;
   fromTs: Date;
   /**
-   * Upper bound (exclusive). Omit to use `warmCutoff(table)` — the table's
-   * resolved warm/cold boundary. Pass an explicit value only when the caller
-   * genuinely owns the range (e.g. a user-supplied time filter).
+   * Exclusive upper bound; defaults to `warmCutoff(table)`. Pass one only
+   * when the caller owns the range (e.g. a user-supplied time filter).
    */
   toTs?: Date;
   decode?: (line: string) => TRow;
   /**
-   * Row order by partition timestamp. `'asc'` (default) yields the oldest
-   * row first; `'desc'` yields the newest first, so a paginated reader that
-   * lists newest-first can stop consuming the stream as soon as its page is
-   * full instead of reading every archived chunk. Rows are globally ordered
-   * across chunks when the table has a registered adapter (its
-   * `rowTimestamp` drives the sort); without one the order is per-chunk
-   * (chunks ordered by manifest bounds, rows in archive order).
+   * Row order by partition timestamp, default `'asc'`. `'desc'` lets a
+   * newest-first paginated reader stop once its page is full instead of
+   * reading every chunk. Order is global across chunks when the table has a
+   * registered adapter (its `rowTimestamp` sorts); otherwise it is per-chunk
+   * (chunks by manifest bounds, rows in archive order).
    */
   order?: 'asc' | 'desc';
 }
@@ -153,24 +140,19 @@ export interface ColdStoreReplayRowArgs {
 }
 
 export interface ColdStoreReplayResult {
-  /** Number of rows newly inserted into PG. */
   inserted: number;
   /** Rows whose unique key was already in PG (idempotent re-replay). */
   skipped: number;
-  /** The chunk that was replayed (`null` when replayRow finds no match). */
+  /** `null` when replayRow finds no match. */
   chunkId: string | null;
 }
 
 /**
- * Purge-sweep options.
- *
- * `tableFilter` restricts to a single table (used by
- * `cold-store purge-now <table>`). `bucketFilter` further restricts to a
- * single bucket subprefix. `limit` caps the number of chunks processed
- * per call so a single sweep can't OOM the orchestrator on a tenant
- * with millions of expired chunks. `dryRun=true` lists candidates
- * without actually deleting anything (the CLI default — operators must
- * pass `--apply`).
+ * Purge-sweep options. `tableFilter` serves `cold-store purge-now <table>`;
+ * `bucketFilter` narrows to one bucket subprefix. `limit` caps chunks per
+ * call so one sweep cannot OOM the orchestrator on a tenant with millions of
+ * expired chunks. `dryRun=true` only lists candidates (the CLI default;
+ * operators pass `--apply`).
  */
 export interface PurgeExpiredChunksOpts {
   tableFilter?: string;
@@ -180,9 +162,8 @@ export interface PurgeExpiredChunksOpts {
 }
 
 /**
- * One row per (chunk attempt, outcome). Returned from
- * `purgeExpiredChunks` so callers (scheduled job, CLI) can log / report
- * what happened without re-querying the chunk index.
+ * One row per (chunk attempt, outcome), so callers can report without
+ * re-querying the chunk index.
  */
 export interface PurgeChunkResult {
   table: string;
@@ -198,19 +179,14 @@ export interface PurgeChunkResult {
 
 export interface PurgeExpiredChunksSummary {
   results: PurgeChunkResult[];
-  /** Total bytes (gzipped) actually purged from S3. */
+  /** Gzipped bytes purged from S3. */
   bytesPurged: number;
-  /** Total chunks actually purged (i.e., outcome === 'purged'). */
+  /** Chunks with outcome `'purged'`. */
   chunksPurged: number;
-  /** Wall-clock duration of the whole sweep. */
   durationMs: number;
 }
 
-/**
- * Chunk-index row shape returned by
- * `BaseColdStore.listPurgeableChunks`. Mirrors `cold_store_chunks` row
- * with a normalized `maxColdDays` field.
- */
+/** A `cold_store_chunks` row with a normalized `maxColdDays`. */
 export interface PurgeableChunk {
   table: string;
   tenantId: string;
@@ -229,20 +205,18 @@ export interface PurgeableChunk {
  */
 export interface ColdStore {
   /**
-   * The table's warm/cold boundary: `now − warmTtlDays`, resolved from the
-   * SAME config the archival writer uses — the registered adapter's effective
-   * config (built-in defaults merged with any
-   * `KICI_COLD_STORE_<TABLE>_WARM_TTL_DAYS` env override). Rows older than
-   * this may live in cold storage; rows newer are guaranteed PG-only.
+   * The table's warm/cold boundary, `now − warmTtlDays`, resolved from the
+   * SAME config the archival writer uses (adapter defaults merged with any
+   * `KICI_COLD_STORE_<TABLE>_WARM_TTL_DAYS` override). Older rows may be in
+   * cold storage; newer rows are guaranteed PG-only.
    *
-   * Readers MUST derive their cold-read upper bound from this rather than
-   * restating a literal. A reader-side value LARGER than the writer's
-   * produces an EARLIER cutoff, which silently hides archived rows: a
-   * manifest whose `min` timestamp is newer than the bound is skipped
-   * entirely, so a read 404s on data that exists in S3.
+   * Readers MUST derive their cold-read upper bound from this, never a
+   * literal. A reader value LARGER than the writer's gives an EARLIER cutoff
+   * that silently skips manifests whose `min` is newer, so a read 404s on
+   * data that exists in S3.
    *
-   * A `warmTtlDays` of zero or less yields a cutoff at or after `now` — the
-   * widest window, which is the safe direction.
+   * `warmTtlDays <= 0` yields a cutoff at or after `now`: the widest, safe
+   * window.
    */
   warmCutoff(table: string): Date;
   /** Stream archived rows that overlap [fromTs, toTs). */
@@ -250,42 +224,35 @@ export interface ColdStore {
   hasRange(args: Omit<ColdStoreFetchRangeArgs<unknown>, 'decode'>): Promise<boolean>;
   countRange(args: Omit<ColdStoreFetchRangeArgs<unknown>, 'decode'>): Promise<number>;
   /**
-   * Run one archive cycle. By default iterates every registered adapter
-   * in registration order; pass `tableFilter` to restrict to a single
-   * adapter (used by `archive-now <table>` CLI commands so an operator
-   * can flush one table on demand without waiting for the next cron tick).
+   * Run one archive cycle over every adapter in registration order, or only
+   * `tableFilter` (the `archive-now <table>` CLI flush).
    */
   runArchiveCycle(opts?: { tableFilter?: string }): Promise<ArchiveCycleSummary>;
   /**
-   * Promote every row in a chunk back into PG transactionally.
-   * Idempotent on re-run via the adapter's `ON CONFLICT DO NOTHING`.
-   * Throws if the adapter doesn't implement `replayInsert`, the chunk
-   * is missing, or the contentHash check fails.
+   * Promote every row in a chunk back into PG in one transaction; re-runs are
+   * idempotent via the adapter's `ON CONFLICT DO NOTHING`. Throws if the
+   * adapter lacks `replayInsert`, the chunk is missing, or the contentHash
+   * check fails.
    */
   replayChunk(args: ColdStoreReplayChunkArgs): Promise<ColdStoreReplayResult>;
   /**
-   * Locate the chunk containing `rowId` (via manifest
-   * `minRowId`/`maxRowId` bounds) and replay it. Returns
-   * `chunkId: null` when no manifest matches — caller handles as
-   * "row truly does not exist anywhere".
+   * Find the chunk holding `rowId` by manifest `minRowId`/`maxRowId` bounds
+   * and replay it. `chunkId: null` means no manifest matches: the row does
+   * not exist anywhere.
    */
   replayRow(args: ColdStoreReplayRowArgs): Promise<ColdStoreReplayResult>;
   /**
-   * Purge expired chunks from S3.
-   *
-   * Looks up `cold_store_chunks` rows where
+   * Purge `cold_store_chunks` rows where
    * `now() > archived_at + max_cold_days * INTERVAL '1 day'` AND
    * `max_cold_days != 'forever'`. For each:
-   *   1. Acquire a per-chunk advisory lock so concurrent sweeps can't
+   *   1. Take a per-chunk advisory lock so concurrent sweeps cannot
    *      double-delete.
-   *   2. Issue `DeleteObject` for both the data and manifest keys.
-   *   3. Call `adapter.purgeChunkRecord(...)` to transactionally delete
-   *      the row from `cold_store_chunks`, decrement the rollup, and
-   *      write a `purge_chunk` audit row.
+   *   2. `DeleteObject` the data and manifest keys.
+   *   3. `adapter.purgeChunkRecord(...)` transactionally deletes the index
+   *      row, decrements the rollup and writes a `purge_chunk` audit row.
    *
-   * `dryRun=true` (CLI default) skips steps 2–3 and returns the
-   * candidate list without mutating anything. Production scheduled
-   * sweeps pass `dryRun=false`.
+   * `dryRun=true` (CLI default) skips steps 2–3 and only returns candidates.
+   * Production scheduled sweeps pass `dryRun=false`.
    */
   purgeExpiredChunks(opts?: PurgeExpiredChunksOpts): Promise<PurgeExpiredChunksSummary>;
 }
@@ -294,14 +261,11 @@ export interface BaseColdStoreDeps {
   db: DbKind;
   config: ColdStoreConfig;
   instanceId: string;
-  /** Caller-supplied logger-like callable; omits pull on shared logger. */
+  /** Caller-supplied logger, so this module does not pull in the shared logger. */
   log: (level: 'info' | 'warn' | 'error', msg: string, extra?: Record<string, unknown>) => void;
-  /** Caller-supplied LRU; shared across consumers if desired. */
+  /** May be shared across consumers. */
   chunkCache?: ChunkLru<string, Buffer>;
-  /**
-   * Pre-built S3 client. If omitted, the BaseColdStore constructs one
-   * from `config.storage` via `createS3Client`. Tests pass a mock.
-   */
+  /** Defaults to `createS3Client(config.storage)`; tests pass a mock. */
   s3Client?: S3Client;
 }
 
@@ -316,7 +280,6 @@ export abstract class BaseColdStore implements ColdStore {
     sizeOf: (m) => JSON.stringify(m).length,
   });
   protected readonly s3: S3Client;
-  /** Registered table adapters by `table` name. */
   protected readonly adapters: Map<string, TableAdapter<unknown>> = new Map();
 
   protected constructor(deps: BaseColdStoreDeps) {
@@ -334,10 +297,7 @@ export abstract class BaseColdStore implements ColdStore {
       });
   }
 
-  /**
-   * Register a concrete table adapter. Subclasses typically call this
-   * from their constructor.
-   */
+  /** Subclasses call this from their constructor. */
   protected registerAdapter(adapter: TableAdapter<unknown>): void {
     if (adapter.db !== this.db) {
       throw new Error(
@@ -359,9 +319,8 @@ export abstract class BaseColdStore implements ColdStore {
   }
 
   /**
-   * CLI-accessible S3 primitives. Exposed so admin CLI commands can run
-   * inspection / reconciliation operations without a direct dependency
-   * on `@aws-sdk/client-s3`. Not intended for hot-path use.
+   * S3 primitives for admin CLI inspection / reconciliation, so the CLI needs
+   * no direct `@aws-sdk/client-s3` dependency. Not for hot-path use.
    */
   get bucket(): string {
     return this.config.storage.bucket;
@@ -370,7 +329,6 @@ export abstract class BaseColdStore implements ColdStore {
     return this.config.storage.prefix;
   }
 
-  /** List all object keys under a prefix, paging internally. */
   async listObjectKeys(prefix: string): Promise<string[]> {
     const keys: string[] = [];
     let continuationToken: string | undefined;
@@ -391,7 +349,6 @@ export abstract class BaseColdStore implements ColdStore {
     return keys;
   }
 
-  /** Fetch an object's raw body as a Buffer. */
   async getObjectBody(key: string): Promise<Buffer> {
     const resp = await this.s3.send(
       new GetObjectCommand({ Bucket: this.config.storage.bucket, Key: key }),
@@ -401,19 +358,15 @@ export abstract class BaseColdStore implements ColdStore {
     return Buffer.from(bytes);
   }
 
-  /** Upload a manifest JSON object at `key`. */
   async putManifestObject(key: string, manifest: ChunkManifest): Promise<void> {
     return this.putManifest(key, manifest);
   }
 
   /**
-   * Delete a single object by key. CLI-accessible companion to
-   * `listObjectKeys` / `getObjectBody`, used by tenant-scoped sweep
-   * paths (e.g. the post-`deleteOrgCascade` S3 cleanup) that operate
-   * on chunks the index already forgot about. Does NOT touch the
-   * `cold_store_chunks` index — callers that need both must follow
-   * the `purgeExpiredChunks` pattern with `withPurgeLock` +
-   * `adapter.purgeChunkRecord`.
+   * For tenant-scoped sweeps (e.g. the post-`deleteOrgCascade` S3 cleanup)
+   * over chunks the index already forgot. Does NOT touch `cold_store_chunks`;
+   * a caller needing both follows `purgeExpiredChunks` (`withPurgeLock` +
+   * `adapter.purgeChunkRecord`).
    */
   async deleteObject(key: string): Promise<void> {
     await this.s3.send(new DeleteObjectCommand({ Bucket: this.config.storage.bucket, Key: key }));
@@ -437,10 +390,9 @@ export abstract class BaseColdStore implements ColdStore {
         instanceId: this.instanceId,
       });
       summary.skipped.disabled += 1;
-      // Non-zero bump so the `kici-cold-store` meter scope + this
-      // counter are visible on /metrics. OTel's Prometheus exporter
-      // filters out counters whose only observations are .add(0), so
-      // every cycle must emit at least one nonzero sample.
+      // OTel's Prometheus exporter drops counters observed only via .add(0),
+      // so every cycle emits one nonzero sample to keep the
+      // `kici-cold-store` scope visible on /metrics.
       coldStoreArchiveCyclesTotal().add(1, {
         db: this.db,
         result: ColdStoreCycleResult.enum.disabled,
@@ -449,8 +401,7 @@ export abstract class BaseColdStore implements ColdStore {
     }
 
     if (this.adapters.size === 0) {
-      // Framework alive but no adapters registered. Bump the cycles
-      // counter so /metrics carries proof that the subsystem ran.
+      // Bump anyway so /metrics proves the subsystem ran.
       coldStoreArchiveCyclesTotal().add(1, {
         db: this.db,
         result: ColdStoreCycleResult.enum.no_tables,
@@ -549,17 +500,14 @@ export abstract class BaseColdStore implements ColdStore {
   /**
    * Archive one (tenant, partitionDate).
    *
-   * - Adapters WITHOUT `coldTtlDays`: single-chunk (v1) path. Writes one
-   *   chunk per partition at the day-prefix root with a v1 manifest. The
-   *   GC sweep treats v1 chunks as `'forever'`.
-   * - Adapters WITH `coldTtlDays`: per-bucket path. Buffers all
-   *   eligible rows, groups by `coldDaysToBucket(coldTtlDays(row))`,
-   *   then emits one chunk per non-empty bucket under the bucket
-   *   subprefix with a v2 manifest carrying `bucket` + `maxColdDays`.
+   * - Without `coldTtlDays`: one chunk per partition at the day-prefix root
+   *   with a v1 manifest; the GC sweep treats v1 chunks as `'forever'`.
+   * - With `coldTtlDays`: rows grouped by `coldDaysToBucket(coldTtlDays(row))`,
+   *   one chunk per non-empty bucket under its subprefix, with a v2 manifest
+   *   carrying `bucket` + `maxColdDays`.
    *
-   * In both paths the caller holds the advisory lock for the
-   * partition. Returns the total row count archived across all chunks
-   * so the outer loop can honor `maxRowsPerCycle`.
+   * The caller holds the partition advisory lock. Returns the total rows
+   * archived so the outer loop can honor `maxRowsPerCycle`.
    */
   private async archivePartition(
     adapter: TableAdapter<unknown>,
@@ -573,10 +521,6 @@ export abstract class BaseColdStore implements ColdStore {
     return this.archivePartitionSingleChunk(adapter, tenantId, partitionDate, summary);
   }
 
-  /**
-   * Single-chunk-per-partition (v1) flow. Adapters that do not
-   * implement `coldTtlDays` get a v1 manifest at the day-prefix root.
-   */
   private async archivePartitionSingleChunk(
     adapter: TableAdapter<unknown>,
     tenantId: string,
@@ -600,8 +544,7 @@ export abstract class BaseColdStore implements ColdStore {
       });
     } catch (err) {
       if (err instanceof Error && /empty row stream/.test(err.message)) {
-        // Race: discovery saw rows, select saw none. Partition got
-        // drained between the two queries. Not an error.
+        // Race: the partition drained between discovery and select. Not an error.
         summary.skipped.min_chunk += 1;
         return { rowsArchived: 0 };
       }
@@ -620,17 +563,11 @@ export abstract class BaseColdStore implements ColdStore {
       encoded,
       partitionStart,
       summary,
-      // Single-chunk (v1): no bucket segment, no v2 manifest fields.
       bucket: undefined,
       maxColdDays: undefined,
     });
   }
 
-  /**
-   * Per-bucket flow. Buffers all eligible rows, groups by
-   * `coldDaysToBucket(coldTtlDays(row))`, then emits one chunk per
-   * non-empty bucket.
-   */
   private async archivePartitionBucketed(
     adapter: TableAdapter<unknown>,
     tenantId: string,
@@ -640,9 +577,8 @@ export abstract class BaseColdStore implements ColdStore {
     const label = { db: this.db, table: adapter.table };
     const coldTtlDays = adapter.coldTtlDays!.bind(adapter);
 
-    // Buffer up to `maxRowsPerCycle` rows so we can re-stream each
-    // bucket subset through `encodeChunk`. Memory stays bounded by the
-    // existing per-cycle row cap.
+    // Buffer (bounded by `maxRowsPerCycle`) so each bucket subset can be
+    // re-streamed through `encodeChunk`.
     type BucketRows = {
       rows: unknown[];
       maxColdDays: ColdRetention;
@@ -686,17 +622,12 @@ export abstract class BaseColdStore implements ColdStore {
             ((r: unknown) => string | undefined) | undefined,
         });
       } catch (err) {
-        // arrayToAsync produces a non-empty stream by construction (we
-        // only enter the loop with bucket.rows.length > 0), so an
-        // 'empty row stream' here would be a framework bug. Re-raise.
+        // Every bucket is non-empty, so 'empty row stream' here is a framework bug.
         throw err;
       }
 
       if (encoded.gzipByteCount < adapter.config.minChunkBytes) {
-        // Bucket too small to meet the minChunkBytes floor — skip this
-        // bucket but continue with the others. Next cycle will retry
-        // (rows still in PG since markArchivedAndDelete hasn't run for
-        // this bucket yet).
+        // Skip only this bucket; its rows stay in PG and the next cycle retries.
         summary.skipped.min_chunk += 1;
         coldStoreArchiveRowsTotal().add(0, { ...label, result: 'skipped_min_chunk' });
         this.log('info', 'cold-store: bucket below minChunkBytes; skipping this cycle', {
@@ -726,11 +657,8 @@ export abstract class BaseColdStore implements ColdStore {
   }
 
   /**
-   * Common chunk-write flow: PUT data, verify, PUT manifest, transactional
-   * mark-archived-and-delete on the adapter, increment metrics.
-   *
-   * Shared by `archivePartitionSingleChunk` (v1 manifests) and
-   * `archivePartitionBucketed` (v2 manifests with bucket + maxColdDays).
+   * PUT data, verify, PUT manifest, then the adapter's transactional
+   * mark-archived-and-delete. Shared by the v1 and v2 (bucketed) paths.
    */
   private async writeChunk(
     adapter: TableAdapter<unknown>,
@@ -747,11 +675,8 @@ export abstract class BaseColdStore implements ColdStore {
     const { tenantId, partitionDate, encoded, partitionStart, summary, bucket, maxColdDays } = args;
     const label = { db: this.db, table: adapter.table };
 
-    // Invariant: bucket and maxColdDays travel together. Either both are set
-    // (per-bucket path → v2 manifest) or both are undefined
-    // (single-chunk path → v1 manifest). A misalignment would write a chunk
-    // under a bucket subprefix with a v1 manifest (or vice versa), creating
-    // data the read-through can't find. Surface it loudly.
+    // Invariant: bucket and maxColdDays are both set (v2) or both undefined
+    // (v1). A mismatch writes a chunk the read-through cannot find.
     if ((bucket === undefined) !== (maxColdDays === undefined)) {
       throw new Error(
         `cold-store writeChunk: bucket and maxColdDays must both be set or both undefined; got bucket=${JSON.stringify(bucket)} maxColdDays=${JSON.stringify(maxColdDays)}`,
@@ -874,10 +799,8 @@ export abstract class BaseColdStore implements ColdStore {
         chunkId,
         error: err instanceof Error ? err.message : String(err),
       });
-      // Do NOT re-throw: one chunk's failure should not abort the
-      // whole partition (other buckets may still succeed) or cycle.
-      // Next cycle retries the same chunk (same chunkId, idempotent
-      // PUT).
+      // Do NOT re-throw: one chunk must not abort the partition or cycle. The
+      // next cycle retries it (same chunkId, idempotent PUT).
       return { rowsArchived: 0 };
     }
   }
@@ -966,11 +889,9 @@ export abstract class BaseColdStore implements ColdStore {
       toTs,
     });
 
-    // A chunk carries only rows of its own partition day (the adapter's
-    // `selectEligible` is bounded to that day), so days never interleave.
-    // Walking day by day and sorting inside each day therefore yields a
-    // stream ordered across every chunk, which is what lets a newest-first
-    // reader stop after its first page.
+    // A chunk holds only its own partition day's rows (`selectEligible` is
+    // day-bounded), so days never interleave: sorting within each day yields
+    // a globally ordered stream, letting a newest-first reader stop early.
     const days = new Map<string, ChunkManifest[]>();
     for (const m of manifests) {
       const list = days.get(m.partitionDate);
@@ -982,9 +903,7 @@ export abstract class BaseColdStore implements ColdStore {
 
     const label = { db: args.db, table: args.table };
     const loadChunk = async (manifest: ChunkManifest): Promise<TRow[]> => {
-      // v2 manifests live under a bucket subprefix (`<day>/<bucket>/<chunk>`);
-      // v1 manifests live at the day root (`<day>/<chunk>`). The schemaVersion
-      // gate keeps the v1 read-back compatible.
+      // v2: `<day>/<bucket>/<chunk>`; v1: `<day>/<chunk>`.
       const dataKey = chunkObjectKey({
         prefix: this.config.storage.prefix,
         db: args.db,
@@ -1021,11 +940,9 @@ export abstract class BaseColdStore implements ColdStore {
       return rows;
     };
 
-    // Keep a bounded window of days loading ahead of the one being yielded,
-    // so consecutive single-chunk days do not serialise into one round trip
-    // each. A consumer that stops early leaves the window's promises to
-    // settle in the background; the `finally` below keeps a late rejection
-    // from surfacing as an unhandled one.
+    // Prefetch a bounded window of days so single-chunk days do not cost one
+    // serial round trip each. If the consumer stops early, the `finally`
+    // keeps a late rejection from going unhandled.
     const pending: Array<Promise<TRow[]>> = [];
     let nextDay = 0;
     const fill = (): void => {
@@ -1065,11 +982,7 @@ export abstract class BaseColdStore implements ColdStore {
     return total;
   }
 
-  /**
-   * Resolve all manifest sidecars whose time-range overlaps
-   * [fromTs, toTs). Uses one LIST walk under the tenant prefix, then
-   * GETs each `.manifest.json`.
-   */
+  /** Manifests overlapping [fromTs, toTs): one LIST walk under the tenant prefix, then GETs. */
   private async listRelevantManifests(args: {
     db: DbKind;
     table: string;
@@ -1103,10 +1016,9 @@ export abstract class BaseColdStore implements ColdStore {
       continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
     } while (continuationToken);
 
-    // A key under `<tenant>/<YYYY>/<MM>/<DD>/` names a chunk of that UTC
-    // day, so a day outside [fromTs, toTs) cannot overlap the range and its
-    // manifest is never fetched. Keys with no day segment fall through to
-    // the manifest test.
+    // `<tenant>/<YYYY>/<MM>/<DD>/` names a UTC day, so a manifest of a day
+    // outside [fromTs, toTs) is never fetched. Keys with no day segment fall
+    // through to the manifest test.
     const fromDay = utcDay(args.fromTs);
     const toDayInclusive = utcDay(new Date(args.toTs.getTime() - 1));
     const candidateKeys =
@@ -1136,9 +1048,8 @@ export abstract class BaseColdStore implements ColdStore {
   }
 
   /**
-   * `getManifest` through the in-process cache. Only the read-through uses
-   * this: the archiver and the reconcile paths must observe the object as it
-   * is in S3 right now, not as this process last saw it.
+   * Read-through only: the archiver and reconcile paths must see the object
+   * as it is in S3 now, not as this process last saw it.
    */
   private async getManifestCached(key: string): Promise<ChunkManifest> {
     const cached = this.manifestCache.get(key);
@@ -1194,18 +1105,11 @@ export abstract class BaseColdStore implements ColdStore {
   // ── Replay-into-PG ─────────────────────────────────────────────────
 
   /**
-   * Promote every row in a chunk back into PG. The adapter owns the
-   * actual INSERT + audit + chunk-counter decrement (transactional).
-   *
-   * Throws when:
-   *  - the cold store is disabled
-   *  - the adapter is unregistered or doesn't implement `replayInsert`
-   *  - the manifest is missing
-   *  - the data file's sha256 doesn't match the manifest's
-   *    `contentHash` (refuse to replay a tampered chunk)
-   *
-   * Idempotent on re-run: the adapter's `ON CONFLICT DO NOTHING`
-   * collapses the second pass to `inserted=0, skipped=rowCount`.
+   * The adapter owns the transactional INSERT + audit + chunk-counter
+   * decrement. Throws when the cold store is disabled, the adapter is
+   * unregistered or lacks `replayInsert`, the manifest is missing, or the
+   * data sha256 differs from the manifest `contentHash` (a tampered chunk).
+   * A re-run yields `inserted=0, skipped=rowCount` via `ON CONFLICT DO NOTHING`.
    */
   async replayChunk(args: ColdStoreReplayChunkArgs): Promise<ColdStoreReplayResult> {
     if (!this.config.enabled) {
@@ -1231,11 +1135,9 @@ export abstract class BaseColdStore implements ColdStore {
     const start = Date.now();
     const label = { db: args.db, table: args.table };
     try {
-      // Discover the manifest key by listing under the day prefix: v1
-      // chunks sit at the day-prefix root, v2 chunks sit under a
-      // `<bucket>` subprefix, and the caller has no reason to know
-      // which layout was used at archive time. chunkId is unique within
-      // a (tenant, partitionDate), so the suffix match is exact.
+      // List the day prefix: the caller does not know whether the chunk is v1
+      // (day root) or v2 (`<bucket>` subprefix). chunkId is unique per
+      // (tenant, partitionDate), so the suffix match is exact.
       const dayPrefix = tenantDayPrefix({
         prefix: this.config.storage.prefix,
         db: args.db,
@@ -1283,9 +1185,7 @@ export abstract class BaseColdStore implements ColdStore {
         gzipByteCount: manifest.gzipByteCount,
         objectKey: dataKey,
       };
-      // Bind to the adapter so `this` inside `replayInsert` resolves to
-      // the adapter instance — without this, the destructured callable
-      // loses its receiver and crashes on `this.kdb`.
+      // Unbound, the callable loses its receiver and crashes on `this.kdb`.
       const replayInsert = adapter.replayInsert.bind(adapter) as (rArgs: {
         rows: ReadonlyArray<unknown>;
         chunkMeta: ChunkCommitMetadata;
@@ -1328,18 +1228,13 @@ export abstract class BaseColdStore implements ColdStore {
   }
 
   /**
-   * Locate the chunk whose `[minRowId, maxRowId]` window covers
-   * `rowId` and replay it. Scans manifests under the tenant prefix
-   * (LIST is one round-trip; manifests are tiny). When several manifests
-   * match (overlapping ranges from re-archives), the one with the
-   * smallest range is preferred — it's the most recently re-archived
-   * shard and therefore the one whose row contents are freshest.
+   * Scans manifests under the tenant prefix (one LIST; manifests are tiny).
+   * When re-archives leave overlapping ranges, the smallest range wins: it is
+   * the most recently re-archived shard, so its rows are freshest.
    *
-   * Returns `chunkId: null` when no manifest matches — the caller
-   * decides whether that means "row never existed" (rerun → 404) or
-   * "S3 outage" (rerun → 410 replayFailed). This method only fails
-   * loudly on infrastructure errors (missing chunk after manifest
-   * found, hash mismatch).
+   * `chunkId: null` (no match) lets the caller choose "row never existed"
+   * (rerun → 404) or "S3 outage" (rerun → 410 replayFailed). It throws only on
+   * infrastructure errors (chunk missing after its manifest, hash mismatch).
    */
   async replayRow(args: ColdStoreReplayRowArgs): Promise<ColdStoreReplayResult> {
     if (!this.config.enabled) {
@@ -1374,10 +1269,9 @@ export abstract class BaseColdStore implements ColdStore {
     let exact: ChunkManifest | null = null;
     for (const key of manifestKeys) {
       const m = await this.getManifest(key);
-      // Primary path: explicit natural-key lookup. Adapters that
-      // populate `replayLookupKeys` (e.g. execution_runs storing run_id
-      // UUIDs) make replayRow exact even when the chunk's `minRowId` /
-      // `maxRowId` are an unrelated SERIAL `id` the caller doesn't know.
+      // Natural-key lookup first: `replayLookupKeys` (e.g. execution_runs
+      // run_id UUIDs) is exact even when `minRowId` / `maxRowId` are a SERIAL
+      // `id` the caller does not know.
       if (m.replayLookupKeys && m.replayLookupKeys.includes(wanted)) {
         exact = m;
         break;
@@ -1411,15 +1305,10 @@ export abstract class BaseColdStore implements ColdStore {
   // ── Cold-store purge sweep ─────────────────────────────────────────
 
   /**
-   * Subclass hook — query the per-DB `cold_store_chunks` index for
-   * purge candidates. Concrete subclasses (PlatformColdStore /
-   * OrchestratorColdStore) implement this with one Kysely SQL query
-   * keyed off `archived_at + max_cold_days * INTERVAL '1 day' < now()`
-   * and `max_cold_days != 'forever'`.
-   *
-   * Returning an empty array makes `purgeExpiredChunks` a no-op.
-   * Default implementation returns `[]` so non-purge subclasses (or
-   * test fixtures) can opt out trivially.
+   * Subclass hook: purge candidates from the per-DB `cold_store_chunks` index,
+   * keyed off `archived_at + max_cold_days * INTERVAL '1 day' < now()` and
+   * `max_cold_days != 'forever'`. The default `[]` makes `purgeExpiredChunks`
+   * a no-op, so non-purge subclasses and test fixtures opt out.
    */
   protected async listPurgeableChunks(_opts: {
     tableFilter?: string;
@@ -1430,14 +1319,11 @@ export abstract class BaseColdStore implements ColdStore {
   }
 
   /**
-   * Acquire a per-chunk advisory lock so concurrent sweeps can't
-   * race on the same `DeleteObject` + `cold_store_chunks` row.
-   *
-   * Default implementation is a no-op (always succeeds). Subclasses
-   * with a Kysely instance override to use `pg_try_advisory_lock` on
-   * `hashtext('cold-store-purge|<db>|<table>|<chunkId>')` and release
-   * inside `fn`'s `finally`. Returns `null` when another worker holds
-   * the lock; returns the `fn` result on success.
+   * Per-chunk advisory lock so concurrent sweeps cannot race on one
+   * `DeleteObject` + `cold_store_chunks` row. The default always succeeds;
+   * subclasses with Kysely use `pg_try_advisory_lock` on
+   * `hashtext('cold-store-purge|<db>|<table>|<chunkId>')`, released in `fn`'s
+   * `finally`. Returns `null` when another worker holds the lock.
    */
   protected async withPurgeLock<T>(
     _args: { table: string; chunkId: string },
@@ -1504,10 +1390,7 @@ export abstract class BaseColdStore implements ColdStore {
       const lockResult = await this.withPurgeLock(
         { table: c.table, chunkId: c.chunkId },
         async () => {
-          // 1. Delete the data + manifest objects from S3. Both deletes
-          //    are issued; if either fails we surface the error and
-          //    leave the chunk-index row in place so the next sweep
-          //    retries.
+          // A failed delete keeps the chunk-index row, so the next sweep retries.
           const manifestKey = c.objectKey.replace(/\.jsonl\.gz$/, '.manifest.json');
           await this.s3.send(
             new DeleteObjectCommand({ Bucket: this.config.storage.bucket, Key: c.objectKey }),
@@ -1515,9 +1398,6 @@ export abstract class BaseColdStore implements ColdStore {
           await this.s3.send(
             new DeleteObjectCommand({ Bucket: this.config.storage.bucket, Key: manifestKey }),
           );
-          // 2. Adapter cleans up PG: DELETE from cold_store_chunks +
-          //    decrement rollup + write 'purge_chunk' audit row, all
-          //    inside one transaction.
           await adapter.purgeChunkRecord!({
             tenantId: c.tenantId,
             chunkId: c.chunkId,
@@ -1586,30 +1466,23 @@ function compareIds(a: string | number, b: string | number): number {
 
 function idDistance(lo: string | number, hi: string | number): number {
   if (typeof lo === 'number' && typeof hi === 'number') return Math.max(0, hi - lo);
-  // String IDs: use length-difference + lexicographic offset as a stable
-  // tie-breaker. We only need a "smaller window > larger window" order
-  // for the best-match preference; exact distance doesn't matter. Clamp
-  // to >= 0 so an inverted range (hi shorter than lo by lexicographic
-  // accident, e.g. "10" < "9") doesn't produce a negative width that
-  // always wins the `width < best.rangeWidth` comparison.
+  // String IDs only need a stable smaller-window-first order, not a true
+  // distance. Clamp to >= 0 so an inverted range (e.g. "10" < "9") cannot
+  // yield a negative width that always wins `width < best.rangeWidth`.
   const lenDelta = String(hi).length - String(lo).length;
   if (lenDelta !== 0) return Math.max(0, lenDelta);
   return String(hi) < String(lo) ? 0 : 1;
 }
 
 /**
- * Best-effort extraction of the table name from a chunk key of shape
- * `<prefix>/<db>/<table>/<tenant>/<YYYY>/<MM>/<DD>/<chunk>.ext` (v1) or
- * `<prefix>/<db>/<table>/<tenant>/<YYYY>/<MM>/<DD>/<bucket>/<chunk>.ext`
- * (v2 with bucket subprefix). Used for metric labels on the read-through
- * path; returns `'unknown'` if the key doesn't parse.
+ * Best-effort table name (for metric labels) from
+ * `<prefix>/<db>/<table>/<tenant>/<YYYY>/<MM>/<DD>[/<bucket>]/<chunk>.ext`;
+ * `'unknown'` if the key does not parse.
  */
 function keyToTable(key: string): string {
   const parts = key.split('/');
-  // Walk from the end: the year segment is always 4 digits. The table
-  // sits two segments before. Walking back from `length - 4` covers
-  // the v1 layout in O(1); the loop catches the v2 layout (one more
-  // segment between year and chunk file) on the second iteration.
+  // The 4-digit year sits two segments after the table. `length - 4` hits it
+  // for v1; v2's extra bucket segment matches on the second iteration.
   for (let i = parts.length - 4; i >= 2; i--) {
     if (/^\d{4}$/.test(parts[i] ?? '')) {
       return parts[i - 2] ?? 'unknown';
@@ -1618,12 +1491,7 @@ function keyToTable(key: string): string {
   return 'unknown';
 }
 
-/**
- * Lift an in-memory array into an `AsyncIterable` so it can feed
- * `encodeChunk` (which expects a stream). Used by the per-bucket
- * archive flow to re-stream each bucket's row subset through the
- * existing single-stream encoder without further refactoring.
- */
+/** Feeds a bucket's buffered rows to the stream-only `encodeChunk`. */
 async function* arrayToAsync<T>(items: ReadonlyArray<T>): AsyncIterable<T> {
   for (const item of items) yield item;
 }

@@ -1,8 +1,8 @@
 /**
- * Event-type bucketing tests. The core guarantee is a PARITY invariant: the
- * matched set produced by the candidates-only matchWorkflowsForEvent must be
- * byte-identical to the matched subset of matchAllWorkflows for every event
- * type — a bucketing bug that dropped a subscribed workflow would surface here.
+ * Event-type bucketing. The PARITY invariant: for every event type, the matched
+ * set from the candidates-only matchWorkflowsForEvent is byte-identical to the
+ * matched subset of matchAllWorkflows, so a bucketing bug that drops a
+ * subscribed workflow surfaces here.
  */
 import { describe, it, expect } from 'vitest';
 import type { LockWorkflow, SimulatedEvent, LockTrigger } from './types.js';
@@ -154,9 +154,8 @@ describe('TRIGGER_TYPE_TO_EVENT_TYPES drift guard', () => {
   });
 
   it('maps every non-webhook trigger _type present in the matcher switch', () => {
-    // These are the trigger _types with an event.type guard (webhook excluded —
-    // it is dynamic). If the matcher grows a new trigger type, this list and the
-    // map must both be updated.
+    // The trigger _types with an event.type guard (webhook excluded: it is
+    // dynamic). A new matcher trigger type updates both this list and the map.
     const expected = [
       'pr',
       'push',

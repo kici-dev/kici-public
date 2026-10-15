@@ -1,16 +1,12 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the typed host-vars dimension to the host roster:
+ * `host_roster.host_properties jsonb NOT NULL DEFAULT '{}'`: the typed host-vars
+ * bag (`string | number | boolean` values) the agent reports at registration
+ * and/or the operator declares (`kici-admin host declare --prop`). Labels stay
+ * the flat-string grouping dimension; properties are a separate queryable one.
  *
- * - `host_roster.host_properties jsonb NOT NULL DEFAULT '{}'` — the typed
- *   property bag (`string | number | boolean` values) reported by the agent at
- *   registration and/or declared by the operator (`kici-admin host declare
- *   --prop`). Labels stay the flat-string grouping dimension; properties are
- *   the separate queryable host-vars dimension.
- *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`): re-running on a DB that already has
- * the column is a no-op. Existing data is preserved (additive column).
+ * Idempotent and additive.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.host_roster

@@ -43,10 +43,9 @@ describe('catalog-policy', () => {
   });
 
   it('every METRIC_LABEL_POLICY entry references a known catalog metric', () => {
-    // Platform-emitted metrics can appear here to declare value bounds
-    // (closed enums, cardinality caps) on labels they themselves set —
-    // they don't need to be orch-pushable. The only hard invariant is
-    // that the metric name is in the catalog at all.
+    // Platform-emitted metrics may declare value bounds here (closed enums,
+    // cardinality caps) without being orch-pushable; the only invariant is
+    // that the metric name is in the catalog.
     for (const name of Object.keys(METRIC_LABEL_POLICY)) {
       expect(
         Object.values(MetricNames).includes(name as MetricName),
@@ -94,7 +93,7 @@ describe('catalog-policy', () => {
   it('executions_total status policy covers every ExecutionRunStatus value', () => {
     const policy = METRIC_LABEL_POLICY.kici_orch_executions_total;
     expect(policy?.status?.values).toEqual([...ExecutionRunStatus.options]);
-    // Regression guard for the original bug: pending/cancelling/held must be allowed.
+    // pending/cancelling/held must be allowed.
     for (const s of ['pending', 'cancelling', 'held']) {
       expect(policy?.status?.values).toContain(s);
     }
@@ -116,11 +115,11 @@ describe('catalog-policy', () => {
   });
 
   it('admits every scaler backend type on scalerType and on the agent scaler label', () => {
-    // The orchestrator stamps `scalerType` straight from its `backends` map,
-    // so any ScalerBackendType the policy omits is dropped as
-    // bad_label_value — which is how the `event` backend silently lost both
-    // resource gauges on the Platform. Same source feeds the agent-side
-    // `scaler` label via ScalerManager.getBackendType.
+    // The orchestrator stamps `scalerType` straight from its `backends` map, so
+    // the Platform drops any ScalerBackendType the policy omits as
+    // bad_label_value, silently losing that backend's resource gauges. The
+    // agent-side `scaler` label comes from the same source
+    // (ScalerManager.getBackendType).
     for (const backendType of ScalerBackendType.options) {
       expect(ORCH_SCALER_VALUES, `scalerType must admit ${backendType}`).toContain(backendType);
       expect(

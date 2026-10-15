@@ -1,9 +1,7 @@
 /**
- * Helpers for `kici-admin db backup` / `db restore`. Kept out of db.ts so the
- * command actions stay thin and the pg_dump/pg_restore + manifest logic is
- * unit-testable without Commander or a real Postgres. Every external effect
- * (process exec, filesystem) is an injectable seam so tests never spawn a
- * binary or touch disk.
+ * Helpers for `kici-admin db backup` / `db restore`, outside db.ts so they test
+ * without Commander or a real Postgres. Process exec and filesystem access are
+ * injectable, so tests never spawn a binary or touch disk.
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -58,15 +56,13 @@ export interface BackupManifest {
 }
 
 export interface CreateDbBackupOptions {
-  /** libpq connection URL of the database to dump. */
+  /** libpq connection URL. */
   databaseUrl: string;
-  /** Absolute or relative path the `.dump` archive is written to. */
   outputPath: string;
-  /** Handle used to insert the `backup_runs` row. */
+  /** Inserts the `backup_runs` row. */
   db: Kysely<Database>;
-  /** Pool used to read the server version, key generation, and cluster id. */
+  /** Reads the server version, key generation, and cluster id. */
   pool: import('pg').Pool;
-  /** Timestamp stamped into the manifest. */
   now: Date;
 }
 
@@ -108,13 +104,10 @@ const defaultPruneIo: PruneIo = {
 };
 
 /**
- * Keep the newest {@link keep} `.dump` files in {@link dir} and delete the
- * rest, each with its `.manifest.json` sidecar. Newest is decided by
- * modification time, with the filename as a tiebreak because the timestamped
- * names sort chronologically. Returns every path removed.
- *
- * A `keep` of 0 or less disables pruning: retention is opt-in, so a
- * misconfigured value must never empty the directory.
+ * Keep the newest {@link keep} `.dump` files in {@link dir}, deleting the rest
+ * with their `.manifest.json` sidecars; newest by mtime, tiebroken by the
+ * chronologically sorting filename. Returns every path removed. A `keep` of 0
+ * or less disables pruning, so a misconfigured value never empties the directory.
  */
 export async function pruneBackupDir(
   dir: string,
@@ -138,8 +131,7 @@ export async function pruneBackupDir(
       await io.unlink(manifestPath(dumpPath));
       removed.push(manifestPath(dumpPath));
     } catch {
-      // A dump written before the manifest existed, or a partially-cleaned
-      // directory — the dump itself is gone, which is what retention wanted.
+      // No sidecar (older dump, or a partly cleaned directory): the dump is gone, which suffices.
     }
   }
   return removed;
@@ -226,15 +218,10 @@ export async function readServerAndKeyMeta(pool: import('pg').Pool): Promise<{
 }
 
 /**
- * Translate a libpq connection URL into a PG* environment overlay. The
- * connection URL (which embeds the DB password) MUST NOT be passed as a
- * pg_dump/pg_restore argv element: `/proc/<pid>/cmdline` is world-readable, so
- * a URL-in-argv leaks the DB password to every local user for the tool's
- * lifetime. libpq reads PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE/PGSSLMODE
- * from the environment (`/proc/<pid>/environ`, owner-only 0400) instead — the
- * same credential-off-the-command-line discipline used elsewhere in the repo.
- * Only the components that are actually present are set, so socket / trust
- * connections (no password, no port) are left untouched.
+ * A libpq URL as a PG* environment overlay. The URL embeds the password and
+ * MUST NOT go into pg_dump/pg_restore argv: `/proc/<pid>/cmdline` is
+ * world-readable, while `/proc/<pid>/environ` is owner-only 0400. Only the
+ * components present are set, so socket / trust connections stay untouched.
  */
 export function pgEnvFromUrl(url: string): NodeJS.ProcessEnv {
   const parsed = new URL(url);
@@ -266,10 +253,9 @@ export async function runPgRestore(
   run: RunFn = defaultRun,
 ): Promise<void> {
   const env = pgEnvFromUrl(url);
-  // pg_restore needs an explicit --dbname to enter "connect + restore into DB"
-  // mode; without it (unlike pg_dump) it does NOT fall back to PGDATABASE and
-  // instead demands -f to emit SQL to a file. The DB name is not a secret, so
-  // it is safe in argv; the connection credentials still ride in PG* env.
+  // Unlike pg_dump, pg_restore does NOT fall back to PGDATABASE: without
+  // --dbname it demands -f and emits SQL. The DB name is no secret, so argv is
+  // safe; credentials still ride in PG* env.
   const dbName = env.PGDATABASE ?? new URL(url).pathname.replace(/^\//, '');
   await run('pg_restore', ['--clean', '--if-exists', '--no-owner', '--dbname', dbName, inputPath], {
     env: { ...process.env, ...env },
@@ -301,13 +287,9 @@ export function buildBackupManifest(input: {
 }
 
 /**
- * Take one orchestrator database backup: pre-flight the `pg_dump` version,
- * dump to {@link CreateDbBackupOptions.outputPath}, write the sidecar manifest,
- * and record the `backup_runs` row.
- *
- * Prints nothing and never exits the process — every failure surfaces as a
- * thrown Error so the caller decides how to report it. That is what lets both
- * `kici-admin db backup` and the pre-upgrade hook share one implementation.
+ * Check the `pg_dump` version, dump, write the sidecar manifest, and record the
+ * `backup_runs` row. Prints nothing and never exits: failures throw, so
+ * `kici-admin db backup` and the pre-upgrade hook share it.
  */
 export async function createDbBackup(opts: CreateDbBackupOptions): Promise<CreateDbBackupResult> {
   const { databaseUrl, outputPath, db, pool, now } = opts;
@@ -344,10 +326,9 @@ export async function createDbBackup(opts: CreateDbBackupOptions): Promise<Creat
 }
 
 /**
- * Message to print after a restore about the secret-key requirement. Returns
- * null when the dump carried no encrypted secrets (nothing to warn about),
- * a loud warning when secrets exist but no `KICI_SECRET_KEY` is set on the box,
- * or an informational reminder when a key IS set (it must be the matching one).
+ * The post-restore secret-key note: null when the dump has no encrypted
+ * secrets, a warning when no `KICI_SECRET_KEY` is set, else a reminder that the
+ * set key must be the matching one.
  */
 export function restoreKeyWarning(input: {
   secretKeyVersion: number | null;

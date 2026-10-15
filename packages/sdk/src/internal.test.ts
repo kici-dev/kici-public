@@ -8,13 +8,10 @@ import * as root from './index.js';
 const SRC = path.dirname(fileURLToPath(import.meta.url));
 
 /**
- * The runtime ABI the agent, compiler, and orchestrator drive on a workflow's
- * behalf. No workflow author calls any of it, so none of it belongs on the
- * compat-protected root barrel.
- *
- * Pinning the set is what stops the root barrel growing a new internal: adding
- * one to `index.ts` without adding it here fails, and the failure names the
- * subpath it should have gone to instead.
+ * The runtime ABI the agent, compiler and orchestrator drive for a workflow. No
+ * author calls it, so none of it belongs on the compat-protected root barrel.
+ * Pinning the set makes a new internal added to `index.ts` fail here, naming
+ * the subpath it belongs on.
  */
 const RUNTIME_INTERNALS = [
   'applyIncludeExclude',

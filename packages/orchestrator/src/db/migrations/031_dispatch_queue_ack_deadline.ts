@@ -1,19 +1,13 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `dispatch_queue.ack_deadline TIMESTAMPTZ` and
- * `dispatch_queue.ack_agent_id TEXT` persisting the per-dispatch
- * acknowledgment deadline for HA-safe lost-dispatch detection.
+ * Add `dispatch_queue.ack_deadline` / `ack_agent_id`: the persisted per-dispatch ack deadline
+ * for HA-safe lost-dispatch detection.
  *
- * The dispatcher stamps both when a job.dispatch is sent and clears them
- * when the agent answers (job.ack / job.reject / job.status running). A
- * `dispatched` row past its deadline is requeued — by the owning coord's
- * in-memory timer, or by the leader-gated sweep
- * (`Dispatcher.sweepExpiredAckDeadlines`) when the owning coord crashed.
- * On coord boot, `Dispatcher.recoverState()` re-arms timers from the
- * persisted deadlines.
- *
- * Idempotent: re-running on a DB that already has either column is a no-op.
+ * Stamped on job.dispatch, cleared on the agent's answer (job.ack / job.reject / job.status
+ * running). A `dispatched` row past its deadline is requeued by the owning coord's timer, or by
+ * the leader-gated `Dispatcher.sweepExpiredAckDeadlines` when that coord crashed;
+ * `Dispatcher.recoverState()` re-arms timers on coord boot. Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colExists = async (name: string): Promise<boolean> => {

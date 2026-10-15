@@ -1,18 +1,14 @@
 /**
- * Scaler provisioning diagnostic check.
- *
- * Reads recent scaler spawn failures (in-process, over a short rolling window)
- * and emits one row per configured scaler backend instance. Severity is
- * bound-aware: a warm-pool/unbound failure is a warning (no run impact yet); a
- * job-bound failure is a failure (a queued run could not get an agent).
+ * Scaler provisioning check: one row per configured backend from in-process spawn failures
+ * over a rolling window. A warm-pool/unbound failure warns (no run impact yet); a job-bound
+ * failure fails (a queued run could not get an agent).
  */
 
 import type { DiagnosticDeps, DiagnosticResult } from '../types.js';
 
-/** Rolling window for "recent" spawn failures. */
 export const SCALER_FAILURE_WINDOW_MS = 5 * 60 * 1000;
 
-/** Keep the per-row message short enough to read in the diagnose table. */
+/** Short enough to read in the diagnose table. */
 const MAX_DETAIL_LEN = 120;
 
 function truncate(s: string): string {
@@ -40,11 +36,9 @@ export async function checkScalerProvisioning(deps: DiagnosticDeps): Promise<Dia
   return backends.map((backend) => {
     const summary = recent.get(backend.name);
     const durationMs = Date.now() - start;
-    // A scaler removed from the config drains before it disappears. Say so on
-    // its row, so an operator can tell a winding-down scaler from a configured one.
-    // The marker LEADS the message: the diagnose table truncates each message to
-    // a fixed width, so a trailing marker is cut off on exactly the rows that
-    // carry failure text. `details` keeps the untruncated values.
+    // A scaler removed from the config drains before it disappears; mark its row. The marker
+    // LEADS because the diagnose table truncates messages to a fixed width, which would cut
+    // a trailing marker on the rows carrying failure text. `details` stays untruncated.
     const retiringPrefix = backend.retiring
       ? `retiring (${backend.activeCount} agent(s) left) — `
       : '';

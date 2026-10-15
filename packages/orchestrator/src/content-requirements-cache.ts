@@ -60,7 +60,6 @@ export class ContentRequirementsCache {
    * caching. Each distinct `(provider, repo, sha, path)` is fetched at most
    * once; concurrent misses coalesce onto one fetch.
    *
-   * @param fetcher - Provider-specific file-contents fetcher.
    * @param repo    - Provider repo identifier ("owner/repo").
    * @param sha     - Git ref (commit SHA, or a branch/tag name).
    * @param path    - Repo-relative file path.

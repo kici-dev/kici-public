@@ -1,10 +1,4 @@
-/**
- * Agent connectivity diagnostic check.
- *
- * Reads the agent registry count and reports whether any agents
- * are connected. Zero agents is a warning (not failure) since
- * agents may be scaling up.
- */
+/** Agent connectivity check. Zero agents only warns: agents may be scaling up. */
 
 import type { DiagnosticDeps, DiagnosticResult } from '../types.js';
 

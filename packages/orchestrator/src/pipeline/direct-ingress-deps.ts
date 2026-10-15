@@ -1,19 +1,15 @@
 /**
  * The `ProcessingDeps` bag the DIRECT-INGRESS pipeline runs on.
  *
- * Two pipelines assemble this bag. `server.ts` builds the one the Platform WS
- * relay hands to `processWebhook`; this module builds the one every HTTP
- * ingress uses — the direct GitHub route, the generic webhook routes, and the
- * internal-event dispatch adapter. On an independent orchestrator there is no
- * relay, so this is the ONLY bag it ever has.
+ * `server.ts` builds the bag the Platform WS relay hands to `processWebhook`;
+ * this module builds the one every HTTP ingress uses — the direct GitHub route,
+ * the generic webhook routes, and the internal-event dispatch adapter. An
+ * independent orchestrator has no relay, so this is its ONLY bag.
  *
- * It lives outside `app.ts` because it is the seam an approval defect hides in.
- * A field the composition root forgets is invisible: the pipeline reads it as
- * `undefined`, every guard downstream is written to degrade rather than throw,
- * and the feature is silently inert. Assembling the bag in a function with a
- * declared return type is what lets a test assert the wiring directly instead
- * of asserting it through a 2,000-line composition root that no test
- * constructs.
+ * It lives outside `app.ts` because a forgotten field reads as `undefined`,
+ * every downstream guard degrades rather than throws, and the feature is
+ * silently inert. A function with a declared return type lets a test assert the
+ * wiring directly, not through a 2,000-line composition root no test constructs.
  */
 import type { ProcessingDeps } from './processor.js';
 import { TrustDirectoryStore } from '../security/trust-directory-store.js';
@@ -23,10 +19,9 @@ import type { SourceLocationData } from '../reporting/check-run-summary.js';
 /**
  * Everything the bag reads that `AppDependencies` already carries.
  *
- * Declared structurally rather than as `AppDependencies` so this module does
- * not import `app.ts` (which imports it) and so the fields the bag actually
- * consumes are enumerated in one readable place. `AppDependencies` satisfies it
- * by construction — the `createApp` call site is the compiler's check of that.
+ * Structural, so this module does not import `app.ts` (which imports it) and
+ * the consumed fields are listed in one place. The `createApp` call site is the
+ * compiler's check that `AppDependencies` satisfies it.
  */
 export interface DirectIngressDepsSource {
   db: ProcessingDeps['db'] & {};
@@ -83,16 +78,12 @@ export interface DirectIngressStores {
 }
 
 /**
- * Build the direct-ingress `ProcessingDeps` factory.
- *
  * The returned function assembles a fresh bag per call, so every field reads
- * the CURRENT subsystem instance — the provider registry is swapped wholesale
- * on a source reload, and a bag captured once would keep dispatching through
- * the replaced one.
+ * the CURRENT subsystem instance: a source reload swaps the provider registry
+ * wholesale, and a bag captured once would keep dispatching through the old one.
  *
- * The two stores are constructed once here rather than per call: both are
- * stateless over the database handle, and one of them is read on every PR
- * delivery.
+ * The two stores are built once, not per call: both are stateless over the
+ * database handle, and one is read on every PR delivery.
  */
 export function createDirectIngressProcessingDeps(
   deps: DirectIngressDepsSource,
@@ -104,17 +95,13 @@ export function createDirectIngressProcessingDeps(
     ) => void;
   },
 ): { build: () => ProcessingDeps; stores: DirectIngressStores } {
-  // Read per `/kici` command rather than per delivery. On an independent
-  // orchestrator it is the only place the operator's own
-  // `kici-admin trust-policy directory-set` registrations exist.
+  // Read per `/kici` command. On an independent orchestrator it is the only
+  // home of the operator's `kici-admin trust-policy directory-set` registrations.
   const trustDirectoryStore = new TrustDirectoryStore(deps.db);
 
   // Read once per PR delivery by the org fork switch. Without it
-  // `evaluateSecurityPolicy` sees no stored row and applies
-  // `FAIL_CLOSED_POLICY`, whose `forkPolicy` is `ignore` — so every fork PR
-  // arriving on this pipeline was DROPPED whatever the org had chosen, and an
-  // operator's `kici-admin trust-policy set --fork-policy hold` had no effect
-  // on the one ingress an independent orchestrator has.
+  // `evaluateSecurityPolicy` applies `FAIL_CLOSED_POLICY` (`forkPolicy: ignore`),
+  // dropping every fork PR on this pipeline whatever the org chose.
   const trustPolicyStore = new TrustPolicyStore(deps.db);
 
   const build = (): ProcessingDeps => ({
@@ -147,21 +134,17 @@ export function createDirectIngressProcessingDeps(
     logStorage: deps.logStorage,
     contextStore: deps.contextStore,
     variableStore: deps.variableStore,
-    // Supplied by the mode hook. `server.ts` (platform / hybrid / observed)
-    // always names it; `standalone.ts` (independent) names it too, so every
-    // mode's direct ingress can raise, persist and release a hold.
+    // Supplied by the mode hook: both `server.ts` (platform / hybrid / observed)
+    // and `standalone.ts` (independent) name it, so every mode's direct ingress
+    // can raise, persist and release a hold.
     heldRunStore: deps.heldRunStore,
-    // No `identityLinks` / `orgMemberPermissions` here: this bag is assembled
-    // outside the Platform WS connection, so there is no pushed directory in
-    // memory to hand over. The store is what the approval path reads instead.
+    // No `identityLinks` / `orgMemberPermissions`: outside the Platform WS
+    // connection there is no pushed directory, so the approval path reads the store.
     trustDirectoryStore,
     trustPolicyStore,
-    // The mode the fork switch is resolved under. `resolveEffectivePolicy` no
-    // longer branches on it — a stored row wins in every mode and the
-    // absent-row answer is fail-closed everywhere — but the read site defaults
-    // an absent value to `platform`, and reporting a mode this orchestrator is
-    // not running in would be a lie waiting for the day the parameter means
-    // something again.
+    // `resolveEffectivePolicy` does not branch on the mode (a stored row wins
+    // and an absent row fails closed everywhere), but the read site defaults an
+    // absent value to `platform`, so pass the mode this orchestrator really runs.
     orchestratorMode: deps.config.mode,
     coordinator: deps.coordinator,
     cronScheduler: deps.cronScheduler,

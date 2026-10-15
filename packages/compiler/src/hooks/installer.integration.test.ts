@@ -1,10 +1,4 @@
-/**
- * Integration tests for hook installer.
- *
- * These tests use real git repos and shell execution to verify that hooks
- * are properly installed and wired up. They are slower than unit tests
- * but prove end-to-end correctness.
- */
+/** Hook installer against real git repos and shell execution. */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdir, rm, readFile, stat, writeFile } from 'node:fs/promises';
 import { exec } from 'node:child_process';
@@ -16,13 +10,11 @@ import { KICI_HOOK_MARKER } from './templates.js';
 
 const execAsync = promisify(exec);
 
-/** Run a git command in a directory */
 async function git(args: string, cwd: string): Promise<string> {
   const { stdout } = await execAsync(`git ${args}`, { cwd });
   return stdout.trim();
 }
 
-/** Create a real git repo in a temp directory */
 async function createGitRepo(): Promise<string> {
   const tempDir = path.join(
     os.tmpdir(),
@@ -53,12 +45,10 @@ describe('hook installer integration', { timeout: 30_000 }, () => {
       expect(result.success).toBe(true);
       expect(result.action).toBe('created');
 
-      // Verify hook file exists and is executable
       const hookPath = path.join(tempDir, '.git', 'hooks', 'pre-commit');
       const stats = await stat(hookPath);
       expect(stats.mode & 0o111).toBeTruthy();
 
-      // Verify content
       const content = await readFile(hookPath, 'utf-8');
       expect(content).toContain('#!/bin/sh');
       expect(content).toContain(KICI_HOOK_MARKER);
@@ -66,20 +56,17 @@ describe('hook installer integration', { timeout: 30_000 }, () => {
     });
 
     it('hook script is valid shell that git can execute', async () => {
-      // Install a hook that creates a marker file instead of running kici
       await installHook('git', { cwd: tempDir });
 
-      // Replace the kici command with a simple touch command for testing
+      // Swap the kici command for one that touches a marker file.
       const hookPath = path.join(tempDir, '.git', 'hooks', 'pre-commit');
       const markerPath = path.join(tempDir, '.hook-ran');
       await writeFile(hookPath, `#!/bin/sh\ntouch "${markerPath}"\n`, { mode: 0o755 });
 
-      // Create a file and commit to trigger the hook
       await writeFile(path.join(tempDir, 'test.txt'), 'hello');
       await git('add test.txt', tempDir);
       await git('commit -m "test commit"', tempDir);
 
-      // Verify the hook actually ran
       const markerExists = await stat(markerPath)
         .then(() => true)
         .catch(() => false);
@@ -87,7 +74,7 @@ describe('hook installer integration', { timeout: 30_000 }, () => {
     });
 
     it('appends to existing hook without breaking it', async () => {
-      // Create an existing hook that creates marker1
+      // A pre-existing hook that creates marker1.
       const hookDir = path.join(tempDir, '.git', 'hooks');
       await mkdir(hookDir, { recursive: true });
       const marker1 = path.join(tempDir, '.hook-original');
@@ -95,16 +82,13 @@ describe('hook installer integration', { timeout: 30_000 }, () => {
         mode: 0o755,
       });
 
-      // Install our hook (appends)
       const result = await installHook('git', { cwd: tempDir });
       expect(result.action).toBe('updated');
 
-      // Verify original command is preserved
       const content = await readFile(path.join(hookDir, 'pre-commit'), 'utf-8');
       expect(content).toContain(`touch "${marker1}"`);
       expect(content).toContain(KICI_HOOK_MARKER);
 
-      // The hook should still be executable
       const stats = await stat(path.join(hookDir, 'pre-commit'));
       expect(stats.mode & 0o111).toBeTruthy();
     });
@@ -134,26 +118,23 @@ describe('hook installer integration', { timeout: 30_000 }, () => {
       expect(result.success).toBe(true);
       expect(result.action).toBe('created');
 
-      // Verify .husky/ directory was created
       const huskyDir = path.join(tempDir, '.husky');
       const huskyExists = await stat(huskyDir)
         .then((s) => s.isDirectory())
         .catch(() => false);
       expect(huskyExists).toBe(true);
 
-      // Verify pre-commit hook exists and contains our command
       const hookPath = path.join(huskyDir, 'pre-commit');
       const content = await readFile(hookPath, 'utf-8');
       expect(content).toContain('npx -y kici@latest compile && git add .kici/kici.lock.json');
 
-      // Verify git hooks path is set (husky init does this)
       const hooksPath = await git('config core.hooksPath', tempDir).catch(() => '');
-      // husky init sets core.hooksPath to .husky (or .husky/_)
+      // husky init sets core.hooksPath to .husky (or .husky/_).
       expect(hooksPath).toMatch(/\.husky/);
     });
 
     it('appends to existing husky pre-commit hook', async () => {
-      // Manually set up .husky/ (simulating existing husky installation)
+      // Simulate an existing husky installation.
       const huskyDir = path.join(tempDir, '.husky');
       await mkdir(huskyDir, { recursive: true });
       await writeFile(path.join(huskyDir, 'pre-commit'), 'npm test\n');
@@ -171,16 +152,9 @@ describe('hook installer integration', { timeout: 30_000 }, () => {
     });
 
     it('falls back to manual setup when npx husky is unavailable', async () => {
-      // Create a fake PATH that doesn't include npx to force fallback
-      // We test the fallback by checking the manual setup works
-      // (The actual npx failure is hard to simulate without PATH manipulation,
-      //  but we can verify the fallback path by checking .husky/ was created
-      //  even without husky package)
-
-      // When .husky/ doesn't exist AND npx husky init fails,
-      // the fallback creates .husky/ manually and sets core.hooksPath
-      // We can't easily force npx to fail, so we test the manual path
-      // by pre-creating .husky/ (which skips the init entirely)
+      // With no .husky/ and a failing `npx husky init`, the fallback creates
+      // .husky/ and sets core.hooksPath. Forcing npx to fail is impractical, so
+      // pre-creating .husky/ (which skips the init) exercises the manual path.
       await mkdir(path.join(tempDir, '.husky'), { recursive: true });
 
       const result = await installHook('husky', { cwd: tempDir });
@@ -210,7 +184,6 @@ describe('hook installer integration', { timeout: 30_000 }, () => {
       expect(result.success).toBe(true);
       expect(result.action).toBe('updated');
 
-      // Verify config was written
       const configPath = path.join(tempDir, 'lefthook.yml');
       const content = await readFile(configPath, 'utf-8');
       expect(content).toContain('pre-commit:');
@@ -219,7 +192,6 @@ describe('hook installer integration', { timeout: 30_000 }, () => {
     });
 
     it('adds to existing lefthook.yml preserving other commands', async () => {
-      // Create existing config
       await writeFile(
         path.join(tempDir, 'lefthook.yml'),
         `pre-commit:

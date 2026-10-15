@@ -1,14 +1,8 @@
-/**
- * Decision trace recording for debugging trigger matching.
- * Records every check performed during trigger evaluation.
- */
+/** Decision trace: every check performed during trigger evaluation, for debugging. */
 
 import { describeTextMatch } from './text-match.js';
 import type { LockTextMatch } from './types.js';
 
-/**
- * Individual trace entry for a single check.
- */
 export interface TraceEntry {
   /** What was checked (e.g., "branch pattern", "path filter", "event type") */
   check: string;
@@ -16,23 +10,17 @@ export interface TraceEntry {
   pattern: string;
   /** The value being tested against */
   value: string;
-  /** Whether the check passed */
   passed: boolean;
-  /** Optional explanation */
   reason?: string;
 }
 
-/**
- * Decision trace for a workflow's trigger evaluation.
- */
+/** Decision trace for a workflow's trigger evaluation. */
 export interface WorkflowDecision {
   workflowName: string;
   matched: boolean;
-  /** Which trigger matched (if any) */
+  /** Index of the trigger that matched, if any */
   matchedTrigger?: number;
-  /** All checks performed */
   checks: TraceEntry[];
-  /** Summary reason */
   summary: string;
   /**
    * The `paths` lists of triggers that matched only because the changed files
@@ -43,17 +31,15 @@ export interface WorkflowDecision {
 }
 
 /**
- * Max characters of any free-text field a trace entry carries, so an
- * essay-length input stays bounded.
+ * Max characters of any free-text field a trace entry carries.
  *
- * The entry count is capped separately, downstream, but a count bound alone
- * bounds nothing: a single `paths` entry names every changed file in the push
- * and a single `bodyMatch` entry quotes a comment body an outsider authored, so
- * fifty entries can still be megabytes. The forwarded trace rides one WebSocket
- * frame to the Platform, and a frame past the server's payload ceiling closes
- * the connection — stalling every delivery for that organization until it
- * reconnects. Bounding at the point each field is minted is what makes the
- * downstream size guards a backstop rather than the only limit.
+ * The downstream entry-count cap alone bounds nothing: one `paths` entry names
+ * every changed file in the push and one `bodyMatch` entry quotes an outsider's
+ * comment body, so fifty entries can still be megabytes. The trace rides one
+ * WebSocket frame to the Platform, and a frame past the server's payload ceiling
+ * closes the connection, stalling every delivery for that organization until it
+ * reconnects. Bounding each field where it is minted makes the downstream size
+ * guards a backstop rather than the only limit.
  */
 export const TRACE_TEXT_MAX = 200;
 
@@ -63,11 +49,9 @@ export function truncateTraceText(text: string): string {
 }
 
 /**
- * Create a new trace entry.
- *
- * Every free-text field is clamped here rather than at each call site: the
- * fields are fed from event content of unbounded size, and one unclamped call
- * site is enough to reintroduce an unbounded frame.
+ * Create a new trace entry. Free-text fields are clamped here, not per call
+ * site: they carry event content of unbounded size, and one unclamped call site
+ * would reintroduce an unbounded frame.
  */
 export function createTraceEntry(
   check: string,
@@ -89,11 +73,10 @@ export function createTraceEntry(
  * Stable `check` labels for the gates an organization-wide global workflow
  * passes on its way to dispatch.
  *
- * The other trigger checks are minted with free-text labels because each one
- * names the trigger field it read. These are named constants instead: they are
- * recorded in one package and read back in another — by code, and by whoever is
- * asking "why did nothing run?" — so a typo on either side would silently
- * produce a trace nobody can search for.
+ * Other trigger checks use free-text labels naming the field they read. These
+ * are constants because one package records them and another reads them back
+ * (by code, and by whoever asks "why did nothing run?"), so a typo on either
+ * side would silently produce a trace nobody can search for.
  */
 export const TraceCheck = {
   /** `repos` glob/regex filter, deciding whether a workflow applies to the event's repo. */
@@ -110,11 +93,11 @@ export const TraceCheck = {
 export type TraceCheck = (typeof TraceCheck)[keyof typeof TraceCheck];
 
 /**
- * Verdict vocabulary shared by both gates.
+ * Verdict vocabulary shared by the gate trace entries.
  *
  * `Indeterminate` is deliberately distinct from `Excluded`: a gate that could
- * not be evaluated did not decide anything, and reporting it as an exclusion
- * would tell a workflow author their filter said no when nothing ever ran it.
+ * not be evaluated decided nothing, and an exclusion would tell the author their
+ * filter said no when nothing ever ran it.
  */
 export const TraceVerdict = {
   Matched: 'matched',
@@ -123,7 +106,6 @@ export const TraceVerdict = {
 } as const;
 export type TraceVerdict = (typeof TraceVerdict)[keyof typeof TraceVerdict];
 
-/** Pick the verdict for a gate from its pass flag and whether it could decide. */
 function verdictFor(passed: boolean, indeterminate: boolean): TraceVerdict {
   if (indeterminate) return TraceVerdict.Indeterminate;
   return passed ? TraceVerdict.Matched : TraceVerdict.Excluded;
@@ -131,9 +113,7 @@ function verdictFor(passed: boolean, indeterminate: boolean): TraceVerdict {
 
 /**
  * Record the Tier-1 `requires` content filter's verdict for one workflow.
- *
- * `files` is the set of repo-relative paths the requirement list reads, so the
- * entry names what was inspected as well as what it concluded.
+ * `files` (the repo-relative paths the list reads) names what was inspected.
  */
 export function createContentRequirementsTraceEntry(args: {
   files: readonly string[];
@@ -154,9 +134,8 @@ export function createContentRequirementsTraceEntry(args: {
 /**
  * Record the Tier-2 `filter` predicate's verdict for one workflow.
  *
- * Without this entry a `filter` exclusion is invisible: the predicate runs on an
- * agent, returns `false`, and the workflow never appears — leaving its
- * author nothing to inspect. The entry is the answer to "why did nothing run?".
+ * Without it a `filter` exclusion is invisible: the predicate returns `false` on
+ * an agent and the workflow never appears, leaving its author nothing to inspect.
  */
 export function createGlobalFilterTraceEntry(args: {
   /** The round's verdict for this candidate: `true` means the filter admitted it. */
@@ -177,11 +156,9 @@ export function createGlobalFilterTraceEntry(args: {
 /**
  * Record that a matched workflow could not be materialized into jobs.
  *
- * A workflow whose triggers matched and whose build then threw is absent from
- * every other record: no run row is created and no job is queued. Omitting it
- * from the trace as well leaves its author unable to tell it apart from a
- * workflow that was never registered — the exact indistinguishability the trace
- * exists to remove.
+ * A workflow whose triggers matched and whose build then threw has no run row
+ * and no queued job; without this entry its author could not tell it apart from
+ * a workflow that was never registered.
  */
 export function createDispatchFailureTraceEntry(reason: string): TraceEntry {
   return createTraceEntry(
@@ -196,14 +173,12 @@ export function createDispatchFailureTraceEntry(reason: string): TraceEntry {
 /**
  * Return a copy of `decision` with `entries` appended to its checks.
  *
- * A decision is treated as a value, never mutated in place: the same object is
- * read by the caller that recorded it, and a gate appending to it would
- * retroactively rewrite what an earlier reader saw.
+ * Never mutated in place: the caller that recorded the decision still reads it,
+ * and appending would retroactively rewrite what that reader saw.
  *
- * A failing appended entry demotes `matched` and replaces `summary`, because a
- * workflow whose triggers matched but whose content filter excluded it did NOT
- * match overall — reporting it as matched is precisely the invisible outcome
- * these entries exist to explain.
+ * A failing appended entry demotes `matched` and replaces `summary`: a workflow
+ * whose triggers matched but whose content filter excluded it did NOT match
+ * overall.
  */
 export function appendChecks(
   decision: WorkflowDecision,
@@ -221,9 +196,8 @@ export function appendChecks(
 /**
  * Record the Tier-0 `commitMessage` filter's verdict for one trigger.
  *
- * `text: undefined` means the event carried no message — an INDETERMINATE
- * verdict, deliberately distinct from an exclusion: reporting it as "excluded"
- * would tell an author their filter said no when nothing ever read it.
+ * `text: undefined` means the event carried no message; the caller marks that
+ * indeterminate, not excluded (see {@link TraceVerdict}).
  */
 export function createCommitMessageTraceEntry(args: {
   match: LockTextMatch;
@@ -251,28 +225,25 @@ export function createCommitMessageTraceEntry(args: {
  * What a withheld trace field is replaced with when the reader does not hold
  * `event_log:read_payload`.
  *
- * Lives here rather than beside the Platform's redactor because it crosses
- * packages: the Platform writes it, the dashboard renders it, and tests assert
- * the permission boundary against it. A literal repeated at each site
- * would drift into a marker one of them no longer recognizes.
+ * Shared because the Platform writes it, the dashboard renders it and tests
+ * assert the permission boundary against it; a literal repeated at each site
+ * would drift.
  */
 export const REDACTED_TRACE_FIELD = '[redacted — requires event_log:read_payload]';
 
 /**
  * Workflow name the truncation marker carries.
  *
- * A reserved sentinel rather than a real workflow: it is written by one package
- * and read back by two others, so a literal repeated at each site would drift
- * into a marker nobody recognizes.
+ * A reserved sentinel, written by one package and read back by two others, so
+ * it lives in one place.
  */
 export const TRACE_TRUNCATION_WORKFLOW_NAME = '(trace truncated)';
 
 /**
  * Build the marker that stands in for the decisions a size budget dropped.
  *
- * The trace is truncated rather than discarded: a reader who is told nothing
- * cannot tell "matching never ran" from "the trace was too large to keep", and
- * those two have opposite answers to "why did my workflow not fire".
+ * Truncated rather than discarded, so a reader can tell "matching never ran"
+ * from "the trace was too large to keep".
  */
 export function createTraceTruncationMarker(omitted: number): Record<string, unknown> {
   return {
@@ -291,11 +262,9 @@ export function createTraceTruncationMarker(omitted: number): Record<string, unk
 }
 
 /**
- * UTF-8 byte length of `text`.
- *
- * Byte length, never `String.length`: the latter counts UTF-16 code units, so a
- * CJK-heavy comment body measures at roughly a third of the bytes it actually
- * costs on the wire and in the stored row.
+ * UTF-8 byte length of `text`. Never `String.length`, which counts UTF-16 code
+ * units: a CJK-heavy body measures at roughly a third of its bytes
+ * on the wire and in the stored row.
  */
 export function utf8ByteLength(text: string): number {
   return new TextEncoder().encode(text).length;
@@ -305,10 +274,8 @@ export function utf8ByteLength(text: string): number {
  * Drop trailing decisions until the serialized array fits `maxBytes`, appending
  * a marker naming how many were dropped.
  *
- * Shared by the orchestrator, which bounds what it puts on the wire, and the
- * Platform, which bounds what it stores. Two independent budgets over one
- * shape: keeping one implementation is what stops them from disagreeing about
- * what a truncated trace looks like.
+ * Shared by the orchestrator (wire budget) and the Platform (storage budget),
+ * so both agree on what a truncated trace looks like.
  */
 export function truncateDecisionsToByteBudget<T>(
   decisions: readonly T[],
@@ -318,9 +285,8 @@ export function truncateDecisionsToByteBudget<T>(
     return { decisions: [...decisions], omitted: 0 };
   }
 
-  // The marker's own size depends on the count it reports, so reserve the
-  // worst case (every decision dropped) rather than discovering a one-entry
-  // overrun after the fact.
+  // The marker's size depends on its count, so reserve the worst case (every
+  // decision dropped) up front.
   const reserved = utf8ByteLength(JSON.stringify(createTraceTruncationMarker(decisions.length)));
   // `[` + `]`, plus the comma joining the marker to whatever precedes it.
   let used = 3 + reserved;
@@ -337,9 +303,6 @@ export function truncateDecisionsToByteBudget<T>(
   return { decisions: [...kept, createTraceTruncationMarker(omitted)], omitted };
 }
 
-/**
- * Create a workflow decision record.
- */
 export function createWorkflowDecision(
   workflowName: string,
   matched: boolean,

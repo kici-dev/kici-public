@@ -10,22 +10,17 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
   };
 });
 
-/**
- * OTel DataPointType enum values (from @opentelemetry/sdk-metrics):
- * HISTOGRAM = 0, EXPONENTIAL_HISTOGRAM = 1, GAUGE = 2, SUM = 3
- */
+/** OTel DataPointType values (@opentelemetry/sdk-metrics); EXPONENTIAL_HISTOGRAM = 1. */
 const DataPointType = { HISTOGRAM: 0, GAUGE: 2, SUM: 3 } as const;
 
 describe('MetricsReporter', () => {
   let MetricsReporter: typeof import('./metrics-reporter.js').MetricsReporter;
   let getPrometheusExporter: ReturnType<typeof vi.fn>;
 
-  // Load the modules ONCE, outside the fake clock. `@kici-dev/shared` pulls in
-  // the OpenTelemetry exporter, so resolving it is real I/O measured in seconds
-  // on a loaded machine. Doing that per-test inside `beforeEach` — and with the
-  // clock already frozen — blew the 10s hook budget intermittently, producing a
-  // timeout with no assertion behind it. ES modules are cached, so one load
-  // serves every test, and each test installs its own mock return value anyway.
+  // Load the modules ONCE, outside the fake clock. `@kici-dev/shared` pulls in the
+  // OpenTelemetry exporter, which takes seconds of real I/O on a loaded machine; loading it
+  // per test in `beforeEach`, with the clock frozen, intermittently blows the 10s hook budget.
+  // ES modules are cached, and each test installs its own mock return value.
   beforeAll(async () => {
     const shared = await import('@kici-dev/shared');
     getPrometheusExporter = shared.getPrometheusExporter as ReturnType<typeof vi.fn>;
@@ -277,9 +272,8 @@ describe('MetricsReporter', () => {
     ]);
     getPrometheusExporter.mockReturnValue(mockExporter);
 
-    // Real aggregator — pushes a snapshot for two agents in the same scaler
-    // pool. The aggregator deliberately collapses agent_id (cardinality
-    // bound), so two agents in the same pool emit ONE summed series.
+    // Real aggregator. It collapses agent_id (cardinality bound), so two agents in the same
+    // scaler pool emit ONE summed series.
     const { AgentMetricsAggregator } = await import('./agent-metrics-aggregator.js');
     const aggregator = new AgentMetricsAggregator({ getScalerForAgent: () => 'firecracker' });
     aggregator.update('agent-aaa', [
@@ -307,16 +301,14 @@ describe('MetricsReporter', () => {
 
     expect(sent.length).toBe(1);
     const all = sent[0]!.metrics;
-    // Orchestrator's own metric is present.
     expect(all.find((m) => m.name === 'kici_orch_agents_active')?.value).toBe(2);
-    // Agent counters from both agents collapse into one summed series
-    // labeled only by `scaler` — never `agent_id`.
+    // One summed series, labeled only by `scaler`, never `agent_id`.
     const agentJobs = all.filter((m) => m.name === 'kici_agent_jobs_total');
     expect(agentJobs).toHaveLength(1);
     expect(agentJobs[0]!.labels).toEqual({ scaler: 'firecracker' });
     expect(agentJobs[0]!.value).toBe(9); // 7 + 2
     expect(agentJobs[0]!.labels?.agent_id).toBeUndefined();
-    // Histogram structure preserved (only one agent emitted it, so no merging).
+    // Only one agent emitted the histogram, so no merging.
     const stepHist = all.find((m) => m.name === 'kici_agent_step_duration_seconds');
     expect(stepHist?.type).toBe('histogram');
     expect(stepHist?.labels).toEqual({ scaler: 'firecracker' });

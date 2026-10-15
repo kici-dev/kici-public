@@ -112,7 +112,6 @@ describe('LogBuffer', () => {
       expect(custom.size()).toBe(5);
 
       const flushed = custom.flush();
-      // Should be the last 5 lines (5, 6, 7, 8, 9)
       expect(flushed).toEqual(['5', '6', '7', '8', '9']);
     });
   });

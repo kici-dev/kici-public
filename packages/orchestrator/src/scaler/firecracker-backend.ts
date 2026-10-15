@@ -1,20 +1,14 @@
 /**
- * Firecracker scaler backend implementation.
+ * Ephemeral agent microVMs under the Firecracker jailer. Lifecycle: prepare chroot, hardlink
+ * rootfs+kernel, create overlay drive, invoke jailer, inject MMDS metadata, destroy with cleanup.
+ * Mirrors the Docker backend's structure.
  *
- * Manages ephemeral agent microVMs using the Firecracker VMM via the jailer.
- * Handles full VM lifecycle: prepare chroot, hardlink rootfs+kernel, create overlay drive,
- * invoke jailer, inject MMDS metadata, and destroy with cleanup.
- *
- * Log capture: Firecracker backend handles log forwarding internally.
- * The jailer is spawned as a non-daemonized detached child with stdout redirected to a
- * serial console log file and VMM logs captured via --log-path. Both files are tailed
- * using fs.watchFile() and forwarded with distinct logsSource tags ('firecracker-serial',
- * 'firecracker-vmm'). The serial-console path is best-effort only: Firecracker's Rust
- * BufWriter around stdout + jailer's uid drop make sparse userspace writes unreliable,
- * so it's treated as defense-in-depth. The canonical agent log path is WS agent.log
- * (attached unconditionally by the agent; see packages/agent/src/server.ts step 6).
- *
- * Follows the Docker backend pattern closely for consistency.
+ * Log capture is internal: the jailer runs as a non-daemonized detached child with stdout
+ * redirected to a serial console log file and VMM logs captured via --log-path. Both files are
+ * tailed and forwarded with logsSource tags 'firecracker-serial' and 'firecracker-vmm'. The
+ * serial path is best-effort defense-in-depth: Firecracker's Rust BufWriter around stdout plus
+ * the jailer's uid drop make sparse userspace writes unreliable. The canonical agent log path
+ * is WS agent.log (attached unconditionally by the agent; see packages/agent/src/server.ts step 6).
  */
 
 import { execFile, spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
@@ -101,19 +95,16 @@ const DEFAULT_OVERLAY_MIB = 2048;
 const logger = createLogger({ prefix: 'firecracker-backend' });
 
 /**
- * Unit of `/proc/<pid>/stat` field 22 (starttime). Linux fixes USER_HZ at 100
- * on every architecture this runs on and exposes no way to read it from Node,
- * so the conversion is only ever used to compare orders of magnitude apart
- * timestamps — see {@link PID_START_SLACK_MS}.
+ * Unit of `/proc/<pid>/stat` field 22 (starttime). Linux fixes USER_HZ at 100 on every
+ * architecture this runs on, and Node cannot read it, so the conversion only compares
+ * timestamps orders of magnitude apart — see {@link PID_START_SLACK_MS}.
  */
 const USER_HZ = 100;
 
 /**
- * Slack allowed between a process's start time and the mtime of the PID file
- * that names it. The jailer writes the file after forking, so the file is
- * normally the newer of the two; the slack only absorbs clock granularity and
- * a slow write. A process that started well after the file cannot be the one
- * the file names.
+ * Slack between a process's start time and the mtime of the PID file naming it. The jailer
+ * writes the file after forking, so the slack only absorbs clock granularity and a slow write;
+ * a process that started well after the file cannot be the one it names.
  */
 const PID_START_SLACK_MS = 60_000;
 
@@ -168,13 +159,10 @@ const SERIAL_LOG_FILE = 'serial-console.log';
 const VMM_LOG_FILE = 'vmm.log';
 
 /**
- * Maximum total bytes allowed for forwarded env vars in a single VM's MMDS payload.
- *
- * Firecracker's default MMDS data store cap is ~51 KiB shared across every metadata
- * field for that VM. The other static fields (URL, agent ID, labels, token, gateway,
- * backpressure) total well under 1 KiB, so 32 KiB is a generous-but-safe budget for
- * operator-defined env vars. Vars exceeding the remaining budget are skipped with a
- * warning rather than silently triggering an opaque MMDS PUT failure mid-spawn.
+ * Byte budget for forwarded env vars in one VM's MMDS payload. Firecracker's default MMDS
+ * store cap is ~51 KiB across all of a VM's metadata; the static fields (URL, agent ID, labels,
+ * token, gateway, backpressure) total under 1 KiB. Vars past the budget are skipped with a
+ * warning instead of failing the MMDS PUT mid-spawn.
  */
 const MMDS_FORWARDED_ENV_BUDGET_BYTES = 32 * 1024;
 
@@ -182,13 +170,10 @@ const MMDS_FORWARDED_ENV_BUDGET_BYTES = 32 * 1024;
 const POSIX_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
- * Interface-name pattern for per-VM TAP devices.
- * Matches what {@link generateTapName} produces — `kici-` plus the LAST 8
- * characters of the VM id, which for a scaler-minted id is 8 lowercase hex.
- * The orphan sweep considers only names of this shape, so the default bridge
- * (`kici-br0`) and any other operator interface outside it are never
- * candidates. The scaler's configured bridge is skipped by name as well, in
- * case an operator named it in this shape: deleting it kills every running VM.
+ * Per-VM TAP name, as {@link generateTapName} produces it: `kici-` plus the LAST 8 chars of
+ * the VM id (8 lowercase hex for a scaler-minted id). The orphan sweep considers only this
+ * shape, so `kici-br0` and other operator interfaces are never candidates. The configured
+ * bridge is also skipped by name, in case it has this shape: deleting it kills every VM.
  */
 const VM_TAP_PATTERN = /^kici-[0-9a-f]{8}$/;
 
@@ -210,17 +195,13 @@ export interface FirecrackerManagedAgent extends ManagedAgent {
   /** TAP device name for cleanup */
   tapDevice: string;
   /**
-   * The `hostAccess` policy resolved for this VM at provision time.
-   *
-   * Carried on the record because a bridge self-heal re-applies isolation for
-   * every live VM, and that path has no `orchestratorUrl` to re-derive the
-   * default from.
+   * The `hostAccess` policy resolved at provision time. Carried because a bridge self-heal
+   * re-applies isolation for every live VM and has no `orchestratorUrl` to re-derive it.
    */
   hostAccess?: string[];
   /**
-   * Set once the VM's agent registered with the orchestrator. Until then a VM
-   * that stops on its own is a failed spawn, and nothing else will tear it
-   * down; afterwards the agent's disconnect does.
+   * Set once the VM's agent registered. Until then a VM that stops on its own is a failed
+   * spawn nothing else tears down; afterwards the agent's disconnect does.
    */
   registered?: boolean;
 }
@@ -230,19 +211,15 @@ export interface FirecrackerScalerBackendOptions {
   name: string;
   /** Label sets this backend can provision */
   labelSets: LabelSetConfig[];
-  /** Maximum concurrent agents */
   maxAgents: number;
   /** Shared IP allocator instance */
   ipAllocator: IpAllocator;
   /**
-   * Extra `hostAccess` entries the orchestrator itself directed agents at —
-   * today its object-storage endpoint. Folded into the agent default so the
-   * narrowing does not cut off a host-local object store.
+   * Extra `hostAccess` entries the orchestrator itself directed agents at (its object-storage
+   * endpoint), folded into the agent default so the narrowing keeps a host-local object store.
    */
   hostServices?: string[];
-  /** Path to firecracker binary */
   firecrackerPath: string;
-  /** Path to jailer binary */
   jailerPath: string;
   /** Default kernel image path */
   kernelPath: string;
@@ -271,41 +248,39 @@ export interface FirecrackerScalerBackendOptions {
   netmask: string;
   /** nft table name for host-network diagnostics. @default 'kici' */
   table?: string;
-  /** Token store for creating ephemeral agent auth tokens. Optional -- when undefined, no token is injected. */
+  /** Token store for ephemeral agent auth tokens; when undefined, no token is injected. */
   tokenStore?: AgentTokenStore;
   /** TTL for ephemeral agent tokens in ms. Default: 1 hour. */
   tokenTtlMs?: number;
   /**
-   * Live resolver for the ephemeral agent-token TTL (ms). When set, called per
-   * spawn so the leader can serve the fleet-wide
-   * `cluster_settings.agent_token_ttl_ms` override; falls back to `tokenTtlMs`.
+   * Live per-spawn resolver for the ephemeral agent-token TTL (ms), so the leader serves the
+   * fleet-wide `cluster_settings.agent_token_ttl_ms` override; falls back to `tokenTtlMs`.
    */
   tokenTtlProvider?: () => Promise<number>;
   /**
-   * How long a spawn waits for the VM's API socket after the jailer starts, in
-   * ms. Default {@link DEFAULT_API_SOCKET_WAIT_MS}.
+   * How long (ms) a spawn waits for the VM's API socket after the jailer starts.
+   * Default {@link DEFAULT_API_SOCKET_WAIT_MS}.
    */
   apiSocketWaitMs?: number;
   /**
    * Live per-spawn resolver for the API-socket wait, so the fleet-wide
-   * `cluster_settings.firecracker_api_socket_wait_ms` applies without a
-   * restart. Falls back to `apiSocketWaitMs`.
+   * `cluster_settings.firecracker_api_socket_wait_ms` applies without a restart. Falls back
+   * to `apiSocketWaitMs`.
    */
   apiSocketWaitMsProvider?: () => Promise<number>;
   /** Agent roles for this scaler. undefined = all, [] = execution only. */
   roles?: string[];
   /**
-   * Wrap privileged commands (`ip`, `chown`) with `sudo -n`. Required when the
-   * orchestrator runs as a non-root user (e.g. user-mode systemd on edge worker
-   * nodes) and operators have set up a sudoers NOPASSWD rule for those binaries.
-   * On hosts where the orchestrator already runs as root, leave this false.
+   * Wrap privileged commands (`ip`, `chown`) with `sudo -n`. Required when the orchestrator
+   * runs as a non-root user (e.g. user-mode systemd on edge worker nodes) with a sudoers
+   * NOPASSWD rule for those binaries; leave false when it runs as root.
    * @default false
    */
   requireSudo?: boolean;
   /**
-   * When true, `ensureHostReady()` verifies and provisions this host bridge on
-   * startup (self-heal). Threaded from `firecracker.autoProvisionHost`. When
-   * false the method is a no-op. @default false (cores pass the real value)
+   * When true, `ensureHostReady()` verifies and provisions this host bridge on startup
+   * (self-heal); when false it is a no-op. Threaded from `firecracker.autoProvisionHost`.
+   * @default false (cores pass the real value)
    */
   autoProvisionHost?: boolean;
   /** Injectable bridge verifier (tests). @default host-network verifyBridge */
@@ -315,21 +290,17 @@ export interface FirecrackerScalerBackendOptions {
 }
 
 /**
- * What a VM's PID file, cross-checked against `/proc`, says about the process
- * it names.
+ * What a VM's PID file, cross-checked against `/proc`, says about the process it names.
  *
- * A bare `parseInt` of the file is not an identity: the PID file outlives the
- * process it names, and Linux recycles PID numbers. Acting on the raw number
- * means `destroy` and `reapUnowned` can `SIGKILL` an unrelated host process
- * (the orchestrator runs as root or under `sudo -n` on these hosts), and a
- * liveness check can call a long-dead VM live forever, so no sweep ever
- * reclaims its chroot or its IP.
+ * A bare `parseInt` of the file is not an identity: the file outlives its process and Linux
+ * recycles PIDs. Acting on the raw number lets `destroy` and `reapUnowned` `SIGKILL` an
+ * unrelated host process (the orchestrator runs as root or under `sudo -n`), and lets a
+ * liveness check call a long-dead VM live forever, so no sweep reclaims its chroot or IP.
  *
- * The states stay distinct because two callers ask opposite questions of them. `gone` and `recycled` both mean the VM that wrote the file is over.
- * `running` means a process with that number is on the host right now, and
- * `identityConfirmed` says whether it is provably this VM's own firecracker —
- * which decides whether that process may be signalled, not whether it exists.
- * `startedAtMs` is the process start time `/proc/<pid>/stat` reports.
+ * Two callers ask opposite questions, so the states stay distinct. `gone` and `recycled` both
+ * mean the VM that wrote the file is over. `running` means a process with that number exists
+ * now; `identityConfirmed` says whether it is provably this VM's firecracker, which decides
+ * whether it may be signalled, not whether it exists. `startedAtMs` comes from `/proc/<pid>/stat`.
  */
 type VmPidProbe =
   | { state: 'gone' }
@@ -348,21 +319,17 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   readonly spawnsOnLocalHost = true;
   maxAgents: number;
 
-  // Firecracker uses two logsSource values (firecracker-serial, firecracker-vmm),
-  // but the getter returns a general identifier for the ScalerBackend interface.
-  // The actual per-stream tagging is handled inside the internal forwarding loops.
+  // The ScalerBackend-level identifier; the forwarding loops tag each stream
+  // (firecracker-serial, firecracker-vmm) themselves.
   readonly logsSource = 'firecracker-serial';
 
   /** AbortControllers for file tailing per managed VM (keyed by agent ID) */
   private readonly tailAbortControllers = new Map<string, AbortController>();
 
   /**
-   * Per-spawn `scaler.failed` emitters, keyed by agent id.
-   *
-   * The jailer's `exit` handler and the spawn-deadline abort both fire outside
-   * `spawn`'s own scope, and the manager releases a spawn reservation only on a
-   * failure event. Holding the emitter here is what lets those two paths report
-   * the failure instead of leaving the reservation held until restart.
+   * Per-spawn `scaler.failed` emitters, keyed by agent id. The jailer's `exit` handler and the
+   * spawn-deadline abort fire outside `spawn`'s scope, and the manager releases a spawn
+   * reservation only on a failure event; without this the reservation stays held until restart.
    */
   private readonly spawnFailureHandlers = new Map<string, (reason: string) => void>();
   /** Liveness probes of spawned VMs whose agent has not registered yet, by agent id. */
@@ -576,12 +543,10 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
 
     let alloc: IpAllocationResult | undefined;
 
-    // The ScalerManager's spawn deadline aborts this signal and then forgets
-    // the agent. Without a listener the backend's own tracking entry — set
-    // above, before any I/O — survives forever: `getActiveCount()` keeps
-    // counting it, so `maxAgents` such timeouts wedge the scaler at capacity
-    // with zero live VMs, and every sweep skips its IP, TAP and chroot because
-    // `trackedVmIds` still names it.
+    // The ScalerManager's spawn deadline aborts this signal and forgets the agent. Without a
+    // listener the tracking entry above survives forever: `maxAgents` such timeouts wedge the
+    // scaler at capacity with zero live VMs, and every sweep skips its IP, TAP and chroot
+    // because `trackedVmIds` still names it.
     const onSpawnAbort = () => {
       this.abandonSpawnDetached(agentId, alloc, 'spawn aborted (deadline or shutdown)');
     };
@@ -598,20 +563,16 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       // 5. Create TAP device and attach to bridge
       emit(ScalerEventType.enum['scaler.network'], `configuring TAP device ${alloc.tapDevice}`);
       await this.execAsync('ip', ['tuntap', 'add', alloc.tapDevice, 'mode', 'tap']);
-      // `isolated on` is the entire VM-to-VM boundary. Every VM's TAP hangs off
-      // one bridge on one subnet, so traffic between two tenants' VMs is
-      // switched at L2 and never enters the IP forward hook — no nft rule can
-      // see it, and the RFC1918 drop that exists to stop exactly this never
-      // evaluates. An isolated port may still forward to the bridge itself, so
-      // VM → gateway → NAT → internet is unaffected; it may not forward to
-      // another isolated port, which is precisely the boundary.
+      // `isolated on` is the entire VM-to-VM boundary. Every VM's TAP hangs off one bridge on
+      // one subnet, so traffic between two tenants' VMs is switched at L2 and never enters the
+      // IP forward hook: no nft rule, including the RFC1918 drop, sees it. An isolated port
+      // still forwards to the bridge itself (VM → gateway → NAT → internet), never to another
+      // isolated port.
       await this.execAsync('ip', ['link', 'set', alloc.tapDevice, 'master', this.bridgeName]);
-      // Two commands, not one. The combined form —
-      // `ip link set <tap> master <br> type bridge_slave isolated on` — is
-      // rejected with `RTNETLINK answers: Operation not supported` on kernels
-      // that support the flag perfectly well when it is set after the port is
-      // already a bridge member. Setting it separately works everywhere the
-      // combined form does, so there is no reason to prefer the one-shot.
+      // Two commands, not one: the combined
+      // `ip link set <tap> master <br> type bridge_slave isolated on` is rejected with
+      // `RTNETLINK answers: Operation not supported` on kernels that accept the flag once the
+      // port is already a bridge member. The split form works everywhere the combined one does.
       await this.execAsync('ip', [
         'link',
         'set',
@@ -625,20 +586,16 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       emit(ScalerEventType.enum['scaler.network'], `allocating IP ${alloc.ip}`);
 
       // 5b. Apply per-VM nftables isolation rules, keyed on the VM's source
-      //     IP. The TAP is enslaved to the bridge, so L3-forwarded traffic
-      //     enters the forward hook with iifname = the BRIDGE device — an
-      //     iifname rule naming the TAP never matches forwarded packets,
-      //     which would leave the VM's isolation (and any networkPolicy
-      //     allowlist) ineffective. saddr matches the routed packet exactly.
-      //     When the orchestrator runs as a non-root user (edge worker), nft
-      //     itself goes through sudo -n.
+      //     IP. The TAP is enslaved to the bridge, so forwarded traffic enters
+      //     the forward hook with iifname = the BRIDGE: an iifname rule naming
+      //     the TAP never matches, leaving isolation and any networkPolicy
+      //     allowlist ineffective. On a non-root orchestrator nft runs via sudo -n.
       const nftOpts = this.nftOpts();
       await ensureKiciTable({ ...nftOpts, requireBaselineChain: true });
-      // Pre-clean before re-adding: rules are removed only on the synchronous
-      // teardown paths this process drives, so a crash, a `kill -9`, or a VM
-      // that died while the orchestrator was down can leave this IP's rules
-      // behind. The allocator recycles IPs, so without this the new tenant
-      // inherits the dead job's allowlist. Idempotent and cheap.
+      // Pre-clean: rules are removed only on the teardown paths this process
+      // drives, so a crash, `kill -9` or a VM that died while the orchestrator
+      // was down leaves this IP's rules behind, and the allocator recycles IPs
+      // — the new tenant would inherit the dead job's allowlist. Idempotent.
       await removeIsolationRules(alloc.ip, nftOpts);
       await addIsolationRules(
         alloc.ip,
@@ -681,35 +638,26 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       writeFileSync(vmmLogPath, '');
 
       // 11b. Open file descriptors for stdout/stderr redirection BEFORE chowning
-      // the chroot to the jailer uid/gid. We open them here while the orchestrator
-      // process still owns the files; the kernel doesn't re-check perms on each
-      // write to an already-open FD, so writes from the jailer child (after privilege
-      // drop) continue to work even though the file is now owned by uid 10000.
-      // This matters when the orchestrator runs as a non-root user (e.g. user-mode
-      // systemd on edge worker nodes) — there, opening the file *after* chown would
-      // fail with EACCES because the orchestrator no longer owns it.
+      // the chroot to the jailer uid/gid. The kernel does not re-check perms on
+      // writes to an open FD, so the jailer child keeps writing after its
+      // privilege drop. On a non-root orchestrator (e.g. user-mode systemd on
+      // edge worker nodes), opening *after* chown fails with EACCES.
       const stdoutFd = openSync(serialLogPath, 'w');
       const stderrFd = openSync(serialLogPath, 'a'); // stderr also goes to serial log file
 
       // 11c. chown the entire VM directory to the jailer UID/GID.
-      // The jailer drops privileges to uid:gid before exec'ing Firecracker,
-      // so all files (rootfs, kernel, config, log files) must be owned by the
-      // jailer user. Without this, Firecracker fails with "Permission denied"
-      // when trying to open --log-path or other files inside the chroot.
+      // The jailer drops to uid:gid before exec'ing Firecracker, which otherwise
+      // fails with "Permission denied" opening --log-path and other chroot files.
       const vmDir = join(this.chrootBaseDir, 'firecracker', agentId);
       await this.execAsync('chown', ['-R', `${this.uid}:${this.gid}`, vmDir]);
 
       // 11c-bis. Restore source-owner on the hardlinked rootfs.ext4 + kernel.
-      // chown -R follows hardlinks (it operates on inodes, not paths), so the
-      // recursive chown above also rewrites the OWNER of the source files at
-      // matchedLabelSet.rootfsPath / kernelPath. On a non-root orchestrator
-      // (Pi worker running as `kici`), the next spawn would then fail to ln
-      // those files because fs.protected_hardlinks=1 forbids hardlinking to
-      // a file you don't own and don't have write access to. Re-chown the
-      // hardlinked entries inside the chroot to the orch process's own uid
-      // — since hardlinks share an inode, this restores the source's owner
-      // too. Skip when the orch runs as root (uid 0 case): there's no source
-      // ownership to restore, and root can hardlink unconditionally anyway.
+      // chown -R operates on inodes, so the chown above also rewrote the owner
+      // of the source files at matchedLabelSet.rootfsPath / kernelPath. On a
+      // non-root orchestrator (Pi worker running as `kici`) the next spawn then
+      // fails to ln them: fs.protected_hardlinks=1 forbids hardlinking a file you
+      // neither own nor can write. Re-chowning the chroot entries to our own uid
+      // restores the shared inode. Root needs no restore and hardlinks freely.
       const orchUid = process.getuid?.();
       const orchGid = process.getgid?.();
       if (orchUid !== undefined && orchUid !== 0) {
@@ -764,10 +712,9 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       // 11e. Set up log tailing (serial console + VMM logs, forwarded internally)
       this.startLogTailing(agentId, serialLogPath, vmmLogPath, child, alloc);
 
-      // 12. Wait for the API socket. A jailer that exits non-zero ends the
-      // wait at once instead of after the full wait. On a rootless host the
-      // chroot permissions are loosened in parallel (see
-      // `loosenChrootPermissions`).
+      // 12. Wait for the API socket; a jailer that exits non-zero ends the wait
+      // at once. A rootless host loosens chroot permissions in parallel
+      // (`loosenChrootPermissions`).
       const bootFailed = watchJailerBootFailure(child);
       const api = new FirecrackerApi(
         this.getSocketPath(agentId),
@@ -799,16 +746,11 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
         agentToken = await this.tokenStore.createEphemeral(agentId, fullLabels, tokenTtlMs);
       }
 
-      // 13b. Build forwarded env map for the agent (matches bare-metal/container precedence:
-      // KICI_AGENT_ENV_* from orchestrator process.env first, then scalers.yaml `env:` overlays).
-      // Apply per-VM byte budget so a runaway value can't push the MMDS payload over Firecracker's
-      // ~51 KiB cap. Reject keys that aren't POSIX-safe to defend against MMDS path injection.
+      // 13b. Build forwarded env map for the agent (see `buildForwardedEnv`).
       const acceptedEnv = this.buildForwardedEnv(matchedLabelSet, agentId);
 
-      // 14. PUT MMDS metadata: orchestrator URL, labels, scaler-managed flag, optional token,
-      // optional host mappings (the scaler's `extraHosts`), optional forwarded env. Labels
-      // and agent ID are needed by the agent at startup (before WS connection), since
-      // loadConfig() reads KICI_LABELS and KICI_AGENT_ID from environment.
+      // 14. PUT MMDS metadata. Labels and agent ID are needed before the WS
+      // connection: loadConfig() reads KICI_LABELS and KICI_AGENT_ID from env.
       await api.putMmds({
         latest: {
           'meta-data': {
@@ -928,23 +870,19 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * Verify and (if needed) provision this backend's host bridge on startup.
-   * No-op unless autoProvisionHost is set. Throws on a real provision failure;
-   * ScalerManager.ensureHostsReady catches per-backend and degrades this scaler.
-   */
-  /**
-   * nft options for this backend's own rules.
-   *
-   * `table` is the operator-configured one, not the literal `kici`: with two
-   * coordinators on one host, coordinator B's baseline goes to `kici_b` while
-   * its per-VM rules used to go to `kici` — coordinator A's table. A's next
-   * re-provision then swept B's live VMs' isolation along with its own, and B's
-   * rules were evaluated against A's subnet-scoped baseline.
+   * nft options for this backend's own rules. `table` is the operator-configured one, not the
+   * literal `kici`: with two coordinators on one host, B's per-VM rules in A's `kici` table
+   * would be swept by A's next re-provision and evaluated against A's subnet-scoped baseline.
    */
   private nftOpts(): { requireSudo: boolean; table: string } {
     return { requireSudo: this.requireSudo, table: this.table };
   }
 
+  /**
+   * Verify and (if needed) provision this backend's host bridge on startup.
+   * No-op unless autoProvisionHost is set. Throws on a real provision failure;
+   * ScalerManager.ensureHostsReady catches per-backend and degrades this scaler.
+   */
   async ensureHostReady(): Promise<void> {
     this.prewarmOverlayTemplates();
     if (!this.autoProvisionHost) return;
@@ -964,17 +902,12 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * Fail loudly on a kernel that will not honour bridge port isolation.
+   * Fail loudly on a kernel that will not honour bridge port isolation. Without the flag every
+   * tenant VM reaches every other one at L2, unseen by nft, so the documented isolation silently
+   * does not exist. Fail-closed like `validateNftablesAvailability` for a missing `nft`.
    *
-   * Without the flag every concurrent tenant's VM can reach every other one at
-   * L2, and no nft rule sees that traffic — so the isolation the operator docs
-   * promise silently does not exist. The same fail-closed posture
-   * `validateNftablesAvailability` takes for a missing `nft`: better to refuse
-   * to run VMs than to run them unisolated.
-   *
-   * The probe is an end-to-end one — create a TAP, enslave it isolated, delete
-   * it — because the flag can be rejected by the kernel, by iproute2, or by the
-   * bridge itself, and only the real command exercises all three.
+   * The probe is end-to-end (create a TAP, enslave it isolated, delete it) because the kernel,
+   * iproute2 or the bridge can each reject the flag, and only the real command exercises all three.
    */
   private async assertBridgePortIsolationSupported(): Promise<void> {
     const probeTap = 'kici-isoprobe';
@@ -986,8 +919,8 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
     try {
       await this.execAsync('ip', ['tuntap', 'add', probeTap, 'mode', 'tap']);
     } catch (err) {
-      // Cannot create a TAP at all — a distinct failure the spawn path reports
-      // on its own; do not misattribute it to missing isolation support.
+      // No TAP at all is a distinct failure the spawn path reports; it is not
+      // missing isolation support.
       logger.warn(`skipping bridge port-isolation probe: ${toErrorMessage(err)}`);
       return;
     }
@@ -1022,13 +955,10 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * Re-apply per-VM isolation rules for every VM this backend still tracks.
-   *
-   * Provisioning no longer deletes the table, but it does sweep the `forward`
-   * chain of everything no live VM owns, and an old-shaped host carries its
-   * baseline there too. Re-applying is what guarantees a self-heal cannot leave
-   * a running VM fail-open. Each identifier is removed before it is re-added,
-   * so a self-heal that fires twice does not duplicate the rules.
+   * Re-apply per-VM isolation rules for every tracked VM. Provisioning sweeps the `forward`
+   * chain of everything no live VM owns (an old-shaped host carries its baseline there too), so
+   * this keeps a self-heal from leaving a running VM fail-open. Each identifier is removed
+   * before it is re-added, so a self-heal that fires twice does not duplicate the rules.
    */
   private async reapplyIsolationForTrackedVms(): Promise<void> {
     const tracked = [...this.agents.values()].filter((a) => a.ip.length > 0);
@@ -1085,13 +1015,11 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   /**
    * Keep loosening a rootless VM's chroot permissions while firecracker starts.
    *
-   * The jailer chmods the chroot root and every directory it creates (`/run`)
-   * to 0700 owned by its `--uid`, which locks out an orchestrator running as
-   * another user from `/run/firecracker.socket`. A `chmod -R go+rX` every
-   * 100 ms reopens each one as soon as it appears; it only changes the
-   * host-side view. One chmod runs at a time: on a slow disk a `sudo chmod -R`
-   * can outlast the tick, and overlapping ones would pile up for the whole
-   * wait.
+   * The jailer chmods the chroot root and every directory it creates (`/run`) to 0700 owned by
+   * its `--uid`, locking an orchestrator running as another user out of
+   * `/run/firecracker.socket`. A `chmod -R go+rX` every 100 ms reopens each one as it appears
+   * (host-side view only). One chmod runs at a time: on a slow disk a `sudo chmod -R` can
+   * outlast the tick, and overlapping ones would pile up for the whole wait.
    *
    * @returns a function that stops the loosening
    */
@@ -1130,19 +1058,15 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   /**
    * Tear the VM down if its process stops before its agent registers.
    *
-   * A guest whose init exits — the agent's fatal startup error, a kernel panic
-   * — reboots, and firecracker exits. Its agent will never register, and
-   * nothing else releases the VM's `maxAgents` slot, TAP, nft rules, IP and
-   * chroot until the manager's stale-spawn prune. The jailer child's own exit
-   * cannot tell this: under `--new-pid-ns` it exits 0 right after the start.
-   * So the VM's process is probed through its PID file, and the probe stops
-   * once the agent registers (its disconnect owns the teardown from then on),
-   * the VM is being destroyed, or it is no longer tracked.
+   * A guest whose init exits (fatal agent startup error, kernel panic) reboots and firecracker
+   * exits; nothing else releases its `maxAgents` slot, TAP, nft rules, IP and chroot until the
+   * manager's stale-spawn prune. The jailer child's exit cannot tell: under `--new-pid-ns` it
+   * exits 0 right after the start. So the VM's PID file is probed until the agent registers (its
+   * disconnect then owns the teardown), the VM is being destroyed, or it is no longer tracked.
    */
   private watchUntilRegistered(agentId: string, alloc: IpAllocationResult): void {
-    // Firecracker started before this point, so a process holding its PID
-    // that started later is another process. Seconds since boot, so a
-    // wall-clock step cannot fake that.
+    // Firecracker started before this point, so a later-started holder of its
+    // PID is another process. Seconds since boot: a wall-clock step cannot fake it.
     const watchStartUptimeS = uptime();
     let goneProbes = 0;
     let probing = false;
@@ -1179,15 +1103,11 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * Whether there is positive evidence that a VM's firecracker process is
-   * gone: its PID file does not exist, the PID it names no longer exists, or
-   * that PID now belongs to a process that started after `sinceUptimeS`
-   * (seconds since boot, taken once firecracker was already running).
-   *
-   * Any other failure — an unreadable PID file, a `/proc` this user cannot
-   * see — is not evidence, so the answer is "not gone". The caller tears the
-   * VM down on a "gone", and tearing down a live VM leaves firecracker running
-   * without its TAP, IP and chroot.
+   * Whether there is positive evidence a VM's firecracker is gone: no PID file, no such PID, or
+   * the PID belongs to a process started after `sinceUptimeS` (seconds since boot, taken once
+   * firecracker was running). Any other failure (unreadable PID file, invisible `/proc`) is
+   * "not gone": the caller tears down on "gone", and tearing down a live VM leaves firecracker
+   * running without its TAP, IP and chroot.
    */
   private async isVmProcessGone(vmId: string, sinceUptimeS: number): Promise<boolean> {
     const pidFile = join(this.getChrootDir(vmId), 'firecracker.pid');
@@ -1297,23 +1217,17 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   /**
    * Force-reclaim a VM this backend no longer tracks in memory.
    *
-   * `destroy()` opens with `if (!managed) return`, so after an orchestrator
-   * restart it silently no-ops while the VM keeps running, holding its RAM and
-   * its IP. `cleanupOrphans()` cannot recover that VM either: every one of its
-   * three passes skips an id whose jailer process is alive, deliberately, since
-   * a live process is the only thing that distinguishes a healthy VM from a
-   * leaked one when you are sweeping blind.
+   * After an orchestrator restart `destroy()` no-ops (`if (!managed) return`) while the VM keeps
+   * its RAM and IP, and `cleanupOrphans()` deliberately skips any id whose jailer process is
+   * alive: sweeping blind, a live process is all that tells a healthy VM from a leaked one.
    *
-   * This is the same reclaim addressed to ONE id whose orphan status the caller
-   * already established, so the liveness check is exactly what must not apply.
-   * See `ScalerBackend.reapUnowned` for the two properties the caller relies on;
-   * the host-local half is enforced here by refusing to act unless the jailer
-   * chroot for `managedId` exists on THIS host. That directory is the only
-   * host-local artifact a VM leaves: an `ip_allocations` row is not one, because
-   * an HA pair is "two identical orchestrators sharing the same PostgreSQL,
-   * scalers, and routing key" (`docs/operator/orchestrator/clustering.md`), so a
-   * peer's live VM has a row naming this very scaler. The row is read only to
-   * finish a reclaim the chroot already authorized.
+   * This is the same reclaim for ONE id the caller already established as an orphan, so the
+   * liveness check must not apply. See `ScalerBackend.reapUnowned` for the two properties the
+   * caller relies on; the host-local half is enforced here by refusing to act unless the jailer
+   * chroot for `managedId` exists on THIS host. That directory is the only host-local artifact a
+   * VM leaves: an HA pair shares PostgreSQL, scalers and routing key
+   * (`docs/operator/orchestrator/clustering.md`), so a peer's live VM has an `ip_allocations`
+   * row naming this very scaler. The row is read only to finish a reclaim the chroot authorized.
    */
   reapUnowned(managedId: string): Promise<boolean> {
     return this.withHostReclaimLock(() => this.reapUnownedLocked(managedId));
@@ -1326,15 +1240,12 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       return false;
     }
 
-    // THE ONE GATE. Without a chroot here, nothing places this VM on this host,
-    // and a shared `ip_allocations` row cannot stand in for one: on an HA pair
-    // both coordinators run the same named scalers against one database, so a
-    // peer's live VM carries a row that names this scaler. Releasing it would
-    // hand its address to the next VM — two guests on one IP, sharing the
-    // saddr-keyed isolation rules that are supposed to separate them. The
-    // row-without-chroot case needs no reclaim anyway: with no chroot there is
-    // no PID file to kill through, and `cleanupOrphans()` Pass 1 already
-    // releases such a row (no PID file means `isChrootPidRunning` reads false).
+    // THE ONE GATE. Without a chroot nothing places this VM on this host, and a
+    // shared `ip_allocations` row cannot (see the method comment): releasing a
+    // peer's row hands its address to the next VM — two guests on one IP,
+    // sharing the saddr-keyed isolation rules meant to separate them. A
+    // row-without-chroot needs no reclaim: there is no PID file to kill through,
+    // and `cleanupOrphans()` Pass 1 releases it (`isChrootPidRunning` reads false).
     if (!(await this.hasChrootOnHost(managedId))) return false;
 
     // A running process this backend cannot identify is not signalled, and the
@@ -1355,9 +1266,8 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       ownsAllocation: alloc !== null && alloc.scaler_name === this.name,
     });
 
-    // Kill the jailer process. Unlike `destroy()` there is no graceful
-    // SendCtrlAltDel first: the guest is a refused agent with no work in
-    // flight, and the API socket belongs to a VM this process never opened.
+    // No graceful SendCtrlAltDel, unlike `destroy()`: the guest is a refused
+    // agent with no work in flight, and this process never opened its socket.
     // A process that could not be signalled keeps running out of its chroot,
     // so nothing is torn down under it and the chroot stays listable.
     if (probe.state === 'running' && !(await this.signalVmProcessOrLog(managedId, probe.pid))) {
@@ -1400,19 +1310,16 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * Reclaim the host resources of a VM nothing tracks, once its process is
-   * dead: forward its remaining logs, remove its isolation rules, TAP and IP,
-   * and delete its chroot.
+   * Reclaim the host resources of a dead, untracked VM: forward its remaining logs, remove its
+   * isolation rules, TAP and IP, and delete its chroot.
    *
-   * A second firecracker scaler on this host has its own IP space and its own
-   * teardown, so only a row naming THIS scaler is ours to release. With no such
-   * row (a worker's in-memory allocator forgets every row on restart) the TAP
-   * named after the VM's id is deleted: the name derives from this VM's id
-   * alone, so it cannot be another VM's.
+   * Only a row naming THIS scaler is ours to release: a second firecracker scaler on this host
+   * has its own IP space and teardown. With no such row (a worker's in-memory allocator forgets
+   * every row on restart) the TAP named after the VM's id is deleted; that name cannot be
+   * another VM's.
    */
   private async teardownUntrackedVm(vmId: string, alloc: IpAllocationRecord | null): Promise<void> {
-    // Forward whatever the serial console and VMM logs still hold before the
-    // chroot goes — this is the only record of why the VM was orphaned.
+    // The logs are the only record of why the VM was orphaned.
     try {
       await this.forwardRemainingLogs(vmId, this.getChrootDir(vmId));
     } catch {
@@ -1494,15 +1401,13 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   /**
    * Stop one live VM nothing on this node tracks, on an operator's request.
    *
-   * The tracked check that authorises the kill and the first `kill(2)` run in
-   * one synchronous tick: tracking only changes between ticks (a registration,
-   * a rehydrated spawn row, a new spawn), so nothing can claim the VM between
-   * the check and the signal. The kernel can still recycle the PID number in
-   * that window; `destroy` and `reapUnowned` carry the same window, and Node
-   * has no pidfd to close it.
+   * The tracked check and the first `kill(2)` run in one synchronous tick: tracking only changes
+   * between ticks (a registration, a rehydrated spawn row, a new spawn), so nothing can claim the
+   * VM in between. The kernel can still recycle the PID in that window, as in `destroy` and
+   * `reapUnowned`; Node has no pidfd to close it.
    *
-   * Runs under the host reclaim lock, so a sweep cannot release this VM's
-   * address to a new VM while the stop is still removing its rules.
+   * Runs under the host reclaim lock, so a sweep cannot release this VM's address to a new VM
+   * while the stop is still removing its rules.
    *
    * @param trackersOf what else on this node tracks the VM, read in the
    *   kill's tick; it must not await.
@@ -1524,9 +1429,8 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       return { vmId, outcome, detail, ...(pid !== undefined ? { pid } : {}) };
     };
 
-    // The id names a chroot directory through `join`, which resolves `..`. An
-    // id like `x/../<tracked id>` would reach a tracked VM's chroot while every
-    // tracker lookup below misses the string, so only one path segment is a VM id.
+    // `join` resolves `..`, so `x/../<tracked id>` would reach a tracked VM's
+    // chroot while every tracker lookup misses the string: one segment only.
     if (vmId.includes('/') || vmId === '.' || vmId === '..') {
       return refused(ScalerVmStopOutcome.enum['not-found'], 'not a VM id: it names a path');
     }
@@ -1593,14 +1497,13 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   /**
    * SIGKILL a VM's firecracker process.
    *
-   * The jailer drops firecracker to `--uid`, so an orchestrator running as
-   * another unprivileged user gets EPERM from `kill(2)`. On a rootless host
-   * (`requireSudo`) the signal goes through `sudo -n -u #<uid> kill`; anywhere
-   * else EPERM means the process lacks CAP_KILL. ESRCH means the process is
-   * already gone, which is the outcome wanted.
+   * The jailer drops firecracker to `--uid`, so another unprivileged user gets EPERM from
+   * `kill(2)`. On a rootless host (`requireSudo`) the signal goes through
+   * `sudo -n -u #<uid> kill`; elsewhere EPERM means the process lacks CAP_KILL. ESRCH (already
+   * gone) is success.
    *
-   * The first statement is the synchronous `kill(2)`: `stopUntrackedVm` relies
-   * on the signal leaving in its caller's tick.
+   * The first statement is the synchronous `kill(2)`: `stopUntrackedVm` relies on the signal
+   * leaving in its caller's tick.
    */
   private async signalVmProcess(pid: number): Promise<void> {
     try {
@@ -1641,9 +1544,8 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * {@link signalVmProcess} for the teardown paths: a failure is logged, never
-   * swallowed, and reported so the caller keeps the chroot of a process that
-   * still runs.
+   * {@link signalVmProcess} for the teardown paths: a failure is logged and reported, so the
+   * caller keeps the chroot of a process that still runs.
    *
    * @returns whether the process was signalled or was already gone
    */
@@ -1680,25 +1582,17 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * Clear MMDS data for an agent after receiving config.ack via WS.
-   * Belt-and-suspenders: even though MMDS only contains orchestrator URL,
-   * clearing it reduces the attack surface to zero post-startup.
-   *
-   * Called by `ScalerManager.onConfigAck`, which reaches it structurally
-   * (`'clearAgentMmds' in backend`) rather than through `ScalerBackend` — no
-   * other backend has an MMDS to clear.
-   *
-   * @param agentId - The agent ID whose VM MMDS should be cleared
+   * Clear an agent's MMDS data after its config.ack arrives via WS, so nothing is left to read
+   * post-startup (belt-and-suspenders). Called by `ScalerManager.onConfigAck` structurally
+   * (`'clearAgentMmds' in backend`), not through `ScalerBackend`: no other backend has an MMDS.
    */
   async clearAgentMmds(agentId: string): Promise<void> {
     try {
       const socketPath = this.getSocketPath(agentId);
       const api = new FirecrackerApi(socketPath);
       await api.clearMmds();
-      // Log at debug level to avoid noise -- this is a belt-and-suspenders measure
     } catch (err) {
-      // Non-fatal: belt + suspenders with in-VM iptables blocking
-      // Log as debug -- MMDS only contains orchestrator URL (not credentials)
+      // Non-fatal: in-VM iptables blocking backs this up.
       void err;
     }
   }
@@ -1727,20 +1621,17 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * Clean up orphaned VMs.
+   * Clean up orphaned VMs; returns the count cleaned.
    *
-   * Safe to call both at startup AND periodically while the backend is active
-   * (see startPeriodicOrphanSweep): each pass explicitly skips VMs that are
-   * currently tracked in-memory (spawning / running / destroying), and Pass 3
-   * re-reads DB allocations after listing host interfaces to close the spawn
-   * race (allocate → ip tuntap add is not atomic).
+   * Safe at startup AND periodically (startPeriodicOrphanSweep): each pass skips VMs tracked
+   * in-memory (spawning / running / destroying), and Pass 3 re-reads DB allocations after
+   * listing host interfaces to close the spawn race (allocate → ip tuntap add is not atomic).
    *
-   * Three passes:
+   * Passes:
    * 1. DB allocations: check if VM process is still running, clean dead ones
    * 2. Filesystem: scan chroot dir for directories not in DB allocations
    * 3. Network: scan host interfaces for orphan TAP devices
-   *
-   * Returns the count of cleaned orphans.
+   * 4. nftables: reap isolation rules no live VM owns
    */
   cleanupOrphans(): Promise<number> {
     return this.withHostReclaimLock(() => this.cleanupOrphansLocked());
@@ -1749,14 +1640,12 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   private async cleanupOrphansLocked(): Promise<number> {
     let cleaned = 0;
 
-    // Snapshot the set of VM IDs currently tracked in-memory. These are
-    // spawning, running, or destroying — never touch their resources even
-    // if a transient filesystem / process-table state makes them look dead.
+    // Tracked VMs are never touched, even if a transient filesystem or
+    // process-table state makes them look dead.
     const trackedVmIds = new Set(this.agents.keys());
 
-    // Single PID-liveness pre-scan of the chroot tree. Built once and consumed
-    // by all three passes so a standalone reap (empty DB + empty tracking)
-    // never deletes a live VM's chroot or TAP. One readdir for the whole method.
+    // One PID-liveness pre-scan shared by every pass, so a standalone reap
+    // (empty DB + empty tracking) never deletes a live VM's chroot or TAP.
     const chrootParent = join(this.chrootBaseDir, 'firecracker');
     let chrootEntries: string[] = [];
     try {
@@ -1781,9 +1670,7 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       const scalerAllocations = allocations.filter((a) => a.scaler_name === this.name);
 
       for (const alloc of scalerAllocations) {
-        // Skip if the VM is currently being spawned or torn down by this
-        // backend — the PID file may not exist yet (spawn) or may have
-        // just been removed (destroy).
+        // Mid-spawn or mid-destroy, the PID file may not exist yet or may be gone.
         if (trackedVmIds.has(alloc.vm_id)) continue;
 
         const isAlive = liveVmIds.has(alloc.vm_id) || (await this.isChrootPidRunning(alloc.vm_id));
@@ -1832,19 +1719,14 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       }
 
       // Pass 3: Scan host network interfaces for orphan TAP devices matching the
-      // per-VM naming pattern with no corresponding DB allocation. Covers the
-      // case where the orchestrator was SIGKILLed mid-destroy — the `ip link
-      // del` in destroy() never ran, and neither the DB nor the chroot dir
-      // retains a record (both are cleaned up first in destroy). NetworkManager
-      // polls every orphan, so even a handful of leaked TAPs burn CPU (2026-04-14
-      // incident: NM main thread wedged for 10 days under TAP churn).
+      // per-VM naming pattern with no DB allocation. Covers an orchestrator
+      // SIGKILLed mid-destroy, after the DB row and chroot went but before
+      // `ip link del`. NetworkManager polls every orphan, so even a few leaked
+      // TAPs burn CPU (2026-04-14 incident: NM main thread wedged for 10 days).
       //
-      // Runtime race protection: spawn() does `allocate()` (DB insert) BEFORE
-      // `ip tuntap add`, so a TAP on the host is guaranteed to have a matching
-      // DB row by the time it exists. But our first DB read could have happened
-      // before that insert. Re-read allocations AFTER listing interfaces and
-      // skip any TAP present in either snapshot, plus any TAP tracked by an
-      // in-memory agent whose DB row may not have landed yet.
+      // Race: spawn() inserts the DB row BEFORE `ip tuntap add`, but our first
+      // read may predate that insert. So re-read AFTER listing interfaces and
+      // skip any TAP in either snapshot or tracked by an in-memory agent.
       const trackedTapDevices = new Set(
         [...this.agents.values()].map((a) => a.tapDevice).filter((tap) => tap.length > 0),
       );
@@ -1855,16 +1737,13 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
           .split('\n')
           .map((line) => line.split(/\s+/)[0])
           .filter((name): name is string => !!name);
-        // Re-read the DB to catch allocations that landed between our first
-        // read and this interface listing.
         let allocatedTapsAfter: Set<string>;
         try {
           const allocationsAfter = await this.ipAllocator.getAllocations();
           allocatedTapsAfter = new Set(allocationsAfter.map((a) => a.tap_device));
         } catch {
-          // If the re-read fails, fall back to the pre-read snapshot — the
-          // guard narrows, not the cleanup, so the worst case is that we
-          // leave a genuine orphan for the next sweep.
+          // Fall back to the first snapshot: at worst a genuine orphan waits
+          // for the next sweep.
           allocatedTapsAfter = allocatedTapsBefore;
         }
         for (const name of ifaceNames) {
@@ -1888,13 +1767,11 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       // DB may not be available on first startup
     }
 
-    // Pass 4: nftables rules. Rules are removed only on the synchronous
-    // teardown paths this process drives, so an orchestrator crash, a
-    // `kill -9`, a VM that died while the orchestrator was down, or a swallowed
-    // `removeIsolationRules` failure leaves `ip saddr <ip> …` rules in the
-    // shared chain forever. The allocator then hands that IP to another
-    // tenant, who inherits the dead job's allowlist — and duplicate drops pile
-    // up unboundedly across restarts.
+    // Pass 4: nftables rules. A crash, `kill -9`, a VM that died while the
+    // orchestrator was down, or a swallowed `removeIsolationRules` failure
+    // leaves `ip saddr <ip> …` rules in the shared chain forever: the next
+    // tenant on that IP inherits the dead job's allowlist, and duplicate drops
+    // pile up unboundedly across restarts.
     cleaned += await this.reapUnownedIsolationRules(liveVmIds);
 
     return cleaned;
@@ -1903,11 +1780,9 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   /**
    * Delete isolation rules for every identifier no live VM owns.
    *
-   * The live set is the VM ids the passes above established, mapped to the IPs
-   * this scaler allocated for them. An identifier the DB does not attribute to
-   * a live VM of this scaler is left alone: a second scaler on the same host
-   * writes to the same chain, and reaping its rules would cut its running jobs
-   * off the network — the mistake this whole sweep exists to stop making.
+   * The live set is the passes' live VM ids, mapped to this scaler's allocated IPs. An
+   * identifier the DB does not attribute to this scaler is left alone: a second scaler on the
+   * host writes to the same chain, and reaping its rules would cut its running jobs off.
    *
    * @returns the number of rules deleted
    */
@@ -1946,18 +1821,14 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * Default interval for periodic orphan sweeps (15 minutes).
-   *
-   * Long-running orchestrators need in-process orphan sweeps because a
-   * host-level cleanup job skips TAP cleanup while an orchestrator is active
-   * (to avoid racing spawns). Without this, leaked
-   * TAPs accumulate until the orchestrator restarts — which can be weeks.
+   * Default periodic orphan sweep interval (15 minutes). A host-level cleanup job skips TAP
+   * cleanup while an orchestrator is active (to avoid racing spawns), so without this sweep
+   * leaked TAPs accumulate until the orchestrator restarts, which can be weeks.
    */
   private static readonly ORPHAN_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
 
   /**
-   * Start a periodic orphan sweep. Idempotent — calling twice has no effect
-   * beyond the first call. Use stopPeriodicOrphanSweep() to stop.
+   * Start a periodic orphan sweep. Idempotent; stopPeriodicOrphanSweep() stops it.
    *
    * @param intervalMs override the default interval (primarily for tests)
    */
@@ -1991,7 +1862,6 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
         // runSweep never throws — but appease the linter
       });
     }, intervalMs);
-    // Don't block process exit on the timer.
     this.orphanSweepTimer.unref?.();
   }
 
@@ -2012,17 +1882,14 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
    * Build the merged forwarded-env map for an agent's MMDS payload.
    *
    * Mirrors bare-metal/container precedence: KICI_AGENT_ENV_*-prefixed vars from the
-   * orchestrator's process.env (prefix stripped) are seeded first, then scalers.yaml
-   * `env:` overlays them (yaml wins on conflict).
+   * orchestrator's process.env (prefix stripped) first, then scalers.yaml `env:` (yaml wins).
    *
-   * Two safety filters apply:
-   * - Keys must match POSIX_ENV_NAME_PATTERN. Otherwise rejected to keep MMDS path
-   *   construction safe inside the VM and to prevent the guest from being asked to
-   *   `export` something the shell can't represent.
-   * - The cumulative byte cost (key + value + 2-byte overhead per entry) must stay
-   *   under MMDS_FORWARDED_ENV_BUDGET_BYTES. Once exceeded, remaining entries are
-   *   skipped and warnings logged. This protects the ~51 KiB MMDS data store cap
-   *   from being blown by an accidentally-huge env value.
+   * Safety filters:
+   * - Keys must match POSIX_ENV_NAME_PATTERN, keeping MMDS path construction safe and never
+   *   asking the guest to `export` something the shell can't represent.
+   * - The cumulative cost (key + value + 2 bytes per entry) must stay under
+   *   MMDS_FORWARDED_ENV_BUDGET_BYTES; entries past it are skipped with a warning, protecting
+   *   the ~51 KiB MMDS store cap from a huge env value.
    */
   buildForwardedEnv(matchedLabelSet: LabelSetConfig, agentId: string): Record<string, string> {
     const merged: Record<string, string> = {};
@@ -2064,10 +1931,9 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
    *   2. label-set's vcpuCount/memSizeMib.
    *   3. backend-level default vcpuCount/memSizeMib.
    *
-   * Firecracker requires integer vCPUs and integer MiB. We round CPUs UP via
-   * Math.ceil to never under-provision (a 0.5-CPU request still gets a whole vCPU)
-   * and floor-divide bytes -> MiB. A debug log is emitted when rounding actually
-   * changes the value, so operators can spot frequent fractional requests.
+   * Firecracker requires integer vCPUs and MiB: CPUs round UP (a 0.5-CPU request gets a whole
+   * vCPU, never under-provisioned) and bytes floor-divide to MiB. A rounding that changes the
+   * value logs at debug, so operators can spot frequent fractional requests.
    */
   buildVmConfig(
     alloc: IpAllocationResult,
@@ -2181,11 +2047,9 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
     args: string[],
     timeoutMs = EXEC_TIMEOUT_MS,
   ): Promise<{ stdout: string; stderr: string }> {
-    // When the orchestrator runs as a non-root user (edge worker nodes), `ip`,
-    // `chown`, `chmod` and `kill` need sudo. The operator must have a NOPASSWD
-    // sudoers entry for these binaries; `-n` fails fast if sudo would prompt.
-    // `kill` runs as the jailer uid, so the sudoers grant for it can only
-    // signal jailer-owned processes.
+    // A non-root orchestrator (edge worker nodes) needs a NOPASSWD sudoers entry
+    // for `ip`, `chown`, `chmod` and `kill`; `-n` fails fast if sudo would prompt.
+    // `kill` runs as the jailer uid, so its grant only signals jailer-owned processes.
     const sudoArgv =
       cmd === 'kill' ? ['-n', '-u', `#${this.uid}`, cmd, ...args] : ['-n', cmd, ...args];
     const [file, argv] =
@@ -2207,45 +2071,32 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   /**
    * Remove a VM's jailer chroot directory.
    *
-   * On rootless nodes (requireSudo), the jailer chowns the chroot contents to
-   * the jailer uid/gid, leaving the inner directories owned by that uid with
-   * mode 0755 — so the orchestrator process (a different, non-root uid) has no
-   * write permission on them and a plain `rm` fails with EACCES. destroy() and
-   * both cleanupOrphans passes treat removal as best-effort and swallow that
-   * failure, so each spawn would otherwise leak a multi-GiB chroot until the
-   * data disk fills and the orchestrator crash-loops on ENOSPC (it can no
-   * longer write its own files to start, so the in-process orphan sweep never
-   * runs to recover). Reclaim ownership via the same sudo-wrapped `chown` path
-   * used for `ip` before the `rm` runs as ourselves. On root nodes (requireSudo
-   * false) the chown is skipped and `rm` works directly.
+   * On rootless nodes (requireSudo) the jailer leaves inner directories owned by its uid with
+   * mode 0755, so a plain `rm` by the orchestrator's uid fails with EACCES. destroy() and both
+   * cleanupOrphans passes swallow that failure, so each spawn would leak a multi-GiB chroot
+   * until the data disk fills and the orchestrator crash-loops on ENOSPC (unable to start, so
+   * its orphan sweep never recovers). Ownership is reclaimed via the sudo-wrapped `chown` first;
+   * root nodes skip it.
    */
   private async removeChrootDir(vmId: string): Promise<void> {
     const dir = join(this.chrootBaseDir, 'firecracker', vmId);
     if (this.requireSudo) {
-      // process.getuid/getgid exist on every POSIX host the Firecracker
-      // backend runs on; the `?? 0` only satisfies the optional typing.
+      // The `?? 0` only satisfies the optional typing; every POSIX host has getuid.
       const owner = `${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`;
       try {
         await this.execAsync('chown', ['-R', owner, dir]);
       } catch {
-        // Best effort — a partial chown still lets the rm reclaim every file
-        // we already own; a total failure means a sudoers misconfig and the
-        // dir stays put for the next sweep (and is now loudly visible).
+        // Best effort: a partial chown still lets the rm reclaim what we own; a
+        // total failure is a sudoers misconfig, and the dir stays for the next sweep.
       }
     }
     await rm(dir, { recursive: true, force: true });
   }
 
-  /**
-   * Get the API socket path for an agent's Firecracker VM.
-   */
   getSocketPath(agentId: string): string {
     return join(this.chrootBaseDir, 'firecracker', agentId, 'root', 'run', 'firecracker.socket');
   }
 
-  /**
-   * Get the chroot directory path for an agent.
-   */
   getChrootDir(agentId: string): string {
     return join(this.chrootBaseDir, 'firecracker', agentId, 'root');
   }
@@ -2292,9 +2143,7 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       return { state: 'gone' };
     }
 
-    // `comm` is parenthesised and may itself contain spaces and parens, so the
-    // remaining fields start after the LAST ')' and the first of them is
-    // field 3.
+    // Fields after the LAST ')' start at field 3 (see `procStartTicks`).
     const commOpen = procStat.indexOf('(');
     const commClose = procStat.lastIndexOf(')');
     if (commOpen < 0 || commClose < commOpen) return { state: 'gone' };
@@ -2349,14 +2198,9 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * Read a VM's PID file and return the PID only when the process it names is
-   * provably still *this* VM's firecracker process.
-   *
-   * This is the guard for acting ON the process — `destroy` and `reapUnowned`
-   * SIGKILL through it — so it fails closed: anything short of a confirmed
-   * identity yields `undefined` and nothing is signalled.
-   *
-   * @returns the PID when it is provably this VM's, otherwise `undefined`
+   * The PID from a VM's PID file, only when it is provably still *this* VM's firecracker.
+   * `destroy` and `reapUnowned` SIGKILL through it, so it fails closed: anything short of a
+   * confirmed identity yields `undefined` and nothing is signalled.
    */
   private async readVmPid(vmId: string): Promise<number | undefined> {
     const probe = await this.probeVmPid(vmId);
@@ -2374,17 +2218,11 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   /**
    * Whether a chroot's PID file names a process that is running right now.
    *
-   * This is the guard for the orphan reaper, which asks the opposite question
-   * from {@link readVmPid} and therefore fails closed in the opposite
-   * direction. `readVmPid` refuses to signal a PID it cannot claim; the reaper
-   * must refuse to DELETE THE ROOTFS under one. A process whose `comm` or
-   * `/proc/<pid>/root` does not match is still a process, and deleting the
-   * files it is running out of corrupts whatever it is — while sparing it costs
-   * only the disk one chroot occupies.
-   *
-   * The leak the identity checks exist to prevent is unaffected: a recycled
-   * number is detected by start time, which this guard honours, so a chroot
-   * whose VM is genuinely over is still reclaimed.
+   * The orphan reaper's guard fails closed opposite to {@link readVmPid}: that refuses to signal
+   * a PID it cannot claim; the reaper must refuse to DELETE THE ROOTFS under one. A process whose
+   * `comm` or `/proc/<pid>/root` does not match is still a process, and deleting its files
+   * corrupts it, while sparing it costs one chroot's disk. A recycled PID is still detected by
+   * start time, so a chroot whose VM is genuinely over is still reclaimed.
    */
   private async isChrootPidRunning(vmId: string): Promise<boolean> {
     const probe = await this.probeVmPid(vmId);
@@ -2400,22 +2238,15 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   }
 
   /**
-   * Whether *this* VM's own firecracker process is still up.
-   *
-   * Liveness is `readVmPid` plus signal 0, so it answers the identity-bearing
-   * question — "is the VM I started still running?" — that
-   * {@link waitForProcessExit} needs. Without the identity checks a recycled
-   * PID answers signal 0 successfully and the VM is spared forever.
-   *
-   * The orphan reaper asks a different question and uses
-   * {@link isChrootPidRunning} instead: a PID it cannot claim is still a live
-   * process, and its rootfs must not be deleted underneath it.
+   * Whether *this* VM's own firecracker process is still up: `readVmPid` plus signal 0, the
+   * identity-bearing question {@link waitForProcessExit} needs. Without the identity checks a
+   * recycled PID answers signal 0 and the VM is spared forever. The orphan reaper uses
+   * {@link isChrootPidRunning} instead.
    */
   private async isVmProcessAlive(vmId: string): Promise<boolean> {
     const pid = await this.readVmPid(vmId);
     if (pid === undefined) return false;
     try {
-      // signal 0 checks process existence without sending a signal
       process.kill(pid, 0);
       return true;
     } catch (err) {
@@ -2425,9 +2256,6 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
     }
   }
 
-  /**
-   * Wait for a VM's jailer process to exit within a timeout.
-   */
   private async waitForProcessExit(vmId: string, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     const interval = 200;
@@ -2441,28 +2269,22 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
     return false;
   }
 
-  /**
-   * Clean up resources after a failed spawn attempt.
-   */
   private async cleanupFailedSpawn(
     agentId: string,
     alloc: IpAllocationResult | undefined,
   ): Promise<void> {
-    // Drop the tracking entry here rather than at each call site: an entry that
-    // outlives its VM is counted by `getActiveCount()` forever and hides the
-    // VM's leaked resources from every sweep, and there is no caller that wants
-    // to clean up a failed spawn and keep tracking it.
+    // The tracking entry is dropped here, not per call site: one outliving its
+    // VM is counted by `getActiveCount()` forever and hides its leaked
+    // resources from every sweep.
     //
-    // Deleting it is also the run-once latch, and that is load-bearing: an
-    // aborted spawn is torn down by `abandonSpawn` and then AGAIN by `spawn`'s
-    // own catch when the aborted API call rejects. The allocator recycles the
-    // released address and TAP name immediately, so the second pass would
-    // delete another VM's isolation rules and its TAP by name. `Map.delete`
-    // reports whether the key was there, which makes the test-and-clear atomic
-    // against the interleaving that produces the race.
+    // The delete is also the load-bearing run-once latch: an aborted spawn is
+    // torn down by `abandonSpawn` and AGAIN by `spawn`'s catch, and the
+    // allocator recycles the address and TAP name immediately, so a second
+    // pass would delete another VM's rules and TAP. `Map.delete`'s return makes
+    // the test-and-clear atomic against that interleaving.
     //
-    // A VM `destroy()` is already tearing down is left to it: running both
-    // would release the same IP and TAP twice.
+    // A VM `destroy()` is tearing down is left to it, so the IP and TAP are
+    // not released twice.
     if (this.agents.get(agentId)?.state === 'destroying') return;
     if (!this.agents.delete(agentId)) return;
     this.spawnFailureHandlers.delete(agentId);
@@ -2493,9 +2315,8 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
 
     this.stopLogTailing(agentId);
 
-    // Clean up chroot directory if created. `removeChrootDir` reclaims
-    // ownership first on rootless hosts: by now the chroot may already belong
-    // to the jailer uid, and a plain `rm` there fails with EACCES.
+    // `removeChrootDir` reclaims ownership on rootless hosts, where the chroot
+    // may already belong to the jailer uid.
     try {
       await this.removeChrootDir(agentId);
     } catch {
@@ -2506,12 +2327,9 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
   // ── Log tailing & boot failure detection ───────────────────────
 
   /**
-   * Start tailing serial console and VMM log files, forwarding lines directly
-   * via forwardLine() with distinct logsSource tags.
-   *
-   * Also monitors the jailer child process for early exit (boot failure detection).
-   * Forwarding is handled internally (not through ScalerManager/AgentLogForwarder)
-   * because Firecracker has two distinct log sources per VM.
+   * Tail the serial console and VMM log files, forwarding lines via forwardLine() with distinct
+   * logsSource tags, and watch the jailer child for early exit (boot failure). Forwarding is
+   * internal, not through ScalerManager/AgentLogForwarder, because each VM has two log sources.
    */
   private startLogTailing(
     agentId: string,
@@ -2542,11 +2360,9 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       { agentId },
     );
 
-    // Monitor for early jailer exit (boot failure detection)
     child.on('exit', (code, sig) => {
-      // Give a small delay for final log lines to be tailed
+      // A small delay lets the final log lines be tailed.
       setTimeout(() => {
-        // Emit structured boot failure event if exit was unexpected
         if (code !== 0 && code !== null) {
           this.stopLogTailing(agentId);
           const failureType = this.detectFailureType(serialLogPath);
@@ -2563,29 +2379,26 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
             undefined,
             'firecracker-serial',
           );
-          // Logging the failure is not enough: the tracking entry, the chroot,
-          // the TAP, the nft rules and the IP allocation all outlive a jailer
-          // that died during boot, and `cleanupOrphans` skips every one of them
-          // because `trackedVmIds` still names the VM. Tear it down here and
-          // report the failure so the manager releases its reservation.
+          // The tracking entry, chroot, TAP, nft rules and IP all outlive a
+          // jailer that died during boot, and `cleanupOrphans` skips them while
+          // `trackedVmIds` names the VM. Tear down and report the failure so
+          // the manager releases its reservation.
           this.abandonSpawnDetached(
             agentId,
             alloc,
             `jailer exited during boot (code ${code}${sig ? `, signal ${sig}` : ''}, ${failureType})`,
           );
         }
-        // A clean exit says nothing about the VM: with `--new-pid-ns` the
-        // jailer parent exits 0 as soon as it has started firecracker in the
-        // new PID namespace. So the log tails keep running (destroy() and
-        // the failed-spawn cleanup stop them), and the VM's own process is
-        // watched through its PID file (`watchUntilRegistered`).
+        // A clean exit says nothing about the VM (`--new-pid-ns`, see
+        // `watchJailerBootFailure`), so the tails keep running until destroy()
+        // or the failed-spawn cleanup stops them, and `watchUntilRegistered`
+        // watches the VM's own process.
       }, 500);
     });
   }
 
   /**
-   * Tail a single log file and forward each line via forwardLine().
-   * For serial console lines: non-JSON lines (kernel boot output) are wrapped
+   * Tail one log file into forwardLine(). Non-JSON serial lines (kernel boot output) are wrapped
    * as debug-level JSON; failure patterns (kernel panic, init failure) are elevated to error.
    */
   private async tailAndForward(
@@ -2598,7 +2411,7 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
     try {
       for await (const line of tailFile(filePath, signal)) {
         if (logsSource === 'firecracker-serial') {
-          // Check if line is JSON (agent structured logs)
+          // JSON lines are agent structured logs.
           let isJson = false;
           try {
             JSON.parse(line);
@@ -2608,7 +2421,6 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
           }
 
           if (!isJson) {
-            // Non-JSON serial line: check for failure patterns
             const level = this.isFailurePattern(line) ? 'error' : 'debug';
             forwardLine(
               JSON.stringify({ level, message: line }),
@@ -2624,7 +2436,7 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
       }
     } catch (err) {
       if ((err as Error).name === 'AbortError') return;
-      // Log tailing error -- not critical, just log it
+      // Not critical: forwarded as a warning.
       forwardLine(
         JSON.stringify({ level: 'warn', message: `Log tailing error for ${filePath}: ${err}` }),
         agentId,
@@ -2635,9 +2447,7 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
     }
   }
 
-  /**
-   * Check if a serial console line matches known boot failure patterns.
-   */
+  /** Whether a serial console line matches a known boot failure pattern. */
   private isFailurePattern(line: string): boolean {
     const patterns = [
       /Kernel panic/i,
@@ -2650,9 +2460,7 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
     return patterns.some((p) => p.test(line));
   }
 
-  /**
-   * Read the serial console log file and detect the type of boot failure.
-   */
+  /** Classify a boot failure from the serial console log. */
   private detectFailureType(serialLogPath: string): string {
     try {
       const content = readFileSync(serialLogPath, 'utf-8');
@@ -2666,10 +2474,7 @@ export class FirecrackerScalerBackend implements ScalerBackend, LiveVmBackend {
     }
   }
 
-  /**
-   * Read and forward any remaining log file content for an orphaned/dead VM.
-   * Called during cleanupOrphans() before deleting the chroot directory.
-   */
+  /** Forward a dead VM's remaining log content before its chroot is deleted. */
   private async forwardRemainingLogs(vmId: string, chrootDir: string): Promise<void> {
     const output = process.stdout;
 

@@ -1,15 +1,13 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the `request_idempotency` claim table: a `request_id`-keyed record that
- * makes run-minting dashboard requests (`run.rerun.request`,
- * `run.manual_schedule.request`) idempotent on the Platform `requestId`. HA
- * coordinator siblings share one orchestrator DB, so when the Platform relay
- * fails over and re-sends the same request to a sibling, the atomic `INSERT …
- * ON CONFLICT DO NOTHING` on `request_id` lets exactly one coordinator win —
- * the loser returns the winner's `new_run_id` instead of minting a second run.
- * Rows are pruned after 1h (far past the ~10s request budget) by the periodic
- * cleanup tick.
+ * Add the `request_idempotency` claim table, making run-minting dashboard
+ * requests (`run.rerun.request`, `run.manual_schedule.request`) idempotent on
+ * the Platform `requestId`. HA coordinator siblings share one DB, so when the
+ * relay fails over and re-sends to a sibling, the atomic `INSERT … ON CONFLICT
+ * DO NOTHING` on `request_id` lets one coordinator win; the loser returns the
+ * winner's `new_run_id`. The cleanup tick prunes rows after 1h (far past the
+ * ~10s request budget).
  *
  * Idempotent: guarded on table existence.
  */

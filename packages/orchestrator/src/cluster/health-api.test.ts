@@ -5,8 +5,6 @@ import type { PeerRegistry, PeerInfo } from './peer-registry.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { AgentRegistry } from '../agent/registry.js';
 
-// ── Mock helpers ────────────────────────────────────────────────
-
 function mockRaft(
   overrides: {
     role?: RaftRole;
@@ -87,8 +85,6 @@ function createPeer(overrides: Partial<PeerInfo> = {}): PeerInfo {
   };
 }
 
-// ── Tests ────────────────────────────────────────────────────────
-
 describe('cluster health API', () => {
   let deps: ClusterHealthRoutesDeps;
 
@@ -101,8 +97,6 @@ describe('cluster health API', () => {
       agentRegistry: mockAgentRegistry(),
     };
   });
-
-  // ── GET /cluster/health ──────────────────────────────────────
 
   describe('GET /cluster/health', () => {
     it('should return healthy status when leader with all peers connected', async () => {
@@ -172,8 +166,7 @@ describe('cluster health API', () => {
     });
 
     it('should return degraded in 3-node cluster with 1 peer lost (quorum preserved via self)', async () => {
-      // 3-node cluster: self + 2 peers. 1 peer disconnected.
-      // Connected nodes = self + 1 peer = 2. Majority of 3 = 2. Quorum holds → degraded, not unhealthy.
+      // Self + 1 of 2 peers = 2 of 3 connected: quorum holds.
       deps.peerRegistry = mockPeerRegistry({
         peerCount: 2,
         connectedPeerCount: 1,
@@ -187,8 +180,7 @@ describe('cluster health API', () => {
     });
 
     it('should return unhealthy in 3-node cluster with 2 peers lost (quorum lost)', async () => {
-      // 3-node cluster: self + 2 peers. Both peers disconnected.
-      // Connected nodes = self only = 1. Majority of 3 = 2. No quorum → unhealthy.
+      // Self only = 1 of 3 connected: no quorum.
       deps.peerRegistry = mockPeerRegistry({
         peerCount: 2,
         connectedPeerCount: 0,
@@ -202,8 +194,7 @@ describe('cluster health API', () => {
     });
 
     it('should return degraded in 5-node cluster with 2 peers lost (quorum preserved)', async () => {
-      // 5-node cluster: self + 4 peers. 2 peers disconnected.
-      // Connected nodes = self + 2 peers = 3. Majority of 5 = 3. Quorum holds → degraded.
+      // Self + 2 of 4 peers = 3 of 5 connected: quorum holds.
       deps.peerRegistry = mockPeerRegistry({
         peerCount: 4,
         connectedPeerCount: 2,
@@ -242,8 +233,6 @@ describe('cluster health API', () => {
       expect(body.status).toBe('unhealthy'); // No leader during election
     });
   });
-
-  // ── GET /cluster/peers ───────────────────────────────────────
 
   describe('GET /cluster/peers', () => {
     it('reports each direction authentication scheme', async () => {
@@ -339,8 +328,6 @@ describe('cluster health API', () => {
       expect(body.peers).toEqual([]);
     });
   });
-
-  // ── GET /cluster/runs ────────────────────────────────────────
 
   describe('GET /cluster/runs', () => {
     it('should return active runs from ExecutionTracker', async () => {

@@ -1,29 +1,19 @@
 /**
- * `kici local trust-root <file>` — export the offline local dev plane's
- * dev-signed identity trust root as a self-contained `{ issuer, jwks }` file.
+ * `kici local trust-root <file>`: export the offline local dev plane's identity
+ * trust root as the `{ issuer, jwks }` file `kici verify-attestation
+ * --trust-root` consumes, to self-test a dev-signed attestation offline.
  *
- * The plane's dev identity mints tokens with issuer `kici-local` (clearly
- * non-prod). To self-test a dev-signed attestation offline, `kici
- * verify-attestation --trust-root <file>` needs the plane's public JWKS + its
- * issuer, supplied out-of-band. This command writes exactly the shape
- * `verify-attestation`'s `--trust-root` file path consumes.
- *
- * The exported issuer is the fixed sentinel `kici-local` — it can NEVER
- * masquerade as the prod issuer (`https://api.kici.dev`), so verifying the same
- * bundle against the default (prod) trust root still rejects structurally.
+ * The issuer is the fixed sentinel `kici-local`, which can never masquerade as
+ * a real orchestrator issuer, so verifying the same bundle against any other
+ * trust root rejects structurally.
  */
 import fs from 'node:fs';
 import pc from 'picocolors';
 import { logger } from '@kici-dev/core';
 import { devIdentityPublicJwkFile } from '../local-plane/plane-manager.js';
 
-/** The plane's fixed non-prod dev-identity issuer. */
 const KICI_LOCAL_ISSUER = 'kici-local';
 
-/**
- * Write the local dev plane's `{ issuer, jwks }` trust root to `outFile`.
- * Returns true on success.
- */
 export async function localTrustRootCommand(outFile: string): Promise<boolean> {
   if (!outFile) {
     logger.error(

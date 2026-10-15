@@ -1,12 +1,9 @@
 /**
- * Orchestrator-side handlers for the fleet-management read path (P2).
- *
- * Each handler answers one Platform->orchestrator read-relay request from
- * `HostRosterStore`. The roster reads return `FleetHostEntry` (the canonical
- * `HostInventoryEntry` plus `confirmed`) so the dashboard can show hosts
- * declared from the dashboard that no agent or operator confirmed yet. The handlers are pure (they take their dependencies as arguments) so
- * the WS wiring in `server.ts` stays a thin adapter and the logic is unit
- * testable without a live DB / Platform connection.
+ * Fleet-management read-relay handlers, answered from `HostRosterStore`. Roster
+ * reads return `FleetHostEntry` (`HostInventoryEntry` plus `confirmed`) so the
+ * dashboard can show dashboard-declared hosts no agent or operator confirmed
+ * yet. Handlers take their deps as arguments, keeping the `server.ts` wiring a
+ * thin adapter and the logic unit-testable without a live DB or Platform.
  */
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
@@ -39,7 +36,7 @@ export interface FleetHandlerDeps {
   rosterGraceMs: number;
   /** Resolve a workflow's runsOnAll predicate + onUnreachable, or null. */
   resolveRunsOnAll: (workflowName: string) => Promise<ResolvedRunsOnAll | null>;
-  /** All registered workflows (for the host-centric workflows-for-host read). */
+  /** Backs the host-centric workflows-for-host read. */
   registrationStore: RegistrationStore;
 }
 
@@ -73,8 +70,7 @@ export async function handleFleetHostRequest(
     .limit(40)
     .execute();
 
-  // The job→run join can return the same run more than once (one row per pinned
-  // job); dedup by run id while preserving the newest-first ordering.
+  // The join yields one row per pinned job; dedup runs, keeping newest-first order.
   const seen = new Set<string>();
   const runs: FleetPinnedRun[] = [];
   for (const r of runRows) {
@@ -123,7 +119,6 @@ export async function handleFleetPreviewRequest(
       out.push({ entry, disposition: 'target' });
       targetCount++;
     } else if (h.lifecycleClass === 'ephemeral') {
-      // Ephemeral hosts that are not live are always skipped.
       out.push({ entry, disposition: 'skipped-ephemeral' });
     } else {
       // Declared-but-absent durable host: counted toward the fan-out only when
@@ -142,10 +137,9 @@ export async function handleFleetPreviewRequest(
 }
 
 /**
- * workflows-for-host: the host-centric inverse of the preview. Resolves this
- * host's label set once, then tests every registered (non-disabled) workflow's
- * runsOnAll predicate against it, returning each match with the fan-out's
- * `onUnreachable` policy and the host's per-workflow disposition.
+ * workflows-for-host: the host-centric inverse of the preview. Tests every
+ * non-disabled workflow's runsOnAll predicate against this host's labels and
+ * returns each match with its `onUnreachable` policy and the host's disposition.
  */
 export async function handleFleetWorkflowsForHostRequest(
   deps: FleetHandlerDeps,
@@ -158,18 +152,15 @@ export async function handleFleetWorkflowsForHostRequest(
   if (!entry || !entry.confirmed) {
     return { type: 'dashboard.fleet.workflows-for-host.response', requestId, workflows: [] };
   }
-  // Mirrors `findFanoutTargets`, the resolver the dispatcher and the preview
-  // both use: an auto-scaler-spawned agent is never a `runsOnAll` fan-out
-  // target, so no workflow fans out to it however well its labels match.
-  // Without this the host page would name fan-outs no run ever produces.
-  // The flag is read off the roster row rather than `entry` because
+  // Mirrors `findFanoutTargets` (dispatcher + preview): an auto-scaler agent is
+  // never a `runsOnAll` target, so the host page must not name fan-outs no run
+  // produces. The flag comes off the roster row, not `entry`, because
   // `FleetHostEntry` extends the SDK-facing `ctx.kici.inventory` shape.
   const row = await deps.rosterStore.get(agentId);
   if (row?.scaler_managed) {
     return { type: 'dashboard.fleet.workflows-for-host.response', requestId, workflows: [] };
   }
-  // The inventory entry carries the wire shape, whose labels are plain strings,
-  // so fold before matching the workflow's predicate against them.
+  // Wire-shape labels are plain strings: fold them before matching.
   const labelSet = canonicalizeLabelSet(entry.labels);
   const workflows: DashboardFleetWorkflowsForHostResponse['workflows'] = [];
   for (const reg of await deps.registrationStore.getAll()) {

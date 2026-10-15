@@ -134,7 +134,7 @@ describe('handleDiagnosticsRequest', () => {
     expect(result.agents[0].version).toBeNull();
   });
 
-  // --- New metadata and scaler tests ---
+  // --- Metadata and scaler tests ---
 
   it('includes orchestrator instanceId in response', async () => {
     const deps = createBaseDeps({

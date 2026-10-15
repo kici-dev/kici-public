@@ -1,17 +1,15 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Track cron last-fired per (registration, schedule) instead of per
- * registration, so a workflow with multiple schedule() triggers fires every
- * schedule — not just the first.
+ * Keys cron last-fired per (registration, schedule), so a workflow with several schedule()
+ * triggers fires every schedule, not just the first.
  *
- * - Adds `cron_last_fired.schedule_key` (= `${cronExpression}\n${timezone}`).
- * - Backfills existing rows from each registration's FIRST schedule trigger
- *   (exactly the schedule the old scheduler fired), so existing last_fired_at
- *   is preserved and NO currently-scheduled workflow re-fires on deploy.
- * - Drops the single-column PK and installs the composite PK.
+ * - `schedule_key` = `${cronExpression}\n${timezone}`.
+ * - Existing rows backfill from each registration's FIRST schedule trigger (the one the old
+ *   scheduler fired), so last_fired_at is preserved and NO scheduled workflow re-fires on deploy.
+ * - The single-column PK becomes the composite PK.
  *
- * Idempotent: re-running on an already-migrated DB skips each step.
+ * Idempotent: each step is skipped when already applied.
  */
 async function columnExists(db: Kysely<unknown>, column: string): Promise<boolean> {
   const check = await sql<{ exists: boolean }>`
@@ -59,8 +57,7 @@ export async function up(db: Kysely<unknown>): Promise<void> {
        AND clf.schedule_key IS NULL
   `.execute(db);
 
-  // Orphan rows: a cron_last_fired row whose registration has no schedule
-  // trigger (unreachable state) can never be re-fired — drop it.
+  // A row whose registration has no schedule trigger (unreachable) can never re-fire.
   await sql`DELETE FROM public.cron_last_fired WHERE schedule_key IS NULL`.execute(db);
 
   await sql`ALTER TABLE public.cron_last_fired ALTER COLUMN schedule_key SET NOT NULL`.execute(db);
@@ -80,11 +77,8 @@ export async function up(db: Kysely<unknown>): Promise<void> {
 }
 
 export async function down(db: Kysely<unknown>): Promise<void> {
-  // Collapse back to one row per registration (keep the most recent fire).
-  // Break ties on last_fired_at with ctid so tied timestamps across two
-  // schedules of the same registration still resolve to exactly one survivor —
-  // a plain `last_fired_at <` leaves both tied rows and the single-column PK
-  // recreation below then fails with a duplicate-key error.
+  // Keep the most recent fire per registration. ctid breaks last_fired_at ties: a plain
+  // `last_fired_at <` keeps both tied rows and the single-column PK fails on a duplicate key.
   await sql`
     DELETE FROM public.cron_last_fired a
       USING public.cron_last_fired b

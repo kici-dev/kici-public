@@ -1,20 +1,14 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `cluster_settings.ownership_db_check_timeout_ms` (nullable bigint).
+ * Deadline for one DB-backed agent-ownership lookup, which runs inbound on every job-scoped
+ * agent frame that misses the in-memory check. Past it the lookup is undecided and the frame
+ * is refused without counting an ownership violation, so a slow DB cannot stall the frame.
  *
- * Deadline for a single database-backed agent-ownership lookup. The lookup runs
- * on the inbound path of every job-scoped agent frame whose in-memory ownership
- * check misses, so a slow database would otherwise stall the frame; past the
- * deadline the lookup resolves as undecided and the frame is refused without
- * counting an ownership violation.
+ * On `cluster_settings` because every coordinator shares the database. NULL ⇒ the
+ * orchestrator's configured default.
  *
- * Cluster-global (every coordinator talks to the same database), so it lives on
- * `cluster_settings` rather than `org_settings`. NULL ⇒ the orchestrator's own
- * configured default applies.
- *
- * Idempotent: guarded on column existence; a re-run on a DB that already has the
- * column is a no-op.
+ * Idempotent: guarded on column existence.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

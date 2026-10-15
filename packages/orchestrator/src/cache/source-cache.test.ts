@@ -2,9 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import type { CacheStorage } from '../storage/types.js';
 import { SourceCache, sourceTarballKey, sourcePointerKey } from './source-cache.js';
 
-/**
- * In-memory CacheStorage mock for unit testing.
- */
+/** In-memory CacheStorage mock. */
 class InMemoryCacheStorage implements CacheStorage {
   private store = new Map<string, { data: Buffer; createdAt: string; lastAccessedAt: string }>();
 
@@ -97,8 +95,8 @@ describe('SourceCache', () => {
     });
 
     it('names the tarball by its own bytes, not by the contentHash', () => {
-      // Content addressing is what makes a mismatched pair unrepresentable: the
-      // bytes at a key can never change after a URL is signed for it.
+      // Content addressing makes a mismatched pair unrepresentable: the bytes at a key
+      // never change after a URL is signed for it.
       expect(sourceTarballKey(ORG_A, digest)).not.toContain(CONTENT);
     });
   });
@@ -106,8 +104,8 @@ describe('SourceCache', () => {
   describe('org scoping', () => {
     it('does not serve one org a tarball another org stored', async () => {
       // Two repos scaffolded from the same `kici init` template produce the same
-      // contentHash. Under the old un-scoped key they shared one object, so
-      // whichever built first won for the life of that object.
+      // contentHash; an un-scoped key would make them share one object, and whichever
+      // built first would win for the life of that object.
       await cache.store(ORG_A, CONTENT, tar);
       expect(await cache.has(ORG_A, CONTENT)).toBe(true);
       expect(await cache.has(ORG_B, CONTENT)).toBe(false);
@@ -124,8 +122,8 @@ describe('SourceCache', () => {
     });
 
     it('shares a warm entry inside one org', async () => {
-      // Byte-identical trees in one org SHOULD share — that is why org, not
-      // repo, is the scoping segment.
+      // Byte-identical trees in one org SHOULD share — why org, not repo, is the
+      // scoping segment.
       await cache.store(ORG_A, CONTENT, tar);
       await cache.store(ORG_A, 'other-content', tar);
       expect(await cache.getUrlAndDigest(ORG_A, 'other-content')).toMatchObject({ digest });

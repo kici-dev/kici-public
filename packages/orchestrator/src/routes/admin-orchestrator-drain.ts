@@ -1,6 +1,4 @@
 /**
- * Orchestrator drain admin routes.
- *
  * Backs the `kici-admin orchestrator drain` / `resume` / `drain --status`
  * verbs used to quiesce a coordinator before an upgrade. Mounted inside
  * `createAdminRoutes` at `/api/v1/admin/orchestrator/drain`, so it inherits the
@@ -29,13 +27,11 @@ export function createOrchestratorDrainRoutes(deps: {
 }): Hono<AdminEnv> {
   const app = createAdminApp(logger);
 
-  // GET — report drain status, no state change.
   app.get('/orchestrator/drain', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'orchestrator.drain');
     return c.json(await deps.drainController.snapshot(), 200);
   });
 
-  // POST — flip the drain flag on ('drain') or off ('resume').
   app.post('/orchestrator/drain', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'orchestrator.drain');
     const body = await c.req.json().catch(() => ({}));

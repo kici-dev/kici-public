@@ -25,3 +25,8 @@ export function mockObserverWs(): ObserverWsLike {
     readyState: 1,
   };
 }
+
+/** A WebSocket `message` event whose `data` is `data` serialised as JSON. */
+export function makeMessageEvent(data: unknown): MessageEvent {
+  return { data: JSON.stringify(data) } as MessageEvent;
+}

@@ -61,10 +61,6 @@ function registration(overrides: Partial<RegisteredWorkflow> = {}): RegisteredWo
   };
 }
 
-/**
- * One candidate. `regOverrides` shapes the registration (repo, sha, routing
- * key); `workflowOverrides` shapes the lock entry (`hasFilter`, `jobs`).
- */
 function candidate(
   name: string,
   opts: {
@@ -179,10 +175,7 @@ const info = {
   routingKey: 'github:1',
 } as unknown as WebhookInfo;
 
-/**
- * A dispatcher that records every input and resolves the tracker as soon as the
- * round job is dispatched, so a test never has to coordinate two promises.
- */
+/** A recording dispatcher that resolves the tracker once the round job is dispatched. */
 function harness(reply: (input: QueuedJobInput) => unknown) {
   const dispatched: QueuedJobInput[] = [];
   const pendingGlobalEvals = new PendingGlobalEvalTracker();
@@ -191,10 +184,9 @@ function harness(reply: (input: QueuedJobInput) => unknown) {
     dispatch: vi.fn(async (input: QueuedJobInput) => {
       dispatched.push(input);
       const jobId = `job-${++seq}`;
-      // Resolve on the next macrotask, not a microtask: the production path
-      // calls `track()` only after `dispatch()` resolves, and a microtask
-      // queued here runs *before* that await continuation, so the resolve
-      // would land on an unregistered job id and hang.
+      // A macrotask, not a microtask: production calls `track()` after
+      // `dispatch()` resolves, and a microtask would resolve an unregistered
+      // job id first and hang.
       setTimeout(() => {
         const value = reply(input);
         if (value instanceof Error) pendingGlobalEvals.reject(jobId, value);
@@ -217,8 +209,7 @@ function roundArgs(
     deps: {
       dispatcher: h.dispatcher,
       pendingGlobalEvals: h.pendingGlobalEvals,
-      // Same-provider default: every routing key resolves to the one bundle the
-      // event also travels on, which is the ordinary case.
+      // Same-provider default: every routing key resolves to the event's bundle.
       providerRegistry: { getByRoutingKey: () => bundle },
       ...extra,
     },
@@ -252,15 +243,12 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('dispatches one globalEvalRound job per group', async () => {
-    // The correctness driver: a global workflow whose only job is a DynamicJobFn
-    // and which declares no filter. Before the round existed, its generator was
-    // never evaluated on this path at all.
+    // The correctness driver: a global workflow with no filter whose only job is
+    // a DynamicJobFn — without the round its generator is never evaluated here.
     //
     // "…and never a dynamicJobFn job" is asserted in
-    // `process-webhook-globals-eval-round.test.ts` instead, over the wired
-    // dispatch where a `dynamicJobFn` job could actually be observed. Asserting
-    // it here would be vacuous: this module emits exactly one job shape, so the
-    // discriminant it does not set can never appear whatever the code does.
+    // `process-webhook-globals-eval-round.test.ts`, over the wired dispatch: this
+    // module emits one job shape, so asserting it here would be vacuous.
     const cand = candidate('org-ci', { dynamic: true });
     const h = harness(() => ({ candidates: [{ workflowName: 'org-ci', run: true, jobs: [] }] }));
     await runVerdicts(roundArgs([cand], h));
@@ -328,10 +316,9 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('builds the workflow clone URL from the registration bundle, not the event bundle', async () => {
-    // A local-source event (file:// URL builder) triggering a workflow authored
-    // in a GitHub repo. The workflow URL must come from the GitHub bundle — the
-    // local builder would produce `file:///srv/canary/acme/ci-pipelines`, a path
-    // that does not exist, and the round dies at checkout before any filter runs.
+    // A local-source event triggering a workflow authored in a GitHub repo: the
+    // local builder would yield a nonexistent `file:///srv/canary/acme/ci-pipelines`
+    // and the round would die at checkout before any filter runs.
     const githubBundle = {
       repoUrlBuilder: {
         buildCloneUrl: (repo: string) => `https://x-access-token:t@github.com/${repo}.git`,
@@ -362,8 +349,7 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('leaves the workflow clone URL empty when the registration bundle is unresolvable', async () => {
-    // Degrade to '' exactly as an absent `repoUrlBuilder` always has — never
-    // fall back to the event's bundle, which is the defect above.
+    // Degrade to '' as an absent `repoUrlBuilder` does — never to the event's bundle.
     const cand = candidate('org-ci', {
       hasFilter: true,
       repo: 'acme/ci-pipelines',
@@ -380,10 +366,8 @@ describe('runGlobalEvalRounds', () => {
 
   it("takes the round job's routing key and provider from the source its clone URL and credentials come from", async () => {
     // A cross-provider lock-file fallback hands the round another source's
-    // bundle and credentials. The dispatcher mints the source clone auth through
-    // the bundle of the job's routing key, so that key has to name the same
-    // source, or the auth is minted by the inbound provider for a clone URL and
-    // a provider context that belong to another one.
+    // bundle and credentials. The dispatcher mints clone auth through the job's
+    // routing-key bundle, so the key must name that same source.
     const fallbackBundle = {
       normalizer: { provider: 'gitlab' },
       repoUrlBuilder: { buildCloneUrl: (repo: string) => `https://gitlab.example.com/${repo}.git` },
@@ -482,8 +466,7 @@ describe('runGlobalEvalRounds', () => {
     const h = harness(() => ({ candidates: [{ workflowName: 'a', run: true }] }));
     const results = await runVerdicts(roundArgs([a, b], h));
 
-    // Positive control: the reported sibling carries a real verdict, so the
-    // assertion below cannot pass because nothing was collected at all.
+    // Positive control: the reported sibling carries a real verdict.
     expect(results.get(candidateKey(a))).toEqual({ workflowName: 'a', run: true });
     const missing = results.get(candidateKey(b));
     expect(missing?.run).toBe(false);
@@ -555,9 +538,8 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('re-runs the round when the event differs at identical shas', async () => {
-    // The wrong-hit case the three-sha key allowed: a push to `main` at commit
-    // X and a pull-request synchronize whose head is commit X. Same workflow
-    // repo, same workflow sha, same source sha — different verdicts.
+    // A push to `main` at X and a PR synchronize with head X share all three
+    // shas yet need different verdicts.
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
     const globalEvalCache = new GlobalEvalRoundCache({ max: 10 });
     const h = harness((input) => ({
@@ -598,8 +580,8 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('does not cache a round whose candidates are all indeterminate', async () => {
-    // An agent-side round-budget breach reports success with this shape.
-    // Caching it would make a webhook redelivery replay the failure forever.
+    // An agent-side round-budget breach reports success in this shape; caching
+    // it would replay the failure on every redelivery.
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
     const globalEvalCache = new GlobalEvalRoundCache({ max: 10 });
     let reply: unknown = {
@@ -609,8 +591,7 @@ describe('runGlobalEvalRounds', () => {
 
     const first = await runVerdicts(roundArgs([a], h, { globalEvalCache }));
     expect(first.get(candidateKey(a))?.indeterminate).toBe(true);
-    // Two dispatches, not one: a round that decided nothing is a failure, so
-    // the group's own retry ran before it was recorded indeterminate.
+    // Two dispatches: a round that decided nothing is a failure and was retried.
     expect(h.dispatched).toHaveLength(2);
 
     reply = { candidates: [{ workflowName: 'a', run: true }] };
@@ -620,9 +601,8 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('does not cache a mixed round that left one candidate undecided', async () => {
-    // A single candidate's budget breach must not be pinned for every
-    // redelivery of the event: the cache read sits ahead of the round's own
-    // retry, so a stored partial failure short-circuits the retry too.
+    // The cache read sits ahead of the round's retry, so a stored partial
+    // failure would pin one candidate's breach for every redelivery.
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
     const b = candidate('b', { hasFilter: true, id: 'reg-b' });
     const globalEvalCache = new GlobalEvalRoundCache({ max: 10 });
@@ -635,9 +615,7 @@ describe('runGlobalEvalRounds', () => {
     const h = harness(() => reply);
 
     const first = await runVerdicts(roundArgs([a, b], h, { globalEvalCache }));
-    // Control: the first round really ran and really decided `a`, so the
-    // re-run below is about the undecided sibling and not about a round that
-    // produced nothing to store.
+    // Control: the first round ran and decided `a`.
     expect(first.get(candidateKey(a))?.run).toBe(true);
     expect(h.dispatched).toHaveLength(1);
 
@@ -653,8 +631,7 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('caches a round only once every candidate is decided', async () => {
-    // The other half of the predicate: a fully-decided round IS still cached,
-    // so the change above works without disabling the cache.
+    // The other half of the predicate: a fully-decided round IS cached.
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
     const b = candidate('b', { hasFilter: true, id: 'reg-b' });
     const globalEvalCache = new GlobalEvalRoundCache({ max: 10 });
@@ -694,8 +671,7 @@ describe('runGlobalEvalRounds', () => {
     const results = await runVerdicts(roundArgs([a], h));
 
     expect(h.dispatcher.dispatch).toHaveBeenCalledTimes(2);
-    // Without the retry the first rejection is the group's final word, so this
-    // verdict is unreachable: the candidate would be indeterminate.
+    // Unreachable without the retry: the candidate would be indeterminate.
     expect(results.get(candidateKey(a))?.run).toBe(true);
   });
 
@@ -713,9 +689,8 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('reports exactly one failure per failed round, naming every affected candidate', async () => {
-    // One record, not one per candidate: the round exists to collapse N
-    // candidate workflows into one pre-run job, so fanning its failure back out
-    // would undo that.
+    // One record, not one per candidate: the round collapses N candidates into
+    // one pre-run job, and so does its failure.
     const a = candidate('org-ci', { hasFilter: true, id: 'reg-a' });
     const b = candidate('org-lint', { hasFilter: true, id: 'reg-b' });
     const h = harness(() => new Error('agent gone'));
@@ -727,11 +702,9 @@ describe('runGlobalEvalRounds', () => {
     expect(failures[0].workflowRepoIdentifier).toBe('org/pipelines');
     expect(failures[0].error).toContain('agent gone');
     expect(failures[0].attempts).toBe(2);
-    // The last attempt's run id, so the errored run row lands on the queue row
-    // whose attempt actually failed last.
+    // The last attempt's run id, so the errored run row lands on the last failed queue row.
     expect(failures[0].runId).toBe(h.dispatched[h.dispatched.length - 1].runId);
-    // Positive control: both candidates really were in this round, and neither
-    // is dispatchable afterwards.
+    // Positive control: both candidates were in this round, and neither dispatches.
     expect(verdicts.size).toBe(2);
     expect([...verdicts.values()].every((v) => v.run === false)).toBe(true);
   });
@@ -749,16 +722,14 @@ describe('runGlobalEvalRounds', () => {
 
     expect(failures).toHaveLength(1);
     expect(failures[0].workflowRepoIdentifier).toBe('org/other');
-    // Control: the healthy group produced a real verdict, so the single failure
-    // above is a per-group record and not a per-delivery one.
+    // Control: the healthy group decided, so the failure is per-group, not per-delivery.
     expect(verdicts.get(candidateKey(a))?.run).toBe(true);
   });
 
   it('treats a round that decided nothing as a failure, and retries it', async () => {
-    // The most likely production failure mode: the agent's round runner never
-    // throws on its own budget breach — it returns `success` with every
-    // candidate padded `indeterminate`. Read as a success it would produce no
-    // retry, no errored run, and no check.
+    // The likeliest production failure: on a budget breach the agent's round
+    // runner returns `success` with every candidate `indeterminate`. Read as a
+    // success it would produce no retry, no errored run and no check.
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
     const b = candidate('b', { hasFilter: true, id: 'reg-b' });
     const h = harness(() => ({
@@ -773,16 +744,14 @@ describe('runGlobalEvalRounds', () => {
     expect(h.dispatcher.dispatch).toHaveBeenCalledTimes(2);
     expect(failures).toHaveLength(1);
     expect(failures[0].workflowNames).toEqual(['a', 'b']);
-    // The agent's own reason survives into the failure, so the errored run row
-    // and the check say why rather than just that.
+    // The agent's reason survives, so the errored run row and the check say why.
     expect(failures[0].error).toContain('round budget exceeded');
     expect(verdicts.get(candidateKey(a))?.run).toBe(false);
   });
 
   it('dispatches the decided half of a partial round without retrying it', async () => {
-    // The other side of the same line: a partially indeterminate round is a
-    // real result. Its decided workflows must still dispatch, and it must not
-    // burn the retry — re-running it would double-dispatch what it decided.
+    // A partially indeterminate round is a real result: its decided workflows
+    // dispatch, and no retry runs, which would double-dispatch them.
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
     const b = candidate('b', { hasFilter: true, id: 'reg-b' });
     const h = harness(() => ({
@@ -798,10 +767,8 @@ describe('runGlobalEvalRounds', () => {
     expect(verdicts.get(candidateKey(a))?.run).toBe(true);
     expect(verdicts.get(candidateKey(b))?.indeterminate).toBe(true);
 
-    // …and it is still reported. Whether a broken filter is visible must not
-    // depend on how many unrelated global workflows share a workflow repo: the
-    // identical fault in a group of ONE already produced a failure record, and
-    // without this one a group of two produced nothing at all.
+    // …and it is still reported: a broken filter's visibility must not depend on
+    // how many unrelated global workflows share its workflow repo.
     expect(failures).toHaveLength(1);
     expect(failures[0].partial).toBe(true);
     // Only the undecided candidate — `a` ran, so naming it would be false.
@@ -833,9 +800,8 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('gives each attempt its own run id', async () => {
-    // Two queue rows must never share a run id — the errored run row is written
-    // under the last attempt's id, so a shared id would attribute the failure
-    // to the wrong queue row.
+    // The errored run row is written under the last attempt's id, so a shared id
+    // would attribute the failure to the wrong queue row.
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
     const h = harness(() => new Error('agent gone'));
     await runVerdicts(roundArgs([a], h));
@@ -845,49 +811,40 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('bounds the wait on a round that is accepted as queued and never settles', async () => {
-    // The exposure this ceiling closes: an empty init-runner fleet makes the
-    // dispatch `queued`, which counts as accepted, and nothing ever reports a
-    // terminal status for the job. Webhook processing awaits the round inline,
-    // so an unbounded wait blocks the delivery forever — and because
-    // `dedup.claim` already recorded the delivery id, the provider's redelivery
-    // is dropped as a duplicate rather than retried.
+    // An empty init-runner fleet makes the dispatch `queued` (accepted) with no
+    // terminal status ever. Webhook processing awaits the round inline, so an
+    // unbounded wait blocks the delivery forever, and since `dedup.claim` holds
+    // the delivery id the provider's redelivery is dropped as a duplicate.
     const pendingGlobalEvals = new PendingGlobalEvalTracker();
     const h = {
       dispatched: [] as QueuedJobInput[],
-      // Never resolves or rejects the tracker: the round job is queued and no
-      // agent ever picks it up.
+      // Never settles the tracker: no agent picks the job up.
       dispatcher: { dispatch: vi.fn(async () => ({ status: 'queued', jobId: 'stuck-1' })) },
       pendingGlobalEvals,
     } as unknown as ReturnType<typeof harness>;
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
 
-    // The round budget is set below the ceiling because the ceiling is raised
-    // to twice the round budget when it does not exceed it — a 20ms ceiling
-    // under the default 120s budget is exactly the misconfiguration
-    // `clampWaitCeiling` refuses, so it would never be the value under test.
+    // The budget sits below the ceiling: `clampWaitCeiling` raises a ceiling
+    // that does not exceed the budget to twice the budget.
     const results = await runVerdicts(
       roundArgs([a], h, {}, { globalEvalRoundTimeoutMs: 10, globalEvalWaitTimeoutMs: 20 }),
     );
 
-    // Positive control: the round really was dispatched and really was tracked,
-    // so the verdict below comes from the ceiling rather than from a path that
-    // never got as far as awaiting anything. Twice, because the ceiling applies
-    // per attempt and a breach is a failure the retry gets to answer.
+    // Positive control: dispatched and tracked, so the verdict comes from the
+    // ceiling. Twice: the ceiling applies per attempt and a breach is retried.
     expect(h.dispatcher.dispatch).toHaveBeenCalledTimes(2);
     const verdict = results.get(candidateKey(a));
     expect(verdict?.run).toBe(false);
     expect(verdict?.indeterminate).toBe(true);
     expect(verdict?.reason).toContain('did not settle');
-    // The bound rejects the tracker entry rather than racing the promise, so a
-    // round nobody will ever report on leaves nothing behind.
+    // The bound rejects the tracker entry rather than racing it, so nothing is left behind.
     expect(pendingGlobalEvals.size).toBe(0);
   });
 
   it('cancels the queue row when it abandons the wait', async () => {
-    // Giving up on the wait does not stop the job: it stays queued, later runs
-    // a full dual checkout plus author code with nobody left to receive the
-    // verdict, and holds an init-runner slot the retry's own round then queues
-    // behind. Each breach makes the next one likelier.
+    // An abandoned wait leaves the job queued: it later runs a dual checkout and
+    // author code for nobody, holding an init-runner slot the retry queues
+    // behind, so each breach makes the next likelier.
     const cancelQueuedJob = vi.fn(async () => {});
     const pendingGlobalEvals = new PendingGlobalEvalTracker();
     let seq = 0;
@@ -909,8 +866,7 @@ describe('runGlobalEvalRounds', () => {
       ),
     );
 
-    // Once per attempt, each naming that attempt's own queue row — a retry must
-    // not leave the previous attempt's orphan behind.
+    // Once per attempt, each naming its own queue row: a retry leaves no orphan.
     expect(cancelQueuedJob).toHaveBeenCalledTimes(2);
     expect(cancelQueuedJob.mock.calls.map((c) => (c as unknown as string[])[0])).toEqual([
       'stuck-1',
@@ -925,8 +881,7 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('still reports the timeout when the cancel itself fails', async () => {
-    // The cancel is best-effort cleanup; it must never replace the verdict the
-    // caller is about to record.
+    // The cancel is best-effort; it never replaces the verdict.
     const pendingGlobalEvals = new PendingGlobalEvalTracker();
     const h = {
       dispatched: [] as QueuedJobInput[],
@@ -947,9 +902,8 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('reads the wait ceiling from cluster settings', async () => {
-    // Both halves of the pair are overridden: a 15ms ceiling over the default
-    // 120s round budget would be raised by `clampWaitCeiling` before it was
-    // ever used, so the override under test has to carry a budget below it.
+    // Both halves are overridden: `clampWaitCeiling` would raise a 15ms ceiling
+    // over the default 120s budget.
     const getNumber = vi.fn(async (column: string, fallback: number) => {
       if (column === 'global_eval_wait_timeout_ms') return 15;
       if (column === 'global_eval_round_timeout_ms') return 5;
@@ -964,8 +918,7 @@ describe('runGlobalEvalRounds', () => {
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
 
     const results = await runVerdicts(
-      // A configured ceiling far past the test's own timeout, so only the
-      // cluster override can let this resolve at all.
+      // Far past the test timeout: only the cluster override lets this resolve.
       roundArgs(
         [a],
         h,
@@ -981,8 +934,7 @@ describe('runGlobalEvalRounds', () => {
   });
 
   it('clears the wait timer when the round settles normally', async () => {
-    // A settled round must not leave a live timer that could later reject an id
-    // the tracker has since re-issued.
+    // A live timer could later reject an id the tracker has re-issued.
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
     const h = harness(() => ({ candidates: [{ workflowName: 'a', run: true }] }));
     const results = await runVerdicts(
@@ -1011,12 +963,10 @@ describe('runGlobalEvalRounds', () => {
 });
 
 /**
- * A customer upgrades their orchestrator and their agents on their own
- * schedule, so an orchestrator ahead of its fleet is a supported state. An
- * agent below {@link MIN_GLOBAL_EVAL_AGENT_VERSION} has no round branch at all,
- * and the damage is not confined to the new feature: a global workflow that
- * merely contains a generator now routes through the round, so its STATIC jobs
- * stop running too.
+ * An orchestrator ahead of its fleet is supported. An agent below
+ * {@link MIN_GLOBAL_EVAL_AGENT_VERSION} has no round branch, and a global
+ * workflow that merely contains a generator routes through the round, so its
+ * STATIC jobs stop running too.
  */
 describe('too-old agent fleet', () => {
   const oldFleet = (...versions: Array<string | null>) => ({
@@ -1032,13 +982,11 @@ describe('too-old agent fleet', () => {
 
     expect(h.dispatcher.dispatch).not.toHaveBeenCalled();
     expect(verdicts.get(candidateKey(a))?.indeterminate).toBe(true);
-    // Actionability is the whole point: a bare timeout tells the operator
-    // nothing about which knob to turn.
+    // Actionable: a bare timeout names no knob to turn.
     expect(verdicts.get(candidateKey(a))?.reason).toContain('Upgrade your agents');
     expect(verdicts.get(candidateKey(a))?.reason).toContain(MIN_GLOBAL_EVAL_AGENT_VERSION);
     expect(failures).toHaveLength(1);
-    // Never attempted, so it must not claim an attempt an operator could go
-    // looking for logs from.
+    // Never attempted, so no attempt an operator could hunt logs for.
     expect(failures[0].attempts).toBe(0);
     expect(failures[0].workflowNames).toEqual(['a']);
   });
@@ -1090,8 +1038,7 @@ describe('too-old agent fleet', () => {
   });
 
   it('still dispatches when no agent reports a version at all', async () => {
-    // An agent that reports nothing proves nothing. Refusing on ignorance would
-    // suppress every global workflow on a fleet that may well be fine.
+    // Refusing on ignorance would suppress every global workflow on a fleet that may be fine.
     const h = harness(() => ({ candidates: [{ workflowName: 'a', run: true }] }));
     await runVerdicts(
       roundArgs([candidate('a', { hasFilter: true })], h, { agentRegistry: oldFleet(null, null) }),
@@ -1100,11 +1047,9 @@ describe('too-old agent fleet', () => {
   });
 
   it('still dispatches when even one agent of an otherwise-old fleet is unreadable', async () => {
-    // The bar is "every agent reports a version and every one is too old", not
-    // "no agent proved itself capable". Refusing suppresses every global
-    // workflow for the delivery, so it has to rest on proof rather than on
-    // ignorance about part of the fleet — the unreadable agent may be the one
-    // that could have decided the round.
+    // Refusal needs every agent to report a version that is too old, not "no
+    // agent proved capable": the unreadable agent may be the one that could
+    // decide the round.
     const h = harness(() => ({ candidates: [{ workflowName: 'a', run: true }] }));
     await runVerdicts(
       roundArgs([candidate('a', { hasFilter: true })], h, {
@@ -1127,20 +1072,17 @@ describe('too-old agent fleet', () => {
 
 describe('wait-ceiling clamp', () => {
   /**
-   * The pairing that must hold: the orchestrator's ceiling has to outlive the
-   * agent's own round budget, which only starts once the round job is RUNNING.
-   * A ceiling at or below it fires on every round that merely queued.
+   * The ceiling must outlive the agent's round budget, which starts only once
+   * the round job is RUNNING; otherwise it fires on every round that queued.
    *
-   * The admin route refuses the pairing on the values it is handed and the CLI
-   * warns, but neither sees a `cluster-settings reset` that nulls one knob while
-   * the other stays stored, nor the env pair, which has no cross-field check.
+   * The admin route refuses a bad pairing and the CLI warns, but neither sees a
+   * `cluster-settings reset` that nulls one knob, nor the env pair, which has no
+   * cross-field check.
    */
   it('raises a ceiling that does not exceed the round budget', async () => {
-    // The round settles at 60ms. The configured ceiling is 20ms — below the
-    // 100ms round budget — so without the clamp the wait is abandoned 40ms
-    // BEFORE the round settles and the candidate comes back indeterminate. The
-    // clamp raises it to twice the budget (200ms), 140ms AFTER it settles.
-    // Both margins are wide enough that a loaded box cannot flip the outcome.
+    // Settles at 60ms. Unclamped, the 20ms ceiling abandons the wait 40ms early;
+    // clamped to twice the 100ms budget (200ms) it ends 140ms after. Both margins
+    // survive a loaded box.
     const pendingGlobalEvals = new PendingGlobalEvalTracker();
     const h = {
       dispatched: [] as QueuedJobInput[],
@@ -1169,13 +1111,9 @@ describe('wait-ceiling clamp', () => {
   });
 
   it('leaves a coherent pair alone', async () => {
-    // Positive control for the case above: with the ceiling already above the
-    // budget the clamp must not move it, so a stuck round gives up at the
-    // configured 25ms.
-    //
-    // 25, not 20: the clamp would raise a 10ms budget to exactly 20ms, so a
-    // 20ms ceiling asserts the same string whether or not the clamp fired —
-    // the test would pass either way and prove nothing.
+    // Positive control: a ceiling above the budget stays put, so a stuck round
+    // gives up at the configured 25ms. Not 20: the clamp raises a 10ms budget to
+    // exactly 20ms, which would pass either way.
     const pendingGlobalEvals = new PendingGlobalEvalTracker();
     const h = {
       dispatched: [] as QueuedJobInput[],
@@ -1189,17 +1127,14 @@ describe('wait-ceiling clamp', () => {
     );
 
     expect(results.get(candidateKey(a))?.reason).toContain('25ms');
-    // The value the clamp WOULD have produced, asserted absent — this is what
-    // makes the case above and this one distinguishable.
+    // The value the clamp WOULD produce, asserted absent.
     expect(results.get(candidateKey(a))?.reason).not.toContain('20ms');
   });
 
   it('refuses to raise past the relay force-release window', async () => {
-    // A 300s round budget with the wait left at its 240s default: doubling
-    // would hold the delivery for 600s, twice, per delivery — past the point
-    // the relay stops waiting for it. The raise is capped, and since the cap
-    // cannot exceed the budget the configured ceiling is left alone, so the
-    // round fails fast and visibly instead of slowly and quietly.
+    // A 300s budget: doubling would hold the delivery 600s, twice, past the
+    // relay's wait. The raise is capped, and a cap that cannot exceed the budget
+    // leaves the configured ceiling alone, so the round fails fast and visibly.
     const pendingGlobalEvals = new PendingGlobalEvalTracker();
     const h = {
       dispatched: [] as QueuedJobInput[],
@@ -1208,9 +1143,7 @@ describe('wait-ceiling clamp', () => {
     } as unknown as ReturnType<typeof harness>;
     const a = candidate('a', { hasFilter: true, id: 'reg-a' });
 
-    // The ceiling is read straight back out of the timeout message, so the
-    // effective value is observable without waiting it out: a 1ms ceiling under
-    // a 300_000ms budget is left at 1ms rather than raised to 600_000ms.
+    // The effective ceiling is read back from the timeout message.
     const results = await runVerdicts(
       roundArgs([a], h, {}, { globalEvalRoundTimeoutMs: 300_000, globalEvalWaitTimeoutMs: 1 }),
     );
@@ -1220,11 +1153,9 @@ describe('wait-ceiling clamp', () => {
   });
 
   it('refuses a raise that clears the round budget by only a sliver', async () => {
-    // The dead band the ratio closes. `raised = min(round * 2, 300_000)` at
-    // `round = 299_000` buys ONE second of headroom, and the old fail-fast test
-    // (`raised <= round`) was false there — so this band took the success path
-    // and logged as if it had fixed something, while no ceiling under the cap
-    // could outlive the budget and every round failed.
+    // The dead band the ratio closes: `raised = min(round * 2, 300_000)` at
+    // `round = 299_000` buys ONE second, yet a bare `raised <= round` fail-fast
+    // test is false there, so the band would log a fix while every round failed.
     const pendingGlobalEvals = new PendingGlobalEvalTracker();
     const h = {
       dispatched: [] as QueuedJobInput[],
@@ -1237,17 +1168,14 @@ describe('wait-ceiling clamp', () => {
       roundArgs([a], h, {}, { globalEvalRoundTimeoutMs: 299_000, globalEvalWaitTimeoutMs: 2 }),
     );
 
-    // Left at the configured 2ms — fails fast and visibly — rather than raised
-    // to a 300_000ms ceiling that would hold the delivery for five minutes and
-    // still time out.
+    // Left at 2ms, not raised to a 300_000ms ceiling that holds five minutes and still times out.
     expect(results.get(candidateKey(a))?.reason).toContain('within 2ms');
     expect(results.get(candidateKey(a))?.reason).not.toContain('300000');
   });
 
   it('raises a configured ceiling that clears the budget by only a sliver', async () => {
-    // The same defect reached from the other side: `wait > round` reads as a
-    // coherent pair to a bare `>`, but a ceiling one percent above the budget
-    // fails every round that waited at all for a free agent.
+    // The same defect from the other side: a ceiling one percent above the
+    // budget passes a bare `>` but fails every round that waited for an agent.
     const pendingGlobalEvals = new PendingGlobalEvalTracker();
     const h = {
       dispatched: [] as QueuedJobInput[],
@@ -1267,10 +1195,9 @@ describe('wait-ceiling clamp', () => {
 
 describe('candidate-budget clamp', () => {
   /**
-   * The axis adjacent to the wait ceiling, unguarded until now. A per-candidate
-   * budget at or above the whole round's lets ONE candidate consume the entire
-   * round; the agent's deadline check then returns and every sibling is padded
-   * indeterminate — and because the group WAS decided in part, nothing retries.
+   * A per-candidate budget at or above the round's lets ONE candidate consume
+   * the round; every sibling is padded indeterminate, and since the group was
+   * decided in part, nothing retries.
    */
   it('lowers a candidate budget that can consume the whole round', async () => {
     const h = harness(() => ({ candidates: [{ workflowName: 'a', run: true }] }));
@@ -1286,8 +1213,7 @@ describe('candidate-budget clamp', () => {
   });
 
   it('leaves the shipped pairing alone', async () => {
-    // Positive control: 20s per candidate under a 120s round is the pairing the
-    // system is designed around and must pass through untouched.
+    // Positive control: the designed 20s-under-120s pairing passes untouched.
     const h = harness(() => ({ candidates: [{ workflowName: 'a', run: true }] }));
     await runVerdicts(
       roundArgs(
@@ -1301,9 +1227,8 @@ describe('candidate-budget clamp', () => {
   });
 
   it('clamps a candidate budget that came from cluster settings', async () => {
-    // The clamp lives on the EFFECTIVE values because that is the pair the
-    // admin route cannot see: a `cluster-settings reset` nulls one knob while
-    // the other stays stored.
+    // The clamp acts on EFFECTIVE values, which the admin route cannot see after
+    // a `cluster-settings reset` nulls one knob.
     const getNumber = vi.fn(async (column: string, fallback: number) => {
       if (column === 'global_eval_candidate_timeout_ms') return 200_000;
       return fallback;
@@ -1320,10 +1245,9 @@ describe('candidate-budget clamp', () => {
 
 describe('truncateReasonText', () => {
   /**
-   * The agent authors these strings, so their length is unbounded — and they
-   * travel verbatim into a commit check's `output.summary`, which GitHub caps at
-   * 65535 characters and rejects with a 422 the best-effort post swallows. The
-   * check would disappear in exactly the case it exists for.
+   * Agent-authored, so unbounded, and copied into a check's `output.summary`,
+   * which GitHub caps at 65535 characters with a 422 the best-effort post
+   * swallows — the check would vanish exactly when needed.
    */
   it('caps an oversize string and says it was cut', () => {
     const out = truncateReasonText('x'.repeat(500), 100);
@@ -1337,8 +1261,7 @@ describe('truncateReasonText', () => {
   });
 
   it('bounds the reasons a decided-nothing round reports', async () => {
-    // Every candidate carries a distinct oversize reason, so the joined string
-    // is ~3x the cap before truncation.
+    // The joined reasons are ~3x the cap before truncation.
     const huge = (n: number) => `${'r'.repeat(MAX_ROUND_REASON_CHARS)}-${n}`;
     const h = harness(() => ({
       candidates: [
@@ -1356,8 +1279,7 @@ describe('truncateReasonText', () => {
     const { failures } = await runGlobalEvalRounds(roundArgs(group, h));
 
     expect(failures).toHaveLength(1);
-    // Positive control: the reason really did reach the error (so the assertion
-    // below is measuring a truncated string, not an absent one).
+    // Positive control: the reason reached the error.
     expect(failures[0].error).toContain('rrr');
     expect(failures[0].error.length).toBeLessThanOrEqual(MAX_ROUND_REASON_CHARS + 200);
   });
@@ -1365,17 +1287,14 @@ describe('truncateReasonText', () => {
 
 describe('truncateReasonText edges', () => {
   it('never returns more than max, even below the marker length', () => {
-    // A max under the marker's own length made the naive form return a string
-    // LONGER than max — the one thing the cap exists to prevent.
+    // Below the marker's length, a naive form returns a string LONGER than max.
     for (const max of [1, 5, 13, 14]) {
       expect(truncateReasonText('x'.repeat(200), max).length).toBeLessThanOrEqual(max);
     }
   });
 
   it('does not split a surrogate pair', () => {
-    // '𝍢' is a surrogate pair (2 UTF-16 units), so every odd cut index lands
-    // between its halves and a naive slice leaves a lone high surrogate — not
-    // valid text, and not something an API will accept.
+    // '𝍢' is a surrogate pair, so an odd cut leaves a lone high surrogate an API rejects.
     const text = '𝍢'.repeat(50);
     let oddCuts = 0;
     for (let max = 14; max < 40; max++) {
@@ -1386,8 +1305,7 @@ describe('truncateReasonText edges', () => {
       expect(out.length).toBeLessThanOrEqual(max);
       if ((max - 13) % 2 === 1) oddCuts++;
     }
-    // Positive control: the loop really did exercise the cuts that land
-    // mid-pair, so the assertion above had something to catch.
+    // Positive control: the loop exercised mid-pair cuts.
     expect(oddCuts).toBeGreaterThan(0);
   });
 

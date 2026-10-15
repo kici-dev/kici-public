@@ -1,35 +1,29 @@
 /**
- * Always-on startup banner for a routed `kici run --local` invocation. States
- * the selected plane, where the agent runs, the secret + identity source, the
- * control commands, and the flags that force a different behavior — so a
- * developer always knows which plane a run used and why.
- *
- * Three variants:
+ * Always-on startup banner for `kici run --local`, so a developer always knows
+ * which plane a run used and why.
  * - `offline`  — independent plane, local secrets, dev-signed identity.
  * - `attached` — hybrid plane, OIDC + attestation signed by the plane's own key.
- * - `fallback` — wanted attached but the Platform was unreachable, so the run
- *   fell back to offline; a LOUD first line makes the degradation obvious.
+ * - `fallback` — attached was wanted but the Platform was unreachable; a LOUD
+ *   first line makes the degradation obvious.
  */
 
 export type RunBannerMode = 'offline' | 'attached' | 'fallback';
 
 export interface RunBannerInput {
   mode: RunBannerMode;
-  /** Plane orchestrator URL (surfaced on the control line). */
   planeUrl: string;
-  /** Org id (attached variant). */
+  /** Attached variant. */
   orgId?: string;
-  /** Why the run fell back to offline (fallback variant). */
+  /** Fallback variant. */
   fallbackReason?: string;
   /**
-   * Trusted fleet-agent profile (`--trusted`): the run routes to the trusted
-   * label set, so steps see the ambient host env (minus the agent's own KiCI
-   * identity secrets). Surfaced as a loud line so a trusted run is never silent.
+   * `--trusted`: the run routes to the trusted label set, so steps see the ambient
+   * host env (minus the agent's own KiCI identity secrets); the banner says so loudly.
    */
   trusted?: boolean;
 }
 
-/** Render the boxed run banner as a plain (uncolored) multi-line string. */
+/** Plain (uncolored) boxed text. */
 export function renderRunBanner(input: RunBannerInput): string {
   const title = input.mode === 'attached' ? 'kici run --local (connected)' : 'kici run --local';
 
@@ -51,7 +45,6 @@ export function renderRunBanner(input: RunBannerInput): string {
       ['force', '--offline (local plane) · --in-place (ambient)'],
     );
   } else {
-    // offline + fallback share the same body.
     rows.push(
       ['plane', 'local dev orchestrator (independent, offline)'],
       ['agent', 'this machine (bare-metal)'],

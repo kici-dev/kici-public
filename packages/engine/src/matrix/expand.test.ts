@@ -110,7 +110,6 @@ describe('expandMultiDimension', () => {
     const result = expandMultiDimension(matrix);
 
     expect(result).toHaveLength(8);
-    // Verify some specific combinations
     expect(result).toEqual(
       expect.arrayContaining([
         { a: '1', b: 'x', c: '!' },
@@ -447,9 +446,8 @@ describe('applyIncludeExclude', () => {
   });
 
   it('should treat empty exclude entry as matching nothing (not everything)', () => {
-    // Regression: an empty exclude object `{}` used to match EVERY combination
-    // because `[].every()` is vacuously true, silently wiping the entire matrix.
-    // This can happen when a conditional spread collapses to `{}`:
+    // A naive `[].every()` is vacuously true, so an empty exclude `{}` would
+    // wipe the entire matrix. A conditional spread can collapse to `{}`:
     //   exclude: [{ ...(cond ? { os: 'mac' } : {}) }]
     const expanded: MatrixValues[] = [
       { os: 'linux', node: '18' },
@@ -471,9 +469,9 @@ describe('applyIncludeExclude', () => {
   });
 
   it('sorts an include entry so it renders the same dimension order as its siblings', () => {
-    // `expandMultiDimension` sorts dimension names, but an include entry keeps
-    // the author's key order, and `formatMatrixSuffix` renders insertion order —
-    // so an include child used to print its dimensions back-to-front relative to
+    // `expandMultiDimension` sorts dimension names, an include entry keeps the
+    // author's key order, and `formatMatrixSuffix` renders insertion order, so
+    // an unsorted include child prints its dimensions back-to-front relative to
     // every expanded sibling.
     const expanded = expandMatrix({ os: ['linux'], node: ['18'] });
     const result = applyIncludeExclude(expanded, [{ os: 'linux', node: '23' }], undefined);

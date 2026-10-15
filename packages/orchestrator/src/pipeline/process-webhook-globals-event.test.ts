@@ -1,26 +1,24 @@
 /**
  * A cross-repo global workflow job carries the event that triggered it.
  *
- * The per-repository dispatch path writes the normalized event envelope into
- * every job config (`dispatch-matched-workflow.ts`, `envelopeEvent`), and the
- * agent reads it back as `ctx.event`. A global job goes through the same
- * pipeline, so it must carry the field too; without it `ctx.event` is `{}` — an
- * SDK-typed payload that is not there, with no error.
+ * Every job config carries the normalized event envelope
+ * (`dispatch-matched-workflow.ts`, `envelopeEvent`), read by the agent as
+ * `ctx.event`; without it a global job's `ctx.event` is silently `{}`.
  *
- * Both global paths are covered because they are separate call sites:
- * `tryDispatchGlobalsWithoutLockFile` (Phase F, no lock file resolves) and
- * `dispatchGlobalWorkflowsForOtherRepos` (Phase J, a lock file resolved). The
- * `sourceRepo` assertions are the load-bearing ones: it is the only field
- * naming the repo the event came from, so it is what an author needs to scope a
- * concurrency group (see `workflow-runner.test.ts`,
- * `buildConcurrencyGroupContext`), and the Phase F path must stamp it on trigger
- * matching's own copy of the event as well.
+ * Both global call sites are covered: `tryDispatchGlobalsWithoutLockFile`
+ * (Phase F, no lock file resolves) and `dispatchGlobalWorkflowsForOtherRepos`
+ * (Phase J, a lock file resolved). The `sourceRepo` assertions are
+ * load-bearing: it is the only field naming the event's repo, which an author
+ * needs to scope a concurrency group (`buildConcurrencyGroupContext`, see
+ * `workflow-runner.test.ts`), and the Phase F path must also stamp it on
+ * trigger matching's copy of the event.
  *
  * The fixture shape mirrors `process-webhook-globals-payload.test.ts`.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { processWebhook } from './process-webhook.js';
 import type { WebhookInfo } from '../webhook/handler.js';
+import { lockFileFixture, lockWorkflow, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 const SOURCE_REPO = 'acme/app';
 const GLOBAL_REPO = 'acme/org-workflows';
@@ -51,13 +49,11 @@ function makeGlobalRegistration() {
         { _type: 'pr', events: ['opened'], targetBranches: [], sourceBranches: [], paths: [] },
       ],
       jobs: [
-        {
-          _type: 'static',
+        staticJob({
           name: 'scan',
           runsOn: [{ kind: 'exact', value: 'default' }],
-          needs: [],
           steps: [{ name: 'scan', hasOutputs: false }],
-        },
+        }),
       ],
     },
   };
@@ -110,20 +106,19 @@ function makeDeps(over: { withLockFile?: boolean } = {}): {
     lockFileCache: {
       get: vi.fn(async () =>
         over.withLockFile
-          ? {
+          ? lockFileFixture({
               schemaVersion: 9,
-              source: { file: '.kici/workflows/ci.ts', export: '#default' },
               contentHash: 'srchash',
               workflows: [
-                {
+                lockWorkflow({
                   name: 'src-push-only',
                   contentHash: 'shash',
                   compileSchemaVersion: 1,
                   triggers: [{ _type: 'push', branches: [], paths: [] }],
                   jobs: [],
-                },
+                }),
               ],
-            }
+            })
           : null,
       ),
     },
@@ -153,8 +148,7 @@ describe('a global workflow job carries its triggering event', () => {
         targetBranch: 'main',
         sourceBranch: 'feature',
         senderUsername: 'octocat',
-        // The repo the event came from — the workflow lives in GLOBAL_REPO, so
-        // this is the only field distinguishing one source repo from another.
+        // The workflow lives in GLOBAL_REPO, so only this names the source repo.
         sourceRepo: SOURCE_REPO,
       }),
     );
@@ -178,9 +172,8 @@ describe('a global workflow job carries its triggering event', () => {
   });
 
   it('carries the raw provider payload so ctx.event exposes it', async () => {
-    // `rawPayloadFromEvent` reads `event.payload`, which is what an author gets
-    // from the provider-specific half of `ctx.event`. An envelope without it is
-    // still an empty payload from the author's side.
+    // `rawPayloadFromEvent` reads `event.payload`: the provider-specific half of
+    // `ctx.event` an author gets.
     const { deps, dispatch } = makeDeps({ withLockFile: true });
 
     await processWebhook(makeInfo(), deps);

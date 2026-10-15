@@ -1,8 +1,7 @@
 import { z } from 'zod';
 
-// --- Platform -> Orchestrator: Log pull request/response only ---
+// --- Platform -> Orchestrator: historical log pull ---
 // Live logs flow via the push-based log.chunk -> BrowserFanOut path.
-// Only request/response for historical log retrieval is needed here.
 
 /** Request historical logs for a completed or running execution. */
 const logRequestSchema = z.object({
@@ -33,7 +32,7 @@ const logResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-// --- Direction-specific exports (single schemas, no union needed) ---
+// --- Direction-specific exports ---
 
 /** Log pull messages flowing from Platform to Orchestrator. */
 export const logPullPlatformToOrchSchema = logRequestSchema;

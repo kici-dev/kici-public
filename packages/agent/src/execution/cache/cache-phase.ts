@@ -1,13 +1,10 @@
 /**
- * Declarative cache phase (sandbox-side).
- *
- * Restores a list of {@link CacheSpec} before the work that depends on them
- * (a job before its steps, or a step before its `run`) and saves them after
- * (on an exact-key miss). Each operation surfaces as a `cache:restore` /
- * `cache:save` pseudo-step — a `step.start` + `step.complete` IPC pair whose
- * `step_type` comes from {@link CacheStepType} — exactly mirroring how hooks
- * render as `hook:*` pseudo-steps. The `step.complete` `data` carries the
- * {@link CacheOutcome} (plus key / matchedKey / bytes) so the agent can feed a
+ * Declarative cache phase (sandbox-side): restores {@link CacheSpec}s before
+ * the dependent work (a job before its steps, a step before its `run`) and
+ * saves them after on an exact-key miss. Each operation is a `cache:restore` /
+ * `cache:save` pseudo-step (a `step.start` + `step.complete` IPC pair, like
+ * `hook:*` pseudo-steps); `step.complete` `data` carries the
+ * {@link CacheOutcome} plus key / matchedKey, so the agent can feed a
  * `run.event` and the dashboard can render hit/miss/saved inline.
  */
 import { CacheStepType, CacheOutcome } from '@kici-dev/engine';
@@ -15,23 +12,20 @@ import { toErrorMessage } from '@kici-dev/shared';
 import type { CacheSpec, CacheApi } from '@kici-dev/sdk';
 import type { RunnerToAgentMessage } from '../sandbox/ipc-protocol.js';
 
-/** The restore outcome remembered per spec key so the save phase can skip exact hits. */
+/** Remembered per spec key so the save phase can skip exact hits. */
 export interface CacheRestoreOutcome {
   hit: boolean;
   matchedKey?: string;
 }
 
 export interface CachePhaseDeps {
-  /** Imperative cache API (the same one bound to `ctx.cache`). */
+  /** The same API bound to `ctx.cache`. */
   cache: CacheApi;
-  /** Emit a runner→agent IPC message (the masked send). */
+  /** The masked runner→agent IPC send. */
   sendIpc: (msg: RunnerToAgentMessage) => void;
   /**
-   * Allocate the next cache pseudo-step index for `ownerStepIndex` (the real
-   * step the cache op belongs to, or {@link JOB_CACHE_OWNER} for job-level
-   * cache). Each owner draws from a disjoint block above every real-step and
-   * hook index, so two concurrently-running steps' cache pseudo-steps never
-   * collide.
+   * Next pseudo-step index for `ownerStepIndex` (the owning real step, or
+   * {@link JOB_CACHE_OWNER}); see {@link createCacheStepIndexAllocator}.
    */
   nextStepIndex: (ownerStepIndex: number) => number;
 }
@@ -39,16 +33,14 @@ export interface CachePhaseDeps {
 /** Owner sentinel for job-level (not step-scoped) cache restore/save. */
 export const JOB_CACHE_OWNER = -1;
 
-/** Block size reserved per owner for cache pseudo-step indices. */
+/** Pseudo-step indices reserved per owner. */
 const CACHE_INDEX_BLOCK = 1000;
 
 /**
- * Build the cache pseudo-step index allocator. Each owner (a real step index, or
- * {@link JOB_CACHE_OWNER}) gets its own disjoint block of {@link CACHE_INDEX_BLOCK}
- * indices, all above every real-step and hook index (`stepCount * 3 + 100`). A
- * step's two-or-more cache pseudo-steps are a pure function of its own owner
- * index, so concurrent children never collide. Under sequential execution the
- * emitted indices stay above all real/hook indices exactly as before.
+ * Each owner (a real step index, or {@link JOB_CACHE_OWNER}) gets a disjoint
+ * block of {@link CACHE_INDEX_BLOCK} indices above every real-step and hook
+ * index (`stepCount * 3 + 100`). A step's cache pseudo-step indices depend only
+ * on its own owner index, so concurrently-running steps never collide.
  */
 export function createCacheStepIndexAllocator(
   stepCount: number,
@@ -63,9 +55,8 @@ export function createCacheStepIndexAllocator(
 }
 
 /**
- * Restore every spec, surfacing each as a `cache:restore` pseudo-step. Returns
- * a map keyed by spec key recording whether the EXACT key hit (so the save
- * phase can skip a redundant save of an entry that already exists).
+ * Returns each spec key's outcome; its `matchedKey` tells the save phase
+ * whether the EXACT key already exists, so it skips a redundant save.
  */
 export async function restoreCacheSpecs(
   specs: CacheSpec[],
@@ -114,10 +105,9 @@ export async function restoreCacheSpecs(
 }
 
 /**
- * Save every spec whose EXACT key did not already hit on restore (immutable +
- * no redundant save), surfacing each as a `cache:save` pseudo-step. A spec
- * whose restore matched a different key via a `restoreKeys` prefix is still
- * saved under its exact key.
+ * Saves every spec whose EXACT key did not hit on restore (entries are
+ * immutable). A spec restored through a `restoreKeys` prefix is still saved
+ * under its exact key.
  */
 export async function saveCacheSpecs(
   specs: CacheSpec[],
@@ -126,7 +116,6 @@ export async function saveCacheSpecs(
   ownerStepIndex: number,
 ): Promise<void> {
   for (const spec of specs) {
-    // Exact key already present (restore matched it verbatim) — nothing to do.
     if (restoreResults.get(spec.key)?.matchedKey === spec.key) continue;
     const stepIndex = deps.nextStepIndex(ownerStepIndex);
     deps.sendIpc({

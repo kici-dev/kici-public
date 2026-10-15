@@ -1,24 +1,16 @@
 /**
- * Typed client for the Platform's org-scoped notification API — the routes the
- * dashboard Notifications tab uses (channels, subscriptions, and the Layer 1
- * Slack-identity roster). Authenticated with the stored PAT + active org,
- * exactly like {@link DashboardClient}, and reachable programmatically via the
- * `kici notifications …` CLI.
- *
- * It composes a {@link DashboardClient} (same auth / org-scoped-URL / error
- * mapping) rather than re-implementing the transport: every path here is
- * relative to `/api/v1/orgs/:orgId/notifications/…`.
+ * Typed client for the Platform's org-scoped notification routes (channels,
+ * subscriptions, the Slack-identity roster) behind `kici notifications`. It
+ * composes a {@link DashboardClient} for auth, org-scoped URLs and error mapping;
+ * every path is relative to `/api/v1/orgs/:orgId/`.
  */
 import { z } from 'zod';
 import { DashboardClient, DashboardClientError } from './dashboard-client.js';
 import { loadGlobalConfig } from './config.js';
 
 /**
- * Notification protocol enums mirrored from the hosted Platform's notification
- * route contract. The public `kici` CLI cannot import the private Platform
- * package, so these values are re-declared here and reused across the client,
- * the command arg parsing, and their tests (the single source of truth on the
- * CLI side).
+ * Mirrored from the Platform's route contract: the public CLI cannot import the
+ * private Platform package. The CLI-side single source of truth.
  */
 export const NotificationChannelKind = z.enum(['slack', 'email']);
 export type NotificationChannelKind = z.infer<typeof NotificationChannelKind>;
@@ -35,7 +27,6 @@ export type RosterSubjectKind = z.infer<typeof RosterSubjectKind>;
 export const RosterInputForm = z.enum(['id', 'username', 'email']);
 export type RosterInputForm = z.infer<typeof RosterInputForm>;
 
-/** A notification channel row as returned by the channels list route. */
 export interface NotificationChannel {
   id: string;
   type: string;
@@ -44,7 +35,6 @@ export interface NotificationChannel {
   created_at?: string;
 }
 
-/** A notification subscription row as returned by the subscriptions list route. */
 export interface NotificationSubscription {
   id: string;
   level: string;
@@ -61,7 +51,6 @@ export interface NotificationSubscription {
   source: string;
 }
 
-/** A Slack-identity roster row as returned by the roster list route. */
 export interface SlackIdentity {
   id: string;
   connection_id: string;
@@ -72,7 +61,6 @@ export interface SlackIdentity {
   status: string;
 }
 
-/** Body for creating a Slack channel. */
 export interface CreateSlackChannelBody {
   type: 'slack';
   connection_id: string;
@@ -80,7 +68,6 @@ export interface CreateSlackChannelBody {
   name: string;
 }
 
-/** Body for creating an email channel. */
 export interface CreateEmailChannelBody {
   type: 'email';
   name: string;
@@ -90,7 +77,7 @@ export interface CreateEmailChannelBody {
 
 export type CreateChannelBody = CreateSlackChannelBody | CreateEmailChannelBody;
 
-/** Body for creating a subscription (mirrors the Platform create route schema). */
+/** Mirrors the Platform create route schema. */
 export interface CreateSubscriptionBody {
   level: NotificationSubLevel;
   channel_id: string;
@@ -106,7 +93,7 @@ export interface CreateSubscriptionBody {
   accumulate_for?: number | null;
 }
 
-/** Body for adding a roster identity (mirrors the Platform add route schema). */
+/** Mirrors the Platform add route schema. */
 export interface AddIdentityBody {
   connection_id: string;
   subject_kind: RosterSubjectKind;
@@ -120,18 +107,13 @@ const channelsListSchema = z.object({ channels: z.array(rowSchema).default([]) }
 const subscriptionsListSchema = z.object({ subscriptions: z.array(rowSchema).default([]) });
 const identitiesListSchema = z.object({ identities: z.array(rowSchema).default([]) });
 
-/**
- * PAT + org-scoped client for the notification routes. Construct via
- * {@link NotificationsClient.load}, which reads `~/.kici/config` and resolves
- * the target org (`--org` override or the saved active org).
- */
+/** Construct via {@link NotificationsClient.load}, which reads `~/.kici/config`. */
 export class NotificationsClient {
   private constructor(private readonly dashboard: DashboardClient) {}
 
   /**
-   * Load the authenticated client. `opts.org` overrides the saved active org
-   * for this invocation; otherwise the saved `activeOrgId` is used. Throws a
-   * {@link DashboardClientError} when the PAT / endpoint / org is missing.
+   * `opts.org` overrides the saved `activeOrgId`. Throws a
+   * {@link DashboardClientError} when the PAT, endpoint or org is missing.
    */
   static async load(opts: { org?: string } = {}): Promise<NotificationsClient> {
     const config = await loadGlobalConfig();

@@ -318,10 +318,8 @@ describe('ctx.kici.oidc token masking', () => {
 
 // --- setEnv / addPath tests ---
 //
-// These test the exact logic implemented in createSandboxStepContext closures.
-// Since createSandboxStepContext is module-private, we replicate the closure
-// behavior here to test the core logic (operator secret guard, process.env mutation,
-// PATH prepend). This matches the implementation in workflow-runner.ts exactly.
+// createSandboxStepContext is module-private, so these replicate its closures
+// exactly (operator secret guard, process.env mutation, PATH prepend).
 
 describe('setEnv', () => {
   /** Build a setEnv closure matching the workflow runner implementation. */
@@ -335,7 +333,6 @@ describe('setEnv', () => {
     };
   }
 
-  // Clean up env vars set during tests
   const keysToClean: string[] = [];
   afterEach(() => {
     for (const key of keysToClean) {
@@ -379,7 +376,6 @@ describe('setEnv', () => {
     const setEnv = makeSetEnv(new Set(['DB_PASSWORD']), warnings);
     keysToClean.push('DB_PASSWORD');
 
-    // Set the "operator" value first
     process.env.DB_PASSWORD = 'secret123';
 
     setEnv('DB_PASSWORD', 'hacked');
@@ -390,11 +386,10 @@ describe('setEnv', () => {
   });
 
   it('blocks override of namespaced operator secret keys', () => {
-    // The operator secret keys set includes keys from both flat and namespaced secrets
+    // The operator secret keys include namespaced secret keys too.
     const warnings: string[] = [];
     const operatorKeys = new Set<string>();
 
-    // Simulate collecting keys from namespacedSecrets
     const namespacedSecrets = { prod: { API_KEY: 'key456' } };
     for (const ctx of Object.values(namespacedSecrets)) {
       for (const key of Object.keys(ctx)) operatorKeys.add(key);
@@ -432,7 +427,6 @@ describe('addPath', () => {
   });
 
   afterEach(() => {
-    // Restore original PATH to avoid test pollution
     if (originalPath !== undefined) {
       process.env.PATH = originalPath;
     } else {
@@ -484,10 +478,7 @@ describe('addPath', () => {
 });
 
 describe('operator secret key collection', () => {
-  /**
-   * Replicate the operator secret key collection logic from main() in workflow-runner.ts.
-   * This tests the Set construction from flat + namespaced secrets.
-   */
+  /** Replicates main()'s operator secret key collection from flat + namespaced secrets. */
   function collectOperatorSecretKeys(
     secrets?: Record<string, string>,
     namespacedSecrets?: Record<string, Record<string, string>>,
@@ -1095,10 +1086,9 @@ describe('concurrency group evaluation', () => {
   });
 
   it('group function receives minimal context (no StepContext)', () => {
-    // The group function signature receives { branch, event } -- NOT StepContext.
-    // This is intentional: group evaluation is lightweight and happens before sandbox setup.
+    // The group function gets { branch, event }, not StepContext: group evaluation
+    // is lightweight and runs before sandbox setup.
     const groupFn = (ctx: { branch: string; event: Record<string, unknown> }) => {
-      // Should NOT have $, log, secrets, etc.
       expect(ctx).toHaveProperty('branch');
       expect(ctx).toHaveProperty('event');
       expect(ctx).not.toHaveProperty('$');
@@ -1147,14 +1137,10 @@ describe('concurrency group evaluation', () => {
 
 describe('concurrency wait mode', () => {
   it('wait ack parks the runner waiting for a follow-up `proceed` over the same WS', () => {
-    // After receiving `{ action: 'wait' }`, the workflow-runner does NOT exit.
-    // It re-arms the single-slot pendingConcurrencyAck waiter and long-polls
-    // for an unsolicited `concurrency.ack` from the orchestrator. The
-    // orchestrator sends `{ action: 'proceed' }` once the slot frees, at
-    // which point the runner returns 'proceed' from
-    // evaluateConcurrencyGroupIfPresent and continues with normal step
-    // execution. The runner does NOT report success to the agent on `wait`
-    // — the run is still in flight from the user's perspective.
+    // On `wait` the runner does NOT exit and does NOT report success: it re-arms
+    // the single-slot pendingConcurrencyAck waiter for an unsolicited
+    // `concurrency.ack`. When the slot frees the orchestrator sends `proceed`,
+    // evaluateConcurrencyGroupIfPresent returns 'proceed', and steps run.
     const waitAck: ConcurrencyAckMessage = {
       type: 'concurrency.ack',
       action: 'wait',
@@ -1172,10 +1158,8 @@ describe('concurrency wait mode', () => {
   });
 
   it('reads KICI_CONCURRENCY_WAIT_TIMEOUT_MS from process.env with a 1h default', () => {
-    // The wait-cap timeout is configurable so customers running long-lived
-    // queue scenarios (e.g., large deployment fan-out) can extend the cap.
-    // The runner reads the env var at the wait point — it doesn't need to
-    // be threaded through the JobExecutionRequest.
+    // Configurable so long-lived queues (e.g. large deployment fan-out) can
+    // extend the cap; read at the wait point, not threaded through the request.
     const parse = (raw: string | undefined): number => Number.parseInt(raw ?? '', 10) || 3_600_000;
 
     expect(parse(undefined)).toBe(3_600_000);
@@ -1201,8 +1185,6 @@ describe('concurrency cancel mode', () => {
 
 describe('no concurrency config path', () => {
   it('jobs without concurrency config skip the entire concurrency protocol', async () => {
-    // When workflow.concurrency is undefined, the concurrency protocol is skipped entirely.
-    // The job proceeds directly to clone and step execution.
     const steps: Step[] = [makeStep('normal-step', vi.fn().mockResolvedValue(undefined))];
     const { send } = collectIpc();
 
@@ -1216,7 +1198,6 @@ describe('no concurrency config path', () => {
       env: {},
     });
 
-    // No concurrency messages in IPC -- just normal step execution
     expect(result.status).toBe('success');
     expect(result.stepResults[0].status).toBe('success');
   });
@@ -1748,21 +1729,21 @@ describe('buildStepLoopRuleInputs', () => {
 });
 
 describe('prepare-phase ordering: global repo pair precedes generator + rules', () => {
-  // The property under test is an ORDERING inside main(), which no unit test can
-  // observe without driving a whole sandbox job. Assert it at the source level
-  // instead: the env injection + repo-pair construction must sit ahead of both
-  // consumers. A generator re-evaluated without KICI_SOURCE_REPO_PATH sees a
-  // different world than the pre-dispatch evaluation did, and
-  // extractStepsFromDynamicJob fails the job when the target job goes missing.
+  // An ORDERING inside main() is unobservable without a whole sandbox job, so it
+  // is asserted at the source level: env injection + repo-pair construction sit
+  // ahead of both consumers. A generator re-evaluated without
+  // KICI_SOURCE_REPO_PATH sees a different world than the pre-dispatch
+  // evaluation, and extractStepsFromDynamicJob fails the job when the target job
+  // goes missing.
   const source = readFileSync(
     fileURLToPath(new URL('./workflow-runner.ts', import.meta.url)),
     'utf8',
   );
 
   const setupAt = source.indexOf('const globalRepoInfo = setupGlobalWorkflowEnv(');
-  // Step extraction is delegated to extractStepsForRun (which owns the
-  // apiTransport closure + the cleanup-only short-circuit); it forwards the repo
-  // pair to extractAndNormalizeSteps. Anchor on main()'s call site.
+  // extractStepsForRun owns step extraction (the apiTransport closure + the
+  // cleanup-only short-circuit) and forwards the repo pair to
+  // extractAndNormalizeSteps; anchor on main()'s call site.
   const extractAt = source.indexOf('await extractStepsForRun(');
   const rulesAt = source.indexOf('await maybeSkipJobOnRules(');
   const helperForwardAt = source.indexOf('return extractAndNormalizeSteps(');
@@ -1799,10 +1780,8 @@ describe('buildSandboxShell same-step env visibility', () => {
   it('a subprocess sees a process.env mutation made AFTER the shell was built (live env, not a snapshot)', async () => {
     delete process.env.KICI_SAMESTEP_TEST;
     const shell = buildSandboxShell(process.cwd(), 0, () => {});
-    // Mutate process.env after the shell is constructed — this mirrors
-    // ctx.setEnv running inside the step, after the step context (and its
-    // shell) were created. With a frozen { ...process.env } copy the
-    // subprocess would echo an empty line; with a live reference it sees the value.
+    // Mirrors ctx.setEnv running after the step context and its shell exist. A
+    // frozen { ...process.env } copy would echo an empty line.
     process.env.KICI_SAMESTEP_TEST = 'live-value';
     const out = await shell`echo "$KICI_SAMESTEP_TEST"`;
     expect(out.stdout.trim()).toBe('live-value');
@@ -1812,28 +1791,25 @@ describe('buildSandboxShell same-step env visibility', () => {
     const abort = new AbortController();
     const shell = buildSandboxShell(process.cwd(), 0, () => {}, abort.signal);
 
-    // `pgrep -f` reads the WHOLE host's process list, so a bare `sleep 45`
-    // probe matches any process whose command line merely contains that
-    // string — a sibling vitest worker running this same file, another agent
-    // on the box, or the probe's own wrapper shell. A nonce in the duration
-    // makes the pattern unforgeable by anything this test did not start.
-    // `sleep` takes a fractional argument, so the duration is still ~45s.
+    // `pgrep -f` reads the WHOLE host's process list, so a bare `sleep 45` probe
+    // matches a sibling vitest worker, another agent on the box, or the probe's
+    // own wrapper shell. A nonce in the (fractional, still ~45s) duration makes
+    // the pattern unforgeable by anything this test did not start.
     const nonce = `${Math.floor(Math.random() * 1e9)}`.padStart(9, '0');
     const duration = `45.${nonce}`;
 
-    // A step timeout aborts this controller. Without the shell being bound to
-    // it the step was only marked failed while its command kept running, and
-    // `onFailure` rolled back underneath a live process.
+    // A step timeout aborts this controller. An unbound shell leaves the command
+    // running after the step is marked failed, so `onFailure` rolls back
+    // underneath a live process.
     const started = Date.now();
     setTimeout(() => abort.abort(), 200);
     await expect(shell`sleep ${duration}`).rejects.toThrow();
     expect(Date.now() - started).toBeLessThan(15_000);
 
-    // The child is gone, not merely detached from the awaiting promise. The
-    // kill is asynchronous, so poll rather than read once and race the signal.
-    // The bracketed dot keeps this probe's own shell from matching itself:
-    // its command line carries `45[.]<nonce>`, which the pattern does not
-    // match because the pattern requires a literal dot in that position.
+    // The child is gone, not merely detached from the promise. The kill is
+    // asynchronous, so poll. The bracketed dot keeps this probe's own shell
+    // (command line `45[.]<nonce>`) from matching the pattern, which requires a
+    // literal dot there.
     const { execSync } = await import('node:child_process');
     const pattern = `sleep 45[.]${nonce}`;
     let survivors = 'unread';
@@ -1893,12 +1869,10 @@ describe('buildConcurrencyGroupContext', () => {
   });
 
   it('collapses both source repos into one group when the event is absent', () => {
-    // The state a global job was dispatched in before the orchestrator wrote
-    // `event` into its job config: the author has only `branch` to key on, so
-    // every source repo pushing its default branch shares one group — and with
+    // Without `event` in the job config the author has only `branch` to key on,
+    // so every source repo pushing its default branch shares one group, and with
     // `cancelInProgress` (the orchestrator's default) one repo's push cancels
-    // another's in-flight run. This is the failure the populated event removes,
-    // asserted directly rather than inferred.
+    // another's in-flight run. The populated event removes this failure.
     const a = perRepoGroup(buildConcurrencyGroupContext(req({ event: undefined })));
     const b = perRepoGroup(buildConcurrencyGroupContext(req({ event: undefined })));
 

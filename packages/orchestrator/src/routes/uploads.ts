@@ -1,12 +1,9 @@
 /**
- * Test-run upload provisioning.
- *
- * Mints an upload record and a presigned PUT URL + ephemeral X25519 public key
- * for the overlay tarball. The developer encrypts the tarball with the returned
- * public key and PUTs it directly to the object store; a test trigger then
- * references the upload id. It is invoked by the `test.relay.uploads.init`
- * relay handler (a run routed through the Platform) and by the direct
- * test-run routes (`POST /api/v1/test/uploads/init`).
+ * Test-run upload provisioning. The developer encrypts the overlay tarball with
+ * the returned public key and PUTs it directly to the object store; a test
+ * trigger then references the upload id. Called by the
+ * `test.relay.uploads.init` relay handler (Platform-routed runs) and by the
+ * direct `POST /api/v1/test/uploads/init` route.
  */
 
 import { randomUUID, generateKeyPairSync } from 'node:crypto';
@@ -17,15 +14,11 @@ import type { CacheStorage } from '../storage/types.js';
 
 const logger = createLogger({ prefix: 'uploads' });
 
-/**
- * Sanitize a routing key for use in S3 storage paths.
- * Replaces characters that are problematic in S3 keys.
- */
+/** Replaces characters that are problematic in S3 keys. */
 function sanitizeRoutingKey(routingKey: string): string {
   return routingKey.replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
-/** Parameters for {@link initTestUpload}. */
 export interface InitTestUploadParams {
   routingKey: string;
   sha?: string;
@@ -46,7 +39,6 @@ export class TestUploadStorageUnavailableError extends Error {
   }
 }
 
-/** Result of {@link initTestUpload}. */
 export interface InitTestUploadResult {
   uploadId: string;
   signedUrl: string;
@@ -54,7 +46,6 @@ export interface InitTestUploadResult {
   expiresIn: number;
 }
 
-/** Dependencies for {@link initTestUpload}. */
 export interface InitTestUploadDeps {
   db: Kysely<Database>;
   cacheStorage?: CacheStorage;
@@ -72,16 +63,13 @@ export async function initTestUpload(
 ): Promise<InitTestUploadResult> {
   const { routingKey, sha, fileCount, compressedSize } = params;
 
-  // Generate ephemeral X25519 keypair for upload encryption.
   const { publicKey, privateKey } = generateKeyPairSync('x25519');
   const publicKeyDer = publicKey.export({ type: 'spki', format: 'der' });
   const privateKeyDer = privateKey.export({ type: 'pkcs8', format: 'der' });
 
-  // Remote test uploads PUT the overlay tarball directly to object storage, so a
-  // presigned URL is mandatory. An orchestrator with no storage configured cannot
-  // serve `kici run remote` — fail loudly with an actionable message rather than
-  // returning an empty signedUrl that surfaces downstream as an opaque
-  // "Failed to parse URL from " fetch error on the developer's machine.
+  // A presigned URL is mandatory. Fail loudly rather than return an empty
+  // signedUrl, which surfaces on the developer's machine as an opaque
+  // "Failed to parse URL from " fetch error.
   if (!deps.cacheStorage) {
     throw new TestUploadStorageUnavailableError(
       'This orchestrator has no object storage configured, so `kici run remote` ' +

@@ -1,8 +1,9 @@
 import { z } from 'zod';
 
 /**
- * When the Platform identity token bound into a provenance bundle was minted,
- * relative to the build. Orthogonal to the run's `SourceOrigin` brand.
+ * When the orchestrator-minted identity token bound into a provenance bundle
+ * was minted, relative to the build. Orthogonal to the run's `SourceOrigin`
+ * brand.
  * `live` — minted synchronously during the build (no deferral).
  * `deferred` — the build's mint failed transiently; the token was minted later
  *   against run/job rows the Platform already had (transient-blip recovery).

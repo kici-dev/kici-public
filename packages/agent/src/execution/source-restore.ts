@@ -1,26 +1,17 @@
 /**
- * `.kici/` source tarball restoration for execution agents.
+ * Installs the orchestrator-cached `.kici/` source tarball at `workDir/.kici`.
+ * Unlike `dep-restore.ts` it reads into memory: source tarballs are kilobytes,
+ * not hundreds of megabytes.
  *
- * Downloads a pre-built `.kici/` source tarball from the orchestrator's cache
- * and installs it at `workDir/.kici` so the workflow entry point becomes
- * importable. Unlike `dep-restore.ts`, which downloads to a file first, it
- * reads the tarball into memory — source tarballs are tiny (kilobytes, not the
- * hundreds of megabytes a `node_modules/` tarball carries).
+ * **Verification.** `dispatch.sourceTarDigest` is the SHA-256 of the tarball
+ * bytes, checked before extraction (as `restoreDeps` checks `depsHash`). With no
+ * digest (a source not from the content-addressed cache) the restore proceeds
+ * unverified.
  *
- * Two properties this path is responsible for:
- *
- * **Verification.** `dispatch.sourceTarDigest` is the SHA-256 of the tarball's
- * own bytes, so the download is checked before anything is extracted — the same
- * contract `restoreDeps` has via `depsHash`. When no digest is dispatched (a
- * source that did not come from the content-addressed cache) the restore
- * proceeds unverified rather than failing.
- *
- * **Replacement, not overlay.** Extraction lands in a scratch directory and the
- * result REPLACES `workDir/.kici` wholesale, save for `node_modules/` — the one
- * directory the tarball deliberately omits, which the deps restore has already
- * written by the time this runs. Extracting over the existing tree left any file
- * the tarball no longer carries in place, so a helper the author deleted
- * survived every warm-cache run and kept being imported.
+ * **Replacement, not overlay.** The result REPLACES `workDir/.kici` wholesale,
+ * save for `node_modules/`, which the tarball omits and the deps restore has
+ * already written. Extracting over the tree would keep a helper the author
+ * deleted importable on every warm-cache run.
  */
 
 import { mkdir, rm, rename } from 'node:fs/promises';
@@ -49,13 +40,7 @@ async function extractSourceTarball(data: Buffer, targetDir: string): Promise<vo
   });
 }
 
-/**
- * Download, verify, and install the `.kici/` source tree.
- *
- * @param workDir - Root of the cloned repository; `.kici` is replaced under it
- * @param sourceTarUrl - `http://`, `https://`, or `file://` URL to the tarball
- * @param sourceTarDigest - Expected SHA-256 of the tarball bytes, when known
- */
+/** `sourceTarUrl` is `http://`, `https://` or `file://`. */
 export async function restoreSource(
   workDir: string,
   sourceTarUrl: string,
@@ -85,25 +70,21 @@ export async function restoreSource(
     }
   }
 
-  // Extract to a scratch dir beside the destination — same filesystem, so the
-  // swap below is a rename rather than a copy — then replace `.kici` wholesale.
+  // Beside the destination, so the swap is a same-filesystem rename.
   const kiciDir = path.join(workDir, '.kici');
   const scratch = path.join(workDir, `.kici.restore-${process.pid}-${Date.now()}`);
   try {
     await extractSourceTarball(data, scratch);
-    // The tarball's members are `.kici/…`, so the extracted tree it holds is
-    // `<scratch>/.kici`. Fall back to the scratch root for a tarball packed
-    // without the prefix rather than installing an empty directory.
+    // Members are `.kici/…`; a tarball packed without the prefix falls back to
+    // the scratch root rather than installing an empty directory.
     const extracted = path.join(scratch, '.kici');
     const src = (await fsPromises.stat(extracted).catch(() => null))?.isDirectory()
       ? extracted
       : scratch;
-    // Carry an already-restored dependency tree across the replacement. The
-    // tarball omits `.kici/node_modules` (`KICI_SOURCE_EXCLUDED_PREFIX`), and
-    // every call path restores the deps tarball into `.kici/node_modules`
-    // BEFORE this runs — so deleting `.kici` wholesale strands the workflow
-    // with no `@kici-dev/sdk` to import, and the inline install that would
-    // repair it runs only when that restore failed.
+    // Every call path restores deps into `.kici/node_modules` BEFORE this, and
+    // the tarball omits it (`KICI_SOURCE_EXCLUDED_PREFIX`): dropping it would
+    // leave no `@kici-dev/sdk`, and the repairing inline install runs only when
+    // that restore failed.
     const installedDeps = path.join(kiciDir, 'node_modules');
     if (await fsPromises.stat(installedDeps).catch(() => null)) {
       await rename(installedDeps, path.join(src, 'node_modules'));

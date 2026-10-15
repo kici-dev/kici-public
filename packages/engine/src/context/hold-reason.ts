@@ -1,27 +1,21 @@
 /**
- * Protection-gate hold-reason template — the free-text sentence the trust gate
- * persists into `held_runs.reason` when a contributor is below a context's
- * `minimumTrust`.
+ * Protection-gate hold-reason template — the sentence the trust gate persists
+ * into `held_runs.reason` when a contributor is below a context's
+ * `minimumTrust`. The orchestrator's trust gate and the test assertions share
+ * this one copy.
  *
- * Single source of truth for the sentence: the orchestrator's trust gate emits
- * it, and test fixtures and assertions compare against it. One copy means a
- * copy edit moves every site at once.
+ * A function rather than an enum: the sentence carries the context name, which
+ * is per-hold data.
  *
- * `held_runs.reason` is a free-text column, so this is a function rather than
- * an enum: the sentence carries the context name, which is per-hold data.
- *
- * Carries no runtime import on purpose — this module reaches the browser
- * through the engine barrel, which must pull in no Node built-ins. The one import
- * below is type-only and is erased at compile time.
+ * No runtime import on purpose: this module reaches the browser through the
+ * engine barrel, which must pull in no Node built-ins.
  */
 import type { TrustTier } from './types.js';
 
 /**
  * Reason a run is held because the context requires `minimumTrust: 'trusted'`
- * and the contributor's tier is below that. `trustTier` is the contributor's
- * actual tier, which the gate has already narrowed to a tier below `trusted` —
- * so the type excludes `'trusted'`, whose sentence would read as a
- * contradiction.
+ * and the contributor's tier is below that. The type excludes `'trusted'`,
+ * whose sentence would read as a contradiction.
  */
 export function trustedContributorHoldReason(
   contextName: string,

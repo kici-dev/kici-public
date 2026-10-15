@@ -6,16 +6,11 @@
  *   source purge-stale --routing-key [--dry-run]   — drop orphan sources/secrets
  *   secret purge --confirm [--org <id>]            — bulk-delete scoped secrets
  *
- * Each command supports two modes:
- *
- *   HTTP mode (default): requires `--url` + `--token`, routes through the
- *   orchestrator admin HTTP API. Preferred when the orchestrator is running
- *   — the service records structured logs and honors admin RBAC.
- *
- *   Direct-DB mode: activated when `--database-url` is passed (or
- *   KICI_DATABASE_URL / DATABASE_URL is set). Opens its own pool and runs the
- *   SQL directly. Use it for cleanup while the orchestrator is deliberately
- *   stopped, so a stale scoped-secret can't crash it on boot.
+ * HTTP mode (default, `--url` + `--token`) goes through the admin API:
+ * preferred while the orchestrator runs, for its structured logs and admin RBAC.
+ * Direct-DB mode (`--database-url`, or KICI_DATABASE_URL / DATABASE_URL) runs
+ * the SQL on its own pool, for cleanup while the orchestrator is deliberately
+ * stopped, so a stale scoped secret cannot crash it on boot.
  */
 import { createInterface } from 'node:readline';
 import type { Command } from 'commander';
@@ -105,11 +100,8 @@ export function registerMaintenanceCommands(
     );
 
   // ── secret purge ────────────────────────────────────────────────────────
-  // Attach the `purge` verb to the existing `secret` namespace (defined in
-  // secret.ts). Commander lets multiple files add subcommands to the same
-  // program.command('secret'); calling .command('secret') again looks up the
-  // existing namespace if already created, else creates a new one — either
-  // way this lands alongside scopes/list/set/delete.
+  // Joins the `secret` namespace from secret.ts when it exists, else creates
+  // it; either way `purge` lands beside scopes/list/set/delete.
   const existingSecret = program.commands.find((c) => c.name() === 'secret');
   const secret =
     existingSecret ?? program.command('secret').description('Scoped secret management');

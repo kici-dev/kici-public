@@ -19,13 +19,10 @@ import { createRequire } from 'node:module';
 import { basename, delimiter, dirname, isAbsolute, join, relative } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-/** Result of npm resolution. */
 interface NpmResolution {
-  /** Absolute path to npm-cli.js, or undefined if using bare 'npm' from PATH. */
+  /** Absolute path to npm-cli.js; undefined means a bare 'npm' from PATH. */
   npmCliPath: string | undefined;
-  /** The Node.js executable path (process.execPath). */
   nodeExe: string;
-  /** Directory containing the Node.js binary. */
   nodeDir: string;
 }
 
@@ -38,13 +35,9 @@ function bundledNpmCliPaths(nodeDir: string): string[] {
 }
 
 /**
- * Resolve the npm CLI path from the current Node.js binary.
- *
- * Checks standard Node.js distribution layout paths:
- * - {nodeDir}/../lib/node_modules/npm/bin/npm-cli.js (Linux/macOS installed)
- * - {nodeDir}/node_modules/npm/bin/npm-cli.js (Windows / some layouts)
- *
- * Returns undefined npmCliPath if neither is found (caller can fall back to PATH).
+ * Resolve npm-cli.js from the current Node binary: `../lib/node_modules/npm`
+ * (Linux/macOS) or `node_modules/npm` (Windows, some layouts). `npmCliPath` is
+ * undefined when neither exists, and the caller falls back to PATH.
  */
 export function resolveNpm(): NpmResolution {
   const nodeExe = process.execPath;
@@ -90,7 +83,7 @@ export const DISTRIBUTION_NPM_CLI_PATHS: readonly string[] = [
   '/usr/share/nodejs/npm/bin/npm-cli.js',
 ];
 
-/** The modules the agent loads from the npm it found: the `.npmrc` parser and the lockfile reader. */
+/** The modules the agent loads from the npm it found: the `.npmrc` parser, the lockfile reader and semver. */
 const NPM_MODULE_IDS = ['ini', '@npmcli/arborist', 'semver'] as const;
 
 /** Where the npm the host install trusts came from. */
@@ -103,9 +96,7 @@ export enum HostNpmSource {
   Path = 'path',
 }
 
-/** What the npm lookup reads from the agent process. */
 export interface HostNpmLookupEnv {
-  /** The Node binary that runs the agent. */
   execPath: string;
   /** The agent process's PATH, never a job's. */
   pathEnv: string | undefined;
@@ -113,7 +104,6 @@ export interface HostNpmLookupEnv {
   distributionCliPaths: readonly string[];
 }
 
-/** The lookup inputs of the running agent. */
 export function hostNpmLookupEnv(): HostNpmLookupEnv {
   return {
     execPath: process.execPath,
@@ -127,7 +117,7 @@ export type HostNpm =
   | { found: true; npmCliPath: string; version: string | null; source: HostNpmSource }
   | { found: false; detail: string };
 
-/** Whether `file` lies strictly inside `dir`. */
+/** Strictly inside. */
 function isInside(file: string, dir: string): boolean {
   const rel = relative(dir, file);
   return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
@@ -246,10 +236,7 @@ export function lookupHostNpm(env: HostNpmLookupEnv = hostNpmLookupEnv()): HostN
 }
 
 /**
- * Verify that npm is usable by running `npm --version`.
- *
- * Called at agent startup when the builder role is active.
- * Throws a descriptive error if npm cannot be executed.
+ * Run `npm --version` at builder-role startup; throws when npm cannot run.
  *
  * @returns The npm version string (e.g., "10.8.1")
  */

@@ -35,17 +35,14 @@ export function eventTypeOf(event: unknown): string | undefined {
  * Install the throwing `changedFiles` accessor shared by `RuleContext` and
  * `FilterContext`.
  *
- * Both contexts contract `changedFiles` to **throw** when the diff is
- * unavailable rather than read as an empty list: a path-based gate that
- * silently sees no changes suppresses work invisibly, and for a `filter` it
- * suppresses every job the workflow declares. On the organization-wide path
- * that leaves no run row at all; on the same-repo path it leaves a `success`
- * run carrying only the workflow's `__init__*` evaluation jobs.
+ * `changedFiles` **throws** when the diff is unavailable rather than reading as
+ * empty: a path gate that sees no changes suppresses work invisibly, and a
+ * `filter` suppresses every job — leaving no run row on the organization-wide
+ * path, or a `success` run with only `__init__*` jobs on the same-repo path.
  *
- * The behaviour lives here, in one `Object.defineProperty`, precisely because a
- * plain `{ changedFiles: [] }` property satisfies both context types with no
- * error anywhere: a second construction site could violate the contract and
- * still typecheck. Every builder of either context calls this.
+ * One shared getter, because a plain `{ changedFiles: [] }` satisfies both
+ * context types and would still typecheck. Every builder of either context
+ * calls this.
  */
 export function defineChangedFilesGetter(
   target: object,

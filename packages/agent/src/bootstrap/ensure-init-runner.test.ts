@@ -16,7 +16,6 @@ const MATERIAL = {
 
 const SHA = 'a'.repeat(64);
 
-/** A payload source that resolves a fixed tarball + hash. */
 function payloadSource(): AgentPayloadSource {
   return { resolve: vi.fn(async () => ({ tarballPath: '/payloads/1.2.3/p.tar.gz', sha256: SHA })) };
 }
@@ -61,20 +60,16 @@ describe('ensureInitRunner (agent-side)', () => {
     expect(result).toEqual({ broughtUp: true });
     expect(transport).toHaveBeenCalledWith('kici.ensureInitRunner', { targetAgentId: 'box-00007' });
 
-    // The launcher was pushed via cat > path (stdin carries the script, which
-    // embeds the bootstrap token + agent id + orchestrator URL + labels).
+    // Pushed via cat > path; stdin carries the script with the bootstrap env.
     const push = calls.find((c) => c.command === 'ssh' && c.stdin?.includes('KICI_AGENT_TOKEN'));
     expect(push?.stdin).toContain('kat_boottoken');
     expect(push?.stdin).toContain('KICI_AGENT_ID=');
     expect(push?.stdin).toContain('box-00007');
     expect(push?.stdin).toContain('ws://10.0.0.1:4000/ws');
     expect(push?.stdin).toContain('kici:init');
-    // Suppress auto-derived role labels: the bootstrap token authorizes only the
-    // init-runner's bring-up labels, so the launcher must set KICI_ROLES empty or
-    // the register is rejected for exceeding the token-bound label scope.
+    // Empty KICI_ROLES: auto-derived role labels exceed the token-bound scope.
     expect(push?.stdin).toContain('KICI_ROLES=');
 
-    // A run invocation chmod's + executes the launcher.
     const run = calls.find((c) => c.command === 'ssh' && c.args.some((a) => a.includes('chmod')));
     expect(run).toBeDefined();
   });

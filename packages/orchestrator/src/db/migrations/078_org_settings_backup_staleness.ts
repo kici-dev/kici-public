@@ -1,12 +1,9 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the nullable `org_settings.backup_staleness_warn_hours INTEGER` column:
- * the per-org override for the DB-backup freshness diagnostic's WARN threshold.
- * NULL falls back to the cluster default (`config.backupStalenessWarnHours`,
- * 24h). Operators tune it per-org via `kici-admin org-settings backup-freshness`.
- *
- * Idempotent: guarded on column existence.
+ * Add `org_settings.backup_staleness_warn_hours`: the per-org WARN threshold for the DB-backup
+ * freshness diagnostic, set via `kici-admin org-settings backup-freshness`. NULL is the cluster
+ * default (`config.backupStalenessWarnHours`, 24h). Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colCheck = await sql<{ exists: boolean }>`

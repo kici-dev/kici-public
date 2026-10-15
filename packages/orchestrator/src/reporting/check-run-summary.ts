@@ -1,13 +1,10 @@
 /**
- * Check run summary, annotation, and progress text builders.
+ * Pure builders for GitHub Checks API summaries, annotations and progress text, from step
+ * results and log buffers. No side effects, no API calls.
  *
- * These are pure functions that produce markdown and annotation objects
- * for the GitHub Checks API. No side effects, no API calls -- just data
- * transformation from step results + log buffers to GitHub-ready output.
- *
- * Per locked decisions:
+ * Output contract:
  * - Summary headline: "Job '{jobName}' failed (N/M steps passed)" or success equivalent
- * - Step table with Status | Step | Duration columns
+ * - Step table with Step | Status | Duration columns
  * - Failed steps: error + last 20 log lines in code blocks
  * - Annotations: failure/warning level, capped at 50
  * - Progress: checklist-style with emoji prefixes
@@ -68,17 +65,13 @@ interface BuildCheckRunSummaryOptions {
   runId: string;
   jobId: string;
   traceIds: { requestId: string; runId: string };
-  /** Total job duration in milliseconds. */
+  /** Milliseconds. */
   jobDurationMs?: number;
   /**
-   * Bytes a caller will add around the returned summary — the reduced-privilege
-   * note it prepends, the annotation-count line it appends — subtracted from
-   * the byte budget below.
-   *
-   * Without it the budget is spent in full here and the caller's own bytes push
-   * the final string over the API's cap, which rejects the entire update and
-   * leaves the check run unresolved. Reserving instead drops one more tier of
-   * log lines, which costs context rather than the whole report.
+   * Bytes the caller adds around the summary (the prepended reduced-privilege note, the
+   * appended annotation-count line), subtracted from the byte budget. Without it the caller's
+   * bytes push the string over the API cap, which rejects the whole update and leaves the
+   * check run unresolved; reserving drops one more log tier instead.
    */
   reservedBytes?: number;
 }
@@ -102,27 +95,20 @@ interface BuildProgressTextOptions {
 export const SUMMARY_BYTE_LIMIT = 65_535;
 
 /**
- * Cut `summary` so it fits the API's cap, whatever a caller wrapped around it.
- *
- * The last line of defence, not the primary mechanism: `reservedBytes` is what
- * keeps a summary readable by dropping log tiers, and this only runs when the
- * final string is still over. Truncating at a UTF-8 boundary matters — a cut
- * through a multi-byte sequence produces a replacement character and can leave
- * the string one byte over the cap it was cut to fit.
+ * Cut `summary` to fit the API's cap, whatever a caller wrapped around it. The last line of
+ * defence: `reservedBytes` keeps a summary readable by dropping log tiers first.
  */
 export function clampSummaryToLimit(summary: string, limit = SUMMARY_BYTE_LIMIT): string {
   const buf = Buffer.from(summary, 'utf-8');
   if (buf.byteLength <= limit) return summary;
   const notice = '\n\n_Summary truncated due to size limits._';
   const noticeBytes = Buffer.byteLength(notice, 'utf-8');
-  // A limit too small to hold the notice would be blown by the notice itself,
-  // so drop it rather than return something still over. Unreachable from the
-  // default cap; stated so the return value never overshoots its own argument.
+  // A limit too small for the notice drops it, so the result never overshoots the limit
+  // (unreachable from the default cap).
   const keep = limit >= noticeBytes ? limit - noticeBytes : limit;
   const tail = limit >= noticeBytes ? notice : '';
-  // `toString` on a slice that ends mid-sequence yields one replacement
-  // character per orphaned byte — wider than the bytes it replaced, so it can
-  // push the result back over the very cap it was cut to fit. Trim them.
+  // A slice ending mid-UTF-8-sequence decodes to replacement characters wider than the
+  // orphaned bytes, which can push the result back over the cap. Trim them.
   const head = buf.subarray(0, keep).toString('utf-8');
   return `${head.replace(/\uFFFD+$/, '')}${tail}`;
 }
@@ -130,10 +116,9 @@ export function clampSummaryToLimit(summary: string, limit = SUMMARY_BYTE_LIMIT)
 /** Maximum annotations per GitHub Checks API request. */
 const MAX_ANNOTATIONS = 50;
 
-/** Progressive log line counts for truncation when summary too large. */
+/** Log lines per failed step, tried in order until the summary fits. */
 const LOG_LINE_TIERS = [20, 10, 5, 0] as const;
 
-// Re-export for consumers that import from this module.
 export { formatDuration } from '@kici-dev/shared';
 
 // ---------------------------------------------------------------------------
@@ -177,11 +162,8 @@ function progressEmoji(status: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Build a rich markdown summary for a GitHub Check run output.summary field.
- *
- * Includes: headline, step table, failure details with log context, trace footer.
- * Respects the 65535 byte limit with progressive log truncation, minus whatever
- * `reservedBytes` the caller will wrap around the result.
+ * Markdown for a check run's output.summary: headline, step table, failure details with log
+ * context, trace footer. Fits 65535 bytes minus `reservedBytes` by progressive log truncation.
  */
 export function buildCheckRunSummary(opts: BuildCheckRunSummaryOptions): string {
   const { stepResults, logBuffer, runId, jobId, traceIds, jobName } = opts;
@@ -191,7 +173,6 @@ export function buildCheckRunSummary(opts: BuildCheckRunSummaryOptions): string 
   const allPassed = passed === total;
   const budget = SUMMARY_BYTE_LIMIT - (opts.reservedBytes ?? 0);
 
-  // Try building with progressively fewer log lines until under byte limit
   for (const maxLogLines of LOG_LINE_TIERS) {
     const summary = buildSummaryWithLogLimit(
       jobName,
@@ -212,7 +193,7 @@ export function buildCheckRunSummary(opts: BuildCheckRunSummaryOptions): string 
     }
   }
 
-  // Final fallback: minimal summary (should always fit)
+  // Minimal fallback (should always fit).
   const headline = allPassed
     ? `**Job '${jobName}' passed** (${passed}/${total} steps passed)`
     : `**Job '${jobName}' failed** (${passed}/${total} steps passed)`;
@@ -235,7 +216,6 @@ function buildSummaryWithLogLimit(
 ): string {
   const parts: string[] = [];
 
-  // Headline
   if (allPassed) {
     parts.push(`**Job '${jobName}' passed** (${passed}/${total} steps passed)`);
   } else {
@@ -244,7 +224,6 @@ function buildSummaryWithLogLimit(
 
   parts.push('');
 
-  // Step table
   parts.push('| Step | Status | Duration |');
   parts.push('|------|--------|----------|');
 
@@ -254,13 +233,11 @@ function buildSummaryWithLogLimit(
     parts.push(`| ${step.name} | ${emoji} ${step.status} | ${duration} |`);
   }
 
-  // Job total duration
   if (jobDurationMs !== undefined) {
     parts.push('');
     parts.push(`**Total duration:** ${formatDuration(jobDurationMs)}`);
   }
 
-  // Failed step details
   const failedSteps = stepResults.filter((s) => s.status === 'failed');
 
   if (failedSteps.length > 0 && maxLogLines >= 0) {
@@ -272,7 +249,6 @@ function buildSummaryWithLogLimit(
       parts.push(`### ${statusEmoji(step.status)} ${step.name}`);
       parts.push('');
 
-      // Timeout message
       if (step.timedOut) {
         const timeoutSec =
           step.durationMs !== undefined ? (step.durationMs / 1000).toFixed(0) : '?';
@@ -280,13 +256,11 @@ function buildSummaryWithLogLimit(
         parts.push('');
       }
 
-      // Error message
       if (step.error) {
         parts.push(`**Error:** ${step.error}`);
         parts.push('');
       }
 
-      // Log lines
       if (maxLogLines > 0) {
         const logEntry = logBuffer.getLastLines({
           runId,
@@ -299,14 +273,12 @@ function buildSummaryWithLogLimit(
             parts.push(`... (showing last ${maxLogLines} of ${logEntry.totalCount} lines)`);
           }
           parts.push('```');
-          // Only take up to maxLogLines from the entry
           const linesToShow = logEntry.lines.slice(-maxLogLines);
           parts.push(linesToShow.join('\n'));
           parts.push('```');
         }
       }
 
-      // Exit code
       if (step.exitCode !== undefined) {
         parts.push('');
         parts.push(`Exit code: ${step.exitCode}`);
@@ -314,7 +286,6 @@ function buildSummaryWithLogLimit(
     }
   }
 
-  // Trace footer
   parts.push('');
   parts.push(`Trace: ${traceIds.requestId} | Run: ${traceIds.runId}`);
 
@@ -326,10 +297,8 @@ function buildSummaryWithLogLimit(
 // ---------------------------------------------------------------------------
 
 /**
- * Build GitHub Check annotation objects from step results and source locations.
- *
- * Returns an object with the annotations array (capped at 50) and the count
- * of remaining annotations that could not be included.
+ * Annotations for failed steps with a source location, capped at 50; `remainingCount` is how
+ * many did not fit.
  */
 export function buildAnnotations(opts: BuildAnnotationsOptions): {
   annotations: CheckAnnotation[];
@@ -341,10 +310,8 @@ export function buildAnnotations(opts: BuildAnnotationsOptions): {
   for (let i = 0; i < stepResults.length; i++) {
     const step = stepResults[i];
 
-    // Only annotate failed steps
     if (step.status !== 'failed') continue;
 
-    // Skip steps without source location
     const loc = sourceLocations.get(i);
     if (!loc) continue;
 
@@ -373,7 +340,6 @@ export function buildAnnotations(opts: BuildAnnotationsOptions): {
     });
   }
 
-  // Cap at MAX_ANNOTATIONS
   if (allAnnotations.length <= MAX_ANNOTATIONS) {
     return { annotations: allAnnotations, remainingCount: 0 };
   }
@@ -389,9 +355,7 @@ export function buildAnnotations(opts: BuildAnnotationsOptions): {
 // ---------------------------------------------------------------------------
 
 /**
- * Build a checklist-style markdown string for live check run updates.
- *
- * Example:
+ * Checklist-style markdown for live check run updates, for example:
  *   checkmark Install deps (1.2s)
  *   checkmark Build (3.4s)
  *   hourglass Run tests...

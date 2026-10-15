@@ -1,29 +1,21 @@
-/**
- * Yes/no confirmation prompt for the `kici-admin` verbs that change or destroy
- * state unless the operator passes `--yes`.
- */
+/** Yes/no prompt for the state-changing `kici-admin` verbs run without `--yes`. */
 import { createInterface } from 'node:readline';
 
-/** Message of the error raised when stdin ends before the operator answers. */
+/** Raised when stdin ends before an answer. */
 export const NO_CONFIRMATION_ANSWER =
   'no answer to the confirmation prompt: stdin closed before a line arrived. ' +
   'Pass --yes to run without the prompt.';
 
-/** The streams the prompt writes to and reads from. */
 export interface ConfirmIo {
   input: NodeJS.ReadableStream;
   output: NodeJS.WritableStream;
 }
 
 /**
- * Write `prompt` and read one line of answer.
- *
- * Resolves true when the line is `y` or `yes` (any case, surrounding spaces
- * ignored) and false for any other line. Rejects with
- * {@link NO_CONFIRMATION_ANSWER} when stdin ends before a line arrives, as it
- * does for a script, a cron job or a `< /dev/null` redirect. Resolving false
- * there would let a verb run without `--yes` exit 0 having done nothing, and
- * the script that ran it would read that as success.
+ * True for a `y` / `yes` line (any case, trimmed), false for any other line.
+ * Rejects with {@link NO_CONFIRMATION_ANSWER} when stdin ends first (a script,
+ * cron or `< /dev/null`): resolving false would exit 0 having done nothing,
+ * which the calling script reads as success.
  */
 export function confirmPrompt(
   prompt: string,

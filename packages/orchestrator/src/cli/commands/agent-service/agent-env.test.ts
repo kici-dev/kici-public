@@ -1,9 +1,7 @@
 /**
- * The contract between `kici-admin agent install` and the agent: the env file
- * the installer writes must load through the agent's own config loader. The
- * loader refuses any KICI_* variable it does not know, so a key the installer
- * misspells stops the agent at startup — which no test on either side alone
- * can see.
+ * The env file `kici-admin agent install` writes must load through the agent's
+ * config loader, which refuses unknown KICI_* variables: a misspelled key stops
+ * the agent at startup, invisible to a test on either side alone.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
@@ -27,9 +25,8 @@ describe('agent install env file → agent loadConfig', () => {
 
   beforeEach(() => {
     saved = { ...process.env };
-    // Every ambient KICI_* variable goes: KICI_DEV=true in a developer shell
-    // would downgrade the unknown-variable check to a warning and let this
-    // test pass without checking anything.
+    // Clear every ambient KICI_*: KICI_DEV=true would downgrade the
+    // unknown-variable check to a warning, so this test would check nothing.
     for (const key of Object.keys(process.env)) {
       if (key.startsWith('KICI_')) delete process.env[key];
     }

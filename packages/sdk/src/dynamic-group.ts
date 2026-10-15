@@ -1,11 +1,6 @@
 /**
- * Dynamic group helpers for cross-domain needs.
- *
- * A DynamicGroupRef allows static jobs to declare a dependency on a dynamic
- * job group by name, without knowing the concrete generated job names.
- *
- * Usage in workflow definition:
- *   needs: [dynamicGroup('test-shards')]
+ * A DynamicGroupRef lets a static job depend on a dynamic job group by name,
+ * without knowing the generated job names:
  *   needs: [dynamicGroup('test-shards', { when: 'always' })]
  */
 
@@ -34,7 +29,6 @@ export function dynamicGroup(name: string, opts?: { when?: NeedsWhenInput }): Dy
   };
 }
 
-/** Type guard to check if a value is a DynamicGroupRef. */
 export function isDynamicGroupRef(value: unknown): value is DynamicGroupRef {
   return typeof value === 'object' && value !== null && DYNAMIC_GROUP_TAG in value;
 }

@@ -1,19 +1,8 @@
 /**
- * Shared run-cancellation path.
- *
- * `cancelRunWithReason` is the single canonical implementation of "cancel
- * this whole run, recording a reason". It is invoked by:
- *
- *  - the operator-facing `POST /api/v1/admin/runs/:runId/cancel` route
- *    (user-initiated `kici cancel`), and
- *  - the WorkflowDeadlineDetector, which cancels runs that exceeded their
- *    workflow-level wall-clock timeout (TimeoutReason.workflow_timeout).
- *
- * Keeping one implementation means the deadline enforcer and the user cancel
- * follow identical mechanics: send `job.cancel` to the agents running the
- * run's jobs, cancel queued dispatch rows, mark pending/queued jobs cancelled,
- * stamp the failure reason, and drive the run terminal when no agent work is
- * outstanding.
+ * The single "cancel this whole run, recording a reason" path, shared by the
+ * `POST /api/v1/admin/runs/:runId/cancel` route (`kici cancel`) and the
+ * WorkflowDeadlineDetector (TimeoutReason.workflow_timeout), so both follow
+ * identical mechanics.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -56,10 +45,9 @@ export interface CancelRunDeps {
    */
   instanceId?: string;
   /**
-   * Forward `job.cancel` to the coordinator holding the agent's socket, with
-   * `force` when the cancel is forced. Returns whether the send left this
-   * process. Undefined ⇒ no peer transport, so a job owned by a sibling is
-   * unreachable rather than orphaned.
+   * Forward `job.cancel` to the coordinator holding the agent's socket; returns
+   * whether the send left this process. Undefined ⇒ no peer transport, so a
+   * job owned by a sibling is unreachable rather than orphaned.
    */
   cancelJobOnPeer?: (
     peerId: string,
@@ -71,9 +59,8 @@ export interface CancelRunDeps {
   /** How stale a `cluster_instances` heartbeat may be and still read as live. */
   ownershipGraceMs?: number;
   /**
-   * Reject a held run's workflow-scoped hold: `rejectWorkflow` bound to the live
-   * processing deps. A cancel of a `held` run goes through it so the approval
-   * request is withdrawn with the run. Undefined where no provider wiring
+   * `rejectWorkflow` bound to the live processing deps, so a cancel of a `held`
+   * run withdraws its approval request. Undefined where no provider wiring
    * exists; the held run is then still cancelled and its holds rejected.
    */
   rejectHeldWorkflow?: (
@@ -96,23 +83,19 @@ export interface CancelRunResult {
   /** Number of `job.cancel` messages dispatched to agents (running jobs). */
   agentsNotified: number;
   /**
-   * Jobs whose owning coordinator is alive but could not be reached — the peer
-   * send failed, or there is no peer transport. They are NOT notified and they
-   * are NOT orphaned: the job may well still be running, so the run stays
-   * `cancelling` and the re-drive sweep tries again.
+   * Jobs whose owning coordinator is alive but unreachable (peer send failed,
+   * or no peer transport). Not notified and NOT orphaned: the job may still be
+   * running, so the run stays `cancelling` and the re-drive sweep retries.
    */
   unreachable: number;
   /** Number of pending/queued execution_jobs rows marked cancelled. */
   pendingCancelled: number;
-  /**
-   * True when the run was already in a terminal status, so the cancel was a
-   * no-op: no agent was notified and no row was written.
-   */
+  /** The run was already terminal: a no-op, nothing notified or written. */
   alreadyTerminal: boolean;
   /**
-   * Set when the run was `held` and a decision reached its holds first — an
-   * approve, a reject or an expiry — so the cancel wrote nothing. Entry points
-   * refuse the cancel with {@link heldRunCancelRefusal}.
+   * The run was `held` and an approve, reject or expiry reached its holds
+   * first, so the cancel wrote nothing. Entry points refuse it with
+   * {@link heldRunCancelRefusal}.
    */
   decidedBeforeCancel?: HeldRunDecidedFirst;
 }
@@ -154,17 +137,13 @@ export class HeldRunCancelRefusedError extends Error {
 
 /**
  * Cancel a whole run, recording `reason` on its cancelled jobs and (if not
- * already set) on the run's failure_reason. Sends `job.cancel` to every agent
- * holding a dispatched job for the run; cancels queued dispatch rows; marks
- * pending/queued jobs cancelled. When no agent had outstanding work, drives
- * the run to its terminal status immediately so the run does not linger in
- * `cancelling`.
+ * already set) on the run's failure_reason: sends `job.cancel` to every agent
+ * holding a dispatched job, cancels queued dispatch rows, marks pending/queued
+ * jobs cancelled. When no agent had outstanding work, drives the run terminal
+ * immediately so it does not linger in `cancelling`.
  *
- * A cancel targeting a run that is already terminal is a no-op: the run's
- * status is read first and, when terminal, the function returns
- * `alreadyTerminal: true` having written nothing. Entry points map that to
- * their own convention (the operator route answers 409; the dashboard/MCP path
- * returns a structured already-terminal result).
+ * An already-terminal run is a no-op returning `alreadyTerminal: true`; the
+ * operator route answers 409, the dashboard/MCP path a structured result.
  */
 export async function cancelRunWithReason(
   deps: CancelRunDeps,
@@ -175,12 +154,10 @@ export async function cancelRunWithReason(
   const { db, jobQueue, registry, executionTracker } = deps;
   const force = options.force ?? false;
 
-  // A cancel racing a run that already finished must not touch the finished
-  // record: overwriting a terminal status, completed_at, attribution or
-  // failure_reason destroys a historical result that nothing else preserves.
-  // A missing row does NOT short-circuit — every entry point answers 404 before
-  // reaching here, and the status-guarded UPDATEs below no-op on a row that
-  // does not exist.
+  // A cancel racing a finished run must not overwrite its terminal status,
+  // completed_at, attribution or failure_reason: nothing else preserves them.
+  // A missing row does NOT short-circuit — every entry point answers 404 first,
+  // and the status-guarded UPDATEs below no-op on it.
   const runRow = await db
     .selectFrom('execution_runs')
     .select(['status'])
@@ -191,11 +168,10 @@ export async function cancelRunWithReason(
     return { agentsNotified: 0, unreachable: 0, pendingCancelled: 0, alreadyTerminal: true };
   }
 
-  // A held run has no job to cancel; what it has is an approval request, and a
-  // cancel withdraws it the way a reject does. When a decision reached the
-  // holds first, the cancel writes nothing and reports that decision instead of
-  // claiming a cancellation: an approve leaves the run resuming, and a reject
-  // or an expiry ends it on its own.
+  // A held run has no job, only an approval request, which a cancel withdraws
+  // like a reject. When a decision reached the holds first, the cancel writes
+  // nothing and reports that decision: an approve leaves the run resuming, a
+  // reject or an expiry ends it on its own.
   if (runRow?.status === ExecutionRunStatus.enum.held) {
     const withdrawal = await cancelHeldRunWithReason(
       { db, executionTracker, rejectHeldWorkflow: deps.rejectHeldWorkflow },
@@ -222,30 +198,24 @@ export async function cancelRunWithReason(
     return { agentsNotified: 0, unreachable: 0, pendingCancelled: 0, alreadyTerminal: false };
   }
 
-  // A run that is not `held` can still carry an open approval request: a hold
-  // raised at dispatch (a workflow `approval` block, a context reviewer) keeps
-  // the run `pending`/`running` with a placeholder job. Cancelling only the
-  // jobs would leave that request pending, and a later approve would still
+  // A non-`held` run can still carry an open approval request: a dispatch-time
+  // hold (a workflow `approval` block, a context reviewer) keeps it
+  // `pending`/`running` with a placeholder job. A later approve would still
   // release it, so every pending hold is withdrawn first.
   await withdrawPendingHoldsOfActiveRun(deps, runId, reason);
 
-  // Notify the agents running this run's jobs so in-flight work unwinds
-  // (graceful hooks unless force).
-  //
-  // Ownership is resolved from the DATABASE, not from this process's
-  // `jobToAgent` map. The coordinator handling a cancel is the owner only by
-  // chance: the Platform routes `run.cancel.request` by routing key and
-  // `requestByRoutingKey` picks any connected pool member. Resolving through a
-  // per-process map made every job a sibling dispatched look orphaned, so the
-  // orphan branch below marked the run cancelled and told the operator the
-  // deploy had stopped while it ran to completion on the other coordinator.
+  // Ownership is resolved from the DATABASE, not this process's `jobToAgent`
+  // map: the Platform routes `run.cancel.request` by routing key and
+  // `requestByRoutingKey` picks any connected pool member, so this coordinator
+  // owns the jobs only by chance. A per-process map made sibling-dispatched
+  // jobs look orphaned, and the orphan branch reported a cancel while the run
+  // completed on the other coordinator.
   const dispatchedJobs = await jobQueue.getDispatchedJobOwnersByRunId(runId);
   const ownership = await resolveJobOwners(deps, dispatchedJobs);
   let agentsNotified = 0;
   let unreachable = 0;
-  // Jobs an agent is still unwinding: the cancel reached it, or its owner is
-  // alive and the forward will be retried. Neither has finished, so neither may
-  // be recorded terminal below — see the `pending`/`queued` sweep.
+  // Jobs still unwinding (cancel delivered, or owner alive and the forward will
+  // be retried); the `pending`/`queued` sweep below must not mark them terminal.
   const stillUnwinding = new Set<string>();
   for (const { jobId, agentId, ownerInstanceId, ownerIsSelf, ownerIsLive } of ownership) {
     if (ownerIsSelf) {
@@ -256,19 +226,17 @@ export async function cancelRunWithReason(
       continue;
     }
     if (!ownerIsLive) continue; // Genuinely orphaned — the orphan branch owns it.
-    // A live sibling holds the agent's socket, and only that coordinator can
-    // put a `job.cancel` frame on it. `peer.job.cancel` already exists on the
-    // wire, so this adds no protocol surface.
+    // Only the live sibling holding the agent's socket can deliver it, over the
+    // existing `peer.job.cancel` wire message.
     const sent = deps.cancelJobOnPeer?.(ownerInstanceId!, runId, jobId, reason, force) ?? false;
     if (sent) {
       agentsNotified++;
       stillUnwinding.add(jobId);
       continue;
     }
-    // The owner is alive but the forward did not leave this process. The job is
-    // very likely still running, so counting it as orphaned would mark the run
-    // cancelled while it executes. Count it unreachable instead: the run stays
-    // `cancelling` (a legal non-terminal status) and the re-drive sweep retries.
+    // Owner alive, forward failed: the job is very likely still running, so it
+    // counts as unreachable, not orphaned. The run stays `cancelling` (a legal
+    // non-terminal status) and the re-drive sweep retries.
     unreachable++;
     stillUnwinding.add(jobId);
     logger.warn('Cancel could not reach the coordinator that owns this job', {
@@ -278,19 +246,15 @@ export async function cancelRunWithReason(
     });
   }
 
-  // Cancel the execution_jobs rows nobody is working: the ones still waiting in
-  // the queue.
+  // Cancel the execution_jobs rows still waiting in the queue.
   //
-  // A job an agent already holds also reads `pending`/`queued` here — the row
-  // only becomes `running` when the agent reports its first frame, and a
-  // dispatch that beat that frame leaves it queued. Such a job is not waiting,
-  // it is unwinding: it runs its onCancel/cleanup hooks and then reports its own
-  // terminal status. Writing `cancelled` for it records a terminal verdict for
-  // work still in flight, and — because `execution_jobs` writes are monotonic —
-  // makes the agent's own terminal frame a rejected write, so the run-completion
-  // fan-out that frame drives never fires and the run never leaves `running`.
-  // Same reasoning as the `unreachable > 0` suppression on the orphan sweep
-  // below, applied one step earlier.
+  // A job an agent already holds can also read `pending`/`queued` (the row turns
+  // `running` only on the agent's first frame). It is unwinding: it runs its
+  // onCancel/cleanup hooks and reports its own terminal status. Writing
+  // `cancelled` for it would, as `execution_jobs` writes are monotonic, reject
+  // the agent's terminal frame, so the run-completion fan-out never fires and
+  // the run never leaves `running`. Same reasoning as the `unreachable > 0`
+  // suppression on the orphan sweep below.
   let pendingQuery = db
     .updateTable('execution_jobs')
     .set({
@@ -308,14 +272,12 @@ export async function cancelRunWithReason(
   const pendingResult = await pendingQuery.execute();
   const pendingCancelled = Number(pendingResult[0]?.numUpdatedRows ?? 0);
 
-  // Cancel queued dispatch_queue entries for the run.
   await jobQueue.cancelByRunId(runId);
 
-  // Stamp attribution + the cancellation reason. Both writes are status-guarded
-  // so a cancel that loses the race against the run finishing writes nothing —
-  // the status read above narrows the window, these predicates close it.
-  // failure_reason is additionally clobber-guarded so a more specific cause
-  // already recorded wins.
+  // Both writes are status-guarded so a cancel losing the race against the run
+  // finishing writes nothing (the status read above narrows the window, these
+  // predicates close it). failure_reason is also clobber-guarded so a more
+  // specific cause already recorded wins.
   await stampCancelAttribution(db, runId, options);
   await db
     .updateTable('execution_runs')
@@ -326,13 +288,12 @@ export async function cancelRunWithReason(
     .execute();
   await stampForce(db, runId, force);
 
-  // A cancel that reached no live owner has to leave a durable trace, or it is
-  // dropped in silence. Nothing else records it: no agent reports `cancelling`
-  // for a job whose cancel never arrived, so the run stays `running`, and
-  // `sweepStuckCancelling` selects on `cancelling` and never sees it. Stamping
-  // the status here is what makes the re-drive real rather than nominal. Same
-  // guard as the agent-reported transition, so a run that finished in the
-  // meantime is untouched, and `cancelling_at` starts the sweep's clock.
+  // A cancel that reached no live owner must leave a durable trace: no agent
+  // reports `cancelling` for a cancel that never arrived, and
+  // `sweepStuckCancelling` selects on `cancelling`, so without this stamp the
+  // re-drive never happens. Same guard as the agent-reported transition (a run
+  // that finished meanwhile is untouched); `cancelling_at` starts the sweep's
+  // clock.
   if (unreachable > 0) {
     await db
       .updateTable('execution_runs')
@@ -342,19 +303,15 @@ export async function cancelRunWithReason(
       .execute();
   }
 
-  // When no agent had outstanding work, the run won't get a later job.complete
-  // to drive it terminal — finish it now from current job state. But a job can
-  // be `dispatched`/`running` in execution_jobs while its agent has no live WS
-  // (it never connected, died, or hasn't acked the dispatch yet — e.g. a
-  // workflow timeout that fires within ~1s of dispatch, before the freshly
-  // spawned agent connects). Such a row is orphaned: no agent will ever send
-  // its `job.complete`, so the run can never complete and a periodic canceller
-  // (the WorkflowDeadlineDetector) would re-fire forever. Cancel every
-  // remaining non-terminal job row so completeRunIfAllJobsTerminal can finish.
+  // No agent had outstanding work, so no later job.complete will drive the run
+  // terminal: finish it now. A `dispatched`/`running` row whose agent has no
+  // live WS (never connected, died, or not yet acked — e.g. a workflow timeout
+  // ~1s after dispatch) is orphaned: no `job.complete` ever comes, and the
+  // WorkflowDeadlineDetector would re-fire forever. Cancel every non-terminal
+  // job row so completeRunIfAllJobsTerminal can finish.
   //
   // `unreachable > 0` suppresses it: a job whose owner is alive but momentarily
-  // unreachable is not an orphan, and cancelling it here would record a
-  // terminal verdict for work that is still running.
+  // unreachable is still running, not orphaned.
   let orphansCancelled = 0;
   if (agentsNotified === 0 && unreachable === 0) {
     const orphanResult = await db
@@ -369,10 +326,9 @@ export async function cancelRunWithReason(
       .execute();
     orphansCancelled = Number(orphanResult[0]?.numUpdatedRows ?? 0);
     await executionTracker.completeRunIfAllJobsTerminal(runId);
-    // A run with no job rows has nothing whose completion drives it terminal,
-    // so the job-driven completion above leaves it in its status. Answering
-    // "cancelled" while the row keeps `pending` is what this closes: the
-    // cancel writes the terminal row itself. A run with jobs is untouched.
+    // A run with no job rows is left in its status by the job-driven completion
+    // above, so the cancel writes its terminal row itself rather than answering
+    // "cancelled" over a `pending` row. A run with jobs is untouched.
     await executionTracker.cancelJoblessRun(runId, reason);
   }
 
@@ -407,13 +363,10 @@ async function withdrawPendingHoldsOfActiveRun(
   // fails-when: a cancel of a running run with a dispatch-time hold leaves the hold pending
   // breaks-if-wrong: a run with no hold must take the plain job cancellation untouched
   if (pendingHold.length === 0) return;
-  // The run is not `held`, so the job cancellation that follows ends it; the
-  // withdrawal settles the holds and their checks and writes no run row.
-  //
-  // A withdraw that loses to a decision is deliberately not refused, unlike
-  // the held-run branch: an approve re-dispatches work onto a run that is
-  // already live, and the job path below cancels that work the same way it
-  // cancels every other job of the run.
+  // The withdrawal settles the holds and their checks and writes no run row.
+  // Losing to a decision is deliberately not refused, unlike the held-run
+  // branch: an approve re-dispatches onto an already-live run, and the job path
+  // cancels that work like every other job of the run.
   const withdrawal = await cancelHeldRunWithReason(
     {
       db: deps.db,
@@ -432,10 +385,9 @@ async function withdrawPendingHoldsOfActiveRun(
 }
 
 /**
- * Record that a forced cancel reached the run, while it is still non-terminal.
- * The stuck-cancelling sweep reads it to re-send a cancel that did not
- * complete with `force`. It is only ever set: a later graceful cancel does not
- * turn a forced one graceful.
+ * Record a forced cancel on a non-terminal run, so the stuck-cancelling sweep
+ * re-sends with `force`. Only ever set: a later graceful cancel does not turn
+ * a forced one graceful.
  */
 async function stampForce(db: Kysely<Database>, runId: string, force: boolean): Promise<void> {
   if (!force) return;
@@ -502,13 +454,10 @@ interface JobOwnership {
 }
 
 /**
- * Resolve, for each dispatched job, which coordinator can actually deliver its
- * `job.cancel`.
- *
- * The agent's CURRENT connection is what matters, so `host_roster`'s
- * `connected_instance_id` wins over the row's `owner_instance_id`: an agent that
- * reconnected to a different coordinator since dispatch is reachable only
- * there. The dispatch record is the fallback for an agent with no roster row.
+ * Resolve which coordinator can deliver each dispatched job's `job.cancel`.
+ * `host_roster`'s `connected_instance_id` wins over the row's
+ * `owner_instance_id`, since an agent that reconnected elsewhere since dispatch
+ * is reachable only there; the dispatch record is the fallback.
  */
 async function resolveJobOwners(
   deps: CancelRunDeps,
@@ -554,13 +503,10 @@ async function resolveJobOwners(
 }
 
 /**
- * Send `job.cancel` down this coordinator's own socket for the agent.
- *
- * Only an OPEN socket can receive it. A socket mid-close is still in the
- * registry until its close handler unregisters it, and sending to it throws, so
- * a non-OPEN socket leaves the job un-notified and the orphan sweep takes it.
- * The send is wrapped so one bad socket cannot abort the whole cancellation and
- * strand the run in `cancelling`.
+ * Send `job.cancel` down this coordinator's own socket for the agent. A
+ * mid-close socket stays registered until its close handler runs and throws on
+ * send, so a non-OPEN socket leaves the job to the orphan sweep. The send is
+ * wrapped so one bad socket cannot strand the run in `cancelling`.
  */
 export function sendLocalCancel(args: {
   registry: Pick<AgentRegistry, 'get'>;

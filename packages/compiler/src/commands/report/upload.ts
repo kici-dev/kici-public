@@ -1,14 +1,8 @@
 /**
- * Upload a report bundle privately to KiCI.
- *
- * Three steps, and the split is the point: the Platform mints a presigned PUT,
- * the bytes go straight from this machine to object storage, and a confirm call
- * lets the Platform verify what actually landed. The bundle never transits the
- * control plane, and the Platform never takes the client's word for the size.
- *
- * Upload is always opt-in (`--upload`). A bundle contains diagnostic data from
- * the customer's own machine, so sending it is a separate, explicit act from
- * producing it.
+ * Private, opt-in (`--upload`) bundle upload. The Platform mints a presigned
+ * PUT, the bytes go straight to object storage, and a confirm call lets the
+ * Platform verify what landed: the bundle never transits the control plane, and
+ * the Platform never trusts the client's size.
  */
 
 import * as fs from 'node:fs';
@@ -24,11 +18,10 @@ export interface UploadMeta {
 export interface UploadDeps {
   createIssueReport: DashboardClient['createIssueReport'];
   confirmIssueReport: DashboardClient['confirmIssueReport'];
-  /** PUT the bundle bytes at the presigned URL. */
   putBytes: (url: string, body: Buffer) => Promise<void>;
 }
 
-/** sha256 of the file, which the Platform records alongside the report. */
+/** The Platform records it alongside the report. */
 export function sha256Of(body: Buffer): string {
   return createHash('sha256').update(body).digest('hex');
 }
@@ -55,11 +48,9 @@ async function defaultDeps(): Promise<UploadDeps> {
 }
 
 /**
- * Upload one bundle and return the reference id to quote to support.
- *
- * Reads the file once and derives both the size and the digest from those same
- * bytes, so what is promised at presign time is necessarily what is uploaded —
- * a stat-then-read would race a file still being written.
+ * Returns the reference id to quote to support. Size and digest come from one
+ * read, so the presign promise matches the upload; stat-then-read would race a
+ * file still being written.
  */
 export async function uploadReportBundle(
   zipPath: string,

@@ -24,9 +24,8 @@ export * from './protocol/messages/auth.js';
 export * from './protocol/messages/capabilities.js';
 
 // --- Protocol: Platform <-> Orchestrator messages ---
-// Explicit curated re-exports of the platform-orchestrator protocol surface,
-// rather than `export *`. The capabilities-update schema stays internal to the
-// discriminated union and is not part of the barrel surface.
+// Curated rather than `export *`: the capabilities-update schema stays
+// internal to the discriminated union.
 export {
   webhookRelaySchema,
   webhookRelayStartSchema,
@@ -183,15 +182,13 @@ export * from './trigger/decision-trace.js';
 export * from './trigger/matcher.js';
 export * from './trigger/diff-range.js';
 // Exported so the orchestrator's org-level repo policy matches repo
-// identifiers by the same rules a workflow's own `repos:` patterns do. A
-// second, subtly different repo matcher is how a deny-list pattern came to
-// mean one thing in the policy and another in the trigger.
+// identifiers by the same rules as a workflow's `repos:` patterns; a second
+// matcher would let a deny-list pattern mean one thing in each.
 export { getRepoGlobMatcher } from './trigger/compiled-matchers.js';
-// The one classifier for "picomatch would read this repo pattern as a
-// negation", shared by every surface that stores a repo pattern — the
-// Platform's role allow-list and the orchestrator's global-workflow policy
-// lists. A second, hand-maintained ban list would let the same pattern
-// language be read two ways.
+// The one "picomatch reads this repo pattern as a negation" classifier, shared
+// by every surface that stores a repo pattern (the Platform's role allow-list,
+// the orchestrator's global-workflow policy lists) so the pattern language is
+// read one way.
 export {
   REGEX_NEGATIVE_ASSERTION,
   isNegatedPattern,

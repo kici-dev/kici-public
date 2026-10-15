@@ -3,21 +3,15 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Add `idx_check_run_tracking_updated_at` on `check_run_tracking (updated_at)`.
  *
- * `CheckRunTrackingStore.pruneStale` — the hourly retention sweep — filters
- * `WHERE updated_at < now() - <window>`. The table already carries two indexes
- * — the primary key on `(provider, owner, repo, sha, check_name)` and the
- * partial `idx_check_run_tracking_run_id` — but `updated_at` leads neither, so
- * that predicate can use neither and without this index every sweep
- * sequentially scans the whole table. The scan
- * is worst exactly where it hurts: a deployment that accumulated rows before
- * retention existed has the largest table and gets the scan hourly, on every
- * coordinator, since the cleanup tick is not leader-gated.
+ * The hourly retention sweep `CheckRunTrackingStore.pruneStale` filters
+ * `WHERE updated_at < now() - <window>`, and `updated_at` leads neither the primary key
+ * `(provider, owner, repo, sha, check_name)` nor the partial `idx_check_run_tracking_run_id`, so
+ * without this index every sweep scans the whole table — hourly, on every coordinator (the
+ * cleanup tick is not leader-gated), and worst on deployments that accumulated rows before
+ * retention existed.
  *
- * Mirrors `idx_dispatch_queue_run_id` (migration 072) and
- * `idx_request_idempotency_created_at` (migration 068), both of which exist to
- * index a TTL sweep's prune predicate.
- *
- * Idempotent: `IF NOT EXISTS` makes a re-run a no-op.
+ * Mirrors `idx_dispatch_queue_run_id` (072) and `idx_request_idempotency_created_at` (068), which
+ * also index a TTL sweep's prune predicate. Idempotent (`IF NOT EXISTS`).
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`

@@ -13,8 +13,7 @@ describe('isCiMarkerSet', () => {
     ['FALSE', false],
     [' false ', false],
     ['', false],
-    // Whitespace-only is "unset-looking", so it must not read as CI — the
-    // emptiness check runs on the trimmed value for exactly this case.
+    // Whitespace-only looks unset, so the emptiness check runs on the trimmed value.
     ['   ', false],
     ['\t\n', false],
     [undefined, false],
@@ -57,11 +56,9 @@ describe('isCiEnvironment', () => {
   });
 
   it('lets a vendor marker beat CI=false — a DELIBERATE divergence from ci-info, do not "fix" it', () => {
-    // ci-info gates all vendor detection behind `env.CI !== 'false'`, so there
-    // CI=false is a global bypass. Ours cancels the generic marker only: an
-    // explicit GITHUB_ACTIONS names a real browserless runner rather than a
-    // user's intent, so it still wins. Pinned so nobody aligns us with ci-info
-    // after reading only the upstream library.
+    // Unlike ci-info, where CI=false bypasses all vendor detection, CI=false
+    // cancels only the generic marker: an explicit GITHUB_ACTIONS names a real
+    // browserless runner, not a user's intent, so it still wins.
     expect(isCiEnvironment({ CI: 'false', GITHUB_ACTIONS: 'true' })).toBe(true);
   });
 

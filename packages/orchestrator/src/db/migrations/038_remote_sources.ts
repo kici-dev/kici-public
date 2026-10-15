@@ -1,14 +1,12 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * `remote_sources` anchors a Platform-relayed `kici run remote` to its real
- * org. One row per org served by this orchestrator: routing key
- * `remote:<orgId>` maps to the canonical org id, so `resolveOrgId` resolves
- * the real tenant through the same local-source path a webhook takes — no
- * GitHub App, no webhook secret, no manual setup. The row is auto-provisioned
- * on Platform auth from the canonical org id carried on `auth.success`.
+ * `remote_sources` anchors a Platform-relayed `kici run remote` to its real org: one row per
+ * served org maps `remote:<orgId>` to the canonical org id, so `resolveOrgId` takes the
+ * webhook's local-source path with no GitHub App, webhook secret or manual setup.
+ * Auto-provisioned on Platform auth from the org id on `auth.success`.
  *
- * Idempotent: a re-run on a DB that already has the table is a no-op.
+ * Idempotent: an existing table is a no-op.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const exists = await sql<{ exists: boolean }>`

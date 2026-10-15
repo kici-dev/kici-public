@@ -33,10 +33,7 @@ export enum HostIdentitySource {
   platform = 'platform',
 }
 
-/**
- * PostgreSQL-only database types.
- * Column names use snake_case matching the actual database column names.
- */
+/** PostgreSQL schema; every key and column name is the snake_case database name. */
 export interface Database {
   dispatch_queue: DispatchQueueTable;
   dedup_cache: DedupCacheTable;
@@ -103,13 +100,12 @@ export interface Database {
 }
 
 /**
- * Open accumulation window for a `workflowsFailedBatch` registration.
- * One live window per subscribing workflow (`registration_id` is unique);
- * the first matching failure opens it and the leader sweep closes it once
- * `expires_at` passes, emitting a single `__workflows_failed_batch` event.
+ * Open accumulation window for a `workflowsFailedBatch` registration, one per subscribing
+ * workflow. The first matching failure opens it; the leader sweep closes it once `expires_at`
+ * passes, emitting a single `__workflows_failed_batch` event.
  */
 export interface BatchAccumulationWindowsTable {
-  /** Window id (primary key). */
+  /** Primary key. */
   id: string;
   /** Owning customer/org id. */
   customer_id: string;
@@ -117,7 +113,7 @@ export interface BatchAccumulationWindowsTable {
   registration_id: string;
   /** Routing key captured at open time so the sweep can emit without the index. */
   routing_key: string;
-  /** Repo identifier captured at open time. */
+  /** Captured at open time. */
   repo_identifier: string;
   /** Accumulation window length in milliseconds. */
   accumulate_for_ms: number;
@@ -127,54 +123,40 @@ export interface BatchAccumulationWindowsTable {
   expires_at: Date;
 }
 
-// Convenience types for batch_accumulation_windows
 export type BatchAccumulationWindow = Selectable<BatchAccumulationWindowsTable>;
 export type NewBatchAccumulationWindow = Insertable<BatchAccumulationWindowsTable>;
 
-/**
- * A single failed run buffered into a batch-accumulation window.
- * Deleted with its window via `ON DELETE CASCADE` when the window is swept.
- */
+/** A failed run buffered into a batch-accumulation window; cascade-deleted with its window. */
 export interface BatchAccumulationItemsTable {
-  /** Item id (primary key). */
+  /** Primary key. */
   id: string;
-  /** Owning window id (FK, cascade-deleted). */
   window_id: string;
-  /** The failed run's id. */
   run_id: string;
-  /** Repo identifier of the failed run. */
   repo_identifier: string;
-  /** Workflow name of the failed run. */
   workflow_name: string;
   /** Failure class (`RunFailureClass`) when known. */
   failure_class: string | null;
   /** Triggering actor username when known. */
   sender_username: string | null;
-  /** When the item was buffered. */
   created_at: Generated<Date>;
 }
 
-// Convenience types for batch_accumulation_items
 export type BatchAccumulationItem = Selectable<BatchAccumulationItemsTable>;
 export type NewBatchAccumulationItem = Insertable<BatchAccumulationItemsTable>;
 
 /**
- * Request idempotency claim table.
- * Keyed on the Platform `requestId`; makes run-minting dashboard requests
- * (`run.rerun.request`, `run.manual_schedule.request`) idempotent across an HA
- * relay failover so a re-sent request returns the first coordinator's
- * `new_run_id` instead of creating a second run. Pruned after 1h.
+ * Makes run-minting dashboard requests (`run.rerun.request`, `run.manual_schedule.request`)
+ * idempotent across an HA relay failover: a re-sent Platform `requestId` returns the first
+ * coordinator's `new_run_id` instead of a second run. Pruned after 1h.
  */
 export interface RequestIdempotencyTable {
-  /** Platform-minted requestId for the run-minting request (primary key / idempotency key). */
+  /** Platform-minted requestId (primary key). */
   request_id: string;
-  /** The run id the winning coordinator created for this requestId. */
+  /** The run the winning coordinator created. */
   new_run_id: string;
-  /** When the claim was recorded. */
   created_at: Generated<Date>;
 }
 
-// Convenience types for request_idempotency
 export type RequestIdempotency = Selectable<RequestIdempotencyTable>;
 export type NewRequestIdempotency = Insertable<RequestIdempotencyTable>;
 export type RequestIdempotencyUpdate = Updateable<RequestIdempotencyTable>;
@@ -188,9 +170,9 @@ export interface BackupRunsTable {
   created_at: Generated<Date>;
   /** Local path the dump was written to (informational). */
   dump_path: string;
-  /** Size of the dump file in bytes. */
+  /** Dump size in bytes. */
   byte_size: string | bigint;
-  /** Secret-key generation the DB's encrypted config was under (null when no encrypted config). */
+  /** Secret-key generation of the DB's encrypted config (null when it has none). */
   secret_key_version: number | null;
   /** Server version string the dump was taken from (e.g. "160003"). */
   pg_server_version: string;
@@ -200,29 +182,21 @@ export interface BackupRunsTable {
   hostname: string;
 }
 
-// Convenience types for backup_runs
 export type BackupRun = Selectable<BackupRunsTable>;
 export type NewBackupRun = Insertable<BackupRunsTable>;
 
-/**
- * Cluster metadata table
- * Key-value store for cluster-wide configuration (e.g. cluster_id).
- */
+/** Key-value store for cluster-wide configuration (e.g. cluster_id). */
 export interface ClusterMetaTable {
-  /** Key identifier (primary key) */
+  /** Primary key. */
   key: string;
-  /** Value */
   value: string;
-  /** When this entry was created */
   created_at: Generated<Date>;
 }
 
-// Convenience types for cluster_meta
 export type ClusterMeta = Selectable<ClusterMetaTable>;
 export type NewClusterMeta = Insertable<ClusterMetaTable>;
 
 /**
- * Join tokens table
  * Stores hashed join tokens. `kici-admin join` and peer token mode find a row by
  * its hash; a token is consumed on first use and re-usable by the instance that
  * consumed it until it expires.
@@ -234,43 +208,32 @@ export interface JoinTokenTable {
   token_hash: string;
   /** Routing info embedded in the token (orgId, routingKey, expiry) */
   routing_info: string;
-  /** Who created this token */
   created_by: string;
-  /** When this token was created */
   created_at: Generated<Date>;
-  /** When this token expires */
   expires_at: Date;
-  /** When this token was consumed (null = unused) */
+  /** null = unused */
   consumed_at: Date | null;
-  /** Who consumed this token (null = unused) — the coordinator that processed the claim */
+  /** The coordinator that processed the claim (null = unused) */
   consumed_by: string | null;
   /**
-   * The instanceId of the joining peer that consumed this token (null = unused).
-   * Distinct from `consumed_by` (the coordinator). Lets the same peer instance
-   * reuse the token until `expires_at` to self-heal after a transient outage.
+   * The joining peer that consumed the token (null = unused); `consumed_by` is the coordinator.
+   * The same peer may reuse the token until `expires_at` to self-heal after a transient outage.
    */
   consumed_by_instance: string | null;
 }
 
-// Convenience types for join_tokens
 export type JoinToken = Selectable<JoinTokenTable>;
 export type NewJoinToken = Insertable<JoinTokenTable>;
 
-/**
- * Dispatch queue table
- * Holds jobs waiting to be dispatched to agents.
- */
+/** Holds jobs waiting to be dispatched to agents. */
 export interface DispatchQueueTable {
   /** UUID primary key */
   id: Generated<string>;
-  /** Unique run identifier for this execution */
   run_id: string;
   /** Workflow name from lock file */
   workflow_name: string;
-  /** Job name within the workflow */
   job_name: string;
-  /** JSONB array of runs-on labels for agent matching.
-   *  Insert: JSON.stringify(labels), Select: auto-parsed by pg driver. */
+  /** JSONB label array: insert `JSON.stringify(labels)`; the pg driver parses it on select. */
   runs_on_labels: string;
   /** JSON-encoded Record of the job configuration, without the fields in `sealed_secrets` */
   job_config: string;
@@ -281,13 +244,11 @@ export interface DispatchQueueTable {
    * before the column existed: those rows keep the fields in the plain column.
    */
   sealed_secrets: ColumnType<string | null, string | null | undefined, string | null>;
-  /** Repository clone URL */
   repo_url: string;
   /** Git ref (branch/tag) */
   ref: string;
-  /** Git commit SHA */
   sha: string;
-  /** Job status: pending | dispatched | expired | failed */
+  /** Job status: a `DispatchQueueStatus` value (`queue/job-queue.ts`). */
   status: Generated<string>;
   /** When this job was queued */
   created_at: Generated<Date>;
@@ -296,7 +257,7 @@ export interface DispatchQueueTable {
   /** Webhook delivery ID for tracing */
   delivery_id: string;
 
-  /** Provider type (e.g., "github", "gitlab") */
+  /** e.g. "github", "gitlab" */
   provider: Generated<string>;
   /** JSON-encoded provider-specific context (e.g., {"installationId": 42}) */
   provider_context: Generated<string>;
@@ -311,48 +272,41 @@ export interface DispatchQueueTable {
   request_id: string | null;
   /** JSONB array of exclusion labels. Default '[]'. */
   exclude_labels: Generated<string>;
-  /** Regex matchers (LabelMatcher[]) the job requires; JS post-filter on top of runs_on_labels. Default '[]'. */
+  /** Required LabelMatcher[] regexes; JS post-filter over runs_on_labels. Default '[]'. */
   runs_on_patterns: Generated<string>;
   /** Regex matchers (LabelMatcher[]) that disqualify an agent; JS post-filter. Default '[]'. */
   exclude_patterns: Generated<string>;
-  /** Routing key (e.g. "github:12345") so dispatch can pick the right
-   *  per-app provider bundle in multi-app setups. Required (NOT NULL). */
+  /** NOT NULL; e.g. "github:12345". Picks the per-app provider bundle in multi-app setups. */
   routing_key: string;
   /**
-   * For jobs in `status='recovering'`, the moment the recovery grace
-   * period elapses. Populated when an agent disconnects with this job
-   * in-flight; cleared when the agent reconnects + claims the job, OR
-   * when the leader-gated sweep transitions the row to `failed`.
-   * NULL for all other statuses.
+   * For `status='recovering'` jobs, when the recovery grace period elapses. Set when an agent
+   * disconnects with the job in flight; cleared when the agent reconnects and claims it, or when
+   * the leader-gated sweep fails the row. NULL for all other statuses.
    */
   recovery_deadline: ColumnType<Date | null, Date | null | undefined, Date | null>;
   /**
-   * Companion to `recovery_deadline`: the agent id that owned the job
-   * before disconnect. Used to validate that a reconnecting agent is
-   * the rightful claimant. NULL for non-recovering rows.
+   * The agent that owned the job before disconnect; a reconnecting agent must match it.
+   * NULL for non-recovering rows.
    */
   recovery_agent_id: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * Most recent scaler spawn-failure detail for this queued job (e.g.
-   * "agent process error: spawn node ENOENT"). Written on a `scaler.failed`
-   * event bound to the job; read by the queue-timeout reaper to surface the
-   * real provisioning cause; cleared on dispatch. NULL when none recorded.
+   * Latest scaler spawn-failure detail (e.g. "agent process error: spawn node ENOENT"). Written
+   * on a `scaler.failed` event bound to the job, surfaced by the queue-timeout reaper as the
+   * provisioning cause, cleared on dispatch. NULL when none recorded.
    */
   last_provisioning_error: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * When this job first read unroutable — no registered agent and no scaler
-   * backend matched its selectors. NULL once it reads routable again, so the
-   * grace clock only ever measures a CONTINUOUS unroutable window. Persisted
-   * rather than in-memory so a restart mid-grace resumes the same clock.
+   * When the job first read unroutable (no agent and no scaler backend matched its selectors).
+   * NULL once routable again, so the grace clock measures only a CONTINUOUS unroutable window.
+   * Persisted so a restart mid-grace resumes the same clock.
    */
   unroutable_since: ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
   /** Times this job was returned to pending for re-dispatch (job.reject / pre-start agent loss). */
   dispatch_attempts: Generated<number>;
   /**
-   * Deadline by which the dispatched job's agent must answer the
-   * job.dispatch (job.ack / job.reject / job.status running). Stamped when
-   * the dispatch is sent, cleared on any answer; `dispatched` rows past the
-   * deadline are requeued by the owning coord's timer or the leader sweep.
+   * Deadline for the agent to answer job.dispatch (job.ack / job.reject / job.status running).
+   * Stamped on send, cleared on any answer; a `dispatched` row past it is requeued by the owning
+   * coord's timer or the leader sweep.
    */
   ack_deadline: ColumnType<Date | null, Date | null | undefined, Date | null>;
   /** Agent the dispatch was sent to (for ack-timeout disconnect + logging). */
@@ -364,47 +318,35 @@ export interface DispatchQueueTable {
    */
   pinned_agent_id: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * Durable owner of a dispatched job: the agent the job was handed to. Written
-   * at dispatch, cleared on requeue. Distinct from `ack_agent_id`, which is
-   * cleared as soon as the agent answers the dispatch and so cannot resolve
-   * ownership later — this column lets a coordinator that never saw the
-   * dispatch answer "does this agent own this job?" from the database alone.
-   * NULL for pending rows and for rows dispatched before the column existed.
+   * Durable owner: the agent the job was handed to. Written at dispatch, cleared on requeue.
+   * Unlike `ack_agent_id` (cleared once the agent answers), it lets a coordinator that never saw
+   * the dispatch resolve ownership from the database alone. NULL for pending rows and for rows
+   * dispatched before the column existed.
    */
   agent_id: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * The coordinator watching this dispatch. Written at claim/dispatch from
-   * `config.instanceId`, cleared on requeue.
-   *
-   * `agent_id` above says which agent holds the job; this says which
-   * coordinator armed the timers for it, which is the question every
-   * cluster-wide sweep has to answer before it acts. A NULL reads as "unknown
-   * owner", never as "not mine" — the convention migration 119 established for
-   * the scaler plane — so an unknown-owner row is spared by recovery selection
-   * and reaped, if genuinely dead, by the stale detector's dispatch-time scan.
+   * The coordinator that armed this dispatch's timers, which every cluster-wide sweep must know
+   * before it acts. Written at claim/dispatch from `config.instanceId`, cleared on requeue.
+   * NULL reads as "unknown owner", never "not mine" (the migration 119 scaler-plane convention):
+   * recovery selection spares the row, and the stale detector's dispatch-time scan reaps it if
+   * genuinely dead.
    */
   owner_instance_id: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * When the row was handed to an agent, as distinct from `created_at`, which
-   * is when it was enqueued. A job that waited behind a busy fleet has an old
-   * `created_at` and a fresh `dispatched_at`, and only the second one measures
-   * "this dispatch has gone unacknowledged". NULL for pending rows and for rows
-   * dispatched before the column existed; readers fall back to `created_at`.
+   * When the row was handed to an agent; `created_at` is when it was enqueued. Only this one
+   * measures "this dispatch has gone unacknowledged" for a job that waited behind a busy fleet.
+   * NULL for pending rows and for rows dispatched before the column existed; readers fall back
+   * to `created_at`.
    */
   dispatched_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
 }
 
 /**
- * Coordinator heartbeat table (cluster_instances)
- *
- * The liveness source every ownership predicate reads: an orchestrator upserts
- * its own row on a fixed tick, and a row whose `last_heartbeat_at` is inside the
- * grace window means that coordinator is alive. It is a DB heartbeat rather than
- * the in-memory peer registry because the peer registry is empty at exactly the
- * moment startup recovery runs — a freshly booted process has handshaken with
- * nobody — and because it needs no peer connectivity, so it works the same in
- * non-Raft multi-coordinator and standalone deployments. `host_roster` does the
- * same job for agents.
+ * Coordinator heartbeats: the liveness source every ownership predicate reads. Each
+ * orchestrator upserts its row on a fixed tick; a `last_heartbeat_at` inside the grace window
+ * means alive. A DB heartbeat, not the in-memory peer registry, because that registry is empty
+ * when startup recovery runs and because it needs no peer connectivity (non-Raft and standalone
+ * deployments work the same). `host_roster` does the same job for agents.
  */
 export interface ClusterInstancesTable {
   /** The coordinator's instance id (`config.instanceId`). */
@@ -419,14 +361,10 @@ export interface ClusterInstancesTable {
   last_heartbeat_at: Generated<Date>;
 }
 
-// Convenience types for cluster_instances
 export type ClusterInstance = Selectable<ClusterInstancesTable>;
 export type NewClusterInstance = Insertable<ClusterInstancesTable>;
 
-/**
- * Deduplication cache table
- * Tracks recently processed webhook delivery IDs to prevent reprocessing.
- */
+/** Tracks recently processed webhook delivery IDs to prevent reprocessing. */
 export interface DedupCacheTable {
   /** Webhook delivery ID (primary key) */
   delivery_id: string;
@@ -469,22 +407,17 @@ export interface IngestOverflowBufferTable {
   /** Last replay error, or null. */
   last_error: string | null;
   /**
-   * When the row moved `buffered` → `replaying`; null while it is buffered.
-   * Separate from `captured_at` (which orders the FIFO drain) so a long-buffered
-   * row is not reclaimed the instant a worker picks it up.
+   * When the row moved `buffered` → `replaying`; null while buffered. Separate from
+   * `captured_at` (the FIFO drain order) so a long-buffered row is not reclaimed on pickup.
    */
   claimed_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
 }
 
-// Convenience types for dispatch_queue
 export type DispatchQueueItem = Selectable<DispatchQueueTable>;
 export type NewDispatchQueueItem = Insertable<DispatchQueueTable>;
 export type DispatchQueueItemUpdate = Updateable<DispatchQueueTable>;
 
-/**
- * IP allocation table for Firecracker VM networking.
- * Tracks assigned IPs from the CIDR pool. DB-backed to survive restarts.
- */
+/** Firecracker VM IPs assigned from the CIDR pool; DB-backed to survive restarts. */
 export interface IpAllocationTable {
   /** Allocated IP address (primary key), e.g. "10.0.0.5" */
   ip: string;
@@ -496,15 +429,10 @@ export interface IpAllocationTable {
   tap_device: string;
   /** Guest MAC address */
   mac_address: string;
-  /** When this IP was allocated */
   allocated_at: Generated<Date>;
 }
 
-/**
- * Execution run table
- * Top-level workflow runs (one per webhook trigger).
- * Stores status, timing, and trigger decision metadata.
- */
+/** Top-level workflow runs, one per webhook trigger. */
 export interface ExecutionRunTable {
   /** UUID primary key */
   id: Generated<string>;
@@ -513,80 +441,64 @@ export interface ExecutionRunTable {
   /** Routing key (e.g. github:appId) for Platform StaleOrchDetector when sharing DB */
   routing_key: string | null;
   /**
-   * Owning org (customer_id), denormalized from routing_key at insert time so
-   * the concurrency-gate running count can be scoped per tenant. Defaults to
-   * '__default__' (the no-source fallback org) via the column DEFAULT.
+   * Owning org, denormalized from routing_key at insert so the concurrency-gate running count
+   * is per tenant. Column DEFAULT '__default__' (the no-source fallback org).
    */
   customer_id: Generated<string>;
   /** Workflow name from lock file */
   workflow_name: string;
-  /** Run status: running | success | failed | cancelled */
+  /** Run status: an `ExecutionRunStatus` value (engine). */
   status: Generated<string>;
   /** Provider type (e.g. "github", "gitlab") */
   provider: string;
   /** Repository identifier (e.g. "owner/repo") */
   repo_identifier: string;
   /**
-   * The branch (or tag) the run PRESENTS — `event.targetBranch`: the branch a
-   * push landed on, the base branch of a pull request, the default branch a
-   * schedule fire executes, the branch an internal trigger inherited.
+   * The branch (or tag) the run PRESENTS — `event.targetBranch`: where a push landed, a PR's
+   * base branch, the default branch a schedule fire executes, or an internal trigger's
+   * inherited branch.
    *
-   * It is NOT a job's checkout ref. A pull-request job checks out the PR HEAD
-   * branch, and every `QueuedJobInput.ref` carries that value instead — the two
-   * are different facts and only one of them belongs here. The distinction is
-   * load-bearing: this column is what an internally-triggered run inherits as
-   * its branch claim before the context branch gate matches it against a
-   * context's `branchRestrictions`, and a fork contributor names the head
-   * branch freely. Every writer that CREATES the row uses the presented branch.
-   * The two reroute projections (`cluster/coordinator.ts`, `worker-core.ts`)
-   * are the exception: they insert from a `job.reroute` message, which carries
-   * only the job's ref. Their row is fail-safe by conflicting — the run is
-   * registered before the first job is handed to an agent
-   * (`startRunBeforeDispatch`), so a reroute is only possible once the
-   * authoritative row exists, and their insert is
-   * `ON CONFLICT (run_id) DO NOTHING`.
+   * NOT a job's checkout ref: a PR job checks out the HEAD branch, carried in
+   * `QueuedJobInput.ref`. Load-bearing: an internally-triggered run inherits this column as its
+   * branch claim before the context branch gate matches `branchRestrictions`, and a fork
+   * contributor names the head branch freely. Every writer that CREATES the row uses the
+   * presented branch. The two reroute projections (`cluster/coordinator.ts`, `worker-core.ts`)
+   * insert from a `job.reroute` message carrying only the job's ref; they are fail-safe because
+   * the run is registered before the first job reaches an agent (`startRunBeforeDispatch`) and
+   * their insert is `ON CONFLICT (run_id) DO NOTHING`.
    */
   ref: string;
-  /** Git commit SHA */
   sha: string;
   /** Webhook delivery ID for tracing */
   delivery_id: string | null;
   /** Serialized WorkflowDecision (trigger decision trace) */
   trigger_decision: string | null;
-  /** When the run started */
   started_at: Generated<Date>;
-  /** When the run completed */
   completed_at: Date | null;
   /**
-   * When the run entered `cancelling`. Stamped once, on the transition, and
-   * never cleared: it is the clock the stuck-cancelling re-drive reads, and no
-   * other column records when the cancel started. NULL for a run that never
-   * cancelled and for one that entered `cancelling` before the column existed.
+   * When the run entered `cancelling`. Stamped once on the transition and never cleared: the
+   * only record of when the cancel started, read by the stuck-cancelling re-drive. NULL for a
+   * run that never cancelled and for one that entered `cancelling` before the column existed.
    */
   cancelling_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
   /**
-   * TRUE once a forced cancel reached the run (migration 153). The
-   * stuck-cancelling re-drive reads it so a cancel that did not complete is
-   * re-sent with `force`. Never reset to FALSE: a later graceful cancel does
-   * not undo a forced one. NULL re-drives gracefully.
+   * TRUE once a forced cancel reached the run (migration 153); the stuck-cancelling re-drive
+   * re-sends an incomplete cancel with `force`. Never reset to FALSE: a later graceful cancel
+   * does not undo a forced one. NULL re-drives gracefully.
    */
   cancel_force: ColumnType<boolean | null, boolean | null | undefined, boolean | null>;
   /**
-   * The run's status generation (migration 150). Starts at 0 and rises by one
-   * each time the run leaves a terminal status to continue. Forwarded on every
-   * `execution.status` frame as `statusEpoch`, so the Platform can tell a
-   * reopen from a frame that arrives late after the run finished.
+   * Status generation (migration 150): starts at 0, +1 each time the run leaves a terminal
+   * status to continue. Sent on every `execution.status` frame as `statusEpoch` so the Platform
+   * tells a reopen from a late frame.
    */
   status_epoch: Generated<number>;
   /** Total execution duration in milliseconds */
   duration_ms: number | null;
   /**
-   * Total raw log bytes accumulated across all jobs of this run. Sum of the
-   * agent-side `LogStreamer.getTotalBytes()` reported on terminal
-   * `step.status` for every step in every job. Default 0 for pre-migration
-   * rows. Powers the operator-side `kici_org_log_bytes` capacity-planning
-   * gauge on the Platform. Postgres BIGINT — pg returns string; cast at
-   * read sites.
+   * Raw log bytes across all jobs: the sum of the agent's `LogStreamer.getTotalBytes()` on each
+   * terminal `step.status`. Default 0 for pre-migration rows. Feeds the Platform's
+   * `kici_org_log_bytes` capacity gauge. Postgres BIGINT — pg returns string; cast at read sites.
    */
   log_bytes: Generated<number>;
   /** Provider-specific context (e.g. {"installationId": 42}) */
@@ -599,66 +511,50 @@ export interface ExecutionRunTable {
   fixture_id: string | null;
   /** Parent run ID for re-run lineage (null for original runs). */
   parent_run_id: string | null;
-  /** Root ancestor run ID for re-run lineage (null for original runs). Always points to the first run in the chain. */
+  /** First run in the re-run chain (null for original runs). */
   original_run_id: string | null;
-  /** User identity that triggered this re-run (null for webhook-triggered). Format: "user:email" or "key:name". */
+  /** Who triggered this re-run: "user:email" or "key:name" (null for webhook-triggered). */
   triggered_by: string | null;
-  /** Agent provenance label when the run was triggered through an agent credential (null otherwise). */
+  /** Agent provenance label when triggered through an agent credential (null otherwise). */
   triggered_by_agent_label: string | null;
   /** User identity that cancelled this run (null for non-cancelled). */
   cancelled_by: string | null;
-  /** Agent provenance label when the run was cancelled through an agent credential (null otherwise). */
+  /** Agent provenance label when cancelled through an agent credential (null otherwise). */
   cancelled_by_agent_label: string | null;
   /** Context name for this run (null if no context applies) */
   context: string | null;
   /** Matched context id for this run (null if no/unresolved context). */
   context_id: string | null;
   /**
-   * The event type that started this run (`push`, `pr:open`, `schedule`, …).
-   *
-   * Persisted because the git credential relay evaluates a named context's
-   * protection rules against the run, and a context may restrict which trigger
-   * types may use it. NULL means the trigger was never recorded, which fails a
-   * `triggerTypeFilters` rule closed — a credential is withheld rather than
-   * granted on a rule nobody could check.
+   * The event type that started this run (`push`, `pr:open`, `schedule`, …). The git credential
+   * relay checks a context's `triggerTypeFilters` against it; NULL (never recorded) fails that
+   * rule closed, withholding the credential.
    */
   trigger_event: string | null;
   /**
-   * The event the OIDC token's SUBJECT is derived from, when that is not
-   * {@link ExecutionRunTable.trigger_event}.
-   *
-   * A re-run records `trigger_event: 'rerun'`, which is what the dashboard's
-   * trigger filter and the credential relay's `triggerTypeFilters` need to
-   * read, but it carries no pull-request dimension — so a re-run of a pull
-   * request presented the branch-shaped subject a push to the same base branch
-   * presents. A re-run copies the original run's event here so the subject
-   * survives the hop.
-   *
-   * `buildIdTokenSubject` is the ONLY reader. NULL means "use `trigger_event`",
-   * which is what every row written before this column existed says, so a
-   * legacy row keeps the subject it already mints.
+   * The event the OIDC token's SUBJECT derives from, when it differs from
+   * {@link ExecutionRunTable.trigger_event}. A re-run records `trigger_event: 'rerun'` (which the
+   * dashboard filter and `triggerTypeFilters` read) and copies the original event here, so a
+   * re-run of a PR keeps the PR-shaped subject instead of a push's branch-shaped one.
+   * `buildIdTokenSubject` is the ONLY reader. NULL means "use `trigger_event`", so a legacy row
+   * keeps the subject it already mints.
    */
   subject_trigger_event: string | null;
   /**
-   * The pull-request HEAD branch — where a contributor's code actually lives.
-   * Distinct from {@link ExecutionRunTable.ref}, which is the base branch a PR
-   * targets. NULL for a non-PR run and for a row written before this column
-   * existed.
+   * The PR HEAD branch, where a contributor's code lives; {@link ExecutionRunTable.ref} is the
+   * base branch. NULL for a non-PR run and for a row written before this column existed.
    */
   head_ref: string | null;
   /**
-   * `owner/repo` of the pull-request HEAD. Equals `repo_identifier` for a
-   * same-repo PR and names the contributor's fork for a fork PR. NULL for a
-   * non-PR run and for a legacy row.
+   * `owner/repo` of the PR HEAD: `repo_identifier` for a same-repo PR, the contributor's fork
+   * for a fork PR. NULL for a non-PR run and for a legacy row.
    */
   head_repository: string | null;
   /**
-   * True when the pull request came from a fork (head repo != base repo).
-   * NULL means NOT RESOLVED — a legacy row, or one of the two reroute
-   * projections, which insert from a `job.reroute` message carrying no event
-   * context. Every claim derived from this column renders NULL as
-   * `'unresolved'` rather than `'false'`, so a trust policy that pins it fails
-   * closed.
+   * True when the PR came from a fork (head repo != base repo). NULL means NOT RESOLVED: a
+   * legacy row, or a reroute projection (its `job.reroute` message carries no event context).
+   * Derived claims render NULL as `'unresolved'`, never `'false'`, so a trust policy pinning it
+   * fails closed.
    */
   is_fork: boolean | null;
   /** Trust tier of the contributor for PR runs (null for non-PR events) */
@@ -667,152 +563,116 @@ export interface ExecutionRunTable {
   lock_file_source: string | null;
   /** Username of the contributor (null for non-PR events) */
   contributor_username: string | null;
-  /** Pull-request number for PR-triggered runs (null for non-PR events). Scopes `/kici approve|reject` hold selection to the comment's PR. */
+  /**
+   * PR number for PR-triggered runs (null for non-PR events). Scopes `/kici approve|reject`
+   * hold selection to the comment's PR.
+   */
   pr_number: number | null;
   /**
-   * Origin provider of the triggering actor (`github` today). Provider-generic
-   * so GitLab/Bitbucket extend later. Null when no actor was captured.
+   * Origin provider of the triggering actor (`github` today; provider-generic for later
+   * GitLab/Bitbucket). Null when no actor was captured.
    */
   trigger_actor_provider: string | null;
   /**
-   * Provider login of the person who triggered the run (pusher / PR author).
-   * Captured for ALL event types, unlike the PR-only `contributor_username`.
+   * Provider login of whoever triggered the run (pusher / PR author), for ALL event types,
+   * unlike the PR-only `contributor_username`.
    */
   trigger_actor_username: string | null;
   /**
    * Immutable provider user id of the triggering actor (mirrors
-   * `identity_links.provider_user_id`). Preferred over the mutable username
-   * when resolving the actor to a KiCI user.
+   * `identity_links.provider_user_id`); preferred over the mutable username when resolving
+   * the actor to a KiCI user.
    */
   trigger_actor_user_id: string | null;
   /**
-   * The repository that DEFINES this run's workflow, when that is not the
-   * repository the run acted on.
-   *
-   * `repo_identifier` is the repository the run acted on and whose code its
-   * jobs check out. For an organization-wide workflow dispatched against
-   * another repository, the workflow was authored somewhere else, and that
-   * authoring repository is recorded here. NULL means the two are the same —
-   * true of every per-repository run.
-   *
-   * Read by the rerun path, which must resolve the workflow from the
-   * repository that defines it rather than from the one it ran against.
+   * The repository that DEFINES this run's workflow, when it differs from `repo_identifier`
+   * (the repository acted on and checked out), as for an organization-wide workflow. NULL means
+   * the same — every per-repository run. The rerun path resolves the workflow from here.
    */
   workflow_repo_identifier: string | null;
   /**
-   * Commit of the workflow repository the run dispatched, when the workflow is
-   * defined in another repository (`workflow_repo_identifier` set). A re-run
+   * Workflow-repository commit dispatched when `workflow_repo_identifier` is set; a re-run
    * dispatches this exact commit. NULL on every per-repository run.
    */
   workflow_sha: string | null;
   /**
-   * The workflow repository's registered branch, when the workflow is defined
-   * in another repository. The git-credential relay checks context branch rules
-   * against it. NULL on every per-repository run.
+   * The workflow repository's registered branch when the workflow lives elsewhere; the
+   * git-credential relay checks context branch rules against it. NULL on every per-repository
+   * run.
    */
   workflow_branch: string | null;
   /**
-   * True when this row records a global evaluation round rather than a
-   * workflow.
-   *
-   * A round decides which organization-wide workflows apply to an event; a
-   * round that fails is recorded as one errored run so the suppression is
-   * visible. Re-running such a run re-executes the evaluation, not a workflow,
-   * so the re-run path branches on this column. It is structural on purpose:
-   * the round job's `__globaleval__` name prefix is a string a customer
-   * workflow may also carry, and a name a customer chooses must not decide
-   * which code path a re-run takes.
+   * True when the row records a global evaluation round (which decides the org-wide workflows
+   * for an event; a failed round is one errored run so the suppression is visible). The re-run
+   * path branches on it to re-execute the evaluation. Structural on purpose: the round job's
+   * `__globaleval__` name prefix is a string a customer workflow may also carry.
    */
   is_global_eval_round: Generated<boolean>;
   /**
-   * The source whose credentials `provider_context` holds, when that is not the
-   * source the event arrived on.
-   *
-   * `routing_key` records the INBOUND source. For a cross-provider global
-   * workflow the lock file resolves through another source's bundle, and the
-   * context is written from that source's credentials — so anything pairing
-   * `routing_key` with `provider_context` hands one source's credentials to
-   * another source's API client. NULL means the two are the same, which is true
-   * of every ordinary run.
-   *
-   * Read by the rerun path of a failed evaluation round, which re-drives the
-   * organization-wide pass and has to hand it the same dispatch pair the
-   * delivery used.
+   * The source whose credentials `provider_context` holds, when not the INBOUND source in
+   * `routing_key` (a cross-provider global workflow resolves through another source's bundle).
+   * Pairing `routing_key` with `provider_context` there would hand one source's credentials to
+   * another's API client. NULL means the same — every ordinary run. The rerun path of a failed
+   * evaluation round reads it to re-drive the org-wide pass with the delivery's dispatch pair.
    */
   dispatch_routing_key: string | null;
   /** Human-readable reason why the run failed (null for non-failed runs). */
   failure_reason: string | null;
   /**
-   * Why the run failed (`RunFailureClass` from `@kici-dev/engine`): never_started
-   * / timed_out / dead_orchestrator / step_failure / cancelled. Derived at run
-   * completion from the terminal job statuses. NULL for success / not-yet-terminal.
+   * `RunFailureClass` (`@kici-dev/engine`): never_started / timed_out / dead_orchestrator /
+   * step_failure / cancelled, derived at completion from the terminal job statuses. NULL for
+   * success / not-yet-terminal.
    */
   failure_class: string | null;
   /**
-   * Structured init-phase failure detail (shape: `InitFailure` from
-   * `@kici-dev/engine`). Non-null means the run never executed a step
-   * because something failed during the init phase (lock-file fetch,
-   * provider context, agent spawn). NULL for normal runs.
+   * `InitFailure` (`@kici-dev/engine`) detail. Non-null means the run never executed a step
+   * because the init phase failed (lock-file fetch, provider context, agent spawn). NULL for
+   * normal runs.
    */
   init_failure: ColumnType<InitFailure | null, unknown, unknown>;
   /**
-   * Whole-run wall-clock timeout in ms from the workflow lock; null when
-   * unset. Read by the WorkflowDeadlineDetector. INTEGER in Postgres, matching
-   * the other `*_ms` columns, so pg returns a plain number.
+   * Whole-run wall-clock timeout in ms from the workflow lock (null = unset), read by the
+   * WorkflowDeadlineDetector. INTEGER like the other `*_ms` columns, so pg returns a number.
    */
   workflow_timeout_ms: ColumnType<number | null, number | null | undefined, number | null>;
-  /** When this record was created */
   created_at: Generated<Date>;
   /**
-   * Run mode for idempotent steps (`apply` | `check` | `check-fail-on-drift`,
-   * the `CheckMode` enum). NULL means a legacy/apply run. A non-apply value
-   * labels the run a check-mode preview in the dashboard.
+   * Idempotent-step mode (`CheckMode`: `apply` | `check` | `check-fail-on-drift`). NULL means a
+   * legacy/apply run; a non-apply value labels the run a check-mode preview in the dashboard.
    */
   check_mode: string | null;
   /**
-   * Set inside the cold-store archive transaction before the row is
-   * DELETEd. Survivors carry NULL. Exists so the
-   * "promote-chunk-back-into-PG" path can restore rows with
-   * their original archive pointer.
+   * Set inside the cold-store archive transaction before the row is DELETEd; survivors carry
+   * NULL. Lets the promote-chunk-back-into-PG path restore rows with their archive pointer.
    */
   archived_at: Date | null;
   /** S3 object key of the chunk that carried this row; see `archived_at`. */
   archive_object_key: string | null;
-  /**
-   * For a run summoned by an invoke gate, the summoning (global) run's id. NULL
-   * for every run not summoned by a gate.
-   */
+  /** The summoning (global) run's id for a gate-summoned run; NULL otherwise. */
   summoned_by_run_id: string | null;
   /**
-   * For a summoned run, the proxy job name in the summoning run to update when
-   * this run completes. NULL for every run not summoned by a gate.
+   * The summoning run's proxy job to update when this run completes; NULL for every run not
+   * summoned by a gate.
    */
   summoned_by_proxy_job: string | null;
   /**
-   * How deep this run sits in an invoke chain. A webhook-triggered run is depth
-   * 0; a run summoned by an invoke gate carries its summoner's depth + 1. Read
-   * back when this run fires its own invoke gate so the chain-depth circuit
-   * breaker bounds recursion. Defaults to 0.
+   * Invoke-chain depth: 0 for a webhook-triggered run, the summoner's depth + 1 for a summoned
+   * one. Read when this run fires its own invoke gate so the chain-depth circuit breaker bounds
+   * recursion. Defaults to 0.
    */
   chain_depth: Generated<number>;
   /**
-   * The coordinator whose dispatch pipeline still has jobs to register for
-   * this run — the durable form of the in-memory pending-jobs token
-   * (`ExecutionTracker.holdRunForPendingJobs`). The owner writes its instance
-   * id when it takes its first token and clears it when it drops its last;
-   * every finalization path defers while the column names a LIVE sibling
-   * (liveness from `cluster_instances`, the same read the dispatch queue's
-   * `owner_instance_id` predicates use). A dead holder's id reads as no
-   * window. NULL for every run with no window open and every row written
-   * before the column existed.
+   * The coordinator whose dispatch pipeline still has jobs to register for this run: the
+   * durable form of the pending-jobs token (`ExecutionTracker.holdRunForPendingJobs`). Written
+   * on its first token, cleared on its last; every finalization path defers while it names a
+   * LIVE sibling (liveness from `cluster_instances`, as the dispatch queue's
+   * `owner_instance_id` predicates read it). A dead holder reads as no window. NULL with no
+   * window open and on rows written before the column existed.
    */
   registration_window_instance_id: string | null;
 }
 
-/**
- * Execution job table
- * Individual jobs within a run (including matrix expansions).
- */
+/** Individual jobs within a run, including matrix expansions. */
 export interface ExecutionJobTable {
   /** UUID primary key */
   id: Generated<string>;
@@ -822,48 +682,38 @@ export interface ExecutionJobTable {
   job_id: string;
   /** Job name (e.g. "test", "test[node-18]") */
   job_name: string;
-  /** Job status: pending | running | success | failed | cancelled | skipped */
+  /** Job status: an `ExecutionJobStatus` value (engine). */
   status: Generated<string>;
   /**
-   * Operator-facing reason this job cannot currently be routed to any agent.
-   * Written by the unroutable probe while the job is still queued, so the cause
-   * is visible long before the job terminalizes; cleared when a matching agent
-   * or scaler backend appears. NULL whenever the job is routable.
+   * Operator-facing reason the job cannot be routed to any agent. Written by the unroutable
+   * probe while queued, so the cause shows before the job terminalizes; cleared when a matching
+   * agent or scaler backend appears. NULL whenever the job is routable.
    */
   routing_reason: ColumnType<string | null, string | null | undefined, string | null>;
-  /**
-   * Matrix values JSON (e.g. {"node": "18"}). JSONB: the driver returns a parsed
-   * object on SELECT, while writers pass a `JSON.stringify` string.
-   */
+  /** Matrix values JSONB (e.g. {"node": "18"}); writers pass a `JSON.stringify` string. */
   matrix_values: ColumnType<Record<string, unknown> | null, string | null, string | null>;
   /** Agent ID that ran this job */
   agent_id: string | null;
-  /** When the job started */
   started_at: Date | null;
-  /** When the job completed */
   completed_at: Date | null;
   /** Job execution duration in milliseconds */
   duration_ms: number | null;
   /**
-   * Total raw log bytes accumulated across all steps of this job. Sum of the
-   * agent-side `LogStreamer.getTotalBytes()` reported on terminal
-   * `step.status` for every step. Default 0 for pre-migration rows.
-   * Postgres BIGINT — pg returns string; cast at read sites.
+   * Raw log bytes across the job's steps (agent `LogStreamer.getTotalBytes()` on each terminal
+   * `step.status`). Default 0 for pre-migration rows. Postgres BIGINT — pg returns string; cast
+   * at read sites.
    */
   log_bytes: Generated<number>;
-  /** Error info if failed */
   error_message: string | null;
   /**
-   * Structured init-phase failure detail (shape: `InitFailure` from
-   * `@kici-dev/engine`). Non-null means the job never executed a step
-   * because something failed during init (lock-file fetch, provider
-   * context, agent spawn). NULL for normal runs.
+   * `InitFailure` (`@kici-dev/engine`) detail. Non-null means the job never executed a step
+   * because init failed (lock-file fetch, provider context, agent spawn). NULL for normal runs.
    */
   init_failure: ColumnType<InitFailure | null, unknown, unknown>;
   /**
-   * Labels used for agent routing (e.g. ["kici:os:linux", "kici:arch:x64"]). JSONB:
-   * the driver returns a parsed array on SELECT, while writers pass a
-   * `JSON.stringify` string. Re-parsing it as a string yields null for every job.
+   * Agent-routing labels JSONB (e.g. ["kici:os:linux", "kici:arch:x64"]); writers pass a
+   * `JSON.stringify` string. The driver returns a parsed array: re-parsing it as a string
+   * yields null for every job.
    */
   runs_on_labels: ColumnType<string[] | null, string | null, string | null>;
   /** Last heartbeat received from agent (for stale run detection) */
@@ -873,27 +723,19 @@ export interface ExecutionJobTable {
   /** Aggregated step outputs JSONB (step-keyed map of outputs). Populated on job success. */
   outputs: string | null;
   /**
-   * Ordered bound deployment-context names for this job, JSON-encoded
-   * `string[]` (null when the job binds none). Written at dispatch and
-   * overwritten with the agent-resolved list for dynamic contexts.
+   * Ordered bound deployment-context names, JSON `string[]` (null when none). Written at
+   * dispatch; overwritten with the agent-resolved list for dynamic contexts.
    */
   contexts: string | null;
   /**
-   * The `gitCredentials` map this job's lock entry declared, as server truth
-   * the credential relay reads on every git network operation. JSONB: the
-   * driver returns a parsed object on SELECT, while writers pass a
-   * `JSON.stringify` string.
+   * The lock entry's `gitCredentials` map: server truth the credential relay reads on every git
+   * network operation. JSONB; writers pass a `JSON.stringify` string. Copied verbatim because
+   * the relay compares byte for byte: `<name>Secret` is a qualified `<context>:<key>` secret
+   * NAME, and `<name>Value` is material for a credential with no store entry.
    *
-   * Copied verbatim from the lock, because the relay compares a request against
-   * it byte for byte: a `<name>Secret` field is a secret NAME in qualified
-   * `<context>:<key>` form, and its `<name>Value` sibling is material for a
-   * credential with no store entry to name.
-   *
-   * This row is written after the dispatch loop, so NULL means either "the job
-   * declared none" or "the row has not caught up with the dispatch yet". The
-   * relay does not guess between them — `git/job-context.ts` reads the job's
-   * dispatch record, which carries the same declaration and is written before
-   * the agent is told about the job.
+   * Written after the dispatch loop, so NULL means "declared none" or "not caught up yet"; the
+   * relay does not guess — `git/job-context.ts` reads the dispatch record, which carries the
+   * same declaration and is written before the agent learns of the job.
    */
   git_credentials: ColumnType<
     Record<string, Record<string, string>> | null,
@@ -920,94 +762,73 @@ export interface ExecutionJobTable {
   /** Fan-out label for a child: matrix suffix or hostname. NULL for non-fanned jobs. */
   variant_label: string | null;
   /**
-   * Wave gate: a fan-out child beyond the job's `maxParallel` window is held
-   * (`true`) instead of dispatched. Cleared by the wave-scheduler when a sibling
-   * reaches terminal and an in-flight slot frees up. NULL/false for any job not
-   * held by a rolling wave.
+   * Wave gate: `true` holds a fan-out child beyond the `maxParallel` window instead of
+   * dispatching it; the wave-scheduler clears it when a sibling terminates and frees a slot.
+   * NULL/false for any job not held by a rolling wave.
    */
   wave_gated: Generated<boolean>;
-  /** The fan-out base's `maxParallel` wave width, stamped on every child. NULL = no bounded wave. */
+  /** The fan-out base's `maxParallel`, stamped on every child. NULL = no bounded wave. */
   wave_max_parallel: number | null;
   /** The fan-out base's `failFast` policy, stamped on every child. NULL = no bounded wave. */
   wave_fail_fast: boolean | null;
   /** Instance id of the worker peer this job was rerouted to, or null if local. */
   rerouted_to_peer: string | null;
-  /** When this record was created */
   created_at: Generated<Date>;
   /**
-   * Denormalized routing_key copied from execution_runs at insert time.
-   * Used by cold-store as the partition tenant. NULLable for safety —
-   * if an insert site doesn't populate it, the cold-store adapter
-   * skips the row.
+   * Copied from execution_runs at insert; the cold-store partition tenant. NULLable for safety:
+   * the cold-store adapter skips a row an insert site left without it.
    */
   routing_key: string | null;
   /** Cold-store archive marker — see ExecutionRunTable.archived_at. */
   archived_at: Date | null;
   /** S3 object key of the chunk that carried this row. */
   archive_object_key: string | null;
-  /**
-   * Job kind (`JobKind`): `standard` runs steps on an agent, `gate` is an
-   * invoke gate, `proxy` mirrors a summoned run. Defaults to `standard`.
-   */
+  /** `JobKind`; defaults to `standard`. */
   job_kind: Generated<string>;
   /** For a `proxy` job, the summoned run it mirrors. NULL for every other kind. */
   summoned_run_id: string | null;
   /**
-   * For a `gate` job, its own wall-clock timeout in milliseconds (copied from the
-   * lock job). A gate runs no steps on an agent, so the agent-side job timeout
-   * cannot fire for it; the orchestrator sweeps this column and fails a gate whose
-   * proxies have not all terminalized in time. NULL = no gate timeout.
+   * A `gate` job's wall-clock timeout in ms, copied from the lock job. A gate runs no agent
+   * steps, so no agent-side timeout fires; the orchestrator sweeps this column and fails a gate
+   * whose proxies have not all terminalized in time. NULL = no gate timeout.
    */
   timeout_ms: number | null;
   /**
-   * The precursor payload a build / init / dynamic-eval job reported on its
-   * terminal `job.status` (shape: `PrecursorResult`), persisted so a
-   * coordinator other than the one whose agent ran the job can settle its
-   * pending tracker from the shared row. JSONB: the driver returns a parsed
-   * object on SELECT, while writers pass a `JSON.stringify` string. NULL for
-   * every ordinary job and for a precursor job that has not reached a
-   * terminal state.
+   * The `PrecursorResult` a build / init / dynamic-eval job reported on its terminal
+   * `job.status`, persisted so any coordinator can settle its pending tracker from the shared
+   * row. JSONB; writers pass a `JSON.stringify` string. NULL for ordinary jobs and for a
+   * precursor job not yet terminal.
    */
   precursor_result: ColumnType<PrecursorResult | null, string | null | undefined, string | null>;
 }
 
-/**
- * Execution step table
- * Individual steps within a job.
- */
+/** Individual steps within a job. */
 export interface ExecutionStepTable {
   /** UUID primary key */
   id: Generated<string>;
   /** References execution_runs.run_id */
   run_id: string;
-  /** Job identifier */
   job_id: string;
   /** Step index within the job (0-based) */
   step_index: number;
-  /** Step name */
   step_name: string;
-  /** Step status: pending | running | success | failed | skipped */
+  /** Step status: an `ExecutionStepStatus` value (engine). */
   status: Generated<string>;
-  /** When the step started */
   started_at: Date | null;
-  /** When the step completed */
   completed_at: Date | null;
   /** Step execution duration in milliseconds */
   duration_ms: number | null;
-  /** Process exit code */
   exit_code: number | null;
-  /** Error info if failed */
   error_message: string | null;
   /** Path in storage backend (e.g. "executions/{runId}/job-test/step-0.log") */
   log_path: string | null;
   /** Step type: 'step' for regular steps, 'hook:onCancel', 'hook:cleanup', etc. for hooks */
   step_type: Generated<string>;
-  /** JSON array of secret context names accessed by this step. NULL = tracking not available (old runs). */
+  /** JSON array of secret context names the step accessed. NULL = not tracked (old runs). */
   secrets_accessed: string | null;
   /**
-   * Idempotent per-step outcome (`CheckStepOutcome`: skipped | applied |
-   * declined | dry-run | no_check). NULL when the step ran without a check
-   * mode. Orthogonal to `status`.
+   * `CheckStepOutcome`: skipped | applied | declined | dry-run | no_check. NULL when the step
+   * ran without a check mode. Orthogonal to `status`.
    */
   check_outcome: string | null;
   /** Human-readable drift summary (`summarize(drift)`). NULL when no drift. */
@@ -1021,12 +842,8 @@ export interface ExecutionStepTable {
   concurrency_kind: string | null;
   /** Parallel-group correlation id shared by a group's children. NULL for sequential steps. */
   group_id: string | null;
-  /** When this record was created */
   created_at: Generated<Date>;
-  /**
-   * Denormalized routing_key copied from execution_runs at insert time.
-   * Used by cold-store as the partition tenant. NULLable for safety.
-   */
+  /** Copied from execution_runs at insert; the cold-store partition tenant. NULLable for safety. */
   routing_key: string | null;
   /** Cold-store archive marker — see ExecutionRunTable.archived_at. */
   archived_at: Date | null;
@@ -1034,25 +851,21 @@ export interface ExecutionStepTable {
   archive_object_key: string | null;
 }
 
-// Convenience types for execution_runs
 export type ExecutionRun = Selectable<ExecutionRunTable>;
 export type NewExecutionRun = Insertable<ExecutionRunTable>;
 export type ExecutionRunUpdate = Updateable<ExecutionRunTable>;
 
-// Convenience types for execution_jobs
 export type ExecutionJob = Selectable<ExecutionJobTable>;
 export type NewExecutionJob = Insertable<ExecutionJobTable>;
 export type ExecutionJobUpdate = Updateable<ExecutionJobTable>;
 
-// Convenience types for execution_steps
 export type ExecutionStep = Selectable<ExecutionStepTable>;
 export type NewExecutionStep = Insertable<ExecutionStepTable>;
 export type ExecutionStepUpdate = Updateable<ExecutionStepTable>;
 
 /**
- * Execution job needs edge table.
- * One row per concrete dependency edge within a run.
- * Static-to-static edges inserted at run start; group edges after resolution.
+ * One row per concrete dependency edge in a run: static-to-static edges at run start, group
+ * edges after resolution.
  */
 export interface ExecutionJobNeedsTable {
   /** References execution_runs.run_id */
@@ -1062,49 +875,36 @@ export interface ExecutionJobNeedsTable {
   /** Upstream job name (the job that must complete first) */
   upstream_name: string;
   /**
-   * Per-edge run-on status-set: a JSON-encoded array of upstream terminal
-   * statuses (ExecutionJobStatus[]) that satisfy the edge. Default
-   * `'["success"]'`. The downstream dispatches when the upstream's terminal
-   * status is a member of this set.
+   * JSON `ExecutionJobStatus[]` of upstream terminal statuses that satisfy the edge (default
+   * `'["success"]'`); the downstream dispatches when the upstream ends in one of them.
    */
   run_on: Generated<string>;
 }
 
-// Convenience types for execution_job_needs
 export type ExecutionJobNeeds = Selectable<ExecutionJobNeedsTable>;
 export type NewExecutionJobNeeds = Insertable<ExecutionJobNeedsTable>;
 
-/**
- * Raft consensus state table
- * Persistent state for Raft leader election across orchestrator cluster.
- * Single row per cluster (default cluster_id = 'default').
- */
+/** Raft leader-election state, one row per cluster (default cluster_id = 'default'). */
 export interface RaftStateTable {
   /** Cluster identifier (primary key). Default 'default'. */
   cluster_id: Generated<string>;
-  /** Current Raft term */
   current_term: Generated<number>;
   /** Instance ID this node voted for in the current term */
   voted_for: string | null;
   /** Current known leader instance ID */
   leader_id: string | null;
-  /** When this state was last updated */
   updated_at: Generated<Date>;
 }
 
-// Convenience types for raft_state
 export type RaftState = Selectable<RaftStateTable>;
 export type RaftStateUpdate = Updateable<RaftStateTable>;
 
 /**
- * Contexts table
- * Named deployment contexts with concurrency, branch restrictions, and approval rules.
- * Scoped to an organization.
+ * Org-scoped named deployment contexts with concurrency, branch restrictions and approval rules.
  */
 export interface ContextsTable {
   /** UUID primary key */
   id: Generated<string>;
-  /** Organization ID */
   org_id: string;
   /** Context name (unique within org) */
   name: string;
@@ -1121,9 +921,8 @@ export interface ContextsTable {
   /** Max concurrent runs (null = unlimited) */
   concurrency_limit: number | null;
   /**
-   * Strategy when concurrency exceeded; see `ConcurrencyStrategy` in
-   * `@kici-dev/engine` for the vocabulary. Stays a plain `string` so a row
-   * written by another orchestrator version always maps (null = unset).
+   * `ConcurrencyStrategy` (`@kici-dev/engine`) applied when concurrency is exceeded; a plain
+   * `string` so a row from another orchestrator version always maps (null = unset).
    */
   concurrency_strategy: Generated<string | null>;
   /** Timeout for queued runs in milliseconds */
@@ -1138,33 +937,23 @@ export interface ContextsTable {
   minimum_trust: string | null;
   /** Whether this context allows local (no-remote) executions. Default false. */
   allow_local_execution: Generated<boolean>;
-  /** Whether this context is active */
   enabled: Generated<boolean>;
-  /** When this context was created */
   created_at: Generated<Date>;
-  /** When this context was last updated */
   updated_at: Generated<Date>;
-  /** Who created this context */
   created_by: string | null;
 }
 
-// Convenience types for contexts
 export type Context = Selectable<ContextsTable>;
 export type NewContext = Insertable<ContextsTable>;
 export type ContextUpdate = Updateable<ContextsTable>;
 
-/**
- * Scoped secrets table
- * Encrypted key-value pairs scoped to org + scope (e.g. context name, repo pattern).
- */
+/** Encrypted key-value pairs scoped to org + scope (e.g. context name, repo pattern). */
 export interface ScopedSecretsTable {
   /** UUID primary key */
   id: Generated<string>;
-  /** Organization ID */
   org_id: string;
   /** Scope identifier (e.g. context name, repo pattern) */
   scope: string;
-  /** Secret key name */
   key: string;
   /** Encrypted secret value */
   encrypted_value: string;
@@ -1172,25 +961,18 @@ export interface ScopedSecretsTable {
   backend_type: Generated<string>;
   /** Version of the encryption key used */
   key_version: Generated<number>;
-  /** When this secret was created */
   created_at: Generated<Date>;
-  /** When this secret was last updated */
   updated_at: Generated<Date>;
 }
 
-// Convenience types for scoped_secrets
 export type ScopedSecret = Selectable<ScopedSecretsTable>;
 export type NewScopedSecret = Insertable<ScopedSecretsTable>;
 export type ScopedSecretUpdate = Updateable<ScopedSecretsTable>;
 
-/**
- * Context bindings table
- * Links contexts to scope patterns (e.g. workflow names, repo identifiers).
- */
+/** Links contexts to scope patterns (e.g. workflow names, repo identifiers). */
 export interface ContextBindingsTable {
   /** UUID primary key */
   id: Generated<string>;
-  /** Organization ID */
   org_id: string;
   /** Context ID (FK to contexts.id, cascade delete) */
   context_id: string;
@@ -1202,89 +984,62 @@ export interface ContextBindingsTable {
    * host.
    */
   host_pattern: Generated<string>;
-  /** When this binding was created */
   created_at: Generated<Date>;
 }
 
-// Convenience types for context_bindings
 export type ContextBinding = Selectable<ContextBindingsTable>;
 export type NewContextBinding = Insertable<ContextBindingsTable>;
 
-/**
- * Context variables table
- * Non-secret key-value pairs attached to a context.
- */
+/** Non-secret key-value pairs attached to a context. */
 export interface ContextVariablesTable {
   /** UUID primary key */
   id: Generated<string>;
-  /** Organization ID */
   org_id: string;
   /** Context ID (FK to contexts.id, cascade delete) */
   context_id: string;
-  /** Variable key name */
   key: string;
-  /** Variable value */
   value: string;
   /** Whether this variable is locked (cannot be overridden by workflow) */
   locked: Generated<boolean>;
-  /** When this variable was created */
   created_at: Generated<Date>;
-  /** When this variable was last updated */
   updated_at: Generated<Date>;
 }
 
-// Convenience types for context_variables
 export type ContextVariable = Selectable<ContextVariablesTable>;
 export type NewContextVariable = Insertable<ContextVariablesTable>;
 export type ContextVariableUpdate = Updateable<ContextVariablesTable>;
 
-/**
- * Context source overrides table
- * Per-source (routing key) variable overrides within a context.
- */
+/** Per-source (routing key) variable overrides within a context. */
 export interface ContextSourceOverridesTable {
   /** UUID primary key */
   id: Generated<string>;
-  /** Organization ID */
   org_id: string;
   /** Context ID (FK to contexts.id, cascade delete) */
   context_id: string;
-  /** Routing key for the source */
   routing_key: string;
-  /** Override key name */
   key: string;
-  /** Override value */
   value: string;
-  /** When this override was created */
   created_at: Generated<Date>;
-  /** When this override was last updated */
   updated_at: Generated<Date>;
 }
 
-// Convenience types for context_source_overrides
 export type ContextSourceOverride = Selectable<ContextSourceOverridesTable>;
 export type NewContextSourceOverride = Insertable<ContextSourceOverridesTable>;
 export type ContextSourceOverrideUpdate = Updateable<ContextSourceOverridesTable>;
 
-/**
- * Held runs table
- * Tracks runs waiting for approval, wait timer, or concurrency slot.
- */
+/** Tracks runs waiting for approval, wait timer, or concurrency slot. */
 export interface HeldRunsTable {
   /** UUID primary key */
   id: Generated<string>;
-  /** Organization ID */
   org_id: string;
   /** Run ID (references execution_runs) */
   run_id: string;
-  /** Job ID within the run */
   job_id: string;
   /** Context ID (FK to contexts.id); null once the context is deleted */
   context_id: string | null;
   /**
-   * Hold type — an engine `HoldType` member ('reviewer' | 'timer' |
-   * 'concurrency' | 'security'). Stays `string` so a row written by a
-   * different orchestrator version is never rejected.
+   * Engine `HoldType` ('reviewer' | 'timer' | 'concurrency' | 'security'). A plain `string`
+   * so a row from a different orchestrator version is never rejected.
    */
   hold_type: string;
   /** Hold status: 'pending' | 'approved' | 'rejected' | 'expired' | 'released' */
@@ -1295,11 +1050,8 @@ export interface HeldRunsTable {
   reason: string | null;
   /** Who approved/rejected this hold */
   approved_by: string | null;
-  /** When this hold was created */
   created_at: Generated<Date>;
-  /** When this hold expires */
   expires_at: Date;
-  /** When this hold was resolved */
   resolved_at: Date | null;
   /**
    * Hold granularity: 'workflow' | 'job' | 'step' (engine `HoldScope`).
@@ -1333,19 +1085,15 @@ export interface HeldRunsTable {
     StepApprovalPayload | string | null
   >;
   /**
-   * Whether this hold's pending `KiCI Security` check actually reached the
-   * provider. `true` after a post returned; `false` when none was attempted or
-   * one failed; `null` on a row written before the column existed, for which
-   * the hold's shape is still the only available answer.
-   *
-   * Read through `postedPendingSecurityCheck`. It decides whether a hold has a
-   * check to terminalize — and terminalizing one it never posted CREATES a
+   * Whether the hold's pending `KiCI Security` check reached the provider: `true` after a post
+   * returned, `false` when none was attempted or one failed, `null` on a pre-column row (the
+   * hold's shape is then the only answer). Read through `postedPendingSecurityCheck` to decide
+   * whether a hold has a check to terminalize — terminalizing one never posted CREATES a
    * `KiCI Security` run on a commit that had none.
    */
   posted_pending_check: Generated<boolean | null>;
 }
 
-// Convenience types for held_runs
 export type HeldRun = Selectable<HeldRunsTable>;
 export type NewHeldRun = Insertable<HeldRunsTable>;
 export type HeldRunUpdate = Updateable<HeldRunsTable>;
@@ -1370,7 +1118,6 @@ export interface HeldRunApprovalsTable {
     ApproverClause[] | string | null | undefined,
     ApproverClause[] | string | null
   >;
-  /** When the decision was recorded */
   created_at: Generated<Date>;
 }
 
@@ -1378,18 +1125,13 @@ export type HeldRunApproval = Selectable<HeldRunApprovalsTable>;
 export type NewHeldRunApproval = Insertable<HeldRunApprovalsTable>;
 export type HeldRunApprovalUpdate = Updateable<HeldRunApprovalsTable>;
 
-/**
- * Secret audit log table
- * Immutable log of secret access and denial events.
- */
+/** Immutable log of secret access and denial events. */
 export interface SecretAuditLogTable {
   /** UUID primary key */
   id: Generated<string>;
-  /** When the event occurred */
   timestamp: Generated<Date>;
   /** The action performed (e.g., 'getSecrets', 'setSecret') */
   action: string;
-  /** The context name involved */
   context_name: string;
   /** Routing key scope */
   routing_key: string | null;
@@ -1407,24 +1149,19 @@ export interface SecretAuditLogTable {
   role: string | null;
   /** Additional metadata (JSON) */
   metadata: string | null;
-  /**
-   * Set inside the archive transaction before the row is DELETEd.
-   * Survivors carry NULL.
-   */
+  /** Set inside the archive transaction before the row is DELETEd; survivors carry NULL. */
   archived_at: Date | null;
   /** S3 object key of the chunk that carried this row; see `archived_at`. */
   archive_object_key: string | null;
 }
 
-// Convenience types for secret_audit_log
 export type SecretAuditLogRow = Selectable<SecretAuditLogTable>;
 export type NewSecretAuditLogRow = Insertable<SecretAuditLogTable>;
 
 /**
- * Access log table.
  * One row per read or orchestrator-admin mutation attributable to an
  * ActorPrincipal (user / api_key / service_account / platform_operator /
- * system). TTL-pruned via expires_at by the cleanup job.
+ * system). Retention: see `archived_at`.
  */
 export interface AccessLogTable {
   id: Generated<string>;
@@ -1441,16 +1178,16 @@ export interface AccessLogTable {
   outcome: string;
   error_message: string | null;
   /**
-   * Human-set agent name, when the actor authenticated with an agent-kind PAT.
-   * NULL for ordinary human / API-key / system actors. Queryable so the access
-   * log can be filtered by agent.
+   * Human-set agent name when the actor used an agent-kind PAT; NULL for human / API-key /
+   * system actors. Queryable so the access log filters by agent.
    */
   agent_label: string | null;
   created_at: Generated<Date>;
   /**
-   * Set inside the archive transaction before the row is DELETEd.
-   * Survivors carry NULL. The table has no `expires_at`-based TTL — rows
-   * older than 30 days are archived to S3 instead of hard-deleted.
+   * Set inside the archive transaction before the row is DELETEd; survivors carry NULL. No
+   * `expires_at`-based TTL. With the cold store on, rows past their per-action warm TTL
+   * (`accessLogWarmSqlCase`) are archived to S3; with it off, the database retention sweep
+   * (`audit_retention_days`) prunes them.
    */
   archived_at: Date | null;
   /** S3 object key of the chunk that carried this row; see `archived_at`. */
@@ -1460,47 +1197,36 @@ export interface AccessLogTable {
 export type AccessLogRow = Selectable<AccessLogTable>;
 export type NewAccessLogRow = Insertable<AccessLogTable>;
 
-/**
- * Admin tokens table
- * Hashed tokens for admin API authentication with role-based access.
- */
+/** Hashed tokens for admin API authentication with role-based access. */
 export interface AdminTokenTable {
   /** UUID primary key */
   id: Generated<string>;
   /** SHA-256 hash of the token */
   token_hash: string;
-  /** Human-readable label */
   label: string;
   /** Role (e.g. 'admin', 'reader') */
   role: string;
   /** Routing key scope (null = all) */
   routing_key: string | null;
   /**
-   * The intended holder, as the operator stated it at `token create --subject`
-   * (an OIDC `sub` or an email). Advisory metadata only: the orchestrator
-   * cannot verify it and never reads it when authorizing a request. It is the
-   * join key the Platform's RBAC drift report compares against org membership.
-   * NULL means nobody recorded a holder — the report's `unlinked` finding.
+   * The intended holder from `token create --subject` (an OIDC `sub` or an email). Advisory
+   * only: never verified and never read when authorizing. The join key the Platform's RBAC
+   * drift report compares against org membership; NULL is the report's `unlinked` finding.
    */
   subject: string | null;
-  /** When this token was created */
   created_at: Generated<Date>;
   /** When this token expires (null = never) */
   expires_at: Date | null;
-  /** When this token was last used */
   last_used_at: Date | null;
-  /** Whether this token has been revoked */
   revoked: Generated<boolean>;
 }
 
-// Convenience types for admin_tokens
 export type AdminTokenRow = Selectable<AdminTokenTable>;
 export type NewAdminTokenRow = Insertable<AdminTokenTable>;
 
 /**
- * Agent tokens table
- * Hashed tokens for agent authentication (PSK-based).
- * Supports static (long-lived, CLI-created) and ephemeral (scaler-issued, TTL-bound) tokens.
+ * Hashed PSK tokens for agent authentication: static (long-lived, CLI-created) or ephemeral
+ * (scaler-issued, TTL-bound).
  */
 export interface AgentTokenTable {
   /** UUID primary key */
@@ -1512,16 +1238,13 @@ export interface AgentTokenTable {
   /** JSON-encoded string[] of agent labels (null = any) */
   labels: string | null;
   /**
-   * JSON-encoded string[] of mandatory labels (a Kubernetes-taint-style gate):
-   * a static agent registering with this token only accepts a job when every
-   * label here appears in the job's required labels. null = no taint (the
-   * default; the agent accepts any job its advertised labels match).
-   * Authorized at mint time alongside `labels`.
+   * JSON `string[]` of mandatory labels (a Kubernetes-taint-style gate): a static agent on this
+   * token accepts a job only when every label here is among the job's required labels. null =
+   * no taint (the default). Authorized at mint time alongside `labels`.
    */
   mandatory_labels: string | null;
   /** Token type: 'ephemeral' (scaler-issued) or 'static' (CLI-created) */
   agent_type: string;
-  /** When this token was created */
   created_at: Generated<Date>;
   /** When this token was last used for authentication */
   last_seen_at: Date | null;
@@ -1532,23 +1255,19 @@ export interface AgentTokenTable {
   /** When this token expires (null = never, static tokens) */
   expires_at: Date | null;
   /**
-   * Single-use marker for bootstrap (init-runner) tokens. Set the first time
-   * the token is consumed at `agent.register`; a second register is rejected.
-   * NULL = never consumed (every static / ephemeral token stays reusable until
-   * expiry).
+   * Single-use marker for bootstrap (init-runner) tokens, set on first `agent.register`; a
+   * second register is rejected. NULL = never consumed (static / ephemeral tokens stay
+   * reusable until expiry).
    */
   consumed_at: ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
 }
 
-// Convenience types for agent_tokens
 export type AgentTokenRow = Selectable<AgentTokenTable>;
 export type NewAgentTokenRow = Insertable<AgentTokenTable>;
 
 /**
- * Config versions table
- * Stores versioned JSONB config snapshots with audit trail.
- * Each config change creates a new version with auto-incrementing version number.
- * Sensitive fields are encrypted and tracked via encrypted_paths array.
+ * Versioned JSONB config snapshots with audit trail; each change adds a version. Sensitive
+ * fields are encrypted and listed in `encrypted_paths`.
  */
 export interface ConfigVersionTable {
   /** UUID primary key */
@@ -1557,7 +1276,6 @@ export interface ConfigVersionTable {
   version: Generated<number>;
   /** Full config snapshot as JSONB */
   config: string;
-  /** When this version was created */
   created_at: Generated<Date>;
   /** Who created this version (e.g. "cli:seed", "api:set", "api:rollback") */
   created_by: string;
@@ -1566,22 +1284,16 @@ export interface ConfigVersionTable {
   /** JSONB paths that contain encrypted values */
   encrypted_paths: Generated<string[]>;
   /**
-   * Master-key generation used to encrypt this row's sensitive fields.
-   * Bumped atomically by `kici-admin rotate-key`; decrypt path accepts
-   * both the current and the previous generation during a grace window.
+   * Master-key generation of this row's sensitive fields, bumped atomically by
+   * `kici-admin rotate-key`; decrypt accepts current and previous during a grace window.
    */
   key_version: Generated<number>;
 }
 
-// Convenience types for config_versions
 export type ConfigVersionRow = Selectable<ConfigVersionTable>;
 export type NewConfigVersionRow = Insertable<ConfigVersionTable>;
 
-/**
- * Internal events table (kici_events)
- * Persists internal events (system + custom) for routing, circuit-breaking, and audit.
- * Events have a TTL-based expiry for automatic cleanup.
- */
+/** Internal events (system + custom) for routing, circuit-breaking and audit; TTL-expired. */
 export interface KiciEventTable {
   /** UUID primary key */
   id: Generated<string>;
@@ -1591,7 +1303,6 @@ export interface KiciEventTable {
   payload: string;
   /** Source repo identifier (null for non-repo events) */
   source_repo: string | null;
-  /** Source routing key */
   source_routing_key: string | null;
   /** Run ID that emitted this event */
   source_run_id: string | null;
@@ -1601,9 +1312,7 @@ export interface KiciEventTable {
   chain_depth: Generated<number>;
   /** Whether all subscribers have processed this event */
   processed: Generated<boolean>;
-  /** When this event was created */
   created_at: Generated<Date>;
-  /** When this event expires (TTL-based cleanup) */
   expires_at: Date;
   /** Optional target repos for cross-repo event targeting (JSONB string[] or null) */
   target_repos: string | null;
@@ -1611,7 +1320,7 @@ export interface KiciEventTable {
   claimed_at: Date | null;
   /** Node id holding the current lease (for diagnostics; not part of the lease check) */
   claimed_by: string | null;
-  /** Number of times this event has been leased for processing */
+  /** Times the event has been leased for processing */
   attempts: Generated<number>;
   /** Most recent dispatch failure message (truncated to 4 KB by application code) */
   last_error: string | null;
@@ -1627,20 +1336,14 @@ export interface KiciEventTable {
   matched_count: number | null;
 }
 
-// Convenience types for kici_events
 export type KiciEvent = Selectable<KiciEventTable>;
 export type NewKiciEvent = Insertable<KiciEventTable>;
 export type KiciEventUpdate = Updateable<KiciEventTable>;
 
-/**
- * Generic webhook sources table (generic_webhook_sources)
- * Stores per-source verification config, event extraction rules, and rate limits
- * for non-GitHub webhook sources.
- */
+/** Non-GitHub webhook sources: verification config, event extraction rules and rate limits. */
 export interface GenericWebhookSourceTable {
   /** UUID primary key */
   id: Generated<string>;
-  /** Customer/tenant identifier */
   customer_id: string;
   /** Human-readable source name (unique within customer when not deleted) */
   name: string;
@@ -1654,7 +1357,6 @@ export interface GenericWebhookSourceTable {
   event_type_header: string | null;
   /** JSONPath expression to extract event type from payload body */
   event_type_path: string | null;
-  /** Header name for idempotency key */
   idempotency_key_header: string | null;
   /** JSONPath expression for idempotency key from body */
   idempotency_key_path: string | null;
@@ -1666,77 +1368,59 @@ export interface GenericWebhookSourceTable {
   allowed_events: string | null;
   /** JSON array of sensitive headers to strip (default: auth-related headers) */
   strip_headers: Generated<string>;
-  /** Whether this source is active */
   enabled: Generated<boolean>;
   /** Token bucket rate limit: requests per minute */
   rate_limit_rpm: Generated<number>;
-  /** When this source was created */
   created_at: Generated<Date>;
-  /** When this source was last updated */
   updated_at: Generated<Date>;
   /** Soft-delete marker (null = active) */
   deleted_at: Date | null;
-  /** Provider implementation to route this source through.
-   *  'generic' (default) → GenericWebhookNormalizer (Stripe-shaped payloads).
-   *  'local' → LocalWebhookNormalizer (github-shaped push/PR payloads for a
-   *  git repository present on the agent filesystem, cloned via file://). */
+  /**
+   * Normalizer: 'generic' (default) → GenericWebhookNormalizer (Stripe-shaped payloads);
+   * 'local' → LocalWebhookNormalizer (github-shaped push/PR payloads for a repository on the
+   * agent filesystem, cloned via file://).
+   */
   provider_type: Generated<string>;
-  /** Git config (JSONB), dual-purpose discriminated by `provider_type`:
-   *  - universal-git sources ('generic' with git_config) store a
-   *    `UniversalGitConfig` (clone URLs, lock-file fetch, clone credentials
-   *    against Forgejo / Gitea / Gogs / GitLab repo-webhook / GitHub repo).
-   *  - local sources ('local') store a `LocalSourceConfig`
-   *    (`{ repoBasePath, cloneUrlBase? }`).
-   *  null for plain generic sources that don't drive git operations. Shape
-   *  validated by the matching Zod schema at the application layer. */
+  /**
+   * Git config JSONB, discriminated by `provider_type`: a universal-git source ('generic' with
+   * git_config) stores a `UniversalGitConfig` (clone URLs, lock-file fetch, clone credentials
+   * against Forgejo / Gitea / Gogs / GitLab repo-webhook / GitHub repo); a 'local' source a
+   * `LocalSourceConfig` (`{ repoBasePath, cloneUrlBase? }`). null for plain generic sources
+   * with no git operations. Validated by the matching Zod schema in the application layer.
+   */
   git_config: ColumnType<string | Record<string, unknown> | null, string | null, string | null>;
 }
 
-// Convenience types for generic_webhook_sources
 export type GenericWebhookSource = Selectable<GenericWebhookSourceTable>;
 export type NewGenericWebhookSource = Insertable<GenericWebhookSourceTable>;
 export type GenericWebhookSourceUpdate = Updateable<GenericWebhookSourceTable>;
 
-/**
- * Cross-repo trust table (cross_repo_trust)
- * Bidirectional trust relationships for cross-repo event delivery.
- * Both source and target must declare trust for delivery to proceed.
- */
+/** Cross-repo event-delivery trust; delivery needs both source and target to declare it. */
 export interface CrossRepoTrustTable {
   /** UUID primary key */
   id: Generated<string>;
   /** Source repo that is trusted to emit events */
   source_repo: string;
-  /** Source routing key */
   source_routing_key: string;
   /** Target repo that accepts events from source */
   target_repo: string;
-  /** Target routing key */
   target_routing_key: string;
   /** JSON array of event name glob patterns allowed (null = all) */
   allowed_events: string | null;
-  /** Whether this trust relationship is active */
   enabled: Generated<boolean>;
-  /** When this trust relationship was created */
   created_at: Generated<Date>;
 }
 
-// Convenience types for cross_repo_trust
 export type CrossRepoTrust = Selectable<CrossRepoTrustTable>;
 export type NewCrossRepoTrust = Insertable<CrossRepoTrustTable>;
 export type CrossRepoTrustUpdate = Updateable<CrossRepoTrustTable>;
 
-/**
- * Test uploads table (test_uploads)
- * Tracks CLI code uploads for remote test runs.
- * Uploads are temporary (24h TTL) and cleaned up by a periodic job.
- */
+/** CLI code uploads for remote test runs; a periodic job removes them after a 24h TTL. */
 export interface TestUploadsTable {
   /** UUID primary key */
   id: Generated<string>;
   /** Client-facing upload ID */
   upload_id: string;
-  /** Routing key for this upload */
   routing_key: string;
   /** Git SHA from the upload */
   sha: string | null;
@@ -1750,7 +1434,6 @@ export interface TestUploadsTable {
   encryption_private_key: string | null;
   /** Upload status: pending | uploaded | dispatched | expired */
   status: Generated<string>;
-  /** When this upload was created */
   created_at: Generated<Date>;
   /** When this upload expires (24h from creation) */
   expires_at: Date;
@@ -1758,16 +1441,11 @@ export interface TestUploadsTable {
   created_by: string | null;
 }
 
-// Convenience types for test_uploads
 export type TestUpload = Selectable<TestUploadsTable>;
 export type NewTestUpload = Insertable<TestUploadsTable>;
 export type TestUploadUpdate = Updateable<TestUploadsTable>;
 
-/**
- * Workflow registrations table
- * Per-workflow rows with full lock entry and trigger type index.
- * Each registration is unique per (routing_key, repo, workflow).
- */
+/** One row per (routing_key, repo, workflow): the full lock entry plus a trigger-type index. */
 export interface WorkflowRegistrationsTable {
   /** UUID primary key */
   id: Generated<string>;
@@ -1788,27 +1466,19 @@ export interface WorkflowRegistrationsTable {
   /** Git commit SHA from the push that last updated this registration */
   commit_sha: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * The repository's default branch, captured from the push that last updated
-   * this registration. A `__schedule_fire` run executes this branch's lock
-   * file, so this IS that run's branch when a context evaluates branch
-   * restrictions.
-   *
-   * NULL when the registration predates migration 123, or when the webhook
-   * payload named no default branch. There is no backfill: the value is only
-   * knowable from a payload, so a NULL row heals on its repo's next
-   * default-branch push. NULL presents no branch, which keeps the honest
-   * branch-gate rejection rather than inventing a branch.
+   * The repo's default branch from the push that last updated this registration. A
+   * `__schedule_fire` run executes this branch's lock file, so this IS that run's branch for
+   * context branch restrictions. NULL when the row predates migration 123 or the payload named
+   * no default branch; no backfill is possible, so a NULL row heals on the next default-branch
+   * push. NULL presents no branch, keeping the honest branch-gate rejection.
    */
   default_branch: ColumnType<string | null, string | null | undefined, string | null>;
   /** Source file path for this workflow (e.g. ".kici/workflows/deploy.ts") */
   source_file: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * `lockfileHash` of the lock file that last registered this workflow: the
-   * package-manager lockfile hash that keys the dependency cache. A run dispatched
-   * from the registration probes the dependency cache with it.
-   *
-   * NULL when that lock file records none, and on rows written before migration
-   * 149. NULL means the run installs its dependencies on the agent.
+   * `lockfileHash` of the lock file that last registered this workflow: the package-manager
+   * lockfile hash a dispatched run probes the dependency cache with. NULL when that lock file
+   * records none and on rows before migration 149; the run then installs deps on the agent.
    */
   lockfile_hash: ColumnType<string | null, string | null | undefined, string | null>;
   /**
@@ -1818,83 +1488,61 @@ export interface WorkflowRegistrationsTable {
    */
   siblings_digest: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * The `commit_sha` written together with `lockfile_hash` and `siblings_digest`.
-   * The key is used only while this equals `commit_sha`: a writer that does not
-   * know the key columns moves `commit_sha` without them, and the key it leaves
-   * behind belongs to an older lock file.
-   *
-   * NULL on rows written before migration 151 and on rows registered with no
-   * commit; such a row uses no key.
+   * The `commit_sha` written with `lockfile_hash` and `siblings_digest`; the key is used only
+   * while this equals `commit_sha`, since a writer unaware of the key columns moves
+   * `commit_sha` alone and leaves an older lock file's key. NULL (rows before migration 151 or
+   * registered with no commit) uses no key.
    */
   dep_cache_key_sha: ColumnType<string | null, string | null | undefined, string | null>;
   /** Whether this is a global workflow (triggers across all repos under same routing key) */
   is_global: ColumnType<boolean, boolean | undefined, boolean>;
   /**
-   * Customer/org ID that owns this registration. Backfilled from the source row
-   * (sources or generic_webhook_sources joined on routing_key) by migration 020,
-   * NOT NULL after backfill. Used by the cross-source webhook lookup index
-   * (RegistrationIndex.byOrgAndEvent) to enforce org isolation.
-   *
-   * Required on insert (no DB default — migration 020 enforces NOT NULL);
-   * Updateable type allows omission so the existing replaceAll UPDATE branch
-   * (which preserves the existing customer_id alongside the rest of the row)
-   * can keep its current shape.
+   * Owning org, backfilled by migration 020 from sources / generic_webhook_sources on
+   * routing_key and NOT NULL since. The cross-source lookup index
+   * (RegistrationIndex.byOrgAndEvent) enforces org isolation with it. Required on insert (no DB
+   * default); optional on update because the replaceAll UPDATE branch preserves it.
    */
   customer_id: ColumnType<string, string, string | undefined>;
-  /** When this registration was created */
   created_at: Generated<Date>;
-  /** When this registration was last updated */
   updated_at: Generated<Date>;
 }
 
-// Convenience types for workflow_registrations
 export type WorkflowRegistration = Selectable<WorkflowRegistrationsTable>;
 export type NewWorkflowRegistration = Insertable<WorkflowRegistrationsTable>;
 export type WorkflowRegistrationUpdate = Updateable<WorkflowRegistrationsTable>;
 
 /**
- * Registry versions table
- * Cluster sync version counter. Incremented on registration changes.
- * Default row with id='default' inserted by migration.
+ * Cluster sync version counter, bumped on registration changes. A migration inserts the
+ * id='default' row.
  */
 export interface RegistryVersionsTable {
   /** Version identifier (default: 'default') */
   id: Generated<string>;
   /** Monotonically increasing version counter */
   version: Generated<number>;
-  /** When the version was last bumped */
   updated_at: Generated<Date>;
 }
 
-// Convenience types for registry_versions
 export type RegistryVersion = Selectable<RegistryVersionsTable>;
 export type RegistryVersionUpdate = Updateable<RegistryVersionsTable>;
 
-/**
- * Cron last-fired table
- * Tracks the last time each cron-triggered workflow registration fired.
- * Used for fire-once-on-recovery after orchestrator restart.
- */
+/** Last fire time per cron registration, for fire-once-on-recovery after a restart. */
 export interface CronLastFiredTable {
   /** References workflow_registrations.id (cascade delete) */
   registration_id: string;
   /** Per-schedule identity: `${cronExpression}\n${timezone}` (see scheduleTriggerKey) */
   schedule_key: string;
-  /** When this cron trigger last fired */
   last_fired_at: Date;
-  /** When this record was last updated */
   updated_at: Generated<Date>;
 }
 
-// Convenience types for cron_last_fired
 export type CronLastFired = Selectable<CronLastFiredTable>;
 export type NewCronLastFired = Insertable<CronLastFiredTable>;
 export type CronLastFiredUpdate = Updateable<CronLastFiredTable>;
 
 /**
- * Run ephemeral keys table (run_ephemeral_keys)
- * Stores per-run X25519 key pairs for cross-job secret output encryption.
- * Private keys are encrypted with the orchestrator PSK (AES-256-GCM).
+ * Per-run X25519 key pairs for cross-job secret output encryption. Private keys are encrypted
+ * with the orchestrator master key (`KICI_SECRET_KEY`, AES-256-GCM).
  */
 export interface RunEphemeralKeysTable {
   /** Run ID (primary key, references execution_runs.run_id) */
@@ -1905,23 +1553,17 @@ export interface RunEphemeralKeysTable {
   public_key: string;
   /** Master-key generation this row is sealed under. Bumped by `rotate-key`. */
   key_version: Generated<number>;
-  /** When this key pair was created */
   created_at: Generated<Date>;
 }
 
-// Convenience types for run_ephemeral_keys
 export type RunEphemeralKey = Selectable<RunEphemeralKeysTable>;
 export type NewRunEphemeralKey = Insertable<RunEphemeralKeysTable>;
 
 /**
- * Run secret outputs table (run_secret_outputs)
- * Stores encrypted secret output values produced by jobs for cross-job consumption.
- *
- * The agent seals a value to the run's ephemeral public key (ECDH + AES-256-GCM),
- * but that envelope is not what lands here: the orchestrator opens it with the
- * run private key and RE-ENCRYPTS the plaintext under the master key
- * (`KICI_SECRET_KEY`) before storing. So this is one of the master-key-wrapped
- * stores and moves with every key rotation.
+ * Encrypted job secret outputs for cross-job consumption. The agent seals each value to the
+ * run's ephemeral public key (ECDH + AES-256-GCM); the orchestrator opens it with the run
+ * private key and RE-ENCRYPTS it under the master key (`KICI_SECRET_KEY`) before storing, so
+ * this store moves with every key rotation.
  */
 export interface RunSecretOutputsTable {
   /** UUID primary key */
@@ -1930,34 +1572,25 @@ export interface RunSecretOutputsTable {
   run_id: string;
   /** Job ID that produced this output */
   job_id: string;
-  /** Output key name */
   output_key: string;
   /**
-   * Base64-encoded value, AES-256-GCM sealed under the master key with AAD
-   * `secret-output:<run_id>`. Read through `unsealSecretOutput`, which carries
-   * the rotation grace window's old-key fallback.
+   * Base64 value, AES-256-GCM sealed under the master key with AAD `secret-output:<run_id>`.
+   * Read through `unsealSecretOutput`, which carries the rotation grace window's old-key fallback.
    */
   encrypted_value: string;
   /** Master-key generation this row is sealed under. Bumped by `rotate-key`. */
   key_version: Generated<number>;
-  /** When this output was stored */
   created_at: Generated<Date>;
 }
 
-// Convenience types for run_secret_outputs
 export type RunSecretOutput = Selectable<RunSecretOutputsTable>;
 export type NewRunSecretOutput = Insertable<RunSecretOutputsTable>;
 
 /**
- * Concurrency groups table (concurrency_groups)
- *
- * The arbiter of `concurrency: { group, max }`, not a record of a decision made
- * elsewhere: a slot is acquired by an advisory-locked transaction that counts
- * `status='active'` rows for the scope and inserts only when the count is below
- * `max`. That is what makes the cap hold across a restart and across every
- * coordinator in a cluster, which a per-process map cannot. A partial unique
- * index on `(routing_key, group_key, run_id) WHERE status='active'` makes a
- * re-acquire idempotent.
+ * The arbiter of `concurrency: { group, max }`: an advisory-locked transaction counts
+ * `status='active'` rows for the scope and inserts only below `max`, so the cap holds across
+ * restarts and every coordinator (a per-process map cannot). A partial unique index on
+ * `(routing_key, group_key, run_id) WHERE status='active'` makes a re-acquire idempotent.
  */
 export interface ConcurrencyGroupsTable {
   /** UUID primary key */
@@ -1966,60 +1599,51 @@ export interface ConcurrencyGroupsTable {
   group_key: string;
   /** Run ID that owns this slot or is queued */
   run_id: string;
-  /** Job ID within the run */
   job_id: string;
   /** Routing key for scoping (e.g. "github:42") */
   routing_key: string;
   /** Status: 'active' | 'queued' | 'completed' | 'cancelled' */
   status: Generated<string>;
-  /** When this entry was created */
   created_at: Generated<Date>;
   /** When this entry was completed/cancelled */
   completed_at: Date | null;
 }
 
-// Convenience types for concurrency_groups
 export type ConcurrencyGroup = Selectable<ConcurrencyGroupsTable>;
 export type NewConcurrencyGroup = Insertable<ConcurrencyGroupsTable>;
 export type ConcurrencyGroupUpdate = Updateable<ConcurrencyGroupsTable>;
 
 /**
- * Sources table
- * Stores webhook source configurations (e.g. GitHub Apps) with routing keys.
- * Secrets (private key, webhook secret) are stored separately in PgSecretStore.
+ * Webhook source configs (e.g. GitHub Apps) with routing keys. Secrets (private key, webhook
+ * secret) live separately in PgSecretStore.
  */
 export interface SourcesTable {
   /** UUID primary key */
   id: Generated<string>;
   /** Provider type (e.g. 'github') */
   provider: string;
-  /** Human-readable source name */
   name: string;
   /** Routing key (e.g. 'github:12345') */
   routing_key: string;
   /** JSONB config (non-sensitive, e.g. { appId: '12345' }) */
   config: string;
   /**
-   * GitHub App slug (the URL-safe identifier GitHub assigns, e.g.
-   * `my-kici-app`). NULL until the GitHub identity fetch populates it. GitHub
-   * is the source of truth for both `name` and `slug` on GitHub-App sources.
+   * GitHub App slug (e.g. `my-kici-app`); NULL until the GitHub identity fetch populates it.
+   * GitHub is the source of truth for `name` and `slug` on GitHub-App sources.
    */
   slug: string | null;
   /** Customer/org identifier for secret and context scoping */
   customer_id: Generated<string>;
-  /** When this source was created */
   created_at: Generated<Date>;
-  /** When this source was last updated */
   updated_at: Generated<Date>;
 }
 
-// Convenience types for sources
 export type Source = Selectable<SourcesTable>;
 export type NewSource = Insertable<SourcesTable>;
 export type SourceUpdate = Updateable<SourcesTable>;
 
 /**
- * Repo-pattern entry stored inside the three jsonb list columns of
+ * Repo-pattern entry stored inside the jsonb repo-list columns of
  * `org_settings`. `routingKey` is optional — when undefined the entry
  * applies to any source in the org; when set, it qualifies the entry to
  * one specific webhook source.
@@ -2030,11 +1654,9 @@ export interface OrgSettingsRepoPatternEntry {
 }
 
 /**
- * Org settings table (org_settings)
- * Per-org (customer_id) global workflow permissions. Each list column
- * holds a jsonb array of {routingKey?, pattern} entries — entries without
- * a `routingKey` apply to any source in the org, entries with a routing
- * key are scoped to that source only.
+ * Per-org (customer_id) global workflow permissions and overrides of cluster defaults. Repo
+ * list columns hold `OrgSettingsRepoPatternEntry[]` jsonb. A BIGINT column reads back from pg
+ * as a string and takes a number on write.
  */
 export interface OrgSettingsTable {
   /** Customer/org identifier (primary key) */
@@ -2046,8 +1668,7 @@ export interface OrgSettingsTable {
     OrgSettingsRepoPatternEntry[] | null | string
   >;
   /**
-   * Repos explicitly denied as event sources for global workflows.
-   * Deny takes precedence over the allow-list (null = no deny patterns).
+   * Repos denied as event sources for global workflows; deny beats the allow-list (null = none).
    */
   global_workflow_denied_repos: ColumnType<
     OrgSettingsRepoPatternEntry[] | null,
@@ -2055,25 +1676,20 @@ export interface OrgSettingsTable {
     OrgSettingsRepoPatternEntry[] | null | string
   >;
   /**
-   * When true, workflow `registries:` URLs may use plain `http://` to any host.
-   * When false (default), only `https://` and loopback / `*.local` `http://`
-   * URLs are accepted; arbitrary `http://` registries are rejected at dispatch.
+   * True lets workflow `registries:` URLs use plain `http://` to any host. False (default)
+   * accepts only `https://` and loopback / `*.local` `http://`; others are rejected at dispatch.
    */
   allow_http_npm_registries: ColumnType<boolean, boolean | undefined, boolean>;
   /**
-   * May an UNTRUSTED ref build its job's container image from a Dockerfile?
-   *
-   * Default false. The build runs outside the job's hardened sandbox, so this
-   * is an opt-in, never inherited.
+   * May an UNTRUSTED ref build its job's container image from a Dockerfile? Default false: the
+   * build runs outside the job's hardened sandbox, so this is opt-in, never inherited.
    */
   allow_untrusted_dockerfile_builds: ColumnType<boolean, boolean | undefined, boolean>;
   /**
-   * Per-operation policy controlling which dashboard.* writes the orch
-   * accepts when routed through Platform. JSONB shape:
-   * `{ [operation]: boolean }` where operation matches the engine enum
-   * `DashboardWriteOperation`. Empty object = all enabled (permissive).
-   * Resolver in `@kici-dev/engine/protocol/dashboard-write-operations`
-   * treats missing keys as `true`.
+   * Which Platform-routed dashboard.* writes the orch accepts: JSONB
+   * `{ [operation]: boolean }` keyed by engine `DashboardWriteOperation`. The resolver in
+   * `@kici-dev/engine/protocol/dashboard-write-operations` treats missing keys as `true`, so
+   * `{}` enables all.
    */
   dashboard_write_policy: ColumnType<
     Record<string, boolean>,
@@ -2081,87 +1697,70 @@ export interface OrgSettingsTable {
     Record<string, boolean> | string
   >;
   /**
-   * Per-org byte quota for the user-facing cache (UserCache). NULL = use the
-   * cluster-wide default (`KICI_USER_CACHE_QUOTA_BYTES`, 5 GiB). Postgres
-   * BIGINT — pg returns a string on select; accept a number on insert/update.
+   * UserCache byte quota. NULL = cluster default (`KICI_USER_CACHE_QUOTA_BYTES`, 5 GiB). BIGINT.
    */
   user_cache_quota_bytes: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-entry TTL (ms) for the user-facing cache (UserCache). NULL = use the
-   * cluster-wide default (`KICI_USER_CACHE_TTL_MS`, 7 days). Postgres BIGINT —
-   * pg returns a string on select; accept a number on insert/update.
+   * UserCache per-entry TTL (ms). NULL = cluster default (`KICI_USER_CACHE_TTL_MS`, 7 days).
+   * BIGINT.
    */
   user_cache_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-org byte quota for user-facing artifacts (ArtifactStore). NULL = use the
-   * cluster-wide default (`KICI_ARTIFACT_QUOTA_BYTES`, 20 GiB). Postgres BIGINT —
-   * pg returns a string on select; accept a number on insert/update.
+   * ArtifactStore byte quota. NULL = cluster default (`KICI_ARTIFACT_QUOTA_BYTES`, 20 GiB).
+   * BIGINT.
    */
   artifact_quota_bytes: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-artifact TTL (ms) for user-facing artifacts (ArtifactStore). NULL = use
-   * the cluster-wide default (`KICI_ARTIFACT_TTL_MS`, 30 days). Postgres BIGINT —
-   * pg returns a string on select; accept a number on insert/update.
+   * ArtifactStore per-artifact TTL (ms). NULL = cluster default (`KICI_ARTIFACT_TTL_MS`,
+   * 30 days). BIGINT.
    */
   artifact_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-org per-artifact size cap (bytes) for user-facing artifacts
-   * (ArtifactStore). NULL = use the cluster-wide default
-   * (`KICI_ARTIFACT_MAX_BYTES`, 1 GiB). Postgres BIGINT — pg returns a string on
-   * select; accept a number on insert/update.
+   * ArtifactStore per-artifact size cap (bytes). NULL = cluster default
+   * (`KICI_ARTIFACT_MAX_BYTES`, 1 GiB). BIGINT.
    */
   artifact_max_bytes: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-org per-run artifact count cap for user-facing artifacts
-   * (ArtifactStore). NULL = use the cluster-wide default
-   * (`KICI_ARTIFACT_MAX_PER_RUN`, 50). Postgres BIGINT — pg returns a string on
-   * select; accept a number on insert/update.
+   * ArtifactStore per-run artifact count cap. NULL = cluster default
+   * (`KICI_ARTIFACT_MAX_PER_RUN`, 50). BIGINT.
    */
   artifact_max_per_run: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-org dispatch-acknowledgment deadline (ms); null = cluster default
-   * (config.dispatchAckTimeoutMs / KICI_DISPATCH_ACK_TIMEOUT_MS). Postgres
-   * BIGINT — pg returns a string on select; accept a number on insert/update.
+   * Dispatch-acknowledgment deadline (ms); null = cluster default
+   * (config.dispatchAckTimeoutMs / KICI_DISPATCH_ACK_TIMEOUT_MS). BIGINT.
    */
   dispatch_ack_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-org webhook-ingest concurrency cap; null = cluster default
-   * (config.ingestOrgMaxConcurrency / KICI_INGEST_ORG_MAX_CONCURRENCY). Postgres
-   * BIGINT — pg returns a string on select; accept a number on insert/update.
+   * Webhook-ingest concurrency cap; null = cluster default
+   * (config.ingestOrgMaxConcurrency / KICI_INGEST_ORG_MAX_CONCURRENCY). BIGINT.
    */
   ingest_max_concurrency: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-org scaler spawn deadline (ms) for a single `backend.spawn` (image pull
-   * + container create + start); null = cluster default
-   * (config.scalerSpawnTimeoutMs / KICI_SCALER_SPAWN_TIMEOUT_MS). Postgres
-   * BIGINT — pg returns a string on select; accept a number on insert/update.
+   * Deadline (ms) for one `backend.spawn` (image pull + container create + start); null =
+   * cluster default (config.scalerSpawnTimeoutMs / KICI_SCALER_SPAWN_TIMEOUT_MS). BIGINT.
    */
   scaler_spawn_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-org reroute spawn window (ms): how long the coordinator waits after a
-   * peer ACKs a reroute before treating "accepted but no progress" as a spawn
-   * failure and re-dispatching. Null = cluster default (config.rerouteSpawnWindowMs).
-   * BIGINT — pg returns a string on select; accept a number on insert/update.
+   * Reroute spawn window (ms): how long after a peer ACKs a reroute the coordinator waits
+   * before treating "accepted but no progress" as a spawn failure and re-dispatching. Null =
+   * cluster default (config.rerouteSpawnWindowMs). BIGINT.
    */
   reroute_spawn_window_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-org reroute ACK timeout (ms) for the reroute sendAndWaitAck deadline.
-   * Null = cluster default (config.rerouteAckTimeoutMs). BIGINT.
+   * Reroute sendAndWaitAck deadline (ms). Null = cluster default (config.rerouteAckTimeoutMs).
+   * BIGINT.
    */
   reroute_ack_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
-  /**
-   * Per-org maximum peer hops for a rerouted job. Null = cluster default
-   * (config.rerouteMaxHops). Plain INTEGER — pg returns a number on select.
-   */
+  /** Max peer hops for a rerouted job. Null = cluster default (config.rerouteMaxHops). INTEGER. */
   reroute_max_hops: ColumnType<number | null, number | null | undefined, number | null>;
   /**
-   * Per-org agent spawns a worker attempts for one rerouted job. Null = cluster
-   * default (config.rerouteSpawnMaxAttempts). Plain INTEGER.
+   * Agent spawns a worker attempts for one rerouted job. Null = cluster default
+   * (config.rerouteSpawnMaxAttempts). INTEGER.
    */
   reroute_spawn_max_attempts: ColumnType<number | null, number | null | undefined, number | null>;
   /**
-   * Per-org wait (ms) after a failed spawn of a rerouted job. Null = cluster
-   * default (config.rerouteSpawnRetryBackoffMs). BIGINT.
+   * Wait (ms) after a failed spawn of a rerouted job. Null = cluster default
+   * (config.rerouteSpawnRetryBackoffMs). BIGINT.
    */
   reroute_spawn_retry_backoff_ms: ColumnType<
     string | null,
@@ -2169,23 +1768,20 @@ export interface OrgSettingsTable {
     number | null
   >;
   /**
-   * Per-org staleness threshold (hours) for the DB-backup freshness diagnostic.
-   * Null = cluster default (config.backupStalenessWarnHours). Plain INTEGER.
+   * DB-backup freshness diagnostic threshold (hours). Null = cluster default
+   * (config.backupStalenessWarnHours). INTEGER.
    */
   backup_staleness_warn_hours: ColumnType<number | null, number | null | undefined, number | null>;
   /**
-   * Per-org dispatch-queue job timeout (ms). A queued job's deadline is
+   * Dispatch-queue job timeout (ms): a queued job's deadline is
    * `job.timeoutMs ?? <this> ?? config.queueTimeoutMs`. Null = cluster default
-   * (config.queueTimeoutMs / KICI_QUEUE_TIMEOUT_MS). Postgres BIGINT — pg
-   * returns a string on select; accept a number on insert/update.
+   * (config.queueTimeoutMs / KICI_QUEUE_TIMEOUT_MS). BIGINT.
    */
   queue_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Per-org bound (ms) on how long a build job's success waits for the cache
-   * publish its agent reported just before it. 0 turns the wait off. Null =
-   * cluster default (config.cacheUploadSettleTimeoutMs /
-   * KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS). Postgres BIGINT — pg returns a string
-   * on select; accept a number on insert/update.
+   * Bound (ms) on how long a build job's success waits for the cache publish its agent
+   * reported just before; 0 turns the wait off. Null = cluster default
+   * (config.cacheUploadSettleTimeoutMs / KICI_CACHE_UPLOAD_SETTLE_TIMEOUT_MS). BIGINT.
    */
   cache_upload_settle_timeout_ms: ColumnType<
     string | null,
@@ -2193,20 +1789,18 @@ export interface OrgSettingsTable {
     number | null
   >;
   /**
-   * Per-org expiry (seconds) for a held approval element before it is rejected
-   * and its run/job/step fails. NOT NULL, default 86400 (one day). An SDK
-   * `requireApproval` `timeout` overrides this per element.
+   * Seconds before a held approval element is rejected and its run/job/step fails. NOT NULL,
+   * default 86400 (one day); an SDK `requireApproval` `timeout` overrides it per element.
    */
   approval_expiry_seconds: ColumnType<number, number | undefined, number>;
   /**
-   * Whether the user who triggered a run may also approve its held elements.
-   * NOT NULL, default true. Operators turn it off to enforce four-eyes review.
+   * Whether a run's triggering user may approve its held elements. NOT NULL, default true;
+   * turn it off to enforce four-eyes review.
    */
   allow_self_approval: ColumnType<boolean, boolean | undefined, boolean>;
   /**
-   * Container-sandbox escape-hatch allow-list: the Linux capabilities a workflow
-   * may request via the SDK `sandbox: { capabilities }` field. NULL / absent
-   * reads as `[]` (deny every capability request). Postgres TEXT[].
+   * Sandbox escape-hatch allow-list: Linux capabilities a workflow may request via SDK
+   * `sandbox: { capabilities }`. NULL reads as `[]` (deny every request). TEXT[].
    */
   sandbox_allowed_capabilities: ColumnType<
     string[] | null,
@@ -2214,36 +1808,27 @@ export interface OrgSettingsTable {
     string[] | null
   >;
   /**
-   * Container-sandbox escape-hatch allow-list: whether a workflow may request
-   * `sandbox: { network: 'host' }`. NULL / absent reads as `false` (deny host
-   * networking). Postgres BOOLEAN.
+   * Sandbox escape-hatch: whether a workflow may request `sandbox: { network: 'host' }`. NULL
+   * reads as `false` (deny host networking).
    */
   sandbox_allow_host_network: ColumnType<
     boolean | null,
     boolean | null | undefined,
     boolean | null
   >;
-  /** When this setting was created */
   created_at: Generated<Date>;
-  /** When this setting was last updated */
   updated_at: Generated<Date>;
 }
 
-// Convenience types for org_settings
 export type OrgSettings = Selectable<OrgSettingsTable>;
 export type NewOrgSettings = Insertable<OrgSettingsTable>;
 export type OrgSettingsUpdate = Updateable<OrgSettingsTable>;
 
 /**
- * Org trust policy (org_trust_policy) — the orchestrator's cache of the
- * Platform-owned per-org trust policy delivered on `trust_policy.update`.
- * Distinct from `org_settings`, which holds operator-owned config: the operator
- * tunes org_settings, the Platform owns this. `source` records which of the two
- * wrote the row.
- *
- * The policy column is plain `string`, not the Zod enum that names the known
- * vocabulary — same reasoning as `held_runs.hold_type`: a value written by a
- * newer Platform must still be readable rather than failing the row.
+ * The orchestrator's cache of the Platform-owned per-org trust policy from
+ * `trust_policy.update`; `org_settings` is the operator-owned counterpart. The policy column is
+ * a plain `string`, not the Zod enum, so a value from a newer Platform stays readable (as with
+ * `held_runs.hold_type`).
  */
 export interface OrgTrustPolicyTable {
   /** Customer/org identifier (primary key) */
@@ -2254,29 +1839,21 @@ export interface OrgTrustPolicyTable {
   approval_expiry_seconds: number;
   /** Which side last wrote this row: platform | local */
   source: string;
-  /** When this policy was last written */
   updated_at: ColumnType<Date, Date | undefined, Date>;
 }
 
-// Convenience types for org_trust_policy
 export type OrgTrustPolicy = Selectable<OrgTrustPolicyTable>;
 export type NewOrgTrustPolicy = Insertable<OrgTrustPolicyTable>;
 export type OrgTrustPolicyUpdate = Updateable<OrgTrustPolicyTable>;
 
 /**
- * Org trust directory (org_trust_directory) — the approval directory
- * `/kici approve` resolves a commenter against: identity links, per-member CI
- * trust levels, and team memberships. Sibling of `org_trust_policy`, same
- * ownership shape: wherever a Platform is attached it pushes this next to the
- * policy on `trust_policy.update` and the orchestrator only reads it back, so
- * approvals survive a restart. On an independent orchestrator there is no
- * Platform, so the operator writes it through
- * `kici-admin trust-policy directory-set` instead.
- *
- * The three JSONB columns are `unknown` on the select side because the pg
- * driver hands back whatever JSON the column holds; `TrustDirectoryStore`
- * validates each one against the wire schema before returning it. Inserts are
- * `JSON.stringify`d strings, matching every other JSONB column here.
+ * The approval directory `/kici approve` resolves a commenter against: identity links, per-member
+ * CI trust levels and team memberships. With a Platform attached, it pushes this beside the
+ * policy on `trust_policy.update` and the orchestrator only reads it back, so approvals survive
+ * a restart; an independent orchestrator's operator writes it with
+ * `kici-admin trust-policy directory-set`. JSONB columns select as `unknown` because pg returns
+ * whatever JSON is stored; `TrustDirectoryStore` validates each against the wire schema.
+ * Inserts are `JSON.stringify`d strings.
  */
 export interface OrgTrustDirectoryTable {
   /** Customer/org identifier (primary key) */
@@ -2287,24 +1864,19 @@ export interface OrgTrustDirectoryTable {
   member_ci_trust: ColumnType<unknown, string, string>;
   /** JSONB array of `{ teamName, memberUserIds }` entries */
   team_memberships: ColumnType<unknown, string, string>;
-  /** When this directory was last written */
   updated_at: ColumnType<Date, Date | undefined, Date>;
 }
 
-// Convenience types for org_trust_directory
 export type OrgTrustDirectory = Selectable<OrgTrustDirectoryTable>;
 export type NewOrgTrustDirectory = Insertable<OrgTrustDirectoryTable>;
 export type OrgTrustDirectoryUpdate = Updateable<OrgTrustDirectoryTable>;
 
 /**
- * Org plan headroom (org_plan_headroom) — the orchestrator's cache of the
- * Platform-owned worker ceiling pushed on `plan.headroom`. Single row
- * (id='default'), because the orchestrator serves exactly one org. Same
- * ownership shape as org_trust_policy: the Platform writes it, the orchestrator
- * only reads it back, so it survives a Platform outage + a coordinator restart.
+ * Cache of the Platform-owned worker ceiling pushed on `plan.headroom`. Single row
+ * (id='default'): the orchestrator serves exactly one org. The Platform writes it and the
+ * orchestrator only reads it back, so it survives a Platform outage plus a coordinator restart.
  */
 export interface OrgPlanHeadroomTable {
-  /** Single-row sentinel id, always 'default'. */
   id: string;
   /** Absolute ceiling on this coordinator's connected worker peers. */
   max_worker_peers: number;
@@ -2314,24 +1886,19 @@ export interface OrgPlanHeadroomTable {
   org_total: number;
   /** Whether the Platform asked the coordinator to drain its excess workers. */
   evict_excess: boolean;
-  /** When this ceiling was last written. */
   updated_at: ColumnType<Date, Date, Date>;
 }
 
 /**
- * Cluster-global settings (cluster_settings) — a single row (id='default') of
- * fleet-wide operator tunables. Each knob is nullable; NULL = use the cluster
- * default from config.ts. Read via ClusterSettingsReader. Distinct from
- * org_settings (per customer_id) — these knobs have no per-tenant meaning.
- * Byte-valued knobs are Postgres BIGINT (pg returns a string on select); count
- * / seconds knobs are INTEGER (pg returns a number).
+ * Single row (id='default') of fleet-wide operator tunables with no per-tenant meaning, read via
+ * ClusterSettingsReader. Each knob is nullable; NULL = the config.ts default. A BIGINT knob (every
+ * byte-valued knob, and some counts) reads back as a string; an INTEGER knob as a number.
  */
 export interface ClusterSettingsTable {
   /**
-   * Database-side retention windows, in days. NULL means the orchestrator's
-   * configured default; 0 disables that window. These prune the warm tables
-   * directly, for the installs that run no object store — with the cold store
-   * on, the archivers keep sole ownership of the tables they register.
+   * Database-side retention windows in days; 0 disables one. They prune the warm tables for
+   * installs with no object store; with the cold store on, the archivers keep sole ownership
+   * of the tables they register.
    */
   run_retention_days: number | null;
   audit_retention_days: number | null;
@@ -2367,66 +1934,59 @@ export interface ClusterSettingsTable {
   >;
   cache_max_tarball_bytes: ColumnType<string | null, number | null | undefined, number | null>;
   cache_ttl_days: ColumnType<number | null, number | null | undefined, number | null>;
-  /** LRU entry ceiling for the lock-file cache. NULL ⇒ the configured default. Applies at next restart. */
+  /** LRU entry ceiling for the lock-file cache. Applies at next restart. */
   lockfile_cache_max: ColumnType<string | null, number | null | undefined, number | null>;
-  /** Byte ceiling for the lock-file cache. NULL ⇒ the configured default. Applies at next restart. */
+  /** Byte ceiling for the lock-file cache. Applies at next restart. */
   lockfile_cache_max_bytes: ColumnType<string | null, number | null | undefined, number | null>;
-  /** Entry TTL (ms) for the lock-file cache. NULL ⇒ the configured default. Applies at next restart. */
+  /** Entry TTL (ms) for the lock-file cache. Applies at next restart. */
   lockfile_cache_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
-  /** LRU entry ceiling for the Tier-1 content cache. NULL ⇒ the configured default. Applies at next restart. */
+  /** LRU entry ceiling for the Tier-1 content cache. Applies at next restart. */
   content_cache_max: ColumnType<string | null, number | null | undefined, number | null>;
-  /** Byte ceiling for the Tier-1 content cache. NULL ⇒ the configured default. Applies at next restart. */
+  /** Byte ceiling for the Tier-1 content cache. Applies at next restart. */
   content_cache_max_bytes: ColumnType<string | null, number | null | undefined, number | null>;
-  /** Entry TTL (ms) for the Tier-1 content cache. NULL ⇒ the configured default. Applies at next restart. */
+  /** Entry TTL (ms) for the Tier-1 content cache. Applies at next restart. */
   content_cache_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
-  /** Wall-clock budget (ms) for a whole Tier-2 global eval round. NULL ⇒ the configured default. Read per round. */
+  /** Wall-clock budget (ms) for a whole Tier-2 global eval round. Read per round. */
   global_eval_round_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
-  /** Wall-clock budget (ms) for one candidate inside a round. NULL ⇒ the configured default. Read per round. */
+  /** Wall-clock budget (ms) for one candidate inside a round. Read per round. */
   global_eval_candidate_timeout_ms: ColumnType<
     string | null,
     number | null | undefined,
     number | null
   >;
-  /** LRU entry ceiling for the round-result cache. NULL ⇒ the configured default. Applies at next restart. */
+  /** LRU entry ceiling for the round-result cache. Applies at next restart. */
   global_eval_cache_max: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * Orchestrator-side ceiling (ms) on waiting for one eval round to settle.
-   * Distinct from the two budgets above, which the agent enforces on itself: a
-   * round that never reaches an agent — or an agent that wedges before its own
-   * budget starts — is only bounded here. NULL ⇒ the configured default. Read
-   * per round.
+   * Orchestrator-side ceiling (ms) on waiting for one eval round to settle. The round and
+   * candidate budgets are agent-enforced, so a round that never reaches an agent, or an agent
+   * that wedges before its budget starts, is bounded only here. Read per round.
    */
   global_eval_wait_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
-  /** How long a Firecracker spawn waits for the VM's API socket. NULL: config default. */
+  /** How long a Firecracker spawn waits for the VM's API socket. */
   firecracker_api_socket_wait_ms: ColumnType<
     string | null,
     number | null | undefined,
     number | null
   >;
   /**
-   * Retention window in days for `check_run_tracking` rows. The hourly cleanup
-   * sweep deletes rows untouched for longer than this; 0 disables the sweep.
-   * NULL ⇒ the orchestrator's configured default.
+   * Retention in days for `check_run_tracking`: the hourly cleanup deletes rows untouched for
+   * longer; 0 disables the sweep.
    */
   check_run_tracking_ttl_days: ColumnType<number | null, number | null | undefined, number | null>;
   /**
-   * Grace window (ms) a job may stay continuously unroutable before it is
-   * terminalized as `unroutable`. NULL = the orchestrator's configured default;
+   * Grace (ms) a job may stay continuously unroutable before it terminalizes as `unroutable`;
    * 0 disables fast-fail, leaving `queue_timeout_ms` as the only backstop.
    */
   unroutable_grace_ms: ColumnType<number | null, number | null | undefined, number | null>;
   /**
-   * Fleet-wide master switch for global workflows. NULL ⇒ the orchestrator's
-   * configured default (`KICI_GLOBAL_WORKFLOWS_ENABLED`, default false). Read
-   * per policy decision through `ClusterSettingsReader.tryGetBoolean`, which
-   * reports an unreadable row separately so the gate can fail closed.
+   * Fleet-wide master switch for global workflows (default `KICI_GLOBAL_WORKFLOWS_ENABLED`,
+   * false). Read per policy decision via `ClusterSettingsReader.tryGetBoolean`, which reports
+   * an unreadable row separately so the gate fails closed.
    */
   global_workflows_enabled: ColumnType<boolean | null, boolean | null | undefined, boolean | null>;
   /**
-   * How long a `replaying` claim on `ingest_overflow_buffer` may stand before
-   * the drain pass reclaims the row for another worker. NULL ⇒ the
-   * orchestrator's configured default. Must exceed the longest a single
-   * delivery's pipeline can legitimately run.
+   * How long a `replaying` claim on `ingest_overflow_buffer` stands before the drain pass
+   * reclaims the row. Must exceed the longest legitimate single-delivery pipeline run.
    */
   ingest_overflow_claim_timeout_ms: ColumnType<
     number | null,
@@ -2436,17 +1996,14 @@ export interface ClusterSettingsTable {
   concurrency_wait_timeout_ms: ColumnType<string | null, number | null | undefined, number | null>;
   agent_token_ttl_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * How often the leader sweeps for stranded event-scaler provisions. Re-read
-   * at the end of every sweep, so a change reschedules the timer on the next
-   * tick rather than waiting for a leadership transition. NULL ⇒ the
-   * orchestrator's configured default.
+   * How often the leader sweeps for stranded event-scaler provisions. Re-read after every
+   * sweep, so a change reschedules on the next tick, not at a leadership transition.
    */
   scaler_reap_interval_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * How long an adopted event-scaler provision whose agent is registered on no
-   * coordinator may sit before it is torn down. Set it well above the peer
-   * heartbeat period: the "registered nowhere" signal is partly heartbeat
-   * derived. NULL ⇒ the orchestrator's configured default. Read per sweep.
+   * How long an adopted event-scaler provision whose agent is registered nowhere may sit
+   * before teardown. Keep it well above the peer heartbeat period: "registered nowhere" is
+   * partly heartbeat-derived. Read per sweep.
    */
   scaler_reap_stranded_timeout_ms: ColumnType<
     string | null,
@@ -2454,9 +2011,8 @@ export interface ClusterSettingsTable {
     number | null
   >;
   /**
-   * How long before the reaper retries a provision whose previous teardown left
-   * the row in place. NULL ⇒ the orchestrator's configured default. Read per
-   * sweep.
+   * How long before the reaper retries a provision whose last teardown left the row in place.
+   * Read per sweep.
    */
   scaler_reap_reattempt_interval_ms: ColumnType<
     string | null,
@@ -2464,17 +2020,15 @@ export interface ClusterSettingsTable {
     number | null
   >;
   /**
-   * How long an expired scaler provisioning claim is kept before the reaper's
-   * sweep deletes it. An expired claim can never be redeemed, so this only
-   * controls how long a late redeemer is told "expired" rather than "unknown
-   * code". NULL ⇒ the orchestrator's configured default. Read per sweep.
+   * How long the reaper keeps an expired provisioning claim. It is never redeemable, so this
+   * only sets how long a late redeemer hears "expired" instead of "unknown code". Read per
+   * sweep.
    */
   scaler_claim_retention_ms: ColumnType<string | null, number | null | undefined, number | null>;
   /**
-   * First deferral applied to an external (event) scaler after one consecutive
-   * provisioning failure. Each further consecutive failure doubles it, up to
-   * `scaler_provision_backoff_max_ms`. NULL ⇒ the orchestrator's configured
-   * default. Read per spawn request.
+   * First deferral for an external (event) scaler after one provisioning failure; each further
+   * consecutive failure doubles it, up to `scaler_provision_backoff_max_ms`. Read per spawn
+   * request.
    */
   scaler_provision_backoff_base_ms: ColumnType<
     string | null,
@@ -2482,9 +2036,8 @@ export interface ClusterSettingsTable {
     number | null
   >;
   /**
-   * Ceiling on the doubling above, so a long provider outage settles into a
-   * steady retry cadence instead of growing without bound. NULL ⇒ the
-   * orchestrator's configured default. Read per spawn request.
+   * Ceiling on that doubling, so a long provider outage settles into a steady retry cadence.
+   * Read per spawn request.
    */
   scaler_provision_backoff_max_ms: ColumnType<
     string | null,
@@ -2492,9 +2045,8 @@ export interface ClusterSettingsTable {
     number | null
   >;
   /**
-   * How many consecutive provisioning failures a scaler may record before its
-   * refusals name repeated failure as the cause rather than a single timeout.
-   * NULL ⇒ the orchestrator's configured default. Read per spawn request.
+   * Consecutive provisioning failures before a scaler's refusals name repeated failure, not a
+   * single timeout, as the cause. Read per spawn request.
    */
   scaler_provision_max_consecutive_failures: ColumnType<
     string | null,
@@ -2502,9 +2054,8 @@ export interface ClusterSettingsTable {
     number | null
   >;
   /**
-   * Deadline for one database-backed agent-ownership lookup. Past it the lookup
-   * resolves as undecided and the frame is refused without counting a
-   * violation. NULL ⇒ the orchestrator's configured default.
+   * Deadline for one DB-backed agent-ownership lookup; past it the lookup is undecided and the
+   * frame is refused without counting a violation.
    */
   ownership_db_check_timeout_ms: ColumnType<
     string | null,
@@ -2512,9 +2063,8 @@ export interface ClusterSettingsTable {
     number | null
   >;
   /**
-   * How long a coordinator leaves a queued job alone after it could not open the
-   * job's sealed secrets, before claiming it again. NULL ⇒ the orchestrator's
-   * configured default.
+   * How long a coordinator leaves a queued job alone after failing to open its sealed secrets
+   * before claiming it again.
    */
   sealed_secrets_retry_backoff_ms: ColumnType<
     string | null,
@@ -2522,10 +2072,9 @@ export interface ClusterSettingsTable {
     number | null
   >;
   /**
-   * Verified-tier origin the dashboard fetches the orchestrator's X25519
-   * dashboard-encryption public key from (and always displays) under the
-   * `encrypted` dashboard-write posture. The tier is explicit opt-in: NULL ⇒ it
-   * is not offered and the convenient tier is used.
+   * Verified-tier origin the dashboard fetches (and always displays) the orchestrator's X25519
+   * dashboard-encryption public key from, under the `encrypted` write posture. Explicit opt-in:
+   * NULL means the tier is not offered and the convenient tier is used.
    */
   dashboard_verified_issuer: ColumnType<string | null, string | null | undefined, string | null>;
   /** Monotonic settings version; bumped on each real settings change, advertised to workers. */
@@ -2534,95 +2083,67 @@ export interface ClusterSettingsTable {
   updated_at: Generated<Date>;
 }
 
-// Convenience types for cluster_settings
 export type ClusterSettings = Selectable<ClusterSettingsTable>;
 export type NewClusterSettings = Insertable<ClusterSettingsTable>;
 export type ClusterSettingsUpdate = Updateable<ClusterSettingsTable>;
 
 /**
- * Pending job contexts table
- * Persists PendingJobContext for crash-recovery of needs-gated jobs.
- * Keyed by (run_id, job_name) matching the in-memory Map key format.
- * Rows are created at storePendingJobContext time, deleted on consume or run completion.
+ * Persisted PendingJobContext for crash recovery of needs-gated jobs, keyed by (run_id,
+ * job_name) like the in-memory Map. Created by storePendingJobContext, deleted on consume or
+ * run completion.
  */
 export interface PendingJobContextsTable {
-  /** Run identifier */
   run_id: string;
-  /** Job name within the workflow */
   job_name: string;
   /** Full QueuedJobInput serialized as JSONB */
   job_input: ColumnType<Record<string, unknown>, string, string>;
   /** string[] of labels serialized as JSONB */
   runs_on_labels: ColumnType<string[], string, string>;
   /**
-   * For an invoke-gate job, its invoke parameters (event, payload, optional,
-   * maxParallel, failFast) serialized as JSON. Non-null marks this pending
-   * context as a gate: when released it summons the source repo's subscribers
-   * instead of dispatching to an agent. NULL for every ordinary job.
+   * An invoke-gate job's parameters (event, payload, optional, maxParallel, failFast) as JSON.
+   * Non-null marks a gate: on release it summons the source repo's subscribers instead of
+   * dispatching to an agent. NULL for every ordinary job.
    */
   invoke_config: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * For a job bound to a context, what the dispatch of the stored job resolves
-   * the job's context variables and secrets from (context names, org, routing
-   * key, host facts, registry-auth inputs) as JSONB. Never a secret value. NULL
-   * for a job with no bound context, and for a row stored before the column
-   * existed, whose `job_input` still carries its resolved context data.
+   * JSONB inputs the stored job's dispatch resolves context variables and secrets from (context
+   * names, org, routing key, host facts, registry-auth inputs); never a secret value. NULL for a
+   * job with no bound context and for a pre-column row, whose `job_input` carries the resolved
+   * context data.
    */
   context_resolution: ColumnType<
     DeferredContextResolution | null,
     string | null | undefined,
     string | null
   >;
-  /**
-   * The secret fields of the stored job, AES-256-GCM encrypted under the
-   * orchestrator master key (`secrets/job-secret-seal.ts`). NULL when there is
-   * nothing to seal, when no master key is configured, and on a row written
-   * before the column existed: those rows keep the fields in the plain column.
-   */
+  /** Sealed secret fields; same contract as `dispatch_queue.sealed_secrets`. */
   sealed_secrets: ColumnType<string | null, string | null | undefined, string | null>;
-  /** When this context was stored */
   created_at: Generated<Date>;
 }
 
-// Convenience types for pending_job_contexts
 export type PendingJobContextRow = Selectable<PendingJobContextsTable>;
 export type NewPendingJobContext = Insertable<PendingJobContextsTable>;
 
 /**
- * Pending workflow dispatch contexts table.
- * Persists the serializable WorkflowDispatchContext inputs needed to resume a
- * workflow whose install gate held. One row per held run (keyed by run_id).
- * Created at hold time, deleted once the resume dispatch is kicked off.
+ * Serializable WorkflowDispatchContext inputs to resume a workflow whose install gate held. One
+ * row per held run, created at hold time and deleted once the resume dispatch starts.
  */
 export interface PendingWorkflowContextsTable {
-  /** Run identifier (one pending dispatch per run) */
   run_id: string;
-  /** Organization id */
   org_id: string;
   /** Serializable WorkflowDispatchContext inputs as JSONB */
   context: ColumnType<Record<string, unknown>, string, string>;
-  /**
-   * The secret fields of the stored job, AES-256-GCM encrypted under the
-   * orchestrator master key (`secrets/job-secret-seal.ts`). NULL when there is
-   * nothing to seal, when no master key is configured, and on a row written
-   * before the column existed: those rows keep the fields in the plain column.
-   */
+  /** Sealed secret fields; same contract as `dispatch_queue.sealed_secrets`. */
   sealed_secrets: ColumnType<string | null, string | null | undefined, string | null>;
-  /** When this context was stored */
   created_at: Generated<Date>;
 }
 export type PendingWorkflowContextRow = Selectable<PendingWorkflowContextsTable>;
 export type NewPendingWorkflowContext = Insertable<PendingWorkflowContextsTable>;
 
 /**
- * Inbound webhook delivery event log table.
- * One row per inbound webhook delivery (relay or direct), regardless of
- * outcome. Joins with the Platform-side `event_log` on `(org_id, delivery_id)`.
- *
- * Payload bytes live in object storage (LogStorage) at `payload_key`. When
- * `payload_omitted=true`, the payload was not stored (size cap or upload
- * failure) -- the metadata + hash + size are still durable for correlation.
- *
+ * One row per inbound webhook delivery (relay or direct), whatever the outcome; joins the
+ * Platform-side `event_log` on `(org_id, delivery_id)`. Payload bytes live in LogStorage at
+ * `payload_key`; an omitted payload still keeps metadata, hash and size for correlation.
  * Retention: 30 days, cleaned by queue/cleanup.ts.
  */
 export interface EventLogTable {
@@ -2664,7 +2185,6 @@ export interface EventLogTable {
   run_id: string | null;
   /** Failure reason when status='failed' */
   error_message: string | null;
-  /** When the delivery was received */
   received_at: Generated<Date>;
   /** Cold-store: set inside the archive transaction; NULL for hot rows. */
   archived_at: Date | null;
@@ -2672,17 +2192,14 @@ export interface EventLogTable {
   archive_object_key: string | null;
 }
 
-// Convenience types for event_log
 export type EventLogRow = Selectable<EventLogTable>;
 export type NewEventLogRow = Insertable<EventLogTable>;
 export type EventLogRowUpdate = Updateable<EventLogTable>;
 
 /**
- * Cold-store chunk counts table (cold_store_chunk_counts).
- * Tracks per-(db, table, tenant) archived-chunk metadata so the
- * `cold_store_chunks_total` gauge and the `kici-admin cold-store list-chunks`
- * CLI can report totals without S3 LIST calls. The cold-store archiver
- * populates it transactionally on each chunk write.
+ * Per-(db, table, tenant) archived-chunk totals, so the `cold_store_chunks_total` gauge and
+ * `kici-admin cold-store list-chunks` need no S3 LIST. The archiver updates it transactionally
+ * on each chunk write.
  */
 export interface ColdStoreChunkCountsTable {
   /** DbKind identifier ('orchestrator' on this side). */
@@ -2701,19 +2218,14 @@ export interface ColdStoreChunkCountsTable {
   last_archived_at: Date | null;
 }
 
-// Convenience types for cold_store_chunk_counts
 export type ColdStoreChunkCountsRow = Selectable<ColdStoreChunkCountsTable>;
 export type NewColdStoreChunkCountsRow = Insertable<ColdStoreChunkCountsTable>;
 export type ColdStoreChunkCountsUpdate = Updateable<ColdStoreChunkCountsTable>;
 
 /**
- * Cold-store chunk index (cold_store_chunks).
- *
- * One row per archived chunk that the GC sweep can later purge from S3.
- * Inserted inside `markArchivedAndDelete`'s transaction by adapters that
- * opt into the per-bucket layout via `coldTtlDays(row)`. V1
- * chunks are NOT in this table — they're treated as
- * `'forever'` and never purged.
+ * One row per archived chunk the GC sweep can later purge from S3, inserted in
+ * `markArchivedAndDelete`'s transaction by adapters that opt into the per-bucket layout via
+ * `coldTtlDays(row)`. V1 chunks are NOT here: they count as `'forever'` and are never purged.
  */
 export interface ColdStoreChunksTable {
   /** DbKind identifier ('orchestrator' on this side). */
@@ -2732,110 +2244,84 @@ export interface ColdStoreChunksTable {
   archived_at: Generated<Date>;
   /** Compressed size of the data chunk (bytes). */
   gzip_bytes: ColumnType<string, string | number, string | number>;
-  /** Number of rows in the chunk. */
   row_count: ColumnType<string, string | number, string | number>;
   /**
-   * Row-level cold-retention horizon — TEXT to accommodate both numeric
-   * day-counts and the literal `'forever'`. The GC sweep checks
-   * `max_cold_days != 'forever' AND now() > archived_at + max_cold_days
-   * * INTERVAL '1 day'`.
+   * Row-level cold-retention horizon: TEXT holding a day count or the literal `'forever'`. The
+   * GC sweep checks
+   * `max_cold_days != 'forever' AND now() > archived_at + max_cold_days * INTERVAL '1 day'`.
    */
   max_cold_days: string;
   /** Full S3 key of the data chunk (used by the GC sweep's DeleteObject). */
   object_key: string;
 }
 
-// Convenience types for cold_store_chunks
 export type ColdStoreChunksRow = Selectable<ColdStoreChunksTable>;
 export type NewColdStoreChunksRow = Insertable<ColdStoreChunksTable>;
 export type ColdStoreChunksUpdate = Updateable<ColdStoreChunksTable>;
 
 /**
- * Check-run tracking table (check_run_tracking).
- *
- * HA-safe persistence for the per-coord state previously held in
- * `CheckRunReporter`'s six in-memory `Map`s. Replacement coord on a
- * Raft leader switch reads this table to recover check-run IDs, build
- * creation state, step-progress entries, in-progress-sent timestamps, and
- * the run-id reverse index used for cleanup. A coord crash mid-check-run
- * no longer leaves a GitHub check stuck in `queued` forever.
+ * HA-safe `CheckRunReporter` state: a replacement coord after a Raft leader switch recovers
+ * check-run IDs, build creation state, step progress, in-progress-sent timestamps and the run-id
+ * cleanup index from here, so a coord crash mid-check-run cannot leave a GitHub check stuck in
+ * `queued`.
  */
 export interface CheckRunTrackingTable {
   /** Provider type (e.g. 'github'). */
   provider: string;
   /** Repo owner / namespace. */
   owner: string;
-  /** Repo name. */
   repo: string;
   /** Git commit SHA the check run is anchored to. */
   sha: string;
   /** Check-run name (e.g. 'kici/build', 'kici/build/job/test', 'kici/build/setup'). */
   check_name: string;
   /**
-   * GitHub Checks API check-run ID. Populated by `checks.create()`; nullable
-   * during the in-flight build-creation window (`build_creation_state =
-   * 'pending'` before the create finishes).
+   * GitHub Checks API check-run ID from `checks.create()`; null while the build create is in
+   * flight (`build_creation_state = 'pending'`).
    */
   check_run_id: ColumnType<number | null, number | null | undefined, number | null>;
   /**
-   * Build check-run creation state: 'pending' while a `setBuildPending`
-   * create is in flight, 'completed' once `setBuildComplete` has reconciled.
-   * Replaces the in-memory `pendingBuildCreations` Promise map.
+   * Build check-run creation state: 'pending' while a `setBuildPending` create is in flight,
+   * 'completed' once `setBuildComplete` has reconciled.
    */
   build_creation_state: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * Step-progress entries as JSONB array. Each entry shape is
-   * `{ name: string, status: string, durationMs?: number }`. Replaces the
-   * in-memory `stepProgress` map.
+   * JSONB array of `{ name: string, status: string, durationMs?: number }` step-progress entries.
    */
   step_progress_json: ColumnType<unknown, string | unknown, string | unknown>;
   /**
-   * Timestamp the first in-progress transition was sent to GitHub. NULL
-   * before the first running step. Replaces the in-memory `inProgressSent`
-   * boolean map (presence-as-truth).
+   * When the first in-progress transition was sent to GitHub; NULL before the first running
+   * step. Presence is the truth value.
    */
   in_progress_sent_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
   /**
-   * When the terminal (`completed`) check-run update was accepted by the
-   * provider. NULL means we have no record of sending it — either it never
-   * happened, or the best-effort write failed. Never treat NULL as proof the
-   * update failed.
-   *
-   * `check_run_id` is written at create time, while the check run is still
-   * `queued`, so it proves creation and never completion. This column is the
-   * completion signal.
+   * When the provider accepted the terminal (`completed`) update: the completion signal, since
+   * `check_run_id` is written while still `queued` and proves only creation. NULL means no
+   * record of sending (never sent, or the best-effort write failed), never proof it failed.
    */
   terminal_sent_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
   /**
-   * KiCI run identifier this check-run belongs to, written at create time.
-   * Indexed (partial, NOT NULL) so a per-run lookup never scans the table.
-   * It is an attribution key, not a retention key — rows are reclaimed by
-   * the `updated_at`-age sweep, which deliberately ignores this column.
+   * Owning KiCI run, written at create time; partial NOT NULL index so a per-run lookup never
+   * scans. An attribution key, not a retention key: the `updated_at`-age sweep reclaims rows and
+   * deliberately ignores it.
    */
   run_id: ColumnType<string | null, string | null | undefined, string | null>;
-  /** When this row was first inserted. */
   created_at: Generated<Date>;
-  /** When this row was last updated. */
   updated_at: Generated<Date>;
 }
 
-// Convenience types for check_run_tracking
 export type CheckRunTrackingRow = Selectable<CheckRunTrackingTable>;
 export type NewCheckRunTrackingRow = Insertable<CheckRunTrackingTable>;
 export type CheckRunTrackingUpdate = Updateable<CheckRunTrackingTable>;
 
 /**
- * Build-provenance attestation table.
- *
- * One row per `ctx.attestProvenance` bundle uploaded to object storage. The
- * dashboard lists/fetches attestations by `(run_id, job_id)`.
+ * One row per `ctx.attestProvenance` bundle in object storage; the dashboard lists and fetches
+ * them by `(run_id, job_id)`.
  */
 export interface AttestationsTable {
   /** Random id (primary key). */
   id: string;
-  /** KiCI run this attestation belongs to. */
   run_id: string;
-  /** KiCI job this attestation was produced by. */
   job_id: string;
   /** Caller-supplied artifact name (e.g. an npm package coordinate). */
   subject_name: string;
@@ -2845,14 +2331,11 @@ export interface AttestationsTable {
   storage_key: string;
   /** Signing mode ('kici' for Mode A). */
   mode: string;
-  /** Bundle media type. */
   media_type: string;
-  /** When this row was inserted. */
   created_at: Generated<Date>;
   /**
-   * Server-side verification verdict computed at ingest. One of
-   * `verified` / `failed` / `unverifiable` / `pending`
-   * (`attestationVerifyStatusSchema.enum.*`). DB default is `pending`.
+   * Ingest-time server-side verdict: `verified` / `failed` / `unverifiable` / `pending`
+   * (`attestationVerifyStatusSchema.enum.*`); DB default `pending`.
    */
   verify_status: Generated<string>;
   /** First failure code from `verifyKiciBundle`, or NULL when verified/pending. */
@@ -2861,7 +2344,6 @@ export interface AttestationsTable {
   verified_at: Date | null;
 }
 
-// Convenience types for attestations
 export type AttestationRow = Selectable<AttestationsTable>;
 export type NewAttestationRow = Insertable<AttestationsTable>;
 
@@ -2900,10 +2382,9 @@ export type OrchestratorSigningKeyRow = Selectable<OrchestratorSigningKeysTable>
 export type NewOrchestratorSigningKeyRow = Insertable<OrchestratorSigningKeysTable>;
 
 /**
- * The orchestrator's X25519 dashboard-encryption keys — the trust root for
- * browser-sealed dashboard writes under the `encrypted` posture. One `active`
- * key seals; rotated-out keys go `revoked` and leave the published JWKS, while
- * their rows stay so envelopes already sealed to the old `kid` still decrypt.
+ * X25519 dashboard-encryption keys: the trust root for browser-sealed dashboard writes under
+ * the `encrypted` posture. One `active` key seals; rotated-out keys go `revoked` and leave the
+ * published JWKS, but their rows stay so envelopes sealed to an old `kid` still decrypt.
  */
 export interface DashboardEncryptionKeysTable {
   /** RFC 7638 thumbprint of the public JWK (primary key, also the `kid`). */
@@ -2926,22 +2407,17 @@ export type DashboardEncryptionKeyRow = Selectable<DashboardEncryptionKeysTable>
 export type NewDashboardEncryptionKeyRow = Insertable<DashboardEncryptionKeysTable>;
 
 /**
- * A user-facing build artifact (`ctx.artifacts.upload`). Named + immutable per
- * run: `UNIQUE (run_id, name)` enforces the first-upload-wins semantics at the
- * DB layer. `customer_id` scopes the row to an org for quota accounting; the
- * tarball lives at `storage_key` (`artifacts/{run_id}/{name}-{discriminator}.tar.gz`,
- * where the discriminator is a hash of the exact name). Reads go through the
- * stored key rather than re-deriving it, so a row written under an earlier key
- * format resolves unchanged.
+ * A user-facing build artifact (`ctx.artifacts.upload`), named and immutable per run:
+ * `UNIQUE (run_id, name)` enforces first-upload-wins. The tarball lives at `storage_key`
+ * (`artifacts/{run_id}/{name}-{discriminator}.tar.gz`, discriminator = a hash of the exact
+ * name); reads use the stored key, never re-derive it, so older key formats resolve unchanged.
  */
 export interface ArtifactsTable {
   /** Random id (primary key). */
   id: string;
   /** Owning customer/org id (quota-accounting scope). */
   customer_id: string;
-  /** KiCI run this artifact belongs to. */
   run_id: string;
-  /** KiCI job that produced this artifact. */
   job_id: string;
   /** Caller-supplied artifact name (unique within the run). */
   name: string;
@@ -2951,11 +2427,9 @@ export interface ArtifactsTable {
   sha256: string;
   /** Object-storage key the tarball was written to. */
   storage_key: string;
-  /** When this row was inserted. */
   created_at: Generated<Date>;
 }
 
-// Convenience types for artifacts
 export type ArtifactRow = Selectable<ArtifactsTable>;
 export type NewArtifactRow = Insertable<ArtifactsTable>;
 
@@ -2967,9 +2441,7 @@ export type NewArtifactRow = Insertable<ArtifactsTable>;
 export interface PendingAttestationsTable {
   /** Random id (primary key). */
   id: string;
-  /** KiCI run this deferred attestation belongs to. */
   run_id: string;
-  /** KiCI job this deferred attestation was produced by. */
   job_id: string;
   /** Caller-supplied artifact name. */
   subject_name: string;
@@ -2981,19 +2453,15 @@ export interface PendingAttestationsTable {
   dsse_envelope: unknown;
   /** The ephemeral public-key JWK (JSONB). */
   public_key: unknown;
-  /** Bundle media type. */
   media_type: string;
   /** SHA-256 of the frozen statement payload — the later-mint binding. */
   statement_hash: string;
   /** Non-`live` AttestationOrigin: `deferred` | `offline-backfill`. */
   origin_kind: string;
-  /** Retry attempts so far. */
   attempt_count: Generated<number>;
   /** First-capture time = the true build-time anchor. */
   created_at: Generated<Date>;
-  /** When fulfilment was last attempted. */
   last_attempt_at: Date | null;
-  /** Last fulfilment error, or NULL. */
   last_error: string | null;
   /**
    * Terminal-rejection time: the Platform definitively rejected the mint
@@ -3005,12 +2473,9 @@ export type PendingAttestationRow = Selectable<PendingAttestationsTable>;
 export type NewPendingAttestationRow = Insertable<PendingAttestationsTable>;
 
 /**
- * Remote-source table (remote_sources).
- *
- * Anchors a Platform-relayed `kici run remote` to its real org: routing key
- * `remote:<orgId>` maps to the canonical org id so `resolveOrgId` resolves the
- * real tenant through the same local-source path a webhook takes. One row per
- * org served by this orchestrator, auto-provisioned on Platform auth.
+ * Anchors a Platform-relayed `kici run remote` to its org: routing key `remote:<orgId>` maps to
+ * the canonical org id, so `resolveOrgId` takes the same local-source path as a webhook. One
+ * row per served org, auto-provisioned on Platform auth.
  */
 export interface RemoteSourcesTable {
   /** Canonical org id (`org_<…>`) this anchor resolves to. */
@@ -3019,9 +2484,7 @@ export interface RemoteSourcesTable {
   routing_key: string;
   /** Cluster id this orchestrator deployment reports, or null. */
   cluster_id: string | null;
-  /** When this row was first provisioned. */
   created_at: Generated<Date>;
-  /** When this row was last upserted. */
   updated_at: Generated<Date>;
 }
 
@@ -3029,14 +2492,9 @@ export type RemoteSourceRow = Selectable<RemoteSourcesTable>;
 export type NewRemoteSourceRow = Insertable<RemoteSourcesTable>;
 
 /**
- * Host roster table (host_roster).
- *
- * KiCI's declared inventory: one durable row per agent the cluster has ever
- * enrolled, reconciled from the in-memory AgentRegistry on register/unregister.
- * `lifecycle_class` (snapshot of the auth token's `agent_type`) drives reaping;
- * `connected_instance_id` records which orchestrator holds the live WS (cluster
- * liveness + the host-fanout reroute target), null when disconnected. Status is
- * derived at read from the shared `last_seen` + `connected_instance_id`.
+ * KiCI's declared inventory: one durable row per agent ever enrolled, reconciled from the
+ * AgentRegistry on register/unregister. `lifecycle_class` drives reaping; status is derived at
+ * read from the shared `last_seen` + `connected_instance_id`.
  */
 export interface HostRosterTable {
   /** UUID primary key */
@@ -3048,14 +2506,10 @@ export interface HostRosterTable {
   /** Snapshot of the token's agent_type: 'static' | 'ephemeral'. */
   lifecycle_class: string;
   /**
-   * True when an auto-scaler backend spawned this agent. Written from the
-   * scaler manager's registration lookup (a spawn record exists for the agent
-   * id), NOT from `lifecycle_class` — that column snapshots the auth TOKEN's
-   * type and reads `ephemeral` for every agent when the auth mode is `none`.
-   *
-   * `runsOnAll` fan-out targets declared fleet members, so a true here keeps
-   * the host out of the fan-out set. Defaults false, so a row predating the
-   * column stays a fan-out target without re-registering.
+   * True when an auto-scaler backend spawned this agent, per the scaler manager's spawn record;
+   * NOT from `lifecycle_class`, which reads `ephemeral` for every agent under auth mode `none`.
+   * True keeps the host out of `runsOnAll` fan-out (declared fleet members only). Default false
+   * keeps pre-column rows fan-out targets without re-registering.
    */
   scaler_managed: ColumnType<boolean, boolean | undefined, boolean>;
   /** JSON-encoded string[] of the post-Gate-1 validated labels. */
@@ -3063,14 +2517,15 @@ export interface HostRosterTable {
   hostname: string | null;
   platform: string | null;
   arch: string | null;
-  /** Which orchestrator instance holds the live WS; null = disconnected. */
+  /**
+   * Which orchestrator holds the live WS (cluster liveness and the host-fanout reroute target);
+   * null = disconnected.
+   */
   connected_instance_id: string | null;
   /**
-   * Typed host-vars dimension (jsonb). A `{ [key]: string | number | boolean }`
-   * bag reported by the agent at registration and/or declared by the operator
-   * (`kici-admin host declare --prop`), shallow-merged on upsert. NOT NULL,
-   * defaults to `{}`. pg returns the parsed object on select; accept a
-   * JSON-stringified value on insert/update.
+   * Typed host-vars jsonb bag, reported by the agent at registration and/or declared by the
+   * operator (`kici-admin host declare --prop`), shallow-merged on upsert. NOT NULL, default
+   * `{}`.
    */
   host_properties: ColumnType<
     Record<string, string | number | boolean>,
@@ -3079,16 +2534,14 @@ export interface HostRosterTable {
   >;
   last_seen: ColumnType<Date, Date | string | undefined, Date | string>;
   /**
-   * Reboot-pending flag for workflow-level host restart. When set to a future
-   * timestamp, the host's imminent disconnect is an expected reboot (not a
-   * recovery-fail) and its pinned post-restart job is held until the host
+   * Workflow-level host restart: a future timestamp marks the imminent disconnect as an
+   * expected reboot (not a recovery-fail) and holds the pinned post-restart job until the host
    * reconnects (down-then-up). NULL = no reboot pending.
    */
   reboot_pending_until: ColumnType<Date | null, Date | string | null, Date | string | null>;
   /**
-   * Pre-agent reach metadata: how to SSH to a declared host before it has a
-   * KiCI agent, for bootstrap bring-up. All nullable — a host with no reach
-   * metadata cannot be bootstrapped and behaves exactly as before.
+   * Pre-agent SSH reach metadata for bootstrap bring-up of a declared host. All nullable: a
+   * host without it cannot be bootstrapped and is otherwise unaffected.
    */
   address: ColumnType<string | null, string | null | undefined, string | null>;
   ssh_user: ColumnType<string | null, string | null | undefined, string | null>;
@@ -3096,9 +2549,8 @@ export interface HostRosterTable {
   /** Scoped-secret ref (`scope/key`) holding the bring-up private key. */
   ssh_key_secret: ColumnType<string | null, string | null | undefined, string | null>;
   /**
-   * Delivery hint: when true, the box can reach the orchestrator's object
-   * storage, so bring-up picks `s3-direct` (the box pulls the payload via a
-   * presigned URL). NULL / false ⇒ the conservative `ssh-push` fallback.
+   * True when the box reaches the orchestrator's object storage, so bring-up picks `s3-direct`
+   * (the box pulls the payload via a presigned URL). NULL / false ⇒ the `ssh-push` fallback.
    */
   s3_reachable: ColumnType<boolean | null, boolean | null | undefined, boolean | null>;
   /** Who last set the host's identity. See {@link HostIdentitySource}. */
@@ -3115,19 +2567,13 @@ export type NewHostRosterRow = Insertable<HostRosterTable>;
 export type HostRosterUpdate = Updateable<HostRosterTable>;
 
 /**
- * Scaler spawning-agents table (scaler_spawning_agents).
- *
- * One row per agent that has been spawned via a scaler backend
- * (container / bare-metal / firecracker / event) but has not yet registered
- * via WS. Persists `bound_job_id` so a replacement coord still issues the
- * eager-dispatch hop when the agent eventually registers, and `run_id`
- * alongside it so a coordinator that never spawned the agent — the
- * leader-gated reaper routinely is not the spawner — can still attribute a
- * provisioning failure back to the job waiting on it. Reaped per
- * instance and adoption-aware: `listReapCandidates` narrows to event rows that
- * are either adopted or past their spawn deadline, and the reaper tears each
- * one down with `deleteSpawningAgent` — an adopted event agent legitimately
- * outlives the spawn timeout, so no blanket age-based sweep may drop it.
+ * One row per agent spawned via a scaler backend but not yet registered via WS. `bound_job_id`
+ * lets a replacement coord still issue the eager-dispatch hop on registration; `run_id` lets a
+ * non-spawning coordinator (the leader-gated reaper usually is one) attribute a provisioning
+ * failure to the waiting job. Reaping is per instance and adoption-aware:
+ * `listReapCandidates` narrows to event rows that are adopted or past their spawn deadline,
+ * torn down via `deleteSpawningAgent`. An adopted event agent legitimately outlives the spawn
+ * timeout, so no blanket age-based sweep may drop it.
  */
 export interface ScalerSpawningAgentsTable {
   agent_id: string;
@@ -3138,8 +2584,8 @@ export interface ScalerSpawningAgentsTable {
   bound_job_id: ColumnType<string | null, string | null | undefined, string | null>;
   spawned_at: Generated<Date>;
   /**
-   * The coordinator instance that spawned this agent. Scopes recovery and the
-   * per-instance reaper. NULL reads as "unknown owner" — never as "not mine".
+   * The spawning coordinator; scopes recovery and the per-instance reaper. NULL reads as
+   * "unknown owner", never "not mine".
    */
   owner_instance_id: ColumnType<string | null, string | null | undefined, string | null>;
   /** The coordinator the agent actually reached when it registered. */
@@ -3147,8 +2593,8 @@ export interface ScalerSpawningAgentsTable {
   /** When the adopting coordinator claimed the agent. */
   adopted_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
   /**
-   * The scaler's mandatory labels, copied onto the row so a coordinator with no
-   * matching scaler entry can still stamp the taint and emit the teardown.
+   * The scaler's mandatory labels, copied so a coordinator with no matching scaler entry can
+   * still stamp the taint and emit the teardown.
    */
   mandatory_labels: ColumnType<
     string[] | null,
@@ -3168,10 +2614,9 @@ export interface ScalerSpawningAgentsTable {
     string | string[] | null
   >;
   /**
-   * The scaler backend that spawned the agent: `container`, `bare-metal`,
-   * `firecracker`, or `event`. `event` is the value every adoption and reap
-   * predicate matches on, so a row missing it can be adopted and reaped by
-   * nobody. NULL means the row predates the column.
+   * Spawning backend: `container`, `bare-metal`, `firecracker` or `event`. Every adoption and
+   * reap predicate matches `event`, so a row missing it is adopted and reaped by nobody. NULL
+   * means the row predates the column.
    */
   backend_type: ColumnType<string | null, string | null | undefined, string | null>;
 }
@@ -3180,17 +2625,11 @@ export type ScalerSpawningAgentRow = Selectable<ScalerSpawningAgentsTable>;
 export type NewScalerSpawningAgentRow = Insertable<ScalerSpawningAgentsTable>;
 
 /**
- * Scaler provision-outcomes table (scaler_provision_outcomes).
- *
- * One row per provisioned agent id, recording what became of the provision.
- * Outlives `scaler_spawning_agents`, whose row is deleted on teardown — so the
- * stale-spawn prune can tell an adopted provision from one that was never
- * adopted, which the spawn row's absence cannot.
- *
- * `adopted_by` is written in the same transaction as
- * `scaler_spawning_agents.adopted_by`, inside `adoptSpawningAgent`, which is
- * the single writer of that column. Any future writer of `adopted_by` MUST
- * write this row too, or the prune loses the signal again.
+ * What became of each provisioned agent id. Outlives the `scaler_spawning_agents` row (deleted
+ * on teardown), so the stale-spawn prune can tell an adopted provision from a never-adopted one.
+ * `adopted_by` is written in the same transaction as `scaler_spawning_agents.adopted_by`, in
+ * `adoptSpawningAgent`, its single writer. Any future writer of `adopted_by` MUST write this row
+ * too, or the prune loses the signal.
  */
 export interface ScalerProvisionOutcomesTable {
   agent_id: string;
@@ -3200,13 +2639,11 @@ export interface ScalerProvisionOutcomesTable {
   /** When it was first adopted. Never refreshed by a re-adopt. */
   adopted_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
   /**
-   * The reaper's teardown reason (`spawn-timeout` / `heartbeat-timeout`), set
-   * only once the teardown was actually delivered. Independent of `adopted_by`:
-   * a `heartbeat-timeout` condemns a provision that WAS adopted, and clearing
-   * the adoption here would restore the misattribution this table removes.
+   * The reaper's teardown reason (`spawn-timeout` / `heartbeat-timeout`), set only once the
+   * teardown was delivered. Independent of `adopted_by`: a `heartbeat-timeout` condemns an
+   * adopted provision, and clearing the adoption would restore the misattribution.
    */
   condemned_reason: ColumnType<string | null, string | null | undefined, string | null>;
-  /** When the reaper condemned it. */
   condemned_at: ColumnType<Date | null, Date | null | undefined, Date | null>;
   recorded_at: Generated<Date>;
   updated_at: ColumnType<Date, Date | string | undefined, Date | string>;
@@ -3216,12 +2653,9 @@ export type ScalerProvisionOutcomeRow = Selectable<ScalerProvisionOutcomesTable>
 export type NewScalerProvisionOutcomeRow = Insertable<ScalerProvisionOutcomesTable>;
 
 /**
- * Scaler agent-jobs table (scaler_agent_jobs).
- *
- * agentId → (runId, jobId) correlation used to route scaler-lifecycle
- * events (spawn / boot / ready / kill) to the execution tracker. Row
- * inserted in `correlateAgentToJob`, deleted on agent disconnect / job
- * completion.
+ * agentId → (runId, jobId) correlation routing scaler-lifecycle events (spawn / boot / ready /
+ * kill) to the execution tracker. Inserted in `correlateAgentToJob`, deleted on agent
+ * disconnect / job completion.
  */
 export interface ScalerAgentJobsTable {
   agent_id: string;
@@ -3234,11 +2668,8 @@ export type ScalerAgentJobRow = Selectable<ScalerAgentJobsTable>;
 export type NewScalerAgentJobRow = Insertable<ScalerAgentJobsTable>;
 
 /**
- * Scaler reservations table (scaler_reservations).
- *
- * One row per outstanding resource reservation. `perScalerUsage` /
- * `globalUsage` are derived state — recomputed from `SUM(...)` on coord
- * boot so the cap-check critical section is correct under HA.
+ * One row per outstanding resource reservation. `perScalerUsage` / `globalUsage` are derived:
+ * recomputed from `SUM(...)` on coord boot so the cap-check critical section holds under HA.
  */
 export interface ScalerReservationsTable {
   agent_id: string;
@@ -3247,8 +2678,8 @@ export interface ScalerReservationsTable {
   mem_bytes: ColumnType<string, string | number, string | number>;
   reserved_at: Generated<Date>;
   /**
-   * The coordinator instance holding the reservation. Scopes recovery and the
-   * per-instance reaper. NULL reads as "unknown owner" — never as "not mine".
+   * The holding coordinator; scopes recovery and the per-instance reaper. NULL reads as
+   * "unknown owner", never "not mine".
    */
   owner_instance_id: ColumnType<string | null, string | null | undefined, string | null>;
 }
@@ -3257,13 +2688,10 @@ export type ScalerReservationRow = Selectable<ScalerReservationsTable>;
 export type NewScalerReservationRow = Insertable<ScalerReservationsTable>;
 
 /**
- * Pending provisioning claims (scaler_pending_claims).
- *
- * One row per outstanding event-scaler claim code, so any coordinator behind the
- * shared endpoint can redeem a code rather than only the process that minted it.
- * The code itself is never stored — only its sha256 — so a DB read cannot hand
- * back a redeemable secret. Single use is enforced by a conditional UPDATE on
- * `consumed_at`.
+ * One row per outstanding event-scaler claim code, so any coordinator behind the shared
+ * endpoint can redeem it, not only the minting process. Only the code's sha256 is stored, so a
+ * DB read never yields a redeemable secret. A conditional UPDATE on `consumed_at` enforces
+ * single use.
  */
 export interface ScalerPendingClaimsTable {
   claim_hash: string;

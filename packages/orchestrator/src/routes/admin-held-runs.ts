@@ -1,42 +1,36 @@
 /**
  * Admin API routes for reading and answering held runs.
  *
- * Exposes GET `/api/v1/admin/held-runs` and POST
- * `/api/v1/admin/held-runs/decision` so `kici-admin held-run list|approve|reject`
- * can release a hold locally, without a Platform.
+ * GET `/api/v1/admin/held-runs` and POST `/api/v1/admin/held-runs/decision` let
+ * `kici-admin held-run list|approve|reject` release a hold locally, without a Platform.
  *
- * **Independent orchestrators only.** Wherever a Platform is attached it owns
- * who may answer a hold: the Platform's held-run trust gate resolves the hold's
- * type and requires `ci_trust:write` for a security hold and `contexts:write` /
- * `contexts:admin` for the rest, against the acting member's org RBAC. This
- * route authenticates with an orchestrator admin token, which carries
- * orchestrator RBAC and no Platform membership at all — so answering a hold here
- * on a Platform-attached deployment would land a release the Platform's own gate
- * never authorized. Both write and read therefore refuse with 409 in
- * `platform` / `hybrid` / `observed`, mirroring the trust-policy write verbs.
+ * **Independent orchestrators only.** With a Platform attached, the Platform's
+ * held-run trust gate owns who may answer a hold: `ci_trust:write` for a security
+ * hold, `contexts:write` / `contexts:admin` for the rest, against the acting
+ * member's org RBAC. An orchestrator admin token carries no Platform membership,
+ * so answering here would land a release that gate never authorized. Both verbs
+ * therefore refuse with 409 in `platform` / `hybrid` / `observed`, mirroring the
+ * trust-policy write verbs.
  *
- * On an independent orchestrator there is no upstream authority, and until this
- * route existed an approval-queue hold there had no answer at all: `/kici
- * approve` releases the `security` queue only, and the dashboard, `kici
- * approve` and the MCP tools all reach the applier over the Platform relay.
+ * On an independent orchestrator this route is the only answer to an
+ * approval-queue hold: `/kici approve` releases the `security` queue only, and the
+ * dashboard, `kici approve` and the MCP tools reach the applier over the Platform relay.
  *
- * Answering goes through the shared `applyDecision` applier, not through a
- * direct row flip, so an approve here obeys the hold's own
- * `approval_requirement` clauses, records a `held_run_approvals` row, and — this
- * is the part a row flip silently skips — resumes the held element through
- * `routeRelease`, which re-dispatches the job or replays the workflow dispatch.
+ * Answering goes through the shared `applyDecision` applier, not a direct row
+ * flip, so an approve obeys the hold's `approval_requirement` clauses, records a
+ * `held_run_approvals` row, and resumes the held element through `routeRelease`
+ * (re-dispatch the job or replay the workflow dispatch) — the part a row flip skips.
  *
- * The resume runs AFTER this route answers. The decision is durable at the
- * applier's own transaction, and the resume it triggers is unbounded work whose
- * latency has no business being the operator's — see
- * `ApplyDecisionResult.consequence`. The access-log entry is written when that
- * consequence settles, so a resume that failed is recorded as `error` with its
- * message rather than being lost behind a successful-looking answer.
+ * The resume runs AFTER this route answers: the decision is durable at the
+ * applier's transaction, and the resume is unbounded work whose latency must not
+ * be the operator's (see `ApplyDecisionResult.consequence`). The access-log entry
+ * is written when that consequence settles, so a failed resume is recorded as
+ * `error` with its message, not hidden behind a successful-looking answer.
  *
  * Releasing a hold lets the held work RUN; it does not make its contributor
- * trusted. The resumed dispatch replays the trust resolution the hold was
- * created under, so an untrusted fork PR still runs with the base-branch lock
- * file, no install/registry secrets, and an isolated cache write scope.
+ * trusted. The resumed dispatch replays the hold's trust resolution, so an
+ * untrusted fork PR still runs with the base-branch lock file, no
+ * install/registry secrets, and an isolated cache write scope.
  */
 import { Hono, type Context } from 'hono';
 import { z } from 'zod';
@@ -71,11 +65,9 @@ import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 const logger = createLogger({ prefix: 'admin-held-runs' });
 
 /**
- * Wording for the Platform-managed refusal, surfaced verbatim by the CLI.
- *
- * It names the surfaces that DO answer a hold on a Platform-attached
- * orchestrator, because "not here" without "there instead" is the refusal an
- * operator reads as a broken build.
+ * Platform-managed refusal, surfaced verbatim by the CLI. It names the surfaces
+ * that DO answer the hold, because "not here" without "there instead" reads as a
+ * broken build.
  */
 export const PLATFORM_MANAGED_HELD_RUN_MESSAGE =
   'Held runs are answered through the KiCI Platform for this orchestrator, which ' +
@@ -84,14 +76,11 @@ export const PLATFORM_MANAGED_HELD_RUN_MESSAGE =
   'with a `/kici approve` pull-request comment.';
 
 /**
- * Wording for the step-scope refusal.
- *
- * A step-scoped hold is answered by notifying the waiting agent through the
- * step-approval bridge, which an independent orchestrator does not wire — so
- * this route has no way to tell the agent. Flipping the row anyway would be
- * strictly worse than refusing: the agent would keep waiting while the row left
- * `pending`, putting it beyond the stale detector's expiry sweep, so the step
- * would block with nothing left to release OR expire it.
+ * Step-scope refusal. A step-scoped hold is answered through the step-approval
+ * bridge, which an independent orchestrator does not wire. Flipping the row
+ * anyway is worse than refusing: the agent keeps waiting while the row leaves
+ * `pending`, beyond the stale detector's expiry sweep, so nothing can release
+ * OR expire the step.
  */
 export const STEP_SCOPE_UNSUPPORTED_MESSAGE =
   'A step-scoped hold is answered by notifying the waiting agent, which this ' +
@@ -99,13 +88,10 @@ export const STEP_SCOPE_UNSUPPORTED_MESSAGE =
   'with nothing left to release or expire it.';
 
 /**
- * Wording for an `--as` id the approval directory does not hold.
- *
- * The directory is the enumerable set of subjects this route will answer as. An
- * id it does not carry is refused rather than passed through, because an
- * unvalidated approver subject is free text: it would let an operator token
- * write any string it liked into `held_run_approvals.approver_user_id` and
- * satisfy any `{user}` clause by naming it.
+ * Refusal for an `--as` id the approval directory does not hold. The directory is
+ * the enumerable set of subjects this route answers as; an unvalidated subject is
+ * free text that would let an operator token write any string into
+ * `held_run_approvals.approver_user_id` and satisfy any `{user}` clause by naming it.
  */
 export function unregisteredApproverMessage(userId: string): string {
   return (
@@ -122,12 +108,9 @@ const VIA_REJECT = 'kici-admin held-run reject';
 /** The release wiring the applier needs to actually resume a released element. */
 export interface HeldRunReleaseWiring {
   /**
-   * Re-dispatch a job-scoped release.
-   *
-   * REQUIRED, and the mount is conditional on it. A release path that flips the
-   * row without dispatching looks like it works and does nothing — the hold
-   * reads `approved`, the job never starts, and no sweep will ever look at the
-   * row again.
+   * Re-dispatch a job-scoped release. REQUIRED, and the mount is conditional on
+   * it: flipping the row without dispatching leaves the hold `approved`, the job
+   * never started, and no sweep ever looking at the row again.
    */
   onJobRelease: (signal: ReleaseSignal) => Promise<void>;
   /** Replay the stored dispatch context of a released workflow-scoped hold. */
@@ -143,28 +126,24 @@ export interface HeldRunReleaseWiring {
 }
 
 export interface HeldRunRouteDeps {
-  /** The held-run store the decision is applied through. */
   store: HeldRunStore;
   /**
-   * The org approval directory — the only place an independent orchestrator
-   * holds team membership, and therefore the only thing that can satisfy a
-   * `{team}` clause on a hold's requirement.
+   * The org approval directory — the only team membership an independent
+   * orchestrator holds, so the only thing that can satisfy a `{team}` clause.
    */
   directory: TrustDirectoryStore;
   /**
-   * Orchestrator database, for the two per-decision reads the applier needs
-   * that no store owns: `org_settings.allow_self_approval` and the run's
-   * triggerer.
+   * For the per-decision reads no store owns: `org_settings.allow_self_approval`
+   * and the run's triggerer.
    */
   db: Kysely<Database>;
   rbac: RbacEnforcer;
-  /** This orchestrator's mode; decides whether either verb is permitted at all. */
+  /** Decides whether either verb is permitted at all. */
   mode: OrchestratorMode;
   /**
-   * Audit sink, REQUIRED for the same reason the trust-policy route's is: the
-   * guarantee this route makes is that a locally-answered hold is always
-   * attributable, and an optional sink would leave that resting on every
-   * construction site remembering to pass one.
+   * REQUIRED, as on the trust-policy route: a locally-answered hold is always
+   * attributable, and an optional sink would rest that on every construction
+   * site remembering to pass one.
    */
   accessLog: AccessLogWriter;
   release: HeldRunReleaseWiring;
@@ -176,50 +155,42 @@ const decisionSchema = z.object({
   decision: ApprovalDecision,
   reason: z.string().min(1).optional(),
   /**
-   * Answer as a registered directory member rather than as the admin token
-   * itself — `kici-admin held-run approve --as <user-id>`.
+   * Answer as a registered directory member rather than as the admin token —
+   * `kici-admin held-run approve --as <user-id>`.
    *
-   * Without it the approver subject is `service:<token user id>`, which
+   * Without it the subject is `service:<token user id>`, which
    * `isActorEligibleForClause` matches against neither a `{user}` clause nor a
-   * `{team}` membership, so a clause-bearing hold on an independent
-   * orchestrator has no answer at all and can only expire. With it the subject
-   * is the member's own id, in the same vocabulary the clauses are written in.
-   *
-   * Validated against the stored approval directory before it is used: see
+   * `{team}` membership, so a clause-bearing hold on an independent orchestrator
+   * can only expire. With it the subject is the member's own id, in the clauses'
+   * vocabulary. Validated against the stored approval directory first: see
    * {@link unregisteredApproverMessage}.
    */
   asUserId: z.string().min(1).optional(),
   /**
    * Marks an approve as a `kici run --approve-all` breakglass approval, so the
-   * access log records it as `held_run.auto_approve` — the same action a
-   * Platform-relayed `--approve-all` writes — instead of an interactive
-   * `held_run.approve`. It changes the audit record only: eligibility is
-   * enforced exactly as for any other approve, and a reject ignores it.
+   * access log records `held_run.auto_approve` (as a Platform-relayed
+   * `--approve-all` does) instead of `held_run.approve`. Audit record only:
+   * eligibility is enforced as for any approve, and a reject ignores it.
    * `kici-admin held-run approve` never sends it.
    */
   autoApprove: z.boolean().optional(),
 });
 
 /**
- * The principal a locally-answered hold is attributed to.
- *
- * A `service_account` bearing the admin token's own user id — the same shape
- * the trust-policy directory writes use, so both operator surfaces attribute
- * the same way.
+ * A locally-answered hold is attributed to a `service_account` bearing the admin
+ * token's user id — the shape the trust-policy directory writes use, so both
+ * operator surfaces attribute the same way.
  */
 function heldRunActor(c: Context<AdminEnv>): ActorPrincipal {
   return { type: 'service_account', id: c.get('userId') };
 }
 
 /**
- * The approval subject for a decision taken through an admin token.
- *
- * Namespaced `service:<token user id>`, matching how the dashboard applier
- * derives a subject for a service-account actor. The namespace is what keeps it
- * from ever colliding with a Keycloak sub named by an `approvers:` clause: an
- * operator token answers as itself, never as a person it typed the name of.
- * `held_run_approvals.approver_user_id` is the record of who approved, and a
- * subject the operator merely asserted would make that record false.
+ * Approval subject for an admin-token decision: `service:<token user id>`, as the
+ * dashboard applier derives for a service-account actor. The namespace keeps it
+ * from colliding with a Keycloak sub named by an `approvers:` clause: an operator
+ * token answers as itself, never as a person it typed, so
+ * `held_run_approvals.approver_user_id` stays a true record of who approved.
  *
  * Re-exported from the shared subject module so this route and the dashboard
  * handler cannot drift into two `service:` namespaces.
@@ -245,9 +216,8 @@ function toSummary(row: HeldRun): Record<string, unknown> {
     reason: row.reason,
     expiresAt:
       row.expires_at instanceof Date ? row.expires_at.toISOString() : (row.expires_at ?? null),
-    // The clauses an approve must satisfy. Printed by the CLI so an operator
-    // can see, before trying, that a hold naming `approvers:` cannot be
-    // answered by an operator token.
+    // Printed by the CLI so an operator sees, before trying, that a hold naming
+    // `approvers:` cannot be answered by an operator token.
     clauses,
   };
 }
@@ -266,11 +236,7 @@ async function readAllowSelfApproval(db: Kysely<Database>, orgId: string): Promi
   }
 }
 
-/**
- * Build the team lookup from a stored approval directory — the same document
- * `/kici approve` is resolved against, and the only place an independent
- * orchestrator holds team membership at all.
- */
+/** Team lookup from the stored approval directory (what `/kici approve` resolves against). */
 function buildTeamLookup(stored: StoredTrustDirectory | null): (team: string) => Set<string> {
   const byTeam = new Map<string, Set<string>>();
   for (const team of stored?.teamMemberships ?? []) {
@@ -280,13 +246,10 @@ function buildTeamLookup(stored: StoredTrustDirectory | null): (team: string) =>
 }
 
 /**
- * Is `userId` a member an operator registered in the approval directory?
- *
- * `memberCiTrustLevels` is the map `upsertLocalMember` writes a key into, so
- * membership of it is exactly "somebody ran `trust-policy directory-set` for
- * this id". The trust LEVEL is deliberately not read here: it gates the
- * `/kici approve` comment channel, while a hold's own
- * `approval_requirement` clauses decide who may answer this one.
+ * A key in `memberCiTrustLevels` (written by `upsertLocalMember`) means exactly
+ * "somebody ran `trust-policy directory-set` for this id". The trust LEVEL is
+ * deliberately not read: it gates the `/kici approve` comment channel, while the
+ * hold's `approval_requirement` clauses decide who may answer this one.
  */
 function isRegisteredMember(stored: StoredTrustDirectory | null, userId: string): boolean {
   return stored !== null && Object.hasOwn(stored.memberCiTrustLevels, userId);
@@ -308,12 +271,10 @@ async function resolveTriggererSub(
 }
 
 /**
- * Terminalize the `KiCI Security` check of a hold this route just ended.
- *
- * `via` names the surface and NO actor is passed. The summary is published
- * verbatim on a public commit check, and the only identity this route holds is
- * an admin token's opaque user id — so it reads "Approved by an approver via
- * kici-admin held-run approve" rather than leaking that id onto a pull request.
+ * Terminalize the `KiCI Security` check of a hold this route just ended. `via`
+ * names the surface and NO actor is passed: the summary is public on the commit
+ * check, and the only identity here is an admin token's opaque user id, so it
+ * reads "Approved by an approver via kici-admin held-run approve" instead.
  */
 function buildSettleSecurityCheck(
   deps: HeldRunRouteDeps,
@@ -349,10 +310,8 @@ export function createHeldRunRoutes(deps: HeldRunRouteDeps): Hono<AdminEnv> {
   }
 
   // GET /api/v1/admin/held-runs?customerId=...&runId=...
-  //
-  // Refuses on a Platform-attached orchestrator alongside the decision verb.
-  // The listing exists to feed a local decision, and offering it where no local
-  // decision can be taken would read as a surface that half works.
+  // Refuses on a Platform-attached orchestrator like the decision verb: the
+  // listing feeds a local decision, and offering it there would half work.
   app.get('/held-runs', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'ci_trust.read');
     const customerId = c.req.query('customerId');
@@ -397,10 +356,8 @@ export function createHeldRunRoutes(deps: HeldRunRouteDeps): Hono<AdminEnv> {
 }
 
 /**
- * Answer one hold and report the applier's own outcome.
- *
- * Split out of the registration so the route factory stays a registry, and so
- * the pre-flight refusals below sit next to the applier call they guard.
+ * Answer one hold. Split out of the registration so the route factory stays a
+ * registry, and so the pre-flight refusals sit next to the applier call they guard.
  */
 async function applyAdminDecision(
   c: Context<AdminEnv>,
@@ -457,22 +414,18 @@ async function applyAdminDecision(
         runId: hold.run_id,
         jobId: hold.job_id,
         status: result.status,
-        // Both facts, never one instead of the other: the admin token is the
-        // principal that authenticated, and the member is the subject the
-        // decision was attributed to. Replacing the actor would make the log
-        // claim a person authenticated who did not.
+        // Both facts: the admin token authenticated, the member is the attributed
+        // subject. Replacing the actor would claim a person authenticated who did not.
         ...(asUserId !== undefined && { approvedAsUserId: asUserId }),
       },
     });
 
   const consequence = result.consequence;
   if (consequence) {
-    // The decision is durable, so this route answers now and audits when the
-    // consequence settles — the resume replay of a workflow-scoped hold is
-    // unbounded work, and an answer that waits for it is an answer whose
-    // latency is the dispatch's. One entry per decision either way; a failed
-    // consequence records `error` with its message, which is where an operator
-    // reading `kici-admin access-log` learns the resume did not land.
+    // The decision is durable: answer now, audit when the (unbounded) resume
+    // settles. One entry per decision either way; a failed consequence records
+    // `error` with its message, which is how `kici-admin access-log` shows a
+    // resume that did not land.
     runDetached(
       logger,
       'Held-run decision audit',

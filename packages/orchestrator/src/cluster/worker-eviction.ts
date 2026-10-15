@@ -5,29 +5,24 @@ import type { PeerInfo, PeerRegistry } from './peer-registry.js';
 export const WORKER_DRAIN_TIMEOUT_MS = 30 * 60 * 1000;
 
 /**
- * The coordinator-side operations eviction needs.
- *
- * Declared here rather than reached for on the coordinator directly: the
- * coordinator owns dispatch and job attribution, but exposes no ineligibility
- * or idle-notification surface, and widening its public API for one caller
- * would couple eviction to it. A fake implementation makes this class unit
- * testable without a running cluster.
+ * The coordinator-side operations eviction needs, declared here because the
+ * coordinator exposes no ineligibility or idle-notification surface, and
+ * widening its API for one caller would couple eviction to it. A fake makes
+ * this class unit testable without a running cluster.
  */
 export interface EvictionHooks {
   /** Stop rerouting new jobs to this peer. */
   markIneligible(instanceId: string): void;
   /**
-   * Restore this peer to dispatch eligibility and drop any idle-notification
-   * registration. Called when a drain is cancelled (the ceiling rose so the
-   * peer is no longer excess) and after a drained peer is disconnected, so a
-   * later re-admission of the same instance starts dispatch-eligible.
+   * Restore dispatch eligibility and drop any idle-notification registration.
+   * Called when a drain is cancelled and after a drained peer is disconnected,
+   * so a later re-admission of the same instance starts dispatch-eligible.
    */
   clearIneligible(instanceId: string): void;
   /** In-flight rerouted jobs currently attributed to this peer. */
   runningJobCount(instanceId: string): number;
   /** Invoke the callback once this peer has no in-flight rerouted jobs. */
   onPeerIdle(instanceId: string, callback: () => void): void;
-  /** Close this peer's connection with the given code and reason. */
   closePeer(instanceId: string, code: number, reason: string): void;
 }
 
@@ -46,11 +41,10 @@ export function selectEvictionTargets(workers: readonly PeerInfo[], ceiling: num
 /**
  * Drain-then-disconnect this coordinator's excess workers.
  *
- * A target is first marked ineligible for new dispatch, then closed once its
- * in-flight rerouted jobs reach terminal status — which the worker's durable
- * outbox and `job.progress.ack` already guarantee — or after
- * `WORKER_DRAIN_TIMEOUT_MS`, after which the coordinator's existing
- * orphan-recovery guard handles whatever remains.
+ * A target is marked ineligible for new dispatch, then closed once its
+ * in-flight rerouted jobs reach terminal status (guaranteed by the worker's
+ * durable outbox and `job.progress.ack`) or after `WORKER_DRAIN_TIMEOUT_MS`,
+ * when the orphan-recovery guard handles whatever remains.
  */
 export class WorkerEviction {
   private readonly draining = new Map<string, NodeJS.Timeout | null>();
@@ -62,14 +56,11 @@ export class WorkerEviction {
   ) {}
 
   /**
-   * Reconcile the connected worker set against the ceiling.
-   *
-   * When `evictExcess` is true, drain the newest workers past `ceiling`;
-   * otherwise the target set is empty. Any drain in flight for a worker that is
-   * no longer a target is CANCELLED — its timer cleared and its dispatch
-   * eligibility restored — so a raised ceiling (or the Platform clearing
-   * `evictExcess` once the org drops back under) rescues a worker instead of
-   * disconnecting it at the drain timeout.
+   * With `evictExcess`, drain the newest workers past `ceiling`; otherwise the
+   * target set is empty. A drain in flight for a worker no longer targeted is
+   * CANCELLED (timer cleared, eligibility restored), so a raised ceiling or the
+   * Platform clearing `evictExcess` once the org drops back under its limit
+   * rescues the worker instead of disconnecting it at the drain timeout.
    */
   reconcile(ceiling: number, evictExcess: boolean): void {
     const targets = evictExcess
@@ -77,7 +68,6 @@ export class WorkerEviction {
       : [];
     const targetIds = new Set(targets.map((t) => t.instanceId));
 
-    // Cancel drains for workers no longer targeted (ceiling rose / no longer evicting).
     for (const instanceId of [...this.draining.keys()]) {
       if (!targetIds.has(instanceId)) this.cancelDrain(instanceId);
     }
@@ -88,7 +78,6 @@ export class WorkerEviction {
     }
   }
 
-  /** Stop an in-flight drain and restore the worker to dispatch eligibility. */
   private cancelDrain(instanceId: string): void {
     const timer = this.draining.get(instanceId);
     if (timer) clearTimeout(timer);
@@ -113,9 +102,8 @@ export class WorkerEviction {
         WS_CLOSE_PLAN_LIMIT,
         'Plan limit: this orchestrator exceeds the organization limit',
       );
-      // Clear the ineligibility + idle registration now that the peer is gone,
-      // so a re-admission of the same instance (ceiling later raised) starts
-      // dispatch-eligible rather than silently receiving zero rerouted jobs.
+      // Without this, a re-admission of the same instance silently receives
+      // zero rerouted jobs.
       this.hooks.clearIneligible(instanceId);
     };
 

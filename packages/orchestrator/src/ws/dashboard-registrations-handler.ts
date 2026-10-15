@@ -1,10 +1,7 @@
 /**
- * Dashboard registrations handler for the orchestrator.
- *
- * Responds to dashboard.registrations.list WS messages from Platform
- * by querying the registration store, enriching with last-triggered
- * timestamps (from execution_runs) and next-fire times (from croner
- * for schedule triggers), and sending the response.
+ * Answers dashboard.registrations.list from the registration store, enriched
+ * with last-triggered timestamps (execution_runs) and schedule next-fire times
+ * (croner).
  */
 import { Cron } from 'croner';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -44,17 +41,12 @@ interface RegistrationSourceMetadata {
 const logger = createLogger({ prefix: 'dashboard-registrations-handler' });
 
 interface DashboardRegistrationsHandlerDeps {
-  /** Organization ID for all operations. */
   orgId: string;
-  /** Send a response message back to Platform over the WS connection. */
   send: (msg: unknown) => void;
-  /** Registration store for DB queries. */
   registrationStore: RegistrationStore;
-  /** Registration index for version info. */
   registrationIndex: RegistrationIndex;
-  /** Database for execution_runs and cron_last_fired queries. */
   db: Kysely<Database>;
-  /** Access log writer — records one row per read / mutation with actor attribution. */
+  /** Records one row per read / mutation with actor attribution. */
   accessLog?: AccessLogWriter;
   /** Routing key for access_log rows (null when not run-scoped). */
   routingKey?: string | null;
@@ -87,12 +79,7 @@ interface RegistrationDeleteMessage {
 type RegistrationMessage =
   RegistrationsListMessage | RegistrationDisableMessage | RegistrationDeleteMessage;
 
-/**
- * Handler for dashboard registration WS messages (list, disable, delete).
- *
- * Queries registration store, enriches with last-triggered and next-fire data,
- * and sends typed response via deps.send().
- */
+/** Dashboard registration WS messages: list, disable, delete. */
 export class DashboardRegistrationsHandler {
   private readonly deps: DashboardRegistrationsHandlerDeps;
   private routingKey: string | null;
@@ -108,21 +95,18 @@ export class DashboardRegistrationsHandler {
     );
   }
 
-  /** Update the orgId used for all operations (called when resolved from DB). */
+  /** Called once the orgId resolves from the DB. */
   setOrgId(orgId: string): void {
     this.deps.orgId = orgId;
   }
 
-  /** Update the routing key bound to access_log rows. */
   setRoutingKey(routingKey: string | null): void {
     this.routingKey = routingKey;
   }
 
   /**
-   * Defense-in-depth dashboard-write policy gate. Returns true when the
-   * operation is allowed and the caller should proceed. Returns false
-   * when the policy is disabled — also records a `denied` access_log row
-   * and emits a structured `operation_disabled` envelope on the WS.
+   * Defense-in-depth policy gate: false when the policy disables the op, after
+   * recording a `denied` row and sending the `operation_disabled` envelope.
    */
   private async enforcePolicy(
     msg: { actor: ActorPrincipal; requestId: string },
@@ -175,7 +159,6 @@ export class DashboardRegistrationsHandler {
       return;
     }
     try {
-      // Look up the registration to get the workflow name for the push event
       const registration = await this.deps.registrationStore.getById(msg.registrationId);
       if (!registration) {
         this.access.record(
@@ -219,11 +202,10 @@ export class DashboardRegistrationsHandler {
         return;
       }
 
-      // Bump version to trigger peer reload
+      // The version bump triggers a peer reload.
       await this.deps.registrationStore.bumpVersion();
       await this.deps.registrationIndex.loadFromDb();
 
-      // Emit push event for real-time UI updates
       const eventType = msg.disabled ? 'registration.disabled' : 'registration.enabled';
       this.deps.send({
         type: eventType,
@@ -280,15 +262,13 @@ export class DashboardRegistrationsHandler {
       return;
     }
     try {
-      // If cancelActiveRuns, cancel active runs for this workflow
       if (msg.cancelActiveRuns) {
         const registration = await this.deps.registrationStore.getById(msg.registrationId);
         if (registration) {
           try {
-            // Find active runs and cancel them. Matched on the repository that
-            // DEFINES the workflow, so a global registration reaches its own
-            // runs and a same-named registration in the acted-on repository
-            // does not — see `runsDefinedByRepos`.
+            // Matched on the repository that DEFINES the workflow, so a global
+            // registration reaches its own runs and a same-named registration in
+            // the acted-on repository does not — see `runsDefinedByRepos`.
             const activeRuns = await this.deps.db
               .selectFrom('execution_runs')
               .select(['run_id'])
@@ -303,11 +283,10 @@ export class DashboardRegistrationsHandler {
                 .set({ status: 'cancelled', completed_at: new Date() })
                 .where('run_id', '=', run.run_id)
                 .execute();
-              // This arm terminalizes the run with a direct UPDATE — it never
-              // reaches the execution tracker, so neither `onExecutionComplete`
-              // nor `onRunTerminalCleanup` fires and the run's un-dispatched
-              // pending job contexts would outlive it. A cancelled run's
-              // needs-gated jobs are exactly the ones holding them.
+              // The direct UPDATE bypasses the execution tracker, so neither
+              // `onExecutionComplete` nor `onRunTerminalCleanup` fires; without
+              // this, the pending job contexts of the cancelled run's needs-gated
+              // jobs would outlive it.
               await cleanupPendingJobContexts(this.deps.db, run.run_id);
             }
 
@@ -336,9 +315,7 @@ export class DashboardRegistrationsHandler {
           'allowed',
           'registration not found',
         );
-        // Not-found is signalled by `success: false` alone — the `error`
-        // field is the internal-error channel, which the Platform maps to
-        // HTTP 500. Omitting it lets the Platform serve a structured 404.
+        // Same not-found signalling as disable: no `error` field.
         this.deps.send({
           type: 'dashboard.registration.delete.result',
           requestId: msg.requestId,
@@ -347,7 +324,6 @@ export class DashboardRegistrationsHandler {
         return;
       }
 
-      // Bump version to trigger peer reload
       await this.deps.registrationStore.bumpVersion();
       await this.deps.registrationIndex.loadFromDb();
 
@@ -388,15 +364,11 @@ export class DashboardRegistrationsHandler {
   }
 
   /**
-   * Batch-fetch source metadata for the routing keys in the registrations,
-   * keyed on `routing_key`. The map combines rows from `sources` (native,
-   * currently always GitHub Apps) and `generic_webhook_sources` (generic /
-   * universal-git / internal). When a routing key is present in both, the
-   * native row wins.
-   *
-   * Each query is wrapped in its own try/catch so a transient failure on
-   * one table still allows enrichment from the other; rows missing in both
-   * fall through to the synthetic fallback in `buildRegistrationSource`.
+   * Source metadata keyed on `routing_key`, from `sources` (native, currently
+   * always GitHub Apps) and `generic_webhook_sources` (generic / universal-git /
+   * internal); the native row wins when a key is in both. Each query fails on
+   * its own, so one table's transient failure still enriches from the other;
+   * keys missing from both get the synthetic fallback in `buildRegistrationSource`.
    */
   private async loadSourceMetadata(
     registrations: RegistrationRow[],
@@ -454,10 +426,8 @@ export class DashboardRegistrationsHandler {
 
   private async handleList(msg: RegistrationsListMessage): Promise<void> {
     try {
-      // 1. Fetch registrations
       let registrations: RegistrationRow[];
       if (msg.repoIdentifier) {
-        // Without customer scoping, get all and filter by repo
         registrations = (await this.deps.registrationStore.getAll()).filter(
           (r) => r.repo_identifier === msg.repoIdentifier,
         );
@@ -465,20 +435,17 @@ export class DashboardRegistrationsHandler {
         registrations = await this.deps.registrationStore.getAll();
       }
 
-      // 2. Filter by trigger type if provided
       if (msg.triggerType) {
         registrations = registrations.filter((r) => r.trigger_types.includes(msg.triggerType!));
       }
 
-      // 3. Batch-fetch last-triggered timestamps from execution_runs
       const lastTriggeredMap = new Map<string, Date>();
       if (registrations.length > 0) {
         try {
           const repoIds = [...new Set(registrations.map((r) => r.repo_identifier))];
-          // Grouped by both repository columns and folded to the DEFINING
-          // repository below, so a global workflow's runs land under the
-          // registration that defines it rather than under the repository they
-          // acted on — see `runsDefinedByRepos`.
+          // Folded to the DEFINING repository below, so a global workflow's runs
+          // land under its defining registration, not the repository they acted
+          // on — see `runsDefinedByRepos`.
           const lastTriggered = await this.deps.db
             .selectFrom('execution_runs')
             .select(['workflow_name', 'repo_identifier', 'workflow_repo_identifier'])
@@ -494,9 +461,8 @@ export class DashboardRegistrationsHandler {
                 row.last_triggered_at instanceof Date
                   ? row.last_triggered_at
                   : new Date(String(row.last_triggered_at));
-              // Two groups can fold onto one key (a per-repository run and a
-              // global run acting on a third repository both defined here), so
-              // keep the later of the two rather than whichever arrived last.
+              // Two groups can fold onto one key (a per-repository run and a global
+              // run acting on a third repository, both defined here): keep the later.
               const existing = lastTriggeredMap.get(key);
               if (!existing || startedAt > existing) {
                 lastTriggeredMap.set(key, startedAt);
@@ -504,12 +470,11 @@ export class DashboardRegistrationsHandler {
             }
           }
         } catch {
-          // execution_runs query failed; last triggered will be null
+          // Last triggered stays null.
           logger.warn('Failed to fetch last-triggered timestamps');
         }
       }
 
-      // 4. Fetch cron_last_fired for schedule registrations
       const cronLastFiredMap = new Map<string, Date>();
       const scheduleRegIds = registrations
         .filter((r) => r.trigger_types.includes('schedule'))
@@ -517,10 +482,8 @@ export class DashboardRegistrationsHandler {
 
       if (scheduleRegIds.length > 0) {
         try {
-          // A registration may have several schedule() triggers → one
-          // cron_last_fired row per schedule. "Last triggered from cron" means
-          // the most recent fire across all of them, so aggregate to MAX per
-          // registration.
+          // One cron_last_fired row per schedule() trigger: "last triggered from
+          // cron" is the MAX across a registration's schedules.
           const cronRows = await this.deps.db
             .selectFrom('cron_last_fired')
             .select(['registration_id'])
@@ -542,7 +505,6 @@ export class DashboardRegistrationsHandler {
         }
       }
 
-      // 5. Get registry version
       let registryVersion = 0;
       let registryUpdatedAt = new Date().toISOString();
       try {
@@ -563,19 +525,13 @@ export class DashboardRegistrationsHandler {
         logger.warn('Failed to fetch registry version');
       }
 
-      // 6. Batch-fetch source metadata keyed by routing_key. We look in both
-      //    `sources` (native — currently always GitHub Apps) and
-      //    `generic_webhook_sources` (generic / universal-git / internal). When
-      //    a routing key exists in both we prefer the native row.
       const sourceMetaMap = await this.loadSourceMetadata(registrations);
 
-      // 7. Build enriched registration items
       const items = registrations.map((reg) => {
         const lastTriggeredKey = `${reg.repo_identifier}:${reg.workflow_name}`;
         const lastTriggeredFromRuns = lastTriggeredMap.get(lastTriggeredKey);
         const lastTriggeredFromCron = cronLastFiredMap.get(reg.id);
 
-        // Pick the most recent of runs vs cron
         let lastTriggeredAt: string | null = null;
         if (lastTriggeredFromRuns && lastTriggeredFromCron) {
           const latest =
@@ -589,7 +545,6 @@ export class DashboardRegistrationsHandler {
           lastTriggeredAt = lastTriggeredFromCron.toISOString();
         }
 
-        // Compute next fire for schedule triggers
         let nextFireAt: string | null = null;
         const scheduleTriggers = reg.lock_entry.triggers.filter(
           (t: LockTrigger) => t._type === 'schedule',
@@ -605,7 +560,7 @@ export class DashboardRegistrationsHandler {
                   earliest = next;
                 }
               } catch {
-                // Invalid cron expression; skip
+                // Invalid cron expression: no next fire from it.
               }
             }
           }
@@ -614,7 +569,6 @@ export class DashboardRegistrationsHandler {
           }
         }
 
-        // Extract source repos from triggers (kici_event, workflow_complete, etc.)
         const sourceRepos = extractSourceRepos(reg.lock_entry.triggers);
 
         return {
@@ -676,12 +630,10 @@ export class DashboardRegistrationsHandler {
 }
 
 /**
- * Build the per-registration `source` payload. Returns null when the
- * registration has no routing key (legacy / global-workflow rows). When the
- * routing key is present but missing from the metadata map (the source row
- * was deleted but the registration still exists), returns a synthetic
- * descriptor with provider derived from the prefix so the dashboard can
- * still render a sensible icon.
+ * Null when the registration has no routing key (legacy / global-workflow
+ * rows). A key missing from the map (source row deleted, registration kept)
+ * gets a synthetic descriptor with the provider derived from the prefix, so
+ * the dashboard still renders a sensible icon.
  */
 function buildRegistrationSource(
   routingKey: string | null | undefined,
@@ -701,14 +653,10 @@ function formatRepoPattern(pattern: LockBranchPattern): string {
 }
 
 /**
- * Extract source repos from triggers that reference external repos.
- * kici_event triggers have a `source` field, lifecycle triggers have `sources`.
- *
- * A global workflow's `repos:` patterns join the same set. Both answer the one
- * question the column asks — which repos' events feed this workflow — so a glob
- * (`myorg/*`) and a literal identifier can share it. Exclusions (`!myorg/old-*`)
- * are carried through verbatim, since which repos are carved out is as much a
- * part of the answer as which are matched.
+ * Which repos' events feed this workflow: kici_event `source`, lifecycle
+ * `sources`, and a global workflow's `repos:` patterns, so a glob (`myorg/*`)
+ * and a literal identifier share the set. Exclusions (`!myorg/old-*`) are
+ * carried verbatim: the carve-outs are part of the answer.
  */
 function extractSourceRepos(triggers: readonly LockTrigger[]): string[] {
   const repos = new Set<string>();

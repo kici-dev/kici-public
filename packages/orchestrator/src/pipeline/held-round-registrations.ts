@@ -1,13 +1,12 @@
 /**
- * The registrations a held global evaluation round is released with.
- *
- * Approving a held round releases the round the approver looked at, so the
- * round, the candidate partition, and the dispatch after it all read the
- * workflow repository's lock file at the commit the hold recorded — never the
- * registrations' current entries, which may have moved on while the round
- * waited. Each current registration supplies the routing key and provider
- * context the fetch and the dispatch use; its lock entry, trigger types,
- * commit, branch and dependency-cache key are replaced by the held commit's.
+ * The registrations a held global evaluation round is released with. Approving
+ * a held round releases the round the approver looked at, so the round, the
+ * candidate partition and the dispatch all read the workflow repository's lock
+ * file at the commit the hold recorded — never the registrations' current
+ * entries, which may have moved on meanwhile. Each current registration
+ * supplies the routing key and provider context the fetch and the dispatch use;
+ * its lock entry, trigger types, commit, branch and dependency-cache key are
+ * replaced by the held commit's.
  */
 import { isLockDynamicJobFn, type LockWorkflow } from '@kici-dev/engine';
 import type { RegisteredWorkflow } from '../registration/registration-index.js';
@@ -57,12 +56,10 @@ function coveredByRound(entry: LockWorkflow): boolean {
 }
 
 /**
- * Why a covered workflow cannot be released, or `undefined` when it can.
- *
- * A workflow registered under several sources of the repository is releasable
- * when any one of its registrations is live and subscribed: the pass the round
- * was held from evaluates every live registration, so neither the first nor the
- * last one alone decides.
+ * Why a covered workflow cannot be released, or `undefined` when it can. A
+ * workflow registered under several sources is releasable when any one
+ * registration is live and subscribed: the pass the round was held from
+ * evaluates every live registration, so neither the first nor the last decides.
  */
 function missingReason(
   name: string,
@@ -110,18 +107,15 @@ function absentAtHeldCommit(
 
 /**
  * The workflow repository's organization-wide registrations for the held
- * event, as they were at the held commit.
+ * event, as they were at the held commit: every live registration of a covered
+ * workflow, one per source, as the pass the round was held from evaluates them.
  *
- * Throws, naming the workflow repository and the workflows, when the release
- * cannot run what the approver approved: the repository registers nothing any
- * more, its lock file at the held commit cannot be read, a workflow the round
- * covered has no live, enabled registration that still subscribes to the event,
- * or the lock file at the held commit does not define it as an
- * organization-wide workflow for the event. The release then fails the held run
- * with that reason and dispatches nothing — never a partial round.
- *
- * Every live registration of a covered workflow is returned, one per source
- * that registers it, as the pass the round was held from evaluates them.
+ * Throws, naming the repository and the workflows, when the release cannot run
+ * what the approver approved: the repository registers nothing any more, its
+ * lock file at the held commit cannot be read, a covered workflow has no live,
+ * enabled registration still subscribed to the event, or the held commit's
+ * lock file does not define it as organization-wide for the event. The release
+ * then fails the held run and dispatches nothing — never a partial round.
  *
  * The covered set is the one the hold recorded. A row held before that record
  * existed falls back to the held commit's round-shaped workflows, which cannot

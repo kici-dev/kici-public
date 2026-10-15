@@ -3,9 +3,8 @@ import { Command } from 'commander';
 import { routeRootArgs, ROOT_VERSION_FLAG } from './root-option-routing.js';
 
 /**
- * A small tree with the shapes the router must tell apart: a root with value,
- * optional-value and boolean options; a group whose leaf declares `--url` (a
- * root flag) and `--version`; and a leaf that declares neither.
+ * A root with value, optional-value and boolean options; a group whose leaf
+ * declares `--url` (a root flag) and `--version`; a leaf that declares neither.
  */
 function tree(): Command {
   const root = new Command('kici-admin')
@@ -72,8 +71,7 @@ describe('routeRootArgs: a command option under a root flag', () => {
     const args = ['orchestrator', 'upgrade', '--url', 'https://x/o.tgz', '--yes'];
     const r = route(args);
     expect(r.hidden).toEqual([2, 3]);
-    // Each stand-in looks like an option the root does not know, so the root
-    // hands it, and everything after it, to the subcommand.
+    // An unknown-option stand-in sends it and everything after to the subcommand.
     for (const i of r.hidden) expect(r.routed[i]).toMatch(/^--/);
     expect(r.restored).toEqual(args);
   });

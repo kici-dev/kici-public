@@ -96,7 +96,6 @@ describe('triggerRun', () => {
   };
 
   it('sends the webhook and resolves the discovered runId', async () => {
-    // First poll: no run yet; second poll: the run appears.
     const get = vi
       .fn()
       .mockResolvedValueOnce({ runs: [] })
@@ -108,7 +107,6 @@ describe('triggerRun', () => {
       timeoutMs: 5_000,
     });
     expect(runId).toBe('run-9');
-    // The webhook was POSTed to the generic route.
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain(
       '/webhook/__default__/generic/src-1',
     );
@@ -133,9 +131,8 @@ describe('triggerRun', () => {
         json: async () => ({ accepted: true, deliveryId: 'rk:mine' }),
       }),
     );
-    // The discovery poll MUST carry the captured, url-encoded delivery id.
-    // A decoy run from another invocation is never returned because the
-    // filtered query only matches this delivery.
+    // The poll MUST carry the url-encoded delivery id, so a decoy run from
+    // another invocation never matches.
     const get = vi.fn(async (path: string) => {
       expect(path).toContain('deliveryId=rk%3Amine');
       return { runs: [{ runId: 'run-mine' }] };
@@ -192,7 +189,7 @@ describe('triggerRun timeout diagnosis', () => {
     defaultBranch: 'kici-local',
   };
 
-  /** Route a single `get` mock across the three paths the diagnosis reads. */
+  /** Routes one `get` mock across the paths the diagnosis reads. */
   const routed = (routes: {
     runs?: unknown;
     health?: unknown;

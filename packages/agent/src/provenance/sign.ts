@@ -1,11 +1,8 @@
 /**
- * Ephemeral-key DSSE signer for KiCI provenance (Mode A).
- *
- * Generates a fresh in-process ES256 keypair (never persisted), DSSE-signs the
- * PAE of the statement bytes with the private half, and returns the envelope
- * plus the public JWK. The public key travels in the bundle so the verifier can
- * check the signature; the key needs no separate trust root because the bundle's
- * identity JWT (verified against the Platform JWKS) anchors the whole package.
+ * Ephemeral-key DSSE signer for KiCI provenance (Mode A). The ES256 keypair is
+ * never persisted; its public JWK travels in the bundle and needs no separate
+ * trust root, because the bundle's identity JWT (verified against the issuing
+ * orchestrator's JWKS) anchors the whole package.
  */
 import { calculateJwkThumbprint, exportJWK, generateKeyPair, type JWK } from 'jose';
 import { buildDsseEnvelope, dssePae, type DsseEnvelope } from '@kici-dev/engine/provenance/dsse';

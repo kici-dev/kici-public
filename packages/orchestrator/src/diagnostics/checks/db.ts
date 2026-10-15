@@ -1,7 +1,7 @@
 /**
  * Database connectivity diagnostic check.
  *
- * Runs a simple SELECT 1 query to verify the database is reachable
+ * Reads one row of `dedup_cache` to verify the database is reachable
  * and reports latency.
  */
 

@@ -4,11 +4,10 @@ import type { LockCacheSpec, LockInitConfig } from '@kici-dev/engine';
 import type { LockJob } from './types.js';
 
 /**
- * The lock-file dynamic fields no longer admit the schema-v11 inline
- * expression `{ _type: 'inline', expression }`. That object is itself a
- * `Record<string, string>`, so the `env` axis is pinned by type identity rather
- * than by an assignment the compiler would accept either way; the two string
- * fields refuse the object outright.
+ * The lock-file dynamic fields refuse the schema-v11 inline expression
+ * `{ _type: 'inline', expression }`. That object is itself a
+ * `Record<string, string>`, so `env` is pinned by type identity, not by an
+ * assignment the compiler would accept either way.
  */
 describe('LockJob dynamic fields', () => {
   // fails-when: `concurrencyGroup` regains `| LockInlineValue`
@@ -61,8 +60,8 @@ describe('LockJob dynamic fields', () => {
 });
 
 /**
- * The engine cannot import the SDK, so the lock-file cache and init shapes are
- * structural mirrors. The generator copies the SDK values through unchanged, so
+ * The engine cannot import the SDK, so its lock-file cache and init shapes are
+ * structural mirrors; the generator copies SDK values through unchanged, so
  * each SDK shape must stay assignable to its mirror.
  */
 describe('engine lock mirrors of SDK shapes', () => {

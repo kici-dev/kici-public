@@ -1,12 +1,9 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `cluster_settings.concurrency_wait_timeout_ms` (nullable BIGINT).
- *
- * Fleet-wide agent concurrency-slot wait timeout (ms), pushed to the agent on `job.dispatch`. NULL → cluster default (`config.concurrencyWaitTimeoutMs`, `KICI_CONCURRENCY_WAIT_TIMEOUT_MS`).
- *
- * Idempotent: guarded on column existence; a re-run on a DB that already has
- * the column is a no-op.
+ * Add `cluster_settings.concurrency_wait_timeout_ms`: the fleet-wide agent concurrency-slot wait
+ * timeout (ms), pushed to the agent on `job.dispatch`. NULL is the cluster default
+ * (`config.concurrencyWaitTimeoutMs`, `KICI_CONCURRENCY_WAIT_TIMEOUT_MS`). Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

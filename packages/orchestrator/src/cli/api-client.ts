@@ -1,10 +1,4 @@
-/**
- * HTTP client wrapper for the kici-admin CLI.
- *
- * Communicates with the orchestrator admin API via Bearer token authentication.
- * All methods are thin wrappers around fetch() that handle JSON serialization,
- * error formatting, and URL construction.
- */
+/** kici-admin's HTTP client for the orchestrator admin API (Bearer token auth). */
 
 import * as fs from 'node:fs';
 import type {
@@ -73,17 +67,15 @@ export interface FleetTopologyResponse {
 }
 
 /**
- * Universal-git configuration shape carried in `git_config` on
- * generic_webhook_sources. Matches `UniversalGitConfigSchema` in
- * `providers/universal-git/config.ts`. Kept as a loose `Record` here to
- * avoid a cross-package import in the CLI wire type.
+ * A source's `git_config`; matches `UniversalGitConfigSchema` in
+ * `providers/universal-git/config.ts`, kept a loose `Record` to avoid a
+ * cross-package import in the CLI wire type.
  */
 export type GenericSourceGitConfigPayload = Record<string, unknown>;
 
 /**
- * Wire shape for a local filesystem source's config
- * (`{ repoBasePath, cloneUrlBase?, inPlace? }`).
- * Matches `LocalSourceConfigSchema` in `providers/local/local-source-config.ts`.
+ * A local source's config; matches `LocalSourceConfigSchema` in
+ * `providers/local/local-source-config.ts`.
  */
 export interface GenericSourceLocalConfigPayload {
   repoBasePath: string;
@@ -92,9 +84,6 @@ export interface GenericSourceLocalConfigPayload {
   inPlace?: boolean;
 }
 
-/**
- * Response shape for generic webhook sources from the admin API.
- */
 export interface GenericSourceResponse {
   id: string;
   customer_id: string;
@@ -121,24 +110,16 @@ export interface GenericSourceResponse {
 }
 
 /**
- * `fetch` rejects with a bare `TypeError: fetch failed` when it cannot reach the
- * host — it names neither the address dialled nor the knob that sets it. Printed
- * through the CLI's `Error: ${message}` handler that becomes `Error: fetch
- * failed`, which reads like a fault in the subcommand rather than a misaddressed
- * client, and sends the operator debugging the wrong thing.
- *
- * The trap is sharpened by two details of this CLI. The base URL comes from
- * `KICI_ADMIN_URL`, not the `KICI_ORCHESTRATOR_URL` an operator is likelier to
- * have exported; and subcommands accepting `--database-url` fall back to direct
- * DB access, so on a host with `KICI_DATABASE_URL` set they keep working while
- * the HTTP-only ones fail — making it look like specific subcommands are broken.
- *
- * So: name the address, name the variable, and name the near-miss.
+ * A bare `TypeError: fetch failed` names neither the address nor the knob that
+ * sets it, so it reads as a broken subcommand rather than a misaddressed client.
+ * The base URL comes from `KICI_ADMIN_URL`, not `KICI_ORCHESTRATOR_URL`, and
+ * subcommands with `--database-url` fall back to direct DB access, so with
+ * `KICI_DATABASE_URL` set only the HTTP-only ones fail. The error therefore names
+ * the address, the variable and the near-miss.
  */
 /**
- * Best-effort one-line detail from a rejected `fetch`. Returns '' when nothing
- * useful is available, so the caller can omit the parenthetical rather than
- * print an empty one.
+ * Best-effort one-line detail from a rejected `fetch`; '' when none, so the
+ * caller omits the parenthetical.
  */
 export function firstCauseMessage(err: unknown): string {
   if (!(err instanceof Error)) return '';
@@ -156,21 +137,16 @@ export function firstCauseMessage(err: unknown): string {
 }
 
 /**
- * True when a rejected `fetch` failed at the transport layer, as opposed to
- * failing while the request was still being built.
- *
- * `fetch` uses a `TypeError` for both, so they are easy to conflate — but only
- * a transport failure means the orchestrator was actually dialled. Measured
- * against Node 24's undici:
+ * True when a rejected `fetch` failed at the transport layer, not while the
+ * request was being built. Both are a `TypeError`, but only a transport failure
+ * means the orchestrator was dialled. Measured against Node 24's undici:
  *
  *   closed port    → TypeError('fetch failed')                       cause: Error(ECONNREFUSED)
  *   invalid header → TypeError('Headers.append: … invalid header …') cause: undefined
  *   invalid URL    → TypeError('Failed to parse URL from …')         cause: Error(ERR_INVALID_URL)
  *
- * The discriminator is therefore the message, NOT the presence of a `cause`:
- * the invalid-URL case carries one. undici uses exactly `fetch failed` for a
- * transport failure and a descriptive message for everything it rejects before
- * opening a connection.
+ * So the discriminator is the message, NOT a `cause` (the invalid-URL case has
+ * one): undici says exactly `fetch failed` only for a transport failure.
  */
 export function isTransportFailure(err: unknown): boolean {
   return err instanceof TypeError && err.message === 'fetch failed';
@@ -187,13 +163,11 @@ export async function fetchAdminApi(
   try {
     return await fetch(url, init);
   } catch (err) {
-    // A request we could never build is not a connectivity problem, and saying
-    // "cannot reach" sends the operator to check ports and firewalls for what is
-    // actually a malformed argument. The common shape is a credential carrying a
-    // stray newline — e.g. read out of an env file that declares the key twice.
+    // An unbuildable request is a malformed argument, not a connectivity problem;
+    // the common shape is a credential with a stray newline (e.g. an env file
+    // declaring the key twice).
     if (!isTransportFailure(err)) {
-      // Trim a trailing period: undici's messages end with one, and appending
-      // ours produces `… invalid header value..` in an operator-facing string.
+      // undici's messages end with a period; trim it to avoid `..`.
       const detail = (err instanceof Error ? err.message : String(err)).replace(/\.$/, '');
       throw new Error(
         `the admin API request to ${baseUrl} could not be built: ${detail}. ` +
@@ -203,16 +177,12 @@ export async function fetchAdminApi(
         { cause: err },
       );
     }
-    // undici puts the actionable detail (ECONNREFUSED, EAI_AGAIN, …) on `cause`,
-    // but not always usefully: the cause is sometimes an Error with an empty
-    // message, and sometimes an AggregateError whose detail sits in `.errors`
-    // (one entry per address tried for a multi-homed host). Take the first
-    // non-empty message available and omit the parenthetical entirely when none
-    // is — ` ()` in a diagnostic is worse than no parenthetical at all.
+    // undici puts the detail (ECONNREFUSED, EAI_AGAIN, …) on `cause`, sometimes
+    // with an empty message or as an AggregateError with one `.errors` entry per
+    // address tried; omit the parenthetical when no message is found.
     const detail = firstCauseMessage(err);
     const cause = detail ? ` (${detail})` : '';
-    // An operator who set neither --url nor KICI_ADMIN_URL dialled the built-in
-    // default, which only reaches an orchestrator on this host at its default port.
+    // The built-in default only reaches an orchestrator on this host at its default port.
     const defaultHint =
       baseUrl === DEFAULT_ADMIN_URL
         ? ` ${DEFAULT_ADMIN_URL} is kici-admin's built-in default, the orchestrator's default ` +
@@ -249,9 +219,6 @@ export class AdminApiClient {
     private readonly token: string,
   ) {}
 
-  /**
-   * Make an authenticated HTTP request to the admin API.
-   */
   private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {
@@ -289,44 +256,26 @@ export class AdminApiClient {
     return (await res.json()) as T;
   }
 
-  /**
-   * Public GET request returning parsed JSON.
-   */
   async get<T>(path: string): Promise<T> {
     return this.request<T>('GET', path);
   }
 
-  /**
-   * Public POST request returning parsed JSON.
-   */
   async post<T>(path: string, body: unknown): Promise<T> {
     return this.request<T>('POST', path, body);
   }
 
-  /**
-   * Public PATCH request returning parsed JSON.
-   */
   async patch<T>(path: string, body: unknown): Promise<T> {
     return this.request<T>('PATCH', path, body);
   }
 
-  /**
-   * Public PUT request returning parsed JSON.
-   */
   async put<T>(path: string, body: unknown): Promise<T> {
     return this.request<T>('PUT', path, body);
   }
 
-  /**
-   * Public DELETE request returning parsed JSON.
-   */
   async delete<T>(path: string): Promise<T> {
     return this.request<T>('DELETE', path);
   }
 
-  /**
-   * Public GET request returning raw response text.
-   */
   async getText(path: string): Promise<string> {
     const url = `${this.baseUrl}${path}`;
     const res = await fetchAdminApi(
@@ -727,13 +676,9 @@ export class AdminApiClient {
   }
 
   /**
-   * Revoke an agent token.
-   *
-   * The orchestrator both flips `agent_tokens.revoked_at` AND
-   * synchronously closes every in-flight agent WS authenticated by
-   * this token. The returned `kicked` count is the number
-   * of WS connections that were closed on the wire — surface it to
-   * the operator so they know the revocation actually propagated.
+   * Revoke an agent token: the orchestrator sets `agent_tokens.revoked_at` AND
+   * synchronously closes every agent WS authenticated by it. `kicked` counts
+   * the closed connections; show it so the operator sees the revocation propagated.
    */
   async revokeAgentToken(id: string): Promise<{ kicked: number }> {
     return this.request<{ kicked: number }>(
@@ -840,7 +785,6 @@ export class AdminApiClient {
 
   // --- Peer forget (drop a departed peer from the live peer registries) ---
 
-  /** Forget a departed peer on this coordinator and every connected sibling. */
   /**
    * Forget a departed peer on this coordinator and every connected sibling. A
    * refusal that only needs the backstop acknowledgement comes back as a body
@@ -1053,10 +997,9 @@ export class AdminApiClient {
   // --- Runs ---
 
   /**
-   * List execution runs. `status` accepts either a single status or a
-   * comma-separated list (e.g. `success,failed`). `since` is an ISO-8601
-   * timestamp; only runs with `created_at` strictly later than this value
-   * are returned.
+   * List runs. `status` takes one status or a comma-separated list (e.g.
+   * `success,failed`). `since` is an ISO-8601 timestamp; only runs with
+   * `created_at` strictly later are returned.
    */
   async listRuns(opts?: {
     status?: string;

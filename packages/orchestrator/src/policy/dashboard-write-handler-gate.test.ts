@@ -19,6 +19,7 @@ import {
   DashboardContextHandler,
   type DashboardContextHandlerDeps,
 } from '../ws/dashboard-context-handler.js';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 import { invalidateDashboardWritePolicyCache } from './dashboard-write-policy.js';
 
 function buildDepsWithDisabledPolicy(disabled: DashboardWritePolicyMap): {
@@ -31,15 +32,8 @@ function buildDepsWithDisabledPolicy(disabled: DashboardWritePolicyMap): {
   const setSecret = vi.fn().mockResolvedValue(undefined);
   const deleteSecret = vi.fn().mockResolvedValue(undefined);
 
-  // The policy module calls:
-  //   db.selectFrom('org_settings').select('dashboard_write_policy')
-  //     .where('customer_id', '=', customerId).executeTakeFirst();
-  const db = {
-    selectFrom: vi.fn().mockReturnThis(),
-    select: vi.fn().mockReturnThis(),
-    where: vi.fn().mockReturnThis(),
-    executeTakeFirst: vi.fn().mockResolvedValue({ dashboard_write_policy: disabled }),
-  };
+  // The policy module reads org_settings.dashboard_write_policy via executeTakeFirst().
+  const { db } = createMockDb({ selectFirstRow: { dashboard_write_policy: disabled } });
 
   const deps: DashboardContextHandlerDeps = {
     orgId: 'org-disabled',

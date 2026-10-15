@@ -13,31 +13,26 @@ export interface RunsArtifactsDownloadOptions {
   output?: string;
 }
 
-/** Extension of the raw artifact archive written by `--archive`. */
 const ARCHIVE_EXTENSION = '.tar.gz';
 
-/** Basename an artifact takes under the output directory in the given mode. */
 export function destBasename(name: string, archive: boolean): string {
   return archive ? `${name}${ARCHIVE_EXTENSION}` : name;
 }
 
 /**
- * Reduce a basename to the form a case-insensitive filesystem looks it up by.
- *
- * The NFC pass is deliberate defence for a widened artifact-name charset:
- * `ArtifactNameSchema` accepts ASCII only today, so no live name can differ by
- * normalisation — but HFS+ stores NFD and APFS folds case while preserving
- * normalisation, so a non-ASCII name would collide on those volumes without it.
+ * The form a case-insensitive filesystem looks a basename up by. The NFC pass
+ * defends a widened name charset: `ArtifactNameSchema` is ASCII-only today, but
+ * HFS+ stores NFD and APFS folds case while preserving normalisation, so a
+ * non-ASCII name would collide on those volumes without it.
  */
 export function foldBasename(basename: string): string {
   return basename.normalize('NFC').toLowerCase();
 }
 
 /**
- * Group basenames that a case-insensitive filesystem resolves to one path.
- *
- * Groups appear in first-appearance order and each group is sorted; a basename
- * with no partner is not reported.
+ * Basenames a case-insensitive filesystem resolves to one path, in
+ * first-appearance order, each group sorted; a basename with no partner is
+ * not reported.
  */
 export function findCaseCollisions(basenames: string[]): string[][] {
   const byFold = new Map<string, Set<string>>();
@@ -51,12 +46,9 @@ export function findCaseCollisions(basenames: string[]): string[][] {
 }
 
 /**
- * Fetch a presigned artifact URL into a Buffer and verify its sha-256.
- *
- * NO `Authorization` header: `downloadUrl` is a presigned object-storage GET,
- * and the PAT authenticates to the Platform, not to object storage — attaching
- * it would leak the credential to the storage host. The bytes therefore flow
- * CLI <-> object storage directly and never transit the Platform.
+ * Verifies the sha-256. NO `Authorization` header: `downloadUrl` is a
+ * presigned object-storage GET, and sending the Platform PAT would leak it to
+ * the storage host. The bytes never transit the Platform.
  */
 async function fetchArtifactBytes(entry: ArtifactListItem): Promise<Buffer> {
   if (!entry.downloadUrl) {
@@ -79,12 +71,9 @@ async function fetchArtifactBytes(entry: ArtifactListItem): Promise<Buffer> {
 }
 
 /**
- * Refuse a listed name that is not a valid artifact name.
- *
- * Every name is validated against {@link ArtifactNameSchema} at upload, so a
- * response carrying one outside that contract comes from a broken or hostile
- * peer. The name becomes a path component under the output directory, so it is
- * checked before it is joined — an unchecked `../…` would let a list response
+ * Uploads validate names against {@link ArtifactNameSchema}, so an invalid one
+ * comes from a broken or hostile peer. The name becomes a path component, so it
+ * is checked before the join: an unchecked `../…` would let a list response
  * write anywhere on the caller's filesystem.
  */
 function assertPathSafeName(name: string): void {
@@ -96,16 +85,12 @@ function assertPathSafeName(name: string): void {
 }
 
 /**
- * Refuse the whole invocation when two targets would land on the same path.
- *
- * Artifact names are case-sensitive, so a run can legitimately hold both
- * `bundle` and `Bundle`. On a filesystem that ignores case in path lookups the
- * two resolve to one path — the second extraction merges into the first's
- * directory, or overwrites its archive under `--archive`. The filesystem is
- * probed only once a fold collision is known to exist, so a case-sensitive
- * output directory downloads both exactly as before. A probe that cannot answer
- * is treated as case-insensitive: the collision is already certain, so the
- * unknown half is resolved towards refusing rather than towards losing data.
+ * Refuses the whole invocation when two targets would land on one path.
+ * Artifact names are case-sensitive (`bundle` and `Bundle` can coexist), but a
+ * case-insensitive filesystem would merge the extractions or overwrite the
+ * archive. The filesystem is probed only once a fold collision exists, so a
+ * case-sensitive directory downloads both. A probe that cannot answer counts as
+ * case-insensitive: refusing beats losing data.
  */
 async function assertNoCaseCollisions(
   targets: ArtifactListItem[],
@@ -138,7 +123,6 @@ async function assertNoCaseCollisions(
   );
 }
 
-/** Fetch one entry and write it to `outDir`, extracted or as the raw archive. */
 async function writeOne(entry: ArtifactListItem, outDir: string, archive: boolean): Promise<void> {
   assertPathSafeName(entry.name);
   const buf = await fetchArtifactBytes(entry);
@@ -153,7 +137,6 @@ async function writeOne(entry: ArtifactListItem, outDir: string, archive: boolea
   console.log(pc.green(`✓ ${entry.name} → ${dest}/`));
 }
 
-/** Resolve which listed artifacts the invocation targets. */
 function resolveTargets(
   artifacts: ArtifactListItem[],
   name: string | undefined,
@@ -175,11 +158,10 @@ export async function runsArtifactsDownloadCommand(
     const client = await DashboardClient.load();
     const { artifacts } = await client.listArtifacts(runId);
     const outDir = options.output ?? process.cwd();
-    // One predicate for "no name was given", shared by target resolution, the
-    // collision guard, and the missing-object tolerance below. `resolveTargets`
-    // treats an empty-string name as "download everything", so testing any of
-    // the three against `name === undefined` instead would let
-    // `download <run-id> "" -o <dir>` download the whole run with the guard off.
+    // One predicate shared by target resolution, the collision guard and the
+    // missing-object tolerance. `resolveTargets` treats "" as "everything", so
+    // `name === undefined` here would let `download <run-id> ""` download the
+    // whole run with the guard off.
     const downloadingAll = !name;
     const targets = resolveTargets(artifacts, name, runId);
 
@@ -188,14 +170,11 @@ export async function runsArtifactsDownloadCommand(
       return true;
     }
 
-    // Validate the whole target set before the first byte is fetched: a hostile
-    // name anywhere in the set refuses the invocation rather than leaving the
-    // artifacts ahead of it on disk.
+    // Validate every name before the first fetch, so a hostile name leaves no
+    // earlier artifacts on disk.
     for (const entry of targets) assertPathSafeName(entry.name);
     if (downloadingAll) {
-      // Only entries the loop below will actually write can collide: one whose
-      // object is gone is skipped, not written, so counting it would refuse a
-      // download that was never going to put two artifacts on one path.
+      // An entry whose object is gone is skipped, not written, so it cannot collide.
       await assertNoCaseCollisions(
         targets.filter((t) => t.downloadUrl),
         outDir,
@@ -203,9 +182,8 @@ export async function runsArtifactsDownloadCommand(
       );
     }
 
-    // Downloading every artifact tolerates an individual entry whose object is
-    // gone: warn and keep going. Naming a single artifact does not — a targeted
-    // request that cannot be satisfied is a failure.
+    // Downloading every artifact warns past a missing object; a named artifact
+    // that cannot be fetched is a failure.
     let failures = 0;
     for (const entry of targets) {
       if (downloadingAll && !entry.downloadUrl) {

@@ -18,7 +18,6 @@ vi.mock('node:os', async (importOriginal) => {
   return { ...actual, uptime: () => actual.uptime() + 3600 };
 });
 
-// Default execFile implementation (always succeeds)
 const defaultExecFileImpl = (
   _cmd: string,
   _args: string[],
@@ -28,7 +27,6 @@ const defaultExecFileImpl = (
   callback(null, { stdout: '', stderr: '' });
 };
 
-// Mock child_process.execFile + spawn
 const mockExecFile = vi.fn(defaultExecFileImpl);
 
 const mockChildProcess = {
@@ -43,7 +41,6 @@ vi.mock('node:child_process', () => ({
   spawn: (...args: unknown[]) => mockSpawn(...args),
 }));
 
-// Mock fs (sync functions)
 const mockWriteFileSync = vi.fn();
 const mockOpenSync = vi.fn().mockReturnValue(42); // fake fd
 const mockCloseSync = vi.fn();
@@ -56,7 +53,6 @@ vi.mock('node:fs', () => ({
   readFileSync: (...args: unknown[]) => mockReadFileSync(...args),
 }));
 
-// Mock fs/promises
 const mockLink = vi.fn().mockResolvedValue(undefined);
 const mockMkdir = vi.fn().mockResolvedValue(undefined);
 const mockRm = vi.fn().mockResolvedValue(undefined);
@@ -162,7 +158,6 @@ vi.mock('./file-tail.js', () => ({
   },
 }));
 
-// Mock FirecrackerApi
 const mockPutMmds = vi.fn().mockResolvedValue(undefined);
 const mockClearMmds = vi.fn().mockResolvedValue(undefined);
 const mockSendCtrlAltDel = vi.fn().mockResolvedValue(undefined);
@@ -183,7 +178,6 @@ vi.mock('./firecracker-api.js', () => ({
 /** The signal the backend gave the most recently built FirecrackerApi. */
 let lastApiSignal: AbortSignal | undefined;
 
-// Mock nftables module
 const mockEnsureKiciTable = vi.fn().mockResolvedValue(undefined);
 const mockAddHostIsolationRules = vi.fn().mockResolvedValue(undefined);
 const mockAddIsolationRules = vi.fn().mockResolvedValue(undefined);
@@ -215,7 +209,6 @@ vi.mock('./overlay-template.js', async (importOriginal) => {
   return { ...actual, OverlayTemplates: StubbedOverlayTemplates };
 });
 
-// Mock IpAllocator
 function createMockIpAllocator() {
   const defaultAllocation: IpAllocationResult = {
     ip: '10.0.0.2',
@@ -234,7 +227,6 @@ function createMockIpAllocator() {
   };
 }
 
-// Import after mocking
 const { FirecrackerScalerBackend } = await import('./firecracker-backend.js');
 // Imported after the mocks: a static import pulls node:child_process into the
 // graph before the mock consts initialize.
@@ -287,7 +279,6 @@ function createBackend(
 describe('FirecrackerScalerBackend', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    // Restore default implementations after each test
     mockExecFile.mockImplementation(defaultExecFileImpl);
     mockSpawn.mockReturnValue(mockChildProcess);
     mockOpenSync.mockReturnValue(42);
@@ -350,7 +341,7 @@ describe('FirecrackerScalerBackend', () => {
         'ws://localhost:8080/ws/agent',
       );
 
-      // TAP device creation (3 calls: tuntap add, link set master, link set up)
+      // TAP device creation: tuntap add, link set master, link set up
       expect(mockExecFile).toHaveBeenCalledWith(
         'ip',
         ['tuntap', 'add', 'kici-aaaaaaaa', 'mode', 'tap'],
@@ -380,24 +371,20 @@ describe('FirecrackerScalerBackend', () => {
         expect.any(Function),
       );
 
-      // Chroot directory creation
       expect(mockMkdir).toHaveBeenCalledWith('/srv/jailer/firecracker/agent-1/root', {
         recursive: true,
       });
 
-      // Rootfs copy
       expect(mockLink).toHaveBeenCalledWith(
         '/opt/rootfs/ubuntu-22.04.ext4',
         '/srv/jailer/firecracker/agent-1/root/rootfs.ext4',
       );
 
-      // Kernel copy
       expect(mockLink).toHaveBeenCalledWith(
         '/opt/kernels/vmlinux',
         '/srv/jailer/firecracker/agent-1/root/kernel',
       );
 
-      // Config JSON written
       expect(mockWriteFile).toHaveBeenCalledOnce();
       const [configPath, configJson] = mockWriteFile.mock.calls[0];
       expect(configPath).toBe('/srv/jailer/firecracker/agent-1/root/config.json');
@@ -439,7 +426,6 @@ describe('FirecrackerScalerBackend', () => {
         },
       );
 
-      // waitForSocket called
       expect(mockWaitForSocket).toHaveBeenCalledWith(30_000);
 
       // MMDS metadata injected (orchestrator URL, agent ID, labels, scaler-managed
@@ -458,7 +444,6 @@ describe('FirecrackerScalerBackend', () => {
         },
       });
 
-      // Tracking updated
       expect(managed.state).toBe('running');
       expect(managed.id).toBe('agent-1');
     });
@@ -493,7 +478,6 @@ describe('FirecrackerScalerBackend', () => {
         'ws://localhost:8080/ws/agent',
       );
 
-      // Should use the node20 rootfsPath
       expect(mockLink).toHaveBeenCalledWith(
         '/opt/rootfs/node20.ext4',
         expect.stringContaining('rootfs.ext4'),
@@ -509,7 +493,6 @@ describe('FirecrackerScalerBackend', () => {
         'ws://localhost:8080/ws/agent',
       );
 
-      // Should use the custom kernel path from label set
       expect(mockLink).toHaveBeenCalledWith(
         '/opt/kernels/custom-vmlinux',
         expect.stringContaining('kernel'),
@@ -608,7 +591,7 @@ describe('FirecrackerScalerBackend', () => {
     it('cleans up on failure: releases IP, deletes TAP, cleans chroot', async () => {
       const { backend, mockIpAllocator } = createBackend();
 
-      // Make jailer spawn throw (spawn is used instead of execFile for jailer)
+      // The jailer runs through spawn, not execFile.
       mockSpawn.mockImplementation(() => {
         throw new Error('jailer failed');
       });
@@ -617,10 +600,8 @@ describe('FirecrackerScalerBackend', () => {
         backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent'),
       ).rejects.toThrow('jailer failed');
 
-      // IP should be released
       expect(mockIpAllocator.release).toHaveBeenCalledWith('agent-1');
 
-      // TAP should be deleted (cleanup call)
       expect(mockExecFile).toHaveBeenCalledWith(
         'ip',
         ['link', 'del', 'kici-aaaaaaaa'],
@@ -628,13 +609,11 @@ describe('FirecrackerScalerBackend', () => {
         expect.any(Function),
       );
 
-      // Chroot should be cleaned
       expect(mockRm).toHaveBeenCalledWith('/srv/jailer/firecracker/agent-1', {
         recursive: true,
         force: true,
       });
 
-      // Agent should not remain in tracking
       expect(backend.getActiveCount()).toBe(0);
     });
 
@@ -854,10 +833,9 @@ describe('FirecrackerScalerBackend', () => {
     });
 
     it('writes per-VM rules to the CONFIGURED table, not the literal kici', async () => {
-      // With two coordinators on one host, coordinator B's baseline goes to
-      // kici_b while its per-VM rules used to go to kici — coordinator A's
-      // table. A's next re-provision then swept B's live VMs' isolation along
-      // with its own, and B's rules were evaluated against A's baseline.
+      // With two coordinators on one host, B's baseline is in kici_b. Per-VM rules
+      // in kici (A's table) would be swept by A's next re-provision and evaluated
+      // against A's baseline.
       const { backend } = createBackend({ table: 'kici_b' });
 
       await backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent');
@@ -900,8 +878,7 @@ describe('FirecrackerScalerBackend', () => {
   });
 
   describe('forwarded env (KICI_AGENT_ENV_* + scalers.yaml env:)', () => {
-    // Snapshot/restore process.env so each test starts clean and we don't
-    // pollute other suites in the same vitest worker.
+    // Snapshot/restore process.env so other suites in the vitest worker stay clean.
     const envSnapshot: Record<string, string | undefined> = {};
     const trackedEnvKeys = ['KICI_AGENT_ENV_HTTP_PROXY', 'KICI_AGENT_ENV_HUGE'];
 
@@ -1020,19 +997,15 @@ describe('FirecrackerScalerBackend', () => {
       try {
         await backend.destroy('agent-1');
 
-        // SendCtrlAltDel attempted
         expect(mockSendCtrlAltDel).toHaveBeenCalledOnce();
 
-        // IP released
         expect(mockIpAllocator.release).toHaveBeenCalledWith('agent-1');
 
-        // Chroot cleaned
         expect(mockRm).toHaveBeenCalledWith('/srv/jailer/firecracker/agent-1', {
           recursive: true,
           force: true,
         });
 
-        // Agent removed from tracking
         expect(backend.getActiveCount()).toBe(0);
       } finally {
         process.kill = origKill;
@@ -1174,7 +1147,6 @@ describe('FirecrackerScalerBackend', () => {
       mockSendCtrlAltDel.mockRejectedValue(new Error('action not supported on arm64'));
       mockReadFile.mockResolvedValue('12345');
 
-      // Mock process.kill to simulate dead VM
       const origKill = process.kill;
       process.kill = vi.fn().mockImplementation(() => {
         throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
@@ -1198,7 +1170,6 @@ describe('FirecrackerScalerBackend', () => {
       vi.clearAllMocks();
       mockExecFile.mockImplementation(defaultExecFileImpl);
 
-      // PID file doesn't exist
       mockReadFile.mockRejectedValue(new Error('ENOENT'));
 
       await backend.destroy('agent-1');
@@ -1997,7 +1968,6 @@ describe('FirecrackerScalerBackend', () => {
     it('destroys all managed agents', async () => {
       const { backend, mockIpAllocator } = createBackend();
 
-      // Track different allocations for each spawn
       const alloc1: IpAllocationResult = {
         ip: '10.0.0.2',
         gateway: '10.0.0.1',
@@ -2023,7 +1993,6 @@ describe('FirecrackerScalerBackend', () => {
 
       expect(backend.getActiveCount()).toBe(2);
 
-      // Mock process.kill for destroy
       const origKill = process.kill;
       process.kill = vi.fn().mockImplementation(() => {
         throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
@@ -2289,8 +2258,7 @@ describe('FirecrackerScalerBackend', () => {
           allocated_at: new Date(),
         },
       ]);
-      // PID file read returns the current process PID -> isVmProcessAlive() returns true,
-      // so DB allocation is considered live and not cleaned in Pass 1.
+      // Our own PID reads as alive, so Pass 1 keeps the DB allocation.
       mockPidFile(String(process.pid));
       mockReaddir.mockResolvedValueOnce([]);
 
@@ -2374,19 +2342,16 @@ describe('FirecrackerScalerBackend', () => {
     });
 
     it('Pass 3 race protection: re-reads allocations after listing interfaces', async () => {
-      // Simulates the narrow race where a spawn's `allocate()` lands AFTER
-      // cleanupOrphans has already read the DB but BEFORE it lists interfaces
-      // (since `allocate()` happens before `ip tuntap add` in spawn(), any
-      // TAP on the host must have a DB row by the time it's visible).
+      // A spawn's `allocate()` lands after the first DB read but before the
+      // interface listing. `allocate()` precedes `ip tuntap add`, so any visible
+      // TAP has a DB row by the re-read.
       const { backend, mockIpAllocator } = createBackend();
 
-      // First DB read: empty (spawn's allocate() hasn't landed yet).
+      // First DB read: empty.
       mockIpAllocator.getAllocations.mockResolvedValueOnce([]);
       mockReaddir.mockResolvedValueOnce([]);
 
-      // Second DB read (Pass 3 re-read, after listing interfaces): the new
-      // spawn's allocation is now visible. The race-protection branch kicks
-      // in and the newly-spawned TAP is NOT deleted.
+      // Pass 3 re-read: the new allocation is visible, so its TAP is NOT deleted.
       mockIpAllocator.getAllocations.mockResolvedValueOnce([
         {
           ip: '10.0.0.6',
@@ -2425,10 +2390,9 @@ describe('FirecrackerScalerBackend', () => {
       // must never have its TAP deleted, even if both DB reads miss it.
       const { backend, mockIpAllocator } = createBackend();
 
-      // First spawn a real agent so this.agents has a tapDevice entry.
       await backend.spawn(['linux', 'firecracker'], 'live-agent', 'ws://localhost:8080/ws/agent');
 
-      // cleanupOrphans() reads the DB twice — return empty both times.
+      // Both DB reads miss it.
       mockIpAllocator.getAllocations.mockResolvedValue([]);
       mockReaddir.mockResolvedValue([]);
 
@@ -2458,9 +2422,7 @@ describe('FirecrackerScalerBackend', () => {
     it('never reaps a live VM (PID alive) even with empty DB + empty tracking', async () => {
       const { backend, mockIpAllocator } = createBackend();
 
-      // No DB allocations and no in-memory tracking: a naive reap would treat
-      // every chroot/TAP as an orphan. The liveness pre-scan must protect the
-      // live VM.
+      // With no DB rows or tracking, only the liveness pre-scan protects the live VM.
       mockIpAllocator.getAllocations.mockResolvedValue([]);
 
       // A realistic scaler-minted id: `generateAgentId` produces
@@ -2475,20 +2437,16 @@ describe('FirecrackerScalerBackend', () => {
       // consulting the live-TAP guard and the negative control would be vacuous.
       const wrongSliceTap = 'kici-deadbeef';
 
-      // Chroot parent holds one live VM dir and one dead orphan dir.
-      // (Single readdir — the pre-scan and Pass 2 share it.)
+      // One live VM dir and one dead orphan; the pre-scan and Pass 2 share the readdir.
       mockReaddir.mockResolvedValue([liveVmId, 'dead-vm-1']);
 
-      // Liveness pre-scan reads each VM's firecracker.pid:
-      //  - the live VM -> our own pid (alive)
-      //  - dead-vm-1   -> ENOENT (dead)
+      // firecracker.pid: our own pid for the live VM, ENOENT for dead-vm-1.
       mockReadFile.mockImplementation(async (p: string) => {
         if (String(p).startsWith('/proc/')) return procStatLine();
         if (p.includes(liveVmId)) return `${process.pid}`;
         throw new Error('ENOENT');
       });
 
-      // Host has the live VM's real TAP and one orphan TAP.
       mockExecFile.mockImplementation((cmd, args, _o, cb) => {
         if (cmd === 'ip' && args[0] === '-br') {
           cb(null, { stdout: `${liveTap}\n${wrongSliceTap}\n`, stderr: '' });
@@ -2580,7 +2538,7 @@ describe('FirecrackerScalerBackend', () => {
       backend.startPeriodicOrphanSweep(1000); // ignored
 
       await vi.advanceTimersByTimeAsync(1000);
-      // Exactly one timer, not two — would be 2 if the second start had created a second interval
+      // One call: the second start must not create a second interval.
       expect(cleanupSpy).toHaveBeenCalledTimes(1);
 
       backend.stopPeriodicOrphanSweep();
@@ -2609,13 +2567,11 @@ describe('FirecrackerScalerBackend', () => {
 
       backend.startPeriodicOrphanSweep(100);
 
-      // Fire multiple interval ticks while cleanupOrphans is still pending.
       await vi.advanceTimersByTimeAsync(100);
       await vi.advanceTimersByTimeAsync(100);
       await vi.advanceTimersByTimeAsync(100);
 
-      // Only one invocation should have been started; the re-entrant guard
-      // drops the overlapping ticks.
+      // The re-entrant guard drops the overlapping ticks.
       expect(cleanupSpy).toHaveBeenCalledTimes(1);
 
       // Complete the slow run and let the next tick fire.
@@ -2653,7 +2609,6 @@ describe('FirecrackerScalerBackend', () => {
       await backend.spawn(['linux', 'firecracker'], 'agent-1', 'ws://localhost:8080/ws/agent');
       expect(backend.getActiveCount()).toBe(1);
 
-      // Provide a second allocation for the second spawn
       mockIpAllocator.allocate.mockResolvedValueOnce({
         ip: '10.0.0.3',
         gateway: '10.0.0.1',

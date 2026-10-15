@@ -7,7 +7,6 @@ export type { ValidationResult } from './validation/index.js';
 
 export { generateLockFile, serializeLockFile } from './lockfile/index.js';
 
-// Lock file types
 export { SCHEMA_VERSION, isLockStaticJob, isLockParallelStep } from './types.js';
 export type {
   LockFile,
@@ -28,6 +27,5 @@ export type {
   LockBranchPattern,
 } from './types.js';
 
-// Error types
 export { formatError, compilerError, isCompilerError } from './errors/index.js';
 export type { SourceLocation, CompilerError } from './errors/index.js';

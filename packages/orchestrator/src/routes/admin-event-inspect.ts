@@ -1,14 +1,13 @@
 /**
- * Admin API routes for inspecting internal events (`kici_events`).
- *
+ * Admin routes to inspect internal events (`kici_events`):
  *   GET /api/v1/admin/events      — list events, newest first (name, outcome, time filters)
  *   GET /api/v1/admin/events/:id  — one event: its payload and the runs it dispatched
  *
  * Each row carries its dispatch state (`pending`, `leased`, `retrying`,
  * `processed`, `dlq`) and, once processed, how the router resolved it
  * (`matched`, `no-target-repo`, …) with the number of workflows it reached.
- * Both routes need `event_dlq.read`, the permission that already gates reading
- * `kici_events` rows; the payload on `show` also needs
+ * Both routes need `event_dlq.read` (which gates reading `kici_events` rows);
+ * the payload on `show` also needs
  * `event_log.read_payload`. A routing-key-scoped token sees only events
  * emitted under its own key.
  */
@@ -68,9 +67,8 @@ function toListRow(e: StoredEvent) {
 export function createAdminEventInspectRoutes(deps: AdminEventInspectRoutesDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
 
-  // Attached per GET route rather than with `app.use`: `POST
-  // /api/v1/admin/events/emit` lives under the same prefix in another router,
-  // which runs its own auth.
+  // Per GET route, not `app.use`: `POST /api/v1/admin/events/emit` shares the
+  // prefix in another router, which runs its own auth.
   const authMiddleware = createBearerAuthMiddleware({
     tokenManager: deps.tokenManager,
     scope: 'admin-event-inspect',
@@ -92,8 +90,8 @@ export function createAdminEventInspectRoutes(deps: AdminEventInspectRoutesDeps)
       outcome = parsed.data;
     }
     const since = parseTime(c.req.query('since'));
-    // `before` is either the next-page cursor (the id of the last event on
-    // the previous page) or an ISO timestamp.
+    // `before` is the next-page cursor (last event id of the previous page) or
+    // an ISO timestamp.
     const rawBefore = c.req.query('before');
     const afterEventId = rawBefore !== undefined && UUID_RE.test(rawBefore) ? rawBefore : undefined;
     const before = afterEventId === undefined ? parseTime(rawBefore) : undefined;

@@ -76,7 +76,6 @@ describe('EventCircuitBreaker', () => {
     });
 
     it('should reject when rate limit is exceeded', async () => {
-      // Fill up the limit
       for (let i = 0; i < 5; i++) {
         await breaker.checkRateLimit('wf:ci');
       }
@@ -88,7 +87,6 @@ describe('EventCircuitBreaker', () => {
     });
 
     it('should track different workflows independently', async () => {
-      // Fill up one workflow
       for (let i = 0; i < 5; i++) {
         await breaker.checkRateLimit('wf:ci');
       }
@@ -102,7 +100,6 @@ describe('EventCircuitBreaker', () => {
       const now = Date.now();
       vi.spyOn(Date, 'now').mockReturnValue(now);
 
-      // Fill up the limit
       for (let i = 0; i < 5; i++) {
         await breaker.checkRateLimit('wf:ci');
       }
@@ -119,7 +116,6 @@ describe('EventCircuitBreaker', () => {
       const now = Date.now();
       vi.spyOn(Date, 'now').mockReturnValue(now);
 
-      // Add some requests
       for (let i = 0; i < 3; i++) {
         await breaker.checkRateLimit('wf:ci');
       }
@@ -175,7 +171,6 @@ describe('EventCircuitBreaker', () => {
 
   describe('reset', () => {
     it('should clear all rate limit state', async () => {
-      // Fill up multiple workflows
       for (let i = 0; i < 5; i++) {
         await breaker.checkRateLimit('wf:ci');
         await breaker.checkRateLimit('wf:deploy');
@@ -185,7 +180,6 @@ describe('EventCircuitBreaker', () => {
       expect((await breaker.checkRateLimit('wf:ci')).allowed).toBe(false);
       expect((await breaker.checkRateLimit('wf:deploy')).allowed).toBe(false);
 
-      // Reset
       breaker.reset();
 
       // Both should be allowed again

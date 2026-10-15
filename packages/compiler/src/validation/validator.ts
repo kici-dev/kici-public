@@ -16,12 +16,9 @@ import {
 } from '../errors/index.js';
 import type { WorkflowWithSource } from '../types.js';
 
-/** Maximum jobs from static matrix expansion (GitHub Actions limit) */
+/** Matches the GitHub Actions limit. */
 const MAX_STATIC_MATRIX_JOBS = 256;
 
-/**
- * Validation result - either success or list of errors.
- */
 export type ValidationResult = { valid: true } | { valid: false; errors: CompilerError[] };
 
 /**
@@ -32,6 +29,7 @@ export type ValidationResult = { valid: true } | { valid: false; errors: Compile
  * 2. No duplicate job names within each workflow
  * 3. Job dependencies are valid (exist, no cycles, no self-refs)
  * 4. Static matrix expansions stay under 256 job limit
+ * 5. Invoke-gate jobs carry no steps and name a non-empty event
  *
  * Each error carries the most precise `file:line:column` the data allows: a
  * job-scoped error anchors to the offending job's first step location (real
@@ -40,12 +38,10 @@ export type ValidationResult = { valid: true } | { valid: false; errors: Compile
  * since `workflow()` captures no call-site).
  *
  * @param workflows - Source-carrying workflows from discovery
- * @returns Validation result with errors if any
  */
 export function validateConfig(workflows: WorkflowWithSource[]): ValidationResult {
   const errors: CompilerError[] = [];
 
-  // Check for duplicate workflow names
   const workflowNames = new Set<string>();
   for (const { workflow, source } of workflows) {
     if (workflowNames.has(workflow.name)) {
@@ -59,7 +55,6 @@ export function validateConfig(workflows: WorkflowWithSource[]): ValidationResul
     workflowNames.add(workflow.name);
   }
 
-  // Validate each workflow
   for (const { workflow, source } of workflows) {
     errors.push(...validateWorkflow(workflow, source.file));
   }
@@ -71,28 +66,23 @@ export function validateConfig(workflows: WorkflowWithSource[]): ValidationResul
   return { valid: true };
 }
 
-/**
- * Validate a single workflow.
- */
 function validateWorkflow(workflow: Workflow, workflowFile: string): CompilerError[] {
   const errors: CompilerError[] = [];
 
-  // Separate static jobs from dynamic job functions
+  // Dynamic job functions cannot be validated at compile time.
   const staticJobs: Job[] = [];
   for (const jobOrFactory of workflow.jobs) {
     if (!isDynamicJobFn(jobOrFactory)) {
       staticJobs.push(jobOrFactory as Job);
     }
-    // Dynamic job functions can't be validated at compile-time
   }
 
-  // Resolve a job name to its best source location (first step, else file:1).
+  // First step location, else file:1.
   const jobLoc = (name: string): SourceLocation => {
     const j = staticJobs.find((s) => s.name === name);
     return j ? locationForJob(j, workflowFile) : { file: workflowFile, line: 1, column: 1 };
   };
 
-  // Check for duplicate job names
   const jobNames = new Set<string>();
   for (const job of staticJobs) {
     if (jobNames.has(job.name)) {
@@ -106,7 +96,7 @@ function validateWorkflow(workflow: Workflow, workflowFile: string): CompilerErr
     jobNames.add(job.name);
   }
 
-  // Collect dynamic job group names for synthetic DAG nodes ( Layer 1)
+  // Dynamic job groups become synthetic DAG nodes.
   const dynamicGroupNames = new Set<string>();
   for (const jobOrFactory of workflow.jobs) {
     if (isDynamicJobFn(jobOrFactory)) {
@@ -117,17 +107,14 @@ function validateWorkflow(workflow: Workflow, workflowFile: string): CompilerErr
     }
   }
 
-  // Validate DAG dependencies (with synthetic group nodes)
   const dagErrors = validateJobDag(staticJobs, workflow.name, jobLoc, dynamicGroupNames);
   errors.push(...dagErrors);
 
-  // Validate static matrix limits
   for (const job of staticJobs) {
     const matrixErrors = validateStaticMatrix(job, workflow.name, workflowFile);
     errors.push(...matrixErrors);
   }
 
-  // Validate invoke-gate jobs (mutually exclusive with steps; non-empty event).
   for (const job of staticJobs) {
     errors.push(...validateInvokeJob(job, jobLoc(job.name)));
   }
@@ -136,9 +123,8 @@ function validateWorkflow(workflow: Workflow, workflowFile: string): CompilerErr
 }
 
 /**
- * Validate an invoke-gate job. A gate is mutually exclusive with step code and
- * must name a non-empty event. Defense-in-depth: the SDK `job()` factory already
- * enforces these, but a generated job could reach the compiler carrying them.
+ * An invoke gate excludes step code and names a non-empty event. Defense in
+ * depth: the SDK `job()` factory enforces both, but a generated job bypasses it.
  */
 function validateInvokeJob(job: Job, location: SourceLocation): CompilerError[] {
   if (!job.invoke) return [];
@@ -163,18 +149,11 @@ function validateInvokeJob(job: Job, location: SourceLocation): CompilerError[] 
   return errors;
 }
 
-/**
- * Best location for a DAG node id: strip the synthetic `__group:` prefix (which
- * has no backing Job) and resolve via the job-location lookup.
- */
+/** A synthetic `__group:` node has no backing Job, so its prefix is stripped first. */
 function dagNodeLocation(nodeId: string, jobLoc: (name: string) => SourceLocation): SourceLocation {
   return jobLoc(nodeId.startsWith('__group:') ? nodeId.slice('__group:'.length) : nodeId);
 }
 
-/**
- * Validate job dependency DAG.
- * Includes synthetic __group: nodes for tagged dynamic job functions ( Layer 1).
- */
 function validateJobDag(
   jobs: Job[],
   workflowName: string,
@@ -183,21 +162,19 @@ function validateJobDag(
 ): CompilerError[] {
   const errors: CompilerError[] = [];
 
-  // Build DAG nodes from static jobs
   const dagNodes = jobs.map((job) => ({
     id: job.name,
     needs: resolveNeeds(job.needs),
   }));
 
-  // Add synthetic nodes for dynamic groups ( Layer 1)
-  // These have no outbound edges at compile time (Layer 2 catches actual cycles)
+  // Group nodes have no outbound edges at compile time; real cycles through a
+  // generated job are caught at runtime.
   if (dynamicGroupNames) {
     for (const groupName of dynamicGroupNames) {
       dagNodes.push({ id: `__group:${groupName}`, needs: [] });
     }
   }
 
-  // Use SDK's validateDag function
   const result = validateDag(dagNodes);
 
   if (!result.valid) {
@@ -206,9 +183,8 @@ function validateJobDag(
         errors.push(
           compilerError(
             'E102',
-            // Comma-join, not ' -> ': nodesInCycle is an unordered set of the jobs on
-            // the cycle (declaration order), so arrows would imply a dependency path
-            // that the id list does not represent.
+            // Comma-join, not ' -> ': nodesInCycle is in declaration order, not
+            // path order, so arrows would imply a path it does not represent.
             `Circular dependency in workflow "${workflowName}": ${result.nodesInCycle.join(', ')}`,
             {
               location: dagNodeLocation(result.nodesInCycle[0] ?? '', jobLoc),
@@ -249,10 +225,7 @@ function validateJobDag(
   return errors;
 }
 
-/**
- * Resolve needs array to job names (handling Job objects, strings, DynamicGroupRef, and object forms).
- * DynamicGroupRef and { group } forms resolve to synthetic __group: node names.
- */
+/** Group references resolve to synthetic `__group:` node names. */
 function resolveNeeds(needs?: Job['needs']): string[] {
   if (!needs) return [];
 
@@ -260,26 +233,21 @@ function resolveNeeds(needs?: Job['needs']): string[] {
     if (typeof need === 'string') {
       return need;
     }
-    // DynamicGroupRef (Symbol-tagged)
     if (isDynamicGroupRef(need)) {
       return `__group:${need.group}`;
     }
-    // Object form with 'group' property (NeedsGroupEntry)
     if ('group' in need && typeof (need as { group: string }).group === 'string') {
       return `__group:${(need as { group: string }).group}`;
     }
-    // Object form with 'name' property (NeedsEntry or Job)
+    // NeedsEntry or Job.
     if ('name' in need) {
       return (need as { name: string }).name;
     }
-    // Unreachable with current union type, but defensive fallback
+    // Unreachable with the current union type.
     return String(need);
   });
 }
 
-/**
- * Validate static matrix doesn't exceed job limit.
- */
 function validateStaticMatrix(
   job: Job,
   workflowName: string,
@@ -289,8 +257,7 @@ function validateStaticMatrix(
 
   if (!job.matrix) return errors;
 
-  // Only validate static matrices at compile-time
-  // Dynamic matrices are evaluated at runtime
+  // A dynamic matrix is evaluated at runtime.
   if (typeof job.matrix === 'function') {
     return errors;
   }
@@ -298,21 +265,17 @@ function validateStaticMatrix(
   let expansionCount = 1;
 
   if (isStaticArray(job.matrix)) {
-    // Single-dimension: count is array length
     expansionCount = job.matrix.length;
   } else if (isStaticObject(job.matrix)) {
-    // Multi-dimension: count is cartesian product
+    // Cartesian product.
     expansionCount = Object.values(job.matrix).reduce(
       (acc, dimension) => acc * dimension.length,
       1,
     );
   }
 
-  // Apply exclude filter (reduces count)
-  // We can't precisely calculate without running the filters,
-  // so we use the raw expansion count as upper bound
-
-  // Apply include additions
+  // Excludes are ignored: counting them needs the filters run, so the raw
+  // expansion is the upper bound.
   if (job.include) {
     expansionCount += job.include.length;
   }

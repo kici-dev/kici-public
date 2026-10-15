@@ -1,12 +1,11 @@
 /**
- * A context a lock workflow names at the workflow level (`LockWorkflow.contexts`)
- * is bound by every job of that workflow and gated per job, exactly like a
- * context the job names itself: the reject rules (repository, branch, trigger,
+ * A workflow-level context (`LockWorkflow.contexts`) is bound by every job and
+ * gated per job like a job's own: the reject rules (repository, branch, trigger,
  * enabled), then the protection gates (required reviewers, wait timer, minimum
- * trust, concurrency), and only after both the context's secrets.
+ * trust, concurrency), and only then the context's secrets.
  *
- * The lock file is committed in the repository, so a workflow-level entry is
- * as attacker-controlled as a job-level one and must cost the same.
+ * The lock file is committed in the repository, so a workflow-level entry is as
+ * attacker-controlled as a job-level one and must cost the same.
  */
 import { describe, expect, it, vi } from 'vitest';
 import { ContextGateRejectReason, ExecutionJobStatus } from '@kici-dev/engine';
@@ -53,11 +52,7 @@ interface Scenario {
   withGenerated?: boolean;
   /** Give the static job a dynamic env, so its contexts are gated after init. */
   withDeferredInit?: boolean;
-  /**
-   * Bind the static job to one DYNAMIC context, which its init round resolves to
-   * this name: the job's contexts are gated after the round, from the names it
-   * reports.
-   */
+  /** Bind the static job to one DYNAMIC context its init round resolves to this name. */
   dynamicJobContext?: string;
 }
 
@@ -68,7 +63,7 @@ interface DbCall {
   args: unknown[];
 }
 
-/** {@link makeHoldDb}, recording every `where` and `set` made on each table. */
+/** {@link makeHoldDb}, recording every `where` and `set` per table. */
 function recordingHoldDb(): { db: unknown; calls: DbCall[] } {
   const db = makeHoldDb() as unknown as Record<string, (table: string) => Record<string, unknown>>;
   const calls: DbCall[] = [];

@@ -1,15 +1,15 @@
 /**
  * WebSocket handler for incoming peer connections from other orchestrators.
  *
- * Accepts WS upgrade, performs ECDH key exchange, and authenticates the peer
- * with mutual-v2: `peer.hello` advertises the scheme, the peer proves its
- * credential (or, on first join, its join token) with an HMAC over the
- * handshake transcript, and this server answers with its own proof and
- * switches to the application key. A join token never arrives here: the peer
- * sends the token's routing segment, and the role and routing key come from
- * the join_tokens row. A request in the scheme earlier releases used is refused
- * with PEER_MUTUAL_AUTH_REQUIRED_REASON. Registers the peer in PeerRegistry and
- * routes messages bidirectionally. Sends periodic heartbeats to the peer.
+ * Performs ECDH key exchange and authenticates the peer with mutual-v2:
+ * `peer.hello` advertises the scheme, the peer proves its credential (or, on
+ * first join, its join token) with an HMAC over the handshake transcript, and
+ * this server answers with its own proof and switches to the application key.
+ * A join token never arrives here: the peer sends the token's routing segment,
+ * and the role and routing key come from the join_tokens row. A request in the
+ * scheme earlier releases used is refused with PEER_MUTUAL_AUTH_REQUIRED_REASON.
+ * Registers the peer in PeerRegistry, routes messages both ways, and sends
+ * periodic heartbeats.
  */
 
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -109,10 +109,7 @@ const logger = createLogger({ prefix: 'peer-handler' });
 declare const KICI_PKG_VERSION: string;
 const SOFTWARE_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.0';
 
-/**
- * Minimal WebSocket interface for peer connections.
- * Same pattern as agent/registry.ts WsLike, allowing mock testing.
- */
+/** Minimal WebSocket surface (like agent/registry.ts WsLike), so tests can mock it. */
 export interface PeerWsLike {
   send(data: string): void;
   close(code?: number, reason?: string): void;
@@ -121,66 +118,52 @@ export interface PeerWsLike {
 }
 
 export interface PeerHandlerDeps {
-  /** Join token manager for validating first-time peer tokens. */
   tokenManager: JoinTokenManager;
-  /** Credential store for session credential CRUD. */
   credentialStore: PeerCredentialStore;
-  /** Accepted roles for connecting peers. Default: ['coordinator', 'worker'] (accept any). */
+  /** Default: ['coordinator', 'worker'] (accept any). */
   acceptedRoles?: Array<'coordinator' | 'worker'>;
-  /** This orchestrator's instance ID. */
   instanceId: string;
-  /** Peer registry to track incoming peers. */
   peerRegistry: PeerRegistry;
-  /** Callback to get this orchestrator's local agent inventory for heartbeats. */
+  /** This orchestrator's local agent inventory, sent in heartbeats. */
   getLocalInventory: () => Omit<PeerHeartbeat, 'type'>;
   /**
-   * The Platform-pushed worker ceiling this coordinator enforces, or `null`
-   * when none was ever received (admit worker joins freely). Read at each
-   * worker-peer admission. Served from the persisted PlanHeadroomStore, so it
-   * survives a Platform disconnect — the coordinator keeps enforcing the last
-   * known ceiling rather than resetting to unlimited.
+   * The Platform-pushed worker ceiling, read at each worker-peer admission;
+   * `null` when none was ever received (admit freely). Served from the
+   * persisted PlanHeadroomStore, so the last known ceiling survives a Platform
+   * disconnect rather than resetting to unlimited.
    */
   getWorkerCeiling?: () => Promise<number | null>;
   /** Heartbeat interval in ms. Default: 30000 (30s). */
   heartbeatIntervalMs?: number;
   /** Auth timeout in ms. Default: 15000 (15s). */
   authTimeoutMs?: number;
-  /** Callback when a job reroute request is received from peer. */
   onJobReroute: (msg: JobReroute) => Promise<void>;
-  /** Callback when a job progress update is received from peer. */
   onJobProgress: (msg: JobProgress, fromPeerId: string, reply: (m: JobProgressAck) => void) => void;
-  /** Callback when a scaler provisioning event is forwarded by a worker peer. */
+  /** A scaler provisioning event a worker peer forwarded. */
   onPeerScalerEvent?: (msg: PeerScalerEvent, fromPeerId: string) => void;
-  /** Callback when a job cancel request is received from peer. */
   onJobCancel: (msg: PeerJobCancel) => void;
-  /** Callback when a log chunk is received from a worker peer. */
+  /** A log chunk a worker peer relayed. */
   onPeerLogChunk?: (chunk: PeerLogChunk, peerId: string) => void;
-  /** Callback when a cache upload request is received from a worker peer. */
+  /** A cache upload request from a worker peer. */
   onPeerCacheUploadRequest?: (
     req: PeerCacheUploadRequest,
     peerId: string,
   ) => Promise<PeerCacheUploadResponse>;
-  /** Callback for Raft vote requests. */
   onRaftVoteRequest?: (msg: RaftVoteRequest) => RaftVoteResponse;
-  /** Callback for Raft vote responses (forwarded to Raft module). */
+  /** Forwarded to the Raft module. */
   onRaftVoteResponse?: (msg: RaftVoteResponse) => void;
-  /** Callback for Raft append entries (leader heartbeat). */
+  /** Leader heartbeat. */
   onRaftAppendEntries?: (msg: RaftAppendEntries) => void;
-  /** Callback when a peer.leaving announcement is received. */
   onPeerLeaving?: (msg: PeerLeaving) => void;
   /**
-   * Callback when a peer.agent-token.revoke announcement is received.
-   * The local handler should call agentRegistry.disconnectByTokenId(tokenId)
-   * to close every in-flight WS authenticated by the now-revoked token.
+   * Should call agentRegistry.disconnectByTokenId(tokenId) to close every
+   * in-flight WS authenticated by the revoked token.
    */
   onAgentTokenRevoke?: (msg: PeerAgentTokenRevoke) => void;
   /**
-   * Callback when a config reload request is received from a peer.
-   * Should execute a local config reload and return the result fields,
-   * which are sent back via peer.config.reload.response.
-   *
-   * If undefined, incoming reload requests are answered with success=false
-   * and an error explaining that reload is unavailable on this peer.
+   * Runs a local config reload; the result goes back via
+   * peer.config.reload.response. If undefined, requests are answered with
+   * success=false and an error saying reload is unavailable on this peer.
    */
   onPeerConfigReload?: (msg: PeerConfigReload) => Promise<{
     success: boolean;
@@ -190,43 +173,38 @@ export interface PeerHandlerDeps {
     fieldsChanged?: string[];
   }>;
   /**
-   * Callback when a peer.clusterSettings.request arrives from a DB-less worker.
-   * Resolves the worker-relevant settings snapshot (async DB read) and the
-   * current cluster_settings version; the result is sent back via
-   * peer.clusterSettings.response. If undefined, requests are answered with the
-   * config-default snapshot at version 0.
+   * Resolves a DB-less worker's settings snapshot and the cluster_settings
+   * version, sent back via peer.clusterSettings.response. If undefined,
+   * requests are answered with the config-default snapshot at version 0.
    */
   onPeerClusterSettingsRequest?: (
     msg: PeerClusterSettingsRequest,
   ) => Promise<{ version: number; settings: WorkerClusterSettings }>;
   /**
-   * Callback when a peer.logs.collect.request arrives from an incoming-dialed
-   * peer. Builds this node's subtree bundle and streams it back through `send`
-   * (peer.logs.collect.chunk frames, or a peer.logs.collect.error on failure).
-   * If undefined, incoming collect requests are ignored.
+   * Builds this node's subtree bundle and streams it back through `send`
+   * (peer.logs.collect.chunk frames, or peer.logs.collect.error on failure).
+   * If undefined, collect requests are ignored.
    */
   onLogsCollectRequest?: (
     msg: PeerLogsCollectRequest,
     send: (out: PeerToPeerMessage) => boolean,
   ) => Promise<void>;
   /**
-   * Answers a peer.scaler.orphans.request a coordinator forwarded to this node
-   * (`kici-admin scaler orphans --target`). A request from a peer that is not
-   * a coordinator is refused before it reaches the handler. If undefined,
-   * requests are answered with ok=false.
+   * Answers a forwarded peer.scaler.orphans.request (`kici-admin scaler orphans
+   * --target`). A non-coordinator peer's request is refused before it reaches
+   * the handler. If undefined, requests are answered with ok=false.
    */
   onScalerOrphansRequest?: ScalerOrphansRequestHandler;
   /**
-   * Reloads this node's scaler config for a peer.scaler.reload.request
-   * (`kici-admin scaler reload`). A request from a peer that is not a
-   * coordinator is refused before it reaches the handler. If undefined,
-   * requests are answered `rejected`.
+   * Reloads this node's scaler config (`kici-admin scaler reload`). A
+   * non-coordinator peer's request is refused before it reaches the handler. If
+   * undefined, requests are answered `rejected`.
    */
   onScalerReloadRequest?: ScalerFileReload;
   /**
    * Forgets a departed peer a sibling coordinator forgot (`kici-admin peer
-   * forget`). A request from a peer that is not a coordinator is refused. If
-   * undefined, requests are answered with outcome `error`.
+   * forget`). A non-coordinator peer's request is refused. If undefined,
+   * requests are answered with outcome `error`.
    */
   onPeerForgetRequest?: PeerForgetRequestHandler;
 }
@@ -281,7 +259,6 @@ interface TokenGrant {
   trigger: 'token-join' | 'idempotent-token-retry';
 }
 
-/** Rate limit tracking per IP. */
 interface RateLimitEntry {
   count: number;
   resetAt: number;
@@ -289,23 +266,16 @@ interface RateLimitEntry {
 
 /** Max failed auth attempts per IP within the window. */
 const RATE_LIMIT_MAX = 5;
-/** Rate limit window in ms. */
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
-/**
- * Create a handler function for incoming peer WebSocket connections.
- *
- * Returns `handleConnection(ws, remoteIp?)` which should be called when a new
- * WebSocket connection is upgraded on the peer endpoint.
- */
 /**
  * Whether a joining peer may be admitted against the plan ceiling.
  *
  * Only workers are gated: a coordinator peer holds its own Platform connection
  * and is counted there, and a peer advertising no role registers as a
- * coordinator (see PeerRegistry.addPeer), so neither is gated here. A `null`
- * ceiling — none ever received — admits freely. The ceiling is ABSOLUTE, so the
- * join is admitted only while the currently-connected worker count is below it.
+ * coordinator (see PeerRegistry.addPeer). A `null` ceiling (none ever received)
+ * admits freely. The ceiling is ABSOLUTE: admit only while the connected worker
+ * count is below it.
  */
 export function shouldAdmitWorker(
   role: string | undefined,
@@ -317,6 +287,10 @@ export function shouldAdmitWorker(
   return connectedWorkerCount < ceiling;
 }
 
+/**
+ * Returns `handleConnection(ws, remoteIp?)`, called for each WebSocket upgraded
+ * on the peer endpoint.
+ */
 export function createPeerHandler(deps: PeerHandlerDeps) {
   const {
     tokenManager,
@@ -347,19 +321,15 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     onPeerForgetRequest,
   } = deps;
 
-  /** Active peer connections by instanceId. */
   const connections = new Map<string, PeerConnection>();
 
-  /** ACK waiters for sendAndWaitAck (server-side connections). Keyed by messageId. */
+  /** sendAndWaitAck waiters for server-side connections, keyed by messageId. */
   const ackWaiters = new Map<
     string,
     { resolve: (accepted: boolean) => void; timer: ReturnType<typeof setTimeout> }
   >();
 
-  /**
-   * Config reload response waiters (server-side connections). Keyed by messageId.
-   * Resolved when a peer.config.reload.response arrives.
-   */
+  /** Keyed by messageId; resolved by peer.config.reload.response. */
   const configReloadWaiters = new Map<
     string,
     {
@@ -368,11 +338,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     }
   >();
 
-  /** Scaler orphan response waiters (server-side connections). */
   const scalerOrphansWaiters = new ScalerOrphansWaiters();
-  /** Scaler reload response waiters (server-side connections). */
   const scalerReloadWaiters = new ScalerReloadWaiters();
-  /** Peer forget response waiters (server-side connections). */
   const peerForgetWaiters = new PeerForgetWaiters();
 
   /** Correlates peer.logs.collect.request with the peer's chunked subtree response. */
@@ -380,14 +347,10 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   /** messageId -> target peer instanceId, so a peer's disconnect rejects only its collects. */
   const logsCollectTargets = new Map<string, string>();
 
-  /** Rate limiting for failed auth attempts by IP. */
+  /** Failed auth attempts, by IP and by instance ID. */
   const rateLimitsByIp = new Map<string, RateLimitEntry>();
-  /** Rate limiting for failed auth attempts by instance ID. */
   const rateLimitsByInstanceId = new Map<string, RateLimitEntry>();
 
-  /**
-   * Check if a key is rate-limited in the given map.
-   */
   function checkLimit(map: Map<string, RateLimitEntry>, key: string): boolean {
     const now = Date.now();
     const entry = map.get(key);
@@ -399,9 +362,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     return entry.count >= RATE_LIMIT_MAX;
   }
 
-  /**
-   * Record a failed attempt in the given map.
-   */
   function recordLimit(map: Map<string, RateLimitEntry>, key: string): void {
     const now = Date.now();
     const entry = map.get(key);
@@ -412,25 +372,18 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     }
   }
 
-  /**
-   * Check rate limit for a given IP and optional instance ID.
-   * Returns true if either dimension is rate-limited.
-   */
+  /** True if either dimension is rate-limited. */
   function isRateLimited(ip: string, instanceId?: string): boolean {
     if (checkLimit(rateLimitsByIp, ip)) return true;
     if (instanceId && checkLimit(rateLimitsByInstanceId, instanceId)) return true;
     return false;
   }
 
-  /**
-   * Record a failed auth attempt for rate limiting in both dimensions.
-   */
   function recordFailedAuth(ip: string, instanceId?: string): void {
     recordLimit(rateLimitsByIp, ip);
     if (instanceId) recordLimit(rateLimitsByInstanceId, instanceId);
   }
 
-  /** Periodic cleanup of expired rate limit entries. */
   const rateLimitCleanupTimer = setInterval(() => {
     const now = Date.now();
     for (const [key, entry] of rateLimitsByIp) {
@@ -441,16 +394,12 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     }
   }, 5 * 60_000);
 
-  /**
-   * Send a plaintext message on a peer WebSocket (pre-ECDH).
-   */
+  /** Pre-ECDH. */
   function sendPlainMessage(ws: PeerWsLike, msg: Record<string, unknown>): void {
     ws.send(JSON.stringify(msg));
   }
 
-  /**
-   * Send an encrypted typed message on a peer WebSocket (post-ECDH).
-   */
+  /** Post-ECDH. */
   function sendEncryptedMessage(
     ws: PeerWsLike,
     sessionKey: Buffer,
@@ -460,10 +409,9 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
-   * Gate a worker join against the Platform-pushed ceiling, before the
-   * `accepted: true` response. Returns true when the join may proceed. A plan
-   * rejection is NOT an auth failure, so it does not call recordFailedAuth and
-   * must not consume the peer's rate-limit budget.
+   * Gate a worker join against the ceiling before the `accepted: true`
+   * response. A plan rejection is NOT an auth failure, so it must not consume
+   * the peer's rate-limit budget via recordFailedAuth.
    */
   async function admitWorkerOrReject(
     role: string | undefined,
@@ -492,9 +440,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     return false;
   }
 
-  /**
-   * Start sending periodic heartbeats to the peer.
-   */
   function startHeartbeat(conn: PeerConnection): void {
     conn.heartbeatTimer = setInterval(() => {
       if (conn.ws.readyState === 1 /* OPEN */) {
@@ -507,9 +452,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     }, heartbeatIntervalMs);
   }
 
-  /**
-   * Clean up a peer connection (heartbeat timer, registry update).
-   */
   function cleanupConnection(conn: PeerConnection): void {
     if (conn.heartbeatTimer) {
       clearInterval(conn.heartbeatTimer);
@@ -520,9 +462,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     connections.delete(conn.peerInstanceId);
   }
 
-  /**
-   * Route an authenticated message from a peer.
-   */
   function routeMessage(conn: PeerConnection, msg: PeerToPeerMessage): void {
     switch (msg.type) {
       case 'peer.heartbeat': {
@@ -540,7 +479,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       }
 
       case 'job.reroute.ack': {
-        // Resolve any pending ack waiter for this message
         const waiter = ackWaiters.get(msg.messageId);
         if (waiter) {
           clearTimeout(waiter.timer);
@@ -596,7 +534,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
                 peerId: conn.peerInstanceId,
                 error: toErrorMessage(err),
               });
-              // Send error response with empty URL
+              // An empty URL is the error response.
               sendEncryptedMessage(conn.ws, conn.sessionKey, {
                 type: 'peer.cache.upload.response',
                 messageId: msg.messageId,
@@ -606,7 +544,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
               });
             });
         } else {
-          // No handler -- send error response
           sendEncryptedMessage(conn.ws, conn.sessionKey, {
             type: 'peer.cache.upload.response',
             messageId: msg.messageId,
@@ -619,19 +556,16 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       }
 
       case 'peer.cache.upload.response': {
-        // Should not receive cache upload response on incoming connection (coordinator side)
         logger.warn('Unexpected peer.cache.upload.response on incoming connection');
         break;
       }
 
       case 'peer.auth.request': {
-        // Should not receive auth request after authentication
         logger.warn('Unexpected peer.auth.request after authentication');
         break;
       }
 
       case 'peer.auth.response': {
-        // Should not receive auth response on incoming connection
         logger.warn('Unexpected peer.auth.response on incoming connection');
         break;
       }
@@ -642,7 +576,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       }
 
       case 'peer.leaving': {
-        // Mark peer as disconnected in registry first, then notify Raft
+        // Registry first, then Raft.
         peerRegistry.markDisconnected(msg.instanceId);
         onPeerLeaving?.(msg);
         break;
@@ -654,7 +588,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       }
 
       case 'peer.config.reload': {
-        // Execute reload locally and reply with response.
         const handler = onPeerConfigReload;
         const replyMessageId = msg.messageId;
         const sendResponse = (response: Omit<PeerConfigReloadResponse, 'type' | 'messageId'>) => {
@@ -701,9 +634,9 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         const send = (response: PeerScalerOrphansResponse): void => {
           sendEncryptedMessage(conn.ws, conn.sessionKey, response);
         };
-        // Only a coordinator forwards an operator's request: a worker never
-        // needs to list or stop another node's VMs. The role is the one the
-        // peer's credential carries, not the one it declares.
+        // Only a coordinator forwards an operator's request: a worker never lists
+        // or stops another node's VMs. The role is the one the peer's credential
+        // carries, not the one it declares.
         if (conn.authenticatedRole !== 'coordinator') {
           logger.warn('Refused a scaler orphan request from a peer that is not a coordinator', {
             peerId: conn.peerInstanceId,
@@ -796,10 +729,9 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       }
 
       case 'peer.clusterSettings.request': {
-        // A DB-less worker pulls the worker-settings snapshot from a coordinator.
-        // A peer with no handler (not a DB-backed coordinator) does not
-        // reply — the worker times out and keeps its boot-time config default,
-        // never a poisoned zero snapshot.
+        // A peer with no handler (not a DB-backed coordinator) does not reply:
+        // the worker times out and keeps its boot-time config default, never a
+        // poisoned zero snapshot.
         if (!onPeerClusterSettingsRequest) break;
         const replyMessageId = msg.messageId;
         onPeerClusterSettingsRequest(msg)
@@ -845,15 +777,9 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     }
   }
 
-  /**
-   * Handle a new incoming peer WebSocket connection.
-   * @param ws - WebSocket connection
-   * @param remoteIp - Remote IP address for rate limiting (optional)
-   */
   function handleConnection(ws: PeerWsLike, remoteIp?: string): void {
     const ip = remoteIp ?? 'unknown';
 
-    // Check rate limiting
     if (isRateLimited(ip)) {
       logger.warn('Rate limited peer connection attempt', { ip });
       ws.close(WS_CLOSE_UNAUTHORIZED, 'Rate limited');
@@ -869,7 +795,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     /** This socket's connection once authenticated; a reconnect replaces it in `connections`. */
     let ownConn: PeerConnection | null = null;
 
-    // Auth timeout: close if not authenticated within threshold
     const authTimer = setTimeout(() => {
       if (!authenticated) {
         logger.warn('Peer auth timeout, closing connection');
@@ -1113,7 +1038,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       PeerAuthScheme.enum['mutual-v2'],
     );
 
-    // Send immediate heartbeat so peer has our full state
+    // Immediate heartbeat, so the peer has our full state.
     const inventory = getLocalInventory();
     sendEncryptedMessage(ws, accepted.appKey, {
       type: 'peer.heartbeat',
@@ -1196,9 +1121,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
-   * Validate a mutual-v2 auth request. Returns the accepted role and K_app, or
-   * null when the request is rejected. The role the peer declares is bound
-   * into its proof but not trusted; the accepted role comes from the
+   * Validate a mutual-v2 auth request; null when rejected. The declared role is
+   * bound into the proof but not trusted: the accepted role comes from the
    * credential row or the join-token row.
    */
   async function handleAuth(
@@ -1207,7 +1131,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     authMsg: PeerAuthRequest,
     ip: string,
   ): Promise<AcceptedAuth | null> {
-    // Protocol version check (minimum-version semantics: future versions accepted)
+    // Minimum-version semantics: future versions are accepted.
     if (authMsg.protocolVersion < MIN_PROTOCOL_VERSION) {
       logger.warn('Peer protocol version below minimum', {
         peerInstanceId: authMsg.instanceId,
@@ -1269,10 +1193,9 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   ): Promise<AcceptedAuth | null> {
     const stored = await credentialStore.findByInstanceId(authMsg.instanceId);
     if (!stored) {
-      // No active credential row exists for this instanceId: a sibling/self
-      // token-join revoked the shared credential, the credential expired, or
-      // the peer's row lives in another cluster's database. The peer deletes
-      // its credential file and falls back to its join token, or, for a
+      // No active row: a sibling/self token-join revoked the shared credential,
+      // it expired, or the row lives in another cluster's database. The peer
+      // deletes its credential file and falls back to its join token, or, as a
       // coordinator without one, issues itself a new credential unless an
       // operator revoked it.
       logger.warn('Peer credential not found', {
@@ -1300,10 +1223,9 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       return rejectAuth(ws, hs, 'Invalid proof', ip, authMsg.instanceId);
     }
 
-    // Update last seen (track which coordinator validated)
+    // Records which coordinator validated.
     await credentialStore.updateLastSeen(stored.credentialHash, instanceId);
 
-    // Gate a worker join against the plan ceiling before accepting.
     if (!(await admitWorkerOrReject(stored.role, ws, hs.handshakeKey, authMsg.instanceId))) {
       return null;
     }
@@ -1374,11 +1296,9 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       sourceTokenHash: resolved.tokenHash,
     });
 
-    // A token-join issues a fresh credential and revokes the prior active one
-    // for this instanceId. Because that credential is shared across the
-    // joining orchestrator's sibling peer-clients, a revokedCount > 0 here
-    // invalidates those siblings' in-flight proofs — log it so a
-    // revoke-driven sibling cascade is visible.
+    // A token-join revokes the prior active credential for this instanceId,
+    // which the joining orchestrator's sibling peer-clients share: a
+    // revokedCount > 0 invalidates their in-flight proofs, so it is logged.
     logger.info(
       grant.trigger === 'token-join'
         ? 'Peer credential issued via token join'
@@ -1391,7 +1311,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
       },
     );
 
-    // Gate a worker join against the plan ceiling before accepting.
     if (!(await admitWorkerOrReject(grant.role, ws, hs.handshakeKey, authMsg.instanceId))) {
       return null;
     }
@@ -1412,12 +1331,10 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     peerInstanceId: string,
   ): Promise<TokenGrant | null> {
     try {
-      // Atomic claim: one UPDATE..WHERE consumed_at IS NULL wins across the
-      // shared-DB mesh, so multiple coordinators never each issue a credential
-      // for the same instanceId off one join token. The joining peer's
-      // instanceId is recorded as consumed_by_instance, so the same peer can
-      // prove its still-valid token again after losing its credential and
-      // self-heal without a redeploy. `instanceId` is this coordinator's id.
+      // One UPDATE..WHERE consumed_at IS NULL wins across the shared-DB mesh, so
+      // coordinators never each issue a credential off one join token. Recording
+      // the peer as consumed_by_instance lets it re-prove a still-valid token
+      // after losing its credential. `instanceId` is this coordinator's id.
       const row = await tokenManager.claimByHash(tokenHash, instanceId, peerInstanceId);
       return { role: row.role, routingKey: row.routing.routingKey, trigger: 'token-join' };
     } catch (err) {
@@ -1430,11 +1347,9 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
         return null;
       }
     }
-    // Idempotent mesh-join recovery: sibling peer-clients of one joining peer
-    // race on its token, and only one wins the claim. The losers are the same
-    // peer establishing its other mesh connections, so they get a fresh
-    // credential when the peer already owns an unrevoked one issued from this
-    // token. Anything else falls through to the rejection.
+    // Idempotent mesh-join recovery: the claim losers are the same peer's
+    // sibling clients, so they get a fresh credential when the peer already
+    // owns an unrevoked one issued from this token. Anything else is rejected.
     const existing = await credentialStore.findByInstanceId(peerInstanceId);
     if (!existing || existing.revokedAt || existing.sourceTokenHash !== tokenHash) {
       logger.warn('Peer token was already used by another instance', {
@@ -1452,10 +1367,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     };
   }
 
-  /**
-   * Send a message to a connected peer by instanceId.
-   * Returns false if peer is not connected via this handler.
-   */
+  /** False if the peer is not connected via this handler. */
   function sendToPeer(targetInstanceId: string, msg: PeerToPeerMessage): boolean {
     const conn = connections.get(targetInstanceId);
     if (!conn || conn.ws.readyState !== 1 /* OPEN */) return false;
@@ -1463,27 +1375,18 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     return true;
   }
 
-  /**
-   * Get the count of authenticated incoming peer connections.
-   */
   function getConnectionCount(): number {
     return connections.size;
   }
 
-  /**
-   * Close a connected peer's socket by instanceId. Used by worker eviction to
-   * disconnect a drained worker. No-op if the peer holds no connection here.
-   */
+  /** Worker eviction disconnects a drained worker here; no-op without a connection. */
   function closePeer(targetInstanceId: string, code: number, reason: string): void {
     const conn = connections.get(targetInstanceId);
     if (!conn) return;
     conn.ws.close(code, reason);
   }
 
-  /**
-   * Broadcast a heartbeat to all connected inbound peers.
-   * Used by orchestrator-core for event-driven heartbeat broadcasts.
-   */
+  /** Event-driven heartbeat broadcast to inbound peers (orchestrator-core). */
   function broadcastHeartbeat(inventory: Omit<PeerHeartbeat, 'type'>): void {
     for (const conn of connections.values()) {
       if (conn.ws.readyState === 1 /* OPEN */) {
@@ -1496,9 +1399,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
-   * Broadcast a peer.agent-token.revoke notification to every connected
-   * inbound peer. The originating orchestrator already kicked locally; this
-   * fan-out closes the matching in-flight WS on every other peer.
+   * The originating orchestrator already kicked locally; this fan-out closes
+   * the matching in-flight WS on every other peer.
    */
   function broadcastAgentTokenRevoke(msg: PeerAgentTokenRevoke): void {
     for (const conn of connections.values()) {
@@ -1509,8 +1411,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
-   * Send a job.reroute message via a server-side connection and wait for ACK.
-   * Used by RunCoordinator for peers that connected TO this coordinator (incoming WS).
+   * RunCoordinator's reroute path for peers that connected TO this coordinator.
    *
    * @returns true if accepted, false if rejected or timeout
    */
@@ -1532,12 +1433,8 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
-   * Send a peer.config.reload to a peer connected via this handler (incoming
-   * WS) and wait for the matching peer.config.reload.response.
-   *
-   * @returns The PeerConfigReloadResponse if delivered, or null if the peer
-   *   is not connected via this handler. Resolves with `success=false` if the
-   *   timeout elapses without a response.
+   * @returns The response, or null if the peer is not connected via this
+   *   handler. Resolves with `success=false` on timeout.
    */
   async function sendConfigReloadAndWait(
     targetInstanceId: string,
@@ -1562,9 +1459,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
-   * Send a peer.forget.request to a peer connected via this handler and wait
-   * for the matching response.
-   *
    * @returns the response; null when the peer is not connected via this
    *   handler; `'timeout'` when no response arrived within `timeoutMs`.
    */
@@ -1578,9 +1472,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
-   * Send a peer.scaler.orphans.request to a peer connected via this handler
-   * (incoming WS) and wait for the matching response.
-   *
    * @returns the response; null when the peer is not connected via this
    *   handler; `'timeout'` when no response arrived within `timeoutMs`.
    */
@@ -1594,9 +1485,6 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
-   * Send a peer.scaler.reload.request to a peer connected via this handler
-   * (incoming WS) and wait for the matching response.
-   *
    * @returns the response; null when the peer is not connected via this
    *   handler; `'timeout'` when no response arrived within `timeoutMs`.
    */
@@ -1609,11 +1497,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     return scalerReloadWaiters.wait(msg.messageId, timeoutMs);
   }
 
-  /**
-   * Send a peer.logs.collect.request to a peer connected via this handler
-   * (incoming WS) and await its reassembled subtree-bundle ZIP. Rejects on
-   * timeout, an error frame, or peer disconnect.
-   */
+  /** Awaits the reassembled subtree-bundle ZIP; rejects on timeout, error frame or disconnect. */
   function sendLogsCollectAndWait(
     targetInstanceId: string,
     msg: PeerLogsCollectRequest,
@@ -1636,9 +1520,7 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
     }
   }
 
-  /**
-   * Clean up rate limit maps and timers. Call on shutdown.
-   */
+  /** Call on shutdown. */
   function cleanup(): void {
     clearInterval(rateLimitCleanupTimer);
     rateLimitsByIp.clear();
@@ -1654,12 +1536,10 @@ export function createPeerHandler(deps: PeerHandlerDeps) {
   }
 
   /**
-   * Close all inbound peer WebSocket connections. Call this before stopping
-   * the HTTP server during graceful shutdown, otherwise server.close() waits
-   * indefinitely for upgraded WebSocket sockets to go idle — Node's
-   * server.closeAllConnections() does NOT touch upgraded protocols (WS/HTTP2).
-   * Without it, the 30s graceful shutdown timer force-exits the orchestrator
-   * with status=1 on every restart while peers are connected.
+   * Call before stopping the HTTP server: server.close() waits forever for
+   * upgraded WebSocket sockets, which server.closeAllConnections() does NOT
+   * touch, so the 30s graceful shutdown timer would force-exit with status=1
+   * on every restart while peers are connected.
    */
   function closeAllInbound(): void {
     for (const [, conn] of connections) {

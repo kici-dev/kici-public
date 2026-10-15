@@ -34,8 +34,7 @@ function makeSpawn(results: Partial<Record<string, SshResult>> = {}): {
   };
   const spawnFn: SpawnFn = vi.fn(async (command, args, opts) => {
     calls.push({ command, args, stdin: opts.stdin, env: opts.env });
-    // The agent start invocation is any ssh-agent call that is not the `-k`
-    // teardown (start now carries `-a <sock> -s`, not just `-s`).
+    // Any ssh-agent call but the `-k` teardown is the start (`-a <sock> -s`).
     if (command === 'ssh-agent' && args[0] !== '-k') return agentStart;
     return results[command] ?? ok;
   });
@@ -70,9 +69,8 @@ describe('sshExec', () => {
     const { spawnFn, calls } = makeSpawn();
     await sshExec(reach, KEY, 'true', {}, { spawnFn });
 
-    // ssh-agent is started with `-a <sock>` pointing at a kici-bootstrap-ssh-*
-    // private dir — never the default /tmp/ssh-XXXX. A host cleanup job keys
-    // off this prefix to reap orphans a SIGKILL left behind.
+    // Never the default /tmp/ssh-XXXX: a host cleanup job keys off the
+    // kici-bootstrap-ssh-* prefix to reap orphans a SIGKILL left behind.
     const start = calls.find((c) => c.command === 'ssh-agent' && c.args[0] !== '-k');
     const bindIdx = start!.args.indexOf('-a');
     expect(bindIdx).toBeGreaterThanOrEqual(0);
@@ -119,22 +117,20 @@ describe('sshExec', () => {
   });
 
   it('clears an inherited SSH_AGENT_PID when the agent start output does not parse', async () => {
-    // Simulate a login/parent ssh-agent already present in this process's env.
+    // An inherited login/parent ssh-agent.
     const priorPid = process.env.SSH_AGENT_PID;
     process.env.SSH_AGENT_PID = '9999';
     try {
-      // ssh-agent start stdout that parseAgentPid cannot extract a PID from
-      // (no `SSH_AGENT_PID=<n>;` token) — the fallback branch.
+      // No `SSH_AGENT_PID=<n>;` token: parseAgentPid's fallback branch.
       const { spawnFn, calls } = makeSpawn();
       const unparsable: SshResult = {
         exitCode: 0,
         stdout: 'SSH_AUTH_SOCK=/tmp/agent.sock; export SSH_AUTH_SOCK;\n',
         stderr: '',
       };
-      // Override the ssh-agent START result (any ssh-agent call that is not -k).
+      // Override the start result, still recording the call.
       const wrapped: SpawnFn = async (command, args, opts) => {
         if (command === 'ssh-agent' && args[0] !== '-k') {
-          // still record the call via the underlying spawnFn's recorder
           return spawnFn(command, args, { ...opts, env: opts.env }).then(() => unparsable);
         }
         return spawnFn(command, args, opts);
@@ -152,7 +148,7 @@ describe('sshExec', () => {
       // Structural invariant: the key is absent, not merely set to the string.
       expect(add && 'SSH_AGENT_PID' in add.env).toBe(false);
       expect(kill && 'SSH_AGENT_PID' in kill.env).toBe(false);
-      // The socket is still our ephemeral one (unchanged behavior).
+      // The socket is still the ephemeral one.
       expect(kill?.env.SSH_AUTH_SOCK).toMatch(/kici-bootstrap-ssh-[^/]+\/agent\.sock$/);
     } finally {
       if (priorPid === undefined) delete process.env.SSH_AGENT_PID;
@@ -179,15 +175,11 @@ describe('sshExec', () => {
 
 describe('defaultSpawn', () => {
   it('resolves with the exit code when the child drops its stdin read end (EPIPE), without crashing', async () => {
-    // A child that exits immediately without reading stdin closes its read end
-    // while a large write is still pending, so child.stdin emits EPIPE. Without
-    // an 'error' handler on the stdin stream this becomes an uncaught exception
-    // that would crash the agent process; with the handler the promise still
-    // resolves via the process 'close' event carrying the real exit code.
-    //
-    // The payload must exceed the kernel pipe buffer (64 KiB on Linux) so the
-    // write cannot fully buffer before the reader exits — that is what
-    // guarantees the pending write hits EPIPE rather than silently succeeding.
+    // A child exiting without reading stdin makes the pending write EPIPE.
+    // Without a stdin 'error' handler that is an uncaught exception crashing
+    // the agent; with it the promise resolves on 'close' with the real exit
+    // code. The payload exceeds the kernel pipe buffer (64 KiB on Linux) so
+    // the write cannot fully buffer and must hit EPIPE.
     const bigStdin = 'x'.repeat(1024 * 1024); // 1 MiB
     const result = await defaultSpawn('sh', ['-c', 'exit 42'], {
       env: process.env,

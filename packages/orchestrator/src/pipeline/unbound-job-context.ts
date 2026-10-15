@@ -1,11 +1,9 @@
 /**
- * The dispatch-time warning for a job context that has no scope binding.
+ * The dispatch-time warning for a job context with no scope binding.
  *
- * A job receives a context's secrets only through the context's scope
- * bindings, so a context with none delivers no secret, and nothing fails until
- * a step reads one. This names each such context in the orchestrator log when
- * the job's context data resolves. Advisory only: it runs after resolution, a
- * failed lookup logs nothing, and the dispatch proceeds unchanged.
+ * Secrets reach a job only through scope bindings, so an unbound context
+ * delivers none and nothing fails until a step reads one. Advisory only: it runs
+ * after resolution, a failed lookup logs nothing, and dispatch is unchanged.
  */
 import type { Context } from '@kici-dev/engine';
 import { createLogger } from '@kici-dev/shared';
@@ -18,9 +16,8 @@ export const UNBOUND_JOB_CONTEXT_MESSAGE =
   'Job binds a context that has no scope binding; it receives no secrets from it';
 
 /**
- * Warn once for every context in `entries` that resolved no secret and has no
- * scope binding. A context that resolved at least one secret is skipped without
- * a lookup, so a bound context costs nothing here.
+ * Warn once per context that resolved no secret and has no scope binding; one
+ * that resolved a secret is skipped without a lookup.
  */
 export async function warnUnboundJobContexts(args: {
   secretResolver: SecretResolverApi | undefined;
@@ -41,8 +38,7 @@ export async function warnUnboundJobContexts(args: {
     try {
       bindings = await countBindings(env.id);
     } catch {
-      // The resolution this follows already succeeded; a failed count leaves
-      // nothing to warn about and must not fail the job's dispatch.
+      // Advisory: a failed count must not fail the dispatch.
       continue;
     }
     // fails-when: a job context with zero bindings dispatches with no log line

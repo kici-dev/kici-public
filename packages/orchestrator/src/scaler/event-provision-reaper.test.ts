@@ -71,9 +71,8 @@ function candidate(overrides: Partial<ReapCandidate> & { ageMs: number }): ReapC
 }
 
 function makeReaper(opts: Partial<EventProvisionReaperOptions> = {}) {
-  // The overrides win, so the handles returned below must be the ones actually
-  // wired in — returning the local stubs instead would make every assertion
-  // against an overridden callback vacuously observe an unused spy.
+  // Return the handles actually wired in: returning local stubs when an
+  // override wins would make assertions vacuously observe an unused spy.
   const emitScaleDown = opts.emitScaleDown ?? vi.fn().mockResolvedValue(undefined);
   const purgeExpiredClaims = opts.purgeExpiredClaims ?? vi.fn().mockResolvedValue(0);
   const purgeProvisionOutcomes = opts.purgeProvisionOutcomes ?? vi.fn().mockResolvedValue(0);
@@ -108,10 +107,7 @@ function leadingReaper(rows: ReapCandidate[], opts: Partial<EventProvisionReaper
   return made;
 }
 
-/**
- * Sweep, advance the clock by `ms`, sweep again — the shape every teardown
- * needs, because no arm fires on a single observation of an unregistered agent.
- */
+/** Sweep, advance by `ms`, sweep again: no arm fires on a single observation. */
 async function sustain(reaper: EventProvisionReaper, ms: number = FLAP_GRACE_MS): Promise<void> {
   await reaper.tick();
   vi.setSystemTime(Date.now() + ms);
@@ -135,8 +131,7 @@ describe('adopterIsLive', () => {
     expect(adopterIsLive({ connected: true, lastHeartbeatAt: 0 }, NOW, FLAP_GRACE_MS)).toBe(true);
   });
 
-  // The whole point: a link blip between two healthy coordinators must not read
-  // as a dead one while the agent is still attached to that peer.
+  // A link blip between two healthy coordinators must not read as a dead one.
   it('treats a just-disconnected peer as live for the flap grace', () => {
     const peer = { connected: false, lastHeartbeatAt: NOW - FLAP_GRACE_MS };
     expect(adopterIsLive(peer, NOW, FLAP_GRACE_MS)).toBe(true);
@@ -157,10 +152,9 @@ describe('clusterViewSufficient', () => {
     expect(clusterViewSufficient(0, 0)).toBe(true);
   });
 
-  // The count must be of *known* peers, not statically configured ones. A
-  // Platform-mode HA pair joins by token and never sets KICI_CLUSTER_PEERS, so
-  // keying on config left both halves of a partition sweeping — each tearing
-  // down the other's live instances.
+  // The count is of *known* peers, not configured ones: a Platform-mode HA pair
+  // joins by token and never sets KICI_CLUSTER_PEERS, so keying on config lets
+  // both halves of a partition tear down each other's live instances.
   it('blocks a coordinator that knows peers but is connected to none', () => {
     expect(clusterViewSufficient(1, 0)).toBe(false);
   });
@@ -170,13 +164,10 @@ describe('clusterViewSufficient', () => {
   });
 });
 
-// Driven through a REAL `PeerRegistry`, not a stub. The Critical-1 bug lived in
-// this call site while `clusterViewSufficient` was fully unit-tested, and a
-// stubbed registry would have reproduced the same blind spot: the whole point is
-// that `getCoordinatorPeers()` filters on role and not on connectivity, which
-// only the real implementation can demonstrate.
+// Driven through a REAL `PeerRegistry`: `getCoordinatorPeers()` filters on role,
+// not connectivity, which a stub would hide while `clusterViewSufficient` alone
+// stays green.
 describe('canReapForCluster', () => {
-  /** A registry holding one coordinator peer, optionally disconnected. */
   function registryWith(
     peers: Array<{ instanceId: string; role: 'coordinator' | 'worker'; connected: boolean }>,
   ): PeerRegistry {
@@ -194,10 +185,9 @@ describe('canReapForCluster', () => {
     return registry;
   }
 
-  // The exact Platform-mode HA-pair partition: no static config, one peer
-  // learned by handshake, now unreachable. Reverting the call site to
-  // `config.cluster.peers.length` alone makes this return true — which is the
-  // bug that emitted teardowns for the other side's live instances.
+  // The Platform-mode HA-pair partition: no static config, one handshaken peer,
+  // now unreachable. Keying on `config.cluster.peers.length` alone returns true
+  // here and tears down the other side's live instances.
   it('blocks when a handshaken coordinator peer is disconnected and config names none', () => {
     const registry = registryWith([
       { instanceId: 'orch-b', role: 'coordinator', connected: false },
@@ -210,8 +200,7 @@ describe('canReapForCluster', () => {
     expect(canReapForCluster(0, registry)).toBe(true);
   });
 
-  // The inverse failure — a guard that blocks forever — would silently disable
-  // the backstop on every single-coordinator deployment.
+  // A guard that blocks forever would disable the backstop on every single coordinator.
   it('sweeps on a coordinator that knows no peers at all', () => {
     expect(canReapForCluster(0, registryWith([]))).toBe(true);
   });
@@ -229,8 +218,7 @@ describe('canReapForCluster', () => {
     expect(canReapForCluster(1, registryWith([]))).toBe(false);
   });
 
-  // A three-node cluster that loses one peer still sees the other, so the
-  // backstop must keep running rather than stand down on a partial loss.
+  // The backstop keeps running on a partial loss.
   it('sweeps on a 3-node cluster with one peer down', () => {
     const registry = registryWith([
       { instanceId: 'orch-b', role: 'coordinator', connected: true },
@@ -241,9 +229,9 @@ describe('canReapForCluster', () => {
 });
 
 describe('reaperFlapGraceMs', () => {
-  // The knob is shared with the rerouted-job guard, whose worst outcome is a
-  // force-failed run; this consumer's worst outcome is a deleted instance. So
-  // an operator lowering it for reroute reasons must not collapse this arm.
+  // The knob is shared with the rerouted-job guard (worst case: a force-failed
+  // run); here the worst case is a deleted instance, so lowering it for reroute
+  // reasons must not collapse this arm.
   it('floors a lowered knob at two peer-stale windows', () => {
     expect(reaperFlapGraceMs(5000, 60_000)).toBe(120_000);
   });
@@ -252,8 +240,7 @@ describe('reaperFlapGraceMs', () => {
     expect(reaperFlapGraceMs(300_000, 60_000)).toBe(300_000);
   });
 
-  // The floor tracks the deployment's own stale timeout rather than a constant,
-  // so a cluster with slower heartbeats gets a proportionally wider guard.
+  // Slower heartbeats get a proportionally wider guard.
   it('tracks the configured stale timeout', () => {
     expect(reaperFlapGraceMs(5000, 90_000)).toBe(180_000);
   });
@@ -302,9 +289,8 @@ describe('EventProvisionReaper', () => {
       expect(listCandidates).toHaveBeenCalledWith(new Date(NOW - SPAWN_TIMEOUT_MS));
     });
 
-    // Leadership can move across an await, and `lastAttemptAt` is per-instance,
-    // so a former leader that keeps emitting races the new one over the same
-    // rows with nothing able to dedupe between them.
+    // Leadership can move across an await and `lastAttemptAt` is per-instance,
+    // so a former leader that keeps emitting races the new one undeduped.
     it('stops mid-sweep when leadership is lost while tearing a row down', async () => {
       const stranded = (agentId: string) =>
         candidate({ agentId, ageMs: 10 * SPAWN_TIMEOUT_MS, ownerInstanceId: 'orch-a' });
@@ -329,10 +315,9 @@ describe('EventProvisionReaper', () => {
       expect(subject.emitScaleDown.mock.calls.map((c) => c[0].agentId)).toEqual(['a1']);
     });
 
-    // A coordinator that is no longer the leader must stop acting on the rest
-    // of the sweep, and must leave no reading of its own standing on the scrape
-    // endpoint. Without the per-candidate guard the loop runs on for a2 and a3
-    // and tears both down after this instance has already lost the right to.
+    // A former leader stops acting on the rest of the sweep and leaves no
+    // reading standing on the scrape endpoint. Without the per-candidate guard
+    // the loop tears down a2 and a3 after losing the right to.
     it('condemns no further rows after leadership is lost mid-loop', async () => {
       const stranded = (agentId: string) =>
         candidate({ agentId, ageMs: 10 * SPAWN_TIMEOUT_MS, ownerInstanceId: 'orch-a' });
@@ -345,8 +330,7 @@ describe('EventProvisionReaper', () => {
       made.reaper.onBecomeLeader();
 
       await made.reaper.tick();
-      // Three clocks are running, none of them past the flap grace yet, so
-      // nothing has been condemned and the gauge is honestly zero.
+      // No clock is past the flap grace yet, so the gauge is honestly zero.
       expect(made.emitScaleDown).not.toHaveBeenCalled();
       expect(lastGauge(setScalerReapUnseenProvisions)).toBe(0);
 
@@ -372,9 +356,8 @@ describe('EventProvisionReaper', () => {
     });
 
     it('widens the outcome retention when the spawn deadline passes half of it', async () => {
-      // The default spawn timeout is far below the 24h floor, so the floor is
-      // what a plain sweep exercises. This is the other arm: a spawn deadline
-      // long enough that twice it exceeds the floor moves the cutoff with it.
+      // The other arm: a spawn deadline whose double exceeds the 24h floor
+      // moves the cutoff with it.
       const spawnTimeoutMs = PROVISION_OUTCOME_RETENTION_MS;
       const resolveWindows = vi.fn().mockResolvedValue({ ...WINDOWS, spawnTimeoutMs });
       const { reaper, purgeProvisionOutcomes } = leadingReaper([], { resolveWindows });
@@ -393,8 +376,8 @@ describe('EventProvisionReaper', () => {
     });
 
     it('keeps sweeping when the outcome purge throws', async () => {
-      // The purge is bookkeeping. A failure there must not strand the interval
-      // reconcile that follows it, or one bad sweep freezes the cadence.
+      // A purge failure must not strand the interval reconcile that follows it,
+      // or one bad sweep freezes the cadence.
       const purgeProvisionOutcomes = vi.fn().mockRejectedValue(new Error('db down'));
       const { reaper } = leadingReaper([], { purgeProvisionOutcomes });
 
@@ -424,10 +407,9 @@ describe('EventProvisionReaper', () => {
   });
 
   // Every window is re-resolved on each sweep and applied to that same sweep.
-  // Five of the six are live cluster_settings knobs; the spawn deadline is the
-  // exception and comes from static config. A knob an operator can set but that
-  // the sweep ignores until the next election is worse than no knob, so each is
-  // pinned to a behaviour that changes when it changes.
+  // All but the spawn deadline (static config) are live cluster_settings knobs;
+  // a knob the sweep ignores until the next election is worse than none, so
+  // each is pinned to a behaviour that changes when it changes.
   describe('live sweep windows', () => {
     it('re-reads its windows on every sweep', async () => {
       const { reaper, resolveWindows } = leadingReaper([]);
@@ -489,8 +471,7 @@ describe('EventProvisionReaper', () => {
     it('applies a changed flap grace to the very next sweep', async () => {
       const row = candidate({ ageMs: 1000, adoptedBy: 'orch-b' });
       const dead = { isPeerLive: () => false };
-      // The dead-adopter arm fires as soon as the absence outlasts the flap
-      // grace, so shrinking the grace is what lets the subject through.
+      // The dead-adopter arm fires once the absence outlasts the flap grace.
       const control = leadingReaper([row], dead);
       const subject = leadingReaper([row], {
         ...dead,
@@ -546,8 +527,8 @@ describe('EventProvisionReaper', () => {
       const resolveWindows = vi.fn().mockResolvedValue({ ...WINDOWS, intervalMs: 5000 });
       const { reaper, listCandidates } = leadingReaper([], { resolveWindows });
 
-      // The timer starts at the boot interval — onBecomeLeader is a synchronous
-      // Raft callback, so nothing has been read from the database yet.
+      // Boot interval: onBecomeLeader is a synchronous Raft callback, so
+      // nothing has been read from the database yet.
       expect(reaper.currentIntervalMs()).toBe(INTERVAL_MS);
 
       await vi.advanceTimersByTimeAsync(INTERVAL_MS);
@@ -598,10 +579,9 @@ describe('EventProvisionReaper', () => {
     });
   });
 
-  // "The agent is registered nowhere" reads false for live agents on routine
-  // events — a local WS reconnect, and the window after any peer reconnect in
-  // which that peer advertises an empty agent list. So the reaper times how
-  // long the observation has held, never how old the row is.
+  // "Registered nowhere" holds for live agents on routine events (a local WS
+  // reconnect, a reconnected peer briefly advertising no agents), so the reaper
+  // times how long the observation has held, never how old the row is.
   describe('sustained-absence debounce', () => {
     it('spares an unadopted provision on the first sample and reaps it once sustained', async () => {
       const { reaper, emitScaleDown } = leadingReaper([
@@ -630,9 +610,9 @@ describe('EventProvisionReaper', () => {
       expect(emitScaleDown).toHaveBeenCalledWith(expect.anything(), HEARTBEAT_TIMEOUT);
     });
 
-    // The pair that pins the stranded window itself: an ancient adopted row
-    // whose adopter is alive. Reaping on the first unregistered sample here is
-    // exactly the coin-flip that tore down live VMs on every peer reconnect.
+    // This pair pins the stranded window: reaping an ancient adopted row with a
+    // live adopter on its first unregistered sample tears down live VMs on
+    // every peer reconnect.
     it('spares a long-running adopted provision seen unregistered once, however old the row', async () => {
       const { reaper, emitScaleDown } = leadingReaper(
         [candidate({ ageMs: 100 * STRANDED_TIMEOUT_MS, adoptedBy: 'orch-b' })],
@@ -660,9 +640,8 @@ describe('EventProvisionReaper', () => {
       expect(emitScaleDown).toHaveBeenCalledWith(expect.anything(), HEARTBEAT_TIMEOUT);
     });
 
-    // A reconnect that repopulates the peer's agent list mid-window must put
-    // the clock back to zero, or a flapping-but-live agent accumulates absence
-    // across unrelated blips until it crosses the window.
+    // Otherwise a flapping-but-live agent accumulates absence across unrelated
+    // blips until it crosses the window.
     it('restarts the clock when the agent is seen registered again', async () => {
       let registered = false;
       const { reaper, emitScaleDown } = leadingReaper(
@@ -931,10 +910,9 @@ describe('EventProvisionReaper', () => {
       expect(emitScaleDown.mock.calls.map((c) => c[0].agentId)).toEqual(['a1', 'a2']);
     });
 
-    // Guards the `lastAttemptAt` half of `pruneTracking` specifically. The
-    // `strandedSince` half has its own test; deleting only this loop must fail
-    // something, so the timings below put the re-emit inside the re-attempt
-    // window — throttled if the entry survived, emitted if it was pruned.
+    // Guards the `lastAttemptAt` half of `pruneTracking` (`strandedSince` has its
+    // own test): the re-emit lands inside the re-attempt window, so a surviving
+    // entry throttles it and a pruned one emits.
     it('forgets attempt history for a row that dropped out of the candidate set', async () => {
       const row = candidate({ ageMs: 10 * SPAWN_TIMEOUT_MS, ownerInstanceId: 'orch-a' });
       const listCandidates = vi
@@ -977,12 +955,9 @@ describe('EventProvisionReaper', () => {
 
   describe('observability', () => {
     it('publishes how many provisions are past the flap grace, not how many are absent', async () => {
-      // `verdict()` refuses to act below the flap grace, and an agent transits
-      // the absent set on every ordinary reconnect — a peer flap empties that
-      // peer's advertised agent list, enrolling every agent it holds at once.
-      // Counting current absences instead would put a healthy cluster
-      // permanently above zero on an alert whose whole premise is that it is
-      // not.
+      // `verdict()` refuses to act below the flap grace, and every peer flap
+      // briefly marks all its agents absent; counting current absences would
+      // keep a healthy cluster permanently above zero on this alert.
       const stranded = (agentId: string) =>
         candidate({ agentId, ageMs: 1000, adoptedBy: 'orch-b' });
       const { reaper } = leadingReaper([stranded('a1'), stranded('a2')]);
@@ -1033,9 +1008,8 @@ describe('EventProvisionReaper', () => {
     });
 
     it('warns once for a row whose owner is unknown, instead of sparing it silently', async () => {
-      // The one stand-down with nothing else to show for it: the agent is not
-      // registered, so no other arm ever reports the row, and a pre-migration
-      // row would otherwise be spared on every sweep forever in silence.
+      // No other arm reports an unregistered row, so a pre-migration row would
+      // otherwise be spared on every sweep forever in silence.
       const rows = [candidate({ agentId: 'legacy-1', ageMs: 10 * SPAWN_TIMEOUT_MS })];
       const { reaper, emitScaleDown } = leadingReaper(rows);
 
@@ -1063,15 +1037,9 @@ describe('EventProvisionReaper', () => {
       expect(lastGauge(setScalerReapUnseenProvisions)).toBe(0);
     });
 
-    // A non-leader observes nothing, so it must not leave its last leader-era
-    // readings standing on the scrape endpoint.
-    // A gauge frozen at its last reading reports a state the reaper is no
-    // longer in. `reapBlocked` standing at 1 after a partition heals into a DB
-    // fault is the case that matters.
-    // The exact sequence that strands the alert: a partition blocks the sweep,
-    // then heals into a database fault. `resolveWindows` runs before the
-    // blocked check, so without an explicit republish on that error path the
-    // gauge stays at 1 and the operator is paged for a partition that is over.
+    // A partition blocks the sweep, then heals into a database fault.
+    // `resolveWindows` runs before the blocked check, so without a republish on
+    // that error path the gauge stays at 1 and pages for a partition that is over.
     it('clears the blocked gauge when a blocked sweep is followed by an unreadable settings read', async () => {
       let visible = false;
       const resolveWindows = vi

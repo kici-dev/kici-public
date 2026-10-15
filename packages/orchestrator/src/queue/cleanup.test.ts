@@ -8,12 +8,9 @@ import type { Database } from '../db/types.js';
 import { JobContainerNeed } from '../scaler/agent-fit.js';
 
 /**
- * An `ExpiredJobInfo` as `markExpired()` returns it. Defaults to a job whose
- * `runsOn` is satisfiable, so a test only states the routing selectors when the
- * routable/unroutable split is what it is exercising.
- *
- * Selectors are taken as plain strings and folded here, the same way
- * `rowToExpiredJobInfo` folds what it reads out of the row.
+ * An `ExpiredJobInfo` as `markExpired()` returns it, defaulting to a
+ * satisfiable `runsOn` so only routable/unroutable tests state selectors.
+ * Plain-string selectors are folded the way `rowToExpiredJobInfo` folds a row.
  */
 function expiredJob(
   over: Pick<ExpiredJobInfo, 'id' | 'runId' | 'jobName'> & {
@@ -51,9 +48,9 @@ function createMockExtras() {
   const updateExecuteTakeFirst = vi.fn().mockResolvedValue({ numUpdatedRows: 1n });
   const selectExecuteTakeFirst = vi.fn().mockResolvedValue({ job_id: 'j-1' });
 
-  // Records each execution_runs UPDATE's `.set(...)` payload + the `.where(...)`
-  // arg tuples so tests can assert when (and with what) the run-level
-  // failure_reason was written, and that the NULL clobber-guard is applied.
+  // Records each execution_runs UPDATE's `.set(...)` payload and `.where(...)`
+  // tuples, to assert the run-level failure_reason write and its NULL
+  // clobber-guard.
   const runSetCalls: Array<Record<string, unknown>> = [];
   const runWhereCalls: unknown[][] = [];
   const runUpdateExecute = vi.fn().mockResolvedValue([{ numUpdatedRows: 1n }]);
@@ -236,7 +233,7 @@ describe('runCleanup', () => {
     const dedup = createMockDedup(0);
     const queue = createMockQueue(expired);
     const extras = createMockExtras();
-    // Simulate no rows updated (job already terminal or doesn't exist in execution_jobs)
+    // No rows updated: the job is already terminal or not in execution_jobs.
     extras._mocks.updateExecuteTakeFirst.mockResolvedValue({ numUpdatedRows: 0n });
 
     await runCleanup(dedup, queue, { db: extras.db, executionTracker: extras.executionTracker });
@@ -350,11 +347,9 @@ describe('runCleanup', () => {
 
     await runCleanup(dedup, queue, { db: extras.db, executionTracker: extras.executionTracker });
 
-    // The clobber-guard lives in the SQL WHERE clause (`failure_reason is null`):
-    // the UPDATE is always issued with the provisioning error, and the
-    // `failure_reason is null` predicate makes it a no-op when a real
-    // step-failure reason is already recorded. Assert the guarded payload +
-    // the NULL predicate are part of the update chain.
+    // The clobber-guard is the SQL `failure_reason is null` predicate: the
+    // UPDATE always carries the provisioning error and is a no-op when a real
+    // step-failure reason is already recorded.
     expect(extras.db.updateTable).toHaveBeenCalledWith('execution_runs');
     expect(extras._mocks.runSetCalls).toEqual([{ failure_reason: provisioningError }]);
     // The second `.where(...)` is the NULL clobber-guard on failure_reason.
@@ -362,8 +357,8 @@ describe('runCleanup', () => {
   });
 
   it('terminalizes a job no agent can run as unroutable, naming the unsatisfied runsOn', async () => {
-    // The false-green this status exists to end: the job never dispatched, so
-    // without a terminal verdict the run finished green on its siblings alone.
+    // The job never dispatched; without a terminal verdict the run would
+    // finish green on its siblings alone.
     const expired: ExpiredJobInfo[] = [
       expiredJob({
         id: 'q-1',
@@ -399,11 +394,10 @@ describe('runCleanup', () => {
   });
 
   it('resolves the expired job check run, naming the unmatched selectors', async () => {
-    // This sweep settles the job by writing execution_jobs directly, so the
-    // execution tracker's terminal-job hook never fires for it. Without an
-    // explicit post here the check run created at trigger match stays `queued`
-    // on the commit forever and no branch-protection rule requiring it can ever
-    // be satisfied.
+    // The sweep writes execution_jobs directly, so the tracker's terminal-job
+    // hook never fires. Without an explicit post, the check run created at
+    // trigger match stays `queued` forever and no branch-protection rule
+    // requiring it can be satisfied.
     const expired: ExpiredJobInfo[] = [
       expiredJob({ id: 'q-1', runId: 'run-1', jobName: 'build', runsOnLabels: ['gpu'] }),
     ];
@@ -475,8 +469,8 @@ describe('runCleanup', () => {
 
   it('promotes the unroutable reason to the run, under the same NULL clobber-guard', async () => {
     // The unmatched-selector text is the only statement of WHICH labels went
-    // unmet. Left off the run, every surface renders the generic
-    // `Failed jobs: <name>` roll-up and the operator's lead disappears.
+    // unmet; without it every surface renders the generic `Failed jobs: <name>`
+    // roll-up.
     const expired: ExpiredJobInfo[] = [
       expiredJob({ id: 'q-1', runId: 'run-1', jobName: 'build', runsOnLabels: ['gpu'] }),
     ];
@@ -578,11 +572,10 @@ describe('runCleanup', () => {
   });
 
   it('a recorded provisioning error keeps timed_out_stale, never unroutable', async () => {
-    // A failed spawn PROVES the labels routed — the scaler matched a backend and
-    // got as far as attempting an agent. Reporting that as `unroutable` would
-    // send an operator to fix a `runsOn` that is already correct, and it would
-    // silently reclassify the whole scaler-provisioning-failure surface. The
-    // probe is not even consulted.
+    // A failed spawn PROVES the labels routed (the scaler matched a backend and
+    // attempted an agent). `unroutable` would send an operator to fix a correct
+    // `runsOn` and reclassify every scaler-provisioning failure. The probe is
+    // not even consulted.
     const provisioningError = 'Container scaler: image pull failed (manifest unknown)';
     const expired: ExpiredJobInfo[] = [
       expiredJob({
@@ -732,9 +725,9 @@ describe('runCleanup', () => {
   });
 
   it('passes a cluster-settings 0 straight through, disabling the sweep', async () => {
-    // 0 is the documented disable value, and it is falsy — a `||` fallback
-    // anywhere on this path would silently substitute the 7-day default and
-    // make the knob impossible to turn off.
+    // 0 is the documented disable value and falsy: a `||` fallback on this
+    // path would substitute the 7-day default, making the knob impossible to
+    // turn off.
     const dedup = createMockDedup(0);
     const queue = createMockQueue([]);
     const extras = createMockExtras();

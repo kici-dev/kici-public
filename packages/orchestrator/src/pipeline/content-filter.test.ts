@@ -55,9 +55,8 @@ describe('filterByContentRequirements', () => {
       { fetcher, cache: newCache() },
     );
     expect(survivors.map((c) => c.name)).toEqual(['B']);
-    // A definite content mismatch: the requirement WAS evaluated and said no.
-    // This is the one drop shape that is not indeterminate, and the trace
-    // renders it as an exclusion the author's own requirement caused.
+    // The one non-indeterminate drop: the requirement was evaluated and said no,
+    // so the trace renders it as an exclusion the author's requirement caused.
     expect(dropped[0]).toMatchObject({ name: 'A', indeterminate: false });
   });
 
@@ -109,8 +108,8 @@ describe('filterByContentRequirements', () => {
   });
 
   it('drops a present-without-bytes (oversize) candidate as indeterminate, not absent', async () => {
-    // The over-1-MiB case: present, but no inline bytes. A byte-reading query
-    // must NOT treat this as an absent/empty file — it drops as indeterminate.
+    // Over 1 MiB: present, no inline bytes. A byte-reading query drops it as
+    // indeterminate, never as an absent/empty file.
     const fetcher = fakeFetcher({ 'o/r@sha:big.json': { present: true } });
     const { survivors, dropped } = await filterByContentRequirements(
       [cand('A', [{ file: 'big.json', format: 'json', exists: ['$.a'] }])],
@@ -123,8 +122,8 @@ describe('filterByContentRequirements', () => {
   });
 
   it('drops a contains-only requirement as indeterminate when bytes are unavailable', async () => {
-    // A raw-text `contains` query reads bytes, so a present-without-bytes (oversize)
-    // file must drop as indeterminate — not slip through as a bare existence check.
+    // `contains` reads bytes, so an oversize file drops as indeterminate rather
+    // than passing as a bare existence check.
     const fetcher = fakeFetcher({ 'o/r@sha:big.txt': { present: true } });
     const { survivors, dropped } = await filterByContentRequirements(
       [cand('A', [{ file: 'big.txt', contains: ['x'] }])],
@@ -137,8 +136,7 @@ describe('filterByContentRequirements', () => {
   });
 
   it('passes a bare existence check even when the file is present without inline bytes', async () => {
-    // A `{ file }` existence check needs no bytes — a present-without-bytes file
-    // still satisfies "the file exists".
+    // A `{ file }` existence check needs no bytes.
     const fetcher = fakeFetcher({ 'o/r@sha:big.bin': { present: true } });
     const { survivors } = await filterByContentRequirements(
       [cand('A', [{ file: 'big.bin' }])],
@@ -182,8 +180,7 @@ describe('filterByContentRequirements', () => {
       { fetcher: undefined, cache: newCache() },
     );
     expect(survivors.map((c) => c.name)).toEqual(['B']);
-    // Nothing ever read the requirement — a provider with no file-contents
-    // fetcher is an infrastructure gap, not the author's filter saying no.
+    // No file-contents fetcher is an infrastructure gap, not the filter saying no.
     expect(dropped[0]).toMatchObject({ name: 'A', indeterminate: true });
   });
 

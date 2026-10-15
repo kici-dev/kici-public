@@ -86,7 +86,6 @@ describe('executeStepLoop', () => {
       startTime: Date.now(),
     });
 
-    // Job should fail because onSuccess hook failed
     expect(result.status).toBe('failed');
     expect(result.failureReason).toContain('onSuccess failed');
 
@@ -198,7 +197,6 @@ describe('executeStepLoop', () => {
     const outputsMap: OutputsMap = new Map();
     const { sendIpc } = collectMessages();
 
-    // Abort after first step
     let callCount = 0;
     const result = await executeStepLoop({
       steps,
@@ -263,13 +261,9 @@ describe('executeStepLoop', () => {
     expect(cleanupCalled).toBe(false);
   });
 
-  // Hook capture invariant: workflow-runner wires `createStepContext` to
-  // `createStepCtxWithCapture` which sets `captureStepIndex` to the passed
-  // index. If the step loop ever calls `createStepContext` for a hook without
-  // an index that makes capture active (>= 0), console.log inside that hook
-  // will silently disappear. Lock this by asserting the step loop calls
-  // `createStepContext` with the expected (stepIndex, stepName) for each
-  // hook invocation — per-step hooks reuse the step's index, post-loop and
+  // Hook capture invariant: workflow-runner's `createStepCtxWithCapture` sets
+  // `captureStepIndex` to the passed index, so a hook given an index < 0 loses its
+  // console.log silently. Per-step hooks reuse the step's index; post-loop and
   // cancel-path hooks allocate fresh indices >= steps.length.
   it('calls createStepContext with non-negative stepIndex and correct stepName for each hook', async () => {
     const calls: Array<{ stepIndex: number; stepName: string }> = [];
@@ -304,16 +298,14 @@ describe('executeStepLoop', () => {
 
     expect(result.status).toBe('success');
 
-    // Per-step hooks reuse the step index (0 or 1), so beforeStep / step body
-    // / afterStep for step N all share stepIndex=N and land in step N's log.
+    // beforeStep / body / afterStep for step N share stepIndex=N and land in step N's log.
     const byName = (name: string) => calls.filter((c) => c.stepName === name);
     expect(byName('s0').every((c) => c.stepIndex === 0)).toBe(true);
     expect(byName('s0').length).toBeGreaterThanOrEqual(3); // beforeStep + body + afterStep
     expect(byName('s1').every((c) => c.stepIndex === 1)).toBe(true);
     expect(byName('s1').length).toBeGreaterThanOrEqual(3);
 
-    // Post-loop hooks get their own stepIndex >= steps.length so they show up
-    // as dedicated step rows in the dashboard.
+    // Post-loop hooks get their own stepIndex >= steps.length: dedicated dashboard rows.
     const onSuccessCalls = calls.filter((c) => c.stepName === 'onSuccess');
     expect(onSuccessCalls).toHaveLength(1);
     expect(onSuccessCalls[0].stepIndex).toBeGreaterThanOrEqual(steps.length);
@@ -323,8 +315,6 @@ describe('executeStepLoop', () => {
     expect(cleanupCalls[0].stepIndex).toBeGreaterThanOrEqual(steps.length);
     expect(cleanupCalls[0].stepIndex).not.toBe(onSuccessCalls[0].stepIndex);
 
-    // Every hook call received a non-negative stepIndex so captureStepIndex
-    // (>= 0 in workflow-runner) will be active during hook execution.
     expect(calls.every((c) => c.stepIndex >= 0)).toBe(true);
   });
 
@@ -546,9 +536,8 @@ describe('executeStepLoop', () => {
   });
 
   it('jobDeadlineSignal interrupts a long-running in-flight step', async () => {
-    // A single long step with no per-step timeout: only the job-deadline signal
-    // can unwind it. Without the signal threaded into the step race, the step
-    // would run to completion (the bug this guards against).
+    // No per-step timeout: only the job-deadline signal threaded into the step race
+    // can unwind it; without it, the step runs to completion.
     let stepResolved = false;
     const steps = [
       makeStep('long-sleep', async () => {
@@ -558,7 +547,6 @@ describe('executeStepLoop', () => {
     ];
 
     const jobDeadline = new AbortController();
-    // Fire the deadline shortly after the step starts.
     setTimeout(() => jobDeadline.abort(), 20);
 
     const outputsMap: OutputsMap = new Map();
@@ -577,7 +565,6 @@ describe('executeStepLoop', () => {
       startTime: Date.now(),
     });
 
-    // The step was aborted by the deadline, not run to completion.
     expect(stepResolved).toBe(false);
     expect(result.status).toBe('failed');
     const stepComplete = messages.find((m) => m.type === 'step.complete');
@@ -619,9 +606,8 @@ describe('executeStepLoop', () => {
     });
 
     expect(result.status).toBe('success');
-    // restore before run, save after run
     expect(order).toEqual(['restore', 'run', 'save']);
-    // pseudo-steps surface as cache:restore / cache:save step.complete IPC
+    // Pseudo-steps surface as cache:restore / cache:save step.complete IPC.
     const cacheCompletes = messages.filter(
       (m) => m.type === 'step.complete' && m.step_type?.startsWith('cache:'),
     );
@@ -1231,8 +1217,7 @@ describe('executeStepLoop check mode', () => {
       checkMode: 'apply',
       startTime: Date.now(),
     });
-    // continueOnError lets the loop reach the next step; the failed step is still
-    // recorded (the job-runner layer applies the "don't fail the job" semantic).
+    // The failed step is still recorded; the job-runner layer applies "don't fail the job".
     expect(secondRun).toHaveBeenCalledTimes(1);
     expect(result.stepResults[0].status).toBe('failed');
     expect(result.stepResults[1].status).toBe('success');
@@ -1348,8 +1333,7 @@ describe('step retry', () => {
       env: {},
       startTime: Date.now(),
     });
-    // Retries exhaust first (2 attempts), then continueOnError lets the loop reach
-    // the next step.
+    // Retries exhaust first, then continueOnError reaches the next step.
     expect(n).toBe(2);
     expect(secondRun).toHaveBeenCalledTimes(1);
     expect(result.stepResults[0].status).toBe('failed');
@@ -1411,10 +1395,9 @@ describe('failing-step diagnostics reach the run log', () => {
     );
   }
 
-  // A step whose body throws must put its error in the step's own log, not only
-  // on `step.complete` — otherwise the persisted run log shows a red step with
-  // nothing explaining it. Subprocess wrappers pack the captured stderr into
-  // that message, so dropping it from the log drops the diagnosis.
+  // A thrown error goes into the step's own log, not only `step.complete`: subprocess
+  // wrappers pack captured stderr into it, and the persisted log would show a red step
+  // with nothing explaining it.
   it('emits the thrown error message as a stderr log line', async () => {
     const messages = await runFailingStep('ssh failed: nft: Could not process rule');
     const lines = logLines(messages);
@@ -1454,17 +1437,15 @@ describe('failing-step diagnostics reach the run log', () => {
     expect(complete!.error!.message).toBe(huge);
   });
 
-  /** Pull the two counts out of the truncation marker line. */
+  /** Pull the line and character counts out of the truncation marker line. */
   function parseTruncationCounts(marker: string): { lines: number; chars: number } {
     const m = /\((\d+) more line\(s\), (\d+) more character\(s\)\)/.exec(marker);
     expect(m, `marker did not carry both counts: ${marker}`).not.toBeNull();
     return { lines: Number(m![1]), chars: Number(m![2]) };
   }
 
-  // The marker is the only record of what the log dropped, so both of its
-  // numbers have to be real. Each cap drops lines AND characters — reporting
-  // one of them as 0 reads as "nothing else was lost" and sends the operator
-  // looking in the wrong place.
+  // The marker is the only record of what the log dropped. Each cap drops lines AND
+  // characters; reporting either as 0 sends the operator looking in the wrong place.
   it('reports both counts when only the line cap fires', async () => {
     // 200 one-character lines: 399 chars total, so the char cap never trips —
     // only the line cap does, and it still drops characters along with lines.
@@ -1508,8 +1489,7 @@ describe('failing-step diagnostics reach the run log', () => {
 });
 
 describe('step timeout aborts what it times out', () => {
-  /** Wire the loop the way workflow-runner does: one controller per step, and
-   *  `ctx.signal` composed from it. */
+  /** Wired like workflow-runner: one controller per step, `ctx.signal` composed from it. */
   function timeoutHarness(body: (ctx: StepContext) => Promise<void>) {
     const controllers = new Map<number, AbortController>();
     const { messages, sendIpc } = collectMessages();

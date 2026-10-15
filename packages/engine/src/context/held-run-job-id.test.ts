@@ -8,9 +8,8 @@ import {
 
 describe('isSecurityHoldJobId', () => {
   it('recognises every sentinel in the map, including ones no arm writes today', () => {
-    // The map keeps its historical members so a hold written by an earlier build
-    // still resolves; a predicate that only knew today's `fork_pr` would leave
-    // such a row's security check hanging.
+    // A hold written by an earlier build must still resolve; a predicate that
+    // knew only `fork_pr` would leave that row's security check hanging.
     for (const sentinel of Object.values(SECURITY_HOLD_JOB_IDS)) {
       expect(isSecurityHoldJobId(sentinel)).toBe(true);
     }
@@ -18,9 +17,8 @@ describe('isSecurityHoldJobId', () => {
   });
 
   it('rejects the install-gate sentinel', () => {
-    // The distinction the callers rest on: an install-gate hold posts no
-    // `KiCI Security` check, so completing one for it would create a check run
-    // on a commit that never had one.
+    // An install-gate hold posts no `KiCI Security` check, so completing one
+    // would create a check run on a commit that never had one.
     expect(isSecurityHoldJobId(installGateJobId('CI'))).toBe(false);
     expect(isSecurityHoldJobId(installGateJobId(''))).toBe(false);
   });

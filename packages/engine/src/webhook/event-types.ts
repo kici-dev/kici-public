@@ -1,22 +1,20 @@
 /**
- * Shared outbound-webhook event-type vocabulary — the single source of truth for
- * the event types a customer can subscribe an endpoint to, consumed by the
- * Platform route validator and the dashboard endpoint-create checkbox list.
+ * Outbound-webhook event types a customer can subscribe an endpoint to, read
+ * by the Platform route validator and the dashboard endpoint-create checkbox
+ * list.
  *
- * Pure Zod (browser-safe): the engine barrel re-exports this module and the
- * dashboard imports the barrel, so no Node built-in may appear here.
+ * Pure Zod: the dashboard imports this through the engine barrel, so no Node
+ * built-in may appear here.
  *
- * `docs/user/dashboard/settings.md` § Webhooks lists the subscribable types in
- * prose — adding a type here means updating that list in the same change.
+ * `docs/user/dashboard/settings.md` § Webhooks lists the subscribable types;
+ * a new type updates that list in the same change.
  */
 import { z } from 'zod';
 
 /**
- * Subscribable webhook event types — the run/job lifecycle events a customer can
- * wire an endpoint to. Written once here; the full `WebhookEventType` enum
- * derives from these plus the non-subscribable ping. Module-private on purpose:
- * `SUBSCRIBABLE_WEBHOOK_EVENT_TYPES` is the one public name for this list, so
- * consumers cannot pick between two spellings of the same vocabulary.
+ * The run/job lifecycle events an endpoint can subscribe to; `WebhookEventType`
+ * adds the ping. Module-private so `SUBSCRIBABLE_WEBHOOK_EVENT_TYPES` is the one
+ * public name for this list.
  */
 const SUBSCRIBABLE_EVENT_VALUES = [
   'run.started',
@@ -48,13 +46,12 @@ export const WebhookEventType = z.enum([...SUBSCRIBABLE_EVENT_VALUES, PING_EVENT
 export type WebhookEventType = z.infer<typeof WebhookEventType>;
 
 /**
- * Readonly value tuple for iteration (UI checkbox list, tests) — the accepted
- * set of `SubscribableWebhookEventType`, in declaration order.
+ * The accepted set of `SubscribableWebhookEventType`, in declaration order, for
+ * iteration (UI checkbox list, tests).
  *
- * A frozen copy, not `SubscribableWebhookEventType.options`: Zod hands back the
- * validator's own internal array from that getter, so re-exporting it would let
- * any consumer `push` / `sort` the shared vocabulary out from under every other
- * module in the process. `event-types.test.ts` asserts the copy still matches
- * the validator's options.
+ * A frozen copy, not `SubscribableWebhookEventType.options`: that getter returns
+ * the validator's own internal array, so any consumer could `push` / `sort` the
+ * vocabulary out from under every other module. `event-types.test.ts` asserts
+ * the copy still matches the validator's options.
  */
 export const SUBSCRIBABLE_WEBHOOK_EVENT_TYPES = Object.freeze([...SUBSCRIBABLE_EVENT_VALUES]);

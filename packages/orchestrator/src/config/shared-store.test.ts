@@ -112,7 +112,6 @@ describe('SharedConfigStore', () => {
     });
 
     it('decrypts sensitive fields when master key is available', async () => {
-      // Encrypt the config first
       const plainConfig = makeSharedConfig();
       const { encrypted, encryptedPaths } = encryptConfigFields(
         plainConfig,
@@ -132,7 +131,6 @@ describe('SharedConfigStore', () => {
 
       const result = await store.getLatest();
       expect(result).not.toBeNull();
-      // Should be decrypted back to plaintext
       expect(result!.config.platform?.token).toBe('platform-token-secret');
       expect(result!.config.secrets?.key).toBe('test-master-key-value');
       expect(result!.config.secrets?.bootstrapAdminToken).toBe('bootstrap-token-secret');
@@ -197,11 +195,9 @@ describe('SharedConfigStore', () => {
 
       await store.save(makeSharedConfig(), 'cli:seed');
 
-      // Check the values passed to insertInto
       const valuesArg = mocks.values.mock.calls[0][0];
       const storedConfig = JSON.parse(valuesArg.config);
 
-      // Encrypted fields should NOT be plaintext
       expect(storedConfig.platform.token).not.toBe('platform-token-secret');
       expect(storedConfig.secrets.key).not.toBe('test-master-key-value');
 
@@ -220,7 +216,6 @@ describe('SharedConfigStore', () => {
       const valuesArg = mocks.values.mock.calls[0][0];
       const storedConfig = JSON.parse(valuesArg.config);
 
-      // Should be plaintext
       expect(storedConfig.platform.token).toBe('platform-token-secret');
       expect(storedConfig.secrets.key).toBe('test-master-key-value');
       expect(valuesArg.encrypted_paths).toEqual([]);
@@ -396,7 +391,6 @@ describe('SharedConfigStore', () => {
     });
 
     it('redacts sensitive fields', async () => {
-      // Config with encrypted fields
       const plainConfig = makeSharedConfig();
       const { encrypted, encryptedPaths } = encryptConfigFields(
         plainConfig,
@@ -416,12 +410,10 @@ describe('SharedConfigStore', () => {
       const result = await store.exportRedacted();
       expect(result).not.toBeNull();
 
-      // Sensitive fields should be redacted
       expect((result as any).platform.token).toBe('***REDACTED***');
       expect((result as any).secrets.key).toBe('***REDACTED***');
       expect((result as any).secrets.bootstrapAdminToken).toBe('***REDACTED***');
 
-      // Non-sensitive fields should be visible
       expect((result as any).platform.url).toBe('wss://platform.kici.dev/ws');
       expect((result as any).agentAuth).toBe('token');
     });
@@ -446,7 +438,6 @@ describe('SharedConfigStore', () => {
 
   describe('encryption round-trip', () => {
     it('encrypts on save and decrypts on read', async () => {
-      // Simulate save: encrypt config and store
       const plainConfig = makeSharedConfig();
       const { encrypted, encryptedPaths } = encryptConfigFields(
         plainConfig,
@@ -455,10 +446,8 @@ describe('SharedConfigStore', () => {
         1,
       );
 
-      // Verify encryption happened
       expect((encrypted as any).platform.token).not.toBe('platform-token-secret');
 
-      // Simulate read: create row with encrypted data
       const row = makeDbRow({
         version: 1,
         config: JSON.stringify(encrypted),
@@ -468,7 +457,6 @@ describe('SharedConfigStore', () => {
       const { db } = createMockDb({ selectFirstRow: row });
       const store = new SharedConfigStore(db, TEST_MASTER_KEY);
 
-      // Read should decrypt
       const result = await store.getLatest();
       expect(result).not.toBeNull();
       expect(result!.config.platform?.token).toBe('platform-token-secret');

@@ -1,12 +1,10 @@
 /**
  * `kici connect <url>` and `kici disconnect`.
  *
- * `connect` saves an orchestrator as the direct target `kici run remote` and
- * `kici types` use, with the orchestrator admin token an operator issued. The
- * token is verified against the orchestrator (`GET /api/v1/test/whoami`)
- * before anything is saved, so a mistyped or revoked token never lands in the
- * config. `disconnect` forgets that target and nothing else: a Platform login
- * stays.
+ * `connect` saves an orchestrator, with an operator-issued admin token, as the
+ * direct target of `kici run remote` and `kici types`. The token is verified
+ * (`GET /api/v1/test/whoami`) before saving, so a mistyped or revoked token
+ * never lands in the config. `disconnect` keeps a Platform login.
  */
 import pc from 'picocolors';
 import { password } from '@inquirer/prompts';
@@ -16,13 +14,12 @@ import { DirectRunClient, type DirectWhoami } from '../remote/direct-client.js';
 import { normalizeOrchestratorUrl } from '../remote/target.js';
 
 export interface ConnectDeps {
-  /** Verify a token; defaults to `GET /api/v1/test/whoami` on the orchestrator. */
+  /** Defaults to `GET /api/v1/test/whoami` on the orchestrator. */
   whoami?: (url: string, token: string) => Promise<DirectWhoami>;
-  /** Read all of standard input; defaults to the process stdin. */
   readStdin?: () => Promise<string>;
-  /** Prompt for the token on a terminal; defaults to a masked prompt. */
+  /** Defaults to a masked prompt. */
   promptToken?: () => Promise<string>;
-  /** Whether standard input is a terminal; defaults to `process.stdin.isTTY`. */
+  /** Defaults to `process.stdin.isTTY`. */
   isTty?: boolean;
   env?: NodeJS.ProcessEnv;
 }
@@ -59,11 +56,7 @@ function describeConnection(url: string, me: DirectWhoami): string {
   return `Connected to ${url} as ${who} (role ${me.role}, orchestrator mode ${me.mode}, organization ${org})`;
 }
 
-/**
- * Verify the token against the orchestrator, then save the direct target.
- *
- * @returns true when the target was verified and saved.
- */
+/** Verify the token against the orchestrator, then save the direct target. */
 export async function connectCommand(
   url: string,
   opts: { tokenStdin?: boolean },

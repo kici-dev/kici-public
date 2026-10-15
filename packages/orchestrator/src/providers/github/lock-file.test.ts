@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { LockFileParseError } from '@kici-dev/engine';
 import { GitHubLockFileFetcher } from './lock-file.js';
+import { lockFileFixture, lockWorkflow } from '../../__test-helpers__/lock-fixtures.js';
 
 // ── Mocks ────────────────────────────────────────────────────────
 
@@ -21,18 +22,15 @@ const TEST_CONFIG = {
   privateKey: '-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----',
 };
 
-const SAMPLE_LOCK_FILE = {
-  schemaVersion: 1,
-  source: { file: '.kici/workflows/ci.ts', export: '#default' },
-  contentHash: 'test-hash',
+const SAMPLE_LOCK_FILE = lockFileFixture({
   workflows: [
-    {
+    lockWorkflow({
       name: 'ci',
       triggers: [{ _type: 'push', branches: [], paths: [] }],
       jobs: [],
-    },
+    }),
   ],
-};
+});
 
 function encodeLockFile(lockFile: object): string {
   return Buffer.from(JSON.stringify(lockFile)).toString('base64');

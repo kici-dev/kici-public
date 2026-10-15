@@ -1,19 +1,11 @@
 /**
- * Unit tests for `resolveApprovalDirectory` — the reader that decides which
- * directory a `/kici approve` comment is authorized against.
+ * `resolveApprovalDirectory` decides which directory a `/kici approve` comment is
+ * authorized against. Precedence: a Platform-pushed in-memory directory is newer
+ * than its persisted row, so it wins; every other `ProcessingDeps` assembly must
+ * read the row, the only home of an independent orchestrator's registrations.
  *
- * The precedence it implements is the whole point: a Platform-pushed directory
- * held in memory is newer than the row it was persisted into, so it wins; every
- * other assembly of `ProcessingDeps` has no in-memory directory at all and must
- * read the row, which on an independent orchestrator is the only place the
- * operator's own registrations exist.
- *
- * The second block is a registration-seam test. The resolver being correct is
- * worth nothing if `app.ts` never hands it the store — that omission is exactly
- * the shape of the defect this whole change exists to fix. What the bag
- * CONTAINS is now asserted behaviourally in `direct-ingress-deps.test.ts`,
- * which constructs it and reads the fields; what remains here is the one thing
- * that test cannot see, namely `app.ts` still routing through that factory.
+ * The second block is a registration-seam test: a correct resolver is worthless
+ * if `app.ts` never hands it the store.
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -50,9 +42,8 @@ describe('resolveApprovalDirectory', () => {
   });
 
   it('prefers an in-memory directory over the persisted row', async () => {
-    // `server.ts` refreshes its in-memory copy on every push, so the row can be
-    // a revision behind. Reading it anyway would resurrect a member whose CI
-    // trust the Platform has already revoked.
+    // The row can be a revision behind `server.ts`'s in-memory copy; reading it
+    // would resurrect a member whose CI trust the Platform already revoked.
     const load = vi.fn().mockResolvedValue(STORED);
     const resolved = await resolveApprovalDirectory(
       depsWith({
@@ -93,8 +84,8 @@ describe('resolveApprovalDirectory', () => {
   });
 
   it('fails closed on a read error rather than throwing at the caller', async () => {
-    // The caller is mid-delivery. A thrown read would abort the whole webhook,
-    // where refusing this one command leaves the hold intact and retryable.
+    // Mid-delivery, a throw aborts the whole webhook; refusing this one command
+    // leaves the hold intact and retryable.
     const load = vi.fn().mockRejectedValue(new Error('connection reset'));
     const resolved = await resolveApprovalDirectory(
       depsWith({ trustDirectoryStore: { load } as never }),
@@ -108,12 +99,9 @@ describe('direct-ingress ProcessingDeps assembly', () => {
   const appSource = readFileSync(fileURLToPath(new URL('../app.ts', import.meta.url)), 'utf8');
 
   it('assembles its bag through the shared factory, not a hand-rolled second copy', () => {
-    // What the bag CONTAINS is asserted behaviourally in
-    // `direct-ingress-deps.test.ts`, which constructs it and reads the fields.
-    // The one thing that test cannot see is `app.ts` quietly reverting to an
-    // inline object literal, which would leave the factory correct and unused —
-    // the exact shape of the defect this whole change exists to fix. So the
-    // seam itself is asserted here, and only the seam.
+    // `direct-ingress-deps.test.ts` asserts what the bag CONTAINS. It cannot see
+    // `app.ts` reverting to an inline literal, leaving the factory correct and
+    // unused, so only that seam is asserted here.
     expect(appSource).toMatch(
       /const \{ build: buildProcessingDeps \} =\s*createDirectIngressProcessingDeps\(/,
     );

@@ -1,7 +1,4 @@
-/**
- * Review comment trigger helper - creates triggers for PR review comment events.
- * Returns a frozen ReviewCommentTriggerConfig directly.
- */
+/** PR review comment trigger helper; returns a frozen ReviewCommentTriggerConfig. */
 
 import type {
   BranchPattern,

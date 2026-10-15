@@ -1,17 +1,13 @@
 /**
- * Dashboard global-workflows handler for the orchestrator.
+ * Handles `dashboard.global-workflows.*` WS messages from Platform by reading or
+ * upserting the `org_settings` row keyed by `customer_id`. The row holds the per-org
+ * repo-pattern lists (allow / deny) of `{routingKey?, pattern}` entries; `routingKey`
+ * optionally pins an entry to one source. The fleet-wide master switch
+ * (`cluster_settings.global_workflows_enabled`) is read-only here: projected as
+ * `enabled`, never written.
  *
- * Responds to `dashboard.global-workflows.*` WS messages from Platform by
- * reading or upserting the `org_settings` row keyed by `customer_id`. The row
- * holds the per-org repo-pattern lists (allow / deny); each
- * entry is a `{routingKey?, pattern}` object that may optionally pin to one
- * source. The master enable switch is fleet-wide
- * (`cluster_settings.global_workflows_enabled`) and read-only here — projected
- * onto the response as `enabled`, never written from this handler.
- *
- * The handler binds a single `customerId` at construction time (via the
- * sources / generic_webhook_sources lookup at server startup) and updates
- * via setOrgId() when a real customer source registers.
+ * `customerId` binds at construction (from the sources / generic_webhook_sources lookup
+ * at server startup) and updates via setOrgId() when a real customer source registers.
  */
 import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -38,25 +34,20 @@ import { toIsoString } from '@kici-dev/engine';
 const logger = createLogger({ prefix: 'dashboard-global-workflows-handler' });
 
 interface DashboardGlobalWorkflowsHandlerDeps {
-  /** Customer / org identifier — primary key on org_settings. */
+  /** Primary key on org_settings. */
   customerId: string;
-  /** Send a response message back to Platform over the WS connection. */
   send: (msg: unknown) => void;
   db: Kysely<Database>;
   /** Reads the fleet-wide master switch for the read-only `enabled` projection. */
   clusterSettings: ClusterSettingsReader;
   /** Applies when the cluster column is NULL — `config.globalWorkflowsEnabled`. */
   globalWorkflowsEnabledDefault: boolean;
-  /** Access log writer — records one row per read / mutation with actor attribution. */
+  /** Records one row per read / mutation with actor attribution. */
   accessLog?: AccessLogWriter;
 }
 
 type GlobalWorkflowsMessage = GlobalWorkflowsGetRequest | GlobalWorkflowsUpdateRequest;
 
-/**
- * Returns true when the message is one this handler can dispatch. Used by the
- * server to route incoming WS messages.
- */
 export function isDashboardGlobalWorkflowsMessage(
   msg: { type: string } | null | undefined,
 ): msg is GlobalWorkflowsMessage {
@@ -80,15 +71,13 @@ export class DashboardGlobalWorkflowsHandler {
     );
   }
 
-  /** Update the customer / org id this handler operates on. */
   setOrgId(customerId: string | null): void {
     this.deps.customerId = customerId ?? '';
   }
 
   /**
-   * Defense-in-depth dashboard-write policy gate. Returns true when the
-   * operation is allowed; false (with a structured `operation_disabled`
-   * envelope and a `denied` access_log row) when policy says no.
+   * Defense-in-depth dashboard-write policy gate. On denial it sends a structured
+   * `operation_disabled` envelope, writes a `denied` access_log row and returns false.
    */
   private async enforcePolicy(
     msg: { actor: ActorPrincipal; requestId: string },
@@ -227,17 +216,13 @@ export class DashboardGlobalWorkflowsHandler {
   }
 
   /**
-   * The effective fleet-wide master switch, for the read-only projection the
-   * dashboard renders as a status badge.
+   * The effective master switch, rendered by the dashboard as a status badge.
    *
-   * Uses the shared 10s-cached reader — unlike the admin route, which reads
-   * uncached because an operator does set-then-show. A dashboard badge that is
-   * up to 10s stale is fine; a second uncached read on every dashboard poll is
-   * not.
+   * Uses the shared 10s-cached reader, unlike the admin route, which reads uncached for
+   * set-then-show. A badge up to 10s stale is fine; an uncached read per poll is not.
    *
-   * An unreadable row resolves to the configured default here rather than
-   * failing closed. This value only decides what the UI displays; the actual
-   * gate is `GlobalWorkflowPolicy`, which does fail closed.
+   * An unreadable row resolves to the configured default rather than failing closed:
+   * this only drives the UI, and the actual gate, `GlobalWorkflowPolicy`, fails closed.
    */
   private async effectiveEnabled(): Promise<boolean> {
     const read = await this.deps.clusterSettings.tryGetBoolean('global_workflows_enabled');
@@ -246,7 +231,7 @@ export class DashboardGlobalWorkflowsHandler {
   }
 
   private async upsertRow(patch: NormalizedPatch): Promise<void> {
-    // jsonb columns: pass arrays through the Kysely json helper. The
+    // jsonb columns: serialise arrays with JSON.stringify. The
     // OrgSettingsTable type accepts `string` on insert (a stringified jsonb
     // payload) so we serialise explicitly to avoid driver-dependent
     // implicit coercion.
@@ -263,9 +248,7 @@ export class DashboardGlobalWorkflowsHandler {
         oc.column('customer_id').doUpdateSet({
           global_workflow_allowed_repos: allowed,
           global_workflow_denied_repos: denied,
-          // Bump updated_at via a raw SQL expression; the generated type
-          // for the column expects a Date, but the DB-side `now()` is the
-          // operationally correct value.
+          // The generated type expects a Date, but the DB-side `now()` is the correct value.
           updated_at: sql<Date>`now()`,
         }),
       )
@@ -273,9 +256,8 @@ export class DashboardGlobalWorkflowsHandler {
   }
 
   /**
-   * Same envelope as `sendError`, for a request the client got wrong. Logged at
-   * warn level: bad input is not a server fault, and error-level rows here would
-   * pollute the error dashboards an operator watches.
+   * `sendError`'s envelope for bad client input, logged at warn: it is not a server
+   * fault, and error-level rows would pollute the operator's error dashboards.
    */
   private sendClientError(type: string, requestId: string, message: string): void {
     logger.warn(`Rejected ${type.replace('.response', '')}`, { requestId, error: message });
@@ -289,21 +271,17 @@ export class DashboardGlobalWorkflowsHandler {
   }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
 interface NormalizedPatch {
   allowedRepos: RepoPatternEntry[] | null;
   deniedRepos: RepoPatternEntry[] | null;
 }
 
 /**
- * The first negation-form pattern carried by an update message, rendered as a
- * message naming the list, the entry index, and the pattern — or null when
- * every incoming entry is storable.
+ * Names the list, index and pattern of the first negation-form pattern in an update, or
+ * null when every entry is storable.
  *
- * The wire schema stays permissive so rows already in `org_settings` keep
- * parsing on read paths; the refusal applies only where a dashboard write
- * would store a new pattern.
+ * The wire schema stays permissive so existing `org_settings` rows keep parsing on read
+ * paths; the refusal applies only where a dashboard write would store a new pattern.
  */
 function firstInvalidPattern(msg: GlobalWorkflowsUpdateRequest): string | null {
   const lists = [
@@ -320,11 +298,7 @@ function firstInvalidPattern(msg: GlobalWorkflowsUpdateRequest): string | null {
   return null;
 }
 
-/**
- * Derive the effective storage state from an existing row (may be undefined)
- * plus a partial update message. Unset fields fall back to the existing value;
- * an explicit `null` clears the corresponding column.
- */
+/** Unset fields keep the existing value; an explicit `null` clears the column. */
 export function buildPatch(
   existing: OrgSettings | undefined,
   msg: GlobalWorkflowsUpdateRequest,
@@ -341,10 +315,8 @@ export function buildPatch(
 }
 
 /**
- * Project a row into the public settings shape. `enabled` is the effective
- * fleet-wide master switch, supplied by the caller (read-only here). When the
- * row does not yet exist, the per-org lists project as null so callers always
- * get a renderable state.
+ * `enabled` is the effective master switch, supplied by the caller. A missing row
+ * projects its lists as null so callers always get a renderable state.
  */
 export function rowToSettings(
   customerId: string,

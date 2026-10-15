@@ -14,12 +14,10 @@ export interface StoredPlanHeadroom {
 const ROW_ID = 'default';
 
 /**
- * The orchestrator's cache of the Platform-owned worker ceiling.
- *
- * Persisted so a coordinator restarting during a Platform outage keeps
- * enforcing the last known ceiling instead of resetting to unlimited. Same
- * ownership shape as `org_trust_policy`: the Platform writes it, the
- * orchestrator only reads it back.
+ * Persisted cache of the Platform-owned worker ceiling, so a coordinator
+ * restarting during a Platform outage keeps the last known ceiling instead of
+ * unlimited. Like `org_trust_policy`, the Platform writes it and the orchestrator
+ * only reads it back.
  */
 export class PlanHeadroomStore {
   constructor(private readonly db: Kysely<Database>) {}

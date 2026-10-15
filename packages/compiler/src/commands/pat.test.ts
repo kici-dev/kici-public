@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { jsonResponse } from '@kici-dev/test-support/http';
 
 vi.mock('../remote/config.js', () => ({
   loadGlobalConfig: vi.fn(),
@@ -8,13 +9,6 @@ import { loadGlobalConfig } from '../remote/config.js';
 import { patCreateCommand } from './pat.js';
 
 const mockedLoadConfig = loadGlobalConfig as ReturnType<typeof vi.fn>;
-
-function jsonResponse(body: unknown, status = 201): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'Content-Type': 'application/json' },
-  });
-}
 
 describe('patCreateCommand', () => {
   beforeEach(() => {
@@ -26,7 +20,7 @@ describe('patCreateCommand', () => {
     const fetchImpl = vi
       .fn()
       .mockResolvedValue(
-        jsonResponse({ id: 'p1', token: 'kici_pat_agent', name: 'claude', expiresAt: 'soon' }),
+        jsonResponse({ id: 'p1', token: 'kici_pat_agent', name: 'claude', expiresAt: 'soon' }, 201),
       );
 
     const ok = await patCreateCommand({
@@ -48,7 +42,7 @@ describe('patCreateCommand', () => {
     const fetchImpl = vi
       .fn()
       .mockResolvedValue(
-        jsonResponse({ id: 'p1', token: 'kici_pat_x', name: 'ci', expiresAt: 's' }),
+        jsonResponse({ id: 'p1', token: 'kici_pat_x', name: 'ci', expiresAt: 's' }, 201),
       );
 
     const ok = await patCreateCommand({

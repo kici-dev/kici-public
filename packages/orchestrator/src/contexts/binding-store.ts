@@ -41,7 +41,6 @@ export class BindingStore {
    */
   async set(orgId: string, contextId: string, bindings: BindingInput[]): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
-      // Delete existing bindings
       await trx
         .deleteFrom('context_bindings')
         .where('org_id', '=', orgId)

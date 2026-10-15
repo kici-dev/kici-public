@@ -1,15 +1,13 @@
 import { TimeoutReason } from '@kici-dev/engine';
 
-/** Handle returned by armJobDeadline; call clear() to cancel the timer. */
 export interface JobDeadlineHandle {
   clear(): void;
 }
 
 /**
- * Arm a job-level wall-clock deadline. When `timeoutMs` is set and elapses
- * before clear() is called, invokes `onTimeout` with the distinct
- * `job_timeout` reason and the configured budget. A no-op when `timeoutMs`
- * is undefined (no job-level cap configured).
+ * Arm a job-level wall-clock deadline: if it elapses before clear(),
+ * `onTimeout` gets the distinct `job_timeout` reason and the budget. A no-op
+ * when `timeoutMs` is undefined or not positive.
  */
 export function armJobDeadline(
   timeoutMs: number | undefined,

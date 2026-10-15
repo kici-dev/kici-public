@@ -3,7 +3,7 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './039_host_roster.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -59,10 +59,8 @@ describeDb('migration 039_host_roster', () => {
   }, 60_000);
 
   it('creates host_roster with the base columns migration 039 establishes', async () => {
-    // The harness applies migrations 001..039, so the table carries exactly the
-    // columns migration 039 establishes. Assert those base columns are present
-    // rather than freezing the exact set, so the test stays stable if 039 is
-    // ever amended alongside a superseding migration.
+    // Assert the base columns are present rather than freezing the exact set, so the test stays
+    // stable if 039 is amended alongside a superseding migration.
     expect(await tableExists('host_roster')).toBe(true);
     expect(await columns()).toEqual(
       expect.arrayContaining(

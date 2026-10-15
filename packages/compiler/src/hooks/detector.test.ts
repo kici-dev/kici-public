@@ -77,14 +77,13 @@ describe('detectHookTools', () => {
   });
 
   it('returns multiple tools sorted by priority', async () => {
-    // Create config files for multiple tools
     await mkdir(path.join(tempDir, '.husky'), { recursive: true });
     await writeFile(path.join(tempDir, '.pre-commit-config.yaml'), 'repos: []');
     await writeFile(path.join(tempDir, 'prek.toml'), '[hooks]');
 
     const result = await detectHookTools(tempDir);
     expect(result).toHaveLength(3);
-    // Should be sorted by priority: husky (1) < pre-commit (3) < prek (4)
+    // Priority: husky (1) < pre-commit (3) < prek (4)
     expect(result[0].name).toBe('husky');
     expect(result[1].name).toBe('pre-commit');
     expect(result[2].name).toBe('prek');
@@ -135,7 +134,7 @@ describe('findGitDir', () => {
   });
 
   it('resolves .git file with absolute gitdir path (worktree)', async () => {
-    // Simulate a worktree: .git is a file pointing to the actual git dir
+    // A worktree's .git is a file pointing to the actual git dir.
     const actualGitDir = path.join(tempDir, 'actual-repo', '.git', 'worktrees', 'my-worktree');
     await mkdir(actualGitDir, { recursive: true });
 
@@ -148,7 +147,6 @@ describe('findGitDir', () => {
   });
 
   it('resolves .git file with relative gitdir path (submodule)', async () => {
-    // Simulate a submodule: .git file with relative path
     const parentGitModules = path.join(tempDir, '.git', 'modules', 'my-sub');
     await mkdir(parentGitModules, { recursive: true });
 
@@ -179,7 +177,7 @@ describe('findGitDir', () => {
     await writeFile(path.join(tempDir, '.git'), 'not a valid gitdir reference\n');
 
     const result = await findGitDir(tempDir);
-    // Should skip this .git file and continue walking up (eventually returns null)
+    // Skips this .git file and keeps walking up.
     expect(result).toBeNull();
   });
 });
@@ -214,7 +212,7 @@ describe('findGitRoot', () => {
   });
 
   it('returns worktree root when .git is a file', async () => {
-    // The worktree root is where the .git file lives, not where it points to
+    // Where the .git file lives, not where it points.
     const actualGitDir = path.join(tempDir, 'repo', '.git', 'worktrees', 'wt');
     await mkdir(actualGitDir, { recursive: true });
 

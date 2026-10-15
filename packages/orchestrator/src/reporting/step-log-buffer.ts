@@ -1,13 +1,8 @@
 /**
- * Ring buffer for per-step log line retention.
- *
- * Stores the last N ANSI-stripped log lines per step for use in check run
- * summaries. Log lines are keyed by `{runId}:{jobId}:{stepIndex}` so each
- * step gets its own independent buffer. When the buffer exceeds maxLines,
- * the oldest lines are evicted.
- *
- * The totalCount field tracks how many lines were added in total (not just
- * retained), enabling the truncation indicator: "showing last 20 of N lines".
+ * Ring buffer of the last N ANSI-stripped log lines per step, for check run summaries.
+ * Keyed by `{runId}:{jobId}:{stepIndex}`; past maxLines the oldest lines are evicted.
+ * `totalCount` counts every line added, which drives the "showing last 20 of N lines"
+ * truncation indicator.
  */
 
 import stripAnsi from 'strip-ansi';
@@ -28,19 +23,11 @@ export class StepLogBuffer {
     this.maxLines = opts?.maxLines ?? 20;
   }
 
-  /**
-   * Build the composite key for a step.
-   */
   private buildKey(key: { runId: string; jobId: string; stepIndex: number }): string {
     return `${key.runId}:${key.jobId}:${key.stepIndex}`;
   }
 
-  /**
-   * Add log lines for a step.
-   *
-   * ANSI codes are stripped from each line before storage.
-   * When the buffer exceeds maxLines, the oldest lines are evicted.
-   */
+  /** Add log lines for a step, ANSI-stripped; past maxLines the oldest are evicted. */
   addLines(key: { runId: string; jobId: string; stepIndex: number }, rawLines: string[]): void {
     const compositeKey = this.buildKey(key);
     let entry = this.entries.get(compositeKey);
@@ -54,18 +41,13 @@ export class StepLogBuffer {
       entry.lines.push(stripped);
       entry.totalCount++;
 
-      // Evict oldest when exceeding maxLines
       if (entry.lines.length > this.maxLines) {
         entry.lines.shift();
       }
     }
   }
 
-  /**
-   * Get the last N lines and total count for a step.
-   *
-   * Returns undefined if no lines have been added for this step.
-   */
+  /** The last N lines and total count for a step; undefined when it has none. */
   getLastLines(key: { runId: string; jobId: string; stepIndex: number }): StepLogEntry | undefined {
     const compositeKey = this.buildKey(key);
     const entry = this.entries.get(compositeKey);
@@ -73,11 +55,7 @@ export class StepLogBuffer {
     return { lines: [...entry.lines], totalCount: entry.totalCount };
   }
 
-  /**
-   * Remove all entries for a given runId.
-   *
-   * Called when the execution tracker prunes a completed run from memory.
-   */
+  /** Remove a run's entries; called when the execution tracker prunes it from memory. */
   cleanup(runId: string): void {
     const prefix = `${runId}:`;
     for (const key of this.entries.keys()) {

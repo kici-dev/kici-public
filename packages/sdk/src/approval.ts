@@ -1,9 +1,7 @@
 /**
- * Workflow-author API for declaring a manual approval gate at step, job, or
- * workflow level. The author writes `approval`; the compiler normalizes it
- * into the lock file's `approval` block, and the orchestrator turns it into a
- * held element at dispatch time (for `when: 'always'`) or the agent turns it
- * into a mid-step drift gate (for `when: 'drift'`).
+ * A manual approval gate at step, job or workflow level. The compiler writes it
+ * into the lock file's `approval` block; the orchestrator holds the element at
+ * dispatch (`when: 'always'`), or the agent gates mid-step (`when: 'drift'`).
  */
 import { approvalTimeoutSecondsSchema } from '@kici-dev/engine';
 
@@ -43,10 +41,7 @@ export interface NormalizedApproval {
   when: ApprovalWhen;
 }
 
-/**
- * Normalize any `ApprovalConfig` form into
- * `{ clauses, reason?, timeoutSeconds?, when }`. `when` defaults to `'always'`.
- */
+/** `when` defaults to `'always'`. Throws on an invalid `timeout`. */
 export function normalizeApproval(c: ApprovalConfig): NormalizedApproval {
   if (c === true) return { clauses: [], when: 'always' };
   if (Array.isArray(c)) return { clauses: c, when: 'always' };

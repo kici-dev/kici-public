@@ -67,12 +67,11 @@ describe('classifyUnroutable', () => {
   });
 
   it('settles an external provisioning failure on the provisioning cause, not the labels', () => {
-    // The shape the event scaler records once its stranded provision is reaped.
-    // The probe deliberately says "nothing routes": a `runsOn` naming only the
-    // scaler's own label matches no CONNECTED agent while the provision is
-    // failing, which is exactly the state that produced the misleading
-    // "No connected agent or scaler backend currently matches …" verdict — a
-    // backend did match, and was actively spawning.
+    // What the event scaler records once its stranded provision is reaped. The
+    // probe deliberately says "nothing routes": a `runsOn` naming only the
+    // scaler's label matches no CONNECTED agent while the provision fails, the
+    // state that yields the misleading "No connected agent or scaler backend
+    // currently matches …" verdict although a backend matched and was spawning.
     const detail =
       'External provisioning for scaler `github-actions` produced no agent: the scale-up ' +
       'event was emitted, but agent agent-77 never registered before the spawn timeout.';
@@ -272,8 +271,7 @@ describe('terminalizeUnroutableJob and the global-eval tracker', () => {
   /**
    * A round job is the one queue entry with an in-process awaiter and no
    * `execution_runs` row, so every other branch of `terminalizeUnroutableJob`
-   * is a no-op for it and the stub below never has to model more than the
-   * first update returning zero rows.
+   * is a no-op and the stub models only the first update returning zero rows.
    */
   const zeroRowDb = () =>
     ({

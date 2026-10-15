@@ -1,24 +1,20 @@
 /**
  * User-facing artifacts layer wrapping CacheStorage + the `artifacts` DB table.
  *
- * Artifacts are named, immutable-per-run build deliverables. Storage layout:
- * `artifacts/{runId}/{name}-{discriminator}.tar.gz` on the same `CacheStorage`
- * backend the user-cache uses; one row per upload carries the size, sha256,
- * and `customer_id` (org quota-accounting scope). Immutability is enforced at
- * two layers: the pre-mint duplicate-name check here AND the DB `UNIQUE
- * (run_id, name)` constraint as a backstop.
+ * Artifacts are named, immutable-per-run build deliverables, stored at
+ * `artifacts/{runId}/{name}-{discriminator}.tar.gz` on the user-cache's
+ * `CacheStorage` backend; one row per upload carries the size, sha256, and
+ * `customer_id` (org quota-accounting scope). Immutability: the pre-mint
+ * duplicate-name check here, with the DB `UNIQUE (run_id, name)` as backstop.
  *
- * Enforcement (before minting a presigned PUT): per-artifact size cap, per-run
- * count cap, per-org byte quota, duplicate name — each maps to a named
- * `ArtifactRejectReason` the agent surfaces verbatim. The size cap, count cap,
- * byte quota, and TTL each take a per-org `org_settings` override when set,
- * falling back to the cluster-wide default otherwise.
+ * Before minting a presigned PUT: per-artifact size cap, per-run count cap,
+ * per-org byte quota, duplicate name — each a named `ArtifactRejectReason` the
+ * agent surfaces verbatim. Caps, quota and TTL take a per-org `org_settings`
+ * override, else the cluster-wide default.
  *
- * TTL: an artifact is considered expired `ttlMs` after `created_at` (per-org
- * override or cluster default). Expired artifacts are excluded from quota sums,
- * download resolution, and the dashboard listing — a lazy model mirroring the
- * user-cache TTL (no active sweep; the backing object also expires lazily via
- * `CacheStorage`'s own TTL).
+ * TTL: expired `ttlMs` after `created_at`, and then excluded from quota sums,
+ * downloads and the dashboard listing — lazy like the user-cache TTL (no
+ * active sweep; the object expires lazily via `CacheStorage`'s own TTL).
  */
 import { randomUUID } from 'node:crypto';
 import type { Kysely } from 'kysely';
@@ -33,10 +29,9 @@ import { ArtifactInternalFailure, artifactInvalidNameError } from './failure-mes
 const logger = createLogger({ prefix: 'artifact-store' });
 
 /**
- * The presigned PUT never landed an object, so there is nothing to record.
- * Distinct from a transient storage/DB error: a caller retrying the commit
- * would keep finding the object absent, so this failure is terminal and is
- * reported straight back to the agent (which fails the workflow step).
+ * The presigned PUT never landed an object. Terminal, unlike a transient
+ * storage/DB error (a retry would keep finding it absent), so it goes straight
+ * back to the agent, which fails the workflow step.
  */
 export class ArtifactObjectMissingError extends Error {
   constructor(readonly storageKey: string) {
@@ -57,16 +52,13 @@ export class ArtifactInvalidNameError extends Error {
 }
 
 /**
- * Map a `completeUpload` failure onto a message safe to send to the agent — which
- * runs untrusted workflow code, so the reason reaches the workflow author and its
- * step logs.
+ * Map a `completeUpload` failure onto a message safe for the agent, which runs
+ * untrusted workflow code (the reason reaches the author's step logs).
  *
- * An invalid-name error already carries a safe message: its constructor formats
- * the schema's own fixed detail, so it passes through unchanged. An object-missing
- * error is a genuinely actionable terminal case and keeps its own category, but
- * the storage key its message embeds does not travel. Anything else is an internal
- * failure the author cannot act on, so it collapses to one literal; the raw
- * exception stays in the orchestrator's own log line.
+ * An invalid-name message is already safe (the schema's fixed detail) and
+ * passes through. Object-missing keeps its own category, but not the storage
+ * key its message embeds. Anything else collapses to one literal; the raw
+ * exception stays in the orchestrator's own log.
  */
 export function classifyArtifactCommitFailure(err: unknown): string {
   if (err instanceof ArtifactInvalidNameError) return err.message;
@@ -83,7 +75,6 @@ export const DEFAULT_ARTIFACT_MAX_BYTES = 1 * 1024 * 1024 * 1024;
 /** Cluster-wide default per-run artifact count cap. */
 export const DEFAULT_ARTIFACT_MAX_PER_RUN = 50;
 
-/** Tarball suffix for committed artifacts. */
 const TAR_SUFFIX = '.tar.gz';
 
 /**
@@ -91,11 +82,9 @@ const TAR_SUFFIX = '.tar.gz';
  * namespace. An all-dots segment (`.`, `..`) is HTTP/S3 path-canonicalized away
  * and breaks the presigned signature, so it is prefixed (mirrors UserCache.seg).
  *
- * This is a defensive net for the server-generated run id, not the mechanism
- * that keeps artifact names apart: because a name is validated against
- * `ArtifactNameSchema` before it ever gets here, sanitizing it is always the
- * identity. Relying on sanitization alone would be unsound — it is many-to-one,
- * so `a/b` and `a_b` would address the same object.
+ * A defensive net for the server-generated run id only: names are validated
+ * against `ArtifactNameSchema` first, so sanitizing one is the identity.
+ * Sanitizing alone would be unsound — it is many-to-one (`a/b` and `a_b`).
  */
 function sanitizeSegment(s: string): string {
   const cleaned = s.replace(/[^A-Za-z0-9._-]/g, '_');
@@ -103,39 +92,27 @@ function sanitizeSegment(s: string): string {
 }
 
 /**
- * Storage key for a run's named artifact.
+ * Storage key for a run's named artifact. Injective over names, so a second
+ * upload can never silently overwrite the first while both rows keep their own
+ * hash.
  *
- * Injective over names: distinct names always produce distinct keys, so a
- * second upload can never silently overwrite the first while both rows keep
- * their own hash.
+ * The trailing discriminator, a hash of the EXACT name, keeps keys apart on a
+ * CASE-INSENSITIVE namespace (the filesystem backend on macOS or Windows),
+ * where `bundle` and `Bundle` would otherwise resolve to one file. Under case
+ * folding it carries the whole separation, hence its width (see
+ * `KEY_DISCRIMINATOR_LENGTH`). The readable stem lets an operator browsing the
+ * bucket tell which artifact an object is. Hashing the sanitized name instead
+ * would fold `a/b` and `a_b` back together.
  *
- * The trailing discriminator is a hash of the exact name, and it is what keeps
- * the keys apart on a CASE-INSENSITIVE object namespace — the filesystem
- * backend on a macOS or Windows host. There `bundle` and `Bundle` would
- * otherwise be two keys resolving to one file; because their discriminators
- * differ, the keys differ by more than case and stay two objects. That is why
- * the discriminator is wide (see `KEY_DISCRIMINATOR_LENGTH`): under case
- * folding it carries the whole separation on its own. The readable stem is kept
- * so an operator browsing the bucket can still tell which artifact an object
- * is.
- *
- * Hashing the EXACT name rather than the sanitized one is deliberate:
- * sanitizing is many-to-one, so a discriminator over its output would fold
- * `a/b` and `a_b` back together.
- *
- * Changing this format does not strand existing artifacts — the key is
- * persisted in `artifacts.storage_key` and the download paths read that column
- * rather than re-deriving. Only the grant and commit paths derive, and both do
- * so at upload time.
+ * Changing this format does not strand existing artifacts: downloads read the
+ * persisted `artifacts.storage_key`; only the grant and commit paths derive,
+ * both at upload time.
  */
 export function artifactStorageKey(runId: string, name: string): string {
   return `artifacts/${sanitizeSegment(runId)}/${sanitizeSegment(name)}-${keyDiscriminator(name)}${TAR_SUFFIX}`;
 }
 
-/**
- * Per-org override of the artifact limits, read from `org_settings`. Each field
- * is optional; an undefined field falls back to the cluster-wide default.
- */
+/** Per-org `org_settings` overrides; an undefined field uses the cluster default. */
 export interface ArtifactOrgLimits {
   quotaBytes?: number;
   ttlMs?: number;
@@ -152,10 +129,7 @@ export interface ArtifactBeginUploadResult {
   uploadUrl?: string;
   storageKey?: string;
   reason?: ArtifactRejectReason;
-  /**
-   * Free-text rejection detail carried when no enforcement `reason` applies —
-   * today, a name that violates the artifact-name contract.
-   */
+  /** Free-text detail when no enforcement `reason` applies (a contract-violating name). */
   error?: string;
 }
 
@@ -174,11 +148,7 @@ export interface ArtifactListEntry {
   sizeBytes: number;
   sha256: string;
   createdAt: string;
-  /**
-   * Presigned GET for the backing object. Present on the run-detail listing
-   * (`listForRunWithUrls`); omitted when the object could not be resolved
-   * (expired / gone).
-   */
+  /** Presigned GET (`listForRunWithUrls`); omitted when the object is expired or gone. */
   downloadUrl?: string;
 }
 
@@ -198,11 +168,9 @@ export class ArtifactStore {
     quotaBytes?: number;
     /** Cluster-wide default TTL (env default). */
     ttlMs?: number;
-    /** Per-artifact size cap. */
     maxBytes?: number;
-    /** Per-run artifact count cap. */
     maxPerRun?: number;
-    /** Per-org override reader (org_settings). When unset, defaults apply. */
+    /** When unset, defaults apply. */
     orgLimitsReader?: ArtifactOrgLimitsReader;
   }) {
     this.storage = opts.storage;
@@ -214,11 +182,7 @@ export class ArtifactStore {
     this.orgLimitsReader = opts.orgLimitsReader;
   }
 
-  /**
-   * Resolve the effective quota, TTL, per-artifact size cap, and per-run count
-   * cap for an org. Each value is the per-org `org_settings` override when set,
-   * otherwise the cluster-wide default.
-   */
+  /** Effective limits for an org: the `org_settings` override, else the default. */
   private async resolveLimits(
     customerId: string,
   ): Promise<{ quotaBytes: number; ttlMs: number; maxBytes: number; maxPerRun: number }> {
@@ -247,24 +211,21 @@ export class ArtifactStore {
     };
   }
 
-  /** ISO cutoff for TTL filtering: rows created before this are expired. */
+  /** Cutoff time for TTL filtering: rows created before this are expired. */
   private cutoff(ttlMs: number): Date {
     return new Date(Date.now() - ttlMs);
   }
 
   /**
-   * Grant or refuse a presigned PUT for a named artifact. Order: name contract →
-   * resolve limits → size cap → duplicate name → per-run count cap → org quota.
-   * The size cap and per-run count cap are the resolved per-org override when
-   * set, otherwise the cluster-wide default. No presigned URL is minted for a
-   * request that would violate any gate.
+   * Grant or refuse a presigned PUT. Order: name contract → resolve limits →
+   * size cap → duplicate name → per-run count cap → org quota. No URL is minted
+   * for a request violating any gate.
    *
-   * The name is checked first, and here rather than only in the SDK, because the
-   * agent runs untrusted customer workflow code: a name that bypassed the SDK
-   * check would be sanitized onto another name's storage key, letting a second
-   * upload overwrite the first object while both rows keep their own hash. A
-   * contract violation is not an enforcement rejection, so it carries a
-   * free-text `error` and no `reason`.
+   * The name is checked here, not only in the SDK, because the agent runs
+   * untrusted workflow code: a name bypassing the SDK check would be sanitized
+   * onto another name's key, letting a second upload overwrite the first object
+   * while both rows keep their own hash. A contract violation is not an
+   * enforcement rejection, so it carries a free-text `error` and no `reason`.
    */
   async beginUpload(args: {
     customerId: string;
@@ -278,8 +239,7 @@ export class ArtifactStore {
     if (nameIssue !== null) {
       logger.warn('artifact upload rejected for a non-conforming name', {
         runId,
-        // The name is untrusted agent input, so it is length-bounded before it
-        // reaches the log; an operator triaging the rejection still needs to see
+        // Untrusted agent input: length-bounded, but logged so an operator sees
         // what was actually sent.
         name: name.slice(0, ARTIFACT_NAME_MAX_LENGTH),
         issue: nameIssue,
@@ -325,29 +285,23 @@ export class ArtifactStore {
   }
 
   /**
-   * Commit a completed upload: write the object metadata sidecar, then insert
-   * the DB row. The `UNIQUE (run_id, name)` constraint (via onConflict-do-nothing)
-   * is the immutability backstop for a racing duplicate that slipped past the
-   * pre-mint check.
+   * Commit a completed upload: write the metadata sidecar, then insert the row.
+   * `UNIQUE (run_id, name)` (onConflict-do-nothing) backstops a racing duplicate
+   * that slipped past the pre-mint check.
    *
-   * The agent asserts neither the key nor the size: the storage key is derived
-   * from the server-resolved `runId` + `name`, and the recorded size is the real
-   * byte size of the stored object read back from the storage backend. Agents
-   * run untrusted customer workflow code, so an echoed key could otherwise point
-   * a row at another tenant's object, and a declared size could under-account
-   * the per-org quota (a presigned PUT does not bind content length).
+   * The agent asserts neither key nor size: the key derives from the
+   * server-resolved `runId` + `name`, the size is read back from storage.
+   * Agents run untrusted code, so an echoed key could point a row at another
+   * tenant's object, and a declared size could under-account the org quota (a
+   * presigned PUT does not bind content length).
    *
-   * The name is re-validated here, not only at `beginUpload`: a commit is its
-   * own inbound message, so an agent can send one for a name it never got a
-   * grant for. Without the check, a non-conforming name would derive the
-   * storage key of a *different*, already-committed artifact and record a second
-   * row against that same object with its own hash.
+   * The name is re-validated: a commit is its own inbound message, possibly for
+   * a name never granted, and a non-conforming name would derive the key of a
+   * *different*, already-committed artifact and record a second row against it.
    *
-   * Throws when the commit cannot be recorded — `ArtifactInvalidNameError` for a
-   * name that violates the contract, `ArtifactObjectMissingError` when the
-   * presigned PUT never landed an object, or the underlying storage / DB error
-   * otherwise. The caller reports the failure back to the agent, which fails the
-   * workflow step rather than leaving a green run with no artifact.
+   * Throws `ArtifactInvalidNameError`, `ArtifactObjectMissingError`, or the
+   * underlying storage / DB error. The caller reports it to the agent, which
+   * fails the step rather than leaving a green run with no artifact.
    */
   async completeUpload(args: {
     customerId: string;
@@ -455,13 +409,11 @@ export class ArtifactStore {
   }
 
   /**
-   * List a run's non-expired artifacts with a presigned GET per entry, newest
-   * first — the shape the dashboard run-detail panel renders. Resolves the org
-   * TTL once, then mints one presigned URL per row; a row whose backing object
-   * is gone lists its metadata with `downloadUrl` omitted rather than being
-   * dropped. Also reports the presigned-URL expiry (seconds) — the storage
-   * backend's `getUrl` signature TTL, NOT the artifact-retention `ttlMs` — so
-   * the dashboard can refresh a rendered `downloadUrl` before its signature
+   * A run's non-expired artifacts with a presigned GET each, newest first, for
+   * the dashboard run-detail panel. A row whose object is gone keeps its
+   * metadata with `downloadUrl` omitted rather than being dropped. Also reports
+   * the presigned-URL expiry in seconds — the backend's `getUrl` signature TTL,
+   * NOT the retention `ttlMs` — so the dashboard can refresh a URL before it
    * expires.
    */
   async listForRunWithUrls(

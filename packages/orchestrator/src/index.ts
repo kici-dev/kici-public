@@ -1,5 +1,3 @@
-// Orchestrator package entry point
-//
 // The orchestrator is a deployed application, not a library.
 // Only symbols with actual external consumers are exported here.
 

@@ -7,8 +7,7 @@
  * renderer keeps it out of an agent's instruction channel; KiCI-generated ids,
  * enum statuses, counts, and timestamps stay plain (trusted).
  *
- * Browser-safe (zod only) so it can ride the engine barrel alongside the rest
- * of the agent-facing read contract.
+ * Browser-safe (zod only), so it rides the engine barrel.
  */
 import { z } from 'zod';
 import { untrusted } from './agent-run-result.js';
@@ -78,10 +77,10 @@ export const agentDiagnosticsSchema = z.object({
 export type AgentDiagnostics = z.infer<typeof agentDiagnosticsSchema>;
 
 /**
- * A secret scope and the key NAMES it holds — never values. Both the scope name
- * and each key name are user-chosen → untrusted. This is the read contract for
- * `list_secrets`: an agent can discover which secret keys exist without ever
- * being handed a secret value.
+ * A secret scope and the key NAMES it holds — never values. The scope name and
+ * each key name are user-chosen → untrusted. The read contract for
+ * `list_secrets`: an agent discovers which secret keys exist without ever being
+ * handed a value.
  */
 export const agentSecretScopeSchema = z.object({
   scope: untrustedString,

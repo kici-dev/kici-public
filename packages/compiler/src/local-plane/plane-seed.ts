@@ -1,20 +1,17 @@
 /**
- * Seed the local `file://` source the plane dispatches an offline routed run
- * through. Idempotent: a stable `kici-local` source is created once and its
- * `repoBasePath` is re-pointed at the current workdir on every run (the isolated
- * profile materializes a fresh tmp clone each time). The org is the independent
- * orchestrator's `__default__` sentinel — the orchestrator DB has no org table,
- * so seeding an org is just passing this id.
+ * Seeds the local `file://` source an offline routed run dispatches through.
+ * Idempotent: the `kici-local` source is created once and re-pointed at the
+ * current workdir every run (the isolated profile clones a fresh tmp dir each
+ * time). The orchestrator DB has no org table, so the org is just the
+ * independent `__default__` sentinel id.
  */
 
 import { AdminApiClient } from '@kici-dev/orchestrator';
 
-/** Independent-mode default org sentinel used by the local plane. */
 export const LOCAL_ORG_ID = '__default__';
-/** Stable name of the plane's local source (reused + re-pointed across runs). */
 export const LOCAL_SOURCE_NAME = 'kici-local';
 
-/** Minimal surface of AdminApiClient plane-seed needs (for test injection). */
+/** The AdminApiClient subset this module needs, for test injection. */
 export interface PlaneSeedClient {
   listGenericSources(
     orgId: string,
@@ -35,19 +32,13 @@ export interface PlaneSeedClient {
   ): Promise<{ source: { id: string; name: string } }>;
 }
 
-/** Result of seeding: the org + the (created or reused) source. */
 export interface SeededSource {
   orgId: string;
   sourceId: string;
   sourceName: string;
 }
 
-/**
- * Ensure the plane has a local `file://` source pointed at `repoDir`. Creates
- * the `kici-local` source on first use; on subsequent runs it re-points the
- * existing source at the new workdir (idempotent reuse). Returns the org +
- * source ids the trigger uses.
- */
+/** Creates the source on first use and re-points it at `repoDir` afterwards. */
 export async function ensureLocalSource(
   planeUrl: string,
   adminToken: string,
@@ -56,10 +47,9 @@ export async function ensureLocalSource(
     orgId?: string;
     name?: string;
     /**
-     * In-place profile: `repoDir` is the operator's real working tree, so the
-     * plane skips the source-pack `__build__` job and each job runs the tree
-     * directly. Always written (true/false) so a subsequent isolated run resets
-     * a previously in-place source.
+     * `repoDir` is the operator's real working tree: the plane skips the
+     * source-pack `__build__` job. Always written, so a later isolated run
+     * resets an in-place source.
      */
     inPlace?: boolean;
     client?: PlaneSeedClient;

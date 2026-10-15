@@ -24,10 +24,8 @@ function isPreset(item: InitItem): boolean {
 }
 
 /**
- * Validate a job's `init` config. `undefined` / `false` / `'auto'` are no-ops;
- * typed presets (`'mise'` / `{ mise }`) carry no `run`, so they need no check.
- * Every remaining generic spec (one, or each element of an array) must carry a
- * non-empty `run` command. Throws with the offending index when validation fails.
+ * `undefined` / `false` / `'auto'` and typed presets pass; every other generic
+ * spec must carry a non-empty `run`. The error names the offending index.
  */
 function validateInit(init: JobOptions['init'], jobName: string): void {
   if (init === undefined || init === false || init === 'auto') return;
@@ -42,11 +40,9 @@ function validateInit(init: JobOptions['init'], jobName: string): void {
 }
 
 /**
- * Validate a job's `sandbox` escape-hatch request. An unknown capability name
- * is a typo that would never match the operator allow-list, so it is rejected
- * at author time (security is still enforced deny-by-default at dispatch — this
- * is a correctness/UX guard). Capability form is normalized by the dispatch
- * resolver, so both `NET_ADMIN` and `CAP_NET_ADMIN` are accepted here.
+ * Reject an unknown capability at author time: a typo would never match the
+ * operator allow-list. A UX guard only; dispatch still enforces deny-by-default.
+ * Both `NET_ADMIN` and `CAP_NET_ADMIN` pass, since dispatch normalizes the form.
  */
 function validateSandbox(sandbox: JobOptions['sandbox'], jobName: string): void {
   if (sandbox === undefined) return;
@@ -170,9 +166,6 @@ export function job<const TSteps extends readonly StepInput[]>(
  */
 export function job<TOutputs = Record<string, unknown>>(options: JobOptions): Job<TOutputs>;
 
-/**
- * Implementation of job() factory.
- */
 export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOptions): Job {
   const name = typeof nameOrOptions === 'string' ? nameOrOptions : randomUUID();
   const options = typeof nameOrOptions === 'string' ? maybeOptions! : nameOrOptions;
@@ -183,7 +176,6 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
     throw new Error(`job('${name}'): 'invoke' is mutually exclusive with 'steps'/'run'`);
   }
 
-  // Normalize steps: if `run` shorthand is used, convert to single-step array
   let steps = options.steps ?? [];
   if (options.run) {
     if (options.steps && options.steps.length > 0) {
@@ -195,10 +187,8 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
   validateInit(options.init, name);
   validateSandbox(options.sandbox, name);
 
-  // When a job binds multiple contexts and no explicit concurrency group is
-  // set, default the concurrency group to the first (primary) bound context's
-  // name. A dynamic first element (function) falls through to dispatch-time
-  // resolution, matching the single-context behaviour.
+  // With no explicit group, the concurrency group defaults to the first bound
+  // context's name; a dynamic (function) first context resolves at dispatch.
   const firstContext = options.contexts?.[0];
   const concurrencyGroup =
     options.concurrencyGroup ?? (typeof firstContext === 'string' ? firstContext : undefined);
@@ -280,28 +270,9 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
 }
 
 /**
- * Validate a job's named git credentials at definition time.
- *
- * Every `*Secret` field is a qualified `<context>:<secret-name>` reference into
- * the secrets backend — the same form `workflow()` enforces for
- * `registries[].tokenSecret`. Catching a pasted credential here matters because
- * the alternative is committing it to a git repository and discovering it later
- * as a confusing auth failure.
- */
-/**
- * Validate a job's container registry auth at definition time.
- *
- * Same contract as `gitCredentials`: every `*Secret` field is a qualified
- * `<context>:<secret-name>` reference, and a pasted credential is refused
- * rather than committed to a git repository. The `*Value` half is material
- * supplied at run time and is deliberately not checked for shape.
- */
-/**
- * Is `p` a repo-relative path that stays inside the repository?
- *
- * Rejects an absolute path and any path whose `..` segments walk out of the
- * tree. Deliberately string-only: the workflow is authored on one machine and
- * the path is resolved on another, so there is no filesystem here to consult.
+ * Rejects an absolute path and any path whose `..` segments leave the tree.
+ * String-only by design: the path resolves on another machine, so there is no
+ * filesystem here to consult.
  */
 function isInsideRepo(p: string): boolean {
   if (p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)) return false;
@@ -319,14 +290,10 @@ function isInsideRepo(p: string): boolean {
 }
 
 /**
- * A container names exactly one image source: a finalized `image`, or a
- * `dockerfile` the agent builds before the job runs.
- *
- * Refused at definition time rather than at dispatch, because the author is the
- * only one who can fix it and the workflow file is where they are looking. The
- * agent re-checks the paths against the real workdir — a lock file is repo
- * content and is not trusted — but that failure reaches a run log, not an
- * editor.
+ * A container names exactly one image source: an `image`, or a `dockerfile` the
+ * agent builds first. Checked at definition time, where the author is looking;
+ * the agent re-checks the paths against the real workdir (a lock file is
+ * untrusted repo content), but that failure reaches a run log, not an editor.
  */
 function validateContainerImageSource(name: string, container: string | ContainerConfig): void {
   if (typeof container === 'string') return;
@@ -369,6 +336,12 @@ function validateContainerImageSource(name: string, container: string | Containe
   }
 }
 
+/**
+ * Every `*Secret` field must be a qualified `<context>:<secret-name>` reference,
+ * as for `gitCredentials` and `registries[].tokenSecret`: a pasted credential is
+ * refused here instead of being committed and surfacing later as a confusing
+ * auth failure. The run-time `*Value` half is deliberately not shape-checked.
+ */
 function validateContainerAuth(name: string, auth: ContainerRegistryAuth): void {
   const bag = auth as unknown as Record<string, unknown>;
   for (const [field, value] of Object.entries(bag)) {

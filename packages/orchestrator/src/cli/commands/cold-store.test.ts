@@ -1,16 +1,7 @@
 /**
- * Smoke tests for `kici-admin cold-store` subcommand wiring.
- *
- * Each subcommand registers under `cold-store` and either:
- *   - rejects fast (exit 2) with a clear "Database URL required" when
- *     KICI_DATABASE_URL / DATABASE_URL is unset and no --database-url
- *     flag is passed; or
- *   - rejects fast (exit 2) with an adapter-aware error when the table
- *     is unknown.
- *
- * Real archive / list-chunks behaviour needs a live Postgres and S3 bucket
- * to talk to. These tests cover only the CLI surface and argument
- * plumbing.
+ * `kici-admin cold-store` wiring only: each subcommand exits 2 with "Database
+ * URL required" when no URL is set, or with an adapter-aware error for an
+ * unknown table. Real archive / list-chunks behaviour needs live Postgres and S3.
  */
 import { describe, expect, it } from 'vitest';
 import { Command } from 'commander';
@@ -59,7 +50,7 @@ async function runCapture(
     throw new Error(`__exit_${code ?? 0}__`);
   }) as typeof process.exit;
 
-  // Ensure no ambient KICI_DATABASE_URL leaks into the CLI under test.
+  // No ambient KICI_DATABASE_URL may leak into the CLI under test.
   const savedKici = process.env.KICI_DATABASE_URL;
   delete process.env.KICI_DATABASE_URL;
 

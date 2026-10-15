@@ -99,12 +99,6 @@ export interface ProviderBundle {
 export class ProviderRegistry {
   private readonly bundles = new Map<string, ProviderBundle>();
 
-  /**
-   * Register a provider bundle by routing key.
-   *
-   * Each routing key gets its own bundle with per-app credentials.
-   * Routing keys have the format "{provider}:{id}" (e.g., "github:12345").
-   */
   registerByRoutingKey(routingKey: string, bundle: ProviderBundle): void {
     this.bundles.set(routingKey, bundle);
   }
@@ -131,9 +125,6 @@ export class ProviderRegistry {
   }
 
   /**
-   * Get the provider bundle by routing key.
-   * Routing keys have the format "{provider}:{id}" (e.g., "github:12345").
-   *
    * A key with no bundle of its own falls back only to its type's default
    * bundle (`{type}:default`, e.g. `generic:default`, which stands in for every
    * plain generic source). It never falls back to another key's bundle: that
@@ -146,29 +137,21 @@ export class ProviderRegistry {
   }
 
   /**
-   * Get just the normalizer for a routing key.
    * Convenience method for webhook handling.
    */
   getNormalizerByRoutingKey(routingKey: string): WebhookNormalizer | undefined {
     return this.getByRoutingKey(routingKey)?.normalizer;
   }
 
-  /**
-   * Iterate over all registered bundles.
-   */
   getAll(): IterableIterator<[string, ProviderBundle]> {
     return this.bundles.entries();
   }
 
-  /**
-   * Get all registered routing keys.
-   */
   getRoutingKeys(): string[] {
     return [...this.bundles.keys()];
   }
 
   /**
-   * Remove a routing key and its bundle.
    * Used during config reload when apps are removed.
    */
   unregister(routingKey: string): boolean {
@@ -180,7 +163,6 @@ export class ProviderRegistry {
   }
 
   /**
-   * Check if a routing key is for a generic webhook source.
    * Generic routing keys have the format "generic:{orgId}:{sourceId}".
    */
   static isGenericRoutingKey(routingKey: string): boolean {
@@ -188,7 +170,6 @@ export class ProviderRegistry {
   }
 
   /**
-   * Remove all registered bundles.
    * Used during full config rebuild on reload.
    */
   clear(): void {

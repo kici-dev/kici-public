@@ -112,10 +112,9 @@ describe('buildUpgradeHooks', () => {
   });
 
   it('throws, rather than exiting, when no admin token is configured', async () => {
-    // kici-admin's own getClient calls process.exit, which a caller cannot
-    // catch — so an upgrade on an install with no admin credentials died
-    // outright instead of degrading. Every admin-API hook must throw here so
-    // the upgrade's own handlers can warn and continue.
+    // kici-admin's getClient calls process.exit, which a caller cannot catch.
+    // Every admin-API hook must throw instead, so an upgrade on an install with
+    // no admin credentials warns and continues.
     const hooks = buildUpgradeHooks(() => null);
 
     await expect(hooks.migrationStatus!()).rejects.toThrow(/no admin token is configured/);

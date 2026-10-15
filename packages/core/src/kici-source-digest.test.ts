@@ -122,10 +122,8 @@ describe('findKiciDir', () => {
 
 describe('the compiler own output is excluded', () => {
   it('does not move when kici.lock.json changes', async () => {
-    // Load-bearing, not a nicety: the compiler computes this digest, writes the
-    // resulting contentHash INTO .kici/kici.lock.json, and the agent recomputes
-    // it over the extracted tree. If the lock file were an input, the agent
-    // would always see a tree the compiler never hashed and reject every run.
+    // The compiler writes the contentHash INTO .kici/kici.lock.json, so as an
+    // input the lock file would make the agent reject every run.
     await write('kici.lock.json', '{"schemaVersion":40,"contentHash":"aaa"}');
     const before = await hashKiciSourceTree(kiciDir);
     await write('kici.lock.json', '{"schemaVersion":40,"contentHash":"bbb"}');
@@ -149,11 +147,9 @@ describe('the compiler own output is excluded', () => {
   });
 
   it('does not move when the generated declarations appear or change', async () => {
-    // `kici init` gitignores `.kici/types/`, so the declarations exist on the
-    // machine that compiles and are absent from the clone the agent hashes. As
-    // an input they made every stored contentHash unreachable: this repo's own
-    // lock recorded the digest WITH `types/secrets.d.ts`, which no agent tree
-    // can reproduce.
+    // `kici init` gitignores `.kici/types/`, so the declarations exist where
+    // the compiler hashes and are absent from the agent's clone; as an input
+    // they make every stored contentHash unreachable.
     const before = await hashKiciSourceTree(kiciDir);
     await write('types/secrets.d.ts', 'declare module "x" {}\n');
     expect(await hashKiciSourceTree(kiciDir)).toBe(before);
@@ -177,13 +173,10 @@ describe('the compiler own output is excluded', () => {
 // ---------------------------------------------------------------------------
 // Symlink-aware classification.
 //
-// `Dirent.isDirectory()` reports on the link, so a symlinked
-// `.kici/node_modules` used to read as a file, escape the directory-only
-// `node_modules/` exclusion, and be hashed as `symlink:<target>` — a member the
-// agent structurally cannot hold, because the tarball drops the path by prefix
-// and the restore materialises a real directory. The producer and its verifier
-// then disagreed about a tree nobody had edited, and every recompile reproduced
-// the same lock.
+// `Dirent.isDirectory()` reports on the link, so without classification a
+// symlinked `.kici/node_modules` escapes the directory-only `node_modules/`
+// exclusion and is hashed as `symlink:<target>`, a member the agent cannot hold
+// (see `matchesAsDirectory`).
 // ---------------------------------------------------------------------------
 
 /** Build one `.kici/` tree holding ordinary source plus every default exclusion. */
@@ -248,10 +241,9 @@ describe('an ordinary tree hashes exactly as it always has', () => {
   });
 
   it('does NOT digest to that value once the fixture gains one file', async () => {
-    // The golden constant is one-sided against a literal, so it is only worth
-    // anything if an altered fixture fails it. Falsification runs through the
-    // INPUT — never by reverting the walk, which would leave a concurrent build
-    // hashing a tree missing the change under test.
+    // The golden constant is only worth anything if an altered fixture fails
+    // it. Falsify through the INPUT, never by reverting the walk: a concurrent
+    // build would hash a tree missing the change under test.
     const dir = await buildOrdinaryTree(repoRoot);
     await addRealNodeModules(dir);
     await fs.writeFile(path.join(dir, 'lib', 'extra.ts'), 'export const x = 1;\n');
@@ -279,8 +271,8 @@ describe('a symlinked node_modules hashes as the dependency tree it is', () => {
     await addLinkedNodeModules(linkedRoot, linked);
     await addRealNodeModules(real);
     if (scaffold) {
-      // What `kici init` leaves behind, which REPLACES the defaults — so a fix
-      // that only edited the default set would not reach this cohort at all.
+      // What `kici init` leaves behind; it REPLACES the defaults, so a fix to
+      // the default set alone would not reach this cohort.
       const body = `${[...KICI_DIGEST_DEFAULT_EXCLUSIONS].join('\n')}\n`;
       await fs.writeFile(path.join(linked, '.kiciignore'), body);
       await fs.writeFile(path.join(real, '.kiciignore'), body);
@@ -290,8 +282,8 @@ describe('a symlinked node_modules hashes as the dependency tree it is', () => {
 
   it('agrees with the real-directory shape under the defaults', async () => {
     const { linked, real } = await bothShapes(false);
-    // Equality across the two shapes, never a fixed hash: it is the
-    // disagreement between producer and agent that was the bug.
+    // Equality across the two shapes, never a fixed hash: producer/agent
+    // disagreement is the defect.
     expect(await hashKiciSourceTree(linked)).toBe(await hashKiciSourceTree(real));
   });
 
@@ -328,11 +320,10 @@ describe('classification resolves a link; the walk never follows one', () => {
     return { root, dir };
   }
 
-  // Every constant below was recorded from the implementation that predates
-  // symlink-aware classification. They pin the shapes the change must NOT
-  // touch — and they are what reddens if anyone ever turns the classification
-  // stat into a traversal, because a traversal replaces the link member with
-  // the members behind it.
+  // Every constant below was recorded before symlink-aware classification.
+  // They pin the shapes it must NOT touch, and redden if the classification
+  // stat becomes a traversal (which replaces the link member with the members
+  // behind it).
   it('leaves an unrelated symlinked directory a member, target string and all', async () => {
     const { root, dir } = await tree('T5');
     await addRealNodeModules(dir);
@@ -381,9 +372,8 @@ describe('classification resolves a link; the walk never follows one', () => {
   });
 
   it('covers a nested symlinked node_modules, matching the real-directory shape', async () => {
-    // The one shape whose hash the change moves. It reaches the value the same
-    // tree has when the dependency directory is real — which is the value an
-    // agent computes — so the move is toward reproducibility, not away.
+    // The one shape whose hash classification moves: to the value of the same
+    // tree with a real dependency directory, which is what an agent computes.
     const linkedRoot = path.join(repoRoot, 'T4-linked');
     const realRoot = path.join(repoRoot, 'T4-real');
     const linked = await buildOrdinaryTree(linkedRoot);
@@ -473,14 +463,12 @@ describe('findDigestReproducibilityWarnings', () => {
   });
 
   it('names a node_modules the exclusion misses because it is not a directory', async () => {
-    // The residual the classification fix cannot reach: a dangling link stats
-    // as nothing, so it stays a file, escapes `node_modules/`, and is hashed —
-    // while the tarball omits the path by prefix. Probing the PATTERNS reports
-    // this tree as covered, which is why the check walks the tree.
+    // Classification cannot reach this: a dangling link stats as nothing, stays
+    // a file, escapes `node_modules/` and is hashed, while the tarball omits it.
+    // Probing the PATTERNS reports the tree covered, so the check walks the tree.
     //
-    // A real compile reaches this: dependencies hoisted to the repository root
-    // with a stale `.kici/node_modules` link left behind still resolve, because
-    // Node walks past the broken entry and keeps looking upward.
+    // A real compile reaches this: with dependencies hoisted to the repo root, a
+    // stale `.kici/node_modules` link still resolves because Node walks upward.
     await fs.rm(path.join(dir, 'node_modules'), { recursive: true, force: true });
     await fs.symlink('../vanished', path.join(dir, 'node_modules'));
 

@@ -3,22 +3,12 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m027 from './027_workflow_timeout.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 027.
- *
- * Creates a uniquely-named throwaway database inside the admin Postgres
- * server, applies migrations 001..027 via the production migration
- * provider, and asserts the resulting schema with information_schema. The
- * throwaway database is dropped in teardown, so the test never mutates any
- * shared schema or data.
- *
- * The admin connection string comes solely from
- * `KICI_TEST_ADMIN_DATABASE_URL`. The suite is gated on the presence of that
- * env var: when it is unset the suite skips, so it stays runnable in
- * environments without a database. When it is set but the server is
- * unreachable, the test fails loudly rather than skipping green.
+ * Real-Postgres test for migration 027: applies 001..027 into a throwaway database (dropped in
+ * teardown, so no shared schema is touched) and asserts the schema via information_schema.
+ * Skips when `KICI_TEST_ADMIN_DATABASE_URL` is unset; fails loudly when set but unreachable.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 
@@ -53,8 +43,7 @@ describeDb('migration 027_workflow_timeout', () => {
     return info !== undefined;
   };
 
-  // describeDb only runs when KICI_TEST_ADMIN_DATABASE_URL is set, so the
-  // non-null assertion is safe inside the suite body.
+  // Safe: describeDb only runs when KICI_TEST_ADMIN_DATABASE_URL is set.
   const adminUrl = ADMIN_URL!;
 
   beforeAll(async () => {
@@ -68,8 +57,6 @@ describeDb('migration 027_workflow_timeout', () => {
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
 
-    // Apply migrations 001..027 via the production provider so the
-    // execution_runs table the column attaches to exists.
     const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
@@ -80,7 +67,6 @@ describeDb('migration 027_workflow_timeout', () => {
 
     const adminPool = new pg.Pool({ connectionString: adminUrl });
     try {
-      // Terminate any lingering backends before dropping.
       await terminateTestDbBackends(adminPool, TEST_DB);
       await adminPool.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {

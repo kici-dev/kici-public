@@ -1,17 +1,13 @@
 /**
  * Org global workflows route through the Tier-2 eval round instead of dropping
- * their dynamic jobs.
+ * their dynamic jobs: a global whose jobs a `DynamicJobFn` produces must
+ * dispatch them, not silently nothing, and a workflow-level `filter` must be
+ * evaluated, or a global that applies to no source repo runs anyway.
  *
- * The defect this suite guards: a global workflow whose jobs a `DynamicJobFn`
- * produces must dispatch those jobs, not nothing at all — no error, no skipped
- * job, no trace. A workflow-level `filter` must be evaluated, or a global that
- * declared it applies to no source repo runs anyway.
- *
- * Both org-global paths are covered, because they are separate call sites that
- * have diverged before: `tryDispatchGlobalsWithoutLockFile` (Phase F, no lock
- * file resolves for the source repo) and `dispatchGlobalWorkflowsForOtherRepos`
- * (Phase J, a lock file did resolve). Both are module-private, so they are
- * driven end-to-end through `processWebhook`.
+ * Both org-global call sites are covered, because they have diverged before:
+ * `tryDispatchGlobalsWithoutLockFile` (Phase F, no lock file resolves for the
+ * source repo) and `dispatchGlobalWorkflowsForOtherRepos` (Phase J, one did).
+ * Both are module-private, so they are driven through `processWebhook`.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { dispatchGlobalWorkflowsForOtherRepos, processWebhook } from './process-webhook.js';
@@ -26,6 +22,7 @@ import { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { GlobalEvalRoundResult, LockJob } from '@kici-dev/engine';
 import { GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL } from '@kici-dev/engine';
 import { dispatchGlobalCandidateViaPipeline } from './global-dispatch.js';
+import { lockFileFixture, lockWorkflow } from '../__test-helpers__/lock-fixtures.js';
 
 // A pass-through spy: every global dispatch still runs the real pipeline, and a
 // test can read the exact job list a candidate handed it.
@@ -69,7 +66,7 @@ function matrixJob(name: string, values: Record<string, unknown[]>): LockJob {
   return { ...staticJob(name), matrix: { _type: 'static', values } } as unknown as LockJob;
 }
 
-/** A `DynamicJobFn` entry — the shape the drop used to discard. */
+/** A `DynamicJobFn` entry. */
 function dynamicEntry() {
   return { _type: 'dynamic' as const, source: { file: '.kici/workflows/org.ts', index: 0 } };
 }
@@ -93,11 +90,9 @@ function pipelineWorkflows(): Array<{ name: string; jobs: Array<Record<string, u
 }
 
 /**
- * A global workflow registration in ANOTHER repo, triggering on push.
- *
- * `jobs` and `hasFilter` are the two knobs the partition reads: a workflow
- * carrying either a dynamic entry or a filter needs the round, everything else
- * dispatches straight from the lock file.
+ * A global workflow registration in ANOTHER repo, triggering on push. The
+ * partition reads `jobs` and `hasFilter`: a dynamic entry or a filter needs the
+ * round, everything else dispatches straight from the lock file.
  */
 function makeGlobalRegistration(over: {
   jobs?: unknown[];
@@ -163,12 +158,10 @@ interface ReposDropLine {
 }
 
 /**
- * Capture the orchestrator's own log lines for the duration of a call.
- *
- * Winston's Console transport writes to `console._stdout` when Node exposes it
- * and to `process.stdout` otherwise, so both are covered — spying on
- * `process.stdout` alone silently records nothing under vitest and the
- * assertion reads as "the line was never emitted".
+ * Capture the orchestrator's log lines for the duration of a call. Winston's
+ * Console transport writes to `console._stdout` when Node exposes it and to
+ * `process.stdout` otherwise; spying on `process.stdout` alone silently records
+ * nothing under vitest, reading as "the line was never emitted".
  */
 function captureLogLines() {
   const lines: string[] = [];
@@ -228,9 +221,9 @@ interface Harness {
   /** The dedicated failed-round commit check. */
   postGlobalEvalFailedCheck: ReturnType<typeof vi.fn>;
   /**
-   * Every tracker and dispatcher call in the order they happened, as
-   * `'run-start'` / `'dispatch:<jobName>'` / `'add-jobs'`. The run row has to be
-   * written BEFORE the jobs are queued, and only an ordered trace can show it.
+   * Every tracker and dispatcher call in order (`'run-start'` /
+   * `'dispatch:<jobName>'` / `'add-jobs'`): only an ordered trace shows the run
+   * row is written BEFORE the jobs are queued.
    */
   callOrder: string[];
   /** Every job input handed to the dispatcher, in dispatch order. */
@@ -242,13 +235,10 @@ interface Harness {
 }
 
 /**
- * Deps that reach the org-global paths.
- *
- * With `withLockFile: false` the bundle has no `lockFileFetcher`, so no lock
- * file resolves for the source repo and `processWebhook` takes Phase F. With
- * `withLockFile: true` a lock file resolves that declares only a `pr` workflow
- * — which cannot match this push — so any dispatch observed came from the
- * Phase J org-global path.
+ * Deps that reach the org-global paths. `withLockFile: false` gives the bundle
+ * no `lockFileFetcher`, so `processWebhook` takes Phase F. `withLockFile: true`
+ * resolves a lock file declaring only a `pr` workflow, which cannot match this
+ * push, so any dispatch observed came from the Phase J org-global path.
  */
 function makeDeps(over: {
   registrations: ReturnType<typeof makeGlobalRegistration>[];
@@ -259,9 +249,8 @@ function makeDeps(over: {
   /** Make the dispatcher throw for this job name (an infrastructure fault). */
   failDispatchOn?: string;
   /**
-   * Make the dispatcher REJECT these job names, as a full queue does. Distinct
-   * from `failDispatchOn`: a throw propagates, a rejection is a value the
-   * caller has to account for.
+   * Make the dispatcher REJECT these job names, as a full queue does: unlike a
+   * `failDispatchOn` throw, a rejection is a value the caller must account for.
    */
   rejectDispatchOn?: string[];
   /** Make every round attempt fail, as a wedged or vanished agent would. */
@@ -269,17 +258,16 @@ function makeDeps(over: {
   /** Attach an execution tracker so the errored run row can be observed. */
   withExecutionTracker?: boolean;
   /**
-   * Extra provider bundles keyed by routing key, for the cross-provider case
-   * where the workflow repo does not live behind the event's provider. Any key
-   * not listed here resolves to the inbound bundle, as before.
+   * Extra provider bundles keyed by routing key, for a workflow repo behind
+   * another provider than the event's. Any unlisted key resolves to the inbound
+   * bundle.
    */
   bundleByRoutingKey?: Record<string, unknown>;
   /** The repo the event came from. Defaults to `acme/app`. */
   sourceRepo?: string;
   /**
-   * The normalized event's two branches. They are equal by default, which is
-   * the push case; a caller sets them apart to tell which of the two a code
-   * path actually reads.
+   * The normalized event's two branches: equal by default (the push case); a
+   * caller sets them apart to tell which one a code path reads.
    */
   branches?: { targetBranch: string; sourceBranch: string };
   /** The normalized event's raw payload — carries `before` / `after` for a push with a range. */
@@ -389,12 +377,11 @@ function makeDeps(over: {
     lockFileCache: {
       get: vi.fn(async () =>
         over.withLockFile
-          ? {
+          ? lockFileFixture({
               schemaVersion: 34,
-              source: { file: '.kici/workflows/ci.ts', export: '#default' },
               contentHash: 'srchash',
               workflows: [
-                {
+                lockWorkflow({
                   name: 'src-pr-only',
                   contentHash: 'shash',
                   compileSchemaVersion: 1,
@@ -408,9 +395,9 @@ function makeDeps(over: {
                     },
                   ],
                   jobs: [],
-                },
+                }),
               ],
-            }
+            })
           : null,
       ),
     },
@@ -446,11 +433,10 @@ function makeDeps(over: {
 
 describe('org global workflows route dynamic jobs through the eval round', () => {
   it('dispatches a static-only global straight from the lock file, with no round', async () => {
-    // The non-vacuity control for every case below: the same harness dispatches
-    // a real job when nothing needs a round, so an empty `workJobs()` elsewhere
-    // is about the round's verdict and not about a harness that never
-    // dispatches. It is also the guard that the immediate path stayed
-    // byte-identical to the pre-round behaviour.
+    // Non-vacuity control for every case below: the harness dispatches a real
+    // job when nothing needs a round, so an empty `workJobs()` elsewhere is the
+    // round's verdict, not a harness that never dispatches. It also guards the
+    // immediate path against change.
     const h = makeDeps({ registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })] });
 
     await processWebhook(makeInfo(), h.deps);
@@ -460,9 +446,9 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
   });
 
   it("builds a global job's workflow clone URL from the registration bundle, not the event bundle", async () => {
-    // The workflow repo lives behind another provider than the event's source
-    // repo. Asking the event's URL builder for it yields a host that does not
-    // serve that repo, and the agent's dual checkout dies on it.
+    // The workflow repo lives behind another provider than the source repo; the
+    // event's URL builder yields a host that does not serve it, and the agent's
+    // dual checkout dies on it.
     const h = makeDeps({
       registrations: [
         makeGlobalRegistration({ jobs: [staticJob('scan')], routingKey: 'gitlab:9' }),
@@ -483,8 +469,8 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
   });
 
   it('dispatches generated jobs for a global workflow with a DynamicJobFn', async () => {
-    // The correctness fix: this workflow's only entry is a `DynamicJobFn`, which
-    // the static-only drop discarded outright — it dispatched nothing at all.
+    // This workflow's only entry is a `DynamicJobFn`; a static-only partition
+    // would dispatch nothing at all.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
       roundResult: {
@@ -504,9 +490,8 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
   });
 
   it('dispatches one eval-round job and never a dynamicJobFn job for a global', async () => {
-    // The falsifiable form of "a global's generator does not take the per-repo
-    // dynamic-eval path": assert over the wired dispatch, where a `dynamicJobFn`
-    // job COULD be observed, rather than over a module that cannot emit one.
+    // "A global's generator does not take the per-repo dynamic-eval path",
+    // asserted over the wired dispatch, where a `dynamicJobFn` job COULD appear.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
       roundResult: {
@@ -610,16 +595,14 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
 
     await processWebhook(makeInfo(), h.deps);
 
-    // The round job itself dispatched — the filter was genuinely evaluated —
-    // and the workflow's own static job did not.
+    // The round job dispatched (the filter was evaluated); the static job did not.
     expect(h.track).toHaveBeenCalledTimes(1);
     expect(h.workJobs()).toEqual([]);
   });
 
   it('explains a filter exclusion in a decision trace', async () => {
-    // A `filter` runs on an agent and returns nothing but a boolean, so its
-    // exclusion leaves no run, no check, and no artifact — the author sees
-    // nothing happen and has no way to ask why. The trace is that answer.
+    // A `filter` returns only a boolean, so its exclusion leaves no run, check or
+    // artifact; the trace is the author's only answer to why nothing happened.
     const lines = captureLogLines();
     try {
       const h = makeDeps({
@@ -648,11 +631,9 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
   });
 
   it('traces an unevaluable requires as indeterminate, not as an exclusion', async () => {
-    // The harness bundle carries no file-contents fetcher, so the Tier-1
-    // requirement cannot be read at all. That is an infrastructure gap, not the
-    // author's requirement saying no — and a trace that renders it as
-    // "excluded" tells the author their filter rejected the commit when nothing
-    // ever looked at it.
+    // The harness bundle has no file-contents fetcher, so the Tier-1 requirement
+    // cannot be read: an infrastructure gap, which a trace must not render as
+    // "excluded" (the author's requirement saying no).
     const lines = captureLogLines();
     try {
       const h = makeDeps({
@@ -705,12 +686,10 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
 
     await processWebhook(makeInfo(), h.deps);
 
-    // The round ran — without this line the empty `workJobs()` would also be
-    // what the immediate path produces for this fixture (a dynamic-only
-    // workflow has no static jobs), so the assertion would not distinguish
-    // "declined by the round" from "never routed to the round". Twice, because
-    // a round whose every candidate is undecided is a failure and gets the
-    // group's one retry.
+    // The round ran: the immediate path also yields an empty `workJobs()` for a
+    // dynamic-only workflow, so this tells "declined by the round" from "never
+    // routed to it". Twice, because a round with every candidate undecided is a
+    // failure and gets the group's one retry.
     expect(h.track).toHaveBeenCalledTimes(2);
     expect(h.workJobs()).toEqual([]);
   });
@@ -723,9 +702,8 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
 
     await processWebhook(makeInfo(), h.deps);
 
-    // Same reason as the case above: prove the round ran before reading
-    // anything into an empty dispatch list. Twice for the same reason — a
-    // round that reported on no candidate at all decided nothing.
+    // As above: prove the round ran (twice — a round that reported on no
+    // candidate decided nothing) before reading an empty dispatch list.
     expect(h.track).toHaveBeenCalledTimes(2);
     expect(h.workJobs()).toEqual([]);
   });
@@ -744,9 +722,9 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
   });
 
   it('does not mutate the jobs the round handed back', async () => {
-    // The round result is handed over BY REFERENCE — a cache hit returns the
-    // stored object as-is — so a mutation on the way into the dispatch build
-    // would be replayed on the next webhook redelivery.
+    // The round result is handed over BY REFERENCE (a cache hit returns the
+    // stored object), so a mutation in the dispatch build would replay on the
+    // next webhook redelivery.
     const generated = staticJob('gen-a');
     const roundResult = {
       candidates: [{ workflowName: GLOBAL_WORKFLOW, run: true, jobs: [generated] }],
@@ -768,7 +746,7 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
 
   it('survives a malformed generated job without failing the whole delivery', async () => {
     // A generated job is proven only to carry a usable `name`; a bad label
-    // matcher still throws at materialize time. It must take down its own
+    // matcher still throws at materialize time, and must take down its own
     // workflow, never the sibling global in the same delivery.
     const broken = { _type: 'static', name: 'broken', runsOn: ['default'] } as unknown as LockJob;
     const h = makeDeps({
@@ -787,10 +765,8 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
   });
 
   it('records the build failure in the trace rather than omitting the workflow', async () => {
-    // A workflow that matched, failed to materialize, and then went missing
-    // from the delivery's trace reproduces exactly the indistinguishability the
-    // trace exists to remove: its author cannot tell it apart from one that was
-    // never registered.
+    // A workflow that matched and failed to materialize must stay in the trace,
+    // or its author cannot tell it from one that was never registered.
     const broken = { _type: 'static', name: 'broken', runsOn: ['default'] } as unknown as LockJob;
     const h = makeDeps({
       registrations: [
@@ -818,13 +794,12 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
   });
 
   it('propagates a dispatcher failure on a round-cleared workflow', async () => {
-    // The catch is bounded to the BUILD. A dispatcher throw — a wedged queue, a
-    // database error — is an infrastructure fault, and swallowing it here would
-    // leave `gen-a` queued under a run id that never reaches `matchedRunIds`,
-    // never reaches the event log, and can never complete. It must fail the
-    // delivery, which records it as `failed` in the event log. Not so the
-    // provider retries: `dedup.claim` already holds this delivery id, so a
-    // redelivery of the same id is dropped as a duplicate.
+    // The catch is bounded to the BUILD. A dispatcher throw (a wedged queue, a
+    // database error) swallowed here would leave `gen-a` queued under a run id
+    // that never reaches `matchedRunIds` or the event log and never completes.
+    // It must fail the delivery, recorded `failed` in the event log. A provider
+    // retry does not recover it: `dedup.claim` already holds this delivery id,
+    // so a redelivery of it is dropped as a duplicate.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
       roundResult: {
@@ -840,18 +815,15 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
     });
 
     await expect(processWebhook(makeInfo(), h.deps)).rejects.toThrow(/dispatch exploded/);
-    // Positive control: the throw happened at DISPATCH time, on the second job —
-    // the first one really was dispatched, so the build succeeded and this is
-    // not the build-catch path in disguise.
+    // Positive control: the throw happened at DISPATCH, on the second job; the
+    // first dispatched, so the build succeeded and this is not the build catch.
     expect(h.workJobs().map((d) => d.jobName)).toEqual(['gen-a', 'gen-b']);
   });
 
   it('propagates a malformed lock-file job on the immediate path', async () => {
-    // Positive control for the case above, and the record of what the immediate
-    // path does today: the SAME malformed job dispatched without a round
-    // genuinely rejects out of `processWebhook`. So the round path completing
-    // cleanly is the round-only catch doing its job, not an exception the
-    // pipeline swallows somewhere else.
+    // Positive control for the case above: the SAME malformed job dispatched
+    // without a round rejects out of `processWebhook`, so the round path
+    // completing cleanly is the round-only catch, not a swallow elsewhere.
     const broken = { _type: 'static', name: 'broken', runsOn: ['default'] } as unknown as LockJob;
     const h = makeDeps({ registrations: [makeGlobalRegistration({ jobs: [broken] })] });
 
@@ -961,10 +933,9 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
   });
 
   it('records the errored run and the check for a round that reported success but decided nothing', async () => {
-    // The agent's round runner never throws on its own budget breach — it
-    // returns `success` with every candidate padded `indeterminate`. Read as a
-    // success that produces no row and no check, which is the failure mode most
-    // likely to happen in production.
+    // On its own budget breach the agent's round runner returns `success` with
+    // every candidate padded `indeterminate`, never a throw — the likeliest
+    // production failure, which read as a success would write no row or check.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
       roundResult: {
@@ -992,9 +963,8 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
   });
 
   it('records nothing when every round succeeds', async () => {
-    // The negative control for the case above: the same tracker and poster are
-    // wired, so their silence here is about the round's outcome and not about a
-    // harness that never observes them.
+    // Negative control: the same tracker and poster are wired, so their silence
+    // here is the round's outcome, not a harness that never observes them.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
       roundResult: {
@@ -1011,9 +981,9 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
   });
 
   it('still completes the delivery when the errored-run write itself fails', async () => {
-    // The round already failed and its workflows are already recorded
-    // indeterminate. Losing the delivery on top of that would take the
-    // event-log row with it, so both records are best-effort.
+    // The round already failed and its workflows are recorded indeterminate;
+    // losing the delivery too would take the event-log row with it, so both
+    // records are best-effort.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
       roundFails: true,
@@ -1023,8 +993,7 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
     h.postGlobalEvalFailedCheck.mockRejectedValue(new Error('403 Forbidden'));
 
     await expect(processWebhook(makeInfo(), h.deps)).resolves.toBeDefined();
-    // Control: both really were attempted, so this is not a path that skipped
-    // them.
+    // Control: both were attempted, so this path did not skip them.
     expect(h.recordRoundFailure).toHaveBeenCalledTimes(1);
     expect(h.postGlobalEvalFailedCheck).toHaveBeenCalledTimes(1);
   });
@@ -1032,16 +1001,14 @@ describe('org global workflows route dynamic jobs through the eval round', () =>
 
 /**
  * An admitted cross-repo global workflow is a run, and must be visible as one.
+ * Jobs that execute with no `execution_runs` row are invisible to everything
+ * keyed on a run (`runs list`, `runs jobs`, the dashboard, cancel), and
+ * `ExecutionTracker.onJobStatus` discards their statuses, because
+ * `execution_jobs` carries a foreign key onto `execution_runs`.
  *
- * The defect this suite guards: jobs that execute while no `execution_runs` row
- * exists. Nothing keyed on a run could see them — not `runs list`, not `runs
- * jobs`, not the dashboard, not cancel — and `ExecutionTracker.onJobStatus`
- * discards every status they report, because `execution_jobs` carries a foreign
- * key onto `execution_runs`.
- *
- * Both dispatch paths are covered, because both go through the shared pipeline:
- * the immediate path (a candidate the lock file fully describes) and the
- * round-cleared path (a candidate a `filter` or a generator decided on).
+ * Both dispatch paths through the shared pipeline are covered: the immediate
+ * path (a candidate the lock file fully describes) and the round-cleared path
+ * (a candidate a `filter` or a generator decided on).
  */
 describe('an admitted cross-repo global workflow creates its run row', () => {
   /** Positional argument names of `ExecutionTracker.onExecutionStarted`. */
@@ -1068,8 +1035,7 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
 
     await processWebhook(info, h.deps);
 
-    // Control: the job really was dispatched, so what follows is about the run
-    // row and not about a harness that dispatched nothing.
+    // Control: the job was dispatched, so what follows is about the run row.
     expect(h.workJobs().map((d) => d.jobName)).toEqual(['scan']);
 
     expect(h.onExecutionStarted).toHaveBeenCalledTimes(1);
@@ -1086,8 +1052,7 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
     expect(call[ARG.sha]).toBe('headsha');
     expect(call[ARG.deliveryId]).toBe(info.deliveryId);
     expect(call[ARG.routingKey]).toBe('github:1');
-    // The trigger match that admitted this candidate, so the row explains why
-    // it ran.
+    // The trigger match that admitted this candidate: why it ran.
     expect(call[ARG.triggerDecision]).toBeTruthy();
     // No jobs at registration time: the dispatcher mints their ids.
     expect(call[ARG.jobs]).toEqual([]);
@@ -1103,10 +1068,10 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
     });
     expect(call[ARG.workflowRepo].identifier).not.toBe(call[ARG.repoIdentifier]);
 
-    // Ordering is the whole point of registering with an empty job list — a
-    // status arriving before the row exists is dropped and never retried. The
-    // pending-jobs token brackets the dispatch window: taken once the row
-    // exists, released once every job is registered.
+    // Ordering is why the row registers with an empty job list: a status arriving
+    // before the row exists is dropped and never retried. The pending-jobs token
+    // brackets the dispatch window: taken once the row exists, released once
+    // every job is registered.
     expect(h.callOrder).toEqual(['run-start', 'hold', 'dispatch:scan', 'add-jobs', 'release']);
     expect(h.addJobsToRun.mock.calls[0][0]).toBe(h.workJobs()[0].runId);
     // The same row shape a per-repository run registers: an unexpanded job
@@ -1117,15 +1082,12 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
   });
 
   it('records the presented branch on the run row, never the job checkout ref', async () => {
-    // `execution_runs.ref` is the branch the run PRESENTS, which is what every
-    // other `onExecutionStarted` caller writes and what the context branch gate
-    // evaluates. The dispatched jobs carry a different value — the checkout ref,
-    // which for a pull request is the head branch a fork contributor names
-    // freely — and this row is read back as a branch claim by the internal-event
-    // branch inheritance, so the two must not be confused.
-    //
-    // The two branches differ here, so the assertion can only hold if the
-    // presented branch is what reaches the row.
+    // `execution_runs.ref` is the branch the run PRESENTS, as every other
+    // `onExecutionStarted` caller writes and the context branch gate evaluates.
+    // The jobs carry the checkout ref, which for a pull request is the head
+    // branch a fork contributor names freely, and the internal-event branch
+    // inheritance reads this row back as a branch claim, so the two must not be
+    // confused. The two branches differ here, so only the presented one passes.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
       withExecutionTracker: true,
@@ -1134,8 +1096,8 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
 
     await processWebhook(makeInfo(), h.deps);
 
-    // Control: the job really was dispatched, and it really does carry the
-    // other branch — so this is about which of two live values the row takes.
+    // Control: the dispatched job carries the other branch, so this tests which
+    // of two live values the row takes.
     expect(h.workJobs().map((d) => d.ref)).toEqual(['attacker-names-this']);
     expect(h.onExecutionStarted).toHaveBeenCalledTimes(1);
     expect(h.onExecutionStarted.mock.calls[0][ARG.ref]).toBe('main');
@@ -1168,12 +1130,11 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
   });
 
   it('tracks every rejected job, so an all-rejected run cannot hang pending', async () => {
-    // The half-present run: with the run row written but a full queue rejecting
-    // every job, dropping the rejections leaves a row with NO `execution_jobs`.
-    // `isRunComplete` ends `run.jobs.size > 0` so it can never finish; the
-    // stale-run detector scans from `execution_jobs` / `dispatch_queue` so it
-    // never sees it; and cold-store archival needs a terminal status. It would
-    // sit `pending` in `runs list` forever.
+    // The half-present run: a full queue rejecting every job, with the
+    // rejections dropped, leaves a row with NO `execution_jobs`. `isRunComplete`
+    // requires `run.jobs.size > 0`, the stale-run detector scans from
+    // `execution_jobs` / `dispatch_queue`, and cold-store archival needs a
+    // terminal status, so it would sit `pending` in `runs list` forever.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [staticJob('scan'), staticJob('lint')] })],
       rejectDispatchOn: ['scan', 'lint'],
@@ -1182,8 +1143,8 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
 
     await processWebhook(makeInfo(), h.deps);
 
-    // Control: both really were attempted, so the assertions below are about
-    // how a rejection is accounted for, not about a dispatch that never ran.
+    // Control: both were attempted, so the assertions below test how a
+    // rejection is accounted for.
     expect(h.dispatched().map((d) => d.jobName)).toEqual(['scan', 'lint']);
     expect(h.onExecutionStarted).toHaveBeenCalledTimes(1);
 
@@ -1220,8 +1181,7 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
 
     const registered = h.addJobsToRun.mock.calls[0][1] as Array<Record<string, unknown>>;
     expect(registered.map((j) => j.jobName)).toEqual(['scan', 'lint']);
-    // The accepted job keeps the dispatcher's own id; only the rejected one is
-    // synthetic.
+    // The accepted job keeps the dispatcher's id; only the rejected one is synthetic.
     expect(registered[0].jobId).toBe('job-scan');
     expect(String(registered[1].jobId)).toMatch(/^rejected-/);
 
@@ -1231,10 +1191,9 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
   });
 
   it("carries a materialized child's base name and matrix values onto its job row", async () => {
-    // `base_job_name` is the rolling-wave scheduler's grouping key, not a
-    // display field — a NULL there makes the wave gate bail. Both values are
-    // already in the job config the dispatch built, so the row can carry the
-    // same identity a per-repository job row does.
+    // `base_job_name` is the rolling-wave scheduler's grouping key, not a display
+    // field: a NULL makes the wave gate bail. The dispatch's job config already
+    // holds both values, so the row carries a per-repository job row's identity.
     const h = makeDeps({
       registrations: [
         makeGlobalRegistration({ jobs: [matrixJob('scan', { os: ['linux', 'macos'] })] }),
@@ -1244,8 +1203,7 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
 
     await processWebhook(makeInfo(), h.deps);
 
-    // Control: the matrix really expanded, so this is about what the expansion
-    // records and not about a job that never fanned out.
+    // Control: the matrix expanded, so this tests what the expansion records.
     const names = h.workJobs().map((d) => d.jobName);
     expect(names).toHaveLength(2);
     expect(names[0]).not.toBe(names[1]);
@@ -1263,8 +1221,7 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
   });
 
   it('records no run for a candidate the round declined', async () => {
-    // The negative control: the same tracker is wired, so its silence here is
-    // about the verdict and not about a harness that never observes it.
+    // Negative control: the same tracker is wired, so its silence is the verdict.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()], hasFilter: true })],
       roundResult: {
@@ -1283,10 +1240,9 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
 
 describe('a global workflow dropped by its `repos` filter says so', () => {
   it('names the workflow, its repo, the patterns and the source repo', async () => {
-    // Before this, the repo-glob drop was the ONE exclusion that emitted
-    // nothing: a global workflow that never fired looked exactly like one that
-    // was never registered, so the only way to tell them apart was to read the
-    // org's lock files by hand.
+    // Without this line, a global workflow dropped by its repo globs looks
+    // exactly like one that was never registered, short of reading the org's
+    // lock files by hand.
     const lines = captureLogLines();
     try {
       const h = makeDeps({
@@ -1319,10 +1275,9 @@ describe('a global workflow dropped by its `repos` filter says so', () => {
   });
 
   it('emits ONE line per delivery, however many globals were dropped', async () => {
-    // The volume guard. A repo-scoped global drops on every delivery from every
-    // repo it does not name, so this is the steady state rather than an
-    // anomaly — a line per workflow would scale with the org's global count and
-    // bury the per-workflow exclusions that do warrant their own line.
+    // The volume guard: a repo-scoped global drops on every delivery from every
+    // repo it does not name, so a line per workflow would scale with the org's
+    // global count and bury the per-workflow exclusions that warrant their own.
     const lines = captureLogLines();
     try {
       const h = makeDeps({
@@ -1356,9 +1311,8 @@ describe('a global workflow dropped by its `repos` filter says so', () => {
   });
 
   it('emits no line for a global whose `repos` filter matches', async () => {
-    // The non-vacuity control for both cases above: the same fixture with a
-    // matching pattern dispatches and stays silent, so the line is about the
-    // mismatch and not about a path that logs unconditionally.
+    // Non-vacuity control for both cases above: the same fixture with a matching
+    // pattern dispatches and stays silent, so the line is not unconditional.
     const lines = captureLogLines();
     let h!: Harness;
     try {
@@ -1410,10 +1364,9 @@ describe('a global workflow dropped by its `repos` filter says so', () => {
   });
 
   it("dispatches for a dot-prefixed source repo under `repos: ['**']`", async () => {
-    // The end-to-end shape of the matcher fix: an org-wide global declares
-    // every repo, and the event comes from a dot-prefixed identifier. Under
-    // picomatch's default that identifier did not match `**`, so the workflow
-    // silently never ran for that repo.
+    // An org-wide global declares every repo, and the event comes from a
+    // dot-prefixed identifier, which picomatch's default `**` does not match,
+    // so the workflow would silently never run for that repo.
     const h = makeDeps({
       sourceRepo: DOT_SOURCE_REPO,
       registrations: [
@@ -1456,23 +1409,20 @@ describe('a global workflow dropped by its `repos` filter says so', () => {
 });
 
 /**
- * A global run's lifecycle across the dispatch window itself.
+ * A global run's lifecycle across the dispatch window. Two defects leave a run
+ * row in a state nothing can repair:
  *
- * Two defects this suite guards, both of which leave a run row in a state
- * nothing can repair:
- *
- * 1. The dispatch loop ran without a pending-jobs token. A job that reached a
- *    terminal state while jobs 2..N were still dispatching finalized the run —
- *    `onJobStatus` recovers an unregistered job into `run.jobs`, and
- *    `isRunComplete` then sees every job it knows about terminal. The run was
- *    written terminal with the wrong status and duration, released its
- *    concurrency slot early, and never re-finalized once `completedAt` was set.
- * 2. A throw inside the window left the row with zero jobs. No sweeper reaps
- *    one: the stale-run detector scans from `execution_jobs` / `dispatch_queue`,
- *    orphan recovery requires `status = 'running'`, cold-store archival requires
- *    a terminal status, and cancel cannot terminalize it either because
- *    `completeRunIfAllJobsTerminal` requires at least one job. It sat `pending`
- *    forever, uncancellable, while the deadline detector re-fired every tick.
+ * 1. A dispatch loop without a pending-jobs token: a job turning terminal while
+ *    jobs 2..N still dispatch finalizes the run (`onJobStatus` recovers an
+ *    unregistered job into `run.jobs`, and `isRunComplete` sees every known job
+ *    terminal) — with the wrong status and duration, releasing its concurrency
+ *    slot early, never re-finalized once `completedAt` is set.
+ * 2. A throw inside the window leaves the row with zero jobs, which no sweeper
+ *    reaps: the stale-run detector scans from `execution_jobs` /
+ *    `dispatch_queue`, orphan recovery requires `status = 'running'`, cold-store
+ *    archival requires a terminal status, and cancel's
+ *    `completeRunIfAllJobsTerminal` requires a job. It sits `pending` forever,
+ *    uncancellable, while the deadline detector re-fires every tick.
  */
 describe('a global run is held open across its dispatch window', () => {
   it('takes a pending-jobs token before the first dispatch and releases it after registration', async () => {
@@ -1483,8 +1433,7 @@ describe('a global run is held open across its dispatch window', () => {
 
     await processWebhook(makeInfo(), h.deps);
 
-    // Control: both jobs really were dispatched, so the window this brackets
-    // is a multi-job one — the only shape the defect can bite in.
+    // Control: both jobs dispatched — a multi-job window, the only shape the defect bites.
     expect(h.workJobs().map((d) => d.jobName)).toEqual(['scan', 'lint']);
 
     expect(h.holdRunForPendingJobs).toHaveBeenCalledTimes(1);
@@ -1534,8 +1483,8 @@ describe('a global run is held open across its dispatch window', () => {
 
   it('terminalizes the run when the first dispatch throws, and still propagates', async () => {
     // The unrecoverable orphan: the row is written, then the only dispatch
-    // explodes, so no `execution_jobs` row and no `dispatch_queue` entry ever
-    // exists for anything to recover the run from.
+    // throws, so no `execution_jobs` row or `dispatch_queue` entry exists to
+    // recover the run from.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
       withExecutionTracker: true,
@@ -1544,8 +1493,7 @@ describe('a global run is held open across its dispatch window', () => {
 
     await expect(processWebhook(makeInfo(), h.deps)).rejects.toThrow(/dispatch exploded/);
 
-    // Control: the run row really was written before the throw, so there IS an
-    // orphan to terminalize and this is not a path that never got that far.
+    // Control: the run row was written before the throw, so there IS an orphan.
     expect(h.onExecutionStarted).toHaveBeenCalledTimes(1);
     const runId = h.onExecutionStarted.mock.calls[0][0] as string;
     // And nothing registered a job against it — the row is genuinely empty.
@@ -1572,17 +1520,15 @@ describe('a global run is held open across its dispatch window', () => {
 
     await expect(processWebhook(makeInfo(), h.deps)).rejects.toThrow(/addJobsToRun exploded/);
 
-    // Control: the dispatch itself succeeded, so this is the registration
-    // failing and not the case above in disguise.
+    // Control: the dispatch succeeded, so this is the registration failing.
     expect(h.workJobs().map((d) => d.jobName)).toEqual(['scan']);
     expect(h.failRun).toHaveBeenCalledTimes(1);
     expect(h.failRun.mock.calls[0][0]).toBe(h.onExecutionStarted.mock.calls[0][0]);
   });
 
   it('lets the original fault propagate even when terminalizing it also fails', async () => {
-    // The delivery must fail with the fault that caused it, not with whatever
-    // the cleanup hit on its way out — the first is diagnosable, the second is
-    // not.
+    // The delivery fails with its causing fault, not the cleanup's — only the
+    // first is diagnosable.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
       withExecutionTracker: true,
@@ -1597,11 +1543,10 @@ describe('a global run is held open across its dispatch window', () => {
   });
 
   it('does not fail a completed dispatch when releasing the pending-jobs hold throws', async () => {
-    // Releasing can finalize the run — DB writes, the provider check, the
-    // Platform forward — so it can throw. From a bare `finally` that throw
+    // Releasing can finalize the run (DB writes, the provider check, the
+    // Platform forward), so it can throw. From a bare `finally` that throw
     // replaces the successful return, failing a delivery whose id `dedup.claim`
-    // already holds: the event is silently lost and every remaining candidate
-    // is skipped.
+    // already holds: the event is silently lost and remaining candidates skipped.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
       withExecutionTracker: true,
@@ -1612,8 +1557,7 @@ describe('a global run is held open across its dispatch window', () => {
 
     await expect(processWebhook(makeInfo(), h.deps)).resolves.not.toThrow();
 
-    // Controls: the dispatch really did complete, so there was a successful
-    // return for the throw to have replaced.
+    // Controls: the dispatch completed, so a successful return existed to replace.
     expect(h.workJobs().map((d) => d.jobName)).toEqual(['scan']);
     expect(h.addJobsToRun).toHaveBeenCalledTimes(1);
     expect(h.releasePendingJobsHold).toHaveBeenCalledTimes(1);
@@ -1622,10 +1566,9 @@ describe('a global run is held open across its dispatch window', () => {
   });
 
   it('lets the original fault propagate when releasing the hold also throws', async () => {
-    // The error path's own sub-case: `failRun` threw and was swallowed, so the
-    // run is still in memory holding the token and the release can finalize a
-    // partially-registered run. The delivery must still fail with the fault
-    // that caused it rather than with the cleanup's.
+    // `failRun` threw and was swallowed, so the in-memory run still holds the
+    // token and the release can finalize a partially-registered run. The
+    // delivery must still fail with its causing fault, not the cleanup's.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
       withExecutionTracker: true,
@@ -1644,12 +1587,9 @@ describe('a global run is held open across its dispatch window', () => {
 });
 
 /**
- * The organization-wide pass can be scoped to one workflow repository.
- *
- * The re-run of a failed evaluation round re-drives this pass for exactly the
- * repository whose round failed. Every other repository's globals already
- * reached their verdict on the original delivery, so re-evaluating them would
- * dispatch a second run for work that already ran.
+ * The organization-wide pass can be scoped to one workflow repository: the
+ * re-run of a failed evaluation round re-drives it for exactly that repository,
+ * since re-evaluating the others would dispatch a second run for work that ran.
  */
 describe('the organization-wide pass honours an onlyWorkflowRepo scope', () => {
   const OTHER_GLOBAL_REPO = 'acme/other-workflows';
@@ -1694,9 +1634,8 @@ describe('the organization-wide pass honours an onlyWorkflowRepo scope', () => {
   }
 
   it('evaluates every workflow repo when no scope is set', async () => {
-    // The non-vacuity control: both registrations really do reach dispatch, so
-    // the single job below is about the scope and not about a harness that only
-    // ever dispatches one.
+    // Non-vacuity control: both registrations reach dispatch, so the single job
+    // below is about the scope.
     const h = twoRepoHarness();
 
     await dispatchGlobalWorkflowsForOtherRepos(passArgs(h));
@@ -1719,9 +1658,9 @@ describe('the organization-wide pass honours an onlyWorkflowRepo scope', () => {
 
   it("records the dispatch source the round's stored credentials belong to", async () => {
     // A cross-provider global resolves its lock file through ANOTHER source's
-    // bundle, so `provider_context` and `routing_key` name different sources. The
-    // re-run rebuilds the dispatch pair from this column; without it, it pairs
-    // one source's credentials with the other source's API client.
+    // bundle, so `provider_context` and `routing_key` name different sources; the
+    // re-run rebuilds the dispatch pair from this column, or it would pair one
+    // source's credentials with the other's API client.
     const h = makeDeps({
       registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
       roundFails: true,
@@ -1782,11 +1721,9 @@ describe('the organization-wide pass honours an onlyWorkflowRepo scope', () => {
   });
 
   /**
-   * The positive signal a re-run gates its success check on.
-   *
-   * "No round failure" is not the same claim: several paths evaluate nothing at
-   * all and report no failure either, so reading their silence as a clean
-   * verdict posts success for work that never ran.
+   * The positive signal a re-run gates its success check on. "No round
+   * failure" is not the same: several paths evaluate nothing and report no
+   * failure, so their silence would post success for work that never ran.
    */
   describe('decidedWorkflowRepos', () => {
     it('names a repository whose candidates dispatched straight from the lock file', async () => {
@@ -1801,9 +1738,8 @@ describe('the organization-wide pass honours an onlyWorkflowRepo scope', () => {
     });
 
     it('names a repository the pass considered and excluded on a real verdict', async () => {
-      // A `run: false` verdict IS a verdict: the round decided the workflow does
-      // not apply. The repository was evaluated, so it counts as decided even
-      // though nothing dispatched.
+      // A `run: false` verdict IS a verdict: the repository was evaluated, so it
+      // counts as decided although nothing dispatched.
       const h = makeDeps({
         registrations: [makeGlobalRegistration({ jobs: [dynamicEntry()] })],
         roundResult: {
@@ -1941,9 +1877,9 @@ describe('the organization-wide pass honours an onlyWorkflowRepo scope', () => {
     });
 
     it('names no repository whose run a held event parked in the security queue', async () => {
-      // A held event decided nothing about the workflows it holds: they run, or
-      // do not, when an approver answers. Counting the repository as decided
-      // would let a re-run post the round-succeeded check on a held event.
+      // A held event decided nothing about its workflows (an approver does), so
+      // counting the repository as decided would let a re-run post the
+      // round-succeeded check on a held event.
       // fails-when: a held event counts its workflow repository as decided, or dispatches the global job
       const h = makeDeps({
         registrations: [makeGlobalRegistration({ jobs: [staticJob('scan')] })],
@@ -1963,11 +1899,10 @@ describe('the organization-wide pass honours an onlyWorkflowRepo scope', () => {
 });
 
 /**
- * Approving the security hold of a held evaluation round runs that round.
- *
- * Driven through `resumeWorkflow`, the release every approval surface reaches,
- * with the real organization-wide pass behind it: the round job must dispatch
- * for the held workflow repository and the jobs it admits must follow.
+ * Approving the security hold of a held evaluation round runs that round,
+ * driven through `resumeWorkflow` (the release every approval surface reaches)
+ * with the real organization-wide pass: the round job must dispatch for the
+ * held workflow repository and the jobs it admits must follow.
  */
 describe('releasing a held evaluation round', () => {
   /** `repos` on a trigger is what makes a workflow organization-wide. */
@@ -1991,7 +1926,7 @@ describe('releasing a held evaluation round', () => {
     dispatch_routing_key: null,
     is_global_eval_round: true,
     provider_context: JSON.stringify({ token: 'src-token' }),
-    // The delivery's `event_log` columns: the mock serves one row to every
+    // The delivery's `event_log` columns: the mock serves this one row to every
     // select whose predicates it satisfies.
     org_id: 'org-1',
     event: 'push',
@@ -2124,7 +2059,7 @@ describe('releasing a held evaluation round', () => {
    * A database whose `execution_runs` writes apply to `row` when their plain
    * `status` guards hold, so a real cancel moves the row the release re-reads.
    * Raw-SQL guards are not evaluated: the round row has no job rows, which is
-   * what the one raw guard on the cancel path (NOT EXISTS execution_jobs) asks.
+   * what the cancel path's one raw guard (NOT EXISTS execution_jobs) asks.
    */
   function runRowDb(row: Record<string, unknown>) {
     const base = createMockDb({ selectFirstRow: row }).db as unknown as Record<string, any>;
@@ -2250,9 +2185,9 @@ describe('releasing a held evaluation round', () => {
     };
 
     /**
-     * A release whose registration moved on from the held commit: at
-     * `globalsha` the filter is gone, so today's registration alone would not
-     * send the workflow to the round.
+     * A registration that moved on from the held commit: at `globalsha` the
+     * filter is gone, so the current registration alone would not send the
+     * workflow to the round.
      */
     function driftedRelease(lockFileAtHeldSha: unknown = { workflows: [heldEntry] }) {
       const harness = releaseHarness({

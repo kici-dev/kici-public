@@ -11,8 +11,6 @@ import type { FileContentsFetcher } from '@kici-dev/engine';
 import { createInstallationOctokit, type GitHubAppConfig } from './auth.js';
 
 /**
- * GitHub-specific implementation of FileContentsFetcher.
- *
  * The installation id is baked in at construction because the
  * FileContentsFetcher interface is credential-less at call time -- a fetcher
  * instance is scoped to one GitHub App installation.
@@ -26,8 +24,6 @@ export class GitHubFileContentsFetcher implements FileContentsFetcher {
   ) {}
 
   /**
-   * Fetch a file's contents from a GitHub repository at a specific ref.
-   *
    * @param owner - Repository owner (e.g. "my-org")
    * @param repo - Repository name (e.g. "my-app")
    * @param path - Repo-relative file path (e.g. ".kici/workflows/ci.ts")
@@ -96,9 +92,6 @@ function encodePath(path: string): string {
     .join('/');
 }
 
-/**
- * Check if an error is a GitHub 404 (Not Found) response.
- */
 function isNotFoundError(error: unknown): boolean {
   return (
     typeof error === 'object' &&

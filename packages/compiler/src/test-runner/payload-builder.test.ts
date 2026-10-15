@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildEventPayload } from './payload-builder.js';
 
-// Mock git-detector to avoid filesystem access
 vi.mock('./git-detector.js', () => ({
   detectRepoFromGit: vi.fn().mockResolvedValue({ owner: 'test-org', name: 'test-repo' }),
 }));
@@ -60,7 +59,7 @@ describe('buildEventPayload', () => {
 
     it('preserves original ref_type for bare create event', async () => {
       const result = await buildEventPayload('create', {});
-      // Default fixture has ref_type: "branch" — bare create should not override
+      // A bare create keeps the default fixture's ref_type.
       expect((result.payload as Record<string, unknown>).ref_type).toBe('branch');
     });
   });

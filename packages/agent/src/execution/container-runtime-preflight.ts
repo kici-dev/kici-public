@@ -1,12 +1,10 @@
 /**
- * The check a container job passes before the agent nests its container: that
- * this host has a container runtime to start it on.
- *
- * Without it, a job routed to a host with no runtime failed deep inside the
- * container client with `connect ENOENT /var/run/docker.sock`, which names
- * neither the job's need nor the agent's labels. The orchestrator keeps
- * container jobs off such agents where it can, but an operator's own agent is
- * never refused one, so this message is what such a job fails with.
+ * Before nesting a container job, check this host has a container runtime.
+ * Otherwise the job dies inside the client on `connect ENOENT
+ * /var/run/docker.sock`, naming neither the job's need nor the agent's labels.
+ * The orchestrator keeps container jobs off such agents where it can, but never
+ * refuses an operator's own agent one, so this message is what the job fails
+ * with.
  */
 import Docker from 'dockerode';
 import { RuntimeFact, runtimeLabel } from '@kici-dev/engine';
@@ -67,10 +65,7 @@ export function missingRuntimeMessage(args: {
 }
 
 /**
- * The runtime this container job's container starts on.
- *
- * `resolve` is injected for tests; it defaults to discovering this host's
- * runtime.
+ * The runtime this job's container starts on. `resolve` is a test injection.
  *
  * @throws ContainerRuntimeUnavailableError when the host has none, with a
  *   message naming the missing runtime and the agent's labels.
@@ -89,12 +84,9 @@ export function requireContainerRuntime(args: {
 }
 
 /**
- * A container client bound to the resolved runtime.
- *
- * A local socket is passed explicitly, so a host that runs only Podman is
- * reached on Podman's socket rather than on the client's Docker default. A
- * remote `DOCKER_HOST` is left to the client, which reads it — and the TLS
- * settings that go with it — from the environment itself.
+ * A local socket is passed explicitly, so a Podman-only host is not reached on
+ * the client's Docker default. A remote `DOCKER_HOST` (and its TLS settings)
+ * the client reads from the environment itself.
  */
 export function dockerClientFor(runtime: ContainerRuntimeEndpoint): Docker {
   return 'socketPath' in runtime ? new Docker({ socketPath: runtime.socketPath }) : new Docker();

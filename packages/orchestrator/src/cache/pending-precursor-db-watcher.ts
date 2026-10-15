@@ -2,23 +2,20 @@
  * The shared-database channel for pending precursor jobs.
  *
  * The dispatch queue is cluster-wide, so a build / init / dynamic-eval job this
- * coordinator dispatched may be claimed by an agent connected to a sibling
- * coordinator. That agent reports to the sibling; the sibling persists the
- * terminal `job.status` — status plus `execution_jobs.precursor_result` — and
- * relays nothing, because between coordinators the shared row IS the report.
- * The trackers on this coordinator would otherwise wait out their own timeout
- * on a job the fleet already finished.
+ * coordinator dispatched may be claimed by an agent on a sibling coordinator.
+ * The sibling persists the terminal `job.status` (status plus
+ * `execution_jobs.precursor_result`) and relays nothing: between coordinators
+ * the shared row IS the report. Without this, local trackers wait out their own
+ * timeout on a job the fleet already finished.
  *
- * While any tracker awaits a job, this watcher polls the rows for exactly that
- * set and hands each terminal one to `settlePendingPrecursor` — the same
- * function the local agent socket goes through, so the two channels cannot
- * disagree on what "finished" means. A job the socket already settled is no
- * longer tracked and is not queried again; a row that is not yet terminal
- * settles nothing and is re-read on the next tick.
+ * While any tracker awaits a job, this watcher polls exactly those rows and
+ * hands each terminal one to `settlePendingPrecursor`, the same function the
+ * local agent socket uses, so the channels cannot disagree on "finished". A job
+ * the socket settled is no longer tracked; a non-terminal row is re-read next
+ * tick.
  *
- * Only builds, inits and dynamic evals ride this channel. A pre-run global
- * eval round is not a run and writes no `execution_jobs` row, so it has no
- * shared row to read; its own wait ceiling still bounds it.
+ * Only builds, inits and dynamic evals ride this channel. A pre-run global eval
+ * round writes no `execution_jobs` row; its own wait ceiling bounds it.
  */
 
 import { sql, type Kysely } from 'kysely';
@@ -35,10 +32,8 @@ import { runDetached } from '../helpers/run-detached.js';
 const logger = createLogger({ prefix: 'pending-precursor-db-watcher' });
 
 /**
- * How often the tracked rows are re-read while anything is pending.
- *
- * The interval is the latency a cross-coordinator build adds before the
- * awaiting pipeline dispatches its real jobs, so it is short; the query is one
+ * Re-read interval while anything is pending. Short, because it is the latency
+ * a cross-coordinator build adds before real jobs dispatch; the query is one
  * primary-key lookup per tracked job and runs only while a tracker is
  * non-empty, so an idle coordinator pays nothing.
  */
@@ -53,13 +48,12 @@ export interface PendingPrecursorDbWatcherDeps {
   pendingInits?: Pick<PendingInitTracker, 'has' | 'resolve' | 'reject' | 'trackedJobIds'>;
   pendingDynamics?: Pick<PendingDynamicTracker, 'has' | 'resolve' | 'reject' | 'trackedJobIds'>;
   /**
-   * Keeps this coordinator's in-memory job status in step with the row it
-   * settled from. The agent frame that would have done so went to the sibling,
-   * and without it the run's completion check on this coordinator reads the
-   * job as still pending forever.
+   * Syncs this coordinator's in-memory job status with the settled row; the
+   * agent frame went to the sibling, and without this the run's completion
+   * check here reads the job as pending forever.
    */
   executionTracker?: { updateInMemoryJob(runId: string, jobId: string, status: string): void };
-  /** Poll interval. Defaults to {@link DEFAULT_PRECURSOR_DB_POLL_MS}. */
+  /** Defaults to {@link DEFAULT_PRECURSOR_DB_POLL_MS}. */
   intervalMs?: number;
 }
 
@@ -69,10 +63,9 @@ export class PendingPrecursorDbWatcher {
   private timer: ReturnType<typeof setInterval> | null = null;
   private tickInFlight = false;
   /**
-   * Terminal rows that carried nothing the settle function could act on —
-   * a `success` with no precursor marker, which a coordinator that predates
-   * `precursor_result` writes. Logged once per job, not once per tick; the
-   * waiter's own timeout still bounds it.
+   * Terminal rows with nothing to settle on — a `success` with no precursor
+   * marker, which a coordinator that predates `precursor_result` writes. Logged
+   * once per job, not per tick; the waiter's own timeout bounds it.
    */
   private readonly warnedNoPayload = new Set<string>();
 
@@ -110,10 +103,9 @@ export class PendingPrecursorDbWatcher {
   }
 
   /**
-   * One pass: read the terminal rows for every tracked job and settle them.
-   * Returns how many entries settled. Never throws — a read fault costs one
-   * tick, and the next one re-reads the same set. Single-flight, so a slow
-   * read cannot stack ticks.
+   * Settle every tracked job's terminal row; returns how many settled. Never
+   * throws — a read fault costs one tick. Single-flight, so a slow read cannot
+   * stack ticks.
    */
   async tick(): Promise<number> {
     if (this.tickInFlight) return 0;

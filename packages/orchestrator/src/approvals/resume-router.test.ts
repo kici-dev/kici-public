@@ -23,10 +23,8 @@ const handlers = () => ({
 
 describe('routeRelease', () => {
   it('sends a job-scoped context hold to the job path', async () => {
-    // The wait-timer / concurrency case. Context-triggered but job-scoped, so it
-    // resumes by re-dispatching the job — there is no workflow context to
-    // rebuild, and routing it to the install-gate path would re-dispatch a whole
-    // workflow.
+    // The wait-timer / concurrency case: job-scoped, so it re-dispatches the job;
+    // the install-gate path would re-dispatch a whole workflow.
     const h = handlers();
     await routeRelease(signal(), h);
     expect(h.onJobRelease).toHaveBeenCalledTimes(1);

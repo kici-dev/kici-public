@@ -37,7 +37,8 @@ GitHub  -->  Platform Relay  -->  Orchestrator  -->  Agent
 16. **Orchestrator applies the content-requirements filter** to the matched candidates: for each trigger that declares `requires`, it reads the named source files at the event's ref through the provider's `FileContentsFetcher` (once per distinct `(repo, sha, path)` via an LRU cache) and evaluates the declarative requirement. Candidates that fail -- or that cannot be evaluated at all (unreadable or oversize content, a fetch error, no fetcher wired) -- are dropped before dispatch with the concrete reason logged. No workflow code runs at this stage. Skipped entirely when no matched trigger declares `requires`.
 17. **Orchestrator checks caches** for source tarballs and dependency tarballs.
 18. **Orchestrator dispatches jobs** to agents via the job queue and WebSocket.
-19. **Orchestrator persists a delivery row** keyed by `(org_id, delivery_id)` to its own `event_log`, including a pointer to the gzipped payload in object storage. The orchestrator's delivery log is surfaced in the dashboard's Settings → Event log tab. See [`webhook-delivery.md`](./webhooks/webhook-delivery.md#delivery-log).
+19. **Orchestrator dispatches organization-wide workflows** from other repositories in the org whose `repos` patterns match this event, through the same dispatch pipeline. A repository with no lock file skips steps 11–18 and still runs this pass. See [global workflows](global-workflows.md).
+20. **Orchestrator persists a delivery row** keyed by `(org_id, delivery_id)` to its own `event_log`, including a pointer to the gzipped payload in object storage. The orchestrator's delivery log is surfaced in the dashboard's Settings → Event log tab. See [`webhook-delivery.md`](./webhooks/webhook-delivery.md#delivery-log).
 
 ## Job execution flow
 
@@ -67,7 +68,7 @@ Orchestrator                         Agent                    Sandbox (child pro
 
 The agent delegates job execution to an `ExecutionSandbox` (container, bare-metal, or firecracker). The sandbox runs customer code in an isolated child process -- never in the agent's V8 isolate.
 
-Six job types are handled. Only the first uses a sandbox; the other five run in-process, because they never execute customer workflow steps:
+Six job types are handled. Only the first uses the step sandbox; the other five skip it, because they never execute customer workflow steps. Of those five, all except bring-up still load a customer workflow module, and they run that load in a separate eval child process, not in the agent:
 
 - **Execution jobs** -- the standard sandbox path.
 - **Init-only jobs** -- dynamic field resolution.
@@ -252,7 +253,7 @@ If cache storage is unavailable or a download fails:
 
 ## Cache storage architecture
 
-Both source and dep caches use `S3CacheStorage` as the sole backend. The `CacheStorage` interface provides a consistent API, but S3 (or any S3-compatible service: SeaweedFS, MinIO, LocalStack) is the only supported implementation.
+Both source and dep caches go through the `CacheStorage` interface, which `KICI_STORAGE_TYPE` resolves to one of two backends. `S3CacheStorage` (AWS S3 or any S3-compatible service: SeaweedFS, MinIO, LocalStack) is the production backend. `FilesystemCacheStorage` stores blobs as local files and replaces pre-signed S3 URLs with HMAC-signed URLs on the orchestrator's `/api/v1/cache/blob/` route. It is for single-host deployments and test sandboxes. See [filesystem backend specifics](../operator/orchestrator/storage-layout.md#filesystem-backend-specifics).
 
 ```
                     +------------------+
@@ -260,11 +261,13 @@ Both source and dep caches use `S3CacheStorage` as the sole backend. The `CacheS
                     | (interface)      |
                     +--------+---------+
                              |
-                   +---------+---------+
-                   | S3CacheStorage     |
-                   | (AWS S3, SeaweedFS,|
-                   |  MinIO, LocalStack)|
-                   +--------------------+
+              +--------------+--------------+
+              |                             |
+   +----------+---------+     +-------------+-----------+
+   | S3CacheStorage     |     | FilesystemCacheStorage  |
+   | (AWS S3, SeaweedFS,|     | (local files, signed    |
+   |  MinIO, LocalStack)|     |  orchestrator URLs)     |
+   +--------------------+     +-------------------------+
 ```
 
 ### Cache key design
@@ -411,13 +414,9 @@ EventRouter.onNotification(eventId) [private]
   |      increments attempts and records claimed_at/claimed_by atomically)
   |-- If lease acquired:
   |     |-- processSubscriptions(event):
-  |     |     |-- If RegistrationIndex available:
-  |     |     |     Look up registrations by trigger type
-  |     |     |     TrustStore.isTrusted() (for cross-repo events)
-  |     |     |     matchAllWorkflows() against registered workflows
-  |     |     |-- Else (no RegistrationIndex):
-  |     |     |     TrustStore.isTrusted() (for cross-routing-key events)
-  |     |     |     matchAllWorkflows() against in-memory lock file subscriptions
+  |     |     |-- RegistrationIndex: look up registrations by trigger type
+  |     |     |-- TrustStore.isTrusted() (for cross-repo events)
+  |     |     |-- matchAllWorkflows() against each registered workflow
   |     |     |-- For each match: onEventMatched(event, lockFile, matchedWorkflows)
   |     |
   |     |-- On success: markProcessed (commits processed=true, clears lease,
@@ -598,8 +597,10 @@ POST /webhook/:orgId/generic/:sourceId
          |-- Rate limit check (per-source rateLimitRpm)
          |-- Verify signature (HMAC-SHA256, bearer token, IP allowlist, or none)
          |-- Deduplication check (idempotency key within dedup window)
-         |-- GenericWebhookNormalizer.normalizeEvent() -> SimulatedEvent
-         |-- Match against lock file triggers (genericWebhook type)
+         |-- GenericWebhookNormalizer.normalizeGenericRequest() -> event type + payload
+         |-- Allowed-events check (per-source allowedEvents)
+         |-- Hand off to the webhook pipeline (429 + Retry-After when ingest sheds)
+         |-- Match registered workflows from the RegistrationIndex (cross-source dispatch)
          |-- Dispatch matched jobs to agents
 ```
 
@@ -610,7 +611,7 @@ POST /webhook/:orgId/generic/:sourceId
 | Signature      | HMAC-SHA256 (always)        | Configurable (HMAC, bearer, IP, none)           |
 | Event type     | X-GitHub-Event header       | Configurable header or payload field            |
 | Delivery ID    | X-GitHub-Delivery header    | Configurable header or auto-generated UUID      |
-| Lock file      | Fetched from repo           | Cached from lock file subscription              |
+| Lock file      | Fetched from repo           | Taken from the workflow registration            |
 | Git operations | Clone, fetch, changed files | None (optional -- non-repo workflows supported) |
 
 ## Database topology

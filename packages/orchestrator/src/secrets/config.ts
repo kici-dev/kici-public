@@ -14,9 +14,6 @@ const DEFAULT_ENV_KEY = 'KICI_SECRET_KEY';
 /** Default environment variable name for the old master key (rotation). */
 const DEFAULT_OLD_ENV_KEY = 'KICI_SECRET_KEY_OLD';
 
-/**
- * Secret store configuration.
- */
 export interface SecretStoreConfig {
   /** 32-byte AES-256 encryption key. */
   masterKey: Buffer;

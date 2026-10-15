@@ -1,7 +1,7 @@
 /**
- * Typed client for the Platform org-scoped dashboard API (the endpoints the
- * web UI uses). Authenticated with the stored PAT + active org. This is the
- * only place in the CLI that knows these routes.
+ * Typed client for the Platform org-scoped dashboard API (the web UI's
+ * endpoints), authenticated with the stored PAT + active org. The only place in
+ * the CLI that knows these routes.
  */
 import { z } from 'zod';
 import {
@@ -35,7 +35,7 @@ export type DashboardErrorKind =
   | 'orchestrator_offline'
   | 'http';
 
-/** Typed error raised by every DashboardClient method on a non-2xx response. */
+/** Raised by every DashboardClient method on a non-2xx response. */
 export class DashboardClientError extends Error {
   constructor(
     readonly kind: DashboardErrorKind,
@@ -47,7 +47,6 @@ export class DashboardClientError extends Error {
   }
 }
 
-/** Filters accepted by the runs-list endpoint. */
 export interface RunsListFilters {
   status?: string;
   workflow?: string;
@@ -56,7 +55,7 @@ export interface RunsListFilters {
   trigger?: string;
   source?: string;
   since?: string;
-  /** Opaque keyset cursor (from a prior page's `nextCursor`). Absent = first page. */
+  /** Opaque keyset cursor from a prior page's `nextCursor`; absent = first page. */
   cursor?: string;
 }
 
@@ -92,8 +91,7 @@ const issueReportListSchema = z.object({
 export type IssueReportListResponse = z.infer<typeof issueReportListSchema>;
 
 const rerunResponseSchema = z.object({ newRunId: z.string() });
-// `alreadyTerminal` is optional: an orchestrator predating the field reports
-// nothing, and absent means "not reported", not "false".
+// An orchestrator predating `alreadyTerminal` omits it: absent means "not reported", not "false".
 const cancelResponseSchema = z.object({
   cancelledJobs: z.number().optional(),
   alreadyTerminal: z.boolean().optional(),
@@ -106,23 +104,20 @@ const registrationsListSchema = z.object({
   registryUpdatedAt: z.string(),
 });
 
-/** Result of {@link DashboardClient.listRegistrations}. */
 export interface RegistrationsListResult {
   registrations: RegistrationItem[];
   registryVersion: number;
   registryUpdatedAt: string;
 }
 
-/** Filters accepted by the registrations-list endpoint. */
 export interface RegistrationsListFilters {
   triggerType?: string;
   repoIdentifier?: string;
 }
 
 /**
- * A secret context (context) as surfaced to the developer CLI's
- * `secrets list` / `types` commands. The orchestrator returns the per-env
- * secret key names (never values) when `includeSecrets` is requested.
+ * A secret context for `kici secrets list` / `kici types`. With `includeSecrets`
+ * the orchestrator returns the per-env secret key names (never values).
  */
 const contextContextSchema = z.object({
   name: z.string(),
@@ -135,12 +130,11 @@ const contextsListSchema = z.object({
   contexts: z.array(contextContextSchema).default([]),
 });
 
-/** A secret context (context) returned by {@link DashboardClient.listContexts}. */
 export type ContextContext = z.infer<typeof contextContextSchema>;
 
 /**
- * Parsed shape of `GET /runs/:runId/artifacts` for the CLI. The per-artifact
- * shape is reused from `@kici-dev/engine` so the CLI and the server cannot drift.
+ * `GET /runs/:runId/artifacts`; the per-artifact shape comes from
+ * `@kici-dev/engine` so CLI and server cannot drift.
  */
 export interface ArtifactsListResult {
   artifacts: ArtifactListItem[];
@@ -222,7 +216,7 @@ export class DashboardClient {
     try {
       detail = ((await res.json()) as { error?: string }).error;
     } catch {
-      /* ignore non-JSON bodies */
+      /* non-JSON body */
     }
     const [kind, fallback] = STATUS_ERROR_MAP[res.status] ?? [
       'http',
@@ -231,17 +225,14 @@ export class DashboardClient {
     throw new DashboardClientError(kind, detail ?? fallback, res.status);
   }
 
-  /** Generic GET helper used by typed methods (and tests). */
   async getJson(path: string): Promise<unknown> {
     return this.request('GET', path);
   }
 
-  /** Generic POST helper used by typed methods (and tests). */
   async postJson(path: string, body?: unknown): Promise<unknown> {
     return this.request('POST', path, body);
   }
 
-  /** Generic DELETE helper used by typed methods (and tests). */
   async deleteJson(path: string): Promise<unknown> {
     return this.request('DELETE', path);
   }
@@ -274,7 +265,6 @@ export class DashboardClient {
     return singleRunSchema.parse(await this.getJson(`/runs/${runId}`)).run;
   }
 
-  /** Fetch the org's recent webhook-activity counts. */
   async getWebhookActivity(windowMinutes = 60): Promise<WebhookActivity> {
     return webhookActivitySchema.parse(
       await this.getJson(`/webhook-activity?windowMinutes=${windowMinutes}`),
@@ -296,20 +286,17 @@ export class DashboardClient {
   }
 
   /**
-   * List a run's artifacts (`GET /runs/:runId/artifacts`). Each entry carries a
-   * presigned `downloadUrl` minted by the customer's orchestrator; the Platform
-   * relays it without re-signing, so the artifact bytes never transit Platform.
+   * Each entry's presigned `downloadUrl` is minted by the customer's orchestrator
+   * and relayed by the Platform without re-signing, so artifact bytes never transit it.
    */
   async listArtifacts(runId: string): Promise<ArtifactsListResult> {
     return artifactsListResultSchema.parse(await this.getJson(`/runs/${runId}/artifacts`));
   }
 
   /**
-   * Reserve an issue-report upload slot.
-   *
-   * Returns a presigned PUT the caller uploads the bundle bytes to directly —
-   * the Platform never proxies them — plus the reference id the customer
-   * quotes to support.
+   * Reserve an issue-report upload slot: a presigned PUT for the bundle bytes
+   * (the Platform never proxies them) plus the reference id the customer quotes
+   * to support.
    */
   async createIssueReport(body: {
     bundleId: string;
@@ -321,7 +308,7 @@ export class DashboardClient {
     return issueReportCreateSchema.parse(await this.postJson('/issue-reports', body));
   }
 
-  /** Tell the Platform the bytes landed, so it can verify and mark the report received. */
+  /** The bytes landed: the Platform verifies and marks the report received. */
   async confirmIssueReport(ref: string): Promise<{ ref: string; status: string }> {
     return issueReportConfirmSchema.parse(
       await this.postJson(`/issue-reports/${encodeURIComponent(ref)}/confirm`),
@@ -355,7 +342,7 @@ export class DashboardClient {
     );
   }
 
-  /** List the org's permanently registered workflows (GET /registrations). */
+  /** The org's permanently registered workflows. */
   async listRegistrations(
     filters: RegistrationsListFilters = {},
   ): Promise<RegistrationsListResult> {
@@ -366,13 +353,7 @@ export class DashboardClient {
     return registrationsListSchema.parse(await this.getJson(`/registrations${suffix}`));
   }
 
-  /**
-   * List the org's contexts as secret contexts (GET /contexts).
-   *
-   * Pass `includeSecrets` to have the orchestrator attach each context's
-   * reachable secret key names (never values). Used by `kici secrets list`
-   * and `kici types`.
-   */
+  /** `includeSecrets` attaches each context's reachable secret key names (never values). */
   async listContexts(includeSecrets = false): Promise<ContextContext[]> {
     const suffix = includeSecrets ? '?includeSecrets=true' : '';
     return contextsListSchema.parse(await this.getJson(`/contexts${suffix}`)).contexts;

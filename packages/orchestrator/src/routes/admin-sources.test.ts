@@ -177,7 +177,7 @@ describe('admin source routes', () => {
       expect(body.results).toHaveLength(3);
       expect(body.errors).toHaveLength(0);
       expect(fetchAppIdentity).toHaveBeenCalledTimes(3);
-      // The whole batch reads the sources table exactly once — was 1 + N before.
+      // The whole batch reads the sources table exactly once, not 1 + N.
       expect(listSources).toHaveBeenCalledTimes(1);
     });
   });
@@ -210,11 +210,10 @@ describe('admin source routes', () => {
     });
   });
 
-  // A routing key is a single already-decoded Hono path param. The handlers
-  // must NOT decode it a second time — a second decode either throws a
-  // URIError (500) when the literal key carries a stray `%`, or silently
-  // collapses a `%NN`-looking key onto a DIFFERENT source (wrong-source
-  // read/mutation). Routing keys carry no charset validation on these routes.
+  // A routing key is an already-decoded Hono path param. A second decode
+  // throws a URIError (500) on a stray `%`, or collapses a `%NN`-looking key
+  // onto a DIFFERENT source (wrong-source read/mutation). These routes do no
+  // charset validation on routing keys.
   describe('source :routingKey path param is decoded exactly once (no double-decode)', () => {
     it('PATCH forwards a literal-% routing key verbatim (was a 500)', async () => {
       const getSource = vi.fn().mockResolvedValue(null);
@@ -270,11 +269,9 @@ describe('admin source routes', () => {
     });
 
     it('POST refresh forwards a literal-% routing key verbatim (was a 500)', async () => {
-      // The refresh route resolves the row out of listSources(). A non-GitHub
-      // row makes the helper throw its "not a GitHub source" error, which the
-      // route maps to a structured 400 — so a 400 here proves the lookup found
-      // the row keyed by the SINGLY-decoded routing key. Under a second decode
-      // the literal `%` raises a URIError and the route answers 500 instead.
+      // A non-GitHub row makes the helper throw "not a GitHub source", mapped
+      // to a structured 400 — so a 400 proves listSources() found the row by the
+      // SINGLY-decoded key. A second decode raises a URIError on `%` → 500.
       const listSources = vi
         .fn()
         .mockResolvedValue([

@@ -1,22 +1,18 @@
 /**
- * StaleRunDetector: periodic DB scanner for stale execution jobs.
+ * Periodic DB scanner that marks jobs whose heartbeats stopped (agent died, network
+ * partition, container killed) as timed_out_stale, and fails dispatch_queue entries
+ * that were dispatched but never acknowledged.
  *
- * Detects jobs that have stopped sending heartbeats (agent died, network partition,
- * container killed, etc.) and marks them as timed_out_stale. Also detects stale
- * dispatch_queue entries that were dispatched but never acknowledged.
- *
- * Key behaviors:
- * - Immediate startup scan for crash recovery (finds stale jobs from before restart)
- * - Periodic scans at configurable interval (default 60s)
- * - Uses timed_out_stale as distinct DB status (not just 'failed')
- * - Optimistic concurrency: WHERE status='running' prevents race with agent completion
- * - Does NOT call executionTracker.onJobStatus() to avoid redundant DB writes
- * - Updates in-memory state and calls completeRunIfAllJobsTerminal for run completion
+ * - Scans once at startup for crash recovery, then every scan interval (default 60s).
+ * - timed_out_stale is a distinct DB status, not 'failed'.
+ * - Optimistic concurrency: WHERE status='running' prevents a race with agent completion.
+ * - Does NOT call executionTracker.onJobStatus(), to avoid redundant DB writes; it
+ *   updates in-memory state and calls completeRunIfAllJobsTerminal instead.
  * - Finishes a run whose every job is terminal but whose finalizer never ran
  *   (a coordinator that died mid-way, or a registration-window holder that
- *   died after a sibling deferred to it)
- * - Force-terminates stale agents via scaler manager
- * - Updates GitHub check runs with timed_out conclusion
+ *   died after a sibling deferred to it).
+ * - Force-terminates stale agents via the scaler manager and completes their GitHub
+ *   check runs as timed_out.
  */
 
 import { sql, type Kysely } from 'kysely';
@@ -68,18 +64,17 @@ export interface StaleRunDetectorDeps {
   dispatcher: Dispatcher;
   registry: AgentRegistry;
   /**
-   * Peer registry used to defer failing a job that was rerouted to a remote
-   * worker peer while that peer is still connected — its terminal status may
-   * still be replayed from the worker's durable outbox.
+   * Defers failing a job rerouted to a remote worker peer while that peer is still
+   * connected — its terminal status may still be replayed from the worker's durable outbox.
    */
   peerRegistry: PeerRegistry;
-  /** Reader for fleet-wide cluster tunables (reroute flap-grace override). */
+  /** Fleet-wide cluster tunables (reroute flap-grace override). */
   clusterSettings: ClusterSettingsReader;
   /** Cluster default for the reroute flap-grace window (config.rerouteFlapGraceMs). */
   rerouteFlapGraceFallbackMs: number;
-  /** Threshold in ms after which a job is considered stale. Default: heartbeatIntervalMs * multiplier */
+  /** Ms after which a job is stale. Default: heartbeatIntervalMs * multiplier */
   staleThresholdMs: number;
-  /** How often to scan for stale jobs in ms. Default: 60_000 */
+  /** Scan interval in ms. Default: 60_000 */
   scanIntervalMs: number;
   /**
    * How stale a `cluster_instances` heartbeat may be and still read as live,
@@ -87,43 +82,38 @@ export interface StaleRunDetectorDeps {
    * {@link instanceLivenessGraceMs} at the default recovery grace period.
    */
   instanceLivenessGraceMs?: number;
-  /** Held run store for expiring overdue held runs. Optional -- if not set, held run cleanup is skipped. */
+  /** Expires overdue held runs. If not set, held run cleanup is skipped. */
   heldRunStore?: HeldRunStore;
-  /** Step-approval bridge — notified when a step-scoped hold expires so the waiting agent fails the step. Optional. */
+  /** Notified when a step-scoped hold expires, so the waiting agent fails the step. */
   stepApprovalBridge?: StepApprovalBridge;
-  /** Fail a whole run when a job/workflow-scoped approval hold expires. Optional. */
+  /** Fails a whole run when a job/workflow-scoped approval hold expires. */
   failRun?: (runId: string, reason: string) => Promise<void>;
   /**
-   * Resume a workflow whose install-gate wait-timer hold has elapsed. Wired to
-   * the same `resumeWorkflow` path as reviewer approvals. Optional -- if not
-   * set, wait-timer workflow holds are not auto-released.
+   * Resumes a workflow whose install-gate wait-timer hold has elapsed, via the same
+   * `resumeWorkflow` path as reviewer approvals. If not set, wait-timer workflow holds
+   * are not auto-released.
    */
   onWorkflowRelease?: (signal: ReleaseSignal) => Promise<void>;
   /**
-   * Resume a released JOB-scoped hold by re-dispatching the job. A job-scoped
-   * wait-timer hold has a pending job context, not a pending workflow context,
-   * so it cannot go through `onWorkflowRelease`.
+   * Re-dispatches the job of a released JOB-scoped hold. Such a hold has a pending job
+   * context, not a pending workflow context, so it cannot go through `onWorkflowRelease`.
    */
   onJobRelease?: (signal: ReleaseSignal) => Promise<void>;
   /**
-   * Resolve a context by name, for the queued-concurrency sweep — it needs each
-   * group's configured `concurrency_limit` to know how many holds a freed slot
-   * lets through. `ContextStore.matchContext`.
+   * `ContextStore.matchContext`: the queued-concurrency sweep needs each group's
+   * `concurrency_limit` to know how many holds a freed slot lets through.
    */
   matchContext?: (
     orgId: string,
     name: string,
   ) => Promise<{ concurrency_limit: number | null } | null>;
-  /** Access-log writer for the orchestrator audit stream. Optional -- if not set, expiry audit rows (`held_run.expire`) are skipped. */
+  /** If not set, expiry audit rows (`held_run.expire`) are skipped. */
   accessLogWriter?: AccessLogWriter;
   /**
-   * Resolve the check poster of the provider bundle serving a routing key, so an
-   * expiring security hold's `KiCI Security` check can be completed. A function
-   * rather than the registry itself because the registry instance is replaced
-   * when sources are (re)loaded, and this detector outlives that.
-   *
-   * Optional -- if not set, an expiring security hold's check is left alone,
-   * which is the pre-existing behaviour rather than a wrong one.
+   * Resolves the check poster serving a routing key, so an expiring security hold's
+   * `KiCI Security` check can be completed. A function rather than the registry, because
+   * the registry instance is replaced when sources are (re)loaded and this detector
+   * outlives that. If not set, an expiring security hold's check is left alone.
    */
   resolveCheckStatusPoster?: ResolveCheckStatusPoster;
 }
@@ -178,18 +168,15 @@ export class StaleRunDetector {
   /**
    * Release queued concurrency holds whose group now has a free slot.
    *
-   * A context's concurrency gate returns `queue` when its limit is met, holding
-   * the job. Nothing released those holds: they sat pending until the expiry
-   * sweep marked them expired and their jobs never ran. This is the release
-   * half.
+   * This is the release half of a context's concurrency gate, which returns `queue` and
+   * holds the job when its limit is met; without it, holds sit pending until the expiry
+   * sweep expires them and their jobs never run.
    *
-   * Driven from the periodic scan rather than from job completion: the
-   * completion callback is constructed before the dispatcher, coordinator and
-   * context store exist, so wiring it there would mean threading four refs
-   * through a hot path. The cost is up to one scan interval of latency before a
-   * freed slot is reused, which for a throughput control is an acceptable
-   * trade — and every release still re-checks the limit, so the bound is never
-   * exceeded regardless of when the sweep runs.
+   * Driven from the periodic scan rather than from job completion: the completion
+   * callback is constructed before the dispatcher, coordinator and context store exist,
+   * so wiring it there would thread four refs through a hot path. The cost is up to one
+   * scan interval before a freed slot is reused, acceptable for a throughput control —
+   * and every release re-checks the limit, so the bound is never exceeded.
    */
   private async releaseFreedConcurrencyHolds(): Promise<void> {
     if (!this.heldRunStore || !this.onJobRelease || !this.matchContext) return;
@@ -225,14 +212,11 @@ export class StaleRunDetector {
   }
 
   /**
-   * Release wait-timer holds whose timer has elapsed, at ANY scope, and route
-   * each to the resume path its shape requires: a workflow install-gate hold
-   * rebuilds its workflow dispatch context, a job-scoped hold re-dispatches the
-   * one job it held.
+   * Release elapsed wait-timer holds at ANY scope: a workflow install-gate hold
+   * rebuilds its workflow dispatch context, a job-scoped hold re-dispatches its job.
    *
-   * Runs BEFORE `expireOverdueHolds` so a wait hold resumes rather than being
-   * failed by the expire-and-fail sweep — that sweep is not scope-filtered, so
-   * the ordering is load-bearing.
+   * Runs BEFORE `expireOverdueHolds` so a wait hold resumes rather than being failed;
+   * that sweep is not scope-filtered, so the ordering is load-bearing.
    */
   private async releaseDueWaitHolds(): Promise<void> {
     if (!this.heldRunStore) return;
@@ -272,18 +256,14 @@ export class StaleRunDetector {
   }
 
   /**
-   * Expire overdue approval holds. Routes each overdue hold by scope BEFORE the
-   * bulk status flip: step-scoped holds notify the waiting agent (which fails
-   * the step), job/workflow-scoped holds fail the whole run. Then the bulk
-   * `expireOverdue()` flips every overdue row to `expired`.
+   * Routes each overdue approval hold by scope BEFORE the bulk `expireOverdue()` flip:
+   * step-scoped holds notify the waiting agent (which fails the step), job/workflow-scoped
+   * holds fail the whole run.
    *
-   * Every overdue row's id is excluded from the security check's contention
-   * query for the whole loop, because `expireOverdue()` has not run yet: each
-   * of them is still `pending` in the database while its siblings are being
-   * routed, and without the exclusion a commit whose two holds both expired
-   * would see each hold refuse on account of the other and leave the check
-   * pending forever. The commits already settled are tracked so one sweep
-   * writes each shared check once.
+   * Every overdue id is excluded from the security check's contention query for the whole
+   * loop: until `expireOverdue()` runs each is still `pending`, so a commit whose two holds
+   * both expired would see each refuse on account of the other and leave the check pending
+   * forever. Settled commits are tracked so one sweep writes each shared check once.
    */
   private async expireOverdueHolds(): Promise<void> {
     if (!this.heldRunStore) return;
@@ -298,26 +278,21 @@ export class StaleRunDetector {
           } else if (this.failRun) {
             await this.failRun(hold.run_id, `Approval expired for ${hold.hold_scope} hold`);
           }
-          // A workflow-scoped hold owns a stored dispatch context that only a
-          // release or a rejection consumes. Expiry reaches neither, so drop it
-          // here — otherwise every unapproved fork PR (the common outcome for a
-          // hold nobody answers) leaves one behind until an orchestrator
-          // restart sweeps it as terminal.
+          // Only a release or rejection consumes a workflow-scoped hold's stored dispatch
+          // context, so expiry drops it here — otherwise every unapproved fork PR leaves
+          // one behind until an orchestrator restart sweeps it as terminal.
           //
-          // Its dispatch already posted the queued `kici/<workflow>` and
-          // per-job check runs, and `failRun` above completes none of them: it
-          // writes DB rows and never fires `onExecutionComplete`, which is the
-          // one callback wired to `updateWorkflowStatus`. Close them as
-          // `timed_out` — the approval window elapsed — before the context they
-          // are derived from is deleted.
+          // `failRun` writes DB rows and never fires `onExecutionComplete` (the one
+          // callback wired to `updateWorkflowStatus`), so the queued `kici/<workflow>`
+          // and per-job check runs are closed as `timed_out` here, before the context
+          // they derive from is deleted.
           if (hold.hold_scope === HoldScope.enum.workflow) {
             await completeUndispatchedHoldChecks({
               db: this.db,
               checkRunReporter: this.checkRunReporter,
               runId: hold.run_id,
               conclusion: CheckRunConclusion.enum.timed_out,
-              // Same summary the security check below carries, so the two
-              // families agree on why the run never started.
+              // Same summary as the security check below, so both agree why the run never started.
               summary: buildHoldEndedSummary({
                 outcome: HoldOutcome.Expired,
                 scope: HoldScope.enum.workflow,
@@ -325,12 +300,10 @@ export class StaleRunDetector {
             });
             await deletePendingWorkflowContext(this.db, hold.run_id);
           }
-          // A hold that posted a pending `KiCI Security` check when it was
-          // raised leaves it `in_progress` here, and nothing above completes
-          // it: `failRun` writes rows, not check runs, and a job-scoped hold
-          // never reaches the workflow branch above at all. At EVERY scope —
-          // an install-gate hold posted no such check and the settler declines
-          // for it rather than fabricating one.
+          // Nothing above completes a pending `KiCI Security` check the hold posted:
+          // `failRun` writes rows, not check runs, and a job-scoped hold never reaches the
+          // workflow branch. Settle at EVERY scope — an install-gate hold posted no such
+          // check and the settler declines for it rather than fabricating one.
           const settled = await settleSecurityCheckForOutcome({
             db: this.db,
             resolvePoster: this.resolveCheckStatusPoster,
@@ -340,9 +313,8 @@ export class StaleRunDetector {
             skipCommits: settledCommits,
           });
           if (settled.commit && settled.posted) settledCommits.add(settled.commit);
-          // Audit the expiry. The stale detector expires the hold automatically
-          // (no human / Keycloak user context), so the actor is the stale-detector
-          // system component.
+          // Expiry is automatic (no human / Keycloak user context), so the audit actor
+          // is the stale-detector system component.
           runDetached(
             logger,
             'Access log write',
@@ -381,16 +353,12 @@ export class StaleRunDetector {
   }
 
   /**
-   * Clean up orphaned jobs left in 'recovering' state from a previous orchestrator instance.
+   * Fail jobs left in 'recovering' state by a previous orchestrator instance.
    *
-   * Recovery timers are in-memory (Dispatcher) and lost on restart. Any jobs still
-   * in 'recovering' state after a restart have no timer and no path to completion,
-   * so they must be failed immediately.
-   *
-   * Call this during startup, before the first periodic scan.
+   * Recovery timers are in-memory (Dispatcher) and lost on restart, so such jobs have
+   * no path to completion. Call during startup, before the first periodic scan.
    */
   async cleanupOrphanedRecoveryJobs(): Promise<void> {
-    // Find affected run IDs before updating so we can check run completion afterward
     const affectedJobs = await this.db
       .selectFrom('execution_jobs')
       .select(['run_id'])
@@ -399,7 +367,6 @@ export class StaleRunDetector {
 
     if (affectedJobs.length === 0) return;
 
-    // Fail execution_jobs in 'recovering' state
     await this.db
       .updateTable('execution_jobs')
       .set({
@@ -410,7 +377,6 @@ export class StaleRunDetector {
       .where('status', '=', ExecutionJobStatus.enum.recovering)
       .execute();
 
-    // Also fail corresponding dispatch_queue entries
     await this.db
       .updateTable('dispatch_queue')
       .set({ status: DispatchQueueStatus.Failed })
@@ -421,9 +387,8 @@ export class StaleRunDetector {
       count: affectedJobs.length,
     });
 
-    // Check run completion for all affected runs — without this, runs whose
-    // only remaining active jobs were in 'recovering' state would be stuck
-    // in 'running' status forever (scan() only checks running/dispatched jobs).
+    // Without this, runs whose only active jobs were 'recovering' stay 'running'
+    // forever (scan() only checks running/dispatched jobs).
     const affectedRunIds = new Set(affectedJobs.map((j) => j.run_id));
     for (const runId of affectedRunIds) {
       try {
@@ -437,15 +402,10 @@ export class StaleRunDetector {
     }
   }
 
-  /**
-   * Start the stale run detector.
-   * Runs an immediate scan for crash recovery, then starts periodic scans.
-   */
+  /** Runs an immediate scan for crash recovery, then starts periodic scans. */
   async start(): Promise<void> {
-    // Immediate scan for crash recovery
     await this.scan();
 
-    // Start periodic scanning
     this.interval = setInterval(() => {
       this.scan().catch((err) => {
         logger.error('Stale detection scan error (interval)', {
@@ -456,9 +416,6 @@ export class StaleRunDetector {
     }, this.scanIntervalMs);
   }
 
-  /**
-   * Stop the stale run detector.
-   */
   stop(): void {
     if (this.interval) {
       clearInterval(this.interval);
@@ -467,64 +424,57 @@ export class StaleRunDetector {
   }
 
   /**
-   * Run a single stale detection scan.
-   *
-   * Three sub-scans:
+   * Run a single stale detection scan:
    * A. Running jobs with old heartbeat (last_heartbeat_at < threshold)
    * B. Running jobs with NULL heartbeat (created_at < threshold, pre-heartbeat jobs)
    * C. Dispatched queue entries that were never acknowledged
+   * then checks run completion for affected runs.
    *
-   * After all sub-scans, checks run completion for affected runs.
-   *
-   * Note: jobs in 'recovering' state are NOT scanned -- they have their own
-   * per-job recovery timers managed by the Dispatcher.
-   * All sub-scans filter on status='running' or status='dispatched',
-   * so recovering jobs are naturally excluded.
+   * Jobs in 'recovering' state are NOT scanned: the Dispatcher owns their per-job
+   * recovery timers, and every sub-scan filters on status='running' or 'dispatched'.
    */
   async scan(): Promise<void> {
     try {
       const threshold = new Date(Date.now() - this.staleThresholdMs);
-      // Time-bound: only scan jobs created in the last 24 hours to prevent scanning ancient history
+      // Only jobs created in the last 24 hours, to avoid scanning ancient history
       const timeBound = new Date(Date.now() - 24 * 60 * 60 * 1000);
       const affectedRunIds = new Set<string>();
       let staleCount = 0;
 
-      // Sub-scan A: Running jobs with old heartbeat
+      // Sub-scan A
       staleCount += await this.scanStaleRunningJobs(threshold, timeBound, affectedRunIds);
 
-      // Sub-scan B: Running jobs with NULL heartbeat (fallback to created_at)
+      // Sub-scan B (falls back to created_at)
       staleCount += await this.scanStaleRunningJobsNullHeartbeat(
         threshold,
         timeBound,
         affectedRunIds,
       );
 
-      // Sub-scan C: Dispatched queue entries that were never acknowledged
+      // Sub-scan C
       staleCount += await this.scanStaleDispatchedJobs(threshold, timeBound, affectedRunIds);
 
-      // Sub-scan F: runs whose every job is terminal and whose finalizer never
-      // ran — routed through the same completion check as the sub-scans above,
-      // whose DB-fallback path finishes them from the rows.
+      // Sub-scan F: all-terminal runs whose finalizer never ran, finished from the rows
+      // by the DB-fallback path of the same completion check as the sub-scans above.
       await this.scanAllTerminalRuns(threshold, timeBound, affectedRunIds);
 
       // Sub-scan G: in-memory runs another coordinator already finished. This
       // coordinator never saw their last job, so nothing else prunes them.
       await this.executionTracker.pruneRunsFinishedElsewhere();
 
-      // Sub-scan E: Expire overdue held runs (after releasing wait-timer holds
-      // so a wait-timer workflow hold resumes instead of being failed).
+      // Sub-scan E: expire overdue held runs, after releasing wait-timer holds
+      // so a wait-timer workflow hold resumes instead of being failed.
       if (this.heldRunStore) {
         await this.releaseDueWaitHolds();
-        // After wait releases, before the expire pass: a slot freed by this
-        // scan's own terminalizations should be reused now rather than next tick.
+        // Before the expire pass, so a slot freed by this scan's own
+        // terminalizations is reused now rather than next tick.
         await this.releaseFreedConcurrencyHolds();
         await this.expireOverdueHolds();
       }
 
-      // Update gauge with total stale jobs found this scan
       setStaleRunsCurrent(staleCount);
 
-      // Sub-scan D: Run completion check for all affected runs
+      // Sub-scan D: run completion check for all affected runs
       for (const runId of affectedRunIds) {
         try {
           await this.executionTracker.completeRunIfAllJobsTerminal(runId);
@@ -553,11 +503,10 @@ export class StaleRunDetector {
   /**
    * Sub-scan F: runs left non-terminal after every job row went terminal.
    *
-   * The coordinator that saw the last job finish defers finalization while a
-   * live sibling still has a registration window open on the run; a holder
-   * that then dies leaves nothing to re-drive that check. A coordinator that
-   * dies between its jobs going terminal and its own finalization leaves the
-   * same shape. Both are finished here from the rows.
+   * Two causes, both finished here from the rows: the coordinator that saw the last job
+   * finish defers finalization while a live sibling holds a registration window open, and
+   * a holder that then dies leaves nothing to re-drive the check; or a coordinator dies
+   * between its jobs going terminal and its own finalization.
    */
   private async scanAllTerminalRuns(
     threshold: Date,
@@ -581,9 +530,7 @@ export class StaleRunDetector {
     }
   }
 
-  /**
-   * Sub-scan A: Find running jobs with stale heartbeats.
-   */
+  /** Sub-scan A: running jobs with stale heartbeats. */
   private async scanStaleRunningJobs(
     threshold: Date,
     timeBound: Date,
@@ -624,8 +571,8 @@ export class StaleRunDetector {
         if (marked) markedCount++;
       } catch (err) {
         // Log-and-continue: one job's failure must not abort the whole scan
-        // tick and strand the remaining jobs (same per-item guard as sub-scans
-        // C and D).
+        // tick and strand the remaining jobs (same per-item guard as sub-scan
+        // D).
         logger.error('Error marking job stale', {
           runId: job.run_id,
           jobId: job.job_id,
@@ -638,9 +585,8 @@ export class StaleRunDetector {
   }
 
   /**
-   * Sub-scan B: Find running jobs with NULL heartbeat and old created_at.
-   * These are jobs that started before the heartbeat system existed or where
-   * the initial heartbeat was never set.
+   * Sub-scan B: running jobs with NULL heartbeat and old created_at — started before the
+   * heartbeat system existed, or the initial heartbeat was never set.
    */
   private async scanStaleRunningJobsNullHeartbeat(
     threshold: Date,
@@ -683,8 +629,8 @@ export class StaleRunDetector {
         if (marked) markedCount++;
       } catch (err) {
         // Log-and-continue: one job's failure must not abort the whole scan
-        // tick and strand the remaining jobs (same per-item guard as sub-scans
-        // C and D).
+        // tick and strand the remaining jobs (same per-item guard as sub-scan
+        // D).
         logger.error('Error marking job stale', {
           runId: job.run_id,
           jobId: job.job_id,
@@ -697,21 +643,15 @@ export class StaleRunDetector {
   }
 
   /**
-   * Sub-scan C: Find dispatched entries that were never acknowledged.
+   * Sub-scan C: dispatches the agent never started — the dispatch_queue row is still
+   * 'dispatched' AND no execution_jobs row is 'running'. Once the agent reports the job
+   * running, sub-scans A and B supervise `execution_jobs.last_heartbeat_at`. Without this
+   * filter, a job whose first step legitimately exceeds the dispatch threshold (e.g. an
+   * inline `npm install` for a workflow that imports `@kici-dev/sdk`) would be marked
+   * stale before sub-scan A's heartbeat path could keep it alive.
    *
-   * Only catches dispatches that the agent never started — i.e., the
-   * dispatch_queue row is still 'dispatched' AND there is no
-   * execution_jobs row in 'running' state. When the agent has reported
-   * the job as running (so execution_jobs.status='running'), heartbeat
-   * supervision falls to sub-scans A and B, which look at
-   * `execution_jobs.last_heartbeat_at`. Without this filter, a long
-   * job whose first step legitimately exceeds the dispatch threshold
-   * (e.g. an inline `npm install` for a workflow that imports
-   * `@kici-dev/sdk`) would be marked stale here before sub-scan A's
-   * heartbeat path has a chance to keep it alive.
-   *
-   * 'queued' jobs are legitimately waiting for agents and handled by
-   * the queue timeout in {@link JobQueue.markExpired} instead.
+   * 'queued' jobs are legitimately waiting for agents; the queue timeout in
+   * {@link JobQueue.markExpired} handles them.
    */
   private async scanStaleDispatchedJobs(
     threshold: Date,
@@ -722,7 +662,6 @@ export class StaleRunDetector {
 
     let markedCount = 0;
     for (const entry of staleEntries) {
-      // Mark dispatch_queue as failed
       const dqResult = await this.db
         .updateTable('dispatch_queue')
         .set({ status: DispatchQueueStatus.Failed })
@@ -734,7 +673,6 @@ export class StaleRunDetector {
         continue; // Already handled by another process
       }
 
-      // Also mark the corresponding execution_jobs row as timed_out_stale
       const errorMessage = 'No heartbeat -- dispatch never acknowledged';
       const ejResult = await this.db
         .updateTable('execution_jobs')
@@ -753,7 +691,6 @@ export class StaleRunDetector {
         .executeTakeFirst();
 
       if (ejResult.numUpdatedRows && ejResult.numUpdatedRows > 0n) {
-        // Find the jobId for in-memory state update
         const ejRow = await this.db
           .selectFrom('execution_jobs')
           .select(['job_id'])
@@ -768,7 +705,6 @@ export class StaleRunDetector {
             ExecutionJobStatus.enum.timed_out_stale,
           );
 
-          // Forward terminal status to Platform
           this.executionTracker.forwardJobTerminalStatus(
             entry.run_id,
             ejRow.job_id,
@@ -777,7 +713,6 @@ export class StaleRunDetector {
             errorMessage,
           );
 
-          // Emit infrastructure event for dashboard timeline
           this.executionTracker.emitInfraEvent(entry.run_id, 'orchestrator.job.stale_detected', {
             jobId: ejRow.job_id,
             metadata: {
@@ -799,7 +734,6 @@ export class StaleRunDetector {
         markedCount++;
         staleRunsDetectedTotal.add(1);
 
-        // Update GitHub check run with timed_out conclusion
         if (this.checkRunReporter) {
           const [owner, repo] = entry.repo_identifier.split('/');
           const providerCtx =
@@ -815,9 +749,8 @@ export class StaleRunDetector {
             repo,
             sha: entry.sha,
             workflowName: entry.workflow_name,
-            // Present only for a cross-repository global run — qualifies the
-            // check-run name so a stale global job cannot resolve the acted-on
-            // repository's same-named check.
+            // Present only for a cross-repository global run: qualifies the check-run
+            // name so a stale global job cannot resolve the acted-on repo's same-named check.
             ...(entry.workflow_repo_identifier && {
               workflowRepoIdentifier: entry.workflow_repo_identifier,
             }),
@@ -826,16 +759,13 @@ export class StaleRunDetector {
             description: errorMessage,
             installationId,
             routingKey: entry.routing_key ?? undefined,
-            // A stale reap is a completion like any other: without the posture
-            // it posts the one check a degraded fork run gets, with nothing on
-            // it to explain the run's reduced privileges.
+            // A stale reap is a completion like any other: without the posture, the one
+            // check a degraded fork run gets would not explain its reduced privileges.
             ...(entry.trust_tier && { trustTier: entry.trust_tier }),
             ...(entry.lock_file_source && { lockFileSource: entry.lock_file_source }),
-            // Explicit runId — the stale-detector tick fires from a
-            // setInterval outside any request-context ALS frame, so the
-            // reporter's fallback can't find the runId. Without this,
-            // buildDetailsUrl() returns undefined and GitHub defaults
-            // details_url to the App's homepage URL.
+            // Explicit: the tick fires from a setInterval outside any request-context ALS
+            // frame, so the reporter's fallback can't find the runId; buildDetailsUrl()
+            // would return undefined and GitHub defaults details_url to the App homepage.
             runId: entry.run_id,
           });
         }
@@ -845,10 +775,7 @@ export class StaleRunDetector {
     return markedCount;
   }
 
-  /**
-   * Mark a single running job as timed_out_stale.
-   * Shared by sub-scans A and B.
-   */
+  /** Mark a running job timed_out_stale. Shared by sub-scans A and B. */
   private async markJobStale(
     job: {
       run_id: string;
@@ -869,11 +796,9 @@ export class StaleRunDetector {
     },
     affectedRunIds: Set<string>,
   ): Promise<boolean> {
-    // If this job was rerouted to a worker peer that is connected — or was seen
-    // within the flap-grace window of a transient reconnect — defer failing it:
-    // the worker's terminal status may still be replayed from its durable
-    // outbox. A rerouted job whose worker has been gone past the grace window
-    // is NOT deferred, so a dead worker's job is still timed out.
+    // Defer failing a job rerouted to a worker peer that is connected, or was seen within
+    // the flap-grace window: its terminal status may still replay from the worker's
+    // durable outbox. A worker gone past the grace window is NOT deferred.
     const flapGraceMs = await this.clusterSettings.getNumber(
       'reroute_flap_grace_ms',
       this.rerouteFlapGraceFallbackMs,
@@ -895,7 +820,7 @@ export class StaleRunDetector {
       ? `No heartbeat received for ${Math.round(staleDurationMs / 1000)}s`
       : 'No heartbeat received (heartbeat was never set)';
 
-    // Optimistic update: only update if still running
+    // Optimistic: only if still running
     const result = await this.db
       .updateTable('execution_jobs')
       .set({
@@ -923,20 +848,19 @@ export class StaleRunDetector {
       staleDurationMs,
     });
 
-    // Increment metrics
     staleRunsDetectedTotal.add(1);
     if (staleDurationMs !== undefined) {
       staleDetectionDurationSeconds.record(staleDurationMs / 1000);
     }
 
-    // Update in-memory state (no redundant DB write via onJobStatus)
+    // In-memory only (no redundant DB write via onJobStatus)
     this.executionTracker.updateInMemoryJob(
       job.run_id,
       job.job_id,
       ExecutionJobStatus.enum.timed_out_stale,
     );
 
-    // Forward terminal status to Platform so its execution_jobs projection stays in sync
+    // Keeps the Platform's execution_jobs projection in sync
     this.executionTracker.forwardJobTerminalStatus(
       job.run_id,
       job.job_id,
@@ -945,7 +869,6 @@ export class StaleRunDetector {
       errorMessage,
     );
 
-    // Emit infrastructure event for dashboard timeline
     this.executionTracker.emitInfraEvent(job.run_id, 'orchestrator.job.stale_detected', {
       jobId: job.job_id,
       metadata: {
@@ -957,13 +880,11 @@ export class StaleRunDetector {
       },
     });
 
-    // Cancel any in-progress steps so dashboard doesn't show stale running indicators
+    // So the dashboard doesn't show stale running indicators
     await this.executionTracker.cancelStepsForJob(job.run_id, job.job_id, errorMessage);
 
-    // Collect affected runId for batch run completion check
     affectedRunIds.add(job.run_id);
 
-    // Update GitHub check run with timed_out conclusion
     if (this.checkRunReporter) {
       const [owner, repo] = job.repo_identifier.split('/');
       const providerCtx =
@@ -979,8 +900,7 @@ export class StaleRunDetector {
         repo,
         sha: job.sha,
         workflowName: job.workflow_name,
-        // Present only for a cross-repository global run — see
-        // `CheckRunReporter.workflowLabel`.
+        // Cross-repository global run only — see `CheckRunReporter.workflowLabel`.
         ...(job.workflow_repo_identifier && {
           workflowRepoIdentifier: job.workflow_repo_identifier,
         }),
@@ -996,16 +916,14 @@ export class StaleRunDetector {
       });
     }
 
-    // Force-terminate stale agent
     if (job.agent_id) {
       if (this.scalerManager) {
         this.scalerManager.onAgentDisconnected(job.agent_id);
       }
-      // Disconnect only the registration that still holds the stale job. An
-      // agent that reconnected after the job went silent no longer holds it
-      // here, and may be running another job: treating that live connection as
-      // disconnected would put its job into a recovery no reconnect ever ends,
-      // and drop the agent from the registry while its socket stays open.
+      // Disconnect only the registration still holding the stale job. An agent that
+      // reconnected since may be running another job: disconnecting it would put that
+      // job into a recovery no reconnect ever ends, and drop the agent from the
+      // registry while its socket stays open.
       if (
         this.registry.get(job.agent_id) &&
         this.dispatcher.getAgentIdForJob(job.job_id) === job.agent_id

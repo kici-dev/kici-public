@@ -1,11 +1,11 @@
 /**
  * Event-type bucketing for trigger matching. Walking every workflow per
- * webhook is O(all-workflows) even though most reject on the event-type guard.
- * We index workflows by the SimulatedEvent.type(s) they can match once per
- * lockfile (memoized on the workflows-array identity) and, on the hot dispatch
- * path, evaluate only the candidates for the incoming event type.
+ * webhook is O(all-workflows) though most reject on the event-type guard, so
+ * workflows are indexed once per lockfile by the SimulatedEvent.type(s) they
+ * can match, and the hot dispatch path evaluates only the incoming type's
+ * candidates.
  *
- * Pure module — no node:* imports — so the engine barrel stays browser-safe.
+ * No node:* imports, so the engine barrel stays browser-safe.
  */
 import type { LockWorkflow, SimulatedEvent } from './types.js';
 import type { WorkflowDecision } from './decision-trace.js';
@@ -19,12 +19,10 @@ import { matchWorkflowTriggers } from './matcher.js';
  * Two triggers are multi-type:
  *  - `webhook` is NOT in this map — its event types are per-instance
  *    (`trigger.events`), resolved in prepareEventBuckets.
- *  - `workflows_failed_batch` matches TWO event types: a failed
- *    `workflow_complete` (accumulation input) and the synthetic
- *    `workflows_failed_batch` (dispatch), so it maps to both.
+ *  - `workflows_failed_batch` maps to both a failed `workflow_complete`
+ *    (accumulation input) and the synthetic `workflows_failed_batch` (dispatch).
  *
- * Guarded against drift by event-buckets.test.ts (the equivalence + guard
- * tests would fail if a guard changed without this map).
+ * event-buckets.test.ts fails if a guard changes without this map.
  */
 export const TRIGGER_TYPE_TO_EVENT_TYPES: Record<string, readonly TriggerEventType[]> = {
   pr: ['pull_request'],
@@ -102,11 +100,9 @@ export function prepareEventBuckets(
 
 /**
  * Match only the workflows subscribed to the incoming event type. Returns
- * candidate decisions (a superset of matched); callers filter `.matched`.
- * The candidate set is a superset of every workflow matchAllWorkflows would
- * mark matched — a workflow matches only if some trigger's guard passes for
- * event.type, which means that trigger indexed the workflow under event.type —
- * so the matched result is identical.
+ * candidate decisions; callers filter `.matched`. A workflow matches only if
+ * some trigger's guard passes for event.type, and that trigger indexed it under
+ * event.type, so the matched result equals matchAllWorkflows'.
  */
 export function matchWorkflowsForEvent(
   workflows: readonly LockWorkflow[],

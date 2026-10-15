@@ -6,9 +6,6 @@ import {
 import type { Role } from '../secrets/rbac.js';
 import { RbacEnforcer } from '../secrets/rbac.js';
 
-/**
- * Create mock admin registration route dependencies.
- */
 function createMockDeps(
   overrides?: Partial<AdminRegistrationRoutesDeps>,
 ): AdminRegistrationRoutesDeps {
@@ -36,7 +33,6 @@ function createMockDeps(
   };
 }
 
-/** Helper: make a request to the admin registration routes app. */
 async function request(
   app: ReturnType<typeof createAdminRegistrationRoutes>,
   method: string,
@@ -87,7 +83,6 @@ describe('admin registration routes', () => {
     deps = createMockDeps();
     app = createAdminRegistrationRoutes(deps);
 
-    // Default: validate returns owner role
     (deps.tokenManager.validate as any).mockResolvedValue({
       id: 'user-1',
       role: 'owner' as Role,
@@ -352,9 +347,8 @@ describe('admin registration routes', () => {
 
   describe('DELETE /registrations/:id', () => {
     it('deletes registration and bumps version', async () => {
-      // The DELETE path now looks up the row's routing_key first so a
-      // scoped token cannot delete a registration outside its scope.
-      // Existence has to be mocked alongside the delete itself.
+      // DELETE reads the row's routing_key first (scope check), so existence
+      // is mocked alongside the delete.
       (deps.registrationStore.getById as any).mockResolvedValue(sampleRegistration);
       (deps.registrationStore.deleteById as any).mockResolvedValue(true);
       (deps.registrationStore.bumpVersion as any).mockResolvedValue(3);
@@ -605,9 +599,8 @@ describe('admin registration routes', () => {
     });
 
     it('accepts a binding to environments with no configured record (lenient)', async () => {
-      // The lock binds env names that have no environment record in this
-      // orchestrator. matchContext returns null → the binding is satisfiable
-      // (lenient), so register-manual 200s.
+      // Env names with no environment record: matchContext returns null → the
+      // binding is satisfiable (lenient), so register-manual 200s.
       const matchContext = vi.fn(async () => null);
       deps = createMockDeps({
         registrationStore: {

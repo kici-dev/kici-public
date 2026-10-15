@@ -27,8 +27,7 @@ describe('unwrapStoredLogLine', () => {
   });
 
   it('passes JSON that is not an envelope through unchanged', () => {
-    // A job that prints its own JSON (a `{"result":"ok"}` line) must not be
-    // rewritten: only an object with a string `msg` is the store's envelope.
+    // Only an object with a string `msg` is the store's envelope.
     expect(unwrapStoredLogLine('{"result":"ok"}')).toBe('{"result":"ok"}');
     expect(unwrapStoredLogLine('{"msg":42}')).toBe('{"msg":42}');
     expect(unwrapStoredLogLine('{not json')).toBe('{not json');

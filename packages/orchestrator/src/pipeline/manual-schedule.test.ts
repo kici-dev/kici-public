@@ -5,11 +5,11 @@ import {
   mergeScheduleInputs,
 } from './manual-schedule.js';
 import type { LockScheduleTrigger, LockWorkflow, MaterializedJob } from '@kici-dev/engine';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
-// Mock the idempotency claim with an in-memory stateful implementation so the
-// `handleManualSchedule` wiring — a `claimed: false` re-send short-circuits
-// before dispatch — is exercised deterministically without a real DB. Real
-// `INSERT … ON CONFLICT` dedup is covered in `request-idempotency.test.ts`.
+// An in-memory idempotency claim exercises the wiring (a `claimed: false` re-send
+// short-circuits before dispatch) without a DB; real `INSERT … ON CONFLICT` dedup
+// is covered in `request-idempotency.test.ts`.
 const idempotency = vi.hoisted(() => {
   const claims = new Map<string, string>();
   let counter = 0;
@@ -48,13 +48,11 @@ function makeRegistration(overrides: Record<string, unknown> = {}) {
       contentHash: 'content-hash-1',
       triggers: [{ _type: 'schedule', cron: '0 * * * *' }],
       jobs: [
-        {
-          _type: 'static',
+        staticJob({
           name: 'beat',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'ping', run: 'echo ok' }],
-          needs: [],
-        },
+        }),
       ],
     },
     ...overrides,
@@ -163,14 +161,12 @@ describe('handleManualSchedule', () => {
           contentHash: 'content-hash-1',
           triggers: [{ _type: 'schedule', cron: '0 * * * *' }],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'beat',
               runsOn: [{ kind: 'exact', value: 'default' }],
               steps: [{ name: 'ping', run: 'echo ok' }],
-              needs: [],
               matrix: { _type: 'static', values: ['a', 'b'] },
-            },
+            }),
           ],
         },
       }),
@@ -196,22 +192,18 @@ describe('handleManualSchedule', () => {
           contentHash: 'content-hash-1',
           triggers: [{ _type: 'schedule', cron: '0 * * * *' }],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'bad',
               runsOn: [{ kind: 'exact', value: 'default' }],
               steps: [{ name: 'ping', run: 'echo ok' }],
-              needs: [],
               // Static matrix with no `values` → materializeFanout throws FanoutError.
               matrix: { _type: 'static' },
-            },
-            {
-              _type: 'static',
+            }),
+            staticJob({
               name: 'good',
               runsOn: [{ kind: 'exact', value: 'default' }],
               steps: [{ name: 'ping', run: 'echo ok' }],
-              needs: [],
-            },
+            }),
           ],
         },
       }),
@@ -225,12 +217,11 @@ describe('handleManualSchedule', () => {
       'req-test',
     );
 
-    // The whole manual trigger no longer fails wholesale — the good job dispatches.
+    // One rejected job does not fail the whole manual trigger: the good job dispatches.
     expect(result.newRunId).toBeDefined();
     expect(harness.dispatcher.dispatch).toHaveBeenCalledOnce();
     expect(harness.dispatcher.dispatch.mock.calls[0][0].jobName).toBe('good');
-    // Both jobs are registered: the surviving 'good' job plus the synthetic
-    // rejected entry for 'bad'.
+    // Both registered: 'good', plus the synthetic rejected entry for 'bad'.
     expect(harness.executionTracker.addJobsToRun).toHaveBeenCalledOnce();
     const registered = harness.executionTracker.addJobsToRun.mock.calls[0][1];
     expect(registered.some((j: { jobName: string }) => j.jobName === 'good')).toBe(true);
@@ -308,26 +299,21 @@ describe('handleManualSchedule', () => {
 
   // ── `run.manual_schedule.request` orch-side trust model (security invariant) ──
   //
-  // Threat: a compromised Platform credential or a rogue Platform process
-  // driving the Platform→Orchestrator dispatch surface. The wire schema
+  // Threat: a compromised Platform credential or rogue Platform process driving
+  // the Platform→Orchestrator dispatch surface. The wire schema
   // (`manualScheduleRequestSchema` in `packages/engine/src/protocol/messages/dashboard.ts`)
-  // carries only
-  // `requestId`, `actor`, and `registrationId` — no Platform-supplied routing
-  // data, lock-file content, or commit SHA. The orchestrator looks up the
-  // registration in its OWN local `registrationIndex` (single-tenant), and all
-  // downstream operations (repoUrl, sha, providerContext, routing key) come
-  // from the registration record. Cross-tenant isolation is therefore enforced
-  // by construction: a rogue Platform that names a `registrationId` not in
-  // this orchestrator's registry cannot drive any side effect.
+  // carries only `requestId`, `actor` and `registrationId` — no routing data,
+  // lock-file content or commit SHA. The orchestrator resolves the registration
+  // in its OWN local `registrationIndex` (single-tenant), and every downstream
+  // value (repoUrl, sha, providerContext, routing key) comes from that record, so
+  // a `registrationId` not in this orchestrator's registry drives no side effect.
   //
-  // The four enforcement branches in `validateScheduleRequest` are already
-  // covered as "feature" tests above (Registration not found / Workflow is
-  // disabled / no schedule trigger / no commit SHA). The tests below pin the
-  // *side-effect-freeness* invariant explicitly — a rejected request MUST
-  // NOT call `dispatcher.dispatch`, `executionTracker.onExecutionStarted`,
-  // or `eventRouter.emit`. The audit-attribution caveat (`triggeredBy` is
-  // Platform-supplied) is identical to the rerun request's, and is by-design
-  // under the 3-tier auth model — outside customer-data isolation.
+  // The enforcement branches of `validateScheduleRequest` are covered as feature
+  // tests above. The tests below pin side-effect-freeness: a rejected request
+  // MUST NOT call `dispatcher.dispatch`, `executionTracker.onExecutionStarted` or
+  // `eventRouter.emit`. The audit-attribution caveat (`triggeredBy` is
+  // Platform-supplied) matches the rerun request's and is by design under the
+  // 3-tier auth model — outside customer-data isolation.
   describe('tenant-isolation invariants under a rogue Platform', () => {
     it('forged registrationId (not in local index) is side-effect-free', async () => {
       const h = makeDeps(null);
@@ -356,11 +342,10 @@ describe('handleManualSchedule', () => {
     });
 
     it('non-schedule-triggered registration cannot be manually triggered (side-effect-free)', async () => {
-      // The schedule-only restriction prevents Platform from using
-      // `run.manual_schedule.request` to dispatch arbitrary registrations
-      // that just happen to exist on this orchestrator (e.g., push- or
-      // pull_request-triggered workflows). Without this gate, the rerun
-      // surface would have an alternate dispatch path with a
+      // The schedule-only restriction stops the Platform from using
+      // `run.manual_schedule.request` to dispatch any registration on this
+      // orchestrator (e.g. push- or pull_request-triggered workflows). Without
+      // it, the rerun surface would gain an alternate dispatch path with a
       // strictly looser trust model.
       const h = makeDeps(
         makeRegistration({

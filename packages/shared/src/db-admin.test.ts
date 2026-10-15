@@ -3,6 +3,7 @@ import type { Migration, MigrationProvider } from 'kysely/migration';
 import pg from 'pg';
 import {
   computeMigrationsHash,
+  dropAndCreateDatabase,
   ensureDatabase,
   maskDatabaseUrl,
   parseDatabaseUrl,
@@ -140,9 +141,8 @@ describe('computeMigrationsHash', () => {
 
 // ── context *Direct helpers ──────────────────────────────────────────
 //
-// These use a mocked pg.Pool — we assert the SQL text and parameter bindings
-// without hitting a real DB. ON CONFLICT semantics and the JSONB serialisation
-// round-trip need a real PostgreSQL, so this file does not cover them.
+// A mocked pg.Pool: SQL text and bindings only. ON CONFLICT semantics and the
+// JSONB round-trip need a real PostgreSQL and are not covered here.
 
 interface MockQueryResult {
   rows: Record<string, unknown>[];
@@ -243,6 +243,25 @@ describe('purgeContextsDirect', () => {
     ]);
     expect(pool.calls[1].params).toEqual([]);
     expect(pool.calls[2].params).toEqual([]);
+  });
+});
+
+describe('dropAndCreateDatabase', () => {
+  let pool: ReturnType<typeof installPoolMock>;
+  afterEach(() => pool?.restore());
+
+  // fails-when: the drop and the connection terminate are separate statements — a client
+  // that reconnects between them fails the DROP with "is being accessed by other users"
+  it('drops with FORCE in one statement, then recreates the database', async () => {
+    pool = installPoolMock([
+      { rows: [], rowCount: 0 },
+      { rows: [], rowCount: 0 },
+    ]);
+    await dropAndCreateDatabase('postgresql://kici:pw@localhost:5432/platform');
+    expect(pool.calls.map((c) => c.sql)).toEqual([
+      'DROP DATABASE IF EXISTS "platform" WITH (FORCE)',
+      'CREATE DATABASE "platform" OWNER "kici"',
+    ]);
   });
 });
 
@@ -963,9 +982,8 @@ describe('listCheckRunTrackingDirect', () => {
     expect(pool.calls[0].sql).toMatch(/build_creation_state/);
   });
 
-  // The column is BIGINT; node-postgres maps int8 to a string. The `::text`
-  // cast pins that at the query level so the declared type stays true even if a
-  // global int8 type parser is added later.
+  // BIGINT maps to a string in node-postgres; `::text` pins that so the declared
+  // type holds even if a global int8 parser is added.
   it('selects check_run_id as text so the BIGINT never arrives as a lossy number', async () => {
     pool = installPoolMock([{ rows: [], rowCount: 0 }]);
     await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', { sha: 'abc123' });
@@ -1001,9 +1019,8 @@ describe('listCheckRunTrackingDirect', () => {
     expect(pool.endCalls).toBe(1);
   });
 
-  // `check_run_id` answers "did we create it?"; only `terminal_sent_at`
-  // answers "did we complete it?". Selecting it is what makes the command able
-  // to attribute a check run that never left `queued`.
+  // Only `terminal_sent_at` answers "did we complete it?", which lets the
+  // command attribute a check run that never left `queued`.
   it('selects terminal_sent_at so a completed update is distinguishable', async () => {
     pool = installPoolMock([{ rows: [], rowCount: 0 }]);
     await listCheckRunTrackingDirect('postgresql://u:p@h:5432/d', { sha: 'abc123' });
@@ -1124,9 +1141,7 @@ describe('registerWorkflowManualDirect', () => {
   });
 });
 
-// Suppress unused-import warnings if lint is aggressive about the `vi`
-// / `beforeEach` imports (they're re-exported to keep future additions
-// symmetric with other test files in the monorepo).
+// Keeps the `vi` / `beforeEach` imports used.
 void beforeEach;
 void vi;
 

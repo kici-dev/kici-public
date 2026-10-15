@@ -1,31 +1,12 @@
 /**
- * Dependency tarball creation for build agents.
+ * Packs a build agent's installed dependency closure into a gzip tarball for
+ * the dep cache, **repo-root-relative** (cwd = clone root), so restore is one
+ * layout for every package manager (entries: `closureEntries`). pnpm and yarn
+ * link `.kici/node_modules` into the root store and in-repo siblings outside
+ * `.kici/`, so those travel with it or the links dangle.
  *
- * After installing dependencies the build agent packs the dependency closure
- * into a gzip tarball for upload to the dep cache. The closure is packed
- * **repo-root-relative** (cwd = the clone root) so restore is a single layout
- * regardless of package manager:
- *
- * - npm: just `.kici/node_modules`.
- * - pnpm: `.kici/node_modules` plus the repo-root `node_modules/.pnpm` virtual
- *   store and the in-repo `workspace:` sibling package directories `.kici`
- *   depends on (with their built output). pnpm lays `.kici/node_modules` out as
- *   symlinks into the root store and into sibling dirs that live outside
- *   `.kici/`, so packing `.kici/node_modules` alone would capture dangling
- *   links — the store and siblings must travel together.
- * - yarn (classic + berry): the resolved node_modules root (standalone `.kici`
- *   → `.kici/node_modules`; hoisted workspace member → the repo-root
- *   `node_modules`) plus the in-repo sibling package directories `.kici` depends
- *   on (with their built output), whose symlinks would dangle otherwise. Berry
- *   runs with a forced `nodeLinker: node-modules`, so its tree has the same
- *   node_modules shape as classic and is packed identically (the flavor only
- *   changes how siblings are referenced — version range vs `workspace:`/`portal:`
- *   — not the packed layout).
- *
- * Uses tar.gz (Node.js built-in zlib, no external binary) in portable mode to
- * strip user/group info for cross-machine consistency; symlinks are preserved
- * as symlinks so the pnpm link graph restores intact. Hard-linked files are
- * packed as regular files, each with its own content.
+ * Portable mode strips user/group info; symlinks stay symlinks so the pnpm link
+ * graph restores intact; hard links are packed as regular files.
  */
 
 import { existsSync } from 'node:fs';
@@ -41,25 +22,20 @@ import { collectInRepoSiblings, resolveYarnNodeModulesRoot } from './workspace-s
 const logger = createLogger({ prefix: 'dep-packer' });
 
 /**
- * Pack the dependency closure into a gzip tarball and compute its SHA-256 hash.
+ * Pack the dependency closure and compute its SHA-256 hash.
  *
- * @param kiciDir - Path to the `.kici/` directory containing node_modules/.
- * @returns Object with the tarball Buffer and its SHA-256 hash string.
- * @throws Error if `.kici/node_modules` does not exist.
+ * @throws Error if the node_modules root (`.kici/node_modules`, or a hoisted
+ *   yarn member's repo-root `node_modules`) does not exist.
  */
 export async function packNodeModules(kiciDir: string): Promise<{ tarball: Buffer; hash: string }> {
   const workDir = dirname(kiciDir);
-  // Detect from the cloned repo's committed manifests (repo root, then .kici/),
-  // never the agent's own launch env. Mirrors dep-installer's detection so the
-  // packed layout matches how the deps were installed.
+  // Mirrors dep-installer's manifest-only detection, so the layout matches the install.
   const packageManager =
     (await detectPackageManagerFromManifests(workDir)) ??
     (await detectPackageManagerFromManifests(kiciDir)) ??
     PackageManager.Npm;
 
-  // A yarn workspace member hoists deps to the repo-root node_modules (no
-  // `.kici/node_modules`), so check the resolved root for yarn; npm/pnpm always
-  // lay down `.kici/node_modules`.
+  // A yarn workspace member hoists to the repo-root node_modules.
   const nmRoot =
     packageManager === PackageManager.Yarn
       ? resolveYarnNodeModulesRoot(workDir, kiciDir)
@@ -73,11 +49,9 @@ export async function packNodeModules(kiciDir: string): Promise<{ tarball: Buffe
   logger.info('Packing dependency closure into tarball', { dir: workDir, packageManager, entries });
   const startTime = Date.now();
 
-  // The closure packs with its mtimes, so two independent installs of the same
-  // lockfile produce different bytes and a different `depsHash`. That is fine:
-  // the dep cache is content-addressed and the `<lockfileHash>.hash` pointer
-  // is re-published on every upload, so a re-pack lands a new object and the
-  // pointer follows it. Do not read this as byte-reproducible packing.
+  // Not byte-reproducible: mtimes are packed, so two installs of one lockfile
+  // differ in `depsHash`. Fine, because the cache is content-addressed and every
+  // upload re-publishes the `<lockfileHash>.hash` pointer.
   const { tarball, hash } = await packGzipTarball(workDir, entries);
 
   const sizeMB = (tarball.length / (1024 * 1024)).toFixed(2);
@@ -91,13 +65,10 @@ export async function packNodeModules(kiciDir: string): Promise<{ tarball: Buffe
 }
 
 /**
- * Compute the repo-root-relative tar entries for the dependency closure. npm
- * needs only `.kici/node_modules`. pnpm additionally needs the root store and
- * the in-repo workspace siblings `.kici` resolves. yarn (classic + berry) packs
- * the resolved node_modules root (standalone → `.kici/node_modules`; hoisted
- * workspace member → root `node_modules`) plus the in-repo siblings, which it
- * links but does not place in the store. Berry's forced node-modules linker
- * gives it the same packed shape as classic.
+ * Repo-root-relative entries. npm: `.kici/node_modules`. pnpm: that plus the
+ * root `node_modules/.pnpm` store and in-repo siblings. yarn: the resolved
+ * node_modules root plus in-repo siblings; berry's forced node-modules linker
+ * packs the same shape as classic.
  */
 async function closureEntries(
   workDir: string,
@@ -124,6 +95,5 @@ async function closureEntries(
     return entries;
   }
 
-  // npm: just .kici/node_modules
   return [relative(workDir, join(kiciDir, 'node_modules'))];
 }

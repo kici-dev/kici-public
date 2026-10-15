@@ -33,14 +33,11 @@ describe('buildSelfContainedAgentPackage', () => {
       outDir: out,
     });
 
-    // version-keyed path
     expect(res.tarballPath).toBe(path.join(out, '0.2.0', 'kici-agent-linux-x64.tar.gz'));
     expect(existsSync(res.tarballPath)).toBe(true);
     expect(existsSync(`${res.tarballPath}.sha256`)).toBe(true);
     expect(res.sha256).toMatch(/^[0-9a-f]{64}$/);
-    // sha256 sidecar content matches
     expect(readFileSync(`${res.tarballPath}.sha256`, 'utf-8')).toContain(res.sha256);
-    // install + node called for the right platform/version
     expect(installMock).toHaveBeenCalledWith(
       expect.objectContaining({ version: '0.2.0', platform: 'linux-x64' }),
     );

@@ -1,12 +1,9 @@
 /**
  * Resolve a job's container spec into something a runtime can pull with.
  *
- * The lock carries credential REFERENCES (`<context>:<secret-name>`), never
- * material — so somebody has to turn those into an authconfig, and three call
- * sites need the identical answer: the agent's container sandbox, the container
- * scaler backend, and the bare-metal backend in container mode. One resolver
- * keeps them from drifting into three subtly different readings of the same
- * lock field.
+ * The lock carries credential REFERENCES (`<context>:<secret-name>`), never material. The
+ * agent's container sandbox, the container scaler backend and the bare-metal backend in
+ * container mode share this one resolver so their readings of the lock field cannot drift.
  */
 
 import { registryHostFromImageRef } from '@kici-dev/engine/scaler/registry-auth';
@@ -29,11 +26,9 @@ export interface ResolveContainerSpawnDeps {
 /**
  * Read one half of a `Sourced<Name>` pair.
  *
- * Mirrors `GitCredentialBroker.sourced` deliberately — same vocabulary, same
- * precedence — with one tightening: setting BOTH halves is an error rather
- * than a silent preference, matching the wire schema's `sourced()` refinement.
- * A workflow that sets both has two different intentions in one field, and
- * quietly honouring one of them is how the wrong credential gets used.
+ * Mirrors `GitCredentialBroker.sourced` (same vocabulary and precedence), except that setting
+ * BOTH halves is an error, matching the wire schema's `sourced()` refinement: quietly honouring
+ * one of two intentions is how the wrong credential gets used.
  */
 async function sourced(
   bag: Record<string, string | undefined>,
@@ -72,14 +67,9 @@ async function sourced(
 }
 
 /**
- * Resolve just the registry credentials for a job's container.
- *
- * Split out of {@link resolveContainerSpawn} because the two consumers diverge
- * for a dockerfile build: there is no image for the SCALER to spawn an agent
- * from, but the AGENT still needs credentials to pull the Dockerfile's own
- * `FROM` base.
- *
- * Returns `undefined` when the job declared no credentials at all.
+ * Resolve just the registry credentials for a job's container; `undefined` when the job
+ * declared none. Separate from {@link resolveContainerSpawn} because for a dockerfile build the
+ * SCALER has no image to spawn from, but the AGENT still needs credentials for the `FROM` base.
  */
 export async function resolveContainerRegistryAuth(
   container: LockContainer,
@@ -95,10 +85,9 @@ export async function resolveContainerRegistryAuth(
   const username =
     auth.username ?? (await sourced(bag, 'username', deps, false)) ?? 'x-access-token';
 
-  // A dockerfile build names its base image INSIDE the Dockerfile, so there is
-  // no reference to derive the registry host from and the author supplies it.
-  // The SDK already requires it; this is the second gate, because a lock file
-  // is repo content and is not trusted.
+  // A dockerfile build names its base INSIDE the Dockerfile, so the author
+  // supplies the registry host. The SDK requires it too; this second gate
+  // exists because a lock file is untrusted repo content.
   const serveraddress = auth.registry ?? (image ? registryHostFromImageRef(image) : undefined);
   if (serveraddress === undefined) {
     throw new Error(
@@ -111,14 +100,13 @@ export async function resolveContainerRegistryAuth(
 }
 
 /**
- * Turn a lock `container` field into an image plus, when the job declared
- * credentials, an authconfig for the registry that image lives in.
+ * Turn a lock `container` field into an image plus, when the job declared credentials, an
+ * authconfig for that image's registry.
  *
- * Returns `undefined` for a job with no container at all — and for a job that
- * BUILDS its image, because the scaler cannot spawn an agent from an image that
- * does not exist yet. That job is run by an ordinary agent, which nests the
- * container after it has cloned and built. So a caller can treat "no container",
- * "container without auth" and "container built from a dockerfile" distinctly.
+ * Returns `undefined` for no container, and for a job that BUILDS its image: the scaler cannot
+ * spawn from an image that does not exist yet, so an ordinary agent runs it and nests the
+ * container after clone and build. A caller can treat "no container", "container without auth"
+ * and "container built from a dockerfile" distinctly.
  */
 export async function resolveContainerSpawn(
   container: LockContainer,

@@ -1,26 +1,18 @@
 /**
  * Test harness for the per-migration real-Postgres suites.
  *
- * A test named `NNN_thing.test.ts` documents the schema that migration `NNN`
- * produces, so it must apply the migration set only as far as `NNN`. Applying
- * the whole set instead runs the assertions against the schema at the head of
- * the migration list, where a later migration may already have dropped or
- * reshaped the column under test — the test then fails, or passes for the wrong
- * reason. Those suites only execute when `KICI_TEST_ADMIN_DATABASE_URL` is set,
- * so that rot stays invisible in a normal `pnpm test` run.
+ * A test named `NNN_thing.test.ts` documents the schema migration `NNN` produces, so it applies
+ * the set only as far as `NNN`: at the head of the list a later migration may have dropped or
+ * reshaped the column under test, and the test fails or passes for the wrong reason. These
+ * suites run only when `KICI_TEST_ADMIN_DATABASE_URL` is set, so that rot is invisible in a
+ * normal `pnpm test`.
  *
- * The harness derives the target from the calling test file's own URL, so a
- * test can neither name the wrong migration nor drift when a file is renamed.
- * It has no fallback to the whole set: an unknown or no-op target throws.
+ * The target comes from the calling test file's own URL, so a test cannot name the wrong
+ * migration or drift on rename. There is no fallback to the whole set: an unknown or no-op
+ * target throws. `migrateToPreviousMigration()` gives a DATA migration the state one step
+ * earlier, derived from the migration list.
  *
- * A DATA migration needs the state one step earlier as well, so it can insert
- * the rows it is supposed to rewrite: `migrateToPreviousMigration()` provides
- * it, deriving that target from the migration list rather than from a name the
- * test spells out.
- *
- * Repo/store tests outside `migrations/` (host roster, artifact store, the repo
- * suites) legitimately want head-of-list schema and use `migrateToLatest()`
- * directly instead.
+ * Repo/store tests outside `migrations/` want head-of-list schema and use `migrateToLatest()`.
  */
 import type { Kysely } from 'kysely';
 import { Migrator, type MigrationResultSet } from 'kysely/migration';
@@ -29,11 +21,8 @@ import { fileURLToPath } from 'node:url';
 import { createMigrationProvider } from './migration-provider.js';
 
 /**
- * Derive `030_held_runs_env_set_null` from a
- * `.../migrations/030_held_runs_env_set_null.test.ts` module URL.
- *
- * Throws when the caller is not a per-migration test, so a copy-paste into an
- * unrelated suite fails loudly instead of silently migrating somewhere odd.
+ * Derive `030_held_runs_env_set_null` from a `.../migrations/030_held_runs_env_set_null.test.ts`
+ * URL. Throws for a non-per-migration caller, so a copy-paste into another suite fails loudly.
  */
 export function migrationNameFromTestUrl(testUrl: string): string {
   const name = basename(fileURLToPath(testUrl)).replace(/\.test\.tsx?$/, '');
@@ -48,14 +37,12 @@ export function migrationNameFromTestUrl(testUrl: string): string {
 }
 
 /**
- * Apply migrations `001..NNN` inclusive, where `NNN` is the migration the
- * calling test file is named after. Pass `import.meta.url` as `testUrl`.
+ * Apply migrations `001..NNN` inclusive, `NNN` being the calling test file's migration. Pass
+ * `import.meta.url` as `testUrl`.
  *
- * Returns Kysely's result set so callers keep their own error handling
- * (`if (error) throw error` / `expect(error).toBeUndefined()`). A target that
- * does not exist surfaces as `error`; a target that applied nothing, or stopped
- * somewhere other than itself, throws — neither can silently degrade into
- * "the whole migration set ran".
+ * Returns Kysely's result set so callers keep their own error handling. A missing target
+ * surfaces as `error`; a target that applied nothing, or stopped elsewhere, throws — neither
+ * silently degrades into "the whole migration set ran".
  */
 export async function migrateToOwnMigration<DB>(
   db: Kysely<DB>,
@@ -88,20 +75,15 @@ export async function migrateToOwnMigration<DB>(
 }
 
 /**
- * Apply migrations `001..NNN-1` — everything up to, but NOT including, the
- * migration the calling test file is named after. Pass `import.meta.url`.
+ * Apply migrations `001..NNN-1`: up to, but NOT including, the calling test file's migration.
+ * Pass `import.meta.url`.
  *
- * This is the pre-migration state a DATA migration has to be tested from. A
- * data migration rewrites rows that already exist, so its test has to straddle
- * it: migrate here, insert the rows an upgraded database actually holds, then
- * call {@link migrateToOwnMigration} and assert what moved. Going straight to
- * `migrateToOwnMigration` leaves no window to insert anything, so the
- * assertions would run against rows the migration never saw — a check that
- * passes identically with the migration body deleted.
+ * A DATA migration's test straddles it: migrate here, insert the rows an upgraded database
+ * holds, then call {@link migrateToOwnMigration} and assert what moved. Without this window the
+ * assertions run against rows the migration never saw, and pass with its body deleted.
  *
- * The target is derived from the migration list, so the caller never names the
- * previous migration and cannot drift when one is inserted before it. A test
- * for the very first migration throws, since there is no earlier state.
+ * The target comes from the migration list, so it cannot drift when a migration is inserted
+ * before it. The first migration throws: there is no earlier state.
  */
 export async function migrateToPreviousMigration<DB>(
   db: Kysely<DB>,

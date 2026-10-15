@@ -2,12 +2,9 @@
  * Interface patterns the Firecracker host setup marks unmanaged in
  * NetworkManager.
  *
- * A leaf module on purpose: it imports nothing, so an out-of-package consumer
- * can read the constant without pulling the orchestrator runtime graph in with
- * it. A NetworkManager drift watchdog derives its
- * expected-pattern set from here rather than re-typing the patterns — a second
- * copy desyncs silently the moment a pattern is added. `host-network.ts`
- * re-exports it and renders `NM_CONF_CONTENT` from it, so the drop-in and the
- * watchdog can never disagree.
+ * A leaf module on purpose: an out-of-package consumer (a NetworkManager drift
+ * watchdog) reads the constant without the orchestrator runtime graph, rather
+ * than re-typing a copy that desyncs silently. `host-network.ts` renders
+ * `NM_CONF_CONTENT` from it, so the drop-in and the watchdog never disagree.
  */
 export const FIRECRACKER_NET_INTERFACES = ['kici-*'] as const;

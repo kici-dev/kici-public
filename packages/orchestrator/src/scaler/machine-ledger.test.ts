@@ -42,11 +42,9 @@ describe('MachineLedger', () => {
   });
 
   it('coordinates reservations across two ledger instances on the same pool', async () => {
-    // Two orchestrators competing for one 4-cpu pool. Each takes 3 cpus.
+    // Two orchestrators compete for one 4-cpu pool: a second 3-cpu request is refused.
     expect(await ledgerA.tryReserve('pool-1', 'agent-a1', 3, 0)).toBe(true);
-    // Second orchestrator's request would push the total to 6 → reject.
     expect(await ledgerB.tryReserve('pool-1', 'agent-b1', 3, 0)).toBe(false);
-    // Smaller request fits.
     expect(await ledgerB.tryReserve('pool-1', 'agent-b2', 1, 0)).toBe(true);
   });
 
@@ -78,8 +76,7 @@ describe('MachineLedger', () => {
   });
 
   it('serializes concurrent reservations correctly under contention', async () => {
-    // 10 concurrent reservations, each requesting 1 cpu, into a 4-cpu pool.
-    // Exactly 4 must succeed.
+    // 10 concurrent 1-cpu reservations into a 4-cpu pool: exactly 4 succeed.
     const attempts = await Promise.all(
       Array.from({ length: 10 }, (_, i) => ledgerA.tryReserve('pool-1', `agent-${i}`, 1, 0)),
     );

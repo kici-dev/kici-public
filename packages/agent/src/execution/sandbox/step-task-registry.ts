@@ -7,16 +7,9 @@ export interface StepTaskSlot {
 }
 
 /**
- * Per-task replacement for the runner's former `currentStepSecrets` /
- * `currentStepDispose` single-slots.
- *
- * The runner used to remember only the *most recent* step's secrets handle and
- * dispose closure; the access-log / mount-record / dispose reader callbacks read
- * that single slot. Under sequential execution that is correct (one step at a
- * time), but two concurrently-running steps would clobber each other's
- * secrets-audit trail. Keying every slot by the step's index keeps each step's
- * audit trail and teardown isolated — sequential behavior is identical, and
- * concurrent `parallel()` children stay correct.
+ * Keyed by step index so concurrent `parallel()` children keep isolated
+ * secrets-audit trails and teardown; a single shared slot would let two
+ * running steps clobber each other's.
  */
 export class StepTaskRegistry {
   #slots = new Map<number, StepTaskSlot>();

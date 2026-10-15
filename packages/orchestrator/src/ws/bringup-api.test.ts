@@ -97,10 +97,9 @@ describe('createEnsureInitRunnerHandler', () => {
   });
 
   it('does NOT no-op (brings up) when the target row is stale / not currently live', async () => {
-    // The convergence handoff guard keys on derived `ready`: a declared host
-    // whose last_seen is stale (the fresh-box case) is NOT ready, so the
-    // bring-up proceeds — this is what makes "runs on all, init-or-not" build a
-    // fresh box while re-running against a now-live box no-ops.
+    // The convergence handoff guard keys on derived `ready`: a declared host with a
+    // stale last_seen (fresh box) is NOT ready, so bring-up proceeds. That makes "runs on
+    // all, init-or-not" build a fresh box, while re-running against a live box no-ops.
     const { deps, mints } = makeDeps();
     (deps.rosterStore.get as ReturnType<typeof vi.fn>).mockResolvedValue({
       agent_id: FRESH,

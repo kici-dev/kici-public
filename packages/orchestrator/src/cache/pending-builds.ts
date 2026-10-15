@@ -1,10 +1,6 @@
 /**
- * Pending build tracker for coordinating build-then-execute pipeline.
- *
- * The orchestrator dispatches a build job and waits for the build agent to
- * finish before retrieving cache URLs and dispatching execution jobs. The
- * underlying tracker logic lives in `PendingTracker<void>`; this subclass
- * just wires the build-specific logger prefix and disconnect error.
+ * Awaits a build job in the build-then-execute pipeline, before cache URLs are
+ * retrieved and execution jobs dispatched.
  */
 
 import { PendingTracker } from './pending-tracker.js';

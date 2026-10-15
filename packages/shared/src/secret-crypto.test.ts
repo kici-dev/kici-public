@@ -23,7 +23,6 @@ describe('AES-256-GCM crypto module', () => {
     const a = encrypt(plaintext, testKey, 1, testAad);
     const b = encrypt(plaintext, testKey, 1, testAad);
     expect(a.data).not.toBe(b.data);
-    // Both should still decrypt correctly
     expect(decrypt(a, testKey, testAad)).toBe(plaintext);
     expect(decrypt(b, testKey, testAad)).toBe(plaintext);
   });
@@ -77,7 +76,6 @@ describe('deriveKey', () => {
     const key = deriveKey(hex);
     expect(key).toBeInstanceOf(Buffer);
     expect(key.length).toBe(32);
-    // Verify it decoded correctly
     expect(key[0]).toBe(0xab);
   });
 

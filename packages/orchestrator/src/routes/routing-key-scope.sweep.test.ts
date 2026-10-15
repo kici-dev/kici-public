@@ -1,18 +1,14 @@
 /**
  * Per-file 403 sweep for routing-key-scoped admin tokens.
  *
- * Each describe block exercises one admin route file, demonstrating
- * that a token carrying `routingKey: 'github:42'` is rejected when it
- * targets a different routing key (or hits an orchestrator-wide /
- * org-only route that refuses routing-key tokens outright). The happy
- * paths (matching routing key, unscoped token) are already covered
- * by the per-file tests next to each route file — this sweep
- * deliberately focuses on the deny case to prevent silent regressions.
+ * Each describe block shows, for one admin route file, that a token carrying
+ * `routingKey: 'github:42'` is rejected on a different routing key (or on an
+ * orchestrator-wide / org-only route that refuses routing-key tokens outright).
+ * The per-file tests cover the happy paths; this sweep covers the deny case.
  *
- * The secret routes are the exception: they have no matching-routing-key
- * happy path at all, because secret scope names and routing keys are
- * disjoint namespaces. A scoped token is refused on every secret route,
- * including one named after its own routing key.
+ * The secret routes have no matching-routing-key happy path: secret scope
+ * names and routing keys are disjoint namespaces, so a scoped token is refused
+ * on every secret route, even one named after its own routing key.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
@@ -51,9 +47,8 @@ interface ScopedTokenInfo {
 }
 
 /**
- * Build a TokenManager stub whose `validate` returns the given
- * scoped-token info for every call. The tests use this to drive each
- * route's per-file auth middleware end-to-end.
+ * A TokenManager whose `validate` always returns the given scoped-token info,
+ * driving each route's per-file auth middleware end-to-end.
  */
 function scopedTokenManager(info: ScopedTokenInfo) {
   return { validate: vi.fn().mockResolvedValue(info) } as any;
@@ -135,9 +130,7 @@ describe('routing-key scope sweep — admin.ts', () => {
     expect(res.status).toBe(403);
   });
 
-  // Secrets have no per-routing-key slice: routing keys and secret scope
-  // paths are disjoint namespaces. A scoped token is refused on every
-  // secret route, including one named after its own routing key.
+  // See the file header: no per-routing-key slice of secrets exists.
   it('refuses scoped token on PUT /secrets/:orgId/:scope/:key for its OWN routing key', async () => {
     const res = await request(
       app,
@@ -169,10 +162,9 @@ describe('routing-key scope sweep — admin.ts', () => {
     expect(deps.secretStore.createScope).not.toHaveBeenCalled();
   });
 
-  // Both sides name the token's own routing key on purpose: that is the only
-  // scope a routing-key match could ever have admitted, so it is the case that
-  // proves the route refuses the scoped token outright rather than refusing
-  // whichever side happens to differ.
+  // Both sides name the token's own routing key: the only scope a match could
+  // admit, so it proves the route refuses the scoped token outright rather
+  // than refusing whichever side differs.
   it('refuses scoped token on PUT /secrets/scopes/rename for its OWN routing key', async () => {
     const res = await request(app, 'PUT', 'http://localhost/api/v1/admin/secrets/scopes/rename', {
       token: VALID_TOKEN,
@@ -228,17 +220,42 @@ describe('routing-key scope sweep — admin.ts', () => {
     expect(res.status).toBe(403);
   });
 
+  // The handler returns 503 before requireUnscopedToken when no tokenStore is wired, so both
+  // cases wire one: otherwise the scoped-token refusal is never reached.
+  function agentTokenStore() {
+    return {
+      createStatic: vi.fn().mockResolvedValue({ id: 'tok-1', token: 'kici_agent_abcdefghijkl' }),
+      list: vi.fn().mockResolvedValue([]),
+    } as any;
+  }
+
+  // fails-when: requireUnscopedToken is dropped from POST /agent-tokens — the scoped token
+  // mints an orchestrator-wide agent token (201).
   it('refuses scoped token on POST /agent-tokens (orchestrator-wide)', async () => {
-    const res = await request(app, 'POST', 'http://localhost/api/v1/agent-tokens', {
+    const tokenStore = agentTokenStore();
+    const scopedApp = createAdminRoutes({ ...deps, tokenStore });
+    const res = await request(scopedApp, 'POST', 'http://localhost/api/v1/agent-tokens', {
       token: VALID_TOKEN,
       body: { labels: [] },
     });
-    // 503 is also acceptable when tokenStore is undefined; but
-    // requireUnscopedToken runs BEFORE the 503 short-circuit because
-    // it sits in the handler body itself only AFTER the tokenStore
-    // check — so for this dep wiring we instead get 503. Verify the
-    // call shape doesn't get further than the auth check.
-    expect([403, 503]).toContain(res.status);
+    expect(res.status).toBe(403);
+    expect(tokenStore.createStatic).not.toHaveBeenCalled();
+  });
+
+  // breaks-if-wrong: the same wiring must still mint for an unscoped token.
+  it('mints an agent token for an unscoped token on POST /agent-tokens', async () => {
+    const tokenStore = agentTokenStore();
+    const unscopedApp = createAdminRoutes({
+      ...deps,
+      tokenManager: scopedTokenManager({ ...ownerScopedToken(), routingKey: null }),
+      tokenStore,
+    });
+    const res = await request(unscopedApp, 'POST', 'http://localhost/api/v1/agent-tokens', {
+      token: VALID_TOKEN,
+      body: { labels: [] },
+    });
+    expect(res.status).toBe(201);
+    expect(tokenStore.createStatic).toHaveBeenCalledOnce();
   });
 });
 
@@ -264,8 +281,7 @@ describe('routing-key scope sweep — admin-runs.ts', () => {
   });
 
   it('refuses scoped token on GET /runs/:runId when the run belongs to a different routing key', async () => {
-    // Override db to return a run whose routing_key does not match the
-    // token's scope, so the handler reaches the enforcement check.
+    // A run with a foreign routing_key, so the handler reaches enforcement.
     deps.db = {
       selectFrom: () => ({
         select: () => ({
@@ -561,10 +577,9 @@ describe('routing-key scope sweep — admin-registrations.ts', () => {
 });
 
 describe('routing-key scope sweep — admin.ts-mounted children', () => {
-  // These routes are mounted under admin.ts (which sets `routingKey`
-  // on the context via its auth middleware). The sweep exercises one
-  // representative deny case per child file so a regression in the
-  // mounted middleware surfaces here.
+  // Mounted under admin.ts, whose auth middleware sets `routingKey`. One
+  // representative deny case per child file surfaces a regression in the
+  // mounted middleware.
 
   function buildAppWithMounts(overrides?: Partial<AdminRouteDeps>) {
     const sourceStore = {

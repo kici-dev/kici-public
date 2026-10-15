@@ -12,10 +12,9 @@ const LOG_ROOT_PREFIX = 'executions/';
  * Step-log objects are write-once (appended during the run, untouched after
  * finalize), so last-modified time is the correct expiry basis — a recent or
  * still-running run's objects were all written within the window and survive.
- * `ttlDays <= 0` disables the sweep (returns 0). Expired objects are collected
- * then bulk-deleted via `deleteMany` (S3 DeleteObjects), so a large sweep is a
- * handful of API calls, not one-per-object. A delete failure is logged and the
- * cleanup tick is not aborted.
+ * `ttlDays <= 0` disables the sweep (returns 0). One `deleteMany` (S3
+ * DeleteObjects) removes them, so a large sweep is a handful of API calls, not
+ * one per object. A delete failure is logged and does not abort the cleanup tick.
  *
  * @returns Number of objects deleted.
  */

@@ -1,7 +1,5 @@
 /**
- * Admin REST API routes for config management.
- *
- * Provides endpoints under /admin/config/* for:
+ * Admin config routes under /admin/config/*:
  * - seed: bulk import shared config from JSON body
  * - get: current effective config (merged local + shared + env)
  * - set: update single field in shared config
@@ -13,7 +11,7 @@
  * - rollback: rollback to specific version
  * - reload: trigger config reload
  *
- * All routes protected by Bearer token auth (reuses admin middleware pattern).
+ * All routes require Bearer token auth.
  */
 
 import { timingSafeEqual } from 'node:crypto';
@@ -30,12 +28,7 @@ import { createAdminApp } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-config' });
 
-/**
- * Result of forwarding a reload request to a peer orchestrator.
- *
- * - `result` carries the ReloadResult from the target peer when delivery succeeded.
- * - `result === null` means the target peer is not connected (or unknown).
- */
+/** `result` is null when the target peer is not connected (or unknown). */
 export interface PeerReloadForwardResult {
   result: ReloadResult | null;
 }
@@ -45,13 +38,11 @@ export interface ConfigRouteDeps {
   configReloader: ConfigReloader;
   localConfigPath?: string;
   loadLocalConfig: () => Promise<LocalConfig>;
-  /** Admin token for Bearer auth. If undefined, routes return 503. */
+  /** Bearer token; undefined makes every route return 503. */
   adminToken?: string;
   /**
-   * Forward a config reload request to a specific peer instance via the
-   * cluster peer connection. Returns the peer's ReloadResult, or `null` if
-   * the target peer is unknown / not connected. When omitted, per-instance
-   * targeting is unavailable and `target` requests return 501.
+   * Forward a reload to a peer over the cluster peer connection; `null` when the
+   * peer is unknown / not connected. Omitted → `target` requests return 501.
    */
   forwardReloadToPeer?: (
     targetInstanceId: string,
@@ -59,16 +50,12 @@ export interface ConfigRouteDeps {
   ) => Promise<ReloadResult | null>;
 }
 
-/**
- * Create admin config routes.
- * Returns a Hono app to be mounted at /admin/config.
- */
+/** Mounted at /admin/config. */
 export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
   const app = createAdminApp<BlankEnv>(logger);
 
   app.use('*', async (c, next) => {
-    // Capture into a local so TS narrows it to `string` for constantTimeEqual;
-    // a bare `deps.adminToken` property access does not narrow across the guard.
+    // A local, because a `deps.adminToken` property access does not narrow across the guard.
     const expectedToken = deps.adminToken;
     if (!expectedToken) {
       return c.json({ error: 'Admin config API not configured (no admin token)' }, 503);
@@ -79,20 +66,14 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
     }
     const token = authHeader.slice(7);
     if (!constantTimeEqual(token, expectedToken)) {
-      // The token is compared in constant time (constantTimeEqual: a byte-length
-      // guard plus timingSafeEqual), so this compare is not a prefix-timing
-      // oracle and cannot throw. This static-token check does no DB lookup, so —
-      // unlike the DB-backed boundary in routes/admin-auth.ts — its auth outcome
-      // has no lookup-failure 503; that scoping is about this auth path only, not
-      // a review verdict on the router's other outcomes.
+      // constantTimeEqual is no prefix-timing oracle and cannot throw. This
+      // static-token check does no DB lookup, so — unlike routes/admin-auth.ts —
+      // its auth outcome has no lookup-failure 503.
       //
-      // The body names the credential this router wants. These routes take the
-      // orchestrator's own secret key, while every other admin route takes the
-      // DB-backed bootstrap admin token — so an operator reaching here with a
-      // working token for those routes needs to know a different one is wanted.
-      // Distinguishing the two by 'Invalid token' against 'Invalid or expired
-      // token' asked the reader to notice one word; naming the variable is what
-      // makes the outcome legible. The token itself is never echoed.
+      // The body names the wanted credential: these routes take the
+      // orchestrator secret key, every other admin route the DB-backed bootstrap
+      // admin token, and telling them apart by one word ('Invalid token' vs
+      // 'Invalid or expired token') is not legible. The token is never echoed.
       return c.json(
         {
           error:
@@ -141,7 +122,6 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
       }
     }
 
-    // Redact sensitive values in the response
     const redacted = redactSensitiveInResponse(config as Record<string, unknown>, pathFilter);
 
     return c.json({ config: redacted, version, source: 'merged' }, 200);
@@ -159,7 +139,7 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
       return c.json({ error: 'path field is required and must be a string' }, 400);
     }
 
-    // Get latest shared config, deep-set the value, save as new version
+    // Saved as a new version of the shared config.
     const latest = await deps.sharedStore.getLatest();
     const currentConfig = latest ? (latest.config as Record<string, unknown>) : {};
 
@@ -312,9 +292,8 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
     const { drain, target } = body as { drain?: boolean; target?: string };
 
     if (target) {
-      // Forward to a specific peer instance via the cluster peer connection.
       if (!deps.forwardReloadToPeer) {
-        // Single-orchestrator deployment (no cluster) — targeting unavailable.
+        // Single-orchestrator deployment (no cluster).
         return c.json(
           { error: 'Per-instance targeting is unavailable: cluster peer routing not configured' },
           501,
@@ -335,7 +314,6 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
       return c.json(result, result.success ? 200 : 500);
     }
 
-    // Execute reload locally
     const result = await deps.configReloader.executeReload({
       source: 'http',
       drain,
@@ -348,13 +326,10 @@ export function createConfigAdminRoutes(deps: ConfigRouteDeps): Hono {
 }
 
 /**
- * Compare a presented token against the configured admin token in constant
- * time. timingSafeEqual throws when the two buffers differ in length, so the
- * byte lengths are checked first and a mismatch is rejected without calling it.
- * The length check itself leaks length; that is accepted, matching the raw-token
- * comparison in providers/generic/verification.ts. Guard on Buffer byte length,
- * not String length: a multi-byte string can share a character count with the
- * expected token yet differ in bytes, which would make timingSafeEqual throw.
+ * Constant-time token compare. timingSafeEqual throws on unequal lengths, so
+ * Buffer BYTE lengths are checked first (a multi-byte string can match the
+ * character count yet differ in bytes). The length check leaks length; that is
+ * accepted, matching the raw-token comparison in providers/generic/verification.ts.
  */
 function constantTimeEqual(provided: string, expected: string): boolean {
   const providedBuffer = Buffer.from(provided, 'utf8');
@@ -365,10 +340,7 @@ function constantTimeEqual(provided: string, expected: string): boolean {
   return timingSafeEqual(providedBuffer, expectedBuffer);
 }
 
-/**
- * Deep-delete a path from an object.
- * Removes the leaf key at the end of the dot-separated path.
- */
+/** Remove the leaf key at the end of a dot-separated path. */
 function deepDeletePath(obj: Record<string, unknown>, path: string): void {
   const segments = path.split('.');
   let current: Record<string, unknown> = obj;
@@ -390,7 +362,7 @@ function deepDeletePath(obj: Record<string, unknown>, path: string): void {
 
 /**
  * Compute differences between two config objects.
- * Returns an array of { path, localValue, sharedValue } objects.
+ * Returns an array of { path, local, shared } objects.
  */
 function computeDiff(
   local: Record<string, unknown>,
@@ -433,9 +405,8 @@ function computeDiff(
 }
 
 /**
- * Redact sensitive-looking values from a response object.
- * Simple heuristic: keys containing 'key', 'secret', 'token', 'password'
- * get their values replaced with '***REDACTED***'.
+ * Heuristic: values of keys containing 'key', 'secret', 'token' or 'password'
+ * become '***REDACTED***'.
  */
 function redactSensitiveInResponse(config: unknown, _pathFilter?: string): unknown {
   if (config === null || config === undefined) return config;

@@ -14,8 +14,10 @@ The run list is the default page when entering an organization (`/orgs/:customer
 Each run is displayed in a table row (desktop) or card (mobile) with:
 
 - **Status** -- colored badge (green = success, red = failed/error/timed out, amber = running/cancelling, yellow = queued/pending/held, gray = cancelled/skipped)
-- **Trigger** -- icon indicating the event type (push, pull request, tag, dispatch, etc.)
-- **Workflow** -- the workflow name from your `.kici/workflows/` directory
+- **Source** -- the source that delivered the event, with an icon for its kind. Hover to see the source kind and routing key
+- **Repository** -- the repository the run belongs to (e.g. `owner/repo`)
+- **Workflow** -- the workflow name from your `.kici/workflows/` directory, preceded by an icon for the trigger event. The first line of the commit message shows beneath it
+- **Event** -- the trigger event type (push, pull request, tag, dispatch, etc.)
 - **Branch** -- the git ref that triggered the run
 - **Commit** -- the first 7 characters of the commit SHA, linked to the provider (GitHub)
 - **Duration** -- how long the run took (e.g. "2m 30s")
@@ -25,8 +27,8 @@ Each run is displayed in a table row (desktop) or card (mobile) with:
 
 Each row carries the same re-run / cancel actions as the run detail page, so the common "retry a flaky run" loop no longer requires opening the run first. They appear on the desktop table, the mobile card, and the commit-grouped view:
 
-- **Re-run** -- shown on terminal-state runs (success, failed, cancelled, error, timed out) that were triggered by a webhook or are themselves a re-run. Opens the same confirmation dialog before re-running on the same commit, then navigates to the new run.
-- **Cancel** -- shown on pending, running, cancelling, or queued runs. For a running run it sends a graceful cancel; for an already-cancelling run a **Force cancel** action appears to kill it immediately without cleanup.
+- **Re-run** -- shown on terminal-state runs (success, failed, cancelled, error, timed out) that carry a trigger event or are themselves a re-run. Opens the same confirmation dialog before re-running on the same commit, then navigates to the new run.
+- **Cancel** -- shown on pending, running, cancelling, queued, or held runs. For a running run it sends a graceful cancel; for an already-cancelling run a **Force cancel** action appears to kill it immediately without cleanup.
 
 Activating a row action never navigates to the run — it runs in place and (for re-run) opens the confirmation dialog.
 
@@ -48,7 +50,7 @@ Filters persist in URL query parameters (e.g. `/runs?status=failed&branch=main`)
 
 ### Sorting
 
-Click any column header to sort the table by that column. Clicking the same header toggles between ascending and descending order. The current sort is reflected in the URL (e.g. `?sort=workflowName&dir=desc`), so sorted views are shareable.
+Click the **Status**, **Workflow**, **Duration**, or **Time** column header to sort the table by that column. Clicking the same header toggles between ascending and descending order. The current sort is reflected in the URL (e.g. `?sort=workflowName&dir=desc`), so sorted views are shareable.
 
 Sorting is server-side -- the API returns results in the requested order.
 
@@ -109,8 +111,8 @@ A summary bar above the two panels shows:
 - **Commit SHA** -- linked to the provider's commit page
 - **Duration** -- total run time
 - **Timestamp** -- relative time since the run started (hover for absolute time)
-- **Re-run button** -- available for terminal-state runs (success, failed, cancelled, error, timed out) triggered by webhooks. Opens a confirmation dialog before re-running on the same commit. After confirmation, navigates to the new run.
-- **Cancel button** -- available for pending, running, cancelling, or queued runs. For running runs, sends a graceful cancel; for already-cancelling runs, a "Force cancel" button appears to immediately kill without cleanup.
+- **Re-run button** -- available for terminal-state runs (success, failed, cancelled, error, timed out) that carry a trigger event or are themselves a re-run. Opens a confirmation dialog before re-running on the same commit. After confirmation, navigates to the new run.
+- **Cancel button** -- available for pending, running, cancelling, queued, or held runs. For running runs, sends a graceful cancel; for already-cancelling runs, a "Force cancel" button appears to immediately kill without cleanup.
 - **Lineage badge** -- if the run is a re-run, a badge shows the parent/child relationship with a link to the original run.
 
 ### Job tree

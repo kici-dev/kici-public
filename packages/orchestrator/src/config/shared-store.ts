@@ -114,7 +114,6 @@ export class SharedConfigStore {
    * Validates with sharedConfigSchema, encrypts sensitive fields,
    * and stores as a new immutable version.
    *
-   * @param config - The config object to save
    * @param createdBy - Who created this version (e.g., "cli:seed", "api:set")
    * @param description - Human-readable change description
    * @returns The new version number
@@ -124,7 +123,6 @@ export class SharedConfigStore {
     createdBy: string,
     description?: string,
   ): Promise<number> {
-    // Validate against shared config schema
     const result = sharedConfigSchema.safeParse(config);
     if (!result.success) {
       const errors = result.error.issues
@@ -136,7 +134,6 @@ export class SharedConfigStore {
     let configToStore: Record<string, unknown> = result.data as Record<string, unknown>;
     let encryptedPaths: string[] = [];
 
-    // Encrypt sensitive fields if master key is available
     if (this.masterKey) {
       const encrypted = encryptConfigFields(
         configToStore,
@@ -189,7 +186,6 @@ export class SharedConfigStore {
    * Rollback to a specific version.
    * Reads the target version and creates a new version as a copy.
    *
-   * @param targetVersion - Version number to rollback to
    * @param createdBy - Who initiated the rollback
    * @returns The new version number
    * @throws Error if target version doesn't exist
@@ -205,7 +201,6 @@ export class SharedConfigStore {
       throw new Error(`Config version ${targetVersion} not found`);
     }
 
-    // Create a new version that's a copy of the target
     // Keep the encrypted fields as-is (no re-encryption needed)
     const row = await this.db
       .insertInto('config_versions')
@@ -382,7 +377,6 @@ export class SharedConfigStore {
 
     let config: Record<string, unknown> = rawConfig;
 
-    // Decrypt if master key available and there are encrypted paths
     if (this.masterKey && encryptedPaths.length > 0) {
       config = decryptConfigFields(
         config,

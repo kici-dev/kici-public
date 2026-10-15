@@ -9,9 +9,8 @@ import { discoverOidcEndpoints } from './oidc-discovery.js';
 import { sleep } from '@kici-dev/engine';
 
 /**
- * Wrap a fetch call so that transport errors (DNS failure, connection refused,
- * TLS handshake failure) surface with the URL that failed and a hint about
- * which env var the user should check, instead of Node's bare "fetch failed".
+ * Surface transport errors (DNS, connection refused, TLS) with the failing URL
+ * and the env var to check, instead of Node's bare "fetch failed".
  */
 async function fetchOrThrow(
   url: string,
@@ -28,68 +27,49 @@ async function fetchOrThrow(
   }
 }
 
-/** Options for the PKCE authorization code flow. */
 interface PkceFlowOptions {
-  /** OIDC issuer URL (e.g., https://auth.your-domain.example.com) */
   issuer: string;
-  /** OAuth client ID for the CLI application */
   clientId: string;
-  /**
-   * Delay before the "still waiting" nudge is printed. A testing seam, not a
-   * user-facing knob — no CLI flag or env var sets it.
-   */
+  /** Delay before the "still waiting" nudge. A testing seam: no flag or env var sets it. */
   nudgeAfterMs?: number;
   /**
-   * How long to wait for the browser callback before giving up. A testing seam,
-   * not a user-facing knob — no CLI flag or env var sets it. The timeout message
-   * states five minutes literally, so a non-default value produces a message
-   * whose duration does not match; that is acceptable only because no user can
-   * set this. Promoting it to a real option means deriving the duration from it.
+   * Browser-callback timeout. A testing seam: no flag or env var sets it. The
+   * timeout message states five minutes literally, which is acceptable only
+   * because no user can change this; promoting it to a real option means
+   * deriving the message's duration from it.
    */
   timeoutMs?: number;
 }
 
-/** Options for the RFC 8628 device authorization flow. */
+/** RFC 8628 device authorization flow options. */
 interface DeviceFlowOptions {
-  /** OIDC issuer URL */
   issuer: string;
-  /** OAuth client ID for the CLI application */
   clientId: string;
 }
 
-/** Options for exchanging an OIDC token for a PAT. */
 interface ExchangeTokenOptions {
-  /** Platform API base URL */
   platformUrl: string;
-  /** OIDC access token */
+  /** OIDC access token. */
   accessToken: string;
-  /** Machine hostname for PAT naming */
+  /** Machine hostname, used to name the PAT. */
   machineName: string;
 }
 
-/** Response from the PAT exchange endpoint. */
 interface ExchangeTokenResult {
-  /** PAT identifier */
   id: string;
-  /** Raw PAT value (kici_pat_...) */
+  /** Raw PAT value (kici_pat_...). */
   token: string;
-  /** ISO 8601 expiry timestamp */
+  /** ISO 8601. */
   expiresAt: string;
 }
 
-/**
- * Generate a PKCE code verifier and challenge.
- *
- * Verifier: 32 random bytes, base64url encoded.
- * Challenge: SHA-256 of verifier, base64url encoded.
- */
+/** PKCE pair: verifier is 32 random bytes, challenge its SHA-256; both base64url. */
 function generatePkceChallenge(): { verifier: string; challenge: string } {
   const verifier = randomBytes(32).toString('base64url');
   const challenge = createHash('sha256').update(verifier).digest('base64url');
   return { verifier, challenge };
 }
 
-/** HTML page served after successful PKCE callback. */
 const SUCCESS_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -135,11 +115,10 @@ const SUCCESS_HTML = `<!DOCTYPE html>
 </html>`;
 
 /**
- * Turn a callback-server `listen` failure into an actionable message.
- *
- * The wording differs by cause on purpose: naming `KICI_CALLBACK_PORT` when the
- * port was ephemeral misdirects the user, and reporting "already in use" for a
- * permission error is a false diagnosis.
+ * Turn a callback-server `listen` failure into an actionable message. The
+ * wording differs by cause on purpose: naming `KICI_CALLBACK_PORT` for an
+ * ephemeral port misdirects the user, and "already in use" for a permission
+ * error is a false diagnosis.
  */
 function describeListenFailure(err: NodeJS.ErrnoException, listenPort: number): string {
   const escapes =
@@ -160,30 +139,21 @@ function describeListenFailure(err: NodeJS.ErrnoException, listenPort: number): 
 }
 
 /**
- * PKCE authorization code flow with localhost callback.
- *
- * Spins up a temporary HTTP server on a random port, opens the browser
- * to the IdP's authorization endpoint, captures the callback with the
- * authorization code, and exchanges it for tokens. The authorization
- * and token endpoints come from the IdP's OIDC discovery document
- * (`/.well-known/openid-configuration`) so the same flow works against
- * any spec-compliant IdP regardless of its URL conventions.
- *
- * @returns OIDC access token
+ * PKCE authorization code flow with a localhost callback server (on an
+ * ephemeral port, or `KICI_CALLBACK_PORT`). Returns the OIDC access token.
+ * Endpoints come from the IdP's OIDC discovery document, so the flow works
+ * against any spec-compliant IdP.
  */
 export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
   const { issuer, clientId, nudgeAfterMs = 90_000, timeoutMs = 5 * 60 * 1000 } = opts;
 
-  // Validate KICI_CALLBACK_PORT before the discovery round-trip — a bad
-  // env var should fail fast with a clear message, not get masked by a
-  // transport error from an unrelated IdP fetch.
+  // Validate before discovery, so a bad env var is not masked by an IdP transport error.
   let listenPort = 0;
   const callbackPortEnv = process.env.KICI_CALLBACK_PORT;
   if (callbackPortEnv) {
     const parsed = parseInt(callbackPortEnv, 10);
-    // The upper bound matters as much as the lower one: `server.listen()`
-    // rejects a port above 65535 with a synchronous RangeError, which escapes
-    // as a raw stack trace instead of reaching describeListenFailure().
+    // `server.listen()` rejects a port above 65535 with a synchronous RangeError
+    // that escapes as a raw stack trace instead of reaching describeListenFailure().
     if (isNaN(parsed) || parsed < 0 || parsed > 65535) {
       throw new Error(
         `KICI_CALLBACK_PORT must be a port number between 0 and 65535, got: "${callbackPortEnv}"`,
@@ -208,11 +178,9 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
         return;
       }
 
-      // The callback landed, so the "your browser cannot reach the callback"
-      // nudge no longer applies. Cancel it here rather than in cleanup(): the
-      // token exchange below can itself outlast the nudge delay, and telling a
-      // user mid-exchange to press Ctrl-C would abort a login that is
-      // succeeding.
+      // Cancel the nudge here, not in cleanup(): the token exchange can outlast
+      // the nudge delay, and telling a user mid-exchange to press Ctrl-C would
+      // abort a login that is succeeding.
       if (nudgeTimer) clearTimeout(nudgeTimer);
 
       const code = url.searchParams.get('code');
@@ -244,14 +212,12 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
         return;
       }
 
-      // Serve success page immediately
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end(SUCCESS_HTML);
 
       const port = (server.address() as AddressInfo).port;
 
       try {
-        // Exchange authorization code for tokens
         const tokenRes = await fetchOrThrow(
           endpoints.token_endpoint,
           {
@@ -290,11 +256,9 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
       if (server.listening) server.close();
     }
 
-    // Without an 'error' listener a failed bind emits 'error' with nobody
-    // attached, so Node raises an uncaught exception and this promise never
-    // settles. cleanup() is safe here: it guards server.close() behind
-    // server.listening (false after a failed bind) and the timers it clears
-    // are not set yet.
+    // Without this listener a failed bind raises an uncaught exception and the
+    // promise never settles. cleanup() is safe: server.listening is false after
+    // a failed bind, and the timers are not set yet.
     server.on('error', (err: NodeJS.ErrnoException) => {
       cleanup();
       reject(new Error(describeListenFailure(err, listenPort)));
@@ -316,11 +280,10 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
 
       const browserCmd = process.env.KICI_BROWSER_CMD;
       if (browserCmd === 'none') {
-        // Machine-parseable output for scripts to capture (no picocolors)
+        // Machine-parseable for scripts (no picocolors).
         console.log(`KICI_AUTH_URL=${authUrl.toString()}`);
         console.log(pc.cyan(`  Waiting for browser callback on port ${actualPort}...`));
       } else if (browserCmd) {
-        // Custom browser command with {url} template
         const cmd = browserCmd.replace('{url}', authUrl.toString());
         exec(cmd, (err) => {
           if (err) {
@@ -332,9 +295,8 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
           }
         });
       } else {
-        // Default: use open package. `open` resolves as soon as it spawns the
-        // launcher, so a launch that never displays a browser does not reject —
-        // print the URL up front so that case is still recoverable.
+        // `open` resolves once it spawns the launcher, so a browser that never
+        // appears does not reject; print the URL up front to stay recoverable.
         console.log(pc.cyan('  Opening browser for authentication...'));
         console.log(pc.dim(`  If it does not open, visit:\n  ${authUrl.toString()}`));
         open(authUrl.toString()).catch(() => {
@@ -347,11 +309,10 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
       }
     });
 
-    // A blocked callback otherwise means five silent minutes before the timeout
-    // says anything, so nudge once mid-wait. The delay has to clear a healthy
-    // interactive sign-in — typing credentials, an MFA prompt, and a cold IdP
-    // login page together run well past half a minute — because a nudge that
-    // fires during a login that is succeeding reads as advice to abort it.
+    // Nudge once mid-wait, so a blocked callback is not five silent minutes. The
+    // delay must clear a healthy sign-in (credentials, MFA, a cold IdP page run
+    // well past half a minute): a nudge during a succeeding login reads as
+    // advice to abort it.
     nudgeTimer = setTimeout(() => {
       console.log(
         pc.yellow(
@@ -376,15 +337,9 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
 }
 
 /**
- * RFC 8628 device authorization flow.
- *
- * Requests a device code from the IdP, displays the user code and
- * verification URI, then polls the token endpoint until the user
- * authorizes the device or the code expires. Endpoints come from the
- * OIDC discovery document so the same flow works against any
- * spec-compliant IdP.
- *
- * @returns OIDC access token
+ * RFC 8628 device authorization flow: shows the user code, then polls the
+ * token endpoint until the user authorizes or the code expires. Returns the
+ * OIDC access token. Endpoints come from OIDC discovery.
  */
 export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
   const { issuer, clientId } = opts;
@@ -392,15 +347,12 @@ export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
 
   const scopes = ['openid', 'profile', 'email', 'offline_access'];
 
-  // Generate PKCE parameters. Keycloak's device authorization flow enforces
-  // PKCE when the client has `pkce.code.challenge.method` set (KiCI's public
-  // clients require S256). RFC 8628 itself
-  // does not require PKCE on device flow, but sending the params is forward-
-  // compatible with PKCE-enforced IdPs and harmless against IdPs that don't
-  // enforce it. The verifier is sent back on the token-poll step below.
+  // Keycloak enforces PKCE on device flow when the client sets
+  // `pkce.code.challenge.method` (KiCI's public clients require S256). RFC 8628
+  // does not require it, and IdPs that don't enforce it ignore the params. The
+  // verifier goes back on the token poll.
   const { verifier, challenge } = generatePkceChallenge();
 
-  // Request device authorization
   const deviceAuthRes = await fetchOrThrow(
     endpoints.device_authorization_endpoint,
     {
@@ -430,10 +382,9 @@ export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
     expires_in: number;
   };
 
-  // Display instructions to user. When the IdP returns verification_uri_complete
-  // the code is embedded in the URL, so the user usually skips code entry and
-  // goes straight to login + approval. Keep the `Enter code:` substring in both
-  // branches so output-parsing scrapers (automated logins, support tooling) keep working.
+  // verification_uri_complete embeds the code, so the user usually skips code
+  // entry. Keep the `Enter code:` substring in both branches: output scrapers
+  // (automated logins, support tooling) parse it.
   console.log();
   console.log(pc.bold('  Device authorization'));
   if (deviceAuth.verification_uri_complete) {
@@ -447,7 +398,7 @@ export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
   console.log(pc.gray(`  Code expires in ${Math.floor(deviceAuth.expires_in / 60)} minutes`));
   console.log();
 
-  // Poll token endpoint (use server-specified interval; default to 5s if not provided)
+  // Server-specified interval, default 5s.
   let intervalMs = (deviceAuth.interval ?? 5) * 1000;
 
   while (true) {
@@ -462,10 +413,7 @@ export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
           client_id: clientId,
           grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
           device_code: deviceAuth.device_code,
-          // PKCE verifier — paired with the code_challenge sent on the
-          // device authorization request above. Keycloak enforces this on
-          // PKCE-required public clients; spec-strict device-flow IdPs
-          // ignore it.
+          // Pairs with the device-authorization code_challenge.
           code_verifier: verifier,
         }),
       },
@@ -484,11 +432,10 @@ export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
 
     switch (errorData.error) {
       case 'authorization_pending':
-        // User hasn't authorized yet, keep polling
         continue;
 
       case 'slow_down':
-        // Increase polling interval by 5 seconds per RFC 8628
+        // +5s per RFC 8628.
         intervalMs += 5000;
         continue;
 
@@ -506,12 +453,7 @@ export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
   }
 }
 
-/**
- * Exchange an OIDC access token for a personal access token (PAT).
- *
- * POSTs to the Platform /api/v1/cli/exchange-token endpoint with the
- * OIDC token as Bearer auth. Returns the generated PAT details.
- */
+/** Exchange an OIDC access token (Bearer) for a PAT at /api/v1/cli/exchange-token. */
 export async function exchangeTokenForPat(
   opts: ExchangeTokenOptions,
 ): Promise<ExchangeTokenResult> {

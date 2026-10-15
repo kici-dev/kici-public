@@ -106,7 +106,7 @@ describe('kici-admin org list', () => {
     expect(JSON.parse(r.stdout)).toEqual({ orgs: [{ orgId: 'org_a', sources: [S.context] }] });
   });
 
-  // fails-when: an exported KICI_DATABASE_URL switches to offline mode silently (Review Focus 2)
+  // fails-when: an exported KICI_DATABASE_URL switches to offline mode silently
   it('says so when KICI_DATABASE_URL switched it to the database', async () => {
     process.env.KICI_DATABASE_URL = 'postgres://u@h/env';
     const r = await run(['org', 'list']);
@@ -115,7 +115,7 @@ describe('kici-admin org list', () => {
     expect(r.stderr).toContain('KICI_DATABASE_URL');
   });
 
-  // fails-when: a 404 from an older orchestrator surfaces as a bare HTTP error (Review Focus 3)
+  // fails-when: a 404 from an older orchestrator surfaces as a bare HTTP error
   // breaks-if-wrong: any other HTTP error passes through unchanged
   it('names an orchestrator that predates the route, and passes other errors through', async () => {
     const missing = await run(

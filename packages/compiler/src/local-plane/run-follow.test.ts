@@ -13,9 +13,8 @@ describe('resolveAcceptanceTimeoutMs', () => {
   });
 
   it('falls back to the default for junk, empty, zero, and negative values', () => {
-    // NaN would make every `now > deadline` comparison false, silently
-    // disabling the window; 0 (what `Number('')` yields) would fail every run
-    // on its first poll. Both are worse than ignoring the typo.
+    // NaN would silently disable the window; 0 (`Number('')`) would fail every
+    // run on its first poll. Both are worse than ignoring the typo.
     for (const raw of ['2 min', '', '  ', '0', '-1', 'Infinity']) {
       expect(resolveAcceptanceTimeoutMs(undefined, raw), raw).toBe(DEFAULT_MS);
     }
@@ -85,12 +84,10 @@ describe('followRun', () => {
   });
 
   it('emits the text of a stored log envelope, not the envelope', async () => {
-    // fails-when: onLine receives `l.value` verbatim — the shape that shipped —
-    // so `kici run --local` printed {"ts":…,"level":"stdout","msg":…} for every
-    // line the job wrote. The admin step-logs route serves the store's JSONL
-    // records unchanged (reporting/step-log-reader.ts wraps each stored line
-    // as `value`), and the store writes every line as that envelope
-    // (reporting/log-writer.ts).
+    // fails-when: onLine receives `l.value` verbatim, so `kici run --local`
+    // prints {"ts":…,"level":"stdout","msg":…} for every job line. The store
+    // writes each line as that envelope (reporting/log-writer.ts) and the admin
+    // step-logs route serves it unchanged as `value` (reporting/step-log-reader.ts).
     const ENVELOPE =
       '{"ts":"2026-09-12T09:30:49.325Z","level":"stdout","msg":"✔ the committed test passes","meta":{}}';
     const emitted: string[] = [];
@@ -128,9 +125,8 @@ describe('followRun', () => {
   });
 
   it('does not conclude while a later dispatch wave is still running (no false green)', async () => {
-    // The run header reports success early (after the __build__ init job), but a
-    // real job is still running — followRun must keep polling until every job is
-    // terminal, then report the settled (failed) run.
+    // The header reports success after the __build__ init job while a real job
+    // still runs; followRun must poll until every job is terminal.
     let ticks = 0;
     const get = vi.fn(async (path: string) => {
       if (path === '/api/v1/admin/runs/run-x') {
@@ -155,9 +151,9 @@ describe('followRun', () => {
   });
 
   it('throws when the run never reaches terminal before the timeout', async () => {
-    // The jobs path must answer with a jobs array like the real admin API: the
-    // acceptance check reads it too, so a run-header-shaped response there would
-    // surface as a TypeError instead of the idle timeout under test.
+    // The jobs path returns a jobs array as the real API does: the acceptance
+    // check reads it too, and a wrong shape would throw a TypeError instead of
+    // the idle timeout under test.
     const client: RunFollowClient = {
       get: vi.fn(async (path: string) =>
         path.endsWith('/jobs')
@@ -176,10 +172,8 @@ describe('followRun', () => {
   });
 
   it('does NOT time out on a long-but-progressing run (streamed lines reset the idle window)', async () => {
-    // A run that stays "running" but streams a new line each tick must not trip
-    // the idle timeout, even though total elapsed time far exceeds it — this is
-    // the long-deploy case (tens of minutes of active output). It reaches success
-    // after several ticks well past the tiny idle window.
+    // The long-deploy case: a run streaming a line each tick must not trip the
+    // idle timeout, though total elapsed time far exceeds it.
     let tick = 0;
     const emitted: string[] = [];
     const get = vi.fn(async (path: string) => {
@@ -202,26 +196,22 @@ describe('followRun', () => {
       throw new Error(`unexpected path ${path}`);
     });
     const client: RunFollowClient = { get: get as RunFollowClient['get'] };
-    // Fake timers make each poll tick advance the clock by exactly
-    // pollIntervalMs: the idle check samples Date.now() once per iteration, so
-    // on a real clock a scheduling stall longer than the 30ms margin between
-    // the two windows below trips the idle timeout under suite load — which is
-    // a stall, not the silence the timeout exists to detect.
+    // Fake timers advance exactly pollIntervalMs per tick. On a real clock a
+    // scheduling stall over the 30ms margin between the windows below trips the
+    // idle timeout under suite load: a stall, not the silence under test.
     vi.useFakeTimers();
     try {
       const following = followRun('http://127.0.0.1:4319', 'tok', 'run-4', {
         client,
         onLine: (l) => emitted.push(l),
         pollIntervalMs: 10,
-        // Idle window smaller than total elapsed (8 ticks × 10ms = 80ms), but each
-        // inter-tick gap (10ms) is well under it — without progress-reset a
-        // total-deadline of 40ms would throw around tick 4; the per-tick streamed
-        // line keeps resetting the idle window so the run reaches success.
+        // Below total elapsed (8 ticks × 10ms = 80ms) but above each 10ms gap:
+        // without the progress reset this would throw around tick 4.
         idleTimeoutMs: 40,
         maxTotalMs: 60_000,
       });
-      // Drive the loop past its 8 ticks; the async advance flushes the mocked
-      // client between timers so each tick observes the next status.
+      // The async advance flushes the mocked client between timers, so each
+      // tick observes the next status.
       await vi.advanceTimersByTimeAsync(10 * 20);
       const outcome = await following;
       expect(outcome.status).toBe('success');
@@ -274,8 +264,8 @@ describe('followRun', () => {
         return { run: { status: polls > 3 ? 'success' : 'running' } };
       }
       if (path === '/api/v1/admin/runs/run-ok/jobs') {
-        // Claimed from the first poll (running, not queued), and terminal once
-        // the run header reports success — otherwise the follow never concludes.
+        // Claimed from the first poll, and terminal once the header reports
+        // success, or the follow never concludes.
         return {
           jobs: [
             {
@@ -330,9 +320,8 @@ describe('followRun', () => {
   });
 
   it('reports a terminal run rather than blaming acceptance for it', async () => {
-    // Cancelled before any agent could claim it: every job stays queued, so the
-    // acceptance window elapses — but the run's outcome is already known, and
-    // "no agent picked up this run" would be a misdiagnosis of a cancellation.
+    // Cancelled before any claim: jobs stay queued past the acceptance window,
+    // but "no agent picked up this run" would misdiagnose a cancellation.
     const get = vi.fn(async (path: string) => {
       if (path === '/api/v1/admin/runs/run-cancelled') return { run: { status: 'cancelled' } };
       if (path === '/api/v1/admin/runs/run-cancelled/jobs') {

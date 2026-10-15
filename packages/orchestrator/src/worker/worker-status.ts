@@ -1,11 +1,4 @@
-/**
- * Worker /status and /drain HTTP endpoint handlers.
- *
- * - GET /status -- returns worker instance info, connection state, agents, active/recent jobs
- * - POST /drain -- sets draining flag, returns active job count
- *
- * These are mounted on the worker's HTTP server in worker-core.ts.
- */
+/** Worker GET /status and POST /drain handlers, mounted in worker-core.ts. */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { InMemoryExecutionTracker } from './in-memory-execution-tracker.js';
@@ -22,12 +15,7 @@ export interface WorkerStatusDeps {
   setDraining: (v: boolean) => void;
 }
 
-/**
- * Create a handler for GET /status.
- *
- * Returns worker instance info including role, coordinator connection state,
- * draining flag, uptime, agent counts, active jobs, and recent job history.
- */
+/** GET /status; recentJobs is capped at 20. */
 export function createWorkerStatusHandler(deps: WorkerStatusDeps) {
   return (_req: IncomingMessage, res: ServerResponse) => {
     const agents = [...deps.agentRegistry.getAllEntries()];
@@ -54,12 +42,7 @@ export function createWorkerStatusHandler(deps: WorkerStatusDeps) {
   };
 }
 
-/**
- * Create a handler for POST /drain.
- *
- * Sets the draining flag to true and returns the current active job count.
- * Idempotent -- calling multiple times has no additional effect.
- */
+/** POST /drain: sets draining and returns the active job count. Idempotent. */
 export function createWorkerDrainHandler(deps: WorkerStatusDeps) {
   return (_req: IncomingMessage, res: ServerResponse) => {
     deps.setDraining(true);

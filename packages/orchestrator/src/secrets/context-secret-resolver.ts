@@ -62,7 +62,6 @@ export function buildContextSecretResolver(deps: ContextSecretResolverDeps): Sec
         getSecrets: (orgId, scope) => pgSecretStore.getSecrets(orgId, scope),
       });
     } else {
-      // External backends (Vault): values are already plaintext; decrypt is identity.
       resolverBackendStores.set(backendName, {
         getAllSecrets: async (orgId: string) => {
           const raw = await store.getAllSecrets(orgId);

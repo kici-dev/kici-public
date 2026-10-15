@@ -3,15 +3,14 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Add `org_settings.allow_untrusted_dockerfile_builds boolean NOT NULL DEFAULT false`.
  *
- * A job may build its container image from a Dockerfile in the repository. That
- * build runs arbitrary `RUN` commands on the agent host's daemon, OUTSIDE the
- * hardened posture the job's own steps get (`CapDrop: ALL`, no-new-privileges,
- * pids/memory/CPU caps) — a build cannot be capability-restricted the way a
- * container run can.
+ * A job may build its image from a repository Dockerfile, whose `RUN` commands
+ * execute on the agent host's daemon OUTSIDE the hardened step posture
+ * (`CapDrop: ALL`, no-new-privileges, pids/memory/CPU caps): a build cannot be
+ * capability-restricted like a container run.
  *
- * So the default is deny for an untrusted ref (a fork PR, an unresolved
- * contributor — the same classification the cache write scope uses). An operator
- * who wants fork PRs building their own images turns it on per org, deliberately.
+ * So it is denied by default for an untrusted ref (a fork PR, an unresolved
+ * contributor — the cache write scope's classification); an operator opts in
+ * per org.
  *
  * Idempotent: a re-run on a DB that already has the column is a no-op.
  */

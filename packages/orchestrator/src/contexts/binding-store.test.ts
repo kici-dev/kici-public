@@ -61,11 +61,8 @@ describe('BindingStore', () => {
         { scopePattern: 'databases/*' },
       ]);
 
-      // Transaction should have been used
       expect(mocks.transaction).toHaveBeenCalled();
-      // Should delete existing bindings
       expect(mocks.deleteFrom).toHaveBeenCalledWith('context_bindings');
-      // Should insert new bindings
       expect(mocks.insertInto).toHaveBeenCalledWith('context_bindings');
     });
 
@@ -135,7 +132,6 @@ describe('BindingStore', () => {
 
       await store.set('org-abc', 'env-001', []);
 
-      // Should delete existing but not insert
       expect(mocks.deleteFrom).toHaveBeenCalledWith('context_bindings');
       expect(mocks.insertInto).not.toHaveBeenCalled();
     });

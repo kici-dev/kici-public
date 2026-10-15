@@ -26,12 +26,10 @@ function createDeps(overrides?: {
   return { registry, healthChecker, syncManager, getBackend, removeBackend };
 }
 
-// A backend name is a single already-decoded Hono path param. The handlers must
-// NOT decode it a second time — a second decode either throws a URIError (500)
-// when the literal name carries a stray `%`, or silently collapses a
-// `%NN`-looking name onto a DIFFERENT backend (wrong-backend read/mutation).
-// `addBackendSchema` puts no charset restriction on `name`, so a backend
-// literally named `100%done` is creatable and both failure modes are reachable.
+// A backend name is an already-decoded Hono path param. A second decode throws
+// a URIError (500) on a stray `%`, or collapses a `%NN`-looking name onto a
+// DIFFERENT backend (wrong-backend read/mutation). `addBackendSchema` puts no
+// charset restriction on `name`, so `100%done` is creatable and both are reachable.
 describe('backend :name path param is decoded exactly once (no double-decode)', () => {
   it('GET /backends/:name forwards a literal-% name verbatim (was a 500)', async () => {
     const deps = createDeps();

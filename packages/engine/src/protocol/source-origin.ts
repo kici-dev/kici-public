@@ -8,7 +8,7 @@ import { z } from 'zod';
  * `run-remote` — a developer's local working-tree overlay (`kici run remote`):
  * the source coordinates are caller-supplied, not a triggered VCS event.
  *
- * The brand is org-asserted (derived from the orchestrator-reported
+ * The brand is org-asserted (from the orchestrator-reported
  * `local_working_tree` flag on the run). The one un-forgeable trust anchor is
  * the origin org id; the brand and the repo/ref/sha are scoped to that org's
  * infrastructure.

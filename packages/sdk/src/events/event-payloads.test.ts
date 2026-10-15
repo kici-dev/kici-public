@@ -34,7 +34,7 @@ describe('EventPayload discriminated union', () => {
       };
 
       if (event.type === 'pull_request') {
-        // After narrowing, these should be typed (not unknown)
+        // Narrowing yields the typed payload, not unknown.
         expectTypeOf(event).toEqualTypeOf<PullRequestEventPayload>();
         expect(event.payload.pull_request.number).toBe(42);
         expect(event.payload.pull_request.draft).toBe(false);
@@ -171,7 +171,7 @@ describe('EventPayload discriminated union', () => {
         customField: 'hello',
       };
 
-      // Index signature allows unknown property access (resolves to unknown)
+      // The index signature types unknown property access as unknown.
       expect(event.customField).toBe('hello');
     });
 

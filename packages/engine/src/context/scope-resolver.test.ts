@@ -125,7 +125,7 @@ describe('resolveSecretsForContext', () => {
       makeSecret('s2', 'aws/p/db', 'DB_HOST', 'deep'),
     ];
     const result = resolveSecretsForContext(bindings, secrets, decryptFn);
-    // 3 segments > 2 segments, so aws/p/db should win despite shorter string
+    // More segments wins despite the shorter string.
     expect(result).toEqual({ DB_HOST: 'decrypted:deep' });
   });
 

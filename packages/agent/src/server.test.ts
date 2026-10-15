@@ -4,13 +4,9 @@ import type { JobDispatch, JobCancel, AgentToOrchestratorMessage } from '@kici-d
 import { decideIdleShutdown } from './idle-shutdown.js';
 
 /**
- * Tests for server.ts wiring logic.
- *
- * We test the dispatch callback logic (concurrency control, drain mode, status messages)
- * in isolation rather than importing the full server.ts (which starts listeners/http).
+ * server.ts wiring (concurrency control, drain mode, status messages), tested in
+ * isolation because importing server.ts starts its listeners.
  */
-
-// --- Helpers to simulate server.ts wiring logic ---
 
 interface MockClient {
   state: string;
@@ -67,10 +63,7 @@ function makeDispatch(overrides: Partial<JobDispatch> = {}): JobDispatch {
   };
 }
 
-/**
- * Creates the onJobDispatch callback that mirrors server.ts logic.
- * This is the core wiring logic we want to test.
- */
+/** Mirrors the server.ts onJobDispatch callback. */
 function createDispatchHandler(opts: {
   client: MockClient;
   jobRunner: MockJobRunner;
@@ -80,7 +73,6 @@ function createDispatchHandler(opts: {
   const { client, jobRunner, config } = opts;
 
   return (dispatch: JobDispatch) => {
-    // Drain mode check
     if (opts.isDraining()) {
       client.sendDirect({
         type: 'job.reject',
@@ -99,7 +91,7 @@ function createDispatchHandler(opts: {
       return;
     }
 
-    // Single-job enforcement: reject if already running a job
+    // Single-job enforcement.
     if (jobRunner.activeJobs.size > 0) {
       client.sendDirect({
         type: 'job.reject',
@@ -118,7 +110,7 @@ function createDispatchHandler(opts: {
       return;
     }
 
-    // Positive dispatch acknowledgment before execution starts.
+    // Acked before execution starts.
     client.sendDirect({
       type: 'job.ack',
       messageId: randomUUID(),
@@ -127,7 +119,6 @@ function createDispatchHandler(opts: {
       timestamp: Date.now(),
     });
 
-    // Accept and execute
     jobRunner
       .execute(dispatch)
       .then(() => {
@@ -138,7 +129,6 @@ function createDispatchHandler(opts: {
       })
       .finally(() => {
         jobRunner.activeJobs.delete(dispatch.jobId);
-        // Send agent.status after completion
         client.sendDirect({
           type: 'agent.status',
           messageId: randomUUID(),
@@ -200,7 +190,6 @@ describe('Server wiring: concurrency control', () => {
   });
 
   it('rejects dispatch with agent.status when already running a job', () => {
-    // Already running one job
     jobRunner.activeJobs.set('job-1', {
       abortController: new AbortController(),
       completionPromise: new Promise(() => {}),
@@ -209,10 +198,8 @@ describe('Server wiring: concurrency control', () => {
     const dispatch = makeDispatch();
     handler(dispatch);
 
-    // Should NOT execute
     expect(jobRunner.execute).not.toHaveBeenCalled();
 
-    // Should send agent.status
     const statusMsgs = client.sentDirect.filter((m) => m.type === 'agent.status');
     expect(statusMsgs).toHaveLength(1);
     const status = statusMsgs[0] as { activeJobs: number };
@@ -262,15 +249,11 @@ describe('Server wiring: concurrency control', () => {
     const dispatch = makeDispatch();
     handler(dispatch);
 
-    // Before completion, no agent.status sent
     expect(client.sentDirect.filter((m) => m.type === 'agent.status')).toHaveLength(0);
 
-    // Complete the job
     resolveJob();
-    // Allow microtask queue to flush
     await new Promise((r) => setTimeout(r, 10));
 
-    // After completion, agent.status should be sent
     const statusMsgs = client.sentDirect.filter((m) => m.type === 'agent.status');
     expect(statusMsgs.length).toBeGreaterThanOrEqual(1);
   });
@@ -290,10 +273,8 @@ describe('Server wiring: drain mode', () => {
     const dispatch = makeDispatch();
     handler(dispatch);
 
-    // Should NOT execute
     expect(jobRunner.execute).not.toHaveBeenCalled();
 
-    // Should send agent.status
     const statusMsgs = client.sentDirect.filter((m) => m.type === 'agent.status');
     expect(statusMsgs).toHaveLength(1);
 
@@ -310,10 +291,9 @@ describe('Server wiring: drain mode', () => {
 });
 
 describe('Server wiring: drain-on-reset-failure gate', () => {
-  // Mirrors the job-completion `.finally` gate in server.ts: drain only when
-  // opted in, not already draining, and the controller's consecutive-reset
-  // failures have reached the threshold. Kept as a mirror (like the other
-  // wiring tests in this file) because the gate is inline in server.ts.
+  // Mirrors the job-completion `.finally` gate, which is inline in server.ts:
+  // drain when opted in, not already draining, and consecutive reset failures
+  // reach the threshold.
   const RESET_FAILURE_DRAIN_THRESHOLD = 3;
   function shouldDrain(
     drainOnResetFailure: boolean,
@@ -349,7 +329,7 @@ describe('Server wiring: cancel callback', () => {
   it('routes cancel to jobRunner.cancel()', () => {
     const jobRunner = createMockJobRunner();
 
-    // Simulate onJobCancel from server.ts
+    // Mirrors onJobCancel.
     const onJobCancel = (cancel: JobCancel) => {
       jobRunner.cancel(cancel.jobId, cancel.reason);
     };
@@ -379,7 +359,7 @@ describe('Server wiring: graceful shutdown', () => {
       completionPromise: jobPromise,
     });
 
-    // Simulate the shutdown wait logic from server.ts
+    // Mirrors the shutdown wait.
     const waitForJobs = async () => {
       if (jobRunner.activeJobs.size > 0) {
         await Promise.allSettled(
@@ -393,10 +373,8 @@ describe('Server wiring: graceful shutdown', () => {
       resolved = true;
     });
 
-    // Not yet resolved
     expect(resolved).toBe(false);
 
-    // Complete the job
     resolveJob();
     await shutdownPromise;
 
@@ -411,7 +389,7 @@ describe('Server wiring: graceful shutdown', () => {
       completionPromise: new Promise(() => {}),
     });
 
-    // Simulate the force-kill logic
+    // Mirrors the force-kill.
     for (const job of jobRunner.activeJobs.values()) {
       job.abortController.abort();
     }
@@ -434,10 +412,7 @@ describe('Server wiring: scaler idle shutdown', () => {
     vi.useRealTimers();
   });
 
-  /**
-   * Simulates the idle shutdown logic from server.ts.
-   * Extracted here to test the connection-gated behavior.
-   */
+  /** Mirrors the server.ts idle-shutdown timer. */
   function evaluateIdleShutdown(opts: {
     scalerManaged: boolean;
     idleTimeoutMs: number;
@@ -470,19 +445,18 @@ describe('Server wiring: scaler idle shutdown', () => {
     client.state = 'disconnected';
     const shutdownFn = vi.fn();
 
-    // Simulate the .finally() logic from server.ts
+    // Mirrors the server.ts `.finally()`.
     const scalerManaged = true;
     const idle = jobRunner.activeJobs.size === 0;
 
     if (scalerManaged && idle) {
       if (client.state !== 'registered') {
-        // Should NOT start timer -- this is the fix
+        // A disconnected agent starts no timer.
       } else {
         shutdownFn();
       }
     }
 
-    // Timer should not have been started
     expect(shutdownFn).not.toHaveBeenCalled();
   });
 
@@ -495,15 +469,12 @@ describe('Server wiring: scaler idle shutdown', () => {
       onShutdown: shutdownFn,
     });
 
-    // Simulate: client is registered, agent is idle -> start timer
     if (client.state === 'registered' && jobRunner.activeJobs.size === 0) {
       startIdleShutdownTimer();
     }
 
-    // Not yet fired
     expect(shutdownFn).not.toHaveBeenCalled();
 
-    // Advance past idle timeout
     vi.advanceTimersByTime(5001);
 
     expect(shutdownFn).toHaveBeenCalledTimes(1);
@@ -518,26 +489,21 @@ describe('Server wiring: scaler idle shutdown', () => {
       onShutdown: shutdownFn,
     });
 
-    // Step 1: Agent is idle but disconnected -- defer shutdown
     if (client.state !== 'registered') {
-      // Deferred -- timer not started
+      // Idle but disconnected: shutdown is deferred.
     }
     expect(shutdownFn).not.toHaveBeenCalled();
 
-    // Step 2: Simulate reconnection (onRegistered callback fires)
     client.state = 'registered';
-    // Route the branch through the same `decideIdleShutdown` the real
-    // client.onRegistered uses, so this case cannot drift from server.ts.
+    // The `decideIdleShutdown` the real onRegistered uses, so this cannot drift.
     if (
       decideIdleShutdown({ scalerManaged: true, activeJobs: jobRunner.activeJobs.size }) === 'idle'
     ) {
       startIdleShutdownTimer();
     }
 
-    // Timer running but not fired yet
     expect(shutdownFn).not.toHaveBeenCalled();
 
-    // Step 3: Advance past idle timeout
     vi.advanceTimersByTime(5001);
 
     expect(shutdownFn).toHaveBeenCalledTimes(1);
@@ -552,13 +518,11 @@ describe('Server wiring: scaler idle shutdown', () => {
       onShutdown: shutdownFn,
     });
 
-    // Step 1: Agent has active job when reconnecting
     jobRunner.activeJobs.set('job-1', {
       abortController: new AbortController(),
       completionPromise: new Promise(() => {}),
     });
 
-    // Step 2: Reconnection
     client.state = 'registered';
     if (
       decideIdleShutdown({ scalerManaged: true, activeJobs: jobRunner.activeJobs.size }) === 'idle'
@@ -566,7 +530,6 @@ describe('Server wiring: scaler idle shutdown', () => {
       startIdleShutdownTimer();
     }
 
-    // Step 3: Advance time -- should NOT fire
     vi.advanceTimersByTime(10000);
 
     expect(shutdownFn).not.toHaveBeenCalled();

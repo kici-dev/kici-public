@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import { ExecutionJobStatus } from '@kici-dev/engine';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 import { evaluateWave } from './wave-scheduler.js';
 
 interface ChildRow {
@@ -13,20 +14,12 @@ interface ChildRow {
   wave_fail_fast: boolean | null;
 }
 
-/**
- * Minimal Kysely stand-in for evaluateWave's single query:
- * `selectFrom('execution_jobs').select([...]).where().where().execute()`.
- */
+/** A DB whose execution_jobs query yields `children`; the rows omit the filtered columns, so all match. */
 function mockDb(children: ChildRow[]): Kysely<Database> {
-  const chain = {
-    select: () => chain,
-    where: () => chain,
-    execute: async () => children,
-  };
-  return { selectFrom: () => chain } as unknown as Kysely<Database>;
+  return createMockDb({ selectRows: children }).db as unknown as Kysely<Database>;
 }
 
-/** Build a fan-out child row with the wave policy stamped (the bounded-wave case). */
+/** A fan-out child row with the wave policy stamped (the bounded-wave case). */
 const child = (
   name: string,
   status: string,

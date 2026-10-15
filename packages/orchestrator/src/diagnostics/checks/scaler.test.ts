@@ -114,9 +114,8 @@ describe('checkScalerProvisioning retirement', () => {
       }),
     );
 
-    // `formatDiagnoseTable` (cli/commands/diagnose.ts) cuts each message at 42
-    // characters, so a marker appended after the failure text would never be
-    // rendered. Assert on the visible slice, not the whole string.
+    // `formatDiagnoseTable` (cli/commands/diagnose.ts) cuts each message at 42 characters, so
+    // a marker after the failure text is never rendered: assert on the visible slice.
     const visible = results[0].message.substring(0, DIAGNOSE_TABLE_MESSAGE_WIDTH);
     expect(visible).toContain('retiring');
     expect(visible).toContain('2 agent(s) left');

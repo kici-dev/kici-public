@@ -3,13 +3,12 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './120_cluster_settings_scaler_reaper.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 120: asserts the four event-scaler reaper
- * columns exist on `cluster_settings` as nullable BIGINTs after migrations
- * 001..120, and that up/down are idempotent. Gated on
- * `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 120: asserts the event-scaler reaper columns
+ * exist on `cluster_settings` as nullable BIGINTs after migrations 001..120,
+ * and that up/down are idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;

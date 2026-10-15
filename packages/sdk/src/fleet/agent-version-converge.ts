@@ -2,27 +2,23 @@
  * Availability-gated fleet agent auto-upgrade — the `agentVersionConverge()`
  * check-step.
  *
- * Placed in a workflow job that runs on an ops agent (one holding
- * `kici:capability:ssh-transport`), it converges a target fleet host onto the
- * orchestrator's own version:
+ * Run on an ops agent (one holding `kici:capability:ssh-transport`), it
+ * converges a target fleet host onto the orchestrator's own version:
  *
- * - **check** compares the host's staged version against the orchestrator target.
- *   Equal ⇒ in-sync (skip). Different ⇒ drift. If the target's self-contained
- *   payloads are UNAVAILABLE for the host's platform, the drift is `blocked`:
- *   the runner surfaces it (held + alarmed) and the apply refuses it, so a
- *   version skew can never be applied.
- * - **apply** (run) re-stages the target payload onto the host and restarts its
- *   agent, driven by THIS ops agent as an external actor over SSH — no
- *   self-update-handoff. It THROWS on a `blocked` drift (belt-and-suspenders on
- *   top of the check + the orchestrator-side availability gate).
+ * - **check** compares the host's staged version with the orchestrator target;
+ *   a difference is drift. If the target's self-contained payloads are
+ *   UNAVAILABLE for the host's platform, the drift is `blocked`: the runner
+ *   surfaces it (held + alarmed) and a version skew is never applied.
+ * - **apply** (run) re-stages the target payload and restarts the host's agent
+ *   from THIS ops agent over SSH — no self-update-handoff. It THROWS on a
+ *   `blocked` drift, on top of the check and the orchestrator-side gate.
  *
- * The re-stage is external-actor driven because the host's own agent cannot
- * swap its running binary underneath itself; the ops agent holds the SSH
- * transport and the host reconnects on its own persistent credential.
+ * The re-stage is external because the host's own agent cannot swap its running
+ * binary underneath itself; the host reconnects on its own persistent
+ * credential.
  *
- * Rolling + drift-approval gating comes from the shipped check-facet machinery:
- * combine with the run-level check mode and `approval: { when: 'drift' }` for a
- * controlled, health-gated roll.
+ * For a controlled, health-gated roll, combine with the run-level check mode and
+ * `approval: { when: 'drift' }`.
  */
 import { step } from '../step.js';
 import type { Step } from '../types.js';

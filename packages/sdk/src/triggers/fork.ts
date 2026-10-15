@@ -1,13 +1,10 @@
-/**
- * Fork trigger helper - creates triggers for fork events.
- * Returns a frozen ForkTriggerConfig directly.
- */
+/** Fork trigger helper for fork events. */
 
 import type { BranchPattern, ForkConfigInput, ForkTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';
 
 /**
- * Create a fork trigger configuration. No filter fields.
+ * Create a frozen fork trigger configuration. No filter fields.
  *
  * @example
  * // Match any fork event

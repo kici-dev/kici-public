@@ -26,6 +26,36 @@ async function writeYaml(dir: string, filename: string, content: string): Promis
   return filepath;
 }
 
+/** A version-1 scaler file holding one container scaler; `scaler` overrides its fields. */
+function oneScaler(scaler: Record<string, unknown>, file: Record<string, unknown> = {}) {
+  return {
+    version: 1,
+    scalers: [
+      {
+        name: 'test',
+        type: 'container',
+        maxAgents: 5,
+        labelSets: [{ labels: ['linux'], image: 'test:latest' }],
+        ...scaler,
+      },
+    ],
+    ...file,
+  };
+}
+
+/** A Firecracker scaler with every required host path and the jailer identity. */
+const FIRECRACKER_SCALER = {
+  name: 'fc',
+  type: 'firecracker',
+  maxAgents: 5,
+  firecrackerPath: '/usr/bin/firecracker',
+  jailerPath: '/usr/bin/jailer',
+  kernelPath: '/opt/kici/vmlinux',
+  uid: 1000,
+  gid: 1000,
+  labelSets: [{ labels: ['linux'], rootfsPath: '/opt/kici/rootfs.ext4' }],
+};
+
 describe('scalerFileSchema', () => {
   it('validates a minimal container scaler config', () => {
     const config = {
@@ -242,53 +272,19 @@ describe('scalerFileSchema', () => {
     expect(() => scalerFileSchema.parse(config)).toThrow();
   });
 
-  it('preserves backpressureMode in label set config', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'container-bp',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest', backpressureMode: 'drop' }],
-        },
-      ],
-    };
-
-    const result = scalerFileSchema.parse(config);
-    expect(result.scalers[0].labelSets[0].backpressureMode).toBe('drop');
-  });
-
-  it('accepts backpressureMode pause', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'container-bp',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest', backpressureMode: 'pause' }],
-        },
-      ],
-    };
-
-    const result = scalerFileSchema.parse(config);
-    expect(result.scalers[0].labelSets[0].backpressureMode).toBe('pause');
+  it.each(['drop', 'pause'])('preserves backpressureMode %s in label set config', (mode) => {
+    const result = scalerFileSchema.parse(
+      oneScaler({
+        labelSets: [{ labels: ['linux'], image: 'test:latest', backpressureMode: mode }],
+      }),
+    );
+    expect(result.scalers[0].labelSets[0].backpressureMode).toBe(mode);
   });
 
   it('rejects invalid backpressureMode', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'container-bp',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest', backpressureMode: 'invalid' }],
-        },
-      ],
-    };
-
+    const config = oneScaler({
+      labelSets: [{ labels: ['linux'], image: 'test:latest', backpressureMode: 'invalid' }],
+    });
     expect(() => scalerFileSchema.parse(config)).toThrow();
   });
 
@@ -371,83 +367,15 @@ describe('scalerFileSchema', () => {
     expect(() => scalerFileSchema.parse(config)).toThrow(/requires a 'rootfsPath' field/);
   });
 
-  it('rejects Firecracker scaler missing firecrackerPath', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'fc-missing-binary',
-          type: 'firecracker',
-          maxAgents: 5,
-          jailerPath: '/usr/bin/jailer',
-          kernelPath: '/opt/kici/vmlinux',
-          uid: 1000,
-          gid: 1000,
-          labelSets: [{ labels: ['linux'], rootfsPath: '/opt/kici/rootfs.ext4' }],
-        },
-      ],
-    };
-
-    expect(() => scalerFileSchema.parse(config)).toThrow(/requires a 'firecrackerPath' field/);
-  });
-
-  it('rejects Firecracker scaler missing jailerPath', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'fc-missing-jailer',
-          type: 'firecracker',
-          maxAgents: 5,
-          firecrackerPath: '/usr/bin/firecracker',
-          kernelPath: '/opt/kici/vmlinux',
-          uid: 1000,
-          gid: 1000,
-          labelSets: [{ labels: ['linux'], rootfsPath: '/opt/kici/rootfs.ext4' }],
-        },
-      ],
-    };
-
-    expect(() => scalerFileSchema.parse(config)).toThrow(/requires a 'jailerPath' field/);
-  });
-
-  it('rejects Firecracker scaler missing kernelPath', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'fc-missing-kernel',
-          type: 'firecracker',
-          maxAgents: 5,
-          firecrackerPath: '/usr/bin/firecracker',
-          jailerPath: '/usr/bin/jailer',
-          uid: 1000,
-          gid: 1000,
-          labelSets: [{ labels: ['linux'], rootfsPath: '/opt/kici/rootfs.ext4' }],
-        },
-      ],
-    };
-
-    expect(() => scalerFileSchema.parse(config)).toThrow(/requires a 'kernelPath' field/);
-  });
-
-  it('rejects Firecracker scaler missing uid and gid', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'fc-missing-uid-gid',
-          type: 'firecracker',
-          maxAgents: 5,
-          firecrackerPath: '/usr/bin/firecracker',
-          jailerPath: '/usr/bin/jailer',
-          kernelPath: '/opt/kici/vmlinux',
-          labelSets: [{ labels: ['linux'], rootfsPath: '/opt/kici/rootfs.ext4' }],
-        },
-      ],
-    };
-
-    expect(() => scalerFileSchema.parse(config)).toThrow(/requires a 'uid' field/);
+  it.each<[string[], RegExp]>([
+    [['firecrackerPath'], /requires a 'firecrackerPath' field/],
+    [['jailerPath'], /requires a 'jailerPath' field/],
+    [['kernelPath'], /requires a 'kernelPath' field/],
+    [['uid', 'gid'], /requires a 'uid' field/],
+  ])('rejects Firecracker scaler missing %j', (missing, error) => {
+    const scaler: Record<string, unknown> = { ...FIRECRACKER_SCALER };
+    for (const field of missing) delete scaler[field];
+    expect(() => scalerFileSchema.parse({ version: 1, scalers: [scaler] })).toThrow(error);
   });
 
   describe('a bare-metal batch path cmd.exe would read as syntax', () => {
@@ -600,53 +528,20 @@ describe('scalerFileSchema', () => {
     expect(result.gateway).toBe('192.168.100.1');
   });
 
-  it('rejects old "docker" type name', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'old-docker',
-          type: 'docker',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest' }],
-        },
-      ],
-    };
-
-    expect(() => scalerFileSchema.parse(config)).toThrow();
-  });
-
-  it('rejects old dockerHost field (strict schema)', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'old-field',
-          type: 'container',
-          maxAgents: 5,
-          dockerHost: 'tcp://192.168.1.10:2376',
-          labelSets: [{ labels: ['linux'], image: 'test:latest' }],
-        },
-      ],
-    };
-
-    expect(() => scalerFileSchema.parse(config)).toThrow(/unrecognized_keys/);
-  });
-
-  it('rejects old dockerSocket field on label set (strict schema)', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'old-socket',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest', dockerSocket: true }],
-        },
-      ],
-    };
-
-    expect(() => scalerFileSchema.parse(config)).toThrow(/unrecognized_keys/);
+  it.each<[string, Record<string, unknown>, RegExp | undefined]>([
+    ['old "docker" type name', { type: 'docker' }, undefined],
+    [
+      'old dockerHost field (strict schema)',
+      { dockerHost: 'tcp://192.168.1.10:2376' },
+      /unrecognized_keys/,
+    ],
+    [
+      'old dockerSocket field on label set (strict schema)',
+      { labelSets: [{ labels: ['linux'], image: 'test:latest', dockerSocket: true }] },
+      /unrecognized_keys/,
+    ],
+  ])('rejects %s', (_label, scaler, error) => {
+    expect(() => scalerFileSchema.parse(oneScaler(scaler))).toThrow(error);
   });
 
   it('validates a Firecracker config with two label sets (different rootfs/kernel)', () => {
@@ -801,104 +696,18 @@ describe('labelSetConfigSchema with networkPolicy', () => {
 });
 
 describe('roles validation', () => {
-  it('parses scaler with no roles field (undefined, backward compat)', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'test',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest' }],
-        },
-      ],
-    };
-    const result = scalerFileSchema.parse(config);
-    expect(result.scalers[0].roles).toBeUndefined();
-  });
-
-  it('parses roles: ["builder"] to ["builder"]', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'test',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest' }],
-          roles: ['builder'],
-        },
-      ],
-    };
-    const result = scalerFileSchema.parse(config);
-    expect(result.scalers[0].roles).toEqual(['builder']);
-  });
-
-  it('parses roles: [] to [] (execution only)', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'test',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest' }],
-          roles: [],
-        },
-      ],
-    };
-    const result = scalerFileSchema.parse(config);
-    expect(result.scalers[0].roles).toEqual([]);
-  });
-
-  it('normalizes roles: ["builder", "all"] to undefined', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'test',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest' }],
-          roles: ['builder', 'all'],
-        },
-      ],
-    };
-    const result = scalerFileSchema.parse(config);
-    expect(result.scalers[0].roles).toBeUndefined();
-  });
-
-  it('normalizes roles: ["all"] to undefined', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'test',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest' }],
-          roles: ['all'],
-        },
-      ],
-    };
-    const result = scalerFileSchema.parse(config);
-    expect(result.scalers[0].roles).toBeUndefined();
+  it.each<[string, Record<string, unknown>, string[] | undefined]>([
+    ['no roles field (undefined, backward compat)', {}, undefined],
+    ['roles: ["builder"]', { roles: ['builder'] }, ['builder']],
+    ['roles: [] (execution only)', { roles: [] }, []],
+    ['roles: ["builder", "all"] normalized', { roles: ['builder', 'all'] }, undefined],
+    ['roles: ["all"] normalized', { roles: ['all'] }, undefined],
+  ])('parses %s to %j', (_label, scaler, expected) => {
+    expect(scalerFileSchema.parse(oneScaler(scaler)).scalers[0].roles).toEqual(expected);
   });
 
   it('rejects roles: ["unknown"]', () => {
-    const config = {
-      version: 1,
-      scalers: [
-        {
-          name: 'test',
-          type: 'container',
-          maxAgents: 5,
-          labelSets: [{ labels: ['linux'], image: 'test:latest' }],
-          roles: ['unknown'],
-        },
-      ],
-    };
-    expect(() => scalerFileSchema.parse(config)).toThrow();
+    expect(() => scalerFileSchema.parse(oneScaler({ roles: ['unknown'] }))).toThrow();
   });
 
   it('rejects labels with kici: prefix in label sets', () => {
@@ -1173,40 +982,21 @@ describe('structured platform field', () => {
     expect(parsed.scalers[0].platform).toBeUndefined();
   });
 
-  it('rejects an unknown os enum value', () => {
-    expect(() =>
-      scalerFileSchema.parse({
-        version: 1,
-        globalMaxAgents: 10,
-        scalers: [
-          {
-            name: 'bad-pool',
-            type: 'bare-metal',
-            maxAgents: 2,
-            platform: { os: 'freebsd', arch: 'x64' },
-            labelSets: [{ labels: ['bare-metal'], binaryPath: '/usr/local/bin/kici-agent' }],
-          },
-        ],
-      }),
-    ).toThrow();
-  });
-
-  it('rejects an unknown arch enum value', () => {
-    expect(() =>
-      scalerFileSchema.parse({
-        version: 1,
-        globalMaxAgents: 10,
-        scalers: [
-          {
-            name: 'bad-pool',
-            type: 'bare-metal',
-            maxAgents: 2,
-            platform: { os: 'linux', arch: 'ppc64' },
-            labelSets: [{ labels: ['bare-metal'], binaryPath: '/usr/local/bin/kici-agent' }],
-          },
-        ],
-      }),
-    ).toThrow();
+  it.each([
+    ['os', { os: 'freebsd', arch: 'x64' }],
+    ['arch', { os: 'linux', arch: 'ppc64' }],
+  ])('rejects an unknown %s enum value', (_field, platform) => {
+    const config = oneScaler(
+      {
+        name: 'bad-pool',
+        type: 'bare-metal',
+        maxAgents: 2,
+        platform,
+        labelSets: [{ labels: ['bare-metal'], binaryPath: '/usr/local/bin/kici-agent' }],
+      },
+      { globalMaxAgents: 10 },
+    );
+    expect(() => scalerFileSchema.parse(config)).toThrow();
   });
 });
 
@@ -1460,26 +1250,19 @@ describe('resource caps schema', () => {
 });
 
 describe('parseMemoryString', () => {
-  it('parses megabytes', () => {
-    expect(parseMemoryString('512m')).toBe(536870912);
-    expect(parseMemoryString('512M')).toBe(536870912);
+  it.each<[string, number]>([
+    ['512m', 536870912],
+    ['512M', 536870912],
+    ['2g', 2147483648],
+    ['2G', 2147483648],
+    ['1024k', 1048576],
+    ['1024K', 1048576],
+  ])('parses %s to %d bytes', (input, bytes) => {
+    expect(parseMemoryString(input)).toBe(bytes);
   });
 
-  it('parses gigabytes', () => {
-    expect(parseMemoryString('2g')).toBe(2147483648);
-    expect(parseMemoryString('2G')).toBe(2147483648);
-  });
-
-  it('parses kilobytes', () => {
-    expect(parseMemoryString('1024k')).toBe(1048576);
-    expect(parseMemoryString('1024K')).toBe(1048576);
-  });
-
-  it('throws on invalid format', () => {
-    expect(() => parseMemoryString('512')).toThrow(/Invalid memory format/);
-    expect(() => parseMemoryString('abc')).toThrow(/Invalid memory format/);
-    expect(() => parseMemoryString('')).toThrow(/Invalid memory format/);
-    expect(() => parseMemoryString('512b')).toThrow(/Invalid memory format/);
+  it.each(['512', 'abc', '', '512b'])('throws on invalid format %j', (input) => {
+    expect(() => parseMemoryString(input)).toThrow(/Invalid memory format/);
   });
 });
 
@@ -1522,36 +1305,16 @@ describe('event scaler config', () => {
     expect(cfg.scalers[0].agentTokenTtlSeconds).toBe(900);
   });
 
-  it('rejects a type:event entry with no provisioningTargets', () => {
-    expect(() =>
-      scalerFileSchema.parse({
-        version: 1,
-        scalers: [
-          {
-            name: 'hetzner',
-            type: 'event',
-            maxAgents: 5,
-            labelSets: [{ labels: ['cloud=hetzner'] }],
-          },
-        ],
-      }),
-    ).toThrow(/provisioningTargets/);
-  });
-
-  it('rejects a type:event entry with an empty provisioningTargets array', () => {
-    expect(() =>
-      scalerFileSchema.parse({
-        version: 1,
-        scalers: [
-          {
-            name: 'hetzner',
-            type: 'event',
-            maxAgents: 5,
-            provisioningTargets: [],
-            labelSets: [{ labels: ['cloud=hetzner'] }],
-          },
-        ],
-      }),
-    ).toThrow(/provisioningTargets/);
+  it.each<[string, Record<string, unknown>]>([
+    ['no provisioningTargets', {}],
+    ['an empty provisioningTargets array', { provisioningTargets: [] }],
+  ])('rejects a type:event entry with %s', (_label, targets) => {
+    const config = oneScaler({
+      name: 'hetzner',
+      type: 'event',
+      labelSets: [{ labels: ['cloud=hetzner'] }],
+      ...targets,
+    });
+    expect(() => scalerFileSchema.parse(config)).toThrow(/provisioningTargets/);
   });
 });

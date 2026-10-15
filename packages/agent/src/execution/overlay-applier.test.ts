@@ -13,7 +13,7 @@ const IV_LENGTH = 12;
 const HKDF_INFO = 'kici-upload-encryption';
 const HKDF_SALT = Buffer.alloc(0);
 
-/** Generate an X25519 keypair (DER-encoded buffers). */
+/** X25519 keypair as DER-encoded buffers. */
 function generateKeypair(): { publicKey: Buffer; privateKey: Buffer } {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
   return {
@@ -31,17 +31,11 @@ function encryptBuffer(data: Buffer, aesKey: Buffer): Buffer {
   return Buffer.concat([iv, authTag, ciphertext]);
 }
 
-/** Compute SHA256 of a buffer. */
 function sha256(data: Buffer): string {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
 
-/**
- * Create a complete encrypted overlay tarball for testing.
- *
- * Returns the encrypted data, the CLI public key, and orchestrator private key
- * needed by the agent to decrypt.
- */
+/** An encrypted overlay tarball, plus the keys the agent decrypts it with. */
 async function createTestOverlay(
   tmpDir: string,
   files: Record<string, string>,
@@ -62,15 +56,12 @@ async function createTestOverlay(
   /** Manifest fields written over the generated ones (for malformed manifests). */
   manifestOverride: Record<string, unknown> = {},
 ): Promise<{ encryptedData: Buffer; cliPublicKey: string; orchestratorPrivateKey: string }> {
-  // Generate keypairs (simulating orchestrator and CLI)
   const orchestratorKp = generateKeypair();
   const cliKp = generateKeypair();
 
-  // Create files in a staging directory
   const stagingDir = path.join(tmpDir, 'staging');
   await fs.mkdir(stagingDir, { recursive: true });
 
-  // Build checksums and write files
   const checksums: Record<string, string> = {};
   const fileList: string[] = [];
 
@@ -97,7 +88,6 @@ async function createTestOverlay(
     fileList.push(linkPath);
   }
 
-  // Write manifest
   const manifestDir = path.join(stagingDir, '.kici-overlay-tmp');
   await fs.mkdir(manifestDir, { recursive: true });
   const manifest = {
@@ -109,7 +99,6 @@ async function createTestOverlay(
   };
   await fs.writeFile(path.join(manifestDir, 'manifest.json'), JSON.stringify(manifest));
 
-  // Create tarball
   const tarballPath = path.join(tmpDir, 'overlay.tar.gz');
   await tarCreate({ gzip: true, file: tarballPath, cwd: stagingDir }, [
     ...fileList,
@@ -118,10 +107,9 @@ async function createTestOverlay(
 
   const tarballData = await fs.readFile(tarballPath);
 
-  // Derive shared secret (CLI side: cli private + orchestrator public)
+  // CLI side: cli private + orchestrator public.
   const aesKey = deriveSharedSecret(cliKp.privateKey, orchestratorKp.publicKey);
 
-  // Encrypt tarball
   const encryptedData = encryptBuffer(tarballData, aesKey);
 
   return {
@@ -169,10 +157,8 @@ describe('overlay-applier', () => {
 
   describe('applyOverlay', () => {
     it('downloads, decrypts, and applies overlay files', async () => {
-      // Create existing file in repo
       await fs.writeFile(path.join(repoDir, 'existing.txt'), 'old content');
 
-      // Create overlay with modified + new files
       const { encryptedData, cliPublicKey, orchestratorPrivateKey } = await createTestOverlay(
         tmpDir,
         {
@@ -182,7 +168,6 @@ describe('overlay-applier', () => {
         },
       );
 
-      // Serve encrypted data via mock -- mock downloadUrl
       const downloadMod = await import('./download.js');
       vi.spyOn(downloadMod, 'downloadUrl').mockResolvedValue(encryptedData);
 
@@ -197,7 +182,6 @@ describe('overlay-applier', () => {
       expect(result.filesDeleted).toBe(0);
       expect(result.verified).toBe(true);
 
-      // Verify files were written
       const existing = await fs.readFile(path.join(repoDir, 'existing.txt'), 'utf-8');
       expect(existing).toBe('updated content');
 
@@ -209,7 +193,6 @@ describe('overlay-applier', () => {
     });
 
     it('applies deletions from manifest', async () => {
-      // Create files to be deleted in repo
       await fs.writeFile(path.join(repoDir, 'to-delete.txt'), 'will be deleted');
       await fs.mkdir(path.join(repoDir, 'src'), { recursive: true });
       await fs.writeFile(path.join(repoDir, 'src/remove-me.ts'), 'also deleted');
@@ -234,11 +217,9 @@ describe('overlay-applier', () => {
       expect(result.filesDeleted).toBe(2);
       expect(result.verified).toBe(true);
 
-      // Verify deletions
       await expect(fs.access(path.join(repoDir, 'to-delete.txt'))).rejects.toThrow();
       await expect(fs.access(path.join(repoDir, 'src/remove-me.ts'))).rejects.toThrow();
 
-      // Verify kept file
       const kept = await fs.readFile(path.join(repoDir, 'keep.txt'), 'utf-8');
       expect(kept).toBe('keep this');
     });
@@ -263,7 +244,6 @@ describe('overlay-applier', () => {
     });
 
     it('throws on checksum mismatch', async () => {
-      // Create overlay with correct checksums
       const orchestratorKp = generateKeypair();
       const cliKp = generateKeypair();
 
@@ -271,7 +251,7 @@ describe('overlay-applier', () => {
       await fs.mkdir(stagingDir, { recursive: true });
       await fs.writeFile(path.join(stagingDir, 'file.txt'), 'real content');
 
-      // Write manifest with WRONG checksums
+      // The manifest checksum is wrong.
       const manifestDir = path.join(stagingDir, '.kici-overlay-tmp');
       await fs.mkdir(manifestDir, { recursive: true });
       const manifest = {
@@ -307,7 +287,7 @@ describe('overlay-applier', () => {
     it('throws on decryption failure with wrong key', async () => {
       const { encryptedData } = await createTestOverlay(tmpDir, { 'file.txt': 'content' });
 
-      // Use a completely different keypair for decryption (will fail)
+      // A different keypair, so decryption fails.
       const wrongKp = generateKeypair();
       const wrongCli = generateKeypair();
 
@@ -962,9 +942,9 @@ describe('overlay-applier', () => {
 
     describe('deletions other entries rely on', () => {
       /**
-       * A clone with `y -> d` and `d/f -> <outside>`. Deleting `y` first used to
-       * make the written deletion path `y/f` miss, so `d/f` survived and the
-       * next write followed it out of the repository.
+       * A clone with `y -> d` and `d/f -> <outside>`. Once `y` is deleted, the
+       * written deletion path `y/f` misses, so `d/f` would survive and the next
+       * write would follow it out of the repository.
        */
       let outsideDir: string;
       beforeEach(async () => {

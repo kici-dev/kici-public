@@ -1,16 +1,9 @@
-/**
- * Audit log query command for kici-admin.
- *
- * Queries the secrets audit log with optional filters.
- */
+/** kici-admin query over the secrets audit log. */
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { cliAction } from './shared/cli-action.js';
 
-/**
- * Format audit entries as a table.
- */
 function formatAuditTable(entries: any[]): string {
   if (entries.length === 0) return 'No audit entries found.';
 

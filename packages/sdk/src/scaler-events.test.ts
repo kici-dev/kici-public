@@ -6,9 +6,8 @@ import {
   ScalerScaleDownPayload,
 } from './index.js';
 
-// Imports from './index.js', not from '@kici-dev/engine': the point of these
-// tests is that the four symbols reach a workflow author through the SDK
-// barrel, which is the only package a workflow file may import.
+// Imports from './index.js', not '@kici-dev/engine': these symbols must reach a
+// workflow author through the SDK barrel, the only package a workflow may import.
 describe('scaler events on the SDK barrel', () => {
   it('exposes the reserved event names', () => {
     expect(SCALER_EVENT_NAMES.scaleUp).toBe('kici.scaler.scale-up');

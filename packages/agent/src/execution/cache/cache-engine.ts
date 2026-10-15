@@ -1,26 +1,14 @@
 /**
  * User-facing cache engine (sandbox-side).
  *
- * Packs `CacheSpec.paths` into a gzip tarball (mirrors dep-packer's tar+sha256
- * approach) and restores a tarball by downloading it to a temp file and
- * verifying its SHA-256 before extracting (as dep-restore does). Drives the
- * orchestrator over an injected request-response transport (IPC -> agent WS ->
- * orchestrator).
+ * Packs `CacheSpec.paths` into a gzip tarball with its SHA-256 (as dep-packer
+ * does) and restores one by downloading to a temp file and verifying the
+ * SHA-256 before extracting (as dep-restore does). Talks to the orchestrator
+ * over an injected transport (IPC -> agent WS -> orchestrator).
  *
- * Path safety: each path is either `~`-prefixed (home-relative) or
- * repo-root-relative; absolute paths and `..` escapes are rejected so a
- * workflow cannot exfiltrate or clobber files outside its tree/home.
- *
- * Multi-root layout: a spec may mix repo-relative and home-relative paths.
- * Each entry is staged under an anchor prefix — `__repo__/<rel>` for
- * repo-root-relative entries, `__home__/<rel>` for `~`-prefixed entries — so a
- * single tarball can carry both roots and extract restores each group to the
- * right destination (repo entries under `workDir`, home entries under the
- * homedir). Extraction lands in a scratch dir first, then moves each group
- * into place so a partial restore never leaves half-written paths in the live
- * tree (mirrors dep-restore). The scratch dir honors `KICI_TMPDIR`, which may
- * sit on a different filesystem from the workspace, so the move falls back to
- * copy-then-remove on `EXDEV` rather than assuming a same-filesystem rename.
+ * A spec may mix repo-relative and `~`-prefixed paths: each entry is staged
+ * under `__repo__/<rel>` or `__home__/<rel>`, so one tarball carries both
+ * roots and extraction restores each group to `workDir` or the homedir.
  */
 import { Readable } from 'node:stream';
 import { homedir } from 'node:os';
@@ -39,9 +27,9 @@ const logger = createLogger({ prefix: 'cache-engine' });
 /** Bound on extracting a downloaded cache tarball; matches the dependency restore's. */
 const EXTRACT_TIMEOUT_MS = 10 * 60 * 1000;
 
-/** Override roots — exposed for tests so the home destination is sandboxable. */
+/** Root overrides, so tests can sandbox the home destination. */
 export interface CacheRoots {
-  /** Home root override (defaults to `os.homedir()`). */
+  /** Defaults to `os.homedir()`. */
   home?: string;
 }
 
@@ -66,15 +54,14 @@ export function resolveCachePath(workDir: string, p: string, roots?: CacheRoots)
 }
 
 interface AnchoredEntry {
-  /** Source absolute path of the cached entry. */
   abs: string;
-  /** Anchor prefix (`__repo__` / `__home__`) the entry stores under. */
+  /** `__repo__` or `__home__`. */
   anchor: string;
-  /** Path relative to its anchor root. */
+  /** Relative to the anchor root. */
   rel: string;
 }
 
-/** Resolve + anchor every spec path; rejects escapes via resolveCachePath. */
+/** Rejects escapes via resolveCachePath. */
 function anchorEntries(workDir: string, paths: string[], roots?: CacheRoots): AnchoredEntry[] {
   const home = roots?.home ?? homedir();
   return paths.map((p) => {
@@ -86,12 +73,9 @@ function anchorEntries(workDir: string, paths: string[], roots?: CacheRoots): An
 }
 
 /**
- * Pack the spec's paths into a gzip tarball + its SHA-256.
- *
- * Each path is copied into a staging dir under its anchor prefix
- * (`__repo__/<rel>` or `__home__/<rel>`), the staging dir is tarred (portable
- * mode strips uid/gid/mtime), and the staging dir is removed. The resulting
- * tarball self-describes which root each entry restores to.
+ * Pack the spec's paths into a gzip tarball and its SHA-256. Each path is
+ * staged under its anchor prefix and tarred in portable mode (no
+ * uid/gid/mtime), so the tarball records which root each entry restores to.
  */
 export async function packCachePaths(
   workDir: string,
@@ -105,8 +89,7 @@ export async function packCachePaths(
     for (const e of entries) {
       const dest = join(staging, e.anchor, e.rel);
       await mkdir(dirname(dest), { recursive: true });
-      // Copy preserving symlinks-as-symlinks (verbatimSymlinks) so a cached
-      // link graph restores intact, matching dep-packer's follow:false intent.
+      // verbatimSymlinks: a cached link graph restores intact (as dep-packer's follow:false).
       await cp(e.abs, dest, { recursive: true, verbatimSymlinks: true });
       topLevel.add(e.anchor);
     }
@@ -127,14 +110,10 @@ export async function packCachePaths(
 }
 
 /**
- * Move a tree from `src` to `dest`. Attempts a rename (same-filesystem, cheap)
- * and falls back to copy-then-remove only on `EXDEV` — the errno `rename(2)`
- * reports when the scratch dir (which honors `KICI_TMPDIR`) is on a different
- * filesystem from the destination workspace. `verbatimSymlinks` keeps a cached
- * symlink graph intact (mirroring packCachePaths), and `preserveTimestamps`
- * keeps mtimes stable so the fallback is byte-for-byte equivalent to the
- * rename. Any non-`EXDEV` error propagates so a real permission or corruption
- * failure is never silently turned into a copy.
+ * Rename, falling back to copy-then-remove only on `EXDEV`: the scratch dir
+ * honors `KICI_TMPDIR`, which may be on another filesystem. The copy keeps
+ * symlinks and mtimes so it matches the rename. Any other error propagates, so
+ * a real permission or corruption failure never silently becomes a copy.
  */
 async function moveOrCopy(src: string, dest: string): Promise<void> {
   try {
@@ -166,10 +145,10 @@ async function moveAnchoredGroups(
 }
 
 /**
- * Extract a cache tarball buffer, verifying its SHA-256 first, then move each
- * anchored group into place (repo entries under `workDir`, home entries under
- * the home root). Extracts into a scratch dir so a partial restore never
- * leaves half-written paths in the live tree.
+ * Verify a cache tarball's SHA-256, extract it, then move each anchored group
+ * into place (repo entries under `workDir`, home entries under the home root).
+ * Extracts into a scratch dir so a partial restore never leaves half-written
+ * paths in the live tree.
  */
 export async function extractCacheTarball(
   tarball: Buffer,
@@ -198,10 +177,9 @@ export async function extractCacheTarball(
 }
 
 /**
- * Remove a temp dir, logging instead of throwing. After an extraction that
- * failed or timed out, `tar` may still be writing into the scratch dir, and an
- * `ENOTEMPTY` from the removal must not replace the error that explains the
- * failure. A leftover sits under the temp root, outside the job's tree.
+ * Log instead of throwing: after a failed or timed-out extraction `tar` may
+ * still be writing, and an `ENOTEMPTY` must not replace the real error. A
+ * leftover sits under the temp root, outside the job's tree.
  */
 async function cleanupQuietly(dir: { path: string; cleanup(): Promise<void> }): Promise<void> {
   try {
@@ -259,9 +237,8 @@ export async function downloadAndExtractCache(
 }
 
 /**
- * Transport the cache engine uses to reach the orchestrator over IPC -> WS.
- * Backed by the agent's request/response relay (added to the IPC protocol in a
- * later wiring task).
+ * How the cache engine reaches the orchestrator (IPC -> WS), backed by the agent's
+ * request/response relay.
  */
 export interface CacheTransport {
   restore(
@@ -272,7 +249,7 @@ export interface CacheTransport {
   completeSave(key: string, tarHash: string, sizeBytes: number): Promise<void>;
 }
 
-/** Build the imperative `ctx.cache` API bound to a workDir + transport. */
+/** The imperative `ctx.cache` API. */
 export function createCacheApi(
   workDir: string,
   transport: CacheTransport,

@@ -1,38 +1,26 @@
 /**
  * Persistence of the webhook payload that started a run.
  *
- * The payload is what the dashboard's Payload tab reads and what a re-run
- * copies onto the new run, so every dispatch path that creates a run from an
- * inbound event must write it. It lives here rather than inline in one
- * dispatcher because there is more than one such path — the per-repository
- * dispatch and both organization-wide (global) dispatch paths — and a run
- * whose path forgot to write it is indistinguishable from a run whose payload
- * was never stored at all.
+ * The dashboard's Payload tab reads it and a re-run copies it forward, so every
+ * dispatch path that creates a run from an inbound event (per-repository and
+ * both organization-wide paths) must write it: a path that forgot looks the
+ * same as a payload never stored.
  */
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { LogStorage } from '../reporting/log-storage.js';
 
-// `pipeline`, not this module's own name: both call sites — the per-repository
-// dispatch and the organization-wide one — already log under that prefix, so
-// keeping it means an existing log selector keyed on it still matches every
-// line this helper emits.
+// `pipeline`, not this module's name: both call sites log under that prefix,
+// so an existing log selector keyed on it still matches this helper's lines.
 const logger = createLogger({ prefix: 'pipeline' });
 
-/**
- * Object-storage key holding the webhook payload for a run. Shared by the
- * writers and by the re-run path that copies a payload forward, so the layout
- * is stated once.
- */
+/** Object-storage key of a run's webhook payload, shared by the writers and the re-run copy. */
 export function webhookPayloadPath(runId: string): string {
   return `executions/${runId}/webhook-payload.json`;
 }
 
 /**
- * Store a run's triggering webhook payload, best-effort.
- *
- * A failure is logged and swallowed: the payload is a debugging aid, and losing
- * it must never cost the run that was about to execute. A no-op when the
- * orchestrator has no object storage configured.
+ * Best-effort: a failure is logged and swallowed, because losing a debugging
+ * aid must never cost the run. A no-op without object storage.
  */
 export async function storeWebhookPayload(args: {
   logStorage: LogStorage | undefined;

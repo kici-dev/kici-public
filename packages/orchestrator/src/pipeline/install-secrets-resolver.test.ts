@@ -15,10 +15,8 @@ import {
 } from './install-secrets-resolver.js';
 import * as metrics from '../metrics/prometheus.js';
 
-// Init telemetry so the OTel meter has a real SDK behind it for any spies
-// further down. The prometheus module already imports cleanly without an
-// initialized SDK (OTel falls back to a no-op meter), so static imports are
-// safe — this init just ensures the counters tick when we exercise them.
+// A real SDK makes the counters tick for the spies below; without it OTel
+// falls back to a no-op meter.
 beforeAll(() => {
   initTelemetry({ serviceName: 'kici-orchestrator-test', metricPrefix: 'kici_orch_' });
 });
@@ -321,9 +319,8 @@ describe('resolveInstallSecrets', () => {
   });
 
   it('persists an install-gate wait hold under the same type as a dispatch-gate one', () => {
-    // Both gates persist a wait hold under the same type, so two semantically
-    // identical holds get the same badge, the same live countdown and the same
-    // "Skip timer" button whichever gate produced them.
+    // Both gates persist a wait hold under one type, so the UI badge, countdown
+    // and "Skip timer" button match whichever gate produced it.
     expect(resolveHoldType('wait', HoldType.enum.timer)).toBe(HoldType.enum.timer);
     expect(resolveHoldType('wait', undefined)).toBe(HoldType.enum.timer);
   });
@@ -449,9 +446,7 @@ describe('resolveInstallSecrets', () => {
     if (r.decision === 'reject') expect(r.reason).toMatch(/secretResolver/);
   });
 
-  // Sanity: ProtectionGateResult import exercise so a refactor that drops the
-  // type re-export from @kici-dev/engine fails the suite loudly rather than
-  // silently breaking the resolver.
+  // Fails loudly if @kici-dev/engine stops re-exporting ProtectionGateResult.
   it('exercises ProtectionGateResult shape', () => {
     const dummy: ProtectionGateResult = { action: 'pass' };
     expect(dummy.action).toBe('pass');
@@ -459,9 +454,8 @@ describe('resolveInstallSecrets', () => {
 });
 
 describe('resolveInstallSecrets — every install context is gated', () => {
-  // Two contexts named by one workflow: `a` from the registry token, `b` from
-  // installEnv. Their rows carry real rule columns, so the real protection
-  // pipeline decides each verdict.
+  // `a` from the registry token, `b` from installEnv; real rule columns, so the
+  // real protection pipeline decides each verdict.
   const A_REVIEWED = makeEnvRow({
     id: 'env-a',
     name: 'a',
@@ -638,9 +632,8 @@ describe('resolveInstallSecrets — every install context is gated', () => {
 });
 
 describe('resolveInstallSecrets — Prometheus metrics', () => {
-  // Each install-secrets counter is its own lazy wrapper with a private `.add`
-  // closure, so a spy on one counter never sees another's calls. Spy on all
-  // three counters and aggregate their calls, then match by attribute shape.
+  // Each counter is a lazy wrapper with a private `.add` closure, so spy on
+  // every counter and match the aggregated calls by attribute shape.
   let addSpies: Array<ReturnType<typeof vi.spyOn>>;
   let durationSpy: ReturnType<typeof vi.spyOn>;
 

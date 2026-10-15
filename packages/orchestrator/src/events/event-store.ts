@@ -102,9 +102,6 @@ export class EventStore {
     return result.id;
   }
 
-  /**
-   * Retrieve a single event by ID.
-   */
   async getById(id: string): Promise<StoredEvent | null> {
     const row = await this.db
       .selectFrom('kici_events')
@@ -481,9 +478,6 @@ export class EventStore {
     this.cleanupTimer.unref();
   }
 
-  /**
-   * Stop periodic cleanup.
-   */
   stopCleanupTimer(): void {
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
@@ -491,9 +485,6 @@ export class EventStore {
     }
   }
 
-  /**
-   * Convert a DB row to a StoredEvent.
-   */
   private rowToStoredEvent(row: {
     id: string;
     event_name: string;

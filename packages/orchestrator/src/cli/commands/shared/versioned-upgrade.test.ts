@@ -1,28 +1,15 @@
 /**
- * Tests for the shared versioned-upgrade helper:
- *
- * - `getInstallBase` — name-scoped install base derivation.
- * - `resolveUpgradeTarget` — folder-anchored target resolution that builds
- *   the ServiceConfig from the on-disk manifest (rather than re-deriving
- *   paths from the service name). The four scenarios mirror the
- *   install/uninstall test matrices:
- *
- *     1. refusal when no targeting flag and no CWD manifest.
- *     2. resolution via `--instance-dir` (installBase comes from the manifest).
- *     3. resolution via `--name` (matches against listInstances output).
- *     4. resolution via CWD manifest.
- *
- * Strategy: stub the service manager's `list` method so we control what
- * the resolver sees; everything else (manifest read, index reconciliation,
- * refusal formatting) runs against real code in real tmpdirs. The
- * archive-extract + symlink-flip path needs a real release archive and is
- * out of scope here.
+ * Only the service manager's `list` is stubbed; manifest reads, index
+ * reconciliation and refusal formatting run for real in tmpdirs.
+ * `resolveUpgradeTarget` builds the ServiceConfig from the on-disk manifest,
+ * never re-deriving paths from the service name. The scenarios (refusal,
+ * `--instance-dir`, `--name`, CWD manifest) mirror the install/uninstall matrices.
  */
 
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { makeTempDir } from '@kici-dev/test-support/tmp';
 import { execSync } from 'node:child_process';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   getInstallBase,
@@ -73,10 +60,6 @@ describe('getInstallBase — name-scoped', () => {
   });
 });
 
-function mkTmp(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
-
 function makeManifest(overrides: Partial<InstanceManifest> = {}): InstanceManifest {
   return {
     component: 'orchestrator',
@@ -93,7 +76,6 @@ function makeManifest(overrides: Partial<InstanceManifest> = {}): InstanceManife
   };
 }
 
-/** Build a ServiceManager stub for one platform whose `list()` returns the supplied set. */
 function makeManager(
   listResult: DiscoveredInstance[] = [],
   platform: ServicePlatform = 'systemd',
@@ -120,9 +102,9 @@ describe('resolveUpgradeTarget — folder-anchored targeting', () => {
   let emptyCwd: string;
 
   beforeEach(() => {
-    tmpInstanceDir = mkTmp('kici-e3-i-');
-    tmpKiciRoot = mkTmp('kici-e3-c-');
-    emptyCwd = mkTmp('kici-e3-cwd-');
+    tmpInstanceDir = makeTempDir('kici-e3-i-');
+    tmpKiciRoot = makeTempDir('kici-e3-c-');
+    emptyCwd = makeTempDir('kici-e3-cwd-');
     savedCwd = process.cwd();
   });
 
@@ -273,10 +255,8 @@ describe('resolveUpgradeTarget — folder-anchored targeting', () => {
   });
 
   it('reads installBase from the manifest rather than re-deriving from name', async () => {
-    // The manifest's installBase intentionally does NOT match the
-    // getInstallBase(platform, name) value. resolveUpgradeTarget MUST
-    // honour the manifest — re-deriving would silently break instances
-    // installed with a non-default base.
+    // installBase deliberately differs from getInstallBase(platform, name):
+    // re-deriving would break instances installed with a non-default base.
     const manifest = makeManifest({
       name: 'kici-custom',
       installBase: '/var/kici-custom-base/',
@@ -477,9 +457,8 @@ describe('switchToInstalledVersion — shared switch sequence', () => {
   let instanceDir: string;
 
   beforeEach(() => {
-    installBase = mkTmp('kici-switch-base-');
-    instanceDir = mkTmp('kici-switch-inst-');
-    // Two installed versioned dirs + an active symlink pointing at the older one.
+    installBase = makeTempDir('kici-switch-base-');
+    instanceDir = makeTempDir('kici-switch-inst-');
     fs.mkdirSync(path.join(installBase, 'orchestrator-0.1.1'), { recursive: true });
     fs.mkdirSync(path.join(installBase, 'orchestrator-0.1.2'), { recursive: true });
     fs.symlinkSync('orchestrator-0.1.1', path.join(installBase, 'orchestrator'));
@@ -688,7 +667,7 @@ describe('switchToInstalledVersion — shared switch sequence', () => {
 describe('extractRelease — the release an archive upgrade installs', () => {
   let tmp: string;
   beforeEach(() => {
-    tmp = mkTmp('kici-extract-release-');
+    tmp = makeTempDir('kici-extract-release-');
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
@@ -772,7 +751,7 @@ describe('installRelease — an archive upgrade with --force', () => {
   let installBase: string;
   let versionedDirPath: string;
   beforeEach(() => {
-    tmp = mkTmp('kici-install-release-');
+    tmp = makeTempDir('kici-install-release-');
     installBase = path.join(tmp, 'base');
     versionedDirPath = path.join(installBase, 'orchestrator-0.9.0');
     // The folder --force would replace: the version the service may run now.
@@ -956,8 +935,7 @@ describe('installGlobalPackage', () => {
       return { status: 0, stdout: '', stderr: '' };
     };
     installGlobalPackage(target, '0.1.27', run);
-    // The pinned node's bin dir must be the FIRST PATH entry so npm's
-    // `env node` / wrapper resolves the unit's node, not the shell's active one.
+    // The pinned node's bin dir must be first so npm's `env node` resolves the unit's node.
     expect(capturedEnv?.PATH?.split(path.delimiter)[0]).toBe('/n/bin');
   });
 
@@ -974,7 +952,7 @@ describe('restartOntoInstalledPackage — the end of every npm-source upgrade', 
   let tmp: string;
   let spec: LaunchSpec;
   beforeEach(() => {
-    tmp = mkTmp('kici-restart-');
+    tmp = makeTempDir('kici-restart-');
     const dist = path.join(
       tmp,
       'node_modules',
@@ -1099,7 +1077,7 @@ describe('npm-source paths end in restartOntoInstalledPackage', () => {
   let tmp: string;
   let entry: string;
   beforeEach(() => {
-    tmp = mkTmp('kici-npm-upgrade-');
+    tmp = makeTempDir('kici-npm-upgrade-');
     const pkgDir = path.join(
       tmp,
       'node_modules',
@@ -1343,5 +1321,220 @@ describe('windowsShellCommand — npm through cmd.exe', () => {
 
   it('refuses an npm path holding a double quote', () => {
     expect(() => windowsShellCommand('C:\\a"b\\npm.cmd', [])).toThrow(/double quote/);
+  });
+});
+
+describe('the bare-metal binaryPath check before an orchestrator upgrade', () => {
+  let tmp: string;
+  let agent: string;
+  let spec: LaunchSpec;
+  beforeEach(() => {
+    tmp = makeTempDir('kici-bm-upgrade-');
+    // The unit's runtime: <prefix>/bin/node running kici-admin's nested orchestrator.
+    const prefix = path.join(tmp, 'node', '24.15.0');
+    const admin = path.join(prefix, 'lib', 'node_modules', 'kici-admin');
+    const orch = path.join(admin, 'node_modules', '@kici-dev', 'orchestrator');
+    fs.mkdirSync(path.join(orch, 'dist'), { recursive: true });
+    fs.mkdirSync(path.join(admin, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(prefix, 'bin'), { recursive: true });
+    fs.writeFileSync(
+      path.join(orch, 'package.json'),
+      JSON.stringify({ name: '@kici-dev/orchestrator', version: '0.17.0' }),
+    );
+    fs.writeFileSync(path.join(orch, 'dist', 'server.js'), READS_ENV_FILE);
+    fs.writeFileSync(path.join(admin, 'bin', 'kici-agent.js'), '', { mode: 0o755 });
+    agent = path.join(prefix, 'bin', 'kici-agent');
+    fs.symlinkSync(path.join(admin, 'bin', 'kici-agent.js'), agent);
+    fs.writeFileSync(path.join(prefix, 'bin', 'node'), '', { mode: 0o755 });
+    spec = {
+      execPath: path.join(prefix, 'bin', 'node'),
+      args: [path.join(orch, 'dist', 'server.js')],
+    };
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  /** An orchestrator instance whose scaler config names `binaryPath`. */
+  function fixture(binaryPath: string) {
+    // JSON is valid YAML, and the scaler config loader reads either.
+    const scalers = path.join(tmp, 'scalers.yaml');
+    const labelSets = [{ labels: ['linux', 'bare-metal'], binaryPath }];
+    const bm = { name: 'bm', type: 'bare-metal', maxAgents: 1, labelSets };
+    fs.writeFileSync(scalers, JSON.stringify({ version: 1, scalers: [bm] }));
+    const envFilePath = path.join(tmp, 'kici-orch.env');
+    fs.writeFileSync(envFilePath, `KICI_SCALER_CONFIG_PATH=${scalers}\n`);
+    const manager = makeManager([], 'systemd');
+    manager.readLaunchSpec = vi.fn().mockResolvedValue(spec);
+    const manifest = makeManifest({ envFilePath, configDir: tmp, name: 'kici-orch' });
+    writeManifest(tmp, manifest);
+    const resolvedInstance = {
+      manifest,
+      manifestPath: path.join(tmp, '.kici-orchestrator.json'),
+      instanceDir: tmp,
+    };
+    const config: ServiceConfig = {
+      name: 'kici-orch',
+      ...SERVICE_TEXT.orchestrator,
+      executablePath: '',
+      envFilePath,
+      workingDirectory: tmp,
+      isUserLevel: true,
+      restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
+      component: 'orchestrator',
+      instanceDir: tmp,
+    };
+    const action = {
+      target: { nodeExecPath: spec.execPath, npmPath: 'npm', owningPackage: 'kici-admin' },
+      version: '0.17.0',
+    };
+    const run = vi.fn((_cmd: string, _args: string[]) => ({ status: 0, stdout: '', stderr: '' }));
+    return { manager, resolvedInstance, config, action, run };
+  }
+
+  it('refuses a self-driving install before npm runs or the service stops', async () => {
+    // binaryPath through mise's node/24, which moved to a runtime without kici-agent.
+    const { manager, resolvedInstance, config, action, run } = fixture(
+      path.join(tmp, 'node', '24', 'bin', 'kici-agent'),
+    );
+    // fails-when: the check runs after `npm install -g` or after the restart,
+    // or never runs for an orchestrator — `run` or a manager seam is called.
+    await expect(
+      performSelfDrivingInstall({
+        component: 'orchestrator',
+        config,
+        resolvedInstance,
+        manager,
+        action,
+        opts: { yes: true },
+        platform: 'systemd',
+        spec,
+        run,
+      }),
+    ).rejects.toThrow(
+      /^refusing to upgrade "kici-orch":.*Set binaryPath to .*24\.15\.0\/bin\/kici-agent,/s,
+    );
+    expect(run).not.toHaveBeenCalled();
+    expect(manager.stop).not.toHaveBeenCalled();
+    expect(manager.start).not.toHaveBeenCalled();
+    expect(manager.restart).not.toHaveBeenCalled();
+    expect(manager.install).not.toHaveBeenCalled();
+  });
+
+  it('refuses a --restart-only upgrade before the service restarts', async () => {
+    const { manager, resolvedInstance, config } = fixture('/nowhere/kici-agent');
+    await expect(
+      restartOnlyUpgrade({
+        component: 'orchestrator',
+        config,
+        resolvedInstance,
+        manager,
+        verdict: { ok: true, version: '0.17.0', manifestVersion: '0.17.0' },
+        opts: { yes: true },
+        platform: 'systemd',
+        spec,
+      }),
+    ).rejects.toThrow(/refusing to upgrade "kici-orch"/);
+    expect(manager.stop).not.toHaveBeenCalled();
+    expect(manager.start).not.toHaveBeenCalled();
+  });
+
+  it('installs and restarts when binaryPath is the agent under the unit runtime', async () => {
+    const { manager, resolvedInstance, config, action, run } = fixture(agent);
+    // breaks-if-wrong: the recommended configuration must upgrade as before.
+    await performSelfDrivingInstall({
+      component: 'orchestrator',
+      config,
+      resolvedInstance,
+      manager,
+      action,
+      opts: { yes: true },
+      platform: 'systemd',
+      spec,
+      run,
+    });
+    expect(run).toHaveBeenCalledWith(
+      'npm',
+      ['install', '-g', 'kici-admin@0.17.0'],
+      expect.anything(),
+    );
+    expect(manager.start).toHaveBeenCalledTimes(1);
+  });
+
+  it('installs and restarts with --skip-binary-path-check despite a missing binaryPath', async () => {
+    const { manager, resolvedInstance, config, action, run } = fixture('/nowhere/kici-agent');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await performSelfDrivingInstall({
+        component: 'orchestrator',
+        config,
+        resolvedInstance,
+        manager,
+        action,
+        opts: { yes: true, skipBinaryPathCheck: true },
+        platform: 'systemd',
+        spec,
+        run,
+      });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('/nowhere/kici-agent'));
+    } finally {
+      warn.mockRestore();
+    }
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(manager.start).toHaveBeenCalledTimes(1);
+  });
+
+  describe('--rollback and --pick', () => {
+    /** Switch the fixture instance from 0.1.2 to the installed 0.1.1. */
+    async function rollBack(binaryPath: string, order: string[]) {
+      const { manager, resolvedInstance, config } = fixture(binaryPath);
+      const installBase = path.join(tmp, 'install');
+      for (const v of ['0.1.1', '0.1.2']) {
+        fs.mkdirSync(path.join(installBase, `orchestrator-${v}`), { recursive: true });
+      }
+      fs.symlinkSync('orchestrator-0.1.2', path.join(installBase, 'orchestrator'));
+      (manager.start as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        order.push('start');
+      });
+      await switchToInstalledVersion({
+        component: 'orchestrator',
+        platform: 'systemd',
+        installBase,
+        config,
+        manager,
+        resolvedInstance,
+        targetVersion: '0.1.1',
+      });
+      return fs.readlinkSync(path.join(installBase, 'orchestrator'));
+    }
+
+    it('prints the diagnosis of a missing binaryPath and still switches', async () => {
+      const order: string[] = [];
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => void order.push('warn'));
+      try {
+        const active = await rollBack('/nowhere/kici-agent', order);
+        // fails-when: the switch runs no check, so the operator learns about
+        // the binaryPath only when the restarted service fails to start.
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringMatching(
+            /^Warning: bare-metal scaler "bm": binaryPath \/nowhere\/kici-agent is not an executable file.*Set binaryPath to .*24\.15\.0\/bin\/kici-agent,/,
+          ),
+        );
+        // breaks-if-wrong: a recovery switch is never refused for a binaryPath —
+        // the rollback still flips the version and starts the service, after the warning.
+        expect(order).toEqual(['warn', 'start']);
+        expect(active).toBe('orchestrator-0.1.1');
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('switches without a warning when binaryPath is the agent under the unit runtime', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        expect(await rollBack(agent, [])).toBe('orchestrator-0.1.1');
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
+    });
   });
 });

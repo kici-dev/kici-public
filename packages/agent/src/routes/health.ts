@@ -6,8 +6,8 @@ import {
   type MetricsRoutesDeps,
 } from '@kici-dev/shared';
 
-// Build-time constants injected by Rolldown (scripts/build-service.mjs).
-// Mirrored on /health so operators can correlate across services without tailing logs.
+// Injected by Rolldown (scripts/build-service.mjs); mirrored on /health so
+// operators can correlate across services without tailing logs.
 declare const KICI_PKG_VERSION: string;
 declare const KICI_SDK_VERSION: string;
 declare const KICI_SDK_BUNDLE_HASH: string;
@@ -17,8 +17,7 @@ declare const KICI_ENGINE_VERSION: string;
 declare const KICI_ENGINE_BUNDLE_HASH: string;
 
 function safe(name: string, fallback = 'unknown'): string {
-  // Rolldown rewrites `typeof KICI_*` at build time; at runtime (ts-source tests,
-  // dev), the identifier is undefined, and `typeof` is the only safe check.
+  // Unbuilt (ts-source tests, dev) the identifier is undefined; `typeof` is the only safe check.
   switch (name) {
     case 'version':
       return typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : fallback;
@@ -39,9 +38,6 @@ function safe(name: string, fallback = 'unknown'): string {
   }
 }
 
-/**
- * Health status provided by the agent runtime.
- */
 interface HealthStatus {
   agentId: string;
   connected: boolean;
@@ -49,16 +45,10 @@ interface HealthStatus {
 }
 
 export interface HealthRoutesDeps extends MetricsRoutesDeps {
-  /** Function returning current agent health status */
   getStatus: () => HealthStatus;
 }
 
 /**
- * Create health, readiness, and metrics routes.
- *
- * Delegates liveness and readiness to the shared health route helper,
- * adding agent-specific status info and a /metrics endpoint.
- *
  * - GET /health  - Liveness probe (always 200, includes agent status)
  * - GET /ready   - Readiness probe (200 if connected, 503 if not)
  * - GET /metrics - Prometheus metrics
@@ -66,7 +56,6 @@ export interface HealthRoutesDeps extends MetricsRoutesDeps {
 export function createHealthRoutes(deps: HealthRoutesDeps): Hono {
   const app = new Hono();
 
-  // Mount shared health + readiness routes
   const baseRoutes = createBaseHealthRoutes({
     livenessInfo: (): AgentLivenessInfo => {
       const status = deps.getStatus();
@@ -91,7 +80,6 @@ export function createHealthRoutes(deps: HealthRoutesDeps): Hono {
 
   app.route('/', baseRoutes);
 
-  // Mount shared metrics route (uses callback pattern)
   const metricsRoutes = createMetricsRoutes({ getMetrics: deps.getMetrics });
   app.route('/', metricsRoutes);
 

@@ -3,14 +3,12 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './149_workflow_registrations_dep_cache_key.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 149: asserts
- * `workflow_registrations.lockfile_hash` and `workflow_registrations.siblings_digest`
- * exist as nullable text columns after migrations 001..149, that a registration
- * written before them reads both back as null, that `up` is idempotent, and that
- * `down` removes both. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 149: `workflow_registrations.lockfile_hash` and
+ * `siblings_digest` are nullable text, an older registration reads both as null, `up` is
+ * idempotent, and `down` removes both. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -75,7 +73,8 @@ describeDb('migration 149_workflow_registrations_dep_cache_key', () => {
   });
 
   it('reads a registration written before the columns existed back as null', async () => {
-    // breaks-if-wrong: an upgraded database's registrations must keep loading, with no dependency-cache key
+    // breaks-if-wrong: an upgraded database's registrations must keep loading, with no
+    // dependency-cache key
     await down(db);
     await sql`
       INSERT INTO public.workflow_registrations

@@ -6,15 +6,13 @@ import type { ProcessingDeps } from './processor.js';
 
 /**
  * The needs gate is event-driven: `evaluateDownstreams` runs once, when an
- * upstream job reports terminal. Root jobs are handed to agents inside the
- * dispatch loop, but `execution_job_needs` is written only after that loop —
- * so an agent that answers inside the gap drives an evaluation that reads zero
- * edges, and the downstream never receives another wakeup. The run then hangs
- * with nothing logged as wrong.
+ * upstream reports terminal. Root jobs reach agents inside the dispatch loop,
+ * but `execution_job_needs` is written after it, so an agent answering in that
+ * gap drives an evaluation that reads zero edges and the run hangs silently.
  *
- * These tests pin the catch-up that closes the gap, and the two ways it must
- * NOT overreach: it may not re-open a gate the normal completion path already
- * claimed, and it may not release a job the rolling-wave scheduler is holding.
+ * These tests pin the catch-up that closes the gap, and that it neither
+ * re-opens a gate the completion path already claimed nor releases a job the
+ * rolling-wave scheduler is holding.
  */
 
 const RUN_ID = 'run-catchup';
@@ -190,10 +188,9 @@ describe('catchUpNeedsGatedJobs', () => {
 
   it('re-firing a job the completion path already claimed cannot run it twice', async () => {
     // recomputeNeedsSatisfied reports `dispatch` whether or not it won the
-    // conditional claim, so the catch-up can re-fire a job evaluateDownstreams
-    // already owns. That is safe only because dispatchReadyJob CONSUMES the
-    // pending job context — the second callback finds none and no-ops. This
-    // pins the contract that makes it safe rather than the count of calls.
+    // claim, so the catch-up can re-fire a job evaluateDownstreams owns. That is
+    // safe only because dispatchReadyJob consumes the pending job context, so the
+    // second callback no-ops. This pins that contract, not the call count.
     const jobs = [
       job({ job_name: 'build', status: ExecutionJobStatus.enum.success, needs_satisfied: true }),
       job({ job_name: 'cleanup', needs_satisfied: true }),
@@ -233,10 +230,9 @@ describe('catchUpNeedsGatedJobs', () => {
   });
 
   it('leaves a group-gated job alone while its edges do not exist yet', async () => {
-    // A job gated on a dynamic group has no execution_job_needs row until the
-    // eval produces the members and resolveGroupEdges writes them.
-    // checkAllUpstreamsSatisfied reads "no edges" as "no needs, dispatch now",
-    // so recomputing such a job would release it before its group has run.
+    // A dynamic-group job has no execution_job_needs row until resolveGroupEdges
+    // writes the members, and checkAllUpstreamsSatisfied reads "no edges" as
+    // "dispatch now", so recomputing it would release it before its group ran.
     const jobs = [job({ job_name: 'deploy' })];
     const { ctx, onJobReadyCallback, onJobStatus } = makeCtx(jobs, []);
 

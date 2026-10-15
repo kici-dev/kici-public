@@ -86,9 +86,9 @@ describe('GlobalWorkflowPolicy', () => {
       expect(result.reason).toBe('Global workflows: cluster settings unreadable');
     });
 
-    // The semantic change: a missing org_settings row used to be a hard deny.
-    // It now means only "this org has no per-org restrictions", so the repo and
-    // source axes evaluate exactly as they do for an all-null row.
+    // A missing org_settings row is not a hard deny. It means only "this org
+    // has no per-org restrictions", so the repo and source axes evaluate exactly
+    // as they do for an all-null row.
     it('allows the repo and source axes with the switch on and NO org row', async () => {
       const db = makeMockDb(undefined);
       const policy = new GlobalWorkflowPolicy(db, CLUSTER_ON, false);

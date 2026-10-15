@@ -20,22 +20,18 @@ export interface SandboxAllowList {
 
 export interface SandboxAllowListReader {
   /**
-   * Read the org's escape-hatch allow-list. Never throws; on a DB error (or no
-   * DB handle) it degrades to the safe deny-all default `{ capabilities: [],
-   * allowHostNetwork: false }` so a sick DB denies escalation rather than
-   * blocking dispatch.
+   * Never throws: a DB error or no DB handle degrades to deny-all, so a sick DB
+   * denies escalation rather than blocking dispatch.
    */
   read(orgId: string): Promise<SandboxAllowList>;
 }
 
 /**
- * Reader for the per-org container-sandbox escape-hatch allow-list. Read once per
- * matched-workflow dispatch (not per request), against a single indexed row, so
- * it is intentionally **uncached**: this is a security control, and an operator's
- * `sandbox-allowlist` change must take effect on the very next dispatch (a cache
- * would leave the old policy in force for its TTL — a stale-deny or stale-allow
- * window on a privilege boundary). The trivial per-dispatch query is the right
- * trade for always-fresh enforcement.
+ * Reader for the per-org container-sandbox escape-hatch allow-list, read once per
+ * matched-workflow dispatch against one indexed row. Intentionally **uncached**:
+ * a security control, so an operator's `sandbox-allowlist` change must apply on
+ * the very next dispatch; a cache TTL would open a stale-deny or stale-allow
+ * window on a privilege boundary.
  */
 export function createSandboxAllowListReader(deps: {
   db?: Kysely<Database>;

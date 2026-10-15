@@ -10,6 +10,7 @@ import { describe, it, expect, vi } from 'vitest';
 import type { ChangedFilesResult } from '@kici-dev/engine';
 import { processWebhook } from './process-webhook.js';
 import type { WebhookInfo } from '../webhook/handler.js';
+import { lockFileFixture, lockWorkflow, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 const SOURCE_REPO = 'acme/app';
 const GLOBAL_REPO = 'acme/org-workflows';
@@ -45,33 +46,30 @@ function makeGlobalRegistration() {
       compileSchemaVersion: 1,
       triggers: [{ _type: 'push', branches: [], paths: ['src/**'] }],
       jobs: [
-        {
-          _type: 'static',
+        staticJob({
           name: 'scan',
           runsOn: [{ kind: 'exact', value: 'default' }],
-          needs: [],
           steps: [{ name: 'scan', hasOutputs: false }],
-        },
+        }),
       ],
     },
   };
 }
 
 /** The event repository's own lock file: one push workflow with no `paths`. */
-const SOURCE_LOCK_FILE = {
+const SOURCE_LOCK_FILE = lockFileFixture({
   schemaVersion: 9,
-  source: { file: '.kici/workflows/ci.ts', export: '#default' },
   contentHash: 'srchash',
   workflows: [
-    {
+    lockWorkflow({
       name: 'src-push-no-paths',
       contentHash: 'shash',
       compileSchemaVersion: 1,
       triggers: [{ _type: 'push', branches: ['release'], paths: [] }],
       jobs: [],
-    },
+    }),
   ],
-};
+});
 
 function makeDeps(changed: ChangedFilesResult, over: { withLockFile?: boolean } = {}) {
   const dispatch = vi.fn().mockResolvedValue({ status: 'queued' });

@@ -5,10 +5,8 @@ const PWSH_INSTALL_DOCS =
   'https://learn.microsoft.com/en-us/powershell/scripting/install/install-powershell-on-windows';
 
 /**
- * Initialize zx for cross-platform execution.
- * Sets the quote function required by zx 8+ on all platforms.
- * On Windows, also configures pwsh as shell.
- * Call this at the start of any script/binary entry point using zx.
+ * Initialize zx at the start of every zx entry point: sets the quote function
+ * zx 8+ requires, and on Windows uses pwsh as the shell.
  */
 export function initZx(): void {
   if (process.platform === 'win32') {
@@ -25,9 +23,8 @@ export function initZx(): void {
 }
 
 /**
- * Ensure PowerShell Core (pwsh) is installed on Windows.
- * Attempts automatic installation via winget using the built-in powershell.exe.
- * If winget is unavailable, prints installation instructions and exits.
+ * Ensure pwsh is installed on Windows, via winget from the built-in
+ * powershell.exe; without winget, print install instructions and exit.
  */
 function ensurePwshWindows(): void {
   console.error(
@@ -35,7 +32,6 @@ function ensurePwshWindows(): void {
       'KiCI uses pwsh for cross-platform command execution.\n',
   );
 
-  // Check if winget is available (using built-in powershell.exe)
   let hasWinget = false;
   try {
     execSync('powershell.exe -NoProfile -Command "Get-Command winget -ErrorAction Stop"', {
@@ -72,8 +68,8 @@ function ensurePwshWindows(): void {
     process.exit(1);
   }
 
-  // Verify pwsh is now available. winget adds it to PATH but the current process
-  // won't see it unless we resolve the full path via powershell.exe.
+  // winget updates PATH, but this process only sees pwsh through a full path
+  // resolved via powershell.exe.
   try {
     const pwshPath = execSync(
       'powershell.exe -NoProfile -Command "(Get-Command pwsh -ErrorAction Stop).Source"',
@@ -81,7 +77,7 @@ function ensurePwshWindows(): void {
     ).trim();
 
     if (pwshPath) {
-      // Add the pwsh directory to PATH so zx's which.sync('pwsh') succeeds
+      // So zx's which.sync('pwsh') succeeds.
       const pwshDir = pwshPath.replace(/\\pwsh\.exe$/i, '');
       process.env.PATH = `${pwshDir};${process.env.PATH}`;
     }

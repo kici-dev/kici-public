@@ -1,12 +1,7 @@
 /**
- * What a scaler-managed agent does about its idle-shutdown timer when
- * `register.ack` arrives.
- *
- * This lives apart from `server.ts` so the rule has exactly one
- * implementation: the server acts on the verdict, and the tests assert on the
- * verdict. Importing `server.ts` starts the agent (it ends in a top-level
- * `guardStartup`), so a function exported from there could only ever be tested
- * by a copy of itself.
+ * What a scaler-managed agent does with its idle-shutdown timer on
+ * `register.ack`. Kept out of `server.ts`, whose import starts the agent
+ * (top-level `guardStartup`), so tests exercise the one real implementation.
  */
 
 /**
@@ -24,10 +19,9 @@ export function decideIdleShutdown(input: {
   warmPool?: boolean;
 }): IdleShutdownDecision {
   if (!input.scalerManaged || input.activeJobs > 0) return 'none';
-  // Warm is read before pendingDispatch: the orchestrator sets them from the
-  // same `boundJobId`, so they are mutually exclusive at the source, and an ack
-  // that somehow carried both must not arm a timer under a warm agent — the
-  // warm-pool reaper is the sole authority on that agent's lifetime.
+  // Warm first: both derive from one `boundJobId`, so they are exclusive, and an
+  // ack carrying both must not arm a timer — the warm-pool reaper alone owns a
+  // warm agent's lifetime.
   if (input.warmPool) return 'warm';
   if (input.pendingDispatch) return 'pending-dispatch';
   return 'idle';

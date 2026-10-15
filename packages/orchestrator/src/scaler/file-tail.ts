@@ -1,12 +1,6 @@
 /**
- * File tailing utility for append-only log files.
- *
- * Provides an async generator that yields complete lines as they are appended
- * to a file, using `fs.watchFile()` for change notifications and partial line
- * buffering for split writes.
- *
- * Used by the Firecracker backend to tail serial console and VMM log files
- * from the jailer chroot directory. The guest writes to `/dev/console`
+ * Tails append-only log files: the Firecracker backend tails the serial console
+ * and VMM log files in the jailer chroot. The guest writes to `/dev/console`
  * unprivileged, so everything this module buffers is tenant-controlled: every
  * buffer here is bounded, and an overflow is reported in-band rather than
  * growing the orchestrator's heap.
@@ -25,8 +19,8 @@ import { StringDecoder } from 'node:string_decoder';
 export const MAX_LINE_BYTES = 64 * 1024;
 
 /**
- * Largest slice read from the file per poll. A burst is drained across several
- * ticks instead of materialising the whole delta in one string.
+ * Largest slice read per poll, so a burst drains across several reads instead
+ * of materialising the whole delta in one string.
  */
 export const MAX_READ_BYTES = 1024 * 1024;
 
@@ -43,18 +37,10 @@ export const MAX_QUEUED_LINES = 10_000;
 const DROP_MARKER_PREFIX = '[dropped ';
 
 /**
- * Tail an append-only file, yielding complete lines as they are written.
- *
- * Pre-creates the file if it does not exist to avoid watch errors.
- * Tracks byte offset and partial (incomplete) trailing lines across reads.
- * Stops when the provided AbortSignal is triggered.
- *
- * @param filePath - Path to the file to tail
- * @param signal - AbortSignal to stop tailing
- * @yields Complete lines (non-empty) as they are appended to the file
+ * Tail an append-only file, yielding complete non-empty lines as they are
+ * written, until `signal` aborts. Pre-creates the file to avoid watch errors.
  */
 export async function* tailFile(filePath: string, signal: AbortSignal): AsyncGenerator<string> {
-  // Pre-create the file if it does not exist
   await writeFile(filePath, '', { flag: 'a' });
 
   let offset = 0;
@@ -62,29 +48,19 @@ export async function* tailFile(filePath: string, signal: AbortSignal): AsyncGen
   /** True while the rest of an over-long logical line is being discarded. */
   let skippingOverlongLine = false;
   /**
-   * Decoder carried across reads.
-   *
-   * Each poll reads at most {@link MAX_READ_BYTES}, and that boundary falls
-   * wherever the byte count lands — including inside a multi-byte UTF-8
-   * sequence. Decoding each slice on its own turns that character into a
-   * replacement character and then mis-decodes the continuation bytes at the
-   * head of the next slice. The decoder holds the incomplete tail and prepends
-   * it, so the character survives the split.
-   *
-   * It never holds more than three bytes, and the file is append-only, so those
-   * bytes always arrive in the next read.
+   * Carried across reads: a {@link MAX_READ_BYTES} slice can end inside a
+   * multi-byte UTF-8 sequence, and decoding slices separately would corrupt that
+   * character. The decoder holds the incomplete tail (at most three bytes, which
+   * the append-only file always delivers in the next read).
    */
   const decoder = new StringDecoder('utf8');
 
   /**
-   * Read at most {@link MAX_READ_BYTES} of new data from the current offset.
-   *
    * The offset advances by the bytes actually consumed, never by a fresh
    * `statSync`: taking the file's size *now* silently drops anything appended
    * while the read stream was draining.
    *
-   * @returns the complete lines the slice produced, plus whether more data is
-   * already waiting so the caller can keep draining
+   * @returns the slice's complete lines, and whether more data is already waiting
    */
   function readNewData(): Promise<{ lines: string[]; more: boolean }> {
     return new Promise<{ lines: string[]; more: boolean }>((resolve, reject) => {
@@ -112,7 +88,6 @@ export async function* tailFile(filePath: string, signal: AbortSignal): AsyncGen
 
       stream.on('end', () => {
         const buf = Buffer.concat(chunks);
-        // Advance by consumed bytes, so the next poll resumes exactly here.
         offset = startOffset + buf.length;
         const raw = decoder.write(buf);
         const parts = raw.split('\n');
@@ -156,9 +131,8 @@ export async function* tailFile(filePath: string, signal: AbortSignal): AsyncGen
     });
   }
 
-  // Use a callback-based approach with fs.watchFile (polling) for reliability
-  // across all platforms and filesystem types (including tmpfs, overlayfs in containers).
-  // fs.watch() can miss events on certain filesystems; watchFile uses stat polling.
+  // fs.watchFile (stat polling), not fs.watch(), which can miss events on some
+  // filesystems (tmpfs, overlayfs in containers).
   const lineQueue: string[] = [];
   /** Cumulative count of complete lines dropped to keep the queue at its cap. */
   let droppedLines = 0;
@@ -195,8 +169,7 @@ export async function* tailFile(filePath: string, signal: AbortSignal): AsyncGen
       readNewData().then(
         ({ lines, more }) => {
           enqueue(lines);
-          // A burst larger than MAX_READ_BYTES needs several passes; keep
-          // draining rather than waiting for the next 100ms poll tick.
+          // Keep draining a large burst rather than waiting for the next poll tick.
           if (more && !stopped) {
             drain();
             return;
@@ -204,7 +177,7 @@ export async function* tailFile(filePath: string, signal: AbortSignal): AsyncGen
           reading = false;
         },
         () => {
-          // Read error -- ignore, will retry on next change
+          // Ignore a read error; the next change retries.
           reading = false;
         },
       );
@@ -212,13 +185,11 @@ export async function* tailFile(filePath: string, signal: AbortSignal): AsyncGen
     drain();
   }
 
-  // Start watching with 100ms polling interval
   watchFile(filePath, { interval: 100 }, onFileChange);
 
-  // Also do an initial read in case data was written before we started watching
+  // Data may predate the watch.
   onFileChange();
 
-  // Stop on abort
   const onAbort = () => {
     stopped = true;
     unwatchFile(filePath, onFileChange);
@@ -241,10 +212,9 @@ export async function* tailFile(filePath: string, signal: AbortSignal): AsyncGen
       if (lineQueue.length > 0) {
         yield lineQueue.shift()!;
       } else {
-        // Wait for new data or abort
         await new Promise<void>((resolve) => {
           resolveWaiter = resolve;
-          // Check if we got stopped while setting up the waiter
+          // Stopped while the waiter was being set up.
           if (stopped) {
             resolveWaiter = null;
             resolve();

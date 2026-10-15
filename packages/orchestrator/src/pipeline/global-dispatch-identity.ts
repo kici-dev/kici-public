@@ -11,7 +11,6 @@
 import type { ProviderBundle } from '../provider-registry.js';
 import type { WorkflowRepoProvenance } from '../reporting/execution-tracker.js';
 
-/** The workflow repository of a run whose workflow is defined in another repository. */
 export interface GlobalDispatchIdentity {
   /** `owner/repo` that defines the workflow. */
   readonly workflowRepoIdentifier: string;
@@ -25,7 +24,6 @@ export interface GlobalDispatchIdentity {
   readonly workflowProviderContext: Record<string, unknown>;
   /** The workflow repository's provider bundle (may differ from the inbound one). */
   readonly workflowBundle: ProviderBundle | undefined;
-  /** Credentials minted for the workflow repository. */
   readonly workflowCredentials: Record<string, unknown>;
 }
 
@@ -75,10 +73,9 @@ export function workflowRepoProvenance(ctx: IdentityCtx): WorkflowRepoProvenance
 }
 
 /**
- * The dual-checkout job-config fields of a dispatch, with the workflow
- * repository's clone URL built by its own provider bundle. Empty for a
- * same-repository dispatch. Throws when the workflow bundle cannot build a
- * clone URL: a global job without a workflow-repository URL cannot run.
+ * The dual-checkout job-config fields, with the workflow repository's clone URL
+ * built by its own provider bundle. Empty for a same-repository dispatch. Throws
+ * when that bundle cannot build a clone URL.
  */
 export function globalJobConfigFor(ctx: IdentityCtx): Record<string, unknown> {
   if (!ctx.global) return {};
@@ -114,10 +111,8 @@ export function globalJobConfigFields(
 }
 
 /**
- * The part of a {@link GlobalDispatchIdentity} a held run stores: everything
- * but the live provider bundle and the minted credentials, both of which a
- * resume re-derives from `workflowRoutingKey`. The commit, branch and provider
- * context are the ones captured when the run was held, so a resumed run
+ * The part of a {@link GlobalDispatchIdentity} a held run stores; a resume
+ * re-derives bundle and credentials from `workflowRoutingKey`. A resumed run
  * executes the workflow commit it was held at, not the live registration's.
  */
 export type SerializableGlobalDispatchIdentity = Omit<

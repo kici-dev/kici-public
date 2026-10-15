@@ -8,13 +8,9 @@ import { toErrorMessage } from '@kici-dev/core';
 import { planePaths, planePorts } from './paths.js';
 import { rotatePlaneLogIfOversized } from './plane-log.js';
 
-/**
- * Podman fallback Postgres image for the local dev plane. The repository's
- * container-pin tooling rewrites this pin in place when the image is bumped.
- */
+/** Podman fallback image. The container-pin tooling rewrites this pin in place. */
 export const PLANE_PG_IMAGE = 'docker.io/library/postgres:18.6-alpine';
 
-/** Name of the fallback podman Postgres container. */
 export const PLANE_PG_CONTAINER = 'kici-local-postgres';
 
 export type PlanePgHandle = {
@@ -24,8 +20,7 @@ export type PlanePgHandle = {
 };
 
 async function defaultReadyPoller(_port: number): Promise<boolean> {
-  // Probe readiness from inside the container so the host does not need a
-  // PostgreSQL client (`pg_isready`) installed.
+  // Probed inside the container, so the host needs no `pg_isready`.
   for (let i = 0; i < 60; i++) {
     try {
       await $`podman exec ${PLANE_PG_CONTAINER} pg_isready -U kici`.quiet();
@@ -38,11 +33,10 @@ async function defaultReadyPoller(_port: number): Promise<boolean> {
 }
 
 /**
- * Resolve the platform-specific `pg_ctl` binary bundled with embedded-postgres.
- * Mirrors the package's own platform → binary-package mapping, resolving the
- * binary package through embedded-postgres's module context (pnpm isolates it
- * as a transitive dependency, so it is not directly resolvable here) and
- * computing the `native/bin/pg_ctl` path from the resolved package directory.
+ * Resolves the `pg_ctl` bundled with embedded-postgres, mirroring its
+ * platform → binary-package mapping. The binary package resolves through
+ * embedded-postgres's module context: pnpm isolates it as a transitive
+ * dependency, so it is not resolvable from here.
  */
 function resolvePgCtl(): string {
   const platform = os.platform();
@@ -61,14 +55,12 @@ function resolvePgCtl(): string {
   if (!pkg) throw new Error(`unsupported platform for embedded Postgres: ${platform}/${arch}`);
   const require = createRequire(import.meta.url);
   const epRequire = createRequire(require.resolve('embedded-postgres'));
-  // The binary package exposes only its entry (dist/index.js); pg_ctl lives at
-  // ../native/bin/pg_ctl relative to it (matching the package's own resolution).
+  // The package exposes only dist/index.js; pg_ctl is at ../native/bin from it.
   const entry = epRequire.resolve(pkg);
   const binName = platform === 'win32' ? 'pg_ctl.exe' : 'pg_ctl';
   return path.resolve(path.dirname(entry), '..', 'native', 'bin', binName);
 }
 
-/** Append one embedded-postgres line to the plane's Postgres log. */
 function appendPgLog(line: string): void {
   fs.appendFileSync(planePaths().pgLogFile, line.endsWith('\n') ? line : `${line}\n`);
 }
@@ -79,26 +71,23 @@ export function isDuplicateDatabaseError(err: unknown): boolean {
 }
 
 /**
- * Initialise the embedded Postgres cluster + the `kici_local` database once. A
- * short-lived in-process server is used only for the one-time bootstrap; the
- * persistent postmaster is started separately (daemonized) so it outlives this
- * CLI invocation.
+ * Initialises the cluster and the `kici_local` database once, with a
+ * short-lived in-process server; the persistent postmaster is daemonized
+ * separately so it outlives this CLI.
  *
- * The bootstrap stamp, written only after the database exists, marks it done.
- * A data directory with `PG_VERSION` but no stamp is a bootstrap that stopped
- * between `initdb` and `CREATE DATABASE`: the next start skips `initdb` and
- * finishes the rest. The server's own output goes to the plane's Postgres log,
- * never to the terminal.
+ * The stamp, written only after the database exists, marks the bootstrap done.
+ * `PG_VERSION` without a stamp is a bootstrap that stopped between `initdb` and
+ * `CREATE DATABASE`: the next start skips `initdb` and finishes the rest. Server
+ * output goes to the plane's Postgres log, never the terminal.
  */
 async function ensureEmbeddedCluster(port: number): Promise<void> {
   const { root, pgData, pgLogFile, pgBootstrapStamp } = planePaths();
   if (fs.existsSync(pgBootstrapStamp)) return;
   fs.mkdirSync(root, { recursive: true });
-  // Imported here, not at module load: importing embedded-postgres installs a
-  // process-wide SIGINT/SIGTERM handler that exits at once. Commands that
-  // never start Postgres load this module through the commands barrel, and
-  // that handler would end `kici run remote` before its Ctrl-C cancel reaches
-  // the orchestrator.
+  // Imported lazily: embedded-postgres installs a process-wide SIGINT/SIGTERM
+  // handler that exits at once. The commands barrel loads this module, and that
+  // handler would end `kici run remote` before its Ctrl-C cancel reaches the
+  // orchestrator.
   const { default: EmbeddedPostgres } = await import('embedded-postgres');
   const pg = new EmbeddedPostgres({
     databaseDir: pgData,
@@ -134,16 +123,13 @@ async function ensureEmbeddedCluster(port: number): Promise<void> {
 }
 
 /**
- * Whether this plane's embedded postmaster is already serving `port`.
+ * Whether this plane's embedded postmaster already serves `port`. `pg_ctl
+ * start` fails against a running cluster, so a boot that reclaims the plane
+ * port but leaves PostgreSQL up (reclaiming another plane's orchestrator
+ * signals only the port holder) would otherwise fall through to Podman and fail.
  *
- * `pg_ctl start` fails outright against a running cluster, so a boot that
- * reclaims the plane port while leaving PostgreSQL up — reclaiming another
- * plane's orchestrator does exactly that, since only the port holder is
- * signalled — would otherwise fall through to the Podman path and fail there.
- *
- * The port comes from the cluster's own `postmaster.pid` (line 4) rather than
- * being assumed, so a postmaster left on a different port is not mistaken for
- * one this plane can reuse.
+ * The port comes from `postmaster.pid` line 4, so a postmaster on another port
+ * is never mistaken for one this plane can reuse.
  */
 export async function embeddedClusterIsServing(port: number): Promise<boolean> {
   const { pgData } = planePaths();
@@ -156,8 +142,7 @@ export async function embeddedClusterIsServing(port: number): Promise<boolean> {
   }
   if (runningPort !== port) return false;
   try {
-    // Exit 0 means the server is running; 3 means it is not, 4 means the data
-    // dir is unusable. Both non-zero cases mean "start it".
+    // Exit 0: running. 3 (stopped) and 4 (unusable data dir) both mean "start it".
     await $`${resolvePgCtl()} -D ${pgData} status`.quiet();
     return true;
   } catch {
@@ -166,10 +151,9 @@ export async function embeddedClusterIsServing(port: number): Promise<boolean> {
 }
 
 /**
- * Start a detached embedded postmaster via `pg_ctl` so it survives the exit of
- * this CLI process (embedded-postgres's in-process server is killed by its own
- * exit hook, so it cannot back a warm plane). The caller decides whether a
- * cluster is already serving; this always starts one.
+ * Starts a detached postmaster via `pg_ctl` so it survives this CLI: the
+ * in-process server dies with embedded-postgres's exit hook. Always starts one;
+ * the caller checks whether a cluster already serves.
  */
 async function defaultEmbeddedDaemon(port: number): Promise<void> {
   const { pgData, pgLogFile } = planePaths();
@@ -177,7 +161,7 @@ async function defaultEmbeddedDaemon(port: number): Promise<void> {
   await $`${pgCtl} -D ${pgData} -o ${`-p ${port}`} -l ${pgLogFile} -w start`.quiet();
 }
 
-/** Stop the detached embedded postmaster (handle-independent, reads the data dir). */
+/** Handle-independent: reads the data dir. */
 async function stopEmbeddedDaemon(): Promise<void> {
   const { pgData } = planePaths();
   if (!fs.existsSync(path.join(pgData, 'postmaster.pid'))) return;
@@ -185,10 +169,7 @@ async function stopEmbeddedDaemon(): Promise<void> {
   await $`${pgCtl} -D ${pgData} stop -m fast`.quiet().catch(() => {});
 }
 
-/**
- * Stop the plane's Postgres by backend kind. Handle-independent so a separate
- * CLI invocation (`kici local down`) can tear down what `up` started.
- */
+/** Handle-independent, so `kici local down` can stop what `up` started. */
 export async function stopPlanePostgres(kind: 'embedded' | 'podman'): Promise<void> {
   if (kind === 'podman') {
     await $`podman rm -f ${PLANE_PG_CONTAINER}`.quiet().catch(() => {});
@@ -198,10 +179,9 @@ export async function stopPlanePostgres(kind: 'embedded' | 'podman'): Promise<vo
 }
 
 /**
- * Provision the local dev plane's Postgres. Prefers the zero-dependency
- * `embedded-postgres` binary (daemonized via pg_ctl so it stays warm); falls
- * back to a podman Postgres container when the embedded binary is unavailable
- * (or when forced via `forcePodman` / `KICI_LOCAL_PG_MODE=podman`).
+ * Prefers the zero-dependency `embedded-postgres` binary, daemonized via pg_ctl
+ * so it stays warm. Falls back to a podman container when the embedded path
+ * fails, or when `forcePodman` / `KICI_LOCAL_PG_MODE=podman` forces it.
  */
 export async function startPlanePostgres(
   opts: {
@@ -219,11 +199,10 @@ export async function startPlanePostgres(
   let embeddedError: unknown;
   if (!forcePodman) {
     try {
-      // A cluster already serving this plane's port is reused as-is, before any
-      // bootstrap: the bootstrap's in-process server and `pg_ctl start` both
-      // fail outright against a running cluster, and that postmaster holds the
-      // log fd — renaming the file under it would send every later line to the
-      // rotated copy and leave the live log empty.
+      // Reuse a cluster already serving the port, before any bootstrap: the
+      // bootstrap server and `pg_ctl start` both fail against it, and its
+      // postmaster holds the log fd, so rotating the file would send every later
+      // line to the rotated copy.
       if (!(await embeddedClusterIsServing(port))) {
         await ensureEmbeddedCluster(port);
         rotatePlaneLogIfOversized(planePaths().pgLogFile);
@@ -231,8 +210,7 @@ export async function startPlanePostgres(
       }
       return { url, kind: 'embedded', stop: () => stopEmbeddedDaemon() };
     } catch (err) {
-      // Native binary unavailable or bootstrap failed — fall through to podman,
-      // keeping the reason for the error raised if podman fails too.
+      // Kept for the error raised if podman fails too.
       embeddedError = err;
     }
   }

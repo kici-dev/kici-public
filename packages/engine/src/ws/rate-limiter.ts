@@ -1,21 +1,10 @@
 /**
- * WebSocket rate limiter with two-tier token bucket (messages + bytes).
- *
- * Provides defense-in-depth against DoS by limiting:
- * - Message count per second (burst capacity + refill)
- * - Byte throughput per second (burst capacity + refill)
- * - Hard message size limit (4MB default)
- *
- * Heartbeats are exempt from rate limiting.
- * Sustained violations (>5s default) result in disconnect.
+ * WebSocket rate limiter (DoS defense in depth): token buckets for messages/s
+ * and bytes/s, plus a hard message size limit (4MB default). Heartbeats are
+ * exempt; sustained violations (>5s default) disconnect.
  */
 
-/**
- * Token bucket algorithm for rate limiting.
- *
- * Supports burst up to `capacity` tokens, refilling at `refillRate` tokens/second.
- * When tokens are exhausted, returns a retryAfterMs estimate.
- */
+/** Token bucket: bursts up to `capacity` tokens, refilling at `refillRate` tokens/second. */
 export class TokenBucket {
   private tokens: number;
   private lastRefill: number;
@@ -28,10 +17,7 @@ export class TokenBucket {
     this.lastRefill = Date.now();
   }
 
-  /**
-   * Try to consume `amount` tokens.
-   * @returns `{ allowed: true }` if tokens available, or `{ allowed: false, retryAfterMs }`.
-   */
+  /** Consume `amount` tokens, or report `{ allowed: false, retryAfterMs }`. */
   consume(amount: number = 1): { allowed: boolean; retryAfterMs?: number } {
     this.refill();
     if (this.tokens >= amount) {
@@ -43,10 +29,7 @@ export class TokenBucket {
     return { allowed: false, retryAfterMs };
   }
 
-  /**
-   * Check if `amount` tokens are available without consuming them.
-   * @returns `{ allowed: true }` if tokens available, or `{ allowed: false, retryAfterMs }`.
-   */
+  /** Like `consume`, without consuming the tokens. */
   peek(amount: number = 1): { allowed: boolean; retryAfterMs?: number } {
     this.refill();
     if (this.tokens >= amount) {
@@ -88,11 +71,9 @@ export interface RateLimitResult {
 }
 
 /**
- * Two-tier WebSocket rate limiter.
- *
- * Checks both message count and byte throughput independently.
- * Heartbeats are exempt. Oversized messages trigger immediate disconnect.
- * Sustained violations (exceeding `disconnectAfterMs`) trigger disconnect.
+ * Two-tier WebSocket rate limiter: message count and byte throughput are checked
+ * independently. Heartbeats are exempt; an oversized message disconnects at
+ * once, and a violation lasting past `disconnectAfterMs` disconnects.
  */
 export class WsRateLimiter {
   private readonly messages: TokenBucket;
@@ -114,24 +95,16 @@ export class WsRateLimiter {
     this.disconnectAfterMs = config?.disconnectAfterMs ?? 5000;
   }
 
-  /**
-   * Check if a message is allowed through.
-   *
-   * @param messageSize - Size of the message in bytes
-   * @param isHeartbeat - Whether this is a heartbeat message (exempt from limiting)
-   * @returns Rate limit decision with action and optional retryAfterMs
-   */
+  /** Decide whether a message (`messageSize` in bytes) is allowed through. */
   check(messageSize: number, isHeartbeat: boolean): RateLimitResult {
-    // Heartbeats are always exempt
     if (isHeartbeat) return { allowed: true, action: 'allow' };
 
-    // Hard size limit check -- reject immediately
     if (messageSize > this.maxMessageSize) {
       return { allowed: false, action: 'disconnect', reason: 'Message too large' };
     }
 
-    // Messages larger than byte bucket capacity can never pass (tokens cap at capacity).
-    // Reject immediately instead of entering a misleading warn/retry loop.
+    // Larger than the byte bucket's capacity can never pass: reject now rather
+    // than enter a misleading warn/retry loop.
     if (messageSize > this.bytesCapacity) {
       return {
         allowed: false,
@@ -140,7 +113,7 @@ export class WsRateLimiter {
       };
     }
 
-    // Check both buckets without consuming — only debit tokens if both allow
+    // Debit tokens only when both buckets allow.
     const msgResult = this.messages.peek(1);
     const byteResult = this.bytes.peek(messageSize);
 
@@ -151,7 +124,6 @@ export class WsRateLimiter {
       return { allowed: true, action: 'allow' };
     }
 
-    // Rate limit exceeded -- track violation duration
     if (this.violationStart === null) {
       this.violationStart = Date.now();
     }

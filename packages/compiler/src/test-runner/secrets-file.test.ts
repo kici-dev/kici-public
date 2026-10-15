@@ -181,16 +181,15 @@ describe('CLI flag parsing logic', () => {
   });
 
   it('CLI flags override file values', () => {
-    // Simulate file load
     const fileSecrets = {
       flat: { API_KEY: 'from-file', OTHER: 'untouched' },
       contexts: { prod: { DB_HOST: 'file-host' } },
     };
 
-    // Simulate --secret override
+    // --secret override
     fileSecrets.flat['API_KEY'] = 'from-cli';
 
-    // Simulate --context override
+    // --context override
     fileSecrets.contexts['prod']['DB_HOST'] = 'cli-host';
 
     expect(fileSecrets.flat['API_KEY']).toBe('from-cli');

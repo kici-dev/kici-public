@@ -1,21 +1,15 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `cluster_settings.sealed_secrets_retry_backoff_ms` (nullable bigint).
+ * How long a coordinator leaves a queued job alone after failing to open its sealed secrets
+ * (sealed under a master key it does not hold). During a rolling key rotation a coordinator
+ * holding the key can take the job in that window; each later re-claim spends a dispatch
+ * attempt, so a job no coordinator can open still fails.
  *
- * How long a coordinator leaves a queued job alone after it claimed the job and
- * could not open its sealed secrets: the job was sealed with a master key this
- * coordinator does not hold. During a rolling key rotation a coordinator that
- * holds the key can take the job in that window; after it, this coordinator can
- * claim the job again, and each claim spends another dispatch attempt, so a job
- * no coordinator can open still fails.
+ * On `cluster_settings` because every coordinator drains the same queue. NULL ⇒ the
+ * orchestrator's configured default.
  *
- * Cluster-global (every coordinator drains the same queue), so it lives on
- * `cluster_settings` rather than `org_settings`. NULL ⇒ the orchestrator's own
- * configured default applies.
- *
- * Idempotent: guarded on column existence; a re-run on a DB that already has the
- * column is a no-op.
+ * Idempotent: guarded on column existence.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

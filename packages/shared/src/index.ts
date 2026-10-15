@@ -16,9 +16,9 @@ export {
   type CommandContext,
   type CommandFailure,
 } from './command-error.js';
-// `redactConfig` / `scrubText` moved to @kici-dev/core (pure, CLI-reachable)
-// and reach this barrel through the `export * from '@kici-dev/core'` above, so
-// every existing `from '@kici-dev/shared'` import keeps resolving.
+// `redactConfig` / `scrubText` live in @kici-dev/core (pure, CLI-reachable)
+// and reach this barrel through the `export * from '@kici-dev/core'` above,
+// so `from '@kici-dev/shared'` imports of them resolve.
 export { addLogsToArchive, MAX_LOG_BYTES } from './diagnostics/bundle-archive.js';
 export {
   chunkBuffer,

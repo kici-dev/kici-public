@@ -1,24 +1,16 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the batch-accumulation tables that back the `workflows_failed_batch`
- * trigger.
+ * Batch-accumulation tables behind the `workflows_failed_batch` trigger.
  *
- * When a `workflow_complete(failed)` event matches a `workflowsFailedBatch`
- * registration, the orchestrator buffers the failed run into a durable window
- * instead of dispatching now. The first failure opens the window (`opened_at`);
- * the Raft-leader-only scanner sweeps windows past `expires_at`, emits one
- * `__workflows_failed_batch` event carrying the buffered runs, and deletes the
- * window (cascading its items).
+ * A `workflow_complete(failed)` event matching a `workflowsFailedBatch` registration buffers
+ * the run into a durable window; the first failure opens it. The Raft-leader-only scanner
+ * sweeps windows past `expires_at`, emits one `__workflows_failed_batch` event with the
+ * buffered runs, and deletes the window (cascading its items).
  *
- * `batch_accumulation_windows` holds one open window per subscribing workflow —
- * `UNIQUE(registration_id)` enforces open-once so concurrent failures append to
- * the same window rather than opening N of them. `routing_key` /
- * `repo_identifier` are captured at open time so the leader sweep can emit the
- * batch event without re-reading the registration index.
- *
- * `batch_accumulation_items` holds the buffered failed runs, deleted with their
- * window via `ON DELETE CASCADE`.
+ * `UNIQUE(registration_id)` enforces one open window per subscribing workflow, so concurrent
+ * failures append rather than open N windows. `routing_key` / `repo_identifier` are captured
+ * at open time so the sweep need not re-read the registration index.
  *
  * Idempotent: guarded on table existence.
  */

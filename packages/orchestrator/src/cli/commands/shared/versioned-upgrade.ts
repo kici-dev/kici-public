@@ -1,11 +1,8 @@
 /**
- * Shared versioned directory upgrade logic for kici-admin upgrade commands.
- *
- * Implements the versioned directory layout:
- * - Extract new version alongside old versions
- * - Update symlink (Unix) or service registration (Windows) atomically
- * - Preserve old versions for rollback
- * - Optional cleanup of old versions
+ * Versioned-directory upgrade shared by the kici-admin upgrade commands: each
+ * release extracts beside the old ones, the symlink (Unix) or service
+ * registration (Windows) switches atomically, and old releases stay for
+ * rollback until `--cleanup`.
  */
 
 import fs from 'node:fs';
@@ -48,19 +45,15 @@ import {
 } from './upgrade-safety.js';
 import { makeTempDir } from '@kici-dev/shared/tmp';
 import { confirmPrompt } from './confirm.js';
+import { preflightBareMetalBinaryPaths } from './bare-metal-binary-check.js';
+import { agentBinaryFromLaunch } from '../../../scaler/agent-binary-location.js';
 
-/** Component types that can be upgraded. */
 export type UpgradeComponent = 'orchestrator' | 'agent';
 
-/** Options for the versioned upgrade command. */
 export interface VersionedUpgradeOptions {
   platform?: ServicePlatform;
-  /**
-   * Service name. No default — targeting flows through {@link resolveInstanceTarget}
-   * which consumes `name`, `instanceDir`, or the CWD manifest in priority order.
-   */
+  /** No default: {@link resolveInstanceTarget} picks the target. */
   name?: string;
-  /** Deploy folder of the instance to upgrade. */
   instanceDir?: string;
   from?: string;
   url?: string;
@@ -70,10 +63,7 @@ export interface VersionedUpgradeOptions {
   rollback?: boolean;
   pick?: boolean;
   force?: boolean;
-  /**
-   * Opt-in escape hatch: restart the already-installed package without
-   * self-driving the npm install (the pre-staged / air-gapped path).
-   */
+  /** Restart the already-installed package without the npm install (pre-staged / air-gapped). */
   restartOnly?: boolean;
   /** Skip the pre-upgrade dump. Loud: printed as a banner and echoed at the end. */
   skipBackup?: boolean;
@@ -88,6 +78,46 @@ export interface VersionedUpgradeOptions {
    * the target's recorded head first, through the still-running newer service.
    */
   migrateDown?: boolean;
+  /**
+   * Upgrade even when a bare-metal scaler's `binaryPath` is not executable or is
+   * a version-manager shim. The check still prints what it found.
+   */
+  skipBinaryPathCheck?: boolean;
+}
+
+/**
+ * Check every bare-metal `binaryPath` of an orchestrator before the upgrade
+ * installs or restarts anything. `spec` is the unit's launch command: the
+ * `kici-agent` installed with its runtime is the one each `binaryPath` should
+ * name. `expectedVersion` is what that agent runs after the upgrade, when the
+ * caller knows it. Throws when a `binaryPath` would stop the restarted service,
+ * unless `skip` is set: then every finding is a warning.
+ */
+async function checkBareMetalBinaryPathsBeforeUpgrade(args: {
+  component: UpgradeComponent;
+  config: ServiceConfig;
+  platform: ServicePlatform;
+  spec: LaunchSpec | null;
+  expectedVersion: string | null;
+  willInstall: boolean;
+  skip: boolean;
+}): Promise<void> {
+  // An agent upgrade has no scalers, and a compose service runs its scalers
+  // inside a container whose paths this host cannot check.
+  if (args.component !== 'orchestrator' || args.platform === 'compose') return;
+  const expectedAgent = args.spec
+    ? agentBinaryFromLaunch(args.spec, isWindows(args.platform))
+    : null;
+  await preflightBareMetalBinaryPaths({
+    serviceName: args.config.name,
+    envFilePath: args.config.envFilePath,
+    workingDirectory: args.config.workingDirectory,
+    expectedAgent,
+    expectedVersion: expectedAgent ? args.expectedVersion : null,
+    willInstall: args.willInstall && expectedAgent !== null,
+    skip: args.skip,
+    warn: (line) => console.warn(line),
+  });
 }
 
 /**
@@ -102,11 +132,9 @@ export interface UpgradeHooks {
   /** Revert the schema to `head` through the running service. */
   migrateDown?: (head: string) => Promise<void>;
   /**
-   * Take the pre-upgrade dump, returning where it landed.
-   *
-   * `envFilePath` comes from the instance manifest, so the dump is taken
-   * against exactly the database the running service uses rather than whatever
-   * the operator's shell exports.
+   * Take the pre-upgrade dump. `envFilePath` comes from the instance manifest,
+   * so the dump hits the database the running service uses, not whatever the
+   * operator's shell exports.
    */
   backup?: (args: {
     outputPath: string;
@@ -114,48 +142,35 @@ export interface UpgradeHooks {
   }) => Promise<{ outputPath: string; byteSize: number }>;
 }
 
-/**
- * Resolved upgrade target: the manifest-backed ServiceConfig the upgrade
- * flow operates on, the manifest's installBase (NOT re-derived from name),
- * and the underlying resolved instance for downstream writes.
- */
+/** The manifest-backed target; `installBase` is the manifest's, never re-derived from the name. */
 export interface UpgradeTarget {
   config: ServiceConfig;
   installBase: string;
   resolvedInstance: ResolvedInstance;
-  /** The driver that manages this install — built for {@link UpgradeTarget.platform}. */
+  /** Built for {@link UpgradeTarget.platform}. */
   manager: ServiceManager;
   /**
-   * The install's own platform: `platformOverride ?? manifest.platform`. Every
-   * downstream question the upgrade asks — the root check, the launcher name,
-   * whether the current version reads a symlink or a version file — is about
-   * the layout on disk, so it is answered from the install, not the host.
+   * `platformOverride ?? manifest.platform`. Every downstream question (root
+   * check, launcher name, symlink vs version file) is about the layout on disk,
+   * so it is answered from the install, not the host.
    */
   platform: ServicePlatform;
 }
 
 /**
- * Resolve the upgrade target via the folder-anchored model and build the
- * ServiceConfig + installBase the rest of the upgrade flow needs.
- *
- * Priority chain (delegated to {@link resolveInstanceTarget}):
- *   1. `opts.instanceDir` — read manifest at that path.
- *   2. `opts.name`        — match against listInstances() output.
- *   3. CWD manifest       — read `./.kici-<component>.json`.
- *   4. otherwise          — refuse with a candidate-list error.
- *
- * The returned `installBase` comes from the manifest, NEVER re-derived from
- * the service name. Instances installed with a non-default base must
- * continue to resolve to that base on upgrade.
+ * Resolve the upgrade target through {@link resolveInstanceTarget}: `instanceDir`,
+ * then `name`, then the CWD `./.kici-<component>.json`, else refuse with a
+ * candidate list. `installBase` comes from the manifest, never re-derived from
+ * the name, so an install with a non-default base keeps it on upgrade.
  */
 export async function resolveUpgradeTarget(args: {
   component: UpgradeComponent;
   opts: { instanceDir?: string; name?: string };
-  /** The `--platform` flag. When set it forces the driver, as it always has. */
+  /** The `--platform` flag; forces the driver when set. */
   platformOverride?: ServicePlatform;
   isUserLevel: boolean;
   kiciRoot: string;
-  /** Driver factory. Defaults to the service barrel's createServiceManager. */
+  /** Defaults to the service barrel's createServiceManager. */
   createManager?: (platform: ServicePlatform) => Promise<ServiceManager>;
 }): Promise<UpgradeTarget> {
   const { component, opts, isUserLevel, kiciRoot } = args;
@@ -175,13 +190,11 @@ export async function resolveUpgradeTarget(args: {
     envFilePath: resolved.manifest.envFilePath,
     workingDirectory: resolved.manifest.configDir,
     isUserLevel: resolved.manifest.isUserLevel,
-    // Share the one restart-policy constant every other lifecycle command uses.
-    // A re-spelled copy here would drift the moment the policy changes, and on
-    // Windows this config is what `upgrade` re-registers the service from.
+    // The shared constant, not a copy that drifts: on Windows `upgrade`
+    // re-registers the service from this config.
     restartPolicy: DEFAULT_RESTART_POLICY,
     component,
-    // Re-embed the deploy-folder marker so an upgraded unit keeps recovery
-    // working even if the instance index is later lost.
+    // Keeps recovery working if the instance index is later lost.
     instanceDir: resolved.instanceDir,
   };
   return {
@@ -198,7 +211,6 @@ function confirm(message: string): Promise<boolean> {
   return confirmPrompt(`${message} [y/N] `, { input: process.stdin, output: process.stdout });
 }
 
-/** Download a file from a URL to a local path. */
 async function downloadArchive(url: string, destPath: string): Promise<void> {
   console.log(`Downloading from ${url}...`);
   const res = await fetch(url);
@@ -211,14 +223,8 @@ async function downloadArchive(url: string, destPath: string): Promise<void> {
 }
 
 /**
- * Install base for a KiCI component instance.
- *
- * Name-scoped so that two instances of the same component (e.g. an org's
- * production orchestrator and a test orchestrator on the same host) own
- * independent versioned trees and symlinks. Per-platform bases:
- *   - systemd / compose: /opt/kici/<name>/
- *   - launchd:           /usr/local/kici/<name>/
- *   - windows:           C:\Program Files\KiCI\<name>\
+ * Name-scoped install base, so two instances of one component on a host own
+ * independent versioned trees and symlinks.
  */
 export function getInstallBase(platform: ServicePlatform, name: string): string {
   const sep = platform === 'windows' ? '\\' : '/';
@@ -233,7 +239,6 @@ export function getInstallBase(platform: ServicePlatform, name: string): string 
   }
 }
 
-/** A choice row for the `--pick` interactive select. */
 export interface PickChoice {
   value: string;
   name: string;
@@ -242,10 +247,9 @@ export interface PickChoice {
 }
 
 /**
- * Build the interactive `--pick` choices, newest-first (lexicographic, matching
- * the rest of the versioned-directory handling). The currently-active version is
- * labeled `(current)` and disabled so it cannot be selected — picking it would be
- * a no-op restart.
+ * `--pick` choices, newest-first (lexicographic, like the rest of the
+ * versioned-directory handling). The active version is disabled: picking it
+ * would be a no-op restart.
  */
 export function buildPickChoices(versions: string[], current: string | null): PickChoice[] {
   return [...versions]
@@ -258,20 +262,14 @@ export function buildPickChoices(versions: string[], current: string | null): Pi
     }));
 }
 
-/**
- * The versions a `--pick` switch may target: every installed version except the
- * currently-active one. Empty when only the current version (or nothing) is
- * installed — the caller turns that into a "nothing to pick" error.
- */
+/** Every installed version except the active one; empty means "nothing to pick". */
 export function selectablePickTargets(versions: string[], current: string | null): string[] {
   return versions.filter((v) => v !== current);
 }
 
 /**
- * Validate that `--pick` is not combined with a source/mode flag it conflicts
- * with. `--pick` activates an already-installed version, so it never downloads
- * (`--from`/`--url`), never takes an explicit `--version`, and is its own mode
- * (not `--rollback`/`--cleanup`). Returns an error message, or null when OK.
+ * `--pick` activates an installed version, so it excludes `--from`, `--url`,
+ * `--version`, `--rollback` and `--cleanup`. Returns an error message, or null.
  */
 export function checkPickFlagConflicts(opts: {
   pick?: boolean;
@@ -311,7 +309,6 @@ async function reregisterWindowsService(
   await manager.install(config);
 }
 
-/** Check if the platform is Windows. */
 function isWindows(platform: ServicePlatform): boolean {
   return platform === 'windows';
 }
@@ -337,17 +334,13 @@ function assertWindowsLaunchReadsEnvFile(args: {
 }
 
 /**
- * Stop the service, register it again on Windows, then start it: the restart
- * every npm-source upgrade ends with.
- *
- * `npm install -g` replaces the package in place, so the launch command the
- * service runs (`spec`, read back from its registration) stays valid. On
- * Windows the registration around that command (the service wrapper's
- * arguments, the description, the recovery settings) is whatever the CLI that
- * installed it wrote, so `install` writes the current one, as the archive
- * upgrade does. A launch command that names a file that does not exist was
- * read back wrong, so it is not registered: the service restarts as it was,
- * with a warning. systemd and launchd keep their unit as it is.
+ * The restart every npm-source upgrade ends with: stop, re-register on
+ * Windows, start. `npm install -g` replaces the package in place, so `spec`
+ * stays valid; on Windows the registration around it (wrapper arguments,
+ * description, recovery settings) is whatever the installing CLI wrote, so
+ * `install` rewrites it. A launch command naming a missing file was read back
+ * wrong and is not registered: the service restarts as it was, with a warning.
+ * systemd and launchd keep their unit.
  */
 export async function restartOntoInstalledPackage(args: {
   manager: ServiceManager;
@@ -394,21 +387,16 @@ export async function restartOntoInstalledPackage(args: {
   await manager.start(config);
 }
 
-/** Get the launcher script name for a component. */
 function getLauncherName(component: UpgradeComponent, platform: ServicePlatform): string {
   const baseName = component === 'orchestrator' ? 'kici-orchestrator-standalone' : 'kici-agent';
   return isWindows(platform) ? `${baseName}.cmd` : baseName;
 }
 
-/**
- * Extract an archive (.tar.gz or .zip) to a destination directory.
- * Returns the name of the top-level directory inside the archive.
- */
+/** Extract a .tar.gz or .zip and return its top-level directory name. */
 function extractArchive(archivePath: string, destDir: string): string {
   fs.mkdirSync(destDir, { recursive: true });
 
   if (archivePath.endsWith('.zip')) {
-    // Windows-style zip extraction
     if (os.platform() === 'win32') {
       execSync(
         `powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${destDir}' -Force"`,
@@ -418,11 +406,9 @@ function extractArchive(archivePath: string, destDir: string): string {
       execSync(`unzip -o "${archivePath}" -d "${destDir}"`, { stdio: 'inherit' });
     }
   } else {
-    // tar.gz extraction
     execSync(`tar -xzf "${archivePath}" -C "${destDir}"`, { stdio: 'inherit' });
   }
 
-  // Find the top-level directory in the extracted content
   const entries = fs.readdirSync(destDir);
   const dirs = entries.filter((e) => fs.statSync(path.join(destDir, e)).isDirectory());
   if (dirs.length === 0) {
@@ -459,11 +445,10 @@ export function extractRelease(args: {
 }
 
 /**
- * Put the release in `archivePath` at `versionedDirPath`. The release is
- * extracted and checked first ({@link extractRelease}); only then is a folder
- * already at `versionedDirPath` removed, which the caller allows with
- * `--force`, and the release copied in. A refused release leaves the install
- * base as it was.
+ * Put the release at `versionedDirPath`. It is extracted and checked first
+ * ({@link extractRelease}); only then is an existing folder there removed
+ * (the caller allows that with `--force`). A refused release leaves the
+ * install base as it was.
  */
 export function installRelease(args: {
   archivePath: string;
@@ -492,10 +477,7 @@ export function installRelease(args: {
   console.log(`Extracted to ${versionedDirPath}`);
 }
 
-/**
- * List installed versions for a component by scanning the install base directory
- * for directories matching `{component}-{version}/`.
- */
+/** Installed versions: the `{component}-{version}/` directories under the install base. */
 function listInstalledVersions(installBase: string, component: UpgradeComponent): string[] {
   if (!fs.existsSync(installBase)) return [];
   const prefix = `${component}-`;
@@ -511,8 +493,8 @@ function listInstalledVersions(installBase: string, component: UpgradeComponent)
 }
 
 /**
- * Read the current symlink target to determine the active version.
- * Returns null if no symlink exists or on Windows.
+ * The active version, from the symlink target, or on Windows from the
+ * version file. Null when neither exists.
  */
 function getCurrentVersion(
   installBase: string,
@@ -520,7 +502,6 @@ function getCurrentVersion(
   platform: ServicePlatform,
 ): string | null {
   if (isWindows(platform)) {
-    // On Windows, there's no symlink — track current version in a text file
     const versionFile = path.join(installBase, `${component}-current-version.txt`);
     try {
       return fs.readFileSync(versionFile, 'utf-8').trim();
@@ -536,18 +517,18 @@ function getCurrentVersion(
     if (target.startsWith(prefix)) {
       return target.slice(prefix.length);
     }
-    // Handle absolute paths
+    // An absolute target.
     const basename = path.basename(target);
     if (basename.startsWith(prefix)) {
       return basename.slice(prefix.length);
     }
   } catch {
-    // Symlink doesn't exist or isn't a symlink
+    // Missing, or not a symlink.
   }
   return null;
 }
 
-/** Write the current version to a tracking file (used on Windows). */
+/** Windows has no symlink, so the active version lives in a file. */
 function writeCurrentVersion(
   installBase: string,
   component: UpgradeComponent,
@@ -557,10 +538,7 @@ function writeCurrentVersion(
   fs.writeFileSync(versionFile, version, 'utf-8');
 }
 
-/**
- * Update the symlink atomically on Unix.
- * Creates a temporary symlink then renames it over the existing one.
- */
+/** Repoint the symlink atomically: a relative temp link renamed over the old one. */
 function updateSymlinkAtomic(
   installBase: string,
   component: UpgradeComponent,
@@ -571,41 +549,23 @@ function updateSymlinkAtomic(
   const target = `${component}-${version}`;
 
   try {
-    // Create temp symlink pointing at the new versioned directory (relative path)
     fs.symlinkSync(target, tmpLink);
-    // Atomic rename over existing symlink
     fs.renameSync(tmpLink, symlinkPath);
   } catch (err) {
-    // Clean up temp link if rename failed
     try {
       fs.unlinkSync(tmpLink);
     } catch {
-      // Ignore cleanup errors
+      // Best-effort cleanup.
     }
     throw err;
   }
 }
 
 /**
- * Perform a versioned directory upgrade for a KiCI component.
- *
- * Flow:
- * 1. Parse upgrade source (--from archive or --url)
- * 2. Determine install base by platform
- * 3. Extract new versioned directory
- * 4. Stop service
- * 5. Update symlink (Unix) or service registration (Windows)
- * 6. Start service
- */
-/**
- * Resolve the target version for an npm-source upgrade (no --from/--url).
- *
- * The npm-source flow assumes the operator already ran
- * `npm install -g @kici-dev/<pkg>@<version>`, which overwrites the global
- * package in place. The running `kici-admin` binary is therefore the new
- * version, and `running` is its self-reported version. We default the target
- * to it, or validate an explicitly-passed --version matches — a mismatch means
- * the npm install did not actually update the global binary.
+ * Target version of a restart-only npm-source upgrade. The operator already
+ * ran `npm install -g`, so the running `kici-admin` is the new version: the
+ * target defaults to `running`, and a different `--version` means the install
+ * did not update the global binary.
  */
 export function resolveNpmSourceVersion(opts: {
   requested: string | undefined;
@@ -627,16 +587,14 @@ export function resolveNpmSourceVersion(opts: {
   return opts.running;
 }
 
-/** Verdict from {@link verifyNpmSourceLaunch}. */
 export type NpmSourceLaunchVerdict =
   { ok: true; version: string; manifestVersion: string | null } | { ok: false; reason: string };
 
 /**
- * Decide whether an npm-source upgrade may proceed, given the version the
- * invoking CLI is (`invoked`) and the version the installed unit will actually
- * launch (`launched`, or null when unresolvable — e.g. an opaque --binary
- * install). On success `manifestVersion` is the value to persist (null = leave
- * the manifest's kiciVersion unchanged because we couldn't verify it).
+ * Whether an npm-source upgrade may proceed: the invoking CLI's version must
+ * match what the unit will launch (`launched`, null when unresolvable such as
+ * an opaque --binary install). A null `manifestVersion` leaves the manifest's
+ * kiciVersion unchanged because it was not verified.
  */
 export function verifyNpmSourceLaunch(opts: {
   component: UpgradeComponent;
@@ -671,12 +629,6 @@ export function verifyNpmSourceLaunch(opts: {
   return { ok: true, version: launched, manifestVersion: launched };
 }
 
-/**
- * An npm-source upgrade proceeds one of three ways: restart the already-installed
- * package (`restart-only`, carrying a {@link NpmSourceLaunchVerdict}), self-drive
- * the install of a resolved target under the unit's own runtime (`self-drive`),
- * or refuse with an operator-facing message (`error`).
- */
 export type NpmSourceUpgradeAction =
   | { kind: 'restart-only'; verdict: NpmSourceLaunchVerdict }
   | { kind: 'self-drive'; target: NpmInstallTarget; version: string }
@@ -684,10 +636,9 @@ export type NpmSourceUpgradeAction =
 
 /**
  * Decide how an npm-source upgrade proceeds. `restart-only` re-verifies and
- * restarts the already-installed package (the pre-staged / air-gapped path).
- * The default self-drives: it resolves the global package + pinned node from
- * the unit's launch spec so the CLI can install the target itself. Returns an
- * `error` action (not a throw) for the two operator-facing refusals.
+ * restarts the installed package; the default self-drives, resolving the
+ * global package and pinned node from the unit's launch spec. Operator-facing
+ * refusals return an `error` action rather than throwing.
  */
 export function planNpmSourceUpgrade(opts: {
   component: UpgradeComponent;
@@ -735,7 +686,7 @@ export function planNpmSourceUpgrade(opts: {
   return { kind: 'self-drive', target, version: requestedVersion };
 }
 
-/** Injected process runner seam for the npm calls of an npm-source upgrade. */
+/** Process runner for the npm calls; tests inject it. */
 export type SpawnRunner = (
   cmd: string,
   args: string[],
@@ -744,11 +695,10 @@ export type SpawnRunner = (
 
 /**
  * The cmd.exe command line for npm on Windows. npm is a batch file there, which
- * Node.js starts only through a shell, and Node.js joins the parts of a shell
- * command with spaces and quotes none of them. The standard Node.js install is
- * under `C:\Program Files`, so the npm path is quoted here. An argument with a
- * character outside those of a package name, a version or a flag is refused
- * rather than handed to cmd.exe.
+ * Node.js starts only through a shell, joining the parts with spaces and
+ * quoting none of them; the npm path is quoted here because the standard Node.js
+ * install is under `C:\Program Files`. An argument with a character outside those of a
+ * package name, a version or a flag is refused rather than handed to cmd.exe.
  */
 export function windowsShellCommand(cmd: string, args: string[]): string {
   if (cmd.includes('"')) {
@@ -785,10 +735,9 @@ function npmEnv(target: NpmInstallTarget): NodeJS.ProcessEnv {
 }
 
 /**
- * Whether `version` of the KiCI packages reads KICI_ENV_FILE, asked of the
- * registry the unit's npm installs from. A release that reads it publishes the
- * env-file loader in `@kici-dev/shared`, which every KiCI package of the same
- * version depends on.
+ * Whether `version` reads KICI_ENV_FILE, asked of the unit's npm registry. Such
+ * a release exports the env-file loader from `@kici-dev/shared`, which every
+ * KiCI package of that version depends on.
  */
 export function npmReleaseReadsEnvFile(
   target: NpmInstallTarget,
@@ -822,18 +771,13 @@ export function npmReleaseReadsEnvFile(
 }
 
 /**
- * Install `<owningPackage>@<version>` globally under the unit's own pinned node,
- * so it lands in exactly the global prefix the unit's ExecStart resolves from.
- *
- * npm derives its global prefix from the node that *runs* npm-cli.js, not from
- * the location of the npm script — and the unit's `<pinned>/bin/npm` is a
- * `#!/usr/bin/env node` shebang (or a version-manager bash wrapper invoking a
- * bare `node`), both of which resolve `node` off PATH. So invoking that npm
- * bare would inherit whatever node the shell has active — exactly the
- * version-manager (mise/nvm/asdf) drift this upgrade exists to fix. We prepend
- * the pinned node's bin dir to PATH so npm always runs under the unit's node
- * and computes the unit's prefix, regardless of the caller's active node. The
- * `run` seam is injected in tests.
+ * Install `<owningPackage>@<version>` globally under the unit's pinned node, so
+ * it lands in the prefix the unit's ExecStart resolves from. npm derives its
+ * global prefix from the node that runs npm-cli.js, and the unit's
+ * `<pinned>/bin/npm` (an `env node` shebang or a version-manager wrapper)
+ * resolves `node` off PATH; run bare it would inherit the shell's active node,
+ * the mise/nvm/asdf drift this upgrade fixes. Hence the pinned bin dir goes
+ * first on PATH ({@link npmEnv}).
  */
 export function installGlobalPackage(
   target: NpmInstallTarget,
@@ -847,12 +791,10 @@ export function installGlobalPackage(
 }
 
 /**
- * Take the pre-upgrade dump and quiesce the coordinator, then report the head
- * the CURRENT version was running at so the manifest can record it.
- *
- * Everything here runs while the service is still up, which is the point: the
- * dump needs a live database, the drain needs a live admin API, and the head
- * has to be read from the version that is about to be replaced.
+ * Take the pre-upgrade dump, quiesce the coordinator, and return the head the
+ * CURRENT version runs at for the manifest. All of it runs while the service
+ * is up: the dump needs a live database, the drain a live admin API, and the
+ * head must come from the version about to be replaced.
  */
 async function runPreStopSafety(args: {
   component: UpgradeComponent;
@@ -863,20 +805,17 @@ async function runPreStopSafety(args: {
   const { component, opts, hooks, resolvedInstance } = args;
   const manifest = resolvedInstance.manifest;
 
-  // An agent has no database and no drain. Nothing below applies to it.
+  // An agent has no database and no drain.
   if (component !== 'orchestrator') return { map: manifest.migrationHeads };
 
-  // Record the head the version being replaced was running at, so a later
-  // rollback to it can be checked.
+  // Recorded so a later rollback to the replaced version can be checked.
   const rows = hooks.migrationStatus ? await readLiveMigrationRows(hooks.migrationStatus) : null;
   const map = rows
     ? mergeMigrationHead(manifest.migrationHeads, manifest.kiciVersion, appliedHead(rows))
     : manifest.migrationHeads;
 
-  // Pre-upgrade backup — unconditional, with a loud opt-out. The conditional
-  // form would need a recorded head, which is absent on exactly the
-  // pre-existing installs most at risk, so it would evaluate to "skip" for
-  // every customer upgrading for the first time under this change.
+  // Unconditional, with a loud opt-out. Gating it on a recorded head would
+  // skip it on exactly the older installs most at risk, which have none.
   if (opts.skipBackup) {
     console.log('');
     console.log('  !!  --skip-backup: no pre-upgrade dump will be taken.');
@@ -901,8 +840,7 @@ async function runPreStopSafety(args: {
     }
   }
 
-  // Drain — default on. Every mechanism already existed and was already
-  // documented as the pre-upgrade step; the only missing piece was the call.
+  // Drain is on by default.
   if (!opts.noDrain && hooks.drain) {
     const timeoutSeconds = Number.parseInt(opts.drainTimeout ?? '300', 10);
     console.log(`Draining (waiting up to ${timeoutSeconds}s for in-flight jobs)...`);
@@ -914,12 +852,10 @@ async function runPreStopSafety(args: {
       }
       console.log('Coordinator quiesced.');
     } catch (err) {
-      // Unreachable is not the same as "jobs are still running". An install
-      // whose CLI has no admin URL or token cannot reach the drain route at
-      // all, and refusing there would break the documented upgrade for every
-      // one of them — a hard break of a path that never drained before. Warn
-      // and continue; a drain that WAS requested and timed out still refuses,
-      // because that one is real evidence of in-flight work.
+      // Unreachable is not "jobs still running": an install whose CLI has no
+      // admin URL or token cannot reach the drain route, and refusing would
+      // break its documented upgrade. Warn and continue; a drain that timed
+      // out still refuses, because that is evidence of in-flight work.
       console.log('');
       console.log(`  !!  The coordinator could not be drained: ${toErrorMessage(err)}`);
       console.log('      Any in-flight jobs will fail when the service restarts.');
@@ -928,11 +864,16 @@ async function runPreStopSafety(args: {
     }
   }
 
-  // The restarted process comes back accepting: the drain flag is in-memory,
-  // so no resume step is needed.
+  // The drain flag is in-memory, so the restarted process comes back accepting.
   return { map };
 }
 
+/**
+ * Run `kici-admin <component> upgrade`: `--pick`, `--rollback` and `--cleanup`
+ * act on installed versions, no `--from`/`--url` is an npm-source upgrade, and
+ * an archive installs a new versioned directory, then stops the service,
+ * switches the symlink (Unix) or registration (Windows), and starts it.
+ */
 export async function performVersionedUpgrade(
   component: UpgradeComponent,
   opts: VersionedUpgradeOptions,
@@ -952,20 +893,18 @@ export async function performVersionedUpgrade(
       },
     );
 
-    // Check root on Unix (required for /opt/kici/ and /usr/local/kici/)
+    // Unix system installs (/opt/kici/, /usr/local/kici/) need root.
     if (!isWindows(platform) && !userLevel && !isRoot()) {
       console.error('Error: root privileges required to upgrade system-level services');
       process.exit(1);
     }
 
-    // Validate --pick flag combination up front.
     const pickConflict = checkPickFlagConflicts(opts);
     if (pickConflict) {
       console.error(`Error: ${pickConflict}`);
       process.exit(1);
     }
 
-    // Handle --pick (interactive switch to an installed version)
     if (opts.pick) {
       await handlePick(
         component,
@@ -980,7 +919,6 @@ export async function performVersionedUpgrade(
       return;
     }
 
-    // Handle --rollback
     if (opts.rollback) {
       await handleRollback(
         component,
@@ -995,19 +933,16 @@ export async function performVersionedUpgrade(
       return;
     }
 
-    // Handle --cleanup
     if (opts.cleanup) {
       await handleCleanup(component, platform, installBase);
       return;
     }
 
-    // No archive source: npm-source upgrade (self-driving by default).
     if (!opts.from && !opts.url) {
       await performNpmSourceUpgrade(component, config, resolvedInstance, manager, opts, platform);
       return;
     }
 
-    // Archive-based upgrade requires an explicit target version.
     if (!opts.version) {
       console.error('Error: --version is required to specify the target version');
       process.exit(1);
@@ -1025,14 +960,24 @@ export async function performVersionedUpgrade(
       process.exit(1);
     }
 
-    // Check service is installed
     const installed = await manager.isInstalled(config);
     if (!installed) {
       console.error(`Error: service "${config.name}" is not installed`);
       process.exit(1);
     }
 
-    // Resolve archive path
+    // Before the archive is fetched or anything changes: a bare-metal
+    // binaryPath that is missing or a shim would stop the restarted service.
+    await checkBareMetalBinaryPathsBeforeUpgrade({
+      component,
+      config,
+      platform,
+      spec: await manager.readLaunchSpec(config),
+      expectedVersion: null,
+      willInstall: false,
+      skip: opts.skipBinaryPathCheck ?? false,
+    });
+
     let archivePath: string;
     const { path: tmpDir, cleanup: cleanupTmpDir } = await makeTempDir('upgrade');
 
@@ -1043,16 +988,13 @@ export async function performVersionedUpgrade(
         process.exit(1);
       }
     } else {
-      // Download from URL
       const ext = opts.url!.endsWith('.zip') ? '.zip' : '.tar.gz';
       archivePath = path.join(tmpDir, `${component}-${version}${ext}`);
       await downloadArchive(opts.url!, archivePath);
     }
 
-    // Get current version info
     const currentVersion = getCurrentVersion(installBase, component, platform);
 
-    // Confirmation
     if (!opts.yes) {
       console.log(`This will upgrade "${config.name}" to version ${version}:`);
       if (currentVersion) {
@@ -1069,7 +1011,6 @@ export async function performVersionedUpgrade(
       }
     }
 
-    // Extract the archive, check the release, and copy it into the install base.
     console.log('Extracting archive...');
     try {
       installRelease({
@@ -1087,11 +1028,9 @@ export async function performVersionedUpgrade(
       throw err;
     }
 
-    // Take a dump and quiesce the coordinator BEFORE anything stops. Both are
-    // orchestrator-only: an agent has no database and no drain.
+    // Dump and quiesce BEFORE anything stops.
     const preStopHeads = await runPreStopSafety({ component, opts, hooks, resolvedInstance });
 
-    // Stop service
     console.log('Stopping service...');
     const status = await manager.status(config);
     if (status.state === 'running') {
@@ -1099,26 +1038,22 @@ export async function performVersionedUpgrade(
       console.log('Service stopped.');
     }
 
-    // Update version pointer
     if (isWindows(platform)) {
       const launcherPath = path.join(versionedDirPath, getLauncherName(component, platform));
       await reregisterWindowsService(manager, config, launcherPath);
-      // Track current version in a file (Windows has no symlinks)
       writeCurrentVersion(installBase, component, version);
       console.log(`Service registration updated to ${launcherPath}`);
     } else {
-      // Unix: atomic symlink update
       updateSymlinkAtomic(installBase, component, version);
       const symlinkPath = path.join(installBase, component);
       console.log(`Symlink updated: ${symlinkPath} -> ${versionedDirName}`);
 
-      // Ensure the launcher script in the symlinked directory is executable
       const launcherPath = path.join(symlinkPath, getLauncherName(component, platform));
       if (fs.existsSync(launcherPath)) {
         fs.chmodSync(launcherPath, 0o755);
       }
 
-      // executablePath points through the symlink
+      // Through the symlink, not the versioned directory.
       config.executablePath = path.join(
         installBase,
         component,
@@ -1126,21 +1061,18 @@ export async function performVersionedUpgrade(
       );
     }
 
-    // Start service
     console.log('Starting service...');
     await manager.start(config);
     console.log('Service started.');
 
-    // Persist the new version into the manifest so subsequent lifecycle
-    // commands and the next upgrade see the current kiciVersion. Writes the
-    // entire manifest in place — every other field is preserved.
+    // Later lifecycle commands and the next upgrade read kiciVersion from here;
+    // every other manifest field is preserved.
     writeManifest(resolvedInstance.instanceDir, {
       ...resolvedInstance.manifest,
       kiciVersion: version,
       migrationHeads: preStopHeads.map,
     });
 
-    // Clean up temp directory
     await cleanupTmpDir();
 
     console.log('');
@@ -1159,14 +1091,13 @@ export async function performVersionedUpgrade(
 }
 
 /**
- * npm-source upgrade (no --from/--url). By default the CLI self-drives: it reads
- * the unit's launch spec to recover the pinned node runtime and the global
- * package its ExecStart resolves (kici-admin when the component is loaded through
- * kici-admin's nested node_modules, or the standalone `@kici-dev/<component>`),
- * installs `<pkg>@<version>` under that runtime with the co-located npm, restarts,
- * and verifies the launched version. `--restart-only` skips the install and just
- * restarts an already-installed package (the pre-staged / air-gapped path). No
- * archive, no versioned dir, no symlink.
+ * npm-source upgrade (no --from/--url); no versioned dir, no symlink. By
+ * default it self-drives: from the unit's launch spec it recovers the pinned
+ * node and the global package ExecStart resolves (kici-admin when the
+ * component loads through its nested node_modules, else the standalone
+ * `@kici-dev/<component>`), installs `<pkg>@<version>` with the co-located
+ * npm, restarts, and verifies the launched version. `--restart-only` skips
+ * the install.
  */
 async function performNpmSourceUpgrade(
   component: UpgradeComponent,
@@ -1185,7 +1116,7 @@ async function performNpmSourceUpgrade(
   const invoked = readKiciVersion();
   const spec = await manager.readLaunchSpec(config);
 
-  // In restart-only mode, keep the existing invoking-CLI-vs-requested guard.
+  // Restart-only: the invoking CLI must be the requested version.
   if (opts.restartOnly) {
     resolveNpmSourceVersion({ requested: opts.version, running: invoked });
   }
@@ -1231,7 +1162,6 @@ async function performNpmSourceUpgrade(
   });
 }
 
-/** The inputs of {@link restartOnlyUpgrade}. */
 export interface RestartOnlyArgs {
   component: UpgradeComponent;
   config: ServiceConfig;
@@ -1244,17 +1174,14 @@ export interface RestartOnlyArgs {
   spec: LaunchSpec | null;
 }
 
-/** The inputs of {@link performSelfDrivingInstall}. */
 export interface SelfDriveArgs extends Omit<RestartOnlyArgs, 'verdict'> {
   action: { target: NpmInstallTarget; version: string };
-  /** Runs npm; tests inject it. */
   run?: SpawnRunner;
 }
 
 /**
- * Restart-only path: the operator pre-installed `@kici-dev/<pkg>@<version>` (or
- * kici-admin) themselves. Verify the unit will launch the invoking CLI's version,
- * restart onto it, and persist the manifest version.
+ * Restart-only path: the operator pre-installed the package. Verify the unit
+ * launches the invoking CLI's version, restart onto it, persist the version.
  */
 export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<void> {
   const { config, resolvedInstance, manager, verdict, opts, platform, spec } = args;
@@ -1262,6 +1189,16 @@ export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<void> {
     console.error(`Error: ${verdict.reason}`);
     process.exit(1);
   }
+
+  await checkBareMetalBinaryPathsBeforeUpgrade({
+    component: args.component,
+    config,
+    platform,
+    spec,
+    expectedVersion: null,
+    willInstall: false,
+    skip: opts.skipBinaryPathCheck ?? false,
+  });
 
   if (!opts.yes) {
     console.log(
@@ -1293,18 +1230,25 @@ export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<void> {
   );
 }
 
-/**
- * Self-driving path: install the resolved global package under the unit's own
- * pinned node/npm, restart, and verify the unit now launches the requested
- * version.
- */
+/** Self-driving path: install under the unit's pinned node/npm, restart, verify the version. */
 export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<void> {
   const { component, config, resolvedInstance, manager, action, opts, platform, spec } = args;
   const { target, version } = action;
 
-  // Before anything is installed: a Windows service may not run a release from
-  // before KICI_ENV_FILE, and once npm has replaced the package the service
-  // would start that release at its next restart.
+  // Before anything is installed: a bare-metal binaryPath that is missing or
+  // a shim would stop the restarted service.
+  await checkBareMetalBinaryPathsBeforeUpgrade({
+    component,
+    config,
+    platform,
+    spec,
+    expectedVersion: `${target.owningPackage}@${version}`,
+    willInstall: true,
+    skip: opts.skipBinaryPathCheck ?? false,
+  });
+
+  // Before anything is installed: once npm replaces the package, a Windows
+  // service would start a pre-KICI_ENV_FILE release at its next restart.
   if (isWindows(platform)) {
     const release = `${target.owningPackage}@${version}`;
     const verdict = npmReleaseReadsEnvFile(target, version, args.run);
@@ -1348,7 +1292,6 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<vo
   console.log('Restarting service onto the freshly-installed package...');
   await restartOntoInstalledPackage({ manager, config, platform, spec });
 
-  // Verify the unit now launches the requested version.
   const newSpec = await manager.readLaunchSpec(config);
   const launched = newSpec ? resolveVersionFromLaunchSpec(newSpec, component) : null;
   if (launched !== version) {
@@ -1367,12 +1310,7 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<vo
   console.log(`Upgrade complete: service "${config.name}" is now running version ${version}.`);
 }
 
-/**
- * Handle `--pick`: interactively choose an already-installed version and switch
- * the active version pointer to it. Lists every installed version (the active
- * one shown disabled), confirms the change, then delegates to
- * {@link switchToInstalledVersion}.
- */
+/** `--pick`: choose an installed version, confirm, then {@link switchToInstalledVersion}. */
 async function handlePick(
   component: UpgradeComponent,
   platform: ServicePlatform,
@@ -1441,15 +1379,10 @@ async function handlePick(
 }
 
 /**
- * Refuse a version switch whose target cannot boot against the current schema.
- *
- * `--rollback` and `--pick` both flip a version pointer, and the previous
- * release's static migration provider does not carry the newer migrations'
- * names — so Kysely throws `corrupted migrations` on boot and systemd restarts
- * it forever. The operator ends up with neither version running, produced by
- * the documented recovery.
- *
- * Returns true when the switch may proceed.
+ * Refuse a switch whose target cannot boot against the current schema: the
+ * older release's static migration provider lacks the newer migrations'
+ * names, so Kysely throws `corrupted migrations` on boot and systemd restarts
+ * it forever, leaving neither version running. Returns true to proceed.
  */
 async function assertSchemaAllowsSwitch(args: {
   component: UpgradeComponent;
@@ -1461,14 +1394,13 @@ async function assertSchemaAllowsSwitch(args: {
 }): Promise<boolean> {
   const { component, targetVersion, resolvedInstance, hooks, migrateDown, yes } = args;
 
-  // An agent has no database, so there is nothing for a schema to be ahead of.
+  // An agent has no database.
   if (component !== 'orchestrator') return true;
   if (!hooks.migrationStatus) return true;
 
   const rows = await readLiveMigrationRows(hooks.migrationStatus);
-  // A service that cannot be reached is not evidence about the schema. Say so
-  // and let the existing confirmation decide, rather than refusing a rollback
-  // because the thing being rolled back is already down.
+  // An unreachable service is no evidence about the schema: let the
+  // confirmation decide rather than refuse a rollback of a service already down.
   if (rows === null) {
     console.log('');
     console.log(`  !!  ${SCHEMA_NOT_CHECKED}`);
@@ -1488,10 +1420,8 @@ async function assertSchemaAllowsSwitch(args: {
     return yes ? true : confirm('Proceed with the switch anyway?');
   }
 
-  // The database is ahead. Refusing is the default: down() is largely untested
-  // and frequently lossy, so running it automatically would make an
-  // untested, data-destroying path the thing that fires while an operator is
-  // already in an incident.
+  // The database is ahead: refuse by default. down() is largely untested and
+  // often lossy, and must not fire automatically mid-incident.
   if (!migrateDown) {
     console.error('');
     console.error(verdict.message);
@@ -1512,8 +1442,8 @@ async function assertSchemaAllowsSwitch(args: {
 
   console.log(`Reverting the schema to ${recordedHead} before switching...`);
   try {
-    // Runs through the STILL-RUNNING newer service, which is the only binary
-    // whose provider carries those migrations' down() functions.
+    // Through the STILL-RUNNING newer service: only its provider carries
+    // those migrations' down() functions.
     await hooks.migrateDown(recordedHead);
     console.log(`Schema reverted to ${recordedHead}.`);
   } catch (err) {
@@ -1525,12 +1455,9 @@ async function assertSchemaAllowsSwitch(args: {
 }
 
 /**
- * Stop the service, switch the active version pointer to an already-installed
- * versioned directory (atomic symlink on Unix; re-registration + version file
- * on Windows), restart, and persist the new `kiciVersion` into the manifest.
- *
- * Shared by `--rollback` (switch to the previous version) and `--pick` (switch
- * to any chosen installed version).
+ * Switch to an installed version for `--rollback` and `--pick`: stop, move the
+ * pointer (atomic symlink on Unix; re-registration and version file on
+ * Windows), start, and persist `kiciVersion` into the manifest.
  */
 export async function switchToInstalledVersion(args: {
   component: UpgradeComponent;
@@ -1540,9 +1467,8 @@ export async function switchToInstalledVersion(args: {
   manager: ServiceManager;
   resolvedInstance: ResolvedInstance;
   targetVersion: string;
-  /** Orchestrator-only pre-stop capabilities. Omitted by the agent upgrade. */
+  /** Omitted by the agent upgrade. */
   hooks?: UpgradeHooks;
-  /** Revert the schema to the target's recorded head before switching. */
   migrateDown?: boolean;
   /** Skip the confirmation the unknown-head warning falls through to. */
   yes?: boolean;
@@ -1566,9 +1492,12 @@ export async function switchToInstalledVersion(args: {
     });
   }
 
-  // The guard lives here rather than in handleRollback so `--pick` inherits it
-  // for free — `--pick` can select ANY installed version, which is a strictly
-  // wider hazard than rolling back one step.
+  // A recovery switch is never refused for a binaryPath: it only warns, so the
+  // operator learns before the restart that the service may not start.
+  await warnAboutBareMetalBinaryPaths(args);
+
+  // Here rather than in handleRollback so `--pick`, which can select ANY
+  // installed version, inherits it.
   const proceed = await assertSchemaAllowsSwitch({
     component,
     targetVersion,
@@ -1604,8 +1533,6 @@ export async function switchToInstalledVersion(args: {
   await manager.start(config);
   console.log('Service started.');
 
-  // Persist the new version into the manifest so subsequent lifecycle commands
-  // and the next upgrade see the current kiciVersion.
   writeManifest(resolvedInstance.instanceDir, {
     ...resolvedInstance.manifest,
     kiciVersion: targetVersion,
@@ -1613,8 +1540,32 @@ export async function switchToInstalledVersion(args: {
 }
 
 /**
- * Handle --rollback: switch symlink to the previous version and restart.
+ * Print the bare-metal `binaryPath` diagnosis before `--rollback` or `--pick`
+ * restarts the service. Never refuses and never throws: both are recovery
+ * paths, and a check that cannot run must not block a recovery.
  */
+async function warnAboutBareMetalBinaryPaths(args: {
+  component: UpgradeComponent;
+  platform: ServicePlatform;
+  config: ServiceConfig;
+  manager: ServiceManager;
+}): Promise<void> {
+  try {
+    await checkBareMetalBinaryPathsBeforeUpgrade({
+      component: args.component,
+      config: args.config,
+      platform: args.platform,
+      spec: await args.manager.readLaunchSpec(args.config).catch(() => null),
+      expectedVersion: null,
+      willInstall: false,
+      skip: true,
+    });
+  } catch (err) {
+    console.warn(`Warning: the bare-metal binaryPath check did not run (${toErrorMessage(err)}).`);
+  }
+}
+
+/** `--rollback`: switch to the previous installed version. */
 async function handleRollback(
   component: UpgradeComponent,
   platform: ServicePlatform,
@@ -1644,13 +1595,12 @@ async function handleRollback(
     process.exit(1);
   }
 
-  // Find the previous version (the one before current in sorted order)
+  // The one before current in sorted order; when current is the oldest, the next one.
   const currentIdx = versions.indexOf(currentVersion);
   let previousVersion: string;
   if (currentIdx > 0) {
     previousVersion = versions[currentIdx - 1]!;
   } else if (versions.length >= 2) {
-    // Current is the oldest, pick the next one
     previousVersion = versions[1]!;
   } else {
     console.error('Error: no alternative version available for rollback');
@@ -1658,7 +1608,6 @@ async function handleRollback(
     return; // unreachable, for TS
   }
 
-  // Confirmation
   if (!opts.yes) {
     console.log(`Rolling back "${config.name}":`);
     console.log(`  Current version: ${currentVersion}`);
@@ -1688,10 +1637,7 @@ async function handleRollback(
   console.log(`Rollback complete: ${currentVersion} -> ${previousVersion}`);
 }
 
-/**
- * Handle --cleanup: remove all versioned directories except the current
- * and previous versions.
- */
+/** `--cleanup`: remove every versioned directory except the current and previous. */
 async function handleCleanup(
   component: UpgradeComponent,
   platform: ServicePlatform,

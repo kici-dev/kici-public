@@ -1,8 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Capture the module logger so the unresolvable-bundle test can assert WHICH
-// routing key the failure names, and the re-fired release tests which level
-// they log at.
+// Captured so tests can assert which routing key a failure names and which level a re-fired
+// release logs at.
 const mockError = vi.hoisted(() => vi.fn());
 const mockWarn = vi.hoisted(() => vi.fn());
 const mockInfo = vi.hoisted(() => vi.fn());
@@ -14,8 +13,7 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
   };
 });
 
-// Mock the heavy dispatch giant so the round-trip test stays focused on the
-// resume wiring (load context → rebuild → dispatch with gate skipped → delete).
+// Mocked so the test covers only the resume wiring (load, rebuild, gated dispatch, delete).
 const dispatchMatchedWorkflow = vi.fn().mockResolvedValue({ dispatchedJobCount: 1 });
 vi.mock('./dispatch-matched-workflow.js', () => ({
   dispatchMatchedWorkflow: (...args: unknown[]) => dispatchMatchedWorkflow(...args),
@@ -53,11 +51,7 @@ import { JobSecretsUnsealError } from '../secrets/job-secret-seal.js';
 /** The `held_runs.job_id` a workflow install-gate hold carries. */
 const INSTALL_GATE_JOB_ID = installGateJobId('CI');
 
-/**
- * The `execution_runs` row every settled security check is addressed from: the
- * same repo, sha, effective routing key and credentials the pending check was
- * posted under.
- */
+/** The `execution_runs` row a settled security check is addressed from, as the pending was. */
 const RUN_ROW = {
   repo_identifier: 'a/b',
   sha: 'sha1',
@@ -66,19 +60,14 @@ const RUN_ROW = {
 };
 
 /**
- * A database whose `execution_runs` lookup answers with `runRow` and whose
- * contention query answers with `contenders` — the other holds still pending on
- * the same commit. The two are told apart by their terminal: the run lookup ends
- * in `executeTakeFirst`, the contention query in `execute`.
+ * The run lookup (`executeTakeFirst`) answers `runRow`; the contention query
+ * (`execute`) answers `contenders`, the other holds pending on the same commit.
  */
 function makeDb(runRow: unknown = RUN_ROW, contenders: unknown[] = []) {
   return createMockDb({ selectFirstRow: runRow, selectRows: contenders }).db;
 }
 
-/**
- * A database answering `executeTakeFirst` per table: the run row, and the first
- * job row (or none). The shared mock answers every table with one row.
- */
+/** Answers `executeTakeFirst` per table (the shared mock answers every table with one row). */
 function makeRunAndJobsDb(runRow: unknown, jobRow: unknown) {
   const byTable: Record<string, unknown> = { execution_runs: runRow, execution_jobs: jobRow };
   return {
@@ -101,11 +90,10 @@ function makeDbWithNoRun() {
 }
 
 /**
- * The workflow-scoped hold row `rejectWorkflow` is handed. An install-gate row
- * carries an `approval_requirement`, because `holdWorkflowForInstallGate`
- * writes it through `createHold` — and that is the clause which would otherwise
- * accept it, so a row without one would pass even with the install-gate guard
- * removed from the ownership predicate.
+ * The workflow-scoped hold row `rejectWorkflow` is handed. It carries an
+ * `approval_requirement`, as `holdWorkflowForInstallGate` writes via
+ * `createHold`; that clause would otherwise accept it, so a row without one
+ * passes even with the install-gate guard removed from the ownership predicate.
  */
 function makeHold(jobId: string, overrides: Partial<SecurityCheckHold> = {}): SecurityCheckHold {
   return {
@@ -152,11 +140,7 @@ function makeInputs(): SerializableWorkflowDispatchInputs {
   } as unknown as SerializableWorkflowDispatchInputs;
 }
 
-/**
- * The same inputs with everything the check-run completion reads: a full static
- * job list (plus one dynamic job it must exclude), an installation id, and a
- * commit sha.
- */
+/** Adds what the check-run completion reads, including one dynamic job it must exclude. */
 function makeInputsWithJobs(): SerializableWorkflowDispatchInputs {
   return {
     ...makeInputs(),
@@ -175,11 +159,7 @@ function makeInputsWithJobs(): SerializableWorkflowDispatchInputs {
 
 const bundle = { normalizer: { provider: 'github' } };
 
-/**
- * A registry whose bundle carries a check poster, for the `KiCI Security` half.
- * The default `bundle` deliberately has none, so the tests that do not care
- * about that check keep exercising the poster-less shape.
- */
+/** A bundle with a check poster, for `KiCI Security`; the default `bundle` has none. */
 function makeRegistryWithPoster(postCheckStatus: ReturnType<typeof vi.fn>) {
   return {
     getByRoutingKey: vi.fn().mockReturnValue({ ...bundle, checkStatusPoster: { postCheckStatus } }),
@@ -239,9 +219,8 @@ function heldGlobalInputs(base = makeInputs()): SerializableWorkflowDispatchInpu
 }
 
 /**
- * Deps whose workflow bundle mints `fresh-token`, and whose registration index
- * reports the workflow repository at `sha` — the live registration, which a
- * resume must not read.
+ * The workflow bundle mints `fresh-token`; the index reports the live registration at `sha`,
+ * which a resume must not read.
  */
 function depsWithRegistrationAt(sha: string, mint = vi.fn().mockResolvedValue('fresh-token')) {
   const workflowBundle = {
@@ -391,14 +370,11 @@ describe('resumeWorkflow', () => {
   });
 
   it('resolves the bundle from the post-overlay routing key on a cross-source resume', async () => {
-    // A cross-source dispatch runs a REGISTRATION's workflow against the
-    // registration's own repository, triggered by an event that arrived on a
-    // different source. `dispatchMatchedWorkflow` is handed the registration's
-    // bundle alongside `effectiveRoutingKey: reg.routingKey`, and
-    // `setupDispatchContext` overlays that key onto `setup.info` — but
-    // `toSerializableInputs` spreads `ctx` verbatim, so `info.routingKey` still
-    // names the INBOUND source. Rebuilding from it hands the resumed run the
-    // inbound source's app: wrong credentials, wrong check poster.
+    // A cross-source dispatch runs a REGISTRATION's workflow on its own repo for
+    // an event from another source. `setupDispatchContext` overlays
+    // `effectiveRoutingKey` onto `setup.info`, but `toSerializableInputs` spreads
+    // `ctx` verbatim, so the stored `info.routingKey` names the INBOUND source:
+    // rebuilding from it gives the wrong credentials and check poster.
     const inboundBundle = { normalizer: { provider: 'generic' } };
     const registrationBundle = { normalizer: { provider: 'github' } };
     await storePendingWorkflowContext(undefined, {
@@ -529,10 +505,8 @@ describe('resumeWorkflow', () => {
   });
 
   it('names the post-overlay routing key when the provider bundle is unresolvable', async () => {
-    // The lookup uses `effectiveRoutingKey ?? info.routingKey`, so the failure
-    // must name that key too. Logging the inbound one points an operator at the
-    // source that resolved fine — on exactly the cross-source case where the two
-    // differ, which is the case most likely to produce this failure.
+    // The lookup uses `effectiveRoutingKey ?? info.routingKey`; naming the
+    // inbound key would point the operator at the source that resolved fine.
     mockError.mockClear();
     await storePendingWorkflowContext(undefined, {
       ...makeInputs(),
@@ -553,10 +527,8 @@ describe('resumeWorkflow', () => {
   });
 
   it('completes the queued check runs when the provider bundle is unresolvable', async () => {
-    // The run is terminal and this release will not be retried, so the checks
-    // the held dispatch posted have nothing left to complete them. This branch
-    // loaded the context, so their names are in hand — unlike its sibling
-    // above, which fails precisely because the context is gone.
+    // The run is terminal and the release is not retried, so nothing else
+    // completes the held dispatch's checks; this branch has their names from the context.
     await storePendingWorkflowContext(undefined, makeInputsWithJobs());
     const completeUndispatchedCheckRuns = vi.fn().mockResolvedValue(undefined);
     const deps = makeDeps({
@@ -580,9 +552,7 @@ describe('resumeWorkflow', () => {
   });
 
   it('leaves the check runs alone on a resume that actually dispatches', async () => {
-    // The control: the completion is bound to the failure branch, not to every
-    // resume. A released hold whose dispatch replays must NOT terminalize the
-    // checks its own jobs are about to report on.
+    // Control: a replaying dispatch must NOT terminalize the checks its jobs report on.
     await storePendingWorkflowContext(undefined, makeInputsWithJobs());
     const completeUndispatchedCheckRuns = vi.fn().mockResolvedValue(undefined);
     const deps = makeDeps({ checkRunReporter: { completeUndispatchedCheckRuns } });
@@ -595,17 +565,14 @@ describe('resumeWorkflow', () => {
 
   describe('a trust-policy hold resumes into the gates it never reached', () => {
     /**
-     * The org trust policy's PR-wide hold is decided by `applyTrustPolicyGate`,
-     * which runs BEFORE `resolveWorkflowInstallSecrets`, so its replay has not
-     * satisfied the install gate and has no claim to skip it.
+     * `applyTrustPolicyGate` runs BEFORE `resolveWorkflowInstallSecrets`, so a
+     * trust-policy hold's replay never satisfied the install gate.
      *
-     * This pins the derivation, NOT a withheld secret. On this path the flag
-     * changes nothing: `resolveInstallSecrets` strips an untrusted
-     * contributor's secrets and returns before the install gate, whose release
-     * path is all `skipProtectionGate` selects, and a trust-policy hold always
-     * carries a non-trusted tier. The case the derivation actually covers is a
-     * run with NO tier, which `isUntrustedTier` reads leniently — see
-     * `skipsInstallGate`.
+     * This pins the derivation, NOT a withheld secret: here the flag changes
+     * nothing, since `resolveInstallSecrets` strips an untrusted contributor's
+     * secrets and returns before the install gate, and a trust-policy hold
+     * always carries a non-trusted tier. The derivation matters for a run with
+     * NO tier, which `isUntrustedTier` reads leniently — see `skipsInstallGate`.
      */
     const forkSignal: ReleaseSignal = {
       ...signal,
@@ -670,10 +637,9 @@ describe('rejectWorkflow', () => {
   });
 
   /**
-   * `setupDispatchContext` posts the queued `kici/<workflow>` + per-job checks
-   * before either gate decides, so a rejected hold has them on the commit with
-   * nothing left to complete them — the checks would sit `queued` forever and
-   * block branch protection.
+   * `setupDispatchContext` posts the queued `kici/<workflow>` and per-job checks
+   * before either gate decides; left alone they sit `queued` forever and block
+   * branch protection.
    */
   describe('completes the check runs the dispatch already posted', () => {
     it('closes them as cancelled, naming only the static jobs, before the context is dropped', async () => {
@@ -705,8 +671,7 @@ describe('rejectWorkflow', () => {
       expect(completeUndispatchedCheckRuns.mock.calls[0][0].summary).toContain(
         'Rejected by alice via /kici reject',
       );
-      // The names are derived from the context, so the close must precede the
-      // delete. Reading the context back as null proves the delete still ran.
+      // The names come from the context, so the close precedes the delete, which still ran.
       expect(await loadPendingWorkflowContext(undefined, 'run1')).toBeNull();
     });
 
@@ -736,9 +701,9 @@ describe('rejectWorkflow', () => {
   });
 
   /**
-   * The `KiCI Security` check the org trust policy's PR-wide hold posted as
-   * `pending`. Nothing else completes it — `cancelHeldRun` writes a run row, not
-   * a check run — so it sat `in_progress` on the commit forever.
+   * The trust policy's PR-wide hold posts `KiCI Security` as `pending`, and
+   * nothing else completes it (`cancelHeldRun` writes a run row, not a check
+   * run), so without this it stays `in_progress` forever.
    */
   describe('completes the security check the hold posted', () => {
     it('closes it as cancelled, under the same summary the kici/ checks carry', async () => {
@@ -768,23 +733,19 @@ describe('rejectWorkflow', () => {
       expect(summary).toContain('Rejected by alice via /kici reject');
       // The next step a contributor can actually take.
       expect(summary).toContain('Push a new commit');
-      // Authenticated with the stored credentials of the app the pending check
-      // was posted through, resolved through the effective routing key.
+      // The pending check's app credentials, via the effective routing key.
       expect(credentials).toEqual({ installationId: 42 });
       expect(deps.providerRegistry.getByRoutingKey).toHaveBeenCalledWith('github:1');
-      // One event, one story: the two check families say the same thing.
+      // Both check families carry the same summary.
       expect(completeUndispatchedCheckRuns.mock.calls[0][0].summary).toBe(summary);
-      // Posted before the context its repo, sha and credentials come from is
-      // dropped.
+      // Posted before the context is dropped.
       expect(await loadPendingWorkflowContext(undefined, 'run1')).toBeNull();
     });
 
     it('does NOT post one for a rejected install-gate hold', async () => {
-      // `postCheckStatus` CREATES the named run when it finds none, and an
-      // install-gate hold posts no pending security check — so posting here
-      // would put a failing `KiCI Security` check on a commit that never had
-      // one. The `kici/…` completion still runs, which is what proves the
-      // rejection took the same path and only the security post was withheld.
+      // `postCheckStatus` CREATES a missing run, and an install-gate hold posts
+      // no pending security check, so posting would add a failing `KiCI Security`
+      // check. The `kici/…` completion still runs, proving only that post was withheld.
       await storePendingWorkflowContext(undefined, makeInputsWithJobs());
       const postCheckStatus = vi.fn().mockResolvedValue(undefined);
       const completeUndispatchedCheckRuns = vi.fn().mockResolvedValue(undefined);
@@ -806,8 +767,7 @@ describe('rejectWorkflow', () => {
     });
 
     it('posts nothing for a hold whose execution_runs row is gone', async () => {
-      // The repo, sha and credentials all come from the run row; without one
-      // there is nothing to address a check run to.
+      // A check run is addressed from the run row's repo, sha and credentials.
       const postCheckStatus = vi.fn().mockResolvedValue(undefined);
       const deps = makeDeps({ providerRegistry: makeRegistryWithPoster(postCheckStatus) });
 

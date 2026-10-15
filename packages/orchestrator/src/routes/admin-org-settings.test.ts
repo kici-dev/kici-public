@@ -58,9 +58,9 @@ function buildTestApp(opts?: { accessLog?: Pick<AccessLogWriter, 'record'> }) {
 }
 
 /**
- * Minimal stateful Kysely stub for the `org_settings` global-workflows path.
- * Records a single row per customer_id and mimics the exact query chain the
- * route uses: selectFrom().selectAll().where().executeTakeFirst() for reads and
+ * Stateful Kysely stub for the `org_settings` global-workflows path: one row
+ * per customer_id, mimicking the route's exact chains,
+ * selectFrom().selectAll().where().executeTakeFirst() for reads and
  * insertInto().values().onConflict(...).execute() for upserts.
  */
 function makeOrgSettingsDbStub() {
@@ -878,8 +878,7 @@ describe('PATCH /org-settings/dashboard-writes', () => {
     expect(setDashboardWritePolicy).not.toHaveBeenCalled();
   });
 
-  // The refusal is a coherent conflict the operator can act on, so it must
-  // reach the CLI verbatim rather than as a generic 500.
+  // An actionable conflict must reach the CLI verbatim, not as a generic 500.
   it('surfaces a refused held-run lockout as a 409 carrying the policy message', async () => {
     vi.mocked(setDashboardWritePolicy).mockRejectedValue(
       new HeldRunLockoutRefusedError(['held_runs.approve']),
@@ -916,8 +915,8 @@ describe('PATCH /org-settings/dashboard-writes — access_log audit', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getDashboardWritePolicy).mockResolvedValue({});
-    // Simulate the real helper firing onChange once per flipped op so the
-    // route's callback runs against the AccessLogWriter spy.
+    // Like the real helper, onChange fires once per flipped op, so the route's
+    // callback runs against the AccessLogWriter spy.
     vi.mocked(setDashboardWritePolicy).mockImplementation(
       async (_db, customerId, updates, options) => {
         for (const [op, value] of Object.entries(updates) as Array<[string, string]>) {

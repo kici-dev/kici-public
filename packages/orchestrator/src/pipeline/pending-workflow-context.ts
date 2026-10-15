@@ -1,16 +1,12 @@
 /**
- * Pending workflow dispatch context store — the workflow-level analogue of the
- * `pending_job_contexts` store. Persists the serializable inputs of a
- * `WorkflowDispatchContext` so a workflow whose install gate held can be
- * resumed (reviewer approve, wait-timer expiry, concurrency slot free) by
- * rebuilding the dispatch context and re-running `dispatchMatchedWorkflow`.
+ * Pending workflow dispatch context store, the workflow-level analogue of
+ * `pending_job_contexts`: persists a held workflow's serializable dispatch
+ * inputs so it can resume (reviewer approve, wait-timer expiry, concurrency
+ * slot free) by re-running `dispatchMatchedWorkflow`. The live `deps` and
+ * `bundle` are rebuilt on resume, never persisted.
  *
- * Only the serializable inputs are stored — the live `deps` (ProcessingDeps)
- * and `bundle` (ProviderBundle) are NOT persisted; they are rebuilt from the
- * live orchestrator on resume.
- *
- * Writes to both an in-memory Map (fast read on the same process) and the DB
- * (crash recovery + cross-orchestrator read), mirroring the pending-job store.
+ * Writes to an in-memory Map (same-process reads) and the DB (crash recovery,
+ * cross-orchestrator reads).
  */
 import { sql, type Kysely } from 'kysely';
 import { TERMINAL_RUN_STATES } from '@kici-dev/engine';
@@ -28,18 +24,15 @@ import {
 } from './global-dispatch-identity.js';
 
 /**
- * The serializable subset of a `WorkflowDispatchContext` — everything except
- * the live `deps` and `bundle`, which are rebuilt on resume. Every field here
- * is JSON-safe (the event, payload, and lock file already ride the WS protocol
- * as JSON). A global run's identity is stored without its workflow bundle and
- * credentials, which the resume re-derives.
+ * The JSON-safe subset of a `WorkflowDispatchContext`. A global run's identity
+ * is stored without its workflow bundle and credentials, which the resume
+ * re-derives.
  */
 export type SerializableWorkflowDispatchInputs = Omit<
   WorkflowDispatchContext,
   'deps' | 'bundle' | 'global'
 > & { global?: SerializableGlobalDispatchIdentity };
 
-/** Stored inputs as a read returns them. */
 export type LoadedWorkflowDispatchInputs = SerializableWorkflowDispatchInputs & {
   /**
    * Set when the row's sealed secret fields could not be decrypted; the
@@ -86,7 +79,6 @@ function sealInputs(inputs: SerializableWorkflowDispatchInputs): {
   };
 }
 
-/** Stored inputs with their sealed secret fields merged back. */
 function unsealInputs(
   context: SerializableWorkflowDispatchInputs,
   sealed: string | null | undefined,
@@ -107,15 +99,12 @@ function unsealInputs(
   }
 }
 
-/** Extract the serializable inputs from a live dispatch context. */
 export function toSerializableInputs(
   ctx: WorkflowDispatchContext,
 ): SerializableWorkflowDispatchInputs {
-  // Strip the two non-serializable deps; everything else is JSON-safe.
-  // `dispatchWindowTokenHeld` also goes: it records that THIS dispatch call is
-  // holding a pending-jobs token, which it releases before returning. Carrying
-  // it into a resumed dispatch would make that call release a token it never
-  // took — stealing one held by a deferred init / dynamic task.
+  // `dispatchWindowTokenHeld` is THIS dispatch call's pending-jobs token,
+  // released before it returns; a resumed dispatch carrying it would release a
+  // token it never took, stealing one held by a deferred init / dynamic task.
   const {
     deps: _deps,
     bundle: _bundle,
@@ -126,7 +115,6 @@ export function toSerializableInputs(
   return global ? { ...rest, global: toSerializableGlobalIdentity(global) } : rest;
 }
 
-/** Persist the pending workflow context to the in-memory Map and the DB. */
 export async function storePendingWorkflowContext(
   db: Kysely<Database> | undefined,
   inputs: SerializableWorkflowDispatchInputs,
@@ -150,7 +138,7 @@ export async function storePendingWorkflowContext(
   }
 }
 
-/** Load the pending workflow context by run id (memory first, then DB). */
+/** Memory first, then DB. */
 export async function loadPendingWorkflowContext(
   db: Kysely<Database> | undefined,
   runId: string,
@@ -168,7 +156,6 @@ export async function loadPendingWorkflowContext(
     : null;
 }
 
-/** Delete the pending workflow context from the in-memory Map and the DB. */
 export async function deletePendingWorkflowContext(
   db: Kysely<Database> | undefined,
   runId: string,
@@ -180,14 +167,12 @@ export async function deletePendingWorkflowContext(
 }
 
 /**
- * Restore the in-memory Map from the DB on startup, skipping rows whose run has
- * already reached a terminal state. Mirrors `restorePendingJobContexts`.
- * Returns the number of restored contexts.
+ * Restore the in-memory Map from the DB on startup, mirroring
+ * `restorePendingJobContexts`. Returns the number restored.
  */
 export async function restorePendingWorkflowContexts(db: Kysely<Database>): Promise<number> {
-  // Clean up stale rows for runs that already reached terminal state.
-  // These can linger if the orchestrator crashed after run completion but before
-  // the fire-and-forget deletePendingWorkflowContext DB delete finished.
+  // Delete rows of terminal runs first: they linger when the orchestrator
+  // crashed before the fire-and-forget deletePendingWorkflowContext finished.
   await db
     .deleteFrom('pending_workflow_contexts')
     .where(
@@ -215,10 +200,7 @@ export async function restorePendingWorkflowContexts(db: Kysely<Database>): Prom
   return restored;
 }
 
-/**
- * Clear all entries from the in-memory pending workflow contexts Map.
- * @internal Exported for testing only.
- */
+/** @internal Exported for testing only. */
 export function clearPendingWorkflowContextsMap(): void {
   pendingWorkflowContexts.clear();
 }

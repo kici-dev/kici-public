@@ -10,6 +10,7 @@ import {
   DEFAULT_PRECURSOR_DB_POLL_MS,
   PendingPrecursorDbWatcher,
 } from './pending-precursor-db-watcher.js';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 const BUILD_ID = '11111111-1111-4111-8111-111111111111';
 const INIT_ID = '22222222-2222-4222-8222-222222222222';
@@ -26,10 +27,8 @@ interface FakeRow {
 }
 
 /**
- * A fake of the one query the watcher issues. Records the ids it was asked
- * for and answers from `rows`, filtered the way the real predicates would —
- * by tracked id and by terminal status — so a test can assert both what was
- * asked and what came back.
+ * Fakes the watcher's query: records the ids asked for and answers from
+ * `rows`, filtered by tracked id and terminal status like the real predicates.
  */
 function fakeDb(rows: FakeRow[], opts: { fail?: Error } = {}) {
   const asked: string[][] = [];
@@ -158,13 +157,10 @@ describe('PendingPrecursorDbWatcher', () => {
     const init = pendingInits.track(INIT_ID);
     const dyn = pendingDynamics.track(DYN_ID);
     const jobs = [
-      {
-        _type: 'static' as const,
+      staticJob({
         name: 'gen-1',
-        runsOn: [{ kind: 'exact' as const, value: 'linux' }],
-        needs: [],
         steps: [{ name: 's', hasOutputs: false }],
-      },
+      }),
     ];
     const { db, asked } = fakeDb([
       row({
@@ -213,7 +209,6 @@ describe('PendingPrecursorDbWatcher', () => {
       }),
     ]);
     expect(await watcher(db).tick()).toBe(0);
-    // The tracker no longer holds the id, so it is not even asked for.
     expect(asked).toEqual([]);
     expect(updateInMemoryJob).not.toHaveBeenCalled();
   });
@@ -280,7 +275,7 @@ describe('PendingPrecursorDbWatcher', () => {
 
   it('defaults to a short poll interval', () => {
     // The interval is the latency a cross-coordinator build adds before the
-    // awaiting pipeline dispatches its real jobs.
+    // pipeline dispatches its real jobs.
     expect(DEFAULT_PRECURSOR_DB_POLL_MS).toBeLessThanOrEqual(5_000);
   });
 });

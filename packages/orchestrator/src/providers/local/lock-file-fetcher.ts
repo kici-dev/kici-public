@@ -15,8 +15,6 @@ import { parseLockDocument } from '../../lockfile-validate.js';
 const logger = createLogger({ prefix: 'local-lock-file' });
 
 /**
- * Local provider implementation of LockFileFetcher.
- *
  * Reads kici.lock.json from the local filesystem at the path derived from
  * the repoIdentifier (which is expected to be a file:// URL or a local path).
  */
@@ -40,8 +38,6 @@ export class LocalLockFileFetcher implements LockFileFetcher {
   constructor(private readonly repoBasePath: string) {}
 
   /**
-   * Fetch the lock file from the local filesystem.
-   *
    * @param repoIdentifier - Either a file:// URL or a relative path under repoBasePath
    * @param ref - Git ref (ignored for filesystem access -- always reads current state)
    * @param _credentials - Not used (file:// access needs no auth)
@@ -53,7 +49,6 @@ export class LocalLockFileFetcher implements LockFileFetcher {
     ref: string,
     _credentials: unknown,
   ): Promise<LockFile | null> {
-    // Resolve the repo path
     let repoPath: string;
     if (repoIdentifier.startsWith('file://')) {
       repoPath = repoIdentifier.slice('file://'.length);

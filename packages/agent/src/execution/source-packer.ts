@@ -1,15 +1,12 @@
 /**
- * `.kici/` source tarball creation for build agents.
+ * Packs a cloned repo's `.kici/` (minus `node_modules/`, which `dep-packer.ts`
+ * packs) into a gzip tarball. Entry mtimes are kept, so it is not
+ * byte-reproducible (`tar-pack.ts`).
  *
- * After cloning a customer repo, packs the `.kici/` directory (excluding
- * `node_modules/` — that lives in its own cached tarball per `dep-packer.ts`)
- * into a deterministic gzip tarball. The tarball bytes are hashed for
- * integrity verification on the execution-job side.
- *
- * The returned hash is the tarball's OWN digest. The orchestrator stores the
- * object under it and the restoring agent verifies the downloaded bytes against
- * it, the same contract the dependency tarball has always had; a separate
- * pointer resolves the workflow `contentHash` to it.
+ * The returned hash is the tarball's OWN digest: the orchestrator stores the
+ * object under it and the restoring agent verifies the download against it, as
+ * for the dependency tarball; a separate pointer maps the workflow
+ * `contentHash` to it.
  */
 
 import { existsSync } from 'node:fs';
@@ -29,9 +26,7 @@ export async function packKiciSource(workDir: string): Promise<{ tarball: Buffer
   logger.info('Packing .kici/ source tarball', { dir: workDir });
   const startTime = Date.now();
 
-  // The filter excludes node_modules/ (already in the deps tarball). The prefix
-  // is the one `hashKiciSourceTree` skips, so the digest and the tarball cover
-  // the same set of files rather than two strings that must be kept in step.
+  // The prefix `hashKiciSourceTree` skips, so digest and tarball cover the same files.
   const { tarball, hash } = await packGzipTarball(
     workDir,
     ['.kici'],

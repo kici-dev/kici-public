@@ -2,8 +2,8 @@
  * The cancel handler behind the dashboard, the `kici runs cancel` CLI, and the
  * MCP `cancel_run` tool.
  *
- * It delegates to `cancelRunWithReason` so the customer-facing cancel follows
- * the same mechanics as the operator-facing one: an already-terminal run is a
+ * Delegates to `cancelRunWithReason` so it follows the operator-facing cancel's
+ * mechanics: an already-terminal run is a
  * no-op, only OPEN agent sockets are notified, queued dispatch rows are
  * cancelled, pending jobs are marked cancelled, and a run with no outstanding
  * agent work is driven terminal.

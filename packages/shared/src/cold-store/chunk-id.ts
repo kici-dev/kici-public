@@ -1,14 +1,8 @@
 /**
- * Deterministic chunk ID computation.
- *
- * A chunk's ID is derived from the tuple
- * `(db, table, tenantId, partitionDate, minRowId, maxRowId)` so that
- * re-running an interrupted archival pass always produces the same ID
- * and therefore the same S3 object key. This is the core of the
- * idempotency guarantee.
- *
- * 16 hex characters (64 bits of sha256) is enough to avoid collisions:
- * at a trillion chunks, birthday probability is ~5e-8.
+ * A chunk ID is a function of `(db, table, tenantId, partitionDate, minRowId,
+ * maxRowId)`, so a re-run of an interrupted archival pass writes the same S3
+ * key: the core of the idempotency guarantee. 16 hex characters (64 bits of
+ * sha256) avoid collisions: at a million chunks the birthday probability is ~3e-8.
  */
 import { sha256 } from '@kici-dev/core';
 import type { DbKind } from './key.js';

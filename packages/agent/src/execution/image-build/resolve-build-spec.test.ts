@@ -119,10 +119,9 @@ describe('resolveJobImageBuildSpec', () => {
   });
 
   it('gives two matrix legs of one job DIFFERENT tags', () => {
-    // The names share a long prefix and differ only in the suffix, so a
-    // name-only tag truncates them to the same string. Two legs of one run on
-    // one host would then race for one tag, and a leg could run its sibling's
-    // image.
+    // The names differ only after a long shared prefix, so a name-only tag
+    // truncates both to one string; two legs of one run on one host would race
+    // for that tag, and a leg could run its sibling's image.
     const long = 'build-the-whole-world-with-every-toolchain-we-support';
     const linux = resolveJobImageBuildSpec({
       ...base,

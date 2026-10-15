@@ -14,16 +14,13 @@ function makeInfo(deliveryId: string): WebhookInfo {
 }
 
 /**
- * Minimal deps: a dedup whose claim() is stubbed, and a provider registry that
- * returns no bundle so processWebhook short-circuits to 'skipped' AFTER claim.
- * db undefined => resolveOrgIdSafe returns '__default__'; eventLog absent.
+ * No provider bundle, so processWebhook short-circuits to 'skipped' AFTER the
+ * claim. db undefined => resolveOrgIdSafe returns '__default__'.
  */
 function makeDeps(claim: (id: string) => Promise<boolean>) {
   return {
     dedup: { claim: vi.fn(claim), exists: vi.fn(), mark: vi.fn(), cleanup: vi.fn() },
-    // `getRoutingKeys` is read by the unknown-provider warn line, which names
-    // what WAS registered — the one fact that turns "we dropped your delivery"
-    // into a diagnosable event.
+    // The unknown-provider warn line reads `getRoutingKeys` to name what WAS registered.
     providerRegistry: { getByRoutingKey: () => undefined, getRoutingKeys: () => [] },
   } as unknown as Parameters<typeof processWebhook>[1];
 }
@@ -40,6 +37,6 @@ describe('processWebhook dedup outcome', () => {
     const deps = makeDeps(claim);
     const out = await processWebhook(makeInfo('new-1'), deps);
     expect(out).toBe(WebhookIngestOutcome.enum.skipped);
-    expect(claim).toHaveBeenCalledTimes(1); // exactly one claim, not two
+    expect(claim).toHaveBeenCalledTimes(1);
   });
 });

@@ -18,9 +18,8 @@ describe('killProcessGroup', () => {
     // killProcessGroup returns 0 or 1 by contract (signalled vs ESRCH).
     const signalled = killProcessGroup(pid, 'SIGKILL');
     expect(signalled).toBe(1);
-    // Wait for the parent to be reaped (event-driven, not a fixed sleep) so the
-    // group is provably gone before asserting ESRCH → 0. Racing Node's zombie
-    // reaping with a fixed sleep is flaky under load.
+    // Event-driven, not a fixed sleep, which races Node's zombie reaping under
+    // load: the group must be gone before asserting ESRCH → 0.
     await new Promise<void>((resolve) => parent.on('exit', () => resolve()));
     // Give the kernel a beat to tear the (now leaderless) group down.
     await new Promise((r) => setTimeout(r, 100));

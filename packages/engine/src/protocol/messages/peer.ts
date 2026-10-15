@@ -4,9 +4,7 @@ import { LogStream } from './log-stream.js';
 import { ScalerEventType } from './scaler-event.js';
 import { LabelMatcher } from '../../labels-match.js';
 
-// --- Peer-to-peer protocol messages ---
-// Used for direct communication between orchestrator instances in a cluster.
-// Covers authentication, heartbeat, job rerouting, progress, cancel, and Raft consensus.
+// --- Peer-to-peer protocol messages between orchestrator instances in a cluster ---
 
 // --- Capability sub-schemas (shared by auth response and heartbeat) ---
 
@@ -20,17 +18,15 @@ const peerAgentSummarySchema = z.object({
   arch: z.string(),
   /**
    * Kubernetes-taint-style mandatory labels inherited from the spawning
-   * scaler. Always sent: a static agent and a warm-pool replenishment spawn
-   * carry `[]`, which is "no gate". Cross-peer routing applies the same gate
-   * the local label matcher does: a connected-agent entry only matches when
-   * every mandatory label appears in the required label set.
+   * scaler; `[]` (static agent, warm-pool replenishment) is "no gate".
+   * Cross-peer routing applies the local matcher's gate: an entry matches only
+   * when every mandatory label appears in the required label set.
    */
   mandatoryLabels: z.array(z.string()),
   /**
-   * Name of the scaler backend that spawned this agent, or null/omitted for
-   * static (stateful) agents not bound to any scaler. Carried so the dashboard
-   * diagnostics tree can group a worker peer's agents under the correct scaler
-   * row (and the stateful-agents row) without a second round trip.
+   * Spawning scaler backend, null/omitted for static (stateful) agents. Lets
+   * the diagnostics tree group a worker peer's agents by scaler without a
+   * second round trip.
    */
   scalerName: z.string().nullable().optional(),
 });
@@ -42,10 +38,9 @@ export const peerCapabilitiesSchema = z.object({
 });
 
 /**
- * Scaler capacity summary included in peer heartbeat and auth response for
- * routing decisions. `.strict()`: the entry once carried a scaler-wide taint
- * union a peer on this protocol floor never sends, so a stray field is a
- * version-skew signal rather than something to ignore.
+ * Scaler capacity summary in peer heartbeat and auth response, for routing.
+ * `.strict()`: a stray field is a version-skew signal, not something to
+ * ignore.
  */
 const scalerCapacitySummarySchema = z
   .object({
@@ -55,23 +50,20 @@ const scalerCapacitySummarySchema = z
     type: z.string().optional(),
     /** Label sets this scaler backend can provision */
     labelSets: z.array(z.array(z.string())),
-    /** Maximum agents for this backend */
     maxAgents: z.number(),
-    /** Current active count for this backend */
     activeCount: z.number(),
     /**
-     * Whether this backend spawns its agents on the peer's own host (bare-metal,
-     * Firecracker, container on a local runtime socket). Lets diagnostics
-     * surface the peer's hostname as the scaler's spawning host.
+     * Whether this backend spawns agents on the peer's own host (bare-metal,
+     * Firecracker, local container runtime), so diagnostics show the peer's
+     * hostname as the spawning host.
      */
     spawnsOnLocalHost: z.boolean().optional(),
     /**
-     * Per-label-set taint gate (Kubernetes-taint-style opt-in), index-aligned
-     * with `labelSets`: entry `i` is the set of labels a job MUST declare in
-     * `runsOn` to route to `labelSets[i]`; an empty entry means that set has no
-     * gate. Cross-peer routing applies the same rule as the local label matcher.
-     * A consumer refuses to route through an entry whose length does not equal
-     * `labelSets.length`, so a malformed advertisement is never indexed into.
+     * Per-label-set taint gate, index-aligned with `labelSets`: entry `i` is
+     * the labels a job MUST declare in `runsOn` to route to `labelSets[i]`;
+     * empty means no gate. Same rule as the local label matcher. A consumer
+     * refuses an entry whose length differs from `labelSets.length`, so a
+     * malformed advertisement is never indexed into.
      */
     labelSetMandatoryLabels: z.array(z.array(z.string())),
   })
@@ -102,9 +94,9 @@ export const peerHelloSchema = z.object({
   /** Base64-encoded 32-byte random nonce (HKDF salt). */
   nonce: z.string(),
   /**
-   * The authentication schemes this server accepts. Strings rather than an
-   * enum, so a hello naming a scheme this build does not know still parses.
-   * Optional so a hello naming none reaches the client's explicit refusal.
+   * Accepted authentication schemes. Strings, not an enum, so an unknown
+   * scheme still parses; optional so a hello naming none reaches the client's
+   * explicit refusal.
    */
   authSchemes: z.array(z.string()).optional(),
 });
@@ -118,10 +110,10 @@ export const peerHelloResponseSchema = z.object({
 
 // --- Peer authentication (mutual-v2) ---
 // Both messages travel under the handshake key. The client proves the shared
-// key (its credential, or its join token) with an HMAC over the handshake
-// transcript; the server answers with its own HMAC over the transcript and the
-// client proof. The client accepts nothing until that server proof verifies,
-// and every later frame uses an application key derived from the shared key.
+// key (credential or join token) with an HMAC over the handshake transcript;
+// the server answers with an HMAC over the transcript and the client proof.
+// The client accepts nothing until the server proof verifies; later frames use
+// an application key derived from the shared key.
 
 /** Peer auth request sent after the ECDH handshake, under the handshake key. */
 export const peerAuthRequestSchema = z.object({
@@ -130,7 +122,7 @@ export const peerAuthRequestSchema = z.object({
   protocolVersion: z.number(),
   /** Software version of the connecting peer (logged). */
   softwareVersion: z.string().optional(),
-  /** Role of the connecting peer, as it declares it. */
+  /** Self-declared role of the connecting peer. */
   role: z.enum(['coordinator', 'worker']).optional(),
   scheme: PeerAuthScheme,
   mode: PeerAuthMode,
@@ -150,11 +142,11 @@ export const peerAuthResponseSchema = z.object({
   serverProof: z.string().optional(),
   /** Session credential issued on first join (worker stores for reconnection). */
   sessionCredential: z.string().optional(),
-  /** Assigned role echoed back to the connecting peer. */
+  /** Assigned role. */
   role: z.string().optional(),
   /** Software version of the coordinator (for version compat check). */
   softwareVersion: z.string().optional(),
-  // Capabilities included when accepted=true
+  // Capabilities, when accepted=true
   agents: z.array(peerAgentSummarySchema).optional(),
   scalerCapacity: z.array(scalerCapacitySummarySchema).optional(),
   capabilities: peerCapabilitiesSchema.optional(),
@@ -211,13 +203,11 @@ export const jobRerouteSchema = z.object({
   type: z.literal('job.reroute'),
   messageId: z.string(),
   /**
-   * Pre-allocated job identifier. The sending coordinator MUST allocate
-   * the jobId before sending so it can register the execution_runs +
-   * execution_jobs rows under that id in its own DB. Receiving peer
-   * (worker or coord) MUST use this exact id when dispatching to its
-   * agent — without that, the agent's later `job.status`/`step.status`
-   * messages reference a jobId the owning coord never wrote to the DB,
-   * and the run silently stalls at `running`.
+   * Pre-allocated by the sending coordinator, which registers its
+   * execution_runs + execution_jobs rows under it. The receiving peer MUST
+   * dispatch with this exact id; otherwise the agent's `job.status` /
+   * `step.status` reference a jobId the owning coord never wrote, and the run
+   * silently stalls at `running`.
    */
   jobId: z.string(),
   runId: z.string(),
@@ -232,29 +222,25 @@ export const jobRerouteSchema = z.object({
   /** Labels that the dispatched agent must NOT have. Absent is `[]`. */
   excludeLabels: z.array(z.string()).optional(),
   /**
-   * Glob/regex include matchers the receiving peer's agent labels must
-   * satisfy (JS post-filter, applied on top of the exact `runsOnLabels`
-   * prefilter — same semantics as the single-orchestrator dispatch path).
-   * Absent is treated as `[]`. A pure-pattern job (no exact labels) carries
-   * its selector here; dropping it would let the job match any local agent.
+   * Glob/regex include matchers (JS post-filter over the exact `runsOnLabels`
+   * prefilter, as on the single-orchestrator path). Absent is `[]`. A
+   * pure-pattern job carries its whole selector here; dropping it would let the
+   * job match any local agent.
    */
   runsOnPatterns: z.array(LabelMatcher).optional(),
   /** Glob/regex matchers that disqualify a candidate agent (JS post-filter). Absent is `[]`. */
   excludePatterns: z.array(LabelMatcher).optional(),
   triedConnections: z.array(z.string()),
   maxHops: z.number(),
-  /** The worker's spawn-retry budget for this job. */
   spawnRetry: rerouteSpawnRetrySchema,
   coordinatorId: z.string(),
   requestId: z.string().optional(),
   traceId: z.string().optional(),
   /** Resolved job configuration (steps, rules, matrix, etc.) for the receiving orch to dispatch. */
   jobConfig: z.record(z.string(), z.unknown()).optional(),
-  /** Clone URL for the repository. */
   repoUrl: z.string().optional(),
-  /** Git ref (branch name). */
+  /** Branch name. */
   ref: z.string().optional(),
-  /** Commit SHA. */
   sha: z.string().optional(),
   /** Provider type (e.g. 'github'). */
   provider: z.string().optional(),
@@ -290,23 +276,17 @@ export const jobRerouteAckSchema = z.object({
 
 /**
  * Job or step progress update forwarded from a worker peer to its owning
- * coordinator (the coord that has the run rows in its DB).
- *
- * `kind` is the discriminator the coord uses to decide which downstream
- * call to make:
- *  - kind='job'  → ExecutionTracker.onJobStatus, which is what drives the
- *                  run-level state machine (running → success/failed/...).
- *                  `stepIndex`/`stepName` are unused for this kind.
+ * coordinator (the one with the run rows in its DB). `kind` routes it:
+ *  - kind='job'  → ExecutionTracker.onJobStatus, which drives the run-level
+ *                  state machine. `stepIndex`/`stepName` are unused.
  *  - kind='step' → ExecutionTracker.onStepStatus, which only persists step
  *                  rows. `stepIndex`/`stepName` MUST point at the step.
+ * Routing a job-level event into onStepStatus leaves a peer-rerouted run stuck
+ * at `running`.
  *
- * Without the discriminator, the coord conflated the two and silently
- * dropped every job-level event into onStepStatus, so the run never
- * advanced past `running` for a peer-rerouted job.
- *
- * `state` is typed as the full ExecutionJobStatus enum because the worker
- * forwards the agent's job.status verbatim; ExecutionStepStatus is a
- * strict subset and the coord trusts `kind` to route correctly.
+ * `state` is the full ExecutionJobStatus because the worker forwards the
+ * agent's job.status verbatim; ExecutionStepStatus is a strict subset and the
+ * coord trusts `kind` to route.
  */
 export const jobProgressSchema = z.object({
   type: z.literal('job.progress'),
@@ -322,10 +302,10 @@ export const jobProgressSchema = z.object({
 });
 
 /**
- * Acknowledgement sent coordinator -> worker once the coordinator has applied
- * a terminal `job.progress` (kind='job') to its run/job DB rows. The worker
- * uses it to prune the matching record from its durable outbox. Carries
- * `state` for debuggability; `(runId, jobId)` is the dedup key.
+ * Coordinator -> worker ack once a terminal `job.progress` (kind='job') is
+ * applied to the run/job rows; the worker prunes the matching record from its
+ * durable outbox. `(runId, jobId)` is the dedup key; `state` is for
+ * debugging.
  */
 export const jobProgressAckSchema = z.object({
   type: z.literal('job.progress.ack'),
@@ -372,7 +352,7 @@ export const raftAppendEntriesSchema = z.object({
 
 // --- Log and cache relay (coordinator-worker topology) ---
 
-/** Log chunk relay: worker -> coordinator. Batched log lines from agent execution. */
+/** Log chunk relay: worker -> coordinator, batched agent log lines. */
 const peerLogChunkSchema = z.object({
   type: z.literal('peer.log.chunk'),
   runId: z.string(),
@@ -387,7 +367,7 @@ const peerLogChunkSchema = z.object({
   ),
 });
 
-/** Cache upload request: worker -> coordinator. Worker agent needs upload URL. */
+/** Cache upload request: worker -> coordinator, for an upload URL. */
 const peerCacheUploadRequestSchema = z.object({
   type: z.literal('peer.cache.upload.request'),
   messageId: z.string(),
@@ -398,7 +378,7 @@ const peerCacheUploadRequestSchema = z.object({
   sizeBytes: z.number(),
 });
 
-/** Cache upload response: coordinator -> worker. Pre-signed upload URL. */
+/** Cache upload response: coordinator -> worker, a pre-signed upload URL. */
 const peerCacheUploadResponseSchema = z.object({
   type: z.literal('peer.cache.upload.response'),
   messageId: z.string(),
@@ -411,10 +391,9 @@ const peerCacheUploadResponseSchema = z.object({
 
 /**
  * What a scaler config reload did on one orchestrator. `rejected`: the file did
- * not load or validate, or an added scaler did not build, and nothing applied.
- * `not-configured`: the orchestrator runs without a scaler config, so there is
- * nothing to reload. `unreachable`: the request did not reach the orchestrator,
- * or it did not answer in time.
+ * not load or validate, or an added scaler did not build; nothing applied.
+ * `not-configured`: no scaler config to reload. `unreachable`: the request
+ * did not arrive or was not answered in time.
  */
 export const ScalerReloadOutcome = z.enum(['applied', 'rejected', 'not-configured', 'unreachable']);
 export type ScalerReloadOutcome = z.infer<typeof ScalerReloadOutcome>;
@@ -453,9 +432,8 @@ export const scalerReloadInstanceResultSchema = scalerReloadAnswerSchema.extend(
 export type ScalerReloadInstanceResult = z.infer<typeof scalerReloadInstanceResultSchema>;
 
 /**
- * Scaler reload request: the orchestrator that received `kici-admin scaler
- * reload` asks each connected peer to re-read its own scaler config. The peer
- * answers with peer.scaler.reload.response.
+ * The orchestrator that received `kici-admin scaler reload` asks each
+ * connected peer to re-read its own scaler config.
  */
 export const peerScalerReloadRequestSchema = z.object({
   type: z.literal('peer.scaler.reload.request'),
@@ -472,9 +450,8 @@ export const peerScalerReloadResponseSchema = scalerReloadAnswerSchema.extend({
 // --- Config reload (per-instance targeting) ---
 
 /**
- * Config reload request: forwarded from one orchestrator to a specific peer
- * when an operator calls POST /admin/config/reload with a `target` parameter.
- * The receiving peer executes a local reload and replies with
+ * Forwarded to a specific peer when POST /admin/config/reload names a
+ * `target`; the peer reloads locally and replies with
  * peer.config.reload.response.
  */
 export const peerConfigReloadSchema = z.object({
@@ -485,8 +462,7 @@ export const peerConfigReloadSchema = z.object({
 });
 
 /**
- * Config reload response: sent back from the target peer carrying the
- * ReloadResult fields produced by ConfigReloader.executeReload().
+ * The target peer's ConfigReloader.executeReload() result.
  */
 export const peerConfigReloadResponseSchema = z.object({
   type: z.literal('peer.config.reload.response'),
@@ -549,9 +525,8 @@ export const scalerVmStopResultSchema = z.object({
 export type ScalerVmStopResult = z.infer<typeof scalerVmStopResultSchema>;
 
 /**
- * Scaler orphan request: forwarded by a coordinator to the node an operator
- * targeted with `kici-admin scaler orphans --target`. The node answers from
- * its own host and its own tracking with peer.scaler.orphans.response.
+ * Forwarded by a coordinator to the node `kici-admin scaler orphans
+ * --target` names; the node answers from its own host and tracking.
  */
 export const peerScalerOrphansRequestSchema = z.object({
   type: z.literal('peer.scaler.orphans.request'),
@@ -580,12 +555,12 @@ export const peerScalerOrphansResponseSchema = z.object({
 
 /**
  * What forgetting a departed peer did on one coordinator. `recent`: the peer
- * was heard from inside the window this coordinator still treats it as alive
- * for (the longer of the stale window and the reroute flap grace, or the
- * backstop grace of a peer that adopted provisions), so it may be partitioned
- * rather than gone. `acknowledgement-required`: forgetting it would switch this
- * coordinator's event-provision backstop back on, and the request did not
- * acknowledge that. Every outcome but `forgotten` keeps the peer.
+ * was heard from inside this coordinator's alive window (the longer of the
+ * stale window and the reroute flap grace, or the backstop grace of a peer that
+ * adopted provisions), so it may be partitioned rather than gone.
+ * `acknowledgement-required`: forgetting it would switch the event-provision
+ * backstop back on, unacknowledged. Every outcome but `forgotten` keeps the
+ * peer.
  */
 export const PeerForgetOutcome = z.enum([
   'forgotten',
@@ -598,9 +573,8 @@ export const PeerForgetOutcome = z.enum([
 export type PeerForgetOutcome = z.infer<typeof PeerForgetOutcome>;
 
 /**
- * Forget request: a coordinator that forgot a departed peer (`kici-admin peer
- * forget`) asks each connected sibling coordinator to drop it from its own
- * live peer registry too.
+ * A coordinator that forgot a departed peer (`kici-admin peer forget`) asks
+ * each connected sibling coordinator to drop it from its live peer registry.
  */
 export const peerForgetRequestSchema = z.object({
   type: z.literal('peer.forget.request'),
@@ -625,26 +599,23 @@ export const peerForgetResponseSchema = z.object({
 /**
  * Worker-relevant cluster settings a DB-less worker pulls from a coordinator.
  *
- * A typed, concrete snapshot (not an open key/value bus): each worker-consumed
- * cluster knob is a field here. Adding the next worker-relevant knob is one
- * field on this schema, not a new protocol message.
+ * A typed snapshot, not an open key/value bus: each worker-consumed knob is a
+ * field here, so a new knob is a new field, not a new protocol message.
  */
 export const workerClusterSettingsSchema = z.object({
   agentTokenTtlMs: z.number(),
   /** How long a Firecracker spawn waits for the VM's API socket. */
   firecrackerApiSocketWaitMs: z.number(),
   /**
-   * The concurrency-slot wait timeout a worker sends on each `job.dispatch`,
-   * from `cluster_settings.concurrency_wait_timeout_ms`.
+   * Concurrency-slot wait timeout sent on each `job.dispatch`, from
+   * `cluster_settings.concurrency_wait_timeout_ms`.
    */
   concurrencyWaitTimeoutMs: z.number(),
 });
 
 /**
- * Cluster-settings pull request: a DB-less worker asks a connected coordinator
- * for the current worker-settings snapshot after a coordinator advertised a
- * clusterSettingsVersion ahead of its own. The coordinator replies with
- * peer.clusterSettings.response.
+ * A DB-less worker asks a coordinator for the worker-settings snapshot once a
+ * coordinator advertises a clusterSettingsVersion ahead of its own.
  */
 export const peerClusterSettingsRequestSchema = z.object({
   type: z.literal('peer.clusterSettings.request'),
@@ -652,8 +623,7 @@ export const peerClusterSettingsRequestSchema = z.object({
 });
 
 /**
- * Cluster-settings pull response: the coordinator resolves the snapshot from
- * cluster_settings and replies with it plus the current version.
+ * The snapshot resolved from cluster_settings, plus the current version.
  */
 export const peerClusterSettingsResponseSchema = z.object({
   type: z.literal('peer.clusterSettings.response'),
@@ -703,23 +673,22 @@ export const peerLogsCollectErrorSchema = z.object({
 export const peerLeavingSchema = z.object({
   type: z.literal('peer.leaving'),
   instanceId: z.string(),
-  /** Current Raft term for leader identification */
+  /** Current Raft term, for leader identification. */
   term: z.number(),
 });
 
 // --- Cross-peer agent-token revoke fan-out ---
 
 /**
- * Notify every peer that an agent token has been revoked so each peer can
- * close its own in-flight WS connections authenticated by that token.
- * The originating peer kicks locally first (via the DELETE admin route),
- * then broadcasts this message over the encrypted peer mesh.
+ * Agent-token revocation broadcast over the encrypted peer mesh, so each peer
+ * closes its in-flight WS connections authenticated by that token. The
+ * originating peer kicks locally first (via the DELETE admin route).
  */
 export const peerAgentTokenRevokeSchema = z.object({
   type: z.literal('peer.agent-token.revoke'),
   /** The `agent_tokens.id` whose in-flight WS must be kicked on every peer. */
   tokenId: z.string().min(1),
-  /** Originating peer's instanceId — for log correlation across the cluster. */
+  /** For log correlation across the cluster. */
   senderInstanceId: z.string().min(1),
 });
 
@@ -728,29 +697,26 @@ export const peerAgentTokenRevokeSchema = z.object({
 /**
  * A scaler provisioning event a worker forwards to the owning coordinator.
  *
- * Workers have no database, so they cannot persist a provisioning failure
- * themselves. When a worker's scaler emits an event correlated to a queued
- * job (e.g. a failed agent spawn), the worker relays it to the coordinator
- * that owns the run; the coordinator's ExecutionTracker writes it to the
- * provisioning log and the dispatch queue's last-error column.
+ * Workers have no database, so a scaler event correlated to a queued job (e.g.
+ * a failed agent spawn) goes to the coordinator owning the run, whose
+ * ExecutionTracker writes it to the provisioning log and the dispatch queue's
+ * last-error column.
  */
 export const peerScalerEventSchema = z.object({
   type: z.literal('scaler.event'),
   runId: z.string(),
   jobId: z.string(),
-  /** The scaler-managed agent id the event is about. */
   agentId: z.string(),
-  /** Scaler event type (one of the ScalerEventType enum members). */
   eventType: ScalerEventType,
   /** Human-readable detail, including any captured spawn stderr tail. */
   detail: z.string(),
-  /** Event timestamp in epoch milliseconds. */
+  /** Epoch milliseconds. */
   timestampMs: z.number(),
   /**
-   * The worker's retry verdict on a `scaler.failed` for a job under its spawn-retry
-   * budget: false while attempts remain, true on the last one. Absent on a repeated
-   * report of one failed spawn and on every other relay; the coordinator then keeps
-   * its spawn window running unchanged.
+   * The worker's retry verdict on a `scaler.failed` under its spawn-retry
+   * budget: false while attempts remain, true on the last. Absent on a repeated
+   * report of one failed spawn and on every other relay, leaving the
+   * coordinator's spawn window unchanged.
    */
   final: z.boolean().optional(),
 });
@@ -758,8 +724,8 @@ export const peerScalerEventSchema = z.object({
 // --- Discriminated unions ---
 
 /**
- * Every peer message type. Both directions carry the same set: each node sends
- * and receives every type, so one list backs both unions.
+ * Every peer message type. Each node sends and receives every type, so one
+ * list backs both unions.
  */
 const peerMessageSchemas = [
   peerHelloSchema,

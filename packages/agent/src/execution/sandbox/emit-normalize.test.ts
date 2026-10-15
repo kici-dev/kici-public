@@ -22,13 +22,11 @@ describe('assertUserEmittableEventName', () => {
   });
 
   /**
-   * The `__` namespace is a PRIVILEGE boundary, not a naming convention: every
-   * name under it skips the event-storm rate limiter, and `__schedule_fire` is
-   * additionally dispatched as a trusted ref (no run causes it), so a step that
-   * could emit `__schedule_fire` would grant itself both. The lifecycle names
-   * inherit the tier of the run behind them, so emitting one forges the
-   * exemption alone. Each minted name is listed rather than one representative
-   * so a future addition cannot quietly fall outside the check.
+   * `__` is a PRIVILEGE boundary: every name under it skips the event-storm rate
+   * limiter, and `__schedule_fire` also dispatches as a trusted ref (no run
+   * causes it). Lifecycle names inherit their run's tier, so emitting one
+   * forges the exemption alone. Every minted name is listed, so an addition
+   * cannot quietly fall outside the check.
    */
   it.each([
     ['__schedule_fire'],
@@ -37,18 +35,15 @@ describe('assertUserEmittableEventName', () => {
     ['__workflows_failed_batch'],
     ['__anything_else'],
   ])('rejects the reserved internal event name %s', (name) => {
-    // The full phrase, not `/reserved/`: a TypeError from a mis-wired import
-    // reads "reservedEventNamePrefix is not a function" and matches the loose
-    // pattern, so the loose pattern proves nothing.
+    // Not `/reserved/`: a mis-wired import's TypeError ("reservedEventNamePrefix
+    // is not a function") matches that too.
     expect(() => assertUserEmittableEventName(name)).toThrow(
       /is reserved for KiCI internal events/,
     );
   });
 
   it('names the prefix that was actually reserved', () => {
-    // The message has to tell the author WHICH namespace they hit — the two
-    // reservations have different reasons, and a generic "reserved" leaves them
-    // guessing.
+    // The message names WHICH namespace: the two reservations have different reasons.
     expect(() => assertUserEmittableEventName('__schedule_fire')).toThrow(/"__"/);
     expect(() => assertUserEmittableEventName('kici.scaler.scale-up')).toThrow(/"kici\."/);
   });

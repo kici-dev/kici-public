@@ -1,19 +1,16 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Cluster-global cache tunables for the lock-file cache and the Tier-1
- * content-requirements cache.
+ * Cluster-global tunables for the lock-file cache and the Tier-1 content-requirements cache.
  *
- * Six additive, nullable columns. NULL means the orchestrator's configured
- * default applies (the `KICI_LOCKFILE_CACHE_*` / `KICI_CONTENT_CACHE_*` env
- * vars stay as the cluster-wide defaults). Sizes and TTLs are structural to the
- * underlying LRU, so a change takes effect at the next orchestrator restart.
+ * Additive and nullable: NULL ⇒ the configured default (`KICI_LOCKFILE_CACHE_*` /
+ * `KICI_CONTENT_CACHE_*`). Sizes and TTLs are structural to the LRU, so a change applies at the
+ * next orchestrator restart.
  *
- * BIGINT rather than INTEGER: a byte ceiling defaults to 64 MiB and the TTLs are
- * in milliseconds, so both leave INTEGER range as soon as an operator raises
- * them.
+ * BIGINT: a byte ceiling defaults to 64 MiB and TTLs are in ms, so both leave INTEGER range
+ * once an operator raises them.
  *
- * Idempotent: each column is guarded on existence, so a re-run is a no-op.
+ * Idempotent: each column is guarded on existence.
  */
 async function columnExists(db: Kysely<unknown>, table: string, column: string): Promise<boolean> {
   const check = await sql<{ exists: boolean }>`

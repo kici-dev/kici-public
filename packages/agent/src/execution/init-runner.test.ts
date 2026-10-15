@@ -2,9 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { evaluateDynamicFields, type FilterEvalInput } from './init-runner.js';
 import type { Workflow, Job, RepoInfo } from '@kici-dev/sdk';
 
-/**
- * Helper to create a minimal Workflow with one job for testing.
- */
+/** A minimal Workflow with one job. */
 function makeWorkflow(jobOverrides: Partial<Job> = {}): Workflow {
   const job: Job = {
     _tag: 'Job',
@@ -311,10 +309,7 @@ describe('workflow-level filter', () => {
     hasFilter: true,
   };
 
-  /**
-   * A filter input whose diff is available by default. `changedFilesStatus` is
-   * overridable so a test can exercise the unavailable-diff contract.
-   */
+  /** Diff available by default; `changedFilesStatus` is overridable for the unavailable-diff contract. */
   function makeFilterInput(over: Partial<FilterEvalInput> = {}): FilterEvalInput {
     const repo: RepoInfo = {
       identifier: 'acme/app',
@@ -349,9 +344,8 @@ describe('workflow-level filter', () => {
   });
 
   it('skips every dynamic field once the filter says the workflow does not apply', async () => {
-    // Positive control for the assertion below: the same job's dynamic env IS
-    // evaluated when the filter passes, so `env: undefined` proves suppression
-    // rather than a job that never had a dynamic field to begin with.
+    // Positive control: the same job's dynamic env IS evaluated when the filter
+    // passes, so `env: undefined` below proves suppression, not a missing field.
     const envFn = vi.fn(() => ({ NODE_ENV: 'staging' }));
     const make = (verdict: boolean) => {
       const workflow = makeWorkflow({ env: envFn });
@@ -401,9 +395,8 @@ describe('workflow-level filter', () => {
   });
 
   it('throws rather than reading an unavailable diff as an empty list', async () => {
-    // The context is built through createFilterContext, so `changedFiles` is a
-    // throwing getter. A plain object literal would silently hand the filter
-    // `[]` here and suppress the workflow with nothing to inspect.
+    // createFilterContext makes `changedFiles` a throwing getter; an object
+    // literal would silently hand the filter `[]` and suppress the workflow.
     const workflow = makeWorkflow();
     workflow.filter = (ctx) => ctx.changedFiles.some((f) => f.startsWith('src/'));
 

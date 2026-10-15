@@ -1,27 +1,20 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `execution_runs.subject_trigger_event TEXT`, nullable.
+ * Add `execution_runs.subject_trigger_event`.
  *
- * A re-run records `trigger_event: 'rerun'`. That is the truthful answer for
- * the two readers that depend on it — the dashboard's trigger-type filter and
- * the git credential relay's trigger-type filters — but it carries no
- * pull-request dimension, so the OIDC subject derived from it fell back to the
- * branch shape. Re-running a fork pull request therefore minted the exact
- * identity a trusted push to the same base branch mints: the collision
- * migration 137's columns were added to break, re-opened one re-run later.
+ * A re-run records `trigger_event: 'rerun'`, correct for the dashboard's and the git credential
+ * relay's trigger-type filters, but with no pull-request dimension the OIDC subject fell back to
+ * the branch shape: re-running a fork pull request minted the identity of a trusted push to the
+ * same base branch, the collision migration 137 broke.
  *
- * This column carries the ORIGINAL run's event forward for that one purpose.
- * `buildIdTokenSubject` is its only reader; `trigger_event` is untouched.
+ * This column carries the ORIGINAL run's event forward for that purpose only;
+ * `buildIdTokenSubject` is its only reader and `trigger_event` is untouched.
  *
- * Nullable, no default, and deliberately NOT backfilled. NULL means "use
- * `trigger_event`", which is what every row written before this column existed
- * says — so a legacy row keeps the subject it already mints. A backfill would
- * have to guess which event a pre-upgrade re-run inherited, and guessing wrong
- * changes an identity a customer's cloud trust policy is already pinning.
- *
- * Idempotent: the add is guarded on existence and the drop uses IF EXISTS, so
- * a re-run is a no-op.
+ * Nullable, no default, deliberately NOT backfilled: NULL means "use `trigger_event`", so a
+ * legacy row keeps the subject it already mints. A backfill would guess which event a
+ * pre-upgrade re-run inherited, and a wrong guess changes an identity a customer's cloud trust
+ * policy pins. Idempotent.
  */
 const COLUMN = 'subject_trigger_event';
 

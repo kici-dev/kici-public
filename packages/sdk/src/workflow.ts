@@ -1,13 +1,18 @@
 import type { Workflow, WorkflowOptions, Trigger } from './types.js';
 import type { TriggerConfig } from './triggers/types.js';
 
-/**
- * Normalize triggers to array.
- * Handles single trigger config or array of trigger configs.
- */
 function normalizeTriggers(on?: Trigger | Trigger[]): TriggerConfig[] | undefined {
   if (!on) return undefined;
   return Array.isArray(on) ? on : [on];
+}
+
+/** A `<context>:<secret-name>` reference: both halves non-empty, no further colons. */
+function isQualifiedSecretRef(value: string): boolean {
+  const idx = value.indexOf(':');
+  if (idx <= 0 || idx >= value.length - 1) return false;
+  const env = value.slice(0, idx);
+  const name = value.slice(idx + 1);
+  return env.length > 0 && name.length > 0 && !name.includes(':');
 }
 
 /**
@@ -28,18 +33,6 @@ function normalizeTriggers(on?: Trigger | Trigger[]): TriggerConfig[] | undefine
  *   description: 'Main CI pipeline',
  * });
  */
-/**
- * Validates a `<context>:<secret-name>` qualified secret reference.
- * Both halves must be non-empty and free of additional colons.
- */
-function isQualifiedSecretRef(value: string): boolean {
-  const idx = value.indexOf(':');
-  if (idx <= 0 || idx >= value.length - 1) return false;
-  const env = value.slice(0, idx);
-  const name = value.slice(idx + 1);
-  return env.length > 0 && name.length > 0 && !name.includes(':');
-}
-
 export function workflow(name: string, options: WorkflowOptions): Workflow {
   if (options.registries) {
     const seenScopes = new Set<string>();

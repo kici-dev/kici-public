@@ -187,11 +187,9 @@ describe('DashboardContextHandler', () => {
     });
 
     it('scopes the list to the request orgId when the Platform carries one', async () => {
-      // Platform-first dev path: the relayed message carries the validated
-      // target org, which must override the orchestrator's static connection
-      // org (deps.orgId = 'org-1'). Without this, a `kici secrets list` against
-      // an org anchored only by remote_sources reads the wrong tenant's
-      // contexts because the connection org points elsewhere.
+      // The relayed, validated target org overrides the static connection org
+      // (deps.orgId = 'org-1'); otherwise `kici secrets list` against an org
+      // anchored only by remote_sources reads the wrong tenant's contexts.
       const handled = await handler.handleMessage({
         type: 'dashboard.contexts.list',
         requestId: 'req-org',
@@ -327,8 +325,7 @@ describe('DashboardContextHandler', () => {
       expect(resp.errorCode).toBe(ContextDeleteErrorCode.enum.pending_held_runs);
 
       // A blocked delete is a business rejection, not a server error: the
-      // access-log row MUST be written with outcome 'denied' (the ternary at
-      // dashboard-context-handler.ts maps ContextDeleteBlockedError → denied).
+      // access-log row MUST carry outcome 'denied' (ContextDeleteBlockedError → denied).
       expect(accessLogRecord).toHaveBeenCalledTimes(1);
       expect(accessLogRecord.mock.calls[0][0]).toMatchObject({
         action: 'context.delete',
@@ -354,9 +351,8 @@ describe('DashboardContextHandler', () => {
     }
 
     it('forwards an explicit null so the field is cleared', async () => {
-      // The bug: every null became undefined, and the store skips undefined
-      // keys — so "turn required reviewers off" silently did nothing and the
-      // approval gate could not be removed through the UI at all.
+      // The store skips undefined keys, so a null mapped to undefined left the
+      // approval gate impossible to remove through the UI.
       const updates = await updatesFor({ requiredReviewers: null, holdExpirySeconds: null });
 
       expect(updates.requiredReviewers).toBeNull();
@@ -381,8 +377,7 @@ describe('DashboardContextHandler', () => {
     });
 
     it('maps a reviewer count to the stored array form', async () => {
-      // The column holds a JSON array; the wire carries a count. This mapping
-      // is pre-existing and must survive the null fix.
+      // The column holds a JSON array; the wire carries a count.
       const updates = await updatesFor({
         requiredReviewers: 2,
         holdExpirySeconds: 3600,
@@ -407,7 +402,6 @@ describe('DashboardContextHandler', () => {
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
-      // Only the allowLocalExecution field is set on the store update.
       expect(deps.contextStore.update).toHaveBeenCalledWith('org-1', 'env-1', {
         allowLocalExecution: true,
       });
@@ -431,7 +425,6 @@ describe('DashboardContextHandler', () => {
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
-      // The store is never touched when the gate denies.
       expect(deps.contextStore.update).not.toHaveBeenCalled();
       const resp = deps.sent[0] as any;
       expect(resp.type).toBe('dashboard.contexts.test_access.set.response');
@@ -498,7 +491,6 @@ describe('DashboardContextHandler', () => {
 
   describe('secrets', () => {
     it('lists secrets from all backend stores', async () => {
-      // Set up backendStores with PG and Vault
       const pgStore = {
         listScopes: vi.fn().mockResolvedValue(['pg:aws/prod', 'pg:__source__/github']),
         listKeys: vi.fn().mockResolvedValue(['API_KEY', 'SECRET']),
@@ -526,8 +518,7 @@ describe('DashboardContextHandler', () => {
       expect(handled).toBe(true);
       const resp = deps.sent[0] as any;
       expect(resp.type).toBe('dashboard.contexts.secrets.list.response');
-      // Should have 3 secrets: 2 keys from pg:aws/prod + 1 from vault:databases/staging
-      // pg:__source__/github is filtered out (internal scope)
+      // pg:__source__/github is an internal scope and is filtered out
       expect(resp.secrets).toHaveLength(3);
       expect(resp.secrets[0].scope).toBe('pg:aws/prod');
       expect(resp.secrets[0].key).toBe('API_KEY');
@@ -570,26 +561,21 @@ describe('DashboardContextHandler', () => {
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
-      // Should route to vault store with unprefixed scope
       expect(vaultStore.setSecret).toHaveBeenCalledWith(
         'org-1',
         'aws/prod',
         'NEW_KEY',
         'secret-value',
       );
-      // PG store should NOT have been called
       expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
     });
 
     it('routes a pg:-qualified write to the CONFIGURED store, never the registry-built one', async () => {
-      // This composes `loadBackendStores` exactly the way the server bootstrap
-      // does. The backend registry synthesizes its own PgSecretStore for the
-      // seeded `pg` row, and that instance carries none of the orchestrator's
-      // configuration — `customerSecretsEnabled` defaults to true (so it would
-      // ignore an operator's `pgCustomerSecrets: false`), its key version is
-      // hardcoded to 1, and it has no old-master-key fallback. Routing
-      // `pg:<path>` there while `<path>` goes to the configured store makes two
-      // spellings of one scope behave differently.
+      // Composes `loadBackendStores` as the server bootstrap does. The registry's
+      // own PgSecretStore for the seeded `pg` row carries no orchestrator config:
+      // `customerSecretsEnabled` defaults to true (ignoring `pgCustomerSecrets:
+      // false`), its key version is hardcoded to 1, and it has no old-master-key
+      // fallback. Routing `pg:<path>` there makes two spellings of one scope differ.
       const registryPgStore = {
         listScopes: vi.fn(),
         listKeys: vi.fn(),
@@ -630,7 +616,7 @@ describe('DashboardContextHandler', () => {
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
-      // PG store receives unprefixed scope (stored without prefix in DB)
+      // Scopes are stored without the backend prefix
       expect(deps.secretStore.setSecret).toHaveBeenCalledWith(
         'org-1',
         'aws/prod',
@@ -692,7 +678,6 @@ describe('DashboardContextHandler', () => {
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
-      // PG store receives unprefixed scope
       expect(deps.secretStore.createScope).toHaveBeenCalledWith('org-1', 'aws/new-scope');
       const resp = deps.sent[0] as any;
       expect(resp.type).toBe('dashboard.contexts.secrets.scope.create.response');
@@ -753,16 +738,14 @@ describe('DashboardContextHandler', () => {
         scope: 'vault:databases/staging',
       } as DashboardPlatformToOrchMessage);
 
-      // Vault store receives unprefixed scope
       expect(vaultStore.deleteScope).toHaveBeenCalledWith('org-1', 'databases/staging');
     });
 
     it('refuses a rename that crosses backends instead of renaming inside the source', async () => {
-      // Resolving oldScope and newScope independently and ignoring the backend
-      // each landed on renames INSIDE the source store: `pg:a -> vault:b`
-      // would rewrite the pg scope to `b` while the operator is told the
-      // secrets now live in Vault. The AAD binds the scope name, so the rows
-      // are re-encrypted under a name that points at the wrong store.
+      // Ignoring the backend each scope resolves to renames INSIDE the source
+      // store: `pg:a -> vault:b` rewrites the pg scope to `b` while the operator
+      // is told the secrets live in Vault, re-encrypted under an AAD scope name
+      // that points at the wrong store.
       const vaultStore = {
         listScopes: vi.fn(),
         listKeys: vi.fn(),
@@ -791,11 +774,9 @@ describe('DashboardContextHandler', () => {
       const resp = deps.sent[0] as any;
       expect(resp.type).toBe('dashboard.contexts.secrets.scope.rename.response');
       expect(resp.error).toContain('across backends');
-      // Both scopes must be resolved against ONE snapshot of the backend map.
-      // With a load per scope, a backend registered or removed between the two
-      // decides this comparison — a qualifier resolving to a backend in one
-      // snapshot and falling through to the default in the other silently
-      // turns a cross-backend rename back into an accepted same-backend one.
+      // Both scopes resolve against ONE backend-map snapshot: with a load per
+      // scope, a backend registered or removed between them can turn a
+      // cross-backend rename into an accepted same-backend one.
       expect(deps.loadBackendStores).toHaveBeenCalledTimes(1);
     });
 
@@ -860,7 +841,6 @@ describe('DashboardContextHandler', () => {
     });
 
     it('returns error when backend does not support scope creation', async () => {
-      // secretStore has no createScope method
       const handled = await handler.handleMessage({
         type: 'dashboard.contexts.secrets.scope.create',
         requestId: 'req-sc-err',
@@ -955,9 +935,8 @@ describe('DashboardContextHandler', () => {
     });
 
     it('rejects setting a secret whose key would make the at-rest AAD ambiguous', async () => {
-      // The AAD is `orgId:scope:key`. scope 'b' + key 'c:d' renders the same
-      // string as scope 'b:c' + key 'd', so a ciphertext written at one
-      // location would authenticate at the other.
+      // The AAD is `orgId:scope:key`: scope 'b' + key 'c:d' equals scope 'b:c' +
+      // key 'd', so a ciphertext would authenticate at the other location.
       deps.secretStore.setSecret = vi.fn().mockResolvedValue(undefined);
 
       await handler.handleMessage({
@@ -975,8 +954,7 @@ describe('DashboardContextHandler', () => {
     });
 
     it('still deletes a secret whose key predates the key rule', async () => {
-      // Delete stays unvalidated so a key stored before the rule existed
-      // remains removable.
+      // Delete stays unvalidated so a key stored before the rule stays removable.
       deps.secretStore.deleteSecret = vi.fn().mockResolvedValue(undefined);
 
       await handler.handleMessage({
@@ -1009,25 +987,14 @@ describe('DashboardContextHandler', () => {
   // ── `dashboard.held-runs.approve` orch-side trust model (security invariant) ──
   //
   // Threat: a compromised Platform credential or a rogue Platform process
-  // driving the Platform→Orchestrator dispatch surface. The handler
-  // performs a single SQL UPDATE on `held_runs` filtered by `id` + `org_id` +
-  // `status='pending'`. Tenant isolation holds at the SQL filter layer: a
-  // rogue Platform that names a `heldRunId` not in this orchestrator's tenant
-  // yields zero updated rows and the response carries a non-actionable error
-  // string with no further side effects.
-  //
-  // Two known properties are NOT covered here because they fall outside
-  // customer-data isolation:
-  //   (1) `approved_by: 'dashboard-user'` is hardcoded instead of derived
-  //       from `stringifyActor(msg.actor)`. Attribution is lost in the
-  //       `held_runs.approved_by` column but the access log still records
-  //       the Platform-supplied actor via its access recorder. That is an
-  //       audit-integrity question, not a tenant-isolation one.
-  //   (2) No orch-side automatic dispatch resume mechanism was found wiring
-  //       `held_runs.status -> approved` back into `dispatch_queue` /
-  //       coordinator routing. A rogue Platform's approval has no immediate
-  //       dispatch consequence on this orchestrator without a separate
-  // webhook re-trigger or rerun.
+  // driving the Platform→Orchestrator dispatch surface. The handler reads the
+  // hold with `approvals.store.getById(orgId, heldRunId)`, where `orgId` is the
+  // request's `orgId` or else the connection org. Tenant isolation holds at that
+  // org-scoped lookup: a `heldRunId` outside the org resolves to nothing, and
+  // the response carries a non-actionable error string with no further side
+  // effects (`recordAndRelease` never runs). The decision records the actor
+  // from `msg.actor`, and an approval that satisfies the hold resumes the held
+  // job, step or workflow after the response is sent.
   describe('tenant-isolation invariants under a rogue Platform', () => {
     it('looks the hold up under the connection org (tenant-isolation gate)', async () => {
       // fails-when: the approve path reads the hold without the org filter.
@@ -1056,7 +1023,6 @@ describe('DashboardContextHandler', () => {
       expect(resp.requestId).toBe('req-not-found');
       expect(resp.error).toMatch(/not found or already resolved/i);
 
-      // Single response sent; no side effects on any other store.
       expect(deps.sent).toHaveLength(1);
       expect(deps.approvals.store.recordAndRelease).not.toHaveBeenCalled();
       expect(deps.contextStore.create).not.toHaveBeenCalled();
@@ -1068,34 +1034,22 @@ describe('DashboardContextHandler', () => {
   // ── `dashboard.contexts.secrets.set` orch-side trust model (security invariant) ──
   //
   // Threat: a compromised Platform credential or a rogue Platform process
-  // driving the Platform→Orchestrator dispatch surface. The wire
-  // schema (`contextSecretSetRequestSchema` in
-  // `packages/engine/src/protocol/messages/dashboard.ts`) carries
-  // `{requestId, actor, scope, key, value}` — no Platform-supplied `orgId`.
-  // The orchestrator handler at
-  // `handleSecretSet` in `packages/orchestrator/src/ws/dashboard-context-handler.ts`
-  // calls `store.setSecret(this.deps.orgId, scope, key, value)` where
-  // `this.deps.orgId` is the orchestrator's OWN configured org. Cross-tenant
-  // write is impossible by construction: this orchestrator process is bound
-  // to one org; another tenant's secrets live in another orchestrator's DB.
+  // driving the Platform→Orchestrator dispatch surface. The wire schema
+  // (`contextSecretSetRequestSchema`, engine `protocol/messages/dashboard.ts`)
+  // carries no `orgId`; `handleSecretSet` calls
+  // `store.setSecret(this.deps.orgId, scope, key, value)` with the orchestrator's
+  // OWN org. Cross-tenant write is impossible by construction: one process, one
+  // org; another tenant's secrets live in another orchestrator's DB.
   //
-  // The PG backend in `packages/orchestrator/src/secrets/pg-secret-store.ts`
-  // additionally binds AAD = orgId:scope:key on encryption — even if a
-  // backend store somehow leaked rows across orgs (which it cannot, the
-  // INSERT also hardcodes org_id), AAD verification would fail on decrypt.
+  // The PG backend (`secrets/pg-secret-store.ts`) also binds AAD =
+  // orgId:scope:key, and its INSERT hardcodes org_id, so a cross-org row would
+  // fail AAD verification on decrypt.
   //
-  // Combined with a rerun request, a rogue Platform CAN inject malicious
-  // values into THIS tenant's workflow execution. That is by-design under
-  // the 3-tier auth model — Platform IS the authority for THIS tenant's
-  // secret CRUD via the dashboard. The tenant-isolation invariant pinned
-  // here is *cross-tenant impossibility*, not "Platform can't influence
-  // this tenant's runs" (it can; that's the whole point of dashboards).
+  // A rogue Platform CAN inject values into THIS tenant's runs (with a rerun):
+  // by design, the Platform is the authority for this tenant's dashboard secret
+  // CRUD. The invariant pinned here is *cross-tenant impossibility*.
   describe('tenant-isolation invariants under a rogue Platform', () => {
     it('handleSecretSet always uses this.deps.orgId — never a Platform-supplied org hint', async () => {
-      // Drive with a wire-shape that has only {scope, key, value} (the schema
-      // does NOT include orgId on this message type). The handler MUST pass
-      // its OWN this.deps.orgId to store.setSecret. The store mock receives
-      // the orgId as the first positional argument.
       await handler.handleMessage({
         type: 'dashboard.contexts.secrets.set',
         requestId: 'req-orgid-1',
@@ -1107,8 +1061,6 @@ describe('DashboardContextHandler', () => {
       expect(deps.secretStore.setSecret).toHaveBeenCalledOnce();
       const [orgIdArg, scopeArg, keyArg] = (deps.secretStore.setSecret as ReturnType<typeof vi.fn>)
         .mock.calls[0];
-      // orgId is sourced from orchestrator deps (this.deps.orgId), NOT from
-      // the wire message. Single-tenant binding by construction.
       expect(orgIdArg).toBe(deps.orgId);
       expect(orgIdArg).toBe('org-1');
       expect(scopeArg).toBe('aws/prod');
@@ -1116,11 +1068,9 @@ describe('DashboardContextHandler', () => {
     });
 
     it('malicious scope strings are stored as data, not interpreted as namespace separators', async () => {
-      // A rogue Platform attempts a path-traversal-style scope and an
-      // SQL-shape scope. Both MUST flow into store.setSecret as plain
-      // string data — never reinterpreted as a different orgId or scope.
-      // The store implementation uses parameterised SQL (pg-secret-store.ts)
-      // so the strings are stored as-is in the `scope` column.
+      // Path-traversal and SQL-shaped scopes MUST reach store.setSecret as plain
+      // data, never as another orgId or scope; pg-secret-store.ts uses
+      // parameterised SQL, so they are stored as-is.
       const maliciousScopes = [
         '../org-other/aws/prod',
         "aws/prod' OR org_id='other",
@@ -1139,13 +1089,8 @@ describe('DashboardContextHandler', () => {
           value: 'evil-value',
         } as DashboardPlatformToOrchMessage);
 
-        // Whatever the scope shape, store.setSecret receives it as plain
-        // string data with the orchestrator's own orgId. The store layer
-        // (PG/Vault) is responsible for handling/rejecting the scope shape
-        // (e.g., PG INSERT with a unique-constraint on (org_id, scope, key)
-        // stores the row; Vault rejects scope characters its API
-        // disallows). Either way: cross-tenant write is impossible because
-        // the orgId argument is hardcoded to deps.orgId.
+        // The store layer (PG/Vault) accepts or rejects the scope shape; either
+        // way the orgId argument is deps.orgId.
         if ((deps.secretStore.setSecret as ReturnType<typeof vi.fn>).mock.calls.length > 0) {
           const [orgIdArg] = (deps.secretStore.setSecret as ReturnType<typeof vi.fn>).mock.calls[0];
           expect(orgIdArg).toBe(deps.orgId);
@@ -1154,18 +1099,14 @@ describe('DashboardContextHandler', () => {
     });
 
     it('Platform-supplied orgId field on the wire is ignored if smuggled (defense-in-depth)', async () => {
-      // The schema does NOT declare an `orgId` field on this message type, so
-      // a strict Zod parse would strip it. But this handler test bypasses the
-      // schema (drives the handler directly), so we explicitly add an orgId
-      // hint to confirm the handler does not pluck it out of the message
-      // object via duck-typing or future-proofing.
+      // A strict Zod parse strips `orgId`; this test bypasses the schema to
+      // prove the handler itself never reads one off the message.
       await handler.handleMessage({
         type: 'dashboard.contexts.secrets.set',
         requestId: 'req-smuggle-orgid',
         scope: 'pg:test',
         key: 'KEY',
         value: 'value',
-        // Smuggled extra field — handler should ignore it.
         orgId: 'other-tenant-org',
       } as unknown as DashboardPlatformToOrchMessage);
 
@@ -1177,10 +1118,8 @@ describe('DashboardContextHandler', () => {
 
   describe('held runs request-org scoping', () => {
     it('scopes the held-runs list query to the request orgId when the Platform carries one', async () => {
-      // A remote run's hold lives under the run's own `remote_sources` org,
-      // which differs from this connection's primary webhook-source org.
-      // Honoring the Platform-carried org is what surfaces the hold to
-      // `kici approve` / `--approve-all` instead of an empty list.
+      // A remote run's hold lives under its own `remote_sources` org, not the
+      // connection org; honoring the carried org surfaces it to `kici approve`.
       const handled = await handler.handleMessage({
         type: 'dashboard.held-runs.list',
         requestId: 'req-hr-list',
@@ -1214,8 +1153,6 @@ describe('DashboardContextHandler', () => {
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
-      // The hold lookup uses the request org so a remote run's hold (recorded
-      // under its `remote_sources` org) is resolvable.
       expect(deps.approvals.store.getById).toHaveBeenCalledWith('org-remote', 'hold-1');
     });
   });
@@ -1238,8 +1175,7 @@ describe('DashboardContextHandler', () => {
     }
 
     it('exactly limit rows available -> hasMore false, returns all rows', async () => {
-      // The handler queries with limit+1 (21); the DB has only 20 rows total,
-      // so it returns 20 -> no further page.
+      // The handler queries limit+1 (21) rows.
       (deps.db.execute as any).mockResolvedValueOnce(makeRuns(20));
 
       const handled = await handler.handleMessage({
@@ -1259,8 +1195,7 @@ describe('DashboardContextHandler', () => {
     });
 
     it('limit+1 rows available -> hasMore true, probe row sliced off', async () => {
-      // The limit+1 (21) query returns 21 rows -> another page exists; the
-      // 21st probe row must not be leaked to the client.
+      // The 21st probe row must not leak to the client.
       (deps.db.execute as any).mockResolvedValueOnce(makeRuns(21));
 
       const handled = await handler.handleMessage({
@@ -1363,7 +1298,6 @@ describe('DashboardContextHandler — encrypted dashboard writes', () => {
   });
 
   it('fail-closed: rejects a plaintext value under the encrypted posture', async () => {
-    // Policy read returns encrypted for secrets.set.
     (deps.db.executeTakeFirst as any).mockResolvedValue({
       dashboard_write_policy: { 'secrets.set': 'encrypted' },
     });
@@ -1508,9 +1442,8 @@ describe('DashboardContextHandler held-runs list hold types', () => {
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
-      // The predicate has to reach the query builder. Narrowing in memory
-      // instead would still return one row here while shipping the org's whole
-      // hold history over the wire.
+      // The predicate must reach the query builder: narrowing in memory would
+      // ship the org's whole hold history over the wire.
       expect(whereCalls()).toContainEqual(['held_runs.id', '=', 'hr-1']);
 
       const resp = deps.sent.at(-1) as any;
@@ -1532,22 +1465,18 @@ describe('DashboardContextHandler held-runs list hold types', () => {
 
   // ── the self-approval gate, driven through the handler ────────────────────
   //
-  // `applyDecision` refuses an approve when `actorSub === triggererSub`, so
-  // this handler's two renderings of one principal — the live actor's subject
-  // and the stored `execution_runs.triggered_by` — have to agree. They did not:
-  // the resolver split `triggered_by` on its first colon, which is wrong for
-  // an agent-mediated trigger (` via agent:<label>` rode along on the id) and
-  // for a service account (the live subject carries a `service:` prefix the
-  // split threw away). Both left the gate comparing strings that can never be
-  // equal, i.e. silently admitting every self-approval.
+  // `applyDecision` refuses an approve when `actorSub === triggererSub`, so the
+  // live actor's subject and the stored `execution_runs.triggered_by` must render
+  // one principal identically. Splitting `triggered_by` on its first colon breaks
+  // an agent-mediated trigger (` via agent:<label>` suffix) and a service account
+  // (`service:` prefix), silently admitting every self-approval.
   //
-  // The cases below drive the handler, not the mapper: the mapper's own unit
-  // tests cannot see a caller that stopped using it.
+  // These drive the handler, not the mapper: the mapper's unit tests cannot see
+  // a caller that stopped using it.
   describe('held-runs approve — self-approval gate', () => {
     /**
-     * A handler wired with the resolver-backed approval path, and a db mock
-     * that answers per selected column (both `org_settings` reads hit the same
-     * table, so the table alone cannot disambiguate them).
+     * The db mock answers per selected column: both `org_settings` reads hit the
+     * same table, so the table alone cannot disambiguate them.
      */
     function selfApprovalHandler(triggeredBy: string) {
       const sent: unknown[] = [];
@@ -1652,10 +1581,9 @@ describe('DashboardContextHandler held-runs list hold types', () => {
   /**
    * The relay answer goes out at the durable record, not at the resume.
    *
-   * The defect: releasing a workflow-scoped fork-PR hold replays the whole
-   * stored dispatch context before acking, which measured 9.8 s inside the
-   * Platform's 10 s relay budget — so an approval that had already landed
-   * answered 504, and the operator's natural retry hit "already resolved".
+   * Releasing a workflow-scoped fork-PR hold replays the whole stored dispatch
+   * context (measured 9.8 s against the Platform's 10 s relay budget), so acking
+   * after it answered 504 and the retry hit "already resolved".
    */
   describe('held-runs approve — answers before the resume', () => {
     function applierHandler(resumeJob: (signal: unknown) => Promise<void>) {
@@ -1738,7 +1666,7 @@ describe('DashboardContextHandler held-runs list hold types', () => {
       expect(resp.type).toBe('dashboard.held-runs.approve.response');
       expect(resp.error).toBeUndefined();
       expect(h.store.recordAndRelease).toHaveBeenCalledTimes(1);
-      // Answered with the resume still in flight — the coupling being removed.
+      // Answered with the resume still in flight.
       expect(releaseResume).toBeDefined();
 
       releaseResume!();
@@ -1768,10 +1696,9 @@ describe('DashboardContextHandler held-runs list hold types', () => {
     });
 
     it('still answers OK when the resume throws, and audits the failure as error', async () => {
-      // Where a failed resume surfaces: one `held_run.approve` access-log entry
-      // with outcome `error` and the failure message, readable in the dashboard
-      // activity view and with `kici-admin access-log`. The approval is durable
-      // regardless, which is why the answer stays a success.
+      // A failed resume surfaces as one `held_run.approve` access-log entry with
+      // outcome `error` (dashboard activity view, `kici-admin access-log`). The
+      // approval is durable, so the answer stays a success.
       const h = applierHandler(() => Promise.reject(new Error('dispatcher exploded')));
 
       await h.handler.handleMessage(approveMsg);

@@ -1,17 +1,16 @@
 /**
- * Object-storage agent payload source — the ops agent's PRIMARY source.
+ * Object-storage agent payload source — the ops agent's primary source.
  *
- * Resolves a version-keyed self-contained agent+Node payload from the
- * orchestrator's own cache bucket via a presigned GET URL the orchestrator
- * mints (`kici.presignAgentPackage`), fetches it once into a local cache dir,
- * and returns it for the SSH-push delivery path. No standing S3 credential ever
- * reaches the ops agent — only a time-limited presigned URL. Payloads are
- * version-keyed and fail-fast: a missing object throws loudly (names the
- * version + platform) rather than staging stale bytes.
+ * Fetches the version-keyed agent+Node payload once into a local cache dir,
+ * through a presigned GET URL the orchestrator mints
+ * (`kici.presignAgentPackage`) for its own cache bucket. No standing S3
+ * credential reaches the ops agent, only a time-limited presigned URL. A
+ * missing object throws, naming the version and platform, rather than
+ * staging stale bytes.
  *
- * For the `s3-direct` delivery path the box pulls the presigned URL itself, so
- * this source is not involved there; it backs `ssh-push` (box cannot reach
- * object storage). `LocalDirPayloadSource` remains the air-gap fallback.
+ * It backs `ssh-push` (the box cannot reach object storage); under `s3-direct`
+ * the box pulls the presigned URL itself. `LocalDirPayloadSource` is the
+ * air-gap fallback.
  */
 import path from 'node:path';
 import { createWriteStream } from 'node:fs';
@@ -30,17 +29,16 @@ export interface PresignedPayload {
 
 export interface S3PayloadSourceDeps {
   /**
-   * Ask the orchestrator to mint a presigned download URL for the version-keyed
-   * payload. Bound to the `kici.presignAgentPackage` RPC over the agent-WS
-   * channel; the orchestrator keys the presign by its own version + the probed
-   * platform. Returns null when no payload object exists for the version.
+   * The `kici.presignAgentPackage` RPC over the agent WS; the orchestrator keys
+   * the presign by its own version and the probed platform. Null when no
+   * payload object exists for the version.
    */
   presign(platform: AgentPlatform, version: string): Promise<PresignedPayload | null>;
-  /** Stream a URL to a local file (binary-safe). Injectable for tests. */
+  /** Binary-safe. Injectable for tests. */
   fetchToFile(url: string, dest: string): Promise<void>;
   /** Local cache root; payloads land under `<cacheDir>/<version>/…` (cache-once). */
   cacheDir: string;
-  /** Filesystem existence check for the cache-once short-circuit. Injectable. */
+  /** The cache-once short-circuit. Injectable. */
   exists?(filePath: string): Promise<boolean>;
 }
 
@@ -74,7 +72,6 @@ export function defaultPayloadCacheDir(): string {
   return path.join(kiciTmpBase(), 'kici-agent-payloads');
 }
 
-/** Default existence check for the cache-once short-circuit. */
 export async function payloadFileExists(filePath: string): Promise<boolean> {
   try {
     await access(filePath);
@@ -84,7 +81,7 @@ export async function payloadFileExists(filePath: string): Promise<boolean> {
   }
 }
 
-/** Stream a (presigned) URL into a local file, binary-safe (no in-memory buffer). */
+/** Streams without an in-memory buffer. */
 export async function fetchUrlToFile(url: string, dest: string): Promise<void> {
   await mkdir(path.dirname(dest), { recursive: true });
   const res = await fetch(url);

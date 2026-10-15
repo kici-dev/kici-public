@@ -1,9 +1,6 @@
 /**
- * kici approve command
- *
- * Approves a held approval gate for a run. Resolves the held element by
- * `--job` / `--step` (or the sole pending hold), then records the approval via
- * the Platform dashboard API (PAT auth).
+ * kici approve — resolve a run's held gate by `--job` / `--step` (or the sole
+ * pending hold) and record the approval through the Platform dashboard API (PAT).
  */
 
 import pc from 'picocolors';
@@ -11,33 +8,24 @@ import { logger, toErrorMessage } from '@kici-dev/core';
 import { resolveHeldRunContext, listHeldRunsForRun, postApprove } from './held-run-client.js';
 import { resolveHeldRunId } from '@kici-dev/engine';
 
-/** Options for the approve command. */
 export interface ApproveOptions {
   /** Match a hold by its job name. */
   job?: string;
   /** Match a step-scoped hold by its step index. */
   step?: string;
   /**
-   * Match one hold by its own id. The escape hatch for an ambiguity nothing
-   * else resolves; the error listing prints the ids when it needs to.
+   * Hold id: the escape hatch for an ambiguity nothing else resolves; the error
+   * listing prints the ids.
    */
   hold?: string;
   /**
-   * Narrow to holds of one type (`reviewer` / `timer` / `concurrency` /
-   * `security`). A job carrying an SDK `requireApproval` AND a security-typed
-   * context gate has two pending holds under one job name, and this is what
-   * separates them.
+   * `reviewer` / `timer` / `concurrency` / `security`. Separates the two holds
+   * of a job with both an SDK `requireApproval` and a security-typed context gate.
    */
   holdType?: string;
 }
 
-/**
- * Approve a held approval gate.
- *
- * @param runId - The run whose hold to approve.
- * @param options - Job/step filters to disambiguate the held element.
- * @returns true on success, false on error.
- */
+/** Returns true on success, false on error. */
 export async function approveCommand(
   runId: string,
   options: ApproveOptions = {},

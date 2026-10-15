@@ -1,21 +1,16 @@
 /**
- * Startup validation for required external tools and binaries.
- *
- * Used by the orchestrator (scaler backends) and agent to verify that all
- * required system tools are available before accepting work. Missing tools
- * cause a clear fatal error at startup rather than cryptic runtime failures.
+ * Startup validation of required system tools for the orchestrator (scaler
+ * backends) and agent: a missing tool is a clear fatal error at startup, not a
+ * cryptic runtime failure.
  */
 
 import { accessSync, constants } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 /**
- * A single tool requirement declaration.
- *
- * - `path-binary`: a binary that must be found on PATH (e.g., 'git', 'ip', 'bash')
- * - `any-path-binary`: at least one of `names` must be found on PATH (e.g.,
- *   'docker' OR 'podman' for the container scaler runtime)
- * - `file-access`: an absolute path that must exist with the specified access mode
+ * `path-binary` must be on PATH; `any-path-binary` needs at least one of
+ * `names` on PATH (e.g. 'docker' OR 'podman'); `file-access` is an absolute
+ * path that must exist with `mode`.
  */
 export type ToolRequirement =
   | { type: 'path-binary'; name: string; reason: string }
@@ -23,12 +18,8 @@ export type ToolRequirement =
   | { type: 'file-access'; path: string; mode: 'executable' | 'readable'; reason: string };
 
 /**
- * Validate a list of tool requirements.
- *
- * Deduplicates requirements, checks each one, and returns ALL errors
- * (not fail-on-first) so the operator sees every missing tool at once.
- *
- * @returns Array of error messages. Empty array means all tools are available.
+ * Deduplicates requirements and returns ALL errors (not fail-on-first), so the
+ * operator sees every missing tool at once. Empty means all are available.
  */
 export function validateRequiredTools(requirements: ToolRequirement[]): string[] {
   const seen = new Set<string>();
@@ -66,30 +57,17 @@ export function validateRequiredTools(requirements: ToolRequirement[]): string[]
 }
 
 /**
- * Check if a binary is available on PATH.
- *
- * Walks the directories in `process.env.PATH` and tests each candidate via
- * `accessSync(..., X_OK)`. Pure-Node implementation — no `which` / `where`
- * dependency, so the check works on minimal base images (Docker Hardened
- * Images, distroless, alpine variants) that strip the `which` binary even
- * when `debianutils` is technically installed.
- *
- * Windows: tries `name` + `name.exe`/`.cmd`/`.bat`/`.com` extensions (mirrors
- * PATHEXT defaults) so `git` resolves to `git.exe` without the caller having
- * to pre-suffix.
+ * Pure-Node PATH walk (`accessSync(..., X_OK)`), with no `which` / `where`
+ * dependency: minimal base images (Docker Hardened Images, distroless, alpine)
+ * strip `which` even when `debianutils` is installed.
  */
 function isBinaryOnPath(name: string): boolean {
   const pathEnv = process.env.PATH;
   if (!pathEnv) return false;
   const dirs = pathEnv.split(delimiter);
-  // Windows: probe the same suffix set Windows itself defaults to on a
-  // fresh install (cmd.exe's PATHEXT default minus the registry-only
-  // entries .VBS / .WSF / .JS that aren't directly executable from
-  // process spawn). Hardcoded rather than reading the Windows PATHEXT
-  // variable because the env-var lint allowlist only permits KICI_*/OS-SDK
-  // names and PATHEXT isn't on that allowlist; the hardcoded set covers
-  // every real shipping case (no operator has ever needed a custom
-  // PATHEXT for a KiCI tool check).
+  // Windows: cmd.exe's default PATHEXT minus .VBS / .WSF / .JS (not directly
+  // spawnable), so `git` resolves to `git.exe`. Hardcoded because the env-var
+  // lint allowlist does not permit PATHEXT; no operator has needed a custom one.
   const exts = process.platform === 'win32' ? ['', '.exe', '.cmd', '.bat', '.com'] : [''];
   for (const dir of dirs) {
     if (!dir) continue;

@@ -5,26 +5,23 @@ const logger = createLogger({ prefix: 'pending-scale-sweeper' });
 
 export interface PendingScaleSweeperOptions {
   /**
-   * Re-drive callback — the dispatcher's `retryPendingScaleRequests` bound to
-   * the `sweep` trigger. Returns the number of jobs re-driven (logged when > 0).
+   * The dispatcher's `retryPendingScaleRequests` bound to the `sweep` trigger. Returns the
+   * number of jobs re-driven (logged when > 0).
    */
   redrive: () => Promise<number>;
-  /** Sweep interval in milliseconds. */
   intervalMs: number;
 }
 
 /**
  * Leader-gated periodic backstop for the scaler capacity-freed re-drive.
  *
- * The capacity-freed hook (`ScalerManager.onCapacityFreed`) handles the common
- * case with near-zero latency, but it can miss edge cases: a spawn that failed
- * silently, a reservation freed on a non-leader coordinator, or a lost event.
- * This sweeper re-runs the SAME `retryPendingScaleRequests` on a timer so a
- * pending at-capacity job is never stranded past one interval.
+ * `ScalerManager.onCapacityFreed` handles the common case at near-zero latency but can miss a
+ * spawn that failed silently, a reservation freed on a non-leader coordinator, or a lost event.
+ * Re-running the SAME `retryPendingScaleRequests` on a timer strands no pending at-capacity job
+ * past one interval.
  *
- * Modeled on `HostRosterReaper` / `EventRetryScanner`: started/stopped via the
- * Raft leadership callbacks, a single timer cleared on `stop()`. Leader-only so
- * multiple coordinators don't each drive the same queue.
+ * Like `HostRosterReaper` / `EventRetryScanner`, it follows the Raft leadership callbacks with
+ * one timer cleared on `stop()`; leader-only so coordinators don't each drive the same queue.
  */
 export class PendingScaleSweeper {
   private readonly redrive: () => Promise<number>;

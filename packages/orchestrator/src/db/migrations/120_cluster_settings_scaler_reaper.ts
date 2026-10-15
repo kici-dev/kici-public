@@ -1,28 +1,20 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Cluster-global tunables for the leader-gated event-scaler provision reaper.
+ * Cluster-global tunables for the leader-gated event-scaler provision reaper: additive, nullable
+ * columns where NULL is the configured default (the `KICI_SCALER_REAP_*` /
+ * `KICI_SCALER_CLAIM_RETENTION_MS` env vars).
  *
- * Four additive, nullable columns. NULL means the orchestrator's configured
- * default applies (the `KICI_SCALER_REAP_*` / `KICI_SCALER_CLAIM_RETENTION_MS`
- * env vars stay as the cluster-wide defaults).
+ * - `scaler_reap_interval_ms` — sweep cadence; re-read after every sweep, so a change
+ *   reschedules the timer on the next tick.
+ * - `scaler_reap_stranded_timeout_ms` — how long an adopted provision whose agent is registered
+ *   on no coordinator sits before teardown.
+ * - `scaler_reap_reattempt_interval_ms` — delay before retrying a provision whose teardown did
+ *   not clear its row.
+ * - `scaler_claim_retention_ms` — how long the sweep keeps an expired provisioning claim.
  *
- * - `scaler_reap_interval_ms` — how often the leader sweeps. Re-read at the end
- *   of every sweep, so a change reschedules the timer on the next tick.
- * - `scaler_reap_stranded_timeout_ms` — how long an adopted provision whose
- *   agent is registered on no coordinator may sit before teardown.
- * - `scaler_reap_reattempt_interval_ms` — how long before a provision whose
- *   teardown did not clear its row is retried.
- * - `scaler_claim_retention_ms` — how long an expired provisioning claim is kept
- *   before the same sweep deletes it.
- *
- * The three windows are read per sweep, so a change lands on the next tick with
- * no restart.
- *
- * BIGINT rather than INTEGER: every value is in milliseconds, and a retention
- * window an operator widens to a few weeks leaves INTEGER range.
- *
- * Idempotent: each column is guarded on existence, so a re-run is a no-op.
+ * The windows are read per sweep, so a change needs no restart. BIGINT because every value is in
+ * ms and a retention widened to a few weeks leaves INTEGER range. Each column add is guarded.
  */
 async function columnExists(db: Kysely<unknown>, table: string, column: string): Promise<boolean> {
   const check = await sql<{ exists: boolean }>`

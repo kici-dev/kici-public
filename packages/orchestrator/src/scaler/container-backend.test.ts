@@ -12,7 +12,6 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   };
 });
 
-// Mock nftables module
 const mockValidateNftablesAvailability = vi.fn().mockResolvedValue(undefined);
 const mockEnsureKiciTable = vi.fn().mockResolvedValue(undefined);
 const mockAddHostIsolationRules = vi.fn().mockResolvedValue(undefined);
@@ -31,7 +30,6 @@ vi.mock('@kici-dev/shared/net', async (importOriginal) => ({
   deleteForwardRules: (...args: unknown[]) => mockDeleteForwardRules(...args),
 }));
 
-// Mock dockerode
 const mockStart = vi.fn().mockResolvedValue(undefined);
 const mockStop = vi.fn().mockResolvedValue(undefined);
 const mockRemove = vi.fn().mockResolvedValue(undefined);
@@ -45,8 +43,8 @@ const mockContainerInspect = vi.fn().mockResolvedValue({
 });
 
 // `ensureRuntimeVolume` probes the runtime volume's completion marker with a
-// short-lived container, so the fake has to be waitable. Exit 0 = the marker is
-// there = the volume is reused rather than repopulated.
+// short-lived container, so the fake is waitable. Exit 0 = marker present =
+// the volume is reused, not repopulated.
 const mockWait = vi.fn().mockResolvedValue({ StatusCode: 0 });
 
 const mockContainer = {
@@ -74,7 +72,6 @@ const mockFollowProgress = vi.fn((_stream: unknown, onFinished: (err: Error | nu
 const mockImageInspect = vi.fn().mockResolvedValue({ Id: 'sha256:mock' });
 const mockGetImage = vi.fn().mockReturnValue({ inspect: mockImageInspect });
 
-// Network-related mocks
 const mockListNetworks = vi.fn().mockResolvedValue([]);
 const mockCreateNetwork = vi.fn().mockResolvedValue({ id: 'net-abc123456789' });
 const mockNetworkInspect = vi.fn().mockResolvedValue({
@@ -202,13 +199,9 @@ describe('ContainerScalerBackend', () => {
     });
 
     it('bounds the agent container without restricting the build it runs', async () => {
-      // `KICI_EXECUTION_MODE=bare-metal` means the workflow's steps run as host
-      // processes INSIDE this container unless the job declares its own image.
-      // A pid ceiling costs a build nothing; dropping capabilities or setting
-      // no-new-privileges would break `apt-get`, `chown` and `sudo` in every
-      // customer step, with no opt-out. The confinement the docs promise is
-      // applied one boundary in, to the nested JOB container, by
-      // packages/agent/src/execution/sandbox/container-hardening.ts.
+      // Build steps run INSIDE this container: a pid ceiling costs nothing, but
+      // dropping capabilities or no-new-privileges would break `apt-get`, `chown`
+      // and `sudo` in every customer step. Rationale: container-hostconfig.ts.
       const backend = await createBackend();
       await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
 
@@ -517,10 +510,8 @@ describe('ContainerScalerBackend', () => {
         await backend.spawn(['linux', 'node20'], 'agent-2', 'http://localhost:4000');
 
         const args = mockCreateContainer.mock.calls[0][0];
-        // scalers.yaml env comes after KICI_AGENT_ENV_ in the array, so it has higher precedence
-        // Both entries may be present, but the last one wins for Docker env
+        // scalers.yaml env follows KICI_AGENT_ENV_ in the array; Docker's last entry wins.
         const nodeVersionEntries = args.Env.filter((e: string) => e.startsWith('NODE_VERSION='));
-        // The last entry should be the scalers.yaml value
         expect(nodeVersionEntries[nodeVersionEntries.length - 1]).toBe('NODE_VERSION=20');
       } finally {
         process.env = originalEnv;
@@ -571,8 +562,8 @@ describe('ContainerScalerBackend', () => {
     });
 
     it('narrows host reachability to the orchestrator port and DNS by default', async () => {
-      // Before the input chain existed, an agent container reached every port
-      // on every one of the host's addresses.
+      // Without the input chain, an agent container reaches every port on every
+      // one of the host's addresses.
       const backend = await createBackend();
       await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
 
@@ -642,14 +633,12 @@ describe('ContainerScalerBackend', () => {
       mockStop.mockRejectedValueOnce(new Error('container already stopped'));
       mockRemove.mockRejectedValueOnce(new Error('container already removed'));
 
-      // Should not throw
       await backend.destroy('agent-1');
       expect(backend.getActiveCount()).toBe(0);
     });
 
     it('handles non-existent managed ID gracefully', async () => {
       const backend = await createBackend();
-      // Should not throw
       await backend.destroy('non-existent');
       expect(backend.getActiveCount()).toBe(0);
     });
@@ -663,13 +652,12 @@ describe('ContainerScalerBackend', () => {
       expect(mockRemoveIsolationRules).toHaveBeenCalledWith('172.30.0.5');
     });
 
-    // The agent inside a container registers, runs its job and disconnects
-    // while spawn() is still awaiting the runtime under load; that disconnect
-    // destroys the agent mid-spawn. Before the fix the tracking entry still
-    // carried the empty backendRef it was created with, so destroy handed
-    // dockerode '' — `POST /containers//stop`, which podman answers with a
-    // redirect docker-modem follows to a host named `containers`, and the
-    // resulting DNS failure was an uncaught exception that killed the process.
+    // Under load the agent can register, run its job and disconnect while spawn()
+    // still awaits the runtime, destroying it mid-spawn. A tracking entry still
+    // carrying its initial empty backendRef hands dockerode '' —
+    // `POST /containers//stop`, which podman answers with a redirect docker-modem
+    // follows to a host named `containers`; the DNS failure is an uncaught
+    // exception that kills the process.
     describe('destroy during spawn', () => {
       it('stops the real container and never hands the runtime an empty id', async () => {
         const backend = await createBackend();
@@ -792,8 +780,8 @@ describe('ContainerScalerBackend', () => {
       const backend = await createBackend();
       const cleaned = await backend.cleanupOrphans();
 
-      // Scoped to this scaler's own name: two orchestrators (or a coordinator
-      // and a worker peer) sharing one docker host used to kill each other's
+      // Scoped to this scaler's own name: otherwise two orchestrators (or a
+      // coordinator and a worker peer) sharing one docker host kill each other's
       // running agents on every boot.
       expect(mockListContainers).toHaveBeenCalledWith({
         all: true,
@@ -885,12 +873,10 @@ describe('ContainerScalerBackend', () => {
     });
 
     it('spares an isolated-network address a neighbouring backend still holds', async () => {
-      // `kici-agent-net` is ONE fixed network on the host: a second container
-      // scaler, the bare-metal backend's container mode, and another
-      // orchestrator on the same runtime all put their agents on it. Reaping
-      // every address this backend does not track would delete a live
-      // neighbour's RFC1918 and cloud-metadata drops — a silent fail-open of
-      // the boundary this sweep exists to repair.
+      // `kici-agent-net` is ONE host-wide network shared with other container
+      // scalers, bare-metal container mode and other orchestrators. Reaping every
+      // untracked address would delete a live neighbour's RFC1918 and
+      // cloud-metadata drops — a silent fail-open of the boundary this sweep repairs.
       mockListContainers.mockResolvedValue([
         {
           Id: 'neighbour-1',
@@ -932,9 +918,9 @@ describe('ContainerScalerBackend', () => {
     });
 
     it('stops every orphan at once rather than one after another', async () => {
-      // Each stop can take its full timeout — longer when the runtime misses the
-      // exit — and the sweep runs before the orchestrator serves, so a serial
-      // sweep over a few leftover agents held a restart for over a minute.
+      // Each stop can take its full timeout (longer when the runtime misses the
+      // exit) and the sweep runs before the orchestrator serves, so a serial sweep
+      // over a few leftover agents holds a restart for over a minute.
       // fails-when: the sweep awaits one orphan's stop before issuing the next.
       mockListContainers.mockResolvedValueOnce([
         { Id: 'orphan-1', State: 'exited' },
@@ -1135,20 +1121,18 @@ describe('ContainerScalerBackend', () => {
 
       await createBackend();
 
-      // Should NOT try to create a new network
       expect(mockCreateNetwork).not.toHaveBeenCalled();
     });
 
     it('handles Docker substring matching by verifying exact name', async () => {
-      // Docker's name filter does substring matching, so "kici-agent-net" might
-      // match "kici-agent-network-other" -- we verify exact name match
+      // Docker's name filter matches substrings: "kici-agent-net" matches
+      // "kici-agent-network-other", so the backend checks the exact name.
       mockListNetworks.mockResolvedValueOnce([
         { Name: 'kici-agent-network-other', Id: 'wrong-net-id' },
       ]);
 
       await createBackend();
 
-      // Should create network since exact name doesn't match
       expect(mockCreateNetwork).toHaveBeenCalled();
     });
 
@@ -1156,7 +1140,6 @@ describe('ContainerScalerBackend', () => {
       await createBackend();
 
       expect(mockEnsureKiciTable).toHaveBeenCalledOnce();
-      // addIsolationRules is NOT called at creation time — it's per-container during spawn
       expect(mockAddIsolationRules).not.toHaveBeenCalled();
     });
 
@@ -1273,7 +1256,6 @@ describe('ContainerScalerBackend', () => {
 
       mockRemoveIsolationRules.mockRejectedValueOnce(new Error('nft failed'));
 
-      // Should NOT throw
       await backend.shutdownAll();
     });
   });
@@ -1292,8 +1274,6 @@ describe('ContainerScalerBackend', () => {
       const result = await detectRuntime('podman');
       expect(result).toBeNull();
 
-      // Should not have probed the docker socket path
-      // (only podman paths are tried)
       const calledPaths = mockAccess.mock.calls.map((c: unknown[]) => c[0]);
       expect(calledPaths).not.toContain('/var/run/docker.sock');
       expect(calledPaths).toContain('/run/podman/podman.sock');
@@ -1458,8 +1438,7 @@ describe('ContainerScalerBackend per-job image', () => {
     // shadow its own /opt/kici.
     expect(created.Image).not.toBe('reg.internal:5000/acme/ci:1.2');
     expect(created.HostConfig.Binds?.some((b) => b.endsWith(':/opt/kici:ro'))).toBeFalsy();
-    // The pool's agent image already starts the agent by default; overriding
-    // its CMD would be a second way to say the same thing.
+    // The pool's agent image already starts the agent by default.
     expect((created as { Cmd?: string[] }).Cmd).toBeUndefined();
   });
 });

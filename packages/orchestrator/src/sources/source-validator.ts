@@ -8,9 +8,6 @@
 import { createAppAuth } from '@octokit/auth-app';
 import { Octokit } from '@octokit/rest';
 
-/**
- * Result of a source credential validation.
- */
 export interface ValidationResult {
   valid: boolean;
   appName?: string;

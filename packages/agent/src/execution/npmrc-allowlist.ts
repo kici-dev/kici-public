@@ -2,13 +2,11 @@
  * Read `.npmrc` files the way npm reads them, keep only allowlisted keys, and
  * write the result back as a fresh file.
  *
- * Raw lines are never copied. npm's `ini` parser splits a file on every run of
- * CR and LF, so a line that looks like one allowlisted key to a LF-only reader
- * can carry a second, arbitrary key after a lone CR. Parsing with npm's own
- * parser (loaded from the npm the host install runs) and serializing only the
- * kept pairs makes the file the package manager reads exactly the pairs this
- * module decided to keep. pnpm reads the written file with the same line
- * splitting.
+ * Raw lines are never copied: npm's `ini` parser splits on every run of CR and
+ * LF, so a line a LF-only reader sees as one allowlisted key can carry a second
+ * key after a lone CR. Parsing with npm's own parser (from the npm the host
+ * install runs) and serializing only kept pairs makes the file npm — and pnpm,
+ * which splits lines the same way — reads exactly the kept pairs.
  */
 
 import { createRequire } from 'node:module';
@@ -75,7 +73,7 @@ export function parseRepoNpmrc(text: string, ini: IniCodec): ParsedNpmrc {
   return { ok: true, entries: ini.decode(text) };
 }
 
-/** The top-level keys of parsed entries, lower-cased. */
+/** Lower-cased. */
 export function npmrcKeys(entries: Record<string, unknown>): string[] {
   return Object.keys(entries).map((k) => k.toLowerCase());
 }
@@ -228,14 +226,12 @@ const TOOL_ENV_NAMES = new Set([
 ]);
 
 /**
- * Names inside a tool namespace above that no tool reads: npm 11.12.1, pnpm
- * 11.3.0 and Node 24 read neither. They are the names registry-auth lines
- * conventionally reference. Matched in this exact case only, since npm reads
- * its `npm_config_*` variables in any case.
+ * Names in a tool namespace above that npm 11.12.1, pnpm 11.3.0 and Node 24 do
+ * not read, and that registry-auth lines conventionally reference. Exact case
+ * only, since npm reads its `npm_config_*` variables in any case.
  */
 const TOOL_ENV_EXEMPT = new Set(['NPM_TOKEN', 'NODE_AUTH_TOKEN']);
 
-/** A portable environment variable name: letters, digits and `_`, not starting with a digit. */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /** Whether `name` is a portable environment variable name. */
@@ -244,11 +240,11 @@ export function isEnvVarName(name: string): boolean {
 }
 
 /**
- * Whether the runtime or a package manager reads `name` from its environment,
- * in any letter case: a proxy, a TLS trust root, a module preload, a config
- * root, a debug switch. Such a name must never reach the host install as an
- * install secret, where it would change what the install contacts, trusts or
- * loads. `NPM_TOKEN` and `NODE_AUTH_TOKEN`, in exactly that case, are not.
+ * Whether the runtime or a package manager reads `name` (any case): a proxy,
+ * TLS trust root, module preload, config root or debug switch. Such a name must
+ * never reach the host install as an install secret, where it would change
+ * what the install contacts, trusts or loads. `NPM_TOKEN` and
+ * `NODE_AUTH_TOKEN`, in exactly that case, are exempt.
  */
 export function isToolReadEnvName(name: string): boolean {
   // fails-when: `NPM_TOKEN` falls through to the `NPM_` prefix rule and refuses

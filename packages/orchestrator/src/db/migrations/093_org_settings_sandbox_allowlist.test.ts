@@ -3,15 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m093 from './093_org_settings_sandbox_allowlist.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 093.
- *
- * Creates a uniquely-named throwaway database, applies migrations 001..093
- * via the production migration provider, and asserts the two nullable sandbox
- * allow-list columns exist (NULL = safe deny-all default). The throwaway
- * database is dropped in teardown.
+ * Real-Postgres test for migration 093: the nullable sandbox allow-list columns
+ * (NULL = safe deny-all default), on a throwaway database migrated through 093.
  *
  * Gated on `KICI_TEST_ADMIN_DATABASE_URL`: skips when unset, fails loudly when
  * set but unreachable.

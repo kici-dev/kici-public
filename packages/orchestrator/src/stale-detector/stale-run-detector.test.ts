@@ -14,7 +14,6 @@ import {
   storePendingWorkflowContext,
 } from '../pipeline/pending-workflow-context.js';
 
-// Mock Prometheus metrics
 vi.mock('../metrics/prometheus.js', () => ({
   staleRunsDetectedTotal: { add: vi.fn() },
   staleDetectionDurationSeconds: { record: vi.fn() },
@@ -25,11 +24,7 @@ vi.mock('../metrics/prometheus.js', () => ({
 
 // ── Chainable mock DB ───────────────────────────────────────────
 
-/**
- * Build a mock that mimics Kysely's chained query builder.
- * Each call to selectFrom/updateTable creates an independent chain
- * that resolves to pre-configured results.
- */
+/** One independent Kysely-like query chain resolving to pre-configured results. */
 function createChainableMock(opts: {
   executeResult?: unknown[];
   executeTakeFirstResult?: unknown;
@@ -82,8 +77,7 @@ function createDeps() {
     onAgentDisconnected: vi.fn(),
   };
 
-  // By default the dispatcher tracks no job to any agent; a test that expects
-  // the agent to be disconnected maps the stale job to it.
+  // Tracks no job to any agent; a test expecting a disconnect maps the stale job to it.
   const dispatcher = {
     onAgentDisconnect: vi.fn().mockResolvedValue(undefined),
     getAgentIdForJob: vi.fn((_jobId: string): string | null => null),
@@ -93,8 +87,8 @@ function createDeps() {
     get: vi.fn().mockReturnValue({ agentId: 'agent-1' }),
   };
 
-  // Default registry has no peers connected, so the rerouted-job guard is a
-  // no-op for local jobs (rerouted_to_peer === null) — existing behavior.
+  // No peers connected, so the rerouted-job guard is a no-op for local jobs
+  // (rerouted_to_peer === null).
   const peerRegistry = {
     getPeer: vi.fn().mockReturnValue(undefined),
   };
@@ -109,10 +103,7 @@ function createDeps() {
   };
 }
 
-/**
- * Build a mock Kysely DB where selectFrom and updateTable calls can be
- * configured per-call-index, enabling precise control of multi-query scans.
- */
+/** A mock Kysely DB whose selectFrom and updateTable results are configured per call index. */
 function createSequentialDb(config: {
   selects: Array<{ executeResult?: unknown[]; executeTakeFirstResult?: unknown }>;
   updates: Array<{ executeTakeFirstResult?: unknown }>;
@@ -131,10 +122,8 @@ function createSequentialDb(config: {
       const cfg = config.updates[idx] ?? { executeTakeFirstResult: { numUpdatedRows: 0n } };
       return createChainableMock({ executeTakeFirstResult: cfg.executeTakeFirstResult });
     }),
-    // `deletePendingWorkflowContext` runs inside the expiry sweep. Without this
-    // it threw into the sweep's own catch, which logs and moves on — so the
-    // whole tail of the sweep was silently skipped in every test that reached
-    // it.
+    // The expiry sweep calls `deletePendingWorkflowContext`; without this it throws into the
+    // sweep's catch, silently skipping the rest of the sweep.
     deleteFrom: vi.fn(() => createChainableMock({})),
   };
 
@@ -191,9 +180,7 @@ describe('StaleRunDetector — wait-timer release routing', () => {
     (d as unknown as { releaseDueWaitHolds(): Promise<void> }).releaseDueWaitHolds();
 
   it('routes a JOB-scoped wait release to the job path, not the workflow path', async () => {
-    // Before job-scoped timer holds were released at all, this sweep filtered
-    // them out entirely; routing them to onWorkflowRelease would re-dispatch a
-    // whole workflow instead of the one job that was held.
+    // onWorkflowRelease would re-dispatch the whole workflow instead of the held job.
     const onJobRelease = vi.fn().mockResolvedValue(undefined);
     const onWorkflowRelease = vi.fn().mockResolvedValue(undefined);
     const d = detectorWith(
@@ -218,7 +205,7 @@ describe('StaleRunDetector — wait-timer release routing', () => {
   });
 
   it('still routes a WORKFLOW-scoped wait release to the install-gate path', async () => {
-    // The positive control: the pre-existing behaviour must be untouched.
+    // Positive control for the job-scoped routing above.
     const onJobRelease = vi.fn().mockResolvedValue(undefined);
     const onWorkflowRelease = vi.fn().mockResolvedValue(undefined);
     const d = detectorWith(
@@ -242,8 +229,7 @@ describe('StaleRunDetector — wait-timer release routing', () => {
   });
 
   it('sweeps even when only a job-release handler is wired', async () => {
-    // The guard used to require onWorkflowRelease, so an orchestrator wired for
-    // job releases only would have skipped the sweep entirely.
+    // The guard must not require onWorkflowRelease.
     const onJobRelease = vi.fn().mockResolvedValue(undefined);
     const d = detectorWith(
       [
@@ -278,11 +264,7 @@ describe('StaleRunDetector', () => {
     const mocks = createDeps();
     const job = staleJob();
 
-    // Scan sequence:
-    // selectFrom 0: sub-scan A (stale running jobs) -> returns [job]
-    // updateTable 0: mark job timed_out_stale -> succeeds (1 row updated)
-    // selectFrom 1: sub-scan B (null heartbeat) -> returns []
-    // selectFrom 2: sub-scan C (dispatch queue) -> returns []
+    // Sub-scan A: stale running jobs; B: null heartbeat; C: dispatch queue.
     const db = createSequentialDb({
       selects: [
         { executeResult: [job] }, // Sub-scan A
@@ -297,14 +279,12 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.scan();
 
-    // Verify updateInMemoryJob called with timed_out_stale
     expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalledWith(
       'run-1',
       'job-1',
       'timed_out_stale',
     );
 
-    // Verify checkRunReporter.updateJobStatus called with description and routingKey
     expect(mocks.checkRunReporter.updateJobStatus).toHaveBeenCalledWith(
       expect.objectContaining({
         provider: 'github',
@@ -320,16 +300,14 @@ describe('StaleRunDetector', () => {
       }),
     );
 
-    // Verify force-terminate
+    // Force-terminate.
     expect(mocks.scalerManager.onAgentDisconnected).toHaveBeenCalledWith('agent-1');
 
-    // Verify completeRunIfAllJobsTerminal called for the affected run
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-1');
   });
 
   it('scan() defers failing a job rerouted to a still-connected worker peer', async () => {
     const mocks = createDeps();
-    // The job's worker peer is currently connected.
     mocks.peerRegistry.getPeer.mockReturnValue({ connected: true });
     const job = staleJob({ rerouted_to_peer: 'arm-worker' });
 
@@ -378,9 +356,8 @@ describe('StaleRunDetector', () => {
 
   it('scan() defers a job whose rerouted peer is flapping (disconnected but recently seen)', async () => {
     const mocks = createDeps();
-    // Peer-WS flap during a coordinator restart: the worker peer is marked
-    // disconnected but its last heartbeat is recent, so it will reconnect and
-    // replay the job's buffered terminal status. The run must NOT be failed.
+    // Peer-WS flap during a coordinator restart: disconnected but recently seen, so the
+    // worker will reconnect and replay the buffered terminal status. Must NOT fail the run.
     mocks.peerRegistry.getPeer.mockReturnValue({ connected: false, lastHeartbeatAt: Date.now() });
     const job = staleJob({ rerouted_to_peer: 'arm-worker' });
 
@@ -404,8 +381,7 @@ describe('StaleRunDetector', () => {
 
   it('scan() still fails a job whose rerouted peer has been gone past the flap-grace window', async () => {
     const mocks = createDeps();
-    // Disconnected and last heartbeat is well beyond the grace window: the
-    // worker is treated as dead, so the job is timed out (it cannot hang).
+    // Last heartbeat well past the grace window: the worker is dead, so the job times out.
     mocks.peerRegistry.getPeer.mockReturnValue({
       connected: false,
       lastHeartbeatAt: Date.now() - 10 * 60 * 1000,
@@ -473,18 +449,15 @@ describe('StaleRunDetector', () => {
   });
 
   it('scan() fails an expired WORKFLOW-scoped hold instead of resuming it', async () => {
-    // The org trust policy's PR-wide hold is workflow-scoped and stores a
-    // dispatch context, so a released one replays that dispatch. Expiry is the
-    // opposite outcome and must never take that path: an approval window that
-    // ran out is a denial, not a deferred approval.
+    // The org trust policy's PR-wide hold stores a dispatch context that a release replays.
+    // Expiry must never take that path: an elapsed approval window is a denial.
     const mocks = createDeps();
     const db = createSequentialDb({
       selects: [{ executeResult: [] }, { executeResult: [] }, { executeResult: [] }],
       updates: [],
     });
 
-    // The context the hold stored. Without it the "dropped" assertion below
-    // would pass on a run that never had one.
+    // Without a stored context, the "dropped" assertion below would pass vacuously.
     clearPendingWorkflowContextsMap();
     await storePendingWorkflowContext(undefined, {
       runId: 'run-fork',
@@ -493,9 +466,8 @@ describe('StaleRunDetector', () => {
     expect(await loadPendingWorkflowContext(undefined, 'run-fork')).not.toBeNull();
 
     const heldRunStore = {
-      // A security hold carries `hold_type: 'security'`, which the wait-timer
-      // sweep's own `hold_type` filter excludes — so it only ever reaches the
-      // expire path, never `releaseDueWaitHolds`.
+      // The wait-timer sweep's `hold_type` filter excludes `security`, so a security hold
+      // only reaches the expire path.
       releaseDueWaitHolds: vi.fn().mockResolvedValue([]),
       listOverdue: vi.fn().mockResolvedValue([
         {
@@ -524,18 +496,14 @@ describe('StaleRunDetector', () => {
     expect(failRun).toHaveBeenCalledWith('run-fork', expect.stringContaining('Approval expired'));
     expect(onWorkflowRelease).not.toHaveBeenCalled();
     expect(onJobRelease).not.toHaveBeenCalled();
-    // Expiry consumes the stored dispatch context too. Only a release or a
-    // rejection would otherwise drop it, and an unanswered hold reaches
-    // neither — so for a fork PR nobody approves, the common outcome, the row
-    // would accumulate until a restart swept it as terminal.
+    // Expiry drops the stored context too: an unanswered hold (the common fork-PR outcome)
+    // gets no release or rejection, so the row would accumulate until a restart.
     expect(await loadPendingWorkflowContext(undefined, 'run-fork')).toBeNull();
   });
 
   it('scan() leaves a JOB-scoped expired hold no workflow context to drop', async () => {
-    // The control: the cleanup is keyed on scope, not run on every expiry. A
-    // job-scoped hold never wrote a workflow context, and a sweep that deleted
-    // by run id regardless could take out a context belonging to a different,
-    // still-live hold on the same run.
+    // Control: the cleanup is keyed on scope. A job-scoped hold wrote no workflow context,
+    // and deleting by run id could take out a still-live hold's context on the same run.
     const mocks = createDeps();
     const db = createSequentialDb({
       selects: [{ executeResult: [] }, { executeResult: [] }, { executeResult: [] }],
@@ -574,10 +542,9 @@ describe('StaleRunDetector', () => {
   });
 
   it('scan() completes the queued check runs of an expired WORKFLOW-scoped hold', async () => {
-    // `failRun` above writes DB rows only — a held run has no in-memory run for
-    // it to fire `onExecutionComplete` from, and the stale check-run sweep only
-    // touches `in_progress` — so without this the `kici/<workflow>` and per-job
-    // checks the dispatch posted stay `queued` on the commit forever.
+    // `failRun` writes DB rows only, a held run has no in-memory run to fire
+    // `onExecutionComplete`, and the stale check-run sweep only touches `in_progress`: without
+    // this the `kici/<workflow>` and per-job checks stay `queued` on the commit forever.
     const mocks = createDeps();
     const db = createSequentialDb({
       selects: [{ executeResult: [] }, { executeResult: [] }, { executeResult: [] }],
@@ -638,16 +605,10 @@ describe('StaleRunDetector', () => {
     clearPendingWorkflowContextsMap();
   });
 
-  /**
-   * The `KiCI Security` check the org trust policy's PR-wide hold posted as
-   * `pending`. `failRun` writes DB rows and no check run, so an unanswered hold
-   * left it `in_progress` on the commit forever.
-   */
   describe('scan() finishes a run whose every job is terminal', () => {
     it('routes each all-terminal candidate through the run completion check', async () => {
       const mocks = createDeps();
-      // Sub-scans A, B, C find nothing; the all-terminal sweep (F) reads one
-      // candidate run row and then its (stale) holder's heartbeat row.
+      // A, B, C find nothing; sweep F reads one candidate run, then its holder's heartbeat.
       const db = createSequentialDb({
         selects: [
           { executeResult: [] },
@@ -708,12 +669,13 @@ describe('StaleRunDetector', () => {
     });
   });
 
+  /**
+   * The `KiCI Security` check the org trust policy's PR-wide hold posted as
+   * `pending`. `failRun` writes DB rows and no check run, so an unanswered hold
+   * left it `in_progress` on the commit forever.
+   */
   describe('scan() completes the security check of an expired hold', () => {
-    /**
-     * The `execution_runs` row the settled security check is addressed from —
-     * the same repo, sha, effective routing key and credentials the pending
-     * check was posted under.
-     */
+    /** The `execution_runs` row: the pending check's repo, sha, routing key and credentials. */
     const RUN_ROW = {
       repo_identifier: 'acme/app',
       sha: 'cafebabe',
@@ -731,13 +693,12 @@ describe('StaleRunDetector', () => {
       const mocks = createDeps();
       const db = createSequentialDb({
         selects: [
-          // Sub-scans A, B, C, and the all-terminal run sweep (F), each empty.
+          // Sub-scans A, B, C and sweep F, each empty.
           { executeResult: [] },
           { executeResult: [] },
           { executeResult: [] },
           { executeResult: [] },
-          // The settler's own two reads: the hold's run row, then the other
-          // holds still pending on that commit.
+          // The settler's reads: the run row, then the other holds pending on that commit.
           { executeTakeFirstResult: RUN_ROW },
           { executeResult: contenders },
         ],
@@ -765,11 +726,9 @@ describe('StaleRunDetector', () => {
             job_id: jobId,
             hold_scope: holdScope,
             hold_type: HoldType.enum.security,
-            // An install-gate row carries one, because
-            // `holdWorkflowForInstallGate` writes it through `createHold` — and
-            // that is the clause which would otherwise accept it, so a row
-            // without one would pass even with the install-gate guard removed
-            // from the ownership predicate.
+            // An install-gate row carries one (`holdWorkflowForInstallGate` writes it through
+            // `createHold`), and that clause would otherwise accept it: without one the row
+            // passes even with the install-gate guard removed from the ownership predicate.
             approval_requirement: jobId.startsWith(INSTALL_JOB_ID_PREFIX)
               ? { clauses: [], expiresAt: 'x', reason: 'r' }
               : null,
@@ -804,18 +763,16 @@ describe('StaleRunDetector', () => {
       // The next step a contributor can actually take.
       expect(summary).toContain('Push a new commit');
       expect(credentials).toEqual({ installationId: 42 });
-      // One event, one story: the two check families say the same thing.
+      // Both check families carry the same summary.
       expect(mocks.checkRunReporter.completeUndispatchedCheckRuns.mock.calls[0][0].summary).toBe(
         summary,
       );
     });
 
     it('does NOT post one for an expired install-gate hold', async () => {
-      // `postCheckStatus` CREATES the named run when it finds none, and an
-      // install-gate hold posts no pending security check — so posting here
-      // would put a `KiCI Security` check on a commit that never had one. The
-      // `kici/…` completion still runs, which is what proves the expiry took
-      // the same path and only the security post was withheld.
+      // `postCheckStatus` CREATES the named run when absent, and an install-gate hold posts
+      // no pending security check, so posting would add a `KiCI Security` check the commit
+      // never had. The `kici/…` completion proves only the security post was withheld.
       const postCheckStatus = vi.fn().mockResolvedValue(undefined);
       const mocks = await runExpirySweep(installGateJobId('CI'), postCheckStatus);
 
@@ -824,10 +781,8 @@ describe('StaleRunDetector', () => {
     });
 
     it('closes the check of an expired JOB-scoped hold too', async () => {
-      // A job-scoped security hold posts the same shared check and never
-      // reaches the workflow-only branch, so before this it timed out with the
-      // check still `in_progress` — permanently, since the row leaves
-      // `pending` and `listOverdue` never sees it again.
+      // A job-scoped hold posts the same shared check but skips the workflow-only branch; a
+      // check left `in_progress` stays so, since the row leaves `pending` and `listOverdue`.
       const postCheckStatus = vi.fn().mockResolvedValue(undefined);
       const mocks = await runExpirySweep('build (18)', postCheckStatus, HoldScope.enum.job);
 
@@ -839,18 +794,14 @@ describe('StaleRunDetector', () => {
       expect(title).toBe('Approval window elapsed');
       expect(summary).toContain('The approval window for a job in this run elapsed');
       expect(summary).toContain('Push a new commit');
-      // A job-scoped hold owns no workflow dispatch context, so the `kici/…`
-      // family is left to the run's own reporting.
+      // No workflow dispatch context, so the `kici/…` family is left to the run's reporting.
       expect(mocks.checkRunReporter.completeUndispatchedCheckRuns).not.toHaveBeenCalled();
     });
 
     it('settles once for a commit whose whole batch expires in one sweep', async () => {
-      // `expireOverdue()` runs AFTER this loop, so every hold in the batch is
-      // still `pending` in the database while its siblings are being routed.
-      // Without excluding the batch, each hold would see the other as a live
-      // contender, neither would post, and the shared check would stay
-      // `in_progress` forever — the exact leak this task closes. And with the
-      // commit tracked, the second hold does not repeat the identical write.
+      // `expireOverdue()` runs AFTER this loop, so the whole batch is still `pending`. Without
+      // excluding the batch each hold sees the other as a live contender, neither posts, and
+      // the shared check stays `in_progress` forever; tracking the commit avoids a repeat write.
       const postCheckStatus = vi.fn().mockResolvedValue(undefined);
       const mocks = createDeps();
       const overdue = [
@@ -878,15 +829,12 @@ describe('StaleRunDetector', () => {
           { executeResult: [] },
           { executeResult: [] },
           { executeResult: [] },
-          // hold-a: its run row, then the pending set — which contains BOTH
-          // rows, because neither has been flipped yet.
+          // hold-a: run row, then the pending set, holding BOTH rows (neither flipped yet).
           { executeTakeFirstResult: RUN_ROW },
           { executeResult: overdue },
-          // hold-b: its run row, then the same pending set. The commit is
-          // already settled, so it returns before that contention query ever
-          // runs — the row is configured anyway so that dropping the batch
-          // exclusion makes hold-b refuse too, rather than quietly picking up
-          // the post hold-a was denied.
+          // hold-b: the commit is settled, so it returns before the contention query; the row
+          // is configured anyway so dropping the batch exclusion makes hold-b refuse too,
+          // rather than pick up the post hold-a was denied.
           { executeTakeFirstResult: RUN_ROW },
           { executeResult: overdue },
         ],
@@ -910,9 +858,7 @@ describe('StaleRunDetector', () => {
     });
 
     it('leaves it pending while another hold on the same commit still owns it', async () => {
-      // The check is one named run per commit. Expiring one hold of a matrix
-      // that is still held must not resolve it — the remaining hold's own
-      // ending is what closes it.
+      // One named check per commit: the last remaining hold's ending closes it.
       const postCheckStatus = vi.fn().mockResolvedValue(undefined);
       await runExpirySweep(
         SECURITY_HOLD_JOB_IDS.fork_pr,
@@ -991,7 +937,6 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.scan();
 
-    // No side effects -- job was already completed
     expect(mocks.executionTracker.updateInMemoryJob).not.toHaveBeenCalled();
     expect(mocks.checkRunReporter.updateJobStatus).not.toHaveBeenCalled();
     expect(mocks.scalerManager.onAgentDisconnected).not.toHaveBeenCalled();
@@ -1001,7 +946,7 @@ describe('StaleRunDetector', () => {
     const { setStaleRunsCurrent } = await import('../metrics/prometheus.js');
     const mocks = createDeps();
 
-    // Two jobs found by SELECT, but only one UPDATE succeeds (the other completed concurrently)
+    // Only one UPDATE succeeds; the other job completed concurrently.
     const job1 = staleJob({ run_id: 'run-1', job_id: 'job-1' });
     const job2 = staleJob({ run_id: 'run-2', job_id: 'job-2' });
 
@@ -1021,10 +966,9 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.scan();
 
-    // Gauge should reflect 1 (actually marked), not 2 (found by SELECT)
+    // The gauge counts marked jobs, not SELECT hits.
     expect(setStaleRunsCurrent).toHaveBeenCalledWith(1);
 
-    // Only run-1 should have completion check (run-2's job wasn't actually stale)
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-1');
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).not.toHaveBeenCalledWith('run-2');
   });
@@ -1032,17 +976,12 @@ describe('StaleRunDetector', () => {
   it('scan() continues processing remaining jobs when one job fails to mark (sub-scan A)', async () => {
     const mocks = createDeps();
 
-    // Three stale jobs in sub-scan A. The middle job's mark throws, but the
-    // per-item try/catch must keep the scan going so job-1 and job-3 are still
-    // processed (the resilience guarantee: one bad job cannot abort the tick).
+    // One bad job cannot abort the tick: the per-item try/catch keeps the scan going.
     const job1 = staleJob({ run_id: 'run-1', job_id: 'job-1' });
     const job2 = staleJob({ run_id: 'run-2', job_id: 'job-2' });
     const job3 = staleJob({ run_id: 'run-3', job_id: 'job-3' });
 
-    // Sub-scan A returns all three jobs; B and C return empty. The first job's
-    // UPDATE succeeds, the second throws (simulating a DB failure inside
-    // markJobStale), the third succeeds — updateTable is called in mark order,
-    // so the throw lands on job-2 alone.
+    // updateTable is called in mark order, so the throw lands on job-2 alone.
     let selectCall = 0;
     let updateCall = 0;
     const db = {
@@ -1065,10 +1004,8 @@ describe('StaleRunDetector', () => {
     } as unknown as StaleRunDetectorDeps['db'];
 
     const detector = new StaleRunDetector(makeDeps(db, mocks));
-    // Must not throw — the scan survives the middle job's failure.
     await expect(detector.scan()).resolves.toBeUndefined();
 
-    // job-1 and job-3 were still marked despite job-2 throwing.
     expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalledWith(
       'run-1',
       'job-1',
@@ -1079,14 +1016,12 @@ describe('StaleRunDetector', () => {
       'job-3',
       'timed_out_stale',
     );
-    // job-2 never completed its mark, so no in-memory update for it.
     expect(mocks.executionTracker.updateInMemoryJob).not.toHaveBeenCalledWith(
       'run-2',
       'job-2',
       'timed_out_stale',
     );
 
-    // Run-completion is still checked for the successfully-marked runs.
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-1');
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-3');
   });
@@ -1112,14 +1047,12 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.scan();
 
-    // Verify the job was detected via sub-scan B
     expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalledWith(
       'run-1',
       'job-1',
       'timed_out_stale',
     );
 
-    // Verify description reflects the null-heartbeat case and routingKey is forwarded
     expect(mocks.checkRunReporter.updateJobStatus).toHaveBeenCalledWith(
       expect.objectContaining({
         state: 'timed_out_stale',
@@ -1164,24 +1097,21 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.scan();
 
-    // Verify execution_jobs was also updated (propagation)
+    // execution_jobs is updated too (propagation).
     expect((db as any).updateTable).toHaveBeenCalledTimes(2);
 
-    // Verify updateInMemoryJob called with the found job_id
     expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalledWith(
       'run-2',
       'ejob-2',
       'timed_out_stale',
     );
 
-    // Verify completeRunIfAllJobsTerminal called for the affected run
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-2');
   });
 
   it('scan() calls completeRunIfAllJobsTerminal for affected runs', async () => {
     const mocks = createDeps();
 
-    // Two stale jobs from different runs
     const job1 = staleJob({ run_id: 'run-1', job_id: 'job-1' });
     const job2 = staleJob({ run_id: 'run-2', job_id: 'job-2' });
 
@@ -1200,15 +1130,13 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.scan();
 
-    // Both runs should have completion checked
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-1');
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-2');
   });
 
   it('crash recovery: completeRunIfAllJobsTerminal called for affected runs', async () => {
-    // Simulates: StaleRunDetector marks a job, then completeRunIfAllJobsTerminal
-    // uses the DB-fallback path because in-memory state is empty (post-restart).
-    // The DB-fallback itself is tested in execution-tracker.test.ts.
+    // Post-restart, completeRunIfAllJobsTerminal takes its DB-fallback path (tested in
+    // execution-tracker.test.ts) because in-memory state is empty.
     const mocks = createDeps();
     const job = staleJob();
 
@@ -1238,7 +1166,6 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.start();
 
-    // selectFrom should have been called by the immediate scan
     expect((db as any).selectFrom).toHaveBeenCalled();
 
     detector.stop();
@@ -1255,15 +1182,12 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.start();
 
-    // Clear call counts from initial scan
     vi.mocked((db as any).selectFrom).mockClear();
 
     detector.stop();
 
-    // Advance past scan interval
     vi.advanceTimersByTime(120_000);
 
-    // No further scans
     expect((db as any).selectFrom).not.toHaveBeenCalled();
   });
 
@@ -1298,8 +1222,7 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.scan();
 
-    // The executionTracker mock does not have onJobStatus.
-    // This confirms the detector never tries to call it -- only updateInMemoryJob.
+    // The mock has no onJobStatus, so a call would throw.
     expect(mocks.executionTracker).not.toHaveProperty('onJobStatus');
     expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalled();
   });
@@ -1307,8 +1230,7 @@ describe('StaleRunDetector', () => {
   it('cleanupOrphanedRecoveryJobs() checks run completion for affected runs', async () => {
     const mocks = createDeps();
 
-    // Sequence: selectFrom (find recovering jobs), updateTable (fail execution_jobs),
-    // updateTable (fail dispatch_queue)
+    // Select recovering jobs, then fail execution_jobs and dispatch_queue.
     const db = createSequentialDb({
       selects: [
         {
@@ -1324,7 +1246,6 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.cleanupOrphanedRecoveryJobs();
 
-    // Both distinct run IDs should have completion checked
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-A');
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledWith('run-B');
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).toHaveBeenCalledTimes(2);
@@ -1341,7 +1262,6 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.cleanupOrphanedRecoveryJobs();
 
-    // No updates should have been performed
     expect((db as any).updateTable).not.toHaveBeenCalled();
     expect(mocks.executionTracker.completeRunIfAllJobsTerminal).not.toHaveBeenCalled();
   });
@@ -1358,7 +1278,6 @@ describe('StaleRunDetector', () => {
 
     const detector = new StaleRunDetector(makeDeps(db, mocks));
 
-    // Should not throw -- scan() catches errors internally
     await expect(detector.scan()).resolves.toBeUndefined();
   });
 
@@ -1379,7 +1298,6 @@ describe('StaleRunDetector', () => {
     const detector = new StaleRunDetector(makeDeps(db, mocks));
     await detector.scan();
 
-    // The job itself is still reaped.
     expect(mocks.executionTracker.updateInMemoryJob).toHaveBeenCalledWith(
       job.run_id,
       job.job_id,
@@ -1432,10 +1350,8 @@ describe('StaleRunDetector — the reaped job carries the run trust posture', ()
   });
 
   it('forwards the run trust posture onto a reaped job check-run completion', async () => {
-    // A reap posts a completion check like any other. On a degraded fork run
-    // that check is one of only two the contributor gets, so dropping the
-    // posture here hides the explanation on exactly the path that most needs
-    // it.
+    // On a degraded fork run the reap's completion check is one of only two the contributor
+    // gets, so dropping the posture hides the explanation where it is most needed.
     const mocks = createDeps();
     const db = createSequentialDb({
       selects: [
@@ -1455,9 +1371,8 @@ describe('StaleRunDetector — the reaped job carries the run trust posture', ()
   });
 
   it('omits both fields for a run whose trust never resolved', async () => {
-    // Positive control: the same path over a row with NULL trust columns must
-    // forward nothing, so the assertion above cannot be passing on a harness
-    // that echoes the fields unconditionally.
+    // Positive control: NULL trust columns forward nothing, so the test above is not passing
+    // on a harness that echoes the fields unconditionally.
     const mocks = createDeps();
     const db = createSequentialDb({
       selects: [

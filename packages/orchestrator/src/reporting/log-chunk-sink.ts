@@ -1,18 +1,14 @@
 /**
- * The single place that decides what happens to a step-log chunk.
+ * The single place that decides what happens to a step-log chunk. Both ingresses feed
+ * it — the local agent WebSocket handler and the coordinator's peer handler (chunks
+ * relayed by a worker orchestrator) — so a worker-dispatched job's logs are persisted,
+ * counted and forwarded exactly like a local one's.
  *
- * Both ingresses feed this sink: the local agent WebSocket handler and the
- * coordinator's peer handler, which receives chunks relayed by a worker
- * orchestrator. Keeping the policy in one place is what makes the two paths
- * behave identically — a worker-dispatched job's logs are persisted, counted
- * and forwarded exactly like a locally-dispatched one's.
- *
- * The storage key is derived from `executionTracker.resolveJobName`, the same
- * call `ExecutionTracker.onStepStatus` uses to fill `execution_steps.log_path`,
- * so the reader and the writer cannot disagree about the naming rule — the
- * resolver falls back to `dispatch_queue.job_name` during the dispatch window
- * before in-memory job state is populated, which is what stops an early chunk
- * from being persisted under an unreadable `job-{jobId}` path.
+ * The storage key comes from `executionTracker.resolveJobName`, the same call
+ * `ExecutionTracker.onStepStatus` uses to fill `execution_steps.log_path`, so reader and
+ * writer cannot disagree on naming. Its `dispatch_queue.job_name` fallback during the
+ * dispatch window, before in-memory job state exists, stops an early chunk from landing
+ * under an unreadable `job-{jobId}` path.
  */
 import type { LogStream } from '@kici-dev/engine';
 import type { LogWriter } from './log-writer.js';
@@ -42,9 +38,8 @@ export interface LogChunkSinkDeps {
   /** Resolves the job name that names the storage path (durable fallback). */
   executionTracker?: { resolveJobName(runId: string, jobId: string): Promise<string> };
   /**
-   * Forward to the Platform for browser fan-out. Absent in independent mode.
-   * The caller wraps the chunk in the `log.chunk` envelope, which keeps this
-   * module free of Platform-protocol knowledge.
+   * Platform forward for browser fan-out; absent in independent mode. The caller wraps
+   * the `log.chunk` envelope, keeping this module free of Platform-protocol knowledge.
    */
   forwardToPlatform?: (chunk: NormalizedLogChunk) => void;
 }
@@ -54,11 +49,10 @@ export function createLogChunkSink(
 ): (chunk: NormalizedLogChunk) => Promise<void> {
   const attrs = { source: deps.source };
 
-  // Async so the storage path can resolve the job name through the durable
-  // resolver. The returned promise is the chunk's write: the agent handler
-  // awaits it, and a caller that does not may ignore it. The synchronous side
-  // effects — metrics, the in-memory tail buffer, Platform fan-out — all run
-  // before the first `await`, so making the sink async does not delay them.
+  // Async so the storage path can use the durable job-name resolver. The returned
+  // promise is the chunk's write (the agent handler awaits it; others may ignore it).
+  // Metrics, the tail buffer and Platform fan-out all run before the first `await`,
+  // so being async does not delay them.
   return async (chunk) => {
     if (chunk.lines.length === 0) return;
 
@@ -88,9 +82,8 @@ export function createLogChunkSink(
           chunk.stream,
         );
       })();
-      // Registered before the job name is resolved, not once the append
-      // starts: the run can complete while the name is being looked up, and
-      // its drain has to wait for this chunk and seal it.
+      // Registered before the name lookup, not when the append starts: the run can
+      // complete during the lookup, and its drain must wait for this chunk and seal it.
       // fails-when: a drain that starts during the name lookup seals the run
       // without this chunk, and the chunk's segment is never sealed
       logWriter.trackPending(chunk.runId, write);

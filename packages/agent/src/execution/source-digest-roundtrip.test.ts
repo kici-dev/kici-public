@@ -10,16 +10,11 @@ import { hashKiciSourceTree } from '@kici-dev/core/kici-source-digest';
 import { packKiciSource } from './source-packer.js';
 
 /**
- * The seam the drift gate actually spans: producer tree → tarball → extraction
- * → the tree the agent re-hashes.
- *
- * Every other digest test hands one function one tree and never asks whether
- * that tree survives the round trip. A `.kici/node_modules` symlink does not:
- * the packer drops the path by prefix, and the restore renames an
- * already-installed dependency directory into the extracted tree. So the
- * producer hashed a member that could not exist on the other side, and every
- * run failed the drift gate against source nobody had touched. This reproduces
- * that in milliseconds.
+ * The seam the drift gate spans: producer tree → tarball → extraction → the tree
+ * the agent re-hashes. Other digest tests use one tree and never ask whether it
+ * survives the round trip. A `.kici/node_modules` symlink does not (the packer
+ * drops the prefix; the restore renames an installed dependency directory into
+ * the tree), so a producer hashing it fails the drift gate on untouched source.
  */
 describe('the digest survives pack → extract → dependency install', () => {
   let root: string;
@@ -32,7 +27,7 @@ describe('the digest survives pack → extract → dependency install', () => {
     await fs.rm(root, { recursive: true, force: true });
   });
 
-  /** Write the producer's repository: `.kici/` plus the borrowed toolchain. */
+  /** `.kici/` plus the borrowed toolchain. */
   async function buildProducerRepo(): Promise<string> {
     const workDir = path.join(root, 'producer');
     const kiciDir = path.join(workDir, '.kici');
@@ -45,8 +40,8 @@ describe('the digest survives pack → extract → dependency install', () => {
     await fs.writeFile(path.join(kiciDir, 'package.json'), '{"name":"x"}\n', 'utf-8');
     await fs.writeFile(path.join(kiciDir, '.npmrc'), 'registry=https://example.test\n', 'utf-8');
 
-    // A sibling tree's dependencies, borrowed through a relative link rather
-    // than installed again — the shape a multi-`.kici/` monorepo produces.
+    // Dependencies borrowed from a sibling tree by relative link, as a
+    // multi-`.kici/` monorepo produces.
     const shared = path.join(workDir, 'shared-node-modules');
     await fs.mkdir(path.join(shared, 'dep'), { recursive: true });
     await fs.writeFile(path.join(shared, 'dep', 'index.js'), 'module.exports = 1;\n', 'utf-8');
@@ -66,8 +61,7 @@ describe('the digest survives pack → extract → dependency install', () => {
         .on('error', reject);
     });
 
-    // Both restore paths end here: the deps tarball is renamed into the tree,
-    // or `npm install` writes it. Either way it is a real directory.
+    // Both restore paths (deps tarball rename, `npm install`) leave a real directory.
     const installed = path.join(workDir, '.kici', 'node_modules', 'dep');
     await fs.mkdir(installed, { recursive: true });
     await fs.writeFile(path.join(installed, 'index.js'), 'module.exports = 1;\n', 'utf-8');

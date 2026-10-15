@@ -1,16 +1,9 @@
 /**
- * Cluster-name management commands for kici-admin.
- *
- * Subcommand namespace: `kici-admin cluster-name {get,set}`.
- *
- * The cluster name is the human-friendly identifier that surfaces on
- * Platform's connection registry and in the dashboard's per-orch URL
- * segment. Mutating it requires admin access (RBAC `secret.write`).
- *
- * Talks to the orchestrator admin API directly (not the Platform
- * dashboard proxy), so the CLI stays operable even when Platform is
- * unavailable. Backed by
- * `packages/orchestrator/src/routes/admin-cluster-name.ts`.
+ * `kici-admin cluster-name {get,set}`: the human-friendly identifier on the
+ * Platform's connection registry and in the dashboard's per-orch URL segment.
+ * `set` needs RBAC `secret.write`. Talks to the orchestrator admin API directly
+ * (`routes/admin-cluster-name.ts`), never the Platform proxy, so it works while
+ * the Platform is down.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';

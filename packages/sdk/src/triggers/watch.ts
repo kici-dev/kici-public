@@ -1,13 +1,8 @@
-/**
- * Watch trigger helper - creates triggers for watch events.
- * Returns a frozen WatchTriggerConfig directly.
- */
-
 import type { BranchPattern, WatchConfigInput, WatchTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';
 
 /**
- * Create a watch trigger configuration.
+ * Create a watch trigger. Returns a frozen WatchTriggerConfig.
  *
  * @example
  * // Match any watch event

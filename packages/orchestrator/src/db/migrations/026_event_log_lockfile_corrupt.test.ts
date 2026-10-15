@@ -3,15 +3,10 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m026 from './026_event_log_lockfile_corrupt.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 026.
- *
- * Creates a uniquely-named throwaway database, applies migrations 001..026
- * via the production migration provider, and asserts that the event_log status
- * CHECK constraint accepts 'lockfile_corrupt' (and still rejects garbage). The
- * throwaway database is dropped in teardown.
+ * Real-Postgres test for migration 026, on a throwaway database migrated through 026.
  *
  * Gated on `KICI_TEST_ADMIN_DATABASE_URL`: skips green when unset, fails loudly
  * when set but unreachable.
@@ -40,8 +35,7 @@ describeDb('migration 026_event_log_lockfile_corrupt', () => {
   let db: Kysely<unknown>;
   let pool: pg.Pool;
 
-  // describeDb only runs when KICI_TEST_ADMIN_DATABASE_URL is set, so the
-  // non-null assertion is safe inside the suite body.
+  // Safe: describeDb only runs when KICI_TEST_ADMIN_DATABASE_URL is set.
   const adminUrl = ADMIN_URL!;
 
   /** Insert a row with the given status, returning whether it was accepted. */
@@ -102,10 +96,8 @@ describeDb('migration 026_event_log_lockfile_corrupt', () => {
   });
 
   it('down() removes lockfile_corrupt from the allowed set', async () => {
-    // The earlier "accepts" tests seeded lockfile_corrupt rows in this shared
-    // throwaway DB. down() restores the narrower constraint, which a real
-    // rollback can only do once no surviving row uses the retired status — so
-    // clear them first (the operator-side prerequisite this test exercises).
+    // down() restores the narrower constraint, which a real rollback can only do once no row
+    // uses the retired status: clear the rows the earlier tests seeded first.
     await sql`DELETE FROM event_log WHERE status = 'lockfile_corrupt'`.execute(db);
     await m026.down(db);
     expect(await statusAccepted('lockfile_corrupt')).toBe(false);

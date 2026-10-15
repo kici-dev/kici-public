@@ -3,13 +3,12 @@
  * paths and the dashboard scope form. The rule runs on the PATH portion of a
  * scope (after any `backend:` prefix has been stripped): non-empty, length
  * bounded, `/`-separated non-empty segments, each segment restricted to
- * `[A-Za-z0-9_.-]`, and no `.`/`..` segments. Kept dependency-free so the
- * engine barrel stays browser-safe.
+ * `[A-Za-z0-9_.-]`, and no `.`/`..` segments. Dependency-free so the engine
+ * barrel stays browser-safe.
  *
- * Callers pass a bare path, so that precondition holds trivially: a writer
- * never supplies a backend qualifier. The `<backend>:` prefix is added by the
- * resolver when it merges secrets across backends at read time, and stripped
- * again before any per-backend call.
+ * Writers never supply a backend qualifier: the resolver adds the `<backend>:`
+ * prefix when it merges secrets across backends at read time, and strips it
+ * before any per-backend call.
  */
 
 /** Allowed characters in a single `/`-separated scope segment. */

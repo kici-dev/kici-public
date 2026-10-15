@@ -2,12 +2,8 @@
  * Shared held-run resolution for the `kici approve` / `kici reject` commands and
  * the developer MCP `approve_run` / `reject_run` tools.
  *
- * Both surfaces first list the pending holds for a run, then resolve the one the
- * caller named via `job` / `step` / `holdType` / `holdId` (or the sole pending
- * hold when there is exactly one and no filter is given). The resolution is a
- * pure function so it can be unit-tested without HTTP, and it imports nothing
- * beyond the shared held-run vocabulary, so it is safe to re-export from the
- * browser-facing engine barrel.
+ * Pure (unit-testable without HTTP) and importing only the shared held-run
+ * vocabulary, so it is safe to re-export from the browser-facing engine barrel.
  *
  * A job name is not a unique key: two independent requirements can gate one job,
  * and each writes its own pending row under that name. So every ambiguity path
@@ -27,10 +23,7 @@ export interface HeldRunSummary {
   holdScope?: HeldRunScope;
   stepIndex?: number | null;
   status: string;
-  /**
-   * Persisted `held_runs.hold_type`, when the orchestrator's list response
-   * carried one. Absent from an older orchestrator's response.
-   */
+  /** Persisted `held_runs.hold_type`; absent from an older orchestrator's response. */
   holdType?: string;
   /**
    * Bound context that requested the hold, when the row carries one. Null once
@@ -47,7 +40,6 @@ export interface HeldRunSummary {
   payload?: { summaryMarkdown: string; drift?: unknown } | null;
 }
 
-/** Filters supplied by the caller. */
 export interface HeldRunFilter {
   /** Match a hold by its job name. */
   job?: string;
@@ -56,12 +48,10 @@ export interface HeldRunFilter {
   /**
    * Match one hold by its own id, ignoring every other filter.
    *
-   * The escape hatch for an ambiguity nothing else can resolve. A job can carry
-   * more than one pending hold — an SDK `requireApproval` and a security-typed
-   * context gate produce two job-scoped rows under one job name — and while
-   * {@link holdType} separates that pair, nothing guarantees a future pair
-   * differs in type. An id always does, and the candidate list prints the ids
-   * whenever two holds are otherwise indistinguishable.
+   * The escape hatch for an ambiguity nothing else can resolve: {@link holdType}
+   * separates today's same-job pair, but nothing guarantees a future pair differs
+   * in type. The candidate list prints the ids whenever two holds are otherwise
+   * indistinguishable.
    */
   holdId?: string;
   /**
@@ -83,11 +73,9 @@ export type ResolveResult =
  * `__install__…` sentinel or an opaque legacy id is reproduced verbatim), with
  * the step index prefixed for a step-scoped hold, and the hold type appended.
  *
- * The type is what makes the candidate list actionable when one job carries two
- * holds — without it both rows rendered as the bare job name, so the list
- * collapsed to a single entry and named a `--job` filter that could not tell
- * them apart. It is omitted when the orchestrator's list response carried none
- * (an older build), which renders exactly as it did before.
+ * The type makes the candidate list actionable when one job carries two holds:
+ * without it both rows render as the bare job name and collapse to a single
+ * entry. It is omitted when an older orchestrator's response carried none.
  */
 function describeHold(hold: HeldRunSummary): string {
   // `||`, not `??`: an empty `jobId` is as unnameable as a missing one, and
@@ -102,10 +90,8 @@ function describeHold(hold: HeldRunSummary): string {
  * The hold descriptions, in listing order, for an error message.
  *
  * A description that occurs once is listed once. One that occurs more than once
- * is listed per hold WITH its id, because at that point the description alone
- * cannot name which hold the caller means and `--hold <id>` is the only filter
- * left that can. Silently de-duplicating those is what made the old message
- * offer a disambiguator it had already discarded the information for.
+ * is listed per hold WITH its id, because then `--hold <id>` is the only filter
+ * that can name the hold the caller means; de-duplicating would discard it.
  */
 function listCandidates(holds: readonly HeldRunSummary[]): string {
   const counts = new Map<string, number>();
@@ -142,11 +128,9 @@ const DISAMBIGUATORS = '--job <name>, --step <index>, --hold-type <type> or --ho
  *   own.
  * - With no filter, the sole pending hold is used; ambiguity is an error.
  *
- * One job can carry more than one pending hold: an SDK `requireApproval` paired
- * with a security-typed context gate writes two job-scoped rows under one job
- * name, because two independent requirements gate the job and both must be
- * answered. `job` alone cannot separate those, which is what `holdType` and
- * `holdId` are for.
+ * An SDK `requireApproval` paired with a security-typed context gate writes two
+ * job-scoped rows under one job name, both of which must be answered; `job`
+ * alone cannot separate them, which is what `holdType` and `holdId` are for.
  */
 export function resolveHeldRunId(
   holds: readonly HeldRunSummary[],
@@ -157,8 +141,6 @@ export function resolveHeldRunId(
     return { ok: false, error: 'No pending approval holds found for this run.' };
   }
 
-  // An id is unique, so it answers on its own — and it is the filter the
-  // candidate list hands the caller when nothing else separates two holds.
   if (filter.holdId !== undefined) {
     const matches = pending.filter((h) => h.id === filter.holdId);
     return pickSingle(matches, `hold '${filter.holdId}'`, pending);

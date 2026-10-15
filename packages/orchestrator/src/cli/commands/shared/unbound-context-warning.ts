@@ -1,20 +1,13 @@
 /**
- * The warning `kici-admin context create` and `kici-admin secret set` print
- * when a context's secrets cannot reach any job.
+ * The warning `context create` and `secret set` print when a context's secrets
+ * reach no job. A job listing a context in `contexts:` gets its secrets only
+ * through the scope bindings of the matched context row (fixed by exact name,
+ * glob by pattern). With no binding it gets none, silently, and
+ * `ctx.secrets.get()` throws at run time; a `<context>:<key>` git-credential or
+ * registry reference resolves through the same bindings and finds nothing too.
  *
- * A job that lists a context in its `contexts:` receives the context's
- * secrets only through the context's scope bindings: the secret resolver reads
- * the bindings of the context row the job's declared name matched — a fixed
- * context by its exact name, a glob context by its pattern — and returns
- * nothing when there are none. So such a context with no binding delivers no
- * secret to those jobs, whatever its scopes hold, and nothing fails loudly — a
- * workflow's `ctx.secrets.get()` throws at run time instead. A
- * `<context>:<key>` git-credential or registry reference resolves through the
- * same bindings, so it finds nothing either. The warning names the context and
- * the `context bind` command that fixes it.
- *
- * Advisory only: the lookup runs after the command's own write succeeded, and
- * a failed lookup prints nothing, so the command's exit code never changes.
+ * Advisory only: it runs after the command's write succeeded, and a failed
+ * lookup prints nothing, so the exit code never changes.
  */
 import { ContextType } from '@kici-dev/engine';
 import { listContextsDirect, showContextDirect } from '@kici-dev/shared';
@@ -36,7 +29,6 @@ export interface WarnIfContextUnboundArgs {
   warn?: (line: string) => void;
 }
 
-/** The warning line for a context with no binding. */
 export function unboundContextWarning(orgId: string, name: string): string {
   return (
     `warning: context '${name}' has no binding, so no job that lists it in contexts: receives its secrets, ` +
@@ -46,10 +38,9 @@ export function unboundContextWarning(orgId: string, name: string): string {
 }
 
 /**
- * The context named `name` with its bindings, or null when no context has that
- * name. The list read comes first, so a name that is not a context (a
- * positional `secret set` scope such as `aws/prod/db`) is answered without a
- * not-found error to tell apart from a real failure.
+ * The context with its bindings, or null. Listing first answers a non-context
+ * name (a `secret set` scope such as `aws/prod/db`) without a not-found error
+ * that would need telling apart from a real failure.
  */
 async function lookupContext(args: WarnIfContextUnboundArgs): Promise<ShowContextResult | null> {
   const { orgId, name, dbUrl, client } = args;
@@ -70,9 +61,8 @@ async function lookupContext(args: WarnIfContextUnboundArgs): Promise<ShowContex
 }
 
 /**
- * Print the unbound-context warning when `name` is a context a job can resolve
- * through (a fixed or glob context, `ContextType`) that has no binding. A
- * template row is a seed for other contexts, not a job context, and stays silent.
+ * Warns for a fixed or glob context (`ContextType`) with no binding. A template
+ * row seeds other contexts, is no job context, and stays silent.
  */
 export async function warnIfContextUnbound(args: WarnIfContextUnboundArgs): Promise<void> {
   let found: ShowContextResult | null;

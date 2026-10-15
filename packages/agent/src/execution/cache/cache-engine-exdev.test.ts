@@ -3,16 +3,13 @@ import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, lstat, stat } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-// Arm state for the injected rename failure. Must come from vi.hoisted: the
-// vi.mock factory below is hoisted above the imports, so a plain const declared
-// here would hit the temporal dead zone when the factory runs.
+// Injected rename-failure state. vi.hoisted, because the hoisted vi.mock factory
+// would hit the temporal dead zone on a plain const.
 const injected = vi.hoisted(() => ({ armed: false, code: 'EXDEV', hits: 0 }));
 
-// Mock node:fs/promises so that ONLY the cross-device move out of the extract
-// scratch dir fails — every other fs call (cp/rm/mkdir/readdir the fallback
-// relies on, plus makeTempDir's own mkdtemp) delegates to the real module, so
-// the test proves the fallback actually lands the bytes rather than that cp was
-// called.
+// ONLY the cross-device move out of the extract scratch dir fails; every other fs
+// call delegates to the real module, so the test proves the fallback lands the
+// bytes rather than that cp was called.
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return {
@@ -23,8 +20,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
     ) => {
       const s = String(src);
       const d = String(dest);
-      // Fail only the scratch -> workspace move (src is the extract scratch,
-      // dest is not), leaving same-directory renames untouched.
+      // Only scratch -> workspace fails; same-directory renames pass through.
       if (
         injected.armed &&
         s.includes('kici-cache-extract-') &&
@@ -42,7 +38,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
   };
 });
 
-// Import the module under test AFTER the mock is registered.
+// Imported AFTER the mock is registered.
 const { packCachePaths, extractCacheTarball } = await import('./cache-engine.js');
 
 beforeEach(() => {
@@ -64,8 +60,7 @@ describe('cache-engine EXDEV fallback', () => {
       injected.armed = true;
       await extractCacheTarball(tarball, dest, hash);
 
-      // Positive control: the injection must have actually fired, otherwise a
-      // green test would prove nothing about the fallback.
+      // Positive control: without a fired injection, green proves nothing.
       expect(injected.hits).toBeGreaterThan(0);
       expect((await readFile(join(dest, 'dist', 'a.txt'))).toString()).toBe('hello');
       expect((await readFile(join(dest, 'dist', 'nested', 'b.txt'))).toString()).toBe('world');
@@ -83,8 +78,7 @@ describe('cache-engine EXDEV fallback', () => {
       await writeFile(join(root, 'dist', 'fresh.txt'), 'fresh');
       const { tarball, hash } = await packCachePaths(root, ['dist']);
 
-      // Pre-seed a stale tree at the destination that the restore must replace,
-      // not merge into.
+      // A stale tree the restore must replace, not merge into.
       await mkdir(join(dest, 'dist'), { recursive: true });
       await writeFile(join(dest, 'dist', 'stale.txt'), 'stale');
 

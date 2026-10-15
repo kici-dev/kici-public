@@ -1,16 +1,8 @@
 /**
- * Event DLQ admin CLI commands for kici-admin.
- *
- *   event-dlq list     — list events in the DLQ
- *   event-dlq count    — total DLQ depth
- *   event-dlq retry <id>     — clear DLQ flag, schedule for retry, pg_notify
- *   event-dlq discard <id>   — permanently delete a DLQ event
- *
- * Operator triage path for at-least-once event delivery. Customers should
- * generally never see anything in the DLQ — when something lands here it
- * usually means a workflow handler is consistently failing and should be fixed
- * at its root cause. This CLI is the triage surface: inspect last_error, retry
- * once a fix is deployed, or discard if the event is no longer relevant.
+ * `kici-admin event-dlq`: operator triage for at-least-once event delivery. An
+ * event here usually means a workflow handler fails consistently: inspect
+ * last_error, retry once a fix is deployed, or discard. `retry` clears the DLQ
+ * flag, schedules a retry and sends pg_notify.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -54,7 +46,6 @@ export function registerEventDlqCommands(program: Command, getClient: () => Admi
     .command('event-dlq')
     .description('Inspect / retry / discard events in the DLQ (at-least-once delivery)');
 
-  // ── list ────────────────────────────────────────────────────────
   dlq
     .command('list')
     .description('List events currently in the DLQ (most recent first)')
@@ -101,7 +92,6 @@ export function registerEventDlqCommands(program: Command, getClient: () => Admi
       }),
     );
 
-  // ── count ───────────────────────────────────────────────────────
   dlq
     .command('count')
     .description('Print the total number of events in the DLQ')
@@ -112,7 +102,6 @@ export function registerEventDlqCommands(program: Command, getClient: () => Admi
       }),
     );
 
-  // ── retry ───────────────────────────────────────────────────────
   dlq
     .command('retry <id>')
     .description('Clear the DLQ flag, reset attempts, and schedule the event for immediate retry')
@@ -126,7 +115,6 @@ export function registerEventDlqCommands(program: Command, getClient: () => Admi
       }),
     );
 
-  // ── discard ─────────────────────────────────────────────────────
   dlq
     .command('discard <id>')
     .description('Permanently delete an event from the DLQ')

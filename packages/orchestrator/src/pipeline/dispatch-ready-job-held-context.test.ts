@@ -30,6 +30,7 @@ import type { QueuedJobInput } from '../queue/job-queue.js';
 import { JobSecretsUnsealError } from '../secrets/job-secret-seal.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 const CONTEXT = 'prod';
 const SECRET = { PROD_TOKEN: 'sekrit' };
@@ -129,8 +130,8 @@ interface ReleaseOptions {
   resolveForContext?: (...args: unknown[]) => Promise<Record<string, string>>;
   /**
    * Context rows the store holds at release, by name; `prod` with no
-   * overrides when omitted. The held job's own rules still hold, as in a real
-   * store — its protection rules are not cleared by the approval.
+   * overrides when omitted. As in a real store, the approval does not clear
+   * the held job's own protection rules.
    */
   rows?: Record<string, Record<string, unknown>>;
   resolveNamedInternal?: (org: string, ctx: string, key: string) => Promise<string | null>;
@@ -637,15 +638,14 @@ async function storeAdmittedJob(s: StoreScenario) {
       routeJobs,
     };
   }
-  const deploy = {
-    _type: 'static',
+  const deploy = staticJob({
     name: DEPLOY,
     runsOn: [{ kind: 'exact', value: 'default' }],
     steps: [{ name: 'echo', run: 'echo deploy' }],
     needs: [STATIC_JOB],
     rules: [],
     contexts: [{ value: CONTEXT, dynamic: false }],
-  } as unknown as LockWorkflow['jobs'][number];
+  });
   ctx.workflow = {
     ...ctx.workflow,
     ...(s.workflowApproval && { approval: APPROVAL as unknown as LockWorkflow['approval'] }),

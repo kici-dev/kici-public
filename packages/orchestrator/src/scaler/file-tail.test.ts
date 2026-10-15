@@ -5,11 +5,10 @@ import { join } from 'node:path';
 import { tailFile, MAX_LINE_BYTES, MAX_QUEUED_LINES, MAX_READ_BYTES } from './file-tail.js';
 
 /**
- * The serial console is guest-controlled: a job inside a tenant's microVM
- * writes to `/dev/console` unprivileged, and every byte lands in the
- * orchestrator's process. These tests pin the three bounds that stop one
- * tenant's job from taking down every tenant on that orchestrator, plus the
- * consumed-bytes offset that stops a burst from being silently dropped.
+ * The serial console is guest-controlled: a tenant's job writes `/dev/console` unprivileged and
+ * every byte lands in the orchestrator. These tests pin the bounds that stop one tenant's job
+ * from taking down every tenant, plus the consumed-bytes offset that keeps a burst from being
+ * silently dropped.
  */
 describe('tailFile', () => {
   let dir: string;
@@ -49,11 +48,9 @@ describe('tailFile', () => {
   });
 
   it('joins a logical line split across writes, and skips the empty ones', async () => {
-    // The partial-line carry-over is the buffer the bounding rewrite reshaped
-    // most: an incomplete trailing slice is held and prepended to the first
-    // part of the NEXT read, and empty parts never reach the consumer. The
-    // over-long cases below exercise the discard path instead, so without this
-    // the ordinary join has no coverage at all.
+    // An incomplete trailing slice is held and prepended to the NEXT read's
+    // first part; empty parts never reach the consumer. The over-long cases
+    // below exercise the discard path, so this is the ordinary join's only coverage.
     await appendFile(file, 'partial');
 
     const controller = new AbortController();
@@ -93,14 +90,12 @@ describe('tailFile', () => {
     const lines = await collect(2);
 
     expect(lines[0].endsWith(' [truncated]')).toBe(true);
-    // The remainder of the over-long line is discarded, not merged into the
-    // next one.
+    // The over-long line's remainder is discarded, not merged into the next.
     expect(lines[1]).toBe('after');
   });
 
   it('drops from the front with an in-band marker when the queue overflows', async () => {
-    // More complete lines than the queue can hold, written before any consumer
-    // reads: the queue fills in one drain pass.
+    // Written before any consumer reads, so the queue fills in one drain pass.
     const total = MAX_QUEUED_LINES + 500;
     let payload = '';
     for (let i = 0; i < total; i++) payload += `line-${i}\n`;
@@ -125,15 +120,13 @@ describe('tailFile', () => {
   });
 
   it('keeps a multi-byte character that straddles the bounded-read boundary', async () => {
-    // The read boundary falls wherever MAX_READ_BYTES lands, which is happily
-    // inside a UTF-8 sequence. Decoding each slice on its own replaces that
-    // character and mis-decodes the continuation bytes leading the next slice.
-    // A three-byte character placed astride the boundary is the smallest case
-    // that shows it.
+    // The MAX_READ_BYTES boundary can fall inside a UTF-8 sequence; decoding
+    // each slice alone replaces that character and mis-decodes the next
+    // slice's leading continuation bytes. A three-byte glyph astride the
+    // boundary is the smallest case.
     const glyph = '☃'; // U+2603, three bytes
-    // Fill the first bounded read to one byte short of its boundary, so the
-    // glyph's first byte is the last byte of read 1 and its other two lead
-    // read 2. `filler` is one complete line; `prefix` opens the next one.
+    // The glyph's first byte ends read 1 and its other two lead read 2.
+    // `filler` is one complete line; `prefix` opens the next one.
     const prefix = 'y'.repeat(9);
     const filler = 'x'.repeat(MAX_READ_BYTES - 11);
     await appendFile(file, `${filler}\n${prefix}${glyph}tail\n`);
@@ -146,10 +139,8 @@ describe('tailFile', () => {
 
   it('resumes exactly where a bounded read stopped, across a multi-read burst', async () => {
     // A delta larger than one bounded read needs several passes. Advancing the
-    // offset by a fresh `statSync` — taking the file's size *now* rather than
-    // the bytes actually consumed — skips everything between the end of the
-    // slice and EOF, so the burst's tail and everything appended after it are
-    // silently lost.
+    // offset by a fresh `statSync` (size *now*, not bytes consumed) skips from
+    // the slice's end to EOF, silently losing the burst's tail and later appends.
     const bigLine = `${'a'.repeat(MAX_READ_BYTES + 4096)}\n`;
     await appendFile(file, bigLine);
 

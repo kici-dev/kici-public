@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 
-// Mock os.homedir to isolate tests from real home directory
 vi.mock('node:os', async () => {
   const actual = await vi.importActual<typeof import('node:os')>('node:os');
   return {
@@ -30,18 +29,15 @@ describe('global config management', () => {
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-config-test-'));
     vi.mocked(os.homedir).mockReturnValue(tempDir);
-    // The vitest harness sets KICI_CONFIG_DIR to an isolated tempdir so the CLI
-    // never reads the developer's ambient ~/.kici. Save it, and repoint it at
-    // exactly the directory the mocked homedir produces, so the file-writing
-    // cases below read and write inside this test's temp dir.
+    // The harness points KICI_CONFIG_DIR at an isolated tempdir; repoint it at
+    // the mocked homedir's directory for this test.
     harnessConfigDir = process.env.KICI_CONFIG_DIR;
     process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
   });
 
   afterEach(async () => {
-    // Restore the harness's isolated dir rather than deleting it, so a later
-    // test file reusing this worker keeps its isolation from the ambient
-    // ~/.kici config.
+    // Restore, not delete: a later test file on this worker stays isolated
+    // from the ambient ~/.kici.
     if (harnessConfigDir === undefined) delete process.env.KICI_CONFIG_DIR;
     else process.env.KICI_CONFIG_DIR = harnessConfigDir;
     vi.restoreAllMocks();
@@ -60,8 +56,7 @@ describe('global config management', () => {
     });
 
     it('ignores KICI_CONFIG_DIR when empty string', () => {
-      // An empty string is falsy, so it falls through to the homedir default
-      // rather than resolving to an empty path. Deliberate — do not "fix".
+      // Deliberate, do not "fix": an empty string falls through to the homedir default.
       const dir = getConfigDir({ KICI_CONFIG_DIR: '' });
       expect(dir).toBe(path.join(tempDir, '.kici'));
     });
@@ -72,10 +67,8 @@ describe('global config management', () => {
     });
 
     it('ignores unrelated env vars and resolves the homedir default', () => {
-      // Only KICI_CONFIG_DIR affects resolution; any other key (including the
-      // runner's own VITEST marker) falls through to ~/.kici. `kici` is a
-      // compat-protected CLI, so a customer whose vitest test shells out to it
-      // must resolve the ordinary default.
+      // `kici` is compat-protected: a customer's vitest test shelling out to it
+      // must resolve the ordinary default despite the VITEST marker.
       expect(getConfigDir({ VITEST: 'true' })).toBe(path.join(tempDir, '.kici'));
       expect(getConfigDir({ NODE_ENV: 'production' })).toBe(path.join(tempDir, '.kici'));
     });
@@ -250,7 +243,7 @@ describe('global config management', () => {
 
       const configPath = path.join(tempDir, '.kici', 'config');
       const stat = await fs.stat(configPath);
-      // 0o600 = owner read/write only (octal 33152 with file type bits, mode is 0o100600)
+      // Owner read/write only; the full mode with file-type bits is 0o100600.
       const mode = stat.mode & 0o777;
       expect(mode).toBe(0o600);
     });
@@ -261,25 +254,20 @@ describe('global config management', () => {
       const configPath = path.join(tempDir, '.kici', 'config');
       const content = await fs.readFile(configPath, 'utf-8');
 
-      // Should be formatted with 2-space indent
       expect(content).toContain('  "pat"');
       expect(content).toContain('  "endpoint"');
-      // Should end with newline
       expect(content.endsWith('\n')).toBe(true);
-      // Should be valid JSON
       expect(() => JSON.parse(content)).not.toThrow();
     });
   });
 
   describe('mergeGlobalConfig', () => {
     it('preserves existing keys while adding new ones', async () => {
-      // Save initial config
       await saveGlobalConfig({
         pat: 'existing-token',
         endpoint: 'https://existing.example.com',
       });
 
-      // Merge new platformEndpoint
       const merged = await mergeGlobalConfig({
         platformEndpoint: 'https://platform.example.com',
       });
@@ -301,7 +289,6 @@ describe('global config management', () => {
       await saveGlobalConfig({ pat: 'first' });
       await mergeGlobalConfig({ endpoint: 'https://orch.example.com' });
 
-      // Reload from disk to verify persistence
       const reloaded = await loadGlobalConfig();
       expect(reloaded.pat).toBe('first');
       expect(reloaded.endpoint).toBe('https://orch.example.com');

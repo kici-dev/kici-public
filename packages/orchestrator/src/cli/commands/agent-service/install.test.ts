@@ -1,22 +1,13 @@
 /**
- * Tests for the agent install command's folder-anchored behavior:
- * --instance-dir handling, manifest write, index append, create-path guard,
- * and the component marker passed through to manager.install(). Wizard wiring
- * is also covered: the --wizard flag calls runAgentWizard() and generates the
- * expected env file content.
- *
- * The strategy: mock only the platform-touching surface of
- * `service/index.js` (createServiceManager, detectPlatform,
- * resolveUserLevel, getConfigDir, getLogDir, kiciConfigRoot), and re-export
- * the real instance helpers (listInstances, writeManifest, appendIndexEntry,
- * readIndex). The real helpers exercise real fs against per-test tmpdirs,
- * so the manifest write + index append paths are covered end-to-end.
+ * Only the platform-touching surface of `service/index.js` is mocked; the real
+ * instance helpers run against per-test tmpdirs, so the manifest write and
+ * index append are covered end to end.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { makeTempDir } from '@kici-dev/test-support/tmp';
 import { Command } from 'commander';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import type {
   DiscoveredInstance,
@@ -25,8 +16,7 @@ import type {
   ServicePlatform,
 } from '../../service/types.js';
 
-// Per-test mock state. Reassigned in beforeEach so each test gets its own
-// tmpdirs + a clean manager stub.
+// Per-test mock state, reassigned in beforeEach.
 /** The systemd driver's scan. */
 let mockListResult: DiscoveredInstance[] = [];
 /** The compose driver's scan — a compose install the systemd driver cannot see. */
@@ -62,15 +52,11 @@ vi.mock('../../service/index.js', async () => {
     kiciConfigRoot: vi.fn(() => mockKiciRoot),
     createServiceManager: vi.fn(async (platform: ServicePlatform) => makeManager(platform)),
     restrictEnvFileAccess: (...args: unknown[]) => mockRestrict(...args),
-    // Substitute the drivers so the host's real systemd and compose registries
-    // stay out of the test. A caller that names its own driver set keeps it,
-    // mapped one-for-one onto doubles — so a guard that asks for a single
-    // host-derived driver scans a single double, and the compose row it would
-    // then miss is really missed. Only a caller that names none gets the
-    // candidate pair, which is what `candidateManagers()` would have built.
-    //
-    // The substitution alone cannot show which of the two the guard asked for,
-    // so the guard test asserts the compose driver's own scan spy ran.
+    // Keep the host's real registries out. A caller's own driver set maps
+    // one-for-one onto doubles, so a single host-derived driver really misses
+    // the compose row; a caller naming none gets the `candidateManagers()`
+    // pair. This cannot show which the guard asked for, so the guard test
+    // asserts the compose driver's own scan spy ran.
     listInstances: (args: Parameters<typeof actual.listInstances>[0]) =>
       actual.listInstances({
         ...args,
@@ -81,7 +67,6 @@ vi.mock('../../service/index.js', async () => {
   };
 });
 
-// Mock the agent wizard module.
 vi.mock('../../wizard/agent-wizard.js', () => ({
   runAgentWizard: vi.fn().mockResolvedValue({
     orchestratorUrl: 'http://orch.example.com:4000',
@@ -90,13 +75,8 @@ vi.mock('../../wizard/agent-wizard.js', () => ({
   }),
 }));
 
-// Import after mocks so the action picks up the mocked module.
 import { registerAgentInstall } from './install.js';
 import { readIndex, manifestPath, readKiciVersion } from '../../service/index.js';
-
-function mkTmp(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 describe('agent install — folder-anchored', () => {
   let program: Command;
@@ -109,10 +89,10 @@ describe('agent install — folder-anchored', () => {
   let consoleWarnSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    tmpInstanceDir = mkTmp('kici-f1-i-');
-    tmpConfigRoot = mkTmp('kici-f1-c-');
+    tmpInstanceDir = makeTempDir('kici-f1-i-');
+    tmpConfigRoot = makeTempDir('kici-f1-c-');
     tmpServiceConfigDir = path.join(tmpConfigRoot, 'kici-test') + path.sep;
-    tmpLogDir = mkTmp('kici-f1-l-');
+    tmpLogDir = makeTempDir('kici-f1-l-');
 
     mockListResult = [];
     mockComposeListResult = [];
@@ -142,7 +122,6 @@ describe('agent install — folder-anchored', () => {
     }
   });
 
-  /** Run the install command with the given args and the canonical defaults. */
   async function runInstall(extraArgs: string[] = []): Promise<void> {
     await program.parseAsync([
       'node',
@@ -174,11 +153,9 @@ describe('agent install — folder-anchored', () => {
     expect(typeof manifest.installBase).toBe('string');
   });
 
-  // The driver set the create-path guard scans, pinned on its own. In the
-  // refusal test below, the compose scan is implied by the refusal firing at
-  // all, so it cannot fail there independently; here nothing conflicts and the
-  // install succeeds, so this assertion is the only thing a single-driver guard
-  // would break.
+  // Pins the create-path guard's driver set alone: in the refusal test below
+  // the refusal implies the compose scan, so only this succeeding install
+  // separates a single-driver guard.
   //
   // fails-when: the guard names one host-derived driver — `listInstances({…,
   // managers: [manager]})`. The compose double is never built and its scan
@@ -267,8 +244,7 @@ describe('agent install — folder-anchored', () => {
         component: 'agent',
       },
     ];
-    // Pre-populate the index with the foreign instanceDir so listInstances
-    // reports it back via the index reconciliation.
+    // Index the foreign instanceDir so listInstances reports it back.
     fs.mkdirSync(tmpConfigRoot, { recursive: true });
     fs.writeFileSync(
       path.join(tmpConfigRoot, 'instances.json'),
@@ -353,9 +329,8 @@ describe('agent install — folder-anchored', () => {
   });
 
   it('refuses when the existing entry has no instanceDir (scan-only)', async () => {
-    // listInstances returns a scan-only entry — there is no row in the index
-    // for this instance, so the discovered instance has no instanceDir. The
-    // guard must still refuse without --force.
+    // A scan-only entry (no index row, so no instanceDir) still refuses
+    // without --force.
     mockListResult = [
       {
         name: 'kici-test',
@@ -411,8 +386,7 @@ describe('agent install — folder-anchored', () => {
     expect(mockInstall).toHaveBeenCalledTimes(1);
     const file = manifestPath(tmpInstanceDir, 'agent');
     expect(fs.existsSync(file)).toBe(true);
-    // appendIndexEntry refuses to overwrite when the foreign entry is still
-    // there; the action catches and warns instead of failing.
+    // appendIndexEntry refuses to overwrite the foreign entry; the action warns.
     const warns = consoleWarnSpy.mock.calls.map((c) => c.join(' ')).join('\n');
     expect(warns).toContain('instance index append failed');
   });

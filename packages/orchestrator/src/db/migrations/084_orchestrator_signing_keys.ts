@@ -1,20 +1,15 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the `orchestrator_signing_keys` table: the cluster-scoped, long-lived
- * ES256 provenance signing keys the orchestrator uses to sign its own build
- * attestations. One `active` key signs; rotated-out keys go `retiring` then
- * `retired` (still served in the JWKS so historical attestations keep
- * verifying); `revoked` keys are removed from the trust root.
+ * Add `orchestrator_signing_keys`: the cluster-scoped, long-lived ES256 keys that sign the
+ * orchestrator's build attestations. One `active` key signs; rotated-out keys go `retiring` then
+ * `retired` (still in the JWKS so historical attestations verify); `revoked` keys leave the
+ * trust root.
  *
- * `public_jwk` is the non-secret public half served at `/.well-known/jwks.json`.
- * `encrypted_private_jwk` holds the AES-256-GCM-wrapped private JWK for `db`
- * custody (wrapped with the orchestrator's `KICI_SECRET_KEY` master key, same
- * posture as `scoped_secrets`) and is NULL for `aws-kms` / `command` custody
- * where the private key never lives in the DB. `key_ref` locates the external
- * key (KMS ARN / signer command) for non-`db` custody.
- *
- * Idempotent: guarded on table existence.
+ * `public_jwk` is served at `/.well-known/jwks.json`. `encrypted_private_jwk` is the
+ * AES-256-GCM-wrapped private JWK for `db` custody (wrapped with `KICI_SECRET_KEY`, like
+ * `scoped_secrets`), NULL for `aws-kms` / `command` custody where the private key never lives in
+ * the DB; `key_ref` then locates the external key (KMS ARN / signer command). Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   if (await tableExists(db, 'orchestrator_signing_keys')) return;

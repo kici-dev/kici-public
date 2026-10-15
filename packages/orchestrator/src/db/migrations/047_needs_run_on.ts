@@ -10,13 +10,11 @@ import { type Kysely, sql } from 'kysely';
  *   `run` → every terminal job status.
  * - Drop `if_failed`.
  *
- * Idempotent: column-exists guarded so re-running on a DB that already has
- * `run_on` (and no `if_failed`) is a no-op. Existing rows are preserved.
+ * Idempotent (column-exists guarded); existing rows are preserved.
  */
 
-// Mirrors the engine keyword→status-set mapping for `always`
-// (TERMINAL_JOB_STATES) so a backfilled `run` edge keeps its run-regardless
-// semantics.
+// Mirrors the engine `always` status set (TERMINAL_JOB_STATES), so a backfilled `run` edge keeps
+// its run-regardless semantics.
 const ALL_TERMINAL_JSON = JSON.stringify([
   'success',
   'failed',
@@ -39,10 +37,8 @@ async function colExists(db: Kysely<unknown>, table: string, name: string): Prom
   return result.rows[0]?.exists ?? false;
 }
 
-// Postgres rejects bound parameters inside a DDL DEFAULT clause, so the
-// success-only default is inlined as a single-quoted literal. The value is a
-// fixed compile-time constant (never user input), and JSON.stringify produces
-// no single quotes, so plain string interpolation is safe here.
+// Postgres rejects bound parameters in a DDL DEFAULT, so the default is inlined. Safe: it is a
+// compile-time constant and JSON.stringify emits no single quotes.
 const SUCCESS_ONLY_DEFAULT = `'${SUCCESS_ONLY_JSON}'`;
 
 export async function up(db: Kysely<unknown>): Promise<void> {

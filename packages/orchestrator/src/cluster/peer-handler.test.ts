@@ -499,7 +499,6 @@ describe('PeerHandler', () => {
       expect(hello.type).toBe('peer.hello');
       expect(hello.ephemeralPublicKey).toBeDefined();
       expect(hello.nonce).toBeDefined();
-      // Verify base64 encoding
       expect(Buffer.from(hello.ephemeralPublicKey, 'base64').length).toBeGreaterThan(0);
       expect(Buffer.from(hello.nonce, 'base64').length).toBe(32);
     });
@@ -512,9 +511,7 @@ describe('PeerHandler', () => {
       const hs = completeEcdhHandshake(ws);
       const { sessionKey } = hs;
 
-      // Session key should be 32 bytes
       expect(sessionKey.length).toBe(32);
-      // No close should have occurred
       expect(ws.closeCode).toBeUndefined();
     });
   });
@@ -526,15 +523,13 @@ describe('PeerHandler', () => {
 
       const { handshakeKey: sessionKey } = await authenticateWithToken(handler, ws);
 
-      // The atomic claim should have fired with the token's hash, this
-      // coordinator's instance ID as the consumedBy attribution, and the
-      // joining peer's instanceId recorded as consumed_by_instance.
+      // The claim carries the token hash, this coordinator as consumedBy, and the
+      // joining peer as consumed_by_instance.
       expect(tokenManager.claimByHash).toHaveBeenCalledWith(
         DEFAULT_TOKEN.tokenHash,
         'handler-orch',
         'remote-peer',
       );
-      // Credential should have been saved
       expect(credentialStore.save).toHaveBeenCalledWith(
         expect.objectContaining({
           instanceId: 'remote-peer',
@@ -543,12 +538,10 @@ describe('PeerHandler', () => {
         }),
       );
 
-      // Auth response should be encrypted and include sessionCredential
-      // After hello + hello.response handling, we should have auth response + heartbeat
+      // After the hello exchange: the encrypted auth response, then a heartbeat.
       const encryptedMessages = ws.sentMessages.slice(1); // skip the plaintext hello
       expect(encryptedMessages.length).toBeGreaterThanOrEqual(1);
 
-      // Find the auth response (encrypted)
       let authResponse: any = null;
       for (const msg of encryptedMessages) {
         try {
@@ -572,26 +565,21 @@ describe('PeerHandler', () => {
     });
 
     it('accepts a returning peer re-presenting its own consumed token with no prior credential', async () => {
-      // Self-heal lockout recovery: a peer lost its credential (transient
-      // outage / deleted credential file) and re-presents its still-valid
-      // join token. The token manager now accepts the same-instance reuse
-      // (returns routing instead of throwing), so the primary path issues a
-      // fresh credential — no recovery branch, no redeploy. findByInstanceId
-      // returns null (the credential is gone), proving the issuance comes
-      // from the primary token path, not the credential-match recovery branch.
+      // Self-heal lockout recovery: a peer that lost its credential re-presents its
+      // still-valid join token. The token manager accepts same-instance reuse, so the
+      // primary path issues a fresh credential — no recovery branch, no redeploy.
+      // findByInstanceId returns null, proving the issuance is not the recovery branch.
       const { handler, tokenManager, credentialStore } = createTestHandler();
       credentialStore.findByInstanceId.mockResolvedValue(null);
       const ws = new MockPeerWs();
 
       const { handshakeKey: sessionKey } = await authenticateWithToken(handler, ws);
 
-      // The manager was asked to claim with the joining peer's instanceId.
       expect(tokenManager.claimByHash).toHaveBeenCalledWith(
         DEFAULT_TOKEN.tokenHash,
         'handler-orch',
         'remote-peer',
       );
-      // A fresh credential was issued via the primary path.
       expect(credentialStore.save).toHaveBeenCalledWith(
         expect.objectContaining({ instanceId: 'remote-peer', role: 'coordinator' }),
       );
@@ -733,8 +721,8 @@ describe('PeerHandler', () => {
   });
 
   describe('idempotent token retry (multi-coord mesh race)', () => {
-    // Helper: build a real-format token + matching validation hash so the
-    // recovery path's parseToken()/tokenHashOf() call chain works end-to-end.
+    // A real-format token and hash, so the recovery path's parseToken()/tokenHashOf()
+    // chain runs end-to-end.
     function makeRealToken(role: 'coordinator' | 'worker' = 'coordinator') {
       const routing = {
         orgId: 'org-1',
@@ -794,7 +782,6 @@ describe('PeerHandler', () => {
       );
       await vi.advanceTimersByTimeAsync(0);
 
-      // Find the auth response
       let authResponse: any = null;
       for (const msg of ws.sentMessages.slice(1)) {
         try {
@@ -835,10 +822,9 @@ describe('PeerHandler', () => {
         tokenManager,
       } = await presentAlreadyUsedToken(token, credentialStore);
 
-      // Recovery branch should issue a fresh credential. The atomic
-      // validate+consume already fired once (and threw ALREADY_USED, which
-      // is what put us in the recovery path); it must NOT have fired again
-      // since recovery doesn't go through the token-claim path.
+      // Recovery issues a fresh credential. The claim fired once (throwing
+      // ALREADY_USED, which entered recovery) and must not fire again: recovery skips
+      // the token-claim path.
       expect(cs.save).toHaveBeenCalledWith(
         expect.objectContaining({
           instanceId: 'remote-peer',
@@ -1114,7 +1100,6 @@ describe('PeerHandler', () => {
 
   describe('credential-based authentication', () => {
     it('accepts a valid credential proof', async () => {
-      // Create a stored credential
       const rawCredential = randomBytes(32).toString('hex');
       const credentialHash = createHash('sha256').update(rawCredential).digest('hex');
 
@@ -1153,7 +1138,6 @@ describe('PeerHandler', () => {
       expect(credentialStore.updateLastSeen).toHaveBeenCalledWith(credentialHash, 'handler-orch');
       expect(ws.closeCode).toBeUndefined();
 
-      // Find auth response
       let authResponse: any = null;
       for (const msg of ws.sentMessages.slice(1)) {
         try {
@@ -1332,12 +1316,10 @@ describe('PeerHandler', () => {
         await vi.advanceTimersByTimeAsync(0);
       }
 
-      // 6th attempt from a NEW IP but SAME instance ID should still get through
-      // to the handshake (rate limit by instanceId is checked after ECDH+auth parsing)
-      // However, the per-IP check at connection time should pass since it's a new IP
+      // A 6th attempt from a NEW IP with the SAME instance ID passes the connect-time
+      // per-IP check; the per-instanceId limit applies only after ECDH and auth parsing.
       const ws6 = new MockPeerWs();
       handler.handleConnection(ws6, '10.0.99.1');
-      // Should receive peer.hello (not immediately closed)
       expect(ws6.closeCode).toBeUndefined();
       expect(ws6.sentMessages.length).toBeGreaterThanOrEqual(1);
       const firstMsg = JSON.parse(ws6.sentMessages[0]);
@@ -1420,7 +1402,6 @@ describe('PeerHandler', () => {
 
       const { sessionKey } = await authenticateWithToken(handler, ws);
 
-      // Send encrypted heartbeat
       const heartbeat = {
         type: 'peer.heartbeat',
         instanceId: 'remote-peer',
@@ -1607,7 +1588,6 @@ describe('PeerHandler', () => {
       const hs = completeEcdhHandshake(ws);
       const { sessionKey } = hs;
 
-      // Send auth request with role: 'worker'
       const authRequest = {
         type: 'peer.auth.request',
         instanceId: 'worker-peer',
@@ -1852,9 +1832,8 @@ describe('PeerHandler', () => {
         forwardToPlatform,
       });
 
-      // The normalize -> sink composition `orchestrator-core` installs on the
-      // coordinator, driven here through a real encrypted `peer.log.chunk`
-      // frame so the wire shape has to survive the handler's schema parse.
+      // The coordinator's normalize -> sink composition from `orchestrator-core`, fed a
+      // real encrypted `peer.log.chunk` so the wire shape survives the schema parse.
       const { handler } = createTestHandler({
         onPeerLogChunk: (chunk) => {
           for (const group of normalizePeerLogChunk(chunk)) sink(group);
@@ -1944,7 +1923,6 @@ describe('PeerHandler', () => {
       // Should have sent encrypted response
       expect(ws.sentMessages.length).toBeGreaterThan(countBefore);
 
-      // Find the cache response in sent messages
       let cacheResponse: any = null;
       for (const msg of ws.sentMessages.slice(countBefore)) {
         try {
@@ -2437,7 +2415,6 @@ describe('PeerHandler', () => {
         }),
       );
 
-      // Find the reload response in sent messages
       let response: any = null;
       for (const msg of ws.sentMessages.slice(countBefore)) {
         try {
@@ -2539,7 +2516,6 @@ describe('PeerHandler', () => {
 
       const { sessionKey } = await authenticateWithToken(handler, ws);
 
-      // Send the reload request and capture the promise
       const promise = handler.sendConfigReloadAndWait(
         'remote-peer',
         { type: 'peer.config.reload', messageId: 'rl-1' },

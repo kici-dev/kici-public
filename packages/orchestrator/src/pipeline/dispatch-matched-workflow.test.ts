@@ -58,11 +58,12 @@ import { releaseInvokeGate } from './invoke-gate.js';
 import { SecurityHoldReason } from '../contexts/held-runs.js';
 import { REDUCED_PRIVILEGE_MARKER } from '../security/reduced-privilege-note.js';
 import type { TrustPolicyHoldReason, TrustPolicyOutcome } from '../security/trust-policy-gate.js';
+import { lockFileFixture, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 /**
- * The Kysely surface `storePendingJobContext` needs inside a transaction. The
- * hold path writes the held_runs row and the pending context together, so every
- * db stub that can reach it hands this back from `transaction().execute`.
+ * The Kysely surface `storePendingJobContext` needs in a transaction. The hold
+ * path writes the held_runs row and pending context together, so every db stub
+ * that can reach it returns this from `transaction().execute`.
  */
 let capturedGroups: string[] = [];
 
@@ -165,11 +166,9 @@ const SLOT_COLUMNS: Record<string, (row: SlotRow) => string> = {
 };
 
 /**
- * Evaluate one `where(column, operator, value)` triple against a row.
- *
- * Throws on anything it does not model. That is the positive control: a slot
- * count that grows a clause this fake cannot read fails loudly instead of
- * silently answering zero and turning every admission assertion green.
+ * Throws on anything it does not model (the positive control): a slot count
+ * that grows a clause this fake cannot read fails loudly instead of answering
+ * zero and turning every admission assertion green.
  */
 function slotPredicate(column: string, operator: string, value: unknown): SlotPredicate {
   const read = SLOT_COLUMNS[column];
@@ -213,13 +212,10 @@ const slotExpressionBuilder = Object.assign(
 );
 
 /**
- * A db stub whose slot count is a real filter over seeded rows, rather than a
- * fixed number.
- *
- * The concurrency assertions are about which rows a count can SEE, so a stub
- * that answers a constant cannot distinguish a fixed count from a correct one.
- * `rows` is live: a caller may push to it mid-run to model a sibling's row
- * landing while the pass is still gating.
+ * A db stub whose slot count is a real filter over seeded rows: the concurrency
+ * assertions are about which rows a count can SEE, which a constant cannot
+ * show. `rows` is live: push mid-run to model a sibling's row landing while
+ * the pass is still gating.
  */
 function makeSlotCountingDb(rows: SlotRow[], stats?: { slotQueries: number }) {
   const db: Record<string, unknown> = {
@@ -281,7 +277,6 @@ function makeTrxHandle() {
   };
 }
 
-/** Build a ProcessingDeps stub whose host roster returns the given matched hosts. */
 function rosterDeps(matched: MatchedHost[]): ProcessingDeps {
   return {
     hostRosterStore: { findFanoutTargets: async () => matched },
@@ -289,10 +284,7 @@ function rosterDeps(matched: MatchedHost[]): ProcessingDeps {
   } as unknown as ProcessingDeps;
 }
 
-/**
- * A `MatchedHost` as the roster returns one. Labels are given as plain strings
- * and folded here, exactly as `matchRows` folds what it reads off the row.
- */
+/** A roster `MatchedHost`; labels are folded here exactly as `matchRows` folds them. */
 function host(over: Partial<Omit<MatchedHost, 'labels'>> & { labels?: string[] }): MatchedHost {
   return {
     agentId: 'a1',
@@ -403,8 +395,8 @@ describe('resolveHostFanoutTargets — --target post-filter', () => {
   });
 
   it('a target that matches some hosts wins over the non-target zero-host heuristic', async () => {
-    // roster all reachable; target narrows to db-01 only — non-target path would
-    // have returned 3 hosts. Confirms the post-filter applies to candidates.
+    // All reachable; target narrows to db-01 (non-target would give 3 hosts),
+    // so the post-filter applies to candidates.
     const deps = rosterDeps(roster);
     const t = target([{ include: [exact('role:db')], exclude: [] }], false);
     const resolved = await resolveHostFanoutTargets(roleJob as never, deps, t);
@@ -436,8 +428,8 @@ describe('resolveHostFanoutTargets — includeUninitialized', () => {
   });
 
   it('without the flag, an unreachable static host is governed by onUnreachable (no bring-up)', async () => {
-    // Default onUnreachable is 'hold' → the unreachable host is still a target,
-    // but it carries no needsBringup (today's behavior, no init-runner attempt).
+    // Default onUnreachable 'hold': the unreachable host stays a target with no
+    // needsBringup (no init-runner attempt).
     const deps = rosterDeps([
       host({ agentId: 'live-01', host: 'live-01', status: HostStatus.ready }),
       host({
@@ -500,10 +492,9 @@ describe('runsOnSelectorsForLockJob', () => {
       ],
       excludeLabels: [{ kind: 'regex', source: '-canary$', flags: '' }],
     } as never;
-    // Every matcher comes back canonical: an exact value folded, a regex source
-    // preserved with the `i` flag forced on (the source cannot be lowercased
-    // without corrupting the pattern). `runsOnExactRaw` is the one field that
-    // keeps the lock file's own spelling — the host pin reads agent ids there.
+    // Matchers come back canonical: exact values folded, regex sources kept with
+    // `i` forced (lowercasing would corrupt the pattern). `runsOnExactRaw` alone
+    // keeps the lock file's spelling, because the host pin reads agent ids there.
     expect(runsOnSelectorsForLockJob(lockJob)).toEqual({
       runsOnLabels: ['role:web'],
       runsOnPatterns: [{ kind: 'regex', source: '^kici:host:box-', flags: 'i' }],
@@ -538,11 +529,7 @@ describe('runsOnSelectorsForLockJob', () => {
   });
 });
 
-/**
- * Chainable Kysely `updateTable(...).set(...).where(...).execute()` stub that
- * records every `.set(...)` payload so a test can assert which run-row UPDATEs
- * fired (context, trust, test-run).
- */
+/** Chainable `updateTable` stub recording every `.set(...)` payload (which run-row UPDATEs fired). */
 function makeUpdateRecordingDb(): {
   db: unknown;
   updates: Array<Record<string, unknown>>;
@@ -560,9 +547,8 @@ function makeUpdateRecordingDb(): {
 }
 
 /**
- * A 2-job context where `deploy` needs `build`. Used to prove the single-orch
- * needs-gated path degrades cleanly with no coordinator / heldRunStore /
- * trust resolution.
+ * `deploy` needs `build`: proves the single-orch needs-gated path degrades
+ * cleanly with no coordinator / heldRunStore / trust resolution.
  */
 function makeNeedsContext(): { ctx: WorkflowDispatchContext; dispatched: QueuedJobInput[] } {
   const dispatched: QueuedJobInput[] = [];
@@ -572,31 +558,26 @@ function makeNeedsContext(): { ctx: WorkflowDispatchContext; dispatched: QueuedJ
     contentHash: 'wf-hash',
     triggers: [],
     jobs: [
-      {
-        _type: 'static' as const,
-        name: 'build',
+      staticJob({
         runsOn: [{ kind: 'exact', value: 'default' }],
         steps: [{ name: 'b', run: 'echo build' }],
-        needs: [],
         rules: [],
-      },
-      {
-        _type: 'static' as const,
+      }),
+      staticJob({
         name: 'deploy',
         runsOn: [{ kind: 'exact', value: 'default' }],
         steps: [{ name: 'd', run: 'echo deploy' }],
         needs: ['build'],
         rules: [],
-      },
+      }),
     ],
   } as unknown as LockWorkflow;
-  const fullLockFile = {
+  const fullLockFile = lockFileFixture({
     schemaVersion: 4 as const,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
     contentHash: 'abc',
     lockfileHash: 'lock',
     workflows: [workflow],
-  } as unknown as WorkflowDispatchContext['fullLockFile'];
+  }) as unknown as WorkflowDispatchContext['fullLockFile'];
   const event: SimulatedEvent = {
     type: 'push',
     action: undefined,
@@ -635,9 +616,8 @@ function makeNeedsContext(): { ctx: WorkflowDispatchContext; dispatched: QueuedJ
     bundle: undefined,
     payload: info.payload,
     repoIdentifier: 'repo',
-    // Required, and stated as the acted-on repository — the per-repository
-    // shape every real caller of this function produces. A case about a
-    // cross-repository workflow overwrites it.
+    // Required; the acted-on repository, as every per-repository caller sets it.
+    // Cross-repository cases overwrite it.
     workflowRepoIdentifier: 'repo',
     credentials: {},
     event,
@@ -651,8 +631,7 @@ function makeNeedsContext(): { ctx: WorkflowDispatchContext; dispatched: QueuedJ
     trustResolution: undefined,
     lockFileSource: undefined,
     crossSource: false,
-    // Required: the harness states the verdict explicitly, exactly as a real
-    // dispatch path must. Cases that exercise the gate overwrite it.
+    // Required: stated explicitly, as a real dispatch path must. Gate cases overwrite it.
     securityDecision: { action: 'pass' },
     extraJobConfig: { isTestRun: true, fixtureId: 'fx-needs' },
     testRun: { fixtureId: 'fx-needs' },
@@ -739,10 +718,8 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('posts no pending security check when there is no store to hold in', async () => {
-    // Same verdict as the case above with the `heldRunStore` taken away, so the
-    // hold row is never written. The pending `KiCI Security` check is settled
-    // only through that row, so posting one here would leave it on the commit
-    // forever.
+    // No `heldRunStore`, so no hold row. The pending `KiCI Security` check is
+    // settled only through that row; posting one would strand it on the commit.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: {
@@ -761,13 +738,11 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('writes the trust-policy hold row and its resume context in one transaction', async () => {
-    // The same pairing `holdJobForApproval` makes, and for the same reason: the
-    // stored workflow context is the only thing that can replay this dispatch,
-    // so a row that outlived a failed context write would be a hold nothing can
-    // release. That run reaches `failRunResumeLost`, which by its own comment
-    // cannot complete the queued `kici/…` checks — so the commit keeps those
-    // too. Written sequentially, kysely leaves the insert on the store's own
-    // pooled connection and it commits regardless of what follows.
+    // Same pairing as `holdJobForApproval`: only the stored context can replay
+    // this dispatch, so a row outliving a failed context write is an
+    // unreleasable hold (it reaches `failRunResumeLost`, which cannot complete
+    // the queued `kici/…` checks). Written sequentially, kysely commits the
+    // insert on the store's own pooled connection regardless of what follows.
     const create = vi.fn().mockResolvedValue({ id: 'held-fork-trx' });
     const contextInserts: string[] = [];
     const trxHandle = {
@@ -803,9 +778,8 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('still holds when there is no database to open a transaction on', async () => {
-    // A local test run (`kici run`) has no database: the context lives only in
-    // memory, so there is nothing to make atomic and nothing to enrol. The hold
-    // must still be written rather than dying on an absent `db.transaction`.
+    // `kici run` has no database (context is in memory only): the hold must
+    // still be written rather than dying on an absent `db.transaction`.
     const create = vi.fn().mockResolvedValue({ id: 'held-fork-nodb' });
     const { ctx } = makeSingleJobContext({ bundle: undefined, db: undefined });
     ctx.securityDecision = holdDecision(SecurityHoldReason.enum.fork_pr);
@@ -820,10 +794,9 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it("records the trust-policy hold's pending check on the row it just wrote", async () => {
-    // The third of the three sites that post a pending `KiCI Security` status,
-    // and it writes its row outside the dispatch loop's transaction. The record
-    // is what stops a later settle terminalizing — and therefore CREATING — a
-    // check this commit never received.
+    // The third site posting a pending `KiCI Security` status, writing outside
+    // the dispatch loop's transaction. The record stops a later settle
+    // terminalizing (and so CREATING) a check this commit never received.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const markPendingCheckPosted = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
@@ -892,9 +865,9 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   /**
-   * One fixture, two verdicts. Everything a dispatch could leave behind is
-   * observable on it — including `checkRunReporter.setPendingAwait`, which is
-   * how the queued `kici/<workflow>` check runs get created on the commit.
+   * One fixture, two verdicts; everything a dispatch leaves behind is
+   * observable, including `checkRunReporter.setPendingAwait`, which creates the
+   * queued `kici/<workflow>` check runs.
    */
   function makeVerdictFixture(decision: TrustPolicyOutcome) {
     const create = vi.fn();
@@ -930,18 +903,14 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   }
 
   it('drops silently on an ignore verdict — no run, no hold, no check, no check run', async () => {
-    // `ignore` withholds every artifact a contributor could see. Reusing the
-    // reject path would write a failed run and post a failure check, which is
-    // exactly the trace `ignore` exists to avoid. The pipeline drops an ignored
-    // event before dispatch; this arm covers the paths that evaluate the policy
-    // for themselves (cross-source, globals).
+    // `ignore` withholds every contributor-visible artifact; the reject path's
+    // failed run and failure check are the trace it exists to avoid. The
+    // pipeline drops ignored events before dispatch; this arm covers paths
+    // that evaluate the policy themselves (cross-source, globals).
     //
-    // The check RUNS are the sharpest of these. They are created by the setup
-    // phase, before the trust-policy gate ever reads the verdict, and nothing
-    // on this path completes them — so an `ignore` that let setup run would
-    // leave a permanently queued check on the commit, which a branch-protection
-    // rule reads as a blocked pull request. That is worse than the visible
-    // rejection `ignore` refuses to write, not merely different from it.
+    // Check RUNS matter most: setup creates them before the gate reads the
+    // verdict and nothing here completes them, so letting setup run leaves a
+    // permanently queued check that branch protection reads as a blocked PR.
     const f = makeVerdictFixture({ action: 'ignore' });
 
     const result = await dispatchMatchedWorkflow(f.ctx);
@@ -957,13 +926,10 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('still creates the queued check runs on a hold — the control for the ignore case', async () => {
-    // Non-vacuity for the assertion above: the same fixture, changed only in
-    // its verdict, DOES reach `setPendingAwait`. Without this the `ignore`
-    // expectation would pass just as well against a harness that never wired a
-    // reporter at all — which is exactly how the missing check runs went
-    // unnoticed. It doubles as the guard that hoisting the `ignore` decision
-    // ahead of setup left `hold` untouched: the check runs are still created,
-    // and the hold is still recorded.
+    // Non-vacuity: the same fixture with only the verdict changed DOES reach
+    // `setPendingAwait`, so the `ignore` case cannot pass against an unwired
+    // reporter. Also guards that hoisting `ignore` ahead of setup left `hold`
+    // untouched: check runs are created and the hold recorded.
     const f = makeVerdictFixture(holdDecision(SecurityHoldReason.enum.fork_pr));
 
     const result = await dispatchMatchedWorkflow(f.ctx);
@@ -976,24 +942,20 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
     expect(result.held).toBe(true);
     expect(f.recordRunHeld).toHaveBeenCalledTimes(1);
     expect(f.dispatched).toHaveLength(0);
-    // A hold leaves its check runs queued on purpose: the pull request is
-    // genuinely waiting, and `/kici approve` replays the dispatch under the
-    // same run. They are completed only when the hold ends without dispatching
-    // — see `rejectWorkflow` and the stale detector's expiry sweep.
+    // A hold leaves its check runs queued on purpose (`/kici approve` replays
+    // under the same run); they complete only when the hold ends without
+    // dispatching — see `rejectWorkflow` and the stale detector's expiry sweep.
     expect(f.completeUndispatchedCheckRuns).not.toHaveBeenCalled();
   });
 
   it('completes the queued check runs on a pre-dispatch init failure', async () => {
-    // Every early exit below the setup phase strands the same checks, not just
-    // the hold ones: `recordInitFailureRun` fires `onExecutionStatusChange` and
-    // never `onExecutionComplete`, the one callback wired to
-    // `updateWorkflowStatus`. `recordInitFailureFromSkip` is the single funnel
-    // for all six of those exits, so closing it there covers the class; the
-    // approval-misconfig gate is the earliest of them and the cheapest to
-    // provoke.
+    // Every early exit after setup strands the same checks: `recordInitFailureRun`
+    // fires `onExecutionStatusChange`, never `onExecutionComplete` (the one
+    // callback wired to `updateWorkflowStatus`). `recordInitFailureFromSkip`
+    // funnels all those exits, so closing it there covers the class; the
+    // approval-misconfig gate is the cheapest to provoke.
     const f = makeVerdictFixture({ action: 'pass' });
-    // A realistic owner/repo: the completion refuses an identifier it cannot
-    // split, so the harness's bare `repo` would short-circuit it.
+    // owner/repo: the completion refuses an unsplittable identifier like bare `repo`.
     f.ctx.repoIdentifier = 'acme/app';
     f.ctx.workflowRepoIdentifier = 'acme/app';
     (f.ctx.workflow as unknown as Record<string, unknown>).approval = {
@@ -1015,12 +977,10 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('completes the queued check runs on a trust-policy rejection', async () => {
-    // A rejection dispatches nothing and stores no resume context, so no run,
-    // job, or queue record ever exists for the terminal reporter paths to key
-    // off — and the stale sweep only touches `in_progress`. Without this the
-    // checks the setup phase posted would stay `queued` on the commit forever.
-    // The `KiCI Security` check the same function posts is a different check
-    // run, so it closes none of these.
+    // A rejection leaves no run, job or queue record for terminal reporters to
+    // key off, and the stale sweep only touches `in_progress`, so setup's
+    // checks would stay `queued` forever. The `KiCI Security` check is a
+    // different check run and closes none of these.
     const f = makeVerdictFixture(rejectDecision(SecurityHoldReason.enum.fork_pr));
     f.ctx.repoIdentifier = 'acme/app';
     f.ctx.workflowRepoIdentifier = 'acme/app';
@@ -1032,17 +992,15 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
     const call = f.completeUndispatchedCheckRuns.mock.calls[0][0];
     expect(call).toMatchObject({
       workflowName: 'ci',
-      // The same name set `setPendingAwait` was given, or the completion
-      // addresses check runs that do not exist.
+      // Must match `setPendingAwait`'s names, or it addresses nonexistent check runs.
       jobNames: f.setPendingAwait.mock.calls[0][0].jobNames,
       owner: f.setPendingAwait.mock.calls[0][0].owner,
       repo: f.setPendingAwait.mock.calls[0][0].repo,
       sha: f.setPendingAwait.mock.calls[0][0].sha,
       conclusion: CheckRunConclusion.enum.failure,
     });
-    // The same body the `KiCI Security` check carries. Branch protection
-    // usually requires `kici/<workflow>`, so this is often the only check a
-    // contributor reads — it has to carry the actionable half too.
+    // Same body as `KiCI Security`: branch protection usually requires
+    // `kici/<workflow>`, often the only check a contributor reads.
     const securityCall = f.postCheckStatus.mock.calls.find((c) => c[2] === 'failure');
     expect(securityCall).toBeDefined();
     expect(call.summary).toBe(securityCall![4]);
@@ -1051,10 +1009,9 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('refuses to address check runs when the repo identifier is not owner/repo', async () => {
-    // The harness default is a bare `repo`. A check run's identity is
-    // (owner, repo, sha, name), so half a name addresses nothing — and
-    // `repo: undefined` would be sent to the provider verbatim. Skipping is the
-    // only safe answer, and it matches the helper's own guard.
+    // Harness default is bare `repo`. A check run is (owner, repo, sha, name),
+    // so half a name addresses nothing and would send `repo: undefined`
+    // verbatim; skipping matches the helper's own guard.
     const f = makeVerdictFixture(rejectDecision(SecurityHoldReason.enum.fork_pr));
     expect(f.ctx.repoIdentifier).toBe('repo');
 
@@ -1065,12 +1022,10 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('cannot express an absent decision — omission is a compile error, not a pass', () => {
-    // `securityDecision` is required on WorkflowDispatchContext, so a
-    // production dispatch path that never states a verdict does not compile
-    // (tsconfig excludes `**/*.test.ts`, so the compiler's guarantee covers
-    // `src/**` — which is where the fail-open lived). This pins that the
-    // harness, like every real call site, states `pass` explicitly rather than
-    // leaving it undefined and relying on a falsy check to wave it through.
+    // `securityDecision` is required, so a `src/**` dispatch path without a
+    // verdict does not compile (tsconfig excludes `**/*.test.ts`). This pins
+    // that the harness, like real call sites, states `pass` explicitly rather
+    // than relying on a falsy check.
     const { ctx } = makeSingleJobContext({ bundle: undefined });
     expect(ctx.securityDecision).toEqual({ action: 'pass' });
   });
@@ -1104,13 +1059,10 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('states the defining repository on both pre-run recording paths', async () => {
-    // The two recording paths that write a run row before any job starts — a
-    // hold and an init failure — must say which repository DEFINES the
-    // workflow, not just which one the run acts on. Omitting it records a NULL
-    // marker, and a NULL marker is not "unknown": every consumer reads it as
-    // "the workflow lives in the repository this run acted on"
-    // (`registration/registration-run-match.ts`), so the authoring team's own
-    // run is filed under someone else's repository.
+    // Pre-job run rows (hold, init failure) must name the repository that
+    // DEFINES the workflow. A NULL marker is not "unknown": consumers read it as
+    // "defined in the acted-on repo" (`registration/registration-run-match.ts`),
+    // misfiling the authoring team's run.
     const WORKFLOW_REPO = 'acme/org-workflows';
 
     const recordRunHeld = vi.fn().mockResolvedValue(undefined);
@@ -1154,15 +1106,11 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('records the presented branch on a held PR run, never the PR head branch', async () => {
-    // `execution_runs.ref` is the branch the run PRESENTS, and a held row is
-    // the row the resumed run keeps (`onExecutionStarted` is a no-op via ON
-    // CONFLICT). It is read back as the run's branch claim when an internal
-    // event inherits from it, so recording the PR HEAD branch here would let a
-    // fork contributor — who names that branch freely — hand a downstream
-    // subscriber a branch claim the PR run itself was denied.
-    //
-    // `sourceBranch` differs from `targetBranch` here so the assertion can only
-    // hold if the presented branch is what reaches the row.
+    // `execution_runs.ref` is the PRESENTED branch, and the resumed run keeps
+    // the held row (`onExecutionStarted` no-ops via ON CONFLICT). Internal
+    // events inherit it as a branch claim, so recording the fork-chosen PR HEAD
+    // branch would hand subscribers a claim the PR run was denied.
+    // `sourceBranch` differs from `targetBranch` so the assertion is non-vacuous.
     const recordRunHeld = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({ bundle: undefined });
     ctx.securityDecision = holdDecision(SecurityHoldReason.enum.fork_pr);
@@ -1234,10 +1182,9 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('holds the whole workflow and stores the context that replays it', async () => {
-    // The release path is `routeRelease`, which discriminates on (scope,
-    // triggerSource) and sends this pair to `resumeWorkflow`. That resume reads
-    // the stored dispatch context; without it the approval would flip the row,
-    // post a green check, and dispatch nothing.
+    // `routeRelease` sends this (scope, triggerSource) to `resumeWorkflow`,
+    // which reads the stored context; without it approval flips the row, posts
+    // a green check, and dispatches nothing.
     clearPendingWorkflowContextsMap();
     const create = vi.fn().mockResolvedValue({ id: 'held-fork-scope' });
     const { ctx } = makeSingleJobContext({ bundle: undefined });
@@ -1254,23 +1201,19 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
       scope: HoldScope.enum.workflow,
       triggerSource: TriggerSource.enum.context,
     });
-    // Control: the loader is not a function that always answers. A run id no
-    // dispatch held reads back null, so the assertion above is about this hold.
+    // Control: an unheld run id reads back null, so the loader does not always answer.
     expect(await loadPendingWorkflowContext(undefined, `${ctx.runId}-never-held`)).toBeNull();
     const pending = await loadPendingWorkflowContext(undefined, ctx.runId);
     expect(pending).not.toBeNull();
     // Approval means "let it run", never "make it trusted": the replay reuses
-    // this run id, so the gate short-circuits rather than re-resolving trust and
-    // the stored tier is the one the resumed run executes under.
+    // this run id, so the gate skips re-resolving trust and the stored tier holds.
     expect(pending!.trustResolution).toMatchObject({ tier: 'unknown' });
     expect(pending!.securityDecision).toMatchObject({ action: 'hold' });
   });
 
   it('stores no resume context when there is no hold row to release it', async () => {
-    // The hold row is the only thing that can release a stored context, so an
-    // orchestrator with no held-run store must write neither. A context written
-    // without one is unreachable by every release path and unreferenced by every
-    // cleanup path.
+    // Only the hold row releases a stored context, so with no held-run store
+    // write neither: a lone context is unreachable by release and cleanup.
     clearPendingWorkflowContextsMap();
     const { ctx } = makeSingleJobContext({ bundle: undefined });
     ctx.securityDecision = holdDecision(SecurityHoldReason.enum.fork_pr);
@@ -1303,8 +1246,7 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
       5 * SECONDS_PER_HOUR,
     );
     (ctx.deps as unknown as Record<string, unknown>).heldRunStore = { create };
-    // A store that would answer 99h if anyone asked. Nobody does: the window
-    // rides on the decision, from the same read that produced the verdict.
+    // The store would answer 99h, but nobody asks: the window rides on the decision.
     const store = storeReturningExpiry(99);
     (ctx.deps as unknown as Record<string, unknown>).trustPolicyStore = store;
 
@@ -1320,9 +1262,8 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('sizes a sub-hour hold in seconds instead of rounding it to an hour', async () => {
-    // The reason the seconds window exists. An hours-granularity expiry cannot
-    // express this at all, and the previous `hours * 3_600_000` arithmetic
-    // would have turned 30 into 108,000,000 ms — 30 HOURS, not 30 seconds.
+    // Why the window is in seconds: hours granularity cannot express this, and
+    // `hours * 3_600_000` turns 30 into 108,000,000 ms (30 HOURS, not seconds).
     const create = vi.fn().mockResolvedValue({ id: 'held-exp-sub-hour' });
     const { ctx } = makeSingleJobContext({ bundle: undefined });
     ctx.securityDecision = holdDecision(SecurityHoldReason.enum.workflow_modification, 30);
@@ -1338,8 +1279,7 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('falls back to the 72h default in independent mode, which carries no expiry', async () => {
-    // Independent mode has no upstream policy, so the decision carries `null`
-    // rather than the 72h a second store read used to invent for it.
+    // Independent mode has no upstream policy: the decision carries `null`, not an invented 72h.
     const create = vi.fn().mockResolvedValue({ id: 'held-exp-2' });
     const { ctx } = makeSingleJobContext({ bundle: undefined });
     ctx.securityDecision = holdDecision(SecurityHoldReason.enum.workflow_modification, null);
@@ -1404,15 +1344,13 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
       (c) => c[2] === 'failure' && c[3] === 'Rejected by trust policy',
     );
     expect(rejectCall).toBeDefined();
-    // A rejected run has no held_runs row, so the check must NOT tell the
-    // contributor to seek an approval that can never happen.
+    // No held_runs row, so the check must NOT tell the contributor to seek approval.
     expect(String(rejectCall![4])).not.toContain('ci_trust:write');
     expect(String(rejectCall![4])).toContain('cannot be approved');
   });
 
   it('does NOT reject on a resume re-entry', async () => {
-    // Mirrors the sibling re-hold test: no executionTracker, so the gate's own
-    // side effect is observed through the check poster instead.
+    // As the re-hold test: no executionTracker, so observe via the check poster.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: {
@@ -1428,9 +1366,8 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
   });
 
   it('covers every trust-policy hold reason with a sentinel job id', () => {
-    // A reason with no sentinel would write `undefined` into held_runs.job_id.
-    // Scoped to the reasons the POLICY raises: `context_trust` comes from the
-    // per-context gate, which writes the real expanded job name instead.
+    // A reason with no sentinel writes `undefined` into held_runs.job_id. Only
+    // POLICY reasons: `context_trust` (per-context gate) writes the expanded job name.
     const policyReasons = SecurityHoldReason.options.filter(
       (r) => r !== SecurityHoldReason.enum.context_trust,
     );
@@ -1440,11 +1377,10 @@ describe('dispatchMatchedWorkflow — trust-policy security gate', () => {
         `${reason} needs a sentinel`,
       ).toBeTruthy();
     }
-    // The historical value must not move, or holds created before the policy
-    // was enforced stop resolving by job id.
+    // Fixed value: holds created before the policy was enforced resolve by it.
     expect(SECURITY_HOLD_JOB_IDS.workflow_modification).toBe('__workflow_modification__');
-    // And the phantom is gone: it was never written to a single row, and
-    // existed only to satisfy a Record over the full reason enum.
+    // No phantom entry: it was never written to a row, only padding a Record
+    // over the full reason enum.
     expect(SECURITY_HOLD_JOB_IDS).not.toHaveProperty('context_trust');
     expect(Object.keys(SECURITY_HOLD_JOB_IDS).sort()).toEqual(policyReasons.slice().sort());
   });
@@ -1454,18 +1390,15 @@ describe('dispatchMatchedWorkflow — absent trust/holds/coordinator deps', () =
   it('dispatches only the root job of a needs DAG; the downstream stays gated', async () => {
     const { ctx, dispatched } = makeNeedsContext();
     const result = await dispatchMatchedWorkflow(ctx);
-    // Both jobs are tracked (root dispatched + downstream gated synthetic), but
-    // only the root `build` reaches the dispatcher — `deploy` is held by the
-    // needs scheduler until `build` completes.
+    // Both jobs are tracked, but only root `build` is dispatched; the needs
+    // scheduler holds `deploy` until `build` completes.
     expect(result.dispatchedJobCount).toBe(2);
     const dispatchedNames = dispatched.map((d) => d.jobName);
     expect(dispatchedNames).toEqual(['build']);
 
-    // The gated downstream (`deploy`) is stored as a pending context that the
-    // needs scheduler re-dispatches later through the base dispatcher (no
-    // wrapper merge). Its stored jobInput MUST already carry extraJobConfig
-    // (isTestRun/fixtureId) so a test run's overlay provenance survives the
-    // deferred dispatch.
+    // `deploy` is re-dispatched later through the base dispatcher (no wrapper
+    // merge), so its stored jobInput MUST already carry extraJobConfig
+    // (isTestRun/fixtureId) for overlay provenance to survive.
     const pending = await consumePendingJobContext(undefined, 'run-needs', 'deploy');
     expect(pending?.jobInput.jobConfig.isTestRun).toBe(true);
     expect(pending?.jobInput.jobConfig.fixtureId).toBe('fx-needs');
@@ -1474,10 +1407,9 @@ describe('dispatchMatchedWorkflow — absent trust/holds/coordinator deps', () =
 
 describe('dispatchMatchedWorkflow — a job no agent can run', () => {
   it('registers a queued-no-backend job so the run cannot finish without it', async () => {
-    // A `runsOn` no agent satisfies makes the dispatcher enqueue the job and
-    // report `queued-no-backend`. Leaving it out of the tracked job set is what
-    // let a run finish GREEN with the job never having run: `isRunComplete`
-    // iterates the REGISTERED jobs, so an unregistered one is invisible to it.
+    // An unsatisfiable `runsOn` enqueues with `queued-no-backend`. It must be
+    // tracked: `isRunComplete` iterates REGISTERED jobs, so an untracked one
+    // lets the run finish GREEN without it running.
     const { ctx, dispatched } = makeSingleJobContext({ bundle: undefined, fullRepo: true });
     ctx.deps.dispatcher.dispatch = async (input) => {
       dispatched.push(input);
@@ -1491,18 +1423,15 @@ describe('dispatchMatchedWorkflow — a job no agent can run', () => {
   });
 
   it('carries the real queue jobId onto the tracked job, not a synthetic one', async () => {
-    // The queue row is what the expiry sweep terminalizes, so the tracked job
-    // must be keyed by the SAME id the dispatcher enqueued under — a synthetic
-    // id would leave the expiry unable to reach the tracked job.
+    // The expiry sweep terminalizes the queue row, so the tracked job must use
+    // the SAME id the dispatcher enqueued under.
     const created: Array<{ jobId: string; jobName: string }> = [];
     const { ctx, dispatched } = makeSingleJobContext({
       bundle: undefined,
       fullRepo: true,
       executionTracker: {
-        // Named positionally after `ExecutionTracker.onExecutionStarted`, whose
-        // 10th parameter is the tracked-job array. Spelling the leading
-        // parameters out (rather than indexing a rest array) keeps the binding
-        // legible if the signature ever grows.
+        // Positional after `ExecutionTracker.onExecutionStarted` (10th param is
+        // the tracked-job array), spelled out to stay legible if it grows.
         onExecutionStarted: vi.fn(
           async (
             _runId: string,
@@ -1547,10 +1476,7 @@ describe('dispatchMatchedWorkflow — a job no agent can run', () => {
 });
 
 describe('dispatchMatchedWorkflow — the run exists before the first job reaches an agent', () => {
-  /**
-   * Build a tracker that records the order of every lifecycle call, plus the
-   * job list each registration carried.
-   */
+  /** Records lifecycle call order and each registration's job list. */
   function makeOrderRecordingTracker(callOrder: string[]) {
     return {
       onExecutionStarted: vi.fn(
@@ -1587,12 +1513,11 @@ describe('dispatchMatchedWorkflow — the run exists before the first job reache
   }
 
   it('registers the run and holds it open before the dispatch loop, releasing only once its jobs are registered', async () => {
-    // The ordering IS the fix. A root job dispatched before the run row exists
-    // reports terminal into `onJobStatus`, which misses in memory, finds no row
-    // via `recoverRunFromDb`, and DROPS the update — so no downstream is ever
-    // released and the run hangs with nothing logged as wrong. The token is the
-    // other half: without it, the first job to finish satisfies `isRunComplete`
-    // while jobs 2..N are still dispatching, and the run is finalized mid-flight.
+    // The ordering is load-bearing: a root job dispatched before the run row exists
+    // reports terminal into `onJobStatus`, misses in memory and via
+    // `recoverRunFromDb`, and DROPS the update, hanging the run silently. The
+    // token stops the first finished job satisfying `isRunComplete` while
+    // jobs 2..N still dispatch.
     const callOrder: string[] = [];
     const { ctx, dispatched } = makeSingleJobContext({
       bundle: undefined,
@@ -1660,11 +1585,10 @@ describe('dispatchMatchedWorkflow — the run exists before the first job reache
   });
 
   it('terminalizes the run when the dispatch loop throws, so a zero-job row cannot strand', async () => {
-    // A row with zero jobs can never satisfy `isRunComplete` (it ends
-    // `run.jobs.size > 0`) and no sweeper reaps one — the stale-run detector
-    // scans from `execution_jobs` / `dispatch_queue`, orphan recovery needs
-    // `running`, cold-store archival needs a terminal status. Left alone it
-    // sits `pending` forever while the deadline detector re-fires every tick.
+    // A zero-job row never satisfies `isRunComplete` (`run.jobs.size > 0`) and
+    // no sweeper reaps it (stale-run scans `execution_jobs` / `dispatch_queue`,
+    // orphan recovery needs `running`, archival needs terminal): it sits
+    // `pending` forever while the deadline detector re-fires every tick.
     const callOrder: string[] = [];
     const tracker = makeOrderRecordingTracker(callOrder);
     const { ctx } = makeSingleJobContext({
@@ -1731,8 +1655,8 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
     const result = await dispatchMatchedWorkflow(ctx);
     expect(result.dispatchedJobCount).toBe(0);
     expect(dispatched).toHaveLength(0);
-    // The deny records a queryable failed run (not a silent failRun) so the
-    // author sees the denial + reason in the dashboard / runs API.
+    // A queryable failed run (not a silent failRun): the denial shows in the
+    // dashboard / runs API.
     expect(recordInitFailureRun).toHaveBeenCalledTimes(1);
     const arg = recordInitFailureRun.mock.calls[0][0] as {
       initFailure: { category: string; message: string };
@@ -1754,9 +1678,8 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('omits contentHash on a test-run job so the agent skips the lock-vs-overlay hash check', async () => {
-    // A test run ships the workflow body as a working-tree overlay that may
-    // differ from the committed lock; the agent must not reject it for a
-    // contentHash mismatch.
+    // A test run's working-tree overlay may differ from the committed lock;
+    // the agent must not reject it for a contentHash mismatch.
     const { ctx, dispatched } = makeSingleJobContext({
       bundle: undefined,
       fullRepo: true,
@@ -1782,8 +1705,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('merges run-wide CLI flat under the env-resolved secrets (CLI wins, no clobber)', async () => {
-    // An env-declaring job gets its context secrets AND the run-wide CLI
-    // flat overlay; on a key collision the CLI value wins (B1-env -> A-CLI-wins).
+    // Context secrets AND the run-wide CLI flat overlay; the CLI value wins a collision.
     const { db } = makeUpdateRecordingDb();
     // The env-rules path queries a running-count; answer 0 and supply db.fn.
     const envDb = {
@@ -1806,8 +1728,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
           execute: async () => undefined,
         }),
       }),
-      // holdJobForApproval writes the hold row and the pending context in
-      // one transaction; the stub hands the same handle back.
+      // holdJobForApproval writes row and context in one transaction.
       transaction: () => ({
         execute: async (cb: (t: unknown) => Promise<unknown>) => cb(makeTrxHandle()),
       }),
@@ -1834,17 +1755,14 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('eager context-gate hold records the expanded job name as job_id, per matrix child', async () => {
-    // `held_runs.job_id` is the value the approval queue renders and that
-    // `kici approve --job <name>` resolves, so the context gate must store the
-    // materialized job's expanded name. A matrix job expands into one hold per
-    // child, and each child must carry its own name.
+    // The approval queue renders `held_runs.job_id` and `kici approve --job`
+    // resolves it, so store the expanded name: one hold per matrix child, each named.
     const created: Array<{ runId: string; jobId: string }> = [];
     const { db } = makeUpdateRecordingDb();
     const envDb = {
       ...(db as object),
       fn: { countAll: () => ({ as: () => ({}) }) },
-      // A non-zero running count trips the concurrency gate, which is the
-      // eager hold path under test.
+      // A non-zero running count trips the concurrency gate (the eager hold path).
       selectFrom: () => ({
         select: () => ({
           where: function (this: unknown) {
@@ -1862,8 +1780,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
           execute: async () => undefined,
         }),
       }),
-      // holdJobForApproval writes the hold row and the pending context in
-      // one transaction; the stub hands the same handle back.
+      // holdJobForApproval writes row and context in one transaction.
       transaction: () => ({
         execute: async (cb: (t: unknown) => Promise<unknown>) => cb(makeTrxHandle()),
       }),
@@ -1890,16 +1807,14 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('holds the run non-terminal across the build window and releases it on return', async () => {
-    // The run is registered with the __build__ job ALONE and the dispatch path
-    // then AWAITS the build, so the build going terminal would otherwise satisfy
-    // isRunComplete and finalize the run before its real jobs are dispatched.
+    // The run is registered with __build__ ALONE and dispatch AWAITS it, so the
+    // build going terminal would otherwise finalize the run before its real jobs.
     const timeline: string[] = [];
     const executionTracker = {
       onExecutionStarted: vi.fn().mockResolvedValue(undefined),
       addJobsToRun: vi.fn().mockResolvedValue(undefined),
       holdRunForPendingJobs: vi.fn(() => timeline.push('register')),
-      // The durable form of the token must have landed before the build wait
-      // starts, so the settle is awaited right after the token is taken.
+      // The durable token must land before the build wait starts.
       registrationWindowSettled: vi.fn(async () => {
         timeline.push('durable');
       }),
@@ -1934,9 +1849,8 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('releases the build-window token on the aborted-build early return', async () => {
-    // A failed build short-circuits dispatch before any real job is registered.
-    // The token taken when the build job was tracked must still be released, or
-    // the run hangs in `running` until the stale detector reaps it.
+    // A failed build short-circuits dispatch; the build's token must still be
+    // released, or the run hangs in `running` until the stale detector reaps it.
     const releasePendingJobsHold = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
@@ -1950,8 +1864,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
         releasePendingJobsHold,
       },
     });
-    // The build job dispatches fine, so the token IS taken; the build itself
-    // then fails, which is the path that aborts dispatch early.
+    // The build dispatches (token taken), then fails, aborting dispatch early.
     (ctx.deps as { buildCoordinator: unknown }).buildCoordinator = {
       ensureBuild: async (_k: string, fn: () => Promise<unknown>) => {
         await fn();
@@ -1965,10 +1878,9 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('completes the queued check runs on the aborted-build early return', async () => {
-    // Same early return as the case above, from the check-run angle. The setup
-    // phase already posted `kici/ci` and `kici/ci/job/build`; `onBuildFailed`
-    // writes the terminal run row and reaches no check run, so without this
-    // they sit `queued` on the commit for a run that will never start.
+    // Same early return, check-run angle: setup posted `kici/ci` and
+    // `kici/ci/job/build`, and `onBuildFailed` reaches no check run, so they
+    // would sit `queued` for a run that never starts.
     const setPendingAwait = vi.fn().mockResolvedValue(undefined);
     const completeUndispatchedCheckRuns = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
@@ -2010,10 +1922,8 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('releases exactly the one token it took, never an unpaired one', async () => {
-    // Tokens are fungible, so an unpaired release consumes someone else's: a
-    // dispatch that released more than it took would drop a deferred init /
-    // dynamic task's token underneath it and finalize the run while that task's
-    // jobs are still being registered.
+    // Tokens are fungible: an unpaired release drops a deferred init / dynamic
+    // task's token and finalizes the run while that task still registers jobs.
     const releasePendingJobsHold = vi.fn().mockResolvedValue(undefined);
     const holdRunForPendingJobs = vi.fn(() => true);
     const { ctx } = makeSingleJobContext({
@@ -2036,8 +1946,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('does not release a token it never took', async () => {
-    // A dispatch that registers no run takes no token, so it must not
-    // decrement the count on the way out.
+    // No run registered, no token taken, so no decrement.
     const releasePendingJobsHold = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
@@ -2058,18 +1967,15 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   /**
-   * A deferred task registers the run's real jobs after dispatch has returned,
-   * so the token it holds must be taken while dispatch is still running and
-   * released only when the task settles. These two tests pin that ordering: if
-   * the token were taken inside the async task instead, `release` for the
-   * build window would land before the deferred `hold`, leaving a window in
-   * which the run is un-held and the build going terminal finalizes it.
+   * A deferred task registers jobs after dispatch returns, so its token is
+   * taken while dispatch runs and released when the task settles. Taken inside
+   * the async task, the build window's `release` would precede the deferred
+   * `hold`, and the build going terminal would finalize the un-held run.
    */
   function makeHoldTimeline() {
     const timeline: string[] = [];
     let outstanding = 0;
-    // Mirrors the real tracker: a release with nothing outstanding is a no-op
-    // (the count clamps at zero) rather than driving it negative.
+    // As the real tracker: releasing with nothing outstanding clamps at zero.
     let spuriousReleases = 0;
     return {
       timeline,
@@ -2093,8 +1999,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
         }),
       },
       markDeferredDone() {
-        // Called once the deferred task's own work is done. If the run was
-        // already un-held before this point, the hold did not cover the task.
+        // After the deferred task's work: an un-held run here means the hold missed the task.
         timeline.push('deferred-registered');
       },
       get outstanding() {
@@ -2111,8 +2016,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
     let sawUnheld = false;
     const pendingDynamics = {
       track: vi.fn(async () => {
-        // The eval is still in flight here — dispatch has already returned and
-        // dropped its own token, so only the deferred token keeps the run open.
+        // Eval in flight after dispatch dropped its token: only the deferred token holds the run.
         if (h.outstanding <= 0) sawUnheld = true;
         h.markDeferredDone();
         return { jobs: [] };
@@ -2136,14 +2040,13 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
 
     expect(h.tracker.holdRunForPendingJobs).toHaveBeenCalledWith('run-1');
     expect(sawUnheld).toBe(false);
-    // The deferred token outlives dispatch: its release comes after the task
-    // registered its jobs, and every token taken is released exactly once.
+    // The deferred token is released after the task registers its jobs; every token exactly once.
     expect(h.timeline).toContain('deferred-registered');
     expect(h.timeline.indexOf('deferred-registered')).toBeLessThan(
       h.timeline.lastIndexOf('release'),
     );
     expect(h.outstanding).toBe(0);
-    // F1's detector: dispatch must never release a token it did not take.
+    // Dispatch must never release a token it did not take.
     expect(h.spuriousReleases).toBe(0);
   });
 
@@ -2179,14 +2082,13 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
       h.timeline.lastIndexOf('release'),
     );
     expect(h.outstanding).toBe(0);
-    // F1's detector: dispatch must never release a token it did not take.
+    // Dispatch must never release a token it did not take.
     expect(h.spuriousReleases).toBe(0);
   });
 
   it('releases the deferred token even when the deferred task fails', async () => {
-    // The task's own catch writes a synthetic failed job row, which must land
-    // while the token is still held — so the release runs after it, via
-    // `.finally()` on the spawned promise rather than inside the task.
+    // The task's catch writes a synthetic failed job row while the token is
+    // held, so release runs in `.finally()` on the spawned promise.
     const h = makeHoldTimeline();
     const pendingDynamics = {
       track: vi.fn().mockRejectedValue(new Error('eval exploded')),
@@ -2206,8 +2108,7 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
     await dispatchMatchedWorkflow(ctx);
     await new Promise((r) => setTimeout(r, 50));
 
-    // No token is left outstanding, so the run cannot hang in `running`, and
-    // no unpaired release stole one.
+    // No token outstanding (no `running` hang) and no unpaired release.
     expect(h.outstanding).toBe(0);
     expect(h.spuriousReleases).toBe(0);
     // The synthetic failure row was registered before the token was dropped.
@@ -2218,9 +2119,8 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('skips the __build__ job for a local run even when build infra is present', async () => {
-    // A local-repo (no-bundle) run carries its source as a working-tree overlay;
-    // the cache/build machinery must be bypassed so the static job dispatches
-    // directly and no __build__ job is created (which would shadow the overlay).
+    // A no-bundle local run's source is a working-tree overlay: bypass the build
+    // machinery so no __build__ job shadows the overlay.
     const { ctx, dispatched } = makeSingleJobContext({
       bundle: undefined,
       fullRepo: true,
@@ -2236,10 +2136,9 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
   });
 
   it('skips the __build__ job for an in-place local run (localWorkingTree) even WITH a bundle', async () => {
-    // A `file://` in-place run has a bundle AND build infra, but the agent runs
-    // the operator's real tree directly — so the source-pack build must be
-    // skipped (packing a dist-less clone would be wrong) and no source tarball
-    // attached.
+    // A `file://` in-place run has a bundle and build infra, but the agent runs
+    // the operator's real tree: skip the source pack (a dist-less clone) and
+    // attach no tarball.
     const { ctx, dispatched } = makeSingleJobContext({
       bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
       fullRepo: true,
@@ -2256,9 +2155,9 @@ describe('dispatchMatchedWorkflow — optional bundle (test-mode / local repo)',
 });
 
 /**
- * Drive `evaluateJobContexts` directly with a single lock job and event,
- * constructing the minimal ctx/setup/buildPrep the deferred-init path reads.
- * `deps.pendingInits` is truthy so a dynamic field routes to the init round.
+ * Drives `evaluateJobContexts` with the minimal ctx/setup/buildPrep the
+ * deferred-init path reads; truthy `deps.pendingInits` routes dynamic fields
+ * to the init round.
  */
 async function runEvaluateJobContexts(over: {
   lockJob: Record<string, unknown> & { name: string };
@@ -2269,11 +2168,7 @@ async function runEvaluateJobContexts(over: {
   deps?: Record<string, unknown>;
   /** Merged onto the materialized job — `pendingDynamicMatrix` is the 4th dynamic field. */
   mat?: Record<string, unknown>;
-  /**
-   * Full materialized-job list, overriding the single `mat` above. A STATIC
-   * matrix reaches `evaluateJobContexts` already expanded, so this is how a
-   * case drives N sibling children through the per-job block.
-   */
+  /** Overrides `mat`: a STATIC matrix arrives expanded, so N children go through the per-job block. */
   mats?: Array<Record<string, unknown>>;
   /** Merged onto the workflow's match decision — `deferredPaths` routes every job to the init round. */
   decision?: Record<string, unknown>;
@@ -2308,8 +2203,7 @@ async function runEvaluateJobContexts(over: {
     credentials: {},
     event,
     ref: 'sha',
-    // A real dispatch context always carries the webhook info; a held job
-    // records its routing key from it.
+    // A held job records its routing key from the webhook info.
     info: { provider: 'local', routingKey: 'local:repo', deliveryId: 'd' },
     resolvedOrgId: '__default__',
     decision: { workflowName: 'ci', matched: true, checks: [], summary: '', ...over.decision },
@@ -2340,8 +2234,7 @@ describe('evaluateJobContexts — dynamic fields defer to the init round', () =>
   });
 
   it('requests an init job for a non-global workflow that declares a filter', async () => {
-    // The job itself is entirely static: without the workflow-level filter it
-    // would dispatch straight through, which is the control below.
+    // Fully static: without the filter it dispatches straight through (the control).
     const staticJob = { _type: 'static' as const, name: 'build' };
     const { deferredInitJobs } = await runEvaluateJobContexts({
       lockJob: staticJob,
@@ -2419,12 +2312,10 @@ describe('evaluateJobContexts — deferred paths defer to the init round', () =>
 });
 
 describe('evaluateJobContexts — a filter defers dispatch, never the evaluation', () => {
-  // A workflow-level filter routes EVERY job through an init job, including
-  // fully static ones. Reusing the dynamic-field `continue` for that skipped the
-  // whole per-job evaluation block — so declaring a filter silently dropped a
-  // job's bound contexts, the context rules that can reject it, and its
-  // approval hold. These pin each of those to the same value with and without
-  // the filter; the no-filter run in each is the control.
+  // A workflow-level filter routes EVERY job, static ones too, through an init
+  // job. That must not skip the per-job block (as the dynamic-field `continue`
+  // does): bound contexts, rejecting context rules and the approval hold must
+  // match with and without the filter (the no-filter run is the control).
   const CONTEXT_JOB = { _type: 'static' as const, name: 'build', contexts: [{ value: 'prod' }] };
 
   /**
@@ -2497,8 +2388,7 @@ describe('evaluateJobContexts — a filter defers dispatch, never the evaluation
       deps: { contextStore: contextStore() },
     });
 
-    // The control proves the context IS resolvable in this harness, so the
-    // assertion below cannot pass vacuously.
+    // Control: the context IS resolvable here.
     expect(control.jobContextData.get('build')?.contextId).toBe('env-prod');
     expect(control.runContextName).toBe('prod');
 
@@ -2521,8 +2411,7 @@ describe('evaluateJobContexts — a filter defers dispatch, never the evaluation
     const envData = withFilter.jobContextData.get('build');
     expect(envData?.held).toBe(true);
     expect(envData?.approvalHold?.requirement.reason).toBe('ship it');
-    // A held job gets NO init job: the flow-back would otherwise dispatch it
-    // past the very hold that stopped it. Approval, not the filter, is its gate.
+    // A held job gets NO init job, or the flow-back dispatches it past its hold.
     expect(withFilter.deferredInitJobs).toHaveLength(0);
     expect(envData?.pendingInit).toBeUndefined();
   });
@@ -2541,9 +2430,7 @@ describe('evaluateJobContexts — a filter defers dispatch, never the evaluation
   });
 
   it('still rejects a job by context rule when the workflow declares a filter', async () => {
-    // The rejection half of the same boundary as the approval hold: a disabled
-    // context hard-rejects the job, and a filter must not make that evaluation
-    // (or its `rejected` verdict) disappear.
+    // The rejection half: a filter must not erase a disabled context's `rejected` verdict.
     const disabledContext = {
       matchContext: async (_org: string, n: string) =>
         n === 'prod' ? { ...contextStore().disabledRow, name: n } : null,
@@ -2563,15 +2450,13 @@ describe('evaluateJobContexts — a filter defers dispatch, never the evaluation
     // The control proves the rejection is the context's doing, not the filter's.
     expect(control.jobContextData.get('build')?.rejected).toBe(true);
     expect(withFilter.jobContextData.get('build')?.rejected).toBe(true);
-    // A rejected job gets NO init job: it is not dispatching either way, and the
-    // flow-back would otherwise carry it past the rule that rejected it.
+    // A rejected job gets NO init job, or the flow-back carries it past its rule.
     expect(withFilter.deferredInitJobs).toHaveLength(0);
     expect(withFilter.jobContextData.get('build')?.pendingInit).toBeUndefined();
   });
 
   it('keeps deferring a dynamic job before its evaluation, as it must', async () => {
-    // The dynamic path is unchanged: its values are unknowable here, so the
-    // whole block IS skipped and the init result drives it.
+    // Dynamic values are unknowable here: the block IS skipped and the init result drives it.
     const { deferredInitJobs, jobContextData } = await runEvaluateJobContexts({
       lockJob: { _type: 'static', name: 'build', contexts: [{ value: 'prod' }], dynamicEnv: true },
       event: { type: 'push' },
@@ -2584,13 +2469,10 @@ describe('evaluateJobContexts — a filter defers dispatch, never the evaluation
 });
 
 describe('evaluateJobContexts — a context reviewer hold unions the workflow-level approval', () => {
-  // A context-driven reviewer hold REPLACES whatever `applyStaticApprovalHolds`
-  // would have minted (both of that function's branches are guarded on
-  // `!jobEnvData.approvalHold`), so the clauses it carries are the run's only
-  // approval requirement. It must therefore carry every source that would
-  // otherwise have gated the job: the context's own reviewers, the job's
-  // `requireApproval`, and — for a root job, the only kind a workflow-level gate
-  // ever holds — the workflow's.
+  // A context reviewer hold REPLACES what `applyStaticApprovalHolds` would mint
+  // (both branches guard on `!jobEnvData.approvalHold`), so it must carry every
+  // gating source: the context's reviewers, the job's `requireApproval`, and,
+  // for a root job (the only kind a workflow gate holds), the workflow's.
   const CTX_REVIEWER = 'ctx-reviewer';
 
   /** A `prod` context requiring one reviewer, so its gate returns a reviewer hold. */
@@ -2659,8 +2541,7 @@ describe('evaluateJobContexts — a context reviewer hold unions the workflow-le
   });
 
   it('mints a context reviewer hold at all (the control)', async () => {
-    // Proves the harness reaches the reviewer branch, so every assertion below
-    // about what that branch carries is non-vacuous.
+    // Control: the harness reaches the reviewer branch.
     const hold = await holdFor({});
     expect(hold).toBeDefined();
     expect(keys(hold)).toEqual([`user:${CTX_REVIEWER}`]);
@@ -2688,10 +2569,8 @@ describe('evaluateJobContexts — a context reviewer hold unions the workflow-le
   });
 
   it('leaves a NON-root job untouched — a workflow gate never held one', async () => {
-    // `applyStaticApprovalHolds` mints the workflow hold for root jobs only
-    // (downstream jobs are gated by their `needs` edges), so unioning the
-    // workflow clauses into a downstream job's hold would ADD an approver the
-    // job never had.
+    // The workflow hold is root-only (downstream jobs gate on `needs`), so its
+    // clauses in a downstream hold would ADD an approver the job never had.
     const hold = await holdFor({
       lockJob: { needs: ['prev'], approval: jobApproval('job-owner') },
       workflow: { approval: wfApproval('wf-owner') },
@@ -2700,9 +2579,7 @@ describe('evaluateJobContexts — a context reviewer hold unions the workflow-le
   });
 
   it('never shrinks the clause set, for a root or a non-root job', async () => {
-    // The additive-only invariant of an approval surface: adding a
-    // workflow-level gate may only ever ADD required approvers to a hold that
-    // already exists, never remove or replace one.
+    // Additive-only: a workflow gate may ADD approvers to a hold, never remove or replace one.
     for (const needs of [[], ['prev']]) {
       const before = await holdFor({
         lockJob: { needs, approval: jobApproval('job-owner') },
@@ -2716,8 +2593,7 @@ describe('evaluateJobContexts — a context reviewer hold unions the workflow-le
   });
 
   it('does not relabel the hold when the workflow contributes clauses', async () => {
-    // `scope` drives the resume path, so the hold stays job-scoped and
-    // context-triggered however many sources its clauses come from.
+    // `scope` drives resume: job-scoped and context-triggered regardless of clause sources.
     const hold = await holdFor({ workflow: { approval: wfApproval('wf-owner') } });
     expect(hold?.scope).toBe(HoldScope.enum.job);
     expect(hold?.triggerSource).toBe(TriggerSource.enum.context);
@@ -2726,16 +2602,11 @@ describe('evaluateJobContexts — a context reviewer hold unions the workflow-le
 });
 
 describe('evaluateJobContexts — a dynamic field defers dispatch, and the hold follows it', () => {
-  // The approval hold for a dynamic-field job is minted in the FLOW-BACK, not
-  // here. Setting `held` before the init round makes
-  // `applyContextRulesAndSecrets` skip its own final block (guarded on `!held`),
-  // so the job's context vars, secrets and registry auth never resolve — and the
-  // stored input the release path dispatches verbatim is missing them.
-  //
-  // So this seam guarantees the DEFERRAL only. That such a job is then held
-  // rather than dispatched is asserted end-to-end in "dispatchMatchedWorkflow —
-  // a held job whose dynamic fields defer"; that its secrets survive the hold in
-  // "— a held dynamic job keeps its context secrets".
+  // A dynamic-field job's hold is minted in the FLOW-BACK: `held` before init
+  // makes `applyContextRulesAndSecrets` skip its `!held` block, so context vars,
+  // secrets and registry auth never reach the stored input release dispatches.
+  // This seam guarantees DEFERRAL only; holding is covered by "a held job whose
+  // dynamic fields defer", secrets by "a held dynamic job keeps its context secrets".
   const APPROVAL = { clauses: [], reason: 'ship it', when: 'always' as const };
   const heldDeps = () => ({ heldRunStore: { create: vi.fn(), createHold: vi.fn() } });
 
@@ -2753,8 +2624,7 @@ describe('evaluateJobContexts — a dynamic field defers dispatch, and the hold 
 
   for (const variant of DYNAMIC_FIELDS) {
     it(`defers a job with ${variant.label} even when it requires approval`, async () => {
-      // The init round must still run: nothing else can resolve a dynamic value,
-      // so suppressing it would make the job undispatchable rather than gated.
+      // Init must run: only it resolves dynamic values, else the job is undispatchable.
       const res = await runEvaluateJobContexts({
         lockJob: { _type: 'static', name: 'build', approval: APPROVAL, ...variant.lockJob },
         event: { type: 'push' },
@@ -2769,7 +2639,7 @@ describe('evaluateJobContexts — a dynamic field defers dispatch, and the hold 
   }
 
   it('leaves a dynamic job with no approval deferred all the same', async () => {
-    // The control: deferral is driven by the dynamic field, not by the approval.
+    // Control: the dynamic field drives deferral, not the approval.
     const res = await runEvaluateJobContexts({
       lockJob: { _type: 'static', name: 'build', dynamicEnv: true },
       event: { type: 'push' },
@@ -2782,10 +2652,9 @@ describe('evaluateJobContexts — a dynamic field defers dispatch, and the hold 
 });
 
 describe('initDispatchSuppression', () => {
-  // The flow-back's own guard. `evaluateJobContexts` never gives a rejected or
-  // held job an init job, so the Gated branch is unreachable through
-  // dispatchMatchedWorkflow — which is exactly why the predicate is exported and
-  // tested directly. An untestable security check is one nobody can prove works.
+  // The flow-back's guard: no rejected or held job gets an init job, so the
+  // Gated branch is unreachable via dispatchMatchedWorkflow; the predicate is
+  // exported to test it directly.
   const filtered = { hasFilter: true } as const;
 
   it('suppresses on a false verdict from a workflow that declares a filter', () => {
@@ -2800,8 +2669,7 @@ describe('initDispatchSuppression', () => {
 
   it('does not suppress on a passing verdict, or on no verdict at all', () => {
     expect(initDispatchSuppression(filtered, { filterPassed: true }, {})).toBeNull();
-    // An agent that predates the filter reports nothing; reading that absence as
-    // "suppress" would stop every dispatch it handles.
+    // An older agent reports nothing; reading absence as "suppress" stops every dispatch.
     expect(initDispatchSuppression(filtered, {}, {})).toBeNull();
   });
 
@@ -2851,11 +2719,9 @@ describe('initDispatchSuppression — deferred paths', () => {
 });
 
 describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', () => {
-  // A job can be BOTH held (approval is read from the lock file) and pendingInit
-  // (its dynamic values are not). The dispatch loop must skip it — holding it
-  // there would store a pending dispatch context built from unresolved values,
-  // and the release path dispatches that stored input verbatim. The flow-back
-  // owns the hold instead, because only it has the resolved values.
+  // A job can be BOTH held (approval from the lock file) and pendingInit. The
+  // dispatch loop skips it: release dispatches stored input verbatim, so only
+  // the flow-back, holding resolved values, may store the hold.
   const APPROVAL = { clauses: [], reason: 'ship it', when: 'always' as const };
   const INIT_JOB_NAME = '__init__ci__build';
 
@@ -2881,8 +2747,7 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
     };
   }
 
-  /** Enough Kysely surface for storePendingJobContext's upsert and the reads
-   * the dispatch path makes along the way (org settings, concurrency count). */
+  /** Kysely surface for the context upsert, org settings and concurrency count. */
   function makeDb() {
     return {
       fn: { countAll: () => ({ as: (alias: string) => alias }) },
@@ -2904,8 +2769,7 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
           execute: async () => undefined,
         }),
       }),
-      // holdJobForApproval writes the hold row and the pending context in
-      // one transaction; the stub hands the same handle back.
+      // holdJobForApproval writes row and context in one transaction.
       transaction: () => ({
         execute: async (cb: (t: unknown) => Promise<unknown>) => cb(makeTrxHandle()),
       }),
@@ -2933,10 +2797,8 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
   }
 
   it('dispatches a dynamic job with no approval, after its init round', async () => {
-    // The positive control. Same setup minus the approval: the init job runs and
-    // the real job follows it to the dispatcher, and no hold is created. Without
-    // this, the assertions below would pass for a build that never dispatches
-    // anything at all.
+    // Positive control without the approval: init runs, the job is dispatched,
+    // no hold, so the assertions below are not vacuous.
     const { create, names } = await run({});
     expect(names).toEqual([INIT_JOB_NAME, 'build']);
     expect(create).not.toHaveBeenCalled();
@@ -2944,17 +2806,14 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
 
   it('holds a dynamic job with requireApproval instead of dispatching it', async () => {
     const { create, names } = await run({ jobApproval: APPROVAL });
-    // The init job still runs — nothing else can resolve the dynamic env — but
-    // the job itself never reaches the dispatcher.
+    // Init still runs (only it resolves the dynamic env); the job is not dispatched.
     expect(names).toEqual([INIT_JOB_NAME]);
     expect(create).toHaveBeenCalledTimes(1);
   });
 
   it('stores a pending context carrying the values the init round resolved', async () => {
-    // The whole reason the flow-back owns this hold. `dispatchReadyJob`
-    // dispatches the STORED input verbatim on release, so if the hold were
-    // created in the dispatch loop the released job would run with its dynamic
-    // env unresolved. Reading the stored context is the only way to see that.
+    // `dispatchReadyJob` dispatches STORED input verbatim, so a dispatch-loop
+    // hold would run with dynamic env unresolved; only the stored context shows it.
     const create = vi.fn().mockResolvedValue({ id: 'held-dyn-2' });
     const { ctx } = makeSingleJobContext({
       bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
@@ -2977,8 +2836,7 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
   });
 
   it('marks a dynamic-only local working-tree run as local when it bootstraps the row', async () => {
-    // A workflow with no static job registers its run through the deferred
-    // bootstrap, the one registration site with no job to start early.
+    // No static job: the run registers through the deferred bootstrap.
     // fails-when: that bootstrap drops localWorkingTree, so no status frame
     // marks a `kici run remote` upload of a dynamic-only workflow
     // breaks-if-wrong: a webhook run (localWorkingTree false) must stay unmarked
@@ -3017,18 +2875,15 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
       const call = tracker.onExecutionStarted.mock.calls[0] as unknown[];
       expect(call[9]).toEqual([]);
       expect(call[20]).toBe(localWorkingTree);
-      // The row is marked too: `recordRunStart` returned before the row existed,
-      // so the bootstrap is the only writer left.
+      // The row is marked too: the bootstrap is its only writer.
       expect(columnWrites.some((c) => c.local_working_tree === true)).toBe(localWorkingTree);
     }
   });
 
   it('holds every child of a dynamic matrix, not one placeholder', async () => {
-    // A static matrix + approval mints one hold PER CHILD, because
-    // evaluateJobContexts iterates the expanded jobs. A dynamic matrix has only
-    // a placeholder at that point, so its children exist solely after the init
-    // round — and the hold has to fan out with them, or approving would resume
-    // a single un-expanded job instead of the N the matrix asked for.
+    // A static matrix gets one hold PER CHILD. A dynamic one is a placeholder
+    // until init, so the hold must fan out after it, or approval resumes one
+    // un-expanded job instead of N.
     const createHold = vi.fn().mockResolvedValue({ id: 'held-mx' });
     const { ctx, dispatched } = makeSingleJobContext({
       bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
@@ -3060,23 +2915,17 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
     );
     const build = registered.find((j) => j.jobName === 'build');
     expect(build).toBeDefined();
-    // The id is what discriminates, not the name: a DISPATCHED job registers
-    // the dispatcher's real job id, while a HELD one registers the
-    // `needs-pending-` placeholder that the release path swaps out. Asserting
-    // only the name passes whether or not the job was gated, so it would have
-    // been satisfied by the ungated dispatch this fix removes.
+    // The id discriminates, not the name: DISPATCHED registers the real job id,
+    // HELD the `needs-pending-` placeholder release swaps out.
     expect(build?.jobId.startsWith(NEEDS_PENDING_JOB_ID_PREFIX)).toBe(true);
   });
 
   it('gates every child of a dynamic matrix against the context concurrency limit', async () => {
-    // The defect: `dispatchResolvedDynamicMatrix` expands AFTER the gate
-    // ran once for the un-expanded placeholder, and each child inherited the
-    // base job's already-decided data via `{ ...baseEnvData }` without being
-    // gated again — so all N combinations dispatched against one checked slot.
-    // The concurrency gate returns `queue` with `holdType: 'concurrency'`, which
-    // is NOT a reviewer hold — so `holdJobForApproval` writes it through
-    // `heldRunStore.create`, not `createHold`. Both are stubbed so a hold that
-    // took the wrong branch would still show up.
+    // `dispatchResolvedDynamicMatrix` expands AFTER the placeholder was gated,
+    // so each child (`{ ...baseEnvData }`) must be gated again, not dispatched
+    // against one checked slot. `queue` with `holdType: 'concurrency'` is not a
+    // reviewer hold, so it goes through `heldRunStore.create`, not `createHold`;
+    // both are stubbed so a wrong-branch hold still shows.
     const create = vi.fn().mockResolvedValue({ id: 'held-conc' });
     const createHold = vi.fn().mockResolvedValue({ id: 'held-conc-approval' });
     const { ctx, dispatched } = makeSingleJobContext({
@@ -3096,8 +2945,7 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
     await dispatchMatchedWorkflow(ctx);
     await new Promise((r) => setTimeout(r, 50));
 
-    // Two slots, three combinations: two children dispatch, the third is queued
-    // by the concurrency gate and gets its own hold row.
+    // Two slots, three combinations: two dispatch, the third gets a hold row.
     const childNames = dispatched.map((d) => d.jobName).filter((n) => n !== INIT_JOB_NAME);
     expect(childNames).toHaveLength(2);
     expect(create).toHaveBeenCalledTimes(1);
@@ -3110,10 +2958,8 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
   });
 
   it('does not spend a slot on the dynamic-matrix placeholder', async () => {
-    // The placeholder is gated before the agent resolves the combinations and
-    // is then REPLACED by its children rather than dispatched. Its reservation
-    // has to be released before they are gated, or a fan-out of N children
-    // would consume N+1 slots and the last child would be held for nothing.
+    // The placeholder is gated, then REPLACED by its children; release its
+    // reservation first, or N children consume N+1 slots.
     const create = vi.fn().mockResolvedValue({ id: 'held-conc-2' });
     const createHold = vi.fn().mockResolvedValue({ id: 'held-conc-2-approval' });
     const { ctx, dispatched } = makeSingleJobContext({
@@ -3140,24 +2986,17 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
   });
 
   it('counts a sibling whose row already landed once, not twice', async () => {
-    // The deferred-init double-count. Unlike the synchronous path — which gates
-    // every job before any `execution_jobs` row exists — the flow-back gates the
-    // children of a resolved dynamic matrix one at a time, awaiting each
-    // child's dispatch in between. So by the time the second child is gated the
-    // first has a real row AND is still held in this pass's admission tally.
-    // Adding a count that can see that row to a tally that also counts it reads
-    // 2 against a limit of 2 and holds a child that had a free slot.
-    //
-    // This is an OVER-HOLD, not an over-admission, and it is the specific way
-    // both earlier attempts at this gate went wrong: they changed what the
-    // count counts without reconciling it against the other term.
+    // Deferred-init double-count: unlike the sync path (gating before any
+    // `execution_jobs` row exists), the flow-back gates matrix children one at
+    // a time, so the first child has a real row AND sits in the admission
+    // tally. Counting both reads 2 against a limit of 2: an OVER-HOLD. Changing
+    // what the count counts must be reconciled against the tally.
     const rows: SlotRow[] = [];
     const create = vi.fn().mockResolvedValue({ id: 'held-conc-3' });
     const createHold = vi.fn().mockResolvedValue({ id: 'held-conc-3-approval' });
     const addJobsToRun = vi.fn();
     const tracker = makeTracker(addJobsToRun);
-    // Every registered job becomes a row the count can see, at `running`: a
-    // child that reached its agent before the next child's gate read the count.
+    // Each registered job becomes a visible `running` row before the next gate reads.
     addJobsToRun.mockImplementation(
       async (runId: string, jobs: Array<{ jobId: string; jobName: string }>) => {
         for (const job of jobs) {
@@ -3194,16 +3033,13 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
     expect(childNames).toHaveLength(2);
     expect(create).not.toHaveBeenCalled();
     expect(createHold).not.toHaveBeenCalled();
-    // The fake really did see the first child's row — without this the case
-    // would pass against a count that answers zero for every query.
+    // Control: the fake saw the first child's row (not an always-zero count).
     expect(rows.map((r) => r.job_name)).toEqual(childNames);
   });
 
   it('still counts another run occupying the same group', async () => {
-    // The companion control for the exclusion above: it is keyed on (this run,
-    // these names), so an identically-named job in a DIFFERENT run must still
-    // occupy its slot. An exclusion written on the job name alone passes the
-    // case above and fails this one.
+    // The exclusion is keyed on (this run, these names): a same-named job in a
+    // DIFFERENT run still occupies its slot. A name-only exclusion fails here.
     const create = vi.fn().mockResolvedValue({ id: 'held-conc-4' });
     const createHold = vi.fn().mockResolvedValue({ id: 'held-conc-4-approval' });
     const rows: SlotRow[] = [
@@ -3237,15 +3073,11 @@ describe('dispatchMatchedWorkflow — a held job whose dynamic fields defer', ()
 });
 
 describe('dispatchMatchedWorkflow — a STATIC context on a dynamic-field job still applies', () => {
-  // `evaluateJobContexts` skips the whole per-job block for any dynamic field,
-  // and the flow-back used to delegate only when the job had a DYNAMIC context.
-  // So a job binding a perfectly static context and declaring `dynamicEnv`
-  // had that context ignored entirely: no gates, no vars, no secrets — because
-  // some OTHER field on the job happened to be dynamic.
-  //
-  // The agent cannot help here: init-runner only emits `contextNames` when
-  // `flags.dynamicContext` is set, which is false for a static binding. The
-  // orchestrator already has the names in the lock file.
+  // `evaluateJobContexts` skips the per-job block for any dynamic field, so the
+  // flow-back must also apply a STATIC context when another field (`dynamicEnv`)
+  // is dynamic: gates, vars and secrets. The agent cannot help: init-runner
+  // emits `contextNames` only under `flags.dynamicContext`; the orchestrator
+  // has the names in the lock file.
   const prodRow = (over: Record<string, unknown> = {}) => ({
     id: 'env-prod',
     org_id: '__default__',
@@ -3315,18 +3147,16 @@ describe('dispatchMatchedWorkflow — a STATIC context on a dynamic-field job st
   });
 
   it("enforces the static context's gates for a dynamicEnv job", async () => {
-    // A disabled context must reject the job. Before this, the gate never ran at
-    // all and the job dispatched regardless.
+    // A disabled context must reject the job, not let it dispatch.
     const dispatched = await run({ enabled: false });
     expect(dispatched.map((d) => d.jobName)).not.toContain('build');
   });
 });
 
 describe('applyInitResultContext — the agent-resolved concurrency group is used', () => {
-  // `init-runner.ts` evaluates a dynamicConcurrencyGroup and reports it as
-  // `initResult.concurrencyGroup`. Nothing read it — the parameter type did not
-  // even name the field — so the job was gated under the CONTEXT name instead
-  // of its own group, silently sharing a limit with everything bound to it.
+  // `init-runner.ts` reports a dynamicConcurrencyGroup as
+  // `initResult.concurrencyGroup`; the job must gate under it, not the CONTEXT
+  // name, or it shares a limit with everything bound to the context.
   it('gates on the group the init round resolved, not the context name', async () => {
     const matched: string[] = [];
     const { ctx } = makeSingleJobContext({
@@ -3353,8 +3183,7 @@ describe('applyInitResultContext — the agent-resolved concurrency group is use
                 branch_restrictions: null,
                 trigger_type_filters: null,
                 repo_patterns: null,
-                // A limit, so the concurrency gate actually evaluates and the
-                // group it counts against matters.
+                // A limit, so the gate evaluates and the group matters.
                 concurrency_limit: 5,
                 concurrency_strategy: null,
                 concurrency_timeout_ms: null,
@@ -3385,18 +3214,17 @@ describe('applyInitResultContext — the agent-resolved concurrency group is use
     await dispatchMatchedWorkflow(ctx);
     await new Promise((r) => setTimeout(r, 50));
 
-    // The running-count query is scoped to the concurrency group; it must be the
-    // agent-resolved one.
+    // The running count is scoped to the agent-resolved group.
     expect(capturedGroups).toContain('deploy-queue');
     expect(capturedGroups).not.toContain('prod');
   });
 });
 
 describe('dispatchMatchedWorkflow — a held job is held on the cluster path too', () => {
-  // With a peer connected, `dispatchableJobs` filters out held jobs and nothing
-  // else in that branch touched them: no held_runs row, no pending context, no
-  // placeholder. The job vanished and the run could report success without it,
-  // while the approval it was waiting on never appeared in any queue.
+  // With a peer connected, `dispatchableJobs` filters out held jobs, so the
+  // cluster branch must still write the held_runs row, pending context and
+  // placeholder, or the job vanishes, the run succeeds without it, and no
+  // approval appears in any queue.
   it('creates the hold and registers the placeholder when peers are connected', async () => {
     const createHold = vi.fn().mockResolvedValue({ id: 'held-cluster-1' });
     const addJobsToRun = vi.fn().mockResolvedValue(undefined);
@@ -3415,7 +3243,6 @@ describe('dispatchMatchedWorkflow — a held job is held on the cluster path too
         recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
       },
     });
-    // Put the run on the cluster path.
     (ctx.deps as unknown as Record<string, unknown>).coordinator = {
       hasConnectedPeers: () => true,
       routeJobs: vi.fn().mockResolvedValue({ localJobs: [], remoteJobs: [] }),
@@ -3434,20 +3261,18 @@ describe('dispatchMatchedWorkflow — a held job is held on the cluster path too
 });
 
 describe('dispatchMatchedWorkflow — a held dynamic job stores its context resolution record', () => {
-  // The static approval hold is minted in the flow-back, AFTER the init round
-  // named the job's context and `applyContextRulesAndSecrets` admitted it. The
-  // stored input carries the init-resolved env and no context secret; the
-  // context resolution record it stores is what the release path resolves the
-  // secrets from.
+  // The static hold is minted in the flow-back, AFTER init names the context
+  // and `applyContextRulesAndSecrets` admits it. Stored input carries the
+  // init-resolved env and no context secret; release resolves secrets from
+  // the stored context resolution record.
   it('stores the context resolution record for a job held with a dynamic env', async () => {
     const createHold = vi.fn().mockResolvedValue({ id: 'held-sec-1' });
     const { ctx } = makeSingleJobContext({
       bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
       fullRepo: true,
       withDynamicEnv: true,
-      // A DYNAMIC context: `applyInitResultContext` delegates to
-      // `applyContextRulesAndSecrets` only when the job has one, which is the
-      // path whose ordering this test pins.
+      // DYNAMIC: the only case `applyInitResultContext` delegates to
+      // `applyContextRulesAndSecrets`, the ordering under test.
       withDynamicContext: true,
       jobApproval: { clauses: [], reason: 'ship it', when: 'always' as const },
       contextStore: {
@@ -3507,7 +3332,7 @@ describe('dispatchMatchedWorkflow — a held dynamic job stores its context reso
     expect(createHold).toHaveBeenCalledTimes(1);
     const pending = await consumePendingJobContext(undefined, ctx.runId, 'build');
     expect(pending).toBeDefined();
-    // The init-resolved env survives (it always did)…
+    // The init-resolved env survives…
     expect(pending?.jobInput.jobConfig.jobEnv).toEqual({ RESOLVED: 'yes' });
     // fails-when: the flow-back stores the held job without running its context rules, so no record exists
     expect(pending?.contextResolution?.contexts).toEqual([{ name: 'prod', id: 'env-prod' }]);
@@ -3517,13 +3342,11 @@ describe('dispatchMatchedWorkflow — a held dynamic job stores its context reso
 });
 
 describe('dispatchMatchedWorkflow — a non-reviewer context hold is resumable', () => {
-  // A wait-timer gate sets held=true but NO approvalHold, and holdJobForApproval
-  // used to return early on that — so the job was registered nowhere, had no
-  // stored dispatch context, and `isRunComplete` could pass without it. The run
-  // reported success while a gated job never ran.
+  // A wait-timer gate sets held=true but NO approvalHold. holdJobForApproval
+  // must still register the job and store its context, or `isRunComplete`
+  // passes and the run succeeds while a gated job never ran.
 
-  /** Enough Kysely surface for the hold path: the concurrency count, the
-   * pending-context upsert, and the transaction the two writes share. */
+  /** Kysely surface for the concurrency count, context upsert and their shared transaction. */
   function makeHoldDb() {
     const db: Record<string, unknown> = {
       fn: { countAll: () => ({ as: (alias: string) => alias }) },
@@ -3545,8 +3368,7 @@ describe('dispatchMatchedWorkflow — a non-reviewer context hold is resumable',
           execute: async () => undefined,
         }),
       }),
-      // holdJobForApproval writes the hold row and the pending context in
-      // one transaction; the stub hands the same handle back.
+      // holdJobForApproval writes row and context in one transaction.
       transaction: () => ({
         execute: async (cb: (t: unknown) => Promise<unknown>) => cb(makeTrxHandle()),
       }),
@@ -3561,8 +3383,7 @@ describe('dispatchMatchedWorkflow — a non-reviewer context hold is resumable',
         executeTakeFirst: async () => undefined,
       }),
     };
-    // The transaction hands the same handle back, which is what lets
-    // storePendingJobContext take `trx` with no signature change.
+    // Same handle back, so storePendingJobContext takes `trx` unchanged.
     db.transaction = () => ({ execute: async (cb: (t: unknown) => Promise<unknown>) => cb(db) });
     return db;
   }
@@ -3588,11 +3409,9 @@ describe('dispatchMatchedWorkflow — a non-reviewer context hold is resumable',
         onJobStatus: vi.fn(),
         holdRunForPendingJobs: vi.fn().mockReturnValue(true),
         releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
-        // Reached only while the bug is present: with no placeholder pushed,
-        // dispatchedJobs is empty and the run takes the init-failure/skip path
-        // (dispatch-matched-workflow.ts, the `dispatchedJobs.length === 0`
-        // branch). After the fix the placeholder makes that branch unreachable
-        // for a held job, and this stub goes unused.
+        // Reached only if no placeholder is pushed: empty dispatchedJobs takes
+        // the init-failure/skip path (`dispatchedJobs.length === 0`); a held
+        // job's placeholder leaves this unused.
         recordInitFailureRun: vi.fn().mockResolvedValue(undefined),
       },
     });
@@ -3617,12 +3436,11 @@ describe('dispatchMatchedWorkflow — a non-reviewer context hold is resumable',
 });
 
 describe('dispatchMatchedWorkflow — a dynamically-bound context is still gated', () => {
-  // `applyContextRulesAndSecrets` — the only caller of `evaluateProtectionRules`
-  // on this path — lives inside the per-job block the dynamic-field deferral
-  // skips. The flow-back re-implemented only the test-run fail-safe, so a job
-  // whose contexts resolve at init time had NO `enabled` check, no branch
-  // restriction, no minimum-trust check, no concurrency limit, no
-  // required-reviewers hold and no wait timer.
+  // `applyContextRulesAndSecrets`, the path's only `evaluateProtectionRules`
+  // caller, is in the per-job block the dynamic deferral skips. The flow-back
+  // must run every rule for init-resolved contexts: `enabled`, branch
+  // restriction, minimum trust, concurrency limit, required reviewers and
+  // wait timer, not just the test-run fail-safe.
   const INIT_JOB_NAME = '__init__ci__build';
 
   function makePendingInits(initResult: Record<string, unknown>) {
@@ -3657,8 +3475,7 @@ describe('dispatchMatchedWorkflow — a dynamically-bound context is still gated
           execute: async () => undefined,
         }),
       }),
-      // holdJobForApproval writes the hold row and the pending context in
-      // one transaction; the stub hands the same handle back.
+      // holdJobForApproval writes row and context in one transaction.
       transaction: () => ({
         execute: async (cb: (t: unknown) => Promise<unknown>) => cb(makeTrxHandle()),
       }),
@@ -3733,8 +3550,7 @@ describe('dispatchMatchedWorkflow — a dynamically-bound context is still gated
   }
 
   it('dispatches when the resolved context passes every gate', async () => {
-    // The positive control. Without it, a build that dispatches nothing at all
-    // would satisfy both assertions below.
+    // Positive control: a build dispatching nothing would satisfy both assertions below.
     const { createHold, names } = await run({});
     expect(names).toEqual([INIT_JOB_NAME, 'build']);
     expect(createHold).not.toHaveBeenCalled();
@@ -3758,9 +3574,8 @@ describe('dispatchMatchedWorkflow — a dynamically-bound context is still gated
   });
 
   it('records the rejection on the run, naming the context and the rule', async () => {
-    // The rejection used to end at a `logger.warn` and a `return`. The static
-    // collector cannot cover it — the context is only named by the init round,
-    // long after that collector ran — so the flow-back records it here.
+    // The static collector cannot record this rejection (init names the context
+    // after it ran), so the flow-back records it, not just a `logger.warn`.
     const { tracker } = await run({ branch_restrictions: ['release/*'] });
 
     const registered = tracker.addJobsToRun.mock.calls.flatMap(
@@ -3789,11 +3604,9 @@ describe('dispatchMatchedWorkflow — a dynamically-bound context is still gated
   });
 
   it('registers the rejected job before the pending-jobs token is released', async () => {
-    // Without the recorded row this run finished GREEN: `__init__` is itself a
-    // tracked job, so the run held one terminal job and the last release
-    // finalized it successfully. The ordering is what makes the rejection part
-    // of that verdict — a row registered after finalization would attach a
-    // non-terminal job to an already-completed run.
+    // Without the row the run finishes GREEN (`__init__` is its one terminal
+    // job). The row must precede finalization, or it attaches a non-terminal job
+    // to a completed run.
     const { tracker } = await run({ enabled: false });
 
     const statusCall = rejectionStatusCall(tracker);
@@ -3805,10 +3618,9 @@ describe('dispatchMatchedWorkflow — a dynamically-bound context is still gated
           (tracker.onJobStatus.mock.calls[i][1] as string).startsWith('rejected-'),
       ),
     );
-    // The run carries two tokens: the dispatch window, released as soon as the
-    // synchronous dispatch returns, and this init round, released in the
-    // spawned task's `.finally()`. Only the LAST release can drop the count to
-    // zero and finalize, so that is the one the row must precede.
+    // Two tokens: the dispatch window (released when sync dispatch returns) and
+    // the init round (released in the task's `.finally()`). The row must
+    // precede the LAST release, which finalizes.
     expect(tracker.holdRunForPendingJobs).toHaveBeenCalled();
     const lastRelease = Math.max(...tracker.releasePendingJobsHold.mock.invocationCallOrder);
     expect(terminalizedAt).toBeLessThan(lastRelease);
@@ -3844,21 +3656,19 @@ describe('dispatchMatchedWorkflow — a non-global workflow filter', () => {
 
   it('suppresses dispatch when the init result reports filterPassed:false', async () => {
     const names = await dispatchWith({ filterPassed: false });
-    // The init job itself still ran — that is where the verdict came from — but
-    // the workflow's own job never reached the dispatcher.
+    // The init job ran (the verdict's source); the workflow's job was not dispatched.
     expect(names).toEqual([INIT_JOB_NAME]);
   });
 
   it('dispatches the job when the filter passes', async () => {
-    // Positive control for the assertion above: the identical setup, differing
-    // only in the verdict, does reach the dispatcher.
+    // Positive control: only the verdict differs, and it dispatches.
     const names = await dispatchWith({ filterPassed: true });
     expect(names).toEqual([INIT_JOB_NAME, 'build']);
   });
 
   it('carries hasFilter on the dynamic eval job so a generator cannot bypass the filter', async () => {
-    // A generator-only workflow has no static job to carry the filter, and a
-    // mixed one would half-dispatch. The eval job has to gate the generator.
+    // A generator-only workflow has no static job to carry the filter and a
+    // mixed one would half-dispatch, so the eval job gates the generator.
     const pendingDynamics = {
       track: vi.fn(async () => []),
       resolve: vi.fn(),
@@ -3904,8 +3714,7 @@ describe('dispatchMatchedWorkflow — a non-global workflow filter', () => {
   });
 
   it('ignores a filterPassed:false from an agent when the workflow declares no filter', async () => {
-    // Defence against a buggy or rogue agent inventing the field: the verdict is
-    // only honoured for a workflow that actually declares a filter.
+    // Against a rogue agent: the verdict counts only when the workflow declares a filter.
     const { ctx, dispatched } = makeSingleJobContext({
       bundle: { normalizer: { provider: 'local' } } as unknown as WorkflowDispatchContext['bundle'],
       fullRepo: true,
@@ -3920,9 +3729,8 @@ describe('dispatchMatchedWorkflow — a non-global workflow filter', () => {
   });
 
   it('dispatches when the agent reports no verdict at all', async () => {
-    // An agent that predates the filter sends an init result with no
-    // `filterPassed` key. Reading that absence as "suppress" would stop every
-    // dispatch such an agent handles, so only an explicit `false` suppresses.
+    // An older agent omits `filterPassed`; only an explicit `false` suppresses,
+    // or every dispatch it handles stops.
     const names = await dispatchWith({});
     expect(names).toEqual([INIT_JOB_NAME, 'build']);
   });
@@ -4038,9 +3846,8 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
   });
 
   it('stamps the matched context_id on the run-level UPDATE for an env-bound job', async () => {
-    // The History tab keys off context_id, so the run-level write must carry
-    // the configured env's id alongside the declared context name. The env
-    // store's matchContext returns `id: env-<name>` for the bound name.
+    // The History tab keys off context_id, so the run write carries the env id
+    // with the context name (matchContext returns `id: env-<name>`).
     const { db, updates } = makeUpdateRecordingDb();
     const envDb = {
       ...(db as object),
@@ -4062,8 +3869,7 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
           execute: async () => undefined,
         }),
       }),
-      // holdJobForApproval writes the hold row and the pending context in
-      // one transaction; the stub hands the same handle back.
+      // holdJobForApproval writes row and context in one transaction.
       transaction: () => ({
         execute: async (cb: (t: unknown) => Promise<unknown>) => cb(makeTrxHandle()),
       }),
@@ -4096,16 +3902,12 @@ describe('dispatchMatchedWorkflow — testRun run-row stamp', () => {
 });
 
 describe('dispatchMatchedWorkflow — checkMode threading', () => {
-  // The run-level check mode (`--check` / `--check --fail-on-drift`) rides on
-  // ctx.extraJobConfig.checkMode. It MUST reach onExecutionStarted's trailing
-  // checkMode argument so the execution_runs.check_mode column is persisted —
-  // otherwise computeRunStatus can never fail a drifted check-fail-on-drift run.
+  // ctx.extraJobConfig.checkMode (`--check` / `--check --fail-on-drift`) MUST
+  // reach onExecutionStarted's checkMode argument so execution_runs.check_mode
+  // persists, or computeRunStatus can never fail a drifted run.
   //
-  // Indexed from the FRONT. `checkMode` sits at a fixed position in
-  // onExecutionStarted's positional signature, whereas its distance from the
-  // END moves every time a trailing argument is added — which silently read a
-  // different argument and failed this test for a reason that had nothing to do
-  // with check mode.
+  // Indexed from the FRONT: the distance from the END moves whenever a
+  // trailing argument is added.
   //
   // 0 runId · 1 workflowName · 2 provider · 3 repoIdentifier · 4 ref · 5 sha ·
   // 6 deliveryId · 7 providerContext · 8 triggerDecision · 9 jobs ·
@@ -4239,15 +4041,13 @@ describe('findInvalidApprovalTimeout', () => {
   });
 
   it('flags an invalid job-level timeout', () => {
-    const job = {
-      _type: 'static' as const,
+    const job = staticJob({
       name: 'deploy',
       steps: [],
       runsOn: [],
-      needs: [],
       rules: [],
       approval: { clauses: [], timeoutSeconds: -5 },
-    };
+    });
     expect(findInvalidApprovalTimeout(wf({ jobs: [job] }))).toEqual({
       scope: 'job',
       jobName: 'deploy',
@@ -4347,19 +4147,14 @@ describe('gatherInvokeResults', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * A Kysely stand-in that RECORDS what the real `ExecutionTracker` writes.
- *
- * These cases run the production tracker rather than a `vi.fn()` stub on
- * purpose: all three fields fail silently when unthreaded, and asserting that
- * `onExecutionStarted` was called with a value would pass just as happily
- * against a recorder that dropped it on the floor. Capturing the row payload
- * the tracker actually builds closes that gap.
+ * RECORDS what the real `ExecutionTracker` writes. The production tracker,
+ * not a `vi.fn()` stub: all three fields fail silently when unthreaded, and a
+ * call assertion passes against a recorder that drops them.
  */
 function makeRecordingRunDb() {
   const runInserts: Array<Record<string, unknown>> = [];
   const runUpdates: Array<{ set: Record<string, unknown>; runId: string | undefined }> = [];
-  // Ordered log of everything that touched `execution_runs`, so a test can
-  // assert WHEN the chain-depth write landed and not merely that it did.
+  // Ordered `execution_runs` log, to assert WHEN the chain-depth write landed.
   const ops: RunRowOp[] = [];
 
   const db: Record<string, unknown> = {
@@ -4381,17 +4176,14 @@ function makeRecordingRunDb() {
         if (table === 'execution_runs') {
           runInserts.push(v);
           ops.push('insert');
-          // A pre-dispatch site carries the depth ON the insert (it writes the
-          // row and returns), so the ordering assertions see one op kind
-          // whichever path put the value there.
+          // Pre-dispatch sites put the depth ON the insert, so ordering sees one op kind.
           if ('chain_depth' in v) ops.push('chain-depth-write');
         }
         return {
           onConflict: () => ({
             execute: async () => undefined,
-            // `recordInitFailureRun` reads the write back through
-            // `guardedWriteApplied` and suppresses its forward when nothing
-            // landed, so the stub has to report that the row DID land.
+            // `recordInitFailureRun` suppresses its forward unless
+            // `guardedWriteApplied` sees the row land.
             executeTakeFirst: async () => ({ numInsertedOrUpdatedRows: 1n }),
           }),
           execute: async () => undefined,
@@ -4449,11 +4241,7 @@ function makeRecordingRunDb() {
 type RunRowOp =
   'insert' | 'update' | 'chain-depth-write' | 'trust-tier-write' | 'dispatch' | 'gate-read';
 
-/**
- * The run row as it stands after a dispatch: the INSERT payload with every
- * subsequent UPDATE merged onto it — i.e. exactly what a later reader of
- * `execution_runs` would see.
- */
+/** The run row after dispatch (INSERT plus merged UPDATEs), as a later reader sees it. */
 function settledRunRow(
   runInserts: Array<Record<string, unknown>>,
   runUpdates: Array<{ set: Record<string, unknown>; runId: string | undefined }>,
@@ -4467,9 +4255,8 @@ function settledRunRow(
 }
 
 /**
- * A Kysely stand-in that serves `releaseInvokeGate` the run row a dispatch
- * actually wrote, appending its read to the SAME ordered op log — so the gate's
- * chain-depth read can be placed relative to the dispatch's chain-depth write.
+ * Serves `releaseInvokeGate` the dispatched run row, logging its read in the
+ * SAME op log to order it against the chain-depth write.
  */
 function makeGateReadDb(row: Record<string, unknown>, ops: RunRowOp[]): unknown {
   return {
@@ -4496,10 +4283,7 @@ function makeGateReadDb(row: Record<string, unknown>, ops: RunRowOp[]): unknown 
   };
 }
 
-/**
- * Dispatch a single-job workflow through the REAL `ExecutionTracker`, returning
- * everything it wrote plus the run contexts it forwarded.
- */
+/** Dispatches through the REAL `ExecutionTracker`; returns its writes and forwarded run contexts. */
 async function dispatchWithRealTracker(
   over: Partial<
     Pick<
@@ -4513,11 +4297,7 @@ async function dispatchWithRealTracker(
       | 'lockFileSource'
     >
   >,
-  /**
-   * Harness knobs that shape the WORKFLOW rather than the context — used to
-   * drive the install-gate hold, which needs a workflow that declares
-   * `installEnv:` plus a context whose protection rules return `wait`.
-   */
+  /** WORKFLOW knobs for the install-gate hold (`installEnv:` plus a context returning `wait`). */
   harness: {
     installEnv?: string[];
     jobContext?: string;
@@ -4543,16 +4323,13 @@ async function dispatchWithRealTracker(
     ...(harness.installEnv && { secretResolver: { resolve: async () => null } }),
   });
   if (harness.installEnv) {
-    // The lock file holds the same workflow object, so one assignment is seen
-    // by both `ctx.workflow` and `ctx.fullLockFile.workflows[0]`.
+    // Same object in `ctx.workflow` and `ctx.fullLockFile.workflows[0]`.
     (ctx.workflow as { installEnv?: readonly string[] }).installEnv = harness.installEnv;
   }
   Object.assign(ctx, over);
 
-  // Record the moment a job actually reaches an agent, in the SAME stream as the
-  // run-row writes. Ordering assertions about "before anything could read it
-  // back" are otherwise unfalsifiable: a write that lands after dispatch appears
-  // in the stream exactly like one that lands before it.
+  // Log agent dispatch in the SAME stream as run-row writes, or "written
+  // before dispatch" is unfalsifiable.
   const inner = ctx.deps.dispatcher.dispatch.bind(ctx.deps.dispatcher);
   (ctx.deps.dispatcher as { dispatch: unknown }).dispatch = async (input: QueuedJobInput) => {
     ops.push('dispatch');
@@ -4587,10 +4364,9 @@ describe('dispatchMatchedWorkflow — internal-trigger context fields', () => {
 
     expect(runInserts.length).toBeGreaterThan(0);
     const decision = JSON.parse(String(runInserts[0].trigger_decision)) as Record<string, unknown>;
-    // The flag `EventRouter.isFailureLifecycleRun` reads back...
+    // The flag `EventRouter.isFailureLifecycleRun` reads...
     expect(decision.dispatchedByFailureLifecycle).toBe(true);
-    // ...alongside everything the decision summary already carried. A replace
-    // rather than a merge would silently drop the match provenance.
+    // ...merged (not replaced) with the summary, keeping match provenance.
     expect(decision.matched).toBe(true);
     expect(decision.workflowName).toBe('ci');
   });
@@ -4621,8 +4397,7 @@ describe('dispatchMatchedWorkflow — internal-trigger context fields', () => {
     ['an empty', ''],
     ['a whitespace-only', '   '],
   ])('treats %s override as unstated and falls back to the derived event', async (_label, ov) => {
-    // A blank string is not a stated value. `??` alone would let it through,
-    // and the run's only answer to "what fired this?" would render as nothing.
+    // A blank string is not a value; `??` alone lets it render "what fired this?" empty.
     const { forwarded } = await dispatchWithRealTracker({ triggerEventOverride: ov });
 
     expect(forwarded.length).toBeGreaterThan(0);
@@ -4635,13 +4410,10 @@ describe('dispatchMatchedWorkflow — internal-trigger context fields', () => {
 // ---------------------------------------------------------------------------
 
 describe('dispatchMatchedWorkflow — a run recorded before dispatch keeps its chain depth', () => {
-  // These four sites (install-gate hold, trust-policy hold, trust-policy
-  // reject, init-failure skip) write their `execution_runs` row and RETURN, so
-  // no later dispatch step stamps anything for them. A hold is resumable, so a
-  // summoned run held here goes on to fire its own invoke gate — and a lost
-  // depth reads as `0`, i.e. "starts a chain", so the circuit breaker fails
-  // OPEN. Asserting the row payload (not a mock call) is the point: a recorder
-  // that dropped the field would satisfy a call assertion just as happily.
+  // Install-gate hold, trust-policy hold/reject and init-failure skip write
+  // their row and RETURN, so nothing later stamps them. A resumed summoned run
+  // fires its own invoke gate, and a lost depth reads `0` ("starts a chain"),
+  // failing the breaker OPEN. Assert the row payload, not a mock call.
 
   it('stamps the depth on the row a trust-policy HOLD inserts', async () => {
     const { ctx, runInserts } = await dispatchWithRealTracker({
@@ -4655,10 +4427,8 @@ describe('dispatchMatchedWorkflow — a run recorded before dispatch keeps its c
   });
 
   it('stamps the depth on the row the INSTALL GATE hold inserts', async () => {
-    // The requirement's own worked example: a summoned run held by the install
-    // gate. This site is reached through a different branch from the
-    // trust-policy hold (`resolveWorkflowInstallSecrets` → `held`), so covering
-    // one says nothing about the other.
+    // A summoned run held by the install gate, a different branch from the
+    // trust-policy hold (`resolveWorkflowInstallSecrets` → `held`).
     const { ctx, runInserts } = await dispatchWithRealTracker(
       { chainDepth: 4 },
       { installEnv: ['prod:NPM_TOKEN'], jobContext: 'prod', contextWaitTimerSeconds: 600 },
@@ -4671,11 +4441,10 @@ describe('dispatchMatchedWorkflow — a run recorded before dispatch keeps its c
   });
 
   it('stamps the depth on the row a build failure BEFORE tracking inserts', async () => {
-    // The fifth site. Its row is terminal with no resume path, so no gate ever
-    // reads this depth back — it is stamped because the row is the run's only
-    // record, and one saying 0 claims to have started the chain it died inside.
-    // Reached only when the build throws before the run was registered, which
-    // is why `ensureBuild` never calls its closure here.
+    // Terminal with no resume, so no gate reads the depth; it is stamped because
+    // the row is the run's only record, and 0 would claim it started the chain.
+    // Reached only when the build throws before registration (`ensureBuild`
+    // never calls its closure).
     const { db, runInserts } = makeRecordingRunDb();
     const tracker = new ExecutionTracker({ db: db as unknown as Kysely<Database> });
     const { ctx } = makeSingleJobContext({
@@ -4727,11 +4496,9 @@ describe('dispatchMatchedWorkflow — a run recorded before dispatch keeps its c
     ['hold', () => holdDecision(SecurityHoldReason.enum.workflow_modification)],
     ['reject', () => rejectDecision(SecurityHoldReason.enum.fork_pr)],
   ])('records the failure-lifecycle marker on the row a %s inserts', async (_label, decision) => {
-    // The HELD case is the load-bearing one: the run resumes onto this same
-    // row, completes, and its completion is what a `workflows_failed_batch`
-    // accumulator would otherwise fold back into the batch that spawned it.
-    // The reject case records it for consistency — that path emits no
-    // completion event today.
+    // HELD is load-bearing: the resumed run completes on this row, and a
+    // `workflows_failed_batch` accumulator would fold it into its spawning
+    // batch. Reject records it for consistency (it emits no completion event).
     const { ctx, runInserts } = await dispatchWithRealTracker({
       dispatchedByFailureLifecycle: true,
       securityDecision: decision() as unknown as TrustPolicyOutcome,
@@ -4753,7 +4520,7 @@ describe('dispatchMatchedWorkflow — a run recorded before dispatch keeps its c
 });
 
 describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate that reads it', () => {
-  /** A `releaseInvokeGate` tracker stand-in — it only has to not get in the way. */
+  /** An inert `releaseInvokeGate` tracker. */
   function gateTrackerStub() {
     return {
       findSyntheticJobId: vi.fn().mockResolvedValue(undefined),
@@ -4762,14 +4529,10 @@ describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate th
   }
 
   it('a gate released after a HELD dispatch reads the stamped depth and refuses to summon', async () => {
-    // The end-to-end statement of the invariant, as ONE chain: the run is held
-    // (so the depth arrives on the pre-dispatch INSERT, not via
-    // `stampChainDepth`'s update), the row is settled exactly as a reader would
-    // see it, and the real breaker reads it back. That is the requirement's own
-    // worked example — a summoned run held by a gate, released, firing its own
-    // gate. Lose the write and the breaker reads 0, summons, and the recursion
-    // is unbounded — so this fails LOUDLY (summon called) rather than
-    // vacuously.
+    // One chain: the held run's depth arrives on the pre-dispatch INSERT (not
+    // `stampChainDepth`), the settled row is read back by the real breaker.
+    // Lose the write and the breaker reads 0 and summons (unbounded
+    // recursion), so this fails LOUDLY.
     const { ctx, runInserts, runUpdates, ops } = await dispatchWithRealTracker({
       chainDepth: 3,
       securityDecision: holdDecision(SecurityHoldReason.enum.workflow_modification),
@@ -4816,12 +4579,10 @@ describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate th
   });
 
   it('stamps the trust tier before any job reaches an agent', async () => {
-    // The relay reads `execution_runs.trust_tier` to decide whether a run may
-    // use its declared git credentials, and a NULL reads LENIENTLY. The later
-    // `recordRunStart` write runs after the dispatch loop and is fire-and-forget,
-    // so without this pre-dispatch stamp a fork pull request is served its
-    // declared credentials for the whole dispatch window — and forever if that
-    // write fails.
+    // The relay gates declared git credentials on `execution_runs.trust_tier`,
+    // and NULL reads LENIENTLY. `recordRunStart` is post-dispatch and
+    // fire-and-forget, so without this stamp a fork PR gets credentials for the
+    // dispatch window, and forever if that write fails.
     const { ops, runUpdates } = await dispatchWithRealTracker({
       trustResolution: {
         tier: 'unknown',
@@ -4831,34 +4592,25 @@ describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate th
 
     const stamp = ops.indexOf('trust-tier-write');
     const dispatch = ops.indexOf('dispatch');
-    // Non-vacuity: BOTH markers must be present, or `indexOf` returning -1
-    // would satisfy the ordering by accident.
+    // Both markers present, or `indexOf` -1 satisfies the ordering by accident.
     expect(stamp).toBeGreaterThanOrEqual(0);
     expect(dispatch).toBeGreaterThanOrEqual(0);
-    // The load-bearing assertion. `recordRunStart` also writes this column, so a
-    // check against the row insert alone would pass on that later write too —
-    // which is exactly the fire-and-forget, post-dispatch write this stamp
-    // exists to front-run.
+    // Load-bearing: `recordRunStart` writes this column too, so checking the
+    // insert alone would pass on the post-dispatch write this stamp front-runs.
     expect(stamp).toBeLessThan(dispatch);
 
-    // Positive control, and it pins WHICH write satisfied the ordering. Both
-    // writes carry the same columns, so a column check no longer separates
-    // them — order does, and both must be present: the pre-dispatch stamp
-    // first, `recordRunStart`'s later write second.
+    // Positive control pinning WHICH write: same columns, so order separates
+    // them; the stamp first, `recordRunStart` second, both present.
     const tierWrites = runUpdates.filter((u) => 'trust_tier' in u.set);
     expect(tierWrites.length).toBeGreaterThanOrEqual(2);
     expect(tierWrites[0].set.trust_tier).toBe('unknown');
   });
 
   it('stamps the lock-file source in that same write, never a tier on its own', async () => {
-    // `lock_file_source` is the column recording that a fork's own workflow
-    // definitions were NOT the ones evaluated, and every reader renders a NULL
-    // as "no reduced-privilege posture" rather than as "unknown" — the same
-    // lenient read the tier stamp above exists to close. Stamping the tier
-    // alone therefore closed one lenient NULL by opening a window on another:
-    // for the whole dispatch window the row reported a resolved `unknown` tier
-    // with no lock source, which is the one state a fork pull request must
-    // never be observed in.
+    // `lock_file_source` records that a fork's own definitions were NOT
+    // evaluated; readers render NULL as "no reduced-privilege posture", the
+    // same lenient read. Stamped with the tier, or the row shows a resolved
+    // `unknown` tier with no lock source, a state a fork PR must never show.
     const { runUpdates, ops } = await dispatchWithRealTracker({
       trustResolution: {
         tier: 'unknown',
@@ -4867,9 +4619,7 @@ describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate th
       lockFileSource: 'base',
     });
 
-    // Non-vacuity, and it names the write under test: the FIRST write to carry
-    // the tier is the pre-dispatch stamp, and it must land before any job
-    // reaches an agent.
+    // The FIRST write carrying the tier is the stamp, before any job reaches an agent.
     const stamped = runUpdates.find((u) => 'trust_tier' in u.set);
     expect(stamped).toBeDefined();
     expect(ops.indexOf('trust-tier-write')).toBeLessThan(ops.indexOf('dispatch'));
@@ -4880,11 +4630,9 @@ describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate th
   });
 
   it('writes no lock_file_source for a dispatch that selects no lock-file branch', async () => {
-    // The control for the case above, and it is what stops the fix from being
-    // "always write a constant". An internal event and a CLI test run resolve a
-    // tier but select no lock-file branch, so their `lockFileSource` is
-    // `undefined` — the column must stay absent from the statement rather than
-    // being written as a value or as an explicit NULL.
+    // Control against "always write a constant": internal events and CLI test
+    // runs select no lock-file branch (`lockFileSource` undefined), so the
+    // column is absent, not a value or explicit NULL.
     const { runUpdates } = await dispatchWithRealTracker({
       trustResolution: {
         tier: 'trusted',
@@ -4899,13 +4647,10 @@ describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate th
   });
 
   it('stamps the trust context on the run the BUILD path registers, too', async () => {
-    // The sibling early-registration site, and the one `startRunBeforeDispatch`
-    // hands off to: a workflow needing a source pack registers the run with the
-    // `__build__` job alone and then awaits the build, so it returns false from
-    // `startRunBeforeDispatch` and never reached the stamp at all. Its row
-    // therefore carried no trust context of any kind — not the tier either —
-    // for the whole build plus static-dispatch window, which is a longer window
-    // than the one above and covers the job that clones the repository.
+    // The sibling site `startRunBeforeDispatch` hands off to (returning false):
+    // a source-pack workflow registers with `__build__` alone and awaits it. It
+    // must stamp trust context too, or the row has none for the build plus
+    // static-dispatch window, which covers the job cloning the repository.
     const { db, runInserts, runUpdates, ops } = makeRecordingRunDb();
     const tracker = new ExecutionTracker({ db: db as unknown as Kysely<Database> });
     const { ctx, dispatched } = makeSingleJobContext({
@@ -4923,9 +4668,7 @@ describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate th
       contributorUsername: 'outside-contributor',
     } as WorkflowDispatchContext['trustResolution'];
     ctx.lockFileSource = 'base';
-    // Record only the workflow's OWN jobs: the `__build__` job is dispatched
-    // before the run row exists at all, so no stamp can precede it and an
-    // assertion that tried would be asserting the impossible.
+    // Only the workflow's OWN jobs: `__build__` dispatches before the row exists.
     const inner = ctx.deps.dispatcher.dispatch.bind(ctx.deps.dispatcher);
     (ctx.deps.dispatcher as { dispatch: unknown }).dispatch = async (input: QueuedJobInput) => {
       if (!input.jobName.startsWith('__build__')) ops.push('dispatch');
@@ -4934,8 +4677,7 @@ describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate th
 
     await dispatchMatchedWorkflow(ctx);
 
-    // Non-vacuity: this really is the build path (the build job went out), the
-    // row really was inserted by it, and a real job really was dispatched.
+    // Non-vacuity: build path taken, row inserted, a real job dispatched.
     expect(dispatched.map((d) => d.jobName)).toContain('__build__ci');
     expect(runInserts.find((r) => r.run_id === ctx.runId)).toBeDefined();
     const stamp = ops.indexOf('trust-tier-write');
@@ -4950,10 +4692,8 @@ describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate th
   });
 
   it('stamps the depth immediately after the row exists, before anything reads it back', async () => {
-    // The ordering half the case above cannot see: `stampChainDepth` is called
-    // per recording site, NOT once at the end of dispatch. A refactor that
-    // deferred it would still satisfy "write before the later gate read" while
-    // leaving every in-dispatch reader looking at 0.
+    // `stampChainDepth` runs per recording site, NOT at dispatch end; deferring
+    // it still passes "write before gate read" but in-dispatch readers see 0.
     const { ops } = await dispatchWithRealTracker({ chainDepth: 4 });
 
     const insert = ops.indexOf('insert');
@@ -4965,10 +4705,9 @@ describe('dispatchMatchedWorkflow — the chain-depth stamp precedes the gate th
 
 describe('a fork-PR hold, held and released end to end', () => {
   /**
-   * The seam the other fork-hold cases each cover one side of: they assert what
-   * the hold STORES and what the resume PASSES to a mocked dispatch. This joins
-   * them with the real `dispatchMatchedWorkflow` on both ends, so "approving a
-   * fork PR runs the workflow" is asserted rather than inferred from two halves.
+   * Joins the fork-hold halves (what the hold STORES, what resume PASSES) with
+   * the real `dispatchMatchedWorkflow` on both ends, asserting "approving a
+   * fork PR runs the workflow".
    */
   it('dispatches the workflow on approval, still under the untrusted tier', async () => {
     clearPendingWorkflowContextsMap();
@@ -5002,22 +4741,18 @@ describe('a fork-PR hold, held and released end to end', () => {
     } as unknown as WorkflowDispatchContext['trustResolution'];
     ctx.lockFileSource = 'base';
 
-    // 1. The policy holds. Nothing dispatches — this is the state the bug left
-    //    the run in permanently.
+    // 1. The policy holds; nothing dispatches.
     const heldResult = await dispatchMatchedWorkflow(ctx);
     expect(heldResult.held).toBe(true);
     expect(dispatched).toHaveLength(0);
 
-    // 2. Force the JSON round trip the in-memory Map skips. A hold routinely
-    //    outlives the process that wrote it, so in production the context
-    //    reaches the resume as a `pending_workflow_contexts` row — round-trip
-    //    it here so the assertions below cannot pass on shared object identity.
+    // 2. Force the JSON round trip (a hold outlives its process, so resume reads
+    //    a `pending_workflow_contexts` row), ruling out shared object identity.
     const stored = await loadPendingWorkflowContext(undefined, ctx.runId);
     expect(stored).not.toBeNull();
     await storePendingWorkflowContext(undefined, JSON.parse(JSON.stringify(stored)));
 
-    // 3. `/kici approve` releases the hold. The real resume rebuilds the
-    //    context and re-enters the real dispatch.
+    // 3. `/kici approve`: the real resume rebuilds the context and re-enters dispatch.
     (ctx.deps as unknown as Record<string, unknown>).providerRegistry = {
       getByRoutingKey: () => ({ normalizer: { provider: 'local' } }),
     };
@@ -5034,21 +4769,17 @@ describe('a fork-PR hold, held and released end to end', () => {
       undefined,
     );
 
-    // The gated work RAN: a job reached the dispatcher, and the held run row was
-    // flipped back off `held` on the way.
+    // The gated work RAN, and the run row left `held`.
     expect(dispatched.length).toBeGreaterThan(0);
     expect(dispatched[0].jobName).toBe('build');
     expect(resumeHeldRun).toHaveBeenCalledWith(ctx.runId);
 
-    // …and it ran UNTRUSTED. Approval means "let it run", never "make it
-    // trusted": the replay short-circuits the trust gate rather than
-    // re-resolving it, so the tier stamped on the run is the one the hold
-    // stored, and no second hold was created.
+    // …UNTRUSTED: approval means "let it run", never "make it trusted". The
+    // replay skips the trust gate, keeps the stored tier, and creates no second hold.
     expect(setRunTrustContext).toHaveBeenCalledWith(ctx.runId, 'unknown', 'base');
     expect(create).toHaveBeenCalledTimes(1);
 
-    // The context is consumed, so a re-fired release is inert rather than a
-    // second dispatch.
+    // The context is consumed: a re-fired release is inert.
     expect(await loadPendingWorkflowContext(undefined, ctx.runId)).toBeNull();
   });
 
@@ -5107,9 +4838,8 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   const UNTRUSTED_TIER = 'unknown';
 
   it('threads the real tier into the security-hold summary and carries the posture note', async () => {
-    // A trust-policy hold stores a resume context, so `/kici approve` replays
-    // the dispatch under this same trust resolution. The check must therefore
-    // describe the posture the resumed run really executes under.
+    // `/kici approve` replays under this trust resolution, so the check
+    // describes the posture the resumed run executes under.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: {
@@ -5139,16 +4869,13 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
     expect(holdCall).toBeDefined();
     expect(String(holdCall![4])).toContain(`(tier: ${UNTRUSTED_TIER})`);
     expect(String(holdCall![4])).toContain(REDUCED_PRIVILEGE_MARKER);
-    // `lockFileSource` is 'base' above, so the note's base-branch clause is the
-    // half that can only come from the run's own recorded source.
+    // `lockFileSource` is 'base': the base-branch clause can only come from the recorded source.
     expect(String(holdCall![4])).toContain('read from the base branch');
   });
 
   it('leaves the posture note off the trust-policy rejection check', async () => {
-    // The control for the case above: identical tier and lock source, opposite
-    // verdict. A rejected run is never dispatched, so a note there would promise
-    // reductions for a run that does not happen — and its absence proves the
-    // hold's note comes from that call site rather than from every check.
+    // Control: same tier and source, reject verdict. A rejected run never
+    // dispatches, so no note; this proves the note comes from the hold site.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: {
@@ -5176,8 +4903,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('stamps the real tier and lock-file source onto the tracked run', async () => {
-    // The in-memory mirror of the two `execution_runs` columns this same site
-    // writes. Without it a job's completion check has no posture to name.
+    // In-memory mirror of this site's two `execution_runs` columns, for completion checks.
     const setRunTrustContext = vi.fn();
     const { ctx } = makeSingleJobContext({
       bundle: undefined,
@@ -5202,10 +4928,8 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('still records the rest of the run when the stamp cannot be applied', async () => {
-    // Every post-start write in `recordRunStart` is best-effort — the two DB
-    // updates beside the stamp each carry their own `.catch()`. A tracker
-    // without the method must therefore cost only the note, not the trust
-    // columns, the test-run stamp, or the dispatch itself.
+    // `recordRunStart`'s post-start writes are best-effort (each `.catch()`es):
+    // a tracker without the method costs only the note.
     const { ctx, dispatched } = makeSingleJobContext({
       bundle: undefined,
       executionTracker: {
@@ -5246,10 +4970,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
     return call ? String(call[4]) : undefined;
   }
 
-  /**
-   * A context whose `minimum_trust` no untrusted fork can satisfy, so the
-   * per-env gate raises a security-typed job hold.
-   */
+  /** `minimum_trust` no fork satisfies, so the per-env gate raises a security-typed hold. */
   function minimumTrustContextStore(): unknown {
     return {
       matchContext: async (_org: string, n: string) =>
@@ -5281,9 +5002,8 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   }
 
   /**
-   * The store + database + tracker a hold needs to actually persist. Without
-   * all three `holdJobForApproval` returns before writing anything, which is
-   * exactly the case the check post must not fire in.
+   * Store, database and tracker: without all three `holdJobForApproval`
+   * writes nothing, and the check post must not fire.
    */
   function holdPersistenceStubs(): {
     heldRunStore: unknown;
@@ -5300,8 +5020,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
     };
     return {
       heldRunStore: {
-        // Distinct ids: a job carrying both an approval hold and a
-        // non-approval one writes BOTH rows, and the two are told apart here.
+        // Distinct ids: a job with approval and non-approval holds writes BOTH rows.
         createHold: vi.fn().mockResolvedValue({ id: 'held-approval' }),
         create: vi.fn().mockResolvedValue({ id: 'held-nonapproval' }),
         markPendingCheckPosted: vi.fn().mockResolvedValue(undefined),
@@ -5345,9 +5064,8 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   }
 
   it('names the posture on a per-context minimum-trust hold, which resumes', async () => {
-    // `holdJobForApproval` writes this hold's pending dispatch context, so
-    // release re-dispatches the job under the same untrusted tier — unlike the
-    // trust-policy hold, whose sentinel job id has no stored context.
+    // Unlike the trust-policy hold (sentinel job id, no context), this stores a
+    // pending context, so release re-dispatches under the same untrusted tier.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: {
@@ -5370,11 +5088,9 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('posts no pending security check when the hold row cannot be written', async () => {
-    // Identical to the case above except that nothing persists the hold: with
-    // no `heldRunStore`, `holdJobForApproval` logs and returns before the
-    // transaction. Every route that terminalizes a `KiCI Security` check
-    // reaches it through that row, so a pending post here would sit on the
-    // commit forever — a permanent branch-protection blocker.
+    // No `heldRunStore`: `holdJobForApproval` returns before the transaction.
+    // `KiCI Security` checks terminalize only via that row, so a pending post
+    // would permanently block branch protection.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: {
@@ -5392,9 +5108,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('posts no pending security check when the hold transaction rolls back', async () => {
-    // The store and the database are both present, so the gate is reached and
-    // the write is attempted — and it throws. The row is gone with the
-    // transaction, so the check must not be on the commit either.
+    // The write is attempted and throws; the row rolls back, so no check either.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const stubs = holdPersistenceStubs();
     const { ctx } = makeSingleJobContext({
@@ -5422,15 +5136,10 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('completes the queued kici/… checks when the hold transaction rolls back', async () => {
-    // The `KiCI Security` check above is a different check run from the queued
-    // `kici/<workflow>` and per-job ones the setup phase posted. Those are
-    // already on the commit when the transaction throws, and the throw reaches
-    // none of the named early exits that complete their own — so without this
-    // they stay `queued` forever and block branch protection.
-    //
-    // Asserted through a real throw rather than by calling the helper: the
-    // condition is "the checks were posted and the dispatch threw", and only
-    // driving the dispatch proves the catch is wired to it.
+    // Setup's queued `kici/<workflow>` and per-job checks (distinct from
+    // `KiCI Security`) are on the commit when the transaction throws, and no
+    // early exit completes them, so they would block branch protection forever.
+    // A real throw, not a helper call, proves the catch is wired.
     const setPendingAwait = vi.fn().mockResolvedValue(undefined);
     const completeUndispatchedCheckRuns = vi.fn().mockResolvedValue(undefined);
     const stubs = holdPersistenceStubs();
@@ -5452,7 +5161,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
         }),
       },
     });
-    // The completion refuses an identifier it cannot split into owner/repo.
+    // The completion needs a splittable owner/repo.
     ctx.repoIdentifier = 'acme/app';
     untrustedFork(ctx);
 
@@ -5462,18 +5171,15 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
     expect(completeUndispatchedCheckRuns).toHaveBeenCalledTimes(1);
     const call = completeUndispatchedCheckRuns.mock.calls[0][0];
     expect(call.conclusion).toBe(CheckRunConclusion.enum.failure);
-    // The same names the setup phase posted — a conclusion under a different
-    // name would create a second check rather than close the first.
+    // Setup's names: a different name creates a second check instead of closing.
     expect(call.jobNames).toEqual(setPendingAwait.mock.calls[0][0].jobNames);
     expect(call.workflowName).toBe(setPendingAwait.mock.calls[0][0].workflowName);
     expect(String(call.summary)).toContain('deadlock detected');
   });
 
   it('completes no checks when the throw lands before they are posted', async () => {
-    // The negative control for the flag. `setupDispatchContext` posts the
-    // checks; a throw from inside `setPendingAwait` itself means nothing is on
-    // the commit, and concluding then would CREATE the very check run it claims
-    // to be closing — a fabricated failing check on a pull request.
+    // Negative control: a throw inside `setPendingAwait` means nothing was
+    // posted, and concluding would CREATE a fabricated failing check.
     const setPendingAwait = vi.fn().mockRejectedValue(new Error('provider 502'));
     const completeUndispatchedCheckRuns = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
@@ -5488,10 +5194,8 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   /**
-   * `holdPersistenceStubs`' database, wrapped so the transaction handle it
-   * hands the callback is captured. The hold row and the job's pending dispatch
-   * context are written together on purpose; asserting the row went through
-   * THIS handle is what proves they can still roll back together.
+   * Captures the transaction handle: the row going through THIS handle proves
+   * it rolls back with the pending context.
    */
   function captureTransactionHandle(db: unknown): { db: unknown; handles: unknown[] } {
     const handles: unknown[] = [];
@@ -5514,10 +5218,8 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   }
 
   it('writes a reviewer hold row through the transaction that carries its resume path', async () => {
-    // Kysely has no ambient transaction: an insert left on the store's own
-    // connection commits regardless of what the `storePendingJobContext` write
-    // beside it does. The row would then survive a rolled-back context — a hold
-    // nothing can resume, which is precisely what writing them together avoids.
+    // Kysely has no ambient transaction: an insert on the store's own connection
+    // commits even if the context write rolls back, leaving an unresumable hold.
     const stubs = holdPersistenceStubs();
     const captured = captureTransactionHandle(stubs.db);
     const { ctx } = makeSingleJobContext({
@@ -5536,8 +5238,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('writes a security hold row through the transaction that carries its resume path', async () => {
-    // The other arm of the same write: a security-typed context gate takes
-    // `create` rather than `createHold`, and carries the same pending context.
+    // The other arm: a security-typed context gate uses `create`, same pending context.
     const stubs = holdPersistenceStubs();
     const captured = captureTransactionHandle(stubs.db);
     const { ctx } = makeSingleJobContext({
@@ -5563,10 +5264,9 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   }
 
   it('records on the hold row that its pending security check reached the provider', async () => {
-    // The settle reads this record to decide whether the hold has a check to
-    // terminalize. Without it the decision falls back to the row's SHAPE, which
-    // says what the post was MEANT to do — and terminalizing a check that was
-    // never posted creates one, on a commit that never carried it.
+    // The settle reads this record to decide whether to terminalize a check;
+    // the row's SHAPE says only what was MEANT, and terminalizing an unposted
+    // check creates one.
     const order: string[] = [];
     const postCheckStatus = vi.fn().mockImplementation(async () => {
       order.push('post');
@@ -5590,16 +5290,12 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
 
     expect(heldSummary(postCheckStatus)).toBeDefined();
     expect(markMock(stubs)).toHaveBeenCalledWith('__default__', ['held-nonapproval']);
-    // The record goes SECOND. Recording first and dying before the post would
-    // leave a row claiming a check the commit does not have, and the settle
-    // would then create one — the fabrication this record exists to prevent.
+    // Record SECOND: recording first then dying before the post makes the settle fabricate a check.
     expect(order).toEqual(['post', 'record']);
   });
 
   it('records nothing when the provider refuses the pending security check', async () => {
-    // The case the shape derivation answered wrong. The post failed, so the
-    // commit has no `KiCI Security` run — and the record has to say so, or the
-    // settle fabricates one when the hold ends.
+    // The post failed, so the record must say so, or the settle fabricates a `KiCI Security` run.
     const postCheckStatus = vi.fn().mockRejectedValue(new Error('403 from the provider'));
     const stubs = holdPersistenceStubs();
     const { ctx } = makeSingleJobContext({
@@ -5621,12 +5317,10 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('retries the record so a transient database error does not strand the check', async () => {
-    // The record is written AFTER the post, deliberately — the reverse order
-    // fabricates a check. So a failure between the two leaves a pending check
-    // no settle will close, and nothing sweeps it. Half that window is a
-    // transient database error, and a retry closes that half. Two failures
-    // then a success is pinned as a literal: a count derived from
-    // PENDING_CHECK_MARK_ATTEMPTS would move with it and still pass at 1.
+    // The record follows the post (the reverse fabricates a check), so a
+    // failure between them strands an unswept pending check; a retry covers
+    // transient DB errors. Two failures then a success is a literal: a count
+    // derived from PENDING_CHECK_MARK_ATTEMPTS would still pass at 1.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const stubs = holdPersistenceStubs();
     let calls = 0;
@@ -5652,8 +5346,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('gives up on the record without failing the dispatch', async () => {
-    // The give-up is bounded: the mark is best-effort by construction, and a
-    // dispatch that threw here would strand the hold as well as the check.
+    // Bounded give-up: the mark is best-effort; throwing would strand the hold too.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const stubs = holdPersistenceStubs();
     markMock(stubs).mockRejectedValue(new Error('connection terminated'));
@@ -5699,10 +5392,9 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   /**
-   * A job whose SDK `requireApproval` meets a security-typed context gate. The
-   * gate mints `nonApprovalHold`, and `applyStaticApprovalHolds` runs after it
-   * and mints `approvalHold` on a `!approvalHold` guard alone — so the job
-   * carries both.
+   * SDK `requireApproval` plus a security-typed context gate: the gate mints
+   * `nonApprovalHold`, then `applyStaticApprovalHolds` mints `approvalHold`
+   * (guarded on `!approvalHold` alone), so the job carries both.
    */
   function bothHoldsContext(postCheckStatus: ReturnType<typeof vi.fn>) {
     const stubs = holdPersistenceStubs();
@@ -5721,13 +5413,10 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   }
 
   it('writes BOTH hold rows for a job carrying a reviewer and a security hold', async () => {
-    // Two independent requirements gate one job, so both must be satisfied for
-    // it to run. Writing only the reviewer row did not merely lose a record —
-    // the trust gate went unenforced, and the reviewer hold releases on
-    // `contexts:write` plus clause eligibility where the trust hold required
-    // `ci_trust:write`. A lower permission was releasing a job the security
-    // gate held, and the resume short-circuits the trust gate rather than
-    // re-resolving trust.
+    // Two independent requirements, both required. Writing only the reviewer
+    // row leaves the trust gate unenforced: the reviewer hold releases on
+    // `contexts:write` plus clause eligibility, not `ci_trust:write`, and the
+    // resume skips re-resolving trust.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx, stubs } = bothHoldsContext(postCheckStatus);
 
@@ -5739,22 +5428,19 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
     };
     expect(store.createHold).toHaveBeenCalledTimes(1);
     expect(store.create).toHaveBeenCalledTimes(1);
-    // The security row keeps its own queue type, which is what scopes it to
-    // `/kici approve`'s `ci_trust:write` surface rather than the reviewer one.
+    // Its own queue type scopes it to `/kici approve`'s `ci_trust:write` surface.
     expect(store.create.mock.calls[0][1]).toMatchObject({
       holdType: HoldType.enum.security,
       queueType: 'security',
     });
-    // Both through the one transaction that also carries the resume context.
+    // Both in the transaction carrying the resume context.
     expect(store.createHold.mock.calls[0][2]).toBe(store.create.mock.calls[0][2]);
     expect(store.create.mock.calls[0][2]).toBeDefined();
   });
 
   it('posts one pending check for a job carrying both a reviewer and a security hold', async () => {
-    // Both post blocks used to fire into the one `KiCI Security` check run, so
-    // which summary a contributor read was decided by whichever provider call
-    // landed second. One post now, rendering the reviewer copy because it names
-    // concrete clauses a human can act on.
+    // One post into the single `KiCI Security` run (two would race on which
+    // summary lands), with the reviewer copy: it names actionable clauses.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx } = bothHoldsContext(postCheckStatus);
 
@@ -5770,15 +5456,10 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('records BOTH holds as owning the one check, in a single call', async () => {
-    // The commit has a single `KiCI Security` run and both holds gate it. If
-    // only the rendered row were recorded, the first hold to end would find no
-    // other owner in the contention query and terminalize the check —
-    // `success`, on an approve — while the other hold still gates the job.
-    // Branch protection would go green over held work.
-    //
-    // ONE call, not two: marking them separately admits a partial mark, whose
-    // survivor is exactly that unrecorded owner. The store turns the id list
-    // into one `WHERE id IN (…)`, so the pair lands atomically or not at all.
+    // Both holds gate the one `KiCI Security` run. Recording only one lets the
+    // first to end terminalize it (`success` on approve) while the other still
+    // gates: green branch protection over held work. ONE call: the store's
+    // `WHERE id IN (…)` marks the pair atomically, with no partial mark.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx, stubs } = bothHoldsContext(postCheckStatus);
 
@@ -5792,10 +5473,8 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('names the trust hold in the reviewer check description', async () => {
-    // Both holds gate the job and the commit carries one check run. Naming only
-    // the approval clauses leaves a contributor asking the named approver, the
-    // approver approving, the job not running, and the text unchanged — a
-    // satisfied requirement with no statement of what is still outstanding.
+    // One check run, two holds: naming only the approval clauses hides what is
+    // still outstanding after the approver approves.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx } = bothHoldsContext(postCheckStatus);
 
@@ -5810,9 +5489,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('says nothing about a trust hold on an approval-only job', async () => {
-    // The control: the line is conditional on a security hold actually existing,
-    // so an ordinary `requireApproval` check does not tell a contributor to go
-    // clear a gate that is not there.
+    // Control: the line appears only with a security hold, not on a plain `requireApproval`.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: {
@@ -5833,8 +5510,7 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('audits both holds it wrote, not just the one whose summary was posted', async () => {
-    // A hold an operator can be asked to approve, with no access-log entry
-    // saying it was raised, is a gap regardless of what was raised alongside it.
+    // Every approvable hold needs its own access-log entry.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const record = vi.fn().mockResolvedValue(undefined);
     const { ctx } = bothHoldsContext(postCheckStatus);
@@ -5852,9 +5528,8 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
   });
 
   it('names the posture on a reviewer-approval hold, which also resumes', async () => {
-    // The hold row and its pending dispatch context are written in one
-    // transaction, so approval re-dispatches the job under this run's own
-    // trust resolution. The note says what that resumed job will not have.
+    // Approval re-dispatches under this run's trust resolution (row and context
+    // share a transaction); the note says what the resumed job will not have.
     const postCheckStatus = vi.fn().mockResolvedValue(undefined);
     const { ctx } = makeSingleJobContext({
       bundle: {
@@ -5878,11 +5553,9 @@ describe('dispatchMatchedWorkflow — the run trust posture reaches its call sit
 });
 
 describe('evaluateJobContexts — a context concurrency limit counts siblings admitted in the same pass', () => {
-  // The running-count query counts jobs whose status is already `running`, and
-  // nothing dispatched in THIS pass is running yet — so before the in-pass
-  // tally every child of a fan-out was evaluated against the same unchanged
-  // number and all N were admitted against one slot. The static path gated each
-  // child individually and was still wrong for exactly this reason.
+  // Nothing dispatched in THIS pass is in the DB count yet, so without the
+  // in-pass tally every fan-out child (static path included) reads the same
+  // number and all N are admitted against one slot.
   const CONTEXT_ROW = {
     id: 'env-prod',
     org_id: '__default__',
@@ -5947,17 +5620,15 @@ describe('evaluateJobContexts — a context concurrency limit counts siblings ad
       deps: { contextStore: contextStore(2), db: makeCountingDb(0) },
     });
 
-    // Two slots, three children: the first two are admitted, the third is
-    // queued by the concurrency gate. Pre-fix all three passed.
+    // Two slots, three children: two admitted, the third queued.
     expect(jobContextData.get('build (a)')?.held).toBeUndefined();
     expect(jobContextData.get('build (b)')?.held).toBeUndefined();
     expect(jobContextData.get('build (c)')?.held).toBe(true);
   });
 
   it('adds the in-pass tally to the running count rather than replacing it', async () => {
-    // One job already running + a limit of 2 leaves exactly one free slot, so
-    // the FIRST child is admitted and the second is not. This fails if the
-    // tally is used alone (both admitted) or the DB count alone (both admitted).
+    // One running + limit 2 leaves one slot: only the FIRST child is admitted.
+    // Fails with the tally alone or the DB count alone (both admitted).
     const { jobContextData } = await runEvaluateJobContexts({
       lockJob: MATRIX_JOB,
       event: { type: 'push' },
@@ -5970,8 +5641,7 @@ describe('evaluateJobContexts — a context concurrency limit counts siblings ad
   });
 
   it('leaves a context with no concurrency limit unaffected', async () => {
-    // The control that proves the two assertions above are not vacuous: the
-    // same three children against an unlimited context all pass.
+    // Control: the same children against an unlimited context all pass.
     const { jobContextData } = await runEvaluateJobContexts({
       lockJob: MATRIX_JOB,
       event: { type: 'push' },
@@ -5999,22 +5669,18 @@ describe('evaluateJobContexts — a context concurrency limit counts siblings ad
   });
 
   it('does not spend an in-pass slot on a needs-gated job', async () => {
-    // A needs-gated job does not dispatch from this pass — the dispatch loop
-    // stores its pending context and the needs scheduler dispatches it later.
-    // Letting it reserve a slot is not merely conservative: a job the
-    // concurrency gate queues takes the hold branch, which the dispatch loop
-    // evaluates BEFORE the needs branch, so the job never reaches the needs
-    // scheduler and the queued-hold release path dispatches it with no upstream
-    // check — beside a still-pending upstream, or after a FAILED one.
-    const deployJob = {
-      _type: 'static' as const,
+    // A needs-gated job dispatches later via the needs scheduler, so it reserves
+    // no slot. If queued, it takes the hold branch (evaluated BEFORE the needs
+    // branch), and the queued-hold release dispatches it with no upstream check,
+    // beside a pending or FAILED upstream.
+    const deployJob = staticJob({
       name: 'deploy',
       runsOn: [{ kind: 'exact', value: 'default' }],
       steps: [{ name: 'echo', run: 'echo hi' }],
       needs: ['build'],
       rules: [],
       contexts: [{ value: 'prod' }],
-    };
+    });
     const { jobContextData } = await runEvaluateJobContexts({
       lockJob: MATRIX_JOB,
       event: { type: 'push' },
@@ -6022,13 +5688,12 @@ describe('evaluateJobContexts — a context concurrency limit counts siblings ad
       deps: { contextStore: contextStore(1), db: makeCountingDb(0) },
     });
 
-    // The root job takes the single slot. The needs-gated one is evaluated
-    // against the DB count alone, so it passes through to the needs scheduler.
+    // The root takes the slot; the needs-gated job sees the DB count alone and
+    // passes to the needs scheduler.
     expect(jobContextData.get('build')?.held).toBeUndefined();
     expect(jobContextData.get('deploy')?.held).toBeUndefined();
 
-    // Non-vacuity by construction: make the same second job a ROOT job and it
-    // IS held, so the assertion above can only hold because it is needs-gated.
+    // Non-vacuity: as a ROOT job the same second job IS held.
     const control = await runEvaluateJobContexts({
       lockJob: MATRIX_JOB,
       event: { type: 'push' },
@@ -6042,10 +5707,8 @@ describe('evaluateJobContexts — a context concurrency limit counts siblings ad
   });
 
   it('keys the admission tally by org id as well as concurrency group', async () => {
-    // The tally inherits the cross-tenant scoping the slot-count query
-    // already enforces on `execution_runs.customer_id`. One dispatch pass
-    // carries a single resolved org id, so this is asserted on the key builder
-    // directly — that is the only place the invariant is observable.
+    // The tally keeps the slot count's `execution_runs.customer_id` tenant
+    // scoping. A pass has one org id, so only the key builder shows it.
     expect(concurrencyAdmissionKey('org-a', 'prod')).not.toBe(
       concurrencyAdmissionKey('org-b', 'prod'),
     );
@@ -6055,12 +5718,9 @@ describe('evaluateJobContexts — a context concurrency limit counts siblings ad
   });
 
   describe('a dispatched job occupies its slot before it reports running', () => {
-    // The gate used to count only jobs whose status was already `running`.
-    // `execution_jobs.status` defaults to `pending`, so a job was invisible to
-    // the gate from the moment it was dispatched until its agent reported back
-    // — a window that includes agent provisioning and runs to minutes on a cold
-    // cloud agent. Every dispatch pass arriving inside it read an empty group,
-    // so five pushes into a limit-1 context admitted five jobs.
+    // `execution_jobs.status` defaults to `pending`, so counting only `running`
+    // misses jobs between dispatch and agent report (minutes on a cold cloud
+    // agent): five pushes into a limit-1 context would admit five jobs.
     const OTHER_RUN = 'run-other';
     const row = (over: Partial<SlotRow>): SlotRow => ({
       run_id: OTHER_RUN,
@@ -6082,22 +5742,18 @@ describe('evaluateJobContexts — a context concurrency limit counts siblings ad
     }
 
     it('holds a job when another run holds the only slot at status pending', async () => {
-      // The defect. The seeded job was dispatched and has not reported running,
-      // which is exactly the state the old predicate could not see.
+      // Dispatched, not yet reported running.
       expect((await gate([row({})]))?.held).toBe(true);
     });
 
     it('admits the same job when the group is empty', async () => {
-      // The control that makes the case above non-vacuous, and the promptness
-      // assertion: one run into an empty limit-1 group dispatches, unheld.
+      // Control and promptness: one run into an empty limit-1 group dispatches unheld.
       expect((await gate([]))?.held).toBeUndefined();
     });
 
     it('does not let a needs-pending placeholder occupy a slot', async () => {
-      // A job the dispatch pass held back is registered under a
-      // `needs-pending-` id so the run stays open for it. It has reached no
-      // agent, so it occupies nothing — and counting it meant a queued hold
-      // occupied the very slot that gates its own release.
+      // A held-back job is registered under a `needs-pending-` id; it reached no
+      // agent and occupies nothing, or a queued hold occupies its own release slot.
       const placeholder = row({ job_id: `${NEEDS_PENDING_JOB_ID_PREFIX}deploy-abcdef` });
       expect((await gate([placeholder]))?.held).toBeUndefined();
     });
@@ -6113,20 +5769,16 @@ describe('evaluateJobContexts — a context concurrency limit counts siblings ad
     });
 
     it('reads the slot count exactly once per gated job', async () => {
-      // Promptness has a second half: the widened predicate must not cost an
-      // extra database round trip per gate. The exclusion rides on the one
-      // count query rather than a second one.
+      // No extra round trip per gate: the exclusion rides on the one count query.
       const stats = { slotQueries: 0 };
       expect((await gate([], stats))?.held).toBeUndefined();
       expect(stats.slotQueries).toBe(1);
     });
 
     it('leaves no second definition of an occupied slot in the dispatch path', async () => {
-      // The three counting paths — this gate, the ready re-gate, and the
-      // release sweep — now read ONE definition. A private copy in the dispatch
-      // path is how they forked in the first place, so its absence is asserted
-      // structurally. The positive control below proves the read can see text
-      // in the file at all.
+      // This gate, the ready re-gate and the release sweep read ONE definition;
+      // a private copy in the dispatch path lets them fork. The positive
+      // control proves the read sees the file.
       const source = await readFile(
         new URL('./dispatch-matched-workflow.ts', import.meta.url),
         'utf8',
@@ -6202,10 +5854,8 @@ describe('resolveGeneratedJobConfigs gitCredentials', () => {
   });
 
   it('ignores a gitCredentials map arriving on the agent reply', async () => {
-    // The load-bearing case. `generatedJobs` is the agent's dynamic-eval reply,
-    // read out of `msg.data.dynamicJobs` as unvalidated JSON. A map taken from
-    // there would let job code name any credential in the org — exactly what
-    // authorizing against a server-side record exists to prevent.
+    // Load-bearing: `generatedJobs` is unvalidated agent JSON
+    // (`msg.data.dynamicJobs`); a map from it would let job code name any org credential.
     const FORGED = { default: { kind: 'token', tokenSecret: 'ci:ROOT_PAT' } };
     const out = await resolve({
       dynamicEntry: {
@@ -6225,20 +5875,17 @@ describe('resolveGeneratedJobConfigs gitCredentials', () => {
       dynamicEntry: { _type: 'dynamic', source: { file: 'ci.ts', index: 0 } },
       generatedJobs: [genLockJob('shard-a', { gitCredentials: FORGED })],
     });
-    // Nothing declared, so nothing is persisted, so the relay refuses every
-    // workflow-supplied ref — fail-closed, not "whatever the agent said".
+    // Nothing declared or persisted: the relay refuses every workflow ref (fail-closed).
     expect('gitCredentials' in out[0].genJobConfig).toBe(false);
     expect(out[0].gitCredentials).toBeUndefined();
   });
 });
 
 describe('dispatchMatchedWorkflow — a routed job carries the test-run provenance', () => {
-  // The coordinator persists a routed job through the BASE dispatcher (on this
-  // instance or a peer), so the dispatcher wrapper's extraJobConfig merge never
-  // runs for it. Wherever a coordinator routes jobs, every relayed `kici run
-  // remote` takes this path; without the bake it reaches the agent with no
-  // fullRepo / tarballUrl / isTestRun, and the agent clones an empty repoUrl
-  // instead of unpacking the overlay.
+  // A coordinator routes through the BASE dispatcher (here or a peer), skipping
+  // the wrapper's extraJobConfig merge, so every relayed `kici run remote`
+  // needs the bake, or the agent gets no fullRepo / tarballUrl / isTestRun and
+  // clones an empty repoUrl instead of unpacking the overlay.
   it('bakes ctx.extraJobConfig into the JobToRoute jobConfig', async () => {
     const routeJobs = vi.fn().mockResolvedValue({
       localJobs: [{ jobName: 'build', jobId: 'routed-1' }],

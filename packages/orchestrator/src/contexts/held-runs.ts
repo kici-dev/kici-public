@@ -59,7 +59,6 @@ export const SecurityHoldReason = z.enum([
 ]);
 export type SecurityHoldReason = z.infer<typeof SecurityHoldReason>;
 
-/** Data required to create a held run. */
 export interface CreateHeldRunData {
   runId: string;
   jobId: string;
@@ -151,7 +150,6 @@ export interface ReleaseSignal {
   triggerSource: TriggerSource;
 }
 
-/** Options for listing held runs. */
 export interface ListHeldRunsOptions {
   status?: string;
   limit?: number;

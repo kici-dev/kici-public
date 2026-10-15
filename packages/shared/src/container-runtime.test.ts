@@ -49,8 +49,7 @@ describe('pullImageIfMissing', () => {
     expect(await pullImageIfMissing({ docker, image: 'reg.internal:5000/a/b:1', authconfig })).toBe(
       true,
     );
-    // A private registry otherwise fails with a 401 that reads like a missing
-    // image.
+    // Without auth a private registry returns a 401 that reads like a missing image.
     expect(pull).toHaveBeenCalledWith('reg.internal:5000/a/b:1', { authconfig });
   });
 
@@ -65,8 +64,7 @@ describe('pullImageIfMissing', () => {
     expect(
       await pullImageIfMissing({ docker, image: 'acme/ci:latest', pullPolicy: 'Always' }),
     ).toBe(true);
-    // A label set on a MOVING tag sets Always; skipping the pull would run
-    // yesterday's bytes under today's tag.
+    // A moving tag sets Always; skipping the pull would run stale bytes under it.
     expect(pull).toHaveBeenCalled();
   });
 
@@ -75,8 +73,7 @@ describe('pullImageIfMissing', () => {
     expect(
       await pullImageIfMissing({ docker, image: 'locally-built:1', pullPolicy: 'Never' }),
     ).toBe(false);
-    // Never means the operator guarantees the image is present — an air-gapped
-    // host, or a locally-built image with no registry to pull from.
+    // Never: the operator guarantees the image is present (air-gapped host, local build).
     expect(pull).not.toHaveBeenCalled();
   });
 
@@ -101,8 +98,7 @@ describe('pullImageIfMissing', () => {
 
 describe('runtimeInjectBind', () => {
   it('mounts the runtime read-only at /opt/kici', () => {
-    // Writable would let a job rewrite the interpreter its own later steps run
-    // under.
+    // Writable would let a job rewrite the interpreter its later steps run under.
     expect(runtimeInjectBind('/var/lib/kici/runtime')).toBe(
       `/var/lib/kici/runtime:${RUNTIME_MOUNT}:ro`,
     );
@@ -205,10 +201,9 @@ function runtimeDocker(
     imageId?: string;
     logs?: string;
     /**
-     * Held instead of the populator's exit status, so a second caller can be
-     * made to arrive while the first is genuinely mid-populate. Without a gate
-     * the populator resolves immediately, the two never overlap, and a
-     * concurrency assertion passes with no mutex present.
+     * Holds the populator's exit status, so a second caller can arrive
+     * mid-populate. Without it the calls never overlap and a concurrency
+     * assertion passes with no mutex present.
      */
     populateGate?: Promise<{ StatusCode: number }>;
   } = {},
@@ -216,9 +211,7 @@ function runtimeDocker(
   const volumeInspect = opts.volumeExists
     ? vi.fn().mockResolvedValue({})
     : vi.fn().mockRejectedValue(new Error('no such volume'));
-  // Every teardown appends here, so a test can assert the ORDER two of them
-  // happen in — which is the whole content of "the populator is gone before
-  // the volume is reaped".
+  // Records teardown ORDER: "the populator is gone before the volume is reaped".
   const teardownOrder: string[] = [];
   const volumeRemove = vi.fn().mockImplementation(() => {
     teardownOrder.push('volume');
@@ -238,8 +231,7 @@ function runtimeDocker(
   });
   const logs = vi.fn().mockResolvedValue(Buffer.from(opts.logs ?? ''));
 
-  // Both the marker probe and the populator are containers; the copy is what
-  // tells them apart.
+  // The marker probe and the populator are both containers; the copy tells them apart.
   const probeWait = vi.fn().mockResolvedValue({
     StatusCode: (opts.volumePopulated ?? true) ? 0 : 1,
   });
@@ -274,7 +266,7 @@ function runtimeDocker(
     createContainer,
     volumeRemove,
     remove,
-    /** How many populator containers were created — 1 means the copy ran once. */
+    /** 1 means the copy ran once. */
     populatorCount: () => populatorArgs.length,
     populatorArg: () => populatorArgs[0],
     probeArg: () => probeArgs[0],
@@ -285,8 +277,8 @@ function runtimeDocker(
 
 describe('runtimeVolumeName', () => {
   it('keys the volume by image CONTENT, so a rebuild gets a fresh runtime', () => {
-    // A moving tag such as :latest is rebuilt in place, so keying by name
-    // would reuse a volume populated from the OLD image.
+    // A moving tag such as :latest is rebuilt in place; keying by name would
+    // reuse a volume populated from the OLD image.
     const a = runtimeVolumeName('sha256:' + 'a'.repeat(64));
     const b = runtimeVolumeName('sha256:' + 'b'.repeat(64));
     expect(a).not.toBe(b);
@@ -298,9 +290,8 @@ describe('runtimeVolumeName', () => {
   });
 
   it('separates the node subtree from the whole tree for the same image', () => {
-    // The two volumes have different ROOTS: a `node` volume's own root is the
-    // node tree. Sharing one name would mount a tree whose bin/node is one
-    // level off, which fails at container start with nothing naming the cause.
+    // A `node` volume's root is the node tree. Sharing a name would mount
+    // bin/node one level off, failing at container start with no named cause.
     const id = 'sha256:' + 'd'.repeat(64);
     expect(runtimeVolumeName(id, RuntimeSubtree.enum.node)).not.toBe(
       runtimeVolumeName(id, RuntimeSubtree.enum.all),
@@ -327,8 +318,7 @@ describe('ensureRuntimeVolume', () => {
     expect(createArg.Image).toBe('kici-agent:1');
     // `cp -a` preserves the executable bits the node binary needs.
     expect(createArg.Cmd.join(' ')).toMatch(/cp -a \/opt\/kici\/\. /);
-    // The populator is a throwaway; leaving it behind would leak a container
-    // per agent-image upgrade.
+    // Leaving the populator behind leaks a container per agent-image upgrade.
     expect(remove).toHaveBeenCalled();
   });
 
@@ -336,10 +326,9 @@ describe('ensureRuntimeVolume', () => {
     const { docker, createContainer } = runtimeDocker();
     await ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' });
 
-    // The agent image runs as `node`, and a fresh named volume is root-owned:
-    // under rootful docker a non-root copy fails with a bare "exited 1".
-    // Rootless podman maps the user and happens to work, which is why this only
-    // appears under rootful docker.
+    // The agent image runs as `node` and a fresh volume is root-owned, so a
+    // non-root copy fails with a bare "exited 1" under rootful docker (rootless
+    // podman maps the user and happens to work).
     expect((createContainer.mock.calls[0][0] as { User?: string }).User).toBe('0:0');
   });
 
@@ -347,10 +336,8 @@ describe('ensureRuntimeVolume', () => {
     const { docker, createContainer } = runtimeDocker();
     await ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' });
 
-    // An empty or partial copy otherwise exits 0 and yields a volume that looks
-    // fine until every spawned container fails to start on a runtime that is
-    // not there. That happened: a volume populated from a pre-/opt/kici image
-    // was reused, and the job image was created but never started.
+    // An empty or partial copy otherwise exits 0, and every container spawned
+    // on the volume fails to start (seen with a volume from a pre-/opt/kici image).
     const cmd = (createContainer.mock.calls[0][0] as { Cmd: string[] }).Cmd.join(' ');
     expect(cmd).toContain('set -e');
     expect(cmd).toContain('test -x /kici-runtime-out/node/bin/node');
@@ -365,8 +352,7 @@ describe('ensureRuntimeVolume', () => {
       subtree: RuntimeSubtree.enum.node,
     });
 
-    // The volume is mounted at /opt/kici/node, so its root has to BE the node
-    // tree — `bin/node`, not `node/bin/node`.
+    // Mounted at /opt/kici/node, so its root holds `bin/node`, not `node/bin/node`.
     const cmd = (createContainer.mock.calls[0][0] as { Cmd: string[] }).Cmd.join(' ');
     expect(cmd).toContain('cp -a /opt/kici/node/. /kici-runtime-out/');
     expect(cmd).toContain('test -x /kici-runtime-out/bin/node');
@@ -382,9 +368,8 @@ describe('ensureRuntimeVolume', () => {
 
   it("carries the populator's own output into the failure", async () => {
     const { docker } = runtimeDocker({ copyExit: 1, logs: 'cp: cannot create: No space left' });
-    // Without it the failure reads only as "exited 1", which says nothing about
-    // whether the tree was missing, the volume unwritable, or the disk full —
-    // a full debugging session was spent recovering exactly that.
+    // Otherwise the failure reads only as "exited 1": no sign of a missing tree,
+    // an unwritable volume or a full disk.
     await expect(ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' })).rejects.toThrow(
       /No space left/,
     );
@@ -395,9 +380,8 @@ describe('ensureRuntimeVolume', () => {
     await expect(ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' })).rejects.toThrow(
       /Failed to materialize/,
     );
-    // Disk hygiene: the absent completion marker already stops a later call
-    // mounting it, but a dead volume would otherwise sit there being overwritten
-    // by every retry.
+    // Disk hygiene: the missing marker already stops a mount, but the dead
+    // volume would sit there, overwritten by every retry.
     expect(volumeRemove).toHaveBeenCalled();
   });
 
@@ -406,17 +390,14 @@ describe('ensureRuntimeVolume', () => {
     await expect(ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' })).rejects.toThrow(
       /Failed to materialize/,
     );
-    // The daemon refuses to remove a volume any container still references, and
-    // a STOPPED populator still counts. Reaping first is a silent no-op that
-    // leaves the dead volume on disk — which is how a test host accumulates
-    // dozens of them.
+    // The daemon refuses to remove a volume any container, even a STOPPED
+    // populator, references: reaping first silently leaves it on disk.
     expect(teardownOrder()).toEqual(['populator', 'volume']);
   });
 
   it('does not reap a volume another populate has completed in the meantime', async () => {
     const { docker, volumeRemove } = runtimeDocker({
-      // No volume when this call looked; the marker is there by the time it
-      // fails — i.e. another process created AND filled it in between.
+      // Another process created AND filled the volume between look and failure.
       volumeExists: false,
       volumePopulated: true,
       copyExit: 1,
@@ -424,12 +405,10 @@ describe('ensureRuntimeVolume', () => {
     await expect(ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' })).rejects.toThrow(
       /Failed to materialize/,
     );
-    // Whether this call created the volume is a snapshot taken BEFORE the copy,
-    // so it cannot authorise a removal after it. Removing a volume that now
-    // reads complete destroys the winner's work and leaves it mounting a
-    // daemon-recreated EMPTY volume. The daemon refuses the reap with 409 only
-    // while the winner's populator is still registered, so the marker is what
-    // covers the window after that container exits.
+    // "This call created it" is a pre-copy snapshot and cannot authorise a
+    // removal after it: removing a now-complete volume leaves the winner
+    // mounting a daemon-recreated EMPTY one. The daemon's 409 covers only while
+    // the winner's populator is registered; the marker covers the rest.
     expect(volumeRemove).not.toHaveBeenCalled();
   });
 
@@ -442,12 +421,11 @@ describe('ensureRuntimeVolume', () => {
     await expect(ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' })).rejects.toThrow(
       /Failed to materialize/,
     );
-    // The in-flight map serialises populates within ONE process. Agents are a
-    // process each on a shared daemon, so the loser of a cross-process race
-    // gets here while the winner is still copying — and force-removing then
-    // destroys the volume the winner is about to mark complete, leaving it to
-    // mount a daemon-recreated EMPTY volume. Only a volume this call created
-    // is safe to reap.
+    // The in-flight map serialises populates within ONE process; agents are a
+    // process each on a shared daemon. A cross-process loser reaches this while
+    // the winner still copies, and force-removing would leave the winner
+    // mounting an EMPTY recreated volume. Only a volume this call created is
+    // safe to reap.
     expect(volumeRemove).not.toHaveBeenCalled();
   });
 
@@ -457,9 +435,7 @@ describe('ensureRuntimeVolume', () => {
       await ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1', subtree });
 
       const cmd = populatorArg().Cmd.join(' ').trim();
-      // Written any earlier the marker lands on a tree that has not been
-      // verified — a half-copied runtime that then reads as complete, which is
-      // the exact bug it exists to prevent.
+      // Any earlier, a half-copied, unverified runtime would read as complete.
       expect(cmd.endsWith('touch /kici-runtime-out/.kici-runtime-complete')).toBe(true);
       expect(cmd.indexOf('test -')).toBeLessThan(cmd.indexOf('touch '));
     }
@@ -469,9 +445,8 @@ describe('ensureRuntimeVolume', () => {
     const { docker, probeArg } = runtimeDocker({ volumeExists: true });
     const name = await ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' });
 
-    // The daemon owns the volume, so the only way to read it is a container —
-    // and it has to be root with the same bind, or it reads a different tree
-    // than the populator wrote.
+    // Only a container can read the daemon-owned volume, and it must be root
+    // with the same bind to read the tree the populator wrote.
     const arg = probeArg();
     expect(arg.Cmd.join(' ')).toContain('test -f /kici-runtime-out/.kici-runtime-complete');
     expect(arg.User).toBe('0:0');
@@ -481,15 +456,13 @@ describe('ensureRuntimeVolume', () => {
   it('labels the probe and the populator so the orphan reaper can find them', async () => {
     const fresh = runtimeDocker();
     await ensureRuntimeVolume({ docker: fresh.docker, agentImage: 'kici-agent:1' });
-    // The reaper selects on `kici-managed=true`; an unlabelled container is
-    // invisible to it, so a process killed between create and remove strands
-    // one nothing can identify.
+    // The reaper selects on `kici-managed=true`: an unlabelled container
+    // stranded by a kill between create and remove is invisible to it.
     expect(fresh.populatorArg().Labels).toEqual({ 'kici-managed': 'true' });
 
     const reused = runtimeDocker({ volumeExists: true });
     await ensureRuntimeVolume({ docker: reused.docker, agentImage: 'kici-agent:1' });
-    // The probe matters more than the populator: it runs on EVERY spawn, where
-    // the reuse path previously created no container at all.
+    // The probe matters more than the populator: it runs on EVERY spawn.
     expect(reused.probeArg().Labels).toEqual({ 'kici-managed': 'true' });
   });
 
@@ -500,9 +473,8 @@ describe('ensureRuntimeVolume', () => {
     });
     await ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' });
 
-    // Existence is NOT population — the silent half of the bug. A volume left
-    // by a crashed or still-running populate inspects fine, and mounting it
-    // yields a half-copied runtime whose failure surfaces nowhere near here.
+    // Existence is NOT population: a volume from a crashed or running populate
+    // inspects fine and mounts a half-copied runtime that fails far from here.
     expect(populatorCount()).toBe(1);
   });
 
@@ -514,26 +486,21 @@ describe('ensureRuntimeVolume', () => {
     const { docker, createVolume, populatorCount } = runtimeDocker({ populateGate: gate });
 
     const first = ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' });
-    // Block until the first call is genuinely INSIDE the populate — its
-    // populator is created and its wait() is parked on the still-closed gate.
-    // Without this the second call arrives after the first has finished and
-    // every assertion below holds with no mutex present.
+    // Wait until the first call is INSIDE the populate (wait() parked on the
+    // gate); otherwise every assertion below holds with no mutex present.
     await vi.waitFor(() => expect(populatorCount()).toBe(1));
 
     const second = ensureRuntimeVolume({ docker, agentImage: 'kici-agent:1' });
-    // Give the second caller a full macrotask to run: it now reaches the same
-    // volume while the first is demonstrably mid-copy. This is the instant the
-    // race used to happen, so assert the property HERE, while the gate is still
-    // closed — un-mutexed, this reads 2.
+    // A full macrotask lets the second caller reach the volume mid-copy. Assert
+    // HERE, with the gate closed: without the mutex this reads 2.
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(populatorCount()).toBe(1);
     expect(createVolume).toHaveBeenCalledTimes(1);
 
     release({ StatusCode: 0 });
 
-    // Two agents spawning together used to both copy into the same mount, so
-    // the loser mounted a tree the winner was still writing. Both now get the
-    // one populate's result.
+    // Two agents spawning together share the one populate's result, so neither
+    // mounts a tree the other is still writing.
     const name = runtimeVolumeName('sha256:' + 'a'.repeat(64));
     expect(await Promise.all([first, second])).toEqual([name, name]);
     expect(populatorCount()).toBe(1);
@@ -546,8 +513,7 @@ describe('ensureRuntimeVolume', () => {
         /Failed to materialize/,
       );
     }
-    // A retained rejected promise would replay the same failure forever, making
-    // every later spawn of this image fail — worse than the race it closes.
+    // A retained rejection would fail every later spawn of this image.
     expect(populatorCount()).toBe(2);
   });
 });

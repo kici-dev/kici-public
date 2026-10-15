@@ -1,15 +1,11 @@
 import { createMeter } from '@kici-dev/shared';
 
 /**
- * OTel meter for kici agent metrics.
+ * OTel meter for agent metrics. Instrument names carry the full `kici_agent_`
+ * prefix: the agent's initTelemetry() sets no exporter `metricPrefix`.
  *
- * Metric names use kici_agent_ prefix. The prefix is applied by the
- * PrometheusExporter configured in initTelemetry() with metricPrefix.
- * Instrument names here omit the prefix since the exporter adds it.
- *
- * Note: OTel PrometheusExporter prepends the configured prefix to all
- * metric names. We use the full name here because the prefix is set
- * at the SDK level (metricPrefix: 'kici_agent_').
+ * The `* - label: description` lines in each metric's JSDoc are data:
+ * scripts/generate-prometheus.ts reads them into the metrics catalog.
  */
 const meter = createMeter('kici-agent');
 

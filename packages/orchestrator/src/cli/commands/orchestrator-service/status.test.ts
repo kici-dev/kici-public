@@ -1,19 +1,16 @@
 /**
- * Tests for the orchestrator status command's folder-anchored behavior:
- * refusal when no targeting flag and no CWD manifest, and --instance-dir
- * resolution flowing through to manager.status with a ServiceConfig built
- * from the manifest. The action also reads the env file for the port + calls
- * /health, but the default mock returns state: 'stopped' so the HTTP path
- * is skipped.
+ * The default mock returns state: 'stopped', so the folder-anchored tests skip
+ * the /health HTTP path.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { makeTempDir } from '@kici-dev/test-support/tmp';
 import { Command } from 'commander';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import type {
   DiscoveredInstance,
+  LaunchSpec,
   ServiceConfig,
   ServiceManager,
   ServicePlatform,
@@ -25,11 +22,12 @@ let mockStatusResult: ServiceStatus = { state: 'stopped' };
 const mockStatus = vi.fn(async () => mockStatusResult);
 const mockList = vi.fn(async (_isUserLevel: boolean) => mockListResult);
 let mockKiciRoot = '';
+/** The launch command the mocked driver reads back from the unit. */
+let mockLaunchSpec: LaunchSpec | null = null;
 
 /** Platforms whose driver the command operated through — discovery `list` calls excluded. */
 const operatedPlatforms: string[] = [];
 
-/** Wrap a driver operation so it records which platform's driver ran it. */
 function op<A extends unknown[], R>(platform: string, fn: (...a: A) => R): (...a: A) => R {
   return (...args: A) => {
     operatedPlatforms.push(platform);
@@ -54,6 +52,7 @@ vi.mock('../../service/index.js', async () => {
       ),
       logs: vi.fn(),
       isInstalled: vi.fn(),
+      readLaunchSpec: async () => mockLaunchSpec,
       list: (...args: unknown[]) => mockList(...(args as Parameters<typeof mockList>)),
     }) as unknown as ServiceManager;
   return {
@@ -62,9 +61,8 @@ vi.mock('../../service/index.js', async () => {
     resolveUserLevel: vi.fn().mockReturnValue(true),
     kiciConfigRoot: vi.fn(() => mockKiciRoot),
     createServiceManager: vi.fn(async (platform: ServicePlatform) => makeManager(platform)),
-    // Manager selection lives in the seam, so the real one runs here with the
-    // driver factory injected: every candidate platform gets its own double, and
-    // `op` records which one the command actually operated through.
+    // The real seam runs with an injected driver factory: one double per
+    // platform, and `op` records which one the command operated through.
     resolveInstanceTarget: (args: Parameters<typeof actual.resolveInstanceTarget>[0]) =>
       actual.resolveInstanceTarget({ ...args, createManager: async (p) => makeManager(p) }),
   };
@@ -79,10 +77,7 @@ import { DB_POOL_ACQUIRE_TIMEOUT_DEFAULT_MS } from '../../../config.js';
 import { RbacEnforcer } from '../../../secrets/rbac.js';
 import { createAdminOrgRoutes } from '../../../routes/admin-orgs.js';
 import { ORG_LIST_PATH, OrgIdSource } from '../../../db/repos/org-ids-repo.js';
-
-function mkTmp(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
+import { createMockDb } from '../../../__test-helpers__/mock-db.js';
 
 function makeManifest(overrides: Partial<InstanceManifest> = {}): InstanceManifest {
   return {
@@ -108,8 +103,8 @@ describe('orchestrator status — folder-anchored', () => {
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    tmpInstanceDir = mkTmp('kici-e4-st-i-');
-    tmpConfigRoot = mkTmp('kici-e4-st-c-');
+    tmpInstanceDir = makeTempDir('kici-e4-st-i-');
+    tmpConfigRoot = makeTempDir('kici-e4-st-c-');
 
     mockListResult = [];
     mockStatusResult = { state: 'stopped' };
@@ -117,6 +112,7 @@ describe('orchestrator status — folder-anchored', () => {
     mockList.mockClear();
     operatedPlatforms.length = 0;
     mockKiciRoot = tmpConfigRoot;
+    mockLaunchSpec = null;
 
     program = new Command();
     program.name('orchestrator');
@@ -136,7 +132,7 @@ describe('orchestrator status — folder-anchored', () => {
 
   it('refuses without --instance-dir/--name and no CWD manifest', async () => {
     const savedCwd = process.cwd();
-    const emptyCwd = mkTmp('kici-e4-st-cwd-');
+    const emptyCwd = makeTempDir('kici-e4-st-cwd-');
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
       throw new Error('process.exit called');
     }) as never);
@@ -218,6 +214,66 @@ describe('orchestrator status — folder-anchored', () => {
     expect(json.configPaths).toEqual({ envFile: manifest.envFilePath });
   });
 
+  /** Run `status` for a systemd instance whose unit launches `spec`, and return its output. */
+  async function statusFor(spec: LaunchSpec, json = false): Promise<string> {
+    mockLaunchSpec = spec;
+    writeManifest(tmpInstanceDir, makeManifest({ name: 'kici-test' }));
+    const entry = { component: 'orchestrator', name: 'kici-test', platform: 'systemd' } as const;
+    writeIndex(tmpConfigRoot, [{ ...entry, isUserLevel: true, instanceDir: tmpInstanceDir }]);
+    consoleLogSpy.mockClear();
+    const args = ['node', 'orchestrator', 'status', '--instance-dir', tmpInstanceDir];
+    await program.parseAsync(json ? [...args, '--json'] : args);
+    return consoleLogSpy.mock.calls.map((c: unknown[]) => c.join(' ')).join('\n');
+  }
+
+  it('prints the agent installed with the unit runtime in both outputs', async () => {
+    // The unit runs kici-admin's orchestrator under <prefix>/bin/node, so npm
+    // linked the agent at <prefix>/bin/kici-agent.
+    const prefix = path.join(tmpInstanceDir, 'node', '24.15.0');
+    const admin = path.join(prefix, 'lib', 'node_modules', 'kici-admin');
+    fs.mkdirSync(path.join(admin, 'bin'), { recursive: true });
+    fs.mkdirSync(path.join(prefix, 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(admin, 'bin', 'kici-agent.js'), '', { mode: 0o755 });
+    const agent = path.join(prefix, 'bin', 'kici-agent');
+    fs.symlinkSync(path.join(admin, 'bin', 'kici-agent.js'), agent);
+    const spec = {
+      execPath: path.join(prefix, 'bin', 'node'),
+      args: [path.join(admin, 'node_modules', '@kici-dev', 'orchestrator', 'dist', 'server.js')],
+    };
+
+    // fails-when: the line is not derived from the unit's launch command, or
+    // is never printed — the path below appears nowhere else in the output.
+    const text = await statusFor(spec);
+    expect(text).toContain(`Agent binary:  ${agent}`);
+    expect(text).not.toContain('(not installed)');
+
+    const json = JSON.parse(await statusFor(spec, true)) as {
+      agentBinary?: { path: string; installed: boolean };
+    };
+    expect(json.agentBinary).toEqual({ path: agent, installed: true });
+  });
+
+  it('marks the agent not installed when the unit runtime has none', async () => {
+    const text = await statusFor({
+      execPath: '/nowhere/bin/node',
+      args: [
+        '/nowhere/lib/node_modules/kici-admin/node_modules/@kici-dev/orchestrator/dist/server.js',
+      ],
+    });
+    expect(text).toContain('Agent binary:  /nowhere/bin/kici-agent (not installed)');
+  });
+
+  it('prints no agent line for a launch command outside a kici-admin install', async () => {
+    // breaks-if-wrong: an archive install names no npm-linked agent, so the
+    // status output must not invent one.
+    const text = await statusFor({
+      execPath: '/opt/kici/orchestrator/kici-orchestrator-standalone',
+      args: [],
+    });
+    expect(text).toContain('--- Config files ---');
+    expect(text).not.toContain('Agent binary:');
+  });
+
   it('reports the compose file from the manifest, not from the host platform', async () => {
     // fails-when: the compose branch reads detectPlatform() instead of the
     // manifest. detectPlatform is mocked to 'systemd' here — the value it
@@ -254,10 +310,8 @@ describe('orchestrator status — folder-anchored', () => {
   });
 
   it('reports paths for the driver --platform forced, not for the manifest', async () => {
-    // `--platform` forces one driver for the whole command, so the status it
-    // prints describes that driver's view. Re-deriving the platform from the
-    // manifest instead makes the two disagree: a systemd driver reporting a
-    // compose file for a stack it is not operating.
+    // `--platform` forces one driver, so the output describes that driver's
+    // view, never a compose file for a stack the systemd driver is not operating.
     //
     // fails-when: `installPlatform` is read off `resolved.manifest.platform`
     // again — `composeFile` reappears here while `manager` is the systemd one.
@@ -356,13 +410,9 @@ const BUILD_GLOBALS = {
 
 /** A database handle whose readiness query succeeds, or throws when `healthy` is false. */
 function fakeDb(healthy: boolean): HealthRoutesDeps['db'] {
-  const execute = async () => {
-    if (!healthy) throw new Error('connection refused');
-    return [];
-  };
-  return {
-    selectFrom: () => ({ select: () => ({ limit: () => ({ execute }) }) }),
-  } as unknown as HealthRoutesDeps['db'];
+  const { db, mocks } = createMockDb();
+  if (!healthy) mocks.selectExecute.mockRejectedValue(new Error('connection refused'));
+  return db;
 }
 
 describe('orchestrator status — health section', () => {
@@ -375,13 +425,11 @@ describe('orchestrator status — health section', () => {
   const ADMIN_TOKEN = 'status-admin-token';
 
   /**
-   * Answer the command's HTTP requests with the orchestrator's real health
-   * routes, so the renderer is fed the body the running service returns.
-   * `basePath` mounts them the way `KICI_BASE_PATH` does. `readyDelayMs` holds
-   * the `/ready` answer back (`'never'` never sends one); a held request still
-   * rejects when the caller aborts it. The org listing is the real admin route
-   * behind a bearer check (`org.missing` leaves it unmounted, like an
-   * orchestrator that predates it).
+   * Answer HTTP with the real health routes. `basePath` mounts them as
+   * `KICI_BASE_PATH` does. `readyDelayMs` holds `/ready` back (`'never'`: no
+   * answer); a held request still rejects on abort. The org listing is the real
+   * admin route behind a bearer check; `org.missing` leaves it unmounted, like
+   * an orchestrator that predates it.
    */
   function serveRealHealthRoutes(opts: {
     dbHealthy: boolean;
@@ -464,8 +512,8 @@ describe('orchestrator status — health section', () => {
   }
 
   beforeEach(() => {
-    tmpInstanceDir = mkTmp('kici-st-health-i-');
-    tmpConfigRoot = mkTmp('kici-st-health-c-');
+    tmpInstanceDir = makeTempDir('kici-st-health-i-');
+    tmpConfigRoot = makeTempDir('kici-st-health-c-');
     mockKiciRoot = tmpConfigRoot;
     mockStatusResult = { state: 'running', pid: 4242 };
     mockStatus.mockClear();
@@ -647,7 +695,7 @@ describe('orchestrator status — health section', () => {
     );
   });
 
-  // fails-when: a Platform client that has not authenticated reads as `none` (Review Focus 4)
+  // fails-when: a Platform client that has not authenticated reads as `none`
   it('says the org is unknown before the first Platform authentication', async () => {
     serveRealHealthRoutes({ dbHealthy: true, org: { getPlatformOrgId: () => undefined } });
     expect((await runStatus([], ['-t', ADMIN_TOKEN])).split('\n')).toContain(

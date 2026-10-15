@@ -1,20 +1,15 @@
 /**
- * `kici-admin dashboard-encryption-key` — the orchestrator's X25519
- * dashboard-encryption key: the trust root a browser seals a secret / variable
- * value to under the `encrypted` dashboard-write posture, so the hosted control
- * plane relays only opaque ciphertext.
+ * `kici-admin dashboard-encryption-key show|list|rotate`: the orchestrator's
+ * X25519 key a browser seals secret / variable values to under the `encrypted`
+ * dashboard-write posture, so the hosted control plane relays only ciphertext.
  *
- *   dashboard-encryption-key show     Print the active kid, its public JWK, where
- *                                     the JWKS is published, and the Verified-tier
- *                                     URL (when that tier is opted into).
- *   dashboard-encryption-key list     List every key on record (kid / status / created_at).
- *   dashboard-encryption-key rotate   Mint a new active key; the prior active key
- *                                     is retired from the published JWKS, but its
- *                                     private half stays on record so envelopes
- *                                     already sealed to it still decrypt.
+ * `show` prints the active kid, its public JWK, the JWKS location and the
+ * Verified-tier URL when opted in; `list` prints every key's kid, status and
+ * created_at. `rotate` retires the prior key from the
+ * published JWKS but keeps its private half, so sealed envelopes still decrypt.
  *
- * The PRIVATE half is master-key wrapped (`KICI_SECRET_KEY`) in the orchestrator
- * DB and is never exportable — recovery from a lost key is a routine rotation.
+ * The PRIVATE half is wrapped with `KICI_SECRET_KEY` in the orchestrator DB and
+ * never exportable; a lost key is recovered by rotation.
  */
 import type { Command } from 'commander';
 import { createLogger, createPool } from '@kici-dev/shared';
@@ -54,11 +49,7 @@ async function withRepo<T>(
   }
 }
 
-/**
- * Where this orchestrator publishes its own JWKS. Independent of the Verified
- * tier: publication happens whenever a provenance issuer is configured, whether
- * or not the dashboard is told to fetch the encryption key from there.
- */
+/** Published whenever a provenance issuer is configured, independent of the Verified tier. */
 function publishedJwksUrl(): string | null {
   const issuer = loadConfig().provenanceSigningIssuer;
   return issuer ? jwksUrlFor(issuer) : null;
@@ -189,7 +180,6 @@ export function registerDashboardEncryptionKeyCommands(program: Command): void {
           await runIdempotentStep(
             {
               name: 'dashboard-encryption-key/rotate',
-              // Rotation always changes state (a fresh key is minted).
               check: async () => ({ reason: 'rotate to a new key' }),
               summarize: () =>
                 'Mint a NEW X25519 dashboard-encryption key and activate it; the current active key is retired from the published JWKS but still decrypts envelopes already sealed to it',

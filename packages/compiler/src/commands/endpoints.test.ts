@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { groupTriggers, displayEndpoints } from './endpoints.js';
 import type { LockWorkflow } from '../types.js';
 
-// Mock dependencies
 vi.mock('../execution/index.js', () => ({
   resolveKiciDir: vi.fn().mockReturnValue('/mock/.kici'),
 }));
@@ -11,7 +10,6 @@ vi.mock('../remote/config.js', () => ({
   loadGlobalConfig: vi.fn().mockResolvedValue({}),
 }));
 
-// Capture logger output
 const logOutput: string[] = [];
 vi.mock('@kici-dev/core', () => ({
   logger: {
@@ -309,18 +307,13 @@ describe('kici endpoints', () => {
       displayEndpoints(groups, 'a3Bf9x2K1mPq');
 
       const output = logOutput.join('\n');
-      // Git provider section
       expect(output).toContain('/webhook/a3Bf9x2K1mPq/github');
-      // Generic webhook section
       expect(output).toContain('/webhook/a3Bf9x2K1mPq/generic/stripe');
-      // Schedule section
       expect(output).toContain('"0 0 * * *"');
       expect(output).toContain('(UTC)');
-      // Lifecycle section
       expect(output).toContain('lifecycle (workflow_complete)');
-      // kici_event section
       expect(output).toContain('kici_event (deploy-done)');
-      // No hint when org ID is resolved
+      // No hint once the org ID resolves.
       expect(output).not.toContain('kici login');
     });
 
@@ -371,7 +364,6 @@ describe('kici endpoints', () => {
       const output = logOutput.join('\n');
       expect(output).toContain('Git provider webhooks');
       expect(output).toContain('/webhook/{orgId}/github');
-      // Should not contain other sections
       expect(output).not.toContain('Generic webhooks');
       expect(output).not.toContain('Scheduled workflows');
       expect(output).not.toContain('Event-driven workflows');

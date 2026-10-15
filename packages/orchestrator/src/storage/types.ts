@@ -1,48 +1,37 @@
 /**
- * Cache storage abstraction for the orchestrator.
+ * Pluggable cache storage for the orchestrator (compiled workflow bundles,
+ * etc.). Implementations handle TTL-based expiry via lastAccessedAt.
  *
- * Provides a pluggable backend interface for storing and retrieving
- * cached data (compiled workflow bundles, etc.). Implementations
- * must handle TTL-based expiry via lastAccessedAt timestamps.
- *
- * Backends:
- *   - `S3CacheStorage` for production / multi-host deployments
- *   - `FilesystemCacheStorage` for single-host / test sandboxes
+ * Backends: `S3CacheStorage` (production / multi-host) and
+ * `FilesystemCacheStorage` (single-host / test sandboxes).
  */
 
-/**
- * Metadata tracked alongside each cached item.
- * Used for TTL-based expiry (based on lastAccessedAt).
- */
+/** Metadata tracked alongside each cached item; drives TTL-based expiry. */
 export interface CacheMetadata {
-  /** ISO timestamp of when the item was first stored */
+  /** ISO timestamp of the first store. */
   createdAt: string;
-  /** ISO timestamp of when the item was last accessed (read or touched) */
+  /** ISO timestamp of the last access (read or touch). */
   lastAccessedAt: string;
 }
 
 /**
- * Pluggable cache storage interface.
- *
- * All operations are async. Implementations must handle TTL-based expiry:
- * an item is considered expired when (now - lastAccessedAt) > ttlMs.
- * Expired items are cleaned up lazily on access.
+ * Pluggable cache storage. An item is expired when
+ * (now - lastAccessedAt) > ttlMs; expired items are cleaned up lazily on access.
  */
 export interface CacheStorage {
-  /** Store a value under the given key. Overwrites if key already exists. */
+  /** Store a value; overwrites an existing key. */
   put(key: string, data: Buffer | string): Promise<void>;
 
   /**
-   * Retrieve a value by key. Returns null if not found or expired.
-   * `ttlMsOverride` applies a per-operation TTL instead of the backend's
-   * constructor-time default (lets per-org cache TTLs override the
-   * cluster-wide default without re-constructing the backend).
+   * Retrieve a value; null if not found or expired. `ttlMsOverride` replaces
+   * the backend's constructor-time TTL for this call, so a per-org cache TTL
+   * overrides the cluster-wide default without re-constructing the backend.
    */
   get(key: string, ttlMsOverride?: number): Promise<Buffer | null>;
 
   /**
-   * Check if a key exists and is not expired, without retrieving data.
-   * `ttlMsOverride` applies a per-operation TTL (see `get`).
+   * Whether a key exists and is not expired, without retrieving data.
+   * `ttlMsOverride`: see `get`.
    */
   has(key: string, ttlMsOverride?: number): Promise<boolean>;
 
@@ -53,78 +42,68 @@ export interface CacheStorage {
   touch(key: string): Promise<void>;
 
   /**
-   * Get a pre-signed download URL for the cached item.
-   * Returns null if not found or expired.
-   * `ttlMsOverride` applies a per-operation TTL (see `get`).
+   * A pre-signed download URL; null if not found or expired.
+   * `ttlMsOverride`: see `get`.
    */
   getUrl(key: string, ttlMsOverride?: number): Promise<string | null>;
 
   /**
-   * The validity window, in seconds, of the pre-signed download URLs this
-   * backend mints via `getUrl` — i.e. how long after minting a `getUrl` link
-   * still authorizes a download before its signature expires. This is the
-   * signature expiry, NOT the artifact-retention TTL; consumers that render a
-   * `getUrl` link (e.g. the dashboard artifacts panel) use it to refresh the
-   * link before it stops working.
+   * How long, in seconds, a `getUrl` link authorizes a download before its
+   * signature expires. This is the signature expiry, NOT the
+   * artifact-retention TTL; consumers that render a `getUrl` link (e.g. the
+   * dashboard artifacts panel) use it to refresh the link in time.
    */
   presignedGetTtlSeconds(): number;
 
   /**
-   * Generate a pre-signed PUT URL for direct agent upload.
-   * Uses the external endpoint (container-routable) when configured.
+   * A pre-signed PUT URL for direct agent upload, signed with the external
+   * (container-routable) endpoint when configured.
    */
   getUploadUrl(key: string): Promise<string>;
 
   /**
-   * Generate the pre-signed PUT URL a developer machine running
-   * `kici run remote` uploads the overlay to. The S3 backend signs it with
+   * The pre-signed PUT URL a developer machine running `kici run remote`
+   * uploads the overlay to. The S3 backend signs it with
    * `KICI_STORAGE_UPLOAD_ENDPOINT`, else the agent-facing
    * `KICI_STORAGE_EXTERNAL_ENDPOINT`, else `KICI_STORAGE_ENDPOINT`.
    */
   getInternalUploadUrl(key: string): Promise<string>;
 
   /**
-   * Set initial metadata on an object that was uploaded via pre-signed URL.
-   * Pre-signed PUT URLs cannot carry custom metadata, so this must be called
-   * after the agent confirms upload via cache.upload.complete.
-   * Sets created-at and last-accessed-at to now.
+   * Set created-at and last-accessed-at to now on an object uploaded via
+   * pre-signed URL. A pre-signed PUT cannot carry custom metadata, so call this
+   * after the agent confirms the upload via cache.upload.complete.
    */
   initMeta(key: string): Promise<void>;
 
   /**
-   * List object keys (relative to the configured prefix) under a sub-prefix,
-   * newest first (by createdAt/last-modified metadata; falls back to
-   * lexicographic when metadata is unavailable). Returns full cache keys
-   * (without the storage prefix). Returns an empty array when nothing matches.
+   * Full cache keys (without the storage prefix) under a sub-prefix, newest
+   * first by createdAt/last-modified metadata (lexicographic when metadata is
+   * unavailable); empty when nothing matches.
    */
   list(subPrefix: string): Promise<string[]>;
 
-  /** Server-side copy from one cache key to another (used for atomic temp -> final commit). */
+  /** Server-side copy between keys (used for atomic temp -> final commit). */
   copy(srcKey: string, destKey: string): Promise<void>;
 
   /**
-   * Read the stored metadata (createdAt + lastAccessedAt) for a key WITHOUT
-   * refreshing lastAccessedAt. Returns null when the key is missing or carries
-   * no metadata. A pure read (no TTL-expiry side effect) — used by quota
-   * eviction to order candidates by access recency.
+   * The stored metadata, read WITHOUT refreshing lastAccessedAt or any
+   * TTL-expiry side effect; null when the key is missing or has no metadata.
+   * Quota eviction uses it to order candidates by access recency.
    */
   getMetadata(key: string): Promise<CacheMetadata | null>;
 
   /**
-   * Byte size of the stored object, or null when the object is missing. A pure
-   * stat — no metadata write and no TTL/last-accessed side effect. Used to
-   * verify an artifact's real size server-side instead of trusting the
-   * agent-declared value.
+   * Byte size of the stored object, or null when missing. A pure stat (no
+   * metadata write, no TTL/last-accessed side effect), used to verify an
+   * artifact's real size server-side instead of trusting the agent's value.
    */
   getObjectSize(key: string): Promise<number | null>;
 }
 
 import type { SharedS3Config } from '@kici-dev/shared';
 
-/**
- * S3 backend config. Extends the generic `SharedS3Config` from
- * `@kici-dev/shared` with the cache-specific `ttlMs` knob.
- */
+/** S3 backend config: `SharedS3Config` plus the cache-specific `ttlMs`. */
 export type S3CacheStorageConfig = SharedS3Config & {
   type: 's3';
   ttlMs: number;
@@ -133,12 +112,10 @@ export type S3CacheStorageConfig = SharedS3Config & {
 };
 
 /**
- * Filesystem backend config. Stores blobs as files under `basePath` and
- * mints HMAC-signed `http://baseUrl<routePrefix>...` URLs that the
- * orchestrator's `/api/v1/cache/blob/*` route verifies before serving.
- *
- * Intended for single-host / test sandboxes where standing up an
- * S3-compatible service is overkill.
+ * Filesystem backend config. Stores blobs under `basePath` and mints
+ * HMAC-signed `http://baseUrl<routePrefix>...` URLs that the orchestrator's
+ * `/api/v1/cache/blob/*` route verifies before serving. For single-host / test
+ * sandboxes.
  */
 export interface FilesystemCacheStorageConfig {
   type: 'filesystem';
@@ -152,8 +129,5 @@ export interface FilesystemCacheStorageConfig {
   signingSecret: string;
 }
 
-/**
- * Configuration for creating a cache storage backend. Discriminated union
- * keyed on `type` so new backends slot in without breaking consumers.
- */
+/** Cache storage backend config, discriminated on `type`. */
 export type CacheStorageConfig = S3CacheStorageConfig | FilesystemCacheStorageConfig;

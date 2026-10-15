@@ -1,17 +1,10 @@
 /**
- * Manifest serialization / parsing.
- *
- * Manifests are small JSON sidecar files next to each `.jsonl.gz`
- * chunk. Serialized with stable key ordering so byte-diffs across
- * archive runs are meaningful.
+ * A manifest is a JSON sidecar next to each `.jsonl.gz` chunk, serialized in a
+ * stable key order so byte-diffs across archive runs are meaningful.
  */
 import type { ChunkManifest } from './types.js';
 
-/**
- * Required fields shared by v1 and v2 manifests. Order is the on-disk
- * key order — keep stable so byte-diffs across archive runs remain
- * meaningful.
- */
+/** Required in v1 and v2. The order is the on-disk key order: keep it stable. */
 const COMMON_REQUIRED_KEYS: ReadonlyArray<keyof ChunkManifest> = [
   'schemaVersion',
   'db',
@@ -31,7 +24,7 @@ const COMMON_REQUIRED_KEYS: ReadonlyArray<keyof ChunkManifest> = [
   'archiverInstanceId',
 ];
 
-/** v2-only required fields — always emitted by `serializeManifest`. */
+/** Required in v2 only. */
 const V2_REQUIRED_KEYS: ReadonlyArray<keyof ChunkManifest> = ['bucket', 'maxColdDays'];
 
 const OPTIONAL_MANIFEST_KEYS: ReadonlyArray<keyof ChunkManifest> = ['replayLookupKeys'];
@@ -77,10 +70,9 @@ export function parseManifest(raw: string | Buffer): ChunkManifest {
       }
     }
   } else {
-    // v1: backfill the cold-purge fields with the most-conservative
-    // values so the GC sweep treats v1 chunks as never-purgeable. The
-    // framework's bucket-prefix migration is forwards-only — v1 chunks
-    // sit at the day-prefix root indefinitely.
+    // v1: backfill the cold-purge fields so the GC sweep never purges a v1
+    // chunk. The bucket-prefix migration is forwards-only: v1 chunks stay at
+    // the day-prefix root indefinitely.
     if (obj.bucket === undefined) obj.bucket = 'forever';
     if (obj.maxColdDays === undefined) obj.maxColdDays = 'forever';
   }

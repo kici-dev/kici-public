@@ -4,19 +4,17 @@
  * Contract:
  *   - tenant column: `org_id` (NULL → synthetic `__orchestrator__`)
  *   - partition column: `created_at`
- *   - warm TTL: 30 days
+ *   - warm TTL: `minAccessLogWarmDays()` table-wide, tightened per row
+ *     by `accessLogWarmSqlCase()`
+ *   - archived chunks purge per `getAccessLogColdDays()`
  *
- * Rows older than 30 days live in S3 indefinitely; there is no
- * `expires_at`-based hard delete.
+ * There is no `expires_at`-based hard delete.
  *
- * Synthetic tenant: orchestrator-level access events (e.g. scheduler
- * tick failures, admin-triggered scheduled jobs) carry `org_id IS
- * NULL`; they collapse to the `__orchestrator__` synthetic prefix.
+ * Orchestrator-level events (e.g. scheduler tick failures, admin-triggered
+ * scheduled jobs) carry `org_id IS NULL` and use the `__orchestrator__` prefix.
  *
- * Recursion: archiving access_log rows writes a new access_log row
- * recording the archive (one per chunk). The new row is itself
- * eligible for archive in a future cycle. Volume is bounded — one
- * audit row per ~50K-row chunk.
+ * Recursion: archiving writes one access_log row per chunk, itself archivable
+ * later. Volume is bounded — one audit row per ~50K-row chunk.
  */
 import { sql, type Kysely, type Selectable } from 'kysely';
 import {
@@ -44,11 +42,9 @@ const ADVISORY_LOCK_NAMESPACE = 'cold-store|orchestrator|access_log';
 const APPROX_ROW_BYTES = 500;
 
 /**
- * Per-table defaults. `warmTtlDays` MUST equal `minAccessLogWarmDays()` so the
- * framework's index-friendly partition scan (`created_at < warmCutoff`) doesn't
- * pre-filter out rows the per-row CASE in `accessLogWarmSqlCase()` would
- * consider eligible. The CASE further tightens eligibility per row based on
- * action / outcome / actor_type.
+ * `warmTtlDays` MUST equal `minAccessLogWarmDays()` so the index-friendly
+ * partition scan (`created_at < warmCutoff`) never drops rows the per-row CASE
+ * in `accessLogWarmSqlCase()` (by action / outcome / actor_type) would archive.
  */
 const DEFAULT_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: minAccessLogWarmDays(),
@@ -81,15 +77,10 @@ export class AccessLogAdapter
   }
 
   async *listEligiblePartitions(args: { warmCutoff: Date }): AsyncIterable<EligiblePartition> {
-    // The existing access_log_org_created_idx (org_id, created_at DESC)
-    // serves the GROUP BY scan in either direction. `sql.lit` produces
-    // an inline literal so PG sees the SELECT and GROUP BY COALESCE
-    // expressions as identical — a parameter binding would create two
-    // distinct $N placeholders and PG would reject the SELECT.
-    //
-    // The per-row `retentionCase` (engine-generated CASE) tightens the
-    // index-friendly `< warmCutoff` predicate so partitions that contain
-    // only rows whose category-specific TTL hasn't elapsed are not yielded.
+    // access_log_org_created_idx (org_id, created_at DESC) serves this scan.
+    // `sql.lit` inlines the literal so the SELECT and GROUP BY COALESCE match;
+    // a bound parameter yields two distinct $N placeholders and PG rejects it.
+    // `retentionCase` skips partitions whose rows' category TTL has not elapsed.
     const synthetic = sql.lit(SYNTHETIC_ORCH_TENANT);
     const retentionCase = sql.raw(accessLogWarmSqlCase());
     const rows = await sql<{ tenant_id: string; partition_date: string }>`
@@ -185,10 +176,10 @@ export class AccessLogAdapter
   }
 
   /**
-   * Per-row cold-retention TTL. Mirrors the warm-side override
-   * layering: outcome=denied/error → 730d (forensic), platform_operator →
-   * `'forever'` (compliance), otherwise per-action map. The framework
-   * groups rows by `coldDaysToBucket(coldTtlDays(row))` at archive time.
+   * Per-row cold-retention TTL, mirroring the warm-side layering:
+   * outcome=denied/error → 730d (forensic), platform_operator → `'forever'`
+   * (compliance), otherwise the per-action map. Archive buckets rows by
+   * `coldDaysToBucket(coldTtlDays(row))`.
    */
   coldTtlDays(row: AccessLogColdStoreRow): ColdRetention {
     return getAccessLogColdDays({
@@ -216,8 +207,7 @@ export class AccessLogAdapter
 
       await trx.deleteFrom('access_log').where('id', 'in', ids).execute();
 
-      // Recursive write: archiving access_log emits one access_log row
-      // per chunk. That row eventually gets archived in a later cycle.
+      // Recursive write: one access_log row per chunk, archived in a later cycle.
       await trx
         .insertInto('access_log')
         .values({
@@ -251,11 +241,9 @@ export class AccessLogAdapter
           last_archived_at = now()
       `.execute(trx);
 
-      // Record the chunk in `cold_store_chunks` so the GC
-      // sweep can find purge candidates without S3 LIST. Only chunks
-      // written by the per-bucket layout (v2 manifest) get a row here;
-      // v1 chunks omit `bucket` and are treated as
-      // `'forever'`.
+      // Index the chunk so the GC sweep finds purge candidates without S3 LIST.
+      // Only per-bucket (v2 manifest) chunks get a row; v1 chunks omit `bucket`
+      // and are treated as `'forever'`.
       if (args.chunkMeta.bucket !== undefined && args.chunkMeta.maxColdDays !== undefined) {
         const maxColdDaysSerialized = String(args.chunkMeta.maxColdDays);
         await trx
@@ -287,7 +275,6 @@ export class AccessLogAdapter
     objectKey: string;
   }): Promise<void> {
     await this.kdb.transaction().execute(async (trx) => {
-      // 1. Drop the chunk-index row.
       await trx
         .deleteFrom('cold_store_chunks')
         .where('db', '=', 'orchestrator')
@@ -295,9 +282,8 @@ export class AccessLogAdapter
         .where('chunk_id', '=', args.chunkId)
         .execute();
 
-      // 2. Decrement the per-(db, table, tenant) rollup; floor at 0
-      //    in case the rollup got out of sync (e.g. someone manually
-      //    deleted from cold_store_chunks).
+      // Floor the rollup at 0 in case it drifted (e.g. a manual delete from
+      // cold_store_chunks).
       await sql`
         UPDATE cold_store_chunk_counts
         SET chunk_count = GREATEST(chunk_count - 1, 0),
@@ -308,8 +294,7 @@ export class AccessLogAdapter
           AND tenant_id = ${args.tenantId}
       `.execute(trx);
 
-      // 3. Audit the purge — orchestrator writes to access_log
-      //    (mirrors the archive_chunk pattern above).
+      // Audit the purge, as archive_chunk does above.
       await trx
         .insertInto('access_log')
         .values({

@@ -3,11 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './130_scaler_provision_outcomes.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
  * Real-Postgres test for migration 130: asserts `public.scaler_provision_outcomes`
- * exists with its purge index after migrations 001..130, that only the two
+ * exists with its purge index after migrations 001..130, that only the
  * identity columns are NOT NULL, that a condemnation written over an adoption
  * keeps the adoption, and that up/down are idempotent. Gated on
  * `KICI_TEST_ADMIN_DATABASE_URL`.
@@ -70,10 +70,8 @@ describeDb('migration 130_scaler_provision_outcomes', () => {
     await adminPool.end();
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
-    // The harness RETURNS (rather than throws) when the target migration is not
-    // registered in `migration-provider.ts`, so an unchecked call leaves the
-    // table absent and every assertion below fails with a confusing
-    // "column should exist" instead of naming the real cause.
+    // The harness RETURNS (not throws) an error when the migration is not registered in
+    // `migration-provider.ts`; unchecked, every assertion fails with a misleading message.
     const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 120_000);

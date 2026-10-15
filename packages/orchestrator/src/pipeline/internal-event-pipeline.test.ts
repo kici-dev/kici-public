@@ -10,12 +10,12 @@ import {
   trustTierRanksCoverEverySchemaTier,
   type InternalEventDispatchContext,
 } from './internal-event-pipeline.js';
+import { lockFileFixture, lockWorkflow, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 /**
- * The shared dispatch core is wrapped, not replaced: every call is recorded so a
- * test can assert on the context the adapter SYNTHESIZED, and `passthrough`
- * lets one case run the real pipeline end-to-end so the synthesized context is
- * proven to be one the core actually accepts.
+ * The shared dispatch core is wrapped, not replaced: every call is recorded for
+ * assertions on the SYNTHESIZED context, and `passthrough` runs the real
+ * pipeline to prove the core accepts that context.
  */
 const core = vi.hoisted(() => ({
   seen: [] as WorkflowDispatchContext[],
@@ -39,10 +39,9 @@ vi.mock('./dispatch-matched-workflow.js', async (importOriginal) => {
 });
 
 describe('deriveInternalEventIdentity', () => {
-  // Pins TODAY's two derivations. A change here is customer-visible:
-  // jobConfigType reaches workflows as ctx.event.type; triggerEvent is the
-  // run's forwarded triggerEvent (tracker memory + Platform forward, not a
-  // column).
+  // A change here is customer-visible: jobConfigType reaches workflows as
+  // ctx.event.type; triggerEvent is the run's forwarded triggerEvent (tracker
+  // memory + Platform forward, not a column).
   it.each([
     ['__schedule_fire', 'schedule', 'schedule'],
     ['__workflow_complete', 'workflow_complete', 'workflow_complete'],
@@ -56,24 +55,19 @@ describe('deriveInternalEventIdentity', () => {
   });
 
   it('de-prefixes a bare prefix to an empty string', () => {
-    // Pins the derivation as TOTAL — it answers for every input, including one
-    // nothing can emit (the emit path refuses the whole `__` namespace, and the
-    // orchestrator mints only enumerated names). It says nothing about the
-    // dispatch core: `dispatchTriggerEvent` derives `''` from this event too,
-    // so its blank-override guard neither fires nor changes the outcome here.
-    // That guard's own coverage lives with it, in
-    // `dispatch-matched-workflow.test.ts` — a blank override over a REAL event
-    // type, which is the only case it decides.
+    // Pins the derivation as TOTAL, even for an input nothing can emit (the
+    // emit path refuses the `__` namespace; the orchestrator mints only
+    // enumerated names). `dispatchTriggerEvent` derives `''` here too, so its
+    // blank-override guard is not exercised; that guard is covered over a REAL
+    // event type in `dispatch-matched-workflow.test.ts`.
     expect(deriveInternalEventIdentity('__')).toEqual({ jobConfigType: '', triggerEvent: '' });
   });
 
   it('agrees with a transcription of the router branches it has to match', () => {
-    // `EventRouter.eventToTriggerType` is private, so this is a TRANSCRIPTION of
-    // its branches, not a call into it — it guards this adapter against drifting
-    // from the transcription, and would not notice the router itself changing.
-    // Keeping it anyway: if the two derivations disagree, a workflow is
-    // dispatched with an `event.type` its own rules never matched on, and a
-    // hand-checkable copy of the rule is what makes that visible in review.
+    // `EventRouter.eventToTriggerType` is private, so this TRANSCRIBES its
+    // branches: it catches adapter drift, not a router change. Kept because a
+    // disagreement dispatches a workflow with an `event.type` its rules never
+    // matched, and a hand-checkable copy makes that visible in review.
     for (const name of ['__schedule_fire', '__workflow_complete', '__job_complete', 'custom.x']) {
       const routerType =
         name === '__schedule_fire'
@@ -88,33 +82,29 @@ describe('deriveInternalEventIdentity', () => {
 
 /**
  * A one-static-job lock file, optionally carrying the given triggers and a
- * `dynamic` job entry (the kind the deleted bespoke path filtered away).
+ * `dynamic` job entry.
  */
 function makeLockFile(
   triggers: LockTrigger[] = [],
   opts: { withDynamicJob?: boolean } = {},
 ): LockFile {
-  return {
+  return lockFileFixture({
     schemaVersion: 4,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
     contentHash: 'abc',
     lockfileHash: 'lock',
     workflows: [
-      {
+      lockWorkflow({
         name: 'notify',
         source: { file: '.kici/workflows/ci.ts', export: '#default' },
         contentHash: 'wf-hash',
         compileSchemaVersion: 1,
         triggers,
         jobs: [
-          {
-            _type: 'static',
-            name: 'build',
+          staticJob({
             runsOn: [{ kind: 'exact', value: 'default' }],
             steps: [{ name: 'echo', run: 'echo hi' }],
-            needs: [],
             rules: [],
-          },
+          }),
           ...(opts.withDynamicJob
             ? [
                 {
@@ -124,9 +114,9 @@ function makeLockFile(
               ]
             : []),
         ],
-      },
+      }),
     ],
-  } as unknown as LockFile;
+  });
 }
 
 function makeDecision(over: Partial<WorkflowDecision> = {}): WorkflowDecision {
@@ -164,11 +154,9 @@ function makeInternalCtx(
 }
 
 /**
- * A bundle carrying only what the dispatch path reads for a clone: the URL
- * builder. Every dispatch site derives `repoUrl` from it, and `undefined` here
- * is NOT a harmless omission — it also classifies the run as a
- * local-working-tree dispatch, so no source tarball is packed and the agent
- * clones an empty URL.
+ * A bundle carrying only the URL builder every dispatch site derives `repoUrl`
+ * from. An `undefined` bundle also classifies the run as a local-working-tree
+ * dispatch: no source tarball is packed and the agent clones an empty URL.
  */
 function makeBundle(): InternalEventDispatchContext['bundle'] {
   return {
@@ -194,9 +182,8 @@ function makeDeps(opts: { withCacheInfra?: boolean } = {}): {
         return { status: 'dispatched' as const, agentId: 'a1', jobId: `job-${dispatched.length}` };
       },
     },
-    // The source-pack half of the real bag. Absent by default so the topology
-    // assertions above stay about the adapter; supplied by the one test that
-    // asserts the build job internal runs now get.
+    // The source-pack half of the real bag, absent by default so topology
+    // assertions stay about the adapter; the build-job test supplies it.
     ...(opts.withCacheInfra && {
       buildCoordinator: {
         ensureBuild: async (_key: string, run: () => Promise<void>) => {
@@ -244,14 +231,12 @@ describe('dispatchInternalEventViaPipeline', () => {
     expect(built.securityDecision).toEqual({ action: 'pass' });
     expect(built.crossSource).toBe(false);
     expect(built.workflowRepoIdentifier).toBe('acme/infra');
-    // An internal event dispatches the acting repository's own lock file, so
-    // the acted-on and defining repositories are one and the same.
+    // An internal event dispatches the acting repository's own lock file.
     expect(built.repoIdentifier).toBe('acme/infra');
     expect(built.resolvedOrgId).toBe('__default__');
     expect(built.localWorkingTree).toBe(false);
     expect(built.info.deliveryId).toBe('evt-1');
     expect(built.info.provider).toBe('github');
-    // The spawned-run summary the bespoke path returned, unchanged.
     expect(result).toEqual({
       runId: built.runId,
       repo: 'acme/infra',
@@ -270,7 +255,6 @@ describe('dispatchInternalEventViaPipeline', () => {
     );
 
     expect(result).toBeNull();
-    // Nothing was dispatched, so nothing has to be un-done.
     expect(core.seen).toHaveLength(0);
   });
 
@@ -333,8 +317,8 @@ describe('dispatchInternalEventViaPipeline', () => {
         deps,
       );
 
-      // Never the sha: the gate must reject with its named cause rather than
-      // quote a commit as though it were a branch an operator could allow.
+      // Never the sha: the gate rejects with its named cause rather than quote
+      // a commit as a branch an operator could allow.
       expect(core.seen[0]!.event.targetBranch).toBe('');
     });
 
@@ -370,7 +354,7 @@ describe('dispatchInternalEventViaPipeline', () => {
         deps,
       );
 
-      // Only a schedule fire runs the default branch's lock file. Everything
+      // Only a schedule fire runs the default branch's lock file; everything
       // else inherits its emitter's branch.
       expect(core.seen[0]!.event.targetBranch).toBe('');
     });
@@ -385,10 +369,8 @@ describe('dispatchInternalEventViaPipeline', () => {
   });
 
   it('threads a zero chainDepth rather than dropping it', async () => {
-    // 0 is a real value (a summoner at depth 0 summons at depth… 0 is what the
-    // caller states). A truthiness guard would drop it and read as "unset",
-    // which is the same value here but not the same statement — and the guard
-    // would drop a future explicit 0 the same way.
+    // 0 is what the caller states. A truthiness guard would drop it as
+    // "unset": the same value here, but not the same statement.
     const { deps } = makeDeps();
 
     await dispatchInternalEventViaPipeline(
@@ -483,10 +465,9 @@ describe('dispatchInternalEventViaPipeline', () => {
 
   /**
    * A schedule fire carries no operator input, so the trigger's declared
-   * defaults are the ONLY source of `ctx.dispatchInputs`. Dropping them would
-   * silently blank every input a scheduled workflow declares — a step reading
-   * `ctx.dispatchInputs.mode` would see `undefined` on a cron run while the
-   * same workflow fired manually from the dashboard still sees `'full'`.
+   * defaults are the ONLY source of `ctx.dispatchInputs`. Dropping them makes
+   * `ctx.dispatchInputs.mode` `undefined` on a cron run while a dashboard fire
+   * of the same workflow sees `'full'`.
    */
   const scheduleTrigger = (cronExpression: string, def: string): LockTrigger =>
     ({
@@ -567,10 +548,8 @@ describe('dispatchInternalEventViaPipeline', () => {
   });
 
   it('builds a context the real dispatch core accepts, and the job sees the event', async () => {
-    // The whole point of the adapter is that internal events stop taking a
-    // bespoke path — so at least one case runs the SYNTHESIZED context through
-    // the real core rather than a stub, and asserts what actually reached the
-    // agent.
+    // Runs the SYNTHESIZED context through the real core, not a stub, and
+    // asserts what reached the agent.
     core.passthrough = true;
     const { deps, dispatched } = makeDeps();
 
@@ -586,30 +565,23 @@ describe('dispatchInternalEventViaPipeline', () => {
     const jobConfig = dispatched[0].jobConfig as { event?: { type?: string } };
     expect(jobConfig.event?.type).toBe('kici_event');
     expect(dispatched[0].runId).toBe(result!.runId);
-    // The clone URL the agent will use. A blank one is the shape a missing
-    // bundle produces, and it fails at checkout — the run cannot materialize
-    // its own workflow source.
+    // A missing bundle yields a blank clone URL, which fails at checkout.
     expect(dispatched[0].repoUrl).toBe('https://github.com/acme/infra.git');
-    // The registration's provider context reaches the dispatched job. It is the
-    // same value `onExecutionStarted` persists as `execution_runs.provider_context`
-    // and the source of the run's forwarded `installationId`.
+    // The registration's provider context: what `onExecutionStarted` persists as
+    // `execution_runs.provider_context`, and the run's forwarded `installationId`.
     expect(dispatched[0].providerContext).toEqual({ installationId: 4242 });
   });
 
   /**
-   * The envelope crosses to the agent as `RuleContext.event` and as the `event`
-   * half of `buildConcurrencyGroupContext`, so every field on it is read by user
-   * code as fact — a placeholder is indistinguishable from a real value there.
-   * `targetBranch` and `changedFiles` must both be ABSENT: an internal event
-   * has no changed files, and the branch it presents is provenance the
-   * orchestrator evaluates rather than a field user code asked for. Publishing
-   * it would silently re-key the documented
+   * The envelope reaches the agent as `RuleContext.event` and as the `event`
+   * half of `buildConcurrencyGroupContext`, so user code reads every field as
+   * fact. `targetBranch` and `changedFiles` must be ABSENT: an internal event
+   * has no changed files, and its branch is provenance the orchestrator
+   * evaluates. Publishing it would re-key the documented
    * `ctx.event.targetBranch ?? 'default'` concurrency group, and with
-   * `cancelInProgress` defaulting on that is a live cancellation-scope change.
-   *
-   * Restored from the deleted `buildInternalJobConfigForWorkflow` suite: the
-   * whitelist is the one guarantee that did not survive the switch to the shared
-   * pipeline, whose `SimulatedEvent` requires `targetBranch`.
+   * `cancelInProgress` on by default that changes the cancellation scope.
+   * The shared pipeline's `SimulatedEvent` requires `targetBranch`, so only
+   * this whitelist keeps it out.
    */
   it('fabricates no field the internal event does not actually carry', async () => {
     core.passthrough = true;
@@ -622,9 +594,8 @@ describe('dispatchInternalEventViaPipeline', () => {
         event: {
           id: 'evt-1',
           eventName: '__schedule_fire',
-          // The cron fire is the sharp case: it is the one internal event with
-          // a commit of its own, and neither that sha nor the branch it
-          // presents may reach the envelope.
+          // The sharp case: the one internal event with its own commit; neither
+          // that sha nor its branch may reach the envelope.
           payload: { commitSha: 'a'.repeat(40) },
         },
         cronCommitSha: 'a'.repeat(40),
@@ -642,16 +613,11 @@ describe('dispatchInternalEventViaPipeline', () => {
   });
 
   /**
-   * A DOCUMENTED BEHAVIOR CHANGE, kept deliberately: threading the provider
-   * bundle flips `cacheInfraAvailable` true for internal runs (the real bag
-   * carries a `buildCoordinator` and a `sourceCache`), so a cron /
-   * `kiciEvent()` / `__workflow_complete` run now packs its source through a
-   * synthetic `__build__` job before its static jobs — exactly as a webhook run
-   * does. The deleted path built no source pack at all and left every agent to
-   * clone from `repoUrl`.
-   *
-   * This is webhook parity and the point of the unification, but it is a
-   * dispatch-topology change, so it is asserted rather than left to reading.
+   * The provider bundle makes `cacheInfraAvailable` true for internal runs (the
+   * real bag carries a `buildCoordinator` and a `sourceCache`), so a cron /
+   * `kiciEvent()` / `__workflow_complete` run packs its source through a
+   * synthetic `__build__` job before its static jobs, as a webhook run does.
+   * This dispatch topology is deliberate, so it is asserted.
    */
   it('packs the source through a build job before the static jobs, like a webhook run', async () => {
     core.passthrough = true;
@@ -659,19 +625,15 @@ describe('dispatchInternalEventViaPipeline', () => {
 
     await dispatchInternalEventViaPipeline(makeDecision(), makeLockFile(), makeInternalCtx(), deps);
 
-    // The build job is dispatched FIRST — the static jobs depend on the pack it
-    // produces, so the order is the assertion, not just the membership.
+    // Order matters: the static jobs depend on the pack the build job produces.
     expect(dispatched.map((d) => d.jobName)).toEqual(['__build__notify', 'build']);
-    // ...and it is pinned to a builder agent rather than any free one.
     expect(dispatched[0].runsOnLabels).toContain('kici:role:builder');
-    // Both jobs belong to the same run.
     expect(new Set(dispatched.map((d) => d.runId)).size).toBe(1);
   });
 
   /**
-   * The headline claim: the bespoke path filtered to `_type: 'static'`
-   * and dropped every dynamic job on the floor. The shared pipeline defers them
-   * to the agent init round instead, so the workflow actually runs.
+   * The shared pipeline defers dynamic jobs to the agent init round rather
+   * than filtering to `_type: 'static'`, so the workflow actually runs.
    */
   it('does not drop a dynamic job the bespoke path silently discarded', async () => {
     core.passthrough = true;
@@ -687,8 +649,7 @@ describe('dispatchInternalEventViaPipeline', () => {
 
     expect(result).not.toBeNull();
     const dispatchResult = core.results[0]!;
-    // The dynamic job is accounted for rather than discarded: it is either
-    // dispatched or explicitly deferred to the init round.
+    // Dispatched or explicitly deferred to the init round, never discarded.
     expect(
       (dispatchResult.dispatchedJobCount ?? 0) + (dispatchResult.deferredJobCount ?? 0),
     ).toBeGreaterThan(1);
@@ -696,27 +657,20 @@ describe('dispatchInternalEventViaPipeline', () => {
 });
 
 /**
- * A chainable Kysely stand-in: every builder method returns the chain, and only
- * the terminals resolve. Rows are keyed by the table `selectFrom` named, so the
- * two-hop trust lookup (`kici_events` → `execution_runs`) is driven purely by
- * what the fake holds — which is what lets one harness express "no event row",
- * "no run row", "no tier" and "the lookup throws" as data rather than as four
- * different mocks.
+ * A chainable Kysely stand-in: builder methods return the chain and only the
+ * terminals resolve. Rows are keyed by the `selectFrom` table, so the two-hop
+ * trust lookup (`kici_events` → `execution_runs`) is driven by data: "no event
+ * row", "no run row", "no tier" and "the lookup throws" need no extra mocks.
  *
- * `tablesRead` records every terminal, so a test can assert that a path did NOT
- * query — the only way to tell "resolved without a lookup" from "looked up and
- * happened to agree".
+ * `tablesRead` records every terminal, the only way to tell "resolved without a
+ * lookup" from "looked up and happened to agree".
  */
 function makeFakeDb(opts: {
   rows?: Record<string, Record<string, unknown> | undefined>;
   /**
-   * Per-run `execution_runs` rows, keyed by the `run_id` the query filters on.
-   *
-   * The batch classification reads SEVERAL runs from the one table, so a single
-   * row per table cannot express "one trusted run and one unknown one". The
-   * chain records the `run_id` the caller filtered on and answers from this map
-   * when it is supplied; a run id with no entry answers `undefined`, which is
-   * the "row is gone" case.
+   * Per-run `execution_runs` rows, keyed by the `run_id` the query filters on,
+   * since batch classification reads SEVERAL runs from one table. A run id with
+   * no entry answers `undefined`: the "row is gone" case.
    */
   runRows?: Record<string, Record<string, unknown> | undefined>;
   throwOnTable?: string;
@@ -781,15 +735,13 @@ function emitterRun(trustTier: unknown, contributorUsername = 'octocat') {
  * Trust classification for an internally-triggered run.
  *
  * `trustResolution: undefined` is NOT neutral: `deriveCacheRefScope` maps it to
- * the isolated user-cache scope, and the Dockerfile-build gate refuses an
- * isolated ref outright — so leaving it unset denied every cron-fired image
- * build and re-namespaced every internal run's user cache.
+ * the isolated user-cache scope, which the Dockerfile-build gate refuses, so
+ * leaving it unset denies every cron-fired image build and re-namespaces every
+ * internal run's user cache.
  *
- * Every case asserts the CONSEQUENCE (`jobConfig.cacheRefScope`, which is what
- * the agent actually reads) as well as the synthesized resolution. The
- * `shared` cases are the positive control for the `isolated` ones: they run the
- * same harness and differ only in the row the fake db holds, so an `isolated`
- * assertion that could never have been anything else is ruled out.
+ * Every case asserts the CONSEQUENCE the agent reads (`jobConfig.cacheRefScope`)
+ * as well as the resolution. The `shared` cases, differing only in the fake db's
+ * row, are the positive control that rules out a vacuous `isolated` assertion.
  */
 describe('dispatchInternalEventViaPipeline — trust classification', () => {
   beforeEach(() => {
@@ -836,11 +788,9 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
     // so there is no emitter whose tier it could inherit.
     ['__schedule_fire'],
     // Minted by `ScalerManager` from its own state, refused from a workflow
-    // step by the same reservation, and rate-exempt — every clause
-    // `__schedule_fire` satisfies. They carry no `sourceRunId`, so without
-    // membership they fell through emitter inheritance to no tier at all, which
-    // isolates the caches and denies a `container: { dockerfile }` provisioning
-    // job.
+    // step, and rate-exempt, like `__schedule_fire`. With no `sourceRunId`,
+    // non-membership would leave no tier: isolated caches and a denied
+    // `container: { dockerfile }` provisioning job.
     [SCALER_EVENT_NAMES.scaleUp],
     [SCALER_EVENT_NAMES.scaleDown],
   ])('%s is trusted — the orchestrator minted it, so nothing external shaped it', async (name) => {
@@ -850,19 +800,16 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
 
     expect((trust as { tier: string }).tier).toBe('trusted');
     expect(cacheRefScope).toBe('shared');
-    // Resolved from the event NAME, not from a lookup: a minted event has no
-    // emitting run to inherit from, and querying for one would be a fallback
-    // waiting to misfire.
+    // Resolved from the event NAME: a minted event has no emitting run, and
+    // querying for one would be a fallback waiting to misfire.
     expect(tablesRead).not.toContain('kici_events');
   });
 
   /**
-   * The two lifecycle events a RUN causes carry that run's id as the event's
-   * `source_run_id`, so they inherit its tier exactly as a user `kiciEvent()`
-   * does. Classifying them by name instead was a privilege-laundering path: an
-   * untrusted fork-PR run completes, its `__workflow_complete` subscriber runs
-   * trusted, and the emitter-inheritance rule is reached around rather than
-   * through.
+   * Lifecycle events a RUN causes carry its id as `source_run_id` and inherit
+   * its tier, as a user `kiciEvent()` does. Classifying them by name would
+   * launder privilege: an untrusted fork-PR run completes and its
+   * `__workflow_complete` subscriber runs trusted.
    */
   it.each([['__workflow_complete'], ['__job_complete']])(
     '%s inherits its emitting run rather than claiming minted trust',
@@ -902,10 +849,9 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
   );
 
   /**
-   * `__workflows_failed_batch` carries no `sourceRunId` — it is one synthetic
-   * event per swept window, caused by many runs at once. So it resolves the
-   * MOST RESTRICTIVE tier across the runs it names: a batch is only as trusted
-   * as its least trusted member.
+   * `__workflows_failed_batch` has no `sourceRunId` (one event per swept window,
+   * caused by many runs), so it resolves the MOST RESTRICTIVE tier across the
+   * runs it names.
    */
   it('a batch of trusted runs resolves trusted', async () => {
     const { db } = makeFakeDb({
@@ -938,11 +884,10 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
   });
 
   /**
-   * The retry scanner caps the carried list at `BATCH_MAX_RUNS` while `total`
-   * stays the true count, so a capped batch's `runs` is a SAMPLE. A minimum
-   * over a sample is not a minimum over the batch, so there is nothing sound to
-   * compute — the fail-safe direction is isolated, and the sample being
-   * entirely trusted is exactly the case that would otherwise fail open.
+   * The retry scanner caps `runs` at `BATCH_MAX_RUNS` while `total` stays the
+   * true count, so a capped batch's `runs` is a SAMPLE whose minimum proves
+   * nothing. It fails safe to isolated; an all-trusted sample would otherwise
+   * fail open.
    */
   it('a capped batch is isolated even when every run it carries is trusted', async () => {
     const { db, tablesRead } = makeFakeDb({
@@ -957,8 +902,7 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
 
     expect(trust).toBeUndefined();
     expect(cacheRefScope).toBe('isolated');
-    // Refused WITHOUT computing: a truncated sample is not evidence, so no run
-    // is read at all.
+    // Refused WITHOUT reading any run.
     expect(tablesRead).not.toContain('execution_runs');
   });
 
@@ -982,9 +926,8 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
   });
 
   it('a batch whose run row is gone is isolated, not silently narrowed to the rest', async () => {
-    // One unreadable member makes the minimum unknowable, and an unknowable
-    // minimum takes the strict path — it does not fall back to the tiers that
-    // happened to resolve.
+    // One unreadable member makes the minimum unknowable, which takes the strict
+    // path rather than the tiers that did resolve.
     const { db } = makeFakeDb({ runRows: { 'run-a': emitterRun('trusted') } });
 
     const { trust, cacheRefScope } = await dispatchWith({
@@ -1024,10 +967,9 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
   });
 
   it.each([
-    // The negative control for the two rows above: membership is the ENUMERATED
-    // name, never the `kici.` prefix. An unrecognized name in the reserved
-    // namespace is not something this orchestrator minted, so it takes the
-    // strict path — the exact same reasoning the `__` namespace already had.
+    // Negative control for the rows above: membership is the ENUMERATED name,
+    // never the `kici.` prefix, so an unrecognized reserved name takes the
+    // strict path, as in the `__` namespace.
     ['kici.scaler.scale-sideways'],
     ['kici.something.else'],
     ['kici.'],
@@ -1051,8 +993,8 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
     const { trust, cacheRefScope } = await dispatchWith({ eventName: 'my.custom.event', db });
 
     expect((trust as { tier: string; contributorUsername: string }).tier).toBe('trusted');
-    // The emitter's contributor travels with the tier: it is who the
-    // subscriber's privilege is answerable to.
+    // The emitter's contributor, whom the subscriber's privilege answers to,
+    // travels with the tier.
     expect((trust as { contributorUsername: string }).contributorUsername).toBe('octocat');
     expect(cacheRefScope).toBe('shared');
   });
@@ -1089,12 +1031,10 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
   });
 
   /**
-   * A stored tier the schema no longer admits is a tier the run DID carry, in a
-   * vocabulary this orchestrator stopped reading — a row written before the
-   * tier set narrowed holds `known`, which meant "not trusted". It inherits as
-   * `unknown`, never as unresolved: `isUntrustedTier(undefined)` is `false`, so
-   * an unresolved read would let a subscriber of a once-untrusted run PASS the
-   * trust gate its emitter was held at.
+   * A stored tier the schema does not admit (an older row's `known`, meaning
+   * "not trusted") is still a tier the run carried. It inherits as `unknown`,
+   * never unresolved: `isUntrustedTier(undefined)` is `false`, so an unresolved
+   * read would let the subscriber PASS the trust gate its emitter was held at.
    */
   it.each([['known'], ['super-trusted']])(
     // fails-when: a non-null stored tier that fails the schema reads as unresolved
@@ -1165,8 +1105,7 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
 
     expect(trust).toBeUndefined();
     expect(cacheRefScope).toBe('isolated');
-    // The run WAS looked for — the fallback is the empty result, not a skipped
-    // query.
+    // The fallback follows an empty result, not a skipped query.
     expect(tablesRead).toContain('execution_runs');
   });
 
@@ -1202,9 +1141,8 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
   });
 
   it('an unrecognized __-prefixed name takes the strict path, not the minted one', async () => {
-    // The minted set is enumerated, not prefix-matched: a `__`-name this
-    // orchestrator does not emit is not evidence that nothing external shaped
-    // it, so it inherits (and, with no emitter, stays isolated).
+    // The minted set is enumerated, not prefix-matched: an unemitted `__`-name
+    // may be externally shaped, so it inherits (no emitter: isolated).
     const { db, tablesRead } = makeFakeDb({ rows: {} });
 
     const { trust, cacheRefScope } = await dispatchWith({ eventName: '__not_a_real_event', db });
@@ -1214,11 +1152,10 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
     expect(tablesRead).toContain('kici_events');
   });
   /**
-   * An invoke-gate summon states its emitting run directly. Its event id is
-   * synthesized (`invoke-<uuid>`) and matches no `kici_events` row, so routing
-   * it through the event lookup would ALWAYS return isolated — a wrong verdict
-   * for a summoner that is trusted, reported as a recurring warn-level error on
-   * every summon of a working feature.
+   * An invoke-gate summon states its emitting run directly. Its synthesized
+   * event id (`invoke-<uuid>`) matches no `kici_events` row, so the event
+   * lookup would ALWAYS return isolated, wrong for a trusted summoner and a
+   * warn-level error on every summon.
    */
   it('a summoned run inherits its summoner directly, with no event lookup', async () => {
     const { db, tablesRead } = makeFakeDb({
@@ -1285,13 +1222,11 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
   });
 
   /**
-   * Ordering, not just presence: the summon check runs BEFORE the minted-name
-   * check. A gate's event name is authored in the workflow
-   * (`invokeSource('__schedule_fire')`), so if minted-name matching ran first a
-   * workflow could grant its own summoned run the trusted tier — silently
-   * overriding the inheritance this whole classification is built on. The name
+   * The summon check runs BEFORE the minted-name check. A gate's event name is
+   * workflow-authored (`invokeSource('__schedule_fire')`), so minted-first
+   * would let a workflow grant its own summoned run the trusted tier. The name
    * is refused upstream too (`runInvokeGate`, `buildSummonCallback`,
-   * `invokeSource`); this asserts the classifier is not the thing holding it.
+   * `invokeSource`); this pins the classifier independently.
    */
   it.each([['__schedule_fire'], ['__workflow_complete'], ['__job_complete']])(
     'a summoned run naming %s still inherits, and is never granted minted-trust',
@@ -1310,8 +1245,8 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
   );
 
   it('a summoned run naming a minted event with an unknown summoner is isolated', async () => {
-    // The same ordering at its sharpest: no summoner row at all. Minted-first
-    // would return `trusted` here; summon-first returns the strict fallback.
+    // No summoner row: minted-first would return `trusted`; summon-first
+    // returns the strict fallback.
     const { db } = makeFakeDb({ rows: {} });
 
     const { trust, cacheRefScope } = await dispatchWith({
@@ -1338,14 +1273,13 @@ describe('dispatchInternalEventViaPipeline — trust classification', () => {
 /**
  * Branch inheritance for a non-schedule internal trigger.
  *
- * A `kiciEvent()` subscriber, an invoke-gate summon, and the two lifecycle
- * events all run off a single emitting run, so they present that run's branch
- * to a context's branch restrictions. Without it, a context restricted to
- * `main` could never accept an event-triggered run at all.
+ * A `kiciEvent()` subscriber, an invoke-gate summon, and the lifecycle events
+ * run off one emitting run and present its branch to context branch
+ * restrictions; otherwise a `main`-restricted context rejects every
+ * event-triggered run.
  *
- * The `main` cases are the positive control for the `''` ones: they run the
- * same harness and differ only in the row the fake db holds, so an empty
- * assertion that could never have been anything else is ruled out.
+ * The `main` cases, differing only in the fake db's row, are the positive
+ * control that rules out a vacuous `''` assertion.
  */
 describe('dispatchInternalEventViaPipeline — inherited branch', () => {
   beforeEach(() => {
@@ -1424,9 +1358,8 @@ describe('dispatchInternalEventViaPipeline — inherited branch', () => {
   });
 
   it('presents no branch when the emitting run ref is a commit sha', async () => {
-    // A run started before branch provenance existed recorded the cron commit
-    // sha in `ref`. Passing that on would quote a sha as a branch — the exact
-    // confusion the named-cause verdict exists to prevent.
+    // An older run can hold the cron commit sha in `ref`; passing it on would
+    // quote a sha as a branch, which the named-cause verdict exists to prevent.
     const { db } = makeFakeDb({
       rows: {
         kici_events: { source_run_id: 'run-1' },
@@ -1461,8 +1394,7 @@ describe('dispatchInternalEventViaPipeline — inherited branch', () => {
   });
 
   it('still inherits the branch when the emitting run tier is unreadable', async () => {
-    // The tier and the branch answer different questions. An unreadable tier
-    // isolates the caches; it says nothing about which branch the run was on.
+    // An unreadable tier isolates the caches; it says nothing about the branch.
     const { db } = makeFakeDb({
       rows: {
         kici_events: { source_run_id: 'run-1' },
@@ -1497,11 +1429,10 @@ describe('dispatchInternalEventViaPipeline — inherited branch', () => {
 /**
  * The restrictiveness ranking must answer for EVERY tier the schema admits.
  *
- * An unranked tier is a fail-open: the batch classification compares ranks, and
- * a tier with no rank compares as less restrictive than `trusted`, so a batch
- * carrying one would resolve `trusted`. `Record<TrustTier, number>` fails the
- * build on an unranked tier; this reads the LIVE `TrustTierSchema.options` so
- * the two cannot drift through a cast either.
+ * An unranked tier fails open: it compares as less restrictive than `trusted`,
+ * so a batch carrying one resolves `trusted`. `Record<TrustTier, number>` fails
+ * the build on one; this reads the LIVE `TrustTierSchema.options` so a cast
+ * cannot hide drift either.
  */
 describe('trust tier restrictiveness ranking', () => {
   it('ranks every tier the schema admits', () => {

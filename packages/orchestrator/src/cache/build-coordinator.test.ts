@@ -24,17 +24,14 @@ describe('BuildCoordinator', () => {
     });
     const triggerBuild = vi.fn().mockReturnValue(buildPromise);
 
-    // Fire two concurrent ensureBuild calls
     const p1 = coordinator.ensureBuild('hash-same', triggerBuild);
     const p2 = coordinator.ensureBuild('hash-same', triggerBuild);
 
-    // triggerBuild should only be called once (coalescing)
+    // Coalesced.
     expect(triggerBuild).toHaveBeenCalledOnce();
 
-    // Both should be the same promise reference
     expect(p1).toBe(p2);
 
-    // Resolve the build
     resolveManual();
     await p1;
     await p2;
@@ -83,7 +80,6 @@ describe('BuildCoordinator', () => {
   it('rejects all waiters on timeout', async () => {
     const coordinator = new BuildCoordinator({ timeoutMs: 50 }); // 50ms timeout
 
-    // Build that never resolves
     const triggerBuild = vi.fn().mockReturnValue(new Promise<void>(() => {}));
 
     const p1 = coordinator.ensureBuild('hash-timeout', triggerBuild);
@@ -103,7 +99,7 @@ describe('BuildCoordinator', () => {
 
     await coordinator.ensureBuild('hash-done', triggerBuild);
 
-    // Allow cleanup microtask to run
+    // Let the cleanup microtask run.
     await new Promise((r) => setTimeout(r, 10));
 
     expect(coordinator.isBuilding('hash-done')).toBe(false);
@@ -136,7 +132,7 @@ describe('BuildCoordinator', () => {
 
     await coordinator.ensureBuild('hash-reentry', triggerBuild);
 
-    // Allow cleanup microtask
+    // Let the cleanup microtask run.
     await new Promise((r) => setTimeout(r, 10));
 
     await coordinator.ensureBuild('hash-reentry', triggerBuild);
@@ -153,7 +149,7 @@ describe('BuildCoordinator', () => {
     const triggerBuild = vi.fn().mockResolvedValue(undefined);
     await coordinator.ensureBuild('hash-timer', triggerBuild);
 
-    // The timer should have been cleared via .finally()
+    // Cleared via .finally().
     expect(clearTimeoutSpy).toHaveBeenCalled();
     clearTimeoutSpy.mockRestore();
   });

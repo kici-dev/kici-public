@@ -3,15 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './037_generic_sources_provider_type_local.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 037.
- *
- * Creates a throwaway database, applies migrations 001..037 via the
- * production provider, and asserts the provider_type CHECK constraint now
- * permits 'local' and rejects 'internal'. Gated on
- * `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 037: the provider_type CHECK permits 'local' and rejects
+ * 'internal'. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -24,8 +20,6 @@ function withDatabase(url: string, dbName: string): string {
 }
 
 /**
- * Minimal valid generic_webhook_sources row for a given provider_type.
- *
  * `id` is a uuid column, so callers pass a logical `tag` used to build a stable
  * deterministic UUID (and the routing_key / name), keeping rows addressable by
  * tag without inserting an invalid uuid literal.
@@ -36,6 +30,7 @@ function tagToUuid(tag: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
+/** Minimal valid generic_webhook_sources row for a given provider_type. */
 async function insertSource(
   db: Kysely<unknown>,
   tag: string,
@@ -110,8 +105,8 @@ describeDb('migration 037_generic_sources_provider_type_local', () => {
   });
 
   it("up() migrates carried-over 'internal' rows to 'local' (down/up round-trip)", async () => {
-    // down() restores the old constraint + flips local→internal, letting us seed
-    // an 'internal' row the way a pre-rename deploy would have.
+    // down() restores the old constraint and flips local→internal, so an 'internal' row seeds
+    // as a pre-rename deploy had.
     await down(db);
     await insertSource(
       db,

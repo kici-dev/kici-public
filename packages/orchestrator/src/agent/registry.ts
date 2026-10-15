@@ -1,12 +1,7 @@
 /**
- * In-memory agent registry with label-based lookup and capacity tracking.
- *
- * Follows the Platform ConnectionRegistry dual-map pattern:
- * - Primary map: agentId -> AgentEntry (direct agent lookup)
- * - Secondary map: label -> Set<agentId> (reverse index for label-based dispatch queries)
- * - WS reverse map: ws -> agentId (fast lookup on WS events)
- *
- * No persistence needed -- agents re-register on reconnect.
+ * In-memory agent registry with label-based lookup and capacity tracking, following the
+ * Platform ConnectionRegistry dual-map pattern. No persistence needed: agents re-register
+ * on reconnect.
  */
 
 import {
@@ -53,22 +48,17 @@ export type { WsLike } from '@kici-dev/engine';
 const logger = createLogger({ prefix: 'agent-registry' });
 
 /**
- * Apply the mandatory-labels gate to a single agent against a required-labels
- * set. Returns `true` when every label in `agent.mandatoryLabels` is present
- * in `requiredLabels`. Empty `agent.mandatoryLabels` is a no-op (returns
- * `true`), so static / non-scaler agents and warm-pool replenishment spawns
- * behave exactly as before.
+ * True when every label in `agent.mandatoryLabels` is in `requiredLabels`. An empty
+ * gate passes, so static agents and warm-pool replenishment spawns are ungated.
  *
- * Mirrors the scaler-side gate in `findBackendForLabels`: that gate reads a
- * `mandatoryLabels` list the scaler config folded at load, and this one folds
- * both sides here, so the agent-matching layer (`AgentRegistry.findAvailable` +
- * `hasMatchingAgent`) and the SQL queue-drain path
- * (`JobQueue.dequeueForLabels` / `dequeueById`) reject the same off-gate
- * dispatch attempts in one case.
+ * Mirrors the scaler-side gate in `findBackendForLabels` (which reads a list the scaler
+ * config folded at load), so the agent-matching layer (`AgentRegistry.findAvailable` +
+ * `hasMatchingAgent`) and the SQL queue-drain path (`JobQueue.dequeueForLabels` /
+ * `dequeueById`) reject the same off-gate dispatch attempts in one case.
  *
- * `requiredLabels` is folded here rather than assumed canonical: callers hand
- * it the job's own `runsOn` labels, and one that skipped the fold would leave a
- * gated agent silently reachable by a differently-cased job.
+ * `requiredLabels` is folded here rather than assumed canonical: callers pass the job's
+ * own `runsOn` labels, and a skipped fold would leave a gated agent silently reachable
+ * by a differently-cased job.
  */
 function satisfiesMandatoryLabels(
   agent: { mandatoryLabels: Set<CanonicalLabel> },
@@ -82,61 +72,49 @@ function satisfiesMandatoryLabels(
   return true;
 }
 
-/**
- * A single tracked agent connection.
- */
+/** A single tracked agent connection. */
 export interface AgentEntry {
-  /** Unique agent identifier. */
   agentId: string;
-  /** The underlying WebSocket (or mock). */
   ws: WsLike;
   /**
-   * Set of labels this agent provides (e.g., "linux", "gpu", "docker"), folded
-   * to canonical form by `register()`. The label reverse index is keyed the
+   * Folded to canonical form by `register()`. The label reverse index is keyed the
    * same way, so a lookup must fold its query before it reaches either.
    */
   labels: Set<CanonicalLabel>;
   /**
-   * Kubernetes-taint-style mandatory labels inherited from the scaler that
-   * spawned this agent. A job is only dispatched to this agent when every
-   * label in `mandatoryLabels` appears in `runsOnLabels` (in addition to the
-   * existing subset/exclusion checks).
+   * Kubernetes-taint-style gate copied from the spawning scaler's `mandatoryLabels`
+   * block: a job is dispatched here only when every one of these appears in its
+   * `runsOnLabels`, on top of the subset/exclusion checks. Empty for static agents and
+   * warm-pool replenishment spawns (no gate).
    *
-   * Empty for static agents and warm-pool replenishment spawns — those have
-   * no opt-in gate and behave exactly as before. Populated only when the
-   * spawning scaler declared a `mandatoryLabels` block; the value is a copy
-   * of the scaler's gate (the scaler-side gate in `findBackendForLabels` is
-   * not enough — once the agent registers, the queue-drain path
-   * (`onAgentAvailable` → `dequeueForLabels`) sees only the agent's labels
-   * and would otherwise pull a queued job whose `runsOn` is a subset of the
-   * agent's labels but does not satisfy the gate).
+   * The scaler-side gate in `findBackendForLabels` is not enough: once the agent
+   * registers, the queue-drain path (`onAgentAvailable` → `dequeueForLabels`) sees only
+   * the agent's labels and would pull a queued job whose `runsOn` is a subset of them
+   * but does not satisfy the gate.
    *
-   * Folded to canonical form by `register()`, so a scaler that declared `GPU`
-   * gates the same jobs a scaler that declared `gpu` does.
+   * Folded to canonical form by `register()`, so a scaler that declared `GPU` gates the
+   * same jobs one that declared `gpu` does.
    */
   mandatoryLabels: Set<CanonicalLabel>;
   /**
-   * True when this agent was spawned by a scaler backend. Scaler-managed
-   * agents are single-use: the scaler destroys them on disconnect, so they
-   * can never reconnect to reclaim recovering jobs. The dispatcher uses
-   * this to triage disconnects (requeue / fail-fast) instead of starting a
-   * recovery window that cannot succeed.
+   * Scaler-spawned agents are single-use: the scaler destroys them on disconnect, so
+   * they never reconnect to reclaim recovering jobs. The dispatcher triages their
+   * disconnects (requeue / fail-fast) instead of starting a recovery window that
+   * cannot succeed.
    */
   scalerManaged: boolean;
   /**
    * True while this agent is being torn down and must receive no new work.
    *
-   * The warm pool decides an agent is idle, marks it, then awaits a destroy
-   * that takes seconds — a container `stop({ t: 5 })`, or a Firecracker
-   * `SendCtrlAltDel` plus its grace. The registry entry survives until the
-   * agent's WebSocket actually closes, so without this flag `findAvailable`
-   * kept returning the agent throughout: a job arriving in that window was
-   * dispatched onto a container that was already exiting, and failed as a
-   * spurious infrastructure error on a healthy system.
+   * A warm-pool destroy takes seconds (a container `stop({ t: 5 })`, or a Firecracker
+   * `SendCtrlAltDel` plus its grace), and the entry survives until the WebSocket closes.
+   * Without this flag `findAvailable` keeps returning the agent, and a job arriving in
+   * that window lands on an exiting container and fails as a spurious infrastructure
+   * error.
    *
-   * In memory rather than DB-backed, unlike reboot-pending: a warm-pool
-   * destroy is issued by this process, lasts seconds, and ends with the
-   * WebSocket close that removes the entry — there is nothing to outlive.
+   * In memory rather than DB-backed, unlike reboot-pending: the destroy is issued by
+   * this process, lasts seconds, and ends with the WebSocket close that removes the
+   * entry — there is nothing to outlive.
    */
   draining: boolean;
   /**
@@ -144,25 +122,23 @@ export interface AgentEntry {
    * dispatch as busy. Unset when no hold is in force. See {@link AgentRegistry.markBusyHeld}.
    */
   busyHeldUntil?: number;
-  /** Number of jobs currently executing on this agent. */
   activeJobs: number;
-  /** Maximum concurrent jobs this agent can handle (default 1). */
+  /** Default 1. */
   maxConcurrency: number;
-  /** Unix epoch ms of the last heartbeat received. */
+  /** Unix epoch ms. */
   lastHeartbeatAt: number;
-  /** Agent platform (os.platform(), e.g. 'linux', 'darwin', 'win32'). */
+  /** `os.platform()`, e.g. 'linux', 'darwin', 'win32'. */
   platform: string;
-  /** Agent architecture (os.arch(), e.g. 'x64', 'arm64'). */
+  /** `os.arch()`, e.g. 'x64', 'arm64'. */
   arch: string;
-  /** Unix epoch ms when the agent registered. */
+  /** Unix epoch ms. */
   registeredAt: number;
-  /** Self-reported agent version (e.g. "0.0.1"). Null if not reported. */
+  /** Self-reported; null if not reported. */
   version: string | null;
   /**
-   * The `agent_tokens.id` row used to authenticate this connection, or
-   * `null` when auth mode is `none`. Indexed by `tokenIdIndex` so a
-   * synchronous revocation kick can enumerate every WS authenticated by
-   * a given token.
+   * The `agent_tokens.id` that authenticated this connection, `null` when auth mode is
+   * `none`. Indexed by `tokenIdIndex` so a synchronous revocation kick can enumerate
+   * every WS authenticated by a token.
    */
   tokenId: string | null;
   // --- Static OS metadata (from agent.register) ---
@@ -180,10 +156,9 @@ export interface AgentEntry {
   memoryAvailableMb: number | null;
   uptimeSeconds: number | null;
   /**
-   * The auth token's `agent_type` (`'static'` | `'ephemeral'`) snapshot, or
-   * `null` when auth mode is `none`. Drives the host roster's
-   * `lifecycle_class` — `static` rows persist + alarm on absence, `ephemeral`
-   * rows are GC'd past their ttl.
+   * The auth token's `agent_type` snapshot, `null` when auth mode is `none`. Drives the
+   * host roster's `lifecycle_class`: `static` rows persist and alarm on absence,
+   * `ephemeral` rows are GC'd past their ttl.
    */
   tokenAgentType: 'static' | 'ephemeral' | null;
 }
@@ -198,43 +173,31 @@ interface AgentMetadata {
   nodeVersion?: string;
   runningAsUser?: string;
   runningAsUid?: number;
-  /**
-   * The `agent_tokens.id` row used to authenticate this connection.
-   * `null` when auth mode is `none` (no token-based auth applied).
-   * Indexed for `disconnectByTokenId(...)` revocation kicks.
-   */
+  /** `null` when auth mode is `none`. Indexed for `disconnectByTokenId(...)` revocation kicks. */
   tokenId?: string | null;
   /**
-   * Kubernetes-taint-style mandatory labels inherited from the scaler that
-   * spawned this agent. Empty / undefined for static agents (no opt-in
-   * gate). Populated by `agent-handler.ts` from the scaler manager's
-   * `onAgentRegistered(...)` return value.
+   * Set by `agent-handler.ts` from the scaler manager's `onAgentRegistered(...)` return
+   * value. Empty / undefined for static agents (no gate).
    */
   mandatoryLabels?: string[];
-  /**
-   * True when a scaler backend spawned this agent (single-use; destroyed
-   * on disconnect). Set by `agent-handler.ts` from the presence of the
-   * scaler registration metadata.
-   */
+  /** Set by `agent-handler.ts` from the presence of the scaler registration metadata. */
   scalerManaged?: boolean;
   /**
-   * The auth token's `agent_type` (`'static'` | `'ephemeral'`), threaded from
-   * `agent-handler.ts` so the host roster can snapshot it as the row's
+   * Threaded from `agent-handler.ts` so the host roster can snapshot it as the row's
    * `lifecycle_class`. `null` / undefined when auth mode is `none`.
    */
   tokenAgentType?: 'static' | 'ephemeral' | null;
   /**
-   * Agent-reported typed host-vars (the `KICI_PROPERTIES` bag), threaded from
-   * the `agent.register` message into the roster upsert (shallow-merged with
-   * any operator-declared properties). Undefined ⇒ the agent reported none.
+   * Agent-reported typed host-vars (the `KICI_PROPERTIES` bag), passed into the roster
+   * upsert (shallow-merged with any operator-declared properties). Undefined ⇒ the
+   * agent reported none.
    */
   properties?: Record<string, string | number | boolean>;
 }
 
 /**
- * Subset of `HostRosterStore` the registry reconciles into. Optional — when no
- * store is injected (e.g. workers, which have no DB), the reconcile hooks are
- * a no-op and the in-memory registry behaves exactly as before.
+ * Subset of `HostRosterStore` the registry reconciles into. Optional: with no store
+ * injected (e.g. workers, which have no DB), the reconcile hooks are a no-op.
  */
 export interface RosterReconciler {
   upsert(input: {
@@ -261,65 +224,42 @@ export interface AgentRegistryDeps {
 }
 
 export class AgentRegistry {
-  /** Primary: agentId -> AgentEntry */
   private readonly agents = new Map<string, AgentEntry>();
 
-  /** Secondary: label -> Set<agentId> (reverse index for label-based queries) */
+  /** label -> agentIds, keyed on the canonical label. */
   private readonly labelIndex = new Map<string, Set<string>>();
 
-  /** Reverse: ws -> agentId (for fast lookup on WS events) */
   private readonly wsToAgentId = new Map<WsLike, string>();
 
   /**
-   * Reverse: tokenId -> Set<agentId> (for synchronous revocation kicks).
-   *
-   * Populated when `register()` is called with a non-null `tokenId`,
-   * cleaned up by `removeFromIndexes()` on `unregister()` /
-   * re-registration. `disconnectByTokenId(tokenId)` walks the matching
-   * set, closes each WS, and unregisters the entry — closing the
-   * gap where a revoked token's in-flight WS retained data-plane
-   * authority until the agent itself disconnected.
+   * tokenId -> agentIds, for synchronous revocation kicks: `disconnectByTokenId` closes
+   * each WS so a revoked token's in-flight connection loses data-plane authority at
+   * once instead of when the agent disconnects.
    */
   private readonly tokenIdIndex = new Map<string, Set<string>>();
 
   /**
-   * Per-tokenId TTL kick timer, keyed by `tokenId`. Scheduled by
-   * `scheduleExpiryKick(tokenId, expiresAt)` at agent register-time
-   * when the auth token has a non-null `expires_at`. Fires
-   * `disconnectByTokenId(tokenId)` when the token's TTL elapses, and
-   * is cleared when (a) the timer fires, (b) `disconnectByTokenId` is
-   * called explicitly via revocation (no double-kick when revoke
-   * races TTL), or (c) the last agent under the tokenId unregisters
-   * naturally (avoid timer leaks on long-lived registries).
-   *
-   * Idempotent: re-scheduling the same tokenId is a no-op as long as
-   * a timer is still queued — a token's `expires_at` doesn't shift
-   * across reconnects of the same agent. Revocation kicks a token's
-   * in-flight WS connections at once; these timers do the same when
-   * the token reaches its natural TTL.
+   * Per-tokenId TTL kick timer, armed by `scheduleExpiryKick` for a token with a
+   * non-null `expires_at`. Cleared when it fires, when a revocation calls
+   * `disconnectByTokenId` (no double kick when revoke races TTL), or when the last agent
+   * under the token unregisters (no timer leak on long-lived registries).
    */
   private readonly tokenExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
-   * Per-agent last roster `last_seen` stamp time (epoch ms). Throttles the
-   * coarse heartbeat write so we don't issue a DB write per agent per
-   * heartbeat — `grace`/`ttl` are minute-scale, so a throttled stamp is
-   * sufficient. Cleaned up alongside the agent in `removeFromIndexes`.
+   * Per-agent last roster `last_seen` stamp (epoch ms). Throttles the heartbeat write
+   * to one per agent per window: `grace`/`ttl` are minute-scale, so a throttled stamp
+   * is sufficient.
    */
   private readonly lastRosterStampAt = new Map<string, number>();
 
   /** Minimum interval between coarse roster `last_seen` stamps per agent. */
   private readonly ROSTER_STAMP_THROTTLE_MS = 60_000;
 
-  /** Optional host-roster reconciler + this instance's id (see AgentRegistryDeps). */
   private readonly rosterStore?: RosterReconciler;
   private readonly instanceId?: string;
 
-  /**
-   * The roster reconcile seam is optional: when no store is injected (workers
-   * with no DB, unit tests), every reconcile hook is a no-op and the in-memory
-   * registry behaves exactly as before.
-   */
+  /** With no roster store (workers with no DB, unit tests), every reconcile hook is a no-op. */
   constructor(deps: AgentRegistryDeps = {}) {
     this.rosterStore = deps.rosterStore;
     this.instanceId = deps.instanceId;
@@ -339,12 +279,11 @@ export class AgentRegistry {
   }
 
   /**
-   * Sockets whose `agent.register` is in flight (awaiting the scaler lookup),
-   * per agent id, with the id of the agent token each authenticated with
-   * (`null` without token auth). Kept here rather than in the WebSocket
-   * handler because the coordinator builds one handler per connection: a
-   * socket's close, and the check a registration makes against another agent
-   * token, must see a registration in flight on another connection.
+   * Sockets whose `agent.register` is in flight (awaiting the scaler lookup), per agent
+   * id, with the agent token id each authenticated with (`null` without token auth).
+   * Kept here rather than in the WebSocket handler because the coordinator builds one
+   * handler per connection: a socket's close, and a registration's check against
+   * another agent token, must see a registration in flight on another connection.
    */
   private readonly registeringSockets = new Map<string, Map<WsLike, string | null>>();
 
@@ -391,8 +330,7 @@ export class AgentRegistry {
   // ── Registration ──────────────────────────────────────────────────
 
   /**
-   * Register an agent. If the agentId already exists, updates the existing
-   * entry (agent reconnection scenario).
+   * Register an agent, replacing an existing entry for the same id (reconnect).
    *
    * @returns the socket the previous entry was bound to, when this register
    *   replaced one bound to a *different* socket. The caller owns that socket's
@@ -415,7 +353,6 @@ export class AgentRegistry {
     const existing = this.agents.get(agentId);
     const supersededWs = existing && existing.ws !== ws ? existing.ws : undefined;
 
-    // Clean up old entry if re-registering (agent reconnection)
     if (existing) {
       this.removeFromIndexes(agentId, existing);
     }
@@ -428,8 +365,7 @@ export class AgentRegistry {
       labels: canonicalizeLabelSet(labels),
       mandatoryLabels: canonicalizeLabelSet(metadata?.mandatoryLabels ?? []),
       scalerManaged: metadata?.scalerManaged ?? false,
-      // A fresh registration is never draining: a reconnecting agent that was
-      // condemned before is a NEW connection with new work to do.
+      // A reconnecting agent that was condemned before is a NEW connection with new work.
       draining: false,
       activeJobs: 0,
       maxConcurrency,
@@ -439,31 +375,26 @@ export class AgentRegistry {
       registeredAt: Date.now(),
       version: version ?? null,
       tokenId,
-      // Static metadata
       hostname: metadata?.hostname ?? null,
       osRelease: metadata?.osRelease ?? null,
       osVersion: metadata?.osVersion ?? null,
       totalMemoryMb: metadata?.totalMemoryMb ?? null,
       cpuCount: metadata?.cpuCount ?? null,
       nodeVersion: metadata?.nodeVersion ?? null,
-      // Process identity
       runningAsUser: metadata?.runningAsUser ?? null,
       runningAsUid: metadata?.runningAsUid ?? null,
-      // Dynamic metadata (populated later via agent.status)
+      // Populated later via agent.status.
       memoryUsedMb: null,
       memoryAvailableMb: null,
       uptimeSeconds: null,
       tokenAgentType: metadata?.tokenAgentType ?? null,
     };
 
-    // Primary map
     this.agents.set(agentId, entry);
 
-    // WS reverse map
     this.wsToAgentId.set(ws, agentId);
 
-    // Label reverse index, keyed on the canonical form so a lookup that folded
-    // its query finds an agent that advertised the label in any case.
+    // Keyed on the canonical form, so a folded lookup finds a label advertised in any case.
     for (const label of canonicalizeLabels(labels)) {
       let agentIds = this.labelIndex.get(label);
       if (!agentIds) {
@@ -473,7 +404,6 @@ export class AgentRegistry {
       agentIds.add(agentId);
     }
 
-    // Token-id reverse index (only when authenticated under a token)
     if (tokenId !== null) {
       let tokenAgents = this.tokenIdIndex.get(tokenId);
       if (!tokenAgents) {
@@ -483,11 +413,10 @@ export class AgentRegistry {
       tokenAgents.add(agentId);
     }
 
-    // Reconcile the durable host roster (best-effort, fire-and-forget). The
-    // in-memory registry stays the dispatch source of truth; the roster is a
-    // durable shadow that survives reconnects and powers declared inventory.
-    // A row with no known lifecycle class defaults to `ephemeral` (the GC-able
-    // class) so an unknown agent is never persisted forever.
+    // Best-effort, fire-and-forget. The in-memory registry stays the dispatch source of
+    // truth; the roster is a durable shadow that survives reconnects and powers declared
+    // inventory. An unknown lifecycle class defaults to `ephemeral` (the GC-able class)
+    // so an unknown agent is never persisted forever.
     if (this.rosterStore && this.instanceId) {
       const instanceId = this.instanceId;
       void this.rosterStore
@@ -500,9 +429,8 @@ export class AgentRegistry {
           // when the auth mode is `none`, so only this flag separates a scaler
           // agent from a fleet host in that mode.
           scalerManaged: metadata?.scalerManaged ?? false,
-          // Persist the canonical form the in-memory entry holds. The roster
-          // reads fold too, so a row written before this did still matches —
-          // but a row written now needs no fold to agree with the registry.
+          // Persist the canonical form the in-memory entry holds. Roster reads fold too,
+          // so an older non-canonical row still matches.
           labels: canonicalizeLabels(labels),
           hostname: metadata?.hostname ?? null,
           platform,
@@ -521,10 +449,7 @@ export class AgentRegistry {
     return supersededWs;
   }
 
-  /**
-   * Unregister an agent by ID. Removes from all indexes.
-   * @returns The removed AgentEntry, or undefined if not found.
-   */
+  /** @returns the removed entry, or undefined if not found. */
   unregister(agentId: string): AgentEntry | undefined {
     const entry = this.agents.get(agentId);
     if (!entry) return undefined;
@@ -532,9 +457,8 @@ export class AgentRegistry {
     this.removeFromIndexes(agentId, entry);
     this.agents.delete(agentId);
 
-    // Clear liveness on the durable roster row (owner-guarded, best-effort).
-    // Covers WS-close / token-revoke / TTL-expiry — all three funnel through
-    // unregister(). The row itself stays (status derives from last_seen +
+    // Owner-guarded, best-effort. WS close, token revoke and TTL expiry all funnel
+    // through here. The row stays (status derives from last_seen +
     // connected_instance_id); only the live-WS ownership is cleared.
     if (this.rosterStore && this.instanceId) {
       void this.rosterStore.markDisconnected(agentId, this.instanceId).catch(() => {});
@@ -543,10 +467,7 @@ export class AgentRegistry {
     return entry;
   }
 
-  /**
-   * Unregister an agent by its WebSocket reference (for disconnect handling).
-   * @returns The removed AgentEntry, or undefined if not found.
-   */
+  /** For disconnect handling. @returns the removed entry, or undefined if not found. */
   unregisterByWs(ws: WsLike): AgentEntry | undefined {
     const agentId = this.wsToAgentId.get(ws);
     if (agentId === undefined) return undefined;
@@ -554,26 +475,19 @@ export class AgentRegistry {
   }
 
   /**
-   * Close every WS authenticated under `tokenId`, send a final
-   * `auth.failure` message, then unregister the entry. Returns the
-   * count of kicked agents.
+   * Send a final `auth.failure` to every WS authenticated under `tokenId`, close it,
+   * and unregister the entry. Returns the count of kicked agents.
    *
-   * Closes the gap on the agent->orchestrator leg: when an admin
-   * revokes a token via `DELETE /api/v1/agent-tokens/:id`, the route
-   * calls this synchronously after `tokenStore.revoke(id)` so the
-   * in-flight WS loses data-plane authority before the handler
-   * returns.
+   * `DELETE /api/v1/agent-tokens/:id` calls this synchronously after
+   * `tokenStore.revoke(id)`, so the in-flight WS loses data-plane authority before the
+   * handler returns.
    *
-   * The WS close code is `WS_CLOSE_AGENT_AUTH_FAILED` (4010); the
-   * agent's reconnect loop treats both the `auth.failure` message and
-   * this close code as permanent and stops retrying.
+   * The close code is `WS_CLOSE_AGENT_AUTH_FAILED` (4010); the agent's reconnect loop
+   * treats both it and the `auth.failure` message as permanent and stops retrying.
    */
   disconnectByTokenId(tokenId: string): number {
-    // Always clear any pending TTL timer first — whether the kick was
-    // initiated by an explicit revoke or fired by the natural TTL, the
-    // post-condition is the same (no agents remain under this token), so
-    // we don't want a redundant fire later. Idempotent: clearTimeout on
-    // an undefined value is a no-op.
+    // Clear the TTL timer first: revoke or natural TTL, afterwards no agents remain
+    // under this token, so a later fire would be redundant.
     const timer = this.tokenExpiryTimers.get(tokenId);
     if (timer !== undefined) {
       clearTimeout(timer);
@@ -583,8 +497,7 @@ export class AgentRegistry {
     const tokenAgents = this.tokenIdIndex.get(tokenId);
     if (!tokenAgents || tokenAgents.size === 0) return 0;
 
-    // Snapshot the agentIds to avoid mutating-while-iterating: each
-    // unregister() below mutates `this.tokenIdIndex` via removeFromIndexes.
+    // Snapshot: each unregister() below mutates `this.tokenIdIndex`.
     const agentIds = [...tokenAgents];
 
     let kicked = 0;
@@ -592,10 +505,8 @@ export class AgentRegistry {
       const entry = this.agents.get(agentId);
       if (!entry) continue;
 
-      // Best-effort wire notification: send `auth.failure` so a
-      // well-behaved agent stops its reconnect loop immediately. If
-      // the WS is already closing/closed the send may throw — swallow
-      // it so a single bad socket cannot block the rest of the kick.
+      // Best-effort, so a well-behaved agent stops reconnecting at once. A send on a
+      // closing socket may throw; swallow it so one bad socket cannot block the kick.
       try {
         if (entry.ws.readyState === 1 /* OPEN */) {
           entry.ws.send(JSON.stringify({ type: 'auth.failure', reason: 'Token revoked' }));
@@ -628,32 +539,23 @@ export class AgentRegistry {
   }
 
   /**
-   * Schedule a one-shot TTL kick for `tokenId` at `expiresAt`. When
-   * the timer fires (or if `expiresAt` is already past), every
-   * in-flight WS authenticated under the token is closed via
-   * `disconnectByTokenId`.
+   * Schedule a one-shot `disconnectByTokenId` kick for `tokenId` at `expiresAt`, or at
+   * once when it is already past.
    *
-   * Idempotent per `tokenId`: if a timer is already scheduled for
-   * this token, the call is a no-op. A token's `expires_at` doesn't
-   * change across reconnects, so re-scheduling would just re-arm the
-   * same trigger.
+   * Idempotent per `tokenId`: a token's `expires_at` doesn't change across reconnects,
+   * so re-scheduling would re-arm the same trigger.
    *
-   * Caller is the agent WS handler at register-time, when the token's
-   * `agent_tokens.expires_at` column is non-null. Static tokens have
-   * `expires_at = null` and are skipped at the call site (they have
-   * no TTL by design). Revocation kicks a token's in-flight WS
-   * connections at once; this timer does the same at the token's
-   * natural TTL.
+   * Called by the agent WS handler at register time when `agent_tokens.expires_at` is
+   * non-null. Static tokens have `expires_at = null` (no TTL by design) and are skipped
+   * at the call site.
    */
   scheduleExpiryKick(tokenId: string, expiresAt: Date): void {
     if (this.tokenExpiryTimers.has(tokenId)) return;
 
     const delayMs = expiresAt.getTime() - Date.now();
     if (delayMs <= 0) {
-      // Already expired — kick immediately. The DB-level `validate()`
-      // would have rejected this token at auth-time, but a race
-      // (token expired between auth and register, or a clock skew)
-      // could land us here legitimately.
+      // `validate()` rejects an expired token at auth time, but the token can expire
+      // between auth and register, or under clock skew.
       this.disconnectByTokenId(tokenId);
       return;
     }
@@ -668,19 +570,14 @@ export class AgentRegistry {
   // ── Label-based lookup ────────────────────────────────────────────
 
   /**
-   * Find available agents that match ALL required labels.
-   * An agent is available when it has capacity (activeJobs < maxConcurrency).
+   * Find available agents that have ALL required labels.
+   * An agent is available when it is not draining and has a free slot
+   * ({@link agentHasFreeSlot}: activeJobs < maxConcurrency and no busy hold).
    *
-   * In addition to the subset + exclusion filters, every label declared in
-   * the agent's `mandatoryLabels` must appear in `requiredLabels`. This is
-   * the agent-side mirror of the scaler-side mandatory-labels gate
-   * (`findBackendForLabels`). Without it, a queued job whose `runsOn` is a
-   * subset of a gated agent's labels but does not list the gate label
-   * would be drained onto that agent the next time `onAgentAvailable`
-   * fires — sidestepping the opt-in semantics the gate is meant to enforce.
-   *
-   * @param requiredLabels - All labels the agent must have (intersection semantics).
-   * @returns Array of matching available AgentEntry objects.
+   * Every label in the agent's `mandatoryLabels` must also appear in `requiredLabels`:
+   * the agent-side mirror of the scaler-side gate (`findBackendForLabels`). Without it,
+   * a queued job whose `runsOn` is a subset of a gated agent's labels but omits the
+   * gate label would be drained onto that agent the next time `onAgentAvailable` fires.
    */
   findAvailable(
     requiredLabels: string[],
@@ -688,9 +585,8 @@ export class AgentRegistry {
     excludeLabels: string[] = [],
     excludePatterns: LabelMatcher[] = [],
   ): AgentEntry[] {
-    // Fold every selector once, here: the entries and the label index below are
-    // canonical, so a caller's `Docker` must become `docker` before it is
-    // compared against either.
+    // Fold every selector once: the entries and the label index are canonical, so a
+    // caller's `Docker` must become `docker` before it is compared against either.
     const required = canonicalizeLabels(requiredLabels);
     const excluded = canonicalizeLabels(excludeLabels);
     const requiredMatchers = requiredPatterns.map(canonicalizeMatcher);
@@ -701,11 +597,9 @@ export class AgentRegistry {
     if (required.length === 0) {
       candidates = [...this.agents.values()].filter((e) => !e.draining && agentHasFreeSlot(e));
     } else {
-      // Start with the set of agents matching the first label (smallest candidate set)
       const firstLabelAgents = this.labelIndex.get(required[0]);
       if (!firstLabelAgents || firstLabelAgents.size === 0) return [];
 
-      // Intersect with all other required labels
       const candidateIds = new Set(firstLabelAgents);
       for (let i = 1; i < required.length; i++) {
         const labelAgents = this.labelIndex.get(required[i]);
@@ -720,7 +614,6 @@ export class AgentRegistry {
         if (candidateIds.size === 0) return [];
       }
 
-      // Filter to agents with capacity
       candidates = [];
       for (const id of candidateIds) {
         const entry = this.agents.get(id)!;
@@ -730,14 +623,12 @@ export class AgentRegistry {
       }
     }
 
-    // Regex include: every required pattern must match some agent label.
     if (requiredMatchers.length > 0) {
       candidates = candidates.filter((a) =>
         requiredMatchers.every((p) => matcherSatisfiedBy(p, a.labels)),
       );
     }
 
-    // Apply exact + regex exclusion filters.
     let filtered = candidates;
     if (excluded.length > 0) {
       filtered = filtered.filter((agent) => {
@@ -753,16 +644,13 @@ export class AgentRegistry {
       );
     }
 
-    // Apply mandatory-labels gate: every label in agent.mandatoryLabels must
-    // appear in requiredLabels. Empty agent.mandatoryLabels is a no-op.
     return filtered.filter((agent) => satisfiesMandatoryLabels(agent, required));
   }
 
   /**
-   * Whether a specific agent satisfies the same label / exclude / mandatory
-   * gate `findAvailable` applies per-agent, ignoring capacity. Used by the
-   * host-fanout pin to verify the resolved agent still matches before pinning
-   * (guards against roster label drift between resolution and dispatch).
+   * The per-agent label / exclude / mandatory gate of `findAvailable`, ignoring
+   * capacity. The host-fanout pin uses it to guard against roster label drift between
+   * resolution and dispatch.
    */
   agentSatisfies(
     agent: AgentEntry,
@@ -788,15 +676,13 @@ export class AgentRegistry {
   }
 
   /**
-   * Check if ANY registered agent matches the required labels, regardless of capacity.
-   * Used to decide whether to queue (agent exists but busy) vs reject (no agent at all).
+   * Whether ANY registered agent matches, regardless of capacity: decides queue (agent
+   * exists but busy) vs reject (no agent at all).
    *
-   * Applies the same `mandatoryLabels` gate as `findAvailable` — a gated
-   * agent only counts as "matching" when every label in its
-   * `mandatoryLabels` is present in `requiredLabels`. Without this, the
-   * dispatcher's `queued-no-backend` decision in `dispatch()` would treat
-   * an off-gate gated agent as "matching but busy" and skip the peer
-   * reroute path even though the local agent can never accept the job.
+   * Applies the `mandatoryLabels` gate of `findAvailable`. Without it, the
+   * `queued-no-backend` decision in `dispatch()` would treat an off-gate agent as
+   * "matching but busy" and skip the peer reroute path, though that agent can never
+   * accept the job.
    */
   hasMatchingAgent(
     requiredLabels: string[],
@@ -804,9 +690,9 @@ export class AgentRegistry {
     excludeLabels: string[] = [],
     excludePatterns: LabelMatcher[] = [],
     /**
-     * An extra test a label-matching agent must pass: whether it can run the
-     * job at all, which its labels cannot express. An agent that matches but
-     * never could is not a reason to keep the job here rather than reroute it.
+     * Whether a label-matching agent can run the job at all, which its labels cannot
+     * express. An agent that never could is no reason to keep the job here rather
+     * than reroute it.
      */
     canRun: (entry: AgentEntry) => boolean = () => true,
   ): boolean {
@@ -819,9 +705,8 @@ export class AgentRegistry {
     if (candidateIds === null) return false;
 
     const ok = (entry: AgentEntry): boolean => {
-      // The two choke points must reject the same dispatches, or the reroute
-      // path is told a local agent can take work that `findAvailable` will
-      // never hand it.
+      // Must reject the same dispatches as `findAvailable`, or the reroute path is told a
+      // local agent can take work it will never be handed.
       if (entry.draining) return false;
       if (excluded.some((e) => entry.labels.has(e))) return false;
       if (requiredMatchers.some((p) => !matcherSatisfiedBy(p, entry.labels))) return false;
@@ -830,8 +715,6 @@ export class AgentRegistry {
     };
 
     if (required.length === 0) {
-      // Walk every agent and return true on the first one that satisfies
-      // both the exclusion filters and the gate.
       for (const entry of this.agents.values()) {
         if (ok(entry)) return true;
       }
@@ -845,14 +728,11 @@ export class AgentRegistry {
   }
 
   /**
-   * Internal helper: intersect the per-label candidate sets to find agentIds
-   * that satisfy `requiredLabels`. Returns `null` when any required label
-   * matches zero agents (so callers can short-circuit). Returns an empty
-   * Set on `requiredLabels.length === 0` since the caller decides the
-   * walk strategy in that case.
+   * Agent ids that have every required label, or `null` when any label matches zero
+   * agents (so callers can short-circuit). An empty Set for no labels: the caller picks
+   * the walk strategy then.
    *
-   * Takes canonical labels: the index it reads is keyed on the canonical form,
-   * so a caller folds before it gets here.
+   * Takes canonical labels, since the index is keyed on the canonical form.
    */
   private intersectLabelCandidates(requiredLabels: readonly CanonicalLabel[]): Set<string> | null {
     if (requiredLabels.length === 0) return new Set();
@@ -878,10 +758,7 @@ export class AgentRegistry {
 
   // ── Job tracking ──────────────────────────────────────────────────
 
-  /**
-   * Increment activeJobs for an agent.
-   * @returns false if agent not found.
-   */
+  /** @returns false if agent not found. */
   incrementActiveJobs(agentId: string): boolean {
     const entry = this.agents.get(agentId);
     if (!entry) return false;
@@ -889,10 +766,7 @@ export class AgentRegistry {
     return true;
   }
 
-  /**
-   * Decrement activeJobs for an agent (min 0).
-   * @returns false if agent not found.
-   */
+  /** Floors at 0. @returns false if agent not found. */
   decrementActiveJobs(agentId: string): boolean {
     const entry = this.agents.get(agentId);
     if (!entry) return false;
@@ -902,24 +776,18 @@ export class AgentRegistry {
 
   // ── Heartbeat ─────────────────────────────────────────────────────
 
-  /**
-   * Update the last heartbeat timestamp for an agent.
-   */
   updateHeartbeat(agentId: string): boolean {
     const entry = this.agents.get(agentId);
     if (!entry) return false;
     entry.lastHeartbeatAt = Date.now();
 
-    // Coarse, throttled roster last_seen stamp (owner-guarded, best-effort).
-    // register() already stamped last_seen, so the first window is suppressed;
-    // subsequent heartbeats refresh the durable column at most once per
-    // throttle window, keeping the reaper's liveness view fresh without a DB
-    // write per heartbeat.
+    // Throttled roster last_seen stamp (owner-guarded, best-effort): at most one write
+    // per window keeps the reaper's liveness view fresh. register() already stamped
+    // last_seen, so the first window is suppressed.
     if (this.rosterStore && this.instanceId) {
       const now = Date.now();
       const last = this.lastRosterStampAt.get(agentId) ?? now;
       if (!this.lastRosterStampAt.has(agentId)) {
-        // First heartbeat after register: seed the window, suppress the write.
         this.lastRosterStampAt.set(agentId, now);
       } else if (now - last >= this.ROSTER_STAMP_THROTTLE_MS) {
         this.lastRosterStampAt.set(agentId, now);
@@ -933,11 +801,9 @@ export class AgentRegistry {
   // ── Lookups ───────────────────────────────────────────────────────
 
   /**
-   * Compact, allocation-cheap snapshot of every registered agent's routing
-   * facts. Used by the dispatcher to log WHY a job found no backend (required
-   * labels vs each agent's labels / capacity), which is otherwise invisible —
-   * a `queued-no-backend` outcome alone doesn't say whether the label set
-   * mismatched, the agent was at capacity, or no agent was connected at all.
+   * Cheap snapshot of every agent's routing facts, so the dispatcher can log WHY a job
+   * found no backend: `queued-no-backend` alone doesn't say whether the labels
+   * mismatched, the agent was at capacity, or no agent was connected.
    */
   agentSummaries(): Array<{
     agentId: string;
@@ -958,28 +824,20 @@ export class AgentRegistry {
   }
 
   /**
-   * Get a single agent entry by ID.
-   */
-  /**
-   * Whether one agent id is currently registered.
-   *
-   * Distinct from `findAvailable`, which answers "which agents could take this
-   * job" — the container orphan sweep needs to know only whether a running
-   * container's agent is present at all, including one that is busy or gated.
+   * Distinct from `findAvailable` ("which agents could take this job"): the container
+   * orphan sweep needs only whether a running container's agent is present at all,
+   * busy or gated included.
    */
   isRegistered(agentId: string): boolean {
     return this.agents.has(agentId);
   }
 
   /**
-   * Condemn an agent: it stays registered and keeps finishing its current work,
-   * but takes no new dispatches.
+   * Condemn an agent before a warm-pool destroy: it stays registered and finishes its
+   * current work, but takes no new dispatches.
    *
-   * Called before a warm-pool destroy is issued. Returns the agent's current
-   * `activeJobs` so the caller can see a job that was claimed between its idle
-   * check and this mark, and back out.
-   *
-   * @returns the agent's active-job count, or `undefined` when it is not registered
+   * @returns the agent's `activeJobs`, so the caller can see a job claimed between its
+   *   idle check and this mark and back out; `undefined` when not registered
    */
   markDraining(agentId: string): number | undefined {
     const entry = this.agents.get(agentId);
@@ -1056,25 +914,16 @@ export class AgentRegistry {
     return this.agents.get(agentId);
   }
 
-  /**
-   * Get an agent entry by its WebSocket reference.
-   */
   getByWs(ws: WsLike): AgentEntry | undefined {
     const agentId = this.wsToAgentId.get(ws);
     if (agentId === undefined) return undefined;
     return this.agents.get(agentId);
   }
 
-  /**
-   * Total number of registered agents.
-   */
   getActiveCount(): number {
     return this.agents.size;
   }
 
-  /**
-   * Iterator over all agent entries (for heartbeat checks, etc).
-   */
   *getAllEntries(): IterableIterator<AgentEntry> {
     yield* this.agents.values();
   }
@@ -1082,18 +931,16 @@ export class AgentRegistry {
   // ── Internal ──────────────────────────────────────────────────────
 
   /**
-   * Remove an agent from the WS reverse map and label index.
-   * Does NOT remove from the primary agents map.
+   * Remove an agent from the WS reverse map, the label index, the roster-stamp
+   * map and the token index (cancelling the token's TTL timer when no agent is
+   * left on it). Does NOT remove from the primary agents map.
    */
   private removeFromIndexes(agentId: string, entry: AgentEntry): void {
-    // Remove WS reverse lookup
     this.wsToAgentId.delete(entry.ws);
 
-    // Drop the coarse roster-stamp throttle entry so it doesn't leak across
-    // many short-lived agents on a long-lived process.
+    // So it doesn't leak across many short-lived agents on a long-lived process.
     this.lastRosterStampAt.delete(agentId);
 
-    // Remove from label index
     for (const label of entry.labels) {
       const agentIds = this.labelIndex.get(label);
       if (agentIds) {
@@ -1104,17 +951,14 @@ export class AgentRegistry {
       }
     }
 
-    // Remove from token-id reverse index
     if (entry.tokenId !== null) {
       const tokenAgents = this.tokenIdIndex.get(entry.tokenId);
       if (tokenAgents) {
         tokenAgents.delete(agentId);
         if (tokenAgents.size === 0) {
           this.tokenIdIndex.delete(entry.tokenId);
-          // No more agents under this token — cancel the pending TTL
-          // kick to avoid leaking the timer (and the closure that
-          // pins this registry instance) on long-lived processes
-          // that authenticate many short-lived tokens.
+          // Cancel the TTL kick so the timer (and its closure pinning this registry)
+          // doesn't leak on processes that authenticate many short-lived tokens.
           const timer = this.tokenExpiryTimers.get(entry.tokenId);
           if (timer !== undefined) {
             clearTimeout(timer);

@@ -209,8 +209,8 @@ function runtimeLabelIsProof(agent: FitAgent): boolean {
 }
 
 /**
- * Whether this agent may run this job. Every dispatch path that hands a
- * queued job to an agent asks this one predicate; labels have already matched.
+ * Whether this agent may run this job, once its labels have matched. Every
+ * dispatch path that hands a queued job to an agent asks this one predicate.
  *
  * In order:
  *

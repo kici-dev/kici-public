@@ -1,15 +1,10 @@
 /**
- * Build the `kici report` bundle.
+ * Build the `kici report` bundle: the orchestrator debug bundle's archive layout
+ * (so `kici-admin inspect-bundle` reads either), collected from the workflow
+ * author's side — their config, project and reported run.
  *
- * Writes the same archive layout the orchestrator's debug bundle uses, so
- * `kici-admin inspect-bundle` reads either one, but collects from the workflow
- * author's side: their config, their project, and the run they are reporting
- * about — rather than an orchestrator's own logs and state.
- *
- * Every collector runs through `runCollector`, which turns a throw into a
- * recorded `error` entry instead of losing the whole bundle. That matters twice
- * over: a customer with one broken collector still gets a shareable report, and
- * the per-collector outcome is itself a product feature — the manifest's
+ * `runCollector` turns a throw into a recorded `error` entry, so one broken
+ * collector still yields a shareable report, and the manifest's
  * `collectionReport` tells the reader which sections are trustworthy.
  */
 
@@ -24,7 +19,6 @@ import { lookupTarget, redactCliConfig, withLookupTarget } from './cli-config.js
 import { collectIdentity, type ReportIdentity } from './identity.js';
 import type { ProbeOutcome } from '../doctor.js';
 
-/** Outcome of one collector. */
 export const CollectionStatus = z.enum(['ok', 'empty', 'error', 'skipped']);
 export type CollectionStatus = z.infer<typeof CollectionStatus>;
 
@@ -34,7 +28,7 @@ export interface CollectionEntry {
   note?: string;
 }
 
-/** Bundle-format version, bumped when the archive layout changes. */
+/** Bumped when the archive layout changes. */
 export const REPORT_BUNDLE_VERSION = '1.0';
 
 export interface ReportManifest {
@@ -48,16 +42,12 @@ export interface ReportManifest {
   collectionReport: CollectionEntry[];
 }
 
-/** One run's diagnostic material, as the dashboard client returns it. */
 export interface RunMaterial {
   detail: unknown;
   logs: string;
 }
 
-/**
- * Injectable seams, mirroring `DoctorDeps`, so every path is unit-testable
- * without real IO or network.
- */
+/** Injectable seams, mirroring `DoctorDeps`, so every path is unit-testable without real IO. */
 export interface ReportBundleDeps {
   loadConfig: () => Promise<Record<string, unknown>>;
   probe: () => Promise<ProbeOutcome | null>;
@@ -85,9 +75,8 @@ export interface ReportBundleResult {
 }
 
 /**
- * Read the project's own KiCI state: which workflows exist and what the lock
- * file says. Deliberately reads metadata rather than workflow source — the
- * source is the customer's code, and a diagnostic bundle should not ship it.
+ * Workflow names and lock-file metadata only: the workflow source is the
+ * customer's code, and a diagnostic bundle should not ship it.
  */
 async function defaultReadProject(kiciDir: string): Promise<Record<string, unknown>> {
   const workflowsDir = path.join(kiciDir, 'workflows');
@@ -140,8 +129,8 @@ const DEFAULT_DEPS: ReportBundleDeps = {
 };
 
 /**
- * Run one collector, recording its outcome instead of letting it abort the
- * bundle. `empty` and `error` are the two signals the dev-side gap filer reads.
+ * Record a collector's outcome instead of aborting the bundle. The dev-side gap
+ * filer reads `empty` and `error`.
  */
 async function runCollector(
   report: CollectionEntry[],
@@ -169,7 +158,6 @@ async function runCollector(
   }
 }
 
-/** Machine facts about the host the report was produced on. */
 function systemInfo(): Record<string, unknown> {
   return {
     platform: os.platform(),
@@ -196,11 +184,8 @@ async function digestOf(file: string): Promise<string> {
 }
 
 /**
- * Collect and write one report bundle.
- *
- * The body stays a narrative caller: each section is one `runCollector` call
- * whose result is appended to the archive, so adding a collector never grows
- * the control flow.
+ * Each section is one `runCollector` call plus an append, so adding a collector
+ * never grows the control flow.
  */
 export async function createReportBundle(
   options: ReportBundleOptions,
@@ -218,10 +203,8 @@ export async function createReportBundle(
   const finalized = new Promise<void>((resolve, reject) => {
     output.on('close', resolve);
     archive.on('error', reject);
-    // Without this, an unwritable --output path (EACCES, EROFS, ENOSPC, or a
-    // directory that exists but is not writable) emits on the stream with no
-    // listener, which Node escalates to an uncaught exception — killing the
-    // process instead of reaching reportCommand's error path.
+    // Without this, an unwritable --output path (EACCES, EROFS, ENOSPC) becomes
+    // an uncaught exception instead of reaching reportCommand's error path.
     output.on('error', reject);
   });
   archive.pipe(output);
@@ -232,10 +215,9 @@ export async function createReportBundle(
     fileCount += 1;
   };
 
-  // A null probe means "not logged in / no active org" — the single most
-  // common state for someone filing a bug report. Recording that as `empty`
-  // made the summary read `incomplete: probe (empty)`, i.e. like a
-  // malfunction, so it is reported as the deliberate skip it is.
+  // A null probe (not logged in / no active org) is the most common state for a
+  // bug reporter; `empty` would read as a malfunction in the summary, so it is
+  // recorded as `skipped`.
   let probe: ProbeOutcome | null | undefined;
   try {
     probe = await deps.probe();
@@ -262,12 +244,10 @@ export async function createReportBundle(
 
   const config = (await runCollector(report, 'config', () => deps.loadConfig(), scrub)) as
     Record<string, unknown> | undefined;
-  // Allowlist redaction first, then free-text scrubbing on the way in — the
-  // two catch different things, and a credential in an unknown field survives
-  // only if neither runs. Both are gated on `redact`: `--no-redact` promises
-  // an unredacted bundle. The CLI allowlist keeps the fields that say which
-  // Platform and organization the CLI uses readable; every credential stays
-  // masked.
+  // Allowlist redaction, then free-text scrubbing: they catch different things.
+  // Both are gated on `redact` (`--no-redact` promises an unredacted bundle).
+  // The allowlist keeps the Platform and organization readable and masks every
+  // credential.
   if (config !== undefined) {
     append(options.redact ? redactCliConfig(config) : config, 'config/config.json');
   }
@@ -285,8 +265,8 @@ export async function createReportBundle(
 
   if (options.runId) {
     // A not-found note names where the CLI looked: a CLI logged in to another
-    // Platform or organization than the run's is the common cause, and the
-    // bare message cannot tell that apart from a deleted run.
+    // Platform or organization is the common cause, indistinguishable from a
+    // deleted run in the bare message.
     const target = lookupTarget(config);
     const runId = options.runId;
     const run = (await runCollector(
@@ -317,9 +297,8 @@ export async function createReportBundle(
     redacted: options.redact,
     collectionReport: report,
   };
-  // Scrubbed like every other entry. `metadata` is verbatim `--metadata k=v`
-  // input, so a secret-shaped value would otherwise ride into the uploaded ZIP
-  // in plain text while the identical token in a log line was masked.
+  // `metadata` is verbatim `--metadata k=v` input, so a secret-shaped value
+  // would otherwise ride into the ZIP in plain text.
   archive.append(scrub(JSON.stringify(manifest, null, 2)), { name: 'manifest.json' });
   fileCount += 1;
 

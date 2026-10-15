@@ -7,7 +7,6 @@ import {
 } from './summary.js';
 import { formatJsonResult } from './json.js';
 import { formatJunitResult } from './junit.js';
-// ── Summary table tests ──────────────────────────────────────────
 
 describe('formatSummary', () => {
   it('renders table with pass/fail/skip statuses', () => {
@@ -25,27 +24,22 @@ describe('formatSummary', () => {
 
     const output = formatSummary(result);
 
-    // Should contain box-drawing characters
     expect(output).toContain('\u250c'); // top-left corner
     expect(output).toContain('\u2518'); // bottom-right corner
     expect(output).toContain('\u2502'); // vertical border
 
-    // Should contain job names
     expect(output).toContain('build');
     expect(output).toContain('test');
     expect(output).toContain('lint');
 
-    // Should contain status indicators (the raw text, not ANSI)
     expect(output).toContain('pass');
     expect(output).toContain('fail');
     expect(output).toContain('skip');
 
-    // Should contain durations
     expect(output).toContain('12.3s');
     expect(output).toContain('5.2s');
     expect(output).toContain('-'); // skipped has no duration
 
-    // Should contain overall result
     expect(output).toContain('FAILED');
     expect(output).toContain('17.5s');
   });
@@ -80,8 +74,6 @@ describe('formatSummary', () => {
   });
 });
 
-// ── Error highlight tests ────────────────────────────────────────
-
 describe('formatErrorHighlight', () => {
   it('includes last lines of failed step', () => {
     const lines = [
@@ -93,10 +85,8 @@ describe('formatErrorHighlight', () => {
 
     const output = formatErrorHighlight('test', lines);
 
-    // Should contain the error header
     expect(output).toContain('Error: test');
 
-    // Should contain all lines
     for (const line of lines) {
       expect(output).toContain(line);
     }
@@ -106,17 +96,13 @@ describe('formatErrorHighlight', () => {
     const lines = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`);
     const output = formatErrorHighlight('build', lines);
 
-    // Should NOT contain early lines
     expect(output).not.toContain('line 1\n');
     expect(output).not.toContain('line 50\n');
 
-    // Should contain last 50 lines
     expect(output).toContain('line 51');
     expect(output).toContain('line 100');
   });
 });
-
-// ── Multi-fixture summary tests ─────────────────────────────────
 
 describe('formatMultiFixtureSummary', () => {
   it('shows aggregate counts', () => {
@@ -183,8 +169,6 @@ describe('formatMultiFixtureSummary', () => {
     expect(output).toContain('2 total');
   });
 });
-
-// ── JSON output tests ────────────────────────────────────────────
 
 describe('formatJsonResult', () => {
   it('produces valid JSON with correct structure', () => {
@@ -266,8 +250,6 @@ describe('formatJsonResult', () => {
   });
 });
 
-// ── JUnit XML output tests ───────────────────────────────────────
-
 describe('formatJunitResult', () => {
   it('produces valid XML with correct structure', () => {
     const results: RunResult[] = [
@@ -285,28 +267,22 @@ describe('formatJunitResult', () => {
 
     const output = formatJunitResult(results);
 
-    // XML declaration
     expect(output).toContain('<?xml version="1.0" encoding="UTF-8"?>');
 
-    // Root element with aggregates
     expect(output).toContain('<testsuites name="kici-test"');
     expect(output).toContain('tests="2"');
     expect(output).toContain('failures="1"');
 
-    // Testsuite for fixture
     expect(output).toContain('<testsuite name="push-main"');
 
-    // Passing testcase (self-closing)
     expect(output).toContain('<testcase name="build"');
     expect(output).toContain('classname="push-main"');
     expect(output).toContain('time="12.300"');
 
-    // Failing testcase with failure element
     expect(output).toContain('<testcase name="test"');
     expect(output).toContain('<failure message="Step failed">');
     expect(output).toContain('</testcase>');
 
-    // Closing tags
     expect(output).toContain('</testsuite>');
     expect(output).toContain('</testsuites>');
   });

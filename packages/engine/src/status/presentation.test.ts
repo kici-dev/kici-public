@@ -145,9 +145,8 @@ describe('failure classification', () => {
 
 describe('TerminalJobStatus', () => {
   it('is exactly TERMINAL_JOB_STATES, in both directions', () => {
-    // The runtime set and the type must not drift. `satisfies` proves every
-    // member of the type is in the set; the length check proves the set has no
-    // member the type omits.
+    // `satisfies` proves the object lists exactly the type's members; the
+    // sorted equality proves the runtime set matches it.
     const fromType = {
       [ExecutionJobStatus.enum.success]: true,
       [ExecutionJobStatus.enum.failed]: true,

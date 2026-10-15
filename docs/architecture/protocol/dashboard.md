@@ -483,7 +483,7 @@ Cache upload request from worker to coordinator. Worker agent needs an upload UR
 | messageId | string                        | Yes      | Unique message ID             |
 | runId     | string                        | Yes      | Execution run ID              |
 | jobId     | string                        | Yes      | Job ID within the run         |
-| cacheType | enum                          | Yes      | One of: `bundle`, `deps`      |
+| cacheType | enum                          | Yes      | One of: `source`, `deps`      |
 | hash      | string                        | Yes      | Content hash for cache keying |
 | sizeBytes | number                        | Yes      | Size of the artifact in bytes |
 

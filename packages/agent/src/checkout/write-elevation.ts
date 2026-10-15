@@ -1,14 +1,11 @@
 /**
- * Open a write window for one repository, pre-flighting the grant.
+ * Open a write window for one repository, pre-flighting the grant. The mint
+ * happens at elevation entry, before any git runs, and the forge returns the
+ * permissions it granted; comparing them turns a cryptic push-time failure at
+ * the end of a long build into a legible one at the call site.
  *
- * The mint happens HERE — at elevation entry, before any git runs — and the
- * forge returns the permissions it actually granted. Comparing the two turns
- * "wrong permission requested" from a cryptic push-time git failure at the end
- * of a long build into a legible failure at the call site.
- *
- * What pre-flight proves: the TOKEN holds the permission. What it cannot prove:
- * that the push will succeed. A branch protection rule or repository ruleset
- * can still reject, and no token inspection predicts that.
+ * Pre-flight proves the TOKEN holds the permission, not that the push succeeds:
+ * branch protection or a ruleset can still reject it.
  */
 
 import type { GrantTable } from './grant-table.js';
@@ -54,8 +51,7 @@ export async function elevateForWrite(
       );
     }
   }
-  // A static credential reports `scoped: false`. It cannot be narrowed, so
-  // there is nothing to verify — proceed and let the caller see the truth.
+  // A static credential (`scoped: false`) cannot be narrowed: nothing to verify.
 
   const parsed = expiresAt ? Date.parse(expiresAt) : Number.NaN;
   const expiry = Number.isFinite(parsed) ? parsed : Date.now() + DEFAULT_GRANT_TTL_MS;

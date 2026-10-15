@@ -2,26 +2,21 @@ import { execSync } from 'node:child_process';
 import path from 'node:path';
 import { z } from 'zod';
 
-/** Git hosts whose origin URL we can turn into a real `owner/repo` + web link. */
+/** Git hosts whose origin URL maps to a real `owner/repo` and web link. */
 export const RecognizedProvider = z.enum(['github', 'gitlab', 'bitbucket']);
 export type RecognizedProvider = z.infer<typeof RecognizedProvider>;
 
-/** Host → provider map. The keys are the canonical public hostnames. */
+/** Keyed by canonical public hostname. */
 const HOST_PROVIDER: Record<string, RecognizedProvider> = {
   'github.com': 'github',
   'gitlab.com': 'gitlab',
   'bitbucket.org': 'bitbucket',
 };
 
-/** The literal provider value stamped when no recognized git origin exists. */
+/** Stamped when no recognized git origin exists. */
 export const LOCAL_PROVIDER = 'local';
 
-/**
- * Parse a git remote URL into `{ provider, owner/repo }` for a recognized host.
- * Handles scp-style ssh (`git@host:owner/repo.git`), `ssh://`, and `https://`
- * forms; strips a trailing `.git`. Returns null for any unrecognized host or
- * unparseable input.
- */
+/** Handles scp-style, `ssh://` and `https://` remotes; null for an unrecognized host or bad input. */
 export function parseGitOrigin(
   url: string,
 ): { provider: RecognizedProvider; repoIdentifier: string } | null {
@@ -40,7 +35,6 @@ export function parseGitOrigin(
   return { provider, repoIdentifier };
 }
 
-/** Read the `origin` remote URL of the working tree at `repoRoot`, or null. */
 export function detectGitOrigin(repoRoot: string): string | null {
   try {
     return execSync('git remote get-url origin', {
@@ -54,9 +48,8 @@ export function detectGitOrigin(repoRoot: string): string | null {
 }
 
 /**
- * Build the repo identity stamped on a `kici run remote` run. A recognized git
- * origin yields the real `owner/repo` + provider so the dashboard can link to
- * it; otherwise a synthetic `local/<basename>` identity with provider `local`.
+ * The repo identity stamped on a `kici run remote` run: the real `owner/repo`
+ * for a recognized origin, so the dashboard can link it, else `local/<basename>`.
  */
 export function buildLocalRepoIdentity(repoRoot: string): {
   repoIdentifier: string;

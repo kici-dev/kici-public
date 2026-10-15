@@ -1,4 +1,4 @@
-/** kici runs list — mirrors the dashboard Runs page list. */
+/** `kici runs list`: mirrors the dashboard Runs page list. */
 import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
 import {
@@ -22,19 +22,16 @@ export async function runsListCommand(options: RunsListOptions = {}): Promise<bo
       return true;
     }
     if (page.runs.length === 0) {
-      // When the runs window is empty, surface recent webhook activity so an
-      // "almost there" evaluator sees that webhooks arrived but nothing matched
-      // — with the next step to test triggers locally.
+      // Show recent webhook activity, so an "almost there" evaluator sees
+      // webhooks arrived but nothing matched, plus how to test triggers locally.
       const activity = await client.getWebhookActivity();
       if (activity.received > 0) {
         const win =
           activity.windowMinutes === 60
             ? 'the last hour'
             : `the last ${activity.windowMinutes} minutes`;
-        // Mirror the dashboard strip copy: when the matched fact is available,
-        // "N received in <win>, M matched"; when the orchestrator was
-        // unavailable, degrade honestly to "N received in <win> but none
-        // produced a run" (no "matched" claim).
+        // Mirrors the dashboard strip: "N received in <win>, M matched", or with
+        // no matched count, "N received in <win> but none produced a run".
         const headline =
           activity.orchestratorUnavailable || activity.matched === undefined
             ? `${activity.received} webhooks received in ${win} but none produced a run`

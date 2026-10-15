@@ -2,13 +2,12 @@
  * The single definition of what `contains` / `notContains` / `matches` /
  * `notMatches` mean.
  *
- * Two sites consume it: the Tier-0 `commitMessage` trigger filter (in
- * `matcher.ts`) and the Tier-1 `requires` content filter (in
- * `content-requirements.ts`). Sharing one function is what keeps them from
- * drifting into two dialects of the same vocabulary.
+ * Shared by the Tier-0 `commitMessage` trigger filter (`matcher.ts`) and the
+ * Tier-1 `requires` content filter (`content-requirements.ts`) so they never
+ * drift into two dialects.
  *
- * Pure string logic — it imports only `safe-regex` and no Node built-in, so it
- * belongs in the browser-safe barrel rather than a subpath export.
+ * Pure string logic — its only package import is `safe-regex` and it uses no
+ * Node built-in, so it belongs in the browser-safe barrel.
  */
 import safeRegex from 'safe-regex';
 import { stripStatefulRegexFlags } from '../regex-flags.js';
@@ -26,14 +25,12 @@ export interface TextMatchResult {
  * pattern. Returns `null` when the pattern is syntactically invalid or fails the
  * `safe-regex` star-height heuristic — callers treat `null` as indeterminate.
  *
- * The flag class names every ECMAScript flag. When it read `[gimsuy]`, a `d`-
- * or `v`-flagged pattern failed to unwrap and the whole `/pattern/flags` string
- * became the pattern — a regex matching literal slashes, which compiles green
- * and never matches what the author wrote.
+ * The flag class names every ECMAScript flag: a flag missing from it fails to
+ * unwrap, and the whole `/pattern/flags` string becomes a pattern matching
+ * literal slashes, which compiles and never matches what the author wrote.
  *
- * `g` and `y` are then stripped: they make the instance carry `lastIndex`
- * between `.test()` calls, which is meaningless for the single yes/no question
- * this asks and actively wrong for any caller that reuses the instance.
+ * `g` and `y` are stripped: their `lastIndex` carry-over between `.test()`
+ * calls is wrong for a caller that reuses the instance.
  */
 export function compileSafeRegex(source: string): RegExp | null {
   const wrapped = /^\/(.+)\/([dgimsuvy]*)$/.exec(source);

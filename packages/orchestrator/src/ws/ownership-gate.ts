@@ -4,7 +4,7 @@ import type { OwnershipTracker } from '../agent/ownership-tracker.js';
 export type OwnershipDecision = 'accept' | 'reject';
 
 /**
- * Resolve whether `agentId` may act on `jobId`, in the two steps every
+ * Resolve whether `agentId` may act on `jobId`, in the steps every
  * job-scoped agent frame shares.
  *
  * 1. No tracker configured — ownership enforcement is off; accept.

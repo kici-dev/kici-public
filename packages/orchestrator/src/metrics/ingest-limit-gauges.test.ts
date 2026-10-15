@@ -3,14 +3,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 /**
- * Knob ↔ limit-gauge parity drift guard.
- *
- * Every effective cap the admission controller enforces is exported as a
- * config-sourced limit gauge so the dashboard shows current-vs-limit and the
- * ratio alerts track the config. This test keeps the shown limits in track with
- * the code: it asserts every `KICI_INGEST_*` env knob is classified as either a
- * cap (with a matching emitted `*_limit`-style gauge) or an explicit non-limit
- * timing tunable — so a new/renamed knob without a decision fails CI.
+ * Knob ↔ limit-gauge parity drift guard. Every admission-controller cap is a config-sourced
+ * limit gauge, so the dashboard shows current-vs-limit and ratio alerts track the config.
+ * Every `KICI_INGEST_*` knob must be a cap (with an emitted limit gauge) or an explicit
+ * non-limit tunable, so a new or renamed knob without a decision fails CI.
  */
 
 const configSrc = readFileSync(fileURLToPath(new URL('../config.ts', import.meta.url)), 'utf8');
@@ -23,8 +19,7 @@ const LIMIT_KNOB_TO_GAUGE: Record<string, string> = {
   KICI_INGEST_ORG_MAX_CONCURRENCY: 'kici_orch_ingest_org_max_concurrency',
   KICI_INGEST_LOOP_LAG_SHED_MS: 'kici_orch_ingest_loop_lag_shed_ms',
   KICI_INGEST_LOOP_LAG_RESUME_MS: 'kici_orch_ingest_loop_lag_resume_ms',
-  // Overflow buffer row cap: current depth (kici_orch_ingest_overflow_buffered)
-  // is plotted against this limit, same current-vs-limit shape as the queue cap.
+  // Plotted against current depth (kici_orch_ingest_overflow_buffered), like the queue cap.
   KICI_INGEST_OVERFLOW_MAX: 'kici_orch_ingest_overflow_max',
 };
 
@@ -34,21 +29,15 @@ const NON_LIMIT_INGEST_KNOBS = new Set<string>([
   'KICI_INGEST_CODEL_INTERVAL_MS',
   'KICI_INGEST_QUEUE_MAX_WAIT_MS',
   'KICI_INGEST_LOOP_LAG_SAMPLE_MS',
-  // Overflow buffer knobs with no current-vs-limit overlay: a boolean policy
-  // toggle, the replayer pass interval, the per-pass replay batch size, and the
-  // per-row replay attempt ceiling.
+  // A policy toggle, the replay interval, the per-pass batch and the per-row attempt ceiling.
   'KICI_INGEST_OVERFLOW_ENABLED',
   'KICI_INGEST_OVERFLOW_REPLAY_INTERVAL_MS',
   'KICI_INGEST_OVERFLOW_REPLAY_BATCH',
   'KICI_INGEST_OVERFLOW_MAX_ATTEMPTS',
-  // A staleness deadline for a queue claim, not a capacity cap: there is no
-  // "current claim age" gauge for a limit overlay to sit beside.
+  // A claim staleness deadline; no "current claim age" gauge exists to overlay.
   'KICI_INGEST_OVERFLOW_CLAIM_TIMEOUT_MS',
-  // The retention bound on a buffered delivery — a deadline like the claim
-  // timeout above, not a capacity cap. Its overlay partner would be a "current
-  // oldest buffered row age" gauge, which does not exist; what an operator
-  // watches instead is kici_orch_ingest_overflow_dropped_total{reason="max_age"}
-  // going non-zero.
+  // A retention deadline with no "oldest buffered row age" gauge; operators watch
+  // kici_orch_ingest_overflow_dropped_total{reason="max_age"} going non-zero instead.
   'KICI_INGEST_OVERFLOW_MAX_AGE_MS',
 ]);
 

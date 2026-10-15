@@ -1,13 +1,4 @@
-/**
- * Shared timeout utility for wrapping async operations with a deadline.
- *
- * Used by init-runner (dynamic field evaluation) and dynamic job function evaluation.
- */
-
-/**
- * Execute a function with a timeout using Promise.race.
- * Throws if the function does not resolve within the given timeout.
- */
+/** Deadline for init-runner dynamic field evaluation and dynamic job function evaluation. */
 export async function withTimeout<T>(
   fn: () => T | Promise<T>,
   timeoutMs: number,

@@ -1,11 +1,5 @@
 /**
  * Secret output store for cross-job secret output CRUD.
- *
- * Provides typed operations against the run_secret_outputs table:
- * - Upsert encrypted secret outputs (per run/job/key)
- * - Retrieve outputs for a specific job or multiple upstream jobs
- * - Delete all outputs for a run (cleanup)
- * - Delete orphaned outputs older than a threshold (maintenance)
  */
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';

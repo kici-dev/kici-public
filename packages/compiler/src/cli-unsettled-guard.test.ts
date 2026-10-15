@@ -8,10 +8,9 @@ import ts from 'typescript';
 import { UNSETTLED_EXIT_MESSAGE } from './cli-unsettled-guard.js';
 
 /**
- * The guard, transpiled to plain JavaScript for the spawned processes. A
- * spawned Node cannot be relied on to load `.ts` itself: Debian's packaged
- * Node.js, which the public CI replica runs, is built without type stripping
- * and refuses the import with ERR_UNKNOWN_FILE_EXTENSION.
+ * Transpiled to JavaScript: Debian's packaged Node.js, which the public CI
+ * replica runs, has no type stripping and refuses `.ts` with
+ * ERR_UNKNOWN_FILE_EXTENSION.
  */
 function transpiledGuardUrl(): string {
   const source = readFileSync(path.join(__dirname, 'cli-unsettled-guard.ts'), 'utf-8');
@@ -31,7 +30,7 @@ const GUARD_URL = transpiledGuardUrl();
 /** Each case runs in its own Node process: the guard acts on that process's exit. */
 const SPAWN_TIMEOUT_MS = 30_000;
 
-/** Run `body` as an ES module in a fresh Node process, with the guard imported as `guard`. */
+/** Runs `body` as an ES module in a fresh Node process, with the guard imported as `guard`. */
 function runNode(body: string): { status: number | null; stderr: string } {
   const script = `import { guardUnsettledExit as guard } from ${JSON.stringify(GUARD_URL)};\n${body}`;
   const result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {

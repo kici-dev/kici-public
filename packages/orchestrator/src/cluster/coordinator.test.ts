@@ -217,7 +217,6 @@ describe('RunCoordinator', () => {
   describe('routeJobs', () => {
     it('dispatches jobs locally when dispatcher accepts (agent available or scaler)', async () => {
       const { coordinator, deps } = createCoordinator();
-      // Default dispatcher mock returns 'dispatched'
 
       const result = await coordinator.routeJobs(makeRunContext(), [
         makeJobToRoute({ jobName: 'build' }),
@@ -280,9 +279,8 @@ describe('RunCoordinator', () => {
 
       expect(result.reroutedJobs).toHaveLength(1);
       const reroutedJobId = result.reroutedJobs[0].jobId;
-      // The marker write must land for the rerouted (runId, jobId) so the
-      // run-recovery sweepers do not force-fail the job while its worker peer
-      // is connected.
+      // The marker keeps the run-recovery sweepers from force-failing the job
+      // while its worker peer is connected.
       expect(deps.executionTracker.markJobReroutedToPeer).toHaveBeenCalledWith(
         'run-7',
         reroutedJobId,
@@ -335,7 +333,7 @@ describe('RunCoordinator', () => {
         makeJobToRoute({ jobName: 'arm-job', runsOnLabels: [['linux', 'arm']] }),
       ]);
 
-      // Both should be rerouted (both go to the first peer in the sorted list)
+      // Both go to the first peer in the sorted list.
       expect(result.reroutedJobs).toHaveLength(2);
       expect(result.failedJobs).toHaveLength(0);
     });
@@ -428,8 +426,7 @@ describe('RunCoordinator', () => {
     });
 
     it('excludes draining peers from routing (findPeersWithCapacity handles this)', async () => {
-      // PeerRegistry.findPeersWithCapacity already excludes draining peers.
-      // We verify the coordinator calls findPeersWithCapacity correctly.
+      // PeerRegistry.findPeersWithCapacity excludes draining peers.
       const { coordinator, deps } = createCoordinator();
       deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
       deps.peerRegistry.findPeersWithCapacity.mockReturnValue([]); // No peers (all draining)
@@ -447,7 +444,6 @@ describe('RunCoordinator', () => {
       const peerClient = createMockPeerClient({ sendAndWaitAckResult: true });
 
       const { coordinator, deps } = createCoordinator();
-      // First call: dispatcher accepts (local agent or scaler); Second call: rejected (no backend)
       deps.dispatcher.dispatch
         .mockResolvedValueOnce({ status: 'dispatched', agentId: 'agent-1', jobId: 'job-1' })
         .mockResolvedValueOnce({ status: 'rejected', reason: 'no backend' });
@@ -497,7 +493,6 @@ describe('RunCoordinator', () => {
       const peerClient2 = createMockPeerClient({ sendAndWaitAckResult: true });
 
       const { coordinator, deps } = createCoordinator();
-      // First job: local dispatch accepts; second+third: rejected (no local backend)
       deps.dispatcher.dispatch
         .mockResolvedValueOnce({ status: 'dispatched', agentId: 'agent-1', jobId: 'local-job-1' })
         .mockResolvedValueOnce({ status: 'rejected', reason: 'no backend' })
@@ -509,7 +504,6 @@ describe('RunCoordinator', () => {
         return undefined;
       });
 
-      // Three generated jobs: one local, one for macOS peer, one for Windows peer
       const result = await coordinator.routeJobs(makeRunContext(), [
         makeJobToRoute({
           jobName: 'gen-linux-build',
@@ -539,7 +533,6 @@ describe('RunCoordinator', () => {
 
     it('handles batch of generated jobs (up to 100) in a single routeJobs call', async () => {
       const { coordinator, deps } = createCoordinator();
-      // All 50 jobs dispatch locally
       deps.dispatcher.dispatch.mockResolvedValue({
         status: 'dispatched',
         agentId: 'agent-1',
@@ -564,9 +557,7 @@ describe('RunCoordinator', () => {
 
     it('returns precise error for peer rejection of generated job', async () => {
       const { coordinator, deps } = createCoordinator();
-      // Local dispatch rejects (no matching backend)
       deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
-      // No peers with capacity, no peers with labels at all
       deps.peerRegistry.findPeersWithCapacity.mockReturnValue([]);
       deps.peerRegistry.findPeersWithLabels.mockReturnValue([]);
 
@@ -582,7 +573,6 @@ describe('RunCoordinator', () => {
       expect(result.reroutedJobs).toHaveLength(0);
       expect(result.failedJobs).toHaveLength(1);
       expect(result.failedJobs[0].jobName).toBe('gen-darwin-special');
-      // Verify the reason describes what labels were requested
       expect(result.failedJobs[0].reason).toContain('No orchestrator in cluster handles labels:');
       expect(result.failedJobs[0].reason).toContain('kici:os:darwin');
     });
@@ -730,10 +720,10 @@ describe('RunCoordinator', () => {
       expect(jobInput.runsOnPatterns).toEqual(runsOnPatterns);
       expect(jobInput.excludePatterns).toEqual(excludePatterns);
 
-      // Prove the threaded selectors drive the real matching authority
-      // (the same 4-tuple Dispatcher.dispatch passes to findAvailable): a
-      // pure-regex job matches the agent carrying the pattern and excludes
-      // an agent that lacks it / carries the excluded label.
+      // The threaded selectors drive the real matching authority (the tuple
+      // Dispatcher.dispatch passes to findAvailable): a pure-regex job matches
+      // the agent carrying the pattern and excludes one that lacks it or
+      // carries the excluded label.
       const registry = new AgentRegistry();
       registry.register('gpu-agent', { send: vi.fn() } as never, ['gpu-a100']);
       registry.register('cpu-agent', { send: vi.fn() } as never, ['cpu-only']);
@@ -830,8 +820,7 @@ describe('RunCoordinator', () => {
         reply,
       );
 
-      // Drain the microtask queue so the tracker promise resolves and the
-      // ack fires (fake timers are active, so we await pending microtasks).
+      // Fake timers are active: await microtasks so the tracker resolves and the ack fires.
       await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
       await vi.waitFor(() =>
         expect(reply).toHaveBeenCalledWith({
@@ -891,11 +880,9 @@ describe('RunCoordinator', () => {
     });
 
     /**
-     * Set up a real reroute so `reroutedJobs` is populated, then return the
-     * coordinator + deps + the allocated jobId for the re-assertion tests.
-     * The reroute-time marker write is a no-op (the execution_jobs row does
-     * not exist yet); the mock is cleared so the re-assertion can be asserted
-     * in isolation.
+     * Perform a real reroute so `reroutedJobs` is populated. The reroute-time
+     * marker write is a no-op (the execution_jobs row does not exist yet), so
+     * its mock is cleared to assert the re-assertion in isolation.
      */
     async function rerouteOne() {
       const peer = makePeerInfo({ instanceId: 'peer-1' });
@@ -991,7 +978,6 @@ describe('RunCoordinator', () => {
         const { coordinator, deps, jobId } = await rerouteOne(); // tracked against peer-1
         deps.executionTracker.onJobStatus.mockClear();
 
-        // Stray terminal from a DIFFERENT peer than the one this job is tracked against.
         coordinator.onPeerJobProgress(
           {
             type: 'job.progress',
@@ -1007,12 +993,10 @@ describe('RunCoordinator', () => {
           'peer-SUPERSEDED',
         );
 
-        // The terminal was not applied to the run.
         expect(deps.executionTracker.onJobStatus).not.toHaveBeenCalled();
 
-        // The tracking entry survived: a subsequent NON-terminal progress from the
-        // tracked peer still re-asserts the rerouted_to_peer marker, which only
-        // happens when reroutedJobs still holds the entry.
+        // The entry survived: only a held reroutedJobs entry makes a later
+        // non-terminal progress re-assert the rerouted_to_peer marker.
         coordinator.onPeerJobProgress(
           {
             type: 'job.progress',
@@ -1056,7 +1040,7 @@ describe('RunCoordinator', () => {
           reply,
         );
 
-        // Ack is synchronous (not gated on a tracker apply, which we skipped).
+        // The ack is synchronous: no tracker apply ran to gate it.
         expect(reply).toHaveBeenCalledWith({
           type: 'job.progress.ack',
           runId: 'run-7',
@@ -1085,11 +1069,9 @@ describe('RunCoordinator', () => {
           'peer-1',
         );
 
-        // Terminal from the tracked peer IS applied.
         await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
 
-        // Cleanup happened: a later progress finds no tracked entry, so it does NOT
-        // re-assert the marker.
+        // The entry is gone, so a later progress does not re-assert the marker.
         deps.executionTracker.markJobReroutedToPeer.mockClear();
         coordinator.onPeerJobProgress(
           {
@@ -1127,7 +1109,7 @@ describe('RunCoordinator', () => {
           'peer-any',
         );
 
-        // No tracked entry → today's unconditional apply is preserved.
+        // No tracked entry: the apply is unconditional.
         await vi.waitFor(() => expect(deps.executionTracker.onJobStatus).toHaveBeenCalled());
       });
     });
@@ -1186,12 +1168,10 @@ describe('RunCoordinator', () => {
       deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer]);
       deps.getPeerClient.mockReturnValue(peerClient);
 
-      // Reroute a job first
       await coordinator.routeJobs(makeRunContext({ runId: 'run-1' }), [
         makeJobToRoute({ jobName: 'gpu-job', runsOnLabels: [['linux', 'gpu']] }),
       ]);
 
-      // Now cancel the run
       coordinator.cancelRun('run-1', 'fail-fast triggered');
 
       expect(peerClient.send).toHaveBeenCalledWith(
@@ -1321,8 +1301,7 @@ describe('RunCoordinator', () => {
   describe('reroute spawn-window backstop (Layer A)', () => {
     /**
      * Reroute one gpu-job to peer-1 (accepts) under a short spawn window so the
-     * post-ACK re-dispatch timer is deterministic. Returns the coordinator +
-     * deps + the peer client + the tracked jobId.
+     * post-ACK re-dispatch timer is deterministic.
      */
     async function setupReroute(windowMs = 1000) {
       const peer1 = makePeerInfo({ instanceId: 'peer-1' });
@@ -1330,7 +1309,6 @@ describe('RunCoordinator', () => {
       const { coordinator, deps } = createCoordinator({
         getRerouteSpawnWindowMs: async () => windowMs,
       } as Partial<RunCoordinatorDeps>);
-      // Initial local dispatch rejects → the job reroutes to peer-1.
       deps.dispatcher.dispatch.mockResolvedValueOnce({ status: 'rejected', reason: 'no backend' });
       deps.peerRegistry.findPeersWithCapacity.mockReturnValue([peer1]);
       deps.getPeerClient.mockReturnValue(peerClient);
@@ -1357,7 +1335,7 @@ describe('RunCoordinator', () => {
       expect(peerClient.send).toHaveBeenCalledWith(
         expect.objectContaining({ type: 'peer.job.cancel', runId: 'run-9', jobId }),
       );
-      // Local re-dispatch reused the SAME jobId (execution row is keyed by it).
+      // The re-dispatch reuses the jobId: the execution row is keyed by it.
       expect(deps.dispatcher.dispatch).toHaveBeenLastCalledWith(
         expect.objectContaining({ jobId, jobName: 'gpu-job' }),
       );
@@ -1390,11 +1368,10 @@ describe('RunCoordinator', () => {
       );
     });
 
-    // A peer COORDINATOR shares this instance's database and writes job status
-    // straight to `execution_jobs`; only a WORKER relays `job.progress`. So for
-    // a coordinator-to-coordinator reroute nothing ever disarms the timer, and
-    // before this check the backstop cancelled every such job that outlived the
-    // window — a slow scaler spawn, a long checkout, a big dependency install.
+    // A peer coordinator writes job status straight to the shared
+    // `execution_jobs`; only a worker relays `job.progress`. So nothing disarms
+    // the timer on a coordinator-to-coordinator reroute, and without this check
+    // the backstop cancels every such job that outlives the window.
     it('does not re-dispatch when the shared row shows the peer already started the job', async () => {
       const { deps, peerClient, jobId } = await setupReroute();
       deps.executionTracker.hasJobStarted.mockResolvedValue(true);
@@ -1409,9 +1386,8 @@ describe('RunCoordinator', () => {
       );
     });
 
-    // The disarm keeps the tracking entry so cancel propagation still reaches
-    // the peer running the job — dropping it would strand a cancelled run's
-    // work on the peer with nothing left to tell it to stop.
+    // The disarm keeps the tracking entry so a cancel still reaches the peer;
+    // dropping it would strand a cancelled run's work there.
     it('still propagates a cancel to the peer after the backstop is disarmed', async () => {
       const { coordinator, deps, peerClient, jobId } = await setupReroute();
       deps.executionTracker.hasJobStarted.mockResolvedValue(true);
@@ -1424,9 +1400,8 @@ describe('RunCoordinator', () => {
       );
     });
 
-    // A read fault must not silently disable the backstop: falling back to the
-    // pre-check behavior re-dispatches, which is idempotent, where trusting the
-    // failure would strand a genuinely failed spawn until the stale detector.
+    // A read fault must not disable the backstop: re-dispatching is idempotent,
+    // while trusting the fault strands a failed spawn until the stale detector.
     it('re-dispatches when the shared row cannot be read', async () => {
       const { deps, peerClient, jobId } = await setupReroute();
       deps.executionTracker.hasJobStarted.mockRejectedValue(new Error('db down'));
@@ -1446,9 +1421,8 @@ describe('RunCoordinator', () => {
       );
     });
 
-    // A peer COORDINATOR relays no terminal `job.progress` — the shared row is
-    // its report — so the disarmed entry has to be reaped from the row itself.
-    // Without this the tracking map grows for the lifetime of the process.
+    // A peer coordinator relays no terminal `job.progress`, so the disarmed
+    // entry is reaped from the shared row, or the tracking map grows forever.
     it('releases the tracking entry once the shared row is terminal', async () => {
       const { coordinator, deps, peerClient } = await setupReroute();
       deps.executionTracker.hasJobStarted.mockResolvedValue(true);
@@ -1467,9 +1441,8 @@ describe('RunCoordinator', () => {
       expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
     });
 
-    // The "read fault re-dispatches" fallback applies to the FIRST observation
-    // only. Once the row has shown the job running, a later fault must not
-    // bounce it — the reap poll repeats for as long as the job does.
+    // The read-fault re-dispatch applies to the first observation only: the
+    // reap poll repeats while the job runs, and a later fault must not bounce it.
     it('does not re-dispatch on a read fault after the peer was seen running', async () => {
       const { deps, peerClient } = await setupReroute();
       deps.executionTracker.hasJobStarted.mockResolvedValue(true);
@@ -1518,7 +1491,6 @@ describe('RunCoordinator', () => {
 
     it('marks the job failed when unroutable after the window (no stale-detector wait)', async () => {
       const { deps, jobId } = await setupReroute();
-      // Re-dispatch: no peers accept, local dispatch also rejects.
       deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
 
       await vi.advanceTimersByTimeAsync(1000);
@@ -1611,8 +1583,7 @@ describe('RunCoordinator', () => {
       deps.dispatcher.dispatch.mockClear();
       peerClient.send.mockClear();
 
-      // A late scaler.failed (e.g. from a superseded peer for the same jobId)
-      // must NOT cancel/bounce the now-healthy running job.
+      // A late scaler.failed must not bounce the now-healthy job.
       coordinator.onPeerScalerEvent(
         {
           type: 'scaler.event',
@@ -1627,7 +1598,6 @@ describe('RunCoordinator', () => {
         'peer-1',
       );
 
-      // Still forwarded to the tracker, but no re-dispatch / cancel.
       expect(deps.executionTracker.emitScalerEvent).toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
       expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
@@ -1677,14 +1647,12 @@ describe('RunCoordinator', () => {
         },
         'peer-1',
       );
-      // Wait for the NAK re-dispatch to fully settle (local dispatch happened).
       await vi.waitFor(() =>
         expect(deps.dispatcher.dispatch).toHaveBeenCalledWith(expect.objectContaining({ jobId })),
       );
       const dispatchCallsAfterNak = deps.dispatcher.dispatch.mock.calls.length;
 
-      // The Layer A window timer fires next — but the tracking entry is gone, so
-      // it must no-op (no second re-dispatch).
+      // The tracking entry is gone, so the window timer no-ops.
       await vi.advanceTimersByTimeAsync(1000);
       expect(deps.dispatcher.dispatch.mock.calls.length).toBe(dispatchCallsAfterNak);
     });
@@ -1698,9 +1666,7 @@ describe('RunCoordinator', () => {
       });
       deps.dispatcher.dispatch.mockClear();
 
-      // A stale scaler.failed relayed by a peer that is NOT the tracked reroute
-      // target (the job was rerouted to peer-1) must be ignored — the tracked
-      // job is healthy and must not be bounced by a superseded peer's signal.
+      // A scaler.failed from a peer other than the tracked target is ignored.
       coordinator.onPeerScalerEvent(
         {
           type: 'scaler.event',
@@ -1715,14 +1681,12 @@ describe('RunCoordinator', () => {
         'peer-SUPERSEDED',
       );
 
-      // Still forwarded to the tracker (persistence is provenance-independent),
-      // but no re-dispatch happens.
+      // Persistence is provenance-independent.
       expect(deps.executionTracker.emitScalerEvent).toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
       expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
 
-      // The SAME scaler.failed from the tracked peer DOES re-dispatch — proof the
-      // job is still tracked with an armed window; only the source gate blocked it.
+      // The same event from the tracked peer re-dispatches: only the source gate blocked it.
       coordinator.onPeerScalerEvent(
         {
           type: 'scaler.event',
@@ -1749,9 +1713,8 @@ describe('RunCoordinator', () => {
         jobId: 'local-1',
       });
 
-      // A stray progress relayed by a peer that is NOT the tracked reroute target
-      // (e.g. a slow, best-effort-cancelled original peer) must NOT disarm the
-      // replacement peer's spawn-window timer.
+      // A stray progress from a non-tracked peer (e.g. a slow, best-effort-cancelled
+      // original) must not disarm the replacement peer's spawn-window timer.
       coordinator.onPeerJobProgress(
         {
           type: 'job.progress',
@@ -1767,8 +1730,7 @@ describe('RunCoordinator', () => {
         'peer-SUPERSEDED',
       );
 
-      // The window is still armed, so a subsequent scaler.failed FROM THE TRACKED
-      // PEER still triggers the NAK re-dispatch — proof the timer was not cleared.
+      // The window is still armed: a scaler.failed from the tracked peer re-dispatches.
       coordinator.onPeerScalerEvent(
         {
           type: 'scaler.event',
@@ -1790,11 +1752,9 @@ describe('RunCoordinator', () => {
     it('still persists tracker updates regardless of the source peer', async () => {
       const { coordinator, deps, jobId } = await setupReroute();
 
-      // A non-matching source: emitScalerEvent must still fire for a non-failed
-      // event, and a NON-terminal job.progress must still drive onJobStatus
-      // (both unconditional). Only a TERMINAL progress from a superseded peer is
-      // gated — that case is covered by the onPeerJobProgress
-      // "terminal source-peer provenance" tests.
+      // From a non-matching source, a non-failed scaler event and a non-terminal
+      // job.progress still apply. Only a terminal progress from a superseded
+      // peer is gated (the "terminal source-peer provenance" tests).
       coordinator.onPeerScalerEvent(
         {
           type: 'scaler.event',
@@ -2003,18 +1963,16 @@ describe('RunCoordinator', () => {
         return undefined;
       });
 
-      // First reroute: peer-1 NAKs, falls back to peer-2
+      // peer-1 NAKs, falls back to peer-2.
       await coordinator.routeJobs(makeRunContext(), [makeJobToRoute({ jobName: 'job-1' })]);
 
-      // Second reroute: peer-1 should be in backoff, so skipped entirely
+      // peer-1 is in backoff, so the second reroute skips it.
       peerClient1.sendAndWaitAck.mockClear();
       peerClient2.sendAndWaitAck.mockClear();
 
       await coordinator.routeJobs(makeRunContext(), [makeJobToRoute({ jobName: 'job-2' })]);
 
-      // peer-1 should not have been tried (in backoff)
       expect(peerClient1.sendAndWaitAck).not.toHaveBeenCalled();
-      // peer-2 should have been used
       expect(peerClient2.sendAndWaitAck).toHaveBeenCalledTimes(1);
     });
 
@@ -2033,11 +1991,9 @@ describe('RunCoordinator', () => {
         return undefined;
       });
 
-      // Each NAK should increment count; verify via backoff behavior
       // After 1 NAK: backoff = min(1000 * 2^1, 60000) = 2000ms
       await coordinator.routeJobs(makeRunContext(), [makeJobToRoute({ jobName: 'job-1' })]);
 
-      // peer-1 was NAKed, should be in backoff
       expect(coordinator.getNakCount('peer-1')).toBe(1);
     });
 
@@ -2045,7 +2001,6 @@ describe('RunCoordinator', () => {
       const peer1 = makePeerInfo({ instanceId: 'peer-1' });
       const peer2 = makePeerInfo({ instanceId: 'peer-2' });
 
-      // First: peer-1 NAKs
       const peerClient1 = createMockPeerClient({ sendAndWaitAckResult: false });
       const peerClient2 = createMockPeerClient({ sendAndWaitAckResult: true });
 
@@ -2061,13 +2016,11 @@ describe('RunCoordinator', () => {
       await coordinator.routeJobs(makeRunContext(), [makeJobToRoute({ jobName: 'job-1' })]);
       expect(coordinator.getNakCount('peer-1')).toBe(1);
 
-      // Now peer-1 ACKs - clear backoff and try again
       peerClient1.sendAndWaitAck.mockResolvedValue(true);
-      // Need to wait for backoff to expire (1000 * 2^1 = 2000ms)
+      // Wait out the backoff (1000 * 2^1 = 2000ms).
       vi.advanceTimersByTime(2100);
 
       await coordinator.routeJobs(makeRunContext(), [makeJobToRoute({ jobName: 'job-2' })]);
-      // After ACK, NAK count should be reset
       expect(coordinator.getNakCount('peer-1')).toBe(0);
     });
 
@@ -2086,14 +2039,12 @@ describe('RunCoordinator', () => {
         return undefined;
       });
 
-      // NAK 10 times: 2^10 * 1000 = 1,024,000 ms, but capped at 60,000
+      // NAK 10 times: 2^10 * 1000 = 1,024,000 ms uncapped; the cap is 60,000.
       for (let i = 0; i < 10; i++) {
-        // Advance past any current backoff
         vi.advanceTimersByTime(61_000);
         await coordinator.routeJobs(makeRunContext(), [makeJobToRoute({ jobName: `job-${i}` })]);
       }
 
-      // Backoff should be capped at 60000ms, not 1,024,000ms
       expect(coordinator.getBackoffUntil('peer-1')).toBeLessThanOrEqual(Date.now() + 60_001);
     });
 
@@ -2109,13 +2060,11 @@ describe('RunCoordinator', () => {
       expect(evictFn).toHaveBeenCalledTimes(1);
       expect(evictFn).toHaveBeenCalledWith(60_000);
 
-      // Fire again
       vi.advanceTimersByTime(30_000);
       expect(evictFn).toHaveBeenCalledTimes(2);
 
       coordinator.stopStaleEvictionTimer();
 
-      // Should not fire again
       vi.advanceTimersByTime(30_000);
       expect(evictFn).toHaveBeenCalledTimes(2);
     });
@@ -2127,7 +2076,6 @@ describe('RunCoordinator', () => {
       coordinator.startStaleEvictionTimer(60_000);
       vi.advanceTimersByTime(30_000);
 
-      // Eviction was called and returned stale peers
       expect(deps.peerRegistry.evictStalePeers).toHaveBeenCalled();
 
       coordinator.stopStaleEvictionTimer();
@@ -2195,10 +2143,9 @@ describe('RunCoordinator', () => {
 
   describe('capacity ranking over heartbeat-ingested peers', () => {
     /**
-     * A peer running an older build advertises the case its operator typed, so
-     * capacity scoring must see the same canonical labels the job selectors
-     * carry. `PeerRegistry.updateHeartbeat` folds on arrival, which is what
-     * lets the coordinator's own comparison stay a plain `Set.has`.
+     * An older-build peer advertises labels in the case its operator typed.
+     * `PeerRegistry.updateHeartbeat` folds them on arrival, so the
+     * coordinator's capacity comparison stays a plain `Set.has`.
      */
     function heartbeatWith(instanceId: string, labels: string[], maxConcurrency: number) {
       return {
@@ -2233,8 +2180,8 @@ describe('RunCoordinator', () => {
           routingKeys: [],
         });
       }
-      // The mixed-case peer has the larger free capacity, so it must sort
-      // first — unless its `Docker` label fails to match the `docker` selector.
+      // The mixed-case peer has more free capacity, so it sorts first unless
+      // its `Docker` label fails to match the `docker` selector.
       registry.updateHeartbeat('peer-mixed', heartbeatWith('peer-mixed', ['Docker'], 8));
       registry.updateHeartbeat('peer-lower', heartbeatWith('peer-lower', ['docker'], 2));
       return {
@@ -2257,8 +2204,7 @@ describe('RunCoordinator', () => {
 
       const { coordinator, deps } = createCoordinator();
       deps.dispatcher.dispatch.mockResolvedValue({ status: 'rejected', reason: 'no backend' });
-      // Deliberately hand them over lowest-capacity-first: the ordering under
-      // test has to actively move `peer-mixed` to the front.
+      // Lowest-capacity-first, so the ordering must actively move `peer-mixed` up.
       deps.peerRegistry.findPeersWithCapacity.mockReturnValue([lower, mixed]);
       deps.getPeerClient.mockImplementation((id: string) => {
         if (id === 'peer-mixed') return clientMixed;
@@ -2287,9 +2233,8 @@ describe('RunCoordinator', () => {
       registry.updateHeartbeat('peer-gated', hb);
 
       const peer = registry.getPeer('peer-gated')!;
-      // The gate folds with the labels, so it still gates. An unfolded `GPU`
-      // gate could never be satisfied by a folded selector, which over-gates:
-      // the agent would be skipped even for a job that does request gpu.
+      // The gate folds with the labels: an unfolded `GPU` gate never matches a
+      // folded selector, so the agent would be skipped even for a gpu job.
       expect(peer.agents[0].mandatoryLabels).toEqual(['gpu']);
     });
   });

@@ -109,17 +109,11 @@ import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
 import { resolveHashFiles } from './hash-files.js';
 
 /**
- * Courtesy compatibility warning for `kici compile`.
- *
- * `minReader` is the emitted lock's `minReaderVersion` (`BREAKING_FLOOR`).
- * `version` is the schema version the compiler emits
- * (`SCHEMA_VERSION`). When `minReader` reaches `version`, which happens only
- * while that constant is the newest schema version, orchestrators older than
- * `version` cannot read the lock, so return a one-line heads-up naming the
- * required orchestrator schema. When it sits below `version` the lock is
- * readable by older orchestrators down to it, so no warning is warranted
- * (return null). The orchestrator remains the authoritative reject; this is
- * informational.
+ * Courtesy compatibility warning for `kici compile`, comparing the lock's
+ * `minReaderVersion` (`BREAKING_FLOOR`) with the emitted `SCHEMA_VERSION`. Only
+ * when `minReader` reaches `version` do orchestrators older than `version` fail
+ * to read the lock; below it, null. Informational: the orchestrator is the
+ * authoritative reject.
  */
 export function schemaWindowWarning(minReader: number, version: number): string | null {
   if (minReader < version) return null;
@@ -130,12 +124,7 @@ export function schemaWindowWarning(minReader: number, version: number): string 
   );
 }
 
-/**
- * Detect git repository root by running `git rev-parse --show-toplevel`.
- * Falls back to cwd if not in a git repo.
- *
- * @returns Absolute path to git root, or cwd if not in git repo
- */
+/** Absolute git repository root, or cwd outside a git repo. */
 export function detectGitRoot(): string {
   try {
     const gitRoot = execSync('git rev-parse --show-toplevel', {
@@ -144,53 +133,35 @@ export function detectGitRoot(): string {
     }).trim();
     return gitRoot;
   } catch {
-    // Not in a git repo, fall back to cwd
     return process.cwd();
   }
 }
 
 /**
- * Compute the dependency-cache key: a SHA-256 hash of the repo's lockfile,
- * scoped to the detected package manager.
+ * Dependency-cache key: hex SHA-256 of the repo's lockfile, or null when none
+ * exists.
  *
  * The authoritative lockfile differs by manager: `.kici/package-lock.json` for
- * npm, the repo-root `pnpm-lock.yaml` for a pnpm workspace, the repo-root
- * `yarn.lock` for a yarn workspace. A pnpm/yarn `.kici/` member resolves against
- * the root lockfile, so keying on `.kici/package-lock.json` alone would miss the
- * authoritative graph. A standalone `.kici` yarn project (its own
- * `packageManager` field + `.kici/yarn.lock`, no root signal) is detected from
- * `.kici/` and keyed on `.kici/yarn.lock`. The hash input is prefixed with the
- * manager name so two managers can never collide on identical lockfile bytes
- * (and a restored tree can never be the wrong layout for the agent's manager).
- * For yarn the prefix also carries the flavor (`yarn-classic` / `yarn-berry`),
- * so a classic-layout dep-cache tarball is never restored into a berry install.
+ * npm, the repo-root `pnpm-lock.yaml` / `yarn.lock` for a pnpm / yarn workspace
+ * (a `.kici/` member resolves against the root lockfile). A standalone `.kici`
+ * yarn project is keyed on `.kici/yarn.lock`. The hash input is prefixed with
+ * the manager name (plus the yarn flavor, `yarn-classic` / `yarn-berry`), so a
+ * restored tarball never has the wrong layout for the agent's install.
  *
  * The detected manager only orders the search; it never restricts it. Detection
- * falls back to the AMBIENT `npm_config_user_agent` when a directory carries no
- * signal of its own, so a repo whose root holds neither a `package.json` nor a
- * lockfile is reported as whatever manager happened to invoke the compiler. A
- * repo compiled under pnpm that keeps an npm `.kici/package-lock.json` was
- * therefore searched for `pnpm-lock.yaml` only, found none, and got no hash at
- * all — which silently disables the orchestrator's dependency cache for it, so
- * every agent installs from the registry and an agent with no registry route
- * cannot run the job at all. Searching every manager's candidates after the
- * detected one's keeps the detected manager authoritative where it has real
- * evidence, and still finds the lockfile that is actually on disk.
- *
- * @param gitRoot - Absolute path to git repository root
- * @returns Hex SHA-256 hash string, or null if no lockfile is found
+ * falls back to the ambient `npm_config_user_agent` when a directory has no
+ * signal, so a pnpm-invoked compile of a repo with an npm
+ * `.kici/package-lock.json` would otherwise find no lockfile, silently disable
+ * the dependency cache, and leave an agent with no registry route unable to run.
  */
 export function computeLockfileHash(gitRoot: string): string | null {
-  // Detect from the repo root first; fall back to `.kici/` so a standalone
-  // `.kici` project (its own packageManager field + lockfile, no root signal)
-  // is still keyed on the right manager + lockfile.
+  // Root first; `.kici/` covers a standalone project with no root signal.
   const pm =
     detectPackageManagerSync(gitRoot) === PackageManager.Npm
       ? detectPackageManagerSync(path.join(gitRoot, '.kici'))
       : detectPackageManagerSync(gitRoot);
 
-  // Every manager's candidates, detected-manager-first. The order is what makes
-  // the detected manager win when more than one lockfile exists.
+  // Detected manager first, so it wins when more than one lockfile exists.
   const byManager = (m: PackageManager): string[] =>
     m === PackageManager.Pnpm
       ? [path.join(gitRoot, 'pnpm-lock.yaml'), path.join(gitRoot, '.kici', 'pnpm-lock.yaml')]
@@ -209,18 +180,11 @@ export function computeLockfileHash(gitRoot: string): string | null {
       try {
         content = readFileSync(lockfilePath, 'utf-8');
       } catch {
-        continue; // try next candidate
+        continue;
       }
-      // The prefix names the manager whose lockfile actually matched, not the
-      // detected one — the hash keys a dep tarball whose on-disk layout is the
-      // matched manager's, so naming the other would let a pnpm-layout tarball
-      // be restored into an npm install.
-      //
-      // For yarn, fold the flavor (classic vs berry) into the prefix too, so a
-      // classic-layout tarball is never restored into a berry install (and vice
-      // versa), even on the practically-impossible identical-bytes case. Probe
-      // the directory the matched lockfile lives in, so the flavor describes the
-      // install that lockfile drives.
+      // Prefix with the matched manager, not the detected one: the tarball's
+      // layout is the matched manager's. The yarn flavor is probed in the
+      // matched lockfile's directory, the install that lockfile drives.
       const prefix =
         manager === PackageManager.Yarn
           ? `${manager}-${detectYarnFlavorSync(path.dirname(lockfilePath))}`
@@ -231,16 +195,7 @@ export function computeLockfileHash(gitRoot: string): string | null {
   return null;
 }
 
-/**
- * Format export reference with hash syntax.
- * Examples:
- * - #build (named export)
- * - #default (single default export)
- * - #default[0] (first item in default array)
- *
- * @param source - Workflow source info
- * @returns Export reference string with hash prefix
- */
+/** Export reference: `#build`, `#default`, or `#default[0]` for an array item. */
 function formatExportRef(source: WorkflowSourceInfo): string {
   if (source.arrayIndex !== undefined) {
     return `#${source.exportName}[${source.arrayIndex}]`;
@@ -251,7 +206,6 @@ function formatExportRef(source: WorkflowSourceInfo): string {
 /**
  * Generate a lock file from validated workflows with source tracking.
  *
- * @param workflowsWithSource - Validated workflows with source info
  * @returns Lock file ready for JSON serialization
  */
 export function generateLockFile(workflowsWithSource: WorkflowWithSource[]): LockFile {
@@ -261,8 +215,7 @@ export function generateLockFile(workflowsWithSource: WorkflowWithSource[]): Loc
   // is the common case — so most locks carry no `siblingsDigest` at all.
   const siblingsDigest = computeSiblingsDigest(gitRoot);
 
-  // For the top-level source, use the first workflow's source
-  // (typically all workflows come from files in the same .kici/workflows/ directory)
+  // Workflows typically share one `.kici/workflows/` directory.
   const firstSource = workflowsWithSource[0]?.source;
   const topLevelSource: LockSource = firstSource
     ? {
@@ -285,10 +238,9 @@ export function generateLockFile(workflowsWithSource: WorkflowWithSource[]): Loc
     );
   });
 
-  // Compute top-level content hash from the full lock file content (excluding the hash itself).
-  // This hash changes only when workflows, triggers, jobs, or bundle hashes change.
-  // minReaderVersion stamps the newest breaking version at emit time so a reader
-  // that predates a breaking change rejects the lock instead of mis-parsing it.
+  // The content hash covers the whole lock except itself. minReaderVersion
+  // makes a reader that predates a breaking change reject the lock instead of
+  // mis-parsing it.
   const minReaderVersion = BREAKING_FLOOR;
   const partial = {
     schemaVersion: SCHEMA_VERSION,
@@ -309,15 +261,7 @@ export function generateLockFile(workflowsWithSource: WorkflowWithSource[]): Loc
   };
 }
 
-/**
- * Transform SDK Workflow to lock file format.
- *
- * @param workflow - The workflow definition
- * @param sourceFile - Relative path to source file (from git root)
- * @param exportRef - Export reference (e.g., #build, #default[0])
- * @param bundleSource - Compiled JS bundle for content hashing
- * @param gitRoot - Git repository root for resolving hashFiles
- */
+/** `sourceFile` is git-root-relative; `bundleSource` feeds the content hash. */
 function transformWorkflow(
   workflow: Workflow,
   sourceFile: string,
@@ -391,11 +335,7 @@ function transformWorkflow(
 
 type TriggerWithRepos = Extract<TriggerConfig, { repos?: readonly unknown[] }>;
 
-/**
- * Spread fragment that adds a `repos` field only when the SDK trigger
- * actually carries cross-repo patterns. Identical pattern is required by
- * 14 of the 22 trigger transforms below.
- */
+/** Adds `repos` only when the trigger carries cross-repo patterns. */
 function reposField(
   trigger: Pick<TriggerWithRepos, 'repos'>,
 ): { repos: readonly LockBranchPattern[] } | Record<string, never> {
@@ -406,34 +346,27 @@ function reposField(
 
 type ExtractTrigger<Tag extends TriggerConfig['_tag']> = Extract<TriggerConfig, { _tag: Tag }>;
 
-/** Normalize a scalar-or-array SDK value to an array. */
 function toArray<T>(v: T | readonly T[] | undefined): readonly T[] {
   if (v === undefined) return [];
   return Array.isArray(v) ? v : [v as T];
 }
 
 /**
- * The `/pattern/flags` shape the lock file stores.
- *
- * The flag class must name every ECMAScript flag, not just the ones that
- * predate ES2022. When it read `[gimsuy]`, a `d`- or `v`-flagged regex failed
- * to unwrap, so `pattern` became the whole `/release-\d+/v` string — which
- * `new RegExp` happily accepts as a pattern matching literal slashes. The lock
- * then stored `/\/release-\d+\/v/`, which compiles green and can never match.
+ * The lock's `/pattern/flags` shape. The flag class names every ECMAScript
+ * flag: with `[gimsuy]`, a `/release-\d+/v` entry fails to unwrap and is stored
+ * as a literal-slash pattern that compiles green and never matches.
  */
 const REGEX_ENTRY = /^\/(.+)\/([dgimsuvy]*)$/;
 
 /**
- * Normalize one regex entry to the lock's `/pattern/flags` form, rejecting an
- * invalid or ReDoS-prone pattern at compile time so a catastrophic pattern fails
- * `kici compile` with author feedback instead of reaching the orchestrator.
+ * Normalize one regex entry to `/pattern/flags`. An invalid or ReDoS-prone
+ * pattern fails `kici compile` instead of reaching the orchestrator.
  */
 function serializeRegexEntry(entry: string | RegExp, ctx: string): string {
   const source = entry instanceof RegExp ? `/${entry.source}/${entry.flags}` : entry;
   const wrapped = REGEX_ENTRY.exec(source);
   const pattern = wrapped ? wrapped[1] : source;
-  // `g` / `y` are dropped so the lock never carries a stateful flag; every other
-  // ECMAScript flag — `d`, `i`, `m`, `s`, `u`, `v` — round-trips.
+  // Stateful `g` / `y` are dropped; every other flag round-trips.
   const flags = stripStatefulRegexFlags(wrapped ? wrapped[2] : '');
   let re: RegExp;
   try {
@@ -452,11 +385,9 @@ function serializeRegexEntry(entry: string | RegExp, ctx: string): string {
 }
 
 /**
- * Serialize a {@link TextMatch} to its lock form: every key normalized to a flat
- * array, every regex to `/pattern/flags`, every degenerate shape rejected.
- *
- * `ctx` is a human label woven into any thrown error (e.g. `push trigger
- * 'commitMessage'`, `requires 'Dockerfile'`).
+ * Serialize a {@link TextMatch}: every key to a flat array, every regex to
+ * `/pattern/flags`, every degenerate shape rejected. `ctx` labels thrown errors
+ * (e.g. `requires 'Dockerfile'`).
  */
 function serializeTextMatch(m: TextMatch, ctx: string): LockTextMatch {
   const contains = toArray(m.contains);
@@ -500,7 +431,6 @@ function serializeTextMatch(m: TextMatch, ctx: string): LockTextMatch {
   };
 }
 
-/** Emit the optional `commitMessage` field for a git-event lock trigger. */
 function commitMessageField(
   commitMessage: TextMatch | undefined,
   triggerLabel: string,
@@ -510,9 +440,8 @@ function commitMessageField(
 }
 
 /**
- * Serialize one SDK content requirement into its lock form, validating and
- * resolving `format: 'auto'` by extension at compile time. A malformed filter
- * throws (fails `kici compile`) rather than reaching the orchestrator.
+ * Serialize one content requirement, resolving `format: 'auto'` by extension.
+ * A malformed filter fails `kici compile` rather than reaching the orchestrator.
  */
 function serializeOneRequirement(req: ContentRequirement): LockContentRequirement {
   const hasJsonQuery =
@@ -533,7 +462,6 @@ function serializeOneRequirement(req: ContentRequirement): LockContentRequiremen
     req.notMatches !== undefined;
   const hasAnyQuery = hasJsonQuery || hasTextQuery || req.ignoreCase !== undefined;
 
-  // `absent` is mutually exclusive with every query key.
   if (req.absent) {
     if (hasAnyQuery) {
       throw compilerError(
@@ -546,7 +474,6 @@ function serializeOneRequirement(req: ContentRequirement): LockContentRequiremen
 
   const format = resolveContentFormat(req.file, req.format);
 
-  // Format/query mismatch: text carries only the raw-text keys; json/yaml carry only exists/match/not.
   if (format === 'text' && hasJsonQuery) {
     throw compilerError(
       'E119',
@@ -583,10 +510,7 @@ function serializeOneRequirement(req: ContentRequirement): LockContentRequiremen
   };
 }
 
-/**
- * Serialize a trigger's `requires` list, or `undefined` when empty (so the lock
- * field stays absent). Each entry is validated + format-resolved at compile time.
- */
+/** `undefined` for an empty list, so the lock field stays absent. */
 function serializeRequires(
   requires: readonly ContentRequirement[] | undefined,
 ): readonly LockContentRequirement[] | undefined {
@@ -615,8 +539,7 @@ function toLockPr(t: ExtractTrigger<'PrTrigger'>): LockPrTrigger {
 }
 
 function toLockPushAndTag(t: ExtractTrigger<'PushTrigger'>): LockTrigger[] {
-  // Resolve + validate once; the same content filter and commit-message filter
-  // apply to the push and to the tag trigger the push config additionally emits.
+  // Resolved once: the push and its derived tag trigger share both filters.
   const requires = requiresField(t.requires);
   const commitMessage = commitMessageField(t.commitMessage, 'push trigger');
   const results: LockTrigger[] = [
@@ -629,7 +552,6 @@ function toLockPushAndTag(t: ExtractTrigger<'PushTrigger'>): LockTrigger[] {
       ...commitMessage,
     } satisfies LockPushTrigger,
   ];
-  // Push triggers with tag patterns also emit a LockTagTrigger.
   if (t.tags.length > 0) {
     results.push({
       _type: 'tag',
@@ -913,18 +835,14 @@ function transformOneTrigger(trigger: TriggerConfig): LockTrigger[] {
 }
 
 /**
- * Transform trigger configs to lock file format.
- * Uses flatMap because push triggers with tags generate two lock triggers.
- * Exported for reuse in the test runner's in-memory lock format conversion.
+ * flatMap: a push trigger with tags emits two lock triggers. Exported for the
+ * test runner's in-memory lock conversion.
  */
 export function transformTriggers(triggers?: TriggerConfig[]): readonly LockTrigger[] {
   if (!triggers) return [];
   return triggers.flatMap(transformOneTrigger);
 }
 
-/**
- * Transform branch patterns to lock file format.
- */
 function transformBranchPatterns(
   patterns: readonly { type: 'glob' | 'regex'; pattern: string; flags?: string }[],
 ): readonly LockBranchPattern[] {
@@ -935,23 +853,18 @@ function transformBranchPatterns(
   }));
 }
 
-/** UUID v4 pattern: 8-4-4-4-12 hex chars */
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Transform jobs array (may contain static jobs and dynamic generators).
- * Assigns counter-based IDs to UUID-named jobs (created by id-less job() factory).
- * Counter only increments for unnamed entries; named jobs keep their names.
- *
- * Builds a UUID-to-renamed-name mapping in a pre-pass so that `needs` references
- * to other UUID-named jobs resolve to their lock file names (job-N), not the UUIDs.
+ * UUID-named jobs (from the id-less `job()` factory) become `job-N`, counting
+ * only those; named jobs keep their names. A pre-pass maps UUIDs to `job-N` so
+ * `needs` references resolve to lock names, not UUIDs.
  */
 function transformJobs(
   jobs: JobOrFactory[],
   configPath: string,
   gitRoot: string,
 ): readonly LockJobOrFactory[] {
-  // Pre-pass: build UUID -> job-N name mapping for resolveNeeds
   let preCounter = 0;
   const uuidToName = new Map<string, string>();
   for (const jobOrFactory of jobs) {
@@ -965,16 +878,14 @@ function transformJobs(
   let jobCounter = 0;
   return jobs.map((jobOrFactory, index): LockJobOrFactory => {
     if (isDynamicJobFn(jobOrFactory)) {
-      // Dynamic job generator - can't serialize, store reference
+      // A generator cannot be serialized; store a reference.
       const groupName = getDynamicJobGroup(jobOrFactory);
       const declaredNeeds = getDynamicJobNeeds(jobOrFactory);
-      // The generator's credential map is the ceiling every job it generates
-      // inherits — the orchestrator reads it from this lock entry, never from
-      // the job definitions the agent's eval returns.
+      // The credential ceiling for every generated job: the orchestrator reads
+      // it from this lock entry, never from the agent's eval result.
       const declaredGitCredentials = getDynamicJobGitCredentials(jobOrFactory);
-      // Result-aware generators declare upstream needs via the options-object
-      // form. Normalize them with the same helper the static-job `needs`
-      // serialization uses so the deferred eval job is gated identically.
+      // Same normalization as static `needs`, so the deferred eval job is
+      // gated identically.
       const resolvedNeeds = declaredNeeds
         ? resolveNeedsForLock(declaredNeeds as Job['needs'], uuidToName)
         : undefined;
@@ -993,7 +904,6 @@ function transformJobs(
       } satisfies LockDynamicJobFn;
     }
 
-    // Static job - detect UUID name (auto-generated by id-less job() factory)
     const j = jobOrFactory as Job;
     const isUuid = UUID_PATTERN.test(j.name);
     const name = isUuid ? `job-${++jobCounter}` : j.name;
@@ -1002,9 +912,8 @@ function transformJobs(
 }
 
 /**
- * Normalize SDK runsOn into lock file matchers.
- * Plain strings stay exact; globs convert to regex; RegExp literals become regex.
- * Throws (via the engine ReDoS gate) on a ReDoS-prone author regex.
+ * Plain strings stay exact; globs and RegExp literals become regex. Throws on a
+ * ReDoS-prone author regex (engine gate).
  */
 function normalizeRunsOnForLock(
   runsOn: RunsOn,
@@ -1022,16 +931,12 @@ function normalizeRunsOnForLock(
 }
 
 /**
- * Validate runsOn labels: reject overlap between required and excluded labels.
+ * Reject overlap between required and excluded labels (exact matchers only: a
+ * glob/regex cannot be statically known to overlap).
  *
- * `kici:` labels ARE valid runsOn selectors. runsOn expresses a requirement on
- * candidate agents — it only narrows the set, it never grants authority — so
- * targeting a `kici:os:linux` / `kici:role:builder` label is benign. The forgery
- * boundary is label *setting* (scaler labelSet validation + the agent
- * register-time scope gate), which is enforced elsewhere and unaffected here.
- *
- * The overlap check compares exact matchers only — a glob/regex include and an
- * exact exclude (or vice versa) cannot be statically known to overlap.
+ * `kici:` labels are valid selectors: runsOn only narrows the candidate set and
+ * never grants authority. The forgery boundary is label *setting* (scaler
+ * labelSet validation and the agent register-time scope gate), enforced elsewhere.
  */
 function validateRunsOn(runsOn: RunsOn, jobName: string, location: SourceLocation): void {
   const { include, exclude } = normalizeRunsOnToMatchers(
@@ -1057,26 +962,17 @@ function validateRunsOn(runsOn: RunsOn, jobName: string, location: SourceLocatio
   }
 }
 
-/**
- * Transform one context reference (static name or function) into a lock
- * `{ value, dynamic }` entry. A function element carries only the `dynamic`
- * flag (the agent resolves it in the init round); a static name carries its
- * literal value.
- */
+/** A function ref carries only the `dynamic` flag; the agent init round resolves it. */
 function transformContextRef(ref: NonNullable<Job['contexts']>[number]): {
   value: string;
   dynamic: boolean;
 } {
   if (typeof ref === 'function') {
-    // Dynamic context elements are resolved by the agent init job.
     return { value: '', dynamic: true };
   }
   return { value: ref, dynamic: false };
 }
 
-/**
- * Transform a static job to lock file format.
- */
 function transformJob(
   job: Job,
   configPath: string,
@@ -1084,11 +980,9 @@ function transformJob(
   gitRoot: string,
   uuidToName?: Map<string, string>,
 ): LockJob {
-  // Best available source anchor for job-scoped compile errors: the job's first
-  // step location, falling back to the workflow file at line 1.
+  // The job's first step location, else the workflow file at line 1.
   const jobLocation = locationForJob(job, configPath);
 
-  // runsOn and runsOnAll are mutually exclusive; exactly one must be present.
   if (job.runsOn !== undefined && job.runsOnAll !== undefined) {
     throw compilerError('E108', `job '${job.name}': runsOn and runsOnAll are mutually exclusive`, {
       location: jobLocation,
@@ -1096,8 +990,7 @@ function transformJob(
         'Set exactly one of runsOn (single agent) or runsOnAll (fan-out to every matching agent).',
     });
   }
-  // An invoke gate never dispatches to an agent, so it names no target; every
-  // other job must.
+  // An invoke gate never dispatches to an agent, so it names no target.
   if (job.invoke === undefined && job.runsOn === undefined && job.runsOnAll === undefined) {
     throw compilerError('E109', `job '${job.name}': one of runsOn or runsOnAll is required`, {
       location: jobLocation,
@@ -1107,8 +1000,6 @@ function transformJob(
   if (job.onUnreachable !== undefined && job.runsOnAll === undefined) {
     console.warn(`[kici] job '${job.name}': onUnreachable is ignored without runsOnAll`);
   }
-  // Fan-out concurrency: maxParallel must be >= 1, and both maxParallel/failFast
-  // are only meaningful on a fan-out job (matrix or runsOnAll).
   if (job.maxParallel !== undefined && job.maxParallel < 1) {
     throw compilerError('E110', `job '${job.name}': maxParallel must be >= 1`, {
       location: jobLocation,
@@ -1121,13 +1012,9 @@ function transformJob(
       `[kici] job '${job.name}': maxParallel/failFast are ignored without matrix or runsOnAll (no fan-out to bound)`,
     );
   }
-  // Validate runsOn for overlap between required and excluded labels
   if (job.runsOn !== undefined) validateRunsOn(job.runsOn, job.name, jobLocation);
 
-  // Resolve contexts into an ordered array of { value, dynamic } entries.
-  // Either spelling normalizes here: `context: 'x'` becomes a one-element
-  // array; `contexts: [...]` is emitted in order. Each function element becomes
-  // a dynamic marker resolved by the agent init round.
+  // `context: 'x'` normalizes to a one-element `contexts` array, kept in order.
   const contextFields: {
     contexts?: Array<{ value: string; dynamic: boolean }>;
   } = {};
@@ -1136,8 +1023,7 @@ function transformJob(
     contextFields.contexts = contextRefs.map((ref) => transformContextRef(ref));
   }
 
-  // Resolve env: static object, or dynamic function marker (resolved by the
-  // agent init round).
+  // A function env becomes a marker the agent init round resolves.
   const envFields: {
     env?: Record<string, string>;
     dynamicEnv?: boolean;
@@ -1150,8 +1036,7 @@ function transformJob(
     }
   }
 
-  // Validate per-job resources at compile time so bad memory strings / nonsense
-  // request-vs-limit pairs fail fast (before the orchestrator ever sees the lockfile).
+  // Fail at compile time, before the orchestrator sees the lock.
   if (job.resources !== undefined) {
     try {
       validateResourceRequest(job.resources);
@@ -1164,8 +1049,7 @@ function transformJob(
     }
   }
 
-  // Resolve concurrencyGroup: static string, or dynamic function marker
-  // (resolved by the agent init round).
+  // A function concurrencyGroup becomes a marker the agent init round resolves.
   const concurrencyFields: {
     concurrencyGroup?: string;
     dynamicConcurrencyGroup?: boolean;
@@ -1235,10 +1119,6 @@ function transformJob(
   };
 }
 
-/**
- * Result of resolving needs to lock file format.
- * Contains the serialized needs array and the list of group names for dependsOnGroups.
- */
 interface ResolvedNeeds {
   readonly needs: readonly (
     string | import('../types.js').LockNeedsEntry | import('../types.js').LockNeedsGroupEntry
@@ -1247,11 +1127,8 @@ interface ResolvedNeeds {
 }
 
 /**
- * Resolve needs to lock file format.
- * Handles strings, Job objects, DynamicGroupRef, and object forms with a `when`
- * run condition (normalized to a `runOn` status-set via the engine helper).
- * Uses the UUID-to-renamed-name mapping so that references to id-less jobs
- * resolve to their lock file names (job-N) instead of the original UUIDs.
+ * A `when` condition normalizes to a `runOn` status set; references to id-less
+ * jobs resolve to their `job-N` lock names through `uuidToName`.
  */
 function resolveNeedsForLock(
   needs?: Job['needs'],
@@ -1268,20 +1145,16 @@ function resolveNeedsForLock(
     if (typeof need === 'string') {
       resolvedNeeds.push(uuidToName?.get(need) ?? need);
     } else if (isDynamicGroupRef(need)) {
-      // DynamicGroupRef -> NeedsGroupEntry in lock file + dependsOnGroups
       resolvedNeeds.push({ group: need.group, runOn: resolveWhenToRunOn(need.when) });
       groups.push(need.group);
     } else if ('_tag' in need && (need as Job)._tag === 'Job') {
-      // Job object -> resolve to name string
       const name = (need as Job).name;
       resolvedNeeds.push(uuidToName?.get(name) ?? name);
     } else if ('group' in need && typeof (need as { group: string }).group === 'string') {
-      // Object form { group: string; when } -> NeedsGroupEntry
       const g = need as { group: string; when?: NeedsWhenInput };
       resolvedNeeds.push({ group: g.group, runOn: resolveWhenToRunOn(g.when) });
       groups.push(g.group);
     } else {
-      // Object form { name: string; when } -> NeedsEntry
       const n = need as { name: string; when?: NeedsWhenInput };
       const name = uuidToName?.get(n.name) ?? n.name;
       resolvedNeeds.push({ name, runOn: resolveWhenToRunOn(n.when) });
@@ -1294,12 +1167,6 @@ function resolveNeedsForLock(
   };
 }
 
-/**
- * Transform steps to lock file format.
- * Assigns counter-based IDs to unnamed steps (bare functions and id-less steps).
- * Counter only increments for unnamed entries; named steps keep their names.
- */
-/** Map an SDK `approval` to the normalized lock `approval` block. */
 function toLockApproval(c: ApprovalConfig): LockApproval {
   const n = normalizeApproval(c);
   return {
@@ -1310,11 +1177,7 @@ function toLockApproval(c: ApprovalConfig): LockApproval {
   };
 }
 
-/**
- * Validate an approval config at job/workflow scope: `when: 'drift'` is a
- * step-scope-only gate (it fires between a step's check and run), so it is a
- * compile error anywhere else.
- */
+/** `when: 'drift'` fires between a step's check and run, so it is step-scope only. */
 function assertNonStepApprovalScope(
   c: ApprovalConfig,
   scope: 'job' | 'workflow',
@@ -1333,10 +1196,7 @@ function assertNonStepApprovalScope(
   }
 }
 
-/**
- * Validate a step's approval config: `when: 'drift'` fires between the step's
- * check and run, so it requires a `check` facet. A compile error otherwise.
- */
+/** `when: 'drift'` fires between check and run, so it requires a `check` facet. */
 function assertStepApprovalCheckFacet(
   step: {
     name?: string;
@@ -1362,17 +1222,15 @@ function assertStepApprovalCheckFacet(
   }
 }
 
-/** Mutable flat-step counter shared across an entire job's step sequence. */
+/** Shared across a job's whole step sequence. */
 interface StepCounter {
   n: number;
 }
 
 /**
- * Transform a job's `steps` array into lock-file entries. Sequential steps and
- * parallel-group children share one flat `step-N` counter (anonymous steps are
- * numbered across the whole flattened sequence, parallel children inline) so the
- * compiler's naming matches the agent's `extractAndNormalizeSteps` enumeration —
- * the flat-stepIndex invariant.
+ * Sequential steps and parallel-group children share one flat `step-N` counter
+ * for anonymous steps, so naming matches the agent's `extractAndNormalizeSteps`
+ * enumeration (the flat-stepIndex invariant). Named steps keep their names.
  */
 export function transformSteps(
   steps: readonly StepInput[],
@@ -1390,12 +1248,10 @@ export function transformSteps(
   });
 }
 
-/** Best step-scoped location: the step's captured call-site, else the job anchor. */
 function stepEntryLocation(entry: unknown, jobLocation: SourceLocation): SourceLocation {
   return (entry as { _sourceLocation?: SourceLocation })._sourceLocation ?? jobLocation;
 }
 
-/** Validate and transform a `ParallelGroup` into a `LockParallelStep`. */
 function transformParallelGroup(
   group: ParallelGroup,
   gitRoot: string,
@@ -1445,7 +1301,6 @@ function transformParallelGroup(
   };
 }
 
-/** Transform a single sequential step (or bare function) into a `LockStep`. */
 function transformSequentialStep(
   stepOrFn: StepInput,
   gitRoot: string,
@@ -1453,12 +1308,10 @@ function transformSequentialStep(
   jobLocation: SourceLocation,
 ): LockStep {
   if (typeof stepOrFn === 'function') {
-    // Bare function step -- auto-named with counter
     counter.n++;
     return { name: `step-${counter.n}`, hasOutputs: false };
   }
   const step = stepOrFn as Step<any>;
-  // Empty name = id-less step -> assign counter
   const name = step.name || `step-${++counter.n}`;
   return {
     name,
@@ -1500,21 +1353,15 @@ function transformSequentialStep(
 }
 
 /**
- * Strip the `?t=...` query suffix added by cache-busting `import()` calls.
- * The cache-buster is a `Date.now()` query parameter used to defeat Node's
- * module cache. It must not leak into the lock file — it poisons sourceLocation
- * determinism and the top-level contentHash. Handles both `.compiled.mjs?t=...`
- * (rolldown compile path) and `.ts?t=...` (direct TS import path).
+ * Strip the `Date.now()` `?t=...` cache-buster from `.compiled.mjs?t=...`
+ * (rolldown path) and `.ts?t=...` (direct import). Leaked into the lock, it
+ * breaks sourceLocation determinism and the top-level contentHash.
  */
 function stripCompiledSuffix(filePath: string): string {
   return filePath.replace(/(?:\.compiled\.mjs)?\?t=\d+$/, '');
 }
 
-/**
- * Convert an absolute file path to a git-root-relative path.
- * If already relative, returns as-is. Normalizes backslashes to forward slashes.
- * Also strips ephemeral `.compiled.mjs?t=...` suffixes from source locations.
- */
+/** Git-root-relative, forward-slashed, cache-buster stripped; a relative path stays put. */
 function makeRelativePath(filePath: string, gitRoot: string): string {
   const cleaned = stripCompiledSuffix(filePath);
   if (!path.isAbsolute(cleaned)) {
@@ -1523,11 +1370,7 @@ function makeRelativePath(filePath: string, gitRoot: string): string {
   return path.relative(gitRoot, cleaned).replaceAll('\\', '/');
 }
 
-/**
- * Transform matrix configuration to lock file format.
- */
 function transformMatrix(matrix: Matrix, jobName: string, configPath: string): LockMatrix {
-  // Check if dynamic (function)
   if (isDynamicFunction(matrix)) {
     return {
       _type: 'dynamic',
@@ -1538,7 +1381,6 @@ function transformMatrix(matrix: Matrix, jobName: string, configPath: string): L
     };
   }
 
-  // Static matrix - include values
   if (isStaticArray(matrix)) {
     return {
       _type: 'static',
@@ -1547,7 +1389,6 @@ function transformMatrix(matrix: Matrix, jobName: string, configPath: string): L
   }
 
   if (isStaticObject(matrix)) {
-    // Copy the object structure
     const values: Record<string, readonly string[]> = {};
     for (const [key, arr] of Object.entries(matrix)) {
       values[key] = [...arr];
@@ -1558,7 +1399,7 @@ function transformMatrix(matrix: Matrix, jobName: string, configPath: string): L
     };
   }
 
-  // Fallback - treat as dynamic if we can't identify it
+  // Unrecognized shapes are treated as dynamic.
   return {
     _type: 'dynamic',
     source: {
@@ -1568,10 +1409,7 @@ function transformMatrix(matrix: Matrix, jobName: string, configPath: string): L
   };
 }
 
-/**
- * Transform rules to lock file format.
- * Rules contain functions and can't be serialized - store references.
- */
+/** Rules hold functions, so the lock stores references. */
 function transformRules(
   rules: Rule[],
   configPath: string,
@@ -1590,9 +1428,7 @@ function transformRules(
 /**
  * Serialize lock file to JSON string.
  *
- * @param lockFile - Lock file object
  * @param pretty - Whether to pretty-print (default: true)
- * @returns JSON string
  */
 export function serializeLockFile(lockFile: LockFile, pretty = true): string {
   return JSON.stringify(lockFile, null, pretty ? 2 : undefined);

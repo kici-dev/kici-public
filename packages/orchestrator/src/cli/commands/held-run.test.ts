@@ -1,16 +1,12 @@
 /**
- * Tests for `kici-admin held-run`.
+ * Asserts what a route-level test cannot see:
  *
- * Three things are asserted that a route-level test cannot see:
- *
- * 1. **The registration seam.** The real `buildProgram()` is walked, so a
- *    command file that exists but is never registered fails here rather than
- *    silently shipping as no command at all.
- * 2. **Hold resolution is the SHARED resolver.** The disambiguation error text
- *    is `resolveHeldRunId`'s own, so a second local resolver would show up as a
- *    different message.
- * 3. **Nothing is POSTed when resolution fails.** An ambiguous `--job` must not
- *    answer an arbitrary one of the two holds it matched.
+ * - **The registration seam.** The real `buildProgram()` is walked, so an
+ *   unregistered command file fails here rather than shipping as no command.
+ * - **Hold resolution is the SHARED resolver.** The disambiguation error is
+ *   `resolveHeldRunId`'s own text; a second local resolver would differ.
+ * - **Nothing is POSTed when resolution fails.** An ambiguous `--job` must not
+ *   answer an arbitrary one of the holds it matched.
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { Command } from 'commander';
@@ -64,8 +60,7 @@ describe('kici-admin held-run', () => {
     vi.spyOn(console, 'error').mockImplementation((msg: unknown) => {
       errors.push(String(msg));
     });
-    // `process.exit` is called on a resolution failure; throwing instead lets
-    // the test observe that the POST never happened.
+    // Throwing from `process.exit` lets the test observe that the POST never happened.
     exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
       throw new Error(`exit:${code}`);
     }) as never);

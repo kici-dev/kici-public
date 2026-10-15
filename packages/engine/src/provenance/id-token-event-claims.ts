@@ -1,12 +1,9 @@
 /**
- * The event-context half of an OIDC ID token's claims, shared by every minter.
+ * The event-context half of an OIDC ID token's claims, which the orchestrator's
+ * minter spreads into its claim object.
  *
  * A cloud trust policy pins `sub` and, ideally, the claims below. Those values
- * are what tells a fork pull request from a trusted push, so the two minters —
- * the customer's orchestrator and the hosted Platform — must derive them
- * identically. Any drift between them is a hole: a bundle minted by one would
- * satisfy a policy written against the other. So the derivation lives here,
- * once, and each minter spreads the result into its own claim object.
+ * tell a fork pull request from a trusted push, so they are derived here, once.
  */
 import { z } from 'zod';
 import { isPullRequestFamilyTriggerEvent } from '../trigger/trigger-event-type.js';
@@ -21,16 +18,15 @@ export interface EventClaimSource {
   /**
    * The event the SUBJECT is derived from, when that is not `trigger_event`.
    *
-   * A re-run records `trigger_event: 'rerun'`, which carries no pull-request
+   * A re-run records `trigger_event: 'rerun'`, which has no pull-request
    * dimension, so a re-run of a pull request would present the branch-shaped
-   * subject a push to the same base branch presents. This column carries the
+   * subject of a push to the same base branch. This column carries the
    * original run's event forward for that one purpose. NULL means "use
-   * `trigger_event`", which is what every row written before the column
-   * existed says — so a legacy row keeps the subject it already mints.
+   * `trigger_event`", so a row written before the column existed keeps its
+   * subject.
    *
-   * Read ONLY by `buildIdTokenSubject`. It is deliberately absent from
-   * `buildEventClaims`: `event_name` reports what actually started THIS run,
-   * and a re-run is a re-run.
+   * Read ONLY by `buildIdTokenSubject`, never by `buildEventClaims`:
+   * `event_name` reports what started THIS run, and a re-run is a re-run.
    */
   subject_trigger_event?: string | null;
   /** Pull-request HEAD branch. */
@@ -41,20 +37,18 @@ export interface EventClaimSource {
   is_fork?: boolean | null;
   /** Resolved trust tier for the triggering actor. */
   trust_tier?: string | null;
-  /** Provider login of the triggering actor. */
   trigger_actor_username?: string | null;
 }
 
 /**
- * The event-context claims. Every value is a STRING and every one is ALWAYS
- * PRESENT.
+ * The event-context claims. Every value is a STRING and ALWAYS PRESENT.
  *
  * Strings because an AWS IAM `StringEquals` condition on an OIDC claim is
  * string-typed and a three-valued `is_fork` has to be expressible. Always
- * present because an ABSENT claim makes a `StringEquals` condition fail — which
- * silently removes the constraint for a policy author who wrote it expecting
- * enforcement. An explicit `''` / `'unresolved'` makes that policy fail closed
- * instead, and makes the unknown state visible in a decoded token.
+ * present because an ABSENT claim makes a `StringEquals` condition fail, which
+ * silently removes the constraint a policy author expected to enforce. An
+ * explicit `''` / `'unresolved'` makes that policy fail closed instead, and
+ * shows the unknown state in a decoded token.
  */
 export interface EventClaims {
   /** Normalized event type, or `'unknown'`. */
@@ -77,12 +71,9 @@ export interface EventClaims {
 export const UNRESOLVED_CLAIM = 'unresolved';
 
 /**
- * Build the event-context claims from a run row.
- *
- * A NULL never becomes a plausible default. `head_repository` does not fall
- * back to `repository`, and `is_fork` does not fall back to `'false'`: both
- * would fail OPEN on a lost write, which is the failure these claims exist to
- * remove.
+ * Build the event-context claims from a run row. A NULL never becomes a
+ * plausible default: `head_repository` does not fall back to `repository`, nor
+ * `is_fork` to `'false'`, because both would fail OPEN on a lost write.
  */
 export function buildEventClaims(run: EventClaimSource): EventClaims {
   return {
@@ -97,29 +88,25 @@ export function buildEventClaims(run: EventClaimSource): EventClaims {
 }
 
 /**
- * Build the token subject.
- *
- * Two shapes, mirroring GitHub Actions' own claim vocabulary — which is what
- * every customer's existing trust policy is written against:
+ * Build the token subject, in GitHub Actions' claim vocabulary, which existing
+ * customer trust policies are written against:
  *
  *   - pull-request family: `repo:<owner/repo>:pull_request`, with NO ref
- *     segment. GitHub omits the ref there for exactly this reason.
- *   - everything else: `repo:<owner/repo>:ref:<ref>:workflow:<name>`, unchanged.
+ *     segment, as GitHub does.
+ *   - everything else: `repo:<owner/repo>:ref:<ref>:workflow:<name>`.
  *
- * A pull request's `ref` is its BASE branch, so the branch-shaped subject made
- * a fork PR against `main` byte-identical to a trusted push to `main`. An
- * external contributor whose PR ran the same workflow minted the exact string a
- * policy pinned, and assumed the customer's cloud role. The two shapes cannot
- * collide: no branch name produces the literal segment `pull_request` in the
- * position a branch subject puts `ref`.
+ * A pull request's `ref` is its BASE branch, so a branch-shaped subject would
+ * make a fork PR against `main` byte-identical to a trusted push to `main`: an
+ * external contributor's PR running the same workflow would mint the string a
+ * policy pinned and assume the customer's cloud role. The two shapes cannot
+ * collide: no branch name produces the literal segment `pull_request` where a
+ * branch subject puts `ref`.
  *
- * The event tested is `subject_trigger_event ?? trigger_event`. A re-run writes
- * `trigger_event: 'rerun'` and carries the original run's event in
- * `subject_trigger_event`, so re-running a pull request keeps the
- * pull-request subject instead of decaying to the colliding branch shape.
- * `trigger_event` itself is left alone because two other readers depend on it:
- * the dashboard's trigger-type filter and the git credential relay's
- * `triggerTypeFilters`, both of which must keep seeing `'rerun'`.
+ * The event tested is `subject_trigger_event ?? trigger_event`, so re-running a
+ * pull request keeps the pull-request subject instead of decaying to the
+ * colliding branch shape. `trigger_event` stays `'rerun'` because the
+ * dashboard's trigger-type filter and the git credential relay's
+ * `triggerTypeFilters` read it.
  */
 export function buildIdTokenSubject(
   run: Pick<
@@ -140,9 +127,9 @@ export function buildIdTokenSubject(
  * freeze a provenance statement that matches what a live mint would say.
  *
  * Every field mirrors a claim `buildIdTokenClaims` derives, so a statement
- * built from this passes `crossCheckBuildContext` against the token that is
- * later minted for the same (run, job) — which is what lets the orchestrator
- * refuse a deferred statement it has not checked against its own run row.
+ * built from it passes `crossCheckBuildContext` against the token later minted
+ * for the same (run, job); that lets the orchestrator refuse a deferred
+ * statement it has not checked against its own run row.
  *
  * `.passthrough()` so an older agent tolerates a field a newer orchestrator
  * adds.

@@ -1,12 +1,8 @@
 /**
- * Tests for `kici-admin org-settings global-workflows` CLI subcommands.
- *
- * Verifies that each subcommand:
- *  - Talks to the orchestrator admin API (NEVER touches the DB directly)
- *  - Maps flags and positional args to the correct HTTP shape
- *  - Formats output as either a table or JSON
- *  - Honours the `--source <routingKey>` qualifier to scope a list entry to
- *    one webhook source (omitting it stores an unqualified entry)
+ * Each subcommand talks to the admin API (NEVER the DB directly), maps flags to
+ * the right HTTP shape, formats table or JSON, and honours `--source
+ * <routingKey>` to scope a list entry to one webhook source (omitted: an
+ * unqualified entry).
  */
 
 import { describe, expect, it, vi, beforeEach } from 'vitest';
@@ -14,6 +10,7 @@ import { Command } from 'commander';
 import { registerOrgSettingsCommands } from './org-settings.js';
 import type { AdminApiClient } from '../api-client.js';
 import { DASHBOARD_WRITE_OPERATIONS } from '@kici-dev/engine/protocol/dashboard-write-operations';
+import { runCli } from '../../__test-helpers__/cli.js';
 
 interface CommandResult {
   stdout: string;
@@ -43,47 +40,9 @@ const SAMPLE_SETTINGS = {
 };
 
 async function runCommand(args: string[], client: Partial<AdminApiClient>): Promise<CommandResult> {
-  const program = new Command();
-  program.exitOverride();
-
-  registerOrgSettingsCommands(program, () => client as AdminApiClient);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:')) {
-      if (err.code?.startsWith('commander.')) {
-        exitCode = err.exitCode ?? 1;
-        errors.push(err.message);
-      } else {
-        console.log = origLog;
-        console.error = origError;
-        process.exit = origExit;
-        throw err;
-      }
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
+  return runCli((p) => registerOrgSettingsCommands(p, () => client as AdminApiClient), args, {
+    recordCommanderErrors: true,
+  });
 }
 
 describe('kici-admin org-settings global-workflows', () => {
@@ -142,9 +101,8 @@ describe('kici-admin org-settings global-workflows', () => {
   });
 
   it('set-enabled is gone — the master switch is cluster-wide', async () => {
-    // The subcommand was removed with the per-org master switch. The point is
-    // that nothing patches the org row any more; commander reports the removed
-    // subcommand as an unknown command (exit non-zero, never 0).
+    // Nothing patches the org row any more: commander reports the subcommand
+    // as unknown (exit non-zero, never 0).
     const { exitCode } = await runCommand(
       ['org-settings', 'global-workflows', 'set-enabled', 'true', '--org', ORG],
       client,
@@ -298,10 +256,8 @@ describe('kici-admin org-settings global-workflows', () => {
     });
   });
 
-  // Universal-git sources participate in the same axes via their
-  // `generic:<orgId>:<sourceId>` routing key. The admin API treats the routing
-  // key as an opaque string in the qualifier, so provider-prefixed keys round
-  // trip exactly as github:* keys do.
+  // The admin API treats the routing key as an opaque qualifier, so a
+  // universal-git `generic:<orgId>:<sourceId>` key round-trips as github:* does.
   it('allow-add supports a universal-git --source qualifier', async () => {
     const genericKey = 'generic:acmeOrg00001:src-abc';
     mockGet.mockResolvedValueOnce({
@@ -841,7 +797,7 @@ describe('kici-admin org-settings dashboard-writes', () => {
 
   // A policy set before the server-side refusal existed can still hold this
   // state, and the operator has no other way to discover it: the row reads as
-  // an ordinary disable, and the answering surface it removed is elsewhere.
+  // an ordinary disable.
   describe('already-disabled held-run lockout', () => {
     const lockedOut = (platformManaged: boolean) => ({
       ...DW_RESPONSE,

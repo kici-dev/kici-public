@@ -4,14 +4,12 @@ import { type Kysely, sql } from 'kysely';
  * Create `org_trust_policy` — the orchestrator's cache of the Platform-owned org
  * trust policy pushed on `trust_policy.update`.
  *
- * A dedicated table rather than `org_settings` columns, because this is
- * Platform-owned policy the orchestrator consumes, not operator-owned config the
- * operator tunes. `source` records which of the two wrote the row so the admin
- * surface can present a Platform-managed policy as read-only.
+ * A dedicated table, not `org_settings` columns: this is Platform-owned policy,
+ * not operator config. `source` records which side wrote the row, so the admin
+ * surface shows a Platform-managed policy as read-only.
  *
- * Persisting rather than caching in memory is deliberate: a security policy that
- * silently reverts to a default across a restart is worse than one that is never
- * applied.
+ * Persisted, not cached in memory: a security policy that silently reverts to a
+ * default across a restart is worse than one never applied.
  *
  * Idempotent: guarded by IF NOT EXISTS, so a re-run is a no-op.
  */

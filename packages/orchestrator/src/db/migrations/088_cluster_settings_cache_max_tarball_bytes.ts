@@ -3,10 +3,10 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Add `cluster_settings.cache_max_tarball_bytes` (nullable BIGINT).
  *
- * Fleet-wide maximum dependency-cache tarball size (bytes); a larger store is rejected. NULL → cluster default (`config.cacheMaxTarballBytes`, `KICI_CACHE_MAX_TARBALL_BYTES`).
+ * Fleet-wide maximum dependency-cache tarball size (bytes); a larger store is rejected.
+ * NULL → cluster default (`config.cacheMaxTarballBytes`, `KICI_CACHE_MAX_TARBALL_BYTES`).
  *
- * Idempotent: guarded on column existence; a re-run on a DB that already has
- * the column is a no-op.
+ * Idempotent: guarded on column existence.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

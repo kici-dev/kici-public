@@ -1,16 +1,13 @@
 /**
- * Delete trigger helper - creates triggers for ref deletion events (branches/tags).
- * Returns a frozen DeleteTriggerConfig directly.
- *
- * Note: `delete` is a reserved word in JavaScript, so the internal function
- * is named `del` and re-exported as `delete` from index.ts.
+ * `delete` is a reserved word, so the function is `del`, re-exported as
+ * `delete` from index.ts.
  */
 
 import type { BranchPattern, DeleteConfigInput, DeleteTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';
 
 /**
- * Create a ref deletion trigger configuration.
+ * Create a ref (branch / tag) deletion trigger. Returns a frozen DeleteTriggerConfig.
  *
  * @example
  * // Match any ref deletion

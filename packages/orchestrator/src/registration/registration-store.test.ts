@@ -241,15 +241,12 @@ describe('RegistrationStore', () => {
 
       await store.replaceAll('owner/repo', workflows, 'github:42', {}, { customerId: 'cust-1' });
 
-      // Should start a transaction
       expect(mocks.transaction).toHaveBeenCalled();
 
-      // Should SELECT existing registrations inside the transaction
       expect(mocks.trxSelectFrom).toHaveBeenCalledWith('workflow_registrations');
 
       // Should UPDATE the existing row (not INSERT)
       expect(mocks.trxUpdateTable).toHaveBeenCalledWith('workflow_registrations');
-      // The where clause should reference the existing ID
       expect(mocks.trxUpdateWhere).toHaveBeenCalledWith('id', '=', 'existing-uuid-1');
 
       // Should NOT insert (workflow already exists)
@@ -266,7 +263,6 @@ describe('RegistrationStore', () => {
 
       await store.replaceAll('owner/repo', workflows, 'github:42', {}, { customerId: 'cust-1' });
 
-      // Should INSERT the new workflow
       expect(mocks.trxInsertInto).toHaveBeenCalledWith('workflow_registrations');
       expect(mocks.trxInsertValues).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -294,12 +290,9 @@ describe('RegistrationStore', () => {
       const workflows = [makeLockWorkflow('new-wf')];
       await store.replaceAll('owner/repo', workflows, 'github:42', {}, { customerId: 'cust-1' });
 
-      // Should DELETE old-wf
       expect(mocks.trxDeleteFrom).toHaveBeenCalledWith('workflow_registrations');
-      // Check that the where clauses filter by the removed workflow names
       expect(mocks.trxDeleteWhere).toHaveBeenCalledWith('workflow_name', 'in', ['old-wf']);
 
-      // Should INSERT new-wf
       expect(mocks.trxInsertInto).toHaveBeenCalledWith('workflow_registrations');
     });
 
@@ -348,7 +341,6 @@ describe('RegistrationStore', () => {
         { customerId: 'cust-1' },
       );
 
-      // The UPDATE set call should NOT contain 'disabled'
       const setArg = mocks.trxUpdateSet.mock.calls[0][0];
       expect(setArg).not.toHaveProperty('disabled');
     });
@@ -371,11 +363,9 @@ describe('RegistrationStore', () => {
 
       await store.replaceAll('owner/repo', [], 'github:42', {}, { customerId: 'cust-1' });
 
-      // Should delete both workflows by name
       expect(mocks.trxDeleteFrom).toHaveBeenCalledWith('workflow_registrations');
       expect(mocks.trxDeleteWhere).toHaveBeenCalledWith('workflow_name', 'in', ['wf-a', 'wf-b']);
 
-      // Should NOT insert or update
       expect(mocks.trxInsertInto).not.toHaveBeenCalled();
       expect(mocks.trxUpdateTable).not.toHaveBeenCalled();
     });
@@ -471,20 +461,16 @@ describe('RegistrationStore', () => {
       const workflows = [makeLockWorkflow('kept-wf'), makeLockWorkflow('new-wf')];
       await store.replaceAll('owner/repo', workflows, 'github:42', {}, { customerId: 'cust-1' });
 
-      // Should UPDATE kept-wf
       expect(mocks.trxUpdateTable).toHaveBeenCalledWith('workflow_registrations');
       expect(mocks.trxUpdateWhere).toHaveBeenCalledWith('id', '=', 'uuid-kept');
 
-      // Should INSERT new-wf
       expect(mocks.trxInsertInto).toHaveBeenCalledWith('workflow_registrations');
 
-      // Should DELETE removed-wf
       expect(mocks.trxDeleteFrom).toHaveBeenCalledWith('workflow_registrations');
       expect(mocks.trxDeleteWhere).toHaveBeenCalledWith('workflow_name', 'in', ['removed-wf']);
     });
   });
 
-  // ─────────────────────────────────────────────────────────────────
   // replaceAll self-heal for stale __default__ customer_id rows.
   //
   // Background: workflow_registrations rows written before the matching
@@ -501,7 +487,6 @@ describe('RegistrationStore', () => {
   // emit an INFO log marker. The heal does NOT fire when both existing
   // and incoming customerIds are '__default__' (preserves legacy
   // unresolved-source behavior and avoids journal noise).
-  // ─────────────────────────────────────────────────────────────────
   describe('replaceAll self-heal', () => {
     beforeEach(() => {
       mockLogger.info.mockClear();

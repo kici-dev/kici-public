@@ -1,9 +1,4 @@
-/**
- * Platform WebSocket connectivity diagnostic check.
- *
- * Attempts an HTTP(S) request to the Platform URL health endpoint
- * to verify the relay is reachable.
- */
+/** Platform connectivity check: an HTTP(S) request to the Platform health endpoint. */
 
 import type { DiagnosticDeps, DiagnosticResult } from '../types.js';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -21,7 +16,7 @@ export async function checkWsToPlatform(deps: DiagnosticDeps): Promise<Diagnosti
   }
 
   try {
-    // Convert ws:// to http:// for health check
+    // ws(s)://…/ws → http(s)://…/health
     const healthUrl = deps.platformUrl
       .replace(/^ws(s?):\/\//, 'http$1://')
       .replace(/\/ws$/, '/health');

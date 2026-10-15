@@ -1,12 +1,10 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `cluster_settings.cache_ttl_days` (nullable INTEGER).
+ * Fleet-wide dependency-cache entry TTL (days): an entry unread for longer expires on the next
+ * lookup. NULL → cluster default (`config.cacheTtlDays`, `KICI_CACHE_TTL_DAYS`).
  *
- * Fleet-wide dependency-cache entry TTL (days). An entry unread for longer is treated as expired on the next lookup. NULL → cluster default (`config.cacheTtlDays`, `KICI_CACHE_TTL_DAYS`).
- *
- * Idempotent: guarded on column existence; a re-run on a DB that already has
- * the column is a no-op.
+ * Idempotent: guarded on column existence.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

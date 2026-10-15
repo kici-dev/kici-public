@@ -87,7 +87,7 @@ describe('shouldRecordAccess — overrides', () => {
   });
 
   it('records platform_operator activity regardless of policy', () => {
-    // Run-detail is sampled at 5% — operator override forces full fidelity.
+    // Sampled at 5%; the operator override forces full fidelity.
     for (let i = 0; i < 100; i++) {
       expect(
         shouldRecordAccess('run.detail.read', 'allowed', operatorActor, `req-${i}`, limiter),
@@ -103,8 +103,7 @@ describe('shouldRecordAccess — overrides', () => {
   });
 
   it('records agent-attributed activity in full for sampled actions', () => {
-    // run.structured.read is sampled at 5% — the agent override forces full
-    // fidelity so the agent-provenance trail is complete.
+    // Sampled at 5%; the agent override keeps the agent-provenance trail complete.
     const agentActor = {
       type: 'user' as const,
       sub: 'u1',

@@ -1,14 +1,11 @@
 /**
  * Event scaler backend — workflow-driven autoscaling.
  *
- * Unlike the local backends (container / bare-metal / firecracker), this backend
- * performs NO local compute. Its `spawn()` emits a `kici.scaler.scale-up` event
- * and its `destroy()` emits a `kici.scaler.scale-down` event; a customer-authored
- * provisioning / teardown workflow (subscribed via `kiciEvent()`) consumes those
- * events to boot and tear down an ephemeral cloud instance. The provisioned
- * instance's agent registers back with the scaler-chosen `agentId` and the
- * existing bound-job dispatch runs the pending job — reusing the whole scaling
- * engine (demand detection, caps, reservations, spawn timeout, teardown).
+ * No local compute: `spawn()` emits `kici.scaler.scale-up` and `destroy()` emits
+ * `kici.scaler.scale-down`, which a customer workflow (via `kiciEvent()`) consumes
+ * to boot and tear down an ephemeral cloud instance. Its agent registers with the
+ * scaler-chosen `agentId` and bound-job dispatch runs the pending job, so the
+ * whole scaling engine (caps, reservations, spawn timeout, teardown) applies.
  */
 
 import { ScalerBackendType, scalerAgentLabels } from '@kici-dev/engine';
@@ -38,22 +35,17 @@ const logger = createLogger({ prefix: 'event-backend' });
 /** Default TTL (seconds) of the ephemeral agent token when the entry omits it. */
 const DEFAULT_AGENT_TOKEN_TTL_SECONDS = 600;
 
-/**
- * Subset of `EventEmitter` the backend needs. Injected so the backend is unit
- * testable without a real event router.
- */
+/** Subset of `EventEmitter` the backend needs; injected for unit tests. */
 export interface ScalerEventEmitterLike {
   emitScalerScaleUp(payload: ScalerScaleUpPayload, targets: string[]): Promise<string>;
   emitScalerScaleDown(payload: ScalerScaleDownPayload, targets: string[]): Promise<string>;
 }
 
 export interface EventScalerBackendOptions {
-  /** The parsed scaler entry (`type: 'event'`). */
+  /** `type: 'event'`. */
   entry: ScalerEntry;
-  /** Emits the reserved scale-up / scale-down events. */
   emitter: ScalerEventEmitterLike;
-  /** Mints ephemeral credentials when a claim code is redeemed — normally by
-   * the provisioned agent self-bootstrapping, or by a provisioning workflow. */
+  /** Redeemed by the self-bootstrapping agent, or by a provisioning workflow. */
   claimStore: ClaimStore;
   /** Correlation-id generator for scale-up / scale-down requests. */
   requestId: () => string;
@@ -103,10 +95,6 @@ export class EventScalerBackend implements ScalerBackend {
     return this.agents.size;
   }
 
-  /**
-   * Register a pending claim, emit a scale-up event to the provisioning targets,
-   * and track the agent as provisioning. Performs no local compute.
-   */
   async spawn(
     labelSet: string[],
     agentId: string,
@@ -120,13 +108,10 @@ export class EventScalerBackend implements ScalerBackend {
       throw new Error('event scaler spawn aborted before start');
     }
 
-    // Full label set the provisioned agent will present at registration (base
-    // labelSet plus the scaler-assigned kici:agent:/kici:scaler:/kici:role:
-    // labels). The ephemeral token is bound to exactly this set — same as the
-    // container / bare-metal / firecracker backends — so the agent's
-    // register-time labels don't trip the scope gate. Binding the token to only
-    // the raw labelSet rejected the register with "labels exceed token-bound
-    // scope" as soon as the agent self-reported its role labels.
+    // The token binds the full set the agent presents at registration (labelSet
+    // plus kici:agent:/kici:scaler:/kici:role:), as the local backends do. Binding
+    // only the raw labelSet rejects the register with "labels exceed token-bound
+    // scope" once the agent self-reports its role labels.
     const fullLabels = scalerAgentLabels(
       labelSet,
       this.type,
@@ -134,10 +119,9 @@ export class EventScalerBackend implements ScalerBackend {
       this.entry.roles,
       spawnContext?.platformTaints,
     );
-    // The gate the agent is registered under, published on the scale-up payload
-    // for the provisioning workflow. The manager resolves it (config plus
-    // derived platform taints) for this label set; a spawn that reaches the
-    // backend without a context carries the configured list alone.
+    // Published for the provisioning workflow. The manager resolves it (config
+    // plus derived platform taints); a spawn without a context carries the
+    // configured list alone.
     const mandatoryLabels = [
       ...(spawnContext?.mandatoryLabels ?? this.entry.mandatoryLabels ?? []),
     ];
@@ -153,12 +137,9 @@ export class EventScalerBackend implements ScalerBackend {
     if (effectiveLimits?.cpus !== undefined) resources.cpus = effectiveLimits.cpus;
     if (effectiveLimits?.memBytes !== undefined) resources.memBytes = effectiveLimits.memBytes;
 
-    // Track BEFORE the emit, matching the three local backends, which all set
-    // their map before any I/O. Emitting first leaves a window in which the
-    // provisioning workflow is already running for an agent this backend's
-    // `getActiveCount()` does not report — and on an event scaler an
-    // uncounted agent is an unbounded bill against the customer's cloud
-    // account.
+    // Track BEFORE the emit, as the local backends do. Emitting first leaves a
+    // window where a provision runs uncounted by `getActiveCount()`, and an
+    // uncounted agent is an unbounded bill against the customer's cloud account.
     const now = Date.now();
     this.agents.set(agentId, { agentId, labelSet, state: 'provisioning', createdAt: now });
 
@@ -167,9 +148,8 @@ export class EventScalerBackend implements ScalerBackend {
         {
           scalerName: this.entry.name,
           agentId,
-          // The provisioning workflow sets the agent's KICI_LABELS from this
-          // field, so it must be the full token-bound set (matching the minted
-          // token's scope), not just the raw labelSet.
+          // The workflow sets KICI_LABELS from this, so it must match the
+          // token's scope.
           labels: fullLabels,
           mandatoryLabels,
           resources,
@@ -199,21 +179,16 @@ export class EventScalerBackend implements ScalerBackend {
   }
 
   /**
-   * Drop the tracked agent, emit a scale-down event (carrying the teardown
-   * reason), then invalidate the pending claim. Idempotent: a repeat destroy of
-   * an already-torn-down agent is a no-op (no duplicate scale-down).
+   * Drop the tracked agent, emit a scale-down with the reason, then invalidate
+   * the pending claim. Idempotent: a repeat destroy emits nothing.
    *
-   * The tracking entry is dropped before the first `await` so a concurrent
-   * destroy of the same agent returns at the guard above and cannot emit a
-   * second scale-down.
+   * The entry is dropped before the first `await`, so a concurrent destroy
+   * returns at the guard and cannot emit a second scale-down.
    *
-   * The claim invalidation is last and fails open. It is a DB delete, and the
-   * scale-down is the only thing that tears down the customer's cloud instance:
-   * running the delete first lets a DB error suppress the teardown for good,
-   * because the agent is already out of `this.agents` and a retried destroy
-   * returns at the guard. A claim left behind instead is inert — the row is
-   * single-use and TTL-bounded, so it can mint at most one token for an agent
-   * id that is being torn down.
+   * The claim invalidation is last and fails open. The scale-down is the only
+   * teardown of the customer's instance, so a DB error before it would suppress
+   * the teardown for good (a retried destroy returns at the guard). A leftover
+   * claim is single-use and TTL-bounded: at most one token for a dying agent id.
    */
   async destroy(managedId: string, context?: ScalerDestroyContext): Promise<void> {
     if (!this.agents.has(managedId)) {
@@ -221,10 +196,8 @@ export class EventScalerBackend implements ScalerBackend {
     }
     this.agents.delete(managedId);
     const reason = context?.reason ?? 'shutdown';
-    // The caller's targets win when it has them: they come from the spawn
-    // record, which is what the provision was actually spawned with. Live
-    // config would otherwise retarget an in-flight teardown the moment an
-    // operator edits `provisioningTargets`.
+    // The caller's targets come from the spawn record and win: live config would
+    // retarget an in-flight teardown when an operator edits `provisioningTargets`.
     const targets = context?.targets?.length ? context.targets : this.provisioningTargets();
     await this.emitter.emitScalerScaleDown(
       {
@@ -252,14 +225,12 @@ export class EventScalerBackend implements ScalerBackend {
   /**
    * Drop the tracked agent without emitting anything.
    *
-   * The counterpart to `adopt()` on the other side of a cross-instance
-   * registration: the spawning coordinator is never told that a peer adopted
-   * its provision, so its entry would otherwise live until the process exits —
-   * inflating `getActiveCount()` against the global cap forever, and handing
-   * `shutdownAll()` a peer's live agent to tear down. Forgetting says "this
-   * coordinator no longer tracks the provision", which is exactly true and says
-   * nothing about whether the customer's instance is still running; the adopter
-   * emits the teardown, and the leader-gated reaper is the backstop.
+   * The spawning side of a cross-instance `adopt()`. The spawner is never told
+   * a peer adopted its provision, so its entry would otherwise inflate
+   * `getActiveCount()` against the global cap until exit, and hand
+   * `shutdownAll()` a peer's live agent. It says nothing about whether the
+   * instance runs: the adopter emits the teardown, the leader-gated reaper is
+   * the backstop.
    */
   forget(agentId: string): void {
     if (!this.agents.delete(agentId)) return;
@@ -283,22 +254,19 @@ export class EventScalerBackend implements ScalerBackend {
     if (entry) entry.state = 'active';
   }
 
-  /** Delegate a credential claim to the backend's claim store. */
   claim(code: string) {
     return this.claimStore.claim(code);
   }
 
   /**
-   * Emits nothing. An event provision is a customer cloud instance whose
-   * lifetime spans the cluster, not this process: the coordinator holding the
-   * agent emits its teardown from the WS-close path, and the leader-gated
-   * reaper is the backstop for one that reaches nobody. This map also carries
-   * provisions a peer has already adopted — the spawning coordinator is never
-   * told — so emitting here would make a routine restart tear down a peer's
-   * running agents.
+   * Emits nothing. A provision's lifetime spans the cluster, not this process:
+   * the coordinator holding the agent emits teardown on WS close, and the
+   * leader-gated reaper is the backstop. The map may hold provisions a peer
+   * adopted, so emitting here would make a routine restart tear down a peer's
+   * agents.
    *
-   * The map is deliberately left intact rather than cleared: a WS close landing
-   * during the remaining shutdown steps then still emits its own teardown.
+   * The map is left intact so a WS close during the remaining shutdown steps
+   * still emits its own teardown.
    */
   async shutdownAll(): Promise<void> {
     if (this.agents.size > 0) {
@@ -309,13 +277,10 @@ export class EventScalerBackend implements ScalerBackend {
   }
 
   /**
-   * Apply the new config. The backend reads `roles`, `agentTokenTtlSeconds`
-   * and `provisioningTargets` off its entry at every spawn (and
-   * `mandatoryLabels` only when a spawn reaches it without a context), so the
-   * entry is replaced here — otherwise a reload that retargets the
-   * provisioning workflow, or changes the scaler's roles, would keep emitting
-   * scale-up events to the old workflow refs and minting agent labels from the
-   * old roles, while the manager's own routing gate used the new ones.
+   * Replace the entry: each spawn reads `roles`, `agentTokenTtlSeconds`,
+   * `provisioningTargets` (and, without a context, `mandatoryLabels`) from it.
+   * Otherwise a reload would keep emitting to the old workflow refs and minting
+   * labels from the old roles while the manager's routing gate uses the new ones.
    */
   reload(
     labelSets: LabelSetConfig[],

@@ -1,8 +1,4 @@
-/**
- * kici hook command
- *
- * Install and manage pre-commit hooks for kici compile.
- */
+/** `kici hook`: pre-commit hooks that run `kici compile`. */
 
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -13,22 +9,12 @@ import { isCiEnvironment } from '@kici-dev/core/ci-env';
 import { detectHookTools, installHook, findGitDir } from '../hooks/index.js';
 import type { HookToolName } from '../hooks/index.js';
 
-/**
- * Options for hook install command
- */
 export interface HookInstallOptions {
-  /** Force raw git hook (ignore detected tools) */
+  /** Force a raw git hook, ignoring detected tools. */
   git?: boolean;
 }
 
-/**
- * Install pre-commit hook for kici compile.
- *
- * @param options - Command options
- * @returns true on success, false on error
- */
 export async function hookInstallCommand(options: HookInstallOptions = {}): Promise<boolean> {
-  // Check if in git repo
   const gitDir = await findGitDir();
   if (!gitDir) {
     logger.error(pc.red('Error: Not in a git repository.'));
@@ -37,18 +23,14 @@ export async function hookInstallCommand(options: HookInstallOptions = {}): Prom
   }
 
   try {
-    // Determine which tool to use
     let selectedTool: HookToolName;
 
     if (options.git) {
-      // Force raw git hook
       selectedTool = 'git';
     } else {
-      // Detect tools
       const tools = await detectHookTools();
 
       if (tools.length === 0) {
-        // No tool detected - use raw git hook or ask
         if (process.stdout.isTTY && !isCiEnvironment()) {
           const choice = await select({
             message: 'No pre-commit tool detected. How would you like to install the hook?',
@@ -64,7 +46,6 @@ export async function hookInstallCommand(options: HookInstallOptions = {}): Prom
           }
           selectedTool = choice as HookToolName;
         } else {
-          // Non-interactive: skip
           logger.info(pc.yellow('No pre-commit tool detected. Use --git to install raw git hook.'));
           return true;
         }
@@ -72,7 +53,6 @@ export async function hookInstallCommand(options: HookInstallOptions = {}): Prom
         selectedTool = tools[0].name;
         logger.info(pc.gray(`Detected ${selectedTool}, installing hook...`));
       } else {
-        // Multiple tools - let user choose in interactive mode
         if (process.stdout.isTTY && !isCiEnvironment()) {
           const tool = await select({
             message: 'Multiple pre-commit tools detected. Which would you like to use?',
@@ -83,17 +63,14 @@ export async function hookInstallCommand(options: HookInstallOptions = {}): Prom
           });
           selectedTool = tool as HookToolName;
         } else {
-          // Non-interactive: use highest priority
           selectedTool = tools[0].name;
           logger.info(pc.gray(`Using ${selectedTool} (highest priority)`));
         }
       }
     }
 
-    // Detect if local Verdaccio is in use (via .kici/.npmrc)
     const useVerdaccio = await detectVerdaccioNpmrc();
 
-    // Install the hook
     const result = await installHook(selectedTool, { useVerdaccio });
 
     if (result.success) {
@@ -114,9 +91,7 @@ export async function hookInstallCommand(options: HookInstallOptions = {}): Prom
   }
 }
 
-/**
- * Detect if local Verdaccio is configured by checking for .kici/.npmrc
- */
+/** A local Verdaccio registry is configured when `.kici/.npmrc` mentions it. */
 async function detectVerdaccioNpmrc(): Promise<boolean> {
   try {
     const npmrcPath = path.resolve('.kici', '.npmrc');

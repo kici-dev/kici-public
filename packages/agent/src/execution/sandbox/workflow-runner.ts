@@ -1,17 +1,13 @@
 /**
- * Workflow Runner -- standalone entry point that runs INSIDE the sandbox.
+ * Workflow runner: the entry point that runs INSIDE the sandbox. The agent process
+ * never loads or executes customer code; only this runner does.
  *
- * This is the code that actually executes customer workflows in isolation.
- * The agent process never loads or executes customer code -- only this runner does.
+ * IPC modes:
+ * - Fork IPC (bare-metal bwrap, Firecracker): the Node.js IPC channel.
+ * - Stdio IPC (container, docker exec): JSON lines, agent → stdin, runner → stdout.
  *
- * Supports two IPC modes:
- * - Fork IPC: Used by bare-metal (bwrap) and Firecracker backends. Messages go
- *   via Node.js IPC channel (process.send / process.on('message')).
- * - Stdio IPC: Used by container backend (docker exec). JSON-line messages flow
- *   bidirectionally: agent writes to container stdin, runner writes to stdout.
- *
- * This file is compiled alongside the agent by rolldown (existing build), but
- * runs as a SEPARATE process spawned by the sandbox backend.
+ * rolldown compiles it alongside the agent, but it runs as a SEPARATE process the
+ * sandbox backend spawns.
  */
 
 import { createInterface } from 'node:readline';
@@ -145,7 +141,7 @@ import { restoreSource } from '../source-restore.js';
 import { evaluateRules, createRuleContext, type RuleEvaluationResult } from '../rule-evaluator.js';
 import { applyOverlay } from '../overlay-applier.js';
 
-/** Build-time agent version (injected by the bundler; 'unknown' in unbundled tests). */
+/** Injected by the bundler; 'unknown' in unbundled tests. */
 declare const KICI_PKG_VERSION: string;
 const AGENT_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : 'unknown';
 
@@ -169,49 +165,36 @@ process.on('unhandledRejection', (reason) => {
 
 // --- IPC Mode Detection ---
 
-/** Whether we are running in fork IPC mode (Node IPC channel available). */
 const isForkMode = typeof process.send === 'function';
 
-/**
- * Saved references to the original stdout/stderr write functions.
- * Used by sendMessage (container mode IPC) and output capture to avoid
- * infinite recursion when process.stdout.write is monkey-patched.
- */
+/** Unpatched writers: sendMessage and output capture use them to avoid recursing into the patch. */
 const origStdoutWrite = process.stdout.write.bind(process.stdout);
 const origStderrWrite = process.stderr.write.bind(process.stderr);
 
 // --- Console Output Capture ---
 
 /**
- * Workflow-level capture flag for the pre-step `prepare` phase
- * (module load, concurrency-group evaluation, rule evaluation).
+ * Capture flag for the pre-step `prepare` phase (module load, concurrency-group and
+ * rule evaluation). When true, stdout/stderr writes become `log.line` with
+ * `stepIndex: -1`, so user console.log there lands in the workflow-level log
+ * (`executions/{runId}/job-{name}/step--1.log`) beside runner narration.
  *
- * When true, process.stdout/stderr writes are captured and emitted as
- * log.line IPC messages with `stepIndex: -1` — the same bucket already used
- * by existing meta-messages like `[kici] Concurrency group: ...`. This means
- * user console.log inside module top-level, concurrency-group functions, and
- * rule check functions lands in the job's workflow-level log file
- * (`executions/{runId}/job-{name}/step--1.log`) alongside runner narration.
- *
- * Mutually exclusive with a step capture scope: the step loop resets this flag
- * to false before any step runs inside its {@link runInStepCapture} scope (the
- * async-context source of {@link currentCaptureStepIndex}).
+ * Mutually exclusive with a step capture scope: the step loop resets it to false
+ * before any step runs inside {@link runInStepCapture}.
  */
 let capturePrepareActive = false;
 
 /**
- * The job's secret masker, set in main() as soon as the execute request (and
- * so the job's secrets) is known. The fatal-error handler masks its report
- * with it; before it is set no job secret exists to mask.
+ * The job's masker for fatal-error reports, set in main() once the execute request
+ * arrives; before that no job secret exists to mask.
  */
 let fatalMasker: LogMasker | null = null;
 
-/** Mask `text` with the job's masker, or return it as it is before one exists. */
 function maskFatalText(text: string): string {
   return fatalMasker?.hasSecrets() ? fatalMasker.mask(text) : text;
 }
 
-/** The maskedSend function used by the output capture. Set during main(). */
+/** The output capture's maskedSend, set in main(). */
 let captureSendFn: ((msg: RunnerToAgentMessage) => void) | null = null;
 
 function captureIsActive(): boolean {
@@ -225,14 +208,9 @@ function captureTargetIndex(): number {
 }
 
 /**
- * Install monkey-patches on process.stdout.write and process.stderr.write
- * so that console.log() / console.error() calls from customer step code
- * are captured and forwarded as log.line IPC messages.
- *
- * Without this, only subprocess output (via ctx.$) goes through zx's log
- * callback. Direct console.log() calls from pure JS/TS step code would be
- * lost (stdout goes to a pipe the fork-runner drains for debugging, but
- * never enters the log streaming pipeline).
+ * Patch process.stdout/stderr.write so customer console output becomes `log.line`
+ * IPC. Without it only ctx.$ subprocess output reaches the log pipeline; direct
+ * console.log goes to a pipe the fork-runner drains for debugging only.
  */
 function installOutputCapture(): void {
   let stdoutBuf = '';
@@ -252,13 +230,10 @@ function installOutputCapture(): void {
         if (line) captureSendFn({ type: 'log.line', stepIndex: stepIdx, line });
       }
     }
-    // In fork mode the captured output already left as a masked `log.line`, so
-    // the raw copy on stdout is a duplicate the fork-runner echoes onto the
-    // agent's own stderr — outside the masker and, for a scaler-spawned agent,
-    // into the orchestrator's journal. Echo it only when the operator asked for
-    // the raw stdio (`KICI_RUNNER_DEBUG_STDIO=true`).
-    // In stdio mode, origStdoutWrite is used by sendMessage for IPC — don't echo
-    // console output there as it would corrupt the JSON-lines protocol.
+    // Fork mode: captured output already left as a masked `log.line`; the raw copy
+    // would be echoed onto the agent's stderr, outside the masker and (scaler-spawned)
+    // into the orchestrator's journal. Echo only with `KICI_RUNNER_DEBUG_STDIO=true`.
+    // Stdio mode: stdout carries the JSON-lines IPC, so console output never goes there.
     if (isForkMode) {
       if (!captureIsActive() || process.env.KICI_RUNNER_DEBUG_STDIO === 'true') {
         return origStdoutWrite(chunk, encodingOrCb, cb);
@@ -267,7 +242,6 @@ function installOutputCapture(): void {
       if (forkCallback) forkCallback();
       return true;
     }
-    // In stdio mode, swallow the raw output (it was already captured as log.line)
     const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
     if (callback) callback();
     return true;
@@ -293,53 +267,31 @@ function installOutputCapture(): void {
           });
       }
     }
-    // Always forward stderr to the real stderr for crash diagnostics
+    // Always forwarded, for crash diagnostics.
     return origStderrWrite(chunk, encodingOrCb, cb);
   }) as any;
 }
 
-/**
- * Flush any remaining partial lines in the output capture buffers.
- * Called after each step completes to ensure no trailing output is lost.
- */
+/** Flush partial capture lines after each step: a newline triggers the closured line split. */
 function flushOutputCapture(): void {
-  // The buffers are closured inside installOutputCapture. To flush them,
-  // we write a final newline which triggers the line split logic.
-  // This is a no-op if buffers are already empty.
   if (captureIsActive()) {
-    // Force flush by writing a newline to both streams
     process.stdout.write('\n');
     process.stderr.write('\n');
   }
 }
 
-/**
- * Send a message from the runner to the agent.
- *
- * In fork mode: uses Node.js IPC channel (process.send).
- * In stdio mode: writes a JSON line to stdout via origStdoutWrite
- * (bypasses any monkey-patch on process.stdout.write).
- */
+/** Fork mode: process.send. Stdio mode: one JSON line via the unpatched stdout writer. */
 function sendMessage(msg: RunnerToAgentMessage): void {
   if (isForkMode) {
     process.send!(msg);
   } else {
-    // Stdout JSON-lines for container (docker exec) mode.
-    // Each message is a single JSON line terminated by newline.
-    // Uses origStdoutWrite to bypass output capture during step execution.
     origStdoutWrite(JSON.stringify(msg) + '\n');
   }
 }
 
-/**
- * Readline interface for stdin in stdio (container) mode.
- * Created once and reused for both receiveRequest() and the response listener.
- */
+/** Stdio-mode stdin reader, shared by receiveRequest() and the response listener. */
 let stdinRl: ReturnType<typeof createInterface> | null = null;
 
-/**
- * Get or create the stdin readline interface for container/stdio mode.
- */
 function getStdinRl(): ReturnType<typeof createInterface> {
   if (!stdinRl) {
     process.stdin.setEncoding('utf-8');
@@ -348,14 +300,7 @@ function getStdinRl(): ReturnType<typeof createInterface> {
   return stdinRl;
 }
 
-/**
- * Receive the execution request from the agent.
- *
- * In fork mode: listens for the first 'execute' message on the IPC channel.
- * In stdio mode: reads JSON-lines from stdin, resolves on the first 'execute' message.
- *
- * @returns The execute message containing the JobExecutionRequest.
- */
+/** Resolve on the first 'execute' message, from the IPC channel or stdin JSON lines. */
 function receiveRequest(): Promise<AgentToRunnerMessage & { type: 'execute' }> {
   if (isForkMode) {
     return new Promise((resolve) => {
@@ -368,7 +313,6 @@ function receiveRequest(): Promise<AgentToRunnerMessage & { type: 'execute' }> {
       process.on('message', handler);
     });
   } else {
-    // Stdio mode: read JSON-lines from stdin, resolve on first 'execute' message.
     return new Promise((resolve, reject) => {
       const rl = getStdinRl();
       const handler = (line: string) => {
@@ -390,60 +334,48 @@ function receiveRequest(): Promise<AgentToRunnerMessage & { type: 'execute' }> {
 
 // --- zx Configuration ---
 
-// Initialize zx for cross-platform quote support.
 initZx();
 
-// Don't echo commands ($`...` → "$ echo hello"), but allow output to flow
-// to process.stdout/stderr so our step output capture can intercept it.
+// Don't echo commands, but let output flow to stdout/stderr for the step capture.
 $.verbose = false;
 $.quiet = false;
 
 // --- Cancel State ---
 
-/** Global abort flag. Set when abort message or SIGTERM is received. */
+/** Set by an abort message or SIGTERM. */
 let aborted = false;
 
 /**
- * Force cancel flag. When true, skip all remaining hooks and exit immediately.
- * Set when abort IPC arrives with force=true, or on second cancel while already cancelling.
+ * Skip all remaining hooks and exit immediately. Set by abort IPC with force=true,
+ * or by a second cancel while already cancelling.
  */
 let forceAborted = false;
 
 /**
- * Set when the job-level wall-clock deadline (the lock job's `timeout`) is
- * breached. Trips the same abort path cancellation uses, but tags the
- * job.complete with the distinct TimeoutReason.job_timeout reason.
+ * Set when the lock job's `timeout` is breached: the cancellation abort path, but
+ * job.complete carries TimeoutReason.job_timeout.
  */
 let jobTimedOut = false;
 
-/** The configured job timeout budget in ms, captured when the deadline fires. */
+/** Job timeout budget in ms, captured when the deadline fires. */
 let jobTimedOutMs: number | undefined;
 
 /**
- * Aborted when the job-level deadline fires. Threaded into the step loop so the
- * IN-FLIGHT step (e.g. a long-running `sleep`) is interrupted immediately on
- * breach — the between-steps `isAborted()` check alone cannot unwind a single
- * long step that has no per-step `timeout`.
+ * Aborted when the job deadline fires, so the IN-FLIGHT step is interrupted at once:
+ * the between-steps `isAborted()` check cannot unwind a long step with no `timeout`.
  */
 const jobDeadlineAbort = new AbortController();
 
 /**
- * Aborted when the job is being torn down by cancellation (abort IPC / SIGTERM),
- * as distinct from the wall-clock deadline (`jobDeadlineAbort`). Each step's
- * `ctx.signal` composes this with the deadline signal and its own per-step
- * controller, so a cancelled job cooperatively unwinds in-flight step bodies
- * that opted into `ctx.signal`. Inert for the rest of the runner today.
+ * Aborted on cancellation (abort IPC / SIGTERM), distinct from `jobDeadlineAbort`.
+ * Each step's `ctx.signal` composes it with the deadline and per-step controller,
+ * so step bodies watching `ctx.signal` unwind cooperatively. Nothing else reads it.
  */
 const jobCancelAbort = new AbortController();
 
 // --- Event Emit Response Tracking ---
 
-/**
- * Pending promises for event.emit requests awaiting responses from the agent.
- *
- * Key: requestId (correlates EventEmitRequest -> EventEmitResponse)
- * Value: resolve/reject pair for the waiting ctx.emit() call
- */
+/** Waiting ctx.emit() calls, keyed by requestId. */
 const pendingEmitResponses = new Map<
   string,
   {
@@ -453,16 +385,7 @@ const pendingEmitResponses = new Map<
   }
 >();
 
-/** Default timeout for event.emit responses (5 seconds). */
 const EMIT_RESPONSE_TIMEOUT_MS = 5_000;
-
-/**
- * Wait for an event.emit.response from the agent with the given requestId.
- *
- * On timeout, resolves with a synthetic success receipt and logs a warning
- * (the orchestrator already persisted the event, so it is still routed even
- * if the ack is lost).
- */
 
 /** In-flight git write-grant requests, keyed by requestId. */
 const pendingGitGrants = new Map<string, (r: GitGrantResponseIpc) => void>();
@@ -474,9 +397,8 @@ function waitForGitGrant(requestId: string): Promise<GitGrantResponseIpc> {
   return new Promise<GitGrantResponseIpc>((resolve) => {
     const timer = setTimeout(() => {
       pendingGitGrants.delete(requestId);
-      // Fail closed: a timed-out elevation must NOT silently proceed as if it
-      // had been granted, or a push would run on read-only credentials and the
-      // error would surface as a confusing auth failure much later.
+      // Fail closed: a timed-out elevation proceeding as granted would push on read-only
+      // credentials and surface much later as a confusing auth failure.
       resolve({
         type: 'git.grant.response',
         requestId,
@@ -492,10 +414,8 @@ function waitForGitGrant(requestId: string): Promise<GitGrantResponseIpc> {
 }
 
 /**
- * Open a write window for one repository, run `fn`, and close it.
- *
- * The revoke rides a `finally`, so a throwing callback still closes the
- * window — and the agent's TTL is the backstop if this process dies outright.
+ * Open a write window for one repository, run `fn`, and close it. The revoke rides a
+ * `finally`; the agent's TTL is the backstop if this process dies outright.
  */
 export async function withRepoWrite(
   repository: string,
@@ -528,17 +448,18 @@ export async function withRepoWrite(
       op: 'revoke',
       grantId: granted.grantId,
     });
-    // Do not await the revoke: the window is already logically closed, the
-    // agent revokes on receipt, and a hung agent must not turn a successful
-    // push into a failed step.
+    // Not awaited: the agent revokes on receipt, and a hung agent must not turn a
+    // successful push into a failed step.
   }
 }
+/**
+ * On timeout, resolve with a synthetic receipt and warn: the orchestrator already
+ * persisted the event, so it is routed even if the ack is lost.
+ */
 function waitForEmitResponse(requestId: string): Promise<EventEmitResponse> {
   return new Promise<EventEmitResponse>((resolve) => {
     const timer = setTimeout(() => {
       pendingEmitResponses.delete(requestId);
-      // Synthetic receipt on timeout -- event was persisted by orchestrator,
-      // delivery proceeds regardless of ack.
       process.stderr.write(
         `[workflow-runner] event.emit response timeout for requestId=${requestId} -- returning synthetic receipt\n`,
       );
@@ -558,7 +479,6 @@ function waitForEmitResponse(requestId: string): Promise<EventEmitResponse> {
       reject: (err: Error) => {
         clearTimeout(timer);
         pendingEmitResponses.delete(requestId);
-        // On rejection, resolve with error-shaped response rather than throwing
         resolve({
           type: 'event.emit.response',
           requestId,
@@ -572,20 +492,14 @@ function waitForEmitResponse(requestId: string): Promise<EventEmitResponse> {
 
 // --- Concurrency Ack Tracking ---
 
-/**
- * Pending promise for the concurrency.ack response from the agent.
- * Only one outstanding concurrency report per job (one workflow = one group).
- */
+/** At most one outstanding concurrency report per job (one workflow = one group). */
 let pendingConcurrencyAck: {
   resolve: (ack: ConcurrencyAckMessage) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 } | null = null;
 
-/**
- * Wait for a concurrency.ack from the agent (relayed from orchestrator).
- * The timeout is configurable (default 30s) and fails the job on expiry.
- */
+/** Wait for the orchestrator's concurrency.ack; expiry (default 30s) fails the job. */
 function waitForConcurrencyAck(timeoutMs: number): Promise<ConcurrencyAckMessage> {
   return new Promise<ConcurrencyAckMessage>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -611,10 +525,7 @@ function waitForConcurrencyAck(timeoutMs: number): Promise<ConcurrencyAckMessage
 
 // --- Agent API Response Tracking ---
 
-/**
- * Pending promises for agent.api.response messages from the agent.
- * Key: requestId, Value: resolve/reject pair.
- */
+/** Keyed by requestId. */
 const pendingApiResponses = new Map<
   string,
   {
@@ -626,9 +537,6 @@ const pendingApiResponses = new Map<
 
 const API_RESPONSE_TIMEOUT_MS = AGENT_API_REQUEST_TIMEOUT_MS;
 
-/**
- * Wait for an agent.api.response from the agent with the given requestId.
- */
 function waitForApiResponse(requestId: string): Promise<unknown> {
   return new Promise<unknown>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -654,10 +562,7 @@ function waitForApiResponse(requestId: string): Promise<unknown> {
 
 // --- User-facing cache request/response tracking ---
 
-/**
- * Pending promises for cache.response messages from the agent.
- * Key: requestId (correlates cache.request -> cache.response).
- */
+/** Keyed by requestId. */
 const pendingCacheResponses = new Map<
   string,
   {
@@ -667,13 +572,10 @@ const pendingCacheResponses = new Map<
   }
 >();
 
-/** Default timeout for a cache request relay (matches the upload-URL request budget). */
+/** Matches the upload-URL request budget. */
 const CACHE_RESPONSE_TIMEOUT_MS = 30_000;
 
-/**
- * Pending promises for provenance.response messages from the agent.
- * Key: requestId (correlates provenance.request -> provenance.response).
- */
+/** Keyed by requestId. */
 const pendingProvenanceResponses = new Map<
   string,
   {
@@ -683,7 +585,6 @@ const pendingProvenanceResponses = new Map<
   }
 >();
 
-/** Wait for a provenance.response from the agent with the given requestId. */
 function waitForProvenanceResponse(requestId: string): Promise<ProvenanceResponseIpc> {
   return new Promise<ProvenanceResponseIpc>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -707,10 +608,7 @@ function waitForProvenanceResponse(requestId: string): Promise<ProvenanceRespons
   });
 }
 
-/**
- * Pending promises for artifacts.response messages from the agent.
- * Key: requestId (correlates artifacts.request -> artifacts.response).
- */
+/** Keyed by requestId. */
 const pendingArtifactResponses = new Map<
   string,
   {
@@ -720,7 +618,6 @@ const pendingArtifactResponses = new Map<
   }
 >();
 
-/** Wait for an artifacts.response from the agent with the given requestId. */
 function waitForArtifactResponse(requestId: string): Promise<ArtifactResponseIpc> {
   return new Promise<ArtifactResponseIpc>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -744,7 +641,6 @@ function waitForArtifactResponse(requestId: string): Promise<ArtifactResponseIpc
   });
 }
 
-/** Wait for a cache.response from the agent with the given requestId. */
 function waitForCacheResponse(requestId: string): Promise<CacheResponseIpc> {
   return new Promise<CacheResponseIpc>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -768,10 +664,7 @@ function waitForCacheResponse(requestId: string): Promise<CacheResponseIpc> {
   });
 }
 
-/**
- * Pending promises for approval.resolved messages from the agent.
- * Key: requestId (correlates approval.request -> approval.resolved).
- */
+/** Keyed by requestId. */
 const pendingApprovalResolutions = new Map<
   string,
   {
@@ -781,14 +674,11 @@ const pendingApprovalResolutions = new Map<
 >();
 
 /**
- * Hard ceiling on how long the runner blocks a step waiting for an approval
- * resolution. The orchestrator enforces the real (org-/SDK-configured) expiry
- * and sends `expired` when it lapses; this is a safety net well above any sane
- * approval window so the runner cannot hang forever if the resolution is lost.
+ * Safety net well above any sane approval window, so a lost resolution cannot hang
+ * the runner; the orchestrator enforces the real expiry and sends `expired`.
  */
 const APPROVAL_RESOLUTION_TIMEOUT_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Wait for an approval.resolved from the agent with the given requestId. */
 function waitForApprovalResolution(requestId: string): Promise<StepApprovalResolvedIpc> {
   return new Promise<StepApprovalResolvedIpc>((resolve) => {
     const timer = setTimeout(() => {
@@ -809,11 +699,9 @@ function waitForApprovalResolution(requestId: string): Promise<StepApprovalResol
 }
 
 /**
- * Send a step-approval `approval.request` IPC (relayed by the agent over the WS
- * as a `step.approval-request`), await the matching `approval.resolved`, and map
- * it onto a `StepApprovalResolution`. A relay error is treated as a fail-closed
- * reject. Shared by the `when: 'always'` and `when: 'drift'` callbacks; the
- * latter carries a drift `payload`.
+ * Send `approval.request` (relayed as `step.approval-request`) and await the matching
+ * `approval.resolved`; a relay error fails closed as a reject. Shared by the
+ * `when: 'always'` and `when: 'drift'` callbacks (the latter carries a `payload`).
  */
 async function requestStepApproval(req: {
   stepIndex: number;
@@ -844,18 +732,12 @@ async function requestStepApproval(req: {
   };
 }
 
-/**
- * Build the `awaitStepApproval` callback the step loop uses to block on an
- * `approval` step (`when: 'always'`).
- */
+/** Blocks on an `approval` step with `when: 'always'`. */
 function buildAwaitStepApproval(): NonNullable<StepLoopOptions['awaitStepApproval']> {
   return (req) => requestStepApproval(req);
 }
 
-/**
- * Build the `awaitStepApprovalWithPayload` callback the step loop uses to block
- * on a `when: 'drift'` step mid-execution, carrying the computed drift payload.
- */
+/** Blocks on a `when: 'drift'` step mid-execution, carrying the drift payload. */
 function buildAwaitStepApprovalWithPayload(): NonNullable<
   StepLoopOptions['awaitStepApprovalWithPayload']
 > {
@@ -863,10 +745,8 @@ function buildAwaitStepApprovalWithPayload(): NonNullable<
 }
 
 /**
- * Build the {@link CacheTransport} the sandbox-side cache engine uses to reach
- * the orchestrator. Each method sends a `cache.request` IPC (relayed by the
- * agent over the WS as a `cache.user.*` message) and awaits the matching
- * `cache.response`. Mirrors the `event.emit` / `agent.api.request` relays.
+ * Each method sends `cache.request` (relayed as `cache.user.*`) and awaits the matching
+ * `cache.response`, like the `event.emit` / `agent.api.request` relays.
  */
 function buildCacheTransport(): CacheTransport {
   return {
@@ -915,10 +795,8 @@ function buildCacheTransport(): CacheTransport {
 }
 
 /**
- * Build the {@link ArtifactTransport} the sandbox-side artifacts engine uses to
- * reach the orchestrator. Each method sends an `artifacts.request` IPC (relayed
- * by the agent over the WS as an `artifacts.upload.*` / `artifacts.download.*`
- * message) and awaits the matching `artifacts.response`. Mirrors
+ * Each method sends `artifacts.request` (relayed as `artifacts.upload.*` /
+ * `artifacts.download.*`) and awaits the matching `artifacts.response`. Mirrors
  * {@link buildCacheTransport}.
  */
 function buildArtifactTransport(): ArtifactTransport {
@@ -976,9 +854,8 @@ async function relayProvenanceIpc(
 }
 
 /**
- * Extract an `owner/repo` identifier from a git clone URL for a deferred
- * statement's `externalParameters.workflow.repository` (the live path reads this
- * from the minted token claim; the deferred path has no token yet).
+ * `owner/repo` for a deferred statement's `externalParameters.workflow.repository`;
+ * the live path reads it from the minted token claim, which the deferred path lacks.
  */
 function extractRepoIdentifier(repoUrl: string): string {
   const match = repoUrl.match(/(?:github|gitlab|bitbucket)\.\w+\/([^/]+\/[^/.]+)/);
@@ -986,27 +863,19 @@ function extractRepoIdentifier(repoUrl: string): string {
 }
 
 /**
- * Build the `ctx.attestProvenance` step helper. Resolves a `path` subject to a
- * SHA-256 digest, threads the identity token via the supplied OIDC getter, and
- * persists the bundle over the IPC -> WS provenance-upload relay. On a transient
- * mint failure the statement is frozen + reported for later minting (deferred);
- * the step still completes.
- */
-/**
  * The context a deferred attestation's frozen statement is built from.
  *
- * Prefers the orchestrator's `provenanceContext` — server truth, derived from
- * the same run row the mint reads, so the frozen statement is field-for-field
- * what a live mint would have produced and the orchestrator can cross-check it.
+ * Prefers the orchestrator's `provenanceContext`: server truth from the run row the
+ * mint reads, so the frozen statement matches a live mint field for field and the
+ * orchestrator can cross-check it.
  *
- * Falls back to the agent's local view when the dispatch carries none (no
- * provenance issuer configured, or a job a worker dispatched).
- * That fallback disagrees with the claims by construction: `request.ref` is the
- * job's CHECKOUT ref, which for a pull request is the HEAD branch where the
- * claim is the BASE branch, and `request.workflowRef` is a global workflow's
- * CLONE ref where the claim is `<name>@<sha>`. So a statement built from it
- * fails the capture cross-check and the defer is dropped — a green job with no
- * attestation, rather than an unchecked statement the orchestrator signs.
+ * Falls back to the agent's local view when the dispatch carries none (no provenance
+ * issuer, or a worker-dispatched job). That view disagrees with the claims by
+ * construction: `request.ref` is the CHECKOUT ref (a PR's HEAD branch, where the
+ * claim is the BASE branch), and `request.workflowRef` is a global workflow's CLONE
+ * ref (the claim is `<name>@<sha>`). Such a statement fails the capture cross-check
+ * and the defer is dropped: a green job with no attestation, never an unchecked
+ * statement the orchestrator signs.
  */
 function buildLocalContext(request: JobExecutionRequest): LocalBuildContext {
   const ctx = request.provenanceContext;
@@ -1036,6 +905,11 @@ function buildLocalContext(request: JobExecutionRequest): LocalBuildContext {
   };
 }
 
+/**
+ * Build `ctx.attestProvenance`: digest a `path` subject, mint via the OIDC getter, and
+ * persist over the provenance-upload relay. A transient mint failure freezes and
+ * reports the statement for later minting (deferred); the step still completes.
+ */
 function buildAttestProvenanceFn(
   request: JobExecutionRequest,
   workDir: string,
@@ -1054,8 +928,7 @@ function buildAttestProvenanceFn(
         getIdToken,
         builderVersions: { 'kici-agent': AGENT_VERSION, 'kici-orchestrator': 'unknown' },
         localContext: buildLocalContext(request),
-        // Transient mint failure: relay the frozen envelope for later minting
-        // instead of uploading a bundle. The job stays green.
+        // Transient mint failure: relay the frozen envelope, not a bundle; the job stays green.
         reportDeferred: async (report) => {
           await relayProvenanceIpc({
             op: 'defer',
@@ -1080,8 +953,7 @@ function buildAttestProvenanceFn(
             subjectName: subject.name,
             mediaType: bundle.mediaType,
           });
-          // The orchestrator owns the canonical key (runId resolved server-side);
-          // mirror its derivation locally for the returned result.
+          // Mirrors the orchestrator's canonical key derivation (runId resolved server-side).
           return `provenance/${request.runId}/${request.jobId}/${subjectDigest}.kici.json`;
         },
       },
@@ -1104,15 +976,11 @@ function buildAttestProvenanceFn(
 }
 
 /**
- * Build the declarative-cache phase dependencies and run the job-level cache
- * restore (Phase 9b).
- *
- * The deps carry one job-scoped cache API (over the same IPC→WS transport
- * `ctx.cache` uses) plus a monotonic pseudo-step index allocator that starts
- * well above every real-step and hook index (hooks use up to `stepCount * 3`).
- * Cache restores/saves surface as `cache:restore` / `cache:save` pseudo-steps
- * allocated from this cursor. The returned `jobCacheRestore` map lets the
- * post-loop save phase skip exact-key hits.
+ * Build the declarative-cache deps and run the job-level restore (Phase 9b). The
+ * deps carry a job-scoped cache API over `ctx.cache`'s transport and a monotonic
+ * allocator for `cache:restore` / `cache:save` pseudo-step indices, starting above
+ * every real-step and hook index (hooks use up to `stepCount * 3`). The returned
+ * `jobCacheRestore` lets the post-loop save skip exact-key hits.
  */
 async function setupJobCache(
   stepCwd: string,
@@ -1138,12 +1006,10 @@ async function setupJobCache(
 }
 
 /**
- * Job-level cache save (Phase 9c). Runs after the step loop, only when every
- * step succeeded and the job was not aborted. Each spec whose exact key did NOT
- * already hit on restore is saved (immutable: a re-save of an existing exact
- * key is skipped by the save phase itself). A no-op when the job declared no
- * cache or did not fully succeed (a failed/aborted job's artifacts may be
- * partial).
+ * Job-level cache save (Phase 9c), only when every step succeeded and the job was
+ * not aborted (a failed/aborted job's artifacts may be partial). Saves each spec
+ * whose exact key missed on restore; entries are immutable, so the save phase
+ * itself skips an existing exact key.
  */
 async function maybeSaveJobCache(
   specs: CacheSpec[],
@@ -1155,10 +1021,7 @@ async function maybeSaveJobCache(
   await saveCacheSpecs(specs, restoreResults, deps, JOB_CACHE_OWNER);
 }
 
-/**
- * Dispatch an agent-to-runner message to the appropriate pending handler.
- * Shared between fork mode (IPC channel) and stdio mode (stdin readline).
- */
+/** Route an agent message to its pending handler; shared by fork and stdio mode. */
 function dispatchAgentMessage(msg: AgentToRunnerMessage): void {
   if (msg.type === 'abort') {
     aborted = true;
@@ -1210,30 +1073,25 @@ function dispatchAgentMessage(msg: AgentToRunnerMessage): void {
 }
 
 if (isForkMode) {
-  // In fork mode, listen for abort, event.emit.response, concurrency.ack,
-  // and agent.api.response messages on the IPC channel.
   process.on('message', (msg: AgentToRunnerMessage) => {
     dispatchAgentMessage(msg);
   });
 } else {
-  // In stdio (container) mode, listen for the same messages on stdin JSON-lines.
-  // The readline is shared with receiveRequest() — after the execute message is
-  // consumed, subsequent lines are response/control messages from the agent.
+  // Shared with receiveRequest(): after `execute`, lines are response/control messages.
   const rl = getStdinRl();
   rl.on('line', (line: string) => {
     try {
       const msg = JSON.parse(line) as AgentToRunnerMessage;
-      // Skip 'execute' messages (already handled by receiveRequest).
       if (msg.type !== 'execute') {
         dispatchAgentMessage(msg);
       }
     } catch {
-      // Non-JSON line on stdin — ignore (could be Docker noise).
+      // Non-JSON line on stdin (Docker noise): ignore.
     }
   });
 }
 
-// SIGTERM handling (used by container backend to stop execution).
+// The container backend stops execution with SIGTERM.
 process.on('SIGTERM', () => {
   aborted = true;
   jobCancelAbort.abort();
@@ -1241,12 +1099,7 @@ process.on('SIGTERM', () => {
 
 // --- IPC Logger ---
 
-/**
- * Create a Logger that sends log lines via IPC.
- *
- * Each log call formats the line and sends it as a log.line IPC message.
- * Format matches the existing createStepLogger: [stepName] [level?] message args...
- */
+/** A Logger over `log.line` IPC, formatted like createStepLogger: `[step] [level?] msg args`. */
 function createIpcLogger(
   stepIndex: number,
   stepName: string,
@@ -1288,12 +1141,10 @@ function needBaseName(need: unknown): { kind: 'job' | 'group'; key: string } | n
 }
 
 /**
- * Build `ctx.needs` for a job's steps from the dispatch envelope. Reconstructs
- * an {@link UpstreamSnapshot} from `upstreamJobOutputs` (flat per single job;
- * `byMatrix` / `byHost` envelopes per fan-out) + `upstreamJobStatuses` (keyed by
- * each upstream job/child name), then resolves the job's declared needs into the
- * `{ result, status }` / ordered-array shape via the shared SDK builder. Returns
- * undefined when the job declares no needs.
+ * Build `ctx.needs` from the dispatch envelope: reconstruct an {@link UpstreamSnapshot}
+ * from `upstreamJobOutputs` (flat per single job; `byMatrix` / `byHost` per fan-out)
+ * and `upstreamJobStatuses` (keyed per job/child name), then resolve declared needs
+ * via the shared SDK builder. Undefined when the job declares no needs.
  */
 export function buildStepNeedsContext(
   declaredNeeds: readonly unknown[] | undefined,
@@ -1314,35 +1165,29 @@ export function buildStepNeedsContext(
     const base = needBaseName(need);
     if (!base) continue;
 
-    // An upstream naming an invoke gate resolves to its per-run results on
-    // `.result` (an InvokeResult[]), NOT to the group shape its proxy children
-    // (`${gate} (...)`) would otherwise imply. Checked before the fan-out branch
-    // so the SDK builder emits the InvokeNeedEntry shape.
+    // An invoke gate resolves to its InvokeResult[] on `.result`, NOT the group shape
+    // its proxy children (`${gate} (...)`) imply; checked before the fan-out branch.
     if (base.kind === 'job' && upstreamInvokeResults?.[base.key]) {
       invokeResults[base.key] = upstreamInvokeResults[base.key];
       resolvedNeeds.push(base.key);
       continue;
     }
 
-    // Child names that fanned out from this base (matrix / host children share
-    // the `${base} (...)` naming) come from the statuses map keyed per-child.
+    // Matrix / host children share the `${base} (...)` naming in the statuses map.
     const childNames = Object.keys(statuses).filter((n) => n.startsWith(`${base.key} (`));
 
     if (base.kind === 'group' || childNames.length > 0) {
-      // Group or fanned-out upstream: an ordered array of children.
       groups[base.key] = [...childNames].sort();
       const envelope = upstreamJobOutputs?.[base.key];
       const bySuffix = envelopeChildOutputs(envelope);
       for (const child of childNames) {
-        // The fan-out child name is `${base} (<suffix>)`; the envelope keys
-        // outputs by `<suffix>`.
+        // The envelope keys outputs by `<suffix>` of `${base} (<suffix>)`.
         const suffix = child.slice(base.key.length + 2, -1);
         jobs[child] = bySuffix[suffix] ?? {};
         snapStatuses[child] = statuses[child];
       }
       resolvedNeeds.push({ group: base.key } as DynamicJobNeed);
     } else {
-      // Single non-fanned upstream.
       jobs[base.key] = upstreamJobOutputs?.[base.key] ?? {};
       if (statuses[base.key]) snapStatuses[base.key] = statuses[base.key];
       resolvedNeeds.push(base.key);
@@ -1355,9 +1200,8 @@ export function buildStepNeedsContext(
 }
 
 /**
- * Extract per-child output records from a fan-out outputs envelope, keyed by the
- * combination suffix (matrix `byMatrix`) or hostname (`runsOnAll` `byHost`).
- * Returns an empty map for a non-envelope value.
+ * Per-child outputs of a fan-out envelope, keyed by combination suffix (`byMatrix`)
+ * or hostname (`byHost`); empty for a non-envelope value.
  */
 function envelopeChildOutputs(
   envelope: Record<string, unknown> | undefined,
@@ -1369,17 +1213,10 @@ function envelopeChildOutputs(
 }
 
 /**
- * Build StepSecrets from the job execution request, wired with the per-step
- * file-mount host (used by `ctx.secrets.mountFile` / `exposeFile`).
- *
- * Returns a `{ secrets, dispose }` handle: `secrets` is bound into the step
- * context, and `dispose` is invoked by the step-loop's `finally` to remove
- * the per-step tmpdir and clear any env vars set via `exposeFile`.
- *
- * The mounted-file content is registered with the active `LogMasker` so any
- * subprocess that echoes the credential gets `***`-replaced in the streamed
- * log -- same masker the rest of the runner uses, so masking is global, not
- * per-step.
+ * StepSecrets wired with the per-step file-mount host (`ctx.secrets.mountFile` /
+ * `exposeFile`). The step loop's `finally` calls `dispose`, which removes the
+ * per-step tmpdir and clears `exposeFile` env vars. Mounted content is registered
+ * with the runner-wide `LogMasker`, so masking is global, not per-step.
  */
 function buildStepSecrets(
   request: JobExecutionRequest,
@@ -1389,7 +1226,7 @@ function buildStepSecrets(
   const orchestratorSecrets = request.secrets ?? {};
   const namespaced = request.namespacedSecrets ?? {};
 
-  // Build flat secrets: orchestrator-level + auto-flattened from all contexts (last wins)
+  // Orchestrator-level plus every context auto-flattened (last wins).
   const mergedFlat = buildMergedFlatSecrets(orchestratorSecrets, namespaced);
 
   let stepTmpHandle: TempHandle | null = null;
@@ -1412,11 +1249,8 @@ function buildStepSecrets(
       const filePath = join(dir, filename);
       await fsPromises.writeFile(filePath, args.content);
       await fsPromises.chmod(filePath, args.mode);
-      // Register the materialised content with the global LogMasker so any
-      // subprocess that echoes it gets `***`-masked. The mount sources are
-      // already in the masker (via createSecretMasker at boot), but a
-      // concatenation of two secrets is a brand-new value -- e.g. two age
-      // keys joined by '\n' produce a string neither secret matches alone.
+      // The sources are already masked, but a concatenation is a new value: two age
+      // keys joined by '\n' form a string neither secret matches alone.
       masker.registerSecrets({ [`__mount_${mountCounter}__`]: args.content });
       onMaskerSecretsAdded();
       return filePath;
@@ -1440,9 +1274,7 @@ function buildStepSecrets(
       }
     },
     onDisposeError: (err) => {
-      // Cleanup failures must not propagate -- they're logged via the
-      // existing stderr trace channel so an operator inspecting the
-      // sandbox log can see them.
+      // Never propagate; the stderr trace reaches an operator reading the sandbox log.
       const message = err instanceof Error ? err.message : String(err);
       origStderrWrite(`[workflow-runner] secret-file cleanup error: ${message}\n`);
     },
@@ -1450,35 +1282,25 @@ function buildStepSecrets(
 }
 
 /**
- * Build a fresh zx `$` shell bound to the sandbox working directory and the
- * sanitized environment (process.env was set by the parent via env-sanitizer
- * before spawning this process). This is the single shell-construction code
- * path shared by step execution (`createSandboxStepContext`) and the per-job
- * init phase (`runInitPhase`), so init commands run through the identical shell
- * steps use — same cwd, same live sanitized env, same masked log streaming.
+ * A fresh zx `$` bound to the sandbox cwd and the env-sanitizer's process.env. The
+ * single shell path for steps (`createSandboxStepContext`) and the init phase
+ * (`runInitPhase`), so both share cwd, live env and masked log streaming.
  *
- * The shell binds `process.env` by reference (not a copy), so a same-step
- * ctx.setEnv / ctx.addPath mutation — which applyEnvDelta writes to live
- * process.env — is visible to that step's own subprocesses, matching the
- * "visible to this step" SDK contract.
+ * `process.env` is bound by reference, so a same-step ctx.setEnv / ctx.addPath
+ * (applyEnvDelta writes live process.env) reaches that step's own subprocesses,
+ * per the SDK's "visible to this step" contract.
  *
- * Intercept zx subprocess output via the log callback: zx does NOT write child
- * stdout/stderr to process.stdout — it pipes to an internal VoidStream and only
- * calls $.log() with { kind: 'stdout'|'stderr', verbose }. We override the log
- * function (`makeStreamingZxLog`) to capture both kinds and send them as masked
- * IPC log.line messages tagged with `stepIndex`.
+ * zx never writes child output to process.stdout; it only calls $.log() with
+ * `{ kind: 'stdout'|'stderr', verbose }`, so `makeStreamingZxLog` turns both kinds
+ * into masked `log.line` IPC tagged with `stepIndex`.
  *
- * The shell is built with `verbose: true` so ordinary subprocess output is
- * flagged `verbose: true` (captured) while a step that opts into
- * `$({ quiet: true })` — e.g. a `sops -d` credential decrypt — is flagged
- * `verbose: false` and dropped by `makeStreamingZxLog`. That gate is what keeps
- * a decrypted secret out of the streamed run log; a `verbose: false` base would
- * flag ordinary output `verbose: false` too and drop every line.
+ * `verbose: true` flags ordinary output captured, while `$({ quiet: true })` (e.g. a
+ * `sops -d` decrypt) flags `verbose: false` and is dropped: that gate keeps a
+ * decrypted secret out of the run log. A `verbose: false` base would drop every line.
  *
- * IMPORTANT: The log function must be passed in the zx$() config, not set on the
- * returned function. zx$() returns a plain function (not the proxy $), so setting
- * step$.log would only set it on the function object and NOT propagate to the
- * AsyncLocalStorage store that zx uses for ProcessPromise snapshots.
+ * IMPORTANT: pass `log` in the zx$() config. zx$() returns a plain function, not the
+ * proxy $, so setting step$.log never reaches the AsyncLocalStorage store zx
+ * snapshots for each ProcessPromise.
  */
 export function buildSandboxShell(
   cwd: string,
@@ -1491,10 +1313,9 @@ export function buildSandboxShell(
     env: process.env as Record<string, string>,
     verbose: true,
     quiet: false,
-    // Bind the shell to the step's abort so a subprocess dies with the step.
-    // Without it a step's own `timeout` (and a job cancel) only marked the step
-    // failed: the command it timed out on kept running, and `onFailure` rolled
-    // back underneath a live process. zx kills the child when the signal fires.
+    // zx kills the child when the step aborts. Without it, a step `timeout` or job
+    // cancel only marks the step failed while the command keeps running, and
+    // `onFailure` rolls back underneath a live process.
     ...(signal ? { signal } : {}),
     log: makeStreamingZxLog((line, stream) =>
       maskedSendFn({ type: 'log.line', stepIndex, line, stream }),
@@ -1502,23 +1323,17 @@ export function buildSandboxShell(
   }) as unknown as typeof $;
 }
 
-/**
- * Resolve the on-the-wire event name for `ctx.emit`. Accepts either an ad-hoc
- * event-name string or a `defineEvent()` definition object (passed by the typed
- * emit overload); a definition resolves to its `.name`, a string passes through.
- */
+/** The wire event name for `ctx.emit`: a `defineEvent()` definition's `.name`, or the string. */
 export function resolveEmitEventName(nameOrDefinition: string | EventDefinition): string {
   return isEventDefinition(nameOrDefinition) ? nameOrDefinition.name : nameOrDefinition;
 }
 
 /**
- * Reject a user `ctx.emit` whose event name uses a reserved prefix: `kici.`
- * (KiCI-internal system events — the event scaler's scale-up / scale-down) or
- * `__` (the events the orchestrator mints for itself). A workflow step must
- * forge neither — a `__` name is dispatched as a TRUSTED ref and skips the
- * event-storm rate limiter, so emitting one would be a privilege escalation,
- * not merely a naming collision. Throws a clear error at the emit call; the
- * orchestrator enforces the same reservation authoritatively.
+ * Reject a user `ctx.emit` with a reserved prefix: `kici.` (KiCI system events, e.g.
+ * the event scaler's scale-up / scale-down) or `__` (orchestrator-minted events). A
+ * `__` name dispatches as a TRUSTED ref and skips the event-storm rate limiter, so
+ * forging one is privilege escalation. The orchestrator enforces this authoritatively;
+ * this throws a clear error at the emit call.
  */
 export function assertUserEmittableEventName(eventName: string): void {
   const reservedPrefix = reservedEventNamePrefix(eventName);
@@ -1530,11 +1345,9 @@ export function assertUserEmittableEventName(eventName: string): void {
 }
 
 /**
- * Sanitize a raw identifier into a valid temp label: lowercase, every
- * non-`[a-z0-9-]` char to `-`, falling back to `'step'` when the result is
- * empty. Applied to both the caller-supplied `ctx.mktemp(label)` and the
- * default step-id label so a friendly-but-irregular label never rejects at the
- * scope. Mirrors the SDK test builder's `sanitizeTempLabel`.
+ * Lowercase, non-`[a-z0-9-]` → `-`, `'step'` when empty, so an irregular
+ * `ctx.mktemp(label)` or step id never rejects at the scope. Mirrors the SDK test
+ * builder's `sanitizeTempLabel`.
  */
 export function sanitizeTempLabel(raw: string): string {
   const cleaned = raw.toLowerCase().replace(/[^a-z0-9-]/g, '-');
@@ -1542,13 +1355,9 @@ export function sanitizeTempLabel(raw: string): string {
 }
 
 /**
- * Drain the job-scoped temp allocator once at job end.
- *
- * Called after the step loop and cancel-path hooks, immediately before the
- * terminal `job.complete` emit, so a single call reclaims every `ctx.mktemp` /
- * `ctx.mktempFile` allocation on success, failure, and cancel/timeout alike. A
- * cleanup failure must NEVER change the job's terminal status, so any error is
- * swallowed into `warn` rather than thrown out of `main()`.
+ * Drain the job temp scope once, after the step loop and cancel-path hooks and right
+ * before `job.complete`, reclaiming every `ctx.mktemp` / `ctx.mktempFile` on every
+ * outcome. A cleanup failure must NEVER change the terminal status: it goes to `warn`.
  */
 export async function drainJobTempScope(
   scope: TempScope,
@@ -1561,11 +1370,7 @@ export async function drainJobTempScope(
   }
 }
 
-/**
- * Job-end wrapper around {@link drainJobTempScope} that routes a cleanup
- * warning to the run log as a job-level (`stepIndex: -1`) line. Kept out of
- * `main()` so the single drain call site stays one line.
- */
+/** {@link drainJobTempScope} with the warning sent as a job-level (`stepIndex: -1`) line. */
 async function drainJobTempScopeToLog(
   scope: TempScope,
   send: (msg: RunnerToAgentMessage) => void,
@@ -1575,11 +1380,7 @@ async function drainJobTempScopeToLog(
   );
 }
 
-/**
- * Map the step loop's terminal status onto the initial job-level status —
- * `success` iff every step succeeded, else `failed`. `main()` may override this
- * afterward for the cancel/timeout paths.
- */
+/** `success` iff every step succeeded; `main()` may override it for cancel/timeout. */
 function initialJobStatus(loopStatus: string): 'success' | 'failed' {
   return loopStatus === ExecutionStepStatus.enum.success
     ? ExecutionJobStatus.enum.success
@@ -1587,11 +1388,8 @@ function initialJobStatus(loopStatus: string): 'success' | 'failed' {
 }
 
 /**
- * Create a StepContext natively inside the workflow runner.
- *
- * The context is reconstructed from the environment and IPC request fields --
- * NOT serialized across the process boundary. This means zx $ runs natively
- * inside this process with full shell access.
+ * A StepContext rebuilt from the environment and the IPC request, NOT serialized
+ * across the process boundary, so zx $ runs natively with full shell access.
  */
 export function createSandboxStepContext(
   workDir: string,
@@ -1625,8 +1423,7 @@ export function createSandboxStepContext(
         params: params ?? {},
       });
       const result = await waitForApiResponse(reqId);
-      // Mask the relayed OIDC ID token so the short-lived credential can
-      // never land in step logs during its validity window.
+      // The short-lived OIDC ID token must never land in step logs while valid.
       if (
         method === OIDC_TOKEN_REQUEST_METHOD &&
         result &&
@@ -1663,26 +1460,14 @@ export function createSandboxStepContext(
     job: { name: request.jobName, runsOn: request.runsOn },
     isTestRun: request.isTestRun ?? false,
     context: request.context,
-    // User-facing cache bound to the job's work dir. Each restore/save drives
-    // the orchestrator over a cache.request IPC -> agent WS -> cache.user.*
-    // relay (see buildCacheTransport), mirroring how ctx.emit / ctx.kici relay.
     cache: createCacheApi(workDir, buildCacheTransport()),
-    // User-facing artifacts bound to the job's work dir. upload/download drive
-    // the orchestrator over an artifacts.request IPC -> agent WS ->
-    // artifacts.upload.*/download.* relay (see buildArtifactTransport).
     artifacts: createArtifactsApi(workDir, buildArtifactTransport()),
     emit: async (
       nameOrDefinition: string | EventDefinition,
       payload?: Record<string, unknown>,
       options?: { target?: { repos?: string[] } },
     ) => {
-      // Accept either an ad-hoc event name or a defineEvent() definition; the
-      // typed overload passes the definition object, so resolve its name here.
       const eventName = resolveEmitEventName(nameOrDefinition);
-      // The `kici.` and `__` prefixes are reserved — KiCI-internal system
-      // events and the orchestrator's own minted events; a user step must not
-      // forge either. Reject client-side for a clear error at the emit call;
-      // the orchestrator rejects it authoritatively too.
       assertUserEmittableEventName(eventName);
       const reqId = randomUUID();
       const request: EventEmitRequest = {
@@ -1692,9 +1477,7 @@ export function createSandboxStepContext(
         payload: payload ?? {},
         ...(options?.target && { target: options.target }),
       };
-      // Send via IPC (same mechanism as other runner-to-agent messages)
       sendMessage(request);
-      // Wait for response with timeout
       const response = await waitForEmitResponse(reqId);
       if (response.error) {
         throw new Error(`Event emission failed: ${response.error}`);
@@ -1710,19 +1493,14 @@ export function createSandboxStepContext(
     setSecretOutput: (key: string, value: string): void => {
       secretOutputs.set(key, value);
     },
-    // Job-scoped scratch: allocations delegate to the single `jobTempScope`
-    // created in `main()`, so every dir/file a step makes is reclaimed by the
-    // one `drainJobTempScope` at job end (success/failure/cancel). An omitted
-    // label defaults to the sanitized step id.
+    // Job-scoped: `drainJobTempScope` reclaims every allocation at job end.
     mktemp: (label?: string) => jobTempScope.mktemp(sanitizeTempLabel(label ?? stepName)),
     mktempFile: (label?: string, opts?: { suffix?: string }) =>
       jobTempScope.mktempFile(sanitizeTempLabel(label ?? stepName), opts),
     kici,
-    // The job's own checkout, as a handle. Present for every job — unlike
-    // `sourceRepo`/`workflowRepo`, which exist only for a global workflow.
-    // `withWrite` opens a bounded write window for THIS repository; see the
-    // git-credential design for why the window is scoped to the repository and
-    // the callback rather than to the step.
+    // Present for every job, unlike the global-workflow-only `sourceRepo`/`workflowRepo`.
+    // `withWrite` opens a write window for THIS repository; the git-credential design
+    // explains why it is scoped to repository and callback, not step.
     repo: {
       identifier: repoIdentifierFromUrl(request.repoUrl),
       path: workDir,
@@ -1740,34 +1518,25 @@ export function createSandboxStepContext(
           waitForGitGrant,
         ),
     },
-    // Build, sign, and persist a provenance attestation. The identity token is
-    // relayed via ctx.kici.oidc.token; the bundle is uploaded over the
-    // provenance.request IPC -> agent WS -> orchestrator presigned PUT.
     attestProvenance: buildAttestProvenanceFn(request, workDir, (o) => kici.oidc.token(o)),
     ...(rawPayload && { rawPayload }),
     ...(request.provider && { provider: request.provider }),
-    // Matrix combination for this child (orchestrator-materialized at dispatch
-    // time); absent for non-matrix jobs. Combination values are always strings
-    // (produced by the matrix expander), so the cast to MatrixValues is sound.
+    // Orchestrator-materialized at dispatch; the matrix expander only produces strings.
     ...(request.matrixValues && {
       matrix: request.matrixValues as Record<string, string | undefined>,
     }),
-    // Host fan-out identity for a runsOnAll child (orchestrator-materialized at
-    // dispatch time); absent for non-host jobs.
+    // Orchestrator-materialized at dispatch for a runsOnAll child.
     ...(request.host && { host: request.host }),
     ...(request.agent && { agent: request.agent }),
-    // Fan-out position (runsOnAll host or matrix combination); absent otherwise.
     ...(() => {
       const fanout = deriveFanout(request);
       return fanout ? { fanout } : {};
     })(),
-    // Operator-supplied, validated + coerced + defaulted workflow-dispatch
-    // inputs (orchestrator-resolved from the lock descriptor). Always present —
-    // empty object when none declared — so `inputs.from(ctx)` never sees undefined.
+    // Validated, coerced and defaulted by the orchestrator from the lock descriptor;
+    // always an object, so `inputs.from(ctx)` never sees undefined.
     dispatchInputs: (request.dispatchInputs ?? {}) as Readonly<
       Record<string, string | number | boolean | null>
     >,
-    // Upstream needs (result + terminal status) for step-level branching.
     ...(() => {
       const needs = buildStepNeedsContext(
         request.jobNeeds,
@@ -1782,11 +1551,7 @@ export function createSandboxStepContext(
 
 // --- Helper ---
 
-/**
- * Derive the fan-out position (`ctx.fanout`) from a dispatch request. Returns
- * `undefined` for a non-fan-out job (no `fanoutTotal`), so `ctx.fanout` is only
- * set for `runsOnAll` host children and matrix combinations.
- */
+/** `ctx.fanout`: set only for `runsOnAll` host children and matrix combinations. */
 export function deriveFanout(request: JobExecutionRequest): FanoutPosition | undefined {
   if (request.fanoutTotal === undefined) return undefined;
   const index = request.fanoutIndex ?? 0;
@@ -1798,7 +1563,7 @@ export function deriveFanout(request: JobExecutionRequest): FanoutPosition | und
   };
 }
 
-/** Raw provider webhook body for ctx.rawPayload — nested in the envelope. */
+/** The raw provider webhook body for ctx.rawPayload, nested in the envelope. */
 export function rawPayloadFromEvent(
   event: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {
@@ -1807,9 +1572,6 @@ export function rawPayloadFromEvent(
   return payload ?? undefined;
 }
 
-/**
- * Check if a file exists at the given path.
- */
 function fileExists(p: string): boolean {
   return existsSync(p);
 }
@@ -1821,11 +1583,7 @@ function trace(msg: string): void {
 
 // --- Phase Helpers (private, share module-level state via closures) ---
 
-/**
- * Send a job.complete + process.exit. Centralises the abort-mid-prepare path
- * (after clone / after deps / after rules) so the messages and exit code
- * stay consistent.
- */
+/** The single abort-mid-prepare exit (after clone / deps / rules): job.complete, then exit. */
 function abortAndExit(reason: string): never {
   trace(reason);
   flushOutputCapture();
@@ -1834,8 +1592,7 @@ function abortAndExit(reason: string): never {
     type: 'job.complete',
     status: ExecutionJobStatus.enum.failed,
     stepResults: [],
-    // When the abort was triggered by the job-level deadline (during a prepare
-    // phase, before the step loop), surface the distinct job_timeout reason.
+    // A job deadline during a prepare phase surfaces the job_timeout reason.
     ...(jobTimedOut && {
       error: `${TimeoutReason.enum.job_timeout}: job exceeded its timeout of ${jobTimedOutMs ?? 0}ms`,
     }),
@@ -1844,10 +1601,8 @@ function abortAndExit(reason: string): never {
 }
 
 /**
- * Phase 1 — Clone the source / workflow repos (or skip when checkout=false).
- * Three modes: full-repo overlay-only (no clone), global dual-clone
- * (workflow + source), or single-repo clone. Each mode emits the same
- * progress IPC log lines as before.
+ * Phase 1 — Clone (skipped when checkout=false): full-repo overlay-only (no clone),
+ * global dual-clone (workflow + source), or single-repo clone.
  */
 async function cloneRepoIfRequested(
   request: JobExecutionRequest,
@@ -1856,8 +1611,7 @@ async function cloneRepoIfRequested(
   sourceDir: string,
   isGlobal: boolean,
 ): Promise<void> {
-  // Delegates to the shared implementation so a host-side checkout and an
-  // in-sandbox one cannot drift apart. This side routes progress to IPC.
+  // Shared with the host-side checkout so the two cannot drift; progress goes to IPC.
   await cloneJobRepos(
     request as unknown as CloneJobReposRequest,
     { workDir, workflowDir, sourceDir },
@@ -1873,9 +1627,8 @@ async function cloneRepoIfRequested(
 }
 
 /**
- * Phase 1b — Apply the encrypted overlay tarball when present (test runs
- * with uncommitted changes). For global workflows the overlay applies to the
- * workflow repo (the one carrying `.kici/`).
+ * Phase 1b — Apply the encrypted overlay tarball (test runs with uncommitted
+ * changes); a global workflow's overlay targets the workflow repo (`.kici/`).
  */
 async function applyOverlayIfRequested(
   request: JobExecutionRequest,
@@ -1907,18 +1660,13 @@ async function applyOverlayIfRequested(
 /**
  * Phase 1c — Make git usable in a full-repo overlay workspace.
  *
- * `kici run remote` uploads the developer's working tree (including `.git`) as
- * a self-contained overlay; no clone happens, so the extracted `.git` directory
- * is owned by whatever UID wrote the tarball. Under rootless podman that UID may
- * not match the container UID, which trips git's "dubious ownership" /
- * `safe.directory` check and makes every step `git` command fail.
+ * `kici run remote` uploads the working tree with `.git` and nothing is cloned, so
+ * `.git` is owned by the tarball writer's UID. Under rootless podman that UID can
+ * differ from the container's, tripping git's `safe.directory` check in every step.
  *
- * Mirroring the `file://`-clone fix in checkout/git-clone.ts, we point
- * `GIT_CONFIG_GLOBAL` at a temp config carrying `safe.directory = *`. Setting it
- * on `process.env` here (before the step loop) means every step subprocess —
- * each zx `$` reads live `process.env` at spawn — inherits it, so git
- * works in steps exactly as it does locally. We also register the dep-restore
- * scratch-dir exclude now that a real `.git` exists in the workspace.
+ * Like the `file://`-clone fix in checkout/git-clone.ts, `GIT_CONFIG_GLOBAL` points
+ * at a temp config with `safe.directory = *`, set on `process.env` before the step
+ * loop so every zx `$` (live `process.env` at spawn) inherits it.
  */
 async function makeOverlayGitUsable(
   request: JobExecutionRequest,
@@ -1933,16 +1681,14 @@ async function makeOverlayGitUsable(
   process.env.GIT_CONFIG_GLOBAL = cfgPath;
   trace(`fullRepo git safe.directory configured via GIT_CONFIG_GLOBAL=${cfgPath}`);
 
-  // The overlay carries a real `.git`, so hide the dep-restore scratch dirs
-  // from the customer's `git status` the same way the clone paths do.
+  // A real `.git` exists, so hide the dep-restore scratch dirs as the clone paths do.
   await excludeScratchFromGit(workspaceDir);
 }
 
 /**
- * Phase 2 — Restore deps from cache (a hash mismatch fails the job; any other
- * restore failure falls back to an inline install) OR install inline. Skipped
- * when `.kici/package.json` doesn't exist.
- * For global workflows deps come from the workflow repo (where `.kici/` lives).
+ * Phase 2 — Restore deps from cache (a hash mismatch fails the job; any other failure
+ * falls back to inline) or install inline. Skipped without `.kici/package.json`; a
+ * global workflow's deps come from the workflow repo.
  */
 async function installDependenciesIfNeeded(
   workflowDir: string,
@@ -1962,7 +1708,6 @@ async function installDependenciesIfNeeded(
     const setupLog = (line: string): void =>
       send({ type: 'log.line', stepIndex: -1, line: `[workflow-runner] ${line}` });
     setupLog(`Restoring deps from ${redactUrl(request.depsUrl)}`);
-    // A hash mismatch rejects and fails the job; any other failure falls back.
     const restored = await tryRestoreDeps({
       workDir: workflowDir,
       depsUrl: request.depsUrl,
@@ -2021,9 +1766,8 @@ async function installDependenciesIfNeeded(
 }
 
 /**
- * Phase 2b — Restore the cached `.kici/` source tarball over the cloned
- * workflow root so the loaded workflow's contentHash matches the lock file
- * exactly. No-op when no `sourceTarUrl` was provided.
+ * Phase 2b — Restore the cached `.kici/` source over the clone, so the loaded
+ * workflow's contentHash matches the lock file exactly.
  */
 async function restoreSourceTarballIfRequested(
   workflowRoot: string,
@@ -2041,12 +1785,9 @@ async function restoreSourceTarballIfRequested(
 }
 
 /**
- * Phase 3 — Install the stdout/stderr capture, then load the workflow module
- * via the oxc-transform ESM loader. Capture is enabled for the prepare phase
- * (module load → concurrency → rules) so user `console.log` lands in the
- * workflow-level log bucket (stepIndex: -1). On load failure we flush + clear
- * the prepare flag before rethrowing so the catch handler in main() doesn't
- * see stale buffer state.
+ * Phase 3 — Install the output capture for the prepare phase (load → concurrency →
+ * rules; stepIndex -1), then load the workflow via the oxc-transform ESM loader. A
+ * load failure flushes and clears the flag first, so main()'s catch sees no stale buffer.
  */
 async function loadWorkflowModuleWithCapture(
   workflowRoot: string,
@@ -2093,19 +1834,15 @@ async function loadWorkflowModuleWithCapture(
 type ConcurrencyAction = 'proceed' | 'wait' | 'cancel' | 'failed';
 
 /**
- * Build the argument the user's `concurrency.group(...)` function receives.
+ * The argument `concurrency.group(...)` receives: the only inputs a group can scope by.
+ * An org-wide workflow sees many repositories whose default branches share a name, so
+ * `event.sourceRepo` is what makes a per-repository group expressible, and the
+ * orchestrator writes the whole envelope into every global job config. An empty
+ * `event` collapses every repository into one group, and with `cancelInProgress`
+ * (the default) one repository's push cancels another's run.
  *
- * The only inputs an author can scope a group by. `branch` alone does not
- * separate one repository from another — an organization-wide workflow runs on
- * events from many repositories, and their default branches share a name — so
- * `event.sourceRepo` is what makes a per-source-repository group expressible.
- * That is why the orchestrator writes the whole normalized envelope into every
- * global job config: an empty `event` here silently collapses every repository
- * into one group, and with `cancelInProgress` (the default) one repository's
- * push then cancels another's in-flight run.
- *
- * Boundary cast: the wire `request.event` is untyped JSON that, per the unified
- * event protocol, always carries the normalized event envelope.
+ * Boundary cast: per the unified event protocol, the untyped wire `request.event`
+ * always carries the normalized envelope.
  */
 export function buildConcurrencyGroupContext(request: JobExecutionRequest): {
   branch: string;
@@ -2118,12 +1855,9 @@ export function buildConcurrencyGroupContext(request: JobExecutionRequest): {
 }
 
 /**
- * Phase 4b — Evaluate the user-defined `concurrency.group(...)` function with
- * a timeout, report the resulting key to the orchestrator, and act on the
- * returned ack. `wait` and `cancel` paths, and a group function that throws,
- * exit the process directly (the run is over from the runner's perspective).
- * Returns 'proceed' to the caller in the success path. Every message goes
- * through `send`, the job's masked send.
+ * Phase 4b — Evaluate `concurrency.group(...)` under a timeout, report the key, and
+ * act on the ack. A final `wait` or `cancel`, or a throwing group function, exits the
+ * process directly; success returns 'proceed'. `send` is the job's masked send.
  */
 async function evaluateConcurrencyGroupIfPresent(
   workflow: Workflow,
@@ -2174,19 +1908,16 @@ async function evaluateConcurrencyGroupIfPresent(
       return 'proceed';
     }
     if (ack.action === 'wait') {
-      // Long-poll for a follow-up ack: when the slot frees, the orchestrator
-      // sends an unsolicited `concurrency.ack { action: 'proceed' }` over the
-      // SAME WS connection. The agent stays connected; we re-arm the
-      // single-slot pending-ack waiter and block until the orchestrator
-      // notifies us, the connection drops, or the configured cap elapses.
+      // Long-poll: when the slot frees, the orchestrator sends an unsolicited
+      // `concurrency.ack { action: 'proceed' }` over the SAME WS connection. Re-arm the
+      // single-slot waiter until then, a dropped connection, or the cap.
       send({
         type: 'log.line',
         stepIndex: -1,
         line: `[kici] Concurrency: queued${ack.reason ? ` (${ack.reason})` : ''}, waiting for slot to free`,
       });
-      // Prefer the orchestrator-pushed cluster value (fleet-wide
-      // cluster_settings.concurrency_wait_timeout_ms); fall back to the agent's
-      // own env/config default when the dispatch omits it.
+      // The fleet-wide cluster_settings.concurrency_wait_timeout_ms when dispatched,
+      // else the agent's own env default.
       const waitCapMs =
         request.concurrencyWaitTimeoutMs ??
         (Number.parseInt(process.env.KICI_CONCURRENCY_WAIT_TIMEOUT_MS ?? '', 10) || 3_600_000);
@@ -2217,9 +1948,8 @@ async function evaluateConcurrencyGroupIfPresent(
         return 'proceed';
       }
       if (ack.action === 'wait') {
-        // Defensive: a second `wait` is unexpected (the orchestrator only sends
-        // unsolicited acks on slot release). Treat as failure rather than
-        // looping forever — the agent is in an inconsistent state.
+        // The orchestrator only sends unsolicited acks on slot release, so a second
+        // `wait` means an inconsistent state: fail rather than loop forever.
         send({
           type: 'log.line',
           stepIndex: -1,
@@ -2267,17 +1997,12 @@ async function evaluateConcurrencyGroupIfPresent(
 }
 
 /**
- * Phase 5 — Inject env vars and build the `RepoInfo` pair that the generator,
- * the job rules, and step contexts receive when the job is a global workflow.
- * No-op for normal jobs.
+ * Phase 5 (head) — For a global workflow, inject env vars and build the `RepoInfo`
+ * pair before anything reads the source tree: the generator's re-evaluation (phase 5)
+ * and the job rules (phase 7) must both see what the pre-dispatch evaluation saw.
  *
- * Runs at the head of phase 5, before anything that may read the source tree:
- * the generator's re-evaluation (phase 5) and the job rules (phase 7) both take
- * the returned pair, and both must see what the pre-dispatch evaluation saw.
- *
- * `sourceRepo.path` is this sandbox's own absolute path — the same repo lives at
- * a different path in the evaluation that produced the job list. Read through
- * it; never compare it or embed it in a job name.
+ * `sourceRepo.path` is this sandbox's own path; the pre-dispatch evaluation saw the
+ * repo elsewhere. Read through it; never compare it or embed it in a job name.
  */
 export function setupGlobalWorkflowEnv(
   request: JobExecutionRequest,
@@ -2300,11 +2025,9 @@ export function setupGlobalWorkflowEnv(
       sha: request.sha,
     },
   };
-  // Injected through the shared writer so this sandbox evaluation and the
-  // pre-dispatch global eval round hand the generator the same ambient env.
-  // The restorer is deliberately discarded: this process runs exactly one job
-  // and then exits, so the keys must stay set for the rest of the job. A
-  // caller in a long-lived process (the eval round, in the agent) must call it.
+  // The shared writer gives the generator the same ambient env as the pre-dispatch
+  // eval round. The restorer is discarded on purpose: this process runs one job and
+  // exits; a long-lived caller (the agent's eval round) must call it.
   applyGlobalWorkflowEnv(repos);
   trace(
     `global workflow env vars injected: KICI_WORKFLOW_REPO_PATH=${workflowDir}, KICI_SOURCE_REPO_PATH=${sourceDir}`,
@@ -2313,13 +2036,11 @@ export function setupGlobalWorkflowEnv(
 }
 
 /**
- * Phase 8 — Cancel-path hook execution. Runs the four cancel hooks
- * (step onCancel → step cleanup → job onCancel → job cleanup) inside-out,
- * accumulating any failure reasons into a compound `cancelFailureReason`.
+ * Phase 10 — Cancel-path hooks, inside-out (step onCancel → step cleanup → job
+ * onCancel → job cleanup), accumulating failures into `cancelFailureReason`.
  *
- * `forceAborted=true` short-circuits and runs none of the hooks; the caller
- * still flips finalStatus to failed (the fork-runner overrides it back to
- * `cancelled` based on its own state machine).
+ * `forceAborted=true` runs no hook; finalStatus is still failed, and the fork-runner
+ * overrides it to `cancelled` from its own state machine.
  */
 async function runCancelPathHooks(args: {
   forceAborted: boolean;
@@ -2330,11 +2051,8 @@ async function runCancelPathHooks(args: {
   outputsMap: OutputsMap;
   createStepCtxWithCapture: (stepIndex: number, stepName: string) => StepContext;
   /**
-   * Tear down per-step state created by a `createStepCtxWithCapture`
-   * invocation, keyed by the hook's pseudo-step index. Each cancel-path hook
-   * allocates a fresh secrets handle via the factory; calling dispose() after
-   * the hook returns ensures the tmpdir is removed and any env vars set via
-   * `exposeFile` are unset before the next hook (or the process exit).
+   * Dispose a hook's secrets handle (tmpdir, `exposeFile` env vars) by pseudo-step
+   * index, before the next hook or the process exit.
    */
   disposeStepResources: (stepIndex: number) => Promise<void>;
   maskedSend: (msg: RunnerToAgentMessage) => void;
@@ -2357,7 +2075,7 @@ async function runCancelPathHooks(args: {
       stepIndex: -1,
       line: '[kici] Force cancel received, skipping all hooks',
     });
-    // finalStatus = 'failed' — fork-runner will override to 'cancelled'
+    // The fork-runner overrides this to 'cancelled'.
     return { finalStatus: ExecutionJobStatus.enum.failed };
   }
 
@@ -2394,8 +2112,7 @@ async function runCancelPathHooks(args: {
     const ctx = createStepCtxWithCapture(hookStepIndex, label);
     let hookResult;
     try {
-      // Wrap the hook body in the capture scope so its console output attributes
-      // to the hook's pseudo-step index rather than the workflow-level bucket.
+      // Console output attributes to the hook's pseudo-step, not the workflow bucket.
       hookResult = await runInStepCapture(hookStepIndex, () =>
         executeHook({
           hook,
@@ -2457,21 +2174,14 @@ async function runCancelPathHooks(args: {
     line: `[kici] Cancel complete, job status: ${cancelFailureReason ? 'failed' : 'cancelled'}`,
   });
 
-  // The graceful cancel path ran the declared onCancel + cleanup hooks in-band,
-  // so tell the supervisor its completion hooks ran — otherwise the between-jobs
-  // phase would re-run cleanup out-of-band and execute it twice. The force-abort
-  // path above returns before here without the marker, which is correct: it
-  // skipped the hooks, so the out-of-band re-run SHOULD fire for it.
+  // The hooks ran in-band, so the between-jobs phase must not re-run cleanup. The
+  // force-abort path skips the hooks and this marker, so its out-of-band re-run fires.
   maskedSend({ type: 'completion-hooks-done' });
 
   return { finalStatus: ExecutionJobStatus.enum.failed, cancelFailureReason };
 }
 
-/**
- * Mutable state threaded through {@link coerceStep} for one job normalization
- * pass: the shared `step-N` counter, the bare-function → name ref map, and the
- * set of step objects this pass has already auto-named.
- */
+/** Mutable state of one {@link coerceStep} normalization pass. */
 export interface CoerceState {
   counter: number;
   refMap: StepRefMap;
@@ -2479,16 +2189,14 @@ export interface CoerceState {
 }
 
 /**
- * Coerce one raw entry (bare function or Step) into a normalized Step, naming
- * anonymous steps `step-N` with a counter shared across the whole flattened
- * sequence (parallel children inline) — matching the compiler's transformSteps
- * enumeration so the flat-stepIndex invariant holds agent ↔ orchestrator.
+ * Name anonymous steps `step-N` with one counter across the flattened sequence
+ * (parallel children inline), matching the compiler's transformSteps so the
+ * flat-stepIndex invariant holds agent ↔ orchestrator.
  *
- * Unnamed steps are named by MUTATING the original object so the SDK's
- * late-bound `.result` proxy (which reads `step.name` at access time) resolves.
- * A step object reused twice in one pass gets a clone with a fresh name on the
- * repeat encounter — mirroring the compiler's per-occurrence naming so lock
- * parity holds; the original keeps its first binding.
+ * Naming MUTATES the original, so the SDK's late-bound `.result` proxy (reads
+ * `step.name` at access time) resolves. A step reused in one pass gets a renamed
+ * clone on repeat, mirroring the compiler's per-occurrence naming; the original
+ * keeps its first binding.
  */
 export function coerceStep(stepOrFn: StepInput, state: CoerceState): Step<any> {
   if (typeof stepOrFn === 'function') {
@@ -2512,21 +2220,14 @@ export function coerceStep(stepOrFn: StepInput, state: CoerceState): Step<any> {
 }
 
 /**
- * Phase 5 — Extract steps for the requested job (re-evaluating the dynamic
- * factory when `dynamicSource` is set, otherwise looking up the static job)
- * and normalise the result into the `Step[]` shape the step loop consumes.
- * Bare-function steps get auto-generated `step-N` names so the IPC reporting
- * and the StepRefMap (used by `.result` proxies) line up.
+ * Phase 5 — Extract the job's steps (re-evaluating the dynamic factory when
+ * `dynamicSource` is set) and normalize them for the step loop.
  */
 async function extractAndNormalizeSteps(
   workflow: Workflow,
   request: JobExecutionRequest,
   apiTransport: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
-  /**
-   * The global-workflow repo pair, or undefined for a normal job. Forwarded to
-   * the generator's re-evaluation so it sees the same world the pre-dispatch
-   * evaluation did.
-   */
+  /** Global-workflow repos, so the re-evaluation sees what the pre-dispatch one did. */
   repos?: GeneratorRepoPair,
 ): Promise<{
   normalizedSteps: Step[];
@@ -2597,14 +2298,11 @@ async function extractAndNormalizeSteps(
 }
 
 /**
- * Phase 6 — Build the output infrastructure: the per-step operator-secret
- * key set (used for setEnv override protection), and the output / job-output
- * maps that back `.result` proxies and `ctx.outputsOf()` / `ctx.jobOutputs()`.
- * Sets the SDK module globals as a side effect — on BOTH the agent's bundled
- * SDK and the workflow module's own SDK instance (`workflowSdkSetters`), with
- * the same map objects. The workflow's within-job `.result` proxies read that
- * instance's module-global step-outputs map, so wiring only the agent's bundled
- * SDK would leave the proxies reading an always-empty map.
+ * Phase 6 — The operator-secret key set (setEnv override protection) and the
+ * output maps behind `.result`, `ctx.outputsOf()` and `ctx.jobOutputs()`. Sets the
+ * SDK module globals on BOTH the agent's bundled SDK and the workflow's own SDK
+ * instance (`workflowSdkSetters`): the workflow's `.result` proxies read the latter,
+ * so wiring only the bundled SDK leaves them reading an always-empty map.
  */
 function buildOutputInfrastructure(
   request: JobExecutionRequest,
@@ -2645,11 +2343,9 @@ function buildOutputInfrastructure(
 }
 
 /**
- * Resolve `event.changedFiles` for rule evaluation before job/step rules run.
- * Ground truth is the agent's own clone (`computeChangedFiles`); the
- * orchestrator's already-fetched list (status `'fetched'`) is a free fast-path.
- * Only runs when a rule could read `ctx.changedFiles` — rule-less jobs skip the
- * git cost. Diff-less events (schedule/tag/manual) resolve to `'unavailable'`.
+ * Resolve `event.changedFiles` before rules run, from the agent's own clone; the
+ * orchestrator's `'fetched'` list is a free fast-path. Rule-less jobs skip the git
+ * cost; diff-less events (schedule/tag/manual) resolve to `'unavailable'`.
  */
 export async function resolveChangedFilesForRules(
   request: JobExecutionRequest,
@@ -2663,10 +2359,8 @@ export async function resolveChangedFilesForRules(
     changedFilesStatus?: ChangedFilesStatus;
   };
   if (ev.changedFilesStatus === 'fetched') return;
-  // Authenticate the git deepen/fetch with the same credentials the clone used
-  // for the SOURCE repo (its own were ephemeral), so a private remote resolves.
-  // Mirror cloneRepoIfRequested's source-auth chain exactly: for a global
-  // workflow the source clone falls back to workflowAuth.
+  // The deepen/fetch reuses the SOURCE clone's credentials (its own were ephemeral),
+  // with cloneRepoIfRequested's exact chain: a global workflow falls back to workflowAuth.
   const sourceAuth = request.sourceAuth ?? request.workflowAuth;
   const resolved = await computeChangedFiles(workDir, request.event as EventPayload, sourceAuth);
   ev.changedFiles = resolved.files;
@@ -2674,17 +2368,13 @@ export async function resolveChangedFilesForRules(
 }
 
 /**
- * Decide the terminal `job.complete` for job-level rule evaluation, or `null`
- * when the job should proceed to step execution.
+ * The terminal `job.complete` for job-level rules, or `null` to run the steps.
  *
- * - `allPassed` → `null` (run the steps).
- * - a rule's `check()` **threw** (`evaluationError`) → FAIL: the gate could not
- *   be evaluated, so treating "couldn't decide" as "don't run" would be a false
- *   green. Report `status: failed` with the error surfaced.
- * - a rule cleanly returned `false` → clean skip: `status: success` with every
- *   step marked skipped (a gate that evaluated and said "don't run").
+ * - a rule's `check()` **threw** (`evaluationError`) → `failed` with the error:
+ *   "couldn't decide" read as "don't run" would be a false green.
+ * - a rule cleanly returned `false` → `success` with every step skipped.
  *
- * Pure and exported so the decision is unit-testable without `process.exit`.
+ * Pure, so it is unit-testable without `process.exit`.
  */
 export function buildJobRuleCompletion(
   ruleResult: RuleEvaluationResult,
@@ -2716,24 +2406,18 @@ export function buildJobRuleCompletion(
 }
 
 /**
- * Phase 7 — Evaluate job-level rules. A clean rule failure sends
- * `job.complete{success}` with all steps skipped; a rule whose `check()` threw
- * sends `job.complete{failed}` with the error surfaced (never a silent
- * success-skip). Returns false when the caller should continue to step
- * execution.
+ * Phase 7 — Evaluate job-level rules; exits with {@link buildJobRuleCompletion}'s
+ * message, or returns false to continue to the steps.
  */
 async function maybeSkipJobOnRules(
   job: Job | undefined,
   request: JobExecutionRequest,
   normalizedSteps: Step[],
   /**
-   * The masking send function. A rule's `check()` is customer code, so the
-   * message it produces carries customer text — `job.complete.error` names the
-   * thrown message verbatim and that value is persisted on the run row. It must
-   * go out through the masker like every other text-bearing message.
+   * Must mask: `job.complete.error` carries the customer `check()`'s thrown message
+   * verbatim, persisted on the run row.
    */
   send: (msg: RunnerToAgentMessage) => void,
-  /** The global-workflow repo pair, or undefined for a normal job. */
   repos?: GeneratorRepoPair,
 ): Promise<boolean> {
   if (!job?.rules || job.rules.length === 0) return false;
@@ -2750,8 +2434,7 @@ async function maybeSkipJobOnRules(
       Record<string, string | number | boolean | null>
     >,
     fanout: deriveFanout(request),
-    // A rule reads the source tree through `sourceRepo.path` the same way a
-    // generator does. Absent for a normal job.
+    // A rule reads the source tree through `sourceRepo.path`, like a generator.
     ...(repos && { sourceRepo: repos.sourceRepo, workflowRepo: repos.workflowRepo }),
   });
   const ruleResult = await evaluateRules(job.rules, ruleCtx, request.jobName);
@@ -2765,16 +2448,12 @@ async function maybeSkipJobOnRules(
 }
 
 /**
- * Build the inputs the step loop turns into every step rule's `RuleContext`.
+ * Inputs for every step rule's `RuleContext`, from the same source as
+ * `maybeSkipJobOnRules`, so step and job rules see the same event, env, dispatch
+ * inputs, fan-out position and global repo pair.
  *
- * Shares its source with `maybeSkipJobOnRules` so a step rule and a job rule
- * see the same world: the same event, env, dispatch inputs, fan-out position,
- * and — for a global workflow — the same source / workflow repo pair. A step
- * rule that received the pair as `undefined` while the job rule beside it
- * received the real thing would read the same `RuleContext` type two ways.
- *
- * The pair is spread conditionally: a present-but-undefined `sourceRepo` reads
- * as "declared" to a rule that guards on the key rather than the value.
+ * The pair is spread conditionally: a present-but-undefined `sourceRepo` reads as
+ * "declared" to a rule that guards on the key rather than the value.
  */
 export function buildStepLoopRuleInputs(
   request: JobExecutionRequest,
@@ -2794,11 +2473,6 @@ export function buildStepLoopRuleInputs(
   };
 }
 
-/**
- * Collect the six job-level hooks (beforeStep / afterStep / onSuccess /
- * onFailure / onCancel / cleanup) into a single typed object the step loop
- * and cancel-path consume.
- */
 function collectJobHooks(job: Job | undefined): JobHooks {
   const jobHooks: JobHooks = {};
   if (!job) return jobHooks;
@@ -2812,21 +2486,16 @@ function collectJobHooks(job: Job | undefined): JobHooks {
 }
 
 /**
- * Base stepIndex for the `init:<n>` pseudo-steps. The step loop reserves the
- * range starting at `steps.length` for hook pseudo-steps (`beforeStep` =
- * `steps.length + i*2`, `afterStep` = `steps.length + i*2 + 1`, and job-level
- * onSuccess/onFailure/cleanup from `steps.length` upward — see step-loop.ts),
- * so init indices must sit ABOVE every possible hook index to avoid collision.
- * A large fixed offset reserves a dedicated range no realistic step/hook count
- * can reach; init:<n> then occupies `INIT_STEP_INDEX_BASE + n`.
+ * `init:<n>` occupies `INIT_STEP_INDEX_BASE + n`, ABOVE every hook pseudo-step index
+ * the step loop allocates from `steps.length` upward (see step-loop.ts); no realistic
+ * step/hook count reaches it.
  */
 const INIT_STEP_INDEX_BASE = 1_000_000;
 
 /**
- * Read the KICI_ENV/KICI_PATH delta written by a command, apply it through
- * `applyEnvDelta` (operator-secret override guard + masked reject log), then
- * truncate the files for the next command. Shared by the per-job init phase and
- * the per-step after-hook so both honor the identical operator-secret guard.
+ * Apply a command's KICI_ENV/KICI_PATH delta through `applyEnvDelta` and truncate the
+ * files. Shared by init and the per-step after-hook, so both honor the same
+ * operator-secret guard.
  */
 async function applyEnvFilesDelta(
   envFiles: EnvFiles,
@@ -2847,19 +2516,14 @@ async function applyEnvFilesDelta(
 }
 
 /**
- * Build the step loop's KICI_ENV/KICI_PATH callbacks with a per-step delta-file
- * pair (keyed by step index). `beforeStepEnvFiles(stepIndex)` lazily creates the
- * step's pair and points the runner's process.env at it (each step's zx $
- * reads live process.env at spawn, which happens AFTER this before-hook, so
- * the shell sees them; the pre-fork env allowlist does not
- * re-filter runtime-set vars). `afterStepApplyEnvFiles(stepIndex)` applies that
- * step's delta and releases the pair.
+ * KICI_ENV/KICI_PATH callbacks with a delta-file pair per step index. The before-hook
+ * points process.env at the pair, which the step's zx $ reads at spawn (the pre-fork
+ * env allowlist does not re-filter runtime-set vars); the after-hook applies the delta
+ * and releases the pair.
  *
- * Env-isolation contract: under sequential execution this is identical to a
- * single shared pair truncated between steps — each step still sees only its own
- * delta. The pair is now per-step so two concurrently-running steps cannot
- * corrupt each other's delta file. `process.env.KICI_ENV` / `process.env.KICI_PATH`
- * remain process-global: only the file pair is per-task.
+ * Env-isolation contract: each step sees only its own delta, and concurrent steps
+ * cannot corrupt each other's file. `process.env.KICI_ENV` / `KICI_PATH` stay
+ * process-global; only the file pair is per-task.
  */
 export function buildStepEnvFileHooks(
   operatorSecretKeys: Set<string>,
@@ -2897,24 +2561,19 @@ export function buildStepEnvFileHooks(
 }
 
 /**
- * Run the per-job init phase with concrete ports, then fail the job (no steps)
- * if any init spec failed or timed out.
+ * Run the per-job init phase; a failed or timed-out init fails the job with no steps.
  *
- * Concrete ports supplied to `runInitPhase`:
- * - shell: a fresh `buildSandboxShell` per init (same zx config steps use), cwd
- *   = the clone root. Each init snapshots `process.env` (which `beginCapture`
- *   has pointed at the shared KICI_ENV/KICI_PATH files), so the command can hand
- *   env + PATH off to later inits and to every step.
- * - cache: the transport-backed `CacheApi` (`createCacheApi`) — the same engine
- *   `ctx.cache` and the declarative cache phase use. Restore before / save on
- *   key miss after.
- * - env: the P1 KICI_ENV/KICI_PATH lifecycle over the shared `envFiles`,
- *   mirroring the step loop's `beforeStepEnvFiles` / `afterStepApplyEnvFiles`
- *   (same `operatorSecretKeys` guard + masked reject log).
+ * Ports for `runInitPhase`:
+ * - shell: a fresh `buildSandboxShell` per init at the clone root. It snapshots
+ *   `process.env`, which `beginCapture` pointed at the shared KICI_ENV/KICI_PATH
+ *   files, so an init hands env + PATH to later inits and every step.
+ * - cache: the same transport-backed `CacheApi` as `ctx.cache`; restore before,
+ *   save on key miss after.
+ * - env: the KICI_ENV/KICI_PATH lifecycle over the shared `envFiles`, with the step
+ *   loop's `operatorSecretKeys` guard.
  *
- * On `result.ok === false`: emit `job.complete{failed}` with `stepResults: []`
- * (no step ran), an actionable error (carrying the distinct P3 timeout reason
- * when `timedOut`), and `process.exit(1)` — the step loop never executes.
+ * On failure: `job.complete{failed}` with `stepResults: []` and the error (with the
+ * timeout reason when `timedOut`), then `process.exit(1)`.
  */
 async function runInitPhaseOrFailJob(args: {
   job: Job | undefined;
@@ -2926,22 +2585,18 @@ async function runInitPhaseOrFailJob(args: {
   const { job, stepCwd, envFiles, operatorSecretKeys, maskedSend } = args;
   const directives = normalizeInitItems(job);
   if (directives.length === 0) return;
-  // Preset / 'auto' expansion happens here, where the clone root (stepCwd) is on
-  // disk to hash for the cache key and scan for auto-detect marker files.
+  // Expanded here because the clone root is on disk to hash for the cache key and
+  // scan for auto-detect markers.
   const initSpecs = await expandInitDirectives(directives, {
     cloneRoot: stepCwd,
     log: (line) => maskedSend({ type: 'log.line', stepIndex: -1, line }),
   });
   if (initSpecs.length === 0) return;
 
-  // The init cache engine is the same transport-backed CacheApi steps use
-  // (createCacheApi over buildCacheTransport), bound to the clone root.
   const initCache = createCacheApi(stepCwd, buildCacheTransport());
 
-  // P1 env-handoff port over the shared KICI_ENV/KICI_PATH files: point the
-  // process env at the (truncated) files before each init so the command's
-  // exports land there; after a successful command read+apply the delta through
-  // applyEnvDelta and truncate for the next init/step.
+  // Before each init, point process env at the truncated files; after a successful
+  // command, apply the delta and truncate for the next init/step.
   const initEnv = {
     beginCapture: async (): Promise<void> => {
       process.env.KICI_ENV = envFiles.envFile;
@@ -2979,21 +2634,8 @@ async function runInitPhaseOrFailJob(args: {
 // --- Main Job Execution Lifecycle ---
 
 /**
- * Run the complete job execution lifecycle.
- *
- * 1. Receive execution request
- * 2. Git clone (if checkout enabled)
- * 3. Dependency handling (cache restore or inline install)
- * 4. Load workflow module (from bundle or source)
- * 5. Extract workflow and steps
- * 6. Evaluate rules (if any)
- * 7. Execute steps sequentially with IPC reporting
- * 8. Send job.complete and exit
- */
-/**
- * Extract + normalize the job's steps, or return an empty set for a cleanup-only
- * re-run (which runs no steps and skips the generator re-evaluation this would
- * otherwise trigger). Owns the `apiTransport` closure the generator uses.
+ * Extract and normalize the job's steps; a cleanup-only re-run gets none and skips
+ * the generator re-evaluation. Owns the generator's `apiTransport` closure.
  */
 async function extractStepsForRun(
   workflow: Workflow,
@@ -3016,6 +2658,7 @@ async function extractStepsForRun(
   return extractAndNormalizeSteps(workflow, request, apiTransport, globalRepoInfo);
 }
 
+/** The job execution lifecycle; the `Phase N` comments below mark each stage. */
 async function main(): Promise<void> {
   trace(`main() started, isForkMode=${isForkMode}, pid=${process.pid}`);
   sendMessage({ type: 'ready' });
@@ -3034,16 +2677,14 @@ async function main(): Promise<void> {
   const sourceDir = isGlobal ? join(workDir, 'source') : workDir;
 
   const masker = createSecretMasker(request);
-  // From here on a fatal error is reported through the job's masker.
   fatalMasker = masker;
   const maskedSend = (msg: RunnerToAgentMessage): void => {
     sendMessage(maskMessageText(msg, masker));
   };
 
-  // Arm the job-level wall-clock deadline (the lock job's `timeout`). On
-  // breach it trips the SAME abort path cancellation uses (so the in-flight
-  // step's own timeout race unwinds and the cancel-path hooks still run),
-  // plus records the distinct job_timeout reason. A no-op when unset.
+  // The lock job's `timeout` (no-op when unset). A breach trips the force-cancel
+  // abort path, so the in-flight step unwinds and the cancel-path hooks are skipped,
+  // and records the job_timeout reason.
   const jobDeadline = armJobDeadline(request.jobTimeoutMs, (reason, timeoutMs) => {
     jobTimedOut = true;
     jobTimedOutMs = timeoutMs;
@@ -3054,30 +2695,27 @@ async function main(): Promise<void> {
       stepIndex: -1,
       line: `[kici] Job exceeded its timeout of ${timeoutMs}ms (${reason}); aborting.`,
     });
-    // Interrupt the in-flight step immediately — flipping `aborted` only takes
-    // effect between steps, which never unwinds a single long-running step.
+    // `aborted` only takes effect between steps; this interrupts the in-flight one.
     jobDeadlineAbort.abort();
   });
 
-  // A between-jobs out-of-band cleanup re-run reuses the preserved workdir: the
-  // clone, dependency install, and source tarball are already in place, so
-  // phases 1–2b are skipped and only the declared cleanup hooks run below.
-  // Setup ends with the one `dep-restore.report` message, before any workflow
-  // code loads: it closes the agent's relay.
+  // A between-jobs cleanup re-run reuses the preserved workdir, so phases 1–2b are
+  // skipped. Setup ends with the one `dep-restore.report`, before any workflow code
+  // loads: it closes the agent's relay.
   await runSetupThenSendDepRestoreReport(
     async (onReport) => {
       if (request.cleanupOnly) return;
-      // Phase 1: clone (if checkout enabled) + overlay tarball
+      // Phase 1: clone + overlay
       await cloneRepoIfRequested(request, workDir, workflowDir, sourceDir, isGlobal);
       await applyOverlayIfRequested(request, workflowDir);
       await makeOverlayGitUsable(request, workflowDir);
       if (aborted) abortAndExit('aborted after clone');
 
-      // Phase 2: deps (cache restore or inline install)
+      // Phase 2: deps
       await installDependenciesIfNeeded(workflowDir, request, maskedSend, onReport);
       if (aborted) abortAndExit('aborted after deps');
 
-      // Phase 2b: restore cached source tarball over .kici/ if present
+      // Phase 2b: cached .kici/ source
       await restoreSourceTarballIfRequested(workflowDir, request);
     },
     (report) => maskedSend({ type: 'dep-restore.report', ...(report && { report }) }),
@@ -3088,19 +2726,13 @@ async function main(): Promise<void> {
   const module: Record<string, unknown> = loaded.module;
   const workflow = extractWorkflow(module, request.workflowName);
 
-  // Phase 4: concurrency group eval (may exit the process for wait/cancel).
-  // Skipped for a cleanup-only re-run — the slot was already released when the
-  // original job ended; re-acquiring it here would wait or cancel spuriously.
+  // Phase 4: concurrency group (may exit). A cleanup-only re-run skips it: the slot
+  // was released when the original job ended, and re-acquiring would wait or cancel.
   if (!request.cleanupOnly) await evaluateConcurrencyGroupIfPresent(workflow, request, maskedSend);
 
-  // Phase 5: inject the global-workflow env + repo pair, then extract steps
-  // (dynamic source eval or static lookup) and normalize.
-  //
-  // The env injection runs FIRST because the generator (below) and the rules
-  // (phase 7) both receive the repo pair and both may read the source tree
-  // through it. A generator re-evaluated in a sandbox that could not see the
-  // source would produce a different job list than the pre-dispatch evaluation
-  // did, and `extractStepsFromDynamicJob` fails the job on that mismatch.
+  // Phase 5: global-workflow env + repo pair FIRST, then extract steps. A generator
+  // that could not see the source would produce a different job list than the
+  // pre-dispatch evaluation, and `extractStepsFromDynamicJob` fails on that mismatch.
   const globalRepoInfo = setupGlobalWorkflowEnv(request, isGlobal, workflowDir, sourceDir);
 
   const { normalizedSteps, nodes, refMap, driftDroppedJobs } = await extractStepsForRun(
@@ -3109,17 +2741,14 @@ async function main(): Promise<void> {
     globalRepoInfo,
   );
 
-  // Phase 6: build output infrastructure (operator-secret keys + outputs maps)
+  // Phase 6: output infrastructure
   const { operatorSecretKeys, outputsMap, secretOutputs, jobOutputsMap } =
     buildOutputInfrastructure(request, refMap, loaded.sdkSetters);
 
-  // Phase 7: job-level rules — may early-exit with skipped steps. Skipped for a
-  // cleanup-only re-run: rules gate whether steps run, and a re-run runs none —
-  // its only purpose is to drive the declared cleanup regardless of rules.
+  // Phase 7: job-level rules (may exit). A cleanup-only re-run runs no steps and
+  // drives the declared cleanup regardless of rules, so it skips them.
   const job = findJob(workflow, request.jobName);
   if (!request.cleanupOnly) {
-    // Resolve changed files (ground truth = the source clone) before rule eval,
-    // only when a job or step rule could read ctx.changedFiles.
     const jobHasRules = (job?.rules?.length ?? 0) > 0;
     const anyStepHasRules = normalizedSteps.some((s) => (s.rules?.length ?? 0) > 0);
     await resolveChangedFilesForRules(request, sourceDir, jobHasRules || anyStepHasRules);
@@ -3130,36 +2759,28 @@ async function main(): Promise<void> {
   // Phase 8: collect job hooks
   const jobHooks = collectJobHooks(job);
 
-  // Tell the supervisor whether this job declares failure/cleanup hooks, so a
-  // between-jobs out-of-band re-run can be decided even if the runner is later
+  // Lets the supervisor decide a between-jobs re-run even if the runner is
   // hard-killed before its completion hooks run.
   maskedSend({
     type: 'hooks-declared',
     declaresCleanup: Boolean(jobHooks.onFailure || jobHooks.cleanup),
   });
 
-  // Phase 9: switch from prepare-phase capture to per-step capture
+  // Phase 9: prepare-phase capture → per-step capture
   flushOutputCapture();
   capturePrepareActive = false;
 
-  // For global workflows, CWD for step execution is the source repo
+  // A global workflow's steps run in the source repo.
   const stepCwd = sourceDir;
 
-  // KICI_ENV / KICI_PATH temp-file contract: one pair of files reused across
-  // the init phase + every step (truncated between each). A command appends
-  // KEY=value lines to $KICI_ENV and one dir per line to $KICI_PATH; the delta
-  // then flows through applyEnvDelta -- the same path ctx.setEnv / ctx.addPath
-  // and the per-step after-hook use. Created here (before init) so init commands
-  // can hand env/PATH off to subsequent inits and to every step.
+  // KICI_ENV / KICI_PATH pair shared by every init (truncated between each; steps
+  // get their own pairs from buildStepEnvFileHooks). A command appends KEY=value
+  // lines to $KICI_ENV and one dir per line to $KICI_PATH; the delta flows through
+  // applyEnvDelta like ctx.setEnv / ctx.addPath.
   const envFiles: EnvFiles = await createEnvFiles(tmpdir());
 
-  // Per-job init phase (after clone + module load, before the step
-  // loop). Each init spec runs through the SAME sandbox shell steps use; on the
-  // first failure/timeout the job fails before any step runs (no step loop).
-  // Skipped on a cleanup-only re-run: re-running init would re-execute the
-  // job's setup commands (restarting the very daemons the reap removes), and an
-  // init failure calls process.exit(1) before the step loop, which would skip
-  // the declared cleanup this re-run exists to run.
+  // Init phase. A cleanup-only re-run skips it: init would restart the very daemons
+  // the reap removes, and an init failure exits before the cleanup this re-run exists for.
   if (!request.cleanupOnly) {
     await runInitPhaseOrFailJob({
       job,
@@ -3170,10 +2791,8 @@ async function main(): Promise<void> {
     });
   }
 
-  // Declarative cache infrastructure + Phase 9b job-level cache restore. On a
-  // cleanup-only re-run, pass no cache specs so the restore side effect (which
-  // could clobber the preserved post-execution state the cleanup hook inspects)
-  // is skipped; the step loop still needs the deps object, but runs no steps.
+  // Phase 9b. A cleanup-only re-run passes no specs: a restore could clobber the
+  // post-execution state its cleanup hook inspects; the step loop still needs the deps.
   const { cachePhaseDeps, jobCacheSpecs, jobCacheRestore } = await setupJobCache(
     stepCwd,
     normalizedSteps.length,
@@ -3181,37 +2800,24 @@ async function main(): Promise<void> {
     maskedSend,
   );
 
-  // Per-step secrets handle (for access-log + mount-record reporting) and the
-  // matching dispose closure (called from the step-loop's `finally` to remove
-  // the per-step mount tmpdir + clear any env vars set via
-  // `ctx.secrets.exposeFile`), keyed by step index so concurrent steps keep
-  // independent secrets-audit trails.
+  // Per-step secrets handles and dispose closures, keyed by step index so concurrent
+  // steps keep independent secrets-audit trails.
   const stepTasks = new StepTaskRegistry();
-  // Per-step abort controllers. The composed `ctx.signal` aborts them when the
-  // job is cancelled / times out, and a `parallel()` group's fail-fast aborts an
-  // individual step's controller to cancel one in-flight sibling.
+  // A `parallel()` group's fail-fast aborts one sibling through its controller.
   const stepAbortControllers = new Map<number, AbortController>();
-  // The single job-scoped allocator behind every step's `ctx.mktemp` /
-  // `ctx.mktempFile` — created here, after all prepare-phase early exits
-  // (`abortAndExit` after clone/deps/rules, concurrency wait/cancel) which run
-  // before any step context exists and so allocate no `ctx` temp dirs, and
-  // drained exactly once at job end below.
+  // Behind every `ctx.mktemp` / `ctx.mktempFile`; created after every prepare-phase
+  // early exit (none allocates `ctx` temp dirs) and drained exactly once at job end.
   const jobTempScope = createTempScope();
   const createStepCtxWithCapture = (stepIndex: number, stepName: string): StepContext => {
     const stepAbort = new AbortController();
     stepAbortControllers.set(stepIndex, stepAbort);
-    // ctx.signal aborts when this step's own controller, the job-cancel signal,
-    // or the job-deadline signal fires.
     const signal = AbortSignal.any([
       stepAbort.signal,
       jobCancelAbort.signal,
       jobDeadlineAbort.signal,
     ]);
-    // Build the secrets handle FIRST so the file-mount host is bound for
-    // this step's invocation. The masker is global to the job; mount calls
-    // register their (potentially-concatenated) content into it before the
-    // file path is returned, so a child process echoing the credential
-    // sees the masked replacement on the streamed log.
+    // Built FIRST so the file-mount host is bound; mounts register their content
+    // with the job-wide masker before returning the path.
     const handle = buildStepSecrets(request, masker, () => {
       // No-op: registerSecrets() already rebuilds the masker pattern.
     });
@@ -3247,8 +2853,7 @@ async function main(): Promise<void> {
     abortStep: (stepIndex) => stepAbortControllers.get(stepIndex)?.abort(),
     getStepAbortSignal: (stepIndex) => stepAbortControllers.get(stepIndex)?.signal,
     checkMode: request.checkMode,
-    // A cleanup-only re-run declares no steps, so drive the completion sequence
-    // down the failed path (onFailure + cleanup) as if the job had failed.
+    // A cleanup-only re-run has no steps: drive onFailure + cleanup as if it failed.
     ...(request.cleanupOnly ? { forceInitialFailure: true } : {}),
     createStepContext: createStepCtxWithCapture,
     sendIpc: maskedSend,
@@ -3260,15 +2865,11 @@ async function main(): Promise<void> {
     isAborted: () => aborted,
     jobDeadlineSignal: jobDeadlineAbort.signal,
     startTime: jobStartTime,
-    // Run each step body (and its hooks) inside an async-context capture scope so
-    // console output attributes to that step's index even when `parallel()`
-    // children run concurrently. The flush below runs inside this scope, so a
-    // step's trailing partial line is still attributed to it.
+    // Async-context capture per step body and hooks, so console output attributes
+    // correctly even for concurrent `parallel()` children.
     runWithStepCapture: runInStepCapture,
     getSecretsAccessLog: (stepIndex) => {
-      // Flush any remaining console output buffered for this step. Called inside
-      // the step's `runWithStepCapture` scope, so the flush attributes to this
-      // step; the scope unwinds on its own once the step run completes.
+      // Inside the step's capture scope, so its trailing partial line stays attributed.
       flushOutputCapture();
       return stepTasks.getAccessLog(stepIndex);
     },
@@ -3277,24 +2878,20 @@ async function main(): Promise<void> {
       stepAbortControllers.delete(stepIndex);
       return stepTasks.dispose(stepIndex);
     },
-    // KICI_ENV / KICI_PATH file callbacks (shared with the init phase via
-    // buildStepEnvFileHooks): point process.env at the files before each step,
-    // apply + truncate the delta after.
     beforeStepEnvFiles: stepEnvHooks.beforeStepEnvFiles,
     afterStepApplyEnvFiles: stepEnvHooks.afterStepApplyEnvFiles,
     awaitStepApproval: buildAwaitStepApproval(),
     awaitStepApprovalWithPayload: buildAwaitStepApprovalWithPayload(),
   });
 
-  // The step loop has returned — disarm the job deadline so a late fire can't
-  // re-trip the abort flags during the cancel-path hooks / final emit.
+  // A late deadline fire must not re-trip the abort flags during hooks / final emit.
   jobDeadline.clear();
 
-  // Phase 9c: job-level cache save (after the step loop, only on full success).
+  // Phase 9c: job-level cache save.
   const jobSucceeded = !aborted && loopResult.status === ExecutionStepStatus.enum.success;
   await maybeSaveJobCache(jobCacheSpecs, jobCacheRestore, cachePhaseDeps, jobSucceeded);
 
-  // Phase 10: cancel-path hooks (when aborted) or pass-through final status
+  // Phase 10: cancel-path hooks when aborted.
   let finalStatus: 'success' | 'failed' = initialJobStatus(loopResult.status);
   let cancelFailureReason: string | undefined;
   if (aborted) {
@@ -3316,16 +2913,11 @@ async function main(): Promise<void> {
     cancelFailureReason = cancelResult.cancelFailureReason;
   }
 
-  // Phase 11: emit job.complete with aggregated outputs and exit.
-  // A timed-out job is a FAILED job (not cancelled): the cancel-path hooks ran
-  // because `aborted` was set, but the run outcome is failure with the
-  // distinct job_timeout reason.
+  // Phase 11: emit job.complete and exit. A timed-out job is FAILED (not cancelled),
+  // with the job_timeout reason.
   if (jobTimedOut) finalStatus = ExecutionJobStatus.enum.failed;
 
-  // Reclaim every `ctx.mktemp` / `ctx.mktempFile` allocation once, here — the
-  // single convergence point for success, failure, and cancel/timeout (the step
-  // loop returned and any cancel-path hooks ran above). Cleanup errors are
-  // swallowed so a failed reclaim never flips the job's terminal status.
+  // The single convergence point for every outcome.
   await drainJobTempScopeToLog(jobTempScope, maskedSend);
 
   emitJobComplete({
@@ -3343,10 +2935,9 @@ async function main(): Promise<void> {
 }
 
 /**
- * Phase 11 — emit the terminal `job.complete` IPC. Aggregates per-step outputs
- * by step name, includes encrypted secret outputs, and selects the error
- * message: a `job_timeout` reason when the job-level deadline tripped, else the
- * step-loop's failure reason (or the cancel-path's compound reason).
+ * Phase 11 — the terminal `job.complete`: per-step outputs by step name, plaintext
+ * secret outputs (the agent encrypts them), and the error: `job_timeout` when the
+ * deadline tripped, else the step loop's reason, overridden by the cancel-path's.
  */
 function emitJobComplete(args: {
   finalStatus: 'success' | 'failed';
@@ -3357,10 +2948,7 @@ function emitJobComplete(args: {
   jobTimeoutMs?: number;
   cancelFailureReason?: string;
   driftDroppedJobs: string[];
-  /**
-   * The masking send function. `job.complete` carries the job's failure reason,
-   * which is persisted on the run row, so it must not bypass the masker.
-   */
+  /** Must mask: the failure reason is persisted on the run row. */
   send: (msg: RunnerToAgentMessage) => void;
 }): void {
   const aggregatedOutputs: Record<string, Record<string, unknown>> = {};
@@ -3387,9 +2975,6 @@ function emitJobComplete(args: {
   });
 }
 
-/**
- * Find a static Job by name in the workflow.
- */
 function findJob(workflow: { jobs: readonly JobOrFactory[] }, jobName: string): Job | undefined {
   for (const item of workflow.jobs) {
     if (!isDynamicJobFn(item) && (item as Job).name === jobName) {
@@ -3402,15 +2987,13 @@ function findJob(workflow: { jobs: readonly JobOrFactory[] }, jobName: string): 
 // --- Entry Point ---
 
 main().catch((error) => {
-  // Unhandled error in the job lifecycle, reported through the job's masker.
   const report = buildFatalReport(error, fatalMasker);
 
-  // Write to stderr for container log capture (IPC might not flush before exit)
+  // For container log capture: IPC might not flush before exit.
   process.stderr.write(report.stderr);
 
-  // Send the error via IPC for agent-level visibility
   for (const msg of report.messages) sendMessage(msg);
 
-  // Give IPC messages time to flush before exiting
+  // Give IPC messages time to flush.
   setTimeout(() => process.exit(1), 100);
 });

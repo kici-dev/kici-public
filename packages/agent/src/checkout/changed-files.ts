@@ -9,25 +9,23 @@ import {
 import type { GitAuth } from './git-clone.js';
 import { setupSshAuth } from './ssh-auth.js';
 
-/** Result of computing the changed-files list from the local clone. */
 export interface ChangedFilesResult {
   files: string[];
   status: ChangedFilesStatus;
 }
 
 /**
- * Authentication context threaded into every git invocation so the deepen /
- * fetch calls that reach the remote are authenticated the same way the clone
- * was. The clone's own credentials are ephemeral (git-clone.ts wipes the SSH
- * key and never persists the token into `.git/config`), so a fetch here would
- * otherwise run unauthenticated and fail on a private remote.
+ * Auth for the deepen / fetch calls, mirroring the clone's. The clone's own
+ * credentials are ephemeral (git-clone.ts wipes the SSH key and never persists
+ * the token into `.git/config`), so without this a fetch fails on a private
+ * remote.
  */
 export interface GitAuthCtx {
   /** Per-command `-c` flags (http.extraHeader for basic auth). */
   args: string[];
-  /** Env overrides (GIT_SSH_COMMAND for ssh auth). */
+  /** GIT_SSH_COMMAND for ssh auth. */
   env?: Record<string, string>;
-  /** Tears down any temp SSH key material. */
+  /** Tears down temp SSH key material. */
   cleanup?: () => Promise<void>;
 }
 
@@ -40,7 +38,6 @@ const DEEPEN_STEP = 50;
 // non-ASCII paths literal so a rule's string comparison matches.
 const BASE_GIT_ARGS = ['-c', 'safe.directory=*', '-c', 'core.quotePath=false'];
 
-/** Build the auth context for the fetches, mirroring git-clone.ts's auth. */
 export async function buildAuthCtx(auth: GitAuth | undefined): Promise<GitAuthCtx> {
   if (!auth) return { args: [] };
   if (auth.kind === 'basic') {
@@ -48,7 +45,7 @@ export async function buildAuthCtx(auth: GitAuth | undefined): Promise<GitAuthCt
     const basic = Buffer.from(`${user}:${auth.secret}`).toString('base64');
     return { args: ['-c', `http.extraHeader=Authorization: Basic ${basic}`] };
   }
-  // ssh — re-establish a temp key (the clone's was already wiped) for the fetch.
+  // ssh: a fresh temp key, since the clone's was already wiped.
   const sshSetup = await setupSshAuth({
     privateKey: auth.secret,
     hostKeyPolicy: auth.sshHostKeyPolicy,
@@ -125,11 +122,11 @@ function twoDotDiff(
  */
 function prDiff(workDir: string, base: string, ctx: GitAuthCtx, head = 'HEAD'): ChangedFilesResult {
   if (!ensureCommit(workDir, head, ctx)) return { files: [], status: 'unavailable' };
-  // The agent's clone is shallow and single-branch (`--depth` implies it), so
-  // the base branch is usually absent. Fetch it into its own remote-tracking
-  // ref: a bare `fetch origin <base>` lands only in FETCH_HEAD, which the next
-  // fetch overwrites — and a FETCH_HEAD left by the clone's own fetch of HEAD
-  // would diff HEAD against itself and report no changed files.
+  // The clone is shallow and single-branch (`--depth` implies it), so the base
+  // is usually absent. Fetch it into its own remote-tracking ref: a bare
+  // `fetch origin <base>` lands only in FETCH_HEAD, which the next fetch
+  // overwrites, and a FETCH_HEAD left by the clone's fetch of HEAD would diff
+  // HEAD against itself and report no changes.
   const baseSpec = `+refs/heads/${base}:refs/remotes/origin/${base}`;
   const resolveBase = (): string | undefined =>
     [base, `origin/${base}`].find((c) =>
@@ -143,9 +140,9 @@ function prDiff(workDir: string, base: string, ctx: GitAuthCtx, head = 'HEAD'): 
     baseRef = resolveBase();
   }
   if (!baseRef) return { files: [], status: 'unavailable' };
-  // Deepen (bounded) until a merge-base with HEAD exists, then three-dot diff.
-  // Each round deepens both sides: the base through its refspec, which keeps
-  // the base ref current, and `head` through its own commit.
+  // Deepen (bounded) until a merge-base exists. Each round deepens both sides:
+  // the base through its refspec (keeping the base ref current), `head`
+  // through its own commit.
   for (let i = 0; i <= MAX_DEEPEN; i++) {
     if (tryGit(workDir, ['merge-base', baseRef, head], ctx)) {
       const out = git(workDir, ['diff', '--name-only', `${baseRef}...${head}`], ctx);
@@ -160,14 +157,12 @@ function prDiff(workDir: string, base: string, ctx: GitAuthCtx, head = 'HEAD'): 
 /**
  * Deepen the shallow history behind `commitish` by DEEPEN_STEP commits.
  *
- * On git 2.54 and later, a `--deepen` fetch moves only the shallow boundaries
- * of the refs it fetches, so deepening the base's refspec leaves `head`'s
- * boundary where it is. Naming `head`'s commit in that same fetch does not move
- * it either. A separate fetch with an absolute `--depth` on the commit moves it
- * on every git version. The
- * depth is counted from the commits already present, so the fetch never
- * shortens the history. Best effort: a remote that refuses a fetch by commit
- * id leaves only the base deepened.
+ * On git 2.54+, a `--deepen` fetch moves only the shallow boundaries of the
+ * refs it fetches; deepening the base's refspec, even naming `head`'s commit in
+ * the same fetch, leaves `head`'s boundary in place. A separate absolute
+ * `--depth` fetch of the commit moves it on every git version; the depth counts
+ * from the commits present, so history never shrinks. Best effort: a remote
+ * refusing a fetch by commit id leaves only the base deepened.
  */
 function deepenCommit(workDir: string, commitish: string, ctx: GitAuthCtx): void {
   let sha: string;
@@ -184,17 +179,16 @@ function deepenCommit(workDir: string, commitish: string, ctx: GitAuthCtx): void
 }
 
 /**
- * Compute the changed-files list from the agent's local clone, over the same
- * range the orchestrator uses (`resolveDiffRange`): a push reads the event's
- * own `before` / `after` commits, fetching them when the checkout lacks them;
- * a pull request diffs its base against the checked-out head. Ground truth for job/step rules, the workflow filter
- * and deferred `paths`. `auth` (the same credentials used for the clone)
- * authenticates the deepen / fetch calls so a private remote resolves.
+ * The changed files from the agent's local clone — ground truth for job/step
+ * rules, the workflow filter and deferred `paths` — over the orchestrator's
+ * range (`resolveDiffRange`): a push diffs the event's `before` / `after`
+ * (fetched when missing); a pull request diffs its base against the
+ * checked-out head. `auth` is the clone's credentials.
  *
- * Returns `unavailable` for an event with no range — a diff-less event
- * (schedule/tag/manual), a push without `before` or `after`, a new branch
- * with no other default branch to diff against — and for any git failure.
- * A deleted branch is `fetched` with no files. Never throws.
+ * `unavailable` for an event with no range (schedule/tag/manual, a push
+ * without `before` or `after`, a new branch with no other default branch) and
+ * for any git failure. A deleted branch is `fetched` with no files. Never
+ * throws.
  */
 export async function computeChangedFiles(
   workDir: string,

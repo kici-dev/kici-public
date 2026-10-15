@@ -49,10 +49,9 @@ export interface FeedbackContract {
 }
 
 /**
- * The single definition of what a reportable discrepancy is and what a report
- * must carry. `kici feedback` prints it, `--json` emits it verbatim, and a
- * repository test asserts the published guide says the same thing — so the
- * CLI and the doc cannot drift apart.
+ * The single definition of a reportable discrepancy and what a report carries.
+ * `kici feedback` prints it, `--json` emits it verbatim, and a repository test
+ * asserts the published guide matches, so CLI and doc cannot drift.
  */
 export const FEEDBACK_CONTRACT: FeedbackContract = {
   tracker: FEEDBACK_TRACKER_URL,
@@ -163,9 +162,9 @@ export function draftIssueUrl(draft: FeedbackDraft): string {
 }
 
 export interface FeedbackOptions {
-  /** Open the prefilled issue form in the default browser. */
+  /** Open the prefilled form in the default browser. */
   open?: boolean;
-  /** Emit the contract as JSON on stdout instead of prose. */
+  /** JSON on stdout instead of prose. */
   json?: boolean;
   /** Path to a JSON draft; print (and with --open, open) the prefilled issue-form URL. */
   draft?: string;
@@ -224,13 +223,9 @@ function printContract(): void {
 
 /**
  * Print the contract for reporting a KiCI discrepancy: what qualifies, what a
- * report must carry, what must never appear in a public issue, and the rule
- * that an agent drafts a report but a human decides to file it.
- *
- * The command reaches no network and files nothing. `--open` opens the
- * prefilled issue form; `--json` emits the same contract for an agent to
- * consume without parsing prose; `--draft <file>` builds the issue-form URL
- * with every field of a JSON draft prefilled.
+ * report carries, what never appears in a public issue, and that an agent
+ * drafts a report but a human decides to file it. Reaches no network and files
+ * nothing.
  */
 export async function feedbackCommand(options: FeedbackOptions = {}): Promise<boolean> {
   if (options.draft) return draftFromFile(options.draft, options.open === true);

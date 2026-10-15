@@ -12,12 +12,11 @@ export type CheckMode = z.infer<typeof CheckMode>;
 
 /**
  * Per-step idempotent outcome. The first four mirror the StepOutcome union in
- * @kici-dev/core/idempotency verbatim (skipped | applied | declined | dry-run);
- * `no_check` covers a plain step (no check facet) skipped under check mode
- * because it cannot be safely previewed.
+ * @kici-dev/core/idempotency verbatim; `no_check` is a plain step (no check
+ * facet) skipped under check mode because it cannot be safely previewed.
  *
- * Orthogonal to ExecutionStepStatus (success | failed | skipped), which stays the
- * top-level status. Dashboard chips map: applied -> "applied", skipped -> "in sync",
+ * Orthogonal to ExecutionStepStatus, which stays the top-level status.
+ * Dashboard chips: applied -> "applied", skipped -> "in sync",
  * dry-run -> "would change", no_check -> "no check".
  */
 export const CheckStepOutcome = z.enum(['skipped', 'applied', 'declined', 'dry-run', 'no_check']);

@@ -23,15 +23,13 @@ describe('keyDiscriminator', () => {
     expect(keyDiscriminator('bundle')).toBe(keyDiscriminator('bundle'));
   });
 
-  // Sanitizing is many-to-one: `seg()` maps both `/` and `_` to `_`, so two
-  // distinct names collapse to one path segment. Hashing the EXACT name is what
-  // keeps them apart.
+  // `seg()` maps both `/` and `_` to `_`; hashing the EXACT name keeps them apart.
   it('separates names that sanitize to the same segment', () => {
     expect(keyDiscriminator('a/b')).not.toBe(keyDiscriminator('a_b'));
   });
 
-  // The case this exists for: on a case-insensitive namespace the discriminator
-  // is the only thing separating names chosen by untrusted workflow code.
+  // On a case-insensitive namespace the discriminator alone separates names
+  // chosen by untrusted workflow code.
   it('separates names differing only by case', () => {
     expect(keyDiscriminator('build')).not.toBe(keyDiscriminator('Build'));
   });

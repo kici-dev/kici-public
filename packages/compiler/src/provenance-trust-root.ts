@@ -1,23 +1,19 @@
 /**
  * Trust-root resolution for `kici verify-attestation`.
  *
- * The verifier never blindly trusts a provenance token's own `iss`: the trusted
- * issuer + its JWKS are supplied out-of-band via `--trust-root`. This resolver
- * turns that flag into a concrete `{ issuer, jwks }`:
+ * The verifier never trusts a token's own `iss`: the issuer and JWKS come
+ * out-of-band via `--trust-root`, either
  *
- *  - an **HTTPS issuer URL** (online): fetch `<url>/.well-known/openid-configuration`,
- *    read its `issuer` + `jwks_uri`, then fetch the JWKS;
- *  - a **local file path** (offline / air-gapped): a self-contained
- *    `{ "issuer": "...", "jwks": { "keys": [...] } }` JSON document, no network.
+ *  - an **HTTP(S) issuer URL**: discovery at `<url>/.well-known/openid-configuration`
+ *    gives `issuer` and `jwks_uri`, then the JWKS is fetched; or
+ *  - a **local file** (air-gapped): `{ "issuer": "...", "jwks": { "keys": [...] } }`.
  *
- * Node-specific (`fetch` + `fs`) so the engine verify core stays pure /
- * browser-safe; the JWKS is passed straight through to the engine, which owns
- * the crypto, so this module defines only a structural `JsonWebKeySet` type
- * rather than depending on `jose`.
+ * Node-specific (`fetch`, `fs`) so the engine verify core stays browser-safe.
+ * The engine owns the crypto, so only a structural `JsonWebKeySet` is defined
+ * here instead of depending on `jose`.
  */
 import { readFile } from 'node:fs/promises';
 
-/** Structural JWKS shape — the engine verifier owns the real `jose` type. */
 export interface JsonWebKeySet {
   keys: Record<string, unknown>[];
 }
@@ -27,10 +23,7 @@ export interface TrustRoot {
   jwks: JsonWebKeySet;
 }
 
-/**
- * Resolve `--trust-root`: an HTTPS issuer URL (discovery → `jwks_uri` → JWKS) or
- * a self-contained offline file `{ issuer, jwks }`.
- */
+/** Discovery falls back to the base URL as issuer and `<base>/.well-known/jwks.json`. */
 export async function resolveTrustRoot(trustRoot: string): Promise<TrustRoot> {
   if (/^https?:\/\//.test(trustRoot)) {
     const base = trustRoot.replace(/\/+$/, '');

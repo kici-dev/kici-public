@@ -83,10 +83,9 @@ describe('buildClusterPatch', () => {
   });
 
   it('exits when a cache entry-count exceeds its ceiling, naming both bounds', () => {
-    // The ceiling is a boot-safety bound: the LRU allocates its index arrays
-    // eagerly from `max`, so an accepted over-ceiling value crashes the
-    // orchestrator at construction — before the admin API this CLI talks to is
-    // listening. Rejecting here is the good error message.
+    // A boot-safety bound: the LRU allocates its index arrays eagerly from
+    // `max`, so an over-ceiling value crashes the orchestrator at construction,
+    // before the admin API is listening. Rejecting here gives the good error.
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
       throw new Error('exit');
     });

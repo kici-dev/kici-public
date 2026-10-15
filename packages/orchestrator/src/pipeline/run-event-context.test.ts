@@ -1,10 +1,8 @@
 /**
- * Tests for the run event-context resolver.
- *
- * The load-bearing case is `isFork` on a NON-PR event. Leaving it unresolved
- * would make every `is_fork = 'false'` cloud trust policy reject legitimate
- * pushes, and the customer's fix — accepting `'unresolved'` too — re-opens the
- * hole the claim exists to close.
+ * Run event-context resolver. The load-bearing case is `isFork` on a NON-PR
+ * event: leaving it unresolved makes every `is_fork = 'false'` cloud trust
+ * policy reject legitimate pushes, and the customer's fix (also accepting
+ * `'unresolved'`) re-opens the hole the claim exists to close.
  */
 import { describe, expect, it } from 'vitest';
 import { resolveRunEventContext } from './run-event-context.js';
@@ -49,10 +47,9 @@ describe('resolveRunEventContext', () => {
   });
 
   it('ignores an isForkPR the normalizer could not actually resolve', () => {
-    // The shape a normalizer really emits for a deleted fork or a trimmed
-    // payload: `isForkPR` is `head !== base`, which collapses to `false` when
-    // there is no head repository to compare. Reading the flag alone would
-    // publish `is_fork = 'false'` for a pull request nobody resolved.
+    // A deleted fork or trimmed payload: `isForkPR` (`head !== base`) collapses
+    // to `false` with no head repository, so reading the flag alone would
+    // publish `is_fork = 'false'` for an unresolved pull request.
     expect(
       resolveRunEventContext({ type: 'pull_request', sourceBranch: 'patch-1', isForkPR: false }),
     ).toEqual({ headRef: 'patch-1', headRepository: null, isFork: null });

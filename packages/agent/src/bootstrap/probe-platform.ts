@@ -1,24 +1,18 @@
 /**
- * Probe a bring-up target's platform over SSH.
- *
- * A stock rescue box has nothing but sshd — no `kici-agent`, no Node — so we
- * cannot ask the box what to run; we must ask what it IS, then stage the
- * matching self-contained payload. One `uname -s -m` (+ a libc check) maps to
- * an `AgentPlatform`; an unsupported target (musl-only, non-Linux, unknown
- * arch) throws early, naming what was detected, rather than staging bytes that
- * won't boot.
+ * Probe a bring-up target's platform over SSH. A stock rescue box has only
+ * sshd (no `kici-agent`, no Node), so the probe asks what the box is, then the
+ * matching self-contained payload is staged. An unsupported target (musl,
+ * non-Linux, unknown arch) throws early, naming what was detected, rather than
+ * staging bytes that won't boot.
  */
 import { AgentPlatform } from '@kici-dev/shared';
 import { sshExec, type SshDeps } from './ssh-exec.js';
 import type { HostReach } from './reach.js';
 
-/** The remote probe: OS + machine, then the libc flavor (glibc vs musl). */
+/** OS + machine, then the libc flavor (glibc vs musl). */
 const PROBE_COMMAND = 'uname -s -m; (ldd --version 2>&1 | head -1) || true';
 
-/**
- * Map `uname -s -m` (+ libc line) output to an `AgentPlatform`. Pure + directly
- * unit-tested. Throws a self-describing error for any unsupported target.
- */
+/** Map `uname -s -m` (+ libc line) output to an `AgentPlatform`; pure. */
 export function parseUname(stdout: string): AgentPlatform {
   const lines = stdout.split('\n');
   const unameLine = (lines[0] ?? '').trim();
@@ -41,7 +35,6 @@ export function parseUname(stdout: string): AgentPlatform {
   );
 }
 
-/** SSH into `reach` and detect its `AgentPlatform` (one probe, fail-fast on unsupported). */
 export async function probeTargetPlatform(
   reach: HostReach,
   privateKey: string,

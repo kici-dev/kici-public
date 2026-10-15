@@ -35,10 +35,8 @@ export interface AccessLogRecord {
   outcome: AccessLogOutcome;
   errorMessage?: string | null;
   /**
-   * Extra key/value pairs merged into `actor_meta` on insert. Lets
-   * callers attach action-specific context (e.g. which dashboard-write
-   * operation flipped) without overloading other columns. Values must
-   * be JSON-serialisable.
+   * Merged into `actor_meta` on insert, for action-specific context (e.g. which
+   * dashboard-write operation flipped). Values must be JSON-serialisable.
    */
   meta?: Record<string, unknown>;
 }
@@ -70,15 +68,13 @@ export interface AccessLogQueryResult {
 }
 
 /**
- * Best-effort writer for the orchestrator `access_log` table. Records one
- * row per read / orchestrator-admin mutation attributable to an
- * ActorPrincipal. Callers get their actor from the incoming Platform proxy
- * message (`msg.actor`) or from the admin HTTP auth chain.
+ * Best-effort writer for `access_log`: one row per read / orchestrator-admin
+ * mutation attributable to an ActorPrincipal (from the Platform proxy's
+ * `msg.actor` or the admin HTTP auth chain).
  *
- * Failure mode: insert errors are logged and swallowed — a broken
- * access_log table MUST NOT take down dashboard reads. Use `secret_audit_log`
- * for the always-consistent secret mutation path; `access_log` is the
- * read + broad-surface audit stream.
+ * Insert errors are logged and swallowed — a broken access_log MUST NOT take
+ * down dashboard reads. `secret_audit_log` is the always-consistent secret
+ * mutation path; `access_log` is the read + broad-surface audit stream.
  */
 export class AccessLogWriter {
   private readonly db: Kysely<Database>;
@@ -96,20 +92,17 @@ export class AccessLogWriter {
   }
 
   /**
-   * Late-binding setter for the cold-store handle. orchestrator-core
-   * builds AccessLogWriter before the cold-store singleton, then
-   * attaches it via this setter (mirrors AuditLogger.setColdStore).
+   * Late binding: orchestrator-core builds this before the cold-store
+   * singleton (mirrors AuditLogger.setColdStore).
    */
   setColdStore(coldStore: ColdStore | null): void {
     this.coldStore = coldStore ?? undefined;
   }
 
   async record(entry: AccessLogRecord): Promise<void> {
-    // The whole body runs under a single try/catch so the documented
-    // best-effort contract holds for every call site. Callers do not
-    // await it (they run it through `runDetached`), and a throw from the
-    // policy gate or the limiter must not reach the process as an
-    // unhandled rejection, which the shutdown hook treats as fatal.
+    // Callers run this through `runDetached` unawaited, so a throw from the
+    // policy gate or limiter would be an unhandled rejection, which the
+    // shutdown hook treats as fatal.
     try {
       await this.insert(this.db, entry);
     } catch (err) {
@@ -122,19 +115,13 @@ export class AccessLogWriter {
   }
 
   /**
-   * Transactional variant: writes the row through the caller's executor so it
-   * commits or rolls back with the mutation it audits.
+   * Writes through the caller's executor so the row commits or rolls back with
+   * the mutation it audits. Unlike `record`, failures PROPAGATE: a caller that
+   * opts into a transaction asserts the mutation must not land unaudited.
    *
-   * Unlike `record`, failures PROPAGATE. The best-effort swallow exists so a
-   * broken `access_log` cannot take down dashboard reads; a caller that opted
-   * into a transaction is asserting the opposite — the mutation must not land
-   * unaudited — so the error has to reach the transaction and abort it.
-   *
-   * The per-action `POLICY_BY_ACTION` gate still applies, so a `sample` /
-   * `rate_limit` action would be dropped here silently and the caller's
-   * mutation would commit unaudited after all. Callers must therefore use an
-   * action whose policy is `always` — which is why `trust_policy.updated` is
-   * one.
+   * The `POLICY_BY_ACTION` gate still applies, so a `sample` / `rate_limit`
+   * action would be dropped silently and the mutation would commit unaudited.
+   * Callers must use an `always` action — why `trust_policy.updated` is one.
    */
   async recordInTransaction(
     executor: Kysely<Database> | Transaction<Database>,
@@ -147,9 +134,8 @@ export class AccessLogWriter {
     executor: Kysely<Database> | Transaction<Database>,
     entry: AccessLogRecord,
   ): Promise<void> {
-    // Apply the engine's per-action policy (sample / rate-limit / always)
-    // with the platform_operator + denied/error overrides. Drops here are
-    // the volume-reduction half of the design.
+    // Per-action policy (sample / rate-limit / always) with the
+    // platform_operator + denied/error overrides; drops here reduce volume.
     if (
       !shouldRecordAccess(
         entry.action,
@@ -163,9 +149,8 @@ export class AccessLogWriter {
     }
     const { actorType, actorId, actorMeta } = flattenActor(entry.actor);
     const mergedMeta = entry.meta ? { ...(actorMeta ?? {}), ...entry.meta } : actorMeta;
-    // An agent-kind credential carries its label on the user (PAT) or api_key
-    // actor; promote it to a queryable column so the access log can be
-    // filtered by agent regardless of credential family.
+    // Promoted to a column so the log filters by agent across credential
+    // families (the label rides on the user (PAT) or api_key actor).
     const agentLabel = agentLabelOf(entry.actor);
     await executor
       .insertInto('access_log')
@@ -188,10 +173,8 @@ export class AccessLogWriter {
   }
 
   /**
-   * Delegates to `loadAccessLogRange` so cold-store rows are
-   * merged transparently when pagination crosses the warm cutoff. The
-   * caller-visible `{items, nextCursor}` shape is preserved. NO
-   * --include-archived flag — access_log is "paginated/transparent".
+   * Cold-store rows merge transparently when pagination crosses the warm
+   * cutoff. NO --include-archived flag — access_log is "paginated/transparent".
    */
   async query(filter: AccessLogQueryFilter): Promise<AccessLogQueryResult> {
     const limit = Math.max(1, Math.min(filter.limit ?? 50, 200));
@@ -219,22 +202,17 @@ export class AccessLogWriter {
   }
 
   /**
-   * Detail lookup by row id. Hot first; on miss falls back to a single
-   * cold-store tenant scan filtering by `id`. Mirrors the
-   * `loadEventLogByDeliveryId` pattern in `load-event-log-range.ts` —
-   * cold-store is partitioned by `(tenant_id, day)` with no cross-tenant
-   * `id` index, so the caller MUST scope the cold scan to one tenant.
+   * Hot first, then one cold-store tenant scan by `id` (like
+   * `loadEventLogByDeliveryId` in `load-event-log-range.ts`): cold-store is
+   * partitioned by `(tenant_id, day)` with no cross-tenant `id` index, so the
+   * scan MUST be scoped to one tenant.
    *
-   * `opts.orgId` supplies the tenant scope. When omitted, only the
-   * synthetic `__orchestrator__` tenant is scanned (matches the
-   * NULL-org_id rows the orchestrator itself emits via
-   * `cold-store-archive` / `cold-store-purge`). The CLI exposes this as
-   * `kici-admin access-log show <id> --org <orgId>`.
+   * `opts.orgId` is that scope; omitted ⇒ only the synthetic `__orchestrator__`
+   * tenant (the NULL-org_id rows `cold-store-archive` / `cold-store-purge`
+   * emit). CLI: `kici-admin access-log show <id> --org <orgId>`.
    *
-   * Best-effort contract: a cold-store error logs a warn line and
-   * returns null, matching `loadAccessLogRange` and
-   * `loadEventLogByDeliveryId`. A transient S3 outage MUST NOT
-   * manufacture a misleading 404-vs-500 distinction at the HTTP layer.
+   * Best-effort, like `loadAccessLogRange`: a cold-store error warns and returns
+   * null, so a transient S3 outage never fakes a 404-vs-500 distinction.
    */
   async getById(id: string, opts?: { orgId?: string }): Promise<AccessLogItem | null> {
     const hot = await this.db

@@ -1,6 +1,4 @@
-/**
- * Cold-store configuration types.
- */
+/** Cold-store configuration types. */
 import type { SharedS3Config } from '../s3-client.js';
 
 /**
@@ -14,9 +12,8 @@ export interface ColdStoreTableConfig {
   /** Minimum age (in days) before a row is eligible to archive. */
   warmTtlDays: number;
   /**
-   * Floor for total warm bytes per tenant per table. Below this, no
-   * archival happens — even if rows are old. Prevents thrashing on
-   * low-traffic tenants.
+   * Floor for total warm bytes per tenant per table. Below it nothing is
+   * archived, even old rows, which prevents thrashing on low-traffic tenants.
    */
   minWarmTenantBytes: number;
   /** Floor for chunk size. Smaller eligible sets are deferred. */
@@ -29,10 +26,7 @@ export interface ColdStoreTableConfig {
   enabled: boolean;
 }
 
-/**
- * Reasonable defaults.
- * Concrete adapters can override any subset of these.
- */
+/** Defaults; concrete adapters can override any subset. */
 export const DEFAULT_TABLE_CONFIG: ColdStoreTableConfig = {
   warmTtlDays: 30,
   minWarmTenantBytes: 5 * 1024 * 1024,
@@ -42,19 +36,11 @@ export const DEFAULT_TABLE_CONFIG: ColdStoreTableConfig = {
   enabled: true,
 };
 
-/**
- * Top-level cold-store configuration passed to `BaseColdStore`.
- */
+/** Top-level cold-store configuration passed to `BaseColdStore`. */
 export interface ColdStoreConfig {
-  /**
-   * S3-compatible storage config. The `prefix` defaults to
-   * `'cold-store/'` when unset.
-   */
+  /** S3-compatible storage config. `prefix` defaults to `'cold-store/'`. */
   storage: SharedS3Config;
-  /**
-   * Per-table overrides keyed by table name; unset tables use
-   * DEFAULT_TABLE_CONFIG.
-   */
+  /** Per-table overrides keyed by table name; unset tables use DEFAULT_TABLE_CONFIG. */
   tables: Record<string, Partial<ColdStoreTableConfig>>;
   /** Global concurrency cap on in-flight S3 PUTs. Default 4. */
   s3Concurrency: number;
@@ -62,10 +48,7 @@ export interface ColdStoreConfig {
   enabled: boolean;
 }
 
-/**
- * Merge DEFAULT_TABLE_CONFIG with overrides to produce the effective
- * per-table config.
- */
+/** Merge DEFAULT_TABLE_CONFIG with overrides into the effective per-table config. */
 export function resolveTableConfig(
   overrides: Partial<ColdStoreTableConfig> | undefined,
 ): ColdStoreTableConfig {

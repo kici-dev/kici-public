@@ -1758,25 +1758,19 @@ export async function runServer(
           // route instead of leaking the canonical `org_<12-char>` id.
           sub.checkRunReporter.setOrgPublicAliasResolver(() => platformClient.getOrgPublicAlias());
 
-          // Bind LogPullHandler send to platformClient.sendRaw
           logPullSendFn = (msg) => platformClient.sendRaw(msg);
 
-          // Bind DashboardHandler send to platformClient.sendRaw
           dashboardSendFn = (msg) => platformClient.sendRaw(msg);
 
           // Bind DashboardContextHandler send to platformClient.sendRaw
           dashboardEnvSendFn = (msg) => platformClient.sendRaw(msg);
 
-          // Bind DashboardRegistrationsHandler send to platformClient.sendRaw
           dashboardRegSendFn = (msg) => platformClient.sendRaw(msg);
 
-          // Bind DashboardBackendsHandler send to platformClient.sendRaw
           dashboardBackendsSendFn = (msg) => platformClient.sendRaw(msg);
 
-          // Bind DashboardFleetWriteHandler send to platformClient.sendRaw
           dashboardFleetWriteSendFn = (msg) => platformClient.sendRaw(msg);
 
-          // Bind DashboardGlobalWorkflowsHandler send to platformClient.sendRaw
           dashboardGlobalWorkflowsSendFn = (msg) => platformClient.sendRaw(msg);
 
           // Live source propagation: when a source is added/removed on this running

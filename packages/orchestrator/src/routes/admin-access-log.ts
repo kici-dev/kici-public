@@ -1,10 +1,8 @@
 /**
- * Admin API routes for the access log (access_log table).
- *
- * Operator-facing read access to read + orchestrator-admin mutation attempts
- * captured with ActorPrincipal attribution. Mirrors the dashboard's
- * dashboard.access-log.list WS handler but exposed over HTTP + Bearer auth
- * so operators can read it from the CLI without going through the dashboard.
+ * Admin API routes for the access log (access_log table): read and
+ * orchestrator-admin mutation attempts with ActorPrincipal attribution.
+ * Mirrors the dashboard.access-log.list WS handler over HTTP + Bearer auth, so
+ * operators can read it from the CLI.
  *
  *   GET /api/v1/admin/access-log
  *     Filters: orgId, actorType, actorId, action, source, outcome,
@@ -49,9 +47,8 @@ export function createAdminAccessLogRoutes(deps: AdminAccessLogRoutesDeps): Hono
   app.use('/api/v1/admin/access-log', authMiddleware);
   app.use('/api/v1/admin/access-log/*', authMiddleware);
 
-  // The access log is orchestrator-wide (it tracks all tenants in one
-  // table). Routing-key-scoped tokens get no slice they could safely
-  // see, so the route is refused entirely.
+  // The access log tracks all tenants in one table, so a routing-key-scoped
+  // token has no slice it could safely see: refused entirely.
   app.use('/api/v1/admin/access-log', requireUnscoped);
   app.use('/api/v1/admin/access-log/*', requireUnscoped);
 
@@ -106,11 +103,9 @@ export function createAdminAccessLogRoutes(deps: AdminAccessLogRoutesDeps): Hono
   app.get('/api/v1/admin/access-log/:id', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'access_log.read');
     const id = c.req.param('id');
-    // `?orgId=` is a tenant-scope hint for the cold-store fallback when
-    // the row was archived (>30d). Empty-string normalises to undefined
-    // so a stray `?orgId=` (no value) is treated as "no hint", which
-    // matches the CLI default. No Zod validation needed — getById
-    // doesn't trust the value for any auth decision.
+    // `?orgId=` is a tenant-scope hint for the cold-store fallback on an
+    // archived row (>30d); an empty value means "no hint", matching the CLI
+    // default. Unvalidated: getById trusts it for no auth decision.
     const orgId = c.req.query('orgId') || undefined;
     const item = await deps.accessLog.getById(id, { orgId });
     if (!item) return c.json({ error: 'Access log entry not found' }, 404);

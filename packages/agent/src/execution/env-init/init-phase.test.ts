@@ -239,8 +239,8 @@ describe('runInitPhase', () => {
       sendIpc: send,
       stepIndexBase: 0,
       env: {
-        // P1 port: allocate fresh KICI_ENV/KICI_PATH files, expose, and after the
-        // command read+parse+apply+truncate. Test stubs return a fixed delta.
+        // The real port allocates KICI_ENV/KICI_PATH files, then reads, applies and
+        // truncates them after the command; these stubs return a fixed delta.
         beginCapture: vi.fn().mockResolvedValue(undefined),
         applyDelta: vi.fn(async () => {
           applied.push({ env: { TOOL_HOME: '/x' }, path: ['/x/bin'] });
@@ -252,9 +252,9 @@ describe('runInitPhase', () => {
   });
 
   it('calls beginCapture BEFORE building the shell (so the env snapshot sees KICI_ENV/KICI_PATH)', async () => {
-    // The sandbox shell snapshots process.env at construction time, so the P1
-    // env files must be pointed-at before shellFor runs — otherwise the init
-    // command sees $KICI_ENV/$KICI_PATH as unbound under `set -u`.
+    // The sandbox shell snapshots process.env at construction time, so the
+    // env-handoff files must be set up before shellFor runs, or the init command
+    // sees $KICI_ENV/$KICI_PATH as unbound under `set -u`.
     const { send } = collectIpc();
     const order: string[] = [];
     const result = await runInitPhase({
@@ -298,7 +298,7 @@ describe('runInitPhase', () => {
     let call = 0;
     const port = {
       beginCapture: vi.fn().mockResolvedValue(undefined),
-      // Simulate P1 applying a per-spec delta into a shared env map.
+      // Applies a per-spec delta into a shared env map.
       applyDelta: vi.fn(async () => {
         if (call++ === 0) {
           env.TOOL = 'a';
@@ -323,7 +323,6 @@ describe('runInitPhase', () => {
 
   it('fails an init that exceeds its timeout with the P3 timeout reason', async () => {
     const { send, msgs } = collectIpc();
-    // shell that never resolves until aborted
     const hangingShell = (() => new Promise(() => {})) as unknown as typeof import('zx').$;
     const result = await runInitPhase({
       specs: [{ run: 'sleep forever', timeout: 20 }],

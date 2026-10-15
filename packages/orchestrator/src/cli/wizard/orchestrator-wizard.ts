@@ -1,10 +1,4 @@
-/**
- * Interactive wizard for orchestrator service setup.
- *
- * Walks the user through essential configuration (mode, DB URL,
- * port, secrets key) with sensible defaults. Returns a config
- * object that the install command uses to write the env file.
- */
+/** Interactive orchestrator setup wizard; install writes its result to the env file. */
 
 import { randomBytes } from 'node:crypto';
 import { access } from 'node:fs/promises';
@@ -30,17 +24,14 @@ export interface OrchestratorSourceHint {
   webhookSecret?: string;
 }
 
-/** Inputs the install command threads into the wizard. */
 export interface OrchestratorWizardOptions {
   /**
-   * Preselect the operating-mode prompt (from `orchestrator install --mode`).
-   * Defaults to `hybrid`, the recommended shape: the Platform relay plus this
-   * orchestrator's own direct webhook ingress.
+   * Preselected mode (`orchestrator install --mode`). Defaults to `hybrid`:
+   * the Platform relay plus this orchestrator's own direct webhook ingress.
    */
   defaultMode?: OrchestratorMode;
 }
 
-/** Config produced by the orchestrator wizard. */
 interface OrchestratorInstallConfig {
   mode: OrchestratorMode;
   databaseUrl: string;
@@ -51,7 +42,6 @@ interface OrchestratorInstallConfig {
   platformToken?: string;
   /** Public base URL of this orchestrator's own ingress (required in observed mode). */
   webhookPublicUrl?: string;
-  /** GitHub App source to add after the orchestrator is running. */
   source?: OrchestratorSourceHint;
 }
 
@@ -61,12 +51,9 @@ function shq(value: string): string {
 }
 
 /**
- * Render the post-install next-step lines for adding the collected GitHub App
- * source. The primary command inlines the webhook secret (copy-paste-runnable);
- * when a secret is present a "Secure alternative" pipes it via stdin so the
- * secret stays out of the process argument list (printf is a shell builtin, and
- * kici-admin receives the value on stdin — so it never appears in `ps`). Returns
- * indented lines for the install "Next steps" block.
+ * "Next steps" lines for adding the collected GitHub App source. The primary
+ * command inlines the webhook secret; a "Secure alternative" pipes it through
+ * stdin from the `printf` builtin, so it never appears in `ps`.
  */
 export function formatSourceAddHint(hint: OrchestratorSourceHint): string[] {
   const key = shq(`@${hint.privateKeyPath}`);
@@ -86,9 +73,8 @@ export function formatSourceAddHint(hint: OrchestratorSourceHint): string[] {
 }
 
 /**
- * Check that the private-key path the operator gave is readable. Returns a
- * warning string when it is not, so the wizard can surface it without aborting
- * the whole install — the source is opt-in and secondary to the orchestrator.
+ * A warning when the private-key path is unreadable, so the wizard surfaces it
+ * without aborting the install (the source is opt-in and secondary).
  */
 export async function checkPrivateKeyReadable(keyPath: string): Promise<string | null> {
   try {
@@ -100,25 +86,14 @@ export async function checkPrivateKeyReadable(keyPath: string): Promise<string |
 }
 
 /**
- * Default Platform relay URL offered by the install wizard. Kept in lockstep
- * with the quickstart compose `KICI_PLATFORM_URL` value (`wss://api.kici.dev/ws`)
- * — the single hosted KiCI Platform relay endpoint. Pinned by
- * orchestrator-wizard.test.ts so the two surfaces cannot drift.
+ * Default Platform relay URL; kept in lockstep with the quickstart compose
+ * `KICI_PLATFORM_URL`, pinned by orchestrator-wizard.test.ts.
  */
 export const DEFAULT_PLATFORM_RELAY_URL = 'wss://api.kici.dev/ws';
 
 /**
- * Run the interactive orchestrator setup wizard.
- *
- * Asks only essential questions per the user decision:
- * 1. Mode (hybrid/platform/observed/independent)
- * 2. Database URL
- * 3. Port
- * 4. Secrets encryption key
- * 5. Bootstrap admin token (for kici-admin authentication)
- * 6. Platform URL + token (if platform/hybrid/observed mode), plus the public
- *    webhook base URL -- required in observed mode, optional in hybrid
- * 7. Webhook secret (if hybrid/independent mode)
+ * Asks only the essential questions. The public webhook base URL is required in
+ * observed mode and optional in hybrid.
  */
 export async function runOrchestratorWizard(
   opts: OrchestratorWizardOptions = {},
@@ -128,7 +103,6 @@ export async function runOrchestratorWizard(
   console.log('==============================');
   console.log('');
 
-  // 1. Mode
   const mode = await promptSelect<OrchestratorMode>(
     'Operating mode:',
     [
@@ -156,14 +130,11 @@ export async function runOrchestratorWizard(
     opts.defaultMode ?? OrchestratorMode.enum.hybrid,
   );
 
-  // 2. Database URL
   console.log('');
   const databaseUrl = await promptDbUrl();
 
-  // 3. Port
   const port = await promptPort(4000);
 
-  // 4. Secrets encryption key
   console.log('');
   const generatedKey = randomBytes(32).toString('hex');
   console.log(`Generated secrets key: ${generatedKey}`);
@@ -175,8 +146,7 @@ export async function runOrchestratorWizard(
     secretsKey = await promptSecret('Enter custom secrets encryption key (64 hex chars):');
   }
 
-  // 5. Bootstrap admin token (used by `kici-admin` to authenticate against
-  //    this orchestrator — e.g. `kici-admin source add`)
+  // The bootstrap admin token authenticates `kici-admin` to this orchestrator.
   console.log('');
   const generatedAdminToken = randomBytes(32).toString('hex');
   console.log(`Generated bootstrap admin token: ${generatedAdminToken}`);
@@ -188,7 +158,6 @@ export async function runOrchestratorWizard(
     bootstrapAdminToken = await promptSecret('Enter custom bootstrap admin token:');
   }
 
-  // 6. Platform connection (platform/hybrid/observed modes)
   let platformUrl: string | undefined;
   let platformToken: string | undefined;
   let webhookPublicUrl: string | undefined;
@@ -204,10 +173,9 @@ export async function runOrchestratorWizard(
       'https://kici.example.com',
     );
   } else if (mode === OrchestratorMode.enum.hybrid) {
-    // Optional in hybrid: the relay already delivers every webhook. A public
-    // base URL additionally lets providers post straight here, so a Platform
-    // outage cannot drop a delivery. Leaving it blank keeps relay-only
-    // ingestion and the route stays served but unadvertised.
+    // Optional in hybrid: the relay delivers every webhook, and a public URL lets
+    // providers post here too, so a Platform outage drops nothing. Blank keeps
+    // relay-only ingestion; the route stays served but unadvertised.
     console.log('');
     console.log("Hybrid also serves this orchestrator's own webhook ingress.");
     console.log('Give its public base URL to have providers post directly, or leave it');
@@ -217,7 +185,7 @@ export async function runOrchestratorWizard(
     );
   }
 
-  // 7. Source setup (optional). Every mode can hold a GitHub App source.
+  // Every mode can hold a GitHub App source.
   let source: OrchestratorInstallConfig['source'];
   console.log('');
   const addSource = await promptConfirm('Add a GitHub App source?', false);

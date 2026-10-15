@@ -113,7 +113,6 @@ export interface SharedConfig {
 export interface AppConfig {
   /** Unique identifier for this orchestrator instance */
   instanceId: string;
-  /** Operating mode */
   mode: OrchestratorMode;
 
   // --- From LocalConfig ---
@@ -221,9 +220,7 @@ export interface AppConfig {
   /** Inbound webhook delivery log: soft cap (bytes). Oversized deliveries are
    *  recorded with payload_omitted=true rather than 413'd. */
   eventLogMaxPayloadBytes: number;
-  /** Log level */
   logLevel: 'debug' | 'info' | 'warn' | 'error';
-  /** Node environment */
   nodeEnv: 'development' | 'production' | 'test';
 }
 

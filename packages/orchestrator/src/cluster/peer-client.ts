@@ -147,17 +147,14 @@ type PeerConnectionState =
   'disconnected' | 'connecting' | 'handshaking' | 'authenticating' | 'connected';
 
 export interface PeerClientOptions {
-  /** WebSocket URL of the remote peer orchestrator. */
   url: string;
-  /** Join token for first-time cluster join (optional if credential file exists). */
+  /** For a first-time cluster join; optional when the credential file exists. */
   joinToken?: string;
-  /** Path to the credential file for reconnection. */
   credentialFile: string;
   /** Shared per-orchestrator coordinator that owns the credential file. */
   authCoordinator: PeerAuthCoordinator;
-  /** This orchestrator's instance ID. */
   instanceId: string;
-  /** Peer registry to update on heartbeats from remote peer. */
+  /** Updated on the remote peer's heartbeats. */
   peerRegistry: PeerRegistry;
   /**
    * Where the dialled address came from. A static target reconnects with
@@ -174,51 +171,42 @@ export interface PeerClientOptions {
   handshakeTimeoutMs?: number;
   /** Called when a discovered target fails mutual authentication; the client then stays down. */
   onMutualAuthFailed?: (failure: PeerMutualAuthFailure) => void;
-  /** Callback to get this orchestrator's local agent inventory for heartbeats. */
+  /** This orchestrator's local agent inventory, for heartbeats. */
   getLocalInventory: () => Omit<PeerHeartbeat, 'type'>;
-  /** Heartbeat interval in ms. Default: 30000 (30s). */
+  /** In ms. Default: 30000. */
   heartbeatIntervalMs?: number;
-  /** Maximum reconnect delay in ms. Default: 60000 (60s). */
+  /** In ms. Default: 60000. */
   maxReconnectDelayMs?: number;
-  /** Callback when a job reroute request is received from peer. */
   onJobReroute: (msg: JobReroute) => Promise<void>;
-  /** Callback when a job progress update is received from peer. */
   onJobProgress: (msg: JobProgress, fromPeerId: string, reply: (m: JobProgressAck) => void) => void;
   /**
-   * Callback invoked once this client reaches the `connected` state (initial
-   * connect AND every reconnect). Carries this client's peer URL.
+   * Called on reaching `connected`: the initial connect AND every reconnect.
+   * Carries this client's peer URL.
    */
   onConnected?: (url: string) => void;
-  /** Callback when a coordinator ACKs a terminal job.progress this worker sent. */
+  /** A coordinator ACKed a terminal job.progress this worker sent. */
   onJobProgressAck?: (msg: JobProgressAck) => void;
-  /** This orchestrator's role. Default: 'coordinator'. */
+  /** Default: 'coordinator'. */
   role?: 'coordinator' | 'worker';
-  /** Callback when a job cancel request is received from peer. */
   onJobCancel: (msg: PeerJobCancel) => void;
-  /** Callback when a log chunk is received from a peer (coordinator side). */
+  /** Coordinator side. */
   onPeerLogChunk?: (chunk: PeerLogChunk) => void;
-  /** Callback when a cache upload request is received from a peer (coordinator side). */
+  /** Coordinator side. */
   onPeerCacheUploadRequest?: (req: PeerCacheUploadRequest) => Promise<PeerCacheUploadResponse>;
-  /** Callback for Raft vote requests. */
   onRaftVoteRequest?: (msg: RaftVoteRequest) => RaftVoteResponse;
-  /** Callback for Raft vote responses (forwarded to Raft module). */
+  /** Forwarded to the Raft module. */
   onRaftVoteResponse?: (msg: RaftVoteResponse) => void;
-  /** Callback for Raft append entries (leader heartbeat). */
+  /** The leader heartbeat. */
   onRaftAppendEntries?: (msg: RaftAppendEntries) => void;
-  /** Callback when a peer.leaving announcement is received. */
   onPeerLeaving?: (msg: PeerLeaving) => void;
   /**
-   * Callback when a peer.agent-token.revoke announcement is received.
-   * The local handler should call agentRegistry.disconnectByTokenId(tokenId)
-   * to close every in-flight WS authenticated by the now-revoked token.
+   * Should call agentRegistry.disconnectByTokenId(tokenId) to close every
+   * in-flight WS authenticated by the revoked token.
    */
   onAgentTokenRevoke?: (msg: PeerAgentTokenRevoke) => void;
   /**
-   * Callback when a config reload request is received from the peer.
-   * Should execute a local config reload and return the result fields,
-   * which are sent back via peer.config.reload.response.
-   *
-   * If undefined, incoming reload requests are answered with success=false.
+   * Runs a local config reload; the result is sent back as
+   * peer.config.reload.response. If undefined, requests get success=false.
    */
   onPeerConfigReload?: (msg: PeerConfigReload) => Promise<{
     success: boolean;
@@ -228,18 +216,15 @@ export interface PeerClientOptions {
     fieldsChanged?: string[];
   }>;
   /**
-   * Callback invoked once the remote peer accepts our auth handshake,
-   * carrying the remote peer's instanceId. Used by callers that initially
-   * register this client in `sub.peerClients` keyed by a placeholder (URL
-   * or stale id) to re-key the map by the canonical instanceId so later
-   * Platform-mediated discovery dedupes against the same client.
+   * Called once the remote peer accepts the auth handshake. Lets a caller that
+   * keyed `sub.peerClients` by a placeholder (URL or stale id) re-key it by the
+   * canonical instanceId, so later Platform-mediated discovery dedupes against
+   * the same client.
    */
   onAuthenticated?: (targetInstanceId: string) => void;
   /**
-   * Callback when a peer.logs.collect.request is received from the peer. Builds
-   * this node's subtree bundle and streams it back via the supplied `send`
-   * (peer.logs.collect.chunk frames, or a peer.logs.collect.error on failure).
-   * If undefined, incoming collect requests are ignored.
+   * Streams this node's subtree bundle back as peer.logs.collect.chunk frames,
+   * or a peer.logs.collect.error on failure. If undefined, requests are ignored.
    */
   onLogsCollectRequest?: PeerLogsCollectResponder;
   /**
@@ -271,34 +256,23 @@ export type PeerLogsCollectResponder = (
   send: (out: PeerToPeerMessage) => boolean,
 ) => Promise<void>;
 
-/**
- * Tracks pending ACKs for job.reroute messages.
- */
+/** A pending job.reroute ACK. */
 interface AckWaiter {
   resolve: (accepted: boolean) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
-/**
- * Tracks pending cache upload responses.
- */
 interface CacheWaiter {
   resolve: (response: PeerCacheUploadResponse) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
-/**
- * Tracks pending config reload responses.
- */
 interface ConfigReloadWaiter {
   resolve: (response: PeerConfigReloadResponse) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
-/**
- * Tracks pending cluster-settings pull responses.
- */
 interface ClusterSettingsWaiter {
   resolve: (response: PeerClusterSettingsResponse | null) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -335,7 +309,7 @@ export class PeerClient {
   private readonly authCoordinator: PeerAuthCoordinator;
   /** Set true between deciding token-join and receiving the auth response. */
   private isJoiner = false;
-  /** complete() callback for the in-flight token-join, if this client is joiner. */
+  /** complete() for the in-flight token-join, when this client is the joiner. */
   private joinComplete: ((issued: CredentialFileData | null) => void) | null = null;
   /** The credential string this client last built a proof with. */
   private lastProvedCredential: string | null = null;
@@ -413,19 +387,15 @@ export class PeerClient {
     this.onPeerForgetRequest = options.onPeerForgetRequest;
   }
 
-  /** Current connection state. */
   get state(): PeerConnectionState {
     return this._state;
   }
 
-  /** The remote peer's instanceId (set after auth handshake). */
+  /** Set after the auth handshake. */
   get targetInstanceId(): string | null {
     return this._targetInstanceId;
   }
 
-  /**
-   * Initiate connection to the peer orchestrator.
-   */
   connect(): void {
     if (this._state !== 'disconnected') {
       logger.warn('connect() called while not disconnected', { state: this._state });
@@ -436,9 +406,7 @@ export class PeerClient {
     this.doConnect();
   }
 
-  /**
-   * Gracefully disconnect. Does not trigger reconnection.
-   */
+  /** Graceful; does not trigger reconnection. */
   disconnect(): void {
     this.intentionalDisconnect = true;
     this.stopHeartbeat();
@@ -468,8 +436,7 @@ export class PeerClient {
   }
 
   /**
-   * Send a peer protocol message. Returns false if not connected.
-   * Messages are encrypted with the session key.
+   * Encrypts with the session key. Returns false if not connected.
    */
   send(msg: PeerToPeerMessage): boolean {
     if (
@@ -485,8 +452,7 @@ export class PeerClient {
   }
 
   /**
-   * Send a message and wait for an ACK response.
-   * Used for job.reroute which expects job.reroute.ack.
+   * Send a job.reroute and wait for its job.reroute.ack.
    *
    * @returns true if accepted, false if rejected or timeout
    */
@@ -504,8 +470,7 @@ export class PeerClient {
   }
 
   /**
-   * Send a log chunk to the coordinator (worker -> coordinator relay).
-   * Fire-and-forget: no ACK expected.
+   * Worker -> coordinator log relay. Fire-and-forget: no ACK expected.
    */
   sendLogChunk(chunk: PeerLogChunk): boolean {
     return this.send(chunk);
@@ -623,8 +588,7 @@ export class PeerClient {
   }
 
   /**
-   * Send a cache upload request to the coordinator and wait for a response
-   * with a pre-signed URL.
+   * Ask the coordinator for a pre-signed cache upload URL.
    *
    * @returns The response with the uploadUrl, or rejects on timeout/disconnect.
    */
@@ -646,9 +610,7 @@ export class PeerClient {
     });
   }
 
-  /**
-   * Calculate the reconnection delay with exponential backoff and jitter.
-   */
+  /** Exponential backoff with jitter. */
   getReconnectDelay(): number {
     return getReconnectDelay(this.reconnectAttempts, this.maxReconnectDelayMs);
   }
@@ -660,9 +622,8 @@ export class PeerClient {
 
     try {
       this.ws = new WebSocket(this.url, {
-        // Cap the maximum decompressed frame size so a rogue or
-        // compromised peer orchestrator cannot OOM us via a compression bomb.
-        // Without this, ws@8.x defaults to 100 MiB.
+        // Caps the decompressed frame size so a rogue peer cannot OOM us with a
+        // compression bomb. Without it, ws@8.x defaults to 100 MiB.
         maxPayload: WS_MAX_PAYLOAD_BYTES,
         perMessageDeflate: {
           concurrencyLimit: 10,
@@ -1027,7 +988,6 @@ export class PeerClient {
       PeerAuthScheme.enum['mutual-v2'],
     );
 
-    // Populate registry with auth response capabilities
     if (msg.agents || msg.scalerCapacity) {
       this.peerRegistry.updateHeartbeat(msg.instanceId, {
         type: 'peer.heartbeat',
@@ -1042,7 +1002,6 @@ export class PeerClient {
       });
     }
 
-    // Send immediate heartbeat
     if (this.ws && this.ws.readyState === WebSocket.OPEN && this.sessionKey) {
       const inventory = this.getLocalInventory();
       this.ws.send(
@@ -1055,12 +1014,12 @@ export class PeerClient {
   }
 
   /**
-   * Handle a rejected peer.auth.response. For the three credential-divergence
-   * reasons, delegate to the coordinator (which deletes the shared file only if
-   * no sibling has refreshed it, preventing a revocation cascade). A failed
-   * token-join releases the in-flight join so siblings can retry. Config-error
-   * reasons (role mismatch / missing auth method / protocol version) skip the
-   * coordinator entirely — deletion would not help.
+   * Handle a rejected peer.auth.response. The credential-divergence reasons go
+   * to the coordinator, which deletes the shared file only if no sibling has
+   * refreshed it (preventing a revocation cascade). A failed token-join releases
+   * the in-flight join so siblings can retry. Config-error reasons (role
+   * mismatch / missing auth method / protocol version) skip the coordinator:
+   * deletion would not help.
    */
   private handleAuthRejected(reason: string | undefined): void {
     logger.error('Peer auth rejected', { reason });
@@ -1090,9 +1049,8 @@ export class PeerClient {
       return;
     }
 
-    // Delegate the file decision to the coordinator before closing, so the
-    // file operation completes before scheduleReconnect fires via the close
-    // event listener (no sync-I/O race with the reconnect backoff).
+    // The coordinator's file decision completes before closing, so it cannot race
+    // the scheduleReconnect the close listener fires.
     runDetached(
       logger,
       'Peer auth rejection handling',
@@ -1117,20 +1075,17 @@ export class PeerClient {
   }
 
   /**
-   * Determine auth method and send encrypted auth request.
+   * Choose the auth method and send the encrypted auth request.
    *
-   * Credentials are **identity-scoped**, not URL-scoped. A single orchestrator
-   * runs N peer-clients (one per remote peer) and they all share the same
-   * on-disk credential file. The credential represents "this orchestrator's
-   * cluster membership credential", and the server (peer-handler) verifies it
-   * by `instanceId` alone — not by the requester URL. So any peer-client
-   * connecting to any peer can use the same credential, as long as the
-   * `instanceId` on disk matches ours.
+   * Credentials are **identity-scoped**, not URL-scoped: every peer-client of
+   * one orchestrator shares one on-disk credential file, and the server
+   * (peer-handler) verifies it by `instanceId` alone. So any peer-client can use
+   * it, as long as the `instanceId` on disk matches ours.
    *
-   * The auth-method decision is delegated to the shared `PeerAuthCoordinator`,
-   * which serializes sibling peer-clients so exactly one token-joins per
-   * reconnect storm (the rest reuse the freshly-written credential). This
-   * client never reads or writes the credential file directly.
+   * The shared `PeerAuthCoordinator` decides the method and serializes sibling
+   * peer-clients, so exactly one token-joins per reconnect storm (the rest reuse
+   * the freshly written credential). This client never reads or writes the
+   * credential file directly.
    */
   private async sendAuthRequest(): Promise<void> {
     const hs = this.handshake;
@@ -1356,7 +1311,7 @@ export class PeerClient {
       }
 
       case 'peer.cache.upload.request': {
-        // Coordinator receives cache upload request from worker peer
+        // Coordinator side: a worker peer asks.
         if (this.onPeerCacheUploadRequest) {
           this.onPeerCacheUploadRequest(msg)
             .then((response) => {
@@ -1372,7 +1327,7 @@ export class PeerClient {
       }
 
       case 'peer.cache.upload.response': {
-        // Worker receives cache upload response from coordinator
+        // Worker side: the coordinator answers.
         const waiter = this.cacheWaiters.get(msg.messageId);
         if (waiter) {
           clearTimeout(waiter.timer);
@@ -1383,7 +1338,6 @@ export class PeerClient {
       }
 
       case 'peer.auth.request': {
-        // Should not receive auth request on outgoing connection
         logger.warn('Unexpected peer.auth.request on outgoing connection');
         break;
       }
@@ -1394,7 +1348,7 @@ export class PeerClient {
       }
 
       case 'peer.leaving': {
-        // Mark peer as disconnected in registry first, then notify Raft
+        // Registry first, then Raft.
         this.peerRegistry.markDisconnected(msg.instanceId);
         this.onPeerLeaving?.(msg);
         break;
@@ -1406,7 +1360,6 @@ export class PeerClient {
       }
 
       case 'peer.config.reload': {
-        // Execute reload locally and reply with response.
         const handler = this.onPeerConfigReload;
         const replyMessageId = msg.messageId;
         const sendReply = (response: Omit<PeerConfigReloadResponse, 'type' | 'messageId'>) => {

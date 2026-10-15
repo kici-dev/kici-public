@@ -23,8 +23,6 @@ export {
 } from './verification.js';
 
 /**
- * Create a ProviderBundle for generic webhook sources.
- *
  * Only provides a normalizer -- no git-related methods.
  * The pipeline processor handles missing capabilities gracefully.
  *

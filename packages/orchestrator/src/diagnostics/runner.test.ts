@@ -59,12 +59,12 @@ describe('runDiagnostics', () => {
     const results = await runDiagnostics(baseDeps, [failCheck, passCheck]);
 
     expect(results).toHaveLength(2);
-    // The failing check should return fail status, not throw
+    // A failing check yields a fail result rather than throwing
     const failResult = results.find((r) => r.status === 'fail');
     expect(failResult).toBeDefined();
     expect(failResult!.message).toContain('connection refused');
 
-    // The passing check should still succeed
+    // The passing check still passes
     const passResult = results.find((r) => r.status === 'pass');
     expect(passResult).toBeDefined();
   });
@@ -85,7 +85,7 @@ describe('runDiagnostics', () => {
   it('uses default checks when none provided', async () => {
     const results = await runDiagnostics(baseDeps);
 
-    // Should return results for all default checks (6)
+    // Runs the default checks; each must yield at least one named result.
     expect(results.length).toBeGreaterThanOrEqual(1);
     for (const result of results) {
       expect(result).toHaveProperty('name');

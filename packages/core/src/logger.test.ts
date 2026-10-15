@@ -24,9 +24,9 @@ function stripAnsi(s: string): string {
 }
 
 /**
- * Build a plain-format logger that writes lines to an in-memory buffer.
- * Mirrors `createCaptureLogger` but exercises the pretty pipeline so we can
- * assert on the rendered string instead of JSON.
+ * A plain-format logger writing lines to an in-memory buffer: like
+ * `createCaptureLogger`, but through the pretty pipeline, so assertions read
+ * the rendered string instead of JSON.
  */
 function createPlainCaptureLogger() {
   const lines: string[] = [];
@@ -49,11 +49,10 @@ function createPlainCaptureLogger() {
 }
 
 /**
- * Helper: create a JSON logger that writes to a captured string buffer.
- * The logger uses createLogger({ json: true }) so the format pipeline
- * (timestamp -> traceContextFormat -> json) is preserved. We only swap
- * the Console transport for a Stream transport WITHOUT a custom format,
- * so the logger-level format runs and we capture the final JSON output.
+ * A JSON logger capturing lines to a buffer. Only the Console transport is
+ * swapped, for a Stream transport WITHOUT a custom format, so the logger-level
+ * pipeline (timestamp -> traceContextFormat -> json) still runs and the capture
+ * is the final JSON output.
  */
 function createCaptureLogger() {
   const lines: string[] = [];
@@ -67,7 +66,6 @@ function createCaptureLogger() {
 
   const logger = createLogger({ json: true });
 
-  // Replace the default Console transport with a Stream transport (no format override)
   logger.clear();
   logger.add(new winston.transports.Stream({ stream }));
 
@@ -82,8 +80,7 @@ function createCaptureLogger() {
 
 describe('setServiceName / getServiceName', () => {
   beforeEach(() => {
-    // Reset _serviceName to undefined between tests.
-    // Cast to bypass the type union for reset purposes.
+    // Reset _serviceName; the cast bypasses the type union.
     (setServiceName as (name: string | undefined) => void)(undefined as unknown as string);
   });
 
@@ -212,7 +209,7 @@ describe('file rotation transport', () => {
 
       const logger = createLogger({ json: true });
 
-      // Should have 2 transports: Console + DailyRotateFile
+      // Console + DailyRotateFile
       expect(logger.transports.length).toBe(2);
       const rotateTransport = logger.transports[1];
       expect(rotateTransport).toBeDefined();
@@ -232,7 +229,7 @@ describe('file rotation transport', () => {
 
       const logger = createLogger({ json: true });
 
-      // Should have only 1 transport: Console
+      // Console only
       expect(logger.transports.length).toBe(1);
     } finally {
       if (origLogDir !== undefined) {

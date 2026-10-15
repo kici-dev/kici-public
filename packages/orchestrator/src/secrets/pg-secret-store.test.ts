@@ -205,7 +205,6 @@ describe('PgSecretStore', () => {
 
       // Verify the query includes the __empty__ filter (same pattern as listKeys)
       expect(db.selectFrom).toHaveBeenCalledWith('scoped_secrets');
-      // Verify result only contains real secrets
       expect(result).toEqual({ DB_PASSWORD: 'super-secret-pw' });
       expect(result).not.toHaveProperty('__empty__');
     });
@@ -369,7 +368,6 @@ describe('PgSecretStore', () => {
       const key = 'DB_PASSWORD';
       const plaintext = 'old-key-secret';
       const aad = `${orgId}:${scope}:${key}`;
-      // Encrypt with old key
       const encrypted = encrypt(plaintext, testKeyOld, 1, aad);
 
       const rows = [
@@ -399,7 +397,6 @@ describe('PgSecretStore', () => {
       const key = 'TOKEN';
       const plaintext = 'new-key-secret';
       const aad = `${orgId}:${scope}:${key}`;
-      // Encrypt with current key
       const encrypted = encrypt(plaintext, testKey, 1, aad);
 
       const rows = [
@@ -429,7 +426,6 @@ describe('PgSecretStore', () => {
       const key = 'SECRET';
       const plaintext = 'fallback-value';
       const aad = `${orgId}:${scope}:${key}`;
-      // Encrypt with old key
       const encrypted = encrypt(plaintext, testKeyOld, 1, aad);
 
       const db = createMockDb({});
@@ -443,7 +439,6 @@ describe('PgSecretStore', () => {
       const orgId = 'org-001';
       const scope = 'aws/prod';
       const aad = `${orgId}:${scope}:SECRET`;
-      // Encrypt with old key
       const encrypted = encrypt('value', testKeyOld, 1, aad);
 
       const rows = [
@@ -518,7 +513,6 @@ describe('PgSecretStore', () => {
         { key: 'KEY_A', value: 'value-a' },
         { key: 'KEY_B', value: 'value-b' },
       ];
-      // Encrypt with old key
       const rows = secrets.map((s, i) => {
         const aad = `${orgId}:${scope}:${s.key}`;
         const enc = encrypt(s.value, testKeyOld, 1, aad);
@@ -590,7 +584,6 @@ describe('PgSecretStore', () => {
 
       await store.createScope('org-001', 'aws/prod');
 
-      // insertInto should NOT have been called
       expect(db.insertInto).not.toHaveBeenCalled();
     });
 

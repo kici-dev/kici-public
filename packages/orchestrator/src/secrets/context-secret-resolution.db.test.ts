@@ -1,7 +1,5 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { Kysely, PostgresDialect } from 'kysely';
-import pg from 'pg';
-import { Migrator } from 'kysely/migration';
+import { beforeAll, expect, it } from 'vitest';
+import type { Kysely } from 'kysely';
 import { ContextType, type SecretStore } from '@kici-dev/engine';
 import type { Logger } from '@kici-dev/shared';
 import { createMigrationProvider } from '../db/migration-provider.js';
@@ -12,30 +10,9 @@ import { buildContextSecretResolver } from './context-secret-resolver.js';
 import type { AuditLogger } from './audit-logger.js';
 import type { PgSecretStore } from './pg-secret-store.js';
 import { resolveJobQualifiedSecret } from './job-secret-gate.js';
-import { terminateTestDbBackends } from '../__test-helpers__/test-db.js';
+import { describeWithTestDb } from '@kici-dev/test-support/test-db';
 
-/**
- * Real-Postgres test for the secret chain a dispatched job runs: match the
- * declared context name, then resolve secrets through the matched row's
- * bindings.
- *
- * A glob context (`deploy-*`) matches a declared name (`deploy-stage`) that no
- * row carries, so the chain delivers its secrets only when the resolver reads
- * the matched row's bindings rather than looking the declared name up again.
- * The mocked suites pin each hop; this one runs the real match query and the
- * real bindings query together. A job's qualified `<context>:<key>` reference
- * takes the same path. Gated on KICI_TEST_ADMIN_DATABASE_URL.
- */
-const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
-const describeDb = ADMIN_URL ? describe : describe.skip;
-const TEST_DB = `kici_ctx_secret_resolution_test_${process.pid}_${Date.now()}`;
 const ORG = 'org-ctx-secrets';
-
-function withDatabase(url: string, dbName: string): string {
-  const parsed = new URL(url);
-  parsed.pathname = `/${dbName}`;
-  return parsed.toString();
-}
 
 /**
  * One `DEPLOY_TOKEN` secret per scope; values are stored and returned as
@@ -76,142 +53,131 @@ const pgSecretStore = {
     scope in SECRETS_BY_SCOPE ? { DEPLOY_TOKEN: SECRETS_BY_SCOPE[scope] } : {},
 } as unknown as PgSecretStore;
 
-describeDb('context secret resolution through the matched row (real Postgres)', () => {
-  let pool: pg.Pool;
-  let db: Kysely<Database>;
-  const adminUrl = ADMIN_URL!;
+/**
+ * Real-Postgres test for the secret chain a dispatched job runs: match the
+ * declared context name, then resolve secrets through the matched row's
+ * bindings.
+ *
+ * A glob context (`deploy-*`) matches a declared name (`deploy-stage`) that no
+ * row carries, so the chain delivers its secrets only when the resolver reads
+ * the matched row's bindings rather than looking the declared name up again.
+ * The mocked suites pin each hop; this one runs the real match query and the
+ * real bindings query together. A job's qualified `<context>:<key>` reference
+ * takes the same path. Gated on KICI_TEST_ADMIN_DATABASE_URL.
+ */
+describeWithTestDb<Database>(
+  'context secret resolution through the matched row (real Postgres)',
+  { prefix: 'kici_ctx_secret_resolution_test', provider: createMigrationProvider() },
+  (getDb) => {
+    let db: Kysely<Database>;
 
-  beforeAll(async () => {
-    const admin = new pg.Pool({ connectionString: adminUrl });
-    try {
-      await admin.query(`CREATE DATABASE "${TEST_DB}"`);
-    } finally {
-      await admin.end();
+    beforeAll(async () => {
+      ({ db } = getDb());
+      const store = new ContextStore(db);
+      const fixed = await store.create(ORG, { name: 'deploy-prod', type: ContextType.enum.fixed });
+      const glob = await store.create(ORG, {
+        name: 'deploy-any',
+        type: ContextType.enum.glob,
+        globPattern: 'deploy-*',
+      });
+      // Binds a scope that carries only OTHER_KEY.
+      const boundCi = await store.create(ORG, { name: 'bound-ci', type: ContextType.enum.fixed });
+      // Neither of these binds a scope.
+      await store.create(ORG, { name: 'legacy-ci', type: ContextType.enum.fixed });
+      await store.create(ORG, {
+        name: 'preview-any',
+        type: ContextType.enum.glob,
+        globPattern: 'preview-*',
+      });
+      await db
+        .insertInto('context_bindings')
+        .values([
+          { org_id: ORG, context_id: fixed.id, scope_pattern: 'deploy/fixed', host_pattern: '**' },
+          { org_id: ORG, context_id: glob.id, scope_pattern: 'deploy/glob', host_pattern: '**' },
+          {
+            org_id: ORG,
+            context_id: boundCi.id,
+            scope_pattern: 'bound-ci/other',
+            host_pattern: '**',
+          },
+        ])
+        .execute();
+    });
+
+    function realResolver() {
+      return buildContextSecretResolver({
+        pgSecretStore,
+        backendStores: new Map([['pg', {} as SecretStore]]),
+        db,
+        auditLogger: { log: async () => undefined } as unknown as AuditLogger,
+        logger: { info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger,
+      });
     }
-    pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
-    db = new Kysely<Database>({ dialect: new PostgresDialect({ pool }) });
-    const { error } = await new Migrator({
-      db,
-      provider: createMigrationProvider(),
-    }).migrateToLatest();
-    if (error) throw error;
 
-    const store = new ContextStore(db);
-    const fixed = await store.create(ORG, { name: 'deploy-prod', type: ContextType.enum.fixed });
-    const glob = await store.create(ORG, {
-      name: 'deploy-any',
-      type: ContextType.enum.glob,
-      globPattern: 'deploy-*',
+    /** Match `declared` the way dispatch does, then resolve its secrets. */
+    async function secretsFor(declared: string): Promise<Record<string, string> | undefined> {
+      const row = await new ContextStore(db).matchContext(ORG, declared);
+      expect(row, `no context matched '${declared}'`).not.toBeNull();
+      const secretResolver = realResolver();
+      const merged = await resolveMultiEnvMergedData({
+        deps: { secretResolver },
+        orgId: ORG,
+        entries: [{ name: declared, env: toContext(row!) }],
+      });
+      return merged.jobSecrets;
+    }
+
+    it('delivers a glob context secret to a job declaring a name only its pattern matches', async () => {
+      // fails-when: the resolver looks 'deploy-stage' up by exact name, which no row carries
+      expect(await secretsFor('deploy-stage')).toEqual({ DEPLOY_TOKEN: 'from-glob-context' });
     });
-    // Binds a scope that carries only OTHER_KEY.
-    const boundCi = await store.create(ORG, { name: 'bound-ci', type: ContextType.enum.fixed });
-    // Neither of these binds a scope.
-    await store.create(ORG, { name: 'legacy-ci', type: ContextType.enum.fixed });
-    await store.create(ORG, {
-      name: 'preview-any',
-      type: ContextType.enum.glob,
-      globPattern: 'preview-*',
+
+    it('resolves an exact fixed context through its own bindings, not the glob that also matches', async () => {
+      // breaks-if-wrong: 'deploy-prod' is a fixed context and must keep winning over 'deploy-*'
+      expect(await secretsFor('deploy-prod')).toEqual({ DEPLOY_TOKEN: 'from-fixed-context' });
     });
-    await db
-      .insertInto('context_bindings')
-      .values([
-        { org_id: ORG, context_id: fixed.id, scope_pattern: 'deploy/fixed', host_pattern: '**' },
-        { org_id: ORG, context_id: glob.id, scope_pattern: 'deploy/glob', host_pattern: '**' },
-        {
-          org_id: ORG,
-          context_id: boundCi.id,
-          scope_pattern: 'bound-ci/other',
-          host_pattern: '**',
+
+    /** Resolve a job's `<declared>:DEPLOY_TOKEN` reference through the job secret gate. */
+    function qualifiedSecret(declared: string): Promise<string> {
+      return resolveJobQualifiedSecret({
+        resolver: realResolver(),
+        contextStore: new ContextStore(db),
+        orgId: ORG,
+        context: declared,
+        key: 'DEPLOY_TOKEN',
+        dispatchCtx: {
+          branch: 'main',
+          triggerType: 'push',
+          repository: 'acme/app',
+          runId: 'run-1',
+          jobId: 'build',
         },
-      ])
-      .execute();
-  }, 60_000);
-
-  afterAll(async () => {
-    await db?.destroy();
-    await pool?.end().catch(() => {});
-    const admin = new pg.Pool({ connectionString: adminUrl });
-    try {
-      await terminateTestDbBackends(admin, TEST_DB);
-      await admin.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
-    } finally {
-      await admin.end();
+        trustTier: 'trusted',
+      });
     }
-  }, 60_000);
 
-  function realResolver() {
-    return buildContextSecretResolver({
-      pgSecretStore,
-      backendStores: new Map([['pg', {} as SecretStore]]),
-      db,
-      auditLogger: { log: async () => undefined } as unknown as AuditLogger,
-      logger: { info() {}, warn() {}, error() {}, debug() {} } as unknown as Logger,
+    it("reads a qualified reference through the glob row's bindings, not a same-named scope", async () => {
+      // fails-when: the reference reads scope 'deploy-stage', which no context binds
+      expect(await qualifiedSecret('deploy-stage')).toBe('from-glob-context');
     });
-  }
 
-  /** Match `declared` the way dispatch does, then resolve its secrets. */
-  async function secretsFor(declared: string): Promise<Record<string, string> | undefined> {
-    const row = await new ContextStore(db).matchContext(ORG, declared);
-    expect(row, `no context matched '${declared}'`).not.toBeNull();
-    const secretResolver = realResolver();
-    const merged = await resolveMultiEnvMergedData({
-      deps: { secretResolver },
-      orgId: ORG,
-      entries: [{ name: declared, env: toContext(row!) }],
+    it('reads a qualified reference to a fixed context through its own bindings', async () => {
+      // breaks-if-wrong: an exact fixed context must still deliver its bound secret
+      expect(await qualifiedSecret('deploy-prod')).toBe('from-fixed-context');
     });
-    return merged.jobSecrets;
-  }
 
-  it('delivers a glob context secret to a job declaring a name only its pattern matches', async () => {
-    // fails-when: the resolver looks 'deploy-stage' up by exact name, which no row carries
-    expect(await secretsFor('deploy-stage')).toEqual({ DEPLOY_TOKEN: 'from-glob-context' });
-  });
-
-  it('resolves an exact fixed context through its own bindings, not the glob that also matches', async () => {
-    // breaks-if-wrong: 'deploy-prod' is a fixed context and must keep winning over 'deploy-*'
-    expect(await secretsFor('deploy-prod')).toEqual({ DEPLOY_TOKEN: 'from-fixed-context' });
-  });
-
-  /** Resolve a job's `<declared>:DEPLOY_TOKEN` reference through the job secret gate. */
-  function qualifiedSecret(declared: string): Promise<string> {
-    return resolveJobQualifiedSecret({
-      resolver: realResolver(),
-      contextStore: new ContextStore(db),
-      orgId: ORG,
-      context: declared,
-      key: 'DEPLOY_TOKEN',
-      dispatchCtx: {
-        branch: 'main',
-        triggerType: 'push',
-        repository: 'acme/app',
-        runId: 'run-1',
-        jobId: 'build',
-      },
-      trustTier: 'trusted',
+    it('refuses a reference to an exact context that binds nothing, though its same-named scope holds the key', async () => {
+      // fails-when: the reference still reads the unbound scope named after the context
+      await expect(qualifiedSecret('legacy-ci')).rejects.toThrow(/Secret not found/);
     });
-  }
 
-  it("reads a qualified reference through the glob row's bindings, not a same-named scope", async () => {
-    // fails-when: the reference reads scope 'deploy-stage', which no context binds
-    expect(await qualifiedSecret('deploy-stage')).toBe('from-glob-context');
-  });
+    it('refuses a reference to a context whose bound scopes lack the key', async () => {
+      // fails-when: the same-named scope is read when the bound scopes miss the key
+      await expect(qualifiedSecret('bound-ci')).rejects.toThrow(/Secret not found/);
+    });
 
-  it('reads a qualified reference to a fixed context through its own bindings', async () => {
-    // breaks-if-wrong: an exact fixed context must still deliver its bound secret
-    expect(await qualifiedSecret('deploy-prod')).toBe('from-fixed-context');
-  });
-
-  it('refuses a reference to an exact context that binds nothing, though its same-named scope holds the key', async () => {
-    // fails-when: the reference still reads the unbound scope named after the context
-    await expect(qualifiedSecret('legacy-ci')).rejects.toThrow(/Secret not found/);
-  });
-
-  it('refuses a reference to a context whose bound scopes lack the key', async () => {
-    // fails-when: the same-named scope is read when the bound scopes miss the key
-    await expect(qualifiedSecret('bound-ci')).rejects.toThrow(/Secret not found/);
-  });
-
-  it('refuses a reference to a glob-matched context that binds nothing', async () => {
-    await expect(qualifiedSecret('preview-7')).rejects.toThrow(/Secret not found/);
-  });
-});
+    it('refuses a reference to a glob-matched context that binds nothing', async () => {
+      await expect(qualifiedSecret('preview-7')).rejects.toThrow(/Secret not found/);
+    });
+  },
+);

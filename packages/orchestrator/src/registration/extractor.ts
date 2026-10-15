@@ -27,9 +27,6 @@ export function hasRepoPatterns(trigger: LockTrigger): boolean {
 /**
  * Extract workflows that have at least one trigger with repo patterns.
  * These are "global workflows" that match events across repositories.
- *
- * @param lockFile - The compiled lock file to extract from
- * @returns Workflows that have at least one trigger with repo patterns
  */
 export function extractGlobalWorkflows(lockFile: LockFile): LockWorkflow[] {
   return lockFile.workflows.filter((w) => w.triggers.some((t) => hasRepoPatterns(t)));
@@ -44,9 +41,6 @@ export function extractGlobalWorkflows(lockFile: LockFile): LockWorkflow[] {
  * generic webhook targets an externally-hosted repo. The
  * per-event lock file pipeline remains the primary matching path for
  * same-source git events; registration is an additive index.
- *
- * @param lockFile - The compiled lock file to extract from
- * @returns Workflows that have at least one registerable trigger or repo patterns
  */
 export function extractRegisterableWorkflows(lockFile: LockFile): LockWorkflow[] {
   return lockFile.workflows.filter((w) =>

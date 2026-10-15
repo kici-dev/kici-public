@@ -1,16 +1,6 @@
 /**
- * Provider abstraction interfaces for KiCI.
- *
- * Composable interfaces that define the contract between the engine
- * and provider-specific implementations (GitHub, GitLab, Bitbucket).
- *
- * Each interface covers a distinct capability:
- * - WebhookNormalizer: Webhook ingestion and event normalization
- * - LockFileFetcher: Repository API access for lock files
- * - ChangedFilesFetcher: Repository API access for changed files
- * - FileContentsFetcher: Repository API access for arbitrary file contents
- * - CloneTokenProvider: Auth token generation for agent clone
- * - RepoUrlBuilder: Provider-specific URL construction
+ * Composable interfaces between the engine and provider-specific
+ * implementations (GitHub, GitLab, Bitbucket), one per capability.
  */
 
 export type { ProviderType } from './types.js';

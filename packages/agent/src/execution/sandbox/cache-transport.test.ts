@@ -3,11 +3,10 @@ import { createCacheApi, type CacheTransport } from '../cache/index.js';
 import type { CacheRequestIpc, CacheResponseIpc } from './ipc-protocol.js';
 
 /**
- * Replica of the `buildCacheTransport` closure in workflow-runner.ts. The real
- * closure is module-private and depends on workflow-runner's module-level IPC
- * send + pending-response map; this replica injects those two seams so the
- * IPC-shape + correlation contract is testable in isolation. Keep it byte-for-byte
- * aligned with the workflow-runner implementation.
+ * Replica of the module-private `buildCacheTransport` closure in
+ * workflow-runner.ts, with its IPC send and pending-response map injected so
+ * the IPC-shape + correlation contract is testable in isolation. Keep it
+ * byte-for-byte aligned with workflow-runner.
  */
 function buildCacheTransport(
   sendIpc: (msg: CacheRequestIpc) => void,

@@ -3,20 +3,12 @@ import { WebSocketServer } from 'ws';
 import { WS_MAX_PAYLOAD_BYTES } from '@kici-dev/engine';
 import { configureSecureWsServer } from './server-options.js';
 
-// ── `permessage-deflate` compression bombs (security invariant) ──
-//
-// Invariant: every WS endpoint that negotiates `permessage-deflate` MUST cap
-// the maximum decompressed message size via `maxPayload` (sized to
-// `WS_MAX_PAYLOAD_BYTES`, 25 MiB) and MUST set `serverNoContextTakeover: true`
-// so per-message dictionary state does not accumulate across messages.
-//
-// The orchestrator's agent-WS server is single-tenant data plane, so the
-// blast radius here is narrower than the Platform branch — a fake or
-// compromised agent DoSes its own orchestrator, not other tenants. Same
-// fix shape, same helper.
-//
-// These tests assert the EXACT configured values so any regression that
-// changes the cap or drops the flag is loud.
+// Security invariant: every WS endpoint that negotiates `permessage-deflate` MUST cap
+// the decompressed message size via `maxPayload` (`WS_MAX_PAYLOAD_BYTES`, 25 MiB) and
+// MUST set `serverNoContextTakeover: true` so dictionary state does not accumulate
+// across messages. The agent-WS server is single-tenant data plane: a fake or
+// compromised agent DoSes its own orchestrator, not other tenants. The tests assert
+// the EXACT values so a changed cap or dropped flag is loud.
 describe('compression bomb defense — orchestrator agent-WS server (security invariant)', () => {
   it('caps maxPayload to bound decompressed frame size (= WS_MAX_PAYLOAD_BYTES)', () => {
     const wss = new WebSocketServer({ noServer: true });
@@ -36,10 +28,9 @@ describe('compression bomb defense — orchestrator agent-WS server (security in
   });
 
   it('leaves clientNoContextTakeover unset to preserve compression on repeated payload shapes', () => {
-    // Defense-in-depth pin: enabling clientNoContextTakeover would kill
-    // compression for log.chunk fan-out (many small frames with repeated
-    // structure). Future change to enable it must be accompanied by a
-    // measurement of the compression-ratio impact.
+    // Enabling clientNoContextTakeover would kill compression for log.chunk fan-out
+    // (many small frames with repeated structure); enabling it needs a measurement of
+    // the compression-ratio impact.
     const wss = new WebSocketServer({ noServer: true });
     configureSecureWsServer(wss);
 

@@ -1,8 +1,5 @@
 import type { HookConfig, HookFn, HookInput } from './types.js';
 
-/**
- * Normalize HookInput to extract run function and optional timeout.
- */
 function normalizeInput(input: HookInput): { run: HookFn; timeout?: number } {
   if (typeof input === 'function') {
     return { run: input };
@@ -64,5 +61,4 @@ export function afterStep(input: HookInput): HookConfig {
   return { name: 'afterStep', type: 'afterStep', run, timeout };
 }
 
-// Re-export types
 export type { HookConfig, HookFn, HookInput, HookContext, OutcomeMetadata } from './types.js';

@@ -11,8 +11,7 @@ import { createMockDb } from './mock-db.js';
  * tell a correctly scoped query from one reading every tenant's rows.
  *
  * The orchestrator and the Platform own independent `createMockDb` builders that
- * owe the same guarantee, so this file is kept byte-identical between them and
- * `mock-db-mirror.test.ts` fails if it drifts.
+ * owe the same guarantee, so each package carries this file.
  *
  * These tests pin the capability rather than any one caller: they run a scoped
  * query and its unscoped twin over the SAME fixture and assert the results

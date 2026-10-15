@@ -39,8 +39,6 @@ describe('parseToken', () => {
   });
 });
 
-// --- DB-dependent tests with mocked Kysely ---
-
 describe('JoinTokenManager', () => {
   it('createToken() returns a string matching format kici_join_v1.<base64url>.<hex64>', async () => {
     const { db, mocks } = createMockDb();

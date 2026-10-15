@@ -1,26 +1,17 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `execution_jobs.precursor_result JSONB NULL` — the payload a precursor
- * job (source-pack build, init, dynamic eval) reports on its terminal
- * `job.status`, persisted so a coordinator other than the one whose agent ran
- * the job can read it back.
+ * Add `execution_jobs.precursor_result`: the payload a precursor job (source-pack build, init,
+ * dynamic eval) reports on its terminal `job.status`, readable by any coordinator.
  *
- * The dispatch queue is cluster-wide: a job one coordinator dispatched may be
- * claimed by an agent connected to a sibling coordinator. The sibling receives
- * the agent's terminal frame; the coordinator awaiting the job never does. The
- * shared row is the channel between them, and until this column existed the
- * row carried the status but not the result — a build's `buildComplete`
- * marker, an init's resolved fields, a dynamic eval's generated jobs — so the
- * awaiting coordinator waited out its build timeout on a build that had
- * succeeded.
+ * The dispatch queue is cluster-wide, so an agent on a sibling coordinator may run the job and
+ * receive its terminal frame, which the awaiting coordinator never sees. The shared row is their
+ * channel; without the result (a build's `buildComplete` marker, an init's resolved fields, a
+ * dynamic eval's generated jobs) the awaiting coordinator waited out its build timeout on a
+ * successful build.
  *
- * Nullable, with no default: NULL means "this job reported no precursor
- * payload", which is true of every ordinary job and of every row written
- * before this column existed.
- *
- * Idempotent: the add is guarded on existence and the drop uses IF EXISTS, so a
- * re-run is a no-op.
+ * Nullable, no default: NULL means "no precursor payload" (every ordinary job and older row).
+ * Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

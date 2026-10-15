@@ -1,10 +1,6 @@
 /**
- * Docker/Podman Compose service manager.
- *
- * Generates compose YAML files and manages service lifecycle via
- * `docker compose` or `podman compose` (auto-detected). Provides
- * a container-based service management backend that works on any
- * platform with Docker or Podman installed.
+ * Compose service manager: writes compose YAML and drives the lifecycle via
+ * `podman compose` or `docker compose` (auto-detected), on any platform.
  */
 
 import { execSync } from 'node:child_process';
@@ -27,33 +23,22 @@ import type {
 type Runtime = 'podman' | 'docker';
 
 /**
- * How long a discovery probe may wait on the container runtime.
+ * Bound on a discovery probe. Discovery runs on non-container paths (every
+ * command resolving `--name`, `install` checking for a same-named instance), so
+ * a wedged daemon must not hold them open; a timeout reads as "no runtime".
  *
- * Discovery runs on paths that have nothing to do with containers: every
- * lifecycle command resolving `--name`, and `install` deciding whether a
- * same-named instance already exists. A wedged container daemon must not hold
- * those commands open, so both probes are bounded and a probe that runs out of
- * time is read as "this runtime does not answer" — the same outcome as a host
- * with no runtime at all.
+ * Healthy probes take 0.22s (`compose version`) and 0.40s (`ps -a`), so 10s is
+ * ~25x the slower: room for a loaded host or cold start, yet a hung daemon
+ * fails in seconds. `detectRuntime` tries two runtimes, so its worst case is 2x.
  *
- * Healthy cost of the two probes on a developer host is 0.22s (`compose
- * version`) and 0.40s (`ps -a`), so 10s is roughly 25x the slower one: wide
- * enough for a loaded host or a cold runtime start, short enough that a
- * `kici-admin` command against a hung daemon fails in seconds. `detectRuntime`
- * tries two runtimes in turn, so its worst case is twice this.
- *
- * SIGKILL rather than the default SIGTERM: a runtime client blocked on a socket
- * read is exactly the case that ignores a polite signal, and a probe that
- * "timed out" and then kept the command open would defeat the bound.
+ * SIGKILL, not SIGTERM: a client blocked on a socket read ignores a polite
+ * signal, and a probe that outlives its timeout defeats the bound.
  */
 const RUNTIME_PROBE_TIMEOUT_MS = 10_000;
 
 /**
- * Detect which container runtime is available.
- * Tries podman compose first, then docker compose.
- *
- * Exported so the orchestrator installer can resolve the runtime once when
- * injecting the `KICI_DEPLOY_CONTAINER_RUNTIME` env var for a compose deploy.
+ * Tries podman compose, then docker compose. Exported for the installer, which
+ * resolves it once to inject `KICI_DEPLOY_CONTAINER_RUNTIME` for a compose deploy.
  *
  * @throws When neither runtime is found.
  */
@@ -84,20 +69,14 @@ export function detectRuntime(): Runtime {
 }
 
 /**
- * Read a `ps` row's labels into a map, accepting either runtime's shape.
- *
- * `docker ps --format '{{json .}}'` renders labels as one comma-joined
- * `key=value` string; `podman ps` renders them as a JSON object. Measured on
- * podman 5.4.2 and docker 28.x against a container carrying
- * `dev.kici.component`:
+ * A `ps` row's labels, in either runtime's shape (measured on podman 5.4.2 and
+ * docker 28.x):
  *
  *   podman -> "Labels":{"dev.kici.component":"orchestrator",...}
  *   docker -> "Labels":"dev.kici.component=orchestrator,..."
  *
- * Reading only the docker shape yields an empty label set on every podman host,
- * so every KiCI container is skipped and discovery reports "no compose
- * instances" — which the caller cannot tell apart from a host that genuinely
- * holds none.
+ * Reading only the docker shape makes a podman host report no compose
+ * instances, indistinguishable from a host that holds none.
  */
 function parseContainerLabels(raw: unknown): Record<string, string> {
   const out: Record<string, string> = {};
@@ -119,11 +98,8 @@ function parseContainerLabels(raw: unknown): Record<string, string> {
 }
 
 /**
- * Read a `ps` row's container name, accepting either runtime's shape.
- *
- * `podman ps` renders `Names` as an array (a container may carry several);
- * `docker ps` renders it as a single string. The compose installer names one
- * container per instance, so the first entry is the instance name.
+ * A `ps` row's container name: podman renders `Names` as an array, docker as a
+ * string. The installer names one container per instance, so the first wins.
  */
 function parseContainerName(raw: unknown): string {
   if (typeof raw === 'string') return raw;
@@ -134,17 +110,11 @@ function parseContainerName(raw: unknown): string {
   return '';
 }
 
-/**
- * Get the path to the compose file for a service.
- * Uses the directory of the env file (e.g., /etc/kici/) as the location.
- */
+/** The compose file sits in the env file's directory (e.g. /etc/kici/). */
 function getComposeFilePath(config: ServiceConfig): string {
   return composeFilePath(config.envFilePath, config.name);
 }
 
-/**
- * Map compose container state strings to our ServiceState type.
- */
 function mapContainerState(state: string): ServiceState {
   const lower = state.toLowerCase();
   if (lower === 'running') return 'running';
@@ -153,20 +123,13 @@ function mapContainerState(state: string): ServiceState {
   return 'unknown';
 }
 
-/**
- * Map restart policy to compose restart mode.
- */
 function getRestartMode(config: ServiceConfig): string {
   if (!config.restartPolicy.enabled) return 'no';
   return 'unless-stopped';
 }
 
 /**
- * Generate compose YAML content for a service.
- *
- * Uses a manual YAML builder to avoid adding a YAML library dependency.
- * The generated file includes the service definition with env_file,
- * restart policy, and volume mounts.
+ * Built by hand to avoid a YAML library dependency.
  *
  * The `image:` line is pinned by manifest-list digest via `resolveImageRef`
  * (`quay.io/kici-dev/kici-<component>:<version>@sha256:<digest>`, whatever the
@@ -196,11 +159,11 @@ function generateComposeYaml(config: ServiceConfig): string {
   ];
 
   if (config.component) {
-    // Marker decoded by list() so podman/docker ps can classify the container's component.
+    // list() classifies the container's component by this label.
     lines.push('    labels:');
     lines.push(`      dev.kici.component: ${config.component}`);
-    // Deploy-folder marker so list() can recover the instanceDir straight from
-    // the container labels, making the instance index a rebuildable cache.
+    // list() recovers the instanceDir from this label, so the instance index
+    // is a rebuildable cache.
     if (config.instanceDir) {
       lines.push(`      dev.kici.instance-dir: "${config.instanceDir}"`);
     }
@@ -215,24 +178,15 @@ export class ComposeServiceManager implements ServiceManager {
   private runtime: Runtime | null = null;
 
   /**
-   * True when the container runtime's own registry answers. A host with
-   * neither podman nor docker cannot hold a running compose install, and a
-   * host whose runtime is momentarily down still holds its installs — so
-   * discovery reads a `false` here as "do not touch this platform's index
-   * rows" rather than as an empty scan.
+   * True when the runtime's registry answers. A host whose runtime is briefly
+   * down still holds its installs, so discovery reads `false` as "leave this
+   * platform's index rows alone", not as an empty scan.
    *
-   * Both halves are needed, and the second is the one that costs something.
-   * `<runtime> compose version` is answered by the compose client alone: with
-   * dockerd stopped it still exits 0 (measured), so a client-only probe reports
-   * available, `list()` then gets an error it cannot distinguish from an empty
-   * registry, and the reconcile prunes live rows. The `RUNTIME_PROBE_TIMEOUT_MS`
-   * bound does not cover this — the client answers instantly whether or not the
-   * daemon is there, so there is nothing for a timeout to catch.
-   *
-   * `ps -q` is the cheapest question only the registry can answer (0.02s
-   * docker / 0.07s podman on a healthy host), and it fails the same two ways
-   * the scan itself would: non-zero for a daemon that is down, and a timeout
-   * kill for one that is hung.
+   * `compose version` alone is not enough: the client answers it with dockerd
+   * stopped (measured), so `list()` would then fail like an empty registry and
+   * the reconcile would prune live rows; no timeout catches an instant answer.
+   * `ps -q` is the cheapest registry-only question (0.02s docker / 0.07s
+   * podman), failing as the scan would: non-zero when down, timeout when hung.
    */
   async available(): Promise<boolean> {
     try {
@@ -248,7 +202,6 @@ export class ComposeServiceManager implements ServiceManager {
     }
   }
 
-  /** Get the runtime binary (`podman` or `docker`), detecting it if not already done. */
   private getRuntime(): Runtime {
     if (!this.runtime) {
       this.runtime = detectRuntime();
@@ -256,7 +209,6 @@ export class ComposeServiceManager implements ServiceManager {
     return this.runtime;
   }
 
-  /** Run a compose command for the given service config. */
   private runCompose(config: ServiceConfig, args: string): void {
     const runtime = this.getRuntime();
     const composeFile = getComposeFilePath(config);
@@ -264,28 +216,24 @@ export class ComposeServiceManager implements ServiceManager {
   }
 
   async install(config: ServiceConfig): Promise<void> {
-    // Detect runtime first (will throw if neither available)
+    // Throws when no runtime is available.
     this.getRuntime();
 
-    // Ensure compose file directory exists
     const composeFile = getComposeFilePath(config);
     const dir = path.dirname(composeFile);
     fs.mkdirSync(dir, { recursive: true });
 
-    // Generate and write compose file
     const yaml = generateComposeYaml(config);
     fs.writeFileSync(composeFile, yaml, 'utf-8');
   }
 
   async uninstall(config: ServiceConfig): Promise<void> {
-    // Stop containers
     try {
       this.runCompose(config, 'down');
     } catch {
       // May already be down
     }
 
-    // Remove compose file
     const composeFile = getComposeFilePath(config);
     if (fs.existsSync(composeFile)) {
       fs.unlinkSync(composeFile);
@@ -312,7 +260,7 @@ export class ComposeServiceManager implements ServiceManager {
         stdio: 'pipe',
       }).toString();
 
-      // Parse JSON output - can be a single object or array of objects
+      // A single object or an array.
       const data = JSON.parse(output);
       const container = Array.isArray(data) ? data[0] : data;
 
@@ -353,9 +301,7 @@ export class ComposeServiceManager implements ServiceManager {
   }
 
   async list(isUserLevel: boolean): Promise<DiscoveredInstance[]> {
-    // Reuse the existing runtime detection from install/uninstall. A missing
-    // runtime (or a probe that throws partway through) means "no KiCI
-    // containers discoverable" — return [] cleanly so the caller can move on.
+    // No runtime means no discoverable KiCI containers.
     let runtime: Runtime;
     try {
       runtime = this.getRuntime();
@@ -363,12 +309,9 @@ export class ComposeServiceManager implements ServiceManager {
       return [];
     }
 
-    // A failed registry read is NOT an empty registry, and the reconcile in
-    // `listInstances` cannot tell the two apart from a return value — an `[]`
-    // there prunes every compose row on the host. So the failure is thrown,
-    // and `scanDrivers` drops this driver from the scan exactly as it drops
-    // one whose `available()` said false. `[]` from here therefore means one
-    // thing only: the registry answered, and holds no KiCI containers.
+    // A failed read throws: an `[]` would make the `listInstances` reconcile
+    // prune every compose row. `scanDrivers` then drops this driver as it does
+    // on `available()` false, so `[]` means only "answered, no KiCI containers".
     let raw: string;
     try {
       raw = execSync(`${runtime} ps -a --filter label=dev.kici.component --format '{{json .}}'`, {

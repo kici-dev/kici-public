@@ -1,9 +1,7 @@
 /**
- * systemd service manager implementation.
- *
- * Generates unit files and manages service lifecycle via systemctl,
- * journalctl, and loginctl commands. Supports both system-level
- * (/etc/systemd/system/) and user-level (~/.config/systemd/user/) services.
+ * systemd service manager: system-level (/etc/systemd/system/) and user-level
+ * (~/.config/systemd/user/) units, driven through systemctl, journalctl and
+ * loginctl.
  */
 
 import { execFileSync, spawn } from 'node:child_process';
@@ -20,14 +18,9 @@ import type {
 } from './types.js';
 
 /**
- * Check whether linger is already enabled for a user.
- *
- * Uses `loginctl show-user <user>` which is readable by any user. Returns
- * true if the user's `Linger` property reads `yes`. Returns false on any
- * parse failure, missing binary, or unknown user — the caller is expected
- * to attempt `enable-linger` in that case.
- *
- * Exported (package-private) for testing.
+ * Whether linger is enabled, via `loginctl show-user` (readable by any user).
+ * False on any failure (parse, missing binary, unknown user), in which case
+ * the caller attempts `enable-linger`. Exported for testing.
  */
 export function isLingerEnabled(user: string): boolean {
   try {
@@ -41,7 +34,7 @@ export function isLingerEnabled(user: string): boolean {
   }
 }
 
-/** Map log level names to systemd priority numbers. */
+/** Log level to systemd priority. */
 const PRIORITY_MAP: Record<string, string> = {
   error: '3',
   warn: '4',
@@ -51,53 +44,40 @@ const PRIORITY_MAP: Record<string, string> = {
 export class SystemdServiceManager implements ServiceManager {
   readonly platform = 'systemd' as const;
 
-  /**
-   * Generate a systemd unit file from a service config.
-   * Visible for testing.
-   */
+  /** Visible for testing. */
   generateUnitFile(config: ServiceConfig): string {
     const lines: string[] = [];
 
-    // [Unit] section
     lines.push('[Unit]');
     lines.push(`Description=${config.description}`);
-    // Component marker — embedded so `list()` can classify the unit by scanning
-    // for `^X-KiCI-Component=` without relying on the unit name. systemd treats
-    // unknown `X-*` directives as opaque user metadata, so they're safe in [Unit].
+    // Lets `list()` classify the unit without relying on its name. systemd
+    // treats unknown `X-*` directives as opaque metadata.
     if (config.component) {
       lines.push(`X-KiCI-Component=${config.component}`);
     }
-    // Deploy-folder marker — embedded so `list()` can recover the instanceDir
-    // straight from the unit, making the instance index a rebuildable cache.
+    // Lets `list()` recover the instanceDir, so the instance index is a rebuildable cache.
     if (config.instanceDir) {
       lines.push(`X-KiCI-InstanceDir=${config.instanceDir}`);
     }
     lines.push('After=network.target postgresql.service');
-    // Start rate limit. `StartLimitIntervalSec=` and `StartLimitBurst=` are
-    // [Unit] directives: systemd has no [Service] key for
-    // `StartLimitIntervalSec=`, so a copy in [Service] is discarded with an
-    // "Unknown key ... ignoring" warning and the window silently falls back to
-    // the manager-wide default. `Restart=` / `RestartSec=` are [Service]
-    // directives and stay in that section below.
+    // StartLimit* are [Unit] directives: a `StartLimitIntervalSec=` in
+    // [Service] is ignored with an "Unknown key" warning and the window falls
+    // back to the manager-wide default.
     if (config.restartPolicy.enabled) {
       lines.push(`StartLimitBurst=${config.restartPolicy.maxRetries}`);
       lines.push(`StartLimitIntervalSec=${config.restartPolicy.windowSeconds}`);
     }
     lines.push('');
 
-    // [Service] section
     lines.push('[Service]');
     lines.push('Type=simple');
     const execArgs = config.args?.length ? ` ${config.args.join(' ')}` : '';
     lines.push(`ExecStart=${config.executablePath}${execArgs}`);
     lines.push(`EnvironmentFile=${config.envFilePath}`);
-    // Prepend the node bin dir to PATH. systemd starts services with a minimal
-    // default PATH that omits non-standard node installs (mise/nvm/asdf, or the
-    // kici-managed cached node). The bare-metal scaler spawns the kici-agent
-    // node script as a child of this process; without node on PATH the
-    // required-tools check refuses to start. Prefer the install-resolved
-    // nodeBinDir (the node running the install command) — when the service is
-    // installed with --binary, executablePath is a wrapper, not node.
+    // systemd's minimal PATH omits non-standard node installs (mise/nvm/asdf,
+    // the kici-managed node), and the bare-metal scaler's kici-agent child
+    // needs node on PATH or the required-tools check refuses to start.
+    // nodeBinDir wins because with --binary, executablePath is a wrapper.
     const nodeBinDir = config.nodeBinDir ?? path.dirname(config.executablePath);
     lines.push(`Environment=PATH=${nodeBinDir}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`);
     lines.push(`WorkingDirectory=${config.workingDirectory}`);
@@ -107,14 +87,13 @@ export class SystemdServiceManager implements ServiceManager {
       lines.push(`Group=${config.user}`);
     }
 
-    // Restart policy — the [Service] half. The StartLimit* rate limit that
-    // bounds these restarts lives in [Unit] above.
+    // The StartLimit* bound on these restarts is in [Unit].
     if (config.restartPolicy.enabled) {
       lines.push('Restart=on-failure');
       lines.push(`RestartSec=${config.restartPolicy.delays[0]}s`);
     }
 
-    // Security hardening (system-level only — user services lack privileges)
+    // System-level only: user services lack the privileges.
     if (!config.isUserLevel) {
       lines.push('');
       lines.push('# Security hardening');
@@ -127,7 +106,6 @@ export class SystemdServiceManager implements ServiceManager {
 
     lines.push('');
 
-    // [Install] section
     lines.push('[Install]');
     lines.push(config.isUserLevel ? 'WantedBy=default.target' : 'WantedBy=multi-user.target');
     lines.push('');
@@ -135,7 +113,6 @@ export class SystemdServiceManager implements ServiceManager {
     return lines.join('\n');
   }
 
-  /** Resolve the unit file path based on service level. */
   private unitFilePath(config: ServiceConfig): string {
     if (config.isUserLevel) {
       return path.join(os.homedir(), '.config', 'systemd', 'user', `${config.name}.service`);
@@ -143,12 +120,10 @@ export class SystemdServiceManager implements ServiceManager {
     return `/etc/systemd/system/${config.name}.service`;
   }
 
-  /** Build systemctl command args, inserting --user for user-level services. */
   private systemctlArgs(config: ServiceConfig, ...args: string[]): string[] {
     return config.isUserLevel ? ['--user', ...args] : args;
   }
 
-  /** Run a systemctl command. */
   private systemctl(config: ServiceConfig, ...args: string[]): void {
     execFileSync('systemctl', this.systemctlArgs(config, ...args), { stdio: 'inherit' });
   }
@@ -157,29 +132,21 @@ export class SystemdServiceManager implements ServiceManager {
     const unitPath = this.unitFilePath(config);
     const unitContent = this.generateUnitFile(config);
 
-    // Ensure directory exists
     fs.mkdirSync(path.dirname(unitPath), { recursive: true });
 
-    // Write unit file
     fs.writeFileSync(unitPath, unitContent, 'utf-8');
 
-    // Reload and enable
     this.systemctl(config, 'daemon-reload');
     this.systemctl(config, 'enable', config.name);
 
-    // Enable linger for user-level services so they survive logout.
-    //
-    // `loginctl enable-linger` requires root (or polkit auth) to enable
-    // linger for a user other than the current session owner, and on some
-    // distros (Debian trixie) it also fails with "Access denied" even when
-    // called for the current user without an interactive polkit prompt.
-    // Check first — if linger is already enabled, this is a no-op and we
-    // skip the privileged call entirely. Otherwise, attempt the call and
-    // emit a clear error explaining the manual fix.
+    // Linger keeps user-level services alive after logout. `enable-linger`
+    // needs root or polkit for another user, and on some distros (Debian
+    // trixie) fails with "Access denied" even for the current user without an
+    // interactive polkit prompt, so skip it when linger is already on.
     if (config.isUserLevel) {
       const user = config.user || os.userInfo().username;
       if (isLingerEnabled(user)) {
-        // Idempotent happy path — nothing to do.
+        // Already enabled.
       } else {
         try {
           execFileSync('loginctl', ['enable-linger', user], { stdio: 'inherit' });
@@ -196,7 +163,6 @@ export class SystemdServiceManager implements ServiceManager {
   }
 
   async uninstall(config: ServiceConfig): Promise<void> {
-    // Stop and disable first (ignore errors if not running)
     try {
       this.systemctl(config, 'stop', config.name);
     } catch {
@@ -208,11 +174,9 @@ export class SystemdServiceManager implements ServiceManager {
       // Service may not be enabled
     }
 
-    // Remove unit file
     const unitPath = this.unitFilePath(config);
     fs.unlinkSync(unitPath);
 
-    // Reload daemon
     this.systemctl(config, 'daemon-reload');
   }
 
@@ -293,7 +257,6 @@ export class SystemdServiceManager implements ServiceManager {
   async logs(config: ServiceConfig, options: LogOptions): Promise<void> {
     const args: string[] = [];
 
-    // Unit flag differs for user vs system
     if (config.isUserLevel) {
       args.push('--user-unit', config.name);
     } else {

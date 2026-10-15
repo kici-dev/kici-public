@@ -48,7 +48,6 @@ const logger = createLogger({ prefix: 'verify-inbound' });
 /** Fixed org_id for source secrets in PgSecretStore (matches SourceStore). */
 const SOURCE_ORG_ID = '__system__';
 
-/** Default GitHub-style signature header. */
 const DEFAULT_GITHUB_SIGNATURE_HEADER = 'x-hub-signature-256';
 
 /** Verification result + non-secret-bearing diagnostic for the orchestrator ACK. */
@@ -77,7 +76,6 @@ export interface VerifyInboundInput {
   clientIp: string | null;
 }
 
-/** Dependencies the dispatcher reads from. */
 export interface VerifyInboundDeps {
   /** Kysely DB handle for `sources` table lookups (github sources). */
   db: Kysely<Database>;

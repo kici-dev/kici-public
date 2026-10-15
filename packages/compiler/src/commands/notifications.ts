@@ -1,12 +1,8 @@
 /**
- * kici notifications commands
- *
- * Customer self-service management of an org's notification configuration —
- * channels, subscriptions, and the Layer 1 Slack-identity roster — under the
- * logged-in user's PAT against the hosted Platform's org-scoped HTTP API. This
- * is a tenant-plane developer operation, so it lives in the public `kici` CLI
- * (like `kici org` / `kici verify-attestation`), never the DB-direct
- * `kici-platform-admin`.
+ * `kici notifications`: self-service management of an org's channels,
+ * subscriptions and Layer 1 Slack-identity roster, under the user's PAT
+ * against the hosted Platform's org-scoped HTTP API. A tenant-plane operation,
+ * so it lives in `kici`, never the DB-direct `kici-platform-admin`.
  */
 
 import pc from 'picocolors';
@@ -24,18 +20,15 @@ import {
   type AddIdentityBody,
 } from '../remote/notifications-client.js';
 
-/** Options common to every notifications subcommand. */
 export interface NotificationsCommonOptions {
-  /** Target organization id (overrides the saved active org). */
+  /** Overrides the saved active org. */
   org?: string;
 }
 
-/** Options for the `list` leaves. */
 export interface NotificationsListOptions extends NotificationsCommonOptions {
   json?: boolean;
 }
 
-/** Options for `channels add`. */
 export interface ChannelsAddOptions extends NotificationsCommonOptions {
   type?: string;
   name?: string;
@@ -45,7 +38,6 @@ export interface ChannelsAddOptions extends NotificationsCommonOptions {
   replyTo?: string;
 }
 
-/** Options for `subscriptions add`. */
 export interface SubscriptionsAddOptions extends NotificationsCommonOptions {
   channel?: string;
   level?: string;
@@ -61,7 +53,6 @@ export interface SubscriptionsAddOptions extends NotificationsCommonOptions {
   accumulateFor?: string;
 }
 
-/** Options for `roster add`. */
 export interface RosterAddOptions extends NotificationsCommonOptions {
   connection?: string;
   subjectKind?: string;
@@ -70,7 +61,6 @@ export interface RosterAddOptions extends NotificationsCommonOptions {
   value?: string;
 }
 
-/** Split a comma-separated flag value into a trimmed, non-empty list. */
 function parseCsv(value: string | undefined): string[] {
   if (!value) return [];
   return value
@@ -79,7 +69,6 @@ function parseCsv(value: string | undefined): string[] {
     .filter((s) => s.length > 0);
 }
 
-/** Print a simple padded table. */
 function printTable(headers: string[], rows: string[][]): void {
   if (rows.length === 0) {
     console.log(pc.gray('None.'));
@@ -92,10 +81,7 @@ function printTable(headers: string[], rows: string[][]): void {
   }
 }
 
-/**
- * Load the client and run `fn`, turning any {@link DashboardClientError} into a
- * red console message and a `false` return (the CLI exit-code convention).
- */
+/** Any error becomes a red console message and a `false` return (the CLI exit-code convention). */
 async function withClient(
   opts: NotificationsCommonOptions,
   fn: (client: NotificationsClient) => Promise<boolean>,
@@ -113,7 +99,6 @@ async function withClient(
   }
 }
 
-/** Validate a value against a Zod enum, printing an actionable error on miss. */
 function requireEnum<T extends string>(
   label: string,
   value: string | undefined,
@@ -220,7 +205,7 @@ export async function notificationsSubscriptionsListCommand(
   });
 }
 
-/** Build a create-subscription body from parsed flags (null on validation error). */
+/** Null on validation error. */
 function buildSubscriptionBody(opts: SubscriptionsAddOptions): CreateSubscriptionBody | null {
   if (!opts.channel) {
     console.error(pc.red('--channel <id> is required'));
@@ -310,7 +295,7 @@ export async function notificationsRosterListCommand(
   });
 }
 
-/** Build an add-identity body from parsed flags (null on validation error). */
+/** Null on validation error. */
 function buildIdentityBody(opts: RosterAddOptions): AddIdentityBody | null {
   if (!opts.connection) {
     console.error(pc.red('--connection <id> is required'));

@@ -4,10 +4,7 @@ import { parse as parseYaml } from 'yaml';
 import type { ParsedSecrets } from '../test-runner/secrets-file.js';
 import { loadSecretsFile } from '../test-runner/secrets-file.js';
 
-/**
- * Parse a dotenv-style file (.env.local) into flat key-value pairs.
- * Lines starting with # are comments. Blank lines are ignored.
- */
+/** Dotenv (`.env.local`): `#` comments, surrounding quotes stripped. */
 function parseDotenv(content: string): Record<string, string> {
   const result: Record<string, string> = {};
 
@@ -21,7 +18,6 @@ function parseDotenv(content: string): Record<string, string> {
     const key = line.slice(0, eqIndex).trim();
     let value = line.slice(eqIndex + 1).trim();
 
-    // Strip surrounding quotes (double or single)
     if (
       value.length >= 2 &&
       ((value[0] === '"' && value[value.length - 1] === '"') ||
@@ -36,11 +32,7 @@ function parseDotenv(content: string): Record<string, string> {
   return result;
 }
 
-/**
- * Parse a secrets.yaml file.
- * Expected format: top-level keys are context names, values are key-value maps.
- * For local execution, all contexts are merged flat (no context resolution).
- */
+/** Top-level keys are context names; local execution merges every context flat. */
 function parseSecretsYaml(content: string): Record<string, string> {
   const parsed = parseYaml(content);
   if (!parsed || typeof parsed !== 'object') return {};
@@ -60,9 +52,6 @@ function parseSecretsYaml(content: string): Record<string, string> {
   return result;
 }
 
-/**
- * Parse --env KEY=VALUE flags into a flat map.
- */
 function parseEnvFlags(flags: string[]): Record<string, string> {
   const result: Record<string, string> = {};
 
@@ -78,9 +67,7 @@ function parseEnvFlags(flags: string[]): Record<string, string> {
   return result;
 }
 
-/**
- * Read a file, returning null if it doesn't exist.
- */
+/** Null on ENOENT. */
 async function readFileOrNull(filePath: string): Promise<string | null> {
   try {
     return await readFile(filePath, 'utf-8');
@@ -101,43 +88,33 @@ async function readFileOrNull(filePath: string): Promise<string | null> {
  * 3. .kici/secrets.yaml (YAML with context scopes, merged flat)
  * 4. --env KEY=VALUE CLI flags
  *
- * Note: process.env is NOT merged here -- it's handled at step-context level.
- *
- * @param kiciDir - Path to the .kici directory
- * @param envFlags - Optional --env KEY=VALUE flag values
- * @returns Merged secrets with correct precedence
+ * process.env is not merged here; the step context handles it.
  */
 export async function loadLocalSecrets(
   kiciDir: string,
   envFlags?: string[],
 ): Promise<ParsedSecrets> {
-  // 1. Load .secrets -- lowest priority
   const iniSecrets = await loadSecretsFile(kiciDir);
 
-  // Start with INI secrets as base
   const flat: Record<string, string> = { ...iniSecrets.flat };
   const contexts: Record<string, Record<string, string>> = {};
 
-  // Copy contexts from INI
   for (const [ctx, vals] of Object.entries(iniSecrets.contexts)) {
     contexts[ctx] = { ...vals };
   }
 
-  // 2. Load .env.local -- overrides .secrets
   const envLocalContent = await readFileOrNull(path.join(kiciDir, '.env.local'));
   if (envLocalContent !== null) {
     const envLocalSecrets = parseDotenv(envLocalContent);
     Object.assign(flat, envLocalSecrets);
   }
 
-  // 3. Load secrets.yaml -- overrides .env.local
   const yamlContent = await readFileOrNull(path.join(kiciDir, 'secrets.yaml'));
   if (yamlContent !== null) {
     const yamlSecrets = parseSecretsYaml(yamlContent);
     Object.assign(flat, yamlSecrets);
   }
 
-  // 4. Parse --env flags -- highest priority
   if (envFlags && envFlags.length > 0) {
     const flagSecrets = parseEnvFlags(envFlags);
     Object.assign(flat, flagSecrets);

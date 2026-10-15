@@ -15,26 +15,16 @@ import {
   type PlatformClientOptions,
 } from './platform-client.js';
 
-// ── Hoisted mock state ──────────────────────────────────────────────
-
-/**
- * vi.hoisted runs before any imports, making these values available
- * inside the vi.mock factory which is also hoisted.
- */
+/** vi.hoisted runs before imports, so the hoisted vi.mock factory can see these. */
 const { mockInstances, mockConstructorArgs } = vi.hoisted(() => {
   return {
     mockInstances: [] as import('node:events').EventEmitter[],
-    // Each entry is the argv array a single `new WebSocket(...)` call received.
-    // Used by the TLS-chain-trust invariant test to introspect the
-    // options object the orchestrator passes to the underlying ws library.
+    // The argv of each `new WebSocket(...)` call, for the TLS / maxPayload tests.
     mockConstructorArgs: [] as unknown[][],
   };
 });
 
-/**
- * Mock the 'ws' module. The factory must be self-contained.
- * We import EventEmitter inside the factory to avoid hoisting issues.
- */
+/** The factory must be self-contained, so it imports EventEmitter itself. */
 vi.mock('ws', async () => {
   const { EventEmitter } = await import('node:events');
 
@@ -73,8 +63,6 @@ vi.mock('ws', async () => {
   };
 });
 
-// ── Typed helpers ───────────────────────────────────────────────────
-
 interface MockWsInstance {
   readyState: number;
   sentMessages: string[];
@@ -102,8 +90,6 @@ function simulateOpen(mock: MockWsInstance): void {
   mock.emit('open');
 }
 
-// ── Test helpers ────────────────────────────────────────────────────
-
 function createClient(overrides: Partial<PlatformClientOptions> = {}) {
   return new PlatformClient({
     url: 'ws://localhost:9999/ws',
@@ -129,8 +115,6 @@ function authenticateClient(client: PlatformClient): MockWsInstance {
   return mock;
 }
 
-// ── Setup / Teardown ────────────────────────────────────────────────
-
 beforeEach(() => {
   mockInstances.length = 0;
   mockConstructorArgs.length = 0;
@@ -140,8 +124,6 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
 });
-
-// ── Tests ───────────────────────────────────────────────────────────
 
 describe('PlatformClient', () => {
   describe('getGithubWebhookUrl', () => {
@@ -262,7 +244,6 @@ describe('PlatformClient', () => {
       const mock = getLatestMock();
       simulateOpen(mock);
 
-      // Verify auth.request was sent with capabilities
       expect(mock.sentMessages).toHaveLength(1);
       const authReq = JSON.parse(mock.sentMessages[0]);
       expect(authReq.type).toBe('auth.request');
@@ -333,8 +314,7 @@ describe('PlatformClient', () => {
         capabilities: { dashboardWrites?: Record<string, boolean> };
       }>;
       expect(sent).toHaveLength(2);
-      // Second broadcast replaces dashboardWrites with the new map; the
-      // caller is responsible for merging on its side (server.ts passes
+      // A broadcast replaces dashboardWrites; the caller merges (server.ts passes
       // the full policy map every time).
       expect(sent[1].capabilities.dashboardWrites).toEqual({ 'variables.set': 'disabled' });
       expect(sent[1].capabilities.orchRole).toBe('coordinator');
@@ -584,17 +564,14 @@ describe('PlatformClient', () => {
 
       expect(client.state).toBe('authenticated');
 
-      // Surviving the stability window is what resets the counter — not the
-      // `auth.success` frame itself. Authenticating happens before the state
-      // replay send, so a connection that dies on the reply is one that
-      // authenticated and was never viable; treating auth as proof of health is
-      // what let such a failure reconnect at the floor delay indefinitely.
+      // Surviving the stability window resets the counter, not `auth.success`:
+      // the state replay send is still ahead of auth.
       vi.advanceTimersByTime(30_000);
 
       mock.readyState = 3;
       mock.emit('close', 1006, Buffer.from('abnormal'));
 
-      // Counter reset, so the next attempt uses the base delay (~1000-1500ms).
+      // Base delay (~1000-1500ms).
       vi.advanceTimersByTime(2000);
 
       expect(mockInstances.length).toBe(attemptsBeforeAuth + 2);
@@ -644,20 +621,16 @@ describe('PlatformClient', () => {
       vi.spyOn(Math, 'random').mockReturnValue(0);
       const client = createClient();
 
-      // Two full connect -> authenticate -> 4003 cycles. Authentication
-      // succeeding does NOT mean the connection is viable: the state replay
-      // send is still ahead of it, and a frame the Platform rejects closes the
-      // socket immediately after. Resetting the counter on auth is what let a
-      // post-auth failure reconnect at the 1.0-1.5s floor indefinitely instead
-      // of escalating toward the 60s ceiling.
+      // A rejected replay frame closes the socket right after auth; resetting on
+      // auth would pin that failure at the 1.0-1.5s floor instead of escalating
+      // toward the 60s ceiling.
       for (let i = 0; i < 2; i++) {
         const mock = authenticateClient(client);
         mock.readyState = 3;
         mock.emit('close', 4003, Buffer.from('Invalid message'));
       }
 
-      // attempts === 2 -> 1000 * 1.5^2. Were the counter reset on auth it
-      // would read 1500 (attempts === 1) forever, however many times it failed.
+      // attempts === 2 -> 1000 * 1.5^2; a reset on auth would read 1500 forever.
       expect(client.getReconnectDelay()).toBe(2250);
 
       vi.spyOn(Math, 'random').mockRestore();
@@ -673,7 +646,6 @@ describe('PlatformClient', () => {
         mock.emit('close', 4003, Buffer.from('Invalid message'));
       }
 
-      // Stay up past the stability window: THAT is what proves health.
       authenticateClient(client);
       vi.advanceTimersByTime(30_000);
 
@@ -690,13 +662,12 @@ describe('PlatformClient', () => {
       first.readyState = 3;
       first.emit('close', 4003, Buffer.from('Invalid message'));
 
-      // Authenticate again but die well before the 30s window elapses.
       const second = authenticateClient(client);
       vi.advanceTimersByTime(5_000);
       second.readyState = 3;
       second.emit('close', 4003, Buffer.from('Invalid message'));
 
-      // Still escalating (attempts === 2), not back at the floor.
+      // attempts === 2, not back at the floor.
       expect(client.getReconnectDelay()).toBe(2250);
 
       vi.spyOn(Math, 'random').mockRestore();
@@ -741,7 +712,6 @@ describe('PlatformClient', () => {
     it('does not count a close that carried no replay', async () => {
       const client = createClient();
 
-      // Three closes with no replay sent on the connection must not trip it.
       for (let i = 0; i < 3; i++) {
         const mock = authenticateClient(client);
         mock.readyState = 3;
@@ -777,8 +747,7 @@ describe('PlatformClient', () => {
     it('clears the counter once a connection proves stable', async () => {
       const client = createClient();
 
-      // Two failures, then a healthy connection, then two more: never reaches 3
-      // consecutively, so the breaker stays shut.
+      // Never 3 consecutive failures, so the breaker stays shut.
       await replayThenReject(client);
       await replayThenReject(client);
 
@@ -834,7 +803,6 @@ describe('PlatformClient', () => {
       const mock = getLatestMock();
       simulateOpen(mock);
 
-      // Clear auth.request message
       mock.sentMessages = [];
 
       simulateMessage(mock, {
@@ -846,7 +814,6 @@ describe('PlatformClient', () => {
       });
 
       const sent = getSentMessages(mock);
-      // Should have source.register message
       const registerMsg = sent.find((m: any) => m.type === 'source.register');
       expect(registerMsg).toBeDefined();
       expect((registerMsg as any).sources).toEqual([
@@ -1021,7 +988,7 @@ describe('PlatformClient', () => {
 
     it('omits configPaths from source.register when nothing is known', () => {
       // An empty object would read on the Platform as "reported nothing known"
-      // rather than "did not report" — the guard in the spread prevents that.
+      // rather than "did not report".
       const client = createClient({
         providerSources: [
           { provider: 'github', routingKey: 'github:42', name: 'My App', subtype: 'github_app' },
@@ -1047,10 +1014,8 @@ describe('PlatformClient', () => {
     });
 
     it('sends source.register with empty sources when no providerSources configured', () => {
-      // A connected orchestrator with zero sources must still announce itself
-      // so the Platform records it as connected (writes its
-      // platform_connections row). It sends source.register with an empty
-      // sources array rather than going silent.
+      // A sourceless orchestrator still announces itself so the Platform writes
+      // its platform_connections row.
       const client = createClient();
       client.connect();
       const mock = getLatestMock();
@@ -1158,7 +1123,6 @@ describe('PlatformClient', () => {
       });
       const mock = authenticateClient(client);
 
-      // Should not throw or change state
       simulateMessage(mock, {
         type: 'source.register.ack',
         messageId: 'msg-ack-1',
@@ -1182,7 +1146,6 @@ describe('PlatformClient', () => {
         rejected: [{ routingKey: 'github:42', reason: 'Duplicate routing key' }],
       });
 
-      // Client remains authenticated even if sources rejected
       expect(client.state).toBe('authenticated');
     });
 
@@ -1231,10 +1194,8 @@ describe('PlatformClient', () => {
     });
 
     it('registerSourceAndAwait rejects with the Platform reason rather than timing out', async () => {
-      // A rejected key used to leave the waiter pending until its 5 s timeout,
-      // so `kici-admin source add` printed "(unavailable)" instead of the
-      // reason the Platform gave — for instance that the source's `--org` does
-      // not match the authenticated Platform organization.
+      // Otherwise `kici-admin source add` waits out the 5 s timeout and prints
+      // "(unavailable)" instead of the Platform's reason (e.g. an `--org` mismatch).
       const client = createClient({ providerSources: [] });
       const mock = authenticateClient(client);
 
@@ -1300,7 +1261,6 @@ describe('PlatformClient', () => {
         providerSources: [{ provider: 'github', routingKey: 'github:42' }],
       });
 
-      // First connection
       client.connect();
       let mock = getLatestMock();
       simulateOpen(mock);
@@ -1312,11 +1272,9 @@ describe('PlatformClient', () => {
         githubWebhookUrl: null,
       });
 
-      // Disconnect
       mock.readyState = 3;
       mock.emit('close', 1006, Buffer.from('abnormal'));
 
-      // Reconnect
       vi.advanceTimersByTime(2000);
       mock = getLatestMock();
       simulateOpen(mock);
@@ -1498,7 +1456,7 @@ describe('PlatformClient', () => {
       });
       const mock = authenticateClient(client);
 
-      // onAuthenticated should NOT be called yet (waiting for ACK)
+      // Not before the ACK.
       expect(onAuthenticated).not.toHaveBeenCalled();
 
       simulateMessage(mock, {
@@ -1557,9 +1515,8 @@ describe('PlatformClient', () => {
       const mock = authenticateClient(client);
       mock.sentMessages = [];
 
-      // dashboard.contexts.create requires `name`; an empty body fails the
-      // primary schema. Without the response guarantee this message is dropped
-      // and the Platform hangs until its 10s forward window lapses (504).
+      // Missing `name` fails the primary schema; without an error frame the
+      // Platform waits out its 10s forward window (504).
       simulateMessage(mock, { type: 'dashboard.contexts.create', requestId: 'req-bad' });
 
       const sent = getSentMessages(mock);
@@ -1625,9 +1582,8 @@ describe('PlatformClient', () => {
     });
 
     it('delivers the workflow repository of a cross-repository global run', () => {
-      // The reporter qualifies the check-run names it times out with this, so
-      // a field dropped at the WS edge silently restores the wrong-repository
-      // cleanup this plumbing exists to prevent.
+      // The reporter qualifies timed-out check-run names with it; dropping it at
+      // the WS edge cleans up the wrong repository's check runs.
       const onStaleCheckrunCleanup = vi.fn();
       const client = createClient({ onStaleCheckrunCleanup });
       const mock = authenticateClient(client);
@@ -1670,16 +1626,10 @@ describe('PlatformClient', () => {
 
   // ── Dashboard env-message dispatch ─────────────────────────────────
   //
-  // `dispatchPlatformMessage` in platform-client.ts ends with a
-  // `default:` exhaustiveness assertion (`const _exhaustive: never =
-  // msg`). Adding a new variant to `PlatformToOrchestratorMessage`
-  // without a matching case fails `pnpm typecheck`, so the historical
-  // bug class (silently-dropped dashboard messages — `dashboard.event-
-  // log.payload.stream` and `dashboard.event-dlq.{list,count,retry,
-  // discard}`) cannot recur.
-  //
-  // The dispatch tests below confirm the on-wire shape of new fall-
-  // through cases still reaches `onDashboardEnvMessage` correctly.
+  // `dispatchPlatformMessage` ends with a `never` exhaustiveness assertion, so a
+  // new `PlatformToOrchestratorMessage` variant without a case fails typecheck
+  // instead of being silently dropped. These tests confirm the fall-through
+  // cases reach `onDashboardEnvMessage`.
 
   describe('dashboard env-message dispatch', () => {
     it('routes dashboard.event-log.payload.stream to onDashboardEnvMessage', () => {
@@ -1804,10 +1754,8 @@ describe('PlatformClient', () => {
       const client = createClient();
       authenticateClient(client);
 
-      // The Zod parse in handleMessage would reject this, so invoke the
-      // private dispatcher directly. The default branch is the
-      // belt-and-braces runtime guard sitting behind the compile-time
-      // exhaustiveness assertion.
+      // Zod would reject this, so call the private dispatcher directly: the
+      // default branch is the runtime guard behind the exhaustiveness assertion.
       const dispatcher = (
         client as unknown as { dispatchPlatformMessage(msg: unknown): void }
       ).dispatchPlatformMessage.bind(client);
@@ -1820,11 +1768,6 @@ describe('PlatformClient', () => {
   // ── Chunked webhook.relay protocol ─────────────────────────────────
 
   describe('chunked webhook.relay protocol', () => {
-    /**
-     * Build a chunked relay scenario: drive a single inbound webhook through
-     * `webhook.relay.start` + N `webhook.relay.chunk` frames and assert what
-     * the orchestrator emits on the wire (plus what the wired callbacks see).
-     */
     function makeStartFrame(messageId: string, body: string, chunkCount: number) {
       return {
         type: 'webhook.relay.start',
@@ -1836,9 +1779,7 @@ describe('PlatformClient', () => {
         signatureHeaderName: 'x-hub-signature-256',
         signatureHeader: 'sha256=deadbeef',
         clientIp: '10.0.0.1',
-        // Default to JSON content-type so tests that supply JSON bodies get
-        // a parsed payload from completeChunkedRelay. Tests for raw-body
-        // routing override this header explicitly.
+        // JSON by default so bodies are parsed; raw-body tests override it.
         headers: { 'x-github-event': 'push', 'content-type': 'application/json' },
         totalSize: Buffer.byteLength(body, 'utf8'),
         chunkCount,
@@ -1871,9 +1812,7 @@ describe('PlatformClient', () => {
 
       simulateMessage(mock, makeChunk('m1', 0, body, true));
 
-      // Allow the async completeChunkedRelay path to flush.
-      // Advance well under the 30s heartbeat so interval doesn't loop, but
-      // long enough to flush the async completeChunkedRelay microtask chain.
+      // Flush the async completeChunkedRelay chain, well under the 30s heartbeat.
       await vi.advanceTimersByTimeAsync(100);
 
       expect(onVerifyInbound).toHaveBeenCalledTimes(1);
@@ -1936,9 +1875,8 @@ describe('PlatformClient', () => {
       simulateMessage(mock, makeChunk('m-cap', 0, body, true));
       await vi.advanceTimersByTimeAsync(100);
 
-      // The capture seam ran with the pre-verify meta + the assembled raw body,
-      // and the controller's own shed reason — the breadcrumb names it, so a
-      // reason the seam never receives is a reason no durable record carries.
+      // The seam gets the pre-verify meta, the raw body and the controller's shed
+      // reason, which the breadcrumb names.
       expect(onShedCapture).toHaveBeenCalledTimes(1);
       const [meta, bodyBuf, reason] = onShedCapture.mock.calls[0]!;
       expect(meta.routingKey).toBe('github:12345');
@@ -1997,9 +1935,7 @@ describe('PlatformClient', () => {
     });
 
     it('does not record a shed for an admitted relay, nor for one verify rejects', async () => {
-      // The counterpart to the shed breadcrumb: the seam that writes the
-      // durable `shed` record must be unreachable for a delivery that was
-      // never shed, or an admitted delivery gains a phantom shed row.
+      // A delivery never shed must not gain a phantom `shed` row.
       const onWebhookRelay = vi.fn().mockResolvedValue(undefined);
       const onShedCapture = vi.fn().mockResolvedValue(undefined);
       const release = vi.fn();
@@ -2065,7 +2001,6 @@ describe('PlatformClient', () => {
       const client = createClient({ onWebhookRelay, onVerifyInbound });
       const mock = authenticateClient(client);
 
-      // Total body "abcdef" split into 3 chunks of 2.
       simulateMessage(mock, makeStartFrame('m2', 'abcdef', 3));
       simulateMessage(mock, makeChunk('m2', 0, 'ab', false));
       simulateMessage(mock, makeChunk('m2', 1, 'cd', false));
@@ -2075,8 +2010,6 @@ describe('PlatformClient', () => {
       ).toHaveLength(0);
 
       simulateMessage(mock, makeChunk('m2', 2, 'ef', true));
-      // Advance well under the 30s heartbeat so interval doesn't loop, but
-      // long enough to flush the async completeChunkedRelay microtask chain.
       await vi.advanceTimersByTimeAsync(100);
 
       const [, bodyBuf] = onVerifyInbound.mock.calls[0]!;
@@ -2094,8 +2027,6 @@ describe('PlatformClient', () => {
 
       simulateMessage(mock, makeStartFrame('m3', 'x', 1));
       simulateMessage(mock, makeChunk('m3', 0, 'x', true));
-      // Advance well under the 30s heartbeat so interval doesn't loop, but
-      // long enough to flush the async completeChunkedRelay microtask chain.
       await vi.advanceTimersByTimeAsync(100);
 
       const acks = getSentMessages(mock).filter(
@@ -2109,7 +2040,6 @@ describe('PlatformClient', () => {
         result: 'rejected_signature',
         reason: 'no rotation secret matched x-hub-signature-256',
       });
-      // onWebhookRelay must NOT be invoked when verify rejects.
       expect(onWebhookRelay).not.toHaveBeenCalled();
     });
 
@@ -2120,10 +2050,7 @@ describe('PlatformClient', () => {
       const mock = authenticateClient(client);
 
       simulateMessage(mock, makeStartFrame('m4', 'aabb', 2));
-      // Skip sequence 0, send 1 directly.
       simulateMessage(mock, makeChunk('m4', 1, 'bb', true));
-      // Advance well under the 30s heartbeat so interval doesn't loop, but
-      // long enough to flush the async completeChunkedRelay microtask chain.
       await vi.advanceTimersByTimeAsync(100);
 
       const acks = getSentMessages(mock).filter(
@@ -2140,9 +2067,7 @@ describe('PlatformClient', () => {
     });
 
     it('ACKs rejected_misconfigured when chunk delivers more bytes than declared totalSize', async () => {
-      // Declared totalSize=4 with chunkCount=2 but final chunk overflows.
-      // (Schema-layer cap >25 MiB is exercised by the schema unit tests; this
-      // test covers the orch-side defensive runtime check.)
+      // The orch-side runtime check; the >25 MiB schema cap has its own tests.
       const client = createClient({
         onVerifyInbound: vi.fn().mockResolvedValue({ result: 'accepted' as const }),
       });
@@ -2150,7 +2075,6 @@ describe('PlatformClient', () => {
 
       simulateMessage(mock, {
         ...makeStartFrame('m-overflow', 'aabb', 2),
-        // Lie about totalSize -- chunks will deliver 6 bytes, declared 4.
         totalSize: 4,
       });
       simulateMessage(mock, makeChunk('m-overflow', 0, 'aa', false));
@@ -2176,8 +2100,6 @@ describe('PlatformClient', () => {
 
       simulateMessage(mock, makeStartFrame('m5', 'not-json', 1));
       simulateMessage(mock, makeChunk('m5', 0, 'not-json', true));
-      // Advance well under the 30s heartbeat so interval doesn't loop, but
-      // long enough to flush the async completeChunkedRelay microtask chain.
       await vi.advanceTimersByTimeAsync(100);
 
       const acks = getSentMessages(mock).filter(
@@ -2215,14 +2137,11 @@ describe('PlatformClient', () => {
     });
 
     it('ACKs rejected_misconfigured when no onVerifyInbound is wired', async () => {
-      // No onVerifyInbound supplied.
       const client = createClient();
       const mock = authenticateClient(client);
 
       simulateMessage(mock, makeStartFrame('m6', '{}', 1));
       simulateMessage(mock, makeChunk('m6', 0, '{}', true));
-      // Advance well under the 30s heartbeat so interval doesn't loop, but
-      // long enough to flush the async completeChunkedRelay microtask chain.
       await vi.advanceTimersByTimeAsync(100);
 
       const acks = getSentMessages(mock).filter(
@@ -2242,37 +2161,23 @@ describe('PlatformClient', () => {
   // Decision (2026-04-28): ACCEPTED RISK. The orchestrator does not pin the
   // Platform's CA.
   //
-  // Summary of the rejection: the threat (orch→Platform MITM with a
-  // misissued leaf cert) requires extraordinary co-prerequisites — DNS/BGP
-  // hijack of the Platform hostname AND a leaf cert for that hostname signed
-  // by ANY system-trusted CA (e.g. ACME-DV via the same DNS hijack, coerced/
-  // rogue public CA, customer-installed enterprise root). The bug is also a
-  // single-tenant cred-theft enabler, not a customer-isolation breach.
-  // Pinning only the orch leg leaves the dashboard,
-  // `kici` developer CLI, `kici-admin` CLI, and provider-outbound legs on
-  // system PKI, so a capable attacker just shifts to the weakest leg.
-  // The chosen mitigation lives at the DNS layer instead (CAA record on
-  // `kici.dev` restricting issuance to Let's Encrypt + HSTS-preload on
-  // the Platform hostname) — which closes the misissuance vector for ALL
-  // legs at once with ~zero recurring cost.
+  // The threat (orch→Platform MITM) needs a DNS/BGP hijack of the Platform
+  // hostname AND a leaf cert from ANY system-trusted CA, and yields single-tenant
+  // credential theft, not a customer-isolation breach. Pinning only the orch leg
+  // leaves the dashboard, `kici`, `kici-admin` and provider-outbound legs on
+  // system PKI, so an attacker shifts to the weakest leg. The mitigation is at the
+  // DNS layer for ALL legs: a CAA record on `kici.dev` restricting issuance to
+  // Let's Encrypt, plus HSTS-preload on the Platform hostname.
   //
-  // The `it.fails` below is retained as a tripwire: today no `ca:` /
-  // `checkServerIdentity:` / `agent:` is passed to the WebSocket constructor,
-  // so the assertion fails and `it.fails` flips it green. If a future change
-  // introduces any of those options (intentionally re-enabling pinning),
-  // `it.fails` flips to red and forces a review of the accepted-risk
-  // decision.
+  // The `it.fails` below is a tripwire: adding `ca:` / `checkServerIdentity:` /
+  // `agent:` to the WebSocket constructor turns it red and forces a review.
   describe('TLS chain trust (intentional non-implementation, accepted-risk)', () => {
     it.fails('orch lacks Platform CA pin — accepted-risk (2026-04-28)', () => {
       const client = createClient({ url: 'wss://platform.example.com/ws' });
       client.connect();
 
-      // Inspect the options object passed to `new WebSocket(url, options)`.
-      // The pin can be expressed in any of three accepted shapes:
-      //   - `ca: <Buffer | string | (Buffer|string)[]>` — explicit CA bundle
-      //   - `checkServerIdentity: <function>` — custom leaf verifier (e.g. SPKI pin)
-      //   - `agent: <https.Agent>` carrying its own pinned roots
-      // If the connect path adopts any of these, this assertion passes.
+      // A pin is a CA bundle (`ca`), a custom leaf verifier (`checkServerIdentity`,
+      // e.g. SPKI pin) or an `agent` carrying its own pinned roots.
       const args = mockConstructorArgs[mockConstructorArgs.length - 1];
       expect(args).toBeDefined();
       const options = args![1] as Record<string, unknown> | undefined;
@@ -2288,17 +2193,11 @@ describe('PlatformClient', () => {
 
   // ── `permessage-deflate` compression bomb defense (security invariant) ──
   //
-  // Invariant: every WS endpoint that negotiates `permessage-deflate`
-  // MUST cap the maximum decompressed message size via `maxPayload`.
-  // Client-side too: a rogue Platform impostor (a successful MITM with
-  // a misissued cert) could otherwise blow up the orchestrator's RAM
-  // with a single compressed frame that decompresses to ~100 MiB
-  // (ws@8.x default maxPayload). The cap must be configured before
-  // `auth.request` is sent so a hostile pre-auth peer cannot exhaust
-  // resources before identity is established.
-  //
-  // Asserts the EXACT configured value (positive control, not just a ceiling)
-  // so any regression that changes `maxPayload` is loud.
+  // Invariant: every WS endpoint that negotiates `permessage-deflate` MUST cap
+  // the decompressed message size via `maxPayload`, client-side too, or a
+  // Platform impostor can send one frame that inflates to ~100 MiB (the ws@8.x
+  // default). The cap is set before `auth.request`, so a hostile pre-auth peer
+  // cannot exhaust resources. Asserts the EXACT value, not just a ceiling.
   describe('compression bomb defense (security invariant)', () => {
     it('caps maxPayload on the WebSocket constructor (= WS_MAX_PAYLOAD_BYTES)', () => {
       const client = createClient({ url: 'wss://platform.example.com/ws' });
@@ -2315,21 +2214,16 @@ describe('PlatformClient', () => {
 
   // ── Legacy single-frame `webhook.relay` MUST NOT bypass on-orch HMAC ──
   //
-  // Invariant: the post-`012_drop_webhook_secret_columns` design makes the
-  // orchestrator's `onVerifyInbound` (HMAC against pgSecretStore) the sole
-  // trust boundary against a rogue Platform operator or a stolen Platform
-  // credential — Platform "never verifies webhook signatures and never stores
-  // customer signing material". Every Platform→Orch path that reaches
-  // `processWebhook` MUST therefore have passed `onVerifyInbound`.
+  // Invariant: the orchestrator's `onVerifyInbound` (HMAC against
+  // pgSecretStore) is the sole trust boundary against a rogue Platform or a
+  // stolen Platform credential — the Platform never verifies signatures or
+  // stores signing material. Every path to `processWebhook` MUST pass it.
   //
-  // Enforcement: `webhookRelaySchema` is intentionally NOT a member of
+  // `webhookRelaySchema` is deliberately NOT in
   // `platformToOrchestratorMessageSchema`, so a forged single-frame
-  // `{type:'webhook.relay', payload, ...}` from Platform fails Zod parse and
-  // falls through `handleNonStandardMessage` (which only matches log-pull
-  // and join-request), where it is logged and dropped. The chunked path
-  // `webhook.relay.start` + `webhook.relay.chunk` is the sole legitimate
-  // route from Platform to `onWebhookRelay`, and it goes through
-  // `onVerifyInbound` first.
+  // `webhook.relay` fails the parse and `handleNonStandardMessage` drops it.
+  // The chunked `webhook.relay.start` + `webhook.relay.chunk` path is the sole
+  // route to `onWebhookRelay`, and it verifies first.
   describe('legacy single-frame webhook.relay HMAC bypass (security invariant)', () => {
     it('single-frame webhook.relay MUST NOT reach onWebhookRelay (HMAC bypass closed)', async () => {
       const onRelay = vi.fn().mockResolvedValue(undefined);
@@ -2341,12 +2235,8 @@ describe('PlatformClient', () => {
       authenticateClient(client);
 
       const mock = getLatestMock();
-      // Forge a single-frame webhook.relay as a rogue Platform, or an
-      // attacker holding a stolen Platform credential, would. Payload is
-      // shaped to look like a GitHub push event so that,
-      // post-dispatch, processWebhook would run trigger match against a
-      // lock file and fan a job out to an agent — i.e. arbitrary workflow
-      // code execution under the tenant's secrets.
+      // A GitHub-push-shaped forgery: if dispatched, it would run arbitrary
+      // workflow code under the tenant's secrets.
       simulateMessage(mock, {
         type: 'webhook.relay',
         messageId: 'forged-1',
@@ -2359,10 +2249,6 @@ describe('PlatformClient', () => {
 
       await vi.advanceTimersByTimeAsync(0);
 
-      // Invariant: forged single-frame webhook.relay must not reach the
-      // dispatcher pipeline. The Zod union no longer includes
-      // `webhookRelaySchema`, so the parse fails and the message is dropped
-      // without ever calling `onVerifyInbound` or `onWebhookRelay`.
       expect(onRelay).not.toHaveBeenCalled();
       expect(onVerify).not.toHaveBeenCalled();
     });
@@ -2388,13 +2274,9 @@ describe('PlatformClient', () => {
       const client = createClient({ onTrustPolicyUpdate });
       const mock = authenticateClient(client);
 
-      // A rogue Platform pushes a maximally-permissive policy plus
-      // forged identityLinks + admin ci_trust for an attacker. The wire
-      // dispatcher just forwards; the orchestrator's onTrustPolicyUpdate
-      // callback in server.ts reads only identityLinks +
-      // memberCiTrustLevels and drops policy.* fields. The defense-in-depth
-      // protections live downstream in trust-resolver.ts (provider API gate)
-      // and dispatch-matched-workflow.ts (per-environment minimumTrust).
+      // A maximally-permissive forged policy. The dispatcher only forwards; the
+      // defenses live in trust-resolver.ts (provider API gate) and
+      // dispatch-matched-workflow.ts (per-environment minimumTrust).
       simulateMessage(mock, {
         type: 'trust_policy.update',
         orgId: 'org-1',
@@ -2499,9 +2381,7 @@ describe('PlatformClient — version-skew NACK + Platform capabilities', () => {
     const mock = authenticateClient(client);
     mock.sentMessages.length = 0;
 
-    // trust_policy.update is a KNOWN Platform→orch type; a frame that fails its
-    // schema (missing required fields) is malformed, not version skew, so no
-    // spurious skew NACK is emitted.
+    // A KNOWN type failing its schema is malformed, not version skew.
     simulateMessage(mock, { type: 'trust_policy.update', messageId: 'bad-1' });
 
     const sent = getSentMessages(mock);
@@ -2514,8 +2394,6 @@ describe('PlatformClient — version-skew NACK + Platform capabilities', () => {
     const mock = authenticateClient(client);
     mock.sentMessages.length = 0;
 
-    // A `nack` that fails schema validation (missing reason) must stay
-    // drop-and-warn — never a NACK-of-NACK.
     simulateMessage(mock, { type: 'nack', messageId: 'x' });
 
     const sent = getSentMessages(mock);
@@ -2610,8 +2488,7 @@ describe('plan ceiling and worker membership', () => {
     const client = createClient({ planHeadroomStore: store as never, onPlanCeiling });
     const mock = authenticateClient(client);
 
-    // Every frame reconciles — a non-evict frame carries evictExcess=false so a
-    // raised ceiling can cancel an in-flight drain, not only start one.
+    // A raised ceiling must be able to cancel an in-flight drain.
     simulateMessage(mock, {
       type: 'plan.headroom',
       maxWorkerPeers: 2,

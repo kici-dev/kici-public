@@ -1,13 +1,7 @@
 /**
- * Orchestrator service command group registration.
- *
- * Registers `kici-admin orchestrator` with install, uninstall, start, stop,
- * restart, status, logs, upgrade, drain, and resume subcommands for managing the
- * orchestrator as a system service.
- *
- * The lifecycle verbs (install/start/stop/…) manage local services directly and
- * do NOT use AdminApiClient. The drain/resume verbs DO — they talk to the running
- * coordinator's admin HTTP API to quiesce it before an upgrade.
+ * `kici-admin orchestrator`: manages the orchestrator as a system service. The
+ * lifecycle verbs act on local services and do NOT use AdminApiClient; drain
+ * and resume DO, quiescing the running coordinator before an upgrade.
  */
 
 import type { Command } from 'commander';
@@ -22,11 +16,9 @@ export function registerOrchestratorServiceCommands(
   program: Command,
   getClient: () => AdminApiClient,
   /**
-   * Non-exiting client factory for the upgrade command. Its drain and
-   * schema-guard steps improve on a path that previously did neither, so an
-   * install with no admin credentials must still be able to upgrade — and
-   * `getClient` exits the process rather than throwing, which a caller cannot
-   * catch.
+   * Non-exiting client factory for upgrade: its drain and schema-guard steps
+   * are optional, so an install with no admin credentials still upgrades, and
+   * `getClient` exits the process, which a caller cannot catch.
    */
   tryGetClient: () => AdminApiClient | null,
 ): void {

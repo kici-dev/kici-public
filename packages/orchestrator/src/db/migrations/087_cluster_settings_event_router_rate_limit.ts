@@ -3,10 +3,12 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Add `cluster_settings.event_router_rate_limit_per_workflow_per_minute` (nullable INTEGER).
  *
- * Fleet-wide per-(source routing key + event) sliding-window rate limit (events/minute) for the event router. NULL → cluster default (`config.eventRouterRateLimitPerWorkflowPerMinute`, `KICI_EVENT_ROUTER_RATE_LIMIT_PER_WORKFLOW_PER_MINUTE`).
+ * Fleet-wide per-(source routing key + event) sliding-window rate limit
+ * (events/minute) for the event router. NULL → cluster default
+ * (`config.eventRouterRateLimitPerWorkflowPerMinute`,
+ * `KICI_EVENT_ROUTER_RATE_LIMIT_PER_WORKFLOW_PER_MINUTE`).
  *
- * Idempotent: guarded on column existence; a re-run on a DB that already has
- * the column is a no-op.
+ * Idempotent: guarded on column existence.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

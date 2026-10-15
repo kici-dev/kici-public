@@ -1,15 +1,13 @@
 /**
- * RebootDeadlineSweep: clears expired host-reboot-pending flags.
+ * Clears expired host-reboot-pending flags.
  *
- * When a workflow's `restartHost()` step runs, the orchestrator sets a
- * `host_roster.reboot_pending_until` deadline and holds the pinned post-restart
- * job until the host completes a reboot cycle. If the host never returns by the
- * deadline, this sweep clears the stale flag. With the flag cleared and the
- * agent still gone, the held post-restart job hits the existing dispatch-queue
- * timeout and the run fails — the "host did not return after reboot" outcome.
+ * A `restartHost()` step sets `host_roster.reboot_pending_until` and holds the pinned
+ * post-restart job until the host completes a reboot cycle. If the host misses the deadline,
+ * this clears the flag; with the agent still gone, the held job hits the dispatch-queue timeout
+ * and the run fails — the "host did not return after reboot" outcome.
  *
- * Driven by the leader-only host-roster reaper's tick (one timer, one leader),
- * so this class owns no timer of its own — just a testable `scan()`.
+ * Driven by the leader-only host-roster reaper's tick (one timer, one leader), so it owns no
+ * timer — just a testable `scan()`.
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -20,7 +18,6 @@ const logger = createLogger({ prefix: 'reboot-deadline-sweep' });
 export interface RebootDeadlineRosterStore {
   /** Agent ids whose reboot-pending deadline has passed at `nowMs`. */
   listExpiredRebootPending(nowMs: number): Promise<string[]>;
-  /** Clear the reboot-pending flag for an agent. */
   clearRebootPending(agentId: string): Promise<void>;
 }
 
@@ -31,7 +28,6 @@ export class RebootDeadlineSweep {
     this.rosterStore = deps.rosterStore;
   }
 
-  /** Clear every reboot-pending flag whose deadline has passed. */
   async scan(): Promise<void> {
     try {
       const expired = await this.rosterStore.listExpiredRebootPending(Date.now());

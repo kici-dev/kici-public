@@ -1,15 +1,12 @@
 /**
  * Orchestrator-side agent-API handlers for the bootstrap bring-up seam.
  *
- * Both `kici.ensureInitRunner` and `kici.preBootSend` ride the agent-WS RPC
- * channel (like `inventory.query` / `host.requestReboot`). The PRIVILEGED half
- * lives here — capability gate, scoped-secret resolve, single-use bootstrap
- * token mint, access-log — and the handler returns the SSH material to the
- * calling agent, which performs the actual SSH transport (it holds the mesh
- * path to the fresh box). The capability gate reads the CALLING agent's labels
- * from the registry; only an agent holding `kici:capability:ssh-transport` may
- * run a bring-up, and every attempt (allowed or denied) writes an access-log
- * row.
+ * These handlers ride the agent-WS RPC channel (like `inventory.query` /
+ * `host.requestReboot`). The PRIVILEGED half lives here — capability gate,
+ * scoped-secret resolve, single-use bootstrap token mint, access-log — and the
+ * calling agent performs the SSH transport (it holds the mesh path to the fresh
+ * box). Only a caller whose registry labels hold `kici:capability:ssh-transport`
+ * may run a bring-up; every attempt (allowed or denied) writes an access-log row.
  */
 import {
   canonicalizeLabel,
@@ -49,7 +46,6 @@ export const PRE_BOOT_DEFAULT_PORT = 2222;
 /** Default forced command at a dropbear unlock endpoint (ignored by `-c` forces). */
 export const PRE_BOOT_DEFAULT_COMMAND = 'cryptroot-unlock';
 
-/** Shared deps for the bring-up handlers. */
 export interface BringupApiDeps {
   registry: AgentRegistry;
   rosterStore: HostRosterStore;
@@ -64,19 +60,18 @@ export interface BringupApiDeps {
   /** Resolve the orchestrator's own version — the payload version to stage on bring-up. */
   resolveVersion: () => string;
   /**
-   * The cache-bucket agent-package store, present only when S3 cache storage is
-   * configured. Backs the `s3-direct` delivery mode: the handler mints a
-   * box-routable presigned download URL for a probed platform. Absent ⇒ every
-   * bring-up falls back to `ssh-push` and the presign RPC is refused.
+   * Cache-bucket agent-package store, present only when S3 cache storage is
+   * configured. Backs `s3-direct` delivery (a box-routable presigned download URL
+   * per probed platform). Absent ⇒ every bring-up uses `ssh-push` and the presign
+   * RPC is refused.
    */
   agentPackages?: AgentPackageDownloadStorage;
 }
 
 /**
- * Reach the calling agent connects to + the resolved private key. Returned to
- * the agent so it can run the SSH transport. The key value transits to the ops
- * agent by design (it custodies the bring-up key), exactly as resolved secrets
- * reach an agent at job dispatch.
+ * Host reach returned to the calling agent for the SSH transport. The private
+ * key returned beside it transits to the ops agent by design (it custodies the
+ * bring-up key), exactly as resolved secrets reach an agent at job dispatch.
  */
 export interface BringupReach {
   agentId: string;
@@ -98,10 +93,10 @@ export interface EnsureInitRunnerResult {
   /** The orchestrator's own version — the self-contained payload version to stage. */
   version?: string;
   /**
-   * Per-host delivery mode the agent uses to stage the payload: `s3-direct` when
-   * the host is declared object-storage-reachable AND a cache store is
-   * configured, else `ssh-push`. The agent probes the platform then requests the
-   * presigned URL via `kici.presignAgentPackage` for the `s3-direct` case.
+   * Payload delivery mode: `s3-direct` when the host is declared
+   * object-storage-reachable AND a cache store is configured, else `ssh-push`.
+   * The agent probes the platform, then requests the presigned URL via
+   * `kici.presignAgentPackage`.
    */
   deliveryMode?: AgentDeliveryMode;
 }
@@ -173,7 +168,7 @@ function recordBringup(
   );
 }
 
-/** Resolve a `scope/key` secret ref into (scope, key). The key is the last segment. */
+/** The key is the last `/` segment of a `scope/key` ref. */
 function splitSecretRef(ref: string): { scope: string; key: string } {
   const idx = ref.lastIndexOf('/');
   if (idx <= 0 || idx === ref.length - 1) {
@@ -182,7 +177,7 @@ function splitSecretRef(ref: string): { scope: string; key: string } {
   return { scope: ref.slice(0, idx), key: ref.slice(idx + 1) };
 }
 
-/** Map a roster HostReach to the agent-facing BringupReach (drops the secret ref). */
+/** Drops the secret ref from the agent-facing reach. */
 function toBringupReach(reach: HostReach): BringupReach {
   return {
     agentId: reach.agentId,
@@ -192,7 +187,6 @@ function toBringupReach(reach: HostReach): BringupReach {
   };
 }
 
-/** Resolve a single `scope/key` secret ref to its value, or throw. */
 async function resolveSecretRef(
   deps: BringupApiDeps,
   ref: string,
@@ -263,16 +257,13 @@ export function createEnsureInitRunnerHandler(
 
     recordBringup(deps, 'fleet.init_runner.bringup', callingAgentId, targetAgentId, 'allowed');
 
-    // Record the staged version so the fleet-convergence gate can later detect
-    // drift on this host (the agent's own self-reported bundle version cannot
-    // distinguish two payloads that share a self-report but differ by staged
-    // key). The bring-up stages the orchestrator's own version.
+    // The fleet-convergence gate detects drift from this record: the agent's
+    // self-reported bundle version cannot tell apart two payloads that share a
+    // self-report but differ by staged key.
     const stagedVersion = deps.resolveVersion();
     await deps.rosterStore.recordStagedVersion(targetAgentId, stagedVersion);
 
-    // Pick s3-direct only when the host is declared object-storage-reachable AND
-    // a cache store is configured to mint the presign; otherwise the
-    // conservative ssh-push fallback (the ops agent fetches + streams the bytes).
+    // ssh-push fallback: the ops agent fetches + streams the bytes.
     const deliveryMode: AgentDeliveryMode =
       reach.s3Reachable === true && deps.agentPackages
         ? AgentDeliveryMode.enum['s3-direct']
@@ -305,14 +296,13 @@ export interface PresignAgentPackageResult {
 }
 
 /**
- * Build the `kici.presignAgentPackage` handler — the follow-up RPC the ops agent
- * calls AFTER it probes the target platform (so the presign is keyed by the real
- * platform). Same capability gate + access-log as the bring-up. Mints a
- * box-routable presigned GET URL for the version-keyed payload from the
- * orchestrator's own cache bucket; no standing S3 credential leaves the
- * orchestrator. A missing payload object throws loudly (never a silent stale
- * stage). Used by BOTH delivery paths: for `s3-direct` the URL goes to the box;
- * for `ssh-push` the ops agent fetches it and streams the bytes onward.
+ * Build the `kici.presignAgentPackage` handler, which the ops agent calls AFTER
+ * it probes the target platform, so the presign is keyed by the real platform.
+ * Same capability gate + access-log as the bring-up. Mints a box-routable
+ * presigned GET URL for the version-keyed payload in the orchestrator's cache
+ * bucket; no standing S3 credential leaves the orchestrator. A missing payload
+ * throws loudly (never a silent stale stage). For `s3-direct` the URL goes to
+ * the box; for `ssh-push` the ops agent fetches it and streams the bytes onward.
  */
 export function createPresignAgentPackageHandler(
   deps: BringupApiDeps,
@@ -398,9 +388,9 @@ export function resolveRestartSpec(properties: Record<string, unknown>): AgentRe
   }
   const service = properties[AGENT_SERVICE_KEY];
   if (typeof service === 'string' && service.length > 0) {
-    // Defensively single-quote the service name so it cannot break out of the
-    // systemctl argv (belt-and-suspenders on top of the reserved-namespace
-    // guard that keeps these keys operator-declared, not agent-forgeable).
+    // Single-quote the service name so it cannot break out of the systemctl argv
+    // (on top of the reserved-namespace guard that keeps these keys
+    // operator-declared, not agent-forgeable).
     const svc = `'${service.replace(/'/g, `'\\''`)}'`;
     return {
       stop: `systemctl --user stop ${svc} || true`,
@@ -424,11 +414,10 @@ export interface AgentVersionStatusResult {
 }
 
 /**
- * Build the `kici.agentVersionStatus` read handler — the availability-gate probe
- * the convergence check-step calls. Returns the target version, the host's
- * recorded staged version, and whether the target's payloads are available for
- * the host's platform (the whole bootstrap set when the platform is unknown). No
- * SSH, no token — a pure read, but same capability gate + audit as the bring-up.
+ * Build the `kici.agentVersionStatus` read handler: the availability-gate probe
+ * the convergence check-step calls. Availability covers the host's platform, or
+ * the whole bootstrap set when the platform is unknown. No SSH, no token — a
+ * pure read, with the same capability gate + audit as the bring-up.
  */
 export function createAgentVersionStatusHandler(
   deps: BringupApiDeps,
@@ -455,7 +444,6 @@ export function createAgentVersionStatusHandler(
 
 /** Material the ops agent receives for a `kici.restageAgent` call. */
 export interface RestageAgentResult {
-  /** How to SSH to the target host. */
   reach: BringupReach;
   /** The resolved bring-up private key (custodied by the ops agent). */
   privateKey: string;
@@ -468,14 +456,13 @@ export interface RestageAgentResult {
 }
 
 /**
- * Build the `kici.restageAgent` handler — the availability-gated, external-actor
- * re-stage authorization. Gates on the caller's `ssh-transport` capability,
+ * Build the `kici.restageAgent` handler: the availability-gated, external-actor
+ * re-stage authorization. Gates on the caller's `ssh-transport` capability and
  * REFUSES loudly when the target version's payloads are unavailable for the
- * host's platform (belt-and-suspenders over the check-step gate — never a
- * skew), resolves the host reach + SSH key + restart spec, records the staged
- * version, audits, and returns the material the ops agent needs to swap + restart
- * the target's agent over SSH. Mints NO token: the re-staged permanent agent
- * reconnects on its own persistent credential (no self-update-handoff).
+ * host's platform (a second gate over the check-step's — never a skew). Returns
+ * what the ops agent needs to swap + restart the target's agent over SSH. Mints
+ * NO token: the re-staged permanent agent reconnects on its own persistent
+ * credential (no self-update-handoff).
  */
 export function createRestageAgentHandler(
   deps: BringupApiDeps,
@@ -491,8 +478,7 @@ export function createRestageAgentHandler(
     const row = await deps.rosterStore.get(targetAgentId);
     if (!row) throw new Error(`host ${targetAgentId} is not in the roster`);
 
-    // Availability gate (fail-closed): never authorize a re-stage onto a version
-    // whose payload objects don't exist — that would be a version skew.
+    // Fail-closed: a re-stage onto a version whose payloads don't exist is a skew.
     const platform = archToAgentPlatform(row.platform, row.arch);
     const platforms = platform ? [platform] : [...AgentPlatform.options];
     const gate = deps.agentPackages
@@ -523,10 +509,9 @@ export function createRestageAgentHandler(
         ? AgentDeliveryMode.enum['s3-direct']
         : AgentDeliveryMode.enum['ssh-push'];
 
-    // Record the staged version as the orchestrator's intent-of-record. The
-    // availability gate above already guaranteed the bytes exist; the on-box
-    // stage verifies the hash before extracting, so a recorded version is never
-    // a version whose payload is absent.
+    // The staged version is the orchestrator's intent-of-record. The gate above
+    // guarantees the bytes exist and the on-box stage verifies the hash before
+    // extracting, so a recorded version never has an absent payload.
     await deps.rosterStore.recordStagedVersion(targetAgentId, version);
     recordBringup(deps, 'fleet.init_runner.bringup', callingAgentId, targetAgentId, 'allowed');
 
@@ -549,10 +534,9 @@ function parseProps(value: unknown): Record<string, unknown> {
 }
 
 /**
- * Build the `kici.preBootSend` handler. Gates on the caller's capability,
- * resolves the pre-boot input secret (e.g. a LUKS passphrase), audits, and
- * returns the input + reach so the agent can pipe it to the target's pre-boot
- * SSH endpoint.
+ * Build the `kici.preBootSend` handler. Gates on the caller's capability and
+ * returns the resolved pre-boot input (e.g. a LUKS passphrase) + reach so the
+ * agent can pipe it to the target's pre-boot SSH endpoint.
  */
 export function createPreBootSendHandler(
   deps: BringupApiDeps,
@@ -566,8 +550,7 @@ export function createPreBootSendHandler(
       throw new CapabilityDeniedError(callingAgentId);
     }
 
-    // Resolve BOTH the host's bring-up SSH key (to authenticate to dropbear)
-    // and the pre-boot input (e.g. the LUKS passphrase to pipe to the prompt).
+    // The bring-up SSH key authenticates to dropbear.
     const { reach, secretValue: privateKey } = await resolveReachAndSecret(
       deps,
       targetAgentId,

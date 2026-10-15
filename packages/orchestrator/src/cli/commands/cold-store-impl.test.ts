@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// The real module builds a store against Postgres + S3; the fake below stands
-// in for both so the test pins what this side passes to the shared ops: the
+// Fakes Postgres + S3 to pin what this side passes the shared ops: the
 // `orchestrator` key segment and the `Orchestrator` error noun.
 const keys = vi.hoisted(() => [
   'cs/orchestrator/execution_runs/rk-1/2026/10/04/abc123.jsonl.gz',

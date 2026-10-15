@@ -22,7 +22,7 @@ export interface ResetResult {
   durationMs: number;
 }
 
-/** Default exec: run the command through the shell, SIGKILL on timeout. */
+/** Through the shell, SIGKILL on timeout. */
 const defaultExec: ExecFn = (command, timeoutMs) =>
   new Promise((resolve) => {
     const child = spawn('/bin/sh', ['-c', command], { stdio: 'ignore' });
@@ -42,9 +42,8 @@ const defaultExec: ExecFn = (command, timeoutMs) =>
   });
 
 /**
- * Run the operator between-jobs reset command. Fail-open: never throws, always
- * resolves to a status. Skips when unconfigured, or when runOn=on-failure and
- * the job succeeded.
+ * Fail-open: never throws. Skips when unconfigured, or when runOn=on-failure
+ * and the job succeeded.
  */
 export async function runBetweenJobsReset(input: ResetInput): Promise<ResetResult> {
   const started = performance.now();

@@ -4,21 +4,17 @@ import { type Kysely, sql } from 'kysely';
  * Record which repository DEFINED the workflow a run executed.
  *
  * `execution_runs.repo_identifier` is the repository the run acted on. For an
- * organization-wide workflow dispatched against another repository those are
- * two different repositories: `repo_identifier` holds the source repository
- * that emitted the event, while the workflow itself was authored elsewhere and
- * travels only per job in `jobConfig.workflowRepoIdentifier` — which lives in
- * `dispatch_queue.job_config` and is pruned once the run's queue rows age out.
+ * organization-wide workflow it is the event's source repository; the defining
+ * one travels only per job in `jobConfig.workflowRepoIdentifier`
+ * (`dispatch_queue.job_config`, pruned once the queue rows age out).
  *
- * So the run row alone could not answer "which repository defines this
- * workflow", and the rerun path read `repo_identifier` as the answer: it
- * re-fetched the source repository's lock file and either failed with a
- * misleading force-push message or, on a same-named workflow, silently ran the
- * source repository's workflow instead.
+ * Without this column the rerun path read `repo_identifier` as the defining
+ * repository: it re-fetched the source repository's lock file and either failed
+ * with a misleading force-push message or silently ran a same-named workflow.
  *
- * Nullable and unbackfilled by design: a null means "the run acted on the
- * repository that defines its workflow", which is true of every per-repository
- * run and of every row written before this column existed.
+ * Nullable and unbackfilled by design: null means the run acted on the
+ * repository that defines its workflow, true of every per-repository run and
+ * every row older than this column.
  *
  * Idempotent: guarded on the column's existence, so re-running is a no-op.
  */

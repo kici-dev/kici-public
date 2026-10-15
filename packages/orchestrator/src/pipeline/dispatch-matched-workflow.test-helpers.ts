@@ -1,8 +1,6 @@
 /**
- * Shared fixtures for the `dispatchMatchedWorkflow` test files.
- *
- * Kept out of any `*.test.ts` file so importing it does not re-register another
- * file's suites in the importer.
+ * Shared fixtures for the `dispatchMatchedWorkflow` tests, kept out of any
+ * `*.test.ts` so importing it re-registers no other file's suites.
  */
 import { expect, vi, type Mock } from 'vitest';
 import type {
@@ -59,10 +57,7 @@ export interface SingleJobContextOptions {
   withDynamicContext?: boolean;
   /** A contextStore stub used verbatim (overrides the jobContext-derived one). */
   contextStore?: unknown;
-  /**
-   * A checkRunReporter stub, so a case can observe the queued check runs the
-   * dispatch setup phase creates against the commit.
-   */
+  /** A checkRunReporter stub, to observe the queued check runs dispatch setup creates. */
   checkRunReporter?: unknown;
 }
 
@@ -111,10 +106,7 @@ function makeSingleJobWorkflow(over: SingleJobContextOptions): LockWorkflow {
   } as unknown as LockWorkflow;
 }
 
-/**
- * A context row named `name` with no rules, always enabled; `rowOver` replaces
- * any column.
- */
+/** A context row named `name` with no rules, always enabled; `rowOver` replaces any column. */
 export function makeJobContextRow(
   name: string,
   over: SingleJobContextOptions,
@@ -165,8 +157,7 @@ function makeSingleJobDeps(
     ...(over.pendingDynamics ? { pendingDynamics: over.pendingDynamics } : {}),
     ...(over.pendingInits ? { pendingInits: over.pendingInits } : {}),
     ...(over.checkRunReporter ? { checkRunReporter: over.checkRunReporter } : {}),
-    // An env-declaring job needs a context store so the core resolves its
-    // per-job secrets (matchContext returns a no-rules config).
+    // An env-declaring job needs a context store to resolve per-job secrets.
     ...(over.jobContext
       ? {
           contextStore: {
@@ -175,9 +166,7 @@ function makeSingleJobDeps(
           },
         }
       : {}),
-    // An explicit contextStore wins over the jobContext-derived one above: it is
-    // spread after it, so a case that passes its own store (e.g. with a disabled
-    // row) runs against that store rather than the always-enabled stub.
+    // Spread last, so an explicit contextStore beats the always-enabled stub.
     ...(over.contextStore ? { contextStore: over.contextStore } : {}),
     // Build infra present but bundle undefined: a local-repo run must NOT probe
     // the cache or dispatch a __build__ job (it carries a working-tree overlay).
@@ -207,10 +196,10 @@ function makeSingleJobDeps(
 }
 
 /**
- * Assemble a minimal real `WorkflowDispatchContext` for a single static job,
- * with a capturing dispatcher and all optional deps absent unless overridden.
- * This is the test-mode shape: `bundle` may be undefined and `trustResolution`
- * is undefined (single-orch, no holds, no trust).
+ * A minimal real `WorkflowDispatchContext` for one static job, with a capturing
+ * dispatcher and optional deps absent unless overridden. Test-mode shape:
+ * `bundle` may be undefined and `trustResolution` is undefined (single-orch, no
+ * holds, no trust).
  */
 export function makeSingleJobContext(over: SingleJobContextOptions): {
   ctx: WorkflowDispatchContext;
@@ -254,9 +243,8 @@ export function makeSingleJobContext(over: SingleJobContextOptions): {
     bundle: over.bundle,
     payload: info.payload,
     repoIdentifier: 'repo',
-    // Required, and stated as the acted-on repository — the per-repository
-    // shape every real caller of this function produces. A case about a
-    // cross-repository workflow overwrites it.
+    // Required; the acted-on repository, as every per-repository caller sets.
+    // Cross-repository cases overwrite it.
     workflowRepoIdentifier: 'repo',
     credentials: {},
     event,
@@ -271,8 +259,7 @@ export function makeSingleJobContext(over: SingleJobContextOptions): {
     lockFileSource: undefined,
     crossSource: false,
     localWorkingTree: over.localWorkingTree ?? false,
-    // Required: the harness states the verdict explicitly, exactly as a real
-    // dispatch path must. Cases that exercise the gate overwrite it.
+    // Required, as on a real dispatch path; gate cases overwrite it.
     securityDecision: { action: 'pass' },
     extraJobConfig: {
       isTestRun: true,
@@ -297,10 +284,8 @@ export interface GateTracker {
 
 /**
  * Resolve once every background task a dispatch started has finished. Each task
- * (a dynamic entry, a deferred init job) takes a pending-jobs token before
- * `dispatchMatchedWorkflow` returns and gives it back when it settles, so the
- * two counts match only when none is still running. A negative assertion made
- * after this cannot pass by running before the task reached its decision.
+ * takes a pending-jobs token before `dispatchMatchedWorkflow` returns and gives
+ * it back when it settles, so a later negative assertion cannot pass early.
  */
 export async function awaitDispatchTasksSettled(tracker: GateTracker): Promise<void> {
   await vi.waitFor(() => {
@@ -311,7 +296,6 @@ export async function awaitDispatchTasksSettled(tracker: GateTracker): Promise<v
   });
 }
 
-/** A fresh {@link GateTracker}. */
 export function makeGateTracker(): GateTracker {
   return {
     addJobsToRun: vi.fn().mockResolvedValue(undefined),

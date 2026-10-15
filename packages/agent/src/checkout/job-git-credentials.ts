@@ -1,15 +1,11 @@
 /**
- * Per-job git credential plumbing.
+ * Per-job git credential plumbing: the grant table, the helper socket git talks
+ * to, and the relay to the orchestrator broker, wired as one object so this
+ * logic is testable without standing up a job.
  *
- * Owns the three things a job needs to authenticate git: the grant table, the
- * helper socket git talks to, and the relay to the orchestrator broker. Kept in
- * its own module so the job runner wires one object rather than three, and so
- * this logic is testable without standing up a job.
- *
- * Scope: this is the HOST path, which covers bare-metal jobs. A container job
- * clones and executes inside the container today and has no route to the
- * socket; that is fixed by the dual-mode container work, which moves the clone
- * to the host and injects `/opt/kici` read-only.
+ * Scope: the HOST path, which covers bare-metal jobs. A container job clones on
+ * the host, but its steps run inside the container, which has no route to the
+ * socket.
  */
 
 import { GIT_CREDENTIAL_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/git-credential-relay';
@@ -38,14 +34,12 @@ export interface JobGitCredentials {
   /** Handler for `git.grant.request` IPC from the sandbox runner. */
   onGitGrantRequest: (request: GitGrantRequestIpc) => Promise<GitGrantResponseIpc>;
   /**
-   * Attach the job's declared credential to an outgoing broker request.
-   *
-   * `ctx.kici.git.github.getToken()` reaches the orchestrator directly rather
-   * than through the credential helper, so without this it would carry no ref
-   * and fall back to the source credential.
+   * Attach the job's declared credential to an outgoing broker request:
+   * `ctx.kici.git.github.getToken()` bypasses the credential helper, so without
+   * this it would carry no ref and fall back to the source credential.
    */
   withRef(params: Record<string, unknown>): Record<string, unknown>;
-  /** Release the socket. Safe to call more than once. */
+  /** Release the socket. Idempotent. */
   close(): Promise<void>;
 }
 
@@ -54,12 +48,7 @@ function repositoryFromPath(path: string | undefined): string {
   return (path ?? '').replace(/^\/+/, '').replace(/\.git$/, '');
 }
 
-/**
- * Stand up git credentials for one job.
- *
- * `sendApiRequest` is the agent's existing orchestrator relay — the same one
- * `ctx.kici` uses — so this adds no new transport.
- */
+/** `sendApiRequest` is the same orchestrator relay `ctx.kici` uses: no new transport. */
 export async function startJobGitCredentials(args: {
   jobId: string;
   /**
@@ -75,13 +64,10 @@ export async function startJobGitCredentials(args: {
   const grants = new GrantTable();
 
   /**
-   * Pick the credential a request should use.
-   *
-   * A per-call name wins; otherwise `default` from the job's declared map;
-   * otherwise undefined, which means the source credential — all a read needs.
-   * An unknown name throws rather than silently falling back, because using a
-   * different credential than the author named is the confusion the map exists
-   * to remove.
+   * A per-call name wins; otherwise the map's `default`; otherwise undefined,
+   * meaning the source credential (all a read needs). An unknown name throws
+   * rather than falling back: using a credential other than the one the author
+   * named is the confusion the map exists to remove.
    */
   const refFor = (name?: string): Readonly<Record<string, string>> | undefined => {
     if (name === undefined) return args.credentials?.default;
@@ -111,7 +97,7 @@ export async function startJobGitCredentials(args: {
     })) as BrokerResult;
   };
 
-  /** Answer one credential query from git, defaulting to read-only. */
+  /** Defaults to read-only. */
   const answer = async (query: HelperQuery): Promise<HelperAnswer> => {
     const repository = repositoryFromPath(query.path);
     if (repository === '') return null;
@@ -119,9 +105,8 @@ export async function startJobGitCredentials(args: {
     const grant = grants.lookup(repository);
     const permissions = grant ? grant.permissions : { contents: 'read' };
     const credential = await ask(repository, permissions);
-    // SSH never reaches the helper — git has no credential helper for SSH, so
-    // that path stays on GIT_SSH_COMMAND. Returning null keeps git honest
-    // rather than handing it a key as a password.
+    // git has no credential helper for SSH (that stays on GIT_SSH_COMMAND), so
+    // return null rather than hand git a key as a password.
     if (!credential || credential.kind !== 'basic') return null;
     return { username: credential.user ?? 'x-access-token', password: credential.secret };
   };
@@ -163,18 +148,15 @@ export async function startJobGitCredentials(args: {
     helperPath: host.helperPath,
     onGitGrantRequest,
     withRef: (params) => {
-      // `credential` is an SDK-side convenience naming an entry in the job's
-      // map. It is resolved HERE and removed: the wire schema does not carry it,
-      // and a plain z.object would strip it silently rather than say so.
+      // `credential` (an SDK-side name for a map entry) is resolved HERE and
+      // removed: the wire schema does not carry it, and a plain z.object would
+      // strip it silently.
       //
-      // An incoming `ref` is REFUSED rather than forwarded. The SDK's public
-      // surface has no `ref` (`getToken` takes `jobId`, `repositories`,
-      // `permissions` and an optional `credential`), so a `ref` arriving here
-      // was hand-built by code running in the job's own process — the very
-      // thing the orchestrator-side declaration check exists to reject. Failing
-      // loudly here means the forgery is named at the site that made it instead
-      // of surfacing as an opaque broker error, and it mirrors `refFor`, which
-      // also throws rather than falling back on an unknown name.
+      // An incoming `ref` is REFUSED: the SDK's public `getToken` has no `ref`,
+      // so one arriving here was hand-built by code in the job's own process —
+      // what the orchestrator-side declaration check rejects. Failing here names
+      // the forgery at its site instead of as an opaque broker error, and mirrors
+      // `refFor`, which also throws rather than falling back on an unknown name.
       const {
         credential,
         ref: incoming,

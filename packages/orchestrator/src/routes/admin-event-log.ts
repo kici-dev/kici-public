@@ -1,11 +1,7 @@
 /**
  * Admin API routes for the inbound webhook delivery log (event_log table).
- *
- * Operator-facing read access to the per-delivery records the orchestrator
- * persists for every inbound webhook. Mirrors the dashboard's WS handler
- * (`DashboardHandler.handleEventLogList/Detail`) but is exposed over HTTP +
- * Bearer auth so operators can read it from the CLI without going through
- * the dashboard.
+ * Mirrors the dashboard's WS handler (`DashboardHandler.handleEventLogList/Detail`)
+ * over HTTP + Bearer auth, so operators can read it from the CLI.
  *
  *   GET /api/v1/admin/event-log
  *     Filters: orgId, routingKey, event, status, from, to, deliveryId, limit, offset
@@ -37,7 +33,7 @@ export interface AdminEventLogRoutesDeps {
   logStorage: LogStorage;
   tokenManager: TokenManager;
   rbac: RbacEnforcer;
-  /** Optional cold-store for archived event_log rows. */
+  /** Holds archived event_log rows. */
   coldStore?: ColdStore;
 }
 
@@ -73,11 +69,9 @@ export function createAdminEventLogRoutes(deps: AdminEventLogRoutesDeps): Hono<A
     const offset = parseInt(c.req.query('offset') ?? '0', 10) || 0;
     const includeArchived = c.req.query('includeArchived') === 'true';
 
-    // Cold-store list requires a routing_key to scope the
-    // tenant-partitioned scan. When `includeArchived=true` and
-    // `routingKey` is supplied, the loader merges hot + cold rows;
-    // otherwise the hot-only path runs (keeping the hot-only
-    // count-and-page contract that callers without routing_key rely on).
+    // The cold-store list needs a routing_key to scope its tenant-partitioned
+    // scan, so hot + cold rows merge only with `includeArchived=true` AND a
+    // routingKey; otherwise the hot-only count-and-page contract holds.
     let rows: Awaited<ReturnType<typeof loadEventLogRange>>;
     let total: number;
     if (includeArchived && routingKey) {
@@ -199,8 +193,7 @@ export function createAdminEventLogRoutes(deps: AdminEventLogRoutesDeps): Hono<A
       deps.rbac.requirePermission(c.get('role'), 'event_log.read_payload');
     }
 
-    // Hot lookup first; on miss falls back to cold-store
-    // (scoped by routingKey when supplied via query).
+    // Hot first; on miss, cold-store (scoped by the routingKey query hint).
     const row = await loadEventLogByDeliveryId({
       db: deps.db,
       coldStore: deps.coldStore,

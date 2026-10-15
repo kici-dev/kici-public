@@ -3,29 +3,25 @@
  *
  * While draining, the Dispatcher routes every new job to the Pending queue
  * (Model A / job-level drain), the peer heartbeat advertises `draining: true`
- * (siblings stop rerouting here), and the scaler stops spawning fresh agents.
- * Jobs already executing on agents finish; `jobsRunning()` drops monotonically
- * to zero, at which point the coordinator is quiesced and safe to restart.
+ * (siblings stop rerouting here), and the scaler stops spawning agents.
+ * Executing jobs finish; once `jobsRunning()` drops monotonically to zero the
+ * coordinator is safe to restart.
  *
- * State is in-memory only: an upgrade restart comes back accepting and the
- * existing startup recovery re-dispatches the Pending backlog.
+ * State is in-memory only: an upgrade restart comes back accepting and startup
+ * recovery re-dispatches the Pending backlog.
  */
 export interface DrainControllerDeps {
-  /** Sum of activeJobs across all connected agents (agentRegistry). */
+  /** Sum of activeJobs across connected agents. */
   activeJobsTotal: () => number;
   /**
-   * Count of dispatch_queue rows in Dispatched status. In the single-coordinator
-   * drain-before-upgrade scenario this equals this instance's in-flight jobs; a
-   * per-instance ownership column does not exist on dispatch_queue, so a
-   * multi-coordinator cluster may over-count here (belt-and-suspenders only —
-   * `activeJobsTotal` is the primary signal, and both shrink monotonically once
-   * the dispatcher gate stops new claims).
+   * Count of Dispatched dispatch_queue rows: this instance's in-flight jobs on a
+   * single coordinator. dispatch_queue has no per-instance ownership column, so
+   * a multi-coordinator cluster may over-count; this is belt-and-suspenders
+   * behind `activeJobsTotal`, and both shrink monotonically once the dispatcher
+   * gate stops new claims.
    */
   dispatchedJobsOwned: () => Promise<number>;
-  /**
-   * Optional hook fired whenever the draining flag changes, used to drive the
-   * `kici_orchestrator_draining` metric. Not fired on a no-op (idempotent) call.
-   */
+  /** Fired when the draining flag changes (drives `kici_orchestrator_draining`), not on a no-op. */
   onChange?: (draining: boolean) => void;
 }
 
@@ -51,12 +47,10 @@ export class DrainController {
   }
 
   /**
-   * Live quiesce signal: jobs currently executing on agents versus any row this
-   * instance already claimed (Dispatched) but whose activeJobs increment has not
-   * yet landed. Since draining stops new claims, this set only shrinks, so a
-   * poll on it is guaranteed to converge to zero. Uses `Math.max` (not sum) — the
-   * Dispatched rows are the durable view of the same jobs the in-memory
-   * activeJobs counts, so summing would double-count the common case.
+   * Live quiesce signal covering executing jobs and claimed (Dispatched) rows
+   * whose activeJobs increment has not landed yet. Draining stops new claims,
+   * so a poll converges to zero. `Math.max`, not a sum: both views count the
+   * same jobs, so summing double-counts the common case.
    */
   async jobsRunning(): Promise<number> {
     const active = this.deps.activeJobsTotal();

@@ -1,14 +1,10 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `org_settings.scaler_spawn_timeout_ms BIGINT` (nullable).
- *
- * Per-org deadline for a single scaler `backend.spawn` (image pull + container
- * create + start). NULL falls back to the cluster-wide default
- * (`KICI_SCALER_SPAWN_TIMEOUT_MS`, default 300s). Operators tune it per tenant
- * via `kici-admin org-settings scaler-spawn-timeout`.
- *
- * Idempotent: a re-run on a DB that already has the column is a no-op.
+ * `org_settings.scaler_spawn_timeout_ms BIGINT` (nullable): per-org deadline
+ * for one scaler `backend.spawn` (image pull + container create + start). NULL
+ * falls back to `KICI_SCALER_SPAWN_TIMEOUT_MS` (default 300s). Tuned per tenant
+ * via `kici-admin org-settings scaler-spawn-timeout`. Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const colCheck = await sql<{ exists: boolean }>`

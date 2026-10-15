@@ -2,36 +2,27 @@ import type { WebSocketServer } from 'ws';
 import { WS_MAX_PAYLOAD_BYTES } from '@kici-dev/engine';
 
 /**
- * Applies the security-relevant options to a `ws` `WebSocketServer` instance.
+ * Single source of truth for the orchestrator's agent-WS server security
+ * options, kept outside the `createApp` graph so it is unit-testable.
  *
- * Single source of truth for the orchestrator's agent-WS server config. Lives
- * here so it is unit-testable independently of the heavy `createApp` dependency
- * graph.
- *
- * The `permessage-deflate` compression-bomb invariant lives here: any
- * field added to defend against compression-bomb DoS — `maxPayload`,
- * `serverNoContextTakeover`, etc. — MUST be set inside this helper so the
- * neighbouring test file can assert it.
+ * Compression-bomb invariant: any field that defends against compression-bomb
+ * DoS (`maxPayload`, `serverNoContextTakeover`, …) MUST be set inside this
+ * helper so the neighbouring test file can assert it.
  */
 export function configureSecureWsServer(wss: WebSocketServer): void {
-  // Cap the maximum decompressed frame size so a fake or compromised agent
-  // cannot OOM the orch with a compression bomb. Without this, ws@8.x
-  // defaults to 100 MiB. See `WS_MAX_PAYLOAD_BYTES` doc-comment for sizing
-  // rationale (matches `WEBHOOK_RELAY_MAX_BODY_BYTES`).
+  // Caps the decompressed frame size so a compromised agent cannot OOM the
+  // orch with a compression bomb; ws@8.x defaults to 100 MiB. Sizing
+  // rationale: the `WS_MAX_PAYLOAD_BYTES` doc-comment.
   wss.options.maxPayload = WS_MAX_PAYLOAD_BYTES;
 
-  // We construct the WebSocketServer ourselves (`new WebSocketServer({ noServer: true })`)
-  // and set this before any connection arrives; the ws library reads
-  // this.options.perMessageDeflate during each handshake, enabling compression
-  // for all clients.
+  // Set before any connection arrives (`noServer: true`); ws reads
+  // options.perMessageDeflate during each handshake.
   wss.options.perMessageDeflate = {
     concurrencyLimit: 10,
     threshold: 128, // Skip compressing tiny messages like heartbeats
-    // Drop the deflate dictionary state between server-sent messages so
-    // per-connection memory does not accumulate under sustained traffic.
-    // Server-side only; leaving `clientNoContextTakeover` unset preserves
-    // compression ratio on patterns with repeated client→server payload
-    // shapes (e.g. log.chunk fan-out from many small frames).
+    // Drops server-side dictionary state between messages so per-connection
+    // memory does not grow. `clientNoContextTakeover` stays unset to keep the
+    // ratio on repeated client→server shapes (e.g. many small log.chunk frames).
     serverNoContextTakeover: true,
   };
 }

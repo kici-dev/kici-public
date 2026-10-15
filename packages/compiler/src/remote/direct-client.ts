@@ -1,13 +1,9 @@
 /**
- * Client for an orchestrator's direct `kici run remote` routes
- * (`/api/v1/test/*`), authenticated with an orchestrator admin token.
- *
- * The transport `kici connect`, `--orchestrator-url` and
- * `KICI_ORCHESTRATOR_TOKEN` select. It speaks the same request and response
- * shapes as the Platform relay (`PlatformRunClient`), so the run loop treats
- * both alike. It also reads the orchestrator admin routes a developer token
- * may use: context secret key names for `kici types`, and held-run listing and
- * decisions on an independent orchestrator.
+ * Client for an orchestrator's direct `/api/v1/test/*` routes, authenticated
+ * with an orchestrator admin token; `kici connect`, `--orchestrator-url` and
+ * `KICI_ORCHESTRATOR_TOKEN` select it. Its shapes match `PlatformRunClient`, so the
+ * run loop treats both alike. It also reads the admin routes a developer token
+ * may use: context secret key names, and held runs on an independent orchestrator.
  */
 import { toErrorMessage } from '@kici-dev/core';
 import type { ApprovalDecision, HeldRunSummary, OrchestratorMode } from '@kici-dev/engine';
@@ -28,7 +24,6 @@ import {
 } from './platform-client.js';
 import { normalizeOrchestratorUrl } from './target.js';
 
-/** What `GET /api/v1/test/whoami` says about the caller. */
 export interface DirectWhoami {
   tokenId: string;
   label: string;
@@ -40,7 +35,6 @@ export interface DirectWhoami {
   permissions: { trigger: boolean; read: boolean };
 }
 
-/** The orchestrator answers but serves no direct test-run API. */
 export class DirectApiUnavailableError extends Error {
   constructor(url: string) {
     super(
@@ -52,10 +46,9 @@ export class DirectApiUnavailableError extends Error {
 }
 
 /**
- * The orchestrator cannot list or answer this run's holds for this caller:
- * the token lacks the trust-policy permissions, the routes are not mounted, or
+ * The token lacks the trust-policy permissions, the routes are not mounted, or
  * the orchestrator leaves held runs to the Platform. The message is the
- * server's own text when it sent one.
+ * server's text when it sent one.
  */
 export class HoldsUnavailableError extends Error {
   constructor(
@@ -72,7 +65,6 @@ const DIRECT_AUTH_MESSAGE =
   'for a new one (`kici-admin token create <label> --role admin --subject <you>`), then ' +
   'run `kici connect <url>` again.';
 
-/** A context with the secret key names bound to it. */
 export interface ContextSecretKeys {
   name: string;
   keys: string[];
@@ -89,7 +81,6 @@ export class DirectRunClient {
     this.token = opts.token;
   }
 
-  /** GET /api/v1/test/whoami — who the token is and what it may do. */
   async whoami(): Promise<DirectWhoami> {
     try {
       return await this.json<DirectWhoami>('/api/v1/test/whoami', { method: 'GET' });
@@ -125,7 +116,7 @@ export class DirectRunClient {
     });
   }
 
-  /** The org's contexts with the secret key names bound to each (never values). */
+  /** Key names only, never values. */
   async listContextSecretKeys(orgId: string): Promise<ContextSecretKeys[]> {
     const data = await this.json<{ contexts?: Array<{ name: string; secret_keys?: string[] }> }>(
       `/api/v1/admin/contexts?orgId=${encodeURIComponent(orgId)}&includeSecrets=true`,
@@ -134,7 +125,6 @@ export class DirectRunClient {
     return (data.contexts ?? []).map((c) => ({ name: c.name, keys: c.secret_keys ?? [] }));
   }
 
-  /** This run's pending holds, through the orchestrator's admin held-run route. */
   async listHolds(orgId: string, runId: string): Promise<HeldRunSummary[]> {
     const query = `customerId=${encodeURIComponent(orgId)}&runId=${encodeURIComponent(runId)}`;
     const response = await this.send(`/api/v1/admin/held-runs?${query}`, { method: 'GET' });
@@ -150,12 +140,9 @@ export class DirectRunClient {
   }
 
   /**
-   * Approve or reject one hold. Resolves false, with the server's reason on
-   * `lastDecisionError`, when the orchestrator refuses the decision.
-   *
-   * `autoApprove` marks a `kici run --approve-all` approval, which the
-   * orchestrator audits as `held_run.auto_approve`. It does not bypass the
-   * hold's eligibility check.
+   * Resolves false, with the server's reason on `lastDecisionError`, on a
+   * refusal. `autoApprove` (`--approve-all`) is audited as
+   * `held_run.auto_approve` and does not bypass the eligibility check.
    */
   async decideHold(
     orgId: string,
@@ -188,7 +175,7 @@ export class DirectRunClient {
     return (await response.json()) as T;
   }
 
-  /** Send one request; a transport failure becomes a `ConnectionError`. */
+  /** A transport failure becomes a `ConnectionError`. */
   private async send(path: string, init: RequestInit): Promise<Response> {
     try {
       return await fetch(`${this.url}${path}`, {
@@ -207,7 +194,6 @@ export class DirectRunClient {
     }
   }
 
-  /** Pass an OK response through; map every other status to a typed error. */
   private async checked(response: Response): Promise<Response> {
     if (response.ok) return response;
     await throwForAccessStatus(response, DIRECT_AUTH_MESSAGE);

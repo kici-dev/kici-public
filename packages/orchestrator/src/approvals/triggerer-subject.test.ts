@@ -3,12 +3,10 @@ import { stringifyActor, type ActorPrincipal } from '@kici-dev/engine';
 import { adminActorSub, triggererSubjectFor } from './triggerer-subject.js';
 
 /**
- * The self-approval gate in `applyDecision` refuses an approve when
- * `actorSub === triggererSub`. Every case here pins one side of that
- * comparison against the other: the persisted `triggered_by` string on the left
- * (built with the real `stringifyActor`, never a hand-written literal, so a
- * change to the persisted format fails here rather than silently), and the live
- * subject the approving surface would produce on the right.
+ * `applyDecision`'s self-approval gate refuses when `actorSub === triggererSub`.
+ * Each case pins the persisted `triggered_by` (built with the real
+ * `stringifyActor`, so a format change fails here) against the live subject the
+ * approving surface produces.
  */
 describe('triggererSubjectFor', () => {
   /** How the dashboard handler renders a live actor (`actorSub`). */
@@ -25,9 +23,8 @@ describe('triggererSubjectFor', () => {
   });
 
   it('matches the dashboard subject for a user acting through an agent', () => {
-    // The regression: `stringifyActor` appends ` via agent:<label>`, so a bare
-    // split-on-first-colon yielded `kc-sub-2 via agent:builder` and the gate
-    // could never fire for an agent-mediated trigger.
+    // `stringifyActor` appends ` via agent:<label>`; a bare split-on-first-colon
+    // yields `kc-sub-2 via agent:builder` and the gate never fires.
     const actor: ActorPrincipal = {
       type: 'user',
       sub: 'kc-sub-2',
@@ -66,8 +63,8 @@ describe('triggererSubjectFor', () => {
   });
 
   it('returns the bare key id for an api_key, the documented residual', () => {
-    // No string transform bridges a persisted `keyId` to the live `ownerSub`
-    // both surfaces render, so this one case is deliberately still unmatched.
+    // No string transform bridges a persisted `keyId` to the live `ownerSub`,
+    // so this case is deliberately unmatched.
     const actor: ActorPrincipal = { type: 'api_key', keyId: 'key-1', ownerSub: 'kc-owner-1' };
     expect(triggererSubjectFor(stringifyActor(actor))).toBe('key-1');
     expect(dashboardActorSub(actor)).toBe('kc-owner-1');

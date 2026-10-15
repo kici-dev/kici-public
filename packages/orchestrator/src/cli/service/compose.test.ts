@@ -1,30 +1,22 @@
-/**
- * Tests for the Docker/Podman Compose service manager.
- *
- * Mocks child_process.execSync and fs operations to test compose file
- * generation and lifecycle commands without requiring Docker/Podman.
- */
+/** Compose service manager tests; execSync and fs are mocked, so no Docker or Podman is needed. */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ServiceConfig } from './types.js';
 import { DEFAULT_RESTART_POLICY } from './types.js';
 
-// Mock child_process
 const mockExecSync = vi.fn();
 vi.mock('node:child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
 }));
 
-// Mock fs
 const mockExistsSync = vi.fn(() => false);
 const mockMkdirSync = vi.fn();
 const mockWriteFileSync = vi.fn();
 const mockUnlinkSync = vi.fn();
 const mockRmSync = vi.fn();
 const mockReadFileSync = vi.fn(() => '');
-// Drive the digest-pinned image ref deterministically so the compose output
-// asserts the `:<version>@sha256:` form without depending on the on-disk
-// installer-image-digests.json (node:fs is mocked below).
+// A fixed digest, so the output asserts the `:<version>@sha256:` form without
+// the on-disk installer-image-digests.json (node:fs is mocked).
 const DIGEST = 'a'.repeat(64);
 vi.mock('./image-digests.js', () => ({
   resolveImageRef: (name: string) => `quay.io/kici-dev/${name}:0.1.15@sha256:${DIGEST}`,
@@ -61,7 +53,6 @@ describe('ComposeServiceManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockExistsSync.mockReturnValue(false);
-    // Default: podman compose available
     mockExecSync.mockImplementation((cmd: string) => {
       if (typeof cmd === 'string' && cmd.includes('podman compose version')) {
         return Buffer.from('podman compose version v2.0.0');
@@ -79,7 +70,6 @@ describe('ComposeServiceManager', () => {
       const mgr = new ComposeServiceManager();
       await mgr.install(testConfig);
 
-      // The compose file write should have been called
       expect(mockWriteFileSync).toHaveBeenCalled();
     });
 
@@ -175,10 +165,8 @@ describe('ComposeServiceManager', () => {
       const mgr = new ComposeServiceManager();
       await mgr.install(testConfig);
 
-      // Compose kills at 10s by default, while the orchestrator's own
-      // graceful-shutdown budget is 30s — so without this it is SIGKILLed
-      // partway through, before it broadcasts `peer.leaving` or closes its
-      // agent sockets.
+      // Compose kills at 10s by default, inside the orchestrator's 30s shutdown
+      // budget: before it broadcasts `peer.leaving` or closes agent sockets.
       const [, content] = mockWriteFileSync.mock.calls[0];
       expect(content).toContain('stop_grace_period: 45s');
     });
@@ -481,12 +469,11 @@ describe('ComposeServiceManager', () => {
       });
     });
 
-    // The two runtimes serialize a `ps` row differently, so each parse path
-    // gets its own fixture, copied verbatim from the real command output:
+    // Each runtime serializes a `ps` row differently, so each gets a verbatim fixture from:
     //   podman ps -a --filter label=dev.kici.component --format '{{json .}}'
     //   docker ps -a --filter label=dev.kici.component --format '{{json .}}'
-    // A single docker-shaped fixture cannot exhibit a podman-only defect, which
-    // is how an object-shaped `Labels` went unread on every podman host.
+    // A docker-shaped fixture alone cannot show a podman-only defect such as
+    // an unread object-shaped `Labels`.
     //
     // fails-when: `list()` reads `Labels` only as a string — the podman case
     // then yields no rows at all, and only the docker case stays green.
@@ -620,10 +607,9 @@ describe('ComposeServiceManager', () => {
     });
   });
 
-  // Discovery reads `available() === false` as "leave this platform's index rows
-  // alone", so the answer decides whether a live compose install survives a
-  // reconcile. Every reconcile test drives a double, which pins the contract and
-  // says nothing about whether this implementation meets it.
+  // `available() === false` tells discovery to leave this platform's index
+  // rows alone, so it decides whether a live install survives a reconcile. The
+  // reconcile tests drive a double, which proves nothing about this class.
   describe('available', () => {
     it('is true when a container runtime answers', async () => {
       mockExecSync.mockImplementation((cmd: string) => {
@@ -637,10 +623,8 @@ describe('ComposeServiceManager', () => {
       expect(await new ComposeServiceManager().available()).toBe(true);
     });
 
-    // The defect this probe exists to catch. `docker compose version` is
-    // answered by the compose client alone — with dockerd stopped it still
-    // exits 0 — so a probe that only proves the client runs reports available
-    // for a host whose registry cannot be read at all.
+    // `docker compose version` exits 0 with dockerd stopped, so a client-only
+    // probe reports available for a host whose registry cannot be read.
     //
     // fails-when: `available()` probes only `<runtime> compose version`. It
     // then returns true here, the scan comes back empty, and the reconcile
@@ -660,10 +644,9 @@ describe('ComposeServiceManager', () => {
       expect(await new ComposeServiceManager().available()).toBe(false);
     });
 
-    // breaks-if-wrong: the probe must not read a healthy-but-empty registry as
-    // unavailable. That would suppress the scan on every host with no running
-    // containers, and a genuinely-removed compose instance would never be
-    // pruned from the index.
+    // breaks-if-wrong: a healthy-but-empty registry read as unavailable
+    // suppresses the scan on every host with no running containers, so a
+    // removed compose instance is never pruned from the index.
     it('is true when the registry answers with no running containers', async () => {
       mockExecSync.mockImplementation((cmd: string) => {
         if (typeof cmd === 'string' && cmd.includes('podman compose version')) {
@@ -708,9 +691,8 @@ describe('ComposeServiceManager', () => {
       expect(await new ComposeServiceManager().available()).toBe(false);
     });
 
-    // A hung daemon surfaces as the ETIMEDOUT execSync throws once it kills the
-    // child. It must read as "unavailable", never propagate as a crash out of a
-    // lifecycle command that only wanted to resolve a name.
+    // A hung daemon surfaces as execSync's ETIMEDOUT; it reads as unavailable,
+    // never a crash out of a command that only resolves a name.
     it('is false, not a throw, when the runtime probe times out', async () => {
       mockExecSync.mockImplementation(() => {
         const err = new Error('spawnSync /bin/sh ETIMEDOUT') as Error & { code?: string };
@@ -722,9 +704,8 @@ describe('ComposeServiceManager', () => {
       await expect(new ComposeServiceManager().available()).resolves.toBe(false);
     });
 
-    // The bound itself. `install` and every `--name` resolution now reach these
-    // two probes, so an unbounded one lets a wedged daemon hold a command open
-    // forever.
+    // `install` and every `--name` resolution reach both probes, so an
+    // unbounded one lets a wedged daemon hold a command open forever.
     //
     // fails-when: either probe drops its `timeout`, or the value moves off the
     // 10s budget the constant documents.

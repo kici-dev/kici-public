@@ -1,13 +1,12 @@
 /**
  * The messages the workflow runner sends when its job lifecycle throws.
  *
- * A fatal error carries whatever the failing phase put in its message: for a
- * failed dependency install that is the installer's stderr, stdout and npm's
- * debug log, which can echo a job secret. The report therefore goes through
- * the job's secret masker, the same as every other runner output. The masker
- * exists once the execute request is received, which is the first point the
- * job's secrets are known; an error thrown before then has no job secret to
- * mask, so the report is sent as it is.
+ * A fatal error carries whatever the failing phase put in its message (for a
+ * failed dependency install: the installer's stderr, stdout and npm's debug
+ * log, which can echo a job secret), so the report goes through the job's
+ * secret masker like every other runner output. The masker exists from the
+ * execute request on, the first point the job's secrets are known; an earlier
+ * error has no job secret to mask and is sent as is.
  */
 
 import { ExecutionJobStatus } from '@kici-dev/engine';
@@ -23,7 +22,6 @@ export interface FatalReport {
   messages: RunnerToAgentMessage[];
 }
 
-/** Build the fatal-error report for `error`, masked by `masker` when given. */
 export function buildFatalReport(error: unknown, masker: LogMasker | null): FatalReport {
   const mask = (text: string): string => (masker?.hasSecrets() ? masker.mask(text) : text);
   const message = toErrorMessage(error);

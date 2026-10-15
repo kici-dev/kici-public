@@ -1,8 +1,6 @@
 /**
- * Agent private API registry.
- *
- * Provides a typed, extensible request-response API over the existing agent WS
- * connection. Each method is registered with a role (read/write) for authorization.
+ * Agent private API: request-response over the existing agent WS connection. Each
+ * method is registered with a role (read/write) for authorization.
  *
  * Adding a new API method:
  * 1. Add the typed method + return type in @kici-dev/sdk (api-types.ts)
@@ -16,13 +14,10 @@ import { createLogger } from '@kici-dev/shared';
 
 const logger = createLogger({ prefix: 'agent-api' });
 
-/** Authorization roles for API methods. */
 export type ApiRole = 'read' | 'write';
 
-/** Handler function for an API method. */
 export type ApiHandler = (agentId: string, params: Record<string, unknown>) => Promise<unknown>;
 
-/** Internal registration for a single API method. */
 interface ApiMethodEntry {
   role: ApiRole;
   handler: ApiHandler;
@@ -59,22 +54,13 @@ export class ApiRoleDeniedError extends Error {
 }
 
 /**
- * Registry for agent private API methods.
- *
- * Methods are dot-namespaced (e.g., 'infrastructure.list') and each has an
- * associated role. The orchestrator checks the caller's allowed roles before
- * invoking the handler.
+ * Methods are dot-namespaced (e.g., 'infrastructure.list'). The orchestrator checks the
+ * caller's allowed roles before invoking the handler.
  */
 export class AgentApiRegistry {
   private readonly methods = new Map<string, ApiMethodEntry>();
 
-  /**
-   * Register an API method.
-   *
-   * @param method - Dot-namespaced method name (e.g., 'infrastructure.list')
-   * @param role - Required role to call this method
-   * @param handler - Async handler that receives agentId and params, returns result
-   */
+  /** Throws when `method` is already registered. */
   register(method: string, role: ApiRole, handler: ApiHandler): void {
     if (this.methods.has(method)) {
       throw new Error(`API method '${method}' is already registered`);
@@ -84,14 +70,8 @@ export class AgentApiRegistry {
   }
 
   /**
-   * Handle an API request.
-   *
-   * @param agentId - The calling agent's ID
-   * @param method - Requested method name
-   * @param params - Method parameters
-   * @param allowedRoles - Roles the caller is authorized for
-   * @returns The method's result
-   * @throws Error if method not found or role not authorized
+   * @throws UnknownApiMethodError / ApiRoleDeniedError if the method is not found or
+   *   the caller lacks its role
    */
   async handle(
     agentId: string,
@@ -111,7 +91,7 @@ export class AgentApiRegistry {
     return entry.handler(agentId, params);
   }
 
-  /** Get all registered method names (for diagnostics). */
+  /** For diagnostics. */
   getMethods(): string[] {
     return [...this.methods.keys()];
   }

@@ -55,10 +55,8 @@ describe('AgentApiRegistry', () => {
   });
 
   it('handles a write method when the agent dispatch grants read+write', async () => {
-    // The agent-handler's agent.api.request dispatch grants ['read', 'write'] to
-    // every agent (a write method only ever affects the calling agent's own
-    // host, e.g. host.requestReboot). This documents that a write method is
-    // reachable through the agent transport.
+    // agent.api.request grants ['read', 'write'] to every agent: a write method
+    // only affects the calling agent's own host (e.g. host.requestReboot).
     const registry = new AgentApiRegistry();
     registry.register('host.requestReboot', 'write', async (agentId, params) => ({
       agentId,
@@ -81,9 +79,8 @@ describe('AgentApiRegistry', () => {
   });
 
   describe('typed rejections', () => {
-    // The two rejections the registry raises deliberately are typed so the agent
-    // WS handler can forward their message verbatim, while any other exception
-    // is replaced with a safe fixed string before it reaches the workflow author.
+    // Typed rejections are forwarded verbatim by the agent WS handler; any other
+    // exception is replaced with a safe fixed string before it reaches the author.
     it('rejects an unknown method with UnknownApiMethodError', async () => {
       const registry = new AgentApiRegistry();
       await expect(registry.handle('agent-1', 'nope', {}, ['read'])).rejects.toBeInstanceOf(

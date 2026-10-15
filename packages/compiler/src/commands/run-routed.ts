@@ -1,11 +1,9 @@
 /**
  * `kici run --local [event]` — a real routed dispatch with this machine as the
- * ephemeral agent, through the warm local dev plane. `resolvePlaneForRun`
- * picks the offline (independent) plane or the Platform-attached one.
- *
- * The run reuses the real orchestrator + agent pipeline end-to-end, so
- * the execution parity dividend (emit / cache / needs / parallel / `KICI_SOURCE_*`)
- * holds by construction — there is no second engine.
+ * ephemeral agent, through the warm local dev plane (offline or
+ * Platform-attached, per `resolvePlaneForRun`). It reuses the real orchestrator
+ * + agent pipeline, so execution parity (emit / cache / needs / parallel /
+ * `KICI_SOURCE_*`) holds by construction: there is no second engine.
  */
 
 import { readFileSync } from 'node:fs';
@@ -35,20 +33,18 @@ export interface RunRoutedOptions {
   connected?: boolean;
   inPlace?: boolean;
   /**
-   * Trusted fleet-agent profile: route this run to the plane's trusted label
-   * set so steps run with the ambient host env passed through (minus the
-   * agent's own KiCI identity secrets). Selects a PRE-CONFIGURED trusted scaler
-   * label set by appending the `self-hosted` routing label to the run's job
-   * `runsOn` — it never injects `KICI_TRUSTED_ENV` onto a dispatch payload.
+   * Trusted fleet-agent profile: steps see the ambient host env (minus the
+   * agent's KiCI identity secrets). Selects a PRE-CONFIGURED trusted scaler
+   * label set by appending the `self-hosted` label to each job's `runsOn`; it
+   * never injects `KICI_TRUSTED_ENV` onto a dispatch payload.
    */
   trusted?: boolean;
   /** Flat per-run secrets (`--env KEY=VALUE`); delivery lands with the secret path. */
   env?: string[];
   /**
-   * Path to a dispatch payload JSON `{ action?, client_payload? }`. Only read
-   * when the event is `dispatch`: `action` becomes the dispatch `types` matcher
-   * key and `client_payload` reaches the workflow. This lets a caller target a
-   * single `dispatch()` workflow on the routed path.
+   * Dispatch payload JSON `{ action?, client_payload? }`, read only for the
+   * `dispatch` event: `action` is the `types` matcher key and
+   * `client_payload` reaches the workflow.
    */
   payload?: string;
   kiciDir?: string;
@@ -56,10 +52,7 @@ export interface RunRoutedOptions {
   debug?: boolean;
 }
 
-/**
- * Entry point for the action-bearing `kici run`. Validates the routing flags and
- * drives the offline routed run. Returns true on run success.
- */
+/** The action-bearing `kici run`. Returns true on run success. */
 export async function runRoutedCommand(options: RunRoutedOptions): Promise<boolean> {
   if (options.debug) process.env.KICI_DEBUG = 'true';
 
@@ -81,12 +74,7 @@ export async function runRoutedCommand(options: RunRoutedOptions): Promise<boole
   return runRouted({ ...options, event: options.event });
 }
 
-/**
- * Read a dispatch payload file `{ action?, client_payload? }`. Returns the
- * action + client_payload the routed dispatch trigger carries. An absent
- * `--payload` yields an empty action (a bare `dispatch()` workflow still
- * matches); a present file is parsed as JSON.
- */
+/** An absent `--payload` yields an empty action: a bare `dispatch()` workflow still matches. */
 export function readDispatchPayload(payloadPath?: string): {
   action?: string;
   clientPayload?: unknown;
@@ -99,14 +87,12 @@ export function readDispatchPayload(payloadPath?: string): {
   return { action: raw.action, clientPayload: raw.client_payload };
 }
 
-/** Drive the full routed run against the warm local plane (offline or attached). */
 async function runRouted(options: RunRoutedOptions & { event: string }): Promise<boolean> {
   const quiet = Boolean(options.quiet);
   const kiciDir = resolveKiciDir(options.kiciDir);
   const repoRoot = path.resolve(kiciDir, '..');
 
-  // Recompile the lock so the on-disk kici.lock.json the plane fetches (and the
-  // overlay commits) reflects the current .kici/ sources.
+  // The plane fetches (and the overlay commits) the on-disk lock.
   const compileOk = quiet
     ? await withStdoutOnStderr(() =>
         compileCommand({ kiciDir, check: false, verbose: options.debug ?? false, quiet: true }),
@@ -114,8 +100,7 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
     : await compileCommand({ kiciDir, check: false, verbose: options.debug ?? false });
   if (!compileOk) return false;
 
-  // Warn honestly when a job targets an OS this host cannot satisfy locally
-  // (the local plane matches only the host's own kici:os:* label).
+  // The local plane matches only the host's own kici:os:* label.
   if (!quiet) {
     try {
       const os = await import('node:os');
@@ -123,7 +108,7 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
       const hints = detectOsMismatchHints(JSON.parse(lockRaw), os.platform(), os.arch());
       for (const hint of hints) logger.warn(pc.yellow(hint));
     } catch {
-      // Best-effort: an unreadable/partial lock never blocks the run.
+      // An unreadable/partial lock never blocks the run.
     }
   }
 
@@ -131,7 +116,6 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
   const restoreLocks: Array<() => void> = [];
   try {
     if (!quiet) logger.info(pc.dim('Starting the local dev plane…'));
-    // Auto-select the plane (offline / attached / fallback) per the run flags.
     const resolved = await resolvePlaneForRun({
       offline: options.offline,
       connected: options.connected,
@@ -161,17 +145,13 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
 
     const workdir = await resolveWorkdir({ inPlace: Boolean(options.inPlace), repoRoot });
     cleanup = workdir.cleanup;
-    // Paths the isolated checkout leaves out (submodules, dangling symlinks). On
-    // stderr, so --json keeps stdout parseable and still shows them.
+    // Paths the isolated checkout leaves out (submodules, dangling symlinks), on
+    // stderr so --json keeps stdout parseable.
     for (const warning of workdir.warnings) process.stderr.write(`${pc.yellow(`⚠ ${warning}`)}\n`);
 
-    // Trusted profile: route every job onto the plane's trusted label set by
-    // appending the `self-hosted` routing label to the workdir lock the plane
-    // reads. With `--in-place`, ALSO append `in-place` so the run lands on the
-    // trusted IN-PLACE label set (the agent uses the real working tree directly,
-    // no clone) — the in-place profile. restore()s un-dirty an
-    // in-place tree in the finally below (an isolated clone is removed by cleanup
-    // regardless).
+    // Labels go into the workdir lock the plane reads. `--in-place` ALSO adds
+    // `in-place` (the agent uses the real working tree, no clone); the
+    // restore()s in the finally un-dirty an in-place tree.
     if (trusted) {
       const lockPath = path.join(workdir.dir, '.kici', 'kici.lock.json');
       restoreLocks.push(injectRunsOnLabel(lockPath, TRUSTED_ROUTING_LABEL).restore);
@@ -182,11 +162,9 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
 
     const seeded = await ensureLocalSource(plane.url, plane.adminToken, {
       repoDir: workdir.dir,
-      // An attached plane belongs to a real Platform organization, and a
-      // generic source's routing key embeds the org. Seeding under the
-      // independent-mode `__default__` sentinel mints a key naming an org the
-      // Platform will reject, so the source registers and never delivers — the
-      // orchestrator refuses the create outright rather than let that happen.
+      // A generic source's routing key embeds the org, so an attached plane
+      // must seed under its real Platform org: the `__default__` sentinel would
+      // mint a key the Platform rejects (the orchestrator refuses that create).
       // Offline and fallback planes have no Platform org and keep the sentinel.
       ...(resolved.kind === 'attached' && { orgId: resolved.orgId }),
       // In-place: the workdir IS the operator's real tree, so the plane skips
@@ -194,10 +172,9 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
       inPlace: Boolean(options.inPlace),
     });
 
-    // Seed the project's local `secrets.yaml` / `.secrets` contexts into the
-    // plane's real scoped-secret store so a job bound to a context resolves the
-    // right scoped value through the real resolver (parity over the old
-    // flatten). Local secret files stay read-only; values only transit into the
+    // Local `secrets.yaml` / `.secrets` contexts go into the plane's real
+    // scoped-secret store, so a context-bound job resolves through the real
+    // resolver. Local secret files stay read-only; values only transit into the
     // local plane's Postgres.
     const seededSecrets = await seedLocalSecrets(plane.url, plane.adminToken, {
       orgId: seeded.orgId,
@@ -220,8 +197,8 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
       plane.adminToken,
       {
         orgId: seeded.orgId,
-        // The generic webhook route resolves a source by (customer_id, name), not
-        // by the routing-key's id segment — so the trigger URL carries the name.
+        // The generic webhook route resolves a source by (customer_id, name),
+        // not the routing key's id segment.
         sourceId: seeded.sourceName,
         repoFullName: '.',
         event:
@@ -238,8 +215,7 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
         defaultBranch: workdir.branch,
         ...(dispatch && { action: dispatch.action, clientPayload: dispatch.clientPayload }),
       },
-      // Context for the timeout diagnosis: the workdir the plane's source was
-      // just re-pointed at, and the log a developer would open next.
+      // For the timeout diagnosis.
       { repoBasePath: workdir.dir, logPath: planeLogPath() },
     );
     if (!quiet) logger.info(pc.green(`Run started: ${runId}`));
@@ -266,12 +242,12 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
     if (options.debug && error instanceof Error && error.stack) logger.error(pc.gray(error.stack));
     return false;
   } finally {
-    // Restore in reverse order (in-place label injected last → restored first).
+    // Reverse order: the in-place label was injected last.
     for (const restore of restoreLocks.reverse()) {
       try {
         restore();
       } catch {
-        /* best-effort: an isolated clone is removed by cleanup anyway */
+        /* an isolated clone is removed by cleanup anyway */
       }
     }
     if (cleanup) await cleanup().catch(() => undefined);

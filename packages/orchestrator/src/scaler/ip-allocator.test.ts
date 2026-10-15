@@ -1,12 +1,4 @@
-/**
- * Tests for the DB-backed CIDR IP allocator.
- *
- * Tests cover:
- * - CIDR parsing and IP arithmetic helpers
- * - MAC address generation
- * - TAP device naming
- * - Allocation, release, and pool exhaustion
- */
+/** Tests for the CIDR IP allocators and their helpers. */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   ipToNumber,
@@ -199,10 +191,8 @@ function createMockAllocatorDb(
   const insertExecute = vi.fn().mockResolvedValue(undefined);
   const deleteExecute = vi.fn().mockResolvedValue(undefined);
 
-  // Track insert calls
   const insertValues = vi.fn().mockReturnValue({ execute: insertExecute });
 
-  // Track delete calls
   const deleteWhere = vi.fn().mockReturnValue({ execute: deleteExecute });
 
   // For selectFrom, we need to distinguish between select('ip') and selectAll()
@@ -229,7 +219,6 @@ function createMockAllocatorDb(
     selectFrom,
     insertInto: vi.fn().mockReturnValue({ values: insertValues }),
     deleteFrom: vi.fn().mockReturnValue({ where: deleteWhere }),
-    // Expose mocks for assertions
     _mocks: {
       insertExecute,
       insertValues,
@@ -263,7 +252,6 @@ describe('DbIpAllocator', () => {
       expect(result.mac).toBe(generateMac('10.0.0.2'));
       expect(result.tapDevice).toBe('kici-vm-001');
 
-      // Verify INSERT was called
       expect(db.insertInto).toHaveBeenCalledWith('ip_allocations');
     });
 

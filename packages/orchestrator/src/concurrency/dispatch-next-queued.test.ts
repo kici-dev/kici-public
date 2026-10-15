@@ -1,8 +1,6 @@
 /**
- * Unit tests for the slot-release dispatch helpers (`tryDispatchNextQueued`
- * and `buildOnConcurrencyAgentDisconnect`). The helpers are exercised against
- * an in-memory `ConcurrencyWaiters` plus fakes for the queue manager and the
- * agent registry — no DB / WS plumbing required.
+ * Slot-release dispatch helpers against an in-memory `ConcurrencyWaiters` and
+ * fake queue manager and registry — no DB / WS plumbing.
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -105,10 +103,9 @@ describe('tryDispatchNextQueued', () => {
       jobId: 'orphan-job',
     };
     const queueManager = makeFakeQueueManager(next);
-    // Second dequeueNext returns null (queue exhausted after the orphan).
     queueManager.dequeueNext.mockResolvedValueOnce(next).mockResolvedValueOnce(null);
+    // No waiter registered.
     const waiters = new ConcurrencyWaiters();
-    // Note: no waiter registered.
     const registry = makeFakeRegistry('agent-x', { send: vi.fn() });
 
     await tryDispatchNextQueued(
@@ -125,9 +122,8 @@ describe('tryDispatchNextQueued', () => {
   });
 
   it('skips orphans and dispatches the first live waiter found', async () => {
-    // First dequeue returns an orphan (no waiter), second dequeue returns a
-    // live waiter — exercises the loop. This is the real-world scenario when
-    // a previous test left a queued row whose agent has long disconnected.
+    // An orphan (no waiter) then a live waiter: exercises the loop past a
+    // queued row whose agent long disconnected.
     const orphan: QueuedJob = {
       id: 'cg-orphan',
       groupKey: GROUP,
@@ -198,16 +194,13 @@ describe('tryDispatchNextQueued', () => {
     );
 
     expect(queueManager.markCompleted).toHaveBeenCalledWith('run-3', GROUP, ROUTING);
-    // Waiter was removed.
     expect(waiters.size()).toBe(0);
   });
 
   it('preserves FIFO order across multiple registered waiters', async () => {
-    // Agent A registered first, then B. dequeueNext returns whoever the
-    // queue manager says is next; the waiters map matches by runId. This
-    // test confirms that the helper does not assume the FIFO head — it
-    // matches by runId so the DB and in-memory state stay aligned even if
-    // the queue manager picks a non-head row (e.g. priority-aware future).
+    // A registered before B, but the helper follows dequeueNext's pick by
+    // runId, not the FIFO head, so DB and in-memory state stay aligned when the
+    // queue manager picks a non-head row.
     const queueManager = makeFakeQueueManager({
       id: 'cg-4',
       groupKey: GROUP,

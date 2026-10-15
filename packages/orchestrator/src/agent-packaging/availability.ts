@@ -1,12 +1,10 @@
 /**
  * Availability gate for version-keyed agent packages.
  *
- * The fleet auto-upgrade convergence NEVER rolls a host to a version whose
- * self-contained payload objects don't exist in the cache bucket — that would
- * stage stale/absent bytes (or leave the fleet at a version skew). This helper
- * `head`s each platform's payload object and reports which are missing, so the
- * caller can HOLD (the convergence gate) or skip re-producing (the upgrade
- * hook). It never throws — the caller decides hold-vs-alarm.
+ * Fleet auto-upgrade NEVER rolls a host to a version whose payload objects are
+ * absent from the cache bucket: that stages stale or absent bytes, or leaves a
+ * version skew. It never throws; the caller holds (convergence gate) or skips
+ * re-producing (upgrade hook).
  */
 import type { AgentPlatform } from '@kici-dev/shared';
 import { agentPackageExists, type AgentPackageDownloadStorage } from './download.js';
@@ -21,9 +19,8 @@ export interface PayloadAvailability {
 
 /**
  * Check that a version's agent payloads exist for every requested platform.
- * Fail-closed by construction: an absent object lands in `missing`, so a caller
- * that gates on `available` can never converge onto a version whose bytes are
- * not present.
+ * Fail-closed: an absent object lands in `missing`, so gating on `available`
+ * never converges onto a version whose bytes are not present.
  */
 export async function assertPayloadsAvailable(
   storage: AgentPackageDownloadStorage,

@@ -1,13 +1,11 @@
 /**
- * The outcome of one dependency restore, in a shape three readers share: the
- * run log (one human line per failed attempt and one at the end), the agent
- * log (a structured `Dep restore report` line), and the runner IPC message
- * that carries the report from the runner child to the agent process.
+ * One dependency restore's outcome, shared by the run log (a line per failed
+ * attempt and one at the end), the agent log (a structured `Dep restore
+ * report` line), and the runner-to-agent IPC message.
  *
- * The runner child's own logger output never reaches the agent log: the fork
- * runner discards the child's stdout (`fork-runner.ts`
- * `setupChildStdioCapture`), and the container runner's stdout carries the IPC
- * protocol. So an execution job's restore reaches the agent log only through
+ * The runner child's logger never reaches the agent log (the fork runner
+ * discards its stdout in `setupChildStdioCapture`; the container runner's
+ * stdout is the IPC channel), so a job's restore reaches it only through
  * {@link createDepRestoreReportRelay} in the parent.
  */
 
@@ -119,7 +117,7 @@ export function formatRestoredLine(r: DepRestoreReport): string {
   return `Deps restored from cache: ${parts.join(', ')}`;
 }
 
-/** Write one report to the agent log. */
+/** To the agent log. */
 export function logDepRestoreReport(
   report: DepRestoreReport,
   context: Record<string, string> = {},
@@ -156,12 +154,11 @@ export function logDepRestoreReport(
 }
 
 /**
- * Run the runner's setup phases, then send the one `dep-restore.report`
- * message that closes the agent's relay: with the restore's report, or with
- * none when no restore ran (no `depsUrl`, no `.kici/package.json`, a
- * cleanup-only run). It is sent even when setup throws, and always before the
- * runner loads the workflow module, so workflow code never runs while the
- * relay is still open.
+ * Run setup, then send the one `dep-restore.report` that closes the agent's
+ * relay — carrying no report when no restore ran (no `depsUrl`, no
+ * `.kici/package.json`, a cleanup-only run). Sent even when setup throws, and
+ * before the workflow module loads, so workflow code never runs while the
+ * relay is open.
  */
 export async function runSetupThenSendDepRestoreReport(
   setup: (onReport: (report: DepRestoreReport) => void) => Promise<void>,
@@ -180,15 +177,13 @@ export async function runSetupThenSendDepRestoreReport(
 /**
  * Relay a runner child's `dep-restore.report` into the agent log.
  *
- * The runner child also runs workflow code — the module it loads, the
- * evaluations before the first step, and the steps — and that code can call
- * `process.send`. The agent log reaches journald and Loki without the run
- * log's `runs:read` check, so the relay takes only what the restore itself
- * sends. The runner sends exactly one `dep-restore.report` at the end of its
- * setup, before it loads the workflow module
- * ({@link runSetupThenSendDepRestoreReport}), so the first such message closes
- * the relay whatever it carries; a `step.start` closes it too. The report it
- * carries is logged only when it parses against {@link depRestoreReportSchema}.
+ * Workflow code in the child (module load, pre-step evaluations, steps) can
+ * call `process.send`, and the agent log reaches journald and Loki without the
+ * run log's `runs:read` check, so the relay accepts only the restore's own
+ * message: the first `dep-restore.report` (sent before the workflow module
+ * loads, {@link runSetupThenSendDepRestoreReport}) closes it whatever it
+ * carries, as does a `step.start`. The report is logged only when it parses
+ * against {@link depRestoreReportSchema}.
  */
 export interface DepRestoreReportRelay {
   onStepStarted(): void;
@@ -211,7 +206,6 @@ export function createDepRestoreReportRelay(
         return;
       }
       closed = true;
-      // Setup ended without a restore.
       if (raw === undefined) return;
       const parsed = depRestoreReportSchema.safeParse(raw);
       if (!parsed.success) {

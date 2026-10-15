@@ -165,7 +165,6 @@ describe('bootstrapWorker', () => {
 
     const subsystems = await bootstrapWorker(config);
 
-    // PeerClient was constructed with the coordinator URL
     const peerClient = subsystems.peerClient as unknown as MockPeerClient;
     expect(peerClient.options.url).toBe('ws://coordinator:4000/ws/peer');
     expect(peerClient.options.instanceId).toBe('test-worker-1');
@@ -375,7 +374,6 @@ describe('bootstrapWorker', () => {
 
     await bootstrapWorker(config);
 
-    // PeerClient.connect() should have been called
     expect(mockPeerClientConnect).toHaveBeenCalledTimes(1);
   });
 });

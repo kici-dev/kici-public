@@ -2,14 +2,10 @@ import { exec } from 'node:child_process';
 import { platform } from 'node:os';
 
 /**
- * Open a URL in the operator's default browser, best-effort. Used by the GitHub
- * App manifest setup flow to launch the create / install pages. Failure is
- * non-fatal — the caller always prints the URL too, so a headless host (or a
- * blocked launcher) just falls back to copy-paste.
- *
- * `KICI_BROWSER_CMD` overrides the launcher: `none` suppresses it entirely
- * (automated tests / headless capture), any other value is run with `{url}` substituted —
- * mirroring the `kici login` convention.
+ * Best-effort: the caller always prints the URL too, so a headless host falls
+ * back to copy-paste. `KICI_BROWSER_CMD` overrides the launcher as in
+ * `kici login`: `none` suppresses it (tests, headless capture), any other
+ * value runs with `{url}` substituted.
  */
 export function openBrowserBestEffort(url: string): void {
   const override = process.env.KICI_BROWSER_CMD;

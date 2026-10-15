@@ -16,9 +16,6 @@ const logger = createLogger({ prefix: 'source-store' });
 /** Fixed org_id for source secrets (sources are not org-scoped in the orchestrator). */
 const SOURCE_ORG_ID = '__system__';
 
-/**
- * Parameters for adding a new source.
- */
 export interface AddSourceParams {
   /** Provider type (e.g. 'github') */
   provider: string;
@@ -38,9 +35,6 @@ export interface AddSourceParams {
   customerId?: string;
 }
 
-/**
- * A source with its decrypted secrets.
- */
 export interface SourceWithSecrets extends Source {
   privateKey: string;
   webhookSecret?: string;
@@ -63,7 +57,6 @@ export class SourceStore {
   async addSource(params: AddSourceParams): Promise<Source> {
     const routingKey = `${params.provider}:${params.appId}`;
 
-    // Check for duplicate routing key
     const existing = await this.db
       .selectFrom('sources')
       .selectAll()
@@ -89,7 +82,6 @@ export class SourceStore {
       .returningAll()
       .executeTakeFirstOrThrow();
 
-    // Store secrets
     const scope = `__source__/${source.id}`;
     await this.secretStore.setSecret(SOURCE_ORG_ID, scope, 'privateKey', params.privateKey);
     if (params.webhookSecret) {
@@ -107,9 +99,6 @@ export class SourceStore {
     return this.db.selectFrom('sources').selectAll().execute();
   }
 
-  /**
-   * Get a single source by routing key, or null if not found.
-   */
   async getSource(routingKey: string): Promise<Source | null> {
     const source = await this.db
       .selectFrom('sources')
@@ -182,7 +171,6 @@ export class SourceStore {
       throw new Error(`Source with routing key ${routingKey} not found`);
     }
 
-    // Build DB update set
     const dbUpdates: Record<string, unknown> = { updated_at: sql`now()` };
     if (updates.name) dbUpdates.name = updates.name;
     if (updates.slug !== undefined) dbUpdates.slug = updates.slug;
@@ -204,7 +192,6 @@ export class SourceStore {
         .returningAll()
         .executeTakeFirstOrThrow();
 
-      // Update secrets if provided
       const scope = `__source__/${source.id}`;
       if (updates.privateKey) {
         await this.secretStore.setSecret(SOURCE_ORG_ID, scope, 'privateKey', updates.privateKey);
@@ -230,12 +217,10 @@ export class SourceStore {
     const source = await this.getSource(routingKey);
     if (!source) return;
 
-    // Delete secrets
     const scope = `__source__/${source.id}`;
     await this.secretStore.deleteSecret(SOURCE_ORG_ID, scope, 'privateKey');
     await this.secretStore.deleteSecret(SOURCE_ORG_ID, scope, 'webhookSecret');
 
-    // Delete from DB
     await this.db.deleteFrom('sources').where('routing_key', '=', routingKey).execute();
 
     logger.info('Source removed', { routingKey });

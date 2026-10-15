@@ -1,21 +1,16 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the `dashboard_encryption_keys` table: the cluster-scoped, long-lived
- * X25519 keypair the orchestrator owns for browser-sealed dashboard writes.
- * Under the `encrypted` dashboard-write posture the browser seals a secret /
- * variable value to the `active` key's public half before it leaves the page,
- * so the hosted Platform relays only opaque ciphertext.
+ * Add `dashboard_encryption_keys`: the cluster-scoped, long-lived X25519 keypair for
+ * browser-sealed dashboard writes. Under the `encrypted` posture the browser seals a secret /
+ * variable value to the `active` key's public half, so the hosted Platform relays only
+ * ciphertext.
  *
- * Modeled on `orchestrator_signing_keys` (migration 084). `public_jwk` is the
- * non-secret OKP/X25519 public JWK (`use:'enc'`) served at
- * `/.well-known/jwks.json`. `encrypted_private_key` holds the AES-256-GCM
- * master-key-wrapped (KICI_SECRET_KEY) DER private key — db custody only, so it
- * is NOT NULL. One `active` key seals; a rotated-out key goes `revoked` and
- * leaves the published JWKS, while its row stays so envelopes already sealed to
- * it still decrypt.
- *
- * Idempotent: guarded on table existence.
+ * Modeled on `orchestrator_signing_keys` (084). `public_jwk` (OKP/X25519, `use:'enc'`) is served
+ * at `/.well-known/jwks.json`. `encrypted_private_key` is the AES-256-GCM KICI_SECRET_KEY-wrapped
+ * DER private key; db custody only, so NOT NULL. One `active` key seals; a rotated-out key goes
+ * `revoked` and leaves the JWKS, but its row stays so already-sealed envelopes decrypt.
+ * Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   if (await tableExists(db, 'dashboard_encryption_keys')) return;

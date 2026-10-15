@@ -1,11 +1,10 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Pending workflow dispatch context — backs resume of a workflow whose install
- * gate held. One row per held run: the serializable dispatch inputs needed to
- * rebuild the WorkflowDispatchContext when the hold releases (reviewer approve,
- * wait-timer expiry, concurrency slot free). The row is deleted once the resume
- * dispatch has been kicked off.
+ * Pending workflow dispatch context, for resuming a workflow whose install gate
+ * held. One row per held run holds the serializable inputs that rebuild the
+ * WorkflowDispatchContext when the hold releases (reviewer approve, wait-timer
+ * expiry, free concurrency slot); it is deleted once the resume dispatch starts.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`

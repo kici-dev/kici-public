@@ -1,6 +1,4 @@
 /**
- * Unit tests for EventLogWriter.
- *
  * Exercises every status path (received/processed/duplicate/lockfile_missing/
  * failed), the size-cap omit path, the storage-failure omit path, and the
  * cross-tier hash equality assertion (the orchestrator MUST hash with the
@@ -13,73 +11,30 @@ import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import type { LogStorage } from '../reporting/log-storage.js';
 import type { WebhookInfo } from './handler.js';
+import { createMockDb, type MockDbMocks } from '../__test-helpers__/mock-db.js';
 import { EventLogWriter, payloadFromObject, payloadFromRawBody } from './event-log.js';
 
 // ── Mock builders ─────────────────────────────────────────────
 
 interface InsertedRow {
   values: Record<string, unknown>;
-  conflictUpdate: Record<string, unknown> | null;
+  conflictUpdate: Record<string, unknown>;
   /** Which ON CONFLICT arm the writer chose for this insert. */
   conflictAction: 'update' | 'nothing' | null;
 }
 
-function createMockDb() {
-  const inserts: InsertedRow[] = [];
-
-  const onConflictBuilder = (captured: InsertedRow) => ({
-    columns: () => ({
-      doUpdateSet: (set: Record<string, unknown>) => {
-        // mutate the captured update set
-        if (captured.conflictUpdate) {
-          Object.assign(captured.conflictUpdate, set);
-        }
-        captured.conflictAction = 'update';
-        return {};
-      },
-      doNothing: () => {
-        captured.conflictAction = 'nothing';
-        return {};
-      },
-    }),
-  });
-
-  const insertBuilder = {
-    values: (values: Record<string, unknown>) => {
-      const conflictUpdate: Record<string, unknown> = {};
-      const captured: InsertedRow = { values, conflictUpdate, conflictAction: null };
-      inserts.push(captured);
-      return {
-        onConflict: (cb: (oc: ReturnType<typeof onConflictBuilder>) => unknown) => {
-          cb(onConflictBuilder(captured));
-          return {
-            execute: vi.fn().mockResolvedValue(undefined),
-          };
-        },
-      };
-    },
+/** The single insert a `record()` call issues, read off the shared mock's spies. */
+function firstInsert(mocks: MockDbMocks): InsertedRow {
+  const conflictAction = mocks.doUpdateSet.mock.calls.length
+    ? 'update'
+    : mocks.doNothing.mock.calls.length
+      ? 'nothing'
+      : null;
+  return {
+    values: mocks.insertValues.mock.calls[0][0],
+    conflictUpdate: mocks.doUpdateSet.mock.calls[0]?.[0] ?? {},
+    conflictAction,
   };
-
-  const mockDb = {
-    insertInto: vi.fn().mockImplementation(() => insertBuilder),
-    selectFrom: vi.fn().mockImplementation(() => ({
-      select: () => ({
-        where: () => ({
-          limit: () => ({
-            execute: vi.fn().mockResolvedValue([]),
-          }),
-        }),
-      }),
-    })),
-    deleteFrom: vi.fn().mockImplementation(() => ({
-      where: () => ({
-        executeTakeFirst: vi.fn().mockResolvedValue({ numDeletedRows: 0n }),
-      }),
-    })),
-    _inserts: inserts,
-  } as unknown as Kysely<Database> & { _inserts: InsertedRow[] };
-
-  return mockDb;
 }
 
 function createMockLogStorage(opts?: { failOnAppend?: boolean }) {
@@ -108,16 +63,15 @@ const baseInfo: WebhookInfo = {
 };
 
 function newWriter(opts?: {
-  db?: ReturnType<typeof createMockDb>;
   storage?: ReturnType<typeof createMockLogStorage>;
   maxPayloadBytes?: number;
 }) {
-  const db = opts?.db ?? createMockDb();
+  const { db, mocks } = createMockDb();
   const storage = opts?.storage ?? createMockLogStorage();
-  const writer = new EventLogWriter(db, storage, {
+  const writer = new EventLogWriter(db as Kysely<Database>, storage, {
     maxPayloadBytes: opts?.maxPayloadBytes ?? 5 * 1024 * 1024,
   });
-  return { writer, db, storage };
+  return { writer, mocks, storage };
 }
 
 // ── Tests ─────────────────────────────────────────────────────
@@ -125,7 +79,7 @@ function newWriter(opts?: {
 describe('EventLogWriter', () => {
   describe('hashing', () => {
     it('uses the same sha256() as @kici-dev/shared (cross-tier join key)', async () => {
-      const { writer, db } = newWriter();
+      const { writer, mocks } = newWriter();
       const payload = payloadFromObject(baseInfo.payload);
       const expected = sha256(payload.raw);
 
@@ -135,12 +89,12 @@ describe('EventLogWriter', () => {
         status: EventLogStatus.enum.processed,
       });
 
-      expect(db._inserts).toHaveLength(1);
-      expect(db._inserts[0].values.payload_hash).toBe(expected);
+      expect(mocks.insertValues).toHaveBeenCalledTimes(1);
+      expect(firstInsert(mocks).values.payload_hash).toBe(expected);
     });
 
     it('hashes raw bytes byte-for-byte (matches Platform direct path)', async () => {
-      const { writer, db } = newWriter();
+      const { writer, mocks } = newWriter();
       const rawBody = '{"hello":"world"}';
       const payload = payloadFromRawBody(rawBody);
 
@@ -150,7 +104,7 @@ describe('EventLogWriter', () => {
         status: EventLogStatus.enum.processed,
       });
 
-      expect(db._inserts[0].values.payload_hash).toBe(sha256(rawBody));
+      expect(firstInsert(mocks).values.payload_hash).toBe(sha256(rawBody));
     });
   });
 
@@ -176,14 +130,14 @@ describe('EventLogWriter', () => {
     });
 
     it('writes the row with payload_omitted=false and a payload_key', () => {
-      const row = result.db._inserts[0].values;
+      const row = firstInsert(result.mocks).values;
       expect(row.payload_omitted).toBe(false);
       expect(row.payload_omitted_reason).toBeNull();
       expect(row.payload_key).toBe('event-log/org-001/delivery-abc-123.json.gz');
     });
 
     it('records the outcome metadata', () => {
-      const row = result.db._inserts[0].values;
+      const row = firstInsert(result.mocks).values;
       expect(row.org_id).toBe('org-001');
       expect(row.delivery_id).toBe('delivery-abc-123');
       expect(row.routing_key).toBe('github:42');
@@ -204,7 +158,7 @@ describe('EventLogWriter', () => {
   describe('size-cap omit path', () => {
     it('records payload_omitted=true with reason size_exceeded and skips upload', async () => {
       // Cap at 32 bytes; the JSON serialization of baseInfo.payload is larger.
-      const { writer, db, storage } = newWriter({ maxPayloadBytes: 32 });
+      const { writer, mocks, storage } = newWriter({ maxPayloadBytes: 32 });
 
       await writer.record(baseInfo, payloadFromObject(baseInfo.payload), {
         orgId: 'org-001',
@@ -213,7 +167,7 @@ describe('EventLogWriter', () => {
       });
 
       expect(storage._writes).toHaveLength(0);
-      const row = db._inserts[0].values;
+      const row = firstInsert(mocks).values;
       expect(row.payload_omitted).toBe(true);
       expect(row.payload_omitted_reason).toBe(PayloadOmittedReason.enum.size_exceeded);
       expect(row.payload_key).toBeNull();
@@ -225,7 +179,9 @@ describe('EventLogWriter', () => {
 
   describe('storage-failure omit path', () => {
     it('records payload_omitted=true with reason storage_failed and continues', async () => {
-      const { writer, db } = newWriter({ storage: createMockLogStorage({ failOnAppend: true }) });
+      const { writer, mocks } = newWriter({
+        storage: createMockLogStorage({ failOnAppend: true }),
+      });
 
       await writer.record(baseInfo, payloadFromObject(baseInfo.payload), {
         orgId: 'org-001',
@@ -233,7 +189,7 @@ describe('EventLogWriter', () => {
         status: EventLogStatus.enum.processed,
       });
 
-      const row = db._inserts[0].values;
+      const row = firstInsert(mocks).values;
       expect(row.payload_omitted).toBe(true);
       expect(row.payload_omitted_reason).toBe(PayloadOmittedReason.enum.storage_failed);
       expect(row.payload_key).toBeNull();
@@ -250,14 +206,14 @@ describe('EventLogWriter', () => {
       EventLogStatus.enum.lockfile_missing,
       EventLogStatus.enum.failed,
     ])('records status=%s', async (status) => {
-      const { writer, db } = newWriter();
+      const { writer, mocks } = newWriter();
       await writer.record(baseInfo, payloadFromObject(baseInfo.payload), {
         orgId: 'org-001',
         source: EventLogSource.enum.direct,
         status,
         ...(status === EventLogStatus.enum.failed && { errorMessage: 'kaboom' }),
       });
-      const row = db._inserts[0].values;
+      const row = firstInsert(mocks).values;
       expect(row.status).toBe(status);
       if (status === EventLogStatus.enum.failed) {
         expect(row.error_message).toBe('kaboom');
@@ -267,14 +223,14 @@ describe('EventLogWriter', () => {
 
   describe('idempotent upsert on (org_id, delivery_id)', () => {
     it('updates outcome fields on conflict but not body-derived fields', async () => {
-      const { writer, db } = newWriter();
+      const { writer, mocks } = newWriter();
       await writer.record(baseInfo, payloadFromObject(baseInfo.payload), {
         orgId: 'org-001',
         source: EventLogSource.enum.direct,
         status: EventLogStatus.enum.received,
       });
       // The conflictUpdate captures what fields would be set on conflict.
-      const update = db._inserts[0].conflictUpdate;
+      const update = firstInsert(mocks).conflictUpdate;
       // Outcome fields: present
       expect(update).toHaveProperty('status');
       expect(update).toHaveProperty('run_id');
@@ -294,11 +250,11 @@ describe('EventLogWriter', () => {
       expect(update).not.toHaveProperty('source');
       expect(update).not.toHaveProperty('provider');
       // The default arm updates; `onlyIfAbsent` is opt-in per call.
-      expect(db._inserts[0].conflictAction).toBe('update');
+      expect(firstInsert(mocks).conflictAction).toBe('update');
     });
 
     it('leaves an existing row alone when the caller passes onlyIfAbsent', async () => {
-      const { writer, db } = newWriter();
+      const { writer, mocks } = newWriter();
       await writer.record(
         baseInfo,
         payloadFromObject(baseInfo.payload),
@@ -312,10 +268,10 @@ describe('EventLogWriter', () => {
       );
       // DO NOTHING, not DO UPDATE: a breadcrumb written after the pipeline
       // already reached an outcome must not downgrade that row back to `shed`.
-      expect(db._inserts[0].conflictAction).toBe('nothing');
-      expect(db._inserts[0].conflictUpdate).toEqual({});
+      expect(firstInsert(mocks).conflictAction).toBe('nothing');
+      expect(firstInsert(mocks).conflictUpdate).toEqual({});
       // The insert itself still carries the full breadcrumb row.
-      expect(db._inserts[0].values).toMatchObject({
+      expect(firstInsert(mocks).values).toMatchObject({
         status: EventLogStatus.enum.shed,
         source: EventLogSource.enum.relay,
         error_message: 'ingest admission shed: loop_overload',

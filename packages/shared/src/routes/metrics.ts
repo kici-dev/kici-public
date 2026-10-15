@@ -1,30 +1,24 @@
 import { Hono } from 'hono';
 
 export interface MetricsRoutesDeps {
-  /** Callback that returns the Prometheus metrics response. */
   getMetrics: () => Promise<{ contentType: string; body: string }>;
 }
 
 /**
  * Create Prometheus metrics route.
  *
- * The caller provides a getMetrics callback that returns the content type
- * and body. This decouples the route from any specific metrics library
- * (prom-client, OTel PrometheusExporter, etc.).
- *
- * @param deps - Dependencies (metrics callback)
- * @returns Hono app with /metrics endpoint
+ * The caller's getMetrics callback decouples the route from any specific
+ * metrics library (prom-client, OTel PrometheusExporter, etc.).
  */
 export function createMetricsRoutes(deps: MetricsRoutesDeps): Hono {
   const app = new Hono();
 
   app.get('/metrics', async (c) => {
     const { contentType, body } = await deps.getMetrics();
-    // Strip OpenMetrics directives (# UNIT, # EOF) that Prometheus 2.x can't parse.
-    // The OTel PrometheusExporter emits these unconditionally with no config to disable them.
-    // Also sanitize metric names: OTel uses dots (e.g. nodejs.eventloop.utilization)
-    // but Prometheus requires underscores. Replace dots with underscores in metric
-    // names on # TYPE, # HELP, and sample lines.
+    // Strip the OpenMetrics directives (# UNIT, # EOF) Prometheus 2.x can't
+    // parse; the OTel PrometheusExporter always emits them. Also replace dots in
+    // OTel metric names (nodejs.eventloop.utilization) with the underscores
+    // Prometheus requires, on # TYPE, # HELP and sample lines.
     const filteredBody = body
       .split('\n')
       .filter((line) => !line.startsWith('# UNIT ') && line !== '# EOF')
@@ -48,7 +42,7 @@ export function createMetricsRoutes(deps: MetricsRoutesDeps): Hono {
         return line;
       })
       .join('\n');
-    // Force standard Prometheus text format content type (not OpenMetrics)
+    // Standard Prometheus text format, never OpenMetrics.
     const safeContentType = contentType.includes('openmetrics')
       ? 'text/plain; version=0.0.4; charset=utf-8'
       : contentType;

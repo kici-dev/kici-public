@@ -1,21 +1,13 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Drop the `source_secrets_change_trigger` and the
- * `notify_source_secrets_change()` plpgsql function.
+ * Drops `source_secrets_change_trigger` and `notify_source_secrets_change()`. Their only
+ * LISTEN/NOTIFY consumer, `WebhookSecretManager`, pushed webhook secrets to the Platform; the
+ * orchestrator now never sends secret material there (the Platform asks it to verify each
+ * webhook, reading `PgSecretStore`), so the NOTIFY traffic has no listener.
  *
- * Both were used by the (now removed) `WebhookSecretManager` which
- * subscribed via LISTEN/NOTIFY to detect changes to webhook secret rows in
- * `scoped_secrets` and pushed them to the multi-tenant Platform via the
- * `source.secrets` WS message. After the chunked-relay cutover the
- * orchestrator never pushes secret material to Platform -- Platform asks
- * the orchestrator to verify each inbound webhook on demand and the
- * verifier reads secrets directly from `PgSecretStore` -- so the trigger
- * is dead code and only emits NOTIFY traffic that nobody listens to.
- *
- * `down` re-creates the function + trigger as they were originally defined
- * in `001_initial.ts`. They wake up no consumer until the `WebhookSecretManager`
- * is restored, so this migration is safe to roll back.
+ * `down` re-creates both as defined in `001_initial.ts`; they wake no consumer, so the
+ * rollback is safe.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`DROP TRIGGER IF EXISTS source_secrets_change_trigger ON public.scoped_secrets`.execute(

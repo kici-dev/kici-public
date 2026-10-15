@@ -76,7 +76,6 @@ describe('X25519 ECDH encryption', () => {
       const tarballPath = path.join(tempDir, 'test.tar.gz');
       await fs.writeFile(tarballPath, originalContent);
 
-      // CLI encrypts with orchestrator's public key
       const { encryptedPath, cliPublicKey } = await encryptTarball(
         tarballPath,
         orchestrator.publicKey,
@@ -86,7 +85,6 @@ describe('X25519 ECDH encryption', () => {
       const encryptedContent = await fs.readFile(encryptedPath);
       expect(encryptedContent.equals(originalContent)).toBe(false);
 
-      // Orchestrator/agent decrypts with own private key + CLI public key
       const decryptedPath = await decryptTarball(
         encryptedPath,
         cliPublicKey,
@@ -99,7 +97,6 @@ describe('X25519 ECDH encryption', () => {
 
     it('handles large binary content', async () => {
       const orchestrator = generateEphemeralKeypair();
-      // 1MB of random binary data
       const originalContent = Buffer.alloc(1024 * 1024);
       for (let i = 0; i < originalContent.length; i++) {
         originalContent[i] = i % 256;
@@ -139,7 +136,6 @@ describe('X25519 ECDH encryption', () => {
       const enc1 = await fs.readFile(result1.encryptedPath);
       const enc2 = await fs.readFile(result2.encryptedPath);
 
-      // Different keys => different ciphertext
       expect(enc1.equals(enc2)).toBe(false);
     });
 
@@ -155,9 +151,8 @@ describe('X25519 ECDH encryption', () => {
         orchestrator.publicKey,
       );
 
-      // Tamper with the ciphertext (flip a byte in the ciphertext section)
       const encrypted = await fs.readFile(encryptedPath);
-      // Byte 28 is the first byte of ciphertext (after 12-byte IV + 16-byte auth tag)
+      // Byte 28 is the first ciphertext byte (after 12-byte IV + 16-byte auth tag).
       if (encrypted.length > 28) {
         encrypted[28] ^= 0xff;
       }
@@ -179,15 +174,13 @@ describe('X25519 ECDH encryption', () => {
 
       const encrypted = await fs.readFile(encryptedPath);
 
-      // Total: 12 (IV) + 16 (auth tag) + content.length (ciphertext)
       expect(encrypted.length).toBe(12 + 16 + content.length);
 
-      // IV is first 12 bytes (should not be all zeros since it's random)
+      // The IV is random, so not all zeros.
       const iv = encrypted.subarray(0, 12);
       expect(iv.length).toBe(12);
       expect(iv.every((b) => b === 0)).toBe(false);
 
-      // Auth tag is next 16 bytes
       const authTag = encrypted.subarray(12, 28);
       expect(authTag.length).toBe(16);
     });
@@ -210,7 +203,7 @@ describe('X25519 ECDH encryption', () => {
         orchestrator.privateKey,
       );
 
-      // Original tarball was overwritten by decrypt output at the same path (without .enc)
+      // Decrypt output overwrote the original tarball path.
       expect(decryptedPath).toBe(tarballPath);
     });
   });

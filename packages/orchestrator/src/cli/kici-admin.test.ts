@@ -6,12 +6,9 @@ import type { Command } from 'commander';
 import { canonicalize, buildProgram, CLI_VERSION } from './kici-admin.js';
 
 /**
- * The entry-point guard in kici-admin.ts compares the invoked script path
- * (`process.argv[1]`) against this module's own resolved path
- * (`fileURLToPath(import.meta.url)`). On macOS the light-package launcher runs
- * `node /tmp/.../kici-admin.cjs`, but `/tmp` is a symlink to `/private/tmp`, so
- * the two sides only match once both are canonicalized through their symlinks.
- * These tests pin `canonicalize` to that behavior.
+ * The kici-admin.ts entry-point guard matches `process.argv[1]` against
+ * `import.meta.url` only once both are canonicalized (macOS `/tmp` links to
+ * `/private/tmp`). These tests pin `canonicalize` to that.
  */
 describe('canonicalize (kici-admin entry guard)', () => {
   let realDir: string;
@@ -44,8 +41,7 @@ describe('canonicalize (kici-admin entry guard)', () => {
     const viaSymlink = path.join(symlinkDir, 'kici-admin.cjs');
     // The symlinked path and the real path are different strings...
     expect(viaSymlink).not.toBe(realFile);
-    // ...but canonicalize collapses both to the same on-disk identity, which is
-    // what lets the entry guard match a symlinked launcher invocation.
+    // ...but canonicalize collapses both to one on-disk identity.
     expect(canonicalize(viaSymlink)).toBe(canonicalize(realFile));
     expect(canonicalize(viaSymlink)).toBe(realFile);
   });
@@ -60,11 +56,7 @@ describe('canonicalize (kici-admin entry guard)', () => {
   });
 });
 
-/**
- * `--version` used to report a hardcoded `0.0.1` placeholder, so a support
- * bundle or an issue report carried no usable version context for the admin
- * CLI. The version now comes from the build-injected package version.
- */
+/** The version comes from the build-injected package version, never a placeholder. */
 describe('kici-admin --version', () => {
   it('reports CLI_VERSION rather than a literal placeholder', () => {
     expect(buildProgram().version()).toBe(CLI_VERSION);
@@ -201,11 +193,9 @@ describe('kici-admin root version flags', () => {
 });
 
 /**
- * Commander matches a root option anywhere in argv, so on its own the root
- * would take the value of a command option declared under a root flag
- * (`-u, --url`, `-t, --token`, `-V, --cli-version`). After the command's name
- * such a flag belongs to the command; every other root flag parses in any
- * position.
+ * Commander matches a root option anywhere in argv. After the command's name, a
+ * root flag (`-u, --url`, `-t, --token`, `-V, --cli-version`) the command also
+ * declares belongs to the command; every other root flag parses in any position.
  */
 describe('kici-admin command options that share a root flag', () => {
   function findCommand(program: Command, names: readonly string[]): Command {

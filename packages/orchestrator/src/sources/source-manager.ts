@@ -30,9 +30,6 @@ import { NotifyListener } from '../db/notify-listener.js';
 
 const logger = createLogger({ prefix: 'sources' });
 
-/**
- * Options for creating a SourceManager.
- */
 export interface SourceManagerOptions {
   /** Raw pg pool for LISTEN/NOTIFY subscriber. */
   pool: pg.Pool;

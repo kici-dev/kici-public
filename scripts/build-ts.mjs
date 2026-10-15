@@ -11,6 +11,7 @@ import {
   pruneStaleArtifacts,
   assertPublished,
   pruneOrphanDeclarations,
+  isTestOnlySource,
 } from './lib/atomic-dist.mjs';
 
 const cwd = process.cwd();
@@ -22,10 +23,9 @@ const pkgVersion = JSON.parse(readFileSync(path.join(cwd, 'package.json'), 'utf8
 // packages carry every baked constant.
 const buildDate = new Date().toISOString();
 
-// Collect all .ts files, filtering out test and declaration files
 const allFiles = [];
 for await (const f of glob('src/**/*.ts', { cwd })) {
-  if (!f.endsWith('.test.ts') && !f.endsWith('.d.ts')) {
+  if (!f.endsWith('.d.ts') && !isTestOnlySource(f)) {
     allFiles.push(f);
   }
 }

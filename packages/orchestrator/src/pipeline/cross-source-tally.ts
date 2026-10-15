@@ -1,8 +1,8 @@
 /**
- * A generic delivery can run both halves — cross-source for other sources'
- * registrations, and the inbound source's own lock when its normalizer reads a
- * repository. The delivery still gets one event-log row: the same-source path
- * writes it, and this wrapper folds the cross-source half into it.
+ * A generic delivery can run both cross-source (other sources' registrations)
+ * and same-source (the inbound lock, when its normalizer reads a repository).
+ * It still gets one event-log row: the same-source path writes it, and this
+ * wrapper folds the cross-source half in.
  */
 import type { ProcessingDeps } from './processor.js';
 import { DEGRADED_CHANGED_FILES_REASON } from './degraded-reason.js';
@@ -15,10 +15,9 @@ export interface CrossSourceTally {
 }
 
 /**
- * Wrap `deps.eventLog` so whichever row the same-source path records — corrupt
- * lock, missing lock, skip or processed — also counts the cross-source half's
- * dispatched jobs and carries its degraded reason. A reason the same-source
- * path already set wins.
+ * Wrap `deps.eventLog` so any row the same-source path records (corrupt lock,
+ * missing lock, skip, processed) adds the cross-source dispatched jobs and its
+ * degraded reason; a same-source reason wins.
  */
 export function withCrossSourceTally(
   deps: ProcessingDeps,

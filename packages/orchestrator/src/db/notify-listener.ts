@@ -1,18 +1,15 @@
 /**
  * A LISTEN subscription that survives losing its connection.
  *
- * A `LISTEN` session is a single checked-out client sitting idle. A Postgres
- * failover, a restart, or an idle-backend sweep terminates it, and the pool's
- * own error handler discards the broken connection without re-acquiring — so
- * the subscription is silently gone while `/health` and `/ready` stay 200. The
- * process keeps running and never hears another NOTIFY on that channel.
+ * A `LISTEN` session is one idle checked-out client. A Postgres failover,
+ * restart or idle-backend sweep terminates it, and the pool discards the broken
+ * connection without re-acquiring — so the subscription is silently gone while
+ * `/health` and `/ready` stay 200.
  *
- * This wraps the pattern once: acquire, subscribe, `LISTEN`, and on `error` or
- * `end` release the dead client and reconnect with jittered exponential
- * backoff until `stop()`. NOTIFY has no durable log, so nothing can be
- * replayed — instead, after a successful re-`LISTEN` the consumer's
- * `onReconnect` re-derives whatever it missed from the database, which is
- * exactly what that consumer already does at cold boot.
+ * On `error` or `end` this releases the dead client and reconnects with
+ * jittered exponential backoff until `stop()`. NOTIFY has no durable log, so
+ * after a successful re-`LISTEN` the consumer's `onReconnect` re-derives what
+ * it missed from the database, as it does at cold boot.
  */
 import type pg from 'pg';
 import { createLogger, toErrorMessage, type Logger } from '@kici-dev/shared';
@@ -87,10 +84,8 @@ export class NotifyListener {
     } catch {
       // The connection may already be gone; releasing is what matters.
     }
-    // pg's pool does not strip listeners a consumer attached, so a client
-    // released with ours still on it carries them into whatever checks it out
-    // next, and every start/stop cycle stacks another set. Both failure paths
-    // in `connect` already do this before releasing.
+    // pg's pool does not strip consumer listeners: a client released with ours
+    // carries them to its next holder, and every start/stop cycle stacks a set.
     client.removeAllListeners();
     client.release();
   }

@@ -1,28 +1,25 @@
 /**
  * Database-side retention for the tables that scale with run volume.
  *
- * The cold store is the other half of this: its archivers do
- * archive-then-delete inside one transaction and own the four tables they
- * register. But the cold store needs `KICI_COLD_STORE_ENABLED=true` and a
- * bucket, and with neither — the default, and the quickstart path — nothing
- * aged at all, so `execution_steps`, `event_log` and `access_log` grew without
- * bound on the operator's own disk.
+ * The cold store's archivers archive-then-delete in one transaction and own the
+ * tables they register, but need `KICI_COLD_STORE_ENABLED=true` and a bucket.
+ * Without them (the default, and the quickstart path) this tier is what keeps
+ * `execution_steps`, `event_log` and `access_log` from growing without bound on
+ * the operator's disk.
  *
  * Two rules keep the tiers from fighting:
  *
- *   - When the cold store is on, this tier skips every table an archiver
- *     registers. Two owners deleting the same rows would race the archiver's
- *     FK guard and could delete a parent whose archive chunk was never
- *     written. One owner per table.
+ *   - With the cold store on, this tier skips every table an archiver
+ *     registers: two owners would race the archiver's FK guard and could delete
+ *     a parent whose archive chunk was never written. One owner per table.
  *   - Nothing is deleted on the first pass. The first pass with a non-zero
  *     window stamps `cluster_settings.retention_announced_at` and reports what
- *     it would remove; deletion begins a week later. An upgrade that silently
- *     deleted an operator's history on its first night would be a behaviour
- *     change nobody was warned about.
+ *     it would remove; deletion begins a week later, so an upgrade never
+ *     silently deletes an operator's history on its first night.
  *
- * Every delete is batched — select ids under a `LIMIT`, then delete by id,
- * looping until a pass comes back short. One unbounded `DELETE` over a table
- * holding millions of rows holds locks for as long as it runs.
+ * Every delete is batched — select ids under a `LIMIT`, delete by id, loop until
+ * a pass comes back short — because one unbounded `DELETE` over millions of rows
+ * holds locks for as long as it runs.
  */
 import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -39,11 +36,10 @@ export const RETENTION_BATCH_SIZE = 5000;
 /** Days between the announce stamp and the first deletion. */
 export const RETENTION_ANNOUNCE_DAYS = 7;
 
-/** Terminal run statuses. A run still queued, running, held or cancelling is
- *  live work whatever its age. */
+/** A run still queued, running, held or cancelling is live work whatever its age. */
 export const TERMINAL_RUN_STATUS_LIST: readonly string[] = [...TERMINAL_RUN_STATES];
 
-/** Terminal held-run statuses. A pending hold is never pruned. */
+/** A pending hold is never pruned. */
 export const TERMINAL_HELD_RUN_STATUSES: readonly string[] = [
   HeldRunStatus.Approved,
   HeldRunStatus.Rejected,
@@ -52,9 +48,9 @@ export const TERMINAL_HELD_RUN_STATUSES: readonly string[] = [
 ];
 
 /**
- * Tables the cold-store archivers register. When the cold store is on these
- * are theirs alone — including the `execution_jobs` / `execution_steps`
- * children, which the run archiver removes with their parent.
+ * Tables the cold-store archivers own when the cold store is on — including the
+ * `execution_jobs` / `execution_steps` children the run archiver removes with
+ * their parent.
  */
 export const COLD_STORE_OWNED_TABLES: readonly string[] = [
   'execution_runs',
@@ -65,7 +61,6 @@ export const COLD_STORE_OWNED_TABLES: readonly string[] = [
   'event_log',
 ];
 
-/** The `cluster_settings` columns this module reads. */
 export type ClusterRetentionColumn =
   | 'run_retention_days'
   | 'audit_retention_days'
@@ -93,7 +88,6 @@ export interface PruneExpiredHistoryDeps {
 }
 
 export interface RetentionSummary {
-  /** Rows deleted, per table. */
   deleted: Record<string, number>;
   /** Rows that WOULD have been deleted, while the announce window runs. */
   pending: Record<string, number>;
@@ -111,10 +105,8 @@ export function allWindowsDisabled(windows: RetentionWindows): boolean {
 }
 
 /**
- * Delete rows in bounded batches, returning the total removed.
- *
- * The loop stops as soon as a pass comes back short, which is what bounds it
- * on a table that is still being written to.
+ * Delete rows in bounded batches. Stopping on the first short pass is what
+ * bounds the loop on a table still being written to.
  */
 export async function deleteInBatches(
   table: string,
@@ -149,11 +141,9 @@ async function countOlderThan(
 }
 
 /**
- * Prune one time-keyed table by id.
- *
- * Kysely's typed builder cannot express a table name chosen at runtime, so the
- * id selection is raw SQL over an allow-listed table/column pair — every
- * caller below passes a literal, never anything derived from input.
+ * Prune one time-keyed table by id. Kysely's typed builder cannot take a runtime
+ * table name, so this is raw SQL — every caller passes a literal table/column,
+ * never anything derived from input.
  */
 async function pruneByAge(
   db: Kysely<Database>,
@@ -180,20 +170,17 @@ async function pruneByAge(
 }
 
 /**
- * Delete terminal runs past the cutoff, children before parents.
+ * Delete terminal runs past the cutoff, children before parents: the jobs and
+ * steps beneath exactly the chosen run ids go first, so no run is left with
+ * orphaned children, and a run with live children is never chosen (its own
+ * status would not be terminal).
  *
- * The batch is chosen from `execution_runs`, then the jobs and steps beneath
- * exactly those run ids are removed first — so a run is never left with
- * orphaned children, and a run still holding live children is never chosen
- * (its own status would not be terminal).
- *
- * A rerun records `parent_run_id`, and that column carries a self-referencing
- * foreign key with no `ON DELETE` action. So a run whose rerun child is newer
- * than the cutoff, still running, or merely in a later batch would abort the
- * `DELETE` — and the whole sweep with it, leaving every table after this one
- * unpruned. The `NOT EXISTS` guard skips such a parent; it becomes eligible on
- * a later pass, once its own children have aged out. This mirrors the
- * cold-store run adapter's `execution_jobs` FK guard.
+ * `parent_run_id` (set by a rerun) is a self-referencing FK with no `ON DELETE`
+ * action, so a parent whose rerun child is newer than the cutoff, still running,
+ * or in a later batch would abort the `DELETE` — and the whole sweep, leaving
+ * every later table unpruned. The `NOT EXISTS` guard skips such a parent until
+ * its children have aged out. Mirrors the cold-store run adapter's
+ * `execution_jobs` FK guard.
  */
 async function pruneRuns(
   db: Kysely<Database>,
@@ -240,7 +227,6 @@ async function pruneRuns(
   }
 }
 
-/** Delete terminal held_runs past the cutoff. */
 async function pruneHeldRuns(
   db: Kysely<Database>,
   cutoff: Date,
@@ -267,8 +253,7 @@ async function pruneHeldRuns(
 
 /**
  * Read the announce stamp, setting it on the first pass that has work to do.
- *
- * Returns true once the window has elapsed and deletion may begin.
+ * True once the window has elapsed and deletion may begin.
  */
 export async function announceGatePassed(
   db: Kysely<Database>,
@@ -313,8 +298,8 @@ export async function pruneExpiredHistory(
   const mayDelete = await announceGatePassed(db, now);
   if (!mayDelete) {
     summary.announcing = true;
-    // Report the volume rather than removing it, so the operator sees the size
-    // of what is about to age out with a week to disable it.
+    // Report the volume so the operator sees what is about to age out, with a
+    // week to disable it.
     if (windows.auditRetentionDays > 0) {
       const cutoff = cutoffFor(now, windows.auditRetentionDays);
       if (owns('event_log')) {
@@ -411,12 +396,8 @@ export async function pruneExpiredHistory(
 }
 
 /**
- * Resolve the effective windows: a live `cluster_settings` value wins over the
- * configured default.
- *
- * `getNumber` returns a genuine 0 when the operator set the knob to 0, which is
- * the documented way to disable a window — so this stays a fallback-on-null
- * read, never `||`.
+ * A live `cluster_settings` value wins over the configured default. A genuine 0
+ * disables a window, so this stays a fallback-on-null read, never `||`.
  */
 export async function resolveRetentionWindows(
   defaults: RetentionWindows,

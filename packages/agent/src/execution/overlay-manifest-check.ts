@@ -1,16 +1,12 @@
 /**
- * Validation of an overlay manifest, before anything is applied.
+ * Overlay manifest validation. The uploader writes the manifest and container
+ * jobs apply the overlay on the agent host, so no entry may reach outside the
+ * repository: not by its own path, an existing symlink, or a directory symlink
+ * the same overlay creates. Every check runs before the first write, so a
+ * refused overlay applies nothing.
  *
- * The manifest is written by whoever uploaded the overlay, and the overlay is
- * applied on the agent host for container jobs, so no entry may reach outside
- * the repository: not through its own path, not through a symlink the
- * repository already has, and not through a directory symlink the same overlay
- * creates. Every check runs before the first write, so a refused overlay
- * applies nothing.
- *
- * The overlay applies its deletions first, then its files, then its directory
- * symlinks. Each entry's parent directory is resolved against the repository as
- * that step finds it.
+ * Apply order is deletions, files, then directory symlinks; each entry's parent
+ * is resolved against the repository as that step finds it.
  */
 
 import fs from 'node:fs/promises';
@@ -23,16 +19,13 @@ import {
   type LinkView,
 } from './overlay-symlinks.js';
 
-/**
- * Manifest describing the overlay contents.
- * Written by the CLI uploader, read by the agent.
- */
+/** Written by the CLI uploader, read by the agent. */
 export interface OverlayManifest {
-  /** HEAD SHA the overlay is based on */
+  /** HEAD SHA the overlay is based on. */
   sha: string;
-  /** Files deleted locally (need to be removed on agent) */
+  /** Files deleted locally, removed on the agent. */
   deletions: string[];
-  /** SHA256 checksums of each included file */
+  /** SHA256 of each included file. */
   checksums: Record<string, string>;
   /**
    * Symlinks whose target is a directory: repo-relative path → link text.
@@ -80,7 +73,6 @@ enum ApplyStep {
   Link = 'link',
 }
 
-/** The kind of manifest entry, as a refusal names it. */
 enum EntryKind {
   File = 'file',
   Deletion = 'deletion',
@@ -95,7 +87,7 @@ interface RepoView extends LinkView {
   files: ReadonlySet<string>;
 }
 
-/** A validated entry plus its real repo-relative path. */
+/** `rel` is the real repo-relative path. */
 interface Placed<T> {
   entry: T;
   rel: string;
@@ -103,14 +95,12 @@ interface Placed<T> {
 
 const quote = (value: unknown): string => JSON.stringify(value);
 
-/** One line of the refusal error, naming the entry, its kind, and the reason. */
 const refusal = (key: unknown, kind: EntryKind, reason: string): string =>
   `${quote(key)} (${kind}): ${reason}`;
 
 /**
- * Resolve one manifest path inside `root`, or say why it is refused: not an
- * absolute path, not one that climbs out with `..`, and not one carrying a NUL
- * byte (which the filesystem would truncate).
+ * Resolves a manifest path inside `root`, refusing an absolute path, a `..`
+ * escape, and a NUL byte (which the filesystem would truncate).
  */
 function resolveInside(root: string, key: unknown): { path: string } | { refused: string } {
   if (typeof key !== 'string' || key.length === 0) return { refused: 'not a non-empty string' };
@@ -137,7 +127,6 @@ async function realAncestor(target: string): Promise<string> {
   }
 }
 
-/** True when `value` is a plain object usable as a string-keyed map. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -161,13 +150,11 @@ function assertManifestShape(manifest: OverlayManifest): void {
 }
 
 /**
- * Walk `parts` from the real directory `start`, one component at a time. Every
- * symlink met is followed and must resolve, inside the repository, to a
- * directory that exists now: a link that would resolve only once the overlay has
- * created something is refused, since whether it does would depend on the order
- * entries are applied in. For a file or a link, a path the overlay deletes counts
- * as gone. On the entry's own path (`inLink` false) a missing directory is fine:
- * `mkdir` creates it.
+ * Walks `parts` from the real directory `start`. Every symlink met must resolve,
+ * inside the repository, to a directory that exists now: one resolving only
+ * after the overlay creates something would depend on apply order. A file or
+ * link the overlay deletes counts as gone. On the entry's own path (`inLink`
+ * false) a missing directory is fine: `mkdir` creates it.
  */
 async function walkDirs(
   view: RepoView,
@@ -261,9 +248,8 @@ function realRel(view: LinkView, realParent: string, dest: string): string {
 }
 
 /**
- * When `abs` is a real directory an entry replaces, the first file or link in it
- * the overlay does not delete: the directory can be removed only once it holds
- * nothing but directories.
+ * The first file or link the overlay keeps inside a real directory `abs` that
+ * an entry replaces; the directory is removable only when it holds directories alone.
  */
 async function leftoverIn(view: LinkView, abs: string): Promise<string | undefined> {
   const stat = await fs.lstat(abs).catch(() => undefined);
@@ -281,11 +267,10 @@ async function leftoverIn(view: LinkView, abs: string): Promise<string | undefin
 }
 
 /**
- * Deletions run first, against the repository as it is. Each is placed at its
- * real path and removed there, so deleting one path can never make another
- * deletion miss: the apply unlinks only files and links, never a directory on
- * another deletion's real path. Two keys naming one real path become one
- * deletion.
+ * Deletions run first, against the repository as it is, each at its real path.
+ * The apply unlinks only files and links, never a directory on another
+ * deletion's real path, so no deletion makes another miss. Keys naming one real
+ * path become one deletion.
  */
 async function checkDeletions(
   keys: unknown[],
@@ -312,10 +297,7 @@ async function checkDeletions(
   return [...placed.values()];
 }
 
-/**
- * Place every directory symlink at its real path, before any link is assumed
- * to exist, so each can be found by the others' checks.
- */
+/** Places every directory symlink before any is assumed to exist, so the others find each. */
 async function placeLinks(
   symlinks: Record<string, unknown>,
   repoRoot: string,
@@ -346,10 +328,7 @@ async function placeLinks(
   return placed;
 }
 
-/**
- * Place every file at its real path. Files run after the deletions and before
- * any directory symlink exists.
- */
+/** Files run after the deletions and before any directory symlink exists. */
 async function placeCopies(
   checksums: Record<string, string>,
   roots: { repoRoot: string; extractRoot: string },
@@ -400,9 +379,8 @@ async function copyRefusal(
 }
 
 /**
- * Walk each placed file's parent again now that every file is known: no file
- * may lie beneath a path another file replaces, which would fail midway once
- * that path is a file.
+ * Re-walks each file's parent with every file known: a file beneath a path
+ * another file replaces would fail midway.
  */
 async function filesBeneathFiles(
   copies: Array<Placed<CheckedCopy & { written: string }>>,
@@ -456,11 +434,7 @@ async function checkLinks(
   return links;
 }
 
-/**
- * Validate the whole manifest before anything touches the filesystem, so a
- * refused overlay applies nothing at all. Throws one error naming every
- * refused key.
- */
+/** Validates before any write; throws one error naming every refused key. */
 export async function checkManifest(
   manifest: OverlayManifest,
   repoDir: string,

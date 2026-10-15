@@ -14,45 +14,33 @@ import {
 import { withTimeout } from './timeout-util.js';
 import { evaluateDeferredPaths } from './deferred-paths.js';
 
-/**
- * Result of evaluating dynamic fields on a job.
- * Only fields that were flagged as dynamic and successfully resolved are set.
- */
+/** Only fields flagged dynamic and successfully resolved are set. */
 export interface InitResult {
   /** Resolved bound-context names, in merge order (one per `contexts` element). */
   contextNames?: string[];
   env?: Record<string, string>;
   concurrencyGroup?: string;
-  /**
-   * Resolved matrix combinations when the job's matrix is a dynamic function.
-   * The orchestrator re-materializes these into N execution jobs at dispatch.
-   */
+  /** Dynamic-matrix combinations; the orchestrator re-materializes them into N execution jobs at dispatch. */
   matrixValues?: MatrixValues[];
   /**
-   * Verdict of the workflow-level `filter`, set only when the init job was asked
-   * to evaluate one (`flags.hasFilter`). `false` means the workflow does not
-   * apply and its job must not be dispatched.
-   *
-   * Optional on purpose: an agent that predates the filter never sets it, so the
-   * orchestrator reads absence as "no verdict was reported", never as "suppress".
+   * Workflow-level `filter` verdict, set only under `flags.hasFilter`; `false`
+   * means the job must not be dispatched. Optional on purpose: an agent that
+   * predates the filter never sets it, and the orchestrator reads absence as
+   * "no verdict", never as "suppress".
    */
   filterPassed?: boolean;
   /**
-   * Verdict on the workflow's deferred `paths`, set only when the init job was
-   * asked to decide them (`flags.deferredPaths`). `false` means the clone's
-   * diff matched none of them and the job must not be dispatched.
-   *
-   * Optional on purpose: an agent that predates deferred paths never sets it,
-   * so the orchestrator reads absence as "no verdict", never as "suppress".
+   * Deferred `paths` verdict, set only under `flags.deferredPaths`; `false`
+   * means the clone's diff matched none and the job must not be dispatched.
+   * Optional for the same older-agent reason as `filterPassed`.
    */
   pathsPassed?: boolean;
 }
 
 /**
- * Everything a workflow-level `filter` needs beyond the workflow module and the
- * event. Supplied by the caller because none of it is derivable here: the source
- * tree lives wherever the init job materialized it, and the diff is ground truth
- * from that same clone.
+ * What a workflow-level `filter` needs beyond the module and the event. The
+ * caller supplies it: the source tree lives wherever the init job materialized
+ * it, and the diff is ground truth from that same clone.
  */
 export interface FilterEvalInput {
   /** The repo whose event triggered this evaluation. */
@@ -67,26 +55,20 @@ export interface FilterEvalInput {
 }
 
 /**
- * Run a workflow's `filter` and report whether the workflow applies.
+ * Shared by both agent-side evaluation sites for a same-repo workflow (the init
+ * job gating each static job's dispatch, and the dynamic-eval job gating whether
+ * a generator runs), so both reach the same verdict from the same inputs.
  *
- * Shared by both agent-side evaluation sites for a same-repo workflow: the init
- * job that gates each static job's dispatch, and the dynamic-eval job that gates
- * whether a generator runs at all. Both must reach the same verdict from the same
- * inputs, so neither builds the context itself.
+ * `createFilterContext`, not an object literal: it installs `changedFiles` as a
+ * throwing getter, so a filter reading the diff on an event without one fails
+ * loudly instead of seeing an empty list that would wrongly suppress every job.
+ * On this same-repo path the verdict is recoverable (the run row with its
+ * `__init__*` jobs exists, and the step log records it); the organization-wide
+ * path, which runs elsewhere, leaves nothing behind.
  *
- * The context is built through `createFilterContext` rather than as an object
- * literal: the factory installs `changedFiles` as a throwing getter, so a filter
- * that reads the diff on an event that has none fails loudly instead of seeing an
- * empty list. A `false` verdict dispatches none of the workflow's own jobs, so a
- * silently-empty diff would suppress it on a mistake. On this same-repo path the
- * verdict is at least recoverable — the run row exists, carrying the `__init__*`
- * jobs, and this evaluation's own step log records the verdict; it is the
- * organization-wide path, which runs elsewhere, that leaves nothing behind.
- *
- * A throwing filter propagates: the evaluating job fails, which surfaces as a
- * failed run. "Could not decide" is never treated as "do not run" — that would
- * be a false green, the same reasoning `buildJobRuleCompletion` applies to a rule
- * whose `check()` threw.
+ * A throwing filter propagates and fails the run: "could not decide" is never
+ * "do not run", which would be a false green (the same reasoning
+ * `buildJobRuleCompletion` applies to a throwing `check()`).
  */
 export async function evaluateWorkflowFilter(
   workflow: Workflow,
@@ -124,10 +106,7 @@ export async function evaluateWorkflowFilter(
   return Boolean(verdict);
 }
 
-/**
- * Find a static job by name in a workflow's jobs array.
- * Skips dynamic job functions (factories).
- */
+/** Skips dynamic job functions (factories). */
 function findJobByName(workflow: Workflow, jobName: string): Job {
   for (const item of workflow.jobs) {
     if (!isDynamicJobFn(item) && (item as Job).name === jobName) {
@@ -138,30 +117,19 @@ function findJobByName(workflow: Workflow, jobName: string): Job {
 }
 
 /**
- * Evaluate dynamic fields (context, env, concurrencyGroup) on a job.
+ * Evaluates a job's dynamic fields (matrix, context, env, concurrencyGroup):
+ * only those whose flag is set. A throwing function propagates (the job fails);
+ * an undefined/null return leaves the field unset; each call has its own timeout.
  *
- * Only fields with their corresponding flag set to true AND whose property
- * on the job is a function will be evaluated. All evaluations happen in a
- * single call per.
+ * Deferred `paths` are decided FIRST (`flags.deferredPaths`, from the diff in
+ * `filterInput`); a no-match returns before the filter, since the workflow never
+ * triggered. The `filter` follows (`flags.hasFilter`); a `false` verdict returns
+ * immediately, since no job of the workflow dispatches and evaluating dynamic
+ * fields would run customer code whose result nothing consumes.
  *
- * -: If a dynamic function throws, the error propagates (job fails).
- * -: If a dynamic function returns undefined/null, the field is left undefined.
- * -: Each dynamic function call is wrapped in a timeout (default 60s).
- *
- * Deferred `paths` are decided FIRST when `flags.deferredPaths` is set, from the
- * clone's diff in `filterInput`; a no-match returns immediately, before the
- * filter, because a workflow whose paths did not match never triggered. The
- * workflow-level `filter` is evaluated next when `flags.hasFilter` is set. A
- * `false` verdict returns immediately: no job of that workflow will be
- * dispatched, so evaluating this one's dynamic fields would run customer code
- * whose result nothing can consume.
- *
- * @param workflow - The extracted Workflow object
- * @param jobName - Name of the job whose dynamic fields to evaluate
- * @param event - Normalized event envelope — same shape every dynamic-function call site receives.
- * @param flags - Which fields are dynamic and need evaluation
- * @param timeoutMs - Timeout per dynamic function call (default 60_000ms)
- * @param filterInput - Source tree + diff the workflow's `filter` and deferred `paths` read. Required when either is set.
+ * @param event - Normalized event envelope, the shape every dynamic-function call site receives.
+ * @param timeoutMs - Per dynamic function call.
+ * @param filterInput - Source tree + diff for `filter` and deferred `paths`; required when either is set.
  */
 export async function evaluateDynamicFields(
   workflow: Workflow,
@@ -214,10 +182,9 @@ export async function evaluateDynamicFields(
       timeoutMs,
       `dynamicMatrix for job '${jobName}'`,
     );
-    // `resolved` is whatever the customer's matrix function returned — arbitrary
-    // runtime data. Count before expanding so an oversized matrix fails with a
-    // typed error instead of exhausting the agent, and name the job on the way
-    // out so the failure is diagnosable from the job log.
+    // `resolved` is arbitrary customer runtime data: count before expanding so an
+    // oversized matrix fails with a typed error instead of exhausting the agent,
+    // and name the job so the failure is diagnosable from the job log.
     let combos: MatrixValues[];
     try {
       const rawCount = matrixCombinationCount(resolved);
@@ -240,8 +207,8 @@ export async function evaluateDynamicFields(
   }
 
   if (flags.dynamicContext) {
-    // Resolve every bound-context element in order (static verbatim, dynamic
-    // functions evaluated). Either spelling normalizes to one ordered list.
+    // Static elements verbatim, functions evaluated, in order; `context` and
+    // `contexts` normalize to one ordered list.
     const envRefs = job.contexts ?? (job.context !== undefined ? [job.context] : undefined);
     if (envRefs && envRefs.length > 0) {
       const names: string[] = [];

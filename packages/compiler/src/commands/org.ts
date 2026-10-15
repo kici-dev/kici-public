@@ -1,23 +1,14 @@
-/**
- * kici org commands
- *
- * Org management: list, use, current.
- * Uses PAT auth to fetch user's organizations from Platform API.
- */
+/** `kici org list|use|current`, backed by the Platform API with PAT auth. */
 
 import pc from 'picocolors';
 import { loadGlobalConfig, mergeGlobalConfig, type GlobalConfig } from '../remote/config.js';
 
-/** Organization returned by Platform API */
 interface UserOrg {
   id: string;
   displayName: string;
   isOwner: boolean;
 }
 
-/**
- * Fetch user's organizations from Platform API using PAT auth.
- */
 async function fetchUserOrgs(config: GlobalConfig): Promise<UserOrg[] | null> {
   const url = `${config.platformEndpoint}/api/v1/user/orgs`;
   const response = await fetch(url, {
@@ -41,14 +32,11 @@ async function fetchUserOrgs(config: GlobalConfig): Promise<UserOrg[] | null> {
   }
 
   const body = (await response.json()) as { orgs: UserOrg[] } | UserOrg[];
-  // Platform /api/v1/user/orgs returns { orgs: [...] }, handle both shapes for safety
+  // The route returns { orgs: [...] }; a bare array is accepted too.
   return Array.isArray(body) ? body : body.orgs;
 }
 
-/**
- * Check that the user is logged in (PAT exists in config).
- * Returns the config if logged in, null otherwise.
- */
+/** The config when a PAT exists, else null. */
 async function requireAuth(): Promise<GlobalConfig | null> {
   const config = await loadGlobalConfig();
   if (!config.pat) {
@@ -64,12 +52,7 @@ async function requireAuth(): Promise<GlobalConfig | null> {
   return config;
 }
 
-/**
- * List user's organizations.
- *
- * Fetches orgs from Platform API and displays them as a formatted table.
- * Active org is marked with a star.
- */
+/** The active org is marked with a star. */
 export async function orgListCommand(): Promise<boolean> {
   const config = await requireAuth();
   if (!config) return false;
@@ -100,12 +83,7 @@ export async function orgListCommand(): Promise<boolean> {
   return true;
 }
 
-/**
- * Switch active organization.
- *
- * Matches by display name (case-insensitive) or ID.
- * Validates org exists before setting.
- */
+/** Matches display name (case-insensitive) or ID; the org must exist. */
 export async function orgUseCommand(nameOrId: string): Promise<boolean> {
   const config = await requireAuth();
   if (!config) return false;
@@ -133,11 +111,7 @@ export async function orgUseCommand(nameOrId: string): Promise<boolean> {
   return true;
 }
 
-/**
- * Display current active organization.
- *
- * If PAT is available, fetches org name for display.
- */
+/** Shows the org name when a PAT can fetch it, else the ID. */
 export async function orgCurrentCommand(): Promise<boolean> {
   const config = await loadGlobalConfig();
 
@@ -146,7 +120,6 @@ export async function orgCurrentCommand(): Promise<boolean> {
     return true;
   }
 
-  // If PAT is available, try to fetch org name
   if (config.pat && config.platformEndpoint) {
     const orgs = await fetchUserOrgs(config);
     if (orgs) {
@@ -158,7 +131,6 @@ export async function orgCurrentCommand(): Promise<boolean> {
     }
   }
 
-  // Fallback: just show the ID
   console.log(`Active org: ${pc.bold(config.activeOrgId)}`);
   return true;
 }

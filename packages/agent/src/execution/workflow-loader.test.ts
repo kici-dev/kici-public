@@ -20,22 +20,17 @@ import { hashKiciSourceTree } from '@kici-dev/core/kici-source-digest';
 let tempDir: string;
 
 /**
- * Link the real `@kici-dev/sdk` into `dir/node_modules` so a workflow written
- * under `dir` resolves the SDK the way a cloned repository does: through its
- * own `node_modules`, by the `createRequire` walk the loader performs.
- *
- * Every fixture tree that the loader must accept needs this. A bare temp tree
- * with no `node_modules` still resolves the SDK on a workstation where pnpm
- * exports its private hoist directory through `NODE_PATH`, and fails on any
- * host where that directory does not carry the workspace `sdk` link — which is
- * a property of the host's install, not of the loader under test.
+ * Link the real `@kici-dev/sdk` into `dir/node_modules`, so the loader's
+ * `createRequire` walk resolves it as in a cloned repo. Every fixture the loader
+ * must accept needs it: a bare temp tree resolves the SDK only where pnpm's
+ * `NODE_PATH` hoist dir carries the workspace `sdk` link — a host property.
  */
 async function linkRealSdk(dir: string): Promise<void> {
   const realSdk = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
     '../../node_modules/@kici-dev/sdk',
   );
-  // Walk up to find the SDK in case pnpm hoisted it
+  // pnpm may have hoisted the SDK higher up.
   let sdkTarget = realSdk;
   const { existsSync } = await import('node:fs');
   if (!existsSync(sdkTarget)) {
@@ -57,9 +52,6 @@ async function linkRealSdk(dir: string): Promise<void> {
 beforeAll(async () => {
   tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-wf-loader-'));
 
-  // The loadWorkflowSource function expects @kici-dev/sdk to be resolvable from the
-  // working directory's node_modules (production: cloned repo). In tests we write
-  // workflow files to a temp dir, so we symlink the real SDK package there.
   await linkRealSdk(tempDir);
 });
 
@@ -92,11 +84,9 @@ export default ci;
 
     const { module } = await loadWorkflowSource(tempDir, sourceFile);
 
-    // Should have default and named exports
     expect(module.default).toBeDefined();
     expect(module.ci).toBeDefined();
 
-    // The exported value should be a Workflow
     const wf = module.ci as Workflow;
     expect(wf._tag).toBe('Workflow');
     expect(wf.name).toBe('ci');
@@ -129,7 +119,6 @@ export const deploy = workflow('deploy', {
     const wf = module.deploy as Workflow;
     expect(wf._tag).toBe('Workflow');
     expect(wf.name).toBe('deploy');
-    // Trigger should be present (pr trigger)
     expect(wf.on).toBeDefined();
     expect(wf.on!.length).toBeGreaterThan(0);
   });
@@ -165,7 +154,6 @@ export const ci = workflow('ci-dynamic', {
     expect(wf._tag).toBe('Workflow');
     expect(wf.name).toBe('ci-dynamic');
     expect(wf.jobs).toHaveLength(2);
-    // First job is static, second is dynamic function
     expect(typeof wf.jobs[0]).toBe('object');
     expect(typeof wf.jobs[1]).toBe('function');
   });
@@ -182,7 +170,6 @@ export default workflow('cleanup-test', {
 
     await loadWorkflowSource(tempDir, sourceFile);
 
-    // Temp file should be cleaned up
     const tempPath = path.join(tempDir, sourceFile + '.compiled.mjs');
     await expect(fs.access(tempPath)).rejects.toThrow();
   });
@@ -253,10 +240,9 @@ export default workflow('hashfiles-ok', {
 `;
     await fs.writeFile(path.join(tempDir, sourceFile), sourceCode, 'utf-8');
 
-    // Agent and compiler both hash the raw TS source (see compiler's loadModule
-    // in packages/compiler/src/execution/executor.ts). The rolldown bundle output
-    // is not involved in the hash — SDK / rolldown version drift would otherwise
-    // make hashes diverge across the compiler/agent boundary.
+    // Both sides hash the raw TS source, never the rolldown bundle, so SDK /
+    // rolldown drift cannot split the compiler and agent hashes (compiler:
+    // packages/compiler/src/execution/executor.ts loadModule).
     const rawSource = sourceCode;
 
     const assetDigest = `${assetRel}\n${assetContent}`;
@@ -286,12 +272,9 @@ export default workflow('raw-source-hash', {
     expect(module.default).toBeDefined();
   });
 
-  // Regression: Git for Windows ships with `core.autocrlf=true` set in the
-  // system gitconfig, so a `git clone file://...` of a Linux-authored repo on
-  // a Windows host writes CRLF into the working tree. The lockfile's
-  // contentHash was computed on Linux against LF source. Without
-  // normalization, the agent would compute a different hash and reject every
-  // dispatched workflow with "lock file is out of date".
+  // Git for Windows sets `core.autocrlf=true` system-wide, so a clone writes
+  // CRLF while the lock hashed LF source on Linux. Without normalization the
+  // agent rejects every workflow with "lock file is out of date".
   it('accepts LF-computed contentHash even when source on disk has CRLF endings', async () => {
     const sourceFile = 'test-crlf-source.ts';
     const sourceCodeLf = `
@@ -300,13 +283,10 @@ export default workflow('crlf-test', {
   jobs: [job('j', { runsOn: 'linux', steps: [step('s', async () => {})] })],
 });
 `;
-    // Lockfile (compiler on Linux) hashes the LF source.
     const expectedHash = createHash('sha256')
       .update(`${COMPILE_SCHEMA_VERSION}:${sourceCodeLf}`)
       .digest('hex');
 
-    // On disk (agent on Windows after `git clone` with autocrlf=true) the
-    // source has CRLF line endings.
     const sourceCodeCrlf = sourceCodeLf.replace(/\n/g, '\r\n');
     await fs.writeFile(path.join(tempDir, sourceFile), sourceCodeCrlf, 'utf-8');
 
@@ -330,7 +310,6 @@ export default workflow('crlf-hashfiles', {
     const sourceCodeCrlf = sourceCodeLf.replace(/\n/g, '\r\n');
     await fs.writeFile(path.join(tempDir, sourceFile), sourceCodeCrlf, 'utf-8');
 
-    // Lockfile contentHash from the LF-source path (compiler on Linux).
     const assetDigestLf = `${assetRel}\n${assetContentLf}`;
     const expectedHash = createHash('sha256')
       .update(`${COMPILE_SCHEMA_VERSION}:${sourceCodeLf}\0${assetDigestLf}`)
@@ -524,13 +503,11 @@ describe('extractStepsFromDynamicJob determinism guard', () => {
     ];
     const workflow = makeDynamicWorkflow(dynamicFn);
 
-    // Target 'job-a' still exists even though 'job-b' is missing and 'job-c' is new
     const result = await extractStepsFromDynamicJob(workflow, 0, 'job-a', {}, {}, undefined, [
       'job-a',
       'job-b',
     ]);
     expect(result.steps).toHaveLength(1);
-    // job-b was dropped (missing from re-eval), reported as drift
     expect(result.droppedJobs).toEqual(['job-b']);
   });
 
@@ -553,8 +530,7 @@ describe('extractStepsFromDynamicJob determinism guard', () => {
   });
 
   it('rebuilds ctx.needs from the frozen snapshot for a result-aware generator', async () => {
-    // Generator names jobs from a group upstream's frozen members, proving the
-    // snapshot (not a live read) drives ctx.needs on re-eval.
+    // Job names come from the frozen members, so the snapshot must drive ctx.needs.
     const dynamicFn = async (c: any) =>
       (c.ctx.needs.scan as Array<{ name: string }>).map((entry) => ({
         _tag: 'Job',
@@ -584,11 +560,8 @@ describe('resolveWorkflowSdkSetters', () => {
   let sdkDir: string;
 
   beforeAll(async () => {
-    // Build a fixture that mimics a workflow tree whose @kici-dev/sdk resolves
-    // to a DIFFERENT physical copy than the agent's own bundle: a temp dir with
-    // a nested node_modules/@kici-dev/sdk stub that records its setter calls, so
-    // we can assert the resolver picked the workflow's copy (createRequire walk),
-    // not the agent's static import.
+    // A workflow tree whose @kici-dev/sdk is a stub recording its setter calls,
+    // a different physical copy from the agent's bundled SDK.
     sdkDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-wf-sdk-'));
     const sdkPkgDir = path.join(sdkDir, 'node_modules', '@kici-dev', 'sdk');
     const sdkDistDir = path.join(sdkPkgDir, 'dist');
@@ -606,9 +579,7 @@ describe('resolveWorkflowSdkSetters', () => {
       }),
       'utf-8',
     );
-    // The root barrel carries no setters — only the internal subpath does, as
-    // in the published package — so a resolver that reached for the root would
-    // find nothing to call.
+    // As in the published package, only the internal subpath carries setters.
     await fs.writeFile(
       path.join(sdkDistDir, 'index.js'),
       'export const __STUB__ = true;\n',
@@ -641,9 +612,6 @@ export function setJobOutputsMap(m) { globalThis.__stubJobMap = m; }
     setters.setStepOutputsMap(stepMap);
     setters.setStepRefMap(refMap);
     setters.setJobOutputsMap(jobMap);
-    // The stub SDK (the workflow's nested copy) was the one invoked — proving the
-    // resolver followed the workflow's node_modules walk rather than the agent's
-    // bundled SDK.
     expect((globalThis as Record<string, unknown>).__stubStepMap).toBe(stepMap);
     expect((globalThis as Record<string, unknown>).__stubRefMap).toBe(refMap);
     expect((globalThis as Record<string, unknown>).__stubJobMap).toBe(jobMap);
@@ -666,8 +634,7 @@ export function setJobOutputsMap(m) { globalThis.__stubJobMap = m; }
         }),
         'utf-8',
       );
-      // A root barrel that still carries the setters, the way an SDK older than
-      // the subpath did — the resolver must not reach for them.
+      // An SDK older than the subpath carried the setters on the root barrel.
       await fs.writeFile(
         path.join(pkgDir, 'dist', 'index.js'),
         `export function setStepOutputsMap() {}
@@ -721,9 +688,8 @@ export default { name: 'tree-gate', helper };
   });
 
   it('rejects an edit to a NON-entry file', async () => {
-    // The defect: the gate re-hashed the entry file alone, so editing an
-    // imported helper passed the gate AND hit the source cache — the OLD helper
-    // ran and the run reported green.
+    // fails-when: the gate hashes the entry file alone, so the stale helper
+    // passes, hits the source cache, and the run reports green.
     const stale = await lockHash();
     await fs.writeFile(path.join(workDir, '.kici/lib/helper.ts'), 'export const helper = 2;\n');
     await expect(loadWorkflowSource(workDir, '.kici/workflows/w.ts', stale)).rejects.toThrow(
@@ -790,9 +756,8 @@ describe('compile schema version gate', () => {
   }
 
   it('names the version mismatch when the lock was compiled by a NEWER compiler', async () => {
-    // The defect: a v7 compiler wrote the lock, the agent implements v6, and the
-    // hash could never match — but the agent reported "workflow source changed"
-    // and told the operator to run `kici compile`, which does not fix it.
+    // fails-when: the agent reports "workflow source changed" and suggests
+    // `kici compile`, which cannot fix a newer-schema lock.
     await writeLock(COMPILE_SCHEMA_VERSION + 1);
     const anyHash = 'a'.repeat(64);
     await expect(loadWorkflowSource(workDir, '.kici/workflows/w.ts', anyHash)).rejects.toThrow(

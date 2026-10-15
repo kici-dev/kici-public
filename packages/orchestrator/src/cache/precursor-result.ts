@@ -1,18 +1,14 @@
 /**
- * Settling a pending precursor job — build, init, dynamic eval, global eval
- * round — from a terminal `job.status`, whichever channel delivered it.
+ * Settles a pending precursor job (build, init, dynamic eval, global eval
+ * round) from a terminal `job.status`, via either channel:
  *
- * Two channels feed the pending trackers:
+ * - **The local agent socket:** `app.ts` hands the frame here.
+ * - **The shared database:** the dispatch queue is cluster-wide, so an agent
+ *   on a sibling coordinator may claim the job; the sibling persists the frame
+ *   to `execution_jobs` and `PendingPrecursorDbWatcher` hands it here in the
+ *   same shape.
  *
- * - **The local agent socket.** The agent that ran the job reports to the
- *   coordinator it is connected to, and `app.ts` hands the frame here.
- * - **The shared database.** The dispatch queue is cluster-wide, so a job this
- *   coordinator dispatched may be claimed by an agent connected to a sibling
- *   coordinator. That sibling's frame never reaches this process; the sibling
- *   persists it to `execution_jobs` instead, and `PendingPrecursorDbWatcher`
- *   reads the row back and hands it here in the same shape.
- *
- * One function settles both so the two channels cannot drift on what counts as
+ * One function settles both so the channels cannot drift on what counts as
  * "the build finished" or "the init returned its result".
  */
 
@@ -25,14 +21,11 @@ import { parseGlobalEvalResult, type PendingGlobalEvalTracker } from './pending-
 import type { InitResult, PendingInitTracker } from './pending-inits.js';
 
 /**
- * The part of a precursor job's terminal `job.status.data` that the awaiting
- * coordinator needs, persisted to `execution_jobs.precursor_result` so a
- * sibling coordinator can read it back.
- *
- * Only the markers and their payloads are kept. The build marker is a flag —
- * the build's artifacts live in the shared source and dependency caches, keyed
- * by content hash, so the waiter re-reads them from there. The init and
- * dynamic-eval markers carry their results, because nothing else does.
+ * The part of a precursor's terminal `job.status.data` the awaiting coordinator
+ * needs, persisted to `execution_jobs.precursor_result` for siblings. The build
+ * marker is a flag (its output lives in the content-hashed source and
+ * dependency caches); the init and dynamic-eval markers carry their results,
+ * because nothing else does.
  */
 export interface PrecursorResult {
   buildComplete?: true;
@@ -42,10 +35,7 @@ export interface PrecursorResult {
   dynamicJobs?: LockJob[];
 }
 
-/**
- * Pull the precursor payload out of a terminal `job.status.data`, or `null`
- * when the frame carries no precursor marker (an ordinary job).
- */
+/** `null` when the frame carries no precursor marker (an ordinary job). */
 export function extractPrecursorResult(
   data: Record<string, unknown> | undefined,
 ): PrecursorResult | null {
@@ -80,23 +70,18 @@ export interface PrecursorJobStatus {
 }
 
 /**
- * Every terminal state other than `success` rejects the waiter. An agent only
- * ever reports `failed` or `cancelled`, but the shared row also carries the
- * orchestrator-side verdicts — `timed_out_stale`, `unroutable`, … — written by
- * a sweep on whichever coordinator reaped the job, and a waiter on another
- * coordinator must not sit out its own timeout on a job the fleet already
- * gave up on.
+ * Every terminal state but `success` rejects. Agents report only `failed` or
+ * `cancelled`, but the shared row also carries sweep verdicts
+ * (`timed_out_stale`, `unroutable`, …) from whichever coordinator reaped the
+ * job, and a waiter elsewhere must not sit out its own timeout on them.
  */
 const isFailure = (state: string): boolean =>
   TERMINAL_JOB_STATES.has(state) && state !== ExecutionJobStatus.enum.success;
 
 /**
- * Resolve or reject whichever tracker awaits `jobId`, from a terminal status.
- *
- * Returns true when an entry settled. A status for a job nobody awaits, or a
- * non-terminal status, settles nothing and returns false — the caller may log
- * that, but must not treat it as an error: the local channel sees every job's
- * frames, precursor or not.
+ * Resolve or reject whichever tracker awaits `jobId`; true when one settled.
+ * False (an unawaited job, a non-terminal status) is not an error: the local
+ * channel sees every job's frames, precursor or not.
  */
 export function settlePendingPrecursor(
   trackers: PendingPrecursorTrackers,
@@ -149,10 +134,8 @@ export function settlePendingPrecursor(
 
   if (pendingGlobalEvals?.has(jobId)) {
     if (state === ExecutionJobStatus.enum.success && data?.globalEvalComplete) {
-      // Parse, never cast: `data` is an unvalidated record, so a cast here
-      // would hand arbitrary agent-supplied JSON to a consumer that
-      // dereferences it. A malformed result fails the round rather than the
-      // process.
+      // Parse, never cast: `data` is unvalidated agent JSON that the consumer
+      // dereferences. A malformed result fails the round, not the process.
       const parsed = parseGlobalEvalResult(data.globalEvalResult);
       if (parsed.ok) {
         pendingGlobalEvals.resolve(jobId, parsed.value);
@@ -161,10 +144,8 @@ export function settlePendingPrecursor(
       }
       settled = true;
     } else if (state === ExecutionJobStatus.enum.success) {
-      // A success carrying no `globalEvalComplete` marker settles nothing on
-      // its own, and the round job has no later terminal state to arrive — so
-      // the waiter would hang until its wait ceiling fires. Reject on the spot
-      // instead: the agent finished and told us nothing we can act on.
+      // A success without the `globalEvalComplete` marker has no later terminal
+      // state to follow, so the waiter would hang until its wait ceiling.
       pendingGlobalEvals.reject(
         jobId,
         new Error('Global eval round reported success without a result payload'),

@@ -1,13 +1,8 @@
-/**
- * Status trigger helper - creates triggers for commit status events.
- * Returns a frozen StatusTriggerConfig directly.
- */
-
 import type { BranchPattern, StatusConfigInput, StatusTriggerConfig } from './types.js';
 import { toBranchPattern, asArray } from './types.js';
 
 /**
- * Create a commit status trigger configuration.
+ * Create a frozen commit status trigger.
  *
  * @example
  * // Match any status event

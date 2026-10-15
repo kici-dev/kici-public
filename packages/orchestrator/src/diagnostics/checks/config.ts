@@ -1,15 +1,11 @@
 /**
- * Config validity diagnostic check.
- *
- * Validates the current orchestrator config against key required fields.
- * Uses a lightweight validation (not the full Zod schema) to avoid
- * importing the entire config module.
+ * Config validity check: a lightweight required-field check rather than the
+ * full Zod schema, to avoid importing the entire config module.
  */
 
 import type { DiagnosticDeps, DiagnosticResult } from '../types.js';
 import { OrchestratorMode } from '@kici-dev/engine';
 
-/** Required config fields and their descriptions. */
 const REQUIRED_FIELDS: Array<{ key: string; label: string }> = [
   { key: 'mode', label: 'Operating mode' },
   { key: 'databaseUrl', label: 'Database URL' },
@@ -37,7 +33,6 @@ export async function checkConfigValidity(deps: DiagnosticDeps): Promise<Diagnos
     };
   }
 
-  // Check for valid mode values
   const mode = deps.config.mode as string;
   const validModes: readonly string[] = OrchestratorMode.options;
   if (!validModes.includes(mode)) {

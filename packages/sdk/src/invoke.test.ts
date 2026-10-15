@@ -24,12 +24,10 @@ describe('invokeSource', () => {
   });
 
   /**
-   * A gate is a workflow-authored emit, so the same reservation `ctx.emit`
-   * enforces applies: `__` names the orchestrator's own events, and `kici.`
-   * names KiCI system events. Every name under either prefix skips the
-   * event-storm rate limiter, and `__schedule_fire` is dispatched as a trusted
-   * ref on top of that. Failing here means the author sees it at compile time;
-   * the orchestrator refuses it again at dispatch.
+   * A gate is a workflow-authored emit, so `ctx.emit`'s reservation applies:
+   * `__` names orchestrator events and `kici.` KiCI system events. Both skip the
+   * event-storm rate limiter, and `__schedule_fire` dispatches as a trusted
+   * ref. Refused here at compile time, and again by the orchestrator at dispatch.
    */
   it.each([
     ['__schedule_fire', '__'],

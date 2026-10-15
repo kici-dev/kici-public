@@ -1,9 +1,6 @@
 /**
- * Admin API routes for workflow registration management.
- *
- * Provides endpoints for listing, inspecting, refreshing, disabling and
- * deleting workflow registrations. All routes are protected by Bearer token
- * authentication via the existing admin auth middleware pattern.
+ * Admin routes to list, inspect, refresh, disable and delete workflow
+ * registrations, all behind the shared admin Bearer auth middleware.
  */
 
 import { Hono } from 'hono';
@@ -28,15 +25,12 @@ export interface AdminRegistrationRoutesDeps {
   tokenManager: TokenManager;
   rbac: RbacEnforcer;
   /**
-   * Resolves a bound environment by name for registration-time satisfiability.
    * When present, a manual registration is rejected up front if a job binds a
    * provably-unsatisfiable environment list (missing/disabled env, or
    * mutually-exclusive fixed branch/trigger/repo restrictions).
    */
   contextStore?: Pick<ContextStore, 'matchContext'>;
 }
-
-// -- Zod schemas for request validation --
 
 const refreshSchema = z.object({
   routingKey: z.string().min(1),
@@ -56,16 +50,10 @@ const registerManualSchema = z.object({
   commitSha: z.string().optional(),
 });
 
-/**
- * Create admin API routes for workflow registration management.
- *
- * @param deps - Admin registration route dependencies
- * @returns Hono app with registration routes mounted at /api/v1/admin/registrations
- */
+/** Routes mounted at /api/v1/admin/registrations. */
 export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
 
-  // -- Bearer token auth middleware --
   const authMiddleware = createBearerAuthMiddleware({
     tokenManager: deps.tokenManager,
     scope: 'admin-registrations',
@@ -73,17 +61,14 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
   app.use('/api/v1/admin/registrations', authMiddleware);
   app.use('/api/v1/admin/registrations/*', authMiddleware);
 
-  // ---- Registration endpoints ----
-
   app.get('/api/v1/admin/registrations', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'context.read');
 
     const customerId = c.req.query('customerId') ?? c.req.query('org');
     const queryRoutingKey = c.req.query('routingKey');
     const tokenRoutingKey = c.get('routingKey');
-    // Routing-key-scoped tokens see only their own routing key:
-    // refuse a mismatching explicit filter, or force the filter
-    // when none was provided.
+    // A routing-key-scoped token sees only its own key: refuse a mismatching
+    // explicit filter, or force the filter when none was given.
     if (tokenRoutingKey) {
       if (queryRoutingKey && queryRoutingKey !== tokenRoutingKey) {
         const denied = enforceRoutingKeyScope(c, queryRoutingKey);
@@ -95,9 +80,8 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
     const triggerType = c.req.query('triggerType');
     const eventName = c.req.query('event');
 
-    // When customerId or event filters are present, use getAll() and apply
-    // all filters in-memory (cross-source webhook lookup path). Otherwise,
-    // honor the existing index-backed routingKey/repo fast paths.
+    // customerId or event filters: getAll() and filter in memory (cross-source
+    // webhook lookup path). Otherwise the index-backed routingKey/repo fast paths.
     let registrations;
     if (customerId || eventName) {
       registrations = await deps.registrationStore.getAll();
@@ -118,8 +102,8 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
     if (routingKey && (customerId || eventName)) {
       registrations = registrations.filter((r) => r.routing_key === routingKey);
     }
-    // Defence-in-depth: a routing-key-scoped token must never observe
-    // rows outside its scope, regardless of the filter shape above.
+    // Defence-in-depth: a scoped token never observes rows outside its scope,
+    // whatever the filter shape above.
     if (tokenRoutingKey) {
       registrations = registrations.filter((r) => r.routing_key === tokenRoutingKey);
     }
@@ -186,8 +170,7 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
       return c.json({ error: 'lock file missing workflows[] array' }, 400);
     }
 
-    // Proactive satisfiability: reject a manual registration whose job binds a
-    // provably-unsatisfiable environment list before it ever dispatches.
+    // Reject a provably-unsatisfiable environment binding before it ever dispatches.
     if (deps.contextStore) {
       const envStore = deps.contextStore;
       try {
@@ -240,7 +223,7 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
     const denied = enforceRoutingKeyScope(c, parsed.routingKey);
     if (denied) return denied;
 
-    // Bump registry version to force all peers to reload
+    // Forces every peer to reload.
     const registryVersion = await deps.registrationStore.bumpVersion();
     await deps.registrationIndex.refreshIfNeeded(registryVersion);
 
@@ -253,15 +236,14 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
     return c.json({ registryVersion }, 200);
   });
 
-  // Disable (or, with `disabled: false`, re-enable) a registration by ID. A
-  // disabled registration stays registered, but none of its triggers dispatch.
+  // Disable (or, with `disabled: false`, re-enable) by ID. A disabled
+  // registration stays registered, but none of its triggers dispatch.
   app.patch('/api/v1/admin/registrations/:id/disable', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'context.update');
 
     const id = c.req.param('id');
     const parsed = disableSchema.parse(await c.req.json());
-    // Look up the row's routing key first so a scoped token cannot toggle a
-    // registration outside its scope, as the DELETE route below does.
+    // Routing key first, so a scoped token cannot toggle outside its scope (as DELETE).
     const existing = await deps.registrationStore.getById(id);
     if (!existing) {
       return c.json({ error: 'Registration not found' }, 404);
@@ -274,7 +256,7 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
       return c.json({ error: 'Registration not found' }, 404);
     }
 
-    // Bump registry version so every peer reloads the disabled flag.
+    // Every peer reloads the disabled flag.
     const registryVersion = await deps.registrationStore.bumpVersion();
     await deps.registrationIndex.refreshIfNeeded(registryVersion);
 
@@ -291,9 +273,8 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
     deps.rbac.requirePermission(c.get('role'), 'context.delete');
 
     const id = c.req.param('id');
-    // Look up the row's routing key first so a scoped token cannot
-    // delete a registration outside its scope. Returning 404 (rather
-    // than 403) for missing rows preserves the prior contract.
+    // Routing key first, so a scoped token cannot delete outside its scope. A
+    // missing row stays 404 (not 403), preserving the existing contract.
     const existing = await deps.registrationStore.getById(id);
     if (!existing) {
       return c.json({ error: 'Registration not found' }, 404);
@@ -306,7 +287,6 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
       return c.json({ error: 'Registration not found' }, 404);
     }
 
-    // Bump registry version to notify peers
     const registryVersion = await deps.registrationStore.bumpVersion();
     await deps.registrationIndex.refreshIfNeeded(registryVersion);
 

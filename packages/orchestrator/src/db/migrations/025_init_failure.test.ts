@@ -3,22 +3,12 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import * as m025 from './025_init_failure.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 025.
- *
- * Creates a uniquely-named throwaway database inside the admin Postgres
- * server, applies migrations 001..025 via the production migration
- * provider, and asserts the resulting schema with information_schema. The
- * throwaway database is dropped in teardown, so the test never mutates any
- * shared schema or data.
- *
- * The admin connection string comes solely from
- * `KICI_TEST_ADMIN_DATABASE_URL`. The suite is gated on the presence of that
- * env var: when it is unset the suite skips, so it stays runnable in
- * environments without a database. When it is set but the server is
- * unreachable, the test fails loudly rather than skipping green.
+ * Real-Postgres test for migration 025: applies 001..025 to a throwaway database dropped in
+ * teardown. Skips without `KICI_TEST_ADMIN_DATABASE_URL`; fails loudly when it is set but the
+ * server is unreachable.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 
@@ -55,8 +45,7 @@ describeDb('migration 025_init_failure', () => {
     return info !== undefined;
   };
 
-  // describeDb only runs when KICI_TEST_ADMIN_DATABASE_URL is set, so the
-  // non-null assertion is safe inside the suite body.
+  // Safe: describeDb runs only when KICI_TEST_ADMIN_DATABASE_URL is set.
   const adminUrl = ADMIN_URL!;
 
   beforeAll(async () => {
@@ -70,8 +59,6 @@ describeDb('migration 025_init_failure', () => {
     pool = new pg.Pool({ connectionString: withDatabase(adminUrl, TEST_DB) });
     db = new Kysely<unknown>({ dialect: new PostgresDialect({ pool }) });
 
-    // Apply migrations 001..025 via the production provider so the
-    // execution_runs / execution_jobs tables the columns attach to exist.
     const { error } = await migrateToOwnMigration(db, import.meta.url);
     if (error) throw error;
   }, 60_000);
@@ -82,7 +69,6 @@ describeDb('migration 025_init_failure', () => {
 
     const adminPool = new pg.Pool({ connectionString: adminUrl });
     try {
-      // Terminate any lingering backends before dropping.
       await terminateTestDbBackends(adminPool, TEST_DB);
       await adminPool.query(`DROP DATABASE IF EXISTS "${TEST_DB}"`);
     } finally {

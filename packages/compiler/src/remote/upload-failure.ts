@@ -1,16 +1,13 @@
 /**
- * Turn a failed overlay upload into an error that says which address failed
- * and which orchestrator setting produced it.
- *
- * The upload goes from the developer machine straight to the address the
- * orchestrator signed. When that address is only reachable from inside the
- * orchestrator's network (`host.docker.internal`, an in-cluster DNS name) the
- * raw fetch error says nothing useful. Only the URL's origin is printed: the
- * query string of a presigned URL carries the credential.
+ * Names the failed address and the orchestrator setting that produced it. The
+ * upload goes straight to the address the orchestrator signed; when that is
+ * reachable only inside the orchestrator's network (`host.docker.internal`, an
+ * in-cluster DNS name), the raw fetch error says nothing useful. Only the
+ * origin is printed: a presigned URL's query string carries the credential.
  */
 import { toErrorMessage } from '@kici-dev/core';
 
-/** Path prefix of the filesystem storage backend's signed blob URLs. */
+/** The filesystem storage backend's signed blob URL prefix. */
 const FS_BLOB_PATH_PREFIX = '/api/v1/cache/blob/';
 
 function parse(signedUrl: string): URL | null {

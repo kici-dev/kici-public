@@ -1,13 +1,10 @@
 /**
- * Shared step-log reader for the agent-facing step-logs endpoint.
- *
- * Resolves a step's stored log file via the same `execution_steps.log_path` +
- * `LogStorage` access the dashboard step.logs path uses, then returns the lines
- * with line-based cursor pagination. A job's workflow-level log (step `-1`:
- * setup narration such as the clone and the dependency install) has no step
- * row, so its key is derived from the job name the writer used.
- * `toAgentStepLogs` wraps every line in an untrusted envelope (log content is
- * process/user output — never trusted).
+ * Step-log reader for the agent-facing step-logs endpoint. Resolves a step's log via
+ * the same `execution_steps.log_path` + `LogStorage` access as the dashboard step.logs
+ * path, with line-based cursor pagination. A job's workflow-level log (step `-1`: setup
+ * narration such as the clone and the dependency install) has no step row, so its key
+ * is derived from the job name the writer used. `toAgentStepLogs` wraps every line in
+ * an untrusted envelope (log content is process/user output — never trusted).
  */
 import type { Kysely } from 'kysely';
 import { wrapUntrusted, type AgentStepLogs } from '@kici-dev/engine';
@@ -41,7 +38,7 @@ export interface ReadStepLogArgs {
   limit?: number;
 }
 
-/** Parse a line-offset cursor; non-numeric / negative becomes 0. */
+/** Non-numeric / negative becomes 0. */
 function parseOffset(cursor: string | undefined): number {
   if (!cursor) return 0;
   const n = parseInt(cursor, 10);
@@ -49,8 +46,7 @@ function parseOffset(cursor: string | undefined): number {
 }
 
 /**
- * Read a page of a step's log lines. Returns an empty page (not an error) when
- * the step row or its log file is absent, so a never-emitted-logs step reads as
+ * An absent step row or log file is an empty page, not an error:
  * `{ lines: [], totalLines: 0, nextCursor: null, recorded: false }`.
  */
 export async function readStepLogLines(
@@ -78,13 +74,10 @@ export async function readStepLogLines(
 }
 
 /**
- * The stored log key of the requested step, or `null` when it has none.
- *
- * A step's row names its log. The workflow-level log is written under a
- * negative index that no `step.status` carries (the wire schema is
- * non-negative), so no row ever names it: its key is built from the job name
- * (see {@link resolveJobName}, which reads the job's row where the log writer
- * reads its in-memory name) and used only when the file exists.
+ * A step's row names its log. The workflow-level log uses a negative index no
+ * `step.status` carries (the wire schema is non-negative), so no row names it: its key
+ * is built from the job name (see {@link resolveJobName}) and used only when the file
+ * exists.
  */
 export async function resolveStepLogPath(
   deps: StepLogReaderDeps,
@@ -105,14 +98,12 @@ export async function resolveStepLogPath(
 }
 
 /**
- * The job name to build a workflow-level log key from: the job's
- * `execution_jobs.job_name`, else its `dispatch_queue.job_name`, else the job id.
+ * `execution_jobs.job_name`, else `dispatch_queue.job_name`, else the job id.
  *
- * The writer names the key through `ExecutionTracker.resolveJobName`, which
- * reads the tracker's in-memory job name instead of the `execution_jobs` row,
- * then the same `dispatch_queue` name, then the job id. The in-memory name is
- * the name the row records, so the two agree once the job has a row; the
- * caller reads the key only when that file exists.
+ * The writer uses `ExecutionTracker.resolveJobName`, which reads the in-memory job name
+ * instead of the `execution_jobs` row, then the same fallbacks. The row records the
+ * in-memory name, so the two agree once the job has a row; the caller reads the key
+ * only when that file exists.
  */
 async function resolveJobName(
   db: Kysely<Database>,
@@ -133,7 +124,6 @@ async function resolveJobName(
   return queued?.job_name ?? args.jobId;
 }
 
-/** Wrap raw step logs into the untrusted-tagged `AgentStepLogs` shape. */
 export function toAgentStepLogs(
   runId: string,
   jobId: string,

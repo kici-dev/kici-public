@@ -3,14 +3,13 @@ import type { AttestationListFilters } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 
 /**
- * The org-wide attestations base query: joins `attestations` to `execution_jobs`
- * (for the job name) and `execution_runs` (for repository / workflow context).
+ * The org-wide attestations base query, joined to `execution_jobs` (job name) and
+ * `execution_runs` (repository / workflow).
  *
- * `attestations.run_id` / `job_id` are TEXT while the
- * `execution_*` keys are `uuid`; Postgres won't compare `uuid = text` implicitly,
- * so the join casts the uuid side to text — mirroring `resolveAttestationsForRun`.
- * The `execution_runs` join is a LEFT join so a row with no matching run still
- * lists (repository / workflow come back null).
+ * `attestations.run_id` / `job_id` are TEXT while the `execution_*` keys are `uuid`,
+ * and Postgres won't compare `uuid = text` implicitly, so the joins cast the uuid side
+ * to text, mirroring `resolveAttestationsForRun`. The `execution_runs` join is LEFT so
+ * a row with no matching run still lists (repository / workflow come back null).
  */
 export function baseAttestationsQuery(db: Kysely<Database>) {
   return db
@@ -28,15 +27,12 @@ export function baseAttestationsQuery(db: Kysely<Database>) {
 export type AttestationsBaseQuery = ReturnType<typeof baseAttestationsQuery>;
 
 /**
- * Base query for the deferred-attestation outbox (`pending_attestations`),
- * joined to `execution_jobs` (job name) and `execution_runs` (repo / workflow
- * context) for the org-wide list's pending summaries.
+ * Base query for the deferred-attestation outbox (`pending_attestations`), joined like
+ * `baseAttestationsQuery` for the org-wide list's pending summaries.
  *
- * Same uuid/text mismatch as `baseAttestationsQuery`: `pending_attestations`
- * `run_id` / `job_id` are TEXT while the `execution_*` keys are `uuid`, and
- * Postgres won't compare `uuid = text` implicitly — so the joins cast the uuid
- * side to text. Both joins are LEFT joins so a pending row with no matching
- * run / job still lists (repository / workflow / job name come back null).
+ * The joins cast the uuid side to text for the same uuid/text mismatch. Both joins are
+ * LEFT so a pending row with no matching run / job still lists (repository / workflow /
+ * job name come back null).
  */
 export function basePendingAttestationsQuery(db: Kysely<Database>) {
   return db
@@ -52,9 +48,8 @@ export function basePendingAttestationsQuery(db: Kysely<Database>) {
 }
 
 /**
- * Apply org-wide attestation filters to the base query. Digest is exact-match;
- * name is an ILIKE substring; status / repository / workflow / job are equality;
- * created_at gets `>=` / `<=` bounds for the date range. Absent filters are
+ * Digest is exact-match; name is an ILIKE substring; status / repository / workflow /
+ * job are equality; created_at gets inclusive `>=` / `<=` bounds. Absent filters are
  * skipped.
  */
 export function applyAttestationFilters(

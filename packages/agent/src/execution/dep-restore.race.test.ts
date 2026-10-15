@@ -1,9 +1,8 @@
 /**
- * The restore against the server shape that broke it: a keep-alive response
- * the server closes the moment the last byte is written, while extraction is
- * slow. Every `tar.x` in this file is throttled, so extraction takes far longer
- * than the download — the production ratio (tens of thousands of small files
- * against a ~1.5 s download).
+ * The restore against the server shape that broke it: a keep-alive response closed
+ * the moment the last byte is written, while extraction is slow. Every `tar.x` here
+ * is throttled to the production ratio (tens of thousands of small files against a
+ * ~1.5 s download).
  */
 import { createServer, type Server } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
@@ -95,10 +94,8 @@ afterAll(async () => {
 
 describe('dep restore against a server that closes right after the response', () => {
   it('control: streaming the body into the slow extraction loses the race', async () => {
-    // The body streamed into extraction (fetch -> gunzip -> tar.x), the shape
-    // restoreDeps must not use. If this control stops failing, the harness no
-    // longer reproduces the race and the next test proves nothing — retire both
-    // deliberately, do not loosen them.
+    // fetch -> gunzip -> tar.x, the shape restoreDeps must not use. If this control
+    // stops failing, the next test proves nothing: retire both, never loosen them.
     let terminated = 0;
     for (let i = 0; i < ROUNDS; i++) {
       const target = join(dir, `control-${i}`);

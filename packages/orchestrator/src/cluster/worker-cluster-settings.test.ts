@@ -54,9 +54,9 @@ describe('resolveWorkerClusterSettingsSnapshot', () => {
     });
   });
 
-  // fails-when: the values and the version come from separate reads. A worker
-  // would record the newer version with the older values, and never pull again
-  // because it pulls only when a coordinator advertises a higher version.
+  // fails-when: the values and the version come from separate reads, so a worker
+  // records the newer version with older values and never pulls again (it pulls
+  // only when a coordinator advertises a higher version).
   it('takes the version and the values from the same read of the row', async () => {
     const snapshot = await resolveWorkerClusterSettingsSnapshot(
       readerOver(

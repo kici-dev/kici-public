@@ -17,17 +17,14 @@ function fakeStore(createId = 'hold-1'): {
  * Let `request()`'s in-flight chain run to the point where it parks on the
  * pending-approval promise.
  *
- * `request()` is deliberately not awaited here — it only settles once someone
- * calls `resolve()` — so its hold creation and audit write have to be waited for
- * some other way. Counting microtask ticks (`await Promise.resolve()` twice) is
- * not that way: it pins the assertions to the exact number of `await`s the
- * implementation happens to traverse today. Adding one behaviour-neutral `await`
- * to `request()` breaks five of these tests, which means they were measuring the
- * implementation's shape rather than its effect.
+ * `request()` settles only once someone calls `resolve()`, so its hold creation
+ * and audit write are waited for another way. Not by counting microtask ticks
+ * (`await Promise.resolve()` twice): that pins the assertions to the number of
+ * `await`s the implementation traverses, so one behaviour-neutral `await` breaks
+ * them — measuring shape rather than effect.
  *
- * Every mock in this file settles on the microtask queue with no timer or I/O in
- * it, so yielding one macrotask turn drains the whole chain however long it is —
- * deterministically, not by racing it.
+ * Every mock here settles on the microtask queue with no timer or I/O, so one
+ * macrotask turn drains the whole chain deterministically, however long it is.
  */
 async function settleRequest(): Promise<void> {
   await new Promise((resolve) => setImmediate(resolve));

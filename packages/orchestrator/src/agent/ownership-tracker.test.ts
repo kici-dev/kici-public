@@ -99,19 +99,16 @@ describe('OwnershipTracker', () => {
     it('resets counter when window expires', () => {
       const tracker = createTracker({ threshold: 3, windowMs: 60_000 });
 
-      // Two violations
       tracker.checkOwnership('agent-1', 'job-1', 'job.status');
       tracker.checkOwnership('agent-1', 'job-2', 'job.status');
 
-      // Advance past window
       vi.advanceTimersByTime(61_000);
 
-      // Two more violations -- counter should reset
+      // The counter has reset.
       tracker.checkOwnership('agent-1', 'job-3', 'job.status');
       tracker.checkOwnership('agent-1', 'job-4', 'job.status');
       expect(onDisconnect).not.toHaveBeenCalled();
 
-      // Third after reset -> triggers disconnect
       tracker.checkOwnership('agent-1', 'job-5', 'job.status');
       expect(onDisconnect).toHaveBeenCalledWith('agent-1', 'Too many ownership violations');
     });
@@ -121,14 +118,12 @@ describe('OwnershipTracker', () => {
     it('removes violation state for agent', () => {
       const tracker = createTracker({ threshold: 3 });
 
-      // Two violations
       tracker.checkOwnership('agent-1', 'job-1', 'job.status');
       tracker.checkOwnership('agent-1', 'job-2', 'job.status');
 
-      // Cleanup
       tracker.cleanup('agent-1');
 
-      // Next violations start fresh -- need 3 more
+      // State starts fresh: 3 more are needed.
       tracker.checkOwnership('agent-1', 'job-3', 'job.status');
       tracker.checkOwnership('agent-1', 'job-4', 'job.status');
       expect(onDisconnect).not.toHaveBeenCalled();
@@ -171,8 +166,7 @@ describe('OwnershipTracker', () => {
       const tracker = createDbTracker(lookup);
 
       await expect(tracker.validateAsync('agent-1', 'job-1', 'job.status')).resolves.toBe(true);
-      // The cached pair short-circuits the synchronous check, so the DB is not
-      // consulted a second time.
+      // The cached pair short-circuits the synchronous check; no second DB call.
       expect(tracker.checkOwnership('agent-1', 'job-1', 'job.status')).toBe(true);
       expect(lookup).toHaveBeenCalledOnce();
       expect(onDisconnect).not.toHaveBeenCalled();
@@ -220,9 +214,8 @@ describe('OwnershipTracker', () => {
     });
 
     it('resolves `unknown` when the lookup outruns the deadline', async () => {
-      // A lookup that never settles: without the deadline race this assertion
-      // could not resolve at all, so the test fails loudly if the bound is
-      // removed rather than passing vacuously.
+      // A lookup that never settles: without the deadline race this never resolves,
+      // so removing the bound fails the test loudly rather than vacuously.
       const lookup = vi.fn().mockReturnValue(new Promise<OwnershipDbResult>(() => {}));
       const tracker = createDbTracker(lookup, {
         threshold: 3,
@@ -255,14 +248,13 @@ describe('OwnershipTracker', () => {
 
       await tracker.validateAsync('agent-1', 'job-1', 'job.status');
 
-      // A leaked deadline timer would still be armed here; the `finally` clear
-      // is what makes the count zero.
+      // The `finally` clear disarms the deadline timer.
       expect(vi.getTimerCount()).toBe(0);
     });
 
     it('falls back to the default deadline when the knob read itself stalls', async () => {
-      // The knob lives in the same database the deadline exists to survive, so
-      // an unbounded read would hang the frame instead of refusing it.
+      // The knob lives in the database the deadline exists to survive; an unbounded
+      // read would hang the frame instead of refusing it.
       const lookup = vi.fn().mockReturnValue(new Promise<OwnershipDbResult>(() => {}));
       const tracker = createDbTracker(lookup, {
         getTimeoutMs: () => new Promise<number>(() => {}),
@@ -295,8 +287,8 @@ describe('OwnershipTracker', () => {
     });
 
     it('ignores a deadline larger than setTimeout can honour', async () => {
-      // Node collapses a delay past the signed 32-bit maximum to 1ms, so an
-      // unclamped knob would invert a generous override into an instant one.
+      // Node collapses a delay past the signed 32-bit maximum to 1ms, so an unclamped
+      // knob would turn a generous override into an instant one.
       const lookup = vi.fn().mockReturnValue(new Promise<OwnershipDbResult>(() => {}));
       const tracker = createDbTracker(lookup, { getTimeoutMs: async () => 5_000_000_000 });
 

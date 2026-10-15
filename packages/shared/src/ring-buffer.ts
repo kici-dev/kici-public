@@ -1,9 +1,7 @@
 /**
- * Generic ring buffer with a configurable maximum size.
- *
- * When the buffer reaches its maximum size, adding a new item drops the oldest
- * item (FIFO overflow). This prevents unbounded memory growth for buffered
- * messages or log lines during temporary disconnections.
+ * Bounded FIFO buffer: at its maximum size, adding an item drops the oldest,
+ * so messages or log lines buffered during a disconnection cannot grow memory
+ * without bound.
  */
 export class RingBuffer<T> {
   private buffer: T[] = [];
@@ -14,11 +12,7 @@ export class RingBuffer<T> {
     this.maxSize = options?.maxSize ?? 10_000;
   }
 
-  /**
-   * Add an item to the buffer.
-   * Returns true if the item was added normally, false if the oldest item
-   * was dropped to make room (ring buffer overflow).
-   */
+  /** Add an item. Returns false when the oldest item was dropped to make room. */
   add(item: T): boolean {
     if (this.buffer.length >= this.maxSize) {
       this.buffer.shift();
@@ -31,8 +25,8 @@ export class RingBuffer<T> {
   }
 
   /**
-   * Flush all buffered items in insertion order, clearing the buffer.
-   * Does NOT reset droppedCount -- caller must explicitly call resetDroppedCount() after processing.
+   * Flush all buffered items in insertion order, clearing the buffer. Does NOT
+   * reset droppedCount: the caller calls resetDroppedCount() after processing.
    */
   flush(): T[] {
     const items = this.buffer;

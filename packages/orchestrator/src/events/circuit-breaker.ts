@@ -20,9 +20,6 @@ export class EventCircuitBreaker {
     this.rateLimiter = new SlidingWindowRateLimiter(config.rateLimitPerWorkflowPerMinute);
   }
 
-  /**
-   * Check if the current chain depth is within limits.
-   */
   checkChainDepth(currentDepth: number): { allowed: boolean; reason?: string } {
     if (currentDepth >= this.config.maxChainDepth) {
       return {

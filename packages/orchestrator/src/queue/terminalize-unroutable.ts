@@ -20,19 +20,19 @@ import type { ExpiredJobInfo } from './job-queue.js';
 const logger = createLogger({ prefix: 'terminalize-unroutable' });
 
 /**
- * Whether ANYTHING could ever run a job with these selectors — a registered
+ * Whether ANYTHING could ever run a job with these selectors: a registered
  * agent (regardless of capacity) that can run it, or a scaler backend able to
  * spawn one.
  *
- * `job`, when given, is what the agent must be able to do beyond its labels:
- * above all start the job's container (`canAgentRunJob`). Absent, any
- * label-matching agent counts.
+ * `job`, when given, is what the agent must do beyond its labels, above all
+ * start the job's container (`canAgentRunJob`). Absent, any label-matching
+ * agent counts.
  *
- * The predicate is allowed to answer "routable" conservatively: the scaler half
- * matches exact labels only, so a pattern-only `runsOn` reads routable on a
+ * It may answer "routable" conservatively: the scaler half matches exact
+ * labels only, so a pattern-only `runsOn` reads routable on a
  * scaler-configured orchestrator. That costs precision on the status and on
- * how quickly the job settles, never safety — a job that reads routable
- * falls through to the queue-timeout backstop.
+ * settle time, never safety — such a job falls through to the queue-timeout
+ * backstop.
  */
 export type CanRouteLabels = (
   requiredLabels: string[],
@@ -85,11 +85,10 @@ export interface TerminalizeDeps {
    * the webhook request awaiting its verdict.
    *
    * A round job is the one queue entry with an in-process awaiter and no
-   * `execution_runs` row — the round decides whether any run exists at all —
-   * so the rest of this function skips it entirely and the awaiter would
-   * otherwise wait out its full ceiling for a job the queue has already
-   * declared dead. With the shipped defaults that is a 120s definitive
-   * fast-fail followed by a 240s wait, twice.
+   * `execution_runs` row (the round decides whether any run exists), so the
+   * rest of this function skips it and the awaiter would otherwise wait out
+   * its full ceiling for a dead job: with the shipped defaults, a 120s
+   * definitive fast-fail followed by a 240s wait, twice.
    */
   pendingGlobalEvals?: Pick<PendingGlobalEvalTracker, 'reject'>;
 }
@@ -137,10 +136,10 @@ export function unroutableMessage(job: JobRoutingFacts, cause = UnroutableCause.
       `the job was never dispatched`
     );
   }
-  // `currently`, and both halves of the probe, because the same verdict covers a
-  // fleet that is merely empty right now — a lone static agent that dropped off
-  // for the whole window reaches this line too, and a message asserting the
-  // labels are wrong would send its operator chasing a correct `runsOn`.
+  // `currently`, and both halves of the probe: the same verdict covers a fleet
+  // that is merely empty right now (a lone static agent offline for the whole
+  // window), and blaming the labels would send its operator chasing a correct
+  // `runsOn`.
   const selector =
     required.length > 0
       ? `runsOn [${required.join(', ')}]`
@@ -152,26 +151,22 @@ export function unroutableMessage(job: JobRoutingFacts, cause = UnroutableCause.
 
 /**
  * Split the two reasons a queued job never ran: nothing in the fleet matched
- * its `runsOn` (`unroutable` — a label/fleet problem an operator has to fix)
+ * its `runsOn` (`unroutable` — a label/fleet problem an operator must fix)
  * versus something matched but never produced a usable agent
  * (`timed_out_stale` — a capacity or provisioning problem).
  *
- * Shared by the unroutable probe (which asks on a short tick, gated by a grace
- * window) and the queue-expiry sweep (which asks once at expiry, as the
- * backstop). One verdict, two moments in time — a second copy of this logic is
- * exactly the drift this module exists to prevent.
+ * Shared by the unroutable probe (short tick, gated by a grace window) and the
+ * queue-expiry sweep (once at expiry, as the backstop): one verdict, two
+ * moments, so never copy this logic.
  */
 export function classifyUnroutable(
   job: JobRoutingFacts,
   canRouteLabels?: CanRouteLabels,
 ): { status: ExecutionJobStatus; errorMessage: string; unroutable: boolean } {
-  // A recorded provisioning error settles it on its own: the scaler got far
-  // enough to attempt (and fail) a spawn, so the labels DID route and the real
-  // cause is that failure. Calling that unroutable would send an operator to
-  // fix a `runsOn` that is already correct.
-  //
-  // Without the probe wired in, every job keeps its historical
-  // `timed_out_stale`.
+  // A recorded provisioning error settles it: the scaler attempted (and failed)
+  // a spawn, so the labels DID route; calling it unroutable would send an
+  // operator to fix a correct `runsOn`. Without the probe wired in, every job
+  // stays `timed_out_stale`.
   const container = job.container ?? JobContainerNeed.None;
   const routes = (need: JobContainerNeed): boolean =>
     canRouteLabels!(job.runsOnLabels, job.runsOnPatterns, job.excludeLabels, job.excludePatterns, {
@@ -246,18 +241,16 @@ export async function terminalizeUnroutableJob(
 ): Promise<string | null> {
   const { status, errorMessage, unroutable } = classifyUnroutable(job, deps.canRouteLabels);
 
-  // Before the `execution_jobs` update, because a global eval round has no such
-  // row and every branch below is a no-op for it. Both callers have already
-  // taken the queue row out of `Pending`, so the job can no longer dispatch and
-  // its awaiter is waiting for something that will never happen. `reject` on an
-  // id nothing tracks — every non-round job, and a round dispatched by another
-  // coordinator — is a no-op.
+  // Before the `execution_jobs` update: a global eval round has no such row, so
+  // every branch below is a no-op for it. Both callers already took the queue
+  // row out of `Pending`, so the job can never dispatch. `reject` on an
+  // untracked id (every non-round job, and a round dispatched by another
+  // coordinator) is a no-op.
   deps.pendingGlobalEvals?.reject(job.id, new Error(errorMessage));
 
   try {
-    // The status guard is what makes this safe to run from several coordinators
-    // at once: the loser updates zero rows and returns null rather than
-    // double-forwarding a terminal status.
+    // The status guard makes this safe across concurrent coordinators: the
+    // loser updates zero rows and returns null rather than double-forwarding.
     const ejResult = await deps.db
       .updateTable('execution_jobs')
       .set({
@@ -272,14 +265,11 @@ export async function terminalizeUnroutableJob(
 
     if (!ejResult.numUpdatedRows || ejResult.numUpdatedRows === 0n) return null;
 
-    // Surface the provisioning error as the run-level failure reason so
-    // `kici status`, `kici-admin runs show`, and the dashboard banner show the
-    // real cause. Only set it when no real step-failure reason has been
-    // recorded yet — never clobber an existing reason.
-    // An unroutable job's message carries the same weight: it is the only
-    // statement of WHICH selectors went unmatched, and a run whose reason
-    // stayed NULL would render the generic `Failed jobs: <name>` roll-up on
-    // every surface the comment above names.
+    // Surface the provisioning error (or the unroutable message, the only
+    // statement of WHICH selectors went unmatched) as the run-level failure
+    // reason, so `kici status`, `kici-admin runs show` and the dashboard banner
+    // show the real cause instead of the generic `Failed jobs: <name>` roll-up.
+    // Set only when no reason is recorded yet — never clobber an existing one.
     const runReason = unroutable ? errorMessage : job.lastProvisioningError;
     if (runReason) {
       await deps.db
@@ -314,10 +304,9 @@ export async function terminalizeUnroutableJob(
         metadata: { jobName: job.jobName, reason: errorMessage },
       });
 
-      // Resolve the job's check run — see `CleanupExtras.checkRunReporter` for
-      // why this path has to post it itself. `errorMessage` is passed as the
-      // description because it is the only text naming the unmatched `runsOn`
-      // selectors (or the provisioning failure).
+      // See `CleanupExtras.checkRunReporter` for why this path posts the check
+      // run itself. `errorMessage` is the only text naming the unmatched
+      // `runsOn` selectors (or the provisioning failure).
       if (deps.checkRunReporter) {
         reportJobCheckRunCompletion(
           {

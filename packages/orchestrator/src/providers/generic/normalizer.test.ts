@@ -8,7 +8,6 @@ import {
 import type { GenericSourceManager } from '../../webhook/generic-sources.js';
 import type { GenericWebhookSource } from '../../db/types.js';
 
-// Mock source for testing
 function createMockSource(overrides: Partial<GenericWebhookSource> = {}): GenericWebhookSource {
   return {
     id: 'src-123',

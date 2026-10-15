@@ -174,7 +174,6 @@ describe('GenericSourcesChangeListener', () => {
     });
     await listener.start();
 
-    // First, register the row.
     client._emit('generic_sources_change', row.routing_key);
     await vi.advanceTimersByTimeAsync(10);
     expect(providerRegistry.getByRoutingKey(row.routing_key)).toBeTruthy();

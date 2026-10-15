@@ -1,16 +1,13 @@
 /**
  * Build the `execution.status` frame the orchestrator forwards to the Platform.
+ * A pure function with its own tests: `server.ts`'s `onExecutionStatusChange`
+ * hook supplies the message id and the clock and hands the result to the
+ * Platform client.
  *
- * Extracted from `server.ts`'s `onExecutionStatusChange` hook so the projection
- * from an {@link ExecutionContext} onto the wire message is a pure function with
- * its own tests. The hook itself stays a thin adapter: it supplies the message
- * id and the clock and hands the result to the Platform client.
- *
- * Every field here is conditional on the context actually carrying it. That is
- * load-bearing for `workflowRepoIdentifier` in particular: the tracker records
- * it only when the repository that DEFINES the workflow differs from the
- * repository the run acted on, so the frame must stay silent for a per-repository
- * run or "present" stops marking a cross-repository global run downstream.
+ * Every field is conditional on the context carrying it. For
+ * `workflowRepoIdentifier` that is load-bearing: the tracker records it only
+ * when the repository that defines the workflow differs from the one the run
+ * acted on, so its presence marks a cross-repository global run downstream.
  */
 import type { ExecutionContext } from '../reporting/execution-tracker.js';
 import type { ExecutionRunStatus, ExecutionStatus, InitFailure } from '@kici-dev/engine';
@@ -40,9 +37,8 @@ export function buildExecutionStatusFrame(args: ExecutionStatusFrameArgs): Execu
     status: args.status,
     ...(context.routingKey && { routingKey: context.routingKey }),
     repoIdentifier: context.repoIdentifier,
-    // Present only for a cross-repository global run — the tracker sets it only
-    // when the defining repository differs from the source one, which is what
-    // makes its presence a reliable "global run" marker on the Platform side.
+    // The tracker sets it only when the defining repository differs from the
+    // source one, so its presence marks a global run on the Platform side.
     ...(context.workflowRepoIdentifier && {
       workflowRepoIdentifier: context.workflowRepoIdentifier,
     }),

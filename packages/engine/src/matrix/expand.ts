@@ -11,22 +11,18 @@ export type MatrixInclude = Record<string, string>;
 export type MatrixExclude = Record<string, string>;
 
 /**
- * Matrix values as exposed to steps.
- * Single-dimension: {value: 'linux'}
- * Multi-dimensional: {os: 'linux', node: '18'}
+ * Matrix values as exposed to steps: `{value: 'linux'}` for a single dimension,
+ * `{os: 'linux', node: '18'}` for several.
  */
 export interface MatrixValues {
-  /** Single-dimension: the value */
   value?: string;
-  /** Multi-dimensional: named properties */
   [dimension: string]: string | undefined;
 }
 
 /**
- * Thrown when a matrix value does not match the documented contract — a
- * `string[]` or a `Record<string, string[]>`. A static matrix is guaranteed by
- * the lock-file schema, but a dynamic matrix returns arbitrary runtime data, so
- * the contract has to be enforced here rather than by the type system.
+ * Thrown when a matrix value is not a `string[]` or a `Record<string, string[]>`.
+ * The lock-file schema guarantees a static matrix, but a dynamic matrix returns
+ * arbitrary runtime data, so the contract is enforced here.
  */
 export class MatrixShapeError extends Error {
   override readonly name = 'MatrixShapeError';
@@ -59,10 +55,10 @@ function coerceElement(value: unknown, where: string): string {
 }
 
 /**
- * Validate and normalize a matrix value. Accepts the two documented shapes,
- * coercing numeric and boolean elements to strings (they already reach job
- * names as strings), and rejects everything else with the contract in the
- * message. Dimensions are sorted here so expansion stays deterministic.
+ * Validate and normalize a matrix value: the two documented shapes, with
+ * numeric and boolean elements coerced to strings (as job names already render
+ * them); anything else is rejected with the contract in the message. Dimensions
+ * are sorted so expansion stays deterministic.
  */
 export function normalizeMatrixInput(input: unknown): NormalizedMatrix {
   if (Array.isArray(input)) {
@@ -71,9 +67,8 @@ export function normalizeMatrixInput(input: unknown): NormalizedMatrix {
     return { kind: 'array', values: Array.from(input, (v, i) => coerceElement(v, `values[${i}]`)) };
   }
   if (input === null || typeof input !== 'object') {
-    // A bare string is the trap worth naming: `Object.entries('linux')` yields
-    // one dimension per character, and expansion then dies on a character that
-    // is not an array. Point the author at the split they forgot.
+    // Name the bare-string trap: `Object.entries('linux')` yields one dimension
+    // per character, and expansion then dies on a non-array.
     const suffix =
       typeof input === 'string'
         ? ' — a bare string is read as one dimension per character; split it into an array'
@@ -103,10 +98,9 @@ export function normalizeMatrixInput(input: unknown): NormalizedMatrix {
  * An empty set list yields a single empty tuple; any empty set yields no tuples.
  */
 export function cartesianProduct<T>(sets: T[][]): T[][] {
-  // Short-circuit on an empty set before reducing. The reduce is left-to-right,
-  // so without this it materializes the whole prefix product before the empty
-  // set collapses the result to nothing — which is how a matrix whose combination
-  // count is 0 could still exhaust memory on the way to producing `[]`.
+  // Without this short-circuit the left-to-right reduce materializes the whole
+  // prefix product before an empty set collapses it, so a zero-combination
+  // matrix could still exhaust memory.
   if (sets.some((set) => set.length === 0)) {
     return [];
   }
@@ -116,50 +110,39 @@ export function cartesianProduct<T>(sets: T[][]): T[][] {
   );
 }
 
-/**
- * Expand single-dimension matrix (array form) to MatrixValues array.
- * Each value becomes {value: string}.
- */
+/** Expand the array form: each value becomes `{value}`. */
 export function expandSingleDimension(matrix: StaticMatrixArray): MatrixValues[] {
   return matrix.map((value) => ({ value }));
 }
 
-/**
- * Expand multi-dimensional matrix (object form) to MatrixValues array.
- * Computes the cartesian product of all dimensions.
- * Dimension names are sorted for deterministic output.
- */
+/** Expand the object form: the cartesian product, dimension names sorted for determinism. */
 export function expandMultiDimension(matrix: StaticMatrixObject): MatrixValues[] {
   const dimensions = Object.entries(matrix);
 
-  // Handle empty (should be caught by validation, but defensive)
+  // Validation should already reject an empty matrix.
   if (dimensions.length === 0) {
     return [];
   }
 
-  // Sort dimension names for deterministic output
   dimensions.sort((a, b) => a[0].localeCompare(b[0]));
 
   const names = dimensions.map(([name]) => name);
   const valueSets = dimensions.map(([, values]) => values);
 
-  // Generate cartesian product
   const combinations = cartesianProduct(valueSets);
 
-  // Map back to named properties. `Object.fromEntries` defines own properties;
-  // assigning `result['__proto__']` in a loop would instead hit the inherited
-  // setter and silently drop a dimension named `__proto__`.
+  // `Object.fromEntries` defines own properties; assigning `result['__proto__']`
+  // would hit the inherited setter and drop a dimension named `__proto__`.
   return combinations.map(
     (combo) => Object.fromEntries(names.map((name, idx) => [name, combo[idx]])) as MatrixValues,
   );
 }
 
 /**
- * Validated entry point: normalizes an untrusted matrix value, then dispatches
- * to single- or multi-dimensional expansion. {@link expandSingleDimension} and
- * {@link expandMultiDimension} remain available for a caller that already holds
- * a typed value; this is the one to use for anything crossing a runtime
- * boundary, such as the return value of a dynamic matrix function.
+ * Validated entry point: normalizes an untrusted matrix value, then expands it.
+ * Use it for anything crossing a runtime boundary, such as a dynamic matrix
+ * function's return value; {@link expandSingleDimension} and
+ * {@link expandMultiDimension} serve a caller already holding a typed value.
  */
 export function expandMatrix(input: unknown): MatrixValues[] {
   const normalized = normalizeMatrixInput(input);
@@ -171,8 +154,7 @@ export function expandMatrix(input: unknown): MatrixValues[] {
 
 /**
  * How many combinations a matrix would expand to, computed WITHOUT building
- * them. Callers use this to refuse an oversized matrix before allocating it —
- * the product is checked, never materialized.
+ * them, so callers can refuse an oversized matrix before allocating it.
  */
 export function matrixCombinationCount(input: unknown): number {
   const normalized = normalizeMatrixInput(input);
@@ -198,12 +180,10 @@ function combinationKey(combo: MatrixValues): string {
  * The first combination whose key collides with an earlier one, or `null` when
  * every combination is distinct.
  *
- * `keyOf` decides what "the same combination" means. Callers that own a job name
- * pass a renderer for the expanded name, because the collision that actually
- * hurts is two children sharing a name — they are indistinguishable to an
- * operator and ambiguous as a needs-edge target. Two structurally different
- * combinations can still render the same name, so name-keying is strictly
- * stronger than the structural default.
+ * `keyOf` defines "the same combination". Callers owning a job name key on the
+ * expanded name, since two children sharing a name are indistinguishable to an
+ * operator and ambiguous as a needs-edge target; structurally different
+ * combinations can render the same name, so this is stronger than the default.
  */
 export function findDuplicateCombination(
   combos: readonly MatrixValues[],
@@ -219,11 +199,8 @@ export function findDuplicateCombination(
 }
 
 /**
- * Apply include/exclude modifications to expanded matrix combinations.
- * Exclude first (remove matching), then include (add new).
- *
- * Exclude matches if ALL specified dimensions match.
- * Include adds new combinations if they don't already exist.
+ * Apply excludes, then includes, to expanded combinations. An exclude matches
+ * when ALL its dimensions match; an include adds a combination not already present.
  */
 export function applyIncludeExclude(
   expanded: MatrixValues[],
@@ -232,9 +209,8 @@ export function applyIncludeExclude(
 ): MatrixValues[] {
   let result = [...expanded];
 
-  // Apply excludes first (remove matching combinations).
-  // An empty exclude entry `{}` must match NOTHING (not everything) — otherwise
-  // a conditional spread that collapses to `{}` silently wipes the whole matrix.
+  // An empty exclude `{}` matches NOTHING, or a conditional spread collapsing to
+  // `{}` would silently wipe the whole matrix.
   if (exclude && exclude.length > 0) {
     result = result.filter((combo) => {
       return !exclude.some((excl) => {
@@ -245,14 +221,12 @@ export function applyIncludeExclude(
     });
   }
 
-  // Apply includes (add new combinations). Empty include entries are ignored
-  // for the same reason: `{}` would add a shape-less combination to the matrix.
+  // Empty includes are ignored too: `{}` would add a shape-less combination.
   if (include && include.length > 0) {
     for (const incl of include) {
       const inclKeys = Object.keys(incl);
       if (inclKeys.length === 0) continue;
 
-      // Check if this exact combination already exists
       const exists = result.some((combo) => {
         const comboKeys = Object.keys(combo);
         if (inclKeys.length !== comboKeys.length) return false;
@@ -260,17 +234,13 @@ export function applyIncludeExclude(
       });
 
       if (!exists) {
-        // Key-sorted copy, for two reasons. Order: `expandMultiDimension` sorts
-        // dimension names but an include entry carries the author's key order,
-        // and `formatMatrixSuffix` renders insertion order — so an unsorted
-        // include child prints its dimensions in a different order than every
-        // expanded sibling. Copy: the pushed object becomes a child job's
-        // `variantValues`, so pushing `incl` itself hands out a live reference
-        // to the lock job's own include entry. `Object.fromEntries` rather than
-        // assignment in a loop: `sorted['__proto__'] = v` runs the inherited
-        // setter instead of defining an own property, so a dimension named
-        // `__proto__` (which `JSON.parse` of a lock file does create) would be
-        // dropped from the combination.
+        // Key-sorted: `formatMatrixSuffix` renders insertion order, so an
+        // author-ordered include would print its dimensions differently from its
+        // sorted expanded siblings. A copy: the object becomes a child's
+        // `variantValues`, and `incl` is the lock job's own entry.
+        // `Object.fromEntries`: loop assignment would hit the inherited
+        // `__proto__` setter and drop that dimension, which `JSON.parse` of a
+        // lock file can create.
         result.push(
           Object.fromEntries(
             [...inclKeys].sort((a, b) => a.localeCompare(b)).map((key) => [key, incl[key]]),

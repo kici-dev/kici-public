@@ -3,24 +3,19 @@ import { type Kysely, sql } from 'kysely';
 /**
  * Access log: one row per read or orchestrator-admin mutation attributable
  * to an ActorPrincipal (dashboard user, api_key, service_account, platform
- * operator break-glass, or system). Backs:
+ * operator break-glass, or system). Backs the dashboard "Data access" tab
+ * (dashboard.access-log.list), GET /api/v1/admin/access-log and
+ * `kici-admin access-log`.
  *
- * - dashboard "Data access" tab (dashboard.access-log.list message)
- * - orchestrator admin HTTP route GET /api/v1/admin/access-log
- * - kici-admin `access-log` CLI subcommand
+ * `secret_audit_log` stays the source of truth for secret *mutation* events
+ * (different retention expectations); access_log records secret *reveals*
+ * with full actor attribution.
  *
- * Covers reads + orchestrator-admin mutations uniformly. `secret_audit_log`
- * stays the source of truth for secret *mutation* events (kept separate for
- * historical reasons and different retention expectations); access_log
- * records secret *reveals* with full actor attribution.
+ * `source` distinguishes platform_proxy / admin_http / admin_cli entry
+ * points. `actor_meta` holds variant-specific extras (ownerSub for api_key,
+ * reason for platform_operator).
  *
- * `source` distinguishes platform_proxy vs admin_http vs admin_cli entry
- * points. `actor_meta` captures the variant-specific extras that don't fit
- * in the flat (actor_type, actor_id) columns — ownerSub for api_key,
- * reason for platform_operator.
- *
- * Retention is TTL-based via expires_at; packages/orchestrator/src/queue/
- * cleanup.ts picks up the prune pass.
+ * Retention is TTL-based via expires_at; queue/cleanup.ts prunes.
  */
 
 export async function up(db: Kysely<any>): Promise<void> {

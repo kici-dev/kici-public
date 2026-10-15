@@ -3,9 +3,7 @@ import type { OrchestratorToPlatformMessage } from '@kici-dev/engine';
 import { EventBuffer } from './event-buffer.js';
 
 describe('EventBuffer', () => {
-  // Generic ring buffer behavior (add/flush/size/clear/overflow) is tested
-  // in @kici-dev/shared RingBuffer tests. These tests verify orchestrator-specific
-  // concerns: OrchestratorToPlatformMessage type compatibility and default maxSize.
+  // Generic ring buffer behavior is tested in @kici-dev/shared RingBuffer tests.
 
   it('buffers and flushes OrchestratorToPlatformMessage objects', () => {
     const buffer = new EventBuffer();

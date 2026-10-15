@@ -21,10 +21,9 @@ export interface AgentPackageResult {
 }
 
 /**
- * The launcher boots the payload on its VENDORED Node (`bin/node`) exclusively —
- * never a system Node. It runs the real installed agent's `server.js`, whose
- * transitive deps (workflow-runner companion, ts-loader hook, oxc binding)
- * resolve natively from the payload's own `node_modules`.
+ * Boots the payload on its VENDORED Node (`bin/node`), never a system Node, running the
+ * installed agent's `server.js`; its transitive deps (workflow-runner companion, ts-loader
+ * hook, oxc binding) resolve from the payload's own `node_modules`.
  */
 const LAUNCHER = `#!/bin/sh
 exec "$(dirname "$0")/bin/node" "$(dirname "$0")/node_modules/@kici-dev/agent/dist/server.js" "$@"
@@ -34,8 +33,7 @@ exec "$(dirname "$0")/bin/node" "$(dirname "$0")/node_modules/@kici-dev/agent/di
 export async function buildSelfContainedAgentPackage(
   opts: BuildAgentPackageOptions,
 ): Promise<AgentPackageResult> {
-  // opts.platform is an AgentPlatform enum (`linux-x64` / `linux-arm64`), so it
-  // always satisfies the allocator's `[a-z0-9-]+` label constraint.
+  // An AgentPlatform value always satisfies the allocator's `[a-z0-9-]+` label constraint.
   return withTempDir(`agent-pkg-${opts.platform}`, async (staging) => {
     await installAgentClosure({
       version: opts.version,
@@ -56,8 +54,8 @@ export async function buildSelfContainedAgentPackage(
     const versionDir = path.join(opts.outDir, opts.version);
     mkdirSync(versionDir, { recursive: true });
     const tarballPath = path.join(versionDir, `kici-agent-${opts.platform}.tar.gz`);
-    // Archive the staging dir's CONTENTS at the tarball root, so extraction into a
-    // target dir yields bin/, kici-agent, node_modules/ directly (no wrapper dir).
+    // Contents at the tarball root: extraction yields bin/, kici-agent,
+    // node_modules/ directly (no wrapper dir).
     const out = $.sync({
       nothrow: true,
       stdio: 'pipe',

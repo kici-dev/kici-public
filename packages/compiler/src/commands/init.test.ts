@@ -36,8 +36,7 @@ describe('writeKiciIgnore', () => {
   });
 
   it('seeds a file that emits no compile warning', async () => {
-    // The whole point of seeding: a new repo must never meet the footgun the
-    // warning exists to explain.
+    // Seeding exists so a new repo never meets the footgun the warning explains.
     await writeKiciIgnore(kiciDir);
     expect((await loadKiciIgnoreRules(kiciDir)).warnings).toEqual([]);
   });
@@ -60,10 +59,8 @@ describe('writeKiciIgnore', () => {
   });
 
   it('excludes a symlinked node_modules, so a scaffolded repo hashes as the agent does', async () => {
-    // The scaffolded file REPLACES the defaults, so a fix that only edited the
-    // default exclusion set would leave every `kici init` repo broken. This
-    // asserts through the file this command actually writes, not through a
-    // restatement of it.
+    // The scaffolded file REPLACES the defaults, so assert through the file this
+    // command writes: a fix to the default set alone leaves `kici init` repos broken.
     await writeKiciIgnore(kiciDir);
     await fs.writeFile(path.join(kiciDir, 'workflow.ts'), 'export const x = 1;\n', 'utf-8');
 
@@ -102,10 +99,8 @@ describe('writeKiciGitignore', () => {
     await writeKiciGitignore(kiciDir);
 
     const content = await fs.readFile(path.join(kiciDir, '.gitignore'), 'utf-8');
-    // The generated type declarations are ignored...
     expect(content).toContain('types/');
-    // ...but the lock file is source (the orchestrator fetches it from the repo),
-    // so it must never be ignored.
+    // The lock file is source (the orchestrator fetches it from the repo).
     expect(content).not.toContain('kici.lock.json');
   });
 

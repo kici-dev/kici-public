@@ -1,9 +1,8 @@
 /**
  * Reload the scaler config, behind `kici-admin scaler reload`.
  *
- * Mounted inside `createAdminRoutes` at `/api/v1/admin`, so the Bearer-token
- * auth middleware has already resolved the caller's role. Needs an unscoped
- * token and the `scaler.manage` permission (owner, admin).
+ * Mounted inside `createAdminRoutes` at `/api/v1/admin`, behind its Bearer-token
+ * auth. Needs an unscoped token and `scaler.manage` (owner, admin).
  *
  * - `POST /api/v1/admin/scaler/reload { single?, timeoutMs? }` — re-read the
  *   scaler config on this orchestrator and, unless `single`, on every peer it
@@ -12,9 +11,8 @@
  *   one first: `200` when no instance refused its file or went unanswered,
  *   `422` otherwise.
  *
- * The route runs the scaler reload only: it does not reload the orchestrator
- * config, so it never bumps the config version the peers follow, and a
- * `single` reload stays on this orchestrator.
+ * It never reloads the orchestrator config, so it never bumps the config
+ * version the peers follow, and a `single` reload stays on this orchestrator.
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
@@ -34,7 +32,6 @@ import { type AdminEnv, createAdminApp, requireUnscoped } from './admin-env.js';
 
 const logger = createLogger({ prefix: 'admin-scaler-reload' });
 
-/** What the route needs from the orchestrator it runs on. */
 export interface ScalerReloadRouteDeps {
   /** This orchestrator's instance id, the audit row's target. */
   instanceId: string;
@@ -45,7 +42,7 @@ export interface ScalerReloadRouteDeps {
   reload: (single: boolean, timeoutMs: number) => Promise<ScalerReloadInstanceResult[]>;
 }
 
-/** How long the route waits for each peer by default. */
+/** Default wait per peer. */
 export const DEFAULT_SCALER_RELOAD_TIMEOUT_MS = 60_000;
 
 /** Outcomes that make the request fail: a refused file, or an instance not reached. */

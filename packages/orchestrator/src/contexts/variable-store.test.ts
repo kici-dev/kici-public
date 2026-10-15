@@ -169,7 +169,6 @@ describe('VariableStore', () => {
   describe('getResolvedVars', () => {
     it('should return only org vars when no routingKey provided', async () => {
       const store = new VariableStore(null as any);
-      // Mock listVars and listSourceOverrides
       vi.spyOn(store, 'listVars').mockResolvedValue([
         makeVarRow({ key: 'API_URL', value: 'org-val', locked: false }) as any,
         makeVarRow({ key: 'DB_HOST', value: 'db.example.com', locked: true }) as any,

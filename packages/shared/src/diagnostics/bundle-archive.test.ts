@@ -25,12 +25,9 @@ describe('addLogsToArchive', () => {
 });
 
 /**
- * Read the raw bytes of a ZIP the archiver just wrote.
- *
- * Deliberately reads the whole artifact rather than one parsed entry: the
- * assertion that matters is "this token appears nowhere in the file we
- * upload", and a per-entry read could miss a copy that leaked into a header or
- * a second entry. Level-0 (stored) compression keeps the payload searchable.
+ * Reads the whole ZIP, not one parsed entry: the assertion is "this token
+ * appears nowhere in the uploaded file", and a per-entry read could miss a copy
+ * in a header or a second entry. Level-0 (stored) compression keeps it searchable.
  */
 async function zipBytesFor(logDir: string, windowHours = 24): Promise<string> {
   const out = path.join(logDir, `bundle-${Date.now()}.zip`);
@@ -56,9 +53,8 @@ describe('addLogsToArchive redaction', () => {
     const bytes = await zipBytesFor(dir);
 
     expect(bytes).not.toContain(token);
-    // Non-vacuity: the same read over the UNSCRUBBED source does contain the
-    // token, so the assertion above is detecting scrubbing rather than an
-    // archive that simply never held the line.
+    // Non-vacuity: the UNSCRUBBED source does contain the token, so the assertion
+    // above detects scrubbing, not an archive that never held the line.
     expect(fs.readFileSync(path.join(dir, 'a.log'), 'utf-8')).toContain(token);
     expect(bytes).toContain('***REDACTED');
   });

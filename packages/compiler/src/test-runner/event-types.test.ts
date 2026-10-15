@@ -34,12 +34,10 @@ describe('parseEventArg', () => {
     expect(result).toEqual({ type: 'pull_request', action: 'opened' });
   });
 
-  // --- Tag ---
   it('parses tag', () => {
     expect(parseEventArg('tag')).toEqual({ type: 'tag' });
   });
 
-  // --- Comment ---
   it('parses comment (default: created)', () => {
     expect(parseEventArg('comment')).toEqual({ type: 'comment', action: 'created' });
   });
@@ -56,7 +54,6 @@ describe('parseEventArg', () => {
     expect(parseEventArg('comment:deleted')).toEqual({ type: 'comment', action: 'deleted' });
   });
 
-  // --- Review ---
   it('parses review (default: submitted)', () => {
     expect(parseEventArg('review')).toEqual({ type: 'review', action: 'submitted' });
   });
@@ -73,7 +70,6 @@ describe('parseEventArg', () => {
     expect(parseEventArg('review:dismissed')).toEqual({ type: 'review', action: 'dismissed' });
   });
 
-  // --- Review comment ---
   it('parses review_comment (default: created)', () => {
     expect(parseEventArg('review_comment')).toEqual({
       type: 'review_comment',
@@ -102,7 +98,6 @@ describe('parseEventArg', () => {
     });
   });
 
-  // --- Release ---
   it('parses release (default: published)', () => {
     expect(parseEventArg('release')).toEqual({ type: 'release', action: 'published' });
   });
@@ -129,12 +124,10 @@ describe('parseEventArg', () => {
     expect(parseEventArg('release:deleted')).toEqual({ type: 'release', action: 'deleted' });
   });
 
-  // --- Dispatch ---
   it('parses dispatch', () => {
     expect(parseEventArg('dispatch')).toEqual({ type: 'dispatch' });
   });
 
-  // --- Create ---
   it('parses create', () => {
     expect(parseEventArg('create')).toEqual({ type: 'create' });
   });
@@ -147,7 +140,6 @@ describe('parseEventArg', () => {
     expect(parseEventArg('create:tag')).toEqual({ type: 'create', refType: 'tag' });
   });
 
-  // --- Delete ---
   it('parses delete', () => {
     expect(parseEventArg('delete')).toEqual({ type: 'delete' });
   });
@@ -160,12 +152,10 @@ describe('parseEventArg', () => {
     expect(parseEventArg('delete:tag')).toEqual({ type: 'delete', refType: 'tag' });
   });
 
-  // --- Status ---
   it('parses status', () => {
     expect(parseEventArg('status')).toEqual({ type: 'status' });
   });
 
-  // --- Workflow run ---
   it('parses workflow_run (default: completed)', () => {
     expect(parseEventArg('workflow_run')).toEqual({
       type: 'workflow_run',
@@ -187,12 +177,10 @@ describe('parseEventArg', () => {
     });
   });
 
-  // --- Fork ---
   it('parses fork', () => {
     expect(parseEventArg('fork')).toEqual({ type: 'fork' });
   });
 
-  // --- Star ---
   it('parses star (default: created)', () => {
     expect(parseEventArg('star')).toEqual({ type: 'star', action: 'created' });
   });
@@ -205,7 +193,6 @@ describe('parseEventArg', () => {
     expect(parseEventArg('star:deleted')).toEqual({ type: 'star', action: 'deleted' });
   });
 
-  // --- Watch ---
   it('parses watch (default: started)', () => {
     expect(parseEventArg('watch')).toEqual({ type: 'watch', action: 'started' });
   });
@@ -214,7 +201,6 @@ describe('parseEventArg', () => {
     expect(parseEventArg('watch:started')).toEqual({ type: 'watch', action: 'started' });
   });
 
-  // --- KiCI event ---
   it('parses kici_event (default)', () => {
     expect(parseEventArg('kici_event')).toEqual({ type: 'kici_event', eventName: 'test-event' });
   });
@@ -233,7 +219,6 @@ describe('parseEventArg', () => {
     });
   });
 
-  // --- Workflow complete ---
   it('parses workflow_complete (default)', () => {
     expect(parseEventArg('workflow_complete')).toEqual({
       type: 'workflow_complete',
@@ -266,7 +251,6 @@ describe('parseEventArg', () => {
     });
   });
 
-  // --- Job complete ---
   it('parses job_complete (default)', () => {
     expect(parseEventArg('job_complete')).toEqual({
       type: 'job_complete',
@@ -294,7 +278,6 @@ describe('parseEventArg', () => {
     });
   });
 
-  // --- Generic webhook ---
   it('parses generic_webhook (default)', () => {
     expect(parseEventArg('generic_webhook')).toEqual({ type: 'generic_webhook' });
   });
@@ -313,7 +296,6 @@ describe('parseEventArg', () => {
     });
   });
 
-  // --- Schedule ---
   it('parses schedule (default)', () => {
     expect(parseEventArg('schedule')).toEqual({ type: 'schedule' });
   });
@@ -325,7 +307,6 @@ describe('parseEventArg', () => {
     });
   });
 
-  // --- Lifecycle ---
   it('parses lifecycle (default: workflow_complete)', () => {
     expect(parseEventArg('lifecycle')).toEqual({
       type: 'lifecycle',
@@ -354,7 +335,6 @@ describe('parseEventArg', () => {
     });
   });
 
-  // --- webhook: alias for generic_webhook: ---
   it('parses webhook:stripe as generic_webhook with source', () => {
     expect(parseEventArg('webhook:stripe')).toEqual({
       type: 'generic_webhook',

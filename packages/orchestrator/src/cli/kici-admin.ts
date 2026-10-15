@@ -1,14 +1,8 @@
 #!/usr/bin/env node
 /**
- * kici-admin CLI binary.
- *
- * Manages secrets, tokens, key rotation, and audit logs
- * through the orchestrator's admin HTTP API.
- *
- * Global options:
- *   --url / -u    Orchestrator URL (env: KICI_ADMIN_URL, default: http://localhost:4000)
- *   --token / -t  Admin API token (env: KICI_ADMIN_TOKEN, required)
- *   -V / --cli-version / --version  Print the CLI version (--version only before a command)
+ * kici-admin CLI binary. Global options: `--url`/`-u` (env KICI_ADMIN_URL,
+ * default http://localhost:4000), `--token`/`-t` (env KICI_ADMIN_TOKEN), and
+ * `-V`/`--cli-version`/`--version` (`--version` only before a command).
  *
  * A command that declares its own option under one of these flags (for
  * example `orchestrator upgrade --url`) owns that flag after its name; see
@@ -72,22 +66,17 @@ import { ROOT_VERSION_FLAG, routeRootArgs } from './root-option-routing.js';
 declare const KICI_PKG_VERSION: string;
 
 /**
- * The version `kici-admin --version` reports.
- *
  * `scripts/build-service.mjs` defines `KICI_PKG_VERSION` for every orchestrator
- * build entry, `cli.js` included, so a shipped binary reports the package
- * version it was built from. The fallback covers a source run (tests, `tsx`),
- * where no bundler substituted the constant — the same shape `server.ts` and
- * `standalone.ts` use for `ORCHESTRATOR_VERSION`.
+ * build entry; the fallback covers a source run (tests, `tsx`), the same shape
+ * `server.ts` and `standalone.ts` use for `ORCHESTRATOR_VERSION`.
  */
 export const CLI_VERSION = typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : '0.0.1';
 
 /**
- * The kici-admin root command: a Commander `Command` whose own option parsing
- * first routes the argv through {@link routeRootArgs}. A leading `--version`
- * prints the CLI version, and an option a command declares under a root
- * option's flag reaches that command. Subcommands are plain `Command`s, so
- * their option parsing is unchanged.
+ * Root command whose option parsing first routes argv through
+ * {@link routeRootArgs}: a leading `--version` prints the CLI version, and an
+ * option a command declares under a root option's flag reaches that command.
+ * Subcommands are plain `Command`s.
  */
 class KiciAdminProgram extends Command {
   override parseOptions(args: string[]): ParseOptionsResult {
@@ -101,10 +90,8 @@ class KiciAdminProgram extends Command {
 }
 
 /**
- * Build the kici-admin Commander program with every command group registered.
  * Exported so the surface registry can walk the real command tree without
- * parsing argv (no action runs during a tree walk, so `getClient` is
- * constructed but never invoked).
+ * parsing argv; no action runs, so `getClient` is never invoked.
  */
 
 export function buildProgram(): Command {
@@ -121,10 +108,7 @@ export function buildProgram(): Command {
     .option('-u, --url <url>', 'Orchestrator URL', process.env.KICI_ADMIN_URL ?? DEFAULT_ADMIN_URL)
     .option('-t, --token <token>', 'Admin API token', process.env.KICI_ADMIN_TOKEN);
 
-  /**
-   * Create an AdminApiClient from global options.
-   * Called lazily by each command to allow --help without requiring --token.
-   */
+  /** Lazy, so --help works without --token. */
   function getClient(): AdminApiClient {
     const opts = program.opts<{ url: string; token?: string }>();
     if (!opts.token) {
@@ -135,21 +119,15 @@ export function buildProgram(): Command {
   }
 
   /**
-   * Like {@link getClient}, but returns null instead of exiting when no admin
-   * token is configured.
-   *
-   * The upgrade command needs this: its drain and schema-guard steps are
-   * best-effort improvements over a path that previously did neither, so an
-   * install whose CLI carries no admin credentials must still be able to
-   * upgrade. `getClient` exits the process rather than throwing, so a caller
-   * cannot catch it and degrade.
+   * Like {@link getClient}, but null instead of exiting without a token. Upgrade's
+   * drain and schema-guard steps are best-effort, so an install with no admin
+   * credentials must still upgrade, and `getClient`'s exit cannot be caught.
    */
   function tryGetClient(): AdminApiClient | null {
     const opts = program.opts<{ url: string; token?: string }>();
     return opts.token ? new AdminApiClient(opts.url, opts.token) : null;
   }
 
-  // Register all command groups
   registerSecretCommands(program, getClient);
   registerRotateCommand(program, getClient);
   registerAuditCommands(program, getClient);
@@ -172,83 +150,58 @@ export function buildProgram(): Command {
   registerDebugBundleCommand(program, getClient);
   registerInspectBundleCommand(program);
   registerOrchestratorServiceCommands(program, getClient, tryGetClient);
-  // Firecracker host-networking ops (provision/verify/teardown bridges) run
-  // locally on the orchestrator host — no admin HTTP client.
+  // Runs locally on the orchestrator host; no admin HTTP client.
   registerFirecrackerCommands(program);
-  // Scaler maintenance: `orphans` goes through the admin HTTP API; `reap-orphans`
-  // runs locally from config — no admin HTTP client, no DB, no running
-  // orchestrator — and recovers a node wedged on ENOSPC.
+  // `reap-orphans` runs locally from config (no HTTP, DB or running orchestrator)
+  // to recover a node wedged on ENOSPC.
   registerScalerCommands(program, getClient);
-  // Agent service commands are added to the existing 'agent' command group
-  // (registered above by registerAgentCommands), so this must come after it.
+  // Extends the 'agent' group, so it must come after registerAgentCommands.
   registerAgentServiceCommands(program);
-  // Agent payload producer (`agent package`) — also added to the 'agent' group.
+  // Also extends the 'agent' group.
   registerAgentPackage(program);
-  // Peer commands use direct DB access, except `peer forget`, which reaches the
-  // running coordinators through the admin HTTP API.
+  // Direct DB, except `peer forget`, which uses the admin HTTP API.
   registerPeerCommands(program, getClient);
-  // Host roster commands use direct DB access (not AdminApiClient)
+  // Direct DB access.
   registerHostCommands(program);
-  // `org list`: the org ids the org-scoped commands below take.
   registerOrgCommands(program, getClient);
   registerOrgSettingsCommands(program, getClient);
   registerClusterSettingsCommands(program, getClient);
   registerTrustPolicyCommands(program, getClient);
   registerHeldRunCommands(program, getClient);
   registerClusterNameCommands(program, getClient);
-  // Cluster identity recovery (reconcile-identity) is DB + S3 direct — no admin
-  // HTTP client — so it works while the orchestrator is crash-looping on a
-  // cluster identity mismatch.
+  // DB + S3 direct, so it works while the orchestrator crash-loops on an identity mismatch.
   registerClusterCommands(program);
-  // Maintenance commands extend `secret` and `source` namespaces with purge
-  // verbs, so must run after registerSecretCommands / registerSourceCommands.
+  // Extends `secret` and `source`, so it must run after their registration.
   registerMaintenanceCommands(program, getClient);
-  // Environment CLI is a new top-level namespace (not an extension).
   registerContextCommands(program, getClient);
-  // Variable CLI is a sibling namespace to `secret` — both write to the same
-  // per-environment trust cone, gated by the dashboard-write policy.
+  // Shares `secret`'s per-environment trust cone and dashboard-write policy.
   registerVariableCommands(program, getClient);
-  // Queue + execution read verbs extend the namespaces created by
-  // registerMaintenanceCommands (queue clear, execution purge-stale), so must
-  // run after it.
+  // Extend namespaces registerMaintenanceCommands creates, so they must run after it.
   registerQueueCommands(program, getClient);
   registerExecutionCommands(program, getClient);
-  // Check-run tracking reads: direct-DB only (no admin HTTP route), so this
-  // takes the program-only registration form.
+  // Direct-DB only: no admin HTTP route.
   registerCheckRunCommands(program);
-  // Registration CLI is a new top-level namespace (alongside the existing
-  // `workflow list` — they cover different concerns).
   registerRegistrationCommands(program, getClient);
-  // Event CLI is a new top-level namespace — `event emit` lands in kici_events
-  // + pg_notify, mirroring the shared `emitKiciEventDirect` helper.
+  // `event emit` writes kici_events + pg_notify, mirroring `emitKiciEventDirect`.
   registerEventCommands(program, getClient);
-  // `event-dlq` is the operator triage surface for at-least-once event delivery
-  // — list / retry / discard events that exhausted their retry budget.
   registerEventDlqCommands(program, getClient);
-  // Cold-store CLI stubs (standalone namespace; admin HTTP-backed).
   registerColdStoreCommands(program, getClient);
-  // Join command does not use AdminApiClient (connects directly to Platform/peer)
+  // Connects directly to the Platform or a peer; no AdminApiClient.
   registerJoinCommand(program);
 
   return program;
 }
 
-/** Build the program and parse argv — the bin-shim entry point. */
+/** The bin-shim entry point. */
 export function runCli(argv: string[] = process.argv): void {
   buildProgram().parse(argv);
 }
 
 /**
- * Canonicalize a path through any symlinks, falling back to a plain `resolve`
- * when the target does not exist on disk. The entry-point guard compares the
- * invoked script path against this module's own path; both sides must be fully
- * canonicalized or a symlinked invocation path silently fails the match. The
- * canonical example is the light-package launcher running
- * `node /tmp/.../kici-admin.cjs` on macOS, where `/tmp` is a symlink to
- * `/private/tmp`: `process.argv[1]` keeps the `/tmp` form while the bundle's
- * `import.meta.url` resolves to the real `/private/tmp` path, so an
- * un-canonicalized comparison is always false and the CLI exits 0 without
- * running any command.
+ * Resolve symlinks, falling back to `resolve` for a missing path. The
+ * entry-point guard needs both sides canonical: on macOS `/tmp` links to
+ * `/private/tmp`, so `process.argv[1]` and `import.meta.url` differ and the CLI
+ * would exit 0 without running any command.
  */
 export function canonicalize(p: string): string {
   try {
@@ -258,10 +211,8 @@ export function canonicalize(p: string): string {
   }
 }
 
-// Only parse argv when this module is the process entry point. The published
-// bin shim imports `runCli` and calls it explicitly, so this guard fires only
-// for a direct `node dist/cli.js` invocation; importing the module (e.g. the
-// surface registry building the command tree) must NOT parse/exit.
+// Fires only for a direct `node dist/cli.js` run (the bin shim calls `runCli`);
+// importing the module must never parse argv or exit.
 if (canonicalize(process.argv[1] ?? '') === canonicalize(fileURLToPath(import.meta.url))) {
   runCli();
 }

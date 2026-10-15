@@ -22,9 +22,7 @@ describe('isHeadless', () => {
   const originalPlatform = process.platform;
 
   beforeEach(() => {
-    // Start with a clean env for each test
     process.env = { ...originalEnv };
-    // Clear all headless-related env vars
     delete process.env.SSH_CONNECTION;
     delete process.env.SSH_CLIENT;
     delete process.env.SSH_TTY;
@@ -188,9 +186,8 @@ describe('isHeadless', () => {
     });
 
     it('returns true on WSL when only SSH_CONNECTION survives', async () => {
-      // `open` refuses the Windows browser for any of the three SSH markers, so
-      // choosing the browser flow here would strand the user on a launch that
-      // silently displays nothing.
+      // `open` refuses the Windows browser under any SSH marker, so the browser
+      // flow would strand the user on a launch that displays nothing.
       process.env.SSH_CONNECTION = '192.168.1.1 12345 192.168.1.2 22';
       expect(await isHeadless()).toBe(true);
       expect(wsl.canAccessPowerShell).not.toHaveBeenCalled();

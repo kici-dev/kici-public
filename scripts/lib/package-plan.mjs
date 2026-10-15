@@ -1,13 +1,12 @@
 /**
- * What `scripts/package.mjs` builds: the components, the platforms, the two
- * package types, and the name of each archive. `package.mjs --list` prints the
- * plan without building it, which is how a release names its assets.
+ * What `scripts/package.mjs` builds: components, platforms, package types and
+ * archive names. A release names its assets with `package.mjs --list`, which
+ * prints the plan without building it.
  */
 
 /**
- * Components, each bundled from one entry point. `licenseDir` is the workspace
- * of the npm package the component ships as: its `LICENSE` becomes the
- * package's `LICENSE`.
+ * `licenseDir` is the workspace of the npm package the component ships as; its
+ * `LICENSE` becomes the package's `LICENSE`.
  */
 export const PACKAGE_TARGETS = [
   {
@@ -46,8 +45,7 @@ export function platformLabel(platform) {
 }
 
 /**
- * The top-level directory inside an archive, and the archive name without its
- * extension.
+ * The archive's top-level directory, and its name without the extension.
  *
  * @param {string} targetName
  * @param {string} version
@@ -69,8 +67,7 @@ export function archiveFileName(targetName, version, platform, type) {
 }
 
 /**
- * The targets, platforms and types the CLI filters select. With neither type
- * flag, or with both, a run builds both types.
+ * With neither type flag, or with both, a run builds both types.
  *
  * @param {{ target?: string, platform?: string, light?: boolean, full?: boolean }} filters
  */
@@ -131,21 +128,19 @@ export function packagingOutcome({ planned, built, failures }) {
 }
 
 /**
- * The name of the container-image digest record in a package. The kici-admin
- * installer reads it from its package root to pin compose images by digest
- * (packages/orchestrator/src/cli/service/image-digests.ts).
+ * The kici-admin installer reads this record from its package root to pin
+ * compose images by digest (packages/orchestrator/src/cli/service/image-digests.ts).
  */
 export const IMAGE_DIGEST_RECORD_FILE = 'installer-image-digests.json';
 
-/** The components whose packages carry the image-digest record. */
 export const IMAGE_DIGEST_RECORD_TARGETS = ['kici-admin'];
 
 /**
- * Parse the image-digest record `--image-digest-record` names. It throws on a
- * record the installer could not use, so a malformed record fails the
- * packaging instead of shipping a kici-admin that pins `:latest`.
+ * Throws on a record the installer could not use, so a malformed
+ * `--image-digest-record` fails the packaging instead of shipping a kici-admin
+ * that pins `:latest`.
  *
- * @param {string} text the record file's content
+ * @param {string} text
  * @param {string} source the record's path, for the error message
  * @returns {{ version: string, images: Record<string, string> }}
  */

@@ -1,11 +1,6 @@
 /**
- * Fleet --pick selector resolution.
- *
- * Resolves a list of `--pick` selectors against the enumerated topology and
- * computes a per-orchestrator FleetSelection: which of that orchestrator's
- * agents (and which downstream workers) the collector should gather. Empty
- * selectors mean "everything" (`all: true` for every orchestrator). A branch
- * with nothing selected is pruned (no request issued).
+ * Resolves `--pick` selectors against the enumerated topology into a per-orchestrator
+ * FleetSelection: which agents (and downstream workers) the collector gathers.
  *
  * Selector forms:
  *   - exact instanceId / agentId      e.g. `coord-a`, `agent-7`
@@ -19,7 +14,6 @@ import type { FleetTopology, FleetTopologyNode } from './fleet-topology.js';
 /** A per-orchestrator selection, keyed by orchestrator instanceId. Absent = prune. */
 export type ResolvedSelectionMap = Map<string, FleetSelection>;
 
-/** Does the selector match this node by exact id, hostname glob, or agent label? */
 function selectorMatchesNode(selector: string, node: FleetTopologyNode): boolean {
   if (selector.startsWith('label:')) {
     const body = selector.slice('label:'.length);
@@ -36,13 +30,9 @@ function selectorMatchesNode(selector: string, node: FleetTopologyNode): boolean
 }
 
 /**
- * Resolve `--pick` selectors into a per-orchestrator FleetSelection map.
- *
- * No selectors -> every orchestrator gets `{ all: true }`. With selectors, an
- * orchestrator is included only if at least one of its agents/workers (or the
- * orchestrator itself) matches; its FleetSelection then carries exactly the
- * matched agent ids and worker instanceIds. Orchestrators with no matches are
- * omitted from the map (their branch is pruned).
+ * No selectors -> every orchestrator gets `{ all: true }`. Otherwise an orchestrator is included
+ * only if it or one of its agents/workers matches, carrying exactly the matched agent ids and
+ * worker instanceIds; one with no matches is omitted (branch pruned, no request issued).
  */
 export function resolveSelection(
   topology: FleetTopology,
@@ -61,8 +51,8 @@ export function resolveSelection(
   const matches = (node: FleetTopologyNode): boolean =>
     selectors.some((s) => selectorMatchesNode(s, node));
 
-  // An orchestrator is selected wholesale when it (or its hostname) matches a
-  // selector directly. Otherwise only its individually-matched children count.
+  // Wholesale when the orchestrator (or its hostname) matches directly; else only matched
+  // children count.
   for (const o of orchestrators) {
     const childAgents = topology.nodes.filter((n) => n.kind === 'agent' && n.parentId === o.id);
     const childWorkers = orchestrators.filter((n) => n.role === 'worker' && n.parentId === o.id);

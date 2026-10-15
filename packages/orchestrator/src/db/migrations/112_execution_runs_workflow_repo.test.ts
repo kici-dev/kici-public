@@ -3,12 +3,11 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './112_execution_runs_workflow_repo.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 112: asserts the authoring-repository
- * column exists on `execution_runs` as a nullable text column after migrations
- * 001..112, that it round-trips, and that up/down are idempotent. Gated on
+ * Real-Postgres test for migration 112: the `execution_runs` authoring-repository column is
+ * nullable text, round-trips, and up/down are idempotent. Gated on
  * `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
@@ -71,9 +70,8 @@ describeDb('migration 112_execution_runs_workflow_repo', () => {
   it('adds the nullable text authoring-repository column', async () => {
     const state = await columnState('execution_runs', COLUMN);
     expect(state.exists, `${COLUMN} should exist`).toBe(true);
-    // Nullable is the whole design: a null means "the run acted on the
-    // repository that defines its workflow", which is every per-repository run
-    // and every row written before this column existed.
+    // NULL means "the run acted on its workflow's own repository": every per-repository run and
+    // every row written before this column existed.
     expect(state.nullable, `${COLUMN} should be nullable`).toBe(true);
     expect(state.dataType, `${COLUMN} should be text`).toBe('text');
   });

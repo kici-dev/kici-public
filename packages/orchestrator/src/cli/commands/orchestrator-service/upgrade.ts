@@ -1,20 +1,11 @@
 /**
- * `kici-admin orchestrator upgrade` command.
+ * `kici-admin orchestrator upgrade`: versioned directory layout. The new version
+ * is extracted beside the old ones (kept for rollback) and the symlink (Unix) or
+ * service registration (Windows) is switched atomically.
  *
- * Upgrades the orchestrator using the versioned directory layout:
- * - Extracts new version alongside old versions
- * - Updates symlink (Unix) or service registration (Windows) atomically
- * - Preserves old versions for rollback
- * - Supports --cleanup and --rollback flags
- *
- * Targeting is folder-anchored: the resolution priority is
- *   1. `--instance-dir <path>`
- *   2. `--name <name>`
- *   3. CWD manifest (`./.kici-orchestrator.json`)
- *   4. otherwise refuses with a candidate-list error.
- *
- * `--name` no longer has a default — every invocation must resolve via one
- * of the above paths.
+ * Targeting is folder-anchored, in priority order: `--instance-dir`, `--name`
+ * (no default), the CWD manifest (`./.kici-orchestrator.json`); otherwise it
+ * refuses with a candidate list.
  */
 
 import type { Command } from 'commander';
@@ -70,6 +61,10 @@ export function registerUpgradeCommand(
       "On a rollback whose database is ahead, revert the schema to the target version's " +
         'recorded head first, through the still-running newer service',
     )
+    .option(
+      '--skip-binary-path-check',
+      'Upgrade even when a bare-metal scaler binaryPath is not an executable kici-agent (missing, not executable, or a version-manager shim); the restarted service will not start until it is fixed',
+    )
     .option('--node-mirror <url>', 'nodejs.org mirror override for the agent package build')
     .option('--npm-registry <url>', 'npm registry override for the agent package build')
     .action(
@@ -95,20 +90,18 @@ export function registerUpgradeCommand(
         agentPackagePlatforms?: string;
         nodeMirror?: string;
         npmRegistry?: string;
+        skipBinaryPathCheck?: boolean;
       }) => {
-        // Commander turns `--no-drain` into `drain: false`; the shared options
-        // carry the negative form, so translate rather than duplicating the flag.
+        // Commander turns `--no-drain` into `drain: false`; the shared options take `noDrain`.
         await performVersionedUpgrade(
           'orchestrator',
           { ...opts, noDrain: opts.drain === false },
           buildUpgradeHooks(tryGetClient),
         );
-        // Auto-package hook (C9): a version-changing upgrade must refresh the
-        // fleet's available agent payloads so the convergence gate finds bytes
-        // for the new version. --rollback/--cleanup/--pick don't advance the
-        // running version, so packaging then is an idempotent no-op (the version
-        // is already present) — safe to always attempt. --no-agent-packages
-        // opts out for operators who publish payloads out-of-band.
+        // A version-changing upgrade refreshes the fleet's agent payloads so the
+        // convergence gate finds bytes for the new version. For --rollback,
+        // --cleanup and --pick it is an idempotent no-op, so it always runs.
+        // --no-agent-packages is for operators who publish payloads out-of-band.
         if (opts.agentPackages === false) return;
         try {
           await runAgentPackageRefresh({
@@ -119,7 +112,6 @@ export function registerUpgradeCommand(
             ...(opts.npmRegistry ? { npmRegistry: opts.npmRegistry } : {}),
           });
         } catch (err) {
-          // Non-fatal to the (already-completed) orchestrator upgrade.
           console.error(
             `[agent package refresh] failed (orchestrator upgrade itself succeeded): ${toErrorMessage(err)}`,
           );

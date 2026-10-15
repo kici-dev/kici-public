@@ -1,12 +1,9 @@
 /**
- * Heartbeat monitor for agent WebSocket connections.
- *
- * Periodically inspects all registered agents and:
- * - Logs warnings for agents past the unhealthy threshold (90s).
+ * Heartbeat monitor for agent WebSocket connections:
+ * - Logs (info level) agents past the unhealthy threshold (90s).
  * - Forcibly disconnects agents past the disconnect threshold (180s).
  *
- * Follows the same pattern as the Platform's heartbeat monitor, for
- * consistency across the three-tier architecture.
+ * Mirrors the Platform's heartbeat monitor.
  */
 
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
@@ -29,10 +26,8 @@ interface AgentHeartbeatMonitorDeps {
 }
 
 /**
- * Periodically inspects all registered agent connections and:
- * - Marks agents as unhealthy after 90s of silence (log only).
- * - Triggers dispatcher.onAgentDisconnect for an agent silent for 180s, then
- *   unregisters it and closes its socket.
+ * An agent silent for 90s is unhealthy (log only). One silent for 180s gets
+ * dispatcher.onAgentDisconnect, then is unregistered and its socket closed.
  */
 export class AgentHeartbeatMonitor {
   private readonly registry: AgentRegistry;
@@ -50,21 +45,17 @@ export class AgentHeartbeatMonitor {
     this.checkIntervalMs = deps.checkIntervalMs ?? 30_000;
   }
 
-  /** Start the periodic heartbeat check. */
   start(): void {
-    if (this.interval) return; // already running
+    if (this.interval) return;
     this.interval = setInterval(() => this.check(), this.checkIntervalMs);
   }
 
-  /** Stop the periodic heartbeat check. */
   stop(): void {
     if (this.interval) {
       clearInterval(this.interval);
       this.interval = null;
     }
   }
-
-  // ── Internal ─────────────────────────────────────────────────────
 
   private check(): void {
     const now = Date.now();
@@ -73,17 +64,15 @@ export class AgentHeartbeatMonitor {
       const elapsed = now - entry.lastHeartbeatAt;
 
       if (elapsed > this.disconnectThresholdMs) {
-        // Agent is stale -- triage its jobs, unregister, then close
         logger.warn('Closing stale agent connection', {
           agentId: entry.agentId,
           elapsedMs: elapsed,
         });
 
-        // The dispatcher reads the registration before its first await, so the
-        // triage starts first. The unregister right after removes the agent at
-        // once, so the socket's close finds no registration: it tears the agent
-        // down as dropped (`heartbeat-timeout` for an event scaler) and does
-        // not triage its jobs a second time.
+        // Ordering: the dispatcher reads the registration before its first await, so
+        // triage starts first. Unregistering right after means the socket's close finds
+        // no registration: it tears the agent down as dropped (`heartbeat-timeout` for an
+        // event scaler) and does not triage its jobs a second time.
         this.dispatcher.onAgentDisconnect(entry.agentId).catch((err) => {
           logger.error('Error handling stale agent disconnect', {
             agentId: entry.agentId,
@@ -96,7 +85,6 @@ export class AgentHeartbeatMonitor {
 
         setAgentsActive(this.registry.getActiveCount());
       } else if (elapsed > this.unhealthyThresholdMs) {
-        // Agent is unhealthy but not stale yet -- log only
         logger.info('Agent connection unhealthy', {
           agentId: entry.agentId,
           elapsedMs: elapsed,

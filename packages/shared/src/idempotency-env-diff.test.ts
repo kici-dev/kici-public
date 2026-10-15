@@ -112,8 +112,6 @@ describe('diffEnvFiles', () => {
       'BBB=old\nAAA=val\nDDD=val\nEEE_GONE=val\n',
     );
     const order = out.map((e) => `${e.kind}:${e.key}`);
-    // added group first (CCC_NEW), then changed (BBB), then removed (EEE_GONE),
-    // then unchanged alpha (AAA, DDD).
     expect(order).toEqual([
       'added:CCC_NEW',
       'changed:BBB',

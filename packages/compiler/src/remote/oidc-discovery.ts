@@ -1,12 +1,11 @@
 import { toErrorMessage } from '@kici-dev/core';
 
 /**
- * Endpoints the CLI's OAuth flows need from an OIDC IdP. A subset of the
- * full OIDC Provider Metadata schema (RFC 8414 / OpenID Connect Discovery
- * 1.0) — we only consume what `pkceFlow` / `deviceFlow` actually call.
+ * The subset of OIDC Provider Metadata (RFC 8414 / OpenID Connect Discovery
+ * 1.0) that `pkceFlow` / `deviceFlow` call.
  */
 export interface OidcDiscoveryEndpoints {
-  /** Issuer claim — used for sanity-checking the discovery document. */
+  /** For sanity-checking the discovery document. */
   issuer: string;
   /** RFC 6749 authorization endpoint (PKCE). */
   authorization_endpoint: string;
@@ -18,30 +17,19 @@ export interface OidcDiscoveryEndpoints {
 
 const cache = new Map<string, OidcDiscoveryEndpoints>();
 
-/**
- * Test-only escape hatch. Clears the per-process cache so a subsequent
- * `discoverOidcEndpoints` call re-fetches the metadata document.
- */
+/** Test-only: clears the per-process cache. */
 export function resetDiscoveryCache(): void {
   cache.clear();
 }
 
 /**
- * Fetch and parse the OIDC Provider Metadata document for an issuer URL,
- * then return the endpoints the CLI needs. Cached per-process so a `kici
- * login` invocation makes at most one discovery round-trip.
+ * Cached per-process, so a `kici login` makes at most one discovery
+ * round-trip. The issuer is a base URL: trailing slashes are stripped and
+ * `/.well-known/openid-configuration` appended, which fits a realm-scoped
+ * Keycloak issuer (`https://auth.example.com/realms/<realm>`).
  *
- * The issuer is treated as a base URL — trailing slashes are stripped and
- * `/.well-known/openid-configuration` is appended. This works for the two
- * IdP shapes the CLI authenticates against:
- *
- *   - Keycloak: issuer = `https://auth.example.com/realms/<name>` (path-segment).
- *   - Keycloak: issuer = `https://auth.example.com/realms/<realm>`
- *     (realm-scoped — discovery lives at `<issuer>/.well-known/...`).
- *
- * Throws with an actionable message if discovery is unreachable (DNS,
- * connection refused, TLS handshake), returns a non-2xx status, fails to
- * parse as JSON, or omits any of the four required fields.
+ * Throws with an actionable message when discovery is unreachable, returns a
+ * non-2xx status, is not JSON, or omits a required field.
  */
 export async function discoverOidcEndpoints(issuer: string): Promise<OidcDiscoveryEndpoints> {
   const base = issuer.trim().replace(/\/+$/, '');

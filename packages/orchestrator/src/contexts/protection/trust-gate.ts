@@ -15,7 +15,6 @@ export function evaluateTrustGate(
   env: Context,
   trustTier: TrustTier | undefined,
 ): ProtectionGateResult {
-  // If context has no minimumTrust, pass
   if (!env.minimumTrust) {
     return { action: 'pass' };
   }

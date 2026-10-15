@@ -1,18 +1,13 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add `execution_runs.status_epoch` (integer, NOT NULL, default 0).
+ * Add `execution_runs.status_epoch`: the run's status generation. The tracker raises it each time
+ * a run leaves a terminal status (it failed before an already-dispatched job reported in, and
+ * continues). Every `execution.status` frame carries it, so the Platform keeps a finished run
+ * finished against a late non-terminal frame and still follows a real reopen.
  *
- * The run's status generation. It starts at 0, and the tracker raises it each
- * time a run leaves a terminal status: a run failed before a job it had already
- * dispatched reported in, and the run continues. Every `execution.status` frame
- * carries it, so the Platform can keep a finished run finished against a
- * non-terminal frame that arrives late, and still follow a real reopen.
- *
- * A constant default adds the column without rewriting the table, and every
- * existing row reads 0: none of them was reopened under this counter.
- *
- * Idempotent: guarded on the column's existence, so re-running is a no-op.
+ * The constant default 0 adds the column without a table rewrite; no existing row was reopened
+ * under this counter. Idempotent.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   const check = await sql<{ exists: boolean }>`

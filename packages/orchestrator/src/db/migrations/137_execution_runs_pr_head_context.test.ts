@@ -3,17 +3,16 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './137_execution_runs_pr_head_context.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 137: asserts `head_ref`, `head_repository`
- * and `is_fork` exist on `execution_runs` as nullable columns with no default,
- * and that up/down are idempotent. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres test for migration 137: `head_ref`, `head_repository` and `is_fork` are nullable
+ * on `execution_runs` with no default, and up/down are idempotent. Gated on
+ * `KICI_TEST_ADMIN_DATABASE_URL`.
  *
- * The absence of a default is the load-bearing part. `is_fork` defaulting to
- * `false` would let a lost write read as "this was not a fork", which fails
- * OPEN for any cloud trust policy pinning the claim. NULL means NOT RESOLVED
- * and renders as `'unresolved'`, which fails closed.
+ * No default is load-bearing: `is_fork` defaulting to `false` would read a lost write as "not a
+ * fork", failing OPEN for a cloud trust policy pinning the claim. NULL renders `'unresolved'`
+ * and fails closed.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -121,8 +120,7 @@ describeDb('migration 137_execution_runs_pr_head_context', () => {
       SELECT ref, head_ref, head_repository, is_fork FROM public.execution_runs
        WHERE workflow_name = 'mig137-forkpr'
     `.execute(db);
-    // Same branch NAME on both sides — the collision this column set exists to
-    // break is not distinguishable by ref alone.
+    // Same branch NAME on both sides: the collision is not distinguishable by ref alone.
     expect(r.rows[0]?.ref).toBe('main');
     expect(r.rows[0]?.head_ref).toBe('main');
     expect(r.rows[0]?.head_repository).toBe('attacker/app');

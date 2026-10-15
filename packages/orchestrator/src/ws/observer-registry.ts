@@ -1,13 +1,8 @@
 /**
- * Registry tracking active WebSocket observers per execution run.
- *
- * Multiple CLI clients can subscribe to observe the same run.
- * The registry handles:
- * - Per-run observer sets with subscribe/unsubscribe
- * - Broadcast of messages (log, step, status, complete) to all observers
- * - Message buffering with monotonic sequence numbers for reconnection backfill
- * - Automatic cleanup of closed/errored connections during broadcast
- * - TTL-based buffer cleanup after run completion
+ * Per-run registry of WebSocket observers (several CLI clients may observe one
+ * run). Messages carry a monotonic per-run sequence and are buffered for
+ * reconnection backfill; closed connections are dropped on broadcast, and a
+ * completed run's buffer is reclaimed after a TTL.
  */
 
 import { createLogger } from '@kici-dev/shared';
@@ -15,15 +10,14 @@ import type { WsLike } from '@kici-dev/engine';
 
 const logger = createLogger({ prefix: 'observer-registry' });
 
-/** Maximum number of messages to buffer per run for reconnection backfill. */
+/** Messages buffered per run for reconnection backfill. */
 const BUFFER_SIZE = 1000;
 
-/** How long to keep buffers after run completion (ms). */
-const COMPLETION_BUFFER_TTL_MS = 5 * 60 * 1000; // 5 minutes
+/** How long a buffer outlives run completion. */
+const COMPLETION_BUFFER_TTL_MS = 5 * 60 * 1000;
 
 export type ObserverWsLike = WsLike;
 
-/** An active observer connection. */
 interface ObserverConnection {
   ws: ObserverWsLike;
   runId: string;
@@ -31,33 +25,23 @@ interface ObserverConnection {
   subscribedAt: number;
 }
 
-/** A buffered message with its sequence number. */
 interface BufferedMessage {
   sequence: number;
   data: string;
 }
 
 export class ObserverRegistry {
-  /** Per-run observer sets. */
   private readonly observers = new Map<string, Set<ObserverConnection>>();
 
-  /** Per-run message buffers for reconnection backfill. */
   private readonly buffers = new Map<string, BufferedMessage[]>();
 
-  /** Monotonic sequence counter per run. */
   private readonly sequenceCounters = new Map<string, number>();
 
-  /** Scheduled buffer cleanup timers (for cancellation on new subscribe). */
+  /** Pending buffer cleanups, cancelled when a new observer subscribes. */
   private readonly cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  /**
-   * Subscribe an observer to a run.
-   *
-   * If `lastSeenSequence` is provided, buffered messages with sequence > lastSeenSequence
-   * are replayed to the observer immediately.
-   */
+  /** Replays buffered messages with sequence > `lastSeenSequence` when it is given. */
   subscribe(runId: string, ws: ObserverWsLike, lastSeenSequence?: number): void {
-    // Cancel any pending buffer cleanup since we have a new observer
     const existingTimer = this.cleanupTimers.get(runId);
     if (existingTimer !== undefined) {
       clearTimeout(existingTimer);
@@ -85,7 +69,6 @@ export class ObserverRegistry {
       lastSeenSequence: lastSeenSequence ?? 'none',
     });
 
-    // Backfill missed messages if lastSeenSequence provided
     if (lastSeenSequence !== undefined && lastSeenSequence > 0) {
       const buffer = this.buffers.get(runId);
       if (buffer) {
@@ -96,7 +79,7 @@ export class ObserverRegistry {
               ws.send(msg.data);
             }
           } catch {
-            // Connection failed during backfill -- will be cleaned up on next broadcast
+            // The next broadcast drops the failed connection.
             logger.warn('Failed to backfill observer', { runId, sequence: msg.sequence });
           }
         }
@@ -110,12 +93,7 @@ export class ObserverRegistry {
     }
   }
 
-  /**
-   * Unsubscribe an observer from a run.
-   *
-   * If the observer set becomes empty, the buffer is kept alive
-   * for potential reconnection (TTL-based cleanup happens later).
-   */
+  /** The buffer outlives an empty observer set, for reconnection. */
   unsubscribe(runId: string, ws: ObserverWsLike): void {
     const observerSet = this.observers.get(runId);
     if (!observerSet) return;
@@ -138,24 +116,17 @@ export class ObserverRegistry {
   }
 
   /**
-   * Broadcast a message object to all observers of a run.
-   *
-   * The message is serialized once, sent to all observers, and added to the
-   * run's buffer with a monotonic sequence number. Closed/errored connections
-   * are removed during broadcast.
+   * Serialize once, stamp a monotonic sequence, buffer, and send to every
+   * observer; closed or erroring connections are removed.
    */
   broadcast(runId: string, message: object): void {
-    // Assign sequence number
     const seq = this.nextSequence(runId);
 
-    // Add sequence to message for client tracking
     const messageWithSeq = { ...message, sequence: seq };
     const data = JSON.stringify(messageWithSeq);
 
-    // Buffer the message
     this.addToBuffer(runId, seq, data);
 
-    // Send to all observers
     const observerSet = this.observers.get(runId);
     if (!observerSet || observerSet.size === 0) return;
 
@@ -173,7 +144,6 @@ export class ObserverRegistry {
       }
     }
 
-    // Clean up closed/errored connections
     for (const conn of toRemove) {
       observerSet.delete(conn);
       logger.debug('Removed closed observer connection', { runId });
@@ -184,9 +154,6 @@ export class ObserverRegistry {
     }
   }
 
-  /**
-   * Convenience: broadcast a log chunk message.
-   */
   broadcastLog(
     runId: string,
     jobId: string,
@@ -207,9 +174,6 @@ export class ObserverRegistry {
     });
   }
 
-  /**
-   * Convenience: broadcast a step lifecycle event.
-   */
   broadcastStep(
     runId: string,
     jobId: string,
@@ -230,9 +194,6 @@ export class ObserverRegistry {
     });
   }
 
-  /**
-   * Convenience: broadcast a run status change.
-   */
   broadcastStatus(runId: string, status: string, jobName?: string): void {
     this.broadcast(runId, {
       type: 'observe.status',
@@ -243,12 +204,7 @@ export class ObserverRegistry {
     });
   }
 
-  /**
-   * Convenience: broadcast run completion with summary.
-   *
-   * After broadcasting, schedules buffer cleanup after COMPLETION_BUFFER_TTL_MS
-   * to allow brief reconnection windows.
-   */
+  /** Schedules buffer cleanup after COMPLETION_BUFFER_TTL_MS, a brief reconnection window. */
   broadcastComplete(runId: string, status: string, summary: object): void {
     this.broadcast(runId, {
       type: 'observe.complete',
@@ -258,7 +214,6 @@ export class ObserverRegistry {
       timestamp: Date.now(),
     });
 
-    // Schedule buffer cleanup after TTL
     const timer = setTimeout(() => {
       this.buffers.delete(runId);
       this.sequenceCounters.delete(runId);
@@ -266,31 +221,23 @@ export class ObserverRegistry {
       logger.debug('Buffer cleaned up after completion TTL', { runId });
     }, COMPLETION_BUFFER_TTL_MS);
 
-    // Store timer for potential cancellation (if observer re-subscribes)
     this.cleanupTimers.set(runId, timer);
   }
 
-  /**
-   * Get the number of active observers for a run.
-   */
   getObserverCount(runId: string): number {
     return this.observers.get(runId)?.size ?? 0;
   }
 
-  /**
-   * Check if a run has any active observers.
-   */
   hasObservers(runId: string): boolean {
     const set = this.observers.get(runId);
     return set !== undefined && set.size > 0;
   }
 
   /**
-   * Remove all buffers for completed runs.
-   * Call periodically or on shutdown to reclaim memory.
+   * Drop every run's buffer, sequence counter, pending cleanup timer and
+   * observer set, active runs included. Call on shutdown.
    */
   cleanup(): void {
-    // Clear all cleanup timers
     for (const timer of this.cleanupTimers.values()) {
       clearTimeout(timer);
     }
@@ -300,21 +247,15 @@ export class ObserverRegistry {
     this.observers.clear();
   }
 
-  /**
-   * Get the current sequence number for a run (for testing).
-   */
+  /** For tests. */
   getCurrentSequence(runId: string): number {
     return this.sequenceCounters.get(runId) ?? 0;
   }
 
-  /**
-   * Get the buffer size for a run (for testing).
-   */
+  /** For tests. */
   getBufferSize(runId: string): number {
     return this.buffers.get(runId)?.length ?? 0;
   }
-
-  // ── Private helpers ────────────────────────────────────────────────
 
   private nextSequence(runId: string): number {
     const current = this.sequenceCounters.get(runId) ?? 0;
@@ -332,7 +273,6 @@ export class ObserverRegistry {
 
     buffer.push({ sequence, data });
 
-    // Cap buffer at BUFFER_SIZE
     if (buffer.length > BUFFER_SIZE) {
       buffer.splice(0, buffer.length - BUFFER_SIZE);
     }

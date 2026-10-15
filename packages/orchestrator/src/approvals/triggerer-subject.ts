@@ -2,14 +2,13 @@
  * Map a persisted `execution_runs.triggered_by` onto the subject vocabulary
  * `applyDecision` compares an approver against.
  *
- * `applyDecision` refuses an approve when `actorSub === triggererSub`, so the
- * two have to be written in the SAME vocabulary or the self-approval gate is
- * inert — it compares two strings that can never be equal and lets every
- * approve through, including one cast by the actor who triggered the run.
+ * `applyDecision` refuses an approve when `actorSub === triggererSub`, so both
+ * must be in the SAME vocabulary, or the self-approval gate compares strings
+ * that can never be equal and admits the actor who triggered the run.
  *
- * They are not the same vocabulary by default. `triggered_by` is
- * `stringifyActor`'s output; the approving surfaces render a live actor
- * differently per type. Three shapes diverge and each is handled below.
+ * By default they differ: `triggered_by` is `stringifyActor`'s output, while the
+ * approving surfaces render a live actor differently per type. Each diverging
+ * shape is handled below.
  */
 import { ACTOR_AGENT_SUFFIX, ActorType } from '@kici-dev/engine';
 
@@ -38,19 +37,17 @@ export function adminActorSub(tokenUserId: string): string {
  * | anything else | unchanged | no other actor type reaches these surfaces |
  *
  * The agent suffix is stripped first. `stringifyActor` renders a `user` or
- * `api_key` who acted through an agent as `user:<sub> via agent:<label>`, and a
- * reader splitting on the first colon gets `<sub> via agent:<label>` — which
- * matches no live subject, so the gate was inert for every agent-mediated
- * trigger. That is the `user` case, i.e. the common one.
+ * `api_key` who acted through an agent as `user:<sub> via agent:<label>`, and
+ * splitting on the first colon alone gives `<sub> via agent:<label>`, which
+ * matches no live subject and leaves the gate inert for every agent-mediated
+ * trigger — the common `user` case.
  *
  * **Residual: `api_key`.** A key's persisted identifier is its `keyId`, while
  * both surfaces render a live `api_key` actor as its owner's Keycloak subject
- * (`ownerSub`). Those are different identifiers for the same principal and no
- * string transform bridges them — closing it needs a keyId → ownerSub lookup,
- * which is a store this pure function does not have. So an owner approving a
- * hold on a run their own key triggered is still admitted. Recorded rather than
- * papered over: returning the bare keyId is at least honest about what was
- * stored.
+ * (`ownerSub`). No string transform bridges them; closing it needs a keyId →
+ * ownerSub lookup, a store this pure function lacks. So an owner approving a
+ * hold on a run their own key triggered is still admitted. Returning the bare
+ * keyId is at least honest about what was stored.
  */
 export function triggererSubjectFor(triggeredBy: string | null | undefined): string | undefined {
   if (!triggeredBy) return undefined;

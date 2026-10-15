@@ -1,11 +1,9 @@
 /**
  * Re-run of an organization-wide run that executed against another repository.
  *
- * The workflow is resolved from the repository that DEFINES it, at the commit
- * the run recorded, and dispatched through the same pipeline a first global run
- * uses. The per-repository re-run would resolve it out of the source
- * repository's lock file instead, and so either fail or run a same-named
- * workflow of that repository.
+ * The workflow is resolved from the repository that DEFINES it, at the recorded
+ * commit. The per-repository re-run would read the source repository's lock
+ * file instead, and either fail or run that repository's same-named workflow.
  */
 import { createLogger, toErrorMessage, type DepCacheKey } from '@kici-dev/shared';
 import {
@@ -82,15 +80,14 @@ interface GlobalRerunPlan {
  * Re-run an organization-wide run against the commits it recorded: the source
  * repository at `sha`, and the workflow repository at `workflow_sha`.
  *
- * The workflow is read from the workflow repository's lock file at the recorded
- * commit, through that repository's registration — its provider bundle and
- * provider context — never from the registration's current lock entry, which
- * may have moved on. The run goes through the same pipeline a first global run
- * does, so contexts, holds, approval gates, and the workflow repository's
- * credentials apply exactly as they did.
+ * The workflow is read through the workflow repository's registration (provider
+ * bundle and context) from its lock file at the recorded commit, never from the
+ * registration's current lock entry. It dispatches through the first-run global
+ * pipeline, so contexts, holds, approval gates and the workflow repository's
+ * credentials apply as they did.
  *
  * Refuses, naming the workflow repository, when the run recorded no workflow
- * commit or the workflow is no longer registered there. Nothing falls back to a
+ * commit or the workflow is no longer registered there; nothing falls back to a
  * current lock file.
  */
 export async function rerunCrossRepoGlobalRun(opts: {
@@ -157,9 +154,9 @@ export async function rerunCrossRepoGlobalRun(opts: {
     lockFileSource: undefined,
     localWorkingTree: false,
     crossSource: false,
-    // The caller is authorized to re-run, which is the same decision an
-    // approval makes; a per-repository re-run passes no trust-policy gate
-    // either. Context rules and `approval` gates still hold the run.
+    // Authorization to re-run is the decision an approval makes, so like a
+    // per-repository re-run this passes no trust-policy gate. Context rules and
+    // `approval` gates still hold the run.
     securityDecision: RELEASED_DECISION,
     triggerEventOverride: 'rerun',
     triggeredBy,
@@ -245,10 +242,9 @@ async function planCrossRepoGlobalRerun(
     deps,
     refusal,
   );
-  // Minted before the request-id claim, although it is not read-only: a failed
-  // mint must refuse on both hops of a failover re-send, and one after the claim
-  // would answer the second hop with a run that never dispatched. A minted token
-  // no dispatch uses expires unused.
+  // Minted before the request-id claim, though not read-only: a failed mint must
+  // refuse on both hops of a failover re-send, and one after the claim would
+  // answer the second hop with a run that never dispatched. An unused token expires.
   const workflowCredentials = await mintWorkflowRepoCredentials(workflowBundle, registration);
 
   const payload = await loadWebhookPayload(originalRun.run_id, deps);
@@ -292,9 +288,8 @@ async function planCrossRepoGlobalRerun(
     global: {
       workflowRepoIdentifier: registration.repoIdentifier,
       workflowSha,
-      // The branch the run recorded, or none: a guessed branch would present a
-      // branch-restricted context with a value nobody recorded, and none makes
-      // such a context refuse.
+      // The recorded branch or none, never a guess: none makes a
+      // branch-restricted context refuse.
       workflowBranch: originalRun.workflow_branch,
       workflowRoutingKey: registration.routingKey,
       workflowProviderContext: registration.providerContext,
@@ -326,12 +321,10 @@ async function loadRerunChainRoot(
 /**
  * The workflow repository's registration of the run's workflow.
  *
- * It supplies what the lock-file fetch and the dispatch need — the routing key
- * and provider context — and it is the proof that the workflow is still
- * offered: a deleted, disabled, or policy-refused registration refuses the
- * re-run. Whether the workflow is organization-wide is judged from its entry at
- * the recorded commit (`globalRerunWorkflow`), the rule the held-round release
- * uses too.
+ * It supplies the routing key and provider context, and proves the workflow is
+ * still offered: a deleted, disabled, or policy-refused registration refuses
+ * the re-run. Whether it is organization-wide is judged at the recorded commit
+ * (`globalRerunWorkflow`), as the held-round release does.
  */
 async function resolveGlobalRerunRegistration(
   originalRun: OriginalRunRow,
@@ -378,11 +371,10 @@ async function resolveGlobalRerunRegistration(
 }
 
 /**
- * The workflow as the run ran it: the workflow repository's lock entry at the
- * recorded commit, with the static jobs a re-run dispatches. Like a
- * per-repository re-run, it repeats the declared static jobs and does not
- * replay jobs a generator produced. Returned with the dependency-cache key of
- * that commit's lock file, which the re-run's build job checks out.
+ * The workflow as the run ran it: the lock entry at the recorded commit,
+ * limited to its declared static jobs (generator-produced jobs are not
+ * replayed, as in a per-repository re-run), plus that lock file's
+ * dependency-cache key, which the re-run's build job checks out.
  */
 async function globalRerunWorkflow(
   registration: RegisteredWorkflow,

@@ -629,7 +629,6 @@ describe('CronScheduler', () => {
 
       scheduler.onLoseLeadership();
 
-      // Advance time past evaluation interval
       vi.advanceTimersByTime(60_000);
 
       // Should NOT evaluate -- no longer leader
@@ -639,7 +638,6 @@ describe('CronScheduler', () => {
 
       vi.advanceTimersByTime(60_000);
 
-      // Should still be the same number of calls
       expect(registrationIndex.getCronSchedules.mock.calls.length).toBe(callsAfterLoss);
       expect(eventRouter.emitInTx).not.toHaveBeenCalled();
     });
@@ -657,7 +655,6 @@ describe('CronScheduler', () => {
         eventRouter,
       });
 
-      // Become leader then lose leadership
       await scheduler.onBecomeLeader();
       eventRouter.emitInTx.mockClear();
       registrationIndex.getCronSchedules.mockClear();
@@ -795,7 +792,6 @@ describe('CronScheduler', () => {
       await scheduler.onBecomeLeader();
       cronStore.getAll.mockClear();
 
-      // Refresh cache with new data
       const refreshedCache = new Map([
         [cronCacheKey('reg-deploy', DEFAULT_KEY), new Date('2026-02-25T10:05:00.000Z')],
       ]);
@@ -865,7 +861,6 @@ describe('CronScheduler', () => {
 
       // tryClaimFire was called but returned false (another node won the race)
       expect(cronStore.tryClaimFire).toHaveBeenCalledTimes(1);
-      // Event should NOT have been emitted
       expect(eventRouter.emitInTx).not.toHaveBeenCalled();
 
       scheduler.stop();

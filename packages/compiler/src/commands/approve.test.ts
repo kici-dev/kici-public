@@ -163,15 +163,10 @@ describe('rejectCommand', () => {
 });
 
 /**
- * A job carrying an SDK `requireApproval` AND a security-typed context gate has
- * TWO pending job-scoped holds under one job name — two independent
- * requirements, both of which must be answered. `--job` cannot separate them,
- * so both commands were dead ends for that shape: every error path named a
- * disambiguator the CLI did not register and the candidate list had already
- * collapsed the information for.
- *
- * These drive the real commands end to end, so they cover the option plumbing
- * (`--hold-type` / `--hold` → the resolver filter) and not only the resolver.
+ * An SDK `requireApproval` plus a security-typed context gate puts TWO pending
+ * job-scoped holds, both to be answered, under one job name, and `--job` cannot
+ * separate them. These drive the real commands end to end, so they cover the
+ * option plumbing (`--hold-type` / `--hold` → the resolver filter) too.
  */
 describe('approve / reject with two holds on one job', () => {
   const reviewer: HeldRunSummary = { ...jobHold, id: 'held-reviewer', holdType: 'reviewer' };
@@ -223,16 +218,14 @@ describe('approve / reject with two holds on one job', () => {
   });
 
   it('offers a usable disambiguator when --job alone cannot choose', async () => {
-    // The dead end: the old message said "cannot disambiguate" and then pointed
-    // at `--job`, the filter that had just failed, above a candidate list that
-    // had de-duplicated the two rows into one entry.
+    // The error must not point back at `--job`, the filter that just failed, nor
+    // collapse the two rows into one candidate.
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce({ ok: true, json: async () => ({ heldRuns: [reviewer, security] }) });
     vi.stubGlobal('fetch', fetchMock);
 
     expect(await approveCommand('run-1', { job: 'deploy' })).toBe(false);
-    // No decision POST — only the list call.
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const printed = logOutput.join('\n');
     expect(printed).toContain('--hold-type <type>');

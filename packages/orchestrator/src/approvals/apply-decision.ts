@@ -1,31 +1,21 @@
 /**
- * Shared approve/reject applier — the single code path behind both the
- * dashboard WS handler and the `kici` CLI HTTP route, so the authorization +
- * resume story is identical regardless of the surface.
+ * Shared approve/reject applier — the single path behind the dashboard WS
+ * handler and the `kici` CLI HTTP route, so authorization and resume are
+ * identical on both surfaces.
  *
- * Flow for an approve:
- *   1. Load the hold + its recorded decisions.
- *   2. Build the team-membership lookup and run `canApprove` (eligibility +
- *      self-approval gate). Ineligible actors are rejected with a clear reason.
- *   3. Record the decision in `held_run_approvals`.
- *   4. Re-evaluate. If all clauses are satisfied, `release()` the hold and
- *      resume the element (re-dispatch for job/workflow; the agent bridge for
- *      step scope — wired by the caller via `onStepRelease`).
- *
- * A reject records the decision and `reject()`s the hold (failing the element).
+ * An approve runs `canApprove` (eligibility + self-approval gate), records the
+ * decision in `held_run_approvals`, and when every clause is satisfied releases
+ * the hold and resumes the element (re-dispatch for job/workflow; the caller's
+ * `onStepRelease` agent bridge for step scope). A reject records the decision
+ * and rejects the hold, failing the element.
  *
  * **A decision answers at its durable record, not at its consequence.** The
- * transaction that flips the hold row — `recordAndRelease` for the satisfying
- * approve, `recordAndReject` for the reject — is the commit point AND the
- * serialization point: both are `WHERE status = 'pending'`, so a second decider
- * loses there, not at the answer. Everything that follows is consequence, and
- * its cost is unbounded: releasing a workflow-scoped hold replays the whole
- * stored dispatch context (re-evaluating triggers, re-fetching the lock file,
- * re-routing jobs), and rejecting one completes a provider check run per job the
- * held dispatch had queued. So the applier returns as soon as the decision is
- * durable and hands the consequence back as `ApplyDecisionResult.consequence` —
- * started, never awaited, and never rejecting. Callers with a waiting HTTP or
- * relay client answer immediately; the reasons are in that field's own doc.
+ * transaction that flips the hold row (`recordAndRelease` / `recordAndReject`)
+ * is the commit AND serialization point: both are `WHERE status = 'pending'`,
+ * so a second decider loses there. The consequence's cost is unbounded
+ * (a workflow release replays the whole stored dispatch context; a reject
+ * completes a provider check run per queued job), so it comes back as
+ * `ApplyDecisionResult.consequence` — started, never awaited, never rejecting.
  */
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import {
@@ -50,14 +40,11 @@ import {
 const logger = createLogger({ prefix: 'apply-decision' });
 
 /**
- * The access-log action a held-run decision is audited under.
- *
- * A `kici run --approve-all` breakglass approval audits as
- * `held_run.auto_approve`, so the trail shows "auto-approved by the dispatcher"
- * apart from an interactive approve. The marker only renames the record:
- * eligibility is enforced the same way for both. It never applies to a reject.
- * Every approving surface takes its action from here, so the Platform-relayed
- * and the direct admin-route approvals cannot audit the same act two ways.
+ * The access-log action a held-run decision is audited under. A
+ * `kici run --approve-all` breakglass approval audits as `held_run.auto_approve`
+ * to set it apart from an interactive approve; eligibility is enforced the same
+ * for both, and a reject never gets it. Every approving surface takes its action
+ * from here, so Platform-relayed and admin-route approvals audit one act one way.
  */
 export function heldRunDecisionAction(
   decision: ApprovalDecision,
@@ -71,17 +58,15 @@ export function heldRunDecisionAction(
 
 /** Whether a decision's post-commit consequence ran to completion. */
 export interface DecisionConsequenceResult {
-  /** True when the whole consequence chain ran; false when a step of it threw. */
+  /** False when a step of the consequence chain threw. */
   ok: boolean;
-  /** The failure message, when `ok` is false. */
   error?: string;
 }
 
 /** Outcome of applying a decision. */
 export interface ApplyDecisionResult {
-  /** Whether the decision was accepted (recorded). */
+  /** Whether the decision was recorded. */
   accepted: boolean;
-  /** Human-readable status: 'released' | 'rejected' | 'pending' | 'ineligible' | 'not-found'. */
   status: 'released' | 'rejected' | 'pending' | 'ineligible' | 'not-found';
   /** When still pending, how many clauses remain unsatisfied. */
   remainingClauses?: number;
@@ -90,26 +75,20 @@ export interface ApplyDecisionResult {
   /** The release signal, when the element was released (for the caller to resume). */
   release?: ReleaseSignal;
   /**
-   * The decision's post-commit consequence — already running, deliberately not
-   * awaited by the applier. Present on `released` and `rejected`, absent on
-   * every outcome that changed nothing (`pending`, `ineligible`, `not-found`).
+   * The post-commit consequence — already running, deliberately not awaited.
+   * Present on `released` and `rejected`; absent when nothing changed.
    *
-   * It NEVER rejects: a throw anywhere in the chain is logged and surfaces as
-   * `{ ok: false, error }`, so a caller may drop it on the floor without
-   * risking an unhandled rejection. A caller that answers a waiting client
-   * answers without awaiting this, and attaches its audit record to it instead
-   * — the record then carries the consequence's real outcome rather than a
-   * guess. A caller that needs the consequence finished before it continues
-   * (a test, a sequential sweep) awaits it.
+   * It NEVER rejects: a throw is logged and surfaces as `{ ok: false, error }`,
+   * so a caller may leave it unawaited. A caller answering a waiting client
+   * answers first and attaches its audit record to this, so the record carries
+   * the real outcome rather than a guess. A test or sequential sweep awaits it.
    *
-   * The consequence is where an approve was spending nine-plus seconds behind a
-   * ten-second relay budget, answering 504 on an approval that had already
-   * landed. It is not a stronger answer for having been awaited: the resume it
-   * runs is the same dispatch the original webhook delivery ran without any
-   * client waiting on it, `dispatchMatchedWorkflow` returning says only that
-   * jobs were routed rather than that any of them ran, and `resumeWorkflow`
-   * already reports its own failures on the run row and on the provider's check
-   * runs rather than through this return value.
+   * Awaiting it made an approve spend nine-plus seconds behind a ten-second
+   * relay budget and answer 504 on an approval that had landed. Awaiting adds no
+   * strength: the resume is the same dispatch the original webhook ran with no
+   * client waiting, `dispatchMatchedWorkflow` returning means only that jobs
+   * were routed, and `resumeWorkflow` reports its own failures on the run row
+   * and the provider's check runs.
    */
   consequence?: Promise<DecisionConsequenceResult>;
 }
@@ -140,34 +119,28 @@ export interface ApplyDecisionDeps {
   onStepReject?: (heldRunId: string, reason?: string) => Promise<void> | void;
   /**
    * Called when a workflow-scoped hold is rejected — cancel the run and drop
-   * the pending workflow context. Carries the whole hold row and the rejecter's
-   * own reason, which becomes the run's cancellation reason: the callers serve
-   * the install gate, the org trust policy's PR-wide hold and the SDK's
-   * workflow-level `requireApproval` alike, so a reason invented at the wiring
-   * site would misattribute one of them.
+   * the pending workflow context. The rejecter's reason becomes the run's
+   * cancellation reason: this serves the install gate, the trust policy's
+   * PR-wide hold and the SDK's workflow `requireApproval` alike, so a reason
+   * invented at the wiring site would misattribute one of them.
    *
-   * The row is what tells those apart — only some of them posted a pending
-   * `KiCI Security` check, and only those have one to complete. Resolves to
-   * whether a terminal security check was WRITTEN, so this applier suppresses
-   * its own post only when one actually landed.
+   * The row tells those apart: only some posted a pending `KiCI Security` check.
+   * Resolves to whether a terminal security check was WRITTEN, so this applier
+   * suppresses its own post only when one landed.
    */
   onWorkflowReject?: (hold: HeldRun, reason?: string) => Promise<boolean>;
   /**
-   * Terminalize the `KiCI Security` check a just-ended hold posted, for every
-   * hold this applier ends that `onWorkflowReject` did not already report.
-   *
-   * Without it a job-scoped security hold answered from the dashboard strands
-   * its check forever: the row leaves `pending`, so the stale detector's
-   * approval-window sweep — which only ever sees pending rows — can no longer
-   * reach it. Optional so an orchestrator with no provider wiring degrades to
+   * Terminalize the `KiCI Security` check of every hold this applier ends that
+   * `onWorkflowReject` did not already report. Without it a job-scoped hold
+   * answered from the dashboard strands its check: the row leaves `pending`, so
+   * the stale detector's pending-only approval-window sweep never reaches it.
+   * Optional so an orchestrator with no provider wiring degrades to
    * flip-and-resume rather than failing the decision.
    *
-   * `actorSub` is the deciding actor's opaque subject id, which is what this
-   * applier has and NOT something a contributor can read. Resolving it to a
-   * display name — or dropping the attribution when it resolves to none — is
-   * the wiring site's job, because only that site holds the org's identity
-   * directory. Omitted entirely where the summary must match one a delegate
-   * built without it; see the reject arm below.
+   * `actorSub` is an opaque subject id a contributor cannot read; the wiring
+   * site resolves it to a display name (or drops it), since only it holds the
+   * org's identity directory. Omitted where the summary must match one a
+   * delegate built without it; see the reject arm below.
    */
   settleSecurityCheck?: (args: {
     hold: HeldRun;
@@ -202,17 +175,15 @@ export async function applyDecision(
   const requirement = normalizeRequirement(hold.approval_requirement);
 
   if (args.decision === ApprovalDecision.enum.reject) {
-    // Atomic: record the reject decision AND flip the hold to rejected in one
-    // transaction, so a crash between the two writes cannot leave an orphaned
-    // reject decision that poisons evaluate() while the hold stays pending.
+    // One transaction, so a crash cannot leave an orphaned reject decision
+    // that poisons evaluate() while the hold stays pending.
     await store.recordAndReject(
       orgId,
       args.heldRunId,
       { approverSub: args.actorSub, decision: ApprovalDecision.enum.reject },
       args.reason,
     );
-    // The reject is durable here; the rest is consequence. See
-    // `ApplyDecisionResult.consequence` for why it is not awaited.
+    // Durable here; see `ApplyDecisionResult.consequence`.
     return {
       accepted: true,
       status: 'rejected',
@@ -234,16 +205,14 @@ export async function applyDecision(
     };
   }
 
-  // Persist which requirement clauses this actor satisfies, so the dashboard
-  // can render per-clause attribution without the team-membership lookup.
+  // Persisted so the dashboard renders per-clause attribution without the
+  // team-membership lookup.
   const clausesSatisfied = requirement.clauses.filter((clause) =>
     isActorEligibleForClause(args.actorSub, clause, teamMembershipLookup),
   );
 
-  // Evaluate the prospective decision set (existing + this approve) in memory.
-  // Only the *satisfying* approve needs the record + release to be atomic; a
-  // non-satisfying approve is a safe lone INSERT (a recorded approve with the
-  // hold still pending is a valid steady state — no orphan to poison anything).
+  // Only the *satisfying* approve needs record + release to be atomic; a
+  // recorded approve with the hold still pending is a valid steady state.
   const prospective: RecordedDecision[] = [
     ...existing,
     { approver_user_id: args.actorSub, decision: 'approve' },
@@ -259,10 +228,8 @@ export async function applyDecision(
     return { accepted: true, status: 'pending', remainingClauses: remaining };
   }
 
-  // Atomic: record the satisfying approve AND release the hold in one
-  // transaction, so a crash between the two writes cannot leave the hold
-  // pending-but-satisfied (which makes canApprove() return false for everyone).
-  // This transaction is the commit point — see `ApplyDecisionResult.consequence`.
+  // One transaction, so a crash cannot leave the hold pending-but-satisfied
+  // (canApprove() then returns false for everyone). The commit point.
   const signal = await store.recordAndRelease(orgId, args.heldRunId, {
     approverSub: args.actorSub,
     decision: ApprovalDecision.enum.approve,
@@ -277,12 +244,9 @@ export async function applyDecision(
 }
 
 /**
- * Run one decision's post-commit consequence, converting any throw into a
- * logged `{ ok: false }`.
- *
- * The returned promise is what `ApplyDecisionResult.consequence` hands back, so
- * it must never reject: its callers are free to leave it unawaited, and an
- * unawaited rejection would take the orchestrator's process down.
+ * Run a post-commit consequence, converting any throw into a logged
+ * `{ ok: false }`. Must never reject: callers may leave it unawaited, and an
+ * unawaited rejection takes the orchestrator process down.
  */
 function runConsequence(
   hold: HeldRun,
@@ -310,13 +274,10 @@ async function approveConsequence(
   signal: ReleaseSignal,
   actorSub: string,
 ): Promise<void> {
-  // BEFORE the resume, not after. A replayed workflow dispatch can hold again
-  // and post its own pending `KiCI Security` status; settling afterwards would
-  // overwrite that pending status with this `success` and show a green security
-  // check over work that is held. In this order the replay's pending post lands
-  // last and wins, which is the true state. Both halves moved out of the
-  // answered path together, so their order — the only thing that reason is
-  // about — is unchanged.
+  // BEFORE the resume: a replayed dispatch can hold again and post its own
+  // pending `KiCI Security` status, which settling afterwards would overwrite
+  // with `success` — a green check over held work. This way the replay's
+  // pending post lands last and wins.
   await deps.settleSecurityCheck?.({
     hold,
     outcome: HoldOutcome.Approved,
@@ -332,28 +293,21 @@ async function rejectConsequence(
   hold: HeldRun,
   args: { heldRunId: string; actorSub: string; reason?: string },
 ): Promise<void> {
-  // Step-scoped rejects must notify the waiting agent so it fails the step
-  // immediately rather than blocking until the hold expires.
+  // A step reject notifies the waiting agent so it fails the step now rather
+  // than blocking until the hold expires.
   let securityCheckWritten = false;
-  // Whether this applier handed the reject to `onWorkflowReject`. The settle
-  // below then stands IN FOR that delegate, which builds its summary with no
-  // actor — so it must render the same sentence rather than a richer one.
-  // Otherwise one reject names its rejecter only on the path where the
-  // delegate happened to throw, which is not a property of the reject.
+  // When the reject went to `onWorkflowReject`, the settle below stands IN FOR
+  // that delegate, which builds its summary with no actor — so it renders the
+  // same sentence, or the rejecter would be named only when the delegate threw.
   let delegatedToWorkflowReject = false;
   if (hold.hold_scope === HoldScope.enum.step) {
     await deps.onStepReject?.(args.heldRunId, args.reason);
   } else if (hold.hold_scope === HoldScope.enum.workflow) {
-    // Workflow-scoped rejects cancel the run and drop the pending context,
-    // and that handler owns the security check of the holds it reports on.
-    //
-    // A throwing delegate leaves `securityCheckWritten` false and falls
-    // through to the settler below, which is the point: the reject has
-    // already landed in the database, and the delegate is the one thing that
-    // would have reported it on the commit. Letting the throw escape here
-    // aborted the whole applier and stranded the hold's pending check — the
-    // same reasoning, and the same handling, as the `/kici reject` handler's
-    // own `.catch` around this call.
+    // That handler owns the security check of the holds it reports on. A
+    // throwing delegate falls through to the settler below: the reject has
+    // landed, and an escaping throw would abort the applier and strand the
+    // pending check — the same handling as the `/kici reject` handler's own
+    // `.catch` around this call.
     delegatedToWorkflowReject = deps.onWorkflowReject !== undefined;
     securityCheckWritten = await Promise.resolve(deps.onWorkflowReject?.(hold, args.reason))
       .then((posted) => posted ?? false)
@@ -366,20 +320,17 @@ async function rejectConsequence(
         return false;
       });
   }
-  // Every other hold this applier rejects — job-scoped above all — has no
-  // delegate to report for it, and its row has just left `pending`, so
-  // nothing downstream will ever see it again. A hold that posted no pending
-  // check declines inside the settler rather than here, so this call cannot
+  // Any other rejected hold (job-scoped above all) has no delegate, and its row
+  // just left `pending`, so nothing downstream sees it again. A hold that
+  // posted no pending check declines inside the settler, so this cannot
   // fabricate one.
   if (!securityCheckWritten) {
     await deps.settleSecurityCheck?.({
       hold,
       outcome: HoldOutcome.Rejected,
-      // Named only where nothing else would have named it. Threading the
-      // actor through `onWorkflowReject` so BOTH paths could name it is a
-      // four-signature change across modules this one does not own; until
-      // that lands, matching the delegate is what makes one reject render one
-      // way.
+      // Named only where nothing else names it. Threading the actor through
+      // `onWorkflowReject` is a four-signature change across modules this one
+      // does not own; matching the delegate keeps one reject rendering one way.
       ...(delegatedToWorkflowReject ? {} : { actorSub: args.actorSub }),
       reason: args.reason,
     });

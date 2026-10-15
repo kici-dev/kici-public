@@ -1,17 +1,14 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add the test-run skipped-environment columns to `execution_jobs`:
+ * Test-run skipped environments on `execution_jobs`:
  *
- * - `execution_jobs.skipped_environments text NULL` — a JSON-encoded `string[]`
- *   of the bound environment names dropped on a test/local run because they
- *   disallow local execution (`allowLocalExecution=false`) or are unconfigured.
- *   NULL = nothing skipped.
- * - `execution_jobs.env_warning text NULL` — the user-visible warning naming the
- *   skipped environments, surfaced on the dashboard run view. NULL = no warning.
+ * - `skipped_environments` — JSON `string[]` of bound environments a test/local run dropped
+ *   (`allowLocalExecution=false` or unconfigured). NULL = nothing skipped.
+ * - `env_warning` — the user-visible warning naming them, on the dashboard run view. NULL = no
+ *   warning.
  *
- * Idempotent (`ADD COLUMN IF NOT EXISTS`); additive, so existing data is
- * preserved.
+ * Idempotent and additive.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.execution_jobs

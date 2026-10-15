@@ -18,17 +18,13 @@ export interface LeaderGatedSchedulerOptions {
   onBecomeLeader?: () => Promise<void> | void;
   /** Whether to unref the interval timer. Default true; pass false to keep the loop alive. */
   unref?: boolean;
-  /**
-   * Logger for the lifecycle + tick-error lines. Pass the owning class's logger so the log
-   * prefix stays that of the scheduler site; defaults to a `leader-gated-scheduler` logger.
-   */
+  /** The owning class's logger, to keep its log prefix; defaults to `leader-gated-scheduler`. */
   logger?: SchedulerLogger;
 }
 
 /**
- * Raft-leader-only periodic scheduler. Encapsulates the become -> (optional async setup) ->
- * start-interval / lose -> stop lifecycle that the orchestrator's leader-gated schedulers share.
- * The interval runs only while this node is the leader. `stop()` is final: no
+ * Raft-leader-only periodic scheduler: become -> (optional async setup) -> start interval;
+ * lose -> stop. The interval runs only while this node is the leader. `stop()` is final: no
  * later leadership change starts another tenure.
  */
 export class LeaderGatedScheduler {
@@ -36,18 +32,13 @@ export class LeaderGatedScheduler {
   private leader = false;
   private readonly logger: SchedulerLogger;
   /**
-   * Monotonic tenure counter. Bumped on every leadership transition
-   * (onBecomeLeader / onLoseLeadership / stop). onBecomeLeader captures its
-   * tenure at entry and re-checks it after the awaited setup: if it changed
-   * during the async setup, leadership was revoked (or superseded by a newer
-   * tenure) mid-flight and this stale tenure must NOT start the interval — that
-   * would leak a timer running tick() while no longer leader.
+   * Monotonic tenure counter, bumped on every leadership transition (onBecomeLeader /
+   * onLoseLeadership / stop). onBecomeLeader re-checks it after the awaited setup: if it
+   * changed, this stale tenure must NOT start the interval, or a timer leaks running tick()
+   * while no longer leader.
    */
   private generation = 0;
-  /**
-   * Set by {@link stop}: the owning process is shutting down, so no later
-   * leadership change starts another tenure.
-   */
+  /** Set by {@link stop}: no later leadership change starts another tenure. */
   private stopped = false;
 
   constructor(private readonly opts: LeaderGatedSchedulerOptions) {
@@ -60,8 +51,6 @@ export class LeaderGatedScheduler {
 
   async onBecomeLeader(): Promise<void> {
     if (this.stopped) return;
-    // Open a new tenure and capture it, so we can detect a leadership change
-    // that lands while the awaited setup below is in flight.
     this.generation += 1;
     const gen = this.generation;
     // Clear any stale timer from a prior tenure (rapid leader transitions can overlap).
@@ -69,18 +58,15 @@ export class LeaderGatedScheduler {
     this.leader = true;
     if (this.opts.onBecomeLeader) await this.opts.onBecomeLeader();
     if (gen !== this.generation) {
-      // Leadership was lost (or superseded by a newer tenure) during the async
-      // setup. Do NOT start the interval — the current leader/timer state is
-      // owned by whichever transition bumped the generation, and starting here
-      // would leak a timer ticking as a non-leader.
+      // Lost or superseded during setup: the transition that bumped the generation owns the
+      // leader/timer state.
       return;
     }
     this.logger.info(`Became leader, starting ${this.opts.name}`, {
       intervalMs: this.opts.intervalMs,
     });
     this.timer = setInterval(() => {
-      // Call tick synchronously (matching the original schedulers, which run their body on the
-      // timer tick and only defer the rejection), catching both a sync throw and an async reject.
+      // tick runs synchronously on the timer; catch both a sync throw and an async reject.
       try {
         const result = this.opts.tick();
         if (result instanceof Promise) {
@@ -96,8 +82,7 @@ export class LeaderGatedScheduler {
   }
 
   onLoseLeadership(): void {
-    // Bump the tenure so any onBecomeLeader still awaiting its setup sees the
-    // change and skips starting the interval.
+    // An onBecomeLeader still awaiting its setup sees the bump and skips the interval.
     this.generation += 1;
     this.leader = false;
     this.clearTimer();
@@ -106,8 +91,7 @@ export class LeaderGatedScheduler {
 
   stop(): void {
     this.stopped = true;
-    // Bump the tenure so an in-flight onBecomeLeader setup does not resurrect a
-    // timer after stop().
+    // An in-flight onBecomeLeader setup must not resurrect a timer after stop().
     this.generation += 1;
     this.clearTimer();
     this.leader = false;

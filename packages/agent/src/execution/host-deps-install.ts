@@ -1,37 +1,27 @@
 /**
- * Install a container job's `.kici/` dependencies on the agent host.
+ * Install a container job's `.kici/` dependencies on the agent host, into the
+ * tree it copies into the container, so the runner finds `.kici/node_modules`
+ * and skips its own install. Without a dependency cache, the in-container
+ * install fails when the registry is reachable from the host only (private, or
+ * resolved only by the host's `/etc/hosts`).
  *
- * A container job's workspace is checked out on the host and then copied into
- * the job container. When the dispatch carries no dependency cache, the runner
- * inside the container installs `.kici/` from the registry — which fails when
- * the registry is reachable from the host but not from the job network (a
- * private registry, or one that only the host's `/etc/hosts` resolves). So the
- * host installs it instead, into the tree it is about to copy in; the runner
- * then finds `.kici/node_modules` and skips its own install.
+ * It runs only when nothing it does can run repository code on the host:
  *
- * The host install runs only when nothing it does can run repository code on
- * the agent host:
+ * - Lifecycle scripts are disabled (`KICI_ALLOW_INSTALL_SCRIPTS` unset).
+ * - The checkout passes the `host-install-eligibility.ts` allowlist: plain npm
+ *   or pnpm, registry-only deps, no workspace, pnpm hooks, yarn or symlinked
+ *   manifest.
+ * - The agent has its own npm (new enough to refuse git deps; `lookupHostNpm`)
+ *   or the pinned pnpm; `host-isolated-install.ts` runs it away from the
+ *   checkout with a sanitized `.npmrc` and environment.
+ * - An npm too old to refuse URL and file sources runs `npm ci`, only with a
+ *   lockfile that pins every package (`host-install-lockfile.ts`).
  *
- * - Lifecycle scripts must be disabled (`KICI_ALLOW_INSTALL_SCRIPTS` unset).
- *   An agent that allows them leaves the install to the container, as before.
- * - The checkout must pass the allowlist in `host-install-eligibility.ts`: a
- *   plain npm or pnpm project with registry-only dependencies, no workspace,
- *   no pnpm hooks, no yarn, no symlinked manifest.
- * - The agent must have its own package manager to run: its npm (new enough
- *   to refuse git dependencies; `lookupHostNpm` in `npm-resolver.ts` finds it)
- *   or the pinned pnpm.
- *   `host-isolated-install.ts` runs it away from the checkout, with a
- *   sanitized `.npmrc` and environment.
- * - An npm too old to refuse URL and file sources itself runs `npm ci`, and
- *   only with a lockfile that pins every package (`host-install-lockfile.ts`).
- *
- * Host-built modules also have to load inside the job container. They do when
- * the agent injects the KiCI runtime (`KICI_RUNTIME_NODE_SOURCE` or
- * `KICI_RUNTIME_IMAGE`): the runner then runs on that runtime, the image
- * preflight admits glibc images only, and the container shares the host's
- * architecture — so a platform-specific package resolved for the host is the
- * one the runner needs. An image that supplies its own `node` may be musl or a
- * different Node version, so its install stays inside the container.
+ * Host-built modules load in the container only with an injected KiCI runtime
+ * (`KICI_RUNTIME_NODE_SOURCE` / `KICI_RUNTIME_IMAGE`): preflight admits glibc
+ * images only and the container shares the host's architecture, so host-resolved
+ * platform packages match. An image's own `node` may be musl or another Node
+ * version, so its install stays in the container.
  */
 
 import { join } from 'node:path';
@@ -46,12 +36,11 @@ import { describeInstallFailure } from './install-failure.js';
 import { redactNpmOutput, type NpmRegistrySpec } from './npm-registry-config.js';
 
 /**
- * Step index of a job's workflow-level log: setup narration that belongs to no
- * single step. The runner's own clone / install / module-load lines use it too.
+ * Step index of the workflow-level log: setup lines belonging to no step, the
+ * runner's own clone / install / module-load lines included.
  */
 export const WORKFLOW_LOG_STEP_INDEX = -1;
 
-/** Prefix of every line the host install writes to the workflow-level log. */
 const LOG_PREFIX = '[host-install]';
 
 /** What the host does with a container job's `.kici/` install. */
@@ -88,10 +77,8 @@ export interface HostDepsInstallFacts {
 }
 
 /**
- * Decide whether the host installs a container job's `.kici/` dependencies.
- * `DepsFromCache`, `NoKiciPackage` and `AlreadyInstalled` are the cases where
- * the runner would not install either. Every other outcome but `Install` leaves
- * a needed install to the container.
+ * `DepsFromCache`, `NoKiciPackage` and `AlreadyInstalled` mean the runner would
+ * not install either; every other non-`Install` outcome leaves it to the container.
  */
 export function decideHostDepsInstall(facts: HostDepsInstallFacts): HostDepsInstall {
   if (facts.hasDepsUrl) return HostDepsInstall.DepsFromCache;
@@ -115,7 +102,6 @@ export function decideHostDepsInstall(facts: HostDepsInstallFacts): HostDepsInst
   return HostDepsInstall.Install;
 }
 
-/** Why the container, not the host, installs — one line per such outcome. */
 const LEFT_TO_CONTAINER: Partial<Record<HostDepsInstall, string>> = {
   [HostDepsInstall.InstallScriptsAllowed]:
     'Install scripts are allowed on this agent, so the job container installs the .kici dependencies',
@@ -143,15 +129,13 @@ export interface InstallKiciDepsOnHostArgs {
   runtimeInjected: boolean;
   /** The agent's sanitized environment; the install reads only locale, temp and PATH. */
   baseEnv: NodeJS.ProcessEnv;
-  /** Writes one line to the job's workflow-level log. */
   log: (line: string) => void;
-  /** Cancels the install with the job. */
   signal?: AbortSignal;
   fileExists: (path: string) => Promise<boolean>;
   /**
-   * Decides eligibility. The job's workflow-declared registries must be on
-   * origins the operator allows, or the container installs instead — so their
-   * tokens reach the host install only for an allowed registry host.
+   * Workflow-declared registries must be on operator-allowed origins, or the
+   * container installs instead, so their tokens reach the host install only for
+   * an allowed registry host.
    */
   checkEligibility: (
     workflowDir: string,
@@ -159,9 +143,8 @@ export interface InstallKiciDepsOnHostArgs {
   ) => Promise<HostInstallEligibility>;
   resolveTool: (pm: HostInstallPlan['packageManager']) => Promise<HostInstallTool | null>;
   /**
-   * Refuses an install the resolved tool cannot keep on the allowed
-   * registries: an npm that runs `npm ci` needs a lockfile that pins every
-   * package. `null` lets the install run.
+   * Refuses an install the tool cannot keep on the allowed registries (an
+   * `npm ci` npm needs a fully pinned lockfile); `null` allows it.
    */
   checkLockedInstall: (
     kiciDir: string,
@@ -171,7 +154,6 @@ export interface InstallKiciDepsOnHostArgs {
   runInstall: (args: RunHostInstallArgs) => Promise<void>;
 }
 
-/** The step -1 line for a checkout the host install refuses. */
 function refusedLine(refused: HostInstallRefused): string {
   return (
     `${LOG_PREFIX} The .kici install cannot run on the agent host (${refused.refusal}: ` +
@@ -179,7 +161,7 @@ function refusedLine(refused: HostInstallRefused): string {
   );
 }
 
-/** Evaluate the checkout and the tooling once the cheap guards allow an install. */
+/** Evaluates the checkout and tooling once the cheap guards allow an install. */
 async function resolveHostInstall(
   args: InstallKiciDepsOnHostArgs,
   say: (line: string) => void,
@@ -217,11 +199,10 @@ async function resolveHostInstall(
 }
 
 /**
- * Install `.kici/` on the host when {@link decideHostDepsInstall} says so, and
- * return the outcome. Every line is redacted of the dispatch's registry tokens
- * and install secrets. A failed install is logged and rethrown with the same
- * redaction, so the job fails with the installer's error rather than retrying
- * the install inside the container.
+ * Install on the host when {@link decideHostDepsInstall} says so. Every line is
+ * redacted of registry tokens and install secrets. A failure is logged and
+ * rethrown, redacted, so the job fails with the installer's error instead of
+ * retrying in the container.
  */
 export async function installKiciDepsOnHost(
   args: InstallKiciDepsOnHostArgs,

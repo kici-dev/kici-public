@@ -1,30 +1,20 @@
 /**
- * regression: agent-token revocation must close in-flight agent WS
- * connections.
+ * Regression: agent-token revocation must close in-flight agent WS connections.
  *
- * Trust model the system claims to hold:
- *   When an admin revokes an agent token (via
- *   `kici-admin agent token revoke <id>` -> DELETE /api/v1/agent-tokens/:id
- *   -> `tokenStore.revoke(id)`), every agent WS authenticated by that
- *   token MUST be closed within a bounded window. The agent must not
- *   retain data-plane access — job claims, log streaming, secret receipt
- *   — past the revocation.
+ * When an admin revokes an agent token (`kici-admin agent token revoke <id>` ->
+ * DELETE /api/v1/agent-tokens/:id -> `tokenStore.revoke(id)`), every agent WS
+ * authenticated by it MUST close within a bounded window: no job claims, log
+ * streaming or secret receipt past the revocation.
  *
- *   The orchestrator's agent WS handler validates the token only once, at
- *   the auth phase: after `register.ack` the WS stays open until the agent
- *   disconnects, and `tokenStore.revoke(id)` only writes `revoked_at` to the
- *   DB. So the revoke route also kicks every in-flight WS under the token
- *   (`AgentRegistry.disconnectByTokenId`), and cluster peers get the same
- *   kick through a `peer.agent-token.revoke` broadcast. Without the kick, an
- *   attacker holding a stolen token would keep data-plane access until they
- *   chose to drop the connection (typically days for a stable agent).
+ * The handler validates the token only at the auth phase, and `revoke(id)` only
+ * writes `revoked_at`. So the revoke route also kicks every in-flight WS under
+ * the token (`AgentRegistry.disconnectByTokenId`), and cluster peers get the
+ * kick through a `peer.agent-token.revoke` broadcast. Without the kick, a stolen
+ * token keeps data-plane access until the attacker drops the connection.
  *
- * The orch->Platform leg holds the same invariant: revoking an
- *   orchestrator API key kicks its open WS, with a `kici:revoke-key`
- *   Valkey channel for cross-instance fan-out.
- *
- * This test asserts the invariant: revocation propagates to in-flight WS
- * within a bounded window.
+ * The orch->Platform leg holds the same invariant: revoking an orchestrator API
+ * key kicks its open WS, with a `kici:revoke-key` Valkey channel for
+ * cross-instance fan-out.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PROTOCOL_VERSION } from '@kici-dev/engine';
@@ -32,7 +22,7 @@ import { createAgentWsHandler } from './agent-handler.js';
 import { AgentRegistry } from '../agent/registry.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
 import type { AgentTokenStore } from '../agent/token-store.js';
-import { mockWs } from '../__test-helpers__/mock-ws.js';
+import { mockWs, makeMessageEvent } from '../__test-helpers__/mock-ws.js';
 
 function mockDispatcher(): Dispatcher {
   return {
@@ -42,10 +32,6 @@ function mockDispatcher(): Dispatcher {
     onJobComplete: vi.fn(),
     releaseRebootPending: vi.fn().mockResolvedValue(undefined),
   } as unknown as Dispatcher;
-}
-
-function makeMessageEvent(data: unknown): MessageEvent {
-  return { data: JSON.stringify(data) } as MessageEvent;
 }
 
 function authRequestMsg(token = 'kat_' + 'a'.repeat(64)) {
@@ -66,13 +52,8 @@ function registerMsg(opts: { agentId: string; labels: string[] }) {
 }
 
 /**
- * Token store that:
- * - returns a valid token row on `validate(...)` initially
- * - flips its internal `revoked` flag on `revoke(...)` so subsequent
- *   `validate()` calls return null (mirrors production semantics: revoked_at IS NULL gate)
- *
- * Lets the test simulate a revocation that the re-validation /
- * listener / kick path can observe.
+ * After `revoke(...)`, `validate()` returns null, mirroring the production
+ * `revoked_at IS NULL` gate.
  */
 function makeRevocableTokenStore(authorizedLabels: string[] | null): {
   store: AgentTokenStore;
@@ -116,13 +97,8 @@ function makeRevocableTokenStore(authorizedLabels: string[] | null): {
 }
 
 /**
- * Simulate the admin DELETE /api/v1/agent-tokens/:id flow at unit-test
- * scope. The real handler:
- *   1) calls `tokenStore.revoke(id)` (DB write)
- *   2) calls `agentRegistry.disconnectByTokenId(id)` (in-flight WS kick)
- *
- * The kick step is what closes the WS; without it the WS stays open
- * until the agent itself disconnects.
+ * Mirrors the DELETE /api/v1/agent-tokens/:id route: the DB write, then the
+ * in-flight WS kick, which is what closes the WS.
  */
 async function adminRevoke(
   registry: AgentRegistry,
@@ -166,22 +142,16 @@ describe('agent-token revocation propagation to in-flight WS', () => {
       ws as any,
     );
 
-    // Sanity: agent is registered and connection is open.
     expect(registry.get('agent-revoked')).toBeDefined();
     expect(ws.close).not.toHaveBeenCalled();
 
-    // Admin revokes the token via the normal path: DB row update +
-    // synchronous registry kick. Replicates what the real DELETE
-    // /api/v1/agent-tokens/:id route does, without spinning up the
-    // HTTP layer at unit-test scope.
     const { revoked, kicked } = await adminRevoke(registry, tokenStore, 'tok-revocable');
     expect(revoked).toBe(true);
     expect(isRevoked()).toBe(true);
     expect(kicked).toBe(1);
 
-    // The kick is synchronous, so the close MUST already be visible
-    // before any timers run. We still advance time as a guard against
-    // any future async hop sneaking into the kick path.
+    // The kick is synchronous; advancing time guards against a future async
+    // hop in the kick path.
     await vi.advanceTimersByTimeAsync(70_000);
 
     // INVARIANT: in-flight WS MUST be closed after revocation.
@@ -189,10 +159,8 @@ describe('agent-token revocation propagation to in-flight WS', () => {
     expect(registry.get('agent-revoked')).toBeUndefined();
   });
 
-  // Sanity counter-test: a NON-revoked agent must remain connected after
-  // the same elapsed time. Catches a regression where the kick mechanism
-  // closes WS too aggressively (e.g., closes every WS on every poll
-  // because the validate predicate inverted).
+  // Counter-test: catches a kick that closes WS too aggressively (e.g. an
+  // inverted validate predicate).
   it('does NOT close in-flight WS when the token has not been revoked', async () => {
     const { store: tokenStore } = makeRevocableTokenStore(null);
     const handler = createAgentWsHandler({

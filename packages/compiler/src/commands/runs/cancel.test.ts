@@ -17,8 +17,7 @@ describe('runsCancelCommand', () => {
   });
 
   it('reports an already-finished run as untouched, not as cancelled', async () => {
-    // The orchestrator leaves a finished run alone, so claiming a cancellation
-    // would be false.
+    // The orchestrator leaves a finished run alone; claiming a cancellation would be false.
     const cancelRun = vi.fn(async () => ({ cancelledJobs: 0, alreadyTerminal: true }));
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({ cancelRun } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});

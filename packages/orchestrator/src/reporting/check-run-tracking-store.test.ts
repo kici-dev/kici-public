@@ -50,12 +50,10 @@ describe('CheckRunTrackingStore', () => {
     });
 
     it('clears any stale terminal marker, in the row AND on conflict', async () => {
-      // The row key is (provider, owner, repo, sha, check_name), so a re-run at
-      // the same commit lands on the row the previous run completed. A new
-      // check-run id means a new check run whose terminal update has not been
-      // sent — inheriting the old marker would suppress the new run's live step
-      // progress. The conflict branch is the one that matters (the row already
-      // exists), so both are asserted.
+      // The row key is (provider, owner, repo, sha, check_name), so a same-commit re-run lands on
+      // the previous run's completed row. A new check-run id is a new check run with no terminal
+      // update sent — inheriting the old marker would suppress its live step progress. The
+      // conflict branch (row exists) is the one that matters, so both are asserted.
       const { db, mocks } = createMockDb();
       const store = new CheckRunTrackingStore(db);
 
@@ -285,9 +283,8 @@ describe('CheckRunTrackingStore', () => {
 
       await store.pruneStale(7);
 
-      // The rows most in need of reaping are precisely the ones a create-time
-      // write left with a NULL run_id, so adding a run_id predicate here would
-      // make the sweep skip its own primary target.
+      // The rows most in need of reaping are those a create-time write left with a NULL run_id;
+      // a run_id predicate would make the sweep skip its primary target.
       const columns = mocks.deleteWhere.mock.calls.map((c) => c[0] as string);
       expect(columns).toEqual(['updated_at']);
     });

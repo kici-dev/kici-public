@@ -10,11 +10,10 @@ import {
 
 export { formatDuration };
 
-// ANSI SGR escape sequence (ESC [ ... m) used by picocolors. Matching the
-// leading ESC keeps width calculations exact when colors are present.
+// ANSI SGR (ESC [ ... m). Matching the leading ESC keeps widths exact.
 const ANSI_SGR = /\[[0-9;]*m/g;
 
-/** Length of a string ignoring ANSI color codes (for column alignment). */
+/** `s` without ANSI color codes, for column alignment. */
 export function stripAnsi(s: string): string {
   return s.replace(ANSI_SGR, '');
 }
@@ -36,16 +35,12 @@ export function relativeTime(iso: string | undefined, now: number = Date.now()):
 type Colorizer = (text: string) => string;
 
 /**
- * Terminal colour for every canonical status.
+ * Exhaustive by type: a new engine status breaks the typecheck instead of
+ * falling through to gray, which reads as "nothing happened".
  *
- * Exhaustive by type: a new engine status breaks this file's typecheck rather
- * than falling through to gray, which in a bare terminal reads as "nothing
- * happened".
- *
- * `drift_dropped` is red here although the dashboard badges it gray. The
- * dashboard pairs its colour with a "Drift dropped" label that carries the
- * meaning; the CLI prints the bare status word, so colour is the only severity
- * signal and a dropped job is a failure.
+ * `drift_dropped` is red though the dashboard badges it gray: the dashboard
+ * adds a label, while the CLI prints the bare word, so colour is the only
+ * severity signal and a dropped job is a failure.
  */
 const STATUS_COLORIZER: Readonly<Record<CanonicalStatus, Colorizer>> = Object.freeze({
   [ExecutionRunStatus.enum.success]: pc.green,

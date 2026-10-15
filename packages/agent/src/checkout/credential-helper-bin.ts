@@ -1,15 +1,11 @@
 /**
- * The executable git spawns as `credential.helper`.
+ * The executable git spawns as `credential.helper`: stdin → agent socket → stdout.
+ * No state, no decisions, no logging — a printed line risks a token in a log, and
+ * git reads unexpected stdout as part of the credential reply.
  *
- * Deliberately minimal: read stdin, forward to the agent over its local socket,
- * write stdout. No state, no decisions, no logging — anything it printed would
- * risk putting a token in a log, and git treats unexpected stdout as part of
- * the credential reply.
- *
- * Every failure mode answers with an EMPTY reply rather than a non-zero exit:
- * git then falls through to its own mechanisms and reports a normal
- * authentication failure, instead of the helper turning a recoverable miss into
- * a crash mid-push.
+ * Every failure answers with an EMPTY reply, never a non-zero exit, so git falls
+ * through to its own mechanisms and reports a normal auth failure instead of a
+ * crash mid-push.
  */
 
 import { parseCredentialInput, formatCredentialOutput } from './credential-helper.js';
@@ -30,8 +26,7 @@ export async function runHelperMain(
   deps: HelperDeps,
 ): Promise<string> {
   const operation = argv[0];
-  // We persist nothing, so `store` and `erase` have nothing to do. Erroring
-  // here would break pushes that are otherwise working.
+  // Nothing is persisted, so `store`/`erase` are no-ops; erroring would break working pushes.
   if (operation !== 'get') return '';
 
   try {

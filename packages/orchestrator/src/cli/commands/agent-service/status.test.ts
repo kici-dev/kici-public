@@ -1,16 +1,13 @@
 /**
- * Tests for the agent status command's folder-anchored behavior:
- * refusal when no targeting flag and no CWD manifest, and --instance-dir
- * resolution flowing through to manager.status with a ServiceConfig built
- * from the manifest. The action also reads the env file for the port + calls
- * /health, but the default mock returns state: 'stopped' so the HTTP path
- * is skipped.
+ * Agent status, folder-anchored: refusal with no targeting flag and no CWD
+ * manifest, and --instance-dir reaching manager.status with a manifest-built
+ * ServiceConfig. The default mock reports 'stopped', which skips the /health call.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { makeTempDir } from '@kici-dev/test-support/tmp';
 import { Command } from 'commander';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import type {
   DiscoveredInstance,
@@ -29,7 +26,7 @@ let mockKiciRoot = '';
 /** Platforms whose driver the command operated through — discovery `list` calls excluded. */
 const operatedPlatforms: string[] = [];
 
-/** Wrap a driver operation so it records which platform's driver ran it. */
+/** Records which platform's driver ran the operation. */
 function op<A extends unknown[], R>(platform: string, fn: (...a: A) => R): (...a: A) => R {
   return (...args: A) => {
     operatedPlatforms.push(platform);
@@ -63,9 +60,8 @@ vi.mock('../../service/index.js', async () => {
     resolveUserLevel: vi.fn().mockReturnValue(true),
     kiciConfigRoot: vi.fn(() => mockKiciRoot),
     createServiceManager: vi.fn(async (platform: ServicePlatform) => makeManager(platform)),
-    // Manager selection lives in the seam, so the real one runs here with the
-    // driver factory injected: every candidate platform gets its own double, and
-    // `op` records which one the command actually operated through.
+    // The real manager selection runs with one double per candidate platform;
+    // `op` records which one the command operated through.
     resolveInstanceTarget: (args: Parameters<typeof actual.resolveInstanceTarget>[0]) =>
       actual.resolveInstanceTarget({ ...args, createManager: async (p) => makeManager(p) }),
   };
@@ -75,10 +71,6 @@ import { registerAgentStatusCommand } from './status.js';
 import { writeIndex, writeManifest } from '../../service/index.js';
 import type { InstanceManifest } from '../../service/index.js';
 import type { AgentLivenessInfo, LivenessResponse } from '@kici-dev/shared';
-
-function mkTmp(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 function makeManifest(overrides: Partial<InstanceManifest> = {}): InstanceManifest {
   return {
@@ -104,8 +96,8 @@ describe('agent status — folder-anchored', () => {
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
-    tmpInstanceDir = mkTmp('kici-f-st-i-');
-    tmpConfigRoot = mkTmp('kici-f-st-c-');
+    tmpInstanceDir = makeTempDir('kici-f-st-i-');
+    tmpConfigRoot = makeTempDir('kici-f-st-c-');
 
     mockListResult = [];
     mockStatusResult = { state: 'stopped' };
@@ -132,7 +124,7 @@ describe('agent status — folder-anchored', () => {
 
   it('refuses without --instance-dir/--name and no CWD manifest', async () => {
     const savedCwd = process.cwd();
-    const emptyCwd = mkTmp('kici-f-st-cwd-');
+    const emptyCwd = makeTempDir('kici-f-st-cwd-');
     const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
       throw new Error('process.exit called');
     }) as never);
@@ -178,9 +170,8 @@ describe('agent status — folder-anchored', () => {
     expect(cfg.isUserLevel).toBe(true);
   });
 
-  // fails-when: the action picks the manager from the host. detectPlatform is
-  // pinned to 'systemd' by the module mock, so a host-derived selection operates
-  // the systemd driver and operatedPlatforms reads ['systemd'].
+  // fails-when: the manager comes from the host (detectPlatform is mocked to
+  // 'systemd'), so operatedPlatforms reads ['systemd'].
   it('operates a compose-manifest install through the compose driver on a systemd host', async () => {
     writeManifest(tmpInstanceDir, makeManifest({ platform: 'compose' }));
 
@@ -190,8 +181,7 @@ describe('agent status — folder-anchored', () => {
     expect(mockStatus).toHaveBeenCalledTimes(1);
   });
 
-  // breaks-if-wrong: the overwhelmingly common case must be unaffected — a
-  // systemd install on a systemd host still operates through the systemd driver.
+  // breaks-if-wrong: a systemd install on a systemd host still uses the systemd driver.
   it('operates a systemd-manifest install through the systemd driver', async () => {
     writeManifest(tmpInstanceDir, makeManifest({ platform: 'systemd' }));
 
@@ -202,11 +192,7 @@ describe('agent status — folder-anchored', () => {
   });
 });
 
-/**
- * A /health body in the agent's declared shape. The type is the one the agent's
- * health route is annotated with, so a field renamed or dropped on the agent side
- * stops this fixture compiling.
- */
+/** Typed as the agent's health route is, so a renamed or dropped field stops this compiling. */
 function agentHealthBody(
   overrides: Partial<LivenessResponse<AgentLivenessInfo>> = {},
 ): LivenessResponse<AgentLivenessInfo> {
@@ -268,8 +254,8 @@ describe('agent status — health section', () => {
   }
 
   beforeEach(() => {
-    tmpInstanceDir = mkTmp('kici-ag-health-i-');
-    tmpConfigRoot = mkTmp('kici-ag-health-c-');
+    tmpInstanceDir = makeTempDir('kici-ag-health-i-');
+    tmpConfigRoot = makeTempDir('kici-ag-health-c-');
     mockKiciRoot = tmpConfigRoot;
     mockStatusResult = { state: 'running', pid: 4343 };
     mockStatus.mockClear();

@@ -1,37 +1,25 @@
 /**
- * regression: an agent's authority over a `jobId` is bounded by the
- * Dispatcher's three ownership windows — `agentJobs` (active dispatch),
- * `recoveringJobs` (in-flight reconnect grace), and `completedJobs`
- * (post-completion grace, `Dispatcher.GRACE_WINDOW_MS = 30_000`).
- * Outside those windows, `Dispatcher.isJobOwnedByAgent` returns false
- * and `OwnershipTracker.checkOwnership` (called on every jobId-bearing
- * inbound message in `agent-handler.ts`) rejects the message.
+ * An agent's authority over a `jobId` is bounded by the Dispatcher's three
+ * ownership windows — `agentJobs` (active dispatch), `recoveringJobs`
+ * (reconnect grace), `completedJobs` (post-completion grace,
+ * `Dispatcher.GRACE_WINDOW_MS = 30_000`). Outside them
+ * `Dispatcher.isJobOwnedByAgent` is false and `OwnershipTracker.checkOwnership`
+ * (on every jobId-bearing inbound message in `agent-handler.ts`) rejects.
  *
- * Trust model (must hold):
- *   An agent token's WS-connection lifetime spans many runs (KiCI has
- *   no per-run token). Per-run authority is enforced at message-time
- *   by the (agentId, jobId) ownership gate. A compromised agent, or an
- *   attacker with a stolen agent token, whose token previously serviced
- *   run R1 cannot, after R1 completes:
+ * Trust model (must hold): a token's WS lifetime spans many runs (no per-run
+ * token), so per-run authority is the (agentId, jobId) gate. A compromised
+ * agent or stolen token that serviced run R1 cannot, after R1 completes, claim:
  *
- *   1. Send a message claiming a jobId owned by another agent
- *      (cross-agent access).
- *   2. Send a message claiming the agent's own previously-completed
- *      jobId after the 30-second grace window expires
- *      (post-completion-grace expiry).
- *   3. Send a message claiming a jobId that was never dispatched to
- *      anyone (never-dispatched access).
+ *   1. a jobId owned by another agent (cross-agent access);
+ *   2. its own completed jobId after the 30-second grace window;
+ *   3. a jobId never dispatched to anyone.
  *
- * Outbound messages (orchestrator → agent) cannot leak prior-run data
- * either: every jobId-bearing outbound message
- * (`job.dispatch` / `job.cancel` / `cache.upload.response` /
- * `event.emit.response`) is scoped to a job that's currently or
- * imminently dispatched to that agent. There is no orch→agent message
- * type that delivers data for an arbitrary historical jobId.
+ * Outbound jobId-bearing messages (`job.dispatch` / `job.cancel` /
+ * `cache.upload.response` / `event.emit.response`) are scoped to a job
+ * currently or imminently dispatched to that agent; no orch→agent message
+ * delivers data for an arbitrary historical jobId.
  *
- * This file is the unit-level tripwire for the (agentId, jobId)
- * gate's three windows. The integration of this gate into
- * `agent-handler.ts` is exercised by the existing
+ * The gate's integration into `agent-handler.ts` is covered by the
  * `agent-handler.test.ts` ownership-tracker scenarios.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -42,8 +30,8 @@ import { canonicalizeLabels } from '@kici-dev/engine';
 import { mockWs } from '../__test-helpers__/mock-ws.js';
 
 /**
- * Must mirror `Dispatcher.GRACE_WINDOW_MS` (private static, line 81 of
- * dispatcher.ts at time of writing). Test uses the literal so a future
+ * Must mirror `Dispatcher.GRACE_WINDOW_MS` (private static in
+ * dispatcher.ts). Test uses the literal so a future
  * regression that quietly extends the window would be visible here.
  */
 const GRACE_WINDOW_MS = 30_000;
@@ -150,9 +138,7 @@ describe('cross-run isolation — agent authority bounded by ownership windows',
   });
 
   it('rejects cross-agent ownership claims (agent-1 cannot claim agent-2 jobId)', async () => {
-    // Two agents are registered. agent-2 receives a job dispatch; agent-1
-    // never owns that job. agent-1 attempting to claim agent-2's jobId is
-    // the canonical cross-run-via-different-agent primitive.
+    // The canonical cross-run-via-different-agent primitive.
     registry.register('agent-1', mockWs(), ['linux']);
     registry.register('agent-2', mockWs(), ['linux']);
     registry.incrementActiveJobs('agent-1'); // make agent-1 busy so dispatch picks agent-2
@@ -178,19 +164,15 @@ describe('cross-run isolation — agent authority bounded by ownership windows',
     expect(result.agentId).toBe('agent-2');
     const agent2JobId = result.jobId;
 
-    // agent-2's authority over its job is fresh and proper.
     expect(dispatcher.isJobOwnedByAgent('agent-2', agent2JobId)).toBe(true);
 
-    // agent-1 attempting to claim agent-2's jobId is rejected.
     expect(dispatcher.isJobOwnedByAgent('agent-1', agent2JobId)).toBe(false);
   });
 
   it('rejects post-completion access after the 30-second grace window expires', async () => {
-    // The 30s grace window legitimately accepts in-flight messages
-    // arriving after the agent reported job completion (log.chunk /
-    // step.status that crossed the wire just before the agent emitted
-    // job.status='completed'). Past the grace window, ownership dies and
-    // any message claiming the completed jobId must be rejected.
+    // The 30s grace window accepts in-flight messages (log.chunk / step.status)
+    // that crossed the wire just before job.status='completed'; past it, a
+    // message claiming the completed jobId is rejected.
     registry.register('agent-1', mockWs(), ['linux']);
     const queue = mockQueue();
     const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
@@ -229,11 +211,9 @@ describe('cross-run isolation — agent authority bounded by ownership windows',
   });
 
   it('rejects access to a jobId that was never dispatched to anyone', async () => {
-    // Synthetic jobId an attacker fabricates and references in a
-    // log.chunk / step.status / cache.upload.* message hoping to read
-    // or write data they were never authorized for. The ownership gate
-    // never says yes for an unknown jobId — there's no implicit trust
-    // surface here, even for an authenticated agent.
+    // A fabricated jobId in a log.chunk / step.status / cache.upload.* message:
+    // the gate never says yes for an unknown jobId, even for an authenticated
+    // agent.
     registry.register('agent-1', mockWs(), ['linux']);
     const queue = mockQueue();
     const dispatcher = new Dispatcher({ registry, queue, metrics, onDispatch });
@@ -245,10 +225,8 @@ describe('cross-run isolation — agent authority bounded by ownership windows',
   });
 
   it('rejects access to a different agent`s job even after that agent disconnects mid-run', async () => {
-    // agent-2 starts a job, then disconnects. The job moves into
-    // recoveringJobs (waiting for agent-2 to reconnect within its own
-    // grace window). agent-1 — never the owner — must not be able to
-    // claim ownership of agent-2's recovering job.
+    // agent-2's job sits in recoveringJobs awaiting its reconnect; agent-1,
+    // never the owner, must not claim it.
     registry.register('agent-1', mockWs(), ['linux']);
     const ws2 = mockWs();
     registry.register('agent-2', ws2, ['linux']);
@@ -278,11 +256,9 @@ describe('cross-run isolation — agent authority bounded by ownership windows',
     // agent-2 disconnects mid-run — its job moves into recoveringJobs.
     await dispatcher.onAgentDisconnect('agent-2');
 
-    // agent-2's ownership during its own reconnect grace is preserved
-    // (so its reconnecting WS can pick up the in-flight job).
+    // Preserved during reconnect grace, so the reconnecting WS can resume it.
     expect(dispatcher.isJobOwnedByAgent('agent-2', jobId)).toBe(true);
 
-    // agent-1 — which had nothing to do with this job — is rejected.
     expect(dispatcher.isJobOwnedByAgent('agent-1', jobId)).toBe(false);
   });
 });

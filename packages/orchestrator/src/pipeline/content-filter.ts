@@ -1,17 +1,15 @@
 /**
- * Tier-1 declarative content-requirements filter (execution-purity model, Part B).
+ * Tier-1 declarative content-requirements filter (execution-purity model,
+ * Part B). After Tier-0 trigger matching, it fetches the files each candidate's
+ * `requires` names, once per distinct `(repo, sha, path)` via the LRU cache,
+ * evaluates the pure-data requirements with the engine matcher, and drops any
+ * candidate that FAILS or is INDETERMINATE before dispatch. No author code runs:
+ * `requires` is a declarative query, which keeps content filtering inside the
+ * orchestrator under the purity model.
  *
- * After Tier-0 trigger matching selects candidate workflows, this step fetches
- * the source files each candidate's `requires` names — once per distinct
- * `(repo, sha, path)` via the LRU cache — evaluates the (pure DATA) requirements
- * with the engine matcher, and drops any candidate that FAILS or is
- * INDETERMINATE before dispatch. No author code is executed: `requires` is a
- * declarative query the orchestrator interprets, which is what keeps content
- * filtering inside the orchestrator under the purity model.
- *
- * Fail-visible: a dropped candidate (definite negative, oversize/unparseable
- * content, a fetch error, or no fetcher/cache available) is logged with the
- * concrete reason. An indeterminate file NEVER passes silently.
+ * Fail-visible: every drop (definite negative, oversize/unparseable content, a
+ * fetch error, or no fetcher/cache) is logged with its reason. An indeterminate
+ * file NEVER passes silently.
  */
 
 import type { FileContentsFetcher, LockContentRequirement } from '@kici-dev/engine';
@@ -45,15 +43,12 @@ export interface ContentFilterOptions {
 }
 
 /**
- * One dropped candidate.
- *
- * `indeterminate` separates the two reasons a drop happens, which mean opposite
- * things to a workflow author: a definite content mismatch is the requirement
- * doing its job, while an unreadable file, a fetch error, or a provider with no
- * file-contents fetcher is the requirement never having been evaluated at all.
- * Both drop the candidate — the filter is fail-visible, so an unevaluable file
- * never passes — but a trace that renders the second as "excluded" tells an
- * author their requirement said no when nothing ever read it.
+ * One dropped candidate. `indeterminate` separates the two drop reasons, which
+ * mean opposite things to an author: a definite content mismatch is the
+ * requirement doing its job, while an unreadable file, a fetch error, or a
+ * provider with no file-contents fetcher means it was never evaluated. Both
+ * drop the candidate, but a trace that renders the second as "excluded" tells
+ * an author their requirement said no when nothing ever read it.
  */
 export interface DroppedCandidate {
   readonly name: string;
@@ -91,12 +86,9 @@ function distinctRequiredPaths(candidates: readonly ContentFilterCandidate[]): s
 }
 
 /**
- * Verdict for one candidate given the resolved file map + per-path fetch errors.
- *
- * Every failing branch says whether it COULD NOT evaluate (`indeterminate`) or
- * evaluated to false. Only the last one — the engine matcher returning a clean
- * negative — is a definite exclusion; a fetch error, an oversize file, and a
- * matcher-reported indeterminate are all "nothing read the requirement".
+ * Verdict for one candidate. Only the engine matcher's clean negative is a
+ * definite exclusion; a fetch error, an oversize file and a matcher-reported
+ * indeterminate are all `indeterminate` ("nothing read the requirement").
  */
 function verdictForCandidate(
   reqs: readonly LockContentRequirement[],
@@ -133,15 +125,10 @@ function verdictForCandidate(
 }
 
 /**
- * Filter candidates by their declarative content requirements.
- *
- * Gathers each distinct `(repo, sha, path)` once via the cache, evaluates every
- * candidate's `requires`, and returns the survivors (pass) split from the
- * dropped (fail / indeterminate, each logged with its reason). A candidate with
- * no `requires` always survives without any fetch (the fast path — like an empty
- * `paths` filter). When a candidate has `requires` but no fetcher/cache is
- * available, it is dropped as indeterminate (fail-visible), never dispatched
- * unfiltered.
+ * Filter candidates by their declarative content requirements. A candidate with
+ * no `requires` always survives without any fetch, like an empty `paths`
+ * filter. One with `requires` but no fetcher/cache is dropped as indeterminate,
+ * never dispatched unfiltered.
  */
 export async function filterByContentRequirements<C extends ContentFilterCandidate>(
   candidates: readonly C[],
@@ -166,12 +153,11 @@ export async function filterByContentRequirements<C extends ContentFilterCandida
   const anyRequires = candidates.some((c) => (c.requires?.length ?? 0) > 0);
   if (!anyRequires) return { survivors: [...candidates], dropped };
 
-  // A requires-bearing candidate cannot be evaluated without both a fetcher and
-  // a cache — drop it fail-visible rather than dispatch unfiltered.
+  // Without a fetcher and a cache nothing can read a requirement: drop it as
+  // indeterminate (not excluded) rather than dispatch unfiltered.
   if (!opts.fetcher || !opts.cache) {
     for (const c of candidates) {
       if ((c.requires?.length ?? 0) > 0) {
-        // Indeterminate, not excluded: nothing ever read the requirement.
         drop(c.name, 'no file-contents fetcher available for this provider', true);
       } else {
         survivors.push(c);
@@ -181,7 +167,6 @@ export async function filterByContentRequirements<C extends ContentFilterCandida
   }
   const { fetcher, cache } = opts;
 
-  // Fetch each distinct required path once.
   const files = new Map<string, FileContentEntry>();
   const errored = new Map<string, string>();
   for (const path of distinctRequiredPaths(candidates)) {

@@ -40,9 +40,7 @@ describe('buildStepEnvFileHooks — per-step delta files', () => {
 
     await hooks.afterStepApplyEnvFiles(0); // applies + releases step 0 only
 
-    // Step 1's file is untouched (still holds its delta).
     expect(await readFile(env1, 'utf8')).toContain('STEP1_KEY=value1');
-    // Step 0's delta landed in process.env.
     expect(process.env.STEP0_KEY).toBe('value0');
     expect(process.env.STEP1_KEY).toBeUndefined();
     delete process.env.STEP0_KEY;

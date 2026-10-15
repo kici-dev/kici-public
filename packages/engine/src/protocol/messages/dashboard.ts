@@ -37,10 +37,8 @@ import {
 
 // --- Dashboard REST-over-WS protocol messages ---
 //
-// These messages enable the Platform dashboard to query run details and step logs
-// from the orchestrator via the existing Platform-orchestrator WebSocket connection.
-// Platform acts as a proxy: receives REST request from dashboard, sends WS request
-// to the correct orchestrator, correlates the response by requestId, returns to dashboard.
+// The Platform proxies a dashboard REST request as a WS request to the right
+// orchestrator over the existing connection and correlates the reply by requestId.
 
 // --- Platform -> Orchestrator: request messages ---
 
@@ -53,9 +51,8 @@ export const dashboardRunDetailRequestSchema = z.object({
 });
 
 /**
- * Request the machine-first, provenance-tagged structured run result from the
- * orchestrator (user-plane equivalent of the orchestrator-admin
- * `/runs/:id/structured` endpoint). Reuses the `AgentRunResult` shape.
+ * Request the provenance-tagged structured run result: the user-plane
+ * equivalent of the orchestrator-admin `/runs/:id/structured` endpoint.
  */
 export const dashboardRunStructuredRequestSchema = z.object({
   type: z.literal('dashboard.run.structured'),
@@ -75,12 +72,11 @@ export const dashboardRunStructuredResponseSchema = z.object({
 export type DashboardRunStructuredResponse = z.infer<typeof dashboardRunStructuredResponseSchema>;
 
 /**
- * Request the current mirror-projection state of a single run from the
- * orchestrator. Unlike `dashboard.run.detail` (a user-plane read that
- * access-logs), this is a **system reconciliation read**: the Platform's
- * `RunMirrorReconciler` issues it for a run stuck non-terminal in the mirror to
- * recover a terminal frame dropped on a live connection. The `actor` is always a
- * `system` principal, and the orchestrator does NOT write an access-log row.
+ * Request a run's current mirror-projection state. A **system reconciliation
+ * read**: the Platform's `RunMirrorReconciler` issues it for a run stuck
+ * non-terminal in the mirror, to recover a terminal frame dropped on a live
+ * connection. The `actor` is always a `system` principal, and the orchestrator
+ * writes no access-log row (unlike `dashboard.run.detail`).
  */
 export const dashboardRunStateRequestSchema = z.object({
   type: z.literal('dashboard.run.state'),
@@ -91,9 +87,8 @@ export const dashboardRunStateRequestSchema = z.object({
 export type DashboardRunStateRequest = z.infer<typeof dashboardRunStateRequestSchema>;
 
 /**
- * Response carrying the run's current `StateReplayRun` mirror-projection shape
- * (the same shape `state.replay` carries), or `run: null` when the orchestrator
- * has no such run. Consumed by `upsertRunMirror` on the Platform side.
+ * The run in the `state.replay` shape, or `run: null` when the orchestrator has
+ * no such run. Consumed by the Platform's `upsertRunMirror`.
  */
 export const dashboardRunStateResponseSchema = z.object({
   type: z.literal('dashboard.run.state.response'),
@@ -111,14 +106,11 @@ export const dashboardStepLogsRequestSchema = z.object({
   runId: z.string(),
   jobId: z.string(),
   stepIndex: z.number(),
-  /**
-   * Optional line-offset cursor (a prior response's `nextCursor`). Absent reads
-   * from the start.
-   */
+  /** A prior response's `nextCursor`. Absent reads from the start. */
   cursor: z.string().optional(),
   /**
-   * Optional max lines to return. Absent = unbounded (the human dashboard relies
-   * on this); the MCP layer opts into paging by sending an explicit limit.
+   * Max lines to return. Absent is unbounded (the human dashboard relies on
+   * this); the MCP layer opts into paging by sending a limit.
    */
   limit: z.number().int().positive().optional(),
 });
@@ -162,9 +154,8 @@ export const dashboardJobDetailSchema = z.object({
   /** Fan-out label for a child: matrix suffix or hostname; null for non-fanned jobs. */
   variantLabel: z.string().nullable().optional(),
   /**
-   * Job kind: `standard` runs steps on an agent, `gate` is an invoke gate, and
-   * `proxy` mirrors a summoned source-repo run. Absent/null for a standard job.
-   *
+   * `standard` runs steps on an agent, `gate` is an invoke gate, and `proxy`
+   * mirrors a summoned source-repo run. Absent/null for a standard job.
    */
   jobKind: JobKind.nullable().optional(),
   /**
@@ -200,19 +191,16 @@ export const dashboardJobDetailSchema = z.object({
   /** User-visible warning naming the skipped test-run contexts. null/absent when none. */
   envWarning: z.string().nullable().optional(),
   /**
-   * A job's non-secret outputs. Present when the job completed successfully with
-   * outputs.
+   * A job's non-secret outputs, present when the job succeeded with outputs.
    *
-   * The value is intentionally `z.record(z.string(), z.unknown())` — the same
-   * loose shape the wire (`job.status.data.outputs`) and `InvokeResult.outputs`
-   * use — because two job kinds populate it with two different shapes:
+   * Loose like `job.status.data.outputs` and `InvokeResult.outputs`, because:
    * - a **standard** job carries the agent's step-keyed map
-   *   (`{ <stepName>: { <outputKey>: value } }`), so each value is itself a map;
-   * - a **proxy** job mirrors a summoned run, and a run's outputs are FLAT
-   *   (`{ <outputKey>: value }`, values scalar), matching `InvokeResult.outputs`.
+   *   (`{ <stepName>: { <outputKey>: value } }`);
+   * - a **proxy** job mirrors a summoned run, whose outputs are FLAT
+   *   (`{ <outputKey>: value }`, values scalar).
    *
-   * A stricter step-keyed record type rejected the flat proxy shape and failed
-   * the whole run-detail response, so the schema accepts either.
+   * A stricter step-keyed type rejected the flat proxy shape and failed the
+   * whole run-detail response.
    */
   outputs: z.record(z.string(), z.unknown()).nullable().optional(),
   /** Secret output key names produced by this job (values are NOT included -- display masked). */
@@ -223,11 +211,9 @@ export const dashboardJobDetailSchema = z.object({
    */
   initFailure: initFailureSchema.optional(),
   /**
-   * Upstream dependency edges for this job (one entry per `needs` declaration),
-   * resolved by the orchestrator from execution_job_needs. `upstreamName` is the
-   * upstream job name; `runOn` is the per-edge run-on status-set (the upstream
-   * terminal statuses that satisfy the edge). null/absent when the job has no
-   * upstreams.
+   * One edge per `needs` declaration, resolved from execution_job_needs. `runOn`
+   * is the upstream terminal statuses that satisfy the edge. null/absent when
+   * the job has no upstreams.
    */
   needs: z
     .array(
@@ -281,12 +267,10 @@ export const dashboardStepLogsResponseSchema = z.object({
 
 // --- Attestations list request/response (REST-over-WS proxy) ---
 //
-// Build-provenance attestations for a run. Like the step-logs read, this is
-// served by the customer orchestrator (which inlines each stored bundle from
-// object storage) and access-logged there; Platform proxies the request and
-// augments the response with the provenance trust root (issuer + JWKS URI)
-// from its own `oidcIssuer` config so the dashboard can verify each bundle
-// client-side.
+// Build-provenance attestations for a run, served by the customer orchestrator
+// (which inlines each stored bundle from object storage) and access-logged
+// there. The orchestrator names its own provenance issuer in `trustedIssuer` so
+// the dashboard can verify each bundle client-side; the Platform only proxies.
 
 /** Request the build-provenance attestations for a run. */
 export const dashboardAttestationsListRequestSchema = z.object({
@@ -318,9 +302,8 @@ export const attestationVerifyStatusSchema = z.enum([
 export type AttestationVerifyStatus = z.infer<typeof attestationVerifyStatusSchema>;
 
 /**
- * Single attestation in the list response, with its bundle inlined from object
- * storage so the dashboard verifies it without a second fetch. The bundle is a
- * KiCI Mode-A bundle (`@kici-dev/engine/provenance/bundle`).
+ * An attestation with its KiCI Mode-A bundle inlined from object storage, so
+ * the dashboard verifies it without a second fetch.
  */
 export const attestationListItemSchema = z.object({
   id: z.string(),
@@ -377,11 +360,9 @@ export type DashboardAttestationsListResponse = z.infer<
 
 // --- Artifacts list request/response (REST-over-WS proxy) ---
 //
-// Named, durable build artifacts uploaded by a run's jobs (`ctx.artifacts`).
-// Like the per-run attestations read, this is served by the customer
-// orchestrator and access-logged there; Platform proxies the request. Each item
-// carries a presigned GET URL (`downloadUrl`) the dashboard links directly, so
-// the artifact bytes never transit Platform.
+// Named build artifacts uploaded by a run's jobs (`ctx.artifacts`), served by
+// the customer orchestrator and access-logged there. Each item's presigned
+// `downloadUrl` is linked directly, so artifact bytes never transit Platform.
 
 /** Request the named artifacts uploaded by a run. */
 export const dashboardArtifactsListRequestSchema = z.object({
@@ -393,9 +374,8 @@ export const dashboardArtifactsListRequestSchema = z.object({
 export type DashboardArtifactsListRequest = z.infer<typeof dashboardArtifactsListRequestSchema>;
 
 /**
- * Single artifact in the list response. `downloadUrl` is a presigned GET the
- * dashboard links directly; it is omitted when the backing object could not be
- * resolved (expired / missing), in which case the row still lists the metadata.
+ * `downloadUrl` is a presigned GET, omitted when the backing object could not
+ * be resolved (expired / missing); the row still lists the metadata.
  */
 export const artifactListItemSchema = z.object({
   name: z.string(),
@@ -413,10 +393,9 @@ export const dashboardArtifactsListResponseSchema = z.object({
   requestId: z.string(),
   artifacts: z.array(artifactListItemSchema),
   /**
-   * Signature-validity window (seconds) of the presigned `downloadUrl`s in this
-   * response, from the storage backend's presigned-GET expiry; the dashboard
-   * refreshes the list on a fraction of it so a displayed link is never stale.
-   * Absent on an error response.
+   * Validity window (seconds) of the presigned `downloadUrl`s, from the storage
+   * backend's presigned-GET expiry; the dashboard refreshes the list on a
+   * fraction of it so a displayed link is never stale. Absent on an error.
    */
   downloadUrlExpiresInSeconds: z.number().int().positive().optional(),
   error: z.string().optional(),
@@ -425,17 +404,11 @@ export type DashboardArtifactsListResponse = z.infer<typeof dashboardArtifactsLi
 
 // --- Org-wide attestations browser (search + browse) ---
 //
-// A second, org-scoped read surface alongside the per-run list above. The list
-// is metadata-only (no inlined bundle) so it stays cheap at any scale; the
-// verdict badge comes from the server-side `verifyStatus` recorded at ingest.
-// The detail get inlines exactly one bundle for the attestation-detail page.
-// (`attestationVerifyStatusSchema` is defined above, next to the list item.)
+// The org-scoped list is metadata-only (no inlined bundle) so it stays cheap at
+// any scale; the verdict badge is the `verifyStatus` recorded at ingest. The
+// detail get inlines exactly one bundle for the attestation-detail page.
 
-/**
- * Metadata-only summary row for the org-wide list. No inlined bundle (keeps the
- * list cheap). `repository` / `workflow` are joined from `execution_runs` when
- * available.
- */
+/** `repository` / `workflow` are joined from `execution_runs` when available. */
 export const attestationListSummarySchema = z.object({
   id: z.string(),
   runId: z.string(),
@@ -553,16 +526,12 @@ export type DashboardAttestationRetryResponse = z.infer<
 
 // --- Run list request/response (REST-over-WS proxy) ---
 //
-// Operator-console read of the orchestrator's run list. Like the run-detail
-// read, this is served by the customer orchestrator and access-logged there;
-// Platform only proxies the request to the right orchestrator connection.
+// Served by the customer orchestrator and access-logged there; the Platform
+// only proxies.
 
 /**
- * Run-summary projection from the orchestrator's execution_runs table.
- *
- * The required fields (`runId` / `routingKey` / `status`) are always present.
- * Every other field is optional: the orchestrator omits what it cannot
- * supply, and the customer runs page degrades a missing field to '—'.
+ * Run-summary projection from execution_runs. The orchestrator omits an
+ * optional field it cannot supply, and the runs page degrades it to '—'.
  */
 export const dashboardRunSummarySchema = z.object({
   runId: z.string(),
@@ -572,7 +541,7 @@ export const dashboardRunSummarySchema = z.object({
   createdAt: z.string(),
   updatedAt: z.string().optional(),
   trigger: z.string().optional(),
-  // enriched (optional — orchestrator omits what it lacks; page degrades to '—'):
+  // enriched:
   workflowName: z.string().optional(),
   sha: z.string().optional(),
   ref: z.string().optional(),
@@ -627,10 +596,8 @@ export type DashboardRunsListResponse = z.infer<typeof dashboardRunsListResponse
 
 // --- Run filters request/response ---
 //
-// Distinct-value filter options the customer runs page renders in its filter
-// controls (statuses / workflows / branches / repositories / triggerTypes /
-// sources). Served by the customer orchestrator and access-logged there;
-// Platform only proxies the request to the right orchestrator connection.
+// Distinct values for the runs page filter controls. Served by the customer
+// orchestrator and access-logged there; the Platform only proxies.
 
 /** Request the distinct filter-option values from the orchestrator. */
 export const dashboardRunsFiltersRequestSchema = z.object({
@@ -696,13 +663,9 @@ export type DashboardSourcesListResponse = z.infer<typeof dashboardSourcesListRe
 // orchestrator never asks the Platform whether a token may act.
 
 /**
- * One orchestrator admin token, as the dashboard plane sees it.
- *
- * The projection deliberately carries NO `token_hash` / `tokenHash` field. A
- * hash is a credential verifier: relaying it would put an offline-crackable
- * value on the dashboard plane for a report that has no use for it.
- * `dashboard.test.ts` asserts the absence so a later field addition cannot
- * reintroduce it by accident.
+ * One orchestrator admin token, as the dashboard plane sees it. It carries NO
+ * `token_hash` / `tokenHash`: a hash is an offline-crackable credential
+ * verifier the report has no use for. `dashboard.test.ts` asserts the absence.
  */
 export const dashboardAdminTokenSummarySchema = z.object({
   id: z.string(),
@@ -716,10 +679,9 @@ export const dashboardAdminTokenSummarySchema = z.object({
    */
   subject: z.string().nullable(),
   /**
-   * The single routing key this token is restricted to, or null for an
-   * unscoped token. Load-bearing for the report: a routing-key-scoped token is
-   * refused outright on the secret, context, org-settings and trust-policy
-   * routes, so it is materially less privileged than its role alone suggests.
+   * The routing key this token is restricted to, or null when unscoped. A
+   * scoped token is refused outright on the secret, context, org-settings and
+   * trust-policy routes, so it is less privileged than its role suggests.
    */
   routingKey: z.string().nullable(),
   createdAt: z.string(),
@@ -757,9 +719,8 @@ export const runRerunRequestSchema = z.object({
   actor: actorPrincipalSchema,
   runId: z.string(),
   /**
-   * The Platform forwards the original run's `routing_key` so the
-   * orchestrator can probe its cold-store under the right tenant prefix
-   * when the run is missing from PG.
+   * The original run's routing key: the orchestrator probes its cold-store
+   * under that tenant prefix when the run is missing from PG.
    */
   routingKey: z.string(),
 });
@@ -771,10 +732,8 @@ const runRerunResponseSchema = z.object({
   newRunId: z.string().optional(),
   error: z.string().optional(),
   /**
-   * Stable, machine-readable error code. Set when the orchestrator
-   * needs to communicate a specific failure shape to the Platform proxy
-   * (e.g. `runArchivedNotRerunnable` → HTTP 410). Free-text `error`
-   * remains the human message.
+   * Machine-readable error code for a specific failure shape (e.g.
+   * `runArchivedNotRerunnable` → HTTP 410); `error` stays the human message.
    */
   errorCode: z.string().optional(),
 });
@@ -817,9 +776,8 @@ const runCancelResponseSchema = z.object({
   requestId: z.string(),
   cancelledJobs: z.number().optional(),
   /**
-   * True when the run was already terminal, so the cancel wrote nothing. Optional
-   * so an orchestrator that predates the field still parses: an absent value
-   * means "not reported", not "false".
+   * True when the run was already terminal, so the cancel wrote nothing. Absent
+   * means "not reported" (an older orchestrator), not "false".
    */
   alreadyTerminal: z.boolean().optional(),
   error: z.string().optional(),
@@ -859,15 +817,14 @@ export const runLineageResponseSchema = z.object({
 
 // --- Event log request/response (REST-over-WS proxy) ---
 //
-// Inbound webhook delivery log: list + detail. Joined server-side by
-// Platform with its own `event_log` projection on (org_id, delivery_id);
-// these schemas describe the orchestrator's half of the projection.
+// Inbound webhook delivery log: list + detail. The Platform joins these with
+// its own `event_log` projection on (org_id, delivery_id); these schemas are
+// the orchestrator's half.
 //
-// The detail response carries the payload INLINE (the orchestrator fetches
-// it from its LogStorage adapter using the row's payload_key — the dashboard
-// never sees the raw object-storage key). Oversized / failed-upload payloads
-// surface as `payloadOmitted: true` with a reason; callers render an empty
-// state in that case.
+// The detail response carries no payload: the body streams over the chunked
+// transport below, so the dashboard never sees the raw object-storage key.
+// Oversized / failed-upload payloads surface as `payloadOmitted: true` with a
+// reason, and callers render an empty state.
 
 /** Single delivery row in the list response (orchestrator-side projection). */
 export const eventLogListItemSchema = z.object({
@@ -897,7 +854,6 @@ export const dashboardEventLogListRequestSchema = z.object({
   actor: actorPrincipalSchema,
   /** Tenant ID -- the orchestrator scopes by org_id, NOT routing key. */
   orgId: z.string(),
-  /** Optional filters. */
   routingKey: z.string().optional(),
   event: z.string().optional(),
   status: EventLogStatus.optional(),
@@ -909,8 +865,7 @@ export const dashboardEventLogListRequestSchema = z.object({
   deliveryId: z.string().optional(),
   /** Page size (default 50, max 200). */
   limit: z.number().optional(),
-  /** Cursor returned by the previous response. Server-defined opaque format
-   *  (encodes received_at + id for stable pagination on ties). */
+  /** Opaque cursor from the previous response; encodes received_at + id so ties paginate stably. */
   cursor: z.string().optional(),
 });
 
@@ -931,20 +886,16 @@ export const dashboardEventLogDetailRequestSchema = z.object({
   orgId: z.string(),
   deliveryId: z.string(),
   /**
-   * Cold-store hint: when the Platform side has resurrected the
-   * archived `event_log` row, it forwards the `routing_key` so the
-   * orchestrator can scope its own cold-store fetch to a single tenant
-   * prefix instead of scanning every routing_key for the org.
+   * Cold-store hint: set when the Platform resurrected the archived
+   * `event_log` row, so the orchestrator's cold-store fetch scans one tenant
+   * prefix instead of every routing_key for the org.
    */
   routingKey: z.string().optional(),
 });
 
-/** Response with the orchestrator-side projection.
- *  The webhook body is NOT included here — it streams over the chunked
- *  transport (see `dashboardEventLogPayloadStreamRequestSchema`). When
- *  `payloadOmitted=true` the `payloadOmittedReason` field on the item carries
- *  the cause; the dashboard renders the empty state without issuing a
- *  payload-stream request in that case. */
+/** The body is NOT included: it streams over the chunked transport
+ *  (`dashboardEventLogPayloadStreamRequestSchema`). When `payloadOmitted=true`
+ *  the dashboard renders the empty state without a payload-stream request. */
 const dashboardEventLogDetailResponseSchema = z.object({
   type: z.literal('dashboard.event-log.detail.response'),
   requestId: z.string(),
@@ -966,9 +917,8 @@ export const dashboardEventLogActivityRequestSchema = z.object({
   toTimestamp: z.string(),
 });
 
-/** Orchestrator-only bucketed counts over the window. `matched`/`unmatched`
- *  distinguish a trigger-no-match delivery from one that produced a run — a
- *  fact the Platform relay cannot compute (see the two-table architecture). */
+/** `matched`/`unmatched` separate a delivery that produced a run from a
+ *  trigger no-match, which only the orchestrator can compute. */
 export const eventLogActivityCountsSchema = z.object({
   total: z.number(),
   matched: z.number(),
@@ -987,46 +937,38 @@ export const dashboardEventLogActivityResponseSchema = z.object({
 
 // --- Event-log payload chunked streaming (REST-over-WS) ---
 //
-// The dashboard fetches the webhook body via a separate chunked-WS path so
-// Platform never buffers the full payload. Three message types coordinate
-// the flow:
+// The webhook body streams over a separate chunked-WS path so the Platform
+// never buffers the full payload:
 //
-//   - `event-log.payload.fetch` (browser → Platform browser-handler)
-//     Browser asks Platform to begin streaming; Platform validates org
-//     membership + `event_log:read_payload` permission, resolves the
-//     orchestrator connection, registers a pending stream, and forwards
-//     the request upstream.
+//   - `event-log.payload.fetch` (browser → Platform): the Platform checks org
+//     membership + `event_log:read_payload`, resolves the orchestrator
+//     connection, registers a pending stream and forwards upstream.
 //
-//   - `dashboard.event-log.payload.stream` (Platform → orchestrator)
-//     Platform asks the orchestrator to read its `event_log` row,
-//     decompress the body, and stream it as chunks. Cross-tenant binding
-//     (mirroring `DashboardProxy`'s source-binding rule) ensures the
-//     orchestrator's reply chunks must come from the connection the
-//     request was sent to.
+//   - `dashboard.event-log.payload.stream` (Platform → orchestrator): the
+//     orchestrator decompresses the `event_log` body and streams it. Reply
+//     chunks must come from the connection the request was sent to
+//     (cross-tenant binding, mirroring `DashboardProxy`'s source-binding rule).
 //
 //   - `dashboard.event-log.payload.chunk` (orchestrator → Platform) +
-//     `event-log.payload.chunk` (Platform → browser)
-//     One chunk per slice. Platform forwards each into the originating
-//     browser WebSocket as it arrives.
+//     `event-log.payload.chunk` (Platform → browser): one chunk per slice,
+//     forwarded into the originating browser WebSocket as it arrives.
 
 /**
- * Reasons a chunked event-log payload stream may terminate without a body.
- * The terminal chunk carries `isLast=true` plus one of these codes in
- * `error`. A successful stream ends with `isLast=true` and no `error`.
+ * Codes in the terminal (`isLast=true`) chunk's `error` when a payload stream
+ * ends without a body; a successful stream has no `error`.
  *
- * - `payload_unavailable`: orchestrator row exists but `payload_omitted=true`
- *   or `payload_key=null`. The dashboard renders the existing empty state
- *   (size cap exceeded / object-storage write failed at ingress).
- * - `not_found`: no orchestrator row matched the deliveryId. The dashboard
- *   shows the existing "delivery not found" message.
- * - `read_failed`: orchestrator could not read or gunzip the body.
- * - `forbidden`: caller lacks `event_log:read_payload`. Platform synthesizes
- *   this code on its side and never forwards the upstream request.
- * - `orch_stream_timeout`: Platform observed no inter-chunk activity for
- *   `KICI_EVENT_LOG_PAYLOAD_STREAM_IDLE_MS` and synthesized a terminal
- *   chunk to evict the stream entry.
- * - `orchestrator_unavailable`: Platform could not select an orchestrator
- *   connection for the request (synthesized on Platform side).
+ * - `payload_unavailable`: the row has `payload_omitted=true` or
+ *   `payload_key=null` (size cap exceeded / object-storage write failed at
+ *   ingress); the dashboard renders the empty state.
+ * - `not_found`: no row matched the deliveryId.
+ * - `read_failed`: the orchestrator could not read or gunzip the body.
+ * - `forbidden`: caller lacks `event_log:read_payload`; the Platform
+ *   synthesizes it and never forwards the request.
+ * - `orch_stream_timeout`: the Platform saw no inter-chunk activity for
+ *   `KICI_EVENT_LOG_PAYLOAD_STREAM_IDLE_MS` and synthesized a terminal chunk
+ *   to evict the stream entry.
+ * - `orchestrator_unavailable`: the Platform could not select an orchestrator
+ *   connection (synthesized on the Platform side).
  */
 export const EventLogPayloadStreamError = z.enum([
   'payload_unavailable',
@@ -1045,28 +987,20 @@ export const dashboardEventLogPayloadStreamRequestSchema = z.object({
   actor: actorPrincipalSchema,
   orgId: z.string(),
   deliveryId: z.string(),
-  /**
-   * Cold-store hint: when Platform has resurrected the archived
-   * `event_log` row, it forwards `routing_key` so the orchestrator can scope
-   * its own cold-store fetch to a single tenant prefix instead of scanning
-   * every routing_key for the org. Mirrors `dashboardEventLogDetailRequestSchema`.
-   */
+  /** Cold-store hint; see `dashboardEventLogDetailRequestSchema.routingKey`. */
   routingKey: z.string().optional(),
 });
 
 /**
  * Orchestrator → Platform / Platform → browser: one chunk of the body.
  *
- * - `seq` is 0-based and monotonic. The orchestrator emits chunks strictly
- *   in order on a single WS connection, which guarantees in-order delivery.
- * - `data` is base64-encoded UTF-8 bytes. Base64 sidesteps mid-multibyte
- *   slicing concerns when chunking by raw byte count.
- * - `isLast=true` ends the stream. The terminal chunk may carry an `error`
- *   code (and `data` is empty) when streaming aborted before sending any
- *   body bytes; or it may carry the final body slice (with `error`
- *   undefined).
- * - `totalBytes` is included only on `seq=0` so the dashboard can render
- *   "N KB / M KB" progress.
+ * - `seq` is 0-based and monotonic; the orchestrator emits chunks in order on
+ *   one WS connection, which guarantees in-order delivery.
+ * - `data` is base64 so chunking by raw byte count can split a multibyte
+ *   UTF-8 character safely.
+ * - `isLast=true` ends the stream, carrying either an `error` code with empty
+ *   `data` (aborted before any body bytes) or the final body slice.
+ * - `totalBytes` is set only on `seq=0`, for "N KB / M KB" progress.
  */
 export const dashboardEventLogPayloadChunkSchema = z.object({
   type: z.literal('dashboard.event-log.payload.chunk'),
@@ -1079,10 +1013,9 @@ export const dashboardEventLogPayloadChunkSchema = z.object({
 });
 
 /**
- * Platform → browser: forwarded chunk. Same shape as the orchestrator-side
- * message, just renamed to keep the `dashboard.*` family for the
- * Platform↔orchestrator hop and align with the browser-facing `log.lines` /
- * `run.status` naming convention.
+ * Platform → browser: the forwarded chunk, renamed so `dashboard.*` stays the
+ * Platform↔orchestrator family and the browser side matches `log.lines` /
+ * `run.status`.
  */
 export const browserEventLogPayloadChunkSchema = z.object({
   type: z.literal('event-log.payload.chunk'),
@@ -1096,11 +1029,9 @@ export const browserEventLogPayloadChunkSchema = z.object({
 
 // --- Event DLQ request/response (REST-over-WS proxy) ---
 //
-// Per-org view of the orchestrator-local dead-letter queue. The DLQ holds
-// custom internal events whose dispatch attempts exhausted the retry budget
-// (or that hit a non-retryable error). The dashboard page calls list / count
-// for the read surface, retry / discard for the write surface; the orch
-// records an access_log row per call using the user actor.
+// Per-org view of the orchestrator-local dead-letter queue: custom internal
+// events that exhausted the retry budget or hit a non-retryable error. The
+// orchestrator records an access_log row per call using the user actor.
 
 /** Single DLQ event in the list response. */
 export const dashboardEventDlqListItemSchema = z.object({
@@ -1205,19 +1136,16 @@ export const contextListRequestSchema = z.object({
   requestId: z.string(),
   actor: actorPrincipalSchema,
   /**
-   * When true, each returned context carries its reachable secret key
-   * names (never values) in `secretKeys`. Used by the developer CLI's
-   * `kici secrets list` / `kici types` commands.
+   * When true, each context carries its reachable secret key names (never
+   * values) in `secretKeys`, for `kici secrets list` / `kici types`.
    */
   includeSecrets: z.boolean().optional(),
   /**
-   * Target org the read must be scoped to, carried per-request by the Platform
-   * (the validated `:orgId` path param). The orchestrator honors this over its
-   * static connection-level org so a Platform-first `kici run remote` org —
-   * anchored only by `remote_sources` — sees its own contexts even when the
-   * orchestrator's connection also serves a webhook source for a different org.
-   * Absent on the legacy customer-dashboard path, where the connection org is
-   * already the request org.
+   * The validated `:orgId` path param. The orchestrator honors it over its
+   * connection-level org, so a Platform-first `kici run remote` org (anchored
+   * only by `remote_sources`) sees its own contexts even when the connection
+   * also serves a webhook source for another org. Absent on the
+   * customer-dashboard path, where the connection org is the request org.
    */
   orgId: z.string().optional(),
 });
@@ -1299,18 +1227,17 @@ export const contextCreateRequestSchema = z.object({
   globPattern: z.string().optional(),
   branchRestrictions: z.array(z.string()).optional(),
   repoPatterns: ContextRepoPatternsSchema.optional(),
-  // A concurrency limit must be a positive integer; `null`/omitted means
-  // unlimited. `0` (or a negative / fractional value) is rejected here because
-  // it wedges the workflow-install concurrency gate into an unreleasable hold.
+  // Omitted means unlimited. `0` (or a negative / fractional value) is rejected
+  // because it wedges the workflow-install concurrency gate into an
+  // unreleasable hold.
   concurrencyLimit: z.number().int().positive().optional(),
   concurrencyStrategy: ConcurrencyStrategy.optional(),
   requiredReviewers: z.number().optional(),
   waitTimerSeconds: z.number().optional(),
-  // A hold expiry must be a positive integer; `null`/omitted means "no explicit
-  // expiry" and resolves to `DEFAULT_HOLD_EXPIRY_SECONDS` on read. `0` (or a
-  // negative / fractional value) is rejected because it puts the hold's
-  // deadline at the instant the hold is created, so the stale detector expires
-  // it before a reviewer can act — cancelling the job the hold existed to gate.
+  // Omitted means no explicit expiry, resolved to `DEFAULT_HOLD_EXPIRY_SECONDS`
+  // on read. `0` (or a negative / fractional value) is rejected because it puts
+  // the deadline at the hold's creation, so the stale detector expires it
+  // before a reviewer can act, cancelling the job the hold existed to gate.
   holdExpirySeconds: z.number().int().positive().optional(),
   enabled: z.boolean().optional(),
 });
@@ -1335,16 +1262,13 @@ export const contextUpdateRequestSchema = z.object({
     branchRestrictions: z.array(z.string()).nullable().optional(),
     // `[]` clears the rule; the column holds a JSON array and has no null state.
     repoPatterns: ContextRepoPatternsSchema.optional(),
-    // Positive integer, or `null` for unlimited. `0`/negative/fractional is
-    // rejected — see the create-request schema above for why.
+    // `null` means unlimited; see the create-request schema for why `0` is rejected.
     concurrencyLimit: z.number().int().positive().nullable().optional(),
     concurrencyStrategy: ConcurrencyStrategy.nullable().optional(),
     requiredReviewers: z.number().nullable().optional(),
     waitTimerSeconds: z.number().nullable().optional(),
-    // Positive integer, or `null` to clear the explicit expiry.
-    // `0`/negative/fractional is rejected — see the create-request schema above
-    // for why. Clearing is how the dashboard's emptied field is expressed, so
-    // `null` stays valid.
+    // `null` clears the explicit expiry (the dashboard's emptied field); see the
+    // create-request schema for why `0` is rejected.
     holdExpirySeconds: z.number().int().positive().nullable().optional(),
     enabled: z.boolean().optional(),
   }),
@@ -1356,7 +1280,7 @@ const contextUpdateResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Set an context's test-run access flag (allowLocalExecution). */
+/** Set a context's test-run access flag (allowLocalExecution). */
 export const contextTestAccessSetRequestSchema = z.object({
   type: z.literal('dashboard.contexts.test_access.set'),
   requestId: z.string(),
@@ -1371,7 +1295,7 @@ const contextTestAccessSetResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Delete an context. */
+/** Delete a context. */
 export const contextDeleteRequestSchema = z.object({
   type: z.literal('dashboard.contexts.delete'),
   requestId: z.string(),
@@ -1380,14 +1304,10 @@ export const contextDeleteRequestSchema = z.object({
 });
 
 /**
- * Machine-readable codes for context-delete rejections.
- *
- * Three-category response taxonomy on dashboard responses, each mapped to a
- * distinct HTTP status by the Platform proxy: a bare free-text `error` is the
- * human message and maps to 400; a missing result (e.g. context not found)
- * maps to 404; an `errorCode` flags a specific business rejection mapped to a
- * non-400/404 status — here `pending_held_runs` → 409. The sibling precedent is
- * the rerun response's `errorCode` (`runArchivedNotRerunnable` → 410) above.
+ * Machine-readable codes for context-delete rejections. The Platform proxy
+ * maps a bare `error` to 400, a missing result (e.g. context not found) to
+ * 404, and an `errorCode` to a specific status — here `pending_held_runs` →
+ * 409, like the rerun response's `runArchivedNotRerunnable` → 410.
  */
 export const ContextDeleteErrorCode = z.enum(['pending_held_runs']);
 export type ContextDeleteErrorCode = z.infer<typeof ContextDeleteErrorCode>;
@@ -1401,7 +1321,7 @@ const contextDeleteResponseSchema = z.object({
 
 // -- Context variables --
 
-/** List variables for an context. */
+/** List variables for a context. */
 export const contextVarsListRequestSchema = z.object({
   type: z.literal('dashboard.contexts.variables.list'),
   requestId: z.string(),
@@ -1425,13 +1345,9 @@ const contextVarsListResponseSchema = z.object({
 });
 
 /**
- * Set (create or update) a variable on an context.
- *
- * Under the `permissive` posture the browser sends the plaintext `value`.
- * Under the `encrypted` posture it sends a `sealed` envelope instead (the value
- * sealed to the orchestrator's X25519 key in the browser). Exactly one of
- * `value` / `sealed` is present; `value` stays optional for backward
- * compatibility with older dashboards that only ever send plaintext.
+ * Set (create or update) a variable on a context. The browser sends the
+ * plaintext `value` under the `permissive` posture, or a `sealed` envelope
+ * under `encrypted`; exactly one is present.
  */
 export const contextVarSetRequestSchema = z
   .object({
@@ -1454,7 +1370,7 @@ const contextVarSetResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Delete a variable from an context. */
+/** Delete a variable from a context. */
 export const contextVarDeleteRequestSchema = z.object({
   type: z.literal('dashboard.contexts.variables.delete'),
   requestId: z.string(),
@@ -1471,7 +1387,7 @@ const contextVarDeleteResponseSchema = z.object({
 
 // -- Source overrides --
 
-/** List source overrides for an context + routing key. */
+/** List source overrides for a context + routing key. */
 export const contextSourceOverridesListRequestSchema = z.object({
   type: z.literal('dashboard.contexts.source-overrides.list'),
   requestId: z.string(),
@@ -1540,7 +1456,7 @@ export const contextBindingEntrySchema = z.object({
 });
 export type ContextBindingEntry = z.infer<typeof contextBindingEntrySchema>;
 
-/** List bindings for an context. */
+/** List bindings for a context. */
 export const contextBindingsListRequestSchema = z.object({
   type: z.literal('dashboard.contexts.bindings.list'),
   requestId: z.string(),
@@ -1555,7 +1471,7 @@ const contextBindingsListResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Set bindings (scope + host patterns) for an context. */
+/** Set bindings (scope + host patterns) for a context. */
 export const contextBindingsSetRequestSchema = z.object({
   type: z.literal('dashboard.contexts.bindings.set'),
   requestId: z.string(),
@@ -1596,13 +1512,9 @@ const contextSecretsListResponseSchema = z.object({
 });
 
 /**
- * Set (create or update) a scoped secret.
- *
- * Under the `permissive` posture the browser sends the plaintext `value`.
- * Under the `encrypted` posture it sends a `sealed` envelope instead (the value
- * sealed to the orchestrator's X25519 key in the browser). Exactly one of
- * `value` / `sealed` is present; `value` stays optional for backward
- * compatibility with older dashboards that only ever send plaintext.
+ * Set (create or update) a scoped secret. The browser sends the plaintext
+ * `value` under the `permissive` posture, or a `sealed` envelope under
+ * `encrypted`; exactly one is present.
  */
 export const contextSecretSetRequestSchema = z
   .object({
@@ -1655,7 +1567,7 @@ const contextSecretScopeCreateResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Rename a scope -- also updates all context bindings referencing old scope. */
+/** Rename a scope, updating every context binding that references it. */
 export const contextSecretScopeRenameRequestSchema = z.object({
   type: z.literal('dashboard.contexts.secrets.scope.rename'),
   requestId: z.string(),
@@ -1670,7 +1582,7 @@ const contextSecretScopeRenameResponseSchema = z.object({
   error: z.string().optional(),
 });
 
-/** Delete a scope and all its secrets. Also removes context bindings referencing this scope. */
+/** Delete a scope, its secrets and every context binding that references it. */
 export const contextSecretScopeDeleteRequestSchema = z.object({
   type: z.literal('dashboard.contexts.secrets.scope.delete'),
   requestId: z.string(),
@@ -1721,16 +1633,14 @@ export const contextHistoryResponseSchema = z.object({
 // -- Held runs --
 
 /**
- * Known held-run statuses — the vocabulary the dashboard renders a labelled
- * badge and a queue tab for, and the vocabulary a client may filter the list
- * by. Defined in `context/held-run-status.ts` and re-exported here so the
- * domain types and the wire schema cannot carry divergent copies; a parity test
- * in the orchestrator asserts these options match every status it persists.
+ * Known held-run statuses: what the dashboard renders badges and queue tabs
+ * for, and what a client may filter by. Re-exported so the domain types and
+ * the wire schema share one copy; an orchestrator parity test asserts it
+ * matches every persisted status.
  *
- * This is deliberately NOT the wire type of the response field:
- * `held_runs.status` is a plain-text column owned by a customer-deployed
- * orchestrator, so the response carries `z.string()` (see
- * `heldRunsListResponseSchema`) and this enum is what the UI switches on.
+ * Deliberately NOT the response field's wire type: `held_runs.status` is a
+ * plain-text column a customer-deployed orchestrator owns, so the response
+ * carries `z.string()` (see `heldRunsListResponseSchema`).
  */
 export { HeldRunStatus } from '../../context/held-run-status.js';
 
@@ -1747,22 +1657,13 @@ export const heldRunsListRequestSchema = z.object({
   queueType: HeldRunQueueType.optional(),
   runId: z.string().optional(),
   /**
-   * Narrow to a single hold by its `held_runs.id`. The Platform's held-run
-   * approval gate uses this to resolve one hold's `holdType` before deciding
-   * which permission the caller needs. Optional so an orchestrator that does
-   * not know the field still answers the request — the Platform then narrows
-   * client-side from the response.
+   * Narrow to one `held_runs.id`; the Platform's approval gate resolves the
+   * hold's `holdType` this way before choosing the permission to check. An
+   * orchestrator that ignores it still answers, and the Platform narrows
+   * client-side.
    */
   heldRunId: z.string().optional(),
-  /**
-   * Target org the read must be scoped to, carried per-request by the Platform
-   * (the validated `:orgId` path param). The orchestrator honors this over its
-   * static connection-level org so a Platform-first `kici run remote` org —
-   * anchored only by `remote_sources` — sees its own held runs even when the
-   * orchestrator's connection also serves a webhook source for a different org.
-   * Absent on the legacy customer-dashboard path, where the connection org is
-   * already the request org.
-   */
+  /** Request-scoped org; see `contextListRequestSchema.orgId`. */
   orgId: z.string().optional(),
 });
 
@@ -1778,33 +1679,21 @@ const heldRunsListResponseSchema = z.object({
         // FK ON DELETE SET NULL): terminal hold history outlives its env.
         contextId: z.string().nullable(),
         contextName: z.string().nullable(),
-        // Carries the gate vocabulary — `HoldType` in @kici-dev/engine, which
-        // the dashboard compares against. The orchestrator sends the persisted
-        // `held_runs.hold_type` verbatim.
-        //
-        // Kept `z.string()` for forward-compatibility with orchestrators that
-        // introduce new hold types: a strict enum would reject the entire
-        // relayed held-runs message on one unknown value. An unrecognised value
-        // renders as a neutral badge carrying the raw string.
+        // The persisted `held_runs.hold_type` verbatim; the dashboard compares
+        // it against `HoldType`.
         holdType: z.string(),
-        // Kept `z.string()` for the same reason as `holdType` above: both
-        // mirror plain-text columns (`held_runs.queue_type` /
-        // `held_runs.status`, each `Generated<string>`) whose vocabulary a
-        // customer-deployed orchestrator owns and can extend ahead of us.
+        // `holdType`, `queueType` and `status` stay `z.string()`: they mirror
+        // plain-text columns whose vocabulary a customer-deployed orchestrator
+        // owns and can extend ahead of us. A strict enum fails the whole
+        // relayed message, and since the Platform recognizes this type, the
+        // relay treats that as malformed rather than version skew and CLOSES
+        // the orchestrator's WebSocket: one `released` wait-timer hold once
+        // dropped the control-plane connection in a reconnect loop.
         //
-        // A strict enum here does NOT degrade one row — it fails the whole
-        // relayed message, and because `dashboard.held-runs.list.response` is a
-        // type the Platform recognizes, the relay treats that failure as
-        // malformed rather than version skew and CLOSES the orchestrator's
-        // WebSocket. That is exactly
-        // what `released` did: one released wait-timer hold dropped the whole
-        // control-plane connection, in a reconnect loop.
-        //
-        // The known vocabularies are `HeldRunQueueType` and `HeldRunStatus`,
-        // which the dashboard compares against; any other value renders as a
-        // neutral badge carrying the raw string. The REQUEST-side filters stay
-        // strict enums — a client-supplied filter with a typo should be
-        // rejected, not silently matched against nothing.
+        // The dashboard compares against `HeldRunQueueType` / `HeldRunStatus`
+        // and renders any other value as a neutral badge with the raw string.
+        // REQUEST-side filters stay strict enums, so a typo is rejected rather
+        // than matched against nothing.
         queueType: z.string(),
         status: z.string(),
         requestedAt: z.coerce.string(),
@@ -1814,9 +1703,8 @@ const heldRunsListResponseSchema = z.object({
         expiresAt: z.coerce.string().nullable(),
         contributorUsername: z.string().nullable().optional(),
         trustTier: z.string().nullable().optional(),
-        // Per-element approval fields (job/workflow/step holds). Optional so
-        // legacy context-only holds (which carry no approval requirement)
-        // still validate.
+        // Per-element approval fields (job/workflow/step holds); absent on
+        // context-only holds, which carry no approval requirement.
         jobId: z.string().optional(),
         holdScope: HoldScope.optional(),
         stepIndex: z.number().nullable().optional(),
@@ -1856,18 +1744,15 @@ export const heldRunApproveRequestSchema = z.object({
   actor: actorPrincipalSchema,
   heldRunId: z.string(),
   /**
-   * Set by the `kici run --approve-all` breakglass: the approval was issued by
-   * the run's own dispatcher auto-approving every gate of that run. Eligibility
-   * is still enforced (this only changes the audit action to
-   * `held_run.auto_approve`); it is never a bypass.
+   * Set by the `kici run --approve-all` breakglass, where the run's own
+   * dispatcher auto-approves every gate. Eligibility is still enforced; it
+   * only changes the audit action to `held_run.auto_approve`.
    */
   autoApprove: z.boolean().optional(),
   /**
-   * Target org the decision must be scoped to, carried per-request by the
-   * Platform (the validated `:orgId` path param). Honored over the static
-   * connection-level org so a remote run's hold — recorded under the run's own
-   * `remote_sources` org — is resolvable even when the orchestrator's
-   * connection also serves a webhook source for a different org.
+   * The validated `:orgId` path param, honored over the connection-level org so
+   * a remote run's hold (recorded under its `remote_sources` org) resolves even
+   * when the connection also serves a webhook source for another org.
    */
   orgId: z.string().optional(),
 });
@@ -1885,13 +1770,7 @@ export const heldRunRejectRequestSchema = z.object({
   actor: actorPrincipalSchema,
   heldRunId: z.string(),
   reason: z.string().optional(),
-  /**
-   * Target org the decision must be scoped to, carried per-request by the
-   * Platform (the validated `:orgId` path param). Honored over the static
-   * connection-level org so a remote run's hold — recorded under the run's own
-   * `remote_sources` org — is resolvable even when the orchestrator's
-   * connection also serves a webhook source for a different org.
-   */
+  /** See `heldRunApproveRequestSchema.orgId`. */
   orgId: z.string().optional(),
 });
 
@@ -2024,7 +1903,7 @@ export type DashboardFleetWorkflowsForHostResponse = z.infer<
   typeof dashboardFleetWorkflowsForHostResponseSchema
 >;
 
-// --- Fleet host writes (Model C: declare / remove) ---
+// --- Fleet host writes (declare / remove) ---
 
 /**
  * Why the orchestrator refused a Platform-relayed fleet host write. Travels in
@@ -2043,7 +1922,7 @@ export const fleetHostDeclareRequestSchema = z.object({
   requestId: z.string(),
   actor: actorPrincipalSchema,
   agentId: z.string(),
-  // Optional: an omitted labels field declares a host with no labels.
+  // Omitted declares a host with no labels.
   labels: z.array(z.string()).optional(),
   hostname: z.string().optional(),
   properties: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
@@ -2069,9 +1948,8 @@ export const fleetHostRemoveRequestSchema = z.object({
 export const fleetHostRemoveResponseSchema = z.object({
   type: z.literal('dashboard.fleet.host.remove.response'),
   requestId: z.string(),
-  // false ⇒ no row matched (not-found). The `error` field carries a
-  // FleetHostWriteRefusal code or an internal error, which the Platform maps
-  // to HTTP 409 or 500.
+  // false ⇒ no row matched. `error` carries a FleetHostWriteRefusal code or an
+  // internal error, which the Platform maps to HTTP 409 or 500.
   removed: z.boolean().optional(),
   error: z.string().optional(),
 });
@@ -2119,11 +1997,9 @@ const diagnosticsScalerSchema = z.object({
   labelSets: z.array(z.array(z.string())),
   config: z.record(z.string(), z.unknown()).optional(),
   /**
-   * The spawning host of this scaler, declared statically by its backend.
-   * Populated (with the owning orchestrator instance's hostname) for backends
-   * that spawn agents on the host itself — bare-metal, Firecracker, container
-   * on a local runtime socket. Omitted for backends that provision elsewhere
-   * (remote container runtime, future cloud backends).
+   * The owning orchestrator instance's hostname, for backends that spawn
+   * agents on the host itself (bare-metal, Firecracker, container on a local
+   * runtime socket). Omitted for backends that provision elsewhere.
    */
   hosts: z.array(z.string()).optional(),
 });
@@ -2326,12 +2202,9 @@ export const registrationsListRequestSchema = z.object({
 });
 
 /**
- * Source identity attached to a registration — fed by a batch lookup against
- * the orchestrator-side `sources` and `generic_webhook_sources` tables keyed
- * on `routing_key`. `name` and `subtype` may be null when the source row was
- * deleted but the registration row still exists (rare; the column degrades
- * gracefully to a synthetic `{ routingKey, provider }` derived from the
- * routing key prefix).
+ * Looked up by `routing_key` in the orchestrator's `sources` and
+ * `generic_webhook_sources` tables. `name` and `subtype` are null when the
+ * source row was deleted; `provider` then derives from the routing key prefix.
  */
 const registrationSourceSchema = z.object({
   routingKey: z.string(),
@@ -2356,21 +2229,16 @@ export const registrationItemSchema = z.object({
   commitSha: z.string().optional(),
   sourceFile: z.string().optional(),
   /**
-   * Source identity (routingKey + friendly name + fine-grained subtype +
-   * coarse provider). `null` when the registration has no `routing_key`
-   * (legacy / global-workflow rows). Mirrors the shape attached to run
-   * summaries so the dashboard can reuse the same icon/label helpers.
+   * `null` when the registration has no `routing_key` (legacy / global-workflow
+   * rows). Mirrors the run-summary shape so the dashboard reuses its
+   * icon/label helpers.
    */
   source: registrationSourceSchema.nullable().optional(),
   /**
-   * True when this registration is a global workflow — one whose trigger
-   * carries `repos:`, so it fires on events from other repos in the org.
-   *
-   * Optional because an orchestrator predating this field omits it. A reader
-   * that needs a value for such a row derives one from `triggers[].repos`,
-   * which is the same signal the orchestrator classifies on at registration
-   * time. Prefer this field when present: it mirrors the `is_global` column
-   * the dispatcher itself reads, so it cannot drift from dispatch behaviour.
+   * True for a global workflow: its trigger carries `repos:`, so it fires on
+   * events from other repos in the org. An older orchestrator omits it; derive
+   * it from `triggers[].repos` then. Prefer this field: it mirrors the
+   * `is_global` column the dispatcher reads, so it cannot drift from dispatch.
    */
   isGlobal: z.boolean().optional(),
 });
@@ -2486,15 +2354,13 @@ export const backendTestResponseSchema = z.object({
 
 // --- Platform-first `kici run remote` relay (REST-over-WS proxy) ---
 //
-// The developer CLI (`kici run remote` + companions) reaches a potentially
-// hidden orchestrator through the Platform over the same dashboard-proxy WS
-// relay. Control-plane messages (upload-init, trigger, status, logs, cancel)
-// ride this relay; the overlay tarball itself uploads directly dev→object-store
-// via the external presigned URL returned by `test.uploads.init`. Each request
-// carries the dev's `actor` (PAT identity), which the orchestrator writes to
-// `access_log`.
+// `kici run remote` and its companions reach a possibly hidden orchestrator
+// through the Platform's dashboard-proxy WS relay. Control messages ride the
+// relay; the overlay tarball uploads directly to the object store via the
+// presigned URL from `test.uploads.init`. Each request carries the developer's
+// `actor` (PAT identity), which the orchestrator writes to `access_log`.
 
-/** Enum of the five test-relay control message types (request side). */
+/** Test-relay control message types (request side). */
 export const TestRelayType = z.enum([
   'test.relay.uploads.init',
   'test.relay.trigger',
@@ -2545,24 +2411,23 @@ export const testRelayTriggerRequestSchema = z.object({
   }),
   workflowName: z.string().optional(),
   uploadId: z.string().optional(),
-  // The CLI's ephemeral X25519 public key used to encrypt the overlay TARBALL.
-  // The orchestrator pairs it with the upload record's stored private key to
-  // decrypt the overlay. Distinct from `encryptedSecretsKey` (which keys the
-  // CLI-supplied secrets blob, present only when secrets were sent).
+  // The CLI's ephemeral X25519 key for the overlay TARBALL, paired with the
+  // upload record's stored private key. Distinct from `encryptedSecretsKey`,
+  // which keys the CLI-supplied secrets blob when secrets were sent.
   cliPublicKey: z.string().optional(),
   inlineLockFile: z.string().optional(),
   fullRepo: z.boolean().optional(),
   /** Run mode for idempotent steps; relayed onto the dispatch event. Omitted = apply. */
   checkMode: CheckMode.optional(),
   /**
-   * Runtime host narrowing from `kici run --target`. Intersects each runsOnAll
-   * job's matched roster with this selector. Omitted for webhook runs.
+   * `kici run --target`: intersects each runsOnAll job's matched roster.
+   * Omitted for webhook runs.
    */
   target: HostTargetSelector.optional(),
   /**
-   * Raw operator-supplied `kici run --input KEY=VALUE` pairs (not coerced /
-   * defaulted), relayed verbatim. The orchestrator validates + coerces + applies
-   * defaults authoritatively against the matched workflow's lock descriptor.
+   * Raw `kici run --input KEY=VALUE` pairs, relayed verbatim. The orchestrator
+   * validates, coerces and applies defaults authoritatively against the
+   * matched workflow's lock descriptor.
    */
   dispatchInputs: z.record(z.string(), z.string()).optional(),
   secrets: z.record(z.string(), z.string()).optional(),
@@ -2608,8 +2473,7 @@ export const testRelayRunStatusResponseSchema = z.object({
         status: z.string(),
         exitCode: z.number().nullable().optional(),
         errorMessage: z.string().nullable().optional(),
-        // Optional: an orchestrator that predates it sends nothing, and the
-        // CLI renders the job's duration as unknown rather than failing.
+        // An older orchestrator omits it; the CLI renders the duration as unknown.
         durationMs: z.number().nullable().optional(),
       }),
     )
@@ -2659,7 +2523,7 @@ export const testRelayCancelResponseSchema = z.object({
 });
 export type TestRelayCancelResponse = z.infer<typeof testRelayCancelResponseSchema>;
 
-/** Union of the five Platform→orchestrator test-relay control requests. */
+/** Union of the Platform→orchestrator test-relay control requests. */
 export type TestRelayRequest =
   | TestRelayUploadsInitRequest
   | TestRelayTriggerRequest
@@ -2732,7 +2596,7 @@ export const dashboardPlatformToOrchSchema = z.discriminatedUnion('type', [
   dashboardFleetHostRequestSchema,
   dashboardFleetPreviewRequestSchema,
   dashboardFleetWorkflowsForHostRequestSchema,
-  // Fleet host writes (Model C: declare / remove)
+  // Fleet host writes (declare / remove)
   fleetHostDeclareRequestSchema,
   fleetHostRemoveRequestSchema,
   // Scaler capacity
@@ -2831,7 +2695,7 @@ export const dashboardOrchToPlatformSchema = z.discriminatedUnion('type', [
   dashboardFleetHostResponseSchema,
   dashboardFleetPreviewResponseSchema,
   dashboardFleetWorkflowsForHostResponseSchema,
-  // Fleet host writes (Model C: declare / remove)
+  // Fleet host writes (declare / remove)
   fleetHostDeclareResponseSchema,
   fleetHostRemoveResponseSchema,
   // Scaler capacity
@@ -2978,10 +2842,9 @@ export const dashboardRunDetailApiResponseSchema = z.object({
   /** Run mode for idempotent steps. A non-apply value labels the run a check-mode preview. */
   checkMode: CheckMode.nullable().optional(),
   /**
-   * Structured init-failure signal for runs that never started a step. Set
-   * when the run row was created via `recordInitFailureRun()` on the
-   * orchestrator and surfaced to the dashboard so the banner can render
-   * even while the orchestrator is offline (Platform-DB fallback path).
+   * Set for a run the orchestrator recorded via `recordInitFailureRun()`; the
+   * banner renders even while the orchestrator is offline (Platform-DB
+   * fallback path).
    */
   initFailure: initFailureSchema.optional(),
 });
@@ -2992,21 +2855,16 @@ export const dashboardStepLogsApiResponseSchema = z.object({
   totalLines: z.number(),
   /** Next line-offset cursor, or null when the page reached the end. */
   nextCursor: z.string().nullable().optional(),
-  /**
-   * Whether a log is stored for the step: `false` when none was ever written,
-   * `true` when one is, even if it holds no lines. Absent when the orchestrator
-   * does not report it.
-   */
+  /** See `dashboardStepLogsResponseSchema.recorded`. */
   recorded: z.boolean().optional(),
 });
 
 /**
- * REST API response for the run attestations list. `trustedIssuer` is the
- * signing orchestrator's provenance issuer, which the dashboard pins each
- * bundle's identity token to (never the bundle's own `iss`), and `jwksUri` is
- * the discovery JWKS endpoint the dashboard fetches to verify. Both are null
- * when the orchestrator does not sign — the dashboard then lists + downloads
- * the bundles but renders the badge as "verification unavailable".
+ * `trustedIssuer` is the signing orchestrator's provenance issuer, which the
+ * dashboard pins each bundle's identity token to (never the bundle's own
+ * `iss`); `jwksUri` is the JWKS endpoint it verifies against. Both are null
+ * when the orchestrator does not sign: the bundles still list and download,
+ * and the badge reads "verification unavailable".
  */
 export const dashboardAttestationsApiResponseSchema = z.object({
   trustedIssuer: z.string().nullable(),
@@ -3015,9 +2873,8 @@ export const dashboardAttestationsApiResponseSchema = z.object({
 });
 
 // --- Runs list REST response (Platform -> Dashboard) ---
-// Source of truth for GET /api/v1/orgs/:org/runs. Defined here (rather than in
-// the private platform package) so the kici CLI can consume the same shape
-// without importing platform internals.
+// Source of truth for GET /api/v1/orgs/:org/runs; lives here, not in the
+// private platform package, so the kici CLI consumes the same shape.
 
 /** Resolved user identity attached to run attribution fields. */
 const runListPrincipalUserSchema = z.object({
@@ -3041,10 +2898,9 @@ export const runListItemSchema = z.object({
   status: z.string(),
   repoIdentifier: z.string().nullable(),
   /**
-   * The repository that DEFINES this run's workflow. Non-null only when it
-   * differs from `repoIdentifier` — i.e. this is an organization-wide global
-   * run, whose workflow file lives in another repo entirely. Optional so a
-   * client parsing a response from an older Platform still validates.
+   * The repository that DEFINES this run's workflow; non-null only for an
+   * org-wide global run whose workflow file lives in another repo. Optional so
+   * a response from an older Platform still validates.
    */
   workflowRepoIdentifier: z.string().nullable().optional(),
   sha: z.string().nullable(),
@@ -3067,9 +2923,8 @@ export const runListItemSchema = z.object({
   hadCompileJob: z.boolean(),
   compileJobId: z.string().nullable(),
   /**
-   * Distinct bound deployment-context names across the run's jobs
-   * (first-seen order). Drives the run-list context chips; empty/absent
-   * when no job binds an context.
+   * Distinct bound deployment-context names across the run's jobs, in
+   * first-seen order, for the run-list chips; empty/absent when none bind.
    */
   contexts: z.array(z.string()).optional(),
   /**
@@ -3152,21 +3007,18 @@ const diagnosticsInfraOrchestratorSchema = z.object({
   raftLeaderId: z.string().nullable().optional(),
   scalerBackends: z.array(z.string()),
   /**
-   * Self-reported deployment shape, used by the dashboard to build the correct
-   * per-orchestrator kici-admin invocation. Orchestrators that never reported
-   * it serialize as `mode: 'unknown'` with null container fields.
+   * Self-reported deployment shape, from which the dashboard builds the
+   * kici-admin invocation. An orchestrator that never reported it serializes
+   * as `mode: 'unknown'` with null container fields.
    *
-   * `adminInvocation` is a shell command, not a pair of raw paths: either half
-   * is single-quoted when its path holds whitespace, so it is rendered verbatim
-   * and a reader that wants the shim path back has to split it as shell words
-   * rather than on the last space.
+   * `adminInvocation` is a shell command rendered verbatim: either half is
+   * single-quoted when its path holds whitespace, so split it as shell words,
+   * never on the last space.
    *
    * `adminPath` is the `windows` counterpart: the RAW, unquoted path of the
-   * `kici-admin.cmd` launcher, null for every other mode and whenever it could
-   * not be located. It is deliberately not a command — cmd.exe runs a
-   * double-quoted path in command position while PowerShell only prints it, so
-   * the renderer has to quote it per shell and a pre-quoted value would take
-   * that choice away.
+   * `kici-admin.cmd` launcher, null for other modes and when not located. Not
+   * a command, because cmd.exe runs a double-quoted path in command position
+   * while PowerShell only prints it, so the renderer quotes it per shell.
    */
   deployment: z.object({
     mode: DeploymentModeSchema,
@@ -3176,19 +3028,16 @@ const diagnosticsInfraOrchestratorSchema = z.object({
     adminPath: z.string().nullable(),
   }),
   /**
-   * Absolute host paths of this orchestrator's own config files, for an
-   * operator who wants to inspect them.
+   * Absolute host paths of this orchestrator's own config files.
    *
-   * Optional, and every member nullable. The Platform always emits the object
-   * — all-nulls when nothing is known — but the field is declared optional
-   * because a customer-installed `kici` CLI validates this same schema and may
-   * be pointed at a Platform that predates the field. Members are null rather
-   * than absent so a reader never has to distinguish "not sent" from "not
-   * known".
+   * The Platform always emits the object (all-nulls when nothing is known);
+   * it is optional because a customer-installed `kici` CLI validates this
+   * schema against a Platform that may predate the field. Members are null,
+   * not absent, so "not sent" never needs telling apart from "not known".
    *
-   * Null for every connection served from the database rather than from a live
-   * in-memory registry entry: these are live-host runtime paths and are not
-   * persisted, the same treatment `deployment.adminInvocation` already gets.
+   * Null for a connection served from the database rather than the live
+   * in-memory registry: runtime paths are not persisted, like
+   * `deployment.adminInvocation`.
    */
   configPaths: z
     .object({
@@ -3230,14 +3079,11 @@ const diagnosticsInfraOrchestratorSchema = z.object({
   error: z.string().optional(),
 });
 /**
- * A single infrastructure health alert.
- *
- * Both vocabulary fields are `z.string()` on purpose. `InfraAlertType` and
- * `InfraAlertSeverity` (`diagnostics/infra-alert.ts`) name the *known*
- * vocabulary the producer mints from and the read-side consumers colour by; the
- * wire stays permissive because the `kici` CLI hard-parses this response while
- * pinned to an older version than the hosted Platform it is talking to. A
- * strict enum would fail the whole response rather than degrade one row.
+ * An infrastructure health alert. `type` and `severity` are `z.string()` on
+ * purpose: `InfraAlertType` / `InfraAlertSeverity` (`diagnostics/infra-alert.ts`)
+ * are the known vocabulary, but the `kici` CLI hard-parses this response while
+ * pinned older than the hosted Platform, and a strict enum would fail the
+ * whole response rather than degrade one row.
  */
 export const diagnosticsInfraAlertSchema = z.object({
   type: z.string(),
@@ -3283,9 +3129,7 @@ export type DashboardAttestationsApiResponse = z.infer<
 export type DashboardJobDetail = z.infer<typeof dashboardJobDetailSchema>;
 
 // --- Dashboard payload utility types ---
-// Extracted item types for use by dashboard components and orchestrator handlers.
-// These are the "inner" shapes — e.g., a single context, a single held run —
-// without the WS envelope (type, requestId).
+// Item shapes (a single context, a single held run) without the WS envelope.
 
 /** Single context from the list response. */
 export type DashboardContext = NonNullable<ContextListResponse['contexts']>[number];
@@ -3300,8 +3144,7 @@ export type DashboardContextVariable = NonNullable<ContextVarsListResponse['vari
 export type DashboardHeldRun = NonNullable<HeldRunsListResponse['heldRuns']>[number];
 
 // --- REST-only dashboard schemas ---
-// These schemas define response shapes for Platform REST endpoints consumed by the dashboard.
-// Shared between Platform (validation) and dashboard (type inference).
+// Platform REST response shapes: the Platform validates, the dashboard infers types.
 
 /** Single infrastructure event for a run (from run_events table). */
 export const runEventSchema = z.object({

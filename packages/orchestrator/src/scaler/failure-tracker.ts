@@ -1,39 +1,33 @@
 /**
  * In-process bounded record of recent scaler spawn failures.
  *
- * The scaler manager records every `scaler.failed` event here at the same site
- * it increments the fleet-wide Prometheus counter. The diagnose scaler check
- * reads recent failures grouped per backend instance to produce its rows. This
- * is memory-only and bounded — the recent-failures window resets on restart,
+ * The scaler manager records every `scaler.failed` event here where it
+ * increments the fleet-wide Prometheus counter; the diagnose scaler check reads
+ * it grouped per backend instance. Memory-only: the window resets on restart,
  * which is acceptable for an on-demand operator view over a short window.
  */
 
-/** A single recorded scaler spawn failure. */
 export interface ScalerFailureRecord {
-  /** Scaler instance name (the configured scaler `name`); the diagnose row key. */
+  /** Configured scaler `name`; the diagnose row key. */
   backendName: string;
-  /** Backend type: 'container' | 'bare-metal' | 'firecracker' | 'event' | 'unknown'. */
+  /** 'container' | 'bare-metal' | 'firecracker' | 'event' | 'unknown'. */
   backendType: string;
   /** True when the failed spawn was bound to a queued job (a run was affected). */
   bound: boolean;
-  /** Captured error string from the scaler event detail. */
   detail: string;
-  /** Event timestamp in epoch milliseconds. */
   timestampMs: number;
 }
 
-/** Per-backend summary of recent failures within a window. */
 export interface BackendFailureSummary {
   backendType: string;
   boundCount: number;
   unboundCount: number;
   /** Detail of the most recent failure in the window. */
   lastError: string;
-  /** Timestamp of the most recent failure in the window. */
   lastAtMs: number;
 }
 
-/** Default ring-buffer capacity. Bounds memory under a failure flood. */
+/** Bounds memory under a failure flood. */
 const DEFAULT_MAX_ENTRIES = 256;
 
 export class ScalerFailureTracker {
@@ -54,8 +48,7 @@ export class ScalerFailureTracker {
 
   /**
    * Group failures newer than `nowMs - windowMs` by backend instance name.
-   * `nowMs` is injected so callers control the clock (and tests are
-   * deterministic).
+   * `nowMs` is injected so callers control the clock (and tests are deterministic).
    */
   recentByBackend(windowMs: number, nowMs: number): Map<string, BackendFailureSummary> {
     const cutoff = nowMs - windowMs;

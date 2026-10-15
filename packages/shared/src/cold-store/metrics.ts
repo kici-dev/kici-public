@@ -1,31 +1,15 @@
 /**
- * Cold-store domain metrics.
+ * Cold-store data-volume metrics; they do not overlap the scheduler-layer
+ * `kici_{platform,orch}_job_*` metrics.
  *
- * These are the "how much data moved through cold-store" metrics;
- * complements (but does not overlap with) the scheduler-layer
- * metrics (`kici_{platform,orch}_job_*`) owned by the scheduled-job
- * wrappers.
+ * `cold_store_archive_cycles_total` increments on every `runArchiveCycle()`
+ * so the meter always surfaces on /metrics: `@opentelemetry/exporter-prometheus`
+ * 0.213.0 drops counters whose only observations are `.add(0)`. The other
+ * counters stay hidden until their first real sample.
  *
- * `cold_store_archive_cycles_total` is always-non-zero — incremented
- * on every `runArchiveCycle()` call with a `result` label — so the
- * meter scope + instrument metadata always surface on /metrics.
- * A "zero-add" counter would not work:
- * `@opentelemetry/exporter-prometheus` 0.213.0 filters out
- * counters whose only observations are `.add(0)`, so we need a
- * guaranteed-non-zero counter to keep the series visible.
- *
- * `cold_store_archive_rows_total` stays dormant (hidden) until a
- * `TableAdapter` actually archives rows — at which point
- * its samples appear naturally.
- *
- * Lazy meter initialization: the `@kici-dev/shared` barrel is imported
- * statically at the top of service entry points (server.ts, worker.ts),
- * which evaluates this module BEFORE `initTelemetry()` sets the global
- * MeterProvider. If we call `createMeter('kici-cold-store')` at module
- * load time, the returned ProxyMeter binds to the no-op provider and
- * its instruments never reach the Prometheus exporter. Resolving the
- * meter + instruments on first access (inside `getCold...()` getters)
- * guarantees we resolve AFTER telemetry is wired up.
+ * Instruments resolve lazily on first access: the `@kici-dev/shared` barrel
+ * loads this module before `initTelemetry()` sets the global MeterProvider, and
+ * a meter created at load time binds to the no-op provider forever.
  */
 import type { Counter, Histogram, Meter } from '@opentelemetry/api';
 import { z } from 'zod';
@@ -52,22 +36,16 @@ let _purgeBytesTotal: Counter | undefined;
 let _purgeDurationSeconds: Histogram | undefined;
 
 /**
- * The `result` label of {@link coldStoreArchiveCyclesTotal}: what one
- * `runArchiveCycle()` tick concluded. `disabled` and `no_tables` are the
- * cycle stopping before any adapter runs (config gate off / nothing
- * registered); `success` wrote at least one chunk; `no_tables` is also what a
- * complete pass reports when every adapter ran and none had a row to move;
- * `failure` had a row fail to archive.
+ * The `result` label of {@link coldStoreArchiveCyclesTotal}. `disabled`: config
+ * gate off. `no_tables`: nothing registered, or every adapter ran with no row to
+ * move. `success`: at least one chunk written. `failure`: a row failed to archive.
  */
 export const ColdStoreCycleResult = z.enum(['disabled', 'no_tables', 'success', 'failure']);
 export type ColdStoreCycleResult = z.infer<typeof ColdStoreCycleResult>;
 
 /**
- * Cycles that `runArchiveCycle()` has completed, labeled by outcome.
- * Always incremented by 1 on every tick — guaranteed-visible proof
- * that the cold-store subsystem is registered and running.
- *
- * `result` is a {@link ColdStoreCycleResult}.
+ * Completed `runArchiveCycle()` ticks by {@link ColdStoreCycleResult}; +1 every
+ * tick, so it is the always-visible proof the subsystem runs.
  */
 export function coldStoreArchiveCyclesTotal(): Counter {
   if (!_archiveCyclesTotal) {
@@ -78,14 +56,7 @@ export function coldStoreArchiveCyclesTotal(): Counter {
   return _archiveCyclesTotal;
 }
 
-/**
- * Total rows archived, by db / table / outcome.
- * `result` ∈ success | failure | skipped_min_chunk | skipped_min_warm.
- *
- * Hidden from /metrics until the first TableAdapter moves
- * a row; the visible proof that the subsystem is wired is
- * `cold_store_archive_cycles_total`, not this counter.
- */
+/** `result` ∈ success | failure | skipped_min_chunk | skipped_min_warm. */
 export function coldStoreArchiveRowsTotal(): Counter {
   if (!_archiveRowsTotal) {
     _archiveRowsTotal = meter().createCounter('cold_store_archive_rows_total', {
@@ -95,10 +66,7 @@ export function coldStoreArchiveRowsTotal(): Counter {
   return _archiveRowsTotal;
 }
 
-/**
- * Total bytes archived, by kind ∈ raw | gzipped. Lets us compute the
- * ongoing compression ratio.
- */
+/** Bytes archived by kind ∈ raw | gzipped, for the compression ratio. */
 export function coldStoreArchiveBytesTotal(): Counter {
   if (!_archiveBytesTotal) {
     _archiveBytesTotal = meter().createCounter('cold_store_archive_bytes_total', {
@@ -108,10 +76,6 @@ export function coldStoreArchiveBytesTotal(): Counter {
   return _archiveBytesTotal;
 }
 
-/**
- * Per-chunk archive duration histogram.
- * Buckets: 10ms, 100ms, 500ms, 1s, 5s, 30s, 120s.
- */
 export function coldStoreArchiveDurationSeconds(): Histogram {
   if (!_archiveDurationSeconds) {
     _archiveDurationSeconds = meter().createHistogram('cold_store_archive_duration_seconds', {
@@ -122,11 +86,7 @@ export function coldStoreArchiveDurationSeconds(): Histogram {
   return _archiveDurationSeconds;
 }
 
-/**
- * Rehydrate requests (cache hit vs miss). Incremented by the
- * read-through layer when it serves a range query from
- * cold storage.
- */
+/** Incremented by the read-through layer when it serves a range query from cold storage. */
 export function coldStoreRehydrateRequestsTotal(): Counter {
   if (!_rehydrateRequestsTotal) {
     _rehydrateRequestsTotal = meter().createCounter('cold_store_rehydrate_requests_total', {
@@ -136,7 +96,6 @@ export function coldStoreRehydrateRequestsTotal(): Counter {
   return _rehydrateRequestsTotal;
 }
 
-/** Bytes read from S3 on rehydrate cache miss. */
 export function coldStoreRehydrateBytesTotal(): Counter {
   if (!_rehydrateBytesTotal) {
     _rehydrateBytesTotal = meter().createCounter('cold_store_rehydrate_bytes_total', {
@@ -146,7 +105,7 @@ export function coldStoreRehydrateBytesTotal(): Counter {
   return _rehydrateBytesTotal;
 }
 
-/** Rehydrate duration (S3 fetch + decode), seconds. */
+/** Covers S3 fetch + decode. */
 export function coldStoreRehydrateDurationSeconds(): Histogram {
   if (!_rehydrateDurationSeconds) {
     _rehydrateDurationSeconds = meter().createHistogram('cold_store_rehydrate_duration_seconds', {
@@ -157,10 +116,6 @@ export function coldStoreRehydrateDurationSeconds(): Histogram {
   return _rehydrateDurationSeconds;
 }
 
-/**
- * Verify-failure counter — bumped on the rare `contentHash` mismatch
- * path during post-write verification.
- */
 export function coldStoreVerifyFailuresTotal(): Counter {
   if (!_verifyFailuresTotal) {
     _verifyFailuresTotal = meter().createCounter('cold_store_verify_failures_total', {
@@ -171,12 +126,8 @@ export function coldStoreVerifyFailuresTotal(): Counter {
 }
 
 /**
- * Rows promoted back into PG via `replayChunk` / `replayRow`.
- * `result` ∈ `success` | `failure` | `idempotent_skip`. The
- * `idempotent_skip` bucket counts rows already present in PG (chunk
- * replayed twice — no-op via ON CONFLICT). Hidden until the first
- * replay runs; the visible proof of the subsystem is
- * `cold_store_archive_cycles_total`.
+ * Rows promoted back into PG via `replayChunk` / `replayRow`. `result` ∈
+ * `success` | `failure` | `idempotent_skip` (row already present: ON CONFLICT no-op).
  */
 export function coldStoreReplayRowsTotal(): Counter {
   if (!_replayRowsTotal) {
@@ -187,11 +138,7 @@ export function coldStoreReplayRowsTotal(): Counter {
   return _replayRowsTotal;
 }
 
-/**
- * Replay duration (S3 GET + manifest scan + decode + INSERT),
- * seconds. Buckets mirror archive duration: 10ms, 100ms, 500ms, 1s, 5s,
- * 30s, 120s.
- */
+/** Covers S3 GET + manifest scan + decode + INSERT. */
 export function coldStoreReplayDurationSeconds(): Histogram {
   if (!_replayDurationSeconds) {
     _replayDurationSeconds = meter().createHistogram('cold_store_replay_duration_seconds', {
@@ -202,13 +149,7 @@ export function coldStoreReplayDurationSeconds(): Histogram {
   return _replayDurationSeconds;
 }
 
-/**
- * Chunks acted on by `purgeExpiredChunks`, labeled by db,
- * table, and outcome. `result` ∈ `purged` | `dry_run` | `skipped_locked`
- * | `failure`. Hidden until the first GC sweep finds candidates;
- * `cold_store_archive_cycles_total` remains the always-non-zero
- * heartbeat for the subsystem.
- */
+/** Chunks acted on by `purgeExpiredChunks`; `result` ∈ `purged` | `dry_run` | `skipped_locked` | `failure`. */
 export function coldStorePurgeChunksTotal(): Counter {
   if (!_purgeChunksTotal) {
     _purgeChunksTotal = meter().createCounter('cold_store_purge_chunks_total', {
@@ -218,7 +159,6 @@ export function coldStorePurgeChunksTotal(): Counter {
   return _purgeChunksTotal;
 }
 
-/** Gzipped bytes deleted from S3 by the purge sweep. */
 export function coldStorePurgeBytesTotal(): Counter {
   if (!_purgeBytesTotal) {
     _purgeBytesTotal = meter().createCounter('cold_store_purge_bytes_total', {
@@ -228,10 +168,6 @@ export function coldStorePurgeBytesTotal(): Counter {
   return _purgeBytesTotal;
 }
 
-/**
- * Purge duration per sweep, seconds. Buckets mirror the
- * archive duration histogram: 10ms, 100ms, 500ms, 1s, 5s, 30s, 120s.
- */
 export function coldStorePurgeDurationSeconds(): Histogram {
   if (!_purgeDurationSeconds) {
     _purgeDurationSeconds = meter().createHistogram('cold_store_purge_duration_seconds', {

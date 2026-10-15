@@ -1,16 +1,11 @@
 /**
- * The one restore-or-fall-back policy every job kind shares: execution jobs
- * (the runner child), init jobs, dynamic evaluations, and global evaluation
- * rounds.
+ * The restore-or-fall-back policy every job kind shares (runner child, init
+ * jobs, dynamic evaluations, global evaluation rounds).
  *
- * - Restored: the success line goes to the run log; the caller installs
- *   nothing.
- * - A hash mismatch fails the job. Installing over a cache entry whose bytes
- *   do not match the orchestrator's record would hide a corrupted or tampered
- *   cache behind a green run.
+ * - A hash mismatch fails the job: installing over it would hide a corrupted or
+ *   tampered cache behind a green run.
  * - Any other failure (download, extraction, an unsupported URL) is logged and
- *   the caller installs the dependencies inline, so a cache problem costs time,
- *   never the run.
+ *   the caller installs inline, so a cache problem costs time, never the run.
  */
 
 import { restoreDeps, type DepRestoreLimits } from './dep-restore.js';
@@ -28,10 +23,7 @@ export interface TryRestoreDepsArgs {
   limits?: Partial<DepRestoreLimits>;
 }
 
-/**
- * Restore the dependency tarball. Resolves `true` when restored, `false` when
- * the caller must install inline; rejects only on a hash mismatch.
- */
+/** `false` when the caller must install inline; rejects only on a hash mismatch. */
 export async function tryRestoreDeps(args: TryRestoreDepsArgs): Promise<boolean> {
   try {
     const report = await restoreDeps(args.workDir, args.depsUrl, args.depsHash, {

@@ -1,12 +1,11 @@
 /**
- * Symbolic links in the overlay the CLI uploads.
+ * Symbolic links in the uploaded overlay.
  *
- * A file symlink ships as a link entry whose manifest checksum covers the file
- * it points at, and the agent dereferences it inside the extracted overlay. So
- * every in-repository link on the way, and the regular file it lands on, ship
- * with it even when they did not change. A symlink whose target is a directory
- * is not content: it ships as its link text in the manifest's `symlinks` map,
- * and the agent recreates it.
+ * A file symlink ships as a link entry whose manifest checksum covers its
+ * target, and the agent dereferences it inside the extracted overlay, so every
+ * in-repository link on the way and the final regular file ship too, changed or
+ * not. A directory symlink ships as its link text in the manifest's `symlinks`
+ * map, and the agent recreates it.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -22,7 +21,7 @@ const GITLINK_MODE = '160000';
 
 /** Selected paths the overlay leaves out, which the CLI warns about. */
 export interface OverlaySkipped {
-  /** Submodules (gitlinks in the index): their files are not uploaded. */
+  /** Gitlinks in the index: their files are not uploaded. */
   submodules: string[];
   /** Untracked nested git repositories: their files are not uploaded. */
   nestedRepositories: string[];
@@ -30,25 +29,22 @@ export interface OverlaySkipped {
   danglingLinks: string[];
 }
 
-/** How the overlay ships each selected path. */
 export interface OverlayEntries {
   /** Regular files and file symlinks: shipped as content and checksummed. */
   files: string[];
-  /** Symlinks whose target is a directory: repo-relative path → link text. */
+  /** Directory symlinks: repo-relative path → link text. */
   symlinks: Record<string, string>;
   /** Paths the agent removes. */
   deletions: string[];
-  /** What the overlay leaves out on purpose. */
   skipped: OverlaySkipped;
 }
 
-/** The paths a selection partitions into, as `selectOverlayFiles` returns them. */
+/** As `selectOverlayFiles` returns them. */
 interface SelectedPaths {
   existingFiles: string[];
   deletedFiles: string[];
 }
 
-/** What one path on disk is, as far as the overlay is concerned. */
 enum EntryKind {
   File = 'file',
   FileLink = 'fileLink',
@@ -57,7 +53,6 @@ enum EntryKind {
   Directory = 'directory',
 }
 
-/** What one path on disk is, with the link text of a directory symlink. */
 type PathKind =
   | { kind: EntryKind.File }
   | { kind: EntryKind.FileLink }
@@ -66,18 +61,15 @@ type PathKind =
   | { kind: EntryKind.Directory };
 
 /**
- * The overlay tarball directory that holds `manifest.json`, where the agent
- * reads it. No repository path under it ships: a copy in the developer's tree
- * would collide with the real manifest at the same tarball path.
+ * The overlay tarball directory that holds `manifest.json`. No repository path
+ * under it ships: it would collide with the real manifest at the same tarball path.
  */
 export const OVERLAY_MANIFEST_DIR = '.kici-overlay-tmp';
 
-/** True for repo-relative paths inside the reserved overlay manifest directory. */
 export function isReservedOverlayPath(relPath: string): boolean {
   return relPath === OVERLAY_MANIFEST_DIR || relPath.startsWith(`${OVERLAY_MANIFEST_DIR}/`);
 }
 
-/** True for repo-relative paths inside the `.git` directory. */
 export function isGitDirPath(relPath: string): boolean {
   return relPath === '.git' || relPath.startsWith('.git/');
 }
@@ -110,9 +102,9 @@ async function classifyPath(
   file: string,
   linkedDirs: Map<string, Promise<boolean>>,
 ): Promise<PathKind> {
-  // git tracks nothing beneath a symlink: a path listed there (a directory the
-  // developer replaced with a link) is gone, even though it reads through the
-  // link. `.git` is walked by the uploader itself, not listed by git.
+  // git tracks nothing beneath a symlink, so a listed path there (a directory
+  // replaced with a link) is gone, though it reads through the link. `.git` is
+  // walked by the uploader, not listed by git.
   if (!isGitDirPath(file) && (await dirIsLinked(realRoot, path.posix.dirname(file), linkedDirs))) {
     return { kind: EntryKind.BeneathLink };
   }
@@ -128,12 +120,11 @@ async function classifyPath(
 }
 
 /**
- * Follow the file symlink `linkRel` one path component at a time, the way the
- * kernel resolves it, and return every symlink met after it plus the regular
- * file it lands on — all repo-relative and free of symlinked directories. Null
- * when the chain leaves the repository, uses an absolute link text (which the
- * agent resolves against its own host), loops, or ends on anything but a
- * regular file: the agent refuses such a link, and nothing ships for it.
+ * Follow `linkRel` one component at a time, as the kernel does, and return every
+ * later symlink plus the final regular file, repo-relative and free of symlinked
+ * directories. Null when the chain leaves the repository, uses an absolute link
+ * text (the agent resolves it on its own host), loops, or ends on a non-regular
+ * file: the agent refuses such a link, so nothing ships for it.
  */
 async function followLinkChain(
   realRoot: string,
@@ -174,9 +165,8 @@ async function followLinkChain(
 }
 
 /**
- * The subset of `paths` git would ship: tracked, or untracked and not ignored.
- * A link must never carry a gitignored file (such as `.kici/.env.local`) into
- * the upload just because a tracked link points at it.
+ * The subset of `paths` git would ship: tracked, or untracked and not ignored,
+ * so a tracked link never carries a gitignored file (`.kici/.env.local`) along.
  */
 function gitShippable(repoRoot: string, paths: string[]): Set<string> {
   try {
@@ -242,10 +232,9 @@ export function gitlinkPaths(repoRoot: string, dirs: string[]): Set<string> {
 }
 
 /**
- * Sort the selected real directories. A submodule, or an untracked nested
- * repository (which git lists with a trailing slash), is skipped: its files are
- * not uploaded. Any other directory replaced a tracked file or symlink, so that
- * path is a deletion; its files ship as untracked files.
+ * A submodule, or an untracked nested repository (git lists it with a trailing
+ * slash), is skipped. Any other directory replaced a tracked file or symlink, so
+ * that path is a deletion and its files ship as untracked files.
  */
 function placeDirectories(repoRoot: string, dirs: string[], entries: OverlayEntries): void {
   if (dirs.length === 0) return;
@@ -263,7 +252,7 @@ function placeDirectories(repoRoot: string, dirs: string[], entries: OverlayEntr
   }
 }
 
-/** Which run the skipped paths are left out of, which decides the warning's wording. */
+/** Which run the skipped paths are left out of; it sets the warning's wording. */
 export enum SkipContext {
   /** `kici run remote`: the paths are not uploaded. */
   RemoteRun = 'remote-run',
@@ -276,10 +265,7 @@ const SKIP_WORDING: Record<SkipContext, { verb: string; where: string }> = {
   [SkipContext.LocalRun]: { verb: 'Not copying', where: 'The isolated checkout' },
 };
 
-/**
- * The CLI warnings for what the overlay left out, one per kind, naming every
- * path.
- */
+/** One CLI warning per skipped kind, naming every path. */
 export function overlaySkipWarnings(skipped: OverlaySkipped, context: SkipContext): string[] {
   const { verb, where } = SKIP_WORDING[context];
   const kinds: Array<[string[], string]> = [
@@ -294,10 +280,9 @@ export function overlaySkipWarnings(skipped: OverlaySkipped, context: SkipContex
     );
 }
 
-/** What one path is placed as, keyed by the kind `classifyPath` found. */
 type Placer = (file: string, kind: PathKind) => void;
 
-/** A classified selection, plus what adding link targets needs from it. */
+/** A classified selection, plus what adding link targets needs. */
 interface Classified {
   entries: OverlayEntries;
   place: Placer;
@@ -344,15 +329,13 @@ async function classify(repoRoot: string, selection: SelectedPaths): Promise<Cla
 }
 
 /**
- * Sort the selected paths into what ships as content (regular files and file
- * symlinks), what ships as a directory symlink, what is deleted, and what is
- * skipped. Used as it is by `kici run --local`, whose clone at `HEAD` already
- * holds every unchanged link target and which recreates each link as a link.
+ * Sort the selected paths into content, directory symlinks, deletions and
+ * skips. `kici run --local` uses it as is: its `HEAD` clone already holds every
+ * unchanged link target, and it recreates each link as a link.
  *
- * A tracked symlink whose target does not exist reads as missing, so the
- * selection already lists it as a deletion; it stays one (the workspace lacks
- * the path, as a read through the link would find), and it is recorded so the
- * CLI can name it.
+ * A dangling tracked symlink is already a deletion in the selection; it stays
+ * one (a read through the link finds nothing either) and is recorded so the CLI
+ * can name it.
  */
 export async function classifySelection(
   repoRoot: string,
@@ -362,9 +345,8 @@ export async function classifySelection(
 }
 
 /**
- * Classify the selection as `classifySelection` does, then add the targets the
- * selected file symlinks need on the agent, which dereferences each file
- * symlink inside the extracted overlay.
+ * `classifySelection`, plus the targets the agent needs to dereference each
+ * selected file symlink inside the extracted overlay.
  *
  * @param isIgnored - The `.kiciignore` matcher; a link target it matches is not shipped
  */

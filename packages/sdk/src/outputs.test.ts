@@ -47,10 +47,9 @@ describe('createStepOutputProxy', () => {
   });
 
   it('well-known string props do not throw', () => {
-    // These should not throw even when outputs map is empty
     const proxy = createStepOutputProxy<{ x: number }>({ name: 'missing' });
 
-    // toString, valueOf, etc. should delegate to Reflect
+    // toString, valueOf, etc. delegate to Reflect.
     expect(() => proxy.toString).not.toThrow();
     expect(() => proxy.valueOf).not.toThrow();
   });
@@ -58,7 +57,6 @@ describe('createStepOutputProxy', () => {
   it('symbol props delegate to Reflect', () => {
     const proxy = createStepOutputProxy<{ x: number }>({ name: 'missing' });
 
-    // Symbol access should not throw
     expect(() => (proxy as any)[Symbol.toPrimitive]).not.toThrow();
     expect(() => (proxy as any)[Symbol.iterator]).not.toThrow();
   });
@@ -67,7 +65,7 @@ describe('createStepOutputProxy', () => {
     outputsMap.set('build', { version: '1.0.0' });
     const proxy = createStepOutputProxy<{ version: string }>({ name: 'build' });
 
-    // Should not throw -- ownKeys and getOwnPropertyDescriptor support JSON.stringify
+    // ownKeys and getOwnPropertyDescriptor support JSON.stringify.
     const json = JSON.stringify(proxy);
     expect(JSON.parse(json)).toEqual({ version: '1.0.0' });
   });
@@ -145,7 +143,6 @@ describe('Step.result integration', () => {
       run: async () => ({ version: '1.0.0', artifact: 'dist/main.js' }),
     });
 
-    // .result exists at runtime (it's a Proxy)
     expect(buildStep.result).toBeDefined();
     expect(typeof buildStep.result).toBe('object');
   });
@@ -163,8 +160,7 @@ describe('Step.result integration', () => {
   it('void step has .result at runtime but typed as never', () => {
     const voidStep = step('checkout', async () => {});
 
-    // At runtime, .result still exists (it's a Proxy), but TypeScript types it as `never`
-    // This is a compile-time check -- at runtime the property exists
+    // TypeScript types .result as `never`, but the Proxy exists at runtime.
     expect((voidStep as any).result).toBeDefined();
   });
 
@@ -176,7 +172,6 @@ describe('Step.result integration', () => {
     // Simulate execution: stepA produces outputs
     outputsMap.set('build', { version: '1.0.0' });
 
-    // stepB accesses stepA.result.version
     const version = stepA.result.version;
     expect(version).toBe('1.0.0');
   });

@@ -1,23 +1,9 @@
 /**
- * `kici-admin signing-key` — orchestrator-owned provenance signing key
- * management (orchestrator DB plane, so it belongs to `kici-admin`).
+ * `kici-admin signing-key`: orchestrator-owned provenance signing keys
+ * (orchestrator DB plane, so `kici-admin`). `export` emits public halves ONLY.
  *
- *   signing-key list                      List keys (kid / status / created_at).
- *                                         Reads the database when a database URL
- *                                         is given (flag or KICI_DATABASE_URL),
- *                                         otherwise the admin API.
- *   signing-key generate                  Generate the initial db-custody key
- *                                         (no-op if one is already active).
- *   signing-key rotate                    Generate a new db-custody key and
- *                                         activate it (old → retiring).
- *   signing-key retire <kid>              Move a retiring key to retired.
- *   signing-key revoke <kid> --reason <r> Distrust a compromised key.
- *   signing-key export --public [--out f] Emit the { issuer, jwks } backup /
- *                                         air-gap trust-root artifact. Public
- *                                         halves ONLY — never private material.
- *
- * The PRIVATE key is non-exportable by design: there is no export of private
- * material and no import. Loss recovery is a routine rotation.
+ * The PRIVATE key is non-exportable by design: no private export and no import.
+ * Loss recovery is a routine rotation.
  */
 import { writeFile } from 'node:fs/promises';
 import type { Command } from 'commander';
@@ -57,7 +43,7 @@ async function fetchSigningKeysOverHttp(client: AdminApiClient): Promise<ListedS
   return body.keys.map((k) => ({ ...k, created_at: new Date(k.created_at) }));
 }
 
-/** Print the key list; the database and admin-API modes share this output. */
+/** Shared by the database and admin-API modes. */
 function printSigningKeys(rows: ListedSigningKey[], json: boolean | undefined): void {
   if (json) {
     console.log(
@@ -108,15 +94,13 @@ async function withRepo<T>(databaseUrl: string | undefined, fn: WithDb<T>): Prom
   }
 }
 
-/** Outcome of {@link generateInitialSigningKey}. */
 export type InitialSigningKeyOutcome =
   { created: true; kid: string } | { created: false; activeKid: string };
 
 /**
- * Generate the initial db-custody key and activate it only while no key is
- * active. Orchestrator nodes create the key on their own, so a node may win the
- * race after the command's check; the node's key then stays active, because the
- * nodes already sign with it, and its kid is returned.
+ * Generate and activate the initial db-custody key only while none is active.
+ * A node may create its own key after the command's check; that key stays
+ * active (nodes already sign with it) and its kid is returned.
  */
 export async function generateInitialSigningKey(
   repo: OrchestratorSigningKeyRepo,
@@ -155,15 +139,11 @@ async function generateAndActivate(
   return g.kid;
 }
 
-/** Why `list` cannot run: it has neither a database URL nor an admin token. */
 const LIST_NEEDS_A_SOURCE =
   'signing-key list needs the orchestrator database (--database-url or KICI_DATABASE_URL) ' +
   'or its admin API (--token or KICI_ADMIN_TOKEN, with --url or KICI_ADMIN_URL)';
 
-/**
- * Register `kici-admin signing-key`. `tryGetClient` returns null when no admin
- * token is configured, so `list` can name both of its data sources.
- */
+/** `tryGetClient` returns null with no admin token, so `list` can name both its sources. */
 export function registerSigningKeyCommands(
   program: Command,
   tryGetClient: () => AdminApiClient | null,

@@ -1,11 +1,7 @@
 /**
- * kici local commands
- *
- * Manage the warm, per-user local dev orchestrator plane: a real independent
- * orchestrator plus a local Postgres (embedded, with a podman fallback) that
- * `kici run --local` dispatches through. `up` boots or reuses the plane,
- * `status` reports it plus the control commands, `down` stops it, and `logs`
- * prints the plane log paths and rotation policy.
+ * `kici local`: the warm, per-user local dev plane `kici run --local` dispatches
+ * through — a real independent orchestrator plus a local Postgres (embedded,
+ * with a podman fallback).
  */
 
 import pc from 'picocolors';
@@ -23,7 +19,6 @@ import { resolvePlaneForRun } from '../local-plane/resolve-plane.js';
 import { PLANE_LOG_MAX_MB } from '../local-plane/plane-log.js';
 import { loadGlobalConfig } from '../remote/config.js';
 
-/** Print the control commands a user needs once the plane is running. */
 function printControlHints(): void {
   console.log('');
   console.log(pc.dim('Control commands:'));
@@ -33,15 +28,12 @@ function printControlHints(): void {
 }
 
 /**
- * Boot (or reuse) the local dev plane, honoring the durable attachment record.
- *
- * Routes through the same `resolvePlaneForRun` resolver `kici run --local` uses,
- * so the two commands share one plane-resolution path and never diverge: an
- * attached + reachable plane comes up hybrid, an attached-but-unreachable plane
- * falls back to offline with a loud banner, and a never-attached plane comes up
- * offline. `--offline` forces the independent boot (without clearing the durable
- * attachment record — only `detach` does that); `--connected` requires an
- * attached, reachable Platform.
+ * Boots or reuses the plane through the `resolvePlaneForRun` resolver
+ * `kici run --local` uses, so the two never diverge: attached and reachable
+ * comes up hybrid, attached but unreachable falls back offline with a loud
+ * banner, never attached comes up offline. `--offline` forces the independent
+ * boot without clearing the attachment record (only `detach` does);
+ * `--connected` requires an attached, reachable Platform.
  */
 export async function localUpCommand(
   flags: { offline?: boolean; connected?: boolean } = {},
@@ -77,10 +69,8 @@ export async function localUpCommand(
 }
 
 /**
- * Render the branch for a plane port held by a process that is not a KiCI plane
- * orchestrator. Kept apart from the not-serving branch because `kici local down`
- * deliberately refuses to signal such a holder, so pointing at it here would
- * send the operator to a command that cannot act.
+ * The plane port is held by a non-KiCI process. `kici local down` refuses to
+ * signal such a holder, so this branch never points at it.
  */
 function printForeignHolder(status: Awaited<ReturnType<typeof planeStatus>>): void {
   console.log(
@@ -95,14 +85,10 @@ function printForeignHolder(status: Awaited<ReturnType<typeof planeStatus>>): vo
 }
 
 /**
- * Render the branch for a plane port held by a KiCI plane orchestrator that is
- * not serving this config dir: our own stamped orchestrator failing its
- * readiness probe, or a plane no stamp here accounts for. Split out of
- * `localStatusCommand` so each branch stays readable.
- *
- * The two get different headlines because only one of them has been probed:
- * readiness is checked for a plane we stamped, so `unready` is a measurement,
- * while a plane we did not stamp is only known to be holding the port.
+ * The plane port is held by a KiCI plane orchestrator not serving this config
+ * dir: our stamped orchestrator failing readiness, or a plane no stamp here
+ * accounts for. The headlines differ because only a plane we stamped is probed,
+ * so `unready` is a measurement; the other is only known to hold the port.
  */
 function printNotServing(status: Awaited<ReturnType<typeof planeStatus>>): void {
   if (status.state === 'foreign-kici') {
@@ -131,14 +117,10 @@ function printNotServing(status: Awaited<ReturnType<typeof planeStatus>>): void 
 }
 
 /**
- * The machine-readable projection of a plane status.
- *
- * An explicit allow-list, NOT `JSON.stringify(status)`. `PlaneStatus` carries
- * `adminToken` — the bootstrap admin token the CLI presents to the plane's
- * admin API — so serializing the whole object would publish it on stdout, and
- * from there into any consumer's logs. `attachment` is omitted for the same
- * reason in miniature: no consumer needs it, and a field that is never emitted
- * cannot leak a field added to it later.
+ * An explicit allow-list, NOT `JSON.stringify(status)`: `PlaneStatus` carries
+ * `adminToken`, the plane's bootstrap admin token, which would land on stdout
+ * and in consumers' logs. `attachment` is omitted too: no consumer needs it, and
+ * a field never emitted cannot leak what is added to it later.
  */
 export interface LocalStatusJson {
   state: PlaneState;
@@ -151,7 +133,7 @@ export interface LocalStatusJson {
   mode: PlaneMode | null;
 }
 
-/** Project a PlaneStatus onto the published JSON shape, absent fields as null. */
+/** Absent fields become null. */
 export function toLocalStatusJson(status: PlaneStatus): LocalStatusJson {
   return {
     state: status.state,
@@ -165,13 +147,12 @@ export function toLocalStatusJson(status: PlaneStatus): LocalStatusJson {
   };
 }
 
-/** Show the local dev plane status and its control commands. */
 export async function localStatusCommand(options?: { json?: boolean }): Promise<boolean> {
   const status = await planeStatus();
 
   // Every state exits 0 in JSON mode: the state belongs in the payload, and a
-  // non-zero exit would be indistinguishable from the failure modes a consumer
-  // must treat as "liveness undeterminable".
+  // non-zero exit would read as a failure the consumer treats as "liveness
+  // undeterminable".
   if (options?.json) {
     console.log(JSON.stringify(toLocalStatusJson(status)));
     return true;
@@ -206,7 +187,7 @@ export async function localStatusCommand(options?: { json?: boolean }): Promise<
   return true;
 }
 
-/** Stop the local dev plane, reporting success only once the port is released. */
+/** Reports success only once the port is released. */
 export async function localDownCommand(): Promise<boolean> {
   console.log(pc.dim('Stopping the local dev plane…'));
   const result = await planeDown();
@@ -222,12 +203,9 @@ export async function localDownCommand(): Promise<boolean> {
 }
 
 /**
- * Print the local dev plane orchestrator log path, plus the rotation policy.
- *
- * The path is the only line this command writes to stdout — the policy note
- * goes to stderr — so a caller reading stdout never has to strip prose from
- * it. The CLI version banner still precedes it, as for every command, so
- * `$(kici local logs)` is NOT a bare path: read the last stdout line.
+ * The log path is this command's only stdout line; the rotation policy goes to
+ * stderr. The CLI version banner still precedes it, so `$(kici local logs)` is
+ * NOT a bare path: read the last stdout line.
  */
 export async function localLogsCommand(): Promise<boolean> {
   const logFile = planeLogPath();
@@ -242,10 +220,10 @@ export async function localLogsCommand(): Promise<boolean> {
 }
 
 /**
- * Attach the local dev plane to the hosted Platform so `kici run --local` mints
- * OIDC + attestation with the plane's own signing key under its own issuer, as
- * a deployed orchestrator does. Mints an org-scoped orchestrator key with the
- * logged-in PAT, then (re)boots the plane hybrid.
+ * Attaches the plane to the hosted Platform so `kici run --local` mints OIDC and
+ * attestation with the plane's own key under its own issuer, as a deployed
+ * orchestrator does. Mints an org-scoped orchestrator key with the logged-in
+ * PAT, then reboots the plane hybrid.
  */
 export async function localAttachCommand(): Promise<boolean> {
   const config = await loadGlobalConfig();
@@ -284,7 +262,7 @@ export async function localAttachCommand(): Promise<boolean> {
   }
 }
 
-/** Detach the local dev plane from the Platform and reboot it offline (independent). */
+/** Reboots the plane offline (independent). */
 export async function localDetachCommand(): Promise<boolean> {
   const config = await loadGlobalConfig();
   try {

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { initTelemetry } from '@kici-dev/shared';
 
-// Initialize OTel SDK before importing metrics (mirrors real startup order)
+// OTel SDK before importing metrics (mirrors real startup order).
 beforeAll(() => {
   initTelemetry({
     serviceName: 'kici-orchestrator-test',
@@ -28,9 +28,7 @@ describe('orchestrator OTel metrics', () => {
     expect(m.scalerConfigReloadsTotal.add).toBeTypeOf('function');
     expect(m.configReloadTotal.add).toBeTypeOf('function');
     expect(m.staleRunsDetectedTotal.add).toBeTypeOf('function');
-    // cross-source webhook dispatch error counter
     expect(m.crossSourceErrorsTotal.add).toBeTypeOf('function');
-    // install-secrets resolution counters
     expect(m.installSecretsDecisionsTotal.add).toBeTypeOf('function');
     expect(m.installSecretsRegistryUsedTotal.add).toBeTypeOf('function');
     expect(m.installSecretsContributorStrippedTotal.add).toBeTypeOf('function');
@@ -43,9 +41,7 @@ describe('orchestrator OTel metrics', () => {
     expect(m.executionDurationSeconds.record).toBeTypeOf('function');
     expect(m.buildDurationSeconds.record).toBeTypeOf('function');
     expect(m.staleDetectionDurationSeconds.record).toBeTypeOf('function');
-    // cross-source webhook dispatch fan-out histogram
     expect(m.crossSourceFanoutSize.record).toBeTypeOf('function');
-    // install-secrets per-environment token resolution duration
     expect(m.installSecretsTokenResolutionDurationSeconds.record).toBeTypeOf('function');
   });
 
@@ -87,14 +83,12 @@ describe('orchestrator OTel metrics', () => {
   it('exports cross-source webhook dispatch metrics', async () => {
     const m = await import('./prometheus.js');
 
-    // Histogram: kici_cross_source_fanout_size
     expect(m.crossSourceFanoutSize).toBeDefined();
     expect(m.crossSourceFanoutSize.record).toBeTypeOf('function');
-    // Should accept zero-match recordings (we record fan-out=0 too)
+    // fan-out=0 is recorded too.
     m.crossSourceFanoutSize.record(0, { event: 'foo' });
     m.crossSourceFanoutSize.record(3, { event: 'foo' });
 
-    // Counter: kici_cross_source_errors_total
     expect(m.crossSourceErrorsTotal).toBeDefined();
     expect(m.crossSourceErrorsTotal.add).toBeTypeOf('function');
     m.crossSourceErrorsTotal.add(1, { reason: 'clone_token' });
@@ -130,7 +124,7 @@ describe('orchestrator OTel metrics', () => {
       byStatus: { pending: 0, dispatched: 2 },
       byLabel: {},
     });
-    // Should not throw; callback observation is exercised on the next Prometheus scrape.
+    // Callback observation is exercised on the next Prometheus scrape.
   });
 
   describe('applyStickyQueueLabels (drained labels emit explicit 0)', () => {
@@ -150,8 +144,7 @@ describe('orchestrator OTel metrics', () => {
       const everSeen = new Set<string>();
 
       applyStickyQueueLabels(everSeen, { linux: 3, macos: 2 });
-      // Next tick: queue fully drained. The drained labels must report 0,
-      // not vanish — otherwise the by-label gauge series freezes in the TSDB.
+      // Queue fully drained: labels must report 0, not vanish, or the gauge series freezes in TSDB.
       expect(applyStickyQueueLabels(everSeen, {})).toEqual({ linux: 0, macos: 0 });
     });
 
@@ -168,7 +161,6 @@ describe('orchestrator OTel metrics', () => {
 
   it('counter .add() works with label attributes', async () => {
     const m = await import('./prometheus.js');
-    // Should not throw
     m.webhooksReceivedTotal.add(1, { source: 'relay', event: 'push' });
     m.webhooksProcessedTotal.add(1, { result: 'matched' });
     m.executionsTotal.add(1, { status: 'running' });
@@ -200,8 +192,7 @@ describe('orchestrator OTel metrics', () => {
 
   it('metric names preserve kici_orch_ prefix', async () => {
     const m = await import('./prometheus.js');
-    // The fact that these exported names exist and work is sufficient --
-    // OTel metric names are set at creation time and match the first argument to meter.createCounter()
+    // Existence suffices: OTel names are fixed at creation by meter.createCounter()'s first arg.
     expect(m.webhooksReceivedTotal).toBeDefined();
     expect(m.logBytesStoredTotal).toBeDefined();
   });
@@ -223,13 +214,10 @@ describe('orchestrator OTel metrics', () => {
     });
   });
 
-  // Regression guard: observable gauges are registered lazily via
-  // registerOrchestratorMetrics() (called by createApp() after initTelemetry),
-  // not at module-eval time. The bundler hoists some statically-imported
-  // module init above the entry's initTelemetry() call, so a module-eval
-  // gauge registration binds to the no-op provider and never reaches the
-  // Prometheus exporter — leaving `kici_orch_agents_active` (and friends)
-  // absent from the orchestrator /metrics scrape and the Platform push.
+  // Observable gauges register lazily via registerOrchestratorMetrics() (createApp() calls it
+  // after initTelemetry), not at module eval: the bundler hoists some static-import init above
+  // initTelemetry(), so a module-eval registration binds to the no-op provider and
+  // `kici_orch_agents_active` (and friends) vanish from /metrics and the Platform push.
   it('registerOrchestratorMetrics() makes observable gauges reach the Prometheus exporter', async () => {
     const { getPrometheusExporter } = await import('@kici-dev/shared');
     const m = await import('./prometheus.js');
@@ -246,17 +234,15 @@ describe('orchestrator OTel metrics', () => {
       sm.metrics.map((metric) => (metric as { descriptor: { name: string } }).descriptor.name),
     );
 
-    // The gauge is present (beforeAll inits telemetry with a kici_orch_ prefix,
-    // so match on the suffix rather than the fully-prefixed name).
+    // Suffix match: beforeAll inits telemetry with a kici_orch_ prefix.
     expect(names.some((n) => n.includes('agents_active'))).toBe(true);
     expect(names.some((n) => n.includes('dispatch_queue_depth'))).toBe(true);
     expect(names.some((n) => n.includes('event_dlq_depth'))).toBe(true);
   });
 
-  // The trust-directory age gauge is deliberately UNSET until the first
-  // approval-directory push. Zero would read as "refreshed this instant",
-  // which is the opposite of "never refreshed" — and an alert on the age
-  // climbing would then never fire on the orchestrator that never got one.
+  // The trust-directory age gauge is deliberately UNSET until the first approval-directory push:
+  // zero reads as "refreshed this instant", and an age-climbing alert would never fire on an
+  // orchestrator that never got one.
   it('reports no trust-directory age until a directory arrives, then reports one', async () => {
     const { getPrometheusExporter } = await import('@kici-dev/shared');
     const m = await import('./prometheus.js');

@@ -1,8 +1,4 @@
-/**
- * Key rotation command for kici-admin.
- *
- * Re-encrypts every master-key-wrapped store with the current master key.
- */
+/** `kici-admin rotate-key`: re-encrypt every master-key-wrapped store with the current key. */
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -69,9 +65,8 @@ export function registerRotateCommand(program: Command, getClient: () => AdminAp
         for (const store of STORES) {
           console.log(`Re-encrypted ${store.reEncrypted(result)} ${store.label}.`);
         }
-        // A non-zero skip is the operator's signal that a row opened under
-        // neither key: it is still sealed under a generation nobody supplied,
-        // and dropping the old key now would lose it for good.
+        // A skipped row opened under neither key: it is sealed under a
+        // generation nobody supplied, and dropping the old key loses it for good.
         const skipped = STORES.filter((s) => s.skipped(result) > 0);
         for (const store of skipped) {
           console.log(

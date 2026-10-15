@@ -25,10 +25,8 @@ describe('manifest', () => {
   it('round-trips v1 (backfills bucket=forever, maxColdDays=forever)', () => {
     const serialized = serializeManifest(SAMPLE);
     const parsed = parseManifest(serialized);
-    // V1 round-trip: parseManifest backfills the v2 cold-purge fields
-    // with `'forever'` so the GC sweep can rely on them always being
-    // present. The serialized form on disk omits them (compatible with
-    // v1 chunks).
+    // V1 round-trip: parseManifest backfills the v2 cold-purge fields with
+    // `'forever'` so the GC sweep can rely on them; the serialized form omits them.
     expect(parsed).toEqual({ ...SAMPLE, bucket: 'forever', maxColdDays: 'forever' });
   });
 

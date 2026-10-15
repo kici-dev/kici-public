@@ -1,21 +1,16 @@
 /**
- * Resume a workflow-scoped hold.
- *
- * Reached by a hold that stores a pending workflow context — the two writers of
- * one are `holdWorkflowForInstallGate` (reviewer approve, wait-timer expiry,
+ * Resume a workflow-scoped hold that stores a pending workflow context. Its two
+ * writers are `holdWorkflowForInstallGate` (reviewer approve, wait-timer expiry,
  * concurrency slot free) and `holdRunForSecurityPolicy`, the org trust policy's
- * PR-wide hold released by `/kici approve`. Both hold before their workflow has
- * any dispatched job, so there is nothing to re-dispatch and the whole dispatch
- * is replayed instead. `routeRelease` sends both here, and sends the SDK's
- * workflow-scoped `explicit` approval to the job path, since that one holds real
- * root jobs and stores no workflow context.
+ * PR-wide hold released by `/kici approve`. Both hold before any job dispatched,
+ * so the whole dispatch is replayed. `routeRelease` sends both here, and sends
+ * the SDK's workflow-scoped `explicit` approval to the job path, since that one
+ * holds real root jobs and stores no workflow context.
  *
- * The release loads the persisted serializable dispatch inputs, re-attaches the
- * live orchestrator deps + the provider bundle (looked up from the live registry
- * by routing key), and re-runs `dispatchMatchedWorkflow` against the same held
- * run row.
- *
- * Which gate held decides what the replay may skip — see `skipsInstallGate`.
+ * The release re-attaches the live deps and provider bundle (by routing key) to
+ * the persisted dispatch inputs and re-runs `dispatchMatchedWorkflow` against
+ * the same held run row. Which gate held decides what the replay may skip — see
+ * `skipsInstallGate`.
  *
  * A held pre-run global evaluation round shares the org trust policy's hold row
  * but stores no dispatch context: its release re-evaluates the round from the
@@ -82,25 +77,22 @@ export type RebuiltWorkflowDispatchContext = Omit<WorkflowDispatchContext, 'glob
 };
 
 /**
- * Rebuild a live `WorkflowDispatchContext` from the persisted serializable
- * inputs by re-attaching the orchestrator's live `deps` and reconstructing the
- * provider `bundle` from the live registry (keyed by the stored routing key).
- * Returns null when the provider bundle can no longer be resolved.
+ * Rebuild a dispatch context from the persisted inputs, re-attaching the live
+ * `deps` and the provider `bundle` from the live registry. Returns null when
+ * the provider bundle, or a global run's workflow bundle, no longer resolves.
  *
- * A global run's identity is rebuilt from what was stored at hold time — the
- * workflow commit, branch and provider context it was held at — never from the
- * live registration, which may have moved to a newer commit while the run
- * waited. Its workflow bundle is looked up by the stored workflow routing key,
- * and it has no credentials until {@link withWorkflowRepoCredentials} mints
- * them. Returns null when the workflow bundle can no longer be resolved either.
+ * A global run's identity comes from what was stored at hold time (workflow
+ * commit, branch, provider context), never from the live registration, which
+ * may have moved on while the run waited. Its workflow bundle is looked up by
+ * the stored workflow routing key, and it has no credentials until
+ * {@link withWorkflowRepoCredentials} mints them.
  *
- * The key it looks the bundle up by is `effectiveRoutingKey ?? info.routingKey`
- * — the post-overlay key, the same one `setupDispatchContext` builds
- * `setup.info` from and the same one the run row records. `info.routingKey` is
- * the INBOUND key and never carries the overlay, so on a cross-source or
- * fallback-resolved dispatch it names the source the event arrived on rather
- * than the source the workflow belongs to: the resumed run would get the wrong
- * app, the wrong credentials, and a check poster writing to the wrong place.
+ * The bundle key is `effectiveRoutingKey ?? info.routingKey` — the post-overlay
+ * key `setupDispatchContext` builds `setup.info` from and the run row records.
+ * `info.routingKey` is the INBOUND key and never carries the overlay, so on a
+ * cross-source or fallback-resolved dispatch it names the source the event
+ * arrived on: the resumed run would get the wrong app, the wrong credentials,
+ * and a check poster writing to the wrong place.
  */
 export function rebuildWorkflowDispatchContext(
   inputs: SerializableWorkflowDispatchInputs,
@@ -179,29 +171,25 @@ export async function withWorkflowRepoCredentials(
 
 /**
  * Whether this released hold WAS the workflow install gate, and so may resume
- * past it.
- *
- * `holdWorkflowForInstallGate` is the one held-run writer that calls
+ * past it. `holdWorkflowForInstallGate` is the one held-run writer that calls
  * `installGateJobId(workflow.name)`, so that prefix identifies its rows. The
- * other hold that reaches this resume — the org trust policy's PR-wide hold — is
- * decided by `applyTrustPolicyGate`, which runs BEFORE
- * `resolveWorkflowInstallSecrets`, so its replay has not satisfied the install
- * gate and has no claim to skip it. An unrecognised `job_id` resolves the same
- * way, which is the fail-closed direction: the worst case is a gate evaluated
- * once more.
+ * org trust policy's PR-wide hold is decided by `applyTrustPolicyGate`, which
+ * runs BEFORE `resolveWorkflowInstallSecrets`, so its replay has not satisfied
+ * the install gate and may not skip it. An unrecognised `job_id` resolves the
+ * same way, the fail-closed direction: at worst a gate is evaluated once more.
  *
- * On today's trust-policy path this is inert, and deliberately kept anyway.
+ * On the current trust-policy path this is inert, and kept deliberately.
  * `skipProtectionGate` only selects the install gate's release path
  * (`gateReleasedInstall`), and `resolveInstallSecrets` strips an untrusted
- * contributor's install secrets and returns BEFORE the gate — so for a run that already has a non-trusted tier the flag
- * decides nothing either way. Every trust-policy hold is such a run:
- * `evaluateSecurityPolicy` passes unless the provider bundle has a fork model,
- * which is the same condition under which trust resolution always yields a tier,
- * and `evaluateTrustPolicy` passes `trusted`. What the derivation guards is the
- * case where a tier is ABSENT — `isUntrustedTier` reads `undefined` leniently
- * and leaves the secrets in place, so such a run does reach the gate. No arm
- * produces that pairing today; this keeps the fail-closed answer ready for one
- * that does, rather than resting on a coincidence two modules apart.
+ * contributor's install secrets and returns BEFORE the gate, so for a run with
+ * a non-trusted tier the flag decides nothing. Every trust-policy hold is such
+ * a run: `evaluateSecurityPolicy` passes unless the provider bundle has a fork
+ * model, the same condition under which trust resolution always yields a tier,
+ * and `evaluateTrustPolicy` passes `trusted`. The derivation guards a run whose
+ * tier is ABSENT: `isUntrustedTier` reads `undefined` leniently and leaves the
+ * secrets in place, so such a run does reach the gate. No arm produces that
+ * pairing yet; this keeps the fail-closed answer ready rather than resting on a
+ * coincidence two modules apart.
  */
 function skipsInstallGate(signal: ReleaseSignal): boolean {
   return signal.jobId.startsWith(INSTALL_JOB_ID_PREFIX);
@@ -347,28 +335,25 @@ export async function resumeWorkflow(
  * the run cancelled, complete the check runs the dispatch already posted, and
  * drop the pending context.
  *
- * The check runs are completed `cancelled`, matching the run row this writes —
- * `cancelHeldRun` sets `execution_runs.status` to `cancelled` with failure class
- * `cancelled`. Without this the workflow and per-job checks stay `queued` on the
- * commit for a run that will never start; see `completeUndispatchedHoldChecks`.
- * It runs before the delete because the pending context is what the check-run
- * names are derived from.
+ * The check runs complete `cancelled`, matching the run row `cancelHeldRun`
+ * writes (status and failure class `cancelled`); otherwise they stay `queued`
+ * for a run that never starts (see `completeUndispatchedHoldChecks`). This runs
+ * before the delete because the check-run names derive from the pending context.
  *
  * The hold row decides whether the `KiCI Security` check is terminalized too:
  * the trust policy's PR-wide hold and the SDK's workflow-level `requireApproval`
  * each posted one pending, while the install gate posted none and must not have
- * one fabricated. That is `postedPendingSecurityCheck`'s job — see it for the
- * per-shape derivation, and for why `queue_type` cannot make the distinction.
+ * one fabricated. See `postedPendingSecurityCheck` for the per-shape derivation
+ * and why `queue_type` cannot make the distinction.
  *
- * This is the single writer of that check for a rejection, on both surfaces the
- * shared applier serves: the dashboard / CLI / MCP reject reaches it through
- * `applyDecision`'s `onWorkflowReject`, and `/kici reject` through the comment
- * handler's. Both therefore render identically on the pull request, and the
- * summary below is the one both check families carry. The returned boolean says
- * whether a security check was actually WRITTEN, so a caller suppresses its own
- * post on the strength of a write rather than of a delegate resolving —
- * a rejection this declines to report (an install gate, or a commit whose other
- * holds are still pending) leaves the caller free to decide for itself.
+ * This is the single writer of that check for a rejection on both surfaces: the
+ * dashboard / CLI / MCP reject (via `applyDecision`'s `onWorkflowReject`) and
+ * `/kici reject` (via the comment handler's), so both render identically and
+ * both check families carry the summary below. The returned boolean says whether
+ * a security check was actually WRITTEN, so a caller suppresses its own post on
+ * a write rather than on a delegate resolving; a rejection this declines to
+ * report (an install gate, or a commit whose other holds are still pending)
+ * leaves the caller free to decide.
  */
 export async function rejectWorkflow(
   hold: SecurityCheckHold,

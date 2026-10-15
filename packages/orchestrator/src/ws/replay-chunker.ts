@@ -5,12 +5,10 @@
  * Platform's WS limiter caps a single message at 4 MB with a 2 MB burst
  * refilling at 500 KB/s, so a replay must be split on BOTH axes: a frame that
  * breaches either one is dropped by the Platform, which closes the connection
- * with 4003. Since nothing about reconnecting reduces the run count, an
- * oversized frame is not a transient failure — the orchestrator rebuilds and
- * resends it forever.
+ * with 4003. Reconnecting does not reduce the run count, so an oversized frame
+ * is not transient: the orchestrator would rebuild and resend it forever.
  *
- * Pure and I/O-free so the bounds can be shrunk in tests without building 500
- * real runs.
+ * Pure and I/O-free so tests can shrink the bounds instead of building 500 runs.
  */
 
 /**
@@ -36,12 +34,11 @@ const DEFAULT_BOUNDS: ChunkBounds = {
 };
 
 /**
- * Split `runs` into frames obeying both bounds, preserving order.
+ * Splits `runs` into frames obeying both bounds, preserving order.
  *
- * A single run larger than `maxBytes` cannot be split — it is emitted alone.
- * That is why the byte test is guarded on a non-empty current chunk: without
- * the guard an oversized run would either loop forever or emit an empty chunk,
- * and an empty `runs` array is not a frame worth sending.
+ * A run larger than `maxBytes` is emitted alone. The byte test is guarded on a
+ * non-empty current chunk; without the guard an oversized run would loop
+ * forever or emit an empty chunk.
  */
 export function chunkReplayRuns<T>(
   runs: readonly T[],

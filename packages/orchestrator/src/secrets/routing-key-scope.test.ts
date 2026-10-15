@@ -1,6 +1,3 @@
-/**
- * Unit tests for the routing-key-scope helpers.
- */
 import { describe, it, expect } from 'vitest';
 import { Hono } from 'hono';
 import { enforceRoutingKeyScope, requireUnscopedToken } from './routing-key-scope.js';

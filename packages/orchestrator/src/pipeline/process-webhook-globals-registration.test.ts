@@ -1,25 +1,19 @@
 /**
  * A global workflow the org policy refuses to register says so, by name.
  *
- * The defect this suite guards: a default-branch push whose lock file declares
- * global workflows had every one of them silently stripped from the
- * registration set whenever `isWorkflowRepoAllowed` denied. The only record was
- * a `logger.warn` naming the reason and the repo — not the workflows, and not
- * the org the policy had actually decided against. That matters because the
- * denial commonly comes from the `'__default__'` org anchor, which no operator
- * ever configured and which the reason string ("global workflows not enabled
- * for this organization") describes as if it were the org they DID configure.
+ * When `isWorkflowRepoAllowed` denies, a default-branch push's global workflows
+ * are stripped from the registration set; the log line must name the workflows
+ * and the org the policy decided against. The denial commonly comes from the
+ * `'__default__'` org anchor, which no operator configured, while the reason
+ * string reads as if it were their org.
  *
- * The failure this produces is remote from its cause in both space and time:
- * the exclusion happens on the AUTHORING repo's push, and what gets
- * investigated is a cross-repo event, days later, that dispatched nothing. With
- * no registration row and no run, "the global was refused registration" and
- * "this repo declares no globals" are byte-identical from every side.
+ * The failure is remote from its cause: the exclusion happens on the AUTHORING
+ * repo's push, and what gets investigated, days later, is a cross-repo event
+ * that dispatched nothing — with no registration row and no run, "refused
+ * registration" and "declares no globals" are indistinguishable.
  *
  * `registerWorkflowsOnDefaultBranchPush` is module-private, so it is driven
- * end-to-end through `processWebhook` — the same reason the sibling globals
- * suites do it that way, and here it additionally exercises the default-branch
- * gate that decides whether registration is attempted at all.
+ * through `processWebhook`, which also exercises the default-branch gate.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { processWebhook } from './process-webhook.js';
@@ -73,12 +67,10 @@ interface ExclusionLine {
 }
 
 /**
- * Capture the orchestrator's own log lines for the duration of a call.
- *
- * Winston's Console transport writes to `console._stdout` when Node exposes it
- * and to `process.stdout` otherwise, so both are covered — spying on
- * `process.stdout` alone silently records nothing under vitest and the
- * assertion reads as "the line was never emitted".
+ * Capture the orchestrator's own log lines for the duration of a call. Winston's
+ * Console transport writes to `console._stdout` when Node exposes it, else to
+ * `process.stdout`; spying on `process.stdout` alone records nothing under
+ * vitest.
  */
 function captureLogLines() {
   const lines: string[] = [];
@@ -124,12 +116,9 @@ interface Harness {
 }
 
 /**
- * Deps that reach the registration path: a default-branch push whose lock file
- * resolves and declares one global plus one ordinary workflow.
- *
- * The two-workflow shape is load-bearing: the exclusion must remove the global
- * and leave the per-repo workflow registered, and a single-workflow fixture
- * cannot tell "dropped the globals" from "dropped everything".
+ * Deps for a default-branch push whose lock file declares one global plus one
+ * ordinary workflow. Load-bearing: a single-workflow fixture cannot tell
+ * "dropped the globals" from "dropped everything".
  */
 function makeDeps(over: {
   allowed: boolean;
@@ -204,8 +193,7 @@ function makeDeps(over: {
     },
   } as unknown as Parameters<typeof processWebhook>[1];
 
-  // `resolveOrgId` reads the `sources` table; stub the whole lookup so the org
-  // under test is the one the policy sees.
+  // Stub `resolveOrgId`'s `sources` lookup so the policy sees the org under test.
   (deps as unknown as { db: unknown }).db = {
     selectFrom: () => ({
       select: () => ({
@@ -242,9 +230,8 @@ describe('a global workflow refused registration says which workflows and which 
       lines.restore();
     }
 
-    // The exclusion really happened: the global is gone from the registration
-    // set and the per-repo workflow survived. Without this the log assertions
-    // below could pass over a delivery that registered everything.
+    // The exclusion really happened; otherwise the log assertions could pass
+    // over a delivery that registered everything.
     expect(h.registered()).toEqual([PER_REPO_WORKFLOW]);
     expect(h.markedGlobal()).toEqual([]);
 
@@ -257,8 +244,8 @@ describe('a global workflow refused registration says which workflows and which 
     expect(line.excludedCount).toBe(1);
     expect(line.workflowRepo).toBe(WORKFLOW_REPO);
     expect(line.routingKey).toBe(ROUTING_KEY);
-    // The datum the old line lacked entirely, and the one that identifies the
-    // cause: the policy read `org_settings` for an org nobody configured.
+    // The datum that identifies the cause: the policy read `org_settings` for an
+    // org nobody configured.
     expect(
       line.orgId,
       'the line does not carry the org, so a denial under the no-tenant anchor reads as a ' +
@@ -276,18 +263,16 @@ describe('a global workflow refused registration says which workflows and which 
     }
 
     const { remedy } = lines.find();
-    // Both the mapping remedy (map the unmapped source) and the fleet-switch
-    // remedy — only the operator knows whether the missing mapping is the real
-    // problem. The master switch is fleet-wide now, so the anchor has no
-    // per-org opt-in of its own.
+    // Both the mapping remedy and the fleet-switch remedy: only the operator
+    // knows whether the missing mapping is the real problem. The master switch
+    // is fleet-wide, so the anchor has no per-org opt-in.
     expect(remedy).toContain(`source update ${ROUTING_KEY} --org <org>`);
     expect(remedy).toContain(`cluster-settings set --global-workflows-enabled true`);
   });
 
   it('gives the ordinary opt-in remedy when a real org denied', async () => {
-    // The control for the case above: the anchor-specific remedy is about the
-    // anchor, not about denial in general. A real org that has not opted in is
-    // a configuration choice, not a mapping gap.
+    // Control: the anchor-specific remedy is about the anchor, not denial in
+    // general; a real org's denial is a configuration choice.
     const lines = captureLogLines();
     try {
       await processWebhook(makeInfo(), makeDeps({ allowed: false, orgId: REAL_ORG }).deps);
@@ -302,9 +287,8 @@ describe('a global workflow refused registration says which workflows and which 
   });
 
   it('emits no line, and registers the global, when the policy admits', async () => {
-    // The non-vacuity control for all three cases above: the same fixture with
-    // an allowing policy registers the global and stays silent, so the line is
-    // about the refusal and not about a path that logs unconditionally.
+    // Non-vacuity control for the cases above: the line is about the refusal,
+    // not a path that logs unconditionally.
     const lines = captureLogLines();
     let h!: Harness;
     try {
@@ -322,14 +306,11 @@ describe('a global workflow refused registration says which workflows and which 
 });
 
 /**
- * The other route to the anchor, and the one that used to leave no trace at
- * all: `resolveOrgIdSafe` catching a DB fault and downgrading to
- * `'__default__'`.
- *
- * The downgrade is not neutral — it denies every org-scoped decision
- * downstream — so a silent catch makes a transient DB fault look exactly like a
- * source an operator deliberately left unmapped, and the exclusion line above
- * would then report a mapping remedy for a mapping that is perfectly fine.
+ * The other route to the anchor: `resolveOrgIdSafe` catching a DB fault and
+ * downgrading to `'__default__'`. The downgrade denies every org-scoped
+ * decision downstream, so a silent catch makes a transient DB fault look like a
+ * deliberately unmapped source, and the exclusion line would report a wrong
+ * mapping remedy.
  */
 describe('a failed org lookup says the org was downgraded, not resolved', () => {
   it('logs the fault and still falls back to the anchor', async () => {
@@ -355,9 +336,8 @@ describe('a failed org lookup says the org was downgraded, not resolved', () => 
   });
 
   it('emits no failure line when the lookup succeeds', async () => {
-    // The non-vacuity control: the line is about the catch, not about every
-    // delivery that ends up on the anchor. The fixture below resolves the
-    // anchor cleanly, from a source row that genuinely carries it.
+    // Non-vacuity control: the line is about the catch, not every delivery on
+    // the anchor; this fixture resolves the anchor cleanly from a source row.
     const lines = captureLogLines();
     try {
       await processWebhook(makeInfo(), makeDeps({ allowed: false }).deps);

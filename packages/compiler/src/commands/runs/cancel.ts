@@ -35,8 +35,7 @@ export async function runsCancelCommand(
       runId,
       options.force ?? false,
     );
-    // An already-finished run is left untouched, so reporting a cancellation
-    // would be false — say what actually happened instead.
+    // An already-finished run is left untouched; do not report a cancellation.
     console.log(
       alreadyTerminal
         ? pc.yellow(`Run ${runId} had already finished; nothing was cancelled.`)

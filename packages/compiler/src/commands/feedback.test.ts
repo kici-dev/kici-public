@@ -53,8 +53,7 @@ describe('feedback command', () => {
     const out = printed();
     expect(out).toContain(FEEDBACK_TRACKER_URL);
     expect(out).toContain(FEEDBACK_CONTRACT.guideUrl);
-    // Searching first is what keeps a public tracker from collecting the same
-    // finding once per agent that reads the docs.
+    // Searching first keeps a public tracker from collecting one duplicate per agent.
     expect(out).toContain(FEEDBACK_CONTRACT.searchCommand);
   });
 

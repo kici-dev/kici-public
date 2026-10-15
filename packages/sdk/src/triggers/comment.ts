@@ -1,7 +1,4 @@
-/**
- * Comment trigger helper - creates triggers for issue/PR comment events.
- * Returns a frozen CommentTriggerConfig directly.
- */
+/** Issue/PR comment trigger helper; returns a frozen CommentTriggerConfig. */
 
 import type {
   BodyMatchPattern,
@@ -13,10 +10,7 @@ import { normalizeRegexFlags } from '@kici-dev/engine';
 import { toBranchPattern, asArray } from './types.js';
 
 /**
- * Convert a string or RegExp to a BodyMatchPattern.
- * Strings become glob patterns, RegExp becomes regex patterns.
- *
- * `g` and `y` are dropped for the same reason as `toBranchPattern`: the reader
+ * Strings become glob patterns, RegExp becomes regex patterns. `g` and `y` are dropped for the same reason as `toBranchPattern`: the reader
  * memoizes the compiled instance, so a sticky one alternates verdicts between
  * comments.
  */

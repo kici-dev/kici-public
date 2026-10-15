@@ -3,20 +3,15 @@ import { Kysely, PostgresDialect, sql } from 'kysely';
 import pg from 'pg';
 import { migrateToOwnMigration } from '../migration-test-harness.js';
 import { down, up } from './127_org_trust_policy_approval_expiry_seconds.js';
-import { terminateTestDbBackends } from '../../__test-helpers__/test-db.js';
+import { terminateTestDbBackends } from '@kici-dev/test-support/test-db';
 
 /**
- * Real-Postgres test for migration 127: asserts
- * `org_trust_policy.approval_expiry_seconds` exists and is NULLABLE after
- * migrations 001..127, that an existing row is left with NULL rather than
- * backfilled, and that up/down are idempotent.
+ * Real-Postgres test for migration 127: `org_trust_policy.approval_expiry_seconds` is NULLABLE,
+ * an existing row stays NULL rather than backfilled, and up/down are idempotent. Gated on
+ * `KICI_TEST_ADMIN_DATABASE_URL`.
  *
- * Nullability is the load-bearing assertion, not a formality. A NOT NULL column
- * with a default would let a row written by a build that predates this column
- * claim the default window instead of the hours its operator set, and every
- * reader resolves NULL as "fall back to approval_expiry_hours".
- *
- * Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Nullability is load-bearing: a NOT NULL default would let a row from an older build claim the
+ * default window instead of its operator's hours; readers resolve NULL to approval_expiry_hours.
  */
 const ADMIN_URL = process.env.KICI_TEST_ADMIN_DATABASE_URL;
 const describeDb = ADMIN_URL ? describe : describe.skip;
@@ -70,8 +65,7 @@ describeDb('migration 127_org_trust_policy_approval_expiry_seconds', () => {
   }, 60_000);
 
   it('adds a nullable approval_expiry_seconds column', async () => {
-    // Positive control: the pre-existing hours column proves the probe can see
-    // this table at all, so "exists: false" below could not be a silent miss.
+    // Positive control: the probe can see this table, so "exists: false" is never a silent miss.
     expect((await columnState('approval_expiry_hours')).exists).toBe(true);
 
     const state = await columnState('approval_expiry_seconds');

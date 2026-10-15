@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { previewCommand, previewEvent } from './preview.js';
 
-// Mock dependencies
 vi.mock('../remote/config.js', () => ({
   loadGlobalConfig: vi.fn(),
 }));
@@ -35,7 +34,6 @@ vi.mock('../lockfile/generator.js', () => ({
   transformTriggers: vi.fn().mockReturnValue([]),
 }));
 
-// Suppress logger output in tests
 vi.mock('@kici-dev/core', () => ({
   logger: {
     info: vi.fn(),
@@ -47,7 +45,6 @@ vi.mock('@kici-dev/core', () => ({
   toErrorMessage: (err) => (err instanceof Error ? err.message : String(err)),
 }));
 
-// Mock node:fs/promises
 vi.mock('node:fs/promises', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs/promises')>();
   return {
@@ -70,7 +67,6 @@ describe('kici preview command (dry-run only)', () => {
       const result = await previewCommand(undefined, { kiciDir: '.kici' });
 
       expect(result).toBe(true);
-      // Should show usage text
       expect(loggerInfo).toHaveBeenCalled();
     });
   });
@@ -79,14 +75,11 @@ describe('kici preview command (dry-run only)', () => {
     it('runs dry-run for push event', async () => {
       const result = await previewCommand('push', { kiciDir: '.kici' });
 
-      // Dry-run path should not throw
-      // The underlying previewEvent uses displayDryRun (mocked)
       expect(typeof result).toBe('boolean');
     });
 
     it('runs dry-run for pr:open event', async () => {
       await previewCommand('pr:open', { kiciDir: '.kici' });
-      // Should not throw
     });
 
     it('runs dry-run for schedule event', async () => {
@@ -107,7 +100,6 @@ describe('kici preview command (dry-run only)', () => {
       const result = await previewCommand('push-main', { kiciDir: '.kici' });
 
       expect(result).toBe(false);
-      // Should print migration message mentioning kici run remote
       expect(loggerInfo).toHaveBeenCalledWith(expect.stringContaining('kici run remote push-main'));
     });
 
@@ -121,10 +113,9 @@ describe('kici preview command (dry-run only)', () => {
     });
 
     it('does not trigger migration for colon-separated patterns', async () => {
-      // Colon patterns are treated as potential event types, not fixture names
-      // Even unknown ones should try the dry-run path (will error naturally)
+      // Colon patterns are event types, not fixture names; even an unknown one
+      // takes the dry-run path, and success depends on parseEventArg.
       const result = await previewCommand('unknown:event', { kiciDir: '.kici' });
-      // This should try to parse as an event -- whether it succeeds depends on parseEventArg
       expect(typeof result).toBe('boolean');
     });
   });
@@ -133,7 +124,6 @@ describe('kici preview command (dry-run only)', () => {
     it('still accepts --dry-run flag', async () => {
       const result = await previewCommand(undefined, { dryRun: 'push', kiciDir: '.kici' });
 
-      // Should delegate to previewEvent
       expect(typeof result).toBe('boolean');
     });
   });
@@ -187,8 +177,8 @@ describe('kici preview command (dry-run only)', () => {
       await previewEvent('push', { kiciDir: '.kici' });
 
       const call = vi.mocked(displayDryRun).mock.calls.at(-1)!;
-      // Dynamic values resolve in the agent init round — preview no longer
-      // computes or forwards any purity warnings.
+      // Dynamic values resolve in the agent init round; preview forwards no
+      // purity warnings.
       expect(call).toHaveLength(3);
       expect(call[3]).toBeUndefined();
     });

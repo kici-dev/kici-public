@@ -3,10 +3,8 @@ import * as closeCodes from './close-codes.js';
 
 describe('WebSocket close codes', () => {
   it('assigns a unique numeric value to every WS_CLOSE_ constant', () => {
-    // Guards against re-introducing a collision like the historical 4030 clash
-    // between the rebalance close and a dead "run not found" constant: the
-    // engine module is the single source of truth, so two names sharing a
-    // number means a consumer interpreting that number is ambiguous.
+    // This module is the single source of truth: two names sharing a number
+    // make that code ambiguous to every consumer.
     const entries = Object.entries(closeCodes).filter(([name]) => name.startsWith('WS_CLOSE_'));
     const byValue = new Map<number, string[]>();
     for (const [name, value] of entries) {

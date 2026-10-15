@@ -1,8 +1,6 @@
 /**
- * LockFileFetcher interface.
- *
- * Fetches kici.lock.json from a provider's repository API.
- * Used by the orchestrator to evaluate triggers without cloning the repo.
+ * Fetches kici.lock.json from a provider's repository API, so the orchestrator
+ * evaluates triggers without cloning the repo.
  */
 
 import type { LockFile } from '../trigger/types.js';
@@ -12,20 +10,14 @@ export interface LockFileFetcher {
   readonly provider: ProviderType;
 
   /**
-   * Whether a fetched lock file may be cached under `{repoIdentifier}:{ref}`.
-   * Omitted means yes. A fetcher whose backing store can change under a fixed
-   * ref — a local working tree read straight from disk, where `ref` carries no
-   * information about the file's content — sets this to `false`, so every
-   * lookup reads the current file instead of the first one cached.
+   * Whether a fetched lock file may be cached under `{repoIdentifier}:{ref}`;
+   * omitted means yes. A fetcher whose content can change under a fixed ref (a
+   * local working tree read from disk) sets `false`, so every lookup reads the
+   * current file.
    */
   readonly cacheable?: boolean;
 
   /**
-   * Fetch the lock file content for a repo at a specific ref.
-   *
-   * Implementation details (API client, caching, auth) are internal
-   * to each provider. The interface only cares about the result.
-   *
    * @param repoIdentifier - Provider-specific repo identifier (e.g., "owner/repo" for GitHub)
    * @param ref - Git ref (branch name, tag, or SHA)
    * @param credentials - Provider-specific auth credentials

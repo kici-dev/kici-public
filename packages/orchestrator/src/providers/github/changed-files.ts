@@ -148,7 +148,8 @@ export class GitHubChangedFilesFetcher implements ChangedFilesFetcher {
    * @param eventType - GitHub event type ("pull_request" or "push")
    * @param payload - Raw GitHub webhook payload
    * @param credentials - Must be GitHubCredentials with installationId
-   * @returns Array of changed file paths
+   * @returns The changed file paths, with status 'fetched', or 'unavailable' when the
+   *   full set cannot be determined
    */
   async getChangedFiles(
     repoIdentifier: string,

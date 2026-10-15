@@ -1,19 +1,14 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add idempotent check-mode columns:
+ * Add the check-mode columns, all nullable. Idempotent.
  *
- * - `execution_runs.check_mode text` — the run's mode (`apply` | `check` |
- *   `check-fail-on-drift`). NULL means a legacy/apply run.
- * - `execution_steps.check_outcome text` — the per-step `CheckStepOutcome`
- *   (`skipped` | `applied` | `declined` | `dry-run` | `no_check`). NULL when
- *   the step ran without a check mode.
- * - `execution_steps.drift_summary text` — the human-readable `summarize(drift)`
- *   line. NULL when no drift.
- * - `execution_steps.drift jsonb` — the structured drift value. NULL when no drift.
- *
- * All nullable. Idempotent: re-running on a DB that already has the columns is
- * a no-op.
+ * - `execution_runs.check_mode` — `apply` | `check` | `check-fail-on-drift`; NULL is a
+ *   legacy/apply run.
+ * - `execution_steps.check_outcome` — the `CheckStepOutcome` (`skipped` | `applied` |
+ *   `declined` | `dry-run` | `no_check`); NULL when the step ran without a check mode.
+ * - `execution_steps.drift_summary` — the `summarize(drift)` line; NULL when no drift.
+ * - `execution_steps.drift` — the structured drift value; NULL when no drift.
  */
 async function colExists(db: Kysely<unknown>, table: string, name: string): Promise<boolean> {
   const result = await sql<{ exists: boolean }>`

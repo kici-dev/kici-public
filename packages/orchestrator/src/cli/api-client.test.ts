@@ -1,9 +1,4 @@
-/**
- * Tests for AdminApiClient.
- *
- * Mocks global fetch to verify correct HTTP method, URL, headers,
- * body serialization, and error handling.
- */
+/** AdminApiClient against a mocked global fetch. */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
@@ -419,11 +414,9 @@ describe('fetchAdminApi — unreachable-host diagnostics', () => {
   });
 
   /**
-   * The bare `TypeError: fetch failed` this replaces reads as a fault in the
-   * subcommand rather than a misaddressed client. Each assertion below pins one
-   * piece of information an operator needs to self-serve, and every one of them
-   * can only be present if the wrapper actually ran — a plain `fetch` rejection
-   * carries none of them.
+   * A bare `TypeError: fetch failed` reads as a fault in the subcommand, not a
+   * misaddressed client. Each assertion pins one fact an operator needs, and a
+   * plain `fetch` rejection carries none of them.
    */
   it('names the address it dialled', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('fetch failed')));
@@ -436,8 +429,7 @@ describe('fetchAdminApi — unreachable-host diagnostics', () => {
       (e: unknown) => e as Error,
     );
     expect(err.message).toContain('KICI_ADMIN_URL');
-    // The direct-DB fallback is what makes some subcommands keep working while
-    // HTTP-only ones fail, which is the misleading part worth spelling out.
+    // The direct-DB fallback keeps some subcommands working while HTTP-only ones fail.
     expect(err.message).toContain('KICI_ORCHESTRATOR_URL');
     expect(err.message).toContain('KICI_DATABASE_URL');
   });
@@ -492,18 +484,16 @@ describe('fetchAdminApi — unreachable-host diagnostics', () => {
 });
 
 /**
- * `fetch` rejects with a TypeError for two unrelated situations: the transport
- * failed, and the request could never be built at all. Reporting the second as
- * the first sends an operator to check firewalls and ports when their token
- * actually contains a stray newline — the orchestrator was never dialled.
+ * `fetch` rejects with a TypeError both when the transport failed and when the
+ * request could never be built; reporting the second as the first sends an
+ * operator to check firewalls when their token holds a stray newline.
  *
  * The real shapes, measured against Node 24's undici:
  *   closed port    → TypeError('fetch failed')                       cause: Error(ECONNREFUSED)
  *   invalid header → TypeError('Headers.append: … invalid header …') cause: undefined
  *   invalid URL    → TypeError('Failed to parse URL from …')         cause: Error(ERR_INVALID_URL)
  *
- * So the discriminator is the message, NOT the presence of a cause — the
- * invalid-URL case carries one.
+ * So the discriminator is the message, NOT the presence of a cause.
  */
 describe('fetchAdminApi — malformed request vs unreachable host', () => {
   const BASE = 'http://127.0.0.1:4000';
@@ -577,8 +567,7 @@ describe('firstCauseMessage', () => {
   it('returns empty string when nothing useful is available', () => {
     const e = new TypeError('fetch failed');
     (e as { cause?: unknown }).cause = new Error('');
-    // Drives the ` ()` defect this exists to prevent: an empty detail must
-    // produce no parenthetical at all.
+    // An empty detail must produce no ` ()` parenthetical.
     expect(firstCauseMessage(e)).toBe('');
     expect(firstCauseMessage(new TypeError('fetch failed'))).toBe('');
     expect(firstCauseMessage('not an error')).toBe('');

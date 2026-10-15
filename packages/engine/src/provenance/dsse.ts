@@ -1,10 +1,9 @@
 /**
- * DSSE (Dead Simple Signing Envelope) helpers for KiCI provenance.
- *
- * Provides the in-toto pre-authentication encoding (PAE) and the envelope
- * assembly used by the agent producer and the verifier. Pure byte / base64
- * assembly with no Node-only crypto, so this module stays browser-safe and is
- * exported at the subpath `@kici-dev/engine/provenance/dsse`.
+ * DSSE (Dead Simple Signing Envelope) helpers for KiCI provenance: the in-toto
+ * pre-authentication encoding (PAE) and the envelope assembly used by the agent
+ * producer and the verifier. Byte / base64 assembly with no crypto, exported at
+ * the subpath `@kici-dev/engine/provenance/dsse`; `buildDsseEnvelope` needs the
+ * Node `Buffer` global.
  *
  * Spec reference: https://github.com/secure-systems-lab/dsse/blob/master/protocol.md
  */
@@ -25,7 +24,7 @@ export type DsseEnvelope = z.infer<typeof dsseEnvelopeSchema>;
 /**
  * DSSE pre-authentication encoding: `"DSSEv1 <lenType> <type> <lenBody> <body>"`.
  * The length fields count bytes (UTF-8 for the type, raw bytes for the payload).
- * This is the exact byte sequence that gets signed and verified.
+ * This is the exact byte sequence that is signed and verified.
  */
 export function dssePae(payloadType: string, payload: Uint8Array): Uint8Array {
   const enc = new TextEncoder();

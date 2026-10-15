@@ -1,9 +1,6 @@
 /**
- * Agent auto-scaler module.
- *
- * Provides pluggable backend-agnostic agent provisioning for the orchestrator.
- * Supports Docker, bare-metal, and Firecracker backends with YAML configuration,
- * label-set matching, and warm pool management.
+ * Agent auto-scaler: pluggable Docker, bare-metal and Firecracker backends with
+ * YAML configuration, label-set matching and warm pool management.
  */
 
 export type {
@@ -47,7 +44,7 @@ export type {
   FirecrackerManagedAgent,
 } from './firecracker-backend.js';
 
-export { createScalerBackend, requiredToolsFor } from './backend-factory.js';
+export { createScalerBackend } from './backend-factory.js';
 export type { BackendFactoryContext, IpAllocatorParams } from './backend-factory.js';
 export { resolveAgentHostAccess, storageHostAccessEntries } from './host-access.js';
 

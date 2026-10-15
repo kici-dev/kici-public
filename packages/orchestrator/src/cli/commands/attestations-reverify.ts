@@ -8,11 +8,10 @@ import { computeAttestationVerdict } from '../../provenance/verify-at-ingest.js'
 const logger = createLogger({ prefix: 'kici-admin-attestations' });
 
 /**
- * Backfill / refresh attestation verdicts. By default it re-evaluates only rows
- * that have no usable verdict yet (`pending` / `unverifiable`) — the rollout
- * path for rows recorded before verify-at-ingest, or before an org configured
- * provenance. With `--all` it re-evaluates every row. Idempotent: re-running
- * over already-verified rows (when `--all`) recomputes the same verdict.
+ * Re-evaluates rows with no usable verdict (`pending` / `unverifiable`), such
+ * as rows recorded before verify-at-ingest or before an org configured
+ * provenance; `--all` covers every row. Idempotent: a verified row recomputes
+ * the same verdict.
  */
 export async function reverifyAttestations(
   db: Kysely<Database>,

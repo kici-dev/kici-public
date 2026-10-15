@@ -1,36 +1,26 @@
 /**
- * Held-run commands for kici-admin.
+ * `kici-admin held-run <list|approve|reject>`: the local answer to a held run
+ * on an orchestrator with no Platform. Every other release surface (dashboard
+ * queue, `kici approve` / `kici reject`, developer MCP tools) is
+ * Platform-relayed, and a `/kici approve` PR comment releases only the
+ * `security` queue, so without these verbs an approval-queue hold could only
+ * expire.
  *
- * Subcommand namespace: `kici-admin held-run <list|approve|reject>`.
+ * The mirror image of `trust-policy set`: they work only where no Platform is
+ * attached, and the route refuses with 409 elsewhere. That refusal is surfaced
+ * verbatim so the CLI cannot drift from what the server said.
  *
- * The local answer to a held run, for an orchestrator that has no Platform.
- * Every other release surface is Platform-relayed — the dashboard approval
- * queue, `kici approve` / `kici reject`, and the developer MCP tools all reach
- * the applier over the control-plane connection — and the one surface that is
- * not, a `/kici approve` pull-request comment, releases the `security` queue
- * only. So on an independent orchestrator an approval-queue hold had no answer
- * at all and could only expire.
+ * By default a decision answers as the admin token, whose `service:` subject
+ * satisfies no `{user}` or `{team}` clause. `--as <user-id>` answers as a
+ * member of the approval directory (`kici-admin trust-policy directory-set`),
+ * so a clause-bearing hold has an answer. An id the directory does not carry is
+ * refused: an unvalidated subject would let a token satisfy any clause by
+ * naming it.
  *
- * These verbs are therefore the mirror image of `trust-policy set`: they work
- * only where no Platform is attached, and the route refuses with 409 wherever
- * one is. That refusal is surfaced verbatim rather than reworded here, so the
- * CLI cannot drift from what the server actually said.
- *
- * A decision answers as the admin token by default, whose `service:` subject
- * satisfies no `{user}` or `{team}` clause — enough for a hold that names
- * nobody, and nothing at all for one that does. `--as <user-id>` answers as a
- * member of the approval directory instead, the one `kici-admin trust-policy
- * directory-set` writes, so a clause-bearing hold on an independent
- * orchestrator has an answer rather than only an expiry. An id the directory
- * does not carry is refused: an unvalidated subject would let a token satisfy
- * any clause by naming it.
- *
- * A hold is named the same way `kici approve` names one — `--job` / `--step` /
- * `--hold-type` / `--hold`, resolved by the shared `resolveHeldRunId` — so an
- * operator disambiguating a doubly-held job types the same flags on either
- * surface. That sharing is the point: a job gated by BOTH a reviewer hold and a
- * security hold writes two pending rows requiring two decisions, and a second
- * resolver would be free to disagree about which one `--job` means.
+ * Holds are named with the same flags as `kici approve` (`--job` / `--step` /
+ * `--hold-type` / `--hold`) through the shared `resolveHeldRunId`: a job gated
+ * by BOTH a reviewer and a security hold has two pending rows, and a second
+ * resolver could disagree about which one `--job` means.
  */
 import type { Command } from 'commander';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -42,18 +32,16 @@ import {
 } from '@kici-dev/engine';
 import type { AdminApiClient } from '../api-client.js';
 
-/** The list response the admin route returns. */
 interface HeldRunListResponse {
   heldRuns: HeldRunSummary[];
 }
 
-/** One held-run row as the admin route reports it, with the clause list it adds. */
+/** The admin route adds the clause list to each row. */
 type AdminHeldRunSummary = HeldRunSummary & {
   /** Approver clauses the hold's requirement carries; `[]` when it names nobody. */
   clauses?: Array<{ team: string } | { user: string }>;
 };
 
-/** The decision response the admin route returns. */
 interface DecisionResponse {
   status: string;
   remainingClauses?: number;
@@ -68,11 +56,9 @@ interface HoldFilterOptions {
 }
 
 /**
- * Answer as a registered directory member rather than as the admin token.
- *
- * Without it the approver subject is the token's own `service:` identity, which
- * matches neither a `{user}` clause nor a `{team}` membership — so a hold whose
- * `approval_requirement` names a person or a team cannot be answered at all.
+ * Answer as a registered directory member. Without it the approver is the
+ * token's `service:` identity, so a hold whose `approval_requirement` names a
+ * person or team cannot be answered.
  */
 interface ApproveAsOption {
   as?: string;
@@ -93,12 +79,9 @@ function formatClause(clause: { team: string } | { user: string }): string {
 }
 
 /**
- * Render the pending holds for a run.
- *
- * Per-entry rather than a count: "which hold do I answer, and who may answer
- * it" is the question this command exists to answer, and the hold id it prints
- * is the `--hold <id>` disambiguator the resolver hands back when nothing else
- * separates two holds.
+ * Per-entry rather than a count: the command answers "which hold, and who may
+ * answer it", and the printed id is the `--hold <id>` disambiguator the
+ * resolver hands back when nothing else separates two holds.
  */
 export function formatHeldRuns(res: { heldRuns: AdminHeldRunSummary[] }, format: string): string {
   if (format === 'json') return JSON.stringify(res, null, 2);
@@ -193,8 +176,7 @@ export function registerHeldRunCommands(program: Command, getClient: () => Admin
         );
         console.log(formatHeldRuns(res, opts.format));
       } catch (err) {
-        // Includes the route's 409 "answered through the KiCI Platform"
-        // message, surfaced verbatim.
+        // Surfaces the route's 409 "answered through the KiCI Platform" verbatim.
         console.error(`Error: ${toErrorMessage(err)}`);
         process.exit(1);
       }

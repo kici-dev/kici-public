@@ -1,11 +1,9 @@
 /**
  * A live agent id belongs to the agent token it registered with: a
- * registration under another token must not take it over. The coordinator
- * builds one WebSocket handler per connection (`app.ts` `upgradeWebSocket`),
- * so every test here drives each socket through its own handler over one
- * shared registry, as production does. The legitimate re-registrations — a
- * reconnect, a rotated or new token once the old connection has gone, a
- * revoked token's successor — must keep working.
+ * registration under another token must not take it over. Each socket gets its
+ * own handler over one shared registry, as `app.ts` `upgradeWebSocket` does.
+ * Legitimate re-registrations (reconnect, rotated token after the old
+ * connection has gone, a revoked token's successor) must keep working.
  */
 import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
 import {
@@ -77,7 +75,6 @@ describe('a live agent id cannot be taken over by another agent token', () => {
     onScalerAgentRegistered.mockResolvedValue(null);
   });
 
-  /** One connection's handler, as the coordinator builds per socket. */
   function connection() {
     const handler = createAgentWsHandler({
       registry,
@@ -91,7 +88,7 @@ describe('a live agent id cannot be taken over by another agent token', () => {
     return { handler, ws };
   }
 
-  /** Authenticate with `token` and register as `agentId`; resolves when handled. */
+  /** Resolves when both frames are handled. */
   async function register(
     conn: ReturnType<typeof connection>,
     token: string,

@@ -1,9 +1,6 @@
 /**
- * In-memory agent token store for worker nodes.
- *
- * Workers have no database access. This implementation stores token
- * hashes in memory and supports both static (long-lived) and ephemeral
- * (TTL-based) tokens with the same kat_ prefix format as the DB-backed
+ * In-memory agent token store for worker nodes, which have no database access.
+ * Supports static and ephemeral (TTL) tokens in the same format as the DB-backed
  * AgentTokenStore.
  *
  * Token format: kat_ + 64 hex chars (32 random bytes = 256 bits).
@@ -13,18 +10,14 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { sha256 } from '@kici-dev/shared';
 
-/** Token prefix for KiCI Agent Tokens. */
 const TOKEN_PREFIX = 'kat_';
 
-/** Number of random bytes for token generation. */
 const TOKEN_BYTES = 32;
 
-/** Generate a new agent token (prefix + random hex). */
 function generateToken(): string {
   return TOKEN_PREFIX + randomBytes(TOKEN_BYTES).toString('hex');
 }
 
-/** Internal token record. */
 interface TokenRecord {
   id: string;
   tokenHash: string;
@@ -36,7 +29,7 @@ interface TokenRecord {
   revokedAt: number | null;
 }
 
-/** Safe token info returned from validate (matches SafeAgentTokenRow shape). */
+/** Matches the SafeAgentTokenRow shape. */
 interface SafeTokenInfo {
   id: string;
   token_prefix: string;
@@ -50,9 +43,6 @@ interface SafeTokenInfo {
 export class StaticAgentTokenStore {
   private readonly tokens = new Map<string, TokenRecord>();
 
-  /**
-   * Create a static (long-lived) agent token.
-   */
   async createStatic(opts: {
     labels?: string[];
     createdBy?: string;
@@ -75,9 +65,6 @@ export class StaticAgentTokenStore {
     return { token, id };
   }
 
-  /**
-   * Create an ephemeral (short-lived) agent token.
-   */
   async createEphemeral(agentId: string, labels: string[], ttlMs: number): Promise<string> {
     const token = generateToken();
     const tokenHash = sha256(token);
@@ -97,11 +84,7 @@ export class StaticAgentTokenStore {
     return token;
   }
 
-  /**
-   * Validate a plaintext token.
-   *
-   * Returns token info if valid, null if unknown/revoked/expired.
-   */
+  /** Returns null for an unknown, revoked or expired token. */
   async validate(token: string): Promise<SafeTokenInfo | null> {
     const tokenHash = sha256(token);
 
@@ -124,11 +107,7 @@ export class StaticAgentTokenStore {
     return null;
   }
 
-  /**
-   * Revoke a token by ID.
-   *
-   * @returns true if newly revoked, false if not found or already revoked.
-   */
+  /** @returns true if newly revoked, false if not found or already revoked. */
   async revoke(id: string): Promise<boolean> {
     const record = this.tokens.get(id);
     if (!record || record.revokedAt !== null) return false;
@@ -136,11 +115,7 @@ export class StaticAgentTokenStore {
     return true;
   }
 
-  /**
-   * Clean up expired ephemeral tokens.
-   *
-   * @returns Number of removed tokens.
-   */
+  /** Remove expired ephemeral tokens; returns how many were removed. */
   async cleanupExpired(): Promise<number> {
     const now = Date.now();
     let count = 0;

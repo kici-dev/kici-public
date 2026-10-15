@@ -1,17 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 import { initTestUpload, TestUploadStorageUnavailableError } from './uploads.js';
-
-/** Build a chainable Kysely insert mock that records the inserted row. */
-function mockDb() {
-  const values = vi.fn().mockReturnThis();
-  const execute = vi.fn().mockResolvedValue(undefined);
-  const insertInto = vi.fn().mockReturnValue({ values, execute });
-  return { db: { insertInto } as any, values, execute, insertInto };
-}
 
 describe('initTestUpload', () => {
   it('returns the developer-facing presigned URL', async () => {
-    const { db, values } = mockDb();
+    const {
+      db,
+      mocks: { insertValues: values },
+    } = createMockDb();
     const getUploadUrl = vi.fn().mockResolvedValue('https://agent.example/put?sig=1');
     const getInternalUploadUrl = vi.fn().mockResolvedValue('https://dev.example/put?sig=2');
 
@@ -29,7 +25,6 @@ describe('initTestUpload', () => {
     expect(result.publicKey).toBeTruthy();
     expect(result.expiresIn).toBe(3600);
 
-    // The ephemeral private key is persisted on the row.
     const row = values.mock.calls[0][0];
     expect(row.routing_key).toBe('remote:org_1');
     expect(row.encryption_private_key).toBeTruthy();
@@ -37,7 +32,10 @@ describe('initTestUpload', () => {
   });
 
   it('throws a typed, actionable error when no cache storage is configured', async () => {
-    const { db, insertInto } = mockDb();
+    const {
+      db,
+      mocks: { insertInto },
+    } = createMockDb();
 
     const run = initTestUpload(
       { db, cacheStorage: undefined },
@@ -51,7 +49,10 @@ describe('initTestUpload', () => {
   });
 
   it('records the createdBy actor on the upload row', async () => {
-    const { db, values } = mockDb();
+    const {
+      db,
+      mocks: { insertValues: values },
+    } = createMockDb();
     await initTestUpload(
       {
         db,

@@ -1,12 +1,12 @@
+import '../../__test-helpers__/shared-mocks.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
 import type { JobDispatch } from '@kici-dev/engine';
 
-// Mock child_process before imports. `execSync` is looked up via dynamic
-// `import('node:child_process')` inside BareMetalSandbox.setup() to verify
-// that `bwrap` is on PATH when sandbox=true. `vi.hoisted` is required because
-// `vi.mock` factories are hoisted above top-level variable declarations.
+// BareMetalSandbox.setup() reaches `execSync` through a dynamic
+// `import('node:child_process')` to check `bwrap` is on PATH when sandbox=true.
+// `vi.hoisted` because `vi.mock` factories hoist above top-level declarations.
 const { mockExecSync } = vi.hoisted(() => ({ mockExecSync: vi.fn() }));
 vi.mock('node:child_process', () => ({
   fork: vi.fn(),
@@ -24,24 +24,11 @@ vi.mock('node:fs', () => ({
   existsSync: vi.fn().mockReturnValue(false),
 }));
 
-// Mock @kici-dev/shared createLogger
-vi.mock('@kici-dev/shared', () => ({
-  createLogger: vi.fn(() => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  })),
-
-  toErrorMessage: (err) => (err instanceof Error ? err.message : String(err)),
-}));
-
 import { BareMetalSandbox } from './bare-metal-sandbox.js';
 import { fork } from 'node:child_process';
 import { access } from 'node:fs/promises';
 import type { RunnerToAgentMessage } from './ipc-protocol.js';
 
-/** Create a minimal fake ChildProcess that supports IPC events. */
 function createFakeChild(): ChildProcess & EventEmitter {
   const child = new EventEmitter() as ChildProcess & EventEmitter;
   child.send = vi.fn().mockReturnValue(true);
@@ -52,7 +39,6 @@ function createFakeChild(): ChildProcess & EventEmitter {
   return child;
 }
 
-/** Create a minimal JobDispatch for testing. */
 function createTestDispatch(): JobDispatch {
   return {
     runId: 'run-1',
@@ -148,9 +134,8 @@ describe('BareMetalSandbox', () => {
     });
 
     it('throws a clear error when sandbox=true but bwrap is not installed', async () => {
-      // This path is how macOS and Windows users (where bwrap does not exist)
-      // will see the feature gate fail. The error must name `bwrap` and the
-      // fix so operators know to install it or disable KICI_SANDBOX.
+      // macOS and Windows, where bwrap does not exist, fail here. The error names
+      // `bwrap` and the fix: install it or disable KICI_SANDBOX.
       mockAccess.mockResolvedValue(undefined);
       mockExecSync.mockClear();
       mockExecSync.mockImplementation(() => {
@@ -171,7 +156,6 @@ describe('BareMetalSandbox', () => {
 
   describe('executeJob', () => {
     it('passes sanitized env to child process (KICI_* excluded)', async () => {
-      // Set agent-internal vars in process.env
       const originalEnv = process.env;
       process.env = {
         ...originalEnv,
@@ -201,21 +185,17 @@ describe('BareMetalSandbox', () => {
         signal: controller.signal,
       });
 
-      // Verify fork was called
       expect(mockFork).toHaveBeenCalledTimes(1);
       const forkCall = mockFork.mock.calls[0]!;
       const envPassed = forkCall[2]?.env as Record<string, string>;
 
-      // Sanitized env should include PATH and HOME (allowlisted)
       expect(envPassed).toHaveProperty('PATH');
       expect(envPassed).toHaveProperty('HOME');
 
-      // Agent-internal vars must NOT be passed
       expect(envPassed).not.toHaveProperty('KICI_ORCHESTRATOR_URL');
       expect(envPassed).not.toHaveProperty('KICI_AGENT_ID');
       expect(envPassed).not.toHaveProperty('DATABASE_URL');
 
-      // Clean up: complete the job
       fakeChild.emit('message', {
         type: 'job.complete',
         status: 'success',
@@ -224,7 +204,6 @@ describe('BareMetalSandbox', () => {
 
       await execPromise;
 
-      // Restore original env
       process.env = originalEnv;
     });
 
@@ -251,10 +230,8 @@ describe('BareMetalSandbox', () => {
         signal: controller.signal,
       });
 
-      // Simulate IPC messages from the runner
       fakeChild.emit('message', { type: 'ready' } satisfies RunnerToAgentMessage);
 
-      // step.start
       fakeChild.emit('message', {
         type: 'step.start',
         stepIndex: 0,
@@ -263,7 +240,6 @@ describe('BareMetalSandbox', () => {
 
       expect(onStepStatus).toHaveBeenCalledWith(0, 'Install deps', 'running');
 
-      // log.line
       fakeChild.emit('message', {
         type: 'log.line',
         stepIndex: 0,
@@ -272,7 +248,6 @@ describe('BareMetalSandbox', () => {
 
       expect(onLogLine).toHaveBeenCalledWith(0, 'npm install done', undefined);
 
-      // step.complete
       fakeChild.emit('message', {
         type: 'step.complete',
         stepIndex: 0,
@@ -284,7 +259,6 @@ describe('BareMetalSandbox', () => {
         durationMs: 5000,
       });
 
-      // job.complete
       fakeChild.emit('message', {
         type: 'job.complete',
         status: 'success',
@@ -317,13 +291,10 @@ describe('BareMetalSandbox', () => {
         signal: controller.signal,
       });
 
-      // Simulate runner sending ready
       fakeChild.emit('message', { type: 'ready' } satisfies RunnerToAgentMessage);
 
-      // Verify execute message was sent back
       expect(fakeChild.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'execute' }));
 
-      // Complete the job
       fakeChild.emit('message', {
         type: 'job.complete',
         status: 'success',
@@ -361,7 +332,6 @@ describe('BareMetalSandbox', () => {
       expect(result.status).toBe('failed');
       expect(result.stepResults).toEqual([]);
 
-      // Should log a crash message
       expect(onLogLine).toHaveBeenCalledWith(-1, expect.stringContaining('[sandbox]'));
     });
   });
@@ -390,7 +360,6 @@ describe('BareMetalSandbox', () => {
       // Trigger abort via AbortController (delegates to graceful cancel)
       controller.abort();
 
-      // Abort IPC message should be sent with force: false
       expect(fakeChild.send).toHaveBeenCalledWith(
         expect.objectContaining({ type: 'abort', force: false }),
       );
@@ -402,7 +371,6 @@ describe('BareMetalSandbox', () => {
       vi.advanceTimersByTime(30_100);
       expect(fakeChild.kill).toHaveBeenCalledWith('SIGKILL');
 
-      // Complete via exit
       fakeChild.emit('exit', null, 'SIGKILL');
 
       const result = await execPromise;

@@ -1,7 +1,3 @@
-/**
- * Unit tests for admin config REST API routes.
- */
-
 import { describe, it, expect, vi } from 'vitest';
 import { ScalerReloadOutcome } from '@kici-dev/engine';
 import { Hono } from 'hono';
@@ -81,11 +77,9 @@ describe('admin-config routes', () => {
         headers: { Authorization: 'Bearer wrong-token' },
       });
       expect(res.status).toBe(401);
-      // Deliberately distinct from the DB-backed routers' AUTH_ERROR.invalid.
-      // The body must name the credential this router wants, not merely say the
-      // token was wrong: every other admin route takes the bootstrap admin token,
-      // so an operator arriving with a working one of those needs to be told a
-      // different credential is expected. It must never echo the token it saw.
+      // Deliberately distinct from AUTH_ERROR.invalid: every other admin route
+      // takes the bootstrap admin token, so the body names the credential this
+      // router wants. It must never echo the token it saw.
       const body = (await res.json()) as { error: string };
       expect(body.error).toContain('KICI_SECRET_KEY');
       expect(body.error).toContain('bootstrap admin token');
@@ -137,7 +131,6 @@ describe('admin-config routes', () => {
   describe('GET / (current effective config)', () => {
     it('returns current merged config (redacted)', async () => {
       const { app } = createTestApp();
-      // Use a known sub-path to test -- we need to use the root mount
       const res = await app.request('http://localhost/admin/config', {
         method: 'GET',
         headers: AUTH,
@@ -146,7 +139,6 @@ describe('admin-config routes', () => {
       const body = await res.json();
       expect(body.source).toBe('merged');
       expect(body.version).toBe(3);
-      // Sensitive fields should be redacted
       expect(body.config.cluster.joinToken).toBe('***REDACTED***');
     });
 

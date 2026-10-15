@@ -1,7 +1,5 @@
 /**
- * Bare-metal scaler backend implementation.
- *
- * Manages ephemeral agent processes using child_process.spawn.
+ * Bare-metal scaler backend: ephemeral agent processes via child_process.spawn.
  * On Linux and macOS each agent leads its own process group, which teardown
  * signals; on Windows teardown ends the agent's process tree with taskkill.
  * All agents are single-use: destroyed after job completion.
@@ -32,6 +30,11 @@ import {
 } from '@kici-dev/shared/container-runtime';
 import { KICI_RUNTIME_DOCKER_LABEL } from './container-routing.js';
 import { spawnsInJobImage } from './agent-fit.js';
+import {
+  versionManagerExecutable,
+  versionManagerRemedy,
+  versionManagerShimMessage,
+} from './agent-binary-location.js';
 import {
   ensureIsolatedNetwork,
   ISOLATED_NETWORK_NAME,
@@ -176,7 +179,6 @@ const EXIT_WAIT_MS = 5_000;
 // its own log file stream, so a logger per spawn would leak one per agent.
 const logger = createLogger({ prefix: 'bare-metal-backend' });
 
-/** Extended ManagedAgent that includes the ChildProcess reference */
 interface BareMetalManagedAgent extends ManagedAgent {
   /** Absent for a container-backed agent, which has no local child process. */
   process?: ChildProcess;
@@ -201,7 +203,7 @@ export interface BareMetalScalerBackendOptions {
    * container mode, which is the only mode with a network boundary.
    */
   hostServices?: string[];
-  /** Token store for creating ephemeral agent auth tokens. Optional -- when undefined, no token is injected. */
+  /** Token store for ephemeral agent auth tokens; when undefined, no token is injected. */
   tokenStore?: AgentTokenStore;
   /** TTL for ephemeral agent tokens in ms. Default: 1 hour. */
   tokenTtlMs?: number;
@@ -218,9 +220,8 @@ export interface BareMetalScalerBackendOptions {
    * (`systemd-run --user --scope --slice=kici-scaler`) and translate the
    * job's effective CPU / memory limits into `CPUQuota=` / `MemoryMax=`
    * properties so the kernel cgroup actually enforces the limits. When
-   * false (the default), bare-metal stays its historical "advisory limits
-   * only" mode — limits drive the scaler's per-machine cap math but no
-   * cgroup is created.
+   * false (the default), limits are advisory only — they drive the scaler's
+   * per-machine cap math but no cgroup is created.
    *
    * Linux-only. On macOS / Windows hosts the option is silently a no-op
    * (`systemd-run` does not exist), with a one-time startup warning.
@@ -330,7 +331,6 @@ export class BareMetalScalerBackend implements ScalerBackend {
     this.enforceCgroups = options.enforceCgroups ?? false;
     this.hostServices = options.hostServices;
 
-    // One-time startup warning about bare-metal trust model
     logger.warn(
       `Bare-metal scaler "${options.name}" configured. Bare-metal agents run as child processes ` +
         `with full host filesystem and network access. This mode is intended for trusted environments only.`,
@@ -408,15 +408,13 @@ export class BareMetalScalerBackend implements ScalerBackend {
    * Declare required tools for a bare-metal scaler entry.
    *
    * - Every label set's `binaryPath` must be an executable file on disk.
-   * - If `KICI_SANDBOX=true` will be forwarded to spawned agents (either via
-   *   the orchestrator's `KICI_AGENT_ENV_KICI_SANDBOX=true` env var or via a
-   *   label set's `env.KICI_SANDBOX=true` in scalers.yaml), then `bwrap` must
-   *   be available on PATH so the agent can actually wrap workflow runners.
+   * - If `KICI_SANDBOX=true` is forwarded to spawned agents (via the
+   *   orchestrator's `KICI_AGENT_ENV_KICI_SANDBOX=true` or a label set's
+   *   `env.KICI_SANDBOX=true`), `bwrap` must be on PATH.
    *
-   *   This check runs at orchestrator startup so misconfiguration fails
-   *   fast with a clear error instead of crashing every job at dispatch
-   *   time. On macOS and Windows (where bwrap does not exist) any attempt
-   *   to enable KICI_SANDBOX will be rejected here.
+   *   Checked at orchestrator startup so misconfiguration fails fast instead of
+   *   crashing every job at dispatch. On macOS and Windows (no bwrap) enabling
+   *   KICI_SANDBOX is rejected here.
    */
   static getRequiredTools(entry: ScalerEntry): ToolRequirement[] {
     const requirements: ToolRequirement[] = entry.labelSets
@@ -428,10 +426,9 @@ export class BareMetalScalerBackend implements ScalerBackend {
         reason: `agent binary for bare-metal scaler "${entry.name}"`,
       }));
 
-    // The shipped kici-agent binary is a `#!/usr/bin/env node` script, so the
-    // orchestrator's PATH (which the bare-metal backend forwards to the spawned
-    // agent) must resolve `node`. Without this the agent dies at job time with
-    // `env: 'node': No such file or directory` — fail fast at startup instead.
+    // kici-agent is a `#!/usr/bin/env node` script and inherits the
+    // orchestrator's PATH; without `node` there it dies at job time with
+    // `env: 'node': No such file or directory`.
     requirements.push({
       type: 'path-binary',
       name: 'node',
@@ -442,7 +439,6 @@ export class BareMetalScalerBackend implements ScalerBackend {
         `systemd unit's Environment=PATH covers the mise/nvm node bin dir).`,
     });
 
-    // KICI_SANDBOX opt-in check. Either source requires bwrap at runtime.
     const sandboxViaGlobalEnv = process.env.KICI_AGENT_ENV_KICI_SANDBOX === 'true';
     const sandboxViaLabelSet = entry.labelSets.some(
       (ls) => ls.env && ls.env.KICI_SANDBOX === 'true',
@@ -477,16 +473,14 @@ export class BareMetalScalerBackend implements ScalerBackend {
     onEvent?: ScalerEventCallback,
     effectiveLimits?: EffectiveLimits,
     spawnContext?: SpawnContext,
-    // Threaded only on the container path, whose image pull can be slow. The
-    // local-process path still spawns quickly enough that the ScalerManager
-    // deadline race is the only guard it needs.
+    // Container path only (slow image pull); the local-process path needs no
+    // guard beyond the ScalerManager deadline race.
     signal?: AbortSignal,
   ): Promise<ManagedAgent> {
     const emit = (eventType: Parameters<ScalerEventCallback>[0]['eventType'], detail: string) => {
       onEvent?.({ agentId, eventType, detail, timestampMs: Date.now() });
     };
 
-    // Find matching label set config
     const normalizedTarget = normalizeLabelSet(labelSet);
     const matchedLabelSet = this._labelSets.find(
       (ls) => normalizeLabelSet(ls.labels) === normalizedTarget,
@@ -497,7 +491,6 @@ export class BareMetalScalerBackend implements ScalerBackend {
       );
     }
 
-    // Check capacity
     if (this.getActiveCount() >= this.maxAgents) {
       throw new Error(
         `Bare-metal backend "${this.name}" at capacity (${this.maxAgents}/${this.maxAgents})`,
@@ -506,23 +499,20 @@ export class BareMetalScalerBackend implements ScalerBackend {
 
     emit(ScalerEventType.enum['scaler.provisioning'], 'spawning agent process');
 
-    // Trusted fleet-agent profile: the matched label set carries
-    // KICI_TRUSTED_ENV=true (or the operator set the global
-    // KICI_AGENT_ENV_KICI_TRUSTED_ENV=true). Agent-launch property ONLY —
-    // never derivable from a dispatch payload.
+    // Trusted fleet-agent profile: an agent-launch property ONLY, never
+    // derivable from a dispatch payload.
     const trustedEnv =
       matchedLabelSet.env?.KICI_TRUSTED_ENV === 'true' ||
       process.env.KICI_AGENT_ENV_KICI_TRUSTED_ENV === 'true';
 
-    // Build sanitized env for agent process (no blanket ...process.env spread).
+    // No blanket ...process.env spread.
     const env: Record<string, string> = {};
 
     // 1. System vars. Default profile copies only the explicit allowlist; the
-    //    trusted profile forwards the ambient host env minus the scrub-list, so
-    //    a trusted host-configuration agent inherits the operator's ambient
-    //    credentials (sops/ssh/aws) while the orchestrator's own KiCI
-    //    identity/operational secrets are still stripped. The explicit KICI_*
-    //    identity assignments below re-set the agent's own values after this.
+    //    trusted profile forwards the ambient host env minus the scrub-list:
+    //    the operator's ambient credentials (sops/ssh/aws) pass, the
+    //    orchestrator's own KiCI identity/operational secrets do not. The
+    //    explicit KICI_* identity assignments below then re-set the agent's own.
     if (trustedEnv) {
       Object.assign(env, buildTrustedPassthroughEnv(process.env));
     } else {
@@ -540,10 +530,9 @@ export class BareMetalScalerBackend implements ScalerBackend {
       }
     }
 
-    // Full label set the agent will present (base + scaler-assigned kici:
-    // labels). The ephemeral token is bound to exactly this set so register-
-    // time labels pass the scope gate; the agent adds only self-reported
-    // os/arch/host facts on top, which the gate exempts.
+    // The ephemeral token is bound to exactly this set so register-time labels
+    // pass the scope gate; the agent adds only the self-reported os/arch/host
+    // facts the gate exempts.
     const fullLabels = scalerAgentLabels(
       labelSet,
       this.type,
@@ -566,11 +555,9 @@ export class BareMetalScalerBackend implements ScalerBackend {
     env.KICI_EXECUTION_MODE = 'bare-metal';
     env.KICI_PORT = '0';
 
-    // Where the agent materializes the KiCI runtime from when it NESTS a job
-    // container. A bare-metal agent is a plain host process with no /opt/kici
-    // of its own, so without an image to copy the tree out of a `container:`
-    // job could only run on an image that ships Node itself. A label set that
-    // declares no image leaves that historical contract in force.
+    // Source of the KiCI runtime when the agent NESTS a job container: a host
+    // process has no /opt/kici, so without it a `container:` job needs an image
+    // that ships Node itself — still the contract for a label set with no image.
     if (matchedLabelSet.image) env.KICI_RUNTIME_IMAGE = matchedLabelSet.image;
 
     // 3.5. Backpressure mode (before label-set env so explicit env: can override)
@@ -581,9 +568,8 @@ export class BareMetalScalerBackend implements ScalerBackend {
     // 4. Label-set env from scalers.yaml (highest priority, overrides KICI_AGENT_ENV_)
     Object.assign(env, matchedLabelSet.env ?? {});
 
-    // Log the trusted-env decision explicitly (mirrors the KICI_SANDBOX
-    // validation surface): a trusted agent runs steps with the ambient host env
-    // passed through, so the decision is auditable at spawn time.
+    // Logged so the trusted-env decision (ambient host env passed to steps) is
+    // auditable at spawn time; mirrors the KICI_SANDBOX validation surface.
     if (trustedEnv) {
       logger.info(
         `Spawning TRUSTED-ENV agent "${agentId}" for scaler "${this.name}" ` +
@@ -594,21 +580,14 @@ export class BareMetalScalerBackend implements ScalerBackend {
     }
 
     // Dual mode: a job that declared its own container image runs IN that
-    // image, with the KiCI runtime injected, rather than as a local process.
-    // Everything above — the env, the ephemeral token, the label set — is
-    // identical either way; only the launch differs.
+    // image with the KiCI runtime injected; only the launch differs from the
+    // local-process path.
     //
-    // OPT-IN, not automatic. A `container:` job already worked here the other
-    // way round: this backend spawned a local agent, and that agent nested a
-    // job container. Taking the job-image path for every such job silently
-    // flips the topology of jobs that work today — which is exactly what broke
-    // two green scaler:bare-metal cases when it was automatic.
-    //
-    // The opt-in is the label set's own shape: one that declares an `image`
-    // and NO `binaryPath` has no local binary to spawn, so it can only mean
-    // job-image mode. An operator who wants the old behaviour changes nothing.
-    // The scaler reads the same function to know which agents it started
-    // inside a job's image, so the two cannot disagree.
+    // OPT-IN, not automatic: a `container:` job also runs as a local agent that
+    // nests a job container, and switching every such job would silently flip
+    // the topology of working jobs. The opt-in is the label set's shape: an
+    // `image` and NO `binaryPath`. The scaler reads the same function, so the two
+    // cannot disagree.
     const jobImageMode = spawnsInJobImage(this.type, matchedLabelSet);
     if (spawnContext?.container && jobImageMode) {
       return await this.spawnContainerAgent({
@@ -650,24 +629,20 @@ export class BareMetalScalerBackend implements ScalerBackend {
       throw err;
     }
 
-    // Don't keep parent alive waiting for child
     child.unref();
 
-    // Create log capture from child stdout/stderr merged into a single stream
     const merged = new PassThrough();
     child.stdout?.pipe(merged, { end: false });
     child.stderr?.pipe(merged, { end: false });
 
-    // End the merged stream once stdout and stderr are drained. 'close' comes
-    // after 'exit' and after the last output, so what the process wrote just
-    // before it exited (a fatal startup error) still reaches the capture.
+    // 'close' follows 'exit' and the last output, so a fatal startup error
+    // still reaches the capture.
     child.on('close', () => {
       merged.end();
     });
 
-    // Bounded ring buffer of the most recent output lines, kept so a spawn
-    // that dies before WS registration can ride its stderr along in the
-    // scaler.failed event detail.
+    // Recent output lines, so a spawn that dies before WS registration carries
+    // its stderr in the scaler.failed detail.
     const TAIL_MAX_LINES = 50;
     const tailBuf: string[] = [];
     const pushTail = (line: string) => {
@@ -707,8 +682,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
     emit(ScalerEventType.enum['scaler.ready'], `agent process started (PID ${child.pid})`);
     emit(ScalerEventType.enum['agent.connecting'], 'waiting for agent WS registration');
 
-    // Emit failure event on spawn error (e.g. ENOENT for missing binary).
-    // Also clean up tracking maps — when spawn fails, the 'exit' event may not fire.
+    // On spawn error (e.g. ENOENT) 'exit' may not fire, so untrack here too.
     child.on('error', (err) => {
       const t = capture.tail();
       const detail = t
@@ -719,7 +693,6 @@ export class BareMetalScalerBackend implements ScalerBackend {
       this.agents.delete(managed.id);
     });
 
-    // Listen for exit event to auto-cleanup from tracking maps
     let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     child.on('exit', (code, signal) => {
       exit = { code, signal };
@@ -752,13 +725,9 @@ export class BareMetalScalerBackend implements ScalerBackend {
   /**
    * Launch the agent inside the job's own container image.
    *
-   * The bare-metal backend historically only ran a local process, which meant a
-   * job naming its own image could not use this pool at all. With the KiCI
-   * runtime injected, the image needs neither Node nor git, so an arbitrary
-   * customer image can host the agent.
-   *
-   * Split out of `spawn()` because that function is already near the 200-line
-   * ceiling and the two launches share nothing past the env.
+   * With the KiCI runtime injected the image needs neither Node nor git, so an
+   * arbitrary customer image can host the agent. Split out of `spawn()`: the two
+   * launches share nothing past the env.
    */
   private async spawnContainerAgent(args: {
     agentId: string;
@@ -767,7 +736,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
     agentImage: string | undefined;
     env: Record<string, string>;
     emit: (eventType: Parameters<ScalerEventCallback>[0]['eventType'], detail: string) => void;
-    /** Resolved cpu / memory ceiling. Dropped entirely before this parameter existed. */
+    /** Resolved cpu / memory ceiling. */
     effectiveLimits?: EffectiveLimits;
     /** Egress policy for the label set this agent serves. */
     networkPolicy?: NetworkPolicy;
@@ -789,9 +758,8 @@ export class BareMetalScalerBackend implements ScalerBackend {
 
     const runtime = await detectRuntime();
     if (!runtime) {
-      // Fail fast and say WHY: routing should have kept this job away from a
-      // runtime-less pool, so reaching here means the label requirement was
-      // bypassed and the operator needs to know which half is wrong.
+      // Routing should keep this job off a runtime-less pool, so reaching here
+      // means the label requirement was bypassed: say which half is wrong.
       throw new Error(
         `Job requires a container runtime, but scaler "${this.name}" found none on this host. ` +
           `Install docker or podman, or route container jobs to a pool that advertises ` +
@@ -852,24 +820,20 @@ export class BareMetalScalerBackend implements ScalerBackend {
         'kici-agent-id': agentId,
         'kici-labels': normalizeLabelSet(labelSet),
       },
-      // The same builder the container backend uses. This path used to write
-      // its own `HostConfig` with no `Memory`, no `NanoCpus` and no hardening,
-      // and `effectiveLimits` was not even a parameter — so a job could take
-      // the host down with the memory limit its operator had configured.
+      // Shared with the container backend, so the operator's limits apply here
+      // too; without them a job can take the host down.
       HostConfig: buildAgentContainerHostConfig({
         ...(effectiveLimits ? { limits: effectiveLimits } : {}),
         binds: [runtimeInjectBind(runtimeVolume)],
         ...(this.extraHosts ? { extraHosts: this.extraHosts } : {}),
       }),
-      // On the isolated network, like every other agent container. Without it
-      // the job container sat on the runtime's default bridge with full LAN,
-      // RFC1918 and cloud-metadata reach.
+      // Without it the container sits on the runtime's default bridge with full
+      // LAN, RFC1918 and cloud-metadata reach.
       NetworkingConfig: { EndpointsConfig: { [ISOLATED_NETWORK_NAME]: {} } },
     });
 
-    // Record BEFORE starting. A throw from `start()` used to leave a started
-    // container that nothing tracked, and `cleanupOrphans` does not cover
-    // bare-metal at all.
+    // Record BEFORE starting: a throw from `start()` must not leave an untracked
+    // container, and `cleanupOrphans` does not cover bare-metal at all.
     const managed: BareMetalManagedAgent = {
       id: agentId,
       labelSet,
@@ -997,7 +961,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
 
     const pid = parseInt(managed.backendRef, 10);
 
-    // Guard against NaN PID (happens when spawn fails before PID is assigned, e.g. ENOENT)
+    // NaN when spawn failed before a PID was assigned (e.g. ENOENT).
     if (isNaN(pid)) {
       this.agents.delete(managedId);
       return;
@@ -1009,11 +973,11 @@ export class BareMetalScalerBackend implements ScalerBackend {
       return;
     }
 
-    // Send SIGTERM to entire process group (negative PID kills group)
+    // Negative PID signals the whole process group.
     try {
       process.kill(-pid, 'SIGTERM');
     } catch (err: unknown) {
-      // ESRCH = no such process -- process already dead
+      // ESRCH: already dead.
       if ((err as NodeJS.ErrnoException).code === 'ESRCH') {
         this.agents.delete(managedId);
         return;
@@ -1021,7 +985,6 @@ export class BareMetalScalerBackend implements ScalerBackend {
       throw err;
     }
 
-    // Wait for exit, then SIGKILL
     const exited = await this.waitForExit(managed, EXIT_WAIT_MS);
     if (!exited) {
       try {
@@ -1037,22 +1000,19 @@ export class BareMetalScalerBackend implements ScalerBackend {
   /**
    * Force-reclaim a container-mode agent this backend no longer tracks.
    *
-   * `destroy()` opens with an in-memory map lookup, so an orchestrator restart
-   * makes it a silent no-op while the container keeps running. The container
-   * backend's own startup sweep does not cover this one either: it reaps only
-   * containers stamped with its OWN `kici-scaler-name`, and it runs only when a
-   * container scaler is configured, which a bare-metal-only deployment has not.
+   * After an orchestrator restart `destroy()` (an in-memory lookup) is a silent
+   * no-op while the container keeps running, and the container backend's sweep
+   * reaps only its OWN `kici-scaler-name` and runs only with a container scaler
+   * configured.
    *
-   * The host-local evidence is the container itself: `spawnContainerAgent` stamps
-   * `kici-agent-id` and `kici-scaler-name` onto it, and a container listing only
-   * ever names containers on this host. So a coordinator cannot reach a peer's
-   * compute through this path — a wrongly-routed agent id matches nothing.
+   * The evidence is the container itself, stamped with `kici-agent-id` and
+   * `kici-scaler-name`; a container listing names only this host's containers,
+   * so a coordinator cannot reach a peer's compute — a wrongly-routed id matches
+   * nothing.
    *
-   * A process-mode agent is NOT reclaimed here. Its PID lives in the in-memory
-   * entry alone, so a restart leaves no durable, host-local artifact to key off,
-   * and reclaiming it would need a persistence mechanism this backend does not
-   * have. Scanning the process table instead would risk signalling a recycled
-   * PID.
+   * A process-mode agent is NOT reclaimed: its PID lives only in memory, so a
+   * restart leaves no durable host-local artifact, and scanning the process
+   * table would risk signalling a recycled PID.
    *
    * @returns `true` when a container for `managedId` was found and removed.
    */
@@ -1090,9 +1050,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
     return reaped;
   }
 
-  /**
-   * Get the LogCapture for a managed agent (used by ScalerManager for log forwarding).
-   */
+  /** Used by ScalerManager for log forwarding. */
   getLogCapture(managedId: string): LogCapture | undefined {
     return this.logCaptures.get(managedId);
   }
@@ -1106,10 +1064,9 @@ export class BareMetalScalerBackend implements ScalerBackend {
     labelSets: LabelSetConfig[],
     opts?: { maxAgents?: number; entry?: ScalerEntry },
   ): ValidationResult {
-    // A label set names what to launch: a local binary, an agent image
-    // (job-image mode), or both. Mirrors the same rule the config schema
-    // enforces at load — a reload that accepted a narrower set than the initial
-    // parse would fail a SIGHUP on a file that started the process fine.
+    // A label set names a local binary, an agent image (job-image mode), or
+    // both. Mirrors the config schema's load rule, so a SIGHUP never fails on a
+    // file that started the process fine.
     const errors: string[] = [];
     labelSets.forEach((ls, i) => {
       if (!ls.binaryPath && !ls.image) {
@@ -1120,6 +1077,14 @@ export class BareMetalScalerBackend implements ScalerBackend {
       if (ls.binaryPath) {
         const refusal = agentLaunchRefusal(ls.binaryPath, process.platform);
         if (refusal) errors.push(`Label set [${i}]: ${refusal}`);
+        // Startup refuses a version-manager shim, so a reload refuses it too.
+        const shim = versionManagerExecutable(ls.binaryPath);
+        if (shim) {
+          errors.push(
+            `Label set [${i}]: ${versionManagerShimMessage(ls.binaryPath, shim)} ` +
+              versionManagerRemedy(shim),
+          );
+        }
       }
     });
     errors.push(...this.jobImageReloadErrors(labelSets, opts?.entry));
@@ -1141,8 +1106,8 @@ export class BareMetalScalerBackend implements ScalerBackend {
    *
    * Windows has no process groups to signal and no SIGTERM, and Node.js cannot
    * send a ctrl-C there (`process.kill` terminates the target unconditionally),
-   * so the tree is ended at once with `taskkill /T /F`. The pid is cmd.exe's, which runs the agent's `node` and
-   * everything it started.
+   * so the tree is ended at once with `taskkill /T /F`. The pid is cmd.exe's,
+   * which runs the agent's `node` and everything it started.
    *
    * Nothing runs once Node.js has seen the child exit: libuv then releases its
    * handle on the process, Windows may give the pid to an unrelated process,
@@ -1156,10 +1121,7 @@ export class BareMetalScalerBackend implements ScalerBackend {
     await this.waitForExit(managed, EXIT_WAIT_MS);
   }
 
-  /**
-   * Wait for a process to exit within a timeout.
-   * Returns true if the process exited, false if timed out.
-   */
+  /** True if the process exited within `timeoutMs`, false on timeout. */
   private waitForExit(managed: BareMetalManagedAgent, timeoutMs: number): Promise<boolean> {
     const child = managed.process;
     // A container-backed agent has no child process; `destroy` removes the
@@ -1177,7 +1139,6 @@ export class BareMetalScalerBackend implements ScalerBackend {
         resolve(true);
       };
 
-      // Check if already dead
       if (child.exitCode !== null || child.signalCode !== null) {
         clearTimeout(timer);
         resolve(true);

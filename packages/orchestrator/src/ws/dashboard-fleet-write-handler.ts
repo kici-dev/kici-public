@@ -1,21 +1,15 @@
 /**
- * Dashboard fleet host-write handler for the orchestrator.
- *
- * Responds to the two Model C fleet write messages from Platform —
- * `dashboard.fleet.host.declare` and `dashboard.fleet.host.remove` — by
- * enforcing the per-org dashboard-write policy, calling the host roster store,
- * writing a `platform_proxy` access-log row, and sending a typed response.
- *
- * Mirrors `DashboardBackendsHandler`: a policy gate (`enforcePolicy`) that
- * short-circuits a disabled op with a structured `operation_disabled` envelope
- * plus a `denied` access-log row, and a `DashboardAccessRecorder` that attributes
- * every outcome to the calling actor.
+ * Handles the Model C fleet writes `dashboard.fleet.host.declare` and
+ * `dashboard.fleet.host.remove` behind the per-org dashboard-write policy,
+ * writing a `platform_proxy` access-log row per outcome. Mirrors
+ * `DashboardBackendsHandler`: a disabled op short-circuits with an
+ * `operation_disabled` envelope plus a `denied` row, and
+ * `DashboardAccessRecorder` attributes every outcome to the calling actor.
  *
  * The handler never passes a write authority, so the roster store applies the
  * Platform's: a declare only creates a new, unconfirmed host, a remove only
  * deletes such a host, and reserved `kici:` labels and properties are refused.
- * A refusal records a `denied` access-log row and answers with a
- * `FleetHostWriteRefusal` code.
+ * A refusal records a `denied` row and answers with a `FleetHostWriteRefusal` code.
  */
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type {
@@ -44,13 +38,10 @@ import { DashboardAccessRecorder } from './dashboard-access.js';
 const logger = createLogger({ prefix: 'dashboard-fleet-write-handler' });
 
 interface DashboardFleetWriteHandlerDeps {
-  /** Send a response message back to Platform over the WS connection. */
   send: (msg: unknown) => void;
-  /** The orchestrator host roster store (declare / remove). */
   rosterStore: HostRosterStore;
-  /** Database — required for dashboard-write policy lookups. */
+  /** For dashboard-write policy lookups. */
   db: Kysely<Database>;
-  /** Access log writer — records one row per mutation with actor attribution. */
   accessLog?: AccessLogWriter;
   /** Org ID for access_log rows (null when the orchestrator isn't org-scoped). */
   orgId?: string | null;
@@ -58,13 +49,8 @@ interface DashboardFleetWriteHandlerDeps {
   routingKey?: string | null;
 }
 
-/** Messages this handler owns. */
 type FleetWriteMessage = FleetHostDeclareRequest | FleetHostRemoveRequest;
 
-/**
- * Handler for the fleet host-write WS messages. Dispatches by type and calls
- * the host roster store behind the dashboard-write policy gate.
- */
 export class DashboardFleetWriteHandler {
   private readonly deps: DashboardFleetWriteHandlerDeps;
   private orgId: string | null;
@@ -83,8 +69,8 @@ export class DashboardFleetWriteHandler {
   }
 
   /**
-   * Update the bound orgId + routingKey. Called from server.ts after resolving
-   * the single tenant org from the `sources` / `generic_webhook_sources` table.
+   * Called from server.ts once the single tenant org resolves from the
+   * `sources`, `generic_webhook_sources` or `remote_sources` table.
    */
   setOrgContext(orgId: string | null, routingKey: string | null): void {
     this.orgId = orgId;
@@ -92,12 +78,9 @@ export class DashboardFleetWriteHandler {
   }
 
   /**
-   * Defense-in-depth dashboard-write policy gate. Returns true when the
-   * operation is allowed and the caller should proceed. Returns false when the
-   * policy is disabled — also records a `denied` access_log row and emits a
-   * structured `operation_disabled` envelope on the WS.
-   *
-   * Fails open when no org is bound — the orch hasn't resolved a customer yet.
+   * Defense-in-depth policy gate: false when the policy disables the op, after
+   * recording a `denied` row and sending the `operation_disabled` envelope.
+   * Fails open when no org is bound (no customer resolved yet).
    */
   private async enforcePolicy(
     msg: { actor: ActorPrincipal; requestId: string },
@@ -154,10 +137,7 @@ export class DashboardFleetWriteHandler {
     });
   }
 
-  /**
-   * Route a fleet host-write message to the appropriate handler. Returns true
-   * if the message was handled, false otherwise.
-   */
+  /** Returns false for a message this handler does not own. */
   async handleMessage(msg: FleetWriteMessage): Promise<boolean> {
     switch (msg.type) {
       case 'dashboard.fleet.host.declare':
@@ -184,8 +164,7 @@ export class DashboardFleetWriteHandler {
       return;
     }
     try {
-      // Never pass an authority: the store's default is the Platform's, which
-      // only creates new, unconfirmed hosts and refuses reserved kici: keys.
+      // No authority: the store's Platform default applies (see the header).
       const { created } = await this.deps.rosterStore.declareStatic({
         agentId: msg.agentId,
         labels: msg.labels,

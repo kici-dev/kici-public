@@ -5,8 +5,7 @@ import { existsSync } from 'node:fs';
 import { compilerError } from '../errors/index.js';
 import type { TypecheckResult } from '../validation/typecheck.js';
 
-// Mock the type-check module so the wiring is exercised deterministically
-// (a real tsc run needs an installed workspace, which this file does not set up).
+// A real tsc run needs an installed workspace, which this file does not set up.
 const runTypecheck = vi.fn<() => Promise<TypecheckResult>>();
 vi.mock('../validation/typecheck.js', () => ({
   runTypecheck: () => runTypecheck(),

@@ -5,16 +5,10 @@ import { dirname, join } from 'node:path';
 import { createMigrationProvider } from './migration-provider.js';
 
 /**
- * Registration-completeness guard.
- *
- * `migration-provider.ts` statically imports every migration (Rolldown can't
- * dynamic-import them at runtime), which means a migration FILE can be added
- * to `migrations/` and silently never run if it isn't also wired into the
- * provider map. A missing registration ships a schema behind the code and only
- * surfaces at deploy time as a "corrupted migrations: … missing" error. This
- * test fails loudly the moment a migration file isn't registered, so the deploy
- * never goes out with a phantom migration. The Platform's migrations carry
- * the same guard.
+ * Registration-completeness guard. `migration-provider.ts` imports every migration statically,
+ * so a file added to `migrations/` but not to the provider map never runs: the schema ships
+ * behind the code and only surfaces at deploy time as "corrupted migrations: … missing". The
+ * Platform's migrations carry the same guard.
  */
 describe('migration provider registration completeness', () => {
   const migrationsDir = join(dirname(fileURLToPath(import.meta.url)), 'migrations');

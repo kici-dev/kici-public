@@ -2,34 +2,23 @@ import type { Rule, RuleContext, RuleResult } from './types.js';
 import { toErrorMessage } from '@kici-dev/core';
 import { ChangedFilesUnavailableError } from './context.js';
 
-/**
- * Result of evaluating rules for a job or workflow.
- * Contains overall pass/fail status and per-rule results.
- */
 export interface RuleEvaluationResult {
   allPassed: boolean;
   results: RuleResult[];
   /**
-   * Set iff a rule's check() threw — an evaluation failure, NOT a clean
-   * `return false`. Consumers fail-hard on this (surface the error + fail the
-   * job/step) instead of treating a crashed gate as a silent skip, which would
-   * be a false green. A clean false leaves this undefined.
+   * Set iff a rule's check() threw, never for a clean `return false`.
+   * Consumers fail the job or step on it: a crashed gate read as a silent skip
+   * would be a false green.
    */
   evaluationError?: { label: string; message: string };
 }
 
 /**
- * Evaluate rules sequentially with fail-fast behavior.
+ * Evaluate rules in order, timing each, and stop at the first failure.
+ * `ChangedFilesUnavailableError` is rethrown, never read as a failed rule.
  *
- * Iterates rules in order, calling each rule's check function with the provided
- * context. Records timing and result for each evaluated rule. Stops evaluation
- * on the first failure (remaining rules are not evaluated).
- *
- * @param rules - Array of Rule objects to evaluate
- * @param context - RuleContext providing event, env, changedFiles, and $
- * @param _label - Human-readable label for logging (e.g., job name) -- reserved for callers
- * @param onRuleResult - Optional callback invoked after each rule evaluation
- * @returns RuleEvaluationResult with allPassed flag and per-rule results
+ * @param _label - Reserved for callers (e.g. the job name); unused here.
+ * @param onRuleResult - Called after each evaluated rule.
  */
 export async function evaluateRules(
   rules: Rule[],
@@ -69,7 +58,6 @@ export async function evaluateRules(
 
     if (!passed) {
       allPassed = false;
-      // Fail fast - stop evaluating remaining rules
       break;
     }
   }

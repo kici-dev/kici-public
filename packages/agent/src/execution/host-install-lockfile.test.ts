@@ -413,11 +413,10 @@ describe('npmLockReader — modules from outside the npm', () => {
 });
 
 /**
- * The real npm against a loopback registry. `foo` is a registry package that
- * declares its own dependency on a tarball URL on a second server, `outside`,
- * which stands for any origin the operator did not allow. `baz` depends on
- * nothing. The npm runs with the argv the host install gives an npm that runs
- * `npm ci`, whatever the local npm's own version.
+ * The real npm against a loopback registry. `foo` depends on a tarball URL on
+ * a second server, `outside` (any origin the operator did not allow); `baz`
+ * depends on nothing. npm runs with the host install's `npm ci` argv, whatever
+ * the local npm's version.
  */
 describe.skipIf(!npmTool)('npm ci on the agent host — real npm, loopback registry', () => {
   const ciTool: HostInstallTool = { ...npmTool!, version: CI_NPM_VERSION };
@@ -515,9 +514,9 @@ describe.skipIf(!npmTool)('npm ci on the agent host — real npm, loopback regis
   }
 
   /**
-   * Run the real npm in `.kici/` with a scratch cache: `npm ci` with the argv
-   * the host install builds for it, or `npm install` with the same flags, which
-   * is what an npm without `--allow-remote` ran before it ran `npm ci`.
+   * Real npm in `.kici/` with a scratch cache: `npm ci` with the host install's
+   * argv, or `npm install` with the same flags (what an npm without
+   * `--allow-remote` ran before `npm ci`).
    */
   async function runNpm(command: NpmInstallCommand): Promise<void> {
     const home = await mkdtemp(join(work, 'home-'));
@@ -528,9 +527,9 @@ describe.skipIf(!npmTool)('npm ci on the agent host — real npm, loopback regis
     });
     expect(argv[1]).toBe(NpmInstallCommand.Ci);
     argv[1] = command;
-    // An npm older than 11.15.0 has no source flags and fetches every source.
-    // npm 12 refuses URL sources by default, so state the older behavior: an
-    // npm that does not know these flags only warns about them.
+    // npm before 11.15.0 has no source flags and fetches every source; npm 12
+    // refuses URL sources by default, so state the older behavior (an npm not
+    // knowing these flags only warns).
     argv.push('--allow-remote=all', '--allow-file=all', '--allow-directory=all');
     await execFileAsync(ciTool.nodeExe, argv, {
       cwd: kici,
@@ -546,11 +545,7 @@ describe.skipIf(!npmTool)('npm ci on the agent host — real npm, loopback regis
       operatorNpmrc: null,
     });
 
-  /**
-   * The plan the eligibility check hands on for this project, built directly,
-   * so the lockfile check is exercised on a lockfile the eligibility check
-   * would refuse first.
-   */
+  /** Built directly, so the lockfile check runs on a lockfile eligibility would refuse first. */
   const lockedPlan = (): HostInstallPlan => ({
     packageManager: PackageManager.Npm,
     lockfile: 'package-lock.json',

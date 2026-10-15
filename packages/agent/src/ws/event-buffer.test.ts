@@ -27,9 +27,8 @@ function createLogChunk(id: string): AgentToOrchestratorMessage {
 }
 
 describe('EventBuffer', () => {
-  // Generic ring buffer behavior (add/flush/size/clear/overflow) is tested
-  // in @kici-dev/shared RingBuffer tests. These tests focus on agent-specific
-  // concerns: message type compatibility and custom default maxSize.
+  // Generic ring buffer behavior is covered by the @kici-dev/shared RingBuffer
+  // tests; these cover message type compatibility and the agent's custom default maxSize.
 
   it('defaults to 5000 max size', () => {
     const buffer = new EventBuffer();

@@ -1,16 +1,13 @@
 /**
- * Firecracker host-network provisioning.
+ * Firecracker host-network provisioning: the per-coordinator bridge (kici-brN)
+ * and its gateway IP, NetworkManager-unmanaged kici-* interfaces, IP forwarding,
+ * and a disjoint, source-scoped nftables table for NAT and egress isolation.
+ * One pure command builder drives live provisioning, the rendered boot script
+ * and read-only verification.
  *
- * Creates the per-coordinator bridge (kici-brN), assigns its gateway IP,
- * marks kici-* interfaces unmanaged by NetworkManager, enables IP forwarding,
- * and builds a disjoint, source-scoped nftables table for NAT + egress
- * isolation. One pure command-builder drives live provisioning, the rendered
- * boot script, and (read-only) verification.
- *
- * This is HOST setup, distinct from the runtime per-VM isolation the rule
- * builder in `@kici-dev/shared/net` performs (added at spawn / removed at
- * destroy). The two share the nft table name but have separate lifecycles;
- * this module never touches the per-VM rules.
+ * HOST setup only. The per-VM isolation rules from `@kici-dev/shared/net`
+ * (added at spawn, removed at destroy) share the nft table name but have their
+ * own lifecycle, and this module never touches them.
  */
 
 import { execFile as execFileCb } from 'node:child_process';
@@ -76,7 +73,6 @@ export function cidrToNetwork(cidr: string): string {
   }
   const prefix = Number(m[5]);
   if (prefix > 32) throw new Error(`Invalid prefix /${prefix} in CIDR "${cidr}" (max /32)`);
-  // Build the 32-bit address, apply the prefix mask.
   const addr = ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]) >>> 0;
   const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
   const net = (addr & mask) >>> 0;
@@ -222,25 +218,22 @@ export function buildBridgeCommands(cfg: FirecrackerBridgeConfig): CommandSpec[]
       '1460',
     ),
     // 7. The tail jump. Every per-VM rule is inserted at the forward chain's
-    //    HEAD, so appending the jump last makes the evaluation order
-    //    permanently: per-VM accepts and drops, then the host baseline. That
-    //    ordering is what makes `networkPolicy.denyAll` deny — before this,
-    //    the baseline's unconditional internet accept sat ahead of the per-VM
-    //    drop and terminated the chain first, so `denyAll` granted full egress.
+    //    HEAD, so appending the jump last fixes the evaluation order: per-VM
+    //    accepts and drops, then the host baseline. That order makes
+    //    `networkPolicy.denyAll` deny; with the baseline's unconditional
+    //    internet accept ahead of the per-VM drop, `denyAll` grants full egress.
     //
-    //    `provisionBridge` deletes every non-per-VM rule from `forward` before
-    //    running this list, so a prior jump (and an old-shaped host baseline
-    //    written directly into `forward`) is gone by the time this lands, and
-    //    exactly one jump ends up in the chain.
+    //    `provisionBridge` first deletes every non-per-VM rule from `forward`
+    //    (a prior jump, an old-shaped baseline written directly into
+    //    `forward`), so exactly one jump ends up in the chain.
     nft('add', 'rule', t, 'forward', 'jump', BASELINE_CHAIN),
-    // 8. Docker coexistence. When docker is co-installed on the FC host it sets
-    //    the netfilter FORWARD policy to DROP and only permits its own bridges,
-    //    which silently drops the FC bridge's NAT'd guest traffic (no guest
-    //    internet). DOCKER-USER is docker's sanctioned hook, evaluated before
-    //    its DROP rules; accept the FC subnet there (both directions). Delete-
-    //    then-insert keeps it idempotent. On a host without docker the
-    //    DOCKER-USER chain is absent and these iptables calls fail benignly
-    //    (swallowed by provisionBridge / `|| true` in the boot script).
+    // 8. Docker coexistence. A co-installed docker sets the netfilter FORWARD
+    //    policy to DROP and permits only its own bridges, which silently drops
+    //    the guests' NAT'd traffic (no guest internet). DOCKER-USER, docker's
+    //    sanctioned hook, runs before its DROP rules, so the FC subnet is
+    //    accepted there in both directions; delete-then-insert keeps it
+    //    idempotent. Without docker the chain is absent and these calls fail
+    //    benignly (swallowed by provisionBridge, `|| true` in the boot script).
     { bin: 'iptables', args: ['-D', 'DOCKER-USER', '-s', subnet, '-j', 'ACCEPT'] },
     { bin: 'iptables', args: ['-I', 'DOCKER-USER', '-s', subnet, '-j', 'ACCEPT'] },
     { bin: 'iptables', args: ['-D', 'DOCKER-USER', '-d', subnet, '-j', 'ACCEPT'] },
@@ -329,27 +322,24 @@ export interface BridgeHealth {
  * Delete every rule in the table's `forward` chain that no live VM owns.
  *
  * A per-VM rule matches one host address or one exact TAP name; everything else
- * in that chain belongs to this provisioner — the tail `jump baseline`, and on
- * a host provisioned by an older boot script, the six baseline rules that used
- * to sit directly in `forward`. Removing only those makes re-provisioning
- * idempotent and upgrades an old-shaped host in place, without the `delete
- * table` that used to strip every running VM's isolation.
+ * in that chain is this provisioner's: the tail `jump baseline` and, on a host
+ * an older boot script provisioned, the six baseline rules that sat directly in
+ * `forward`. Removing only those makes re-provisioning idempotent and upgrades
+ * an old-shaped host in place, without a `delete table` that strips every
+ * running VM's isolation.
  *
- * One exception, and it is not this provisioner's: on a host that also runs a
- * container-mode agent, the agent installs ONE drop set for its whole
- * {@link JOB_NETWORK_SUBNET} rather than one per job container, so that a
- * customer image's `ENTRYPOINT` cannot run ahead of its own rules. nft reports
- * a subnet source as a prefix object, which is exactly what makes
- * `listForwardRules` report no per-agent identifier — so those rules read as
- * this provisioner's and would be reaped, leaving every job container already
- * running at that moment with no egress filtering until the next job repairs
- * it. They are spared by name.
+ * One exception is not this provisioner's: a container-mode agent on the same
+ * host installs ONE drop set for its whole {@link JOB_NETWORK_SUBNET}, not one
+ * per job container, so a customer image's `ENTRYPOINT` cannot run ahead of its
+ * rules. nft reports a subnet source as a prefix object, so `listForwardRules`
+ * reports no per-agent identifier and those rules read as this provisioner's.
+ * Reaping them would leave every running job container without egress
+ * filtering until the next job repairs it, so they are spared by name.
  *
- * Best-effort: a chain that cannot be read yields no rules, so a fresh host
- * sweeps nothing and provisioning proceeds. A chain whose TEXT cannot be read
- * sweeps nothing either — the spared set is unknown at that point, and deleting
- * an unclassified rule from a chain carrying a security control is the wrong
- * direction to guess in.
+ * Best-effort: an unreadable chain yields no rules, so a fresh host sweeps
+ * nothing and provisioning proceeds. A chain whose TEXT cannot be read sweeps
+ * nothing either: the spared set is unknown, and deleting an unclassified rule
+ * from a chain carrying a security control is the wrong direction to guess in.
  */
 export async function sweepUnownedForwardRules(
   cfg: FirecrackerBridgeConfig,
@@ -402,12 +392,11 @@ export async function provisionBridge(
     }
   }
 
-  // Clear the chain of everything this provisioner owns — a prior `jump
-  // baseline`, and any host baseline written directly into `forward` by an
-  // older boot script — while leaving every per-VM rule in place. This is what
-  // replaces the old `delete table`, which took the live VMs' isolation with
-  // it. It must not be split from the chain-split below: running one without
-  // the other leaves either a duplicated jump or two baselines.
+  // Clear what this provisioner owns from `forward` (a prior `jump baseline`,
+  // an older boot script's in-chain baseline) and keep every per-VM rule; a
+  // `delete table` here would take the live VMs' isolation with it. Never split
+  // this from the command list below: one without the other leaves a
+  // duplicated jump or two baselines.
   await sweepUnownedForwardRules(resolved, opts);
 
   for (const spec of buildBridgeCommands(resolved)) {
@@ -421,15 +410,13 @@ export async function provisionBridge(
       const benignDelete =
         (line.startsWith('nft delete table') || line.startsWith('nft flush chain')) &&
         /No such file|does not exist/i.test(msg);
-      // `ip link add` on a re-run answers "RTNETLINK answers: File exists";
-      // `ip addr add` answers "Error: ipv4: Address already assigned." — both
-      // mean the resource is already present and the re-run is a no-op.
+      // On a re-run `ip link add` answers "RTNETLINK answers: File exists" and
+      // `ip addr add` answers "Error: ipv4: Address already assigned.".
       const benignExists =
         /File exists|already a member|already assigned|exists/i.test(msg) &&
         (line.includes('link add') || line.includes('addr add'));
-      // Docker-coexistence carve-out: the DOCKER-USER accept rules are
-      // best-effort. A `-D` of an absent rule, an absent DOCKER-USER chain (no
-      // docker on this host), or a missing iptables binary must not fail
+      // The DOCKER-USER rules are best-effort: a `-D` of an absent rule, an
+      // absent chain (no docker) or a missing iptables binary must not fail
       // provisioning.
       const benignDockerUser =
         line.includes('DOCKER-USER') &&
@@ -468,11 +455,10 @@ export async function verifyBridge(
     const { stdout } = await runner({ bin: 'ip', args: ['-j', 'link', 'show', cfg.bridgeName] });
     const link = JSON.parse(stdout) as Array<{ operstate?: string; flags?: string[] }>;
     bridgeExists = link.length > 0;
-    // A bridge with no enslaved TAP reports operstate DOWN + NO-CARRIER even
-    // when administratively up — that's the normal post-provision state before
-    // any microVM spawns. The administrative state is the IFF_UP flag in
-    // `flags`; that's what we assert (operstate UP/UNKNOWN also counts, for a
-    // bridge that happens to already have a carrier-bearing member).
+    // A bridge with no enslaved TAP reports operstate DOWN + NO-CARRIER while
+    // administratively up, the normal state before any microVM spawns. So the
+    // IFF_UP flag decides; operstate UP/UNKNOWN also counts, for a bridge that
+    // already has a carrier-bearing member.
     const adminUp = (link[0]?.flags ?? []).includes('UP');
     const operUp = link[0]?.operstate === 'UP' || link[0]?.operstate === 'UNKNOWN';
     bridgeUp = adminUp || operUp;
@@ -595,10 +581,9 @@ export function forwardEndsInBaselineJump(nftJson: string): boolean {
  *
  * The table, its chains and the tail jump can all be in place while neither
  * rule set serves this subnet: a second bridge provisioned into the same table
- * flushes both chains and refills them with its own subnet. Every guest on this
- * bridge then loses internet access — no name resolves — and a check that stops
- * at the chain layout still reads the host as healthy, so the self-heal never
- * runs.
+ * flushes both chains and refills them with its own subnet. This bridge's
+ * guests then lose internet access (no name resolves), and a check that stops
+ * at the chain layout reads the host healthy, so the self-heal never runs.
  */
 async function checkSubnetRules(
   cfg: FirecrackerBridgeConfig,
@@ -824,11 +809,10 @@ export function renderBootScript(cfg: FirecrackerBridgeConfig): string {
     '#!/usr/bin/env bash',
     `# Generated by kici-admin firecracker --persist for bridge ${cfg.bridgeName}. Do not hand-edit.`,
     'set -euo pipefail',
-    // Write the NM-unmanaged conf via a quoted heredoc so the multi-line
-    // content lands verbatim (real newlines, no shell expansion). `printf '%s'`
-    // would NOT interpret backslash escapes in its argument, so embedding
-    // \n-escaped content there collapses the conf onto one line — a single
-    // comment line NM ignores, leaving kici-* interfaces NM-managed on reboot.
+    // A quoted heredoc lands the multi-line NM conf verbatim (real newlines, no
+    // shell expansion). `printf '%s'` does NOT interpret backslash escapes, so
+    // \n-escaped content collapses onto one comment line NM ignores, leaving
+    // kici-* interfaces NM-managed on reboot.
     `cat > ${NM_CONF_PATH} <<'KICI_NM_EOF' || true`,
     NM_CONF_CONTENT.replace(/\n$/, ''),
     'KICI_NM_EOF',
@@ -840,13 +824,11 @@ export function renderBootScript(cfg: FirecrackerBridgeConfig): string {
 }
 
 /**
- * Minimal POSIX-safe single-quote shell escaping for boot-script tokens.
- *
- * `*` is deliberately NOT in the bare-token allow-list: an `nft` arg like
- * `kici-*` (the iifname match) must reach nft literally, but an unquoted
- * `kici-*` would be glob-expanded by bash against the CWD. Tokens carrying any
- * shell metacharacter (incl. `*`, spaces, `{`/`;` from chain definitions) are
- * single-quoted so they pass through verbatim.
+ * POSIX single-quote escaping for boot-script tokens: a token with any shell
+ * metacharacter (`*`, a space, `{` or `;` from a chain definition) is quoted so
+ * it passes through verbatim. `*` is deliberately NOT in the bare-token
+ * allow-list: `kici-*` (the iifname match) must reach nft literally, and bash
+ * would glob-expand it unquoted against the CWD.
  */
 function shellQuote(tok: string): string {
   if (/^[A-Za-z0-9_./:=,+-]+$/.test(tok)) return tok;

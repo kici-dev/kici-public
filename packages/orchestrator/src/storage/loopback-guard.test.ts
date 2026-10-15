@@ -83,9 +83,8 @@ describe('isLoopbackBind', () => {
   it.each(['0.0.0.0', '::'])(
     'disagrees with isLoopbackHost on the wildcard %s, which stays a destination non-address',
     (wildcard) => {
-      // The two predicates answer different questions and must not be collapsed
-      // back into one: a wildcard is not a reachable destination, but it is a
-      // listener on every interface.
+      // Never merge the predicates: a wildcard is no reachable destination, but it listens on
+      // every interface.
       expect(isLoopbackHost(wildcard)).toBe(true);
       expect(isLoopbackBind(wildcard)).toBe(false);
     },

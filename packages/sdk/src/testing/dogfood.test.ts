@@ -2,10 +2,9 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { createTestStepContext, type TestStepContext } from '@kici-dev/sdk/testing';
 import type { StepContext } from '@kici-dev/sdk';
 
-// A customer's step function under test — pure CI logic that shells out,
-// reads a secret, sets an output env var, and emits a completion event. This
-// test imports through the public package specifier exactly as a customer
-// would, so it exercises the @kici-dev/sdk/testing subpath from a user's side.
+// A customer's step function (shells out, reads a secret, sets an output env
+// var, emits a completion event), imported through the public
+// @kici-dev/sdk/testing specifier exactly as a customer would.
 async function deployStep(ctx: StepContext): Promise<void> {
   const branch = (await ctx.$`echo main`).stdout.trim();
   const token = await ctx.secrets.get('DEPLOY_TOKEN');

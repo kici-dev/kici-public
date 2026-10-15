@@ -110,9 +110,8 @@ describe('collectInRepoSiblings', () => {
 
 describe('computeSiblingsDigest', () => {
   it('moves when a sibling source file changes', () => {
-    // The defect: the dep pointer was keyed on `lockfileHash` alone, and editing
-    // a sibling moves no package-manager lock file — so a warm dep cache
-    // restored the sibling's STALE built output over the fresh clone.
+    // Editing a sibling moves no package-manager lock file, so a dep pointer
+    // keyed on `lockfileHash` alone restores the sibling's STALE built output.
     const before = computeSiblingsDigest(root);
     write('libs/lib/src/index.ts', 'export const x = 2;\n');
     commitAll();
@@ -144,8 +143,8 @@ describe('computeSiblingsDigest', () => {
   });
 
   it('is null when .kici depends on no in-repo sibling', () => {
-    // The common case: most locks carry no siblingsDigest, so their dep pointer
-    // keys exactly as before and existing entries stay live.
+    // Most locks carry no siblingsDigest; their dep pointer keys unchanged and
+    // existing entries stay live.
     write('.kici/package.json', '{"name":"k","dependencies":{"zod":"^3.0.0"}}');
     commitAll();
     expect(computeSiblingsDigest(root)).toBeNull();

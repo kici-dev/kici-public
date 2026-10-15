@@ -1056,44 +1056,47 @@ State replay sent on orchestrator reconnection. Contains a full snapshot of all 
 
 Each RunSnapshot:
 
-| Field                  | Type           | Required | Description                                                                  |
-| ---------------------- | -------------- | -------- | ---------------------------------------------------------------------------- |
-| runId                  | string         | Yes      | Execution run ID                                                             |
-| workflowName           | string         | Yes      | Workflow name                                                                |
-| status                 | enum           | Yes      | One of: `pending`, `running`, `success`, `failed`, `cancelled`, `cancelling` |
-| routingKey             | string         | No       | Provider routing key                                                         |
-| repoIdentifier         | string         | No       | Repository identifier (e.g., `owner/repo`)                                   |
-| workflowRepoIdentifier | string         | No       | Repository that DEFINES the workflow, when that is not `repoIdentifier`      |
-| sha                    | string         | No       | Commit SHA                                                                   |
-| ref                    | string         | No       | Git branch or tag                                                            |
-| triggerEvent           | string         | No       | Trigger event type                                                           |
-| commitMessage          | string         | No       | First line of the commit message                                             |
-| jobCount               | number         | Yes      | Total number of jobs in this run                                             |
-| startedAt              | number         | Yes      | Unix timestamp when run started                                              |
-| completedAt            | number         | No       | Unix timestamp when run completed                                            |
-| durationMs             | number         | No       | Run duration in milliseconds                                                 |
-| parentRunId            | string or null | No       | Parent run ID for re-run lineage                                             |
-| originalRunId          | string or null | No       | Root ancestor run ID (first run in the chain)                                |
-| triggeredBy            | string or null | No       | User identity that triggered this re-run                                     |
-| failureReason          | string         | No       | Human-readable reason why the run failed (only present for failed runs)      |
-| statusEpoch            | integer        | Yes      | The run's status generation, with the same meaning as on `execution.status`  |
-| jobs                   | JobSnapshot[]  | Yes      | Array of job snapshots within the run                                        |
+| Field                  | Type           | Required | Description                                                                                                                                        |
+| ---------------------- | -------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| runId                  | string         | Yes      | Execution run ID                                                                                                                                   |
+| workflowName           | string         | Yes      | Workflow name                                                                                                                                      |
+| status                 | enum           | Yes      | One of: `pending`, `running`, `success`, `failed`, `cancelled`, `cancelling`, `held`                                                               |
+| routingKey             | string         | No       | Provider routing key                                                                                                                               |
+| repoIdentifier         | string         | No       | Repository identifier (e.g., `owner/repo`)                                                                                                         |
+| workflowRepoIdentifier | string         | No       | Repository that DEFINES the workflow, when that is not `repoIdentifier`                                                                            |
+| sha                    | string         | No       | Commit SHA                                                                                                                                         |
+| ref                    | string         | No       | Git branch or tag                                                                                                                                  |
+| triggerEvent           | string         | No       | Trigger event type                                                                                                                                 |
+| commitMessage          | string         | No       | First line of the commit message                                                                                                                   |
+| jobCount               | number         | Yes      | Total number of jobs in this run                                                                                                                   |
+| startedAt              | number         | Yes      | Unix timestamp when run started                                                                                                                    |
+| completedAt            | number         | No       | Unix timestamp when run completed                                                                                                                  |
+| durationMs             | number         | No       | Run duration in milliseconds                                                                                                                       |
+| parentRunId            | string or null | No       | Parent run ID for re-run lineage                                                                                                                   |
+| originalRunId          | string or null | No       | Root ancestor run ID (first run in the chain)                                                                                                      |
+| triggeredBy            | string or null | No       | User identity that triggered this re-run                                                                                                           |
+| triggeredByAgentLabel  | string or null | No       | Agent provenance label when the run was triggered through an agent credential                                                                      |
+| failureReason          | string         | No       | Human-readable reason why the run failed (only present for failed runs)                                                                            |
+| failureClass           | enum           | No       | Why a terminal run failed: `never_started`, `timed_out`, `dead_orchestrator`, `step_failure`, `cancelled` (only present for failed/cancelled runs) |
+| statusEpoch            | integer        | Yes      | The run's status generation, with the same meaning as on `execution.status`                                                                        |
+| jobs                   | JobSnapshot[]  | Yes      | Array of job snapshots within the run                                                                                                              |
 
 Each JobSnapshot:
 
-| Field        | Type           | Required | Description                   |
-| ------------ | -------------- | -------- | ----------------------------- |
-| jobId        | string         | Yes      | Job ID                        |
-| jobName      | string         | Yes      | Human-readable job name       |
-| status       | string         | Yes      | Job status                    |
-| startedAt    | number         | No       | Unix timestamp job started    |
-| completedAt  | number         | No       | Unix timestamp job ended      |
-| durationMs   | number         | No       | Job duration (ms)             |
-| errorMessage | string or null | No       | Error message if job failed   |
-| agentId      | string or null | No       | Agent ID executing this job   |
-| runsOnLabels | string[]       | No       | Labels used for agent routing |
+| Field        | Type           | Required | Description                                                   |
+| ------------ | -------------- | -------- | ------------------------------------------------------------- |
+| jobId        | string         | Yes      | Job ID                                                        |
+| jobName      | string         | Yes      | Human-readable job name                                       |
+| status       | string         | Yes      | Job status                                                    |
+| startedAt    | number         | No       | Unix timestamp job started                                    |
+| completedAt  | number         | No       | Unix timestamp job ended                                      |
+| durationMs   | number         | No       | Job duration (ms)                                             |
+| errorMessage | string or null | No       | Error message if job failed                                   |
+| agentId      | string or null | No       | Agent ID executing this job                                   |
+| runsOnLabels | string[]       | No       | Labels used for agent routing                                 |
+| contexts     | string[]       | No       | Ordered bound context names for this job (multi-context jobs) |
 
-> Authoritative source: `packages/engine/src/protocol/messages/execution-status.ts` -- `stateReplaySchema`
+> Authoritative source: `packages/engine/src/protocol/messages/execution-status.ts` -- `stateReplaySchema`, `stateReplayRunSchema`
 
 ## See also
 

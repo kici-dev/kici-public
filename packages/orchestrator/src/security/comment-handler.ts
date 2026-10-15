@@ -48,7 +48,6 @@ interface CommentCommand {
   runId?: string;
 }
 
-/** Parameters for the approval comment handler. */
 export interface HandleApprovalCommentParams {
   commentBody: string;
   commenterUsername: string;
@@ -109,7 +108,6 @@ export interface HandleApprovalCommentParams {
   onWorkflowReject?: (hold: HeldRun, reason: string) => Promise<boolean>;
 }
 
-/** Result of handling a comment. */
 interface HandleApprovalResult {
   handled: boolean;
   reason?: string;

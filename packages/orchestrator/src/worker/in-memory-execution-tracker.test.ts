@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { InMemoryExecutionTracker, type StatusUpdate } from './in-memory-execution-tracker.js';
+import { startRun } from '../__test-helpers__/tracker.js';
 
 describe('InMemoryExecutionTracker', () => {
   const makeJobs = (names: string[]) =>
@@ -7,18 +8,11 @@ describe('InMemoryExecutionTracker', () => {
 
   it('stores run state via onExecutionStarted', async () => {
     const tracker = new InMemoryExecutionTracker({});
-    await tracker.onExecutionStarted(
-      'run-1',
-      'build',
-      'github',
-      'owner/repo',
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      { installationId: 42 },
-      null,
-      makeJobs(['lint', 'test']),
-    );
+    await startRun(tracker, {
+      workflowName: 'build',
+      providerContext: { installationId: 42 },
+      jobs: makeJobs(['lint', 'test']),
+    });
 
     const status = tracker.getRunStatus('run-1');
     expect(status).not.toBeNull();
@@ -29,18 +23,10 @@ describe('InMemoryExecutionTracker', () => {
   it('dropJob removes the job without forwarding it', async () => {
     const forward = vi.fn();
     const tracker = new InMemoryExecutionTracker({ onStatusForward: forward });
-    await tracker.onExecutionStarted(
-      'run-1',
-      'build',
-      'github',
-      'owner/repo',
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      makeJobs(['lint', 'test']),
-    );
+    await startRun(tracker, {
+      workflowName: 'build',
+      jobs: makeJobs(['lint', 'test']),
+    });
 
     tracker.dropJob('run-1', 'job-0');
     // fails-when: the worker reports a verdict the coordinator already made
@@ -64,18 +50,10 @@ describe('InMemoryExecutionTracker', () => {
       onStatusForward: (update) => forwards.push(update),
     });
 
-    await tracker.onExecutionStarted(
-      'run-1',
-      'build',
-      'github',
-      'owner/repo',
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      makeJobs(['lint']),
-    );
+    await startRun(tracker, {
+      workflowName: 'build',
+      jobs: makeJobs(['lint']),
+    });
 
     await tracker.onJobStatus('run-1', 'job-0', 'running', Date.now());
 
@@ -96,18 +74,10 @@ describe('InMemoryExecutionTracker', () => {
       onStatusForward: (update) => forwards.push(update),
     });
 
-    await tracker.onExecutionStarted(
-      'run-1',
-      'build',
-      'github',
-      'owner/repo',
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      makeJobs(['lint']),
-    );
+    await startRun(tracker, {
+      workflowName: 'build',
+      jobs: makeJobs(['lint']),
+    });
 
     await tracker.onStepStatus('run-1', 'job-0', 0, 'Install deps', 'running', Date.now());
 
@@ -124,18 +94,10 @@ describe('InMemoryExecutionTracker', () => {
   it('adds to recentJobs ring buffer when job reaches terminal status', async () => {
     const tracker = new InMemoryExecutionTracker({});
 
-    await tracker.onExecutionStarted(
-      'run-1',
-      'build',
-      'github',
-      'owner/repo',
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      makeJobs(['lint', 'test']),
-    );
+    await startRun(tracker, {
+      workflowName: 'build',
+      jobs: makeJobs(['lint', 'test']),
+    });
 
     await tracker.onJobStatus('run-1', 'job-0', 'running', Date.now());
     await tracker.onJobStatus('run-1', 'job-0', 'success', Date.now());
@@ -149,27 +111,19 @@ describe('InMemoryExecutionTracker', () => {
   it('caps ring buffer at configured limit', async () => {
     const tracker = new InMemoryExecutionTracker({ recentJobsLimit: 3 });
 
-    // Create 5 jobs across different runs
     for (let r = 0; r < 5; r++) {
-      await tracker.onExecutionStarted(
-        `run-${r}`,
-        'build',
-        'github',
-        'owner/repo',
-        'refs/heads/main',
-        'abc123',
-        `delivery-${r}`,
-        {},
-        null,
-        makeJobs([`job-r${r}`]),
-      );
+      await startRun(tracker, {
+        runId: `run-${r}`,
+        workflowName: 'build',
+        deliveryId: `delivery-${r}`,
+        jobs: makeJobs([`job-r${r}`]),
+      });
       await tracker.onJobStatus(`run-${r}`, 'job-0', 'running', Date.now());
       await tracker.onJobStatus(`run-${r}`, 'job-0', 'success', Date.now());
     }
 
     const recent = tracker.getRecentJobs();
     expect(recent).toHaveLength(3);
-    // Most recent first
     expect(recent[0].jobName).toBe('job-r4');
     expect(recent[2].jobName).toBe('job-r2');
   });
@@ -177,53 +131,34 @@ describe('InMemoryExecutionTracker', () => {
   it('works without onStatusForward callback (no-op)', async () => {
     const tracker = new InMemoryExecutionTracker({});
 
-    await tracker.onExecutionStarted(
-      'run-1',
-      'build',
-      'github',
-      'owner/repo',
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      makeJobs(['lint']),
-    );
+    await startRun(tracker, {
+      workflowName: 'build',
+      jobs: makeJobs(['lint']),
+    });
 
-    // Should not throw
     await tracker.onJobStatus('run-1', 'job-0', 'running', Date.now());
     await tracker.onStepStatus('run-1', 'job-0', 0, 'Install deps', 'running', Date.now());
   });
 
   it('removes run from memory once all jobs are terminal', async () => {
     const tracker = new InMemoryExecutionTracker({});
-    await tracker.onExecutionStarted(
-      'run-1',
-      'build',
-      'github',
-      'owner/repo',
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      makeJobs(['lint', 'test']),
-    );
+    await startRun(tracker, {
+      workflowName: 'build',
+      jobs: makeJobs(['lint', 'test']),
+    });
 
     await tracker.onJobStatus('run-1', 'job-0', 'running', Date.now());
     await tracker.onJobStatus('run-1', 'job-0', 'success', Date.now());
-    // Run still in memory — job-1 is still pending
+    // job-1 is still pending.
     expect(tracker.getRunStatus('run-1')).not.toBeNull();
 
     await tracker.onJobStatus('run-1', 'job-1', 'running', Date.now());
     await tracker.onJobStatus('run-1', 'job-1', 'failed', Date.now());
-    // All jobs terminal — run should be cleaned up
     expect(tracker.getRunStatus('run-1')).toBeNull();
   });
 
   it('ignores status updates for unknown runs', async () => {
     const tracker = new InMemoryExecutionTracker({});
-    // Should not throw
     await tracker.onJobStatus('unknown-run', 'job-0', 'running', Date.now());
     await tracker.onStepStatus('unknown-run', 'job-0', 0, 'step', 'running', Date.now());
   });
@@ -231,18 +166,10 @@ describe('InMemoryExecutionTracker', () => {
   it('getRecentJobs returns most recent first', async () => {
     const tracker = new InMemoryExecutionTracker({});
 
-    await tracker.onExecutionStarted(
-      'run-1',
-      'build',
-      'github',
-      'owner/repo',
-      'refs/heads/main',
-      'abc123',
-      'delivery-1',
-      {},
-      null,
-      makeJobs(['first', 'second']),
-    );
+    await startRun(tracker, {
+      workflowName: 'build',
+      jobs: makeJobs(['first', 'second']),
+    });
 
     await tracker.onJobStatus('run-1', 'job-0', 'running', Date.now());
     await tracker.onJobStatus('run-1', 'job-0', 'success', Date.now());

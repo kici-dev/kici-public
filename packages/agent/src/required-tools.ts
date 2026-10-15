@@ -1,6 +1,4 @@
-/**
- * The host binaries the agent checks for at startup.
- */
+/** The host binaries the agent checks for at startup. */
 import type { ToolRequirement } from '@kici-dev/shared';
 
 /**

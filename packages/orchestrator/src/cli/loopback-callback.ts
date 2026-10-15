@@ -6,16 +6,15 @@ import {
 } from '../providers/github/manifest-form.js';
 
 /**
- * Ephemeral localhost server that backs the GitHub App manifest setup flow.
- * Serves the auto-submitting manifest form at `/` and catches GitHub's redirect
- * (`/cb?code=…&state=…`). The setup code is exchanged for credentials in the
- * CLI, never on the Platform — this loopback keeps the whole flow on the
- * orchestrator host (mirrors the `kici login` browser-OAuth loopback).
+ * Ephemeral localhost server for the GitHub App manifest flow: serves the
+ * auto-submitting form at `/` and catches GitHub's `/cb?code=…&state=…`
+ * redirect. The setup code is exchanged in the CLI, never on the Platform, so
+ * the whole flow stays on the orchestrator host (like `kici login`'s loopback).
  */
 export interface ManifestLoopback {
-  /** http://127.0.0.1:<port>/cb — GitHub redirect target. */
+  /** http://127.0.0.1:<port>/cb */
   redirectUrl: string;
-  /** http://127.0.0.1:<port>/ — serves the manifest form. */
+  /** http://127.0.0.1:<port>/ */
   formUrl: string;
   waitForCode(timeoutMs: number): Promise<{ code: string; state: string }>;
   close(): void;
@@ -27,11 +26,8 @@ export function startManifestLoopback(opts: {
   createUrl: string;
 }): Promise<ManifestLoopback> {
   return new Promise((resolveServer) => {
-    // The callback result is delivered via a deferred. Settling it stores the
-    // outcome; `waitForCode` reads from the stored outcome (or waits for it),
-    // so the deferred never sits rejected without a handler attached — which
-    // would surface as an unhandled rejection if the callback fires before any
-    // `waitForCode` consumer awaits it.
+    // Settling stores the outcome and `waitForCode` reads it, so a callback
+    // that fires before any consumer awaits never becomes an unhandled rejection.
     let outcome:
       | { ok: true; value: { code: string; state: string } }
       | { ok: false; error: Error }
@@ -75,8 +71,7 @@ export function startManifestLoopback(opts: {
       );
     });
 
-    // Swallow client-side socket errors (e.g. a connection torn down right as
-    // the server closes) so they never surface as an unhandled exception.
+    // A client socket torn down as the server closes must not become an unhandled exception.
     server.on('clientError', () => {});
 
     server.listen(0, '127.0.0.1', () => {
@@ -87,7 +82,7 @@ export function startManifestLoopback(opts: {
         formUrl: `${base}/`,
         waitForCode: (timeoutMs) =>
           new Promise<{ code: string; state: string }>((resolve, reject) => {
-            // Already settled before this consumer awaited — replay immediately.
+            // Settled before this consumer awaited: replay.
             if (outcome) {
               outcome.ok ? resolve(outcome.value) : reject(outcome.error);
               return;

@@ -1,20 +1,9 @@
-/**
- * Diagnostic health check command for kici-admin.
- *
- * Calls the orchestrator's /admin/diagnose endpoint and displays
- * results as a formatted table or raw JSON.
- *
- * Exit codes:
- *   0 - all checks pass
- *   1 - any check warns
- *   2 - any check fails
- */
+/** `kici-admin diagnose`. Exit codes: 0 all pass, 1 any warns, 2 any fails. */
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { toErrorMessage, diagnoseExitCode, type DiagnoseResponse } from '@kici-dev/shared';
 
-/** ANSI color codes for terminal output. */
 const COLORS = {
   green: '\x1b[32m',
   yellow: '\x1b[33m',
@@ -24,9 +13,6 @@ const COLORS = {
   bold: '\x1b[1m',
 } as const;
 
-/**
- * Colorize a status string for terminal output.
- */
 function colorizeStatus(status: string): string {
   switch (status) {
     case 'pass':
@@ -44,15 +30,11 @@ function colorizeStatus(status: string): string {
 }
 
 /**
- * Width of the table's Message column. A check message is cut at this many
- * characters, so anything a check wants an operator to see in the default
- * (non-`--json`) output has to fit inside it.
+ * Messages are cut at this many characters, so what a check wants an operator
+ * to see in the default (non-`--json`) output must fit.
  */
 export const DIAGNOSE_TABLE_MESSAGE_WIDTH = 42;
 
-/**
- * Format diagnostic results as a table.
- */
 function formatDiagnoseTable(response: DiagnoseResponse): string {
   const lines: string[] = [];
 
@@ -62,7 +44,6 @@ function formatDiagnoseTable(response: DiagnoseResponse): string {
   lines.push(`Overall: ${colorizeStatus(response.status)}`);
   lines.push('');
 
-  // Table header
   const header =
     'Status  | Check                    | Message                                    | Duration';
   lines.push(header);

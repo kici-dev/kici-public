@@ -1,12 +1,9 @@
 /**
- * Load a workflow repository's lock entries as they were at a recorded commit.
- *
- * An organization-wide run records the commit of the repository that defines
- * its workflow (`execution_runs.workflow_sha`). Two paths act on such a run
- * later, after that repository may have moved on: the re-run of a finished
- * global run, and the release of a held evaluation round. Both must run the
- * workflow version the run was created against, never the registration's
- * current one. This module is the one place that resolves it.
+ * Load a workflow repository's lock entries at the commit an organization-wide
+ * run recorded (`execution_runs.workflow_sha`). The re-run of a finished global
+ * run and the release of a held evaluation round act after that repository may
+ * have moved on, and must run the version the run was created against, never
+ * the registration's current one. This module is the one place that resolves it.
  */
 import type { LockFile, LockWorkflow } from '@kici-dev/engine';
 import type { ProviderRegistry } from '../provider-registry.js';
@@ -15,10 +12,9 @@ import { depCacheKeyOf, type DepCacheKey } from '@kici-dev/shared';
 import { hasRepoPatterns } from '../registration/extractor.js';
 
 /**
- * Whether a lock entry is an organization-wide workflow: a trigger carries
- * `repos:`. The re-run and the held-round release both judge a workflow by its
- * entry at the recorded commit through this one rule, never by the current
- * registration.
+ * A lock entry is organization-wide when a trigger carries `repos:`. The re-run
+ * and the held-round release judge a workflow by its entry at the recorded
+ * commit through this one rule, never by the current registration.
  */
 export function isOrganizationWideEntry(entry: LockWorkflow): boolean {
   return entry.triggers.some(hasRepoPatterns);
@@ -63,14 +59,12 @@ export interface WorkflowLockEntryAtSha {
 }
 
 /**
- * The lock entries of `registrations` at `sha`, keyed by workflow name.
- *
- * Every registration must belong to the same workflow repository. When each
- * registration is already at `sha`, its stored lock entry is that version and
- * nothing is fetched. Otherwise the lock file is fetched at `sha` through the
- * registration's own provider bundle, with the registration's provider context
- * — the same fetcher a per-repository re-run reads its own lock file with. A
- * workflow the lock file at `sha` does not define is absent from the result.
+ * The lock entries of `registrations` at `sha`, keyed by workflow name. Every
+ * registration must belong to one workflow repository. When each is already at
+ * `sha`, its stored lock entry is that version and nothing is fetched; otherwise
+ * the lock file is fetched at `sha` through the registration's own bundle and
+ * provider context, the fetcher a per-repository re-run uses. A workflow the
+ * lock file at `sha` does not define is absent from the result.
  *
  * Throws, naming the workflow repository, when the lock file cannot be read:
  * the caller refuses rather than falling back to any other version.

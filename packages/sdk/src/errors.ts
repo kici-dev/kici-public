@@ -1,6 +1,4 @@
-/**
- * Thrown when accessing a secret key that does not exist in the flat secrets proxy.
- */
+/** Thrown when accessing a secret key that does not exist in the flat secrets proxy. */
 export class SecretNotFoundError extends Error {
   constructor(
     public readonly key: string,

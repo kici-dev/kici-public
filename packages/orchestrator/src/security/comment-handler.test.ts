@@ -1,3 +1,4 @@
+import '../__test-helpers__/shared-mocks.js';
 import { describe, it, expect, vi } from 'vitest';
 import { parseKiciCommand, handleApprovalComment } from './comment-handler.js';
 import type { HandleApprovalCommentParams } from './comment-handler.js';
@@ -12,20 +13,6 @@ import {
   TriggerSource,
 } from '@kici-dev/engine';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
-
-vi.mock('@kici-dev/shared', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@kici-dev/shared')>();
-  return {
-    ...actual,
-    createLogger: () => ({
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-      debug: vi.fn(),
-    }),
-    toErrorMessage: (err: unknown) => (err instanceof Error ? err.message : String(err)),
-  };
-});
 
 describe('parseKiciCommand', () => {
   it('parses /kici approve', () => {

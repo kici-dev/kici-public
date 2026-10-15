@@ -1,15 +1,6 @@
 /**
- * Secret backend management commands for kici-admin.
- *
- * Provides subcommands for backend CRUD, connectivity testing, and sync:
- *   backend add <name>    Register a new secret backend
- *   backend remove <name> Remove a backend (with confirmation)
- *   backend list          List all registered backends
- *   backend test [name]   Test backend connectivity
- *   backend sync [name]   Trigger scope discovery sync
- *
- * Credentials are read from environment variables or files (not shell args)
- * per design decision.
+ * `kici-admin backend` commands: secret backend CRUD, connectivity tests and
+ * scope sync. Credentials come from environment variables or files, not shell args.
  */
 
 import { readFileSync } from 'node:fs';
@@ -21,8 +12,6 @@ import { cliAction, resolveDirectDbUrl } from './shared/cli-action.js';
 
 export function registerBackendCommands(program: Command, getClient: () => AdminApiClient): void {
   const backend = program.command('backend').description('Manage secret backends');
-
-  // ── backend add <name> ────────────────────────────────────────────
 
   backend
     .command('add <name>')
@@ -76,8 +65,6 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
       }),
     );
 
-  // ── backend remove <name> ─────────────────────────────────────────
-
   backend
     .command('remove <name>')
     .description('Remove a registered secret backend')
@@ -85,7 +72,6 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
     .action(
       cliAction(async (name: string, opts) => {
         if (!opts.yes) {
-          // Fetch backend to show scope count in confirmation
           let scopeInfo = '';
           try {
             const info = await getClient().getBackend(name);
@@ -107,8 +93,6 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
       }),
     );
 
-  // ── backend list ──────────────────────────────────────────────────
-
   backend
     .command('list')
     .description('List all registered secret backends')
@@ -120,7 +104,6 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
           return;
         }
 
-        // Print formatted table
         const header = [
           'NAME'.padEnd(20),
           'TYPE'.padEnd(8),
@@ -151,8 +134,6 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
       }),
     );
 
-  // ── backend test [name] ───────────────────────────────────────────
-
   backend
     .command('test [name]')
     .description('Test backend connectivity (by name or inline config)')
@@ -173,10 +154,8 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
         let result: { ok: boolean; error?: string; latencyMs: number };
 
         if (name && !opts.type) {
-          // Test a named registered backend
           result = await getClient().testNamedBackend(name);
         } else if (opts.type) {
-          // Test inline config
           const backendType = opts.type;
           if (backendType !== 'pg' && backendType !== 'vault') {
             console.error('Error: --type must be "pg" or "vault"');
@@ -204,17 +183,10 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
       }),
     );
 
-  // ── backend purge-stale ───────────────────────────────────────────
-  //
-  // Direct-DB-only helper: removes backends whose encrypted config can no
-  // longer be decrypted (e.g. KICI_SECRET_KEY rotated while the database kept
-  // configs encrypted under the previous key). The default `pg` backend is
-  // preserved — it's seeded by the initial migration with config_encrypted = ''
-  // (sentinel), so it's never the source of the decryption failure.
-  //
-  // This is a break-glass bootstrap command: it must run *before* the
-  // orchestrator starts, because BackendRegistry.loadAllStores() crashes
-  // orchestrator startup when the key rotated. That's why it has no HTTP mode.
+  // Removes backends whose config no longer decrypts (e.g. KICI_SECRET_KEY
+  // rotated). The default `pg` backend is kept: its config_encrypted is the ''
+  // sentinel. Direct-DB only, because it must run before the orchestrator
+  // starts: BackendRegistry.loadAllStores() crashes startup after a key rotation.
 
   backend
     .command('purge-stale')
@@ -240,8 +212,6 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
         }
       }),
     );
-
-  // ── backend sync [name] ───────────────────────────────────────────
 
   backend
     .command('sync [name]')
@@ -273,9 +243,6 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/**
- * Build Vault backend config from CLI options and env vars.
- */
 function buildVaultConfig(opts: Record<string, string | undefined>): Record<string, unknown> {
   const vaultUrl = opts.vaultUrl ?? process.env.KICI_BACKEND_VAULT_URL;
   if (!vaultUrl) {
@@ -302,7 +269,7 @@ function buildVaultConfig(opts: Record<string, string | undefined>): Record<stri
     }
     config.roleId = roleId;
 
-    // Secret ID: prefer file, then flag, then env
+    // Prefer file, then flag, then env.
     let secretId: string | undefined;
     if (opts.secretIdFile) {
       secretId = readFileSync(opts.secretIdFile, 'utf-8').trim();
@@ -328,9 +295,6 @@ function buildVaultConfig(opts: Record<string, string | undefined>): Record<stri
   return config;
 }
 
-/**
- * Build PG backend config from CLI options and env vars.
- */
 function buildPgConfig(opts: Record<string, string | undefined>): Record<string, unknown> {
   const connectionString = opts.connectionString ?? process.env.KICI_BACKEND_PG_URL;
   if (!connectionString) {
@@ -341,9 +305,6 @@ function buildPgConfig(opts: Record<string, string | undefined>): Record<string,
   return { connectionString };
 }
 
-/**
- * Format health status for display.
- */
 function formatHealth(status: string): string {
   switch (status) {
     case 'healthy':
@@ -357,9 +318,6 @@ function formatHealth(status: string): string {
   }
 }
 
-/**
- * Print a backend summary after add/update.
- */
 function printBackendSummary(b: Record<string, unknown>): void {
   console.log(`  Name:          ${b.name}`);
   console.log(`  Type:          ${b.backendType}`);

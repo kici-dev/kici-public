@@ -1,7 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { Command } from 'commander';
+import { runCli } from '../../__test-helpers__/cli.js';
 
-// Shared mock fns
 const mockCreateToken = vi.fn();
 const mockListActive = vi.fn();
 const mockRevoke = vi.fn();
@@ -50,47 +49,8 @@ const { PeerForgetOutcome } = await import('@kici-dev/engine');
 async function runCommand(
   args: string[],
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
-  const program = new Command();
-  program.exitOverride();
-
   const mockGetClient = () => ({}) as any;
-  registerPeerCommands(program, mockGetClient);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:')) {
-      console.log = origLog;
-      console.error = origError;
-      process.exit = origExit;
-
-      // Commander errors are control flow
-      if (err.code?.startsWith('commander.'))
-        return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
-      throw err;
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode };
+  return runCli((p) => registerPeerCommands(p, mockGetClient), args);
 }
 
 describe('peer CLI commands', () => {
@@ -172,8 +132,7 @@ describe('peer CLI commands', () => {
         '--json',
       ]);
 
-      // Stdout must be a single JSON document — no prose, no "works until it expires"
-      // footer — so callers can pipe through `JSON.parse` safely.
+      // A single JSON document with no prose footer, so callers can `JSON.parse` it.
       const parsed = JSON.parse(stdout);
       expect(parsed).toEqual(
         expect.objectContaining({
@@ -192,8 +151,7 @@ describe('peer CLI commands', () => {
           expiryMs: 2 * 3600_000,
         }),
       );
-      // --json contract: module logger must be silenced so its info line
-      // doesn't leak into the JSON stdout channel.
+      // The module logger's info line must not leak into the JSON stdout.
       expect(mockSilenceJoinTokenLogger).toHaveBeenCalledTimes(1);
     });
 
@@ -326,7 +284,6 @@ describe('peer CLI commands', () => {
       delete process.env.KICI_DATABASE_URL;
     });
 
-    // Restore env after suite
     it('restore env after prune-credentials suite', () => {
       if (originalKiciDbUrl !== undefined) process.env.KICI_DATABASE_URL = originalKiciDbUrl;
       expect(true).toBe(true);
@@ -339,12 +296,10 @@ describe('peer CLI commands', () => {
         '--database-url',
         'postgresql://localhost/kici',
       ]);
-      // Commander's requiredOption throws a `commander.missingMandatoryOptionValue`
-      // error before action runs; our harness swallows it so exitCode stays null
-      // but the direct helper must not have been invoked.
+      // requiredOption throws `commander.missingMandatoryOptionValue` before the
+      // action runs; exitOverride catches it rather than process.exit, so
+      // exitCode stays null.
       expect(mockPrunePeerCredentialsDirect).not.toHaveBeenCalled();
-      // exitCode is null because Commander throws (caught by exitOverride) rather
-      // than calling process.exit.
       expect(exitCode).toBeNull();
     });
 
@@ -416,7 +371,6 @@ describe('peer CLI commands', () => {
       delete process.env.KICI_DATABASE_URL;
     });
 
-    // Restore after suite
     it('restore env after suite', () => {
       if (originalKiciDbUrl !== undefined) process.env.KICI_DATABASE_URL = originalKiciDbUrl;
       expect(true).toBe(true);

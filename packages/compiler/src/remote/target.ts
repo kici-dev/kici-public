@@ -10,11 +10,10 @@
  *   3. The direct target saved by `kici connect`.
  *   4. The Platform login saved by `kici login`.
  *
- * `KICI_ORCHESTRATOR_URL` alone never selects a direct target. The agent and
- * the orchestrator read that variable as their own socket address, so a host
- * or container that runs one often has it set, and a `kici` command there
- * would otherwise switch transport without asking. An empty variable counts as
- * unset.
+ * `KICI_ORCHESTRATOR_URL` alone never selects a direct target: the agent and
+ * orchestrator read it as their own socket address, so a host running one often
+ * has it set and `kici` would otherwise switch transport without asking. An
+ * empty variable counts as unset.
  */
 import type { GlobalConfig } from './config.js';
 
@@ -29,10 +28,8 @@ export const NO_RUN_TARGET_MESSAGE =
   'orchestrator, or `kici login` to send them through the KiCI Platform.';
 
 /**
- * Normalize an orchestrator URL to the HTTP base its API is served under:
- * no trailing slash, and an agent-style `ws(s)://…/ws` socket URL mapped to
- * its `http(s)://` server (the agent socket and the HTTP API share one
- * server). A base path is kept.
+ * No trailing slash, and an agent-style `ws(s)://…/ws` URL maps to its
+ * `http(s)://` server (socket and HTTP API share one server). A base path is kept.
  *
  * @throws When the URL does not parse or its scheme is not http(s) or ws(s).
  */
@@ -60,16 +57,11 @@ const SCHEME_MAP: Record<string, string> = {
   'wss:': 'https:',
 };
 
-/** Read an env var, treating an empty string as unset. */
 function envValue(env: NodeJS.ProcessEnv, key: string): string | undefined {
   const value = env[key];
   return value ? value : undefined;
 }
 
-/**
- * Resolve the run target from a `--orchestrator-url` flag, the environment and
- * the saved config.
- */
 export function resolveRunTarget(input: {
   flagUrl?: string;
   env: NodeJS.ProcessEnv;

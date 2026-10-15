@@ -107,8 +107,8 @@ describe('renderFileDrifts', () => {
     ]);
     expect(lines[0]).toBe('3 file(s) drifted: 1 new, 1 content, 1 mode');
     expect(lines).toHaveLength(4);
-    // Path column starts at the same byte offset on every line — that's how
-    // the category column gets visually aligned regardless of label length.
+    // The path column starts at the same byte offset on every line, whatever
+    // the label length.
     const pathOffsets = lines.slice(1).map((l) => l.search(/\S+$/));
     expect(new Set(pathOffsets).size).toBe(1);
   });
@@ -223,9 +223,8 @@ describe('renderFileDriftWithDiff', () => {
       localContent: 'two\n',
     };
     const lines = renderFileDriftWithDiff(entry, { color: true });
-    // ANSI escape sequences for red/green should appear on the +/- bodies.
+    // At least one ANSI escape introducer colours the +/- bodies.
     const body = lines.join('\n');
-    // Match an ANSI escape sequence introducer. Looking for at least one.
     expect(/\x1b\[/.test(body)).toBe(true);
   });
 
@@ -418,11 +417,9 @@ describe('renderFileDriftBody (dispatch)', () => {
 });
 
 describe('renderFileDriftBody (yaml-semantic dispatch)', () => {
-  // Side-effect import: registers the yaml renderer via
-  // `setYamlDiffRenderer` so the dispatch in `renderFileDriftBody`
-  // routes `.yaml` entries through the dotted-path semantic renderer.
-  // The same wire-up happens in `deploy-prod/render.ts` in production;
-  // the test imports it explicitly.
+  // The side-effect import registers the yaml renderer (`setYamlDiffRenderer`)
+  // so `renderFileDriftBody` routes `.yaml` entries through the dotted-path
+  // semantic renderer, as `deploy-prod/render.ts` does in production.
 
   it('routes a .yaml entry through the yaml-semantic renderer (non-sensitive)', async () => {
     await import('./idempotency-yaml-diff.js');

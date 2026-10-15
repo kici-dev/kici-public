@@ -22,10 +22,7 @@ import { z } from 'zod';
 
 const joinTokenLogger = createLogger({ prefix: 'join-token' });
 
-/**
- * Silence the module-level logger (e.g. when a CLI is emitting JSON on stdout
- * and a stray log line would break the contract).
- */
+/** Silence the module logger, e.g. while a CLI emits JSON on stdout. */
 export function silenceJoinTokenLogger(): void {
   joinTokenLogger.silent = true;
 }
@@ -103,10 +100,7 @@ interface JoinTokenManagerDeps {
 export class JoinTokenManager {
   constructor(private readonly deps: JoinTokenManagerDeps) {}
 
-  /**
-   * Create a new join token.
-   * Returns the full token string (only available at creation time).
-   */
+  /** Returns the full token string, available only at creation time. */
   async createToken(opts: {
     orgId: string;
     routingKey: string;
@@ -155,12 +149,11 @@ export class JoinTokenManager {
    * Peer token mode: claim the row the presented token's secret hashes to. Role and
    * routing come from the row (`claimByHash`), never from the token's routing part.
    *
-   * Self-healing reuse: a join token is re-consumable by the same joining peer
-   * (`peerInstanceId`) until its `expires_at`. A peer that lost its credential
-   * re-presents the still-valid join token already in its env, and the coordinator
-   * issues a fresh credential without an operator action. Reuse is bounded by both
-   * `expires_at` and the consuming instanceId, so it never widens a leaked token's
-   * usefulness beyond the instance that first consumed it.
+   * Self-healing reuse: the same joining peer (`peerInstanceId`) can re-consume
+   * the token until `expires_at`, so a peer that lost its credential re-presents
+   * the token in its env and gets a fresh credential without an operator action.
+   * Bounding reuse by `expires_at` and the consuming instanceId keeps a leaked
+   * token useless beyond the instance that first consumed it.
    */
   async validateAndConsumeToken(
     token: string,
@@ -283,10 +276,8 @@ export class JoinTokenManager {
 }
 
 /**
- * Build a JoinTokenManager backed by its own connection pool to the given
- * orchestrator database URL. Mirrors `createPeerCredentialStoreFromUrl`;
- * used by tests that need to exercise token validation/reuse against a real
- * cluster DB.
+ * A JoinTokenManager with its own connection pool, for tests against a real
+ * cluster DB. Mirrors `createPeerCredentialStoreFromUrl`.
  */
 export function createJoinTokenManagerFromUrl(
   databaseUrl: string,
@@ -304,12 +295,10 @@ export function createJoinTokenManagerFromUrl(
 }
 
 /**
- * Narrow detector for the "already been used" error thrown by
- * validateAndConsumeToken(). Used by peer-handler.ts to branch into the
- * idempotent recovery path on legitimate mesh-join races (sibling
- * peer-clients on the same peer identity racing on a shared join token
- * across a multi-coordinator shared-DB mesh). Other validation failures
- * (expired, not found, bad parse) MUST NOT be treated as recoverable.
+ * Detects the "already been used" error from validateAndConsumeToken(), which
+ * peer-handler.ts treats as recoverable: sibling peer-clients of one peer
+ * identity race on a shared token across a shared-DB mesh. Other validation
+ * failures (expired, not found, bad parse) MUST NOT be treated as recoverable.
  */
 export function isTokenAlreadyUsedError(err: unknown): boolean {
   return err instanceof Error && err.message === TOKEN_ALREADY_USED_MESSAGE;
@@ -317,9 +306,6 @@ export function isTokenAlreadyUsedError(err: unknown): boolean {
 
 // --- Pure functions ---
 
-/**
- * Parse a join token string into routing info and secret hex.
- */
 export function parseToken(token: string): {
   routing: TokenRouting;
   routingB64: string;

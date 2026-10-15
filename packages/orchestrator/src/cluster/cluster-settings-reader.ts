@@ -55,43 +55,31 @@ export type ClusterStringColumn = 'dashboard_verified_issuer';
 export type ClusterBooleanColumn = 'global_workflows_enabled';
 
 /**
- * Ceiling for the three LRU entry-count knobs — `lockfile_cache_max`,
- * `content_cache_max`, and `global_eval_cache_max`.
+ * Boot-safety ceiling for `lockfile_cache_max`, `content_cache_max` and
+ * `global_eval_cache_max`, not a policy preference.
  *
- * This is a boot-safety bound, not a policy preference. The underlying LRU
- * allocates its index arrays eagerly from `max` — several typed arrays plus the
- * TTL and size arrays the caches ask for — so the cost is paid at construction
- * with zero entries cached. Measured on the shipped version: an empty cache at
- * `max` 5,000,000 costs ~191 MB, and at 5,000,000,000 the constructor throws
- * `RangeError: Invalid array length`.
+ * The LRU allocates its index, TTL and size arrays eagerly from `max`, so the
+ * cost is paid with zero entries cached: `max` 5,000,000 costs ~191 MB empty,
+ * and 5,000,000,000 throws `RangeError: Invalid array length`. All three caches
+ * are built inside `bootstrapOrchestrator`, so a bad stored value crashes the
+ * orchestrator before its admin API — the only way `kici-admin cluster-settings`
+ * reaches the value — is listening.
  *
- * That throw is what makes an unbounded knob dangerous rather than merely
- * wasteful. All three caches are built inside `bootstrapOrchestrator`, so a bad
- * stored value crashes the orchestrator before its admin API is listening —
- * and the admin API is the only way `kici-admin cluster-settings` can reach the
- * stored value. The knob would brick the very tool needed to un-brick it.
- *
- * 100,000 is 200x the shipped default of 500 and costs ~4 MB per empty cache,
- * so it is far above any plausible operator setting while keeping boot bounded.
+ * 100,000 is 200x the shipped default of 500 and costs ~4 MB per empty cache.
  */
 export const CACHE_MAX_ENTRIES_CEILING = 100_000;
 
 /**
  * Bound a stored entry-count knob to something the LRU constructor survives.
  *
- * Applied at the read site rather than only at the write site, because the
- * write-side validation cannot reach a value that is already in the database —
- * set before the ceiling shipped, or written by any path other than the admin
- * route. Clamping here is what actually guarantees a stored value cannot
- * prevent boot.
+ * Applied at the read site because write-side validation cannot reach a value
+ * already in the database (set before the ceiling shipped, or by a path other
+ * than the admin route).
  *
- * A value that is not a usable positive count (NaN, non-finite, below 1) falls
- * back to the configured default rather than clamping to 1: a 1-entry cache
- * thrashes silently, which is harder to diagnose than ignoring garbage.
- * The fallback is floored and bounded by the ceiling on the same path as the
- * stored value, so neither a fractional nor an above-ceiling configured default
- * can reach the LRU constructor as a non-integer or unclamped max — the
- * constructor rejects both, and either would prevent boot.
+ * A non-usable count (NaN, non-finite, below 1) falls back to the configured
+ * default rather than clamping to 1: a 1-entry cache thrashes silently. The
+ * fallback is floored and clamped on the same path, because the constructor
+ * rejects a non-integer or unclamped max and either would prevent boot.
  */
 export function clampCacheMaxEntries(value: number, fallback: number): number {
   const usable = !Number.isFinite(value) || value < 1 ? fallback : value;
@@ -99,13 +87,12 @@ export function clampCacheMaxEntries(value: number, fallback: number): number {
 }
 
 /**
- * A knob read that keeps "the operator never set this" separate from "we could
- * not read it".
+ * A knob read that keeps "never set" separate from "could not read".
  *
- * `{ ok: true, value: null }` is a genuine unset — a missing row, a null
- * column, or a cleared (empty) string. `{ ok: false }` means the query failed,
- * so the caller decides: most knobs want their cluster default, but one whose
- * default is a weaker trust tier must hold its last known value instead.
+ * `{ ok: true, value: null }` is a genuine unset (missing row, null column,
+ * cleared string). `{ ok: false }` means the query failed: most knobs want
+ * their cluster default, but one whose default is a weaker trust tier must
+ * hold its last known value instead.
  */
 export type ClusterSettingRead<T> = { ok: true; value: T | null } | { ok: false };
 
@@ -113,16 +100,15 @@ const DEFAULT_CACHE_TTL_MS = 10_000;
 
 /**
  * Reads the single cluster_settings row (id='default') once per short TTL
- * window and serves every fleet-wide knob from that snapshot. `getNumber` and
- * `getString` degrade to the caller's `fallback` (the config.ts cluster
- * default) on no-db / missing row / null column / DB error, so a hot-path read
- * never blocks on a sick DB. {@link ClusterSettingsReader.tryGetString} is the
- * one exception: it reports a failed query as `{ ok: false }` rather than a
- * default, for the caller whose default would be a weaker trust tier.
+ * window and serves every fleet-wide knob from that whole-row snapshot.
+ * `getNumber` and `getString` degrade to the caller's `fallback` (the config.ts
+ * cluster default) on no-db / missing row / null column / DB error, so a
+ * hot-path read never blocks on a sick DB. {@link ClusterSettingsReader.tryGetString}
+ * instead reports a failed query as `{ ok: false }`, for the caller whose
+ * default would be a weaker trust tier.
  *
- * There is exactly one row, so a whole-row cache is strictly simpler than a
- * per-column cache: one DB hit per TTL window serves every column and every
- * read-site.
+ * There is exactly one row, so a whole-row cache is simpler than a per-column
+ * one: one DB hit per TTL window serves every column and every read-site.
  */
 export class ClusterSettingsReader {
   private cache: {
@@ -138,12 +124,9 @@ export class ClusterSettingsReader {
   ) {}
 
   /**
-   * The cached row plus whether it reflects a successful read.
-   *
    * `readable` lives on the cache entry, not around the query, because the
-   * negative cache serves reads 2..N of a TTL window without touching the DB:
-   * deriving "unreadable" from the catch alone would report those reads as a
-   * genuine unset.
+   * negative cache serves reads 2..N of a TTL window without touching the DB;
+   * deriving it from the catch alone would report those reads as a genuine unset.
    */
   private async loadSnapshot(): Promise<{ row: ClusterSettings | undefined; readable: boolean }> {
     const now = Date.now();
@@ -179,9 +162,8 @@ export class ClusterSettingsReader {
   }
 
   /**
-   * The whole row from one read (undefined when there is no row or the read
-   * failed). For a caller that needs several columns that agree with each
-   * other, such as a value and the row version it belongs to.
+   * The whole row from one read (undefined on no row or a failed read), for a
+   * caller needing columns that agree, such as a value and its row version.
    */
   async getRow(): Promise<ClusterSettings | undefined> {
     return this.loadRow();
@@ -195,9 +177,8 @@ export class ClusterSettingsReader {
   }
 
   /**
-   * Resolve a fleet-wide text knob; `fallback` is the config.ts cluster default
-   * (which may itself be null). An empty stored string is treated as unset so an
-   * operator clearing the knob via the admin API behaves like a NULL.
+   * `fallback` is the config.ts cluster default (may be null). An empty stored
+   * string is unset, so clearing the knob via the admin API behaves like a NULL.
    */
   async getString(column: ClusterStringColumn, fallback: string | null): Promise<string | null> {
     const row = await this.loadRow();
@@ -206,12 +187,9 @@ export class ClusterSettingsReader {
   }
 
   /**
-   * Resolve a fleet-wide text knob without collapsing a read failure into a
-   * default.
-   *
-   * There is deliberately no `fallback` parameter: the point of this variant is
-   * that the caller — not the reader — decides what an unreadable knob means.
-   * An empty stored string is unset, matching {@link getString}.
+   * Resolve a text knob without collapsing a read failure into a default:
+   * deliberately no `fallback`, so the caller decides what an unreadable knob
+   * means. An empty stored string is unset, matching {@link getString}.
    */
   async tryGetString(column: ClusterStringColumn): Promise<ClusterSettingRead<string>> {
     const { row, readable } = await this.loadSnapshot();
@@ -221,18 +199,14 @@ export class ClusterSettingsReader {
   }
 
   /**
-   * Resolve a fleet-wide boolean knob without collapsing a read failure into a
-   * default.
+   * Resolve a boolean knob without collapsing a read failure into a default.
    *
-   * There is deliberately no `getBoolean(column, fallback)` companion. The
-   * security gate that consumes this must tell the reader's outcomes apart
-   * itself: a stored `false` and a NULL both deny today, but they deny for
-   * different reasons, and `{ ok: false }` must deny regardless of what the
-   * configured default happens to be. A convenience wrapper that folded the
-   * failure into the default would be safe only for as long as that default
-   * stayed `false`. A caller that only needs a display value (the dashboard
-   * status badge) folds `{ ok: false }` into the default explicitly at its own
-   * site, where getting it wrong misreports a badge rather than opening a gate.
+   * Deliberately no `getBoolean(column, fallback)` companion: the consuming
+   * security gate must deny on `{ ok: false }` whatever the configured default
+   * is, and a wrapper folding failure into the default is safe only while that
+   * default stays `false`. A display-only caller (the dashboard status badge)
+   * folds `{ ok: false }` into the default at its own site, where a mistake
+   * misreports a badge rather than opening a gate.
    */
   async tryGetBoolean(column: ClusterBooleanColumn): Promise<ClusterSettingRead<boolean>> {
     const { row, readable } = await this.loadSnapshot();
@@ -242,13 +216,12 @@ export class ClusterSettingsReader {
   }
 
   /**
-   * The cluster_settings row version last seen in the cache (0 if never loaded).
+   * The row version last seen in the cache (0 if never loaded).
    *
-   * Synchronous — never awaits a DB read — so the heartbeat timer can read it
-   * safely and advertise it to workers. When the cache is cold or expired it
-   * kicks a non-blocking refresh so the advertised version self-heals within a
-   * cache-TTL window without depending on a `getNumber()` call, then returns
-   * the last-loaded value.
+   * Synchronous, so the heartbeat timer can advertise it to workers. A cold or
+   * expired cache kicks a non-blocking refresh, so the advertised version
+   * self-heals within a TTL window without a `getNumber()` call; this call
+   * returns the last-loaded value.
    */
   getCachedVersion(): number {
     if (this.db && (!this.cache || this.cache.expiresAt <= Date.now())) {

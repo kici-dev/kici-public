@@ -1,9 +1,4 @@
-/**
- * Diagnostic health check types.
- *
- * Defines the shape of diagnostic results and check functions
- * used by the diagnostic runner and CLI/HTTP interfaces.
- */
+/** Diagnostic result and check shapes, shared by the runner and the CLI/HTTP interfaces. */
 
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
@@ -11,43 +6,37 @@ import type { AgentRegistry } from '../agent/registry.js';
 import type { ScalerManager } from '../scaler/manager.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
 
-/** Result of a single diagnostic check. */
 export interface DiagnosticResult {
   /** Human-readable check name (e.g., "Database connectivity"). */
   name: string;
-  /** Check outcome: pass, warn, or fail. */
   status: 'pass' | 'warn' | 'fail';
   /** Short description of the result. */
   message: string;
-  /** Optional structured details for debugging. */
+  /** Structured details for debugging. */
   details?: Record<string, unknown>;
-  /** How long the check took to run in milliseconds. */
   durationMs: number;
 }
 
-/** Dependencies available to diagnostic checks. */
 export interface DiagnosticDeps {
-  /** DB connection (optional -- standalone mode may not have DB). */
+  /** Standalone mode may not have a DB. */
   db?: Kysely<Database>;
-  /** Platform WS URL (for connectivity check). */
+  /** Platform WS URL (for the connectivity check). */
   platformUrl?: string;
-  /** Agent registry for checking connected agents. */
   agentRegistry?: AgentRegistry;
-  /** Orchestrator config (for config validity check). */
+  /** Orchestrator config (for the config validity check). */
   config: Record<string, unknown>;
-  /** TLS cert path (for expiry check). */
+  /** TLS cert path (for the expiry check). */
   tlsCertPath?: string;
-  /** Scaler manager for recent spawn-failure health (optional -- no scaler configured). */
+  /** For recent spawn-failure health; absent when no scaler is configured. */
   scalerManager?: ScalerManager;
   /**
-   * Fleet-wide settings reader. When present, a check reads the live
-   * `cluster_settings` value rather than only the configured default — so
-   * `kici-admin diagnose` reports what the cluster is actually doing.
+   * When present, a check reads the live `cluster_settings` value rather than only the
+   * configured default — so `kici-admin diagnose` reports what the cluster actually does.
    */
   clusterSettings?: ClusterSettingsReader;
 }
 
-/** A diagnostic check function. May return one result or several (e.g. one per scaler backend). */
+/** May return one result or several (e.g. one per scaler backend). */
 export type DiagnosticCheck = (
   deps: DiagnosticDeps,
 ) => Promise<DiagnosticResult | DiagnosticResult[]>;

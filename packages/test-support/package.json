@@ -1,0 +1,48 @@
+{
+  "name": "@kici-dev/test-support",
+  "version": "0.0.0",
+  "description": "Test helpers shared by the KiCI package test suites. Never published to npm.",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./test-db": {
+      "import": "./dist/test-db.js",
+      "types": "./dist/test-db.d.ts"
+    },
+    "./mock-db-query": {
+      "import": "./dist/mock-db-query.js",
+      "types": "./dist/mock-db-query.d.ts"
+    },
+    "./logger-mock": {
+      "import": "./dist/logger-mock.js",
+      "types": "./dist/logger-mock.d.ts"
+    },
+    "./http": {
+      "import": "./dist/http.js",
+      "types": "./dist/http.d.ts"
+    },
+    "./tmp": {
+      "import": "./dist/tmp.js",
+      "types": "./dist/tmp.d.ts"
+    },
+    "./tmp-setup": {
+      "import": "./dist/tmp-setup.js",
+      "types": "./dist/tmp-setup.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-ts.mjs && tsc -p tsconfig.build.json --emitDeclarationOnly",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "kysely": "^0.29.4",
+    "pg": "^8.23.0",
+    "vitest": "^5.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.4",
+    "@types/pg": "^8.23.1"
+  }
+}

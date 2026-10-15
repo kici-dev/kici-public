@@ -1,43 +1,28 @@
 /**
- * Source-create gate tripwires.
- *
- * Two invariants protect the orchestrator from registering arbitrary
- * GitHub Apps as sources without proof of ownership:
+ * Source-create gate tripwires: two invariants stop the orchestrator
+ * registering arbitrary GitHub Apps as sources without proof of ownership.
  *
  *  1. The handler calls `validateGitHubSource(appId, privateKey)` BEFORE
- *     `sourceStore.addSource(...)`. If validation rejects (the appId +
- *     privateKey pair fails GitHub's `GET /app` JWT auth — i.e., the
- *     caller does not actually possess the App's private key), the
- *     handler returns 400 and the source is NOT persisted. Removing
- *     this gate would let an external attacker, or one holding an
- *     operator token, register a source for ANY GitHub App by App ID
- *     alone, then receive webhooks meant for that App's installations
- *     and resolve secrets against repo names that match its triggers.
+ *     `sourceStore.addSource(...)`. If the pair fails GitHub's `GET /app` JWT
+ *     auth (the caller lacks the App's private key), it returns 400 and
+ *     persists nothing. Without this gate an external attacker, or one holding
+ *     an operator token, could register a source for ANY GitHub App by App ID
+ *     alone, receive webhooks meant for its installations, and resolve secrets
+ *     against repo names that match its triggers.
  *
  *  2. The routing key is SERVER-DERIVED from the validated `appId`
- *     (`${provider}:${appId}` — see `source-store.ts:addSource`). The
- *     handler at `admin-sources.ts` does NOT read `routingKey` from
- *     the request body. A request that includes a forged
- *     `routingKey: 'github:victim-appid'` MUST be ignored — the
- *     persisted row's routing_key MUST equal the server-derived value
- *     based on the caller-submitted `appId`. Removing this gate would
- *     let a caller squat an arbitrary routing key (e.g.,
- *     `github:99999`) and intercept webhooks routed by that key.
+ *     (`${provider}:${appId}`, see `source-store.ts:addSource`);
+ *     `admin-sources.ts` never reads `routingKey` from the body. A forged
+ *     `routingKey: 'github:victim-appid'` MUST be ignored, else a caller could
+ *     squat any routing key (e.g. `github:99999`) and intercept its webhooks.
  *
- * Trust model (must hold):
- *   For an external, unauthenticated attacker and for one holding a
- *   stolen admin token, the source-create handler's pre-DB validate call is
- *   the cryptographic gate that requires proof of GitHub App
- *   ownership. The webhook-routing layer sits on top
- *   of this — but if the source-create gate were bypassed, an attacker
- *   could register the victim App's ID with their own private key and
- *   later... well, they couldn't, because validateGitHubSource calls
- *   `GET /app` and that request fails without the real private key.
- *   The point of THIS test is that the gate is invoked at all, in
- *   the right order. A future refactor that moved validation AFTER
- *   the addSource call (e.g., as part of a post-write enrichment
- *   step) would silently widen the attack surface. This test keeps
- *   the call order honest.
+ * Trust model (must hold): for an external unauthenticated attacker and for
+ * one holding a stolen admin token, the pre-DB validate call is the
+ * cryptographic proof of GitHub App ownership; the webhook-routing layer sits
+ * on top. `GET /app` fails without the real private key, so THIS test only
+ * pins that the gate runs at all, in the right order: moving validation AFTER
+ * addSource (e.g. as a post-write enrichment step) would silently widen the
+ * attack surface.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createSourceRoutes } from './admin-sources.js';
@@ -67,9 +52,7 @@ describe('source-create gate invariants', () => {
 
   describe('cryptographic ownership gate (validateGitHubSource → addSource ordering)', () => {
     it('REJECTS the request and does NOT persist when validateGitHubSource fails', async () => {
-      // Simulate the gate firing — invalid appId + privateKey pair.
-      // Real validator would call `GET /app` and fail because the
-      // caller doesn't have the App's actual private key.
+      // The real validator's `GET /app` fails without the App's private key.
       vi.mocked(sourceValidator.validateGitHubSource).mockResolvedValueOnce({
         valid: false,
         error: 'GitHub API validation failed: bad credentials',
@@ -95,9 +78,7 @@ describe('source-create gate invariants', () => {
       const body = (await res.json()) as { error: string };
       expect(body.error).toContain('GitHub API validation failed');
 
-      // The critical invariant: addSource MUST NOT have been called.
-      // A future refactor that persisted-then-validated, or that
-      // ignored validator failures, would fail this assertion.
+      // Fails if the handler persists then validates, or ignores a validator failure.
       expect(addSource).not.toHaveBeenCalled();
     });
 
@@ -129,8 +110,6 @@ describe('source-create gate invariants', () => {
 
       expect(res.status).toBe(201);
 
-      // The validator was called BEFORE addSource — assert ordering by
-      // checking both invocation orders.
       expect(vi.mocked(sourceValidator.validateGitHubSource)).toHaveBeenCalledTimes(1);
       expect(addSource).toHaveBeenCalledTimes(1);
 
@@ -141,10 +120,8 @@ describe('source-create gate invariants', () => {
     });
 
     it('REJECTS when required fields are missing (no validator/addSource invocation)', async () => {
-      // Defense-in-depth: the handler validates required fields before
-      // even calling validateGitHubSource. An attacker who omits the
-      // privateKey can't trick the handler into treating the source as
-      // "validated" by skipping the gate entirely.
+      // Defense-in-depth: required fields are checked before validateGitHubSource,
+      // so omitting privateKey cannot skip the gate and count as "validated".
       const addSource = vi.fn();
       const sourceStore = createMockSourceStore({ addSource });
       const app = createSourceRoutes({ sourceStore });
@@ -181,10 +158,8 @@ describe('source-create gate invariants', () => {
       const sourceStore = createMockSourceStore({ addSource });
       const app = createSourceRoutes({ sourceStore });
 
-      // The attacker's body includes a forged `routingKey` pointing at
-      // a victim's appId (`99999`). The handler MUST NOT pass this
-      // value through to addSource — addSource derives the routing
-      // key server-side from `appId` (which is `42`).
+      // A forged `routingKey` names a victim's appId (`99999`); addSource
+      // derives the key server-side from `appId` (`42`).
       const res = await app.request('/sources', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -202,12 +177,9 @@ describe('source-create gate invariants', () => {
       expect(addSource).toHaveBeenCalledTimes(1);
 
       const callArg = addSource.mock.calls[0][0];
-      // The handler MUST NOT forward `routingKey` to the store. The
-      // store computes it from `appId`. If the handler grew a
-      // `routingKey: body.routingKey` line, this assertion fails.
+      // Fails if the handler forwards `routingKey: body.routingKey` to the store.
       expect(callArg).not.toHaveProperty('routingKey');
-      // Caller's appId (which the validator approved) is what the
-      // store will use to derive the routing key.
+      // The store derives the key from the validator-approved appId.
       expect(callArg.appId).toBe('42');
     });
   });

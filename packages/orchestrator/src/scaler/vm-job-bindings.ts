@@ -1,19 +1,15 @@
 /**
- * Durable job-to-agent bindings, read from the coordinator's dispatch queue.
- *
- * A worker has no database, so this is the coordinator's half of the
- * live-VM tracking: a VM whose agent holds a non-terminal job is tracked, even
- * when the node that runs the VM has lost every in-memory trace of it.
+ * Durable job-to-agent bindings from the coordinator's dispatch queue: the coordinator's half
+ * of live-VM tracking (a worker has no database). A VM whose agent holds a non-terminal job is
+ * tracked even when its node has lost every in-memory trace of it.
  */
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import { TERMINAL_DISPATCH_STATUSES } from '../queue/job-queue.js';
 
 /**
- * The non-terminal job each of `agentIds` holds, keyed by agent id. An agent
- * holds a job it was dispatched (`agent_id`) and a job waiting for it to
- * reconnect (`recovery_agent_id`). The value is the job id the queue
- * dispatches by, `dispatch_queue.id`.
+ * The non-terminal job (`dispatch_queue.id`) each of `agentIds` holds: one it was dispatched
+ * (`agent_id`) or one waiting for it to reconnect (`recovery_agent_id`).
  */
 export async function findActiveJobBindings(
   db: Kysely<Database>,

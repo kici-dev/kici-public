@@ -16,13 +16,10 @@ export interface DownloadNodeOptions {
 }
 
 /**
- * Fetch a Node dist URL, retrying transient failures. The runtime download is a
- * bootstrap-critical step on a box that may have flaky egress (a fresh customer
- * host, a CDN blip); a single bare `fetch` turns any transient connect/DNS/5xx
- * hiccup into an opaque `fetch failed` that aborts the whole packaging run. We
- * retry connection-level throws and 5xx responses with exponential backoff, and
- * fold the underlying `cause` (e.g. `connect ETIMEDOUT …`, `UND_ERR_…`) into the
- * final error so a genuine failure is diagnosable instead of a bare message.
+ * Fetch a Node dist URL, retrying connection-level throws and 5xx responses with
+ * exponential backoff: a fresh customer host or a CDN blip must not abort the
+ * whole packaging run on one opaque `fetch failed`. The final error folds in the
+ * underlying `cause` (e.g. `connect ETIMEDOUT …`, `UND_ERR_…`) so it is diagnosable.
  */
 async function fetchNodeDist(url: string, attempts = 4): Promise<Response> {
   let lastErr: unknown;
@@ -53,16 +50,12 @@ async function fetchNodeDist(url: string, attempts = 4): Promise<Response> {
  * Download + SHASUMS256-verify the Node runtime for a glibc-Linux platform and
  * vendor `node` + `npm` into the payload.
  *
- * Fetches the release's SHASUMS256.txt, finds the entry for the target
- * platform's `.tar.gz`, downloads the archive, verifies its sha256 against that
- * entry, and extracts the runtime into `<prefix>/` (where `<prefix>` is the
- * grandparent of `destBinPath`): the `node` binary at `<prefix>/bin/node`, the
- * `bin/npm` + `bin/npx` launcher symlinks, and the bundled npm package under
- * `<prefix>/lib/node_modules/npm`. npm is required so the booted agent can
- * install a workflow's `.kici/` dependencies on a box with no system Node —
- * `resolveNpm()` finds it at `<nodeDir>/../lib/node_modules/npm/bin/npm-cli.js`.
- * The vendored Node is what the produced payload boots on — no system Node is
- * ever used.
+ * Extracts into `<prefix>/` (the grandparent of `destBinPath`): `bin/node`, the
+ * `bin/npm` + `bin/npx` launcher symlinks, and `lib/node_modules/npm`. npm is
+ * required so the booted agent can install a workflow's `.kici/` dependencies on
+ * a box with no system Node — `resolveNpm()` finds it at
+ * `<nodeDir>/../lib/node_modules/npm/bin/npm-cli.js`. The payload boots on the
+ * vendored Node; no system Node is ever used.
  */
 export async function downloadNodeBinary(opts: DownloadNodeOptions): Promise<void> {
   const { nodeOs, nodeArch } = splitAgentPlatform(opts.platform);
@@ -84,9 +77,7 @@ export async function downloadNodeBinary(opts: DownloadNodeOptions): Promise<voi
     );
   }
 
-  // Extract into the payload prefix (grandparent of `<prefix>/bin/node`), so the
-  // dist layout — bin/{node,npm,npx} + lib/node_modules/npm — lands verbatim and
-  // `resolveNpm()`'s `<nodeDir>/../lib/node_modules/npm` lookup resolves.
+  // The dist layout lands verbatim under the prefix so `resolveNpm()` resolves.
   const prefixDir = path.dirname(path.dirname(opts.destBinPath));
   mkdirSync(prefixDir, { recursive: true });
   const archivePath = path.join(prefixDir, filename);

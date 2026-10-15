@@ -1,19 +1,13 @@
 /**
- * In-repo workspace-sibling discovery for the agent's dependency handling.
+ * In-repo workspace-sibling discovery. A pnpm or yarn-classic workspace links a
+ * `.kici/` member's `workspace:` (pnpm) or version-range (yarn) siblings as
+ * symlinks to package dirs inside the clone but outside `.kici/` and the
+ * `node_modules` store. The dep-cache packer must carry those dirs (or the
+ * symlinks dangle), and the yarn install path must build them (yarn links a
+ * sibling but does not build it).
  *
- * A pnpm or yarn-classic workspace lays out a `.kici/` member's `workspace:`
- * (pnpm) or version-range (yarn) siblings as symlinks pointing at package
- * directories that live inside the clone but outside `.kici/` and outside the
- * `node_modules` store. The dep-cache packer must travel those sibling dirs with
- * the closure (their symlinks would dangle otherwise), and the yarn install path
- * must build them (the install links a sibling but does not build it).
- *
- * `collectInRepoSiblings` walks a starting `node_modules` (and transitively each
- * discovered sibling's `node_modules`), returning each in-repo sibling directory
- * once, repo-root-relative, in breadth-first discovery order. The starting
- * `node_modules` is a parameter so it serves pnpm + yarn-standalone (seeded at
- * `.kici/node_modules`) and yarn-workspace-member (seeded at the hoisted root
- * `node_modules`).
+ * The seed `node_modules` is a parameter: pnpm and yarn-standalone seed at
+ * `.kici/node_modules`, a yarn workspace member at the hoisted root.
  */
 
 import { lstat, readdir, realpath } from 'node:fs/promises';
@@ -32,11 +26,8 @@ export function resolveYarnNodeModulesRoot(repoRoot: string, kiciDir: string): s
 }
 
 /**
- * Walk `seedNodeModules` (and transitively each in-repo sibling's
- * `node_modules`) collecting the repo-root-relative directories of workspace
- * siblings — package dirs that live inside the clone but outside `.kici/` and
- * outside the repo-root `node_modules/` store. Returns each dir once, in
- * discovery (BFS) order.
+ * Walk `seedNodeModules`, and transitively each sibling's `node_modules`,
+ * returning each sibling dir once, repo-root-relative, in BFS order.
  */
 export async function collectInRepoSiblings(
   workDir: string,
@@ -88,7 +79,6 @@ async function resolveNodeModulesLinks(nmDir: string): Promise<string[]> {
   return targets;
 }
 
-/** Return the real path of `p` if it is a symlink, else null. */
 async function resolveIfSymlink(p: string): Promise<string | null> {
   try {
     const stat = await lstat(p);

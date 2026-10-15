@@ -87,7 +87,7 @@ describe('validateConfig cross-domain DAG validation', () => {
       jobs: [testGenerator, deployJob],
     });
 
-    // Should not report missing dependency for __group:tests
+    // `__group:tests` is no missing dependency.
     const result = validateConfig([wrap(w)]);
     expect(result.valid).toBe(true);
   });
@@ -144,7 +144,6 @@ describe('validateConfig error locations', () => {
   });
 
   it('E102 lists only true cycle members, comma-joined (jx<->jy, jz needs jx)', () => {
-    // jx<->jy is the only cycle; jz merely depends on jx and must not appear.
     // Multi-char ids avoid colliding with the fixed error-message words.
     const w = workflow('ci', {
       jobs: [
@@ -159,8 +158,7 @@ describe('validateConfig error locations', () => {
     const err = res.errors.find((e) => e.code === 'E102');
     expect(err).toBeDefined();
     expect(err!.message).toContain('jx, jy');
-    // jz depends on the cycle but is not part of it, and the message must not
-    // imply an ordered dependency path.
+    // No non-member, and no implied ordered dependency path.
     expect(err!.message).not.toContain('jz');
     expect(err!.message).not.toContain(' -> ');
   });
@@ -214,9 +212,8 @@ describe('approval on an organization-wide workflow', () => {
 });
 
 describe('invoke-gate validation', () => {
-  // Raw Job objects bypass the SDK factory guard so the validator's own
-  // defense-in-depth checks (a generated job could carry these shapes) are
-  // exercised directly.
+  // Raw Job objects bypass the SDK factory guard to exercise the validator's own
+  // checks: a generated job could carry these shapes.
   function rawJob(overrides: Partial<Job> & { name: string }): Job {
     return {
       _tag: 'Job',

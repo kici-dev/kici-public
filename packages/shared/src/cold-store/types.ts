@@ -1,11 +1,14 @@
 /**
- * Core types for the cold-storage archival framework.
- *
- * This module defines the shapes that the DB-agnostic
- * cold-store framework exchanges with its two concrete consumers
- * (Platform, Orchestrator).
+ * Shapes the DB-agnostic cold-storage archival framework exchanges with its
+ * consumers (Platform, Orchestrator).
  */
 import type { DbKind } from './key.js';
+
+/**
+ * Cold-retention horizon for a chunk: number of days the chunk lives in S3
+ * after archival before being purged, or `'forever'` to never purge.
+ */
+export type ColdRetention = number | 'forever';
 
 /**
  * Sidecar manifest written next to every archived chunk.
@@ -16,23 +19,15 @@ import type { DbKind } from './key.js';
  * `verify-chunk` CLI detect bit-rot or mutation without re-reading the
  * body at ingestion time.
  */
-/**
- * Cold-retention horizon for a chunk: number of days the chunk lives in S3
- * after archival before being purged, or `'forever'` to never purge.
- */
-export type ColdRetention = number | 'forever';
-
 export interface ChunkManifest {
   /**
    * Manifest schema version.
    *
-   * - `1`: no bucket, no cold-TTL metadata. The framework
-   *   treats v1 chunks as `bucket='forever'` / `maxColdDays='forever'` so
-   *   the GC sweep never purges them.
-   * - `2`: cold-store purge. Adds `bucket` (S3-segment string)
-   *   and `maxColdDays` (numeric or `'forever'`). The GC sweep keys off
-   *   `archivedAt + maxColdDays`, NOT the bucket name — multiple actions
-   *   with different per-row TTLs can share a bucket.
+   * - `1`: no bucket or cold-TTL metadata; treated as `bucket='forever'` /
+   *   `maxColdDays='forever'`, so the GC sweep never purges it.
+   * - `2`: adds `bucket` (S3 segment) and `maxColdDays` (numeric or
+   *   `'forever'`). The GC sweep keys off `archivedAt + maxColdDays`, NOT the
+   *   bucket name — actions with different per-row TTLs can share a bucket.
    */
   schemaVersion: 1 | 2;
   db: DbKind;
@@ -64,14 +59,11 @@ export interface ChunkManifest {
   /** Instance ID of the archiver process, for forensics. */
   archiverInstanceId: string;
   /**
-   * Optional list of natural-key lookup tokens (e.g. UUID
-   * `run_id`) for every row in the chunk, populated when the adapter
-   * implements `replayLookupKey()`. Used by `BaseColdStore.replayRow()`
-   * to find the chunk holding a specific natural key when the manifest's
-   * `minRowId`/`maxRowId` are an internal SERIAL `id` that callers don't
-   * have. Chunks written without `replayLookupKey()` (older chunks, or an
-   * adapter without it) omit this field; replayRow falls back to the
-   * `minRowId`/`maxRowId` range comparison in that case.
+   * Natural-key lookup tokens (e.g. UUID `run_id`) for every row, present when
+   * the adapter implements `replayLookupKey()`. `BaseColdStore.replayRow()`
+   * uses them to find a natural key when `minRowId`/`maxRowId` are an internal
+   * SERIAL `id` callers don't have; without them it falls back to the
+   * `minRowId`/`maxRowId` range comparison.
    */
   replayLookupKeys?: string[];
   /**
@@ -81,11 +73,10 @@ export interface ChunkManifest {
    */
   bucket?: string;
   /**
-   * Maximum per-row cold TTL (days, or `'forever'`) across all
-   * rows in the chunk. The GC sweep purges a chunk when
-   * `now > archivedAt + maxColdDays * 86_400_000`. Multiple actions with
-   * different per-row TTLs can share a bucket, so the sweep MUST use this
-   * field (not the bucket name) for correctness.
+   * Maximum per-row cold TTL (days, or `'forever'`) across the chunk's rows.
+   * The GC sweep purges a chunk when `now > archivedAt + maxColdDays * 86_400_000`,
+   * and MUST use this field, not the bucket name, since actions with different
+   * per-row TTLs can share a bucket.
    */
   maxColdDays?: ColdRetention;
 }

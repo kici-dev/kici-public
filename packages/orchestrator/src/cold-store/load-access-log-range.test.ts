@@ -5,11 +5,8 @@ import { loadAccessLogRange, type AccessLogColdRow } from './load-access-log-ran
 import type { Database } from '../db/types.js';
 
 /**
- * Direct unit tests for `loadAccessLogRange`. Complements the
- * `AccessLogWriter` tests in `audit/access-log.test.ts`, which only
- * exercise `getById` (the legacy detail lookup). The pagination-with-
- * cold-resume branch handled here had no direct coverage prior to this
- * file — that gap is what let the silent-data-loss bug land.
+ * Direct tests for `loadAccessLogRange`, covering the pagination-with-cold-resume
+ * branch that `audit/access-log.test.ts` (only `getById`) leaves untested.
  */
 
 const COLD_DAY = new Date('2026-01-01T00:00:00.000Z'); // older than warm cutoff
@@ -74,11 +71,9 @@ function makeColdStoreMock(opts: {
 }
 
 /**
- * Mock Kysely just enough that the chain in the hot SELECT branch
- * (`selectFrom → selectAll → orderBy → orderBy → limit → where* →
- * execute`) returns the supplied rows. Each `where(...)` returns the
- * same builder so an arbitrary number of optional filters can be
- * chained without specific stubs per filter.
+ * Mock the hot SELECT chain (`selectFrom → selectAll → orderBy → orderBy →
+ * limit → where* → execute`); every method returns the same builder, so any
+ * number of optional filters chains.
  */
 function makeHotMockDb(hotRows: AccessLogColdRow[]): {
   db: Kysely<Database>;
@@ -95,12 +90,7 @@ function makeHotMockDb(hotRows: AccessLogColdRow[]): {
   return { db: { selectFrom } as unknown as Kysely<Database>, execute };
 }
 
-/**
- * For cold-resume calls the hot SELECT is skipped entirely, so no Kysely
- * methods are touched. Return a stub that throws if anything tries to
- * use it — that doubles as a guard that the cold-resume branch never
- * accidentally triggers the hot path.
- */
+/** Cold resume skips the hot SELECT; this stub throws on any use to prove it. */
 function makeUnusedDb(): Kysely<Database> {
   const guard: ProxyHandler<object> = {
     get(_, prop) {
@@ -126,17 +116,14 @@ describe('loadAccessLogRange cold-store error propagation', () => {
       }),
     ).rejects.toThrow('S3 outage');
 
-    // The cold scan was attempted exactly once for the requested tenant.
     expect(fetchRange).toHaveBeenCalledTimes(1);
     const callArg = fetchRange.mock.calls[0][0] as { tenantId: string; table: string };
     expect(callArg).toMatchObject({ table: 'access_log', tenantId: 'org-1' });
   });
 
   it('returns hot rows with a soft-fallback warning when coldStore fails in mixed mode', async () => {
-    // Hot returns fewer than `limit` rows AND fromTimestamp is older
-    // than the 30-day warm cutoff, so loadAccessLogRange descends into
-    // cold. The cold side throws — caller should get the hot rows back
-    // with nextCursor=null (hot didn't fill the page).
+    // A short hot page plus a fromTimestamp past the 30-day warm cutoff descends
+    // into cold; cold throws, so the hot rows come back with nextCursor=null.
     const HOT_ROW: AccessLogColdRow = {
       ...SAMPLE_COLD_1,
       id: 'hot-1',
@@ -152,19 +139,17 @@ describe('loadAccessLogRange cold-store error propagation', () => {
       coldStore,
       filter: { orgId: 'org-1', fromTimestamp: COLD_DAY },
       limit: 50,
-      // No cursor → cursor.source is null/undefined → mixed (first-page) mode.
+      // No cursor → mixed (first-page) mode.
     });
 
     expect(result.items).toHaveLength(1);
     expect(result.items[0].id).toBe('hot-1');
-    // Hot returned only one row (less than limit) so there's no hot-next-page.
     expect(result.nextCursor).toBeNull();
     expect(fetchRange).toHaveBeenCalledTimes(1);
   });
 
   it('returns cold rows when cursor.source === "cold" and the cold scan succeeds (regression guard)', async () => {
-    // Happy path for the cold-resume branch — protects the existing
-    // functionality the bug fix's catch-block branch must not break.
+    // Happy path the catch-block error handling must not break.
     const { coldStore, fetchRange } = makeColdStoreMock({
       rows: [SAMPLE_COLD_2, SAMPLE_COLD_1],
     });
@@ -177,10 +162,8 @@ describe('loadAccessLogRange cold-store error propagation', () => {
       cursor: buildColdCursorForId(new Date('2026-02-01T00:00:00.000Z'), 'sentinel'),
     });
 
-    // Both cold rows precede the sentinel cursor, so both come back
-    // (sorted desc by created_at, id).
+    // Both cold rows precede the sentinel cursor (desc by created_at, id).
     expect(result.items.map((i) => i.id)).toEqual(['cold-2', 'cold-1']);
-    // Page wasn't filled to limit → no further cursor.
     expect(result.nextCursor).toBeNull();
     expect(fetchRange).toHaveBeenCalledTimes(1);
   });

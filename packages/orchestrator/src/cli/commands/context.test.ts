@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { Command } from 'commander';
+import { runCli } from '../../__test-helpers__/cli.js';
 
-// Shared mock fns for *Direct helpers + AdminApiClient
 const mockSeedContextDirect = vi.fn();
 const mockSeedContextBindingDirect = vi.fn();
 const mockSetContextPolicyDirect = vi.fn();
@@ -50,44 +50,10 @@ async function runCommand(
   args: string[],
   client: MockClient = makeMockClient(),
 ): Promise<{ stdout: string; stderr: string; exitCode: number | null; client: MockClient }> {
-  const program = new Command();
-  program.exitOverride();
-
-  registerContextCommands(program, () => client as any);
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const origLog = console.log;
-  const origError = console.error;
-  let exitCode: number | null = null;
-
-  console.log = (...a: any[]) => logs.push(a.join(' '));
-  console.error = (...a: any[]) => errors.push(a.join(' '));
-
-  const origExit = process.exit;
-  process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
-    throw new Error(`EXIT:${code}`);
-  }) as any;
-
-  try {
-    await program.parseAsync(args, { from: 'user' });
-  } catch (err: any) {
-    if (!err.message?.startsWith('EXIT:')) {
-      if (!err.code?.startsWith('commander.')) {
-        console.log = origLog;
-        console.error = origError;
-        process.exit = origExit;
-        throw err;
-      }
-    }
-  } finally {
-    console.log = origLog;
-    console.error = origError;
-    process.exit = origExit;
-  }
-
-  return { stdout: logs.join('\n'), stderr: errors.join('\n'), exitCode, client };
+  return {
+    ...(await runCli((p) => registerContextCommands(p, () => client as any), args)),
+    client,
+  };
 }
 
 describe('kici-admin context CLI', () => {
@@ -266,7 +232,10 @@ describe('kici-admin context CLI', () => {
       expect(stderr.toLowerCase()).toContain('invalid json');
     });
 
-    it('rejects --type glob without --glob-pattern', async () => {
+    it.each([
+      [['--type', 'glob'], '--glob-pattern'],
+      [['--glob-pattern', 'x/*'], '--type glob'],
+    ])('rejects create with only %j, naming %s', async (flags, missing) => {
       const { stderr, exitCode } = await runCommand([
         'context',
         'create',
@@ -274,30 +243,12 @@ describe('kici-admin context CLI', () => {
         'o',
         '--name',
         'review',
-        '--type',
-        'glob',
+        ...flags,
         '--database-url',
         'postgres://local',
       ]);
       expect(exitCode).toBe(1);
-      expect(stderr).toContain('--glob-pattern');
-    });
-
-    it('rejects --glob-pattern without --type glob', async () => {
-      const { stderr, exitCode } = await runCommand([
-        'context',
-        'create',
-        '--org',
-        'o',
-        '--name',
-        'review',
-        '--glob-pattern',
-        'x/*',
-        '--database-url',
-        'postgres://local',
-      ]);
-      expect(exitCode).toBe(1);
-      expect(stderr).toContain('--type glob');
+      expect(stderr).toContain(missing);
     });
 
     it('passes globPattern through in direct-DB mode', async () => {
@@ -592,9 +543,12 @@ describe('kici-admin context CLI', () => {
       expect(stderr).toContain('not found');
     });
 
-    it('sends null when --hold-expiry is empty, so the column is cleared', async () => {
-      // `Number('') === 0`, so a plain integer parse turns "clear" into a
-      // 0-second expiry — which cancels every hold on the context.
+    // `Number('') === 0`, so a plain integer parse would turn "clear" (an empty
+    // value) into a 0-second expiry, which cancels every hold on the context.
+    it.each([
+      ['', null],
+      ['900', 900],
+    ])('sends --hold-expiry %j as holdExpirySeconds %j', async (value, expected) => {
       mockSetContextPolicyDirect.mockResolvedValue(undefined);
       const { exitCode } = await runCommand([
         'context',
@@ -604,32 +558,13 @@ describe('kici-admin context CLI', () => {
         '--env',
         'staging',
         '--hold-expiry',
-        '',
+        value,
         '--database-url',
         'postgres://local',
       ]);
       expect(exitCode).toBeNull();
       const callArgs = mockSetContextPolicyDirect.mock.calls[0][1];
-      expect(callArgs.holdExpirySeconds).toBeNull();
-    });
-
-    it('sends a positive --hold-expiry unchanged', async () => {
-      mockSetContextPolicyDirect.mockResolvedValue(undefined);
-      const { exitCode } = await runCommand([
-        'context',
-        'set-policy',
-        '--org',
-        'o',
-        '--env',
-        'staging',
-        '--hold-expiry',
-        '900',
-        '--database-url',
-        'postgres://local',
-      ]);
-      expect(exitCode).toBeNull();
-      const callArgs = mockSetContextPolicyDirect.mock.calls[0][1];
-      expect(callArgs.holdExpirySeconds).toBe(900);
+      expect(callArgs.holdExpirySeconds).toBe(expected);
     });
 
     it('omits holdExpirySeconds entirely when --hold-expiry is not passed', async () => {

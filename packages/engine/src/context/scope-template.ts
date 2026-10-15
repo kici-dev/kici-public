@@ -9,15 +9,13 @@ const PLACEHOLDER = /\$\{(agentId|host|label:[^}]+)\}/g;
  * binding's `scope_pattern` with a fan-out child's identity, so one templated
  * binding selects each host's own subtree (`prod/hosts/${agentId}/**`).
  *
- * Returns the substituted pattern, or `null` when the binding must be **skipped
- * for this host** because either:
- * - a referenced variable is unresolved (a missing `${label:NAME}`), or
- * - a substituted value is unsafe — it contains anything outside
- *   `[A-Za-z0-9._-]` (a `/` path separator or a glob metacharacter), which
- *   could let a hostname/label value escape its segment or inject a pattern.
+ * Returns `null` (skip the binding **for this host**) when a referenced variable
+ * is unresolved (a missing `${label:NAME}`) or a substituted value has anything
+ * outside `[A-Za-z0-9._-]` (a `/` or glob metacharacter), which could let a
+ * hostname/label value escape its segment or inject a pattern.
  *
- * A multi-valued label resolves to its lexicographic-first value
- * (deterministic). A pattern with no placeholders is returned unchanged.
+ * A multi-valued label resolves to its lexicographically first value. A pattern
+ * with no placeholders is returned unchanged.
  */
 export function substituteScopePattern(pattern: string, facts: HostFacts): string | null {
   if (!pattern.includes('${')) return pattern;

@@ -1,7 +1,6 @@
 /**
  * The admin cancel route's answer for a cancel that did not find the run
- * already terminal. Kept apart from the route so the mapping is testable
- * without assembling the whole app.
+ * terminal; apart from the route so it is testable without the whole app.
  */
 import { ExecutionRunStatus } from '@kici-dev/engine';
 import { HeldRunWithdrawal, type HeldRunDecidedFirst } from './cancel-held-run.js';
@@ -24,8 +23,7 @@ export interface CancelRouteAnswer {
 }
 
 export function cancelRouteAnswer(result: CancelRunResult): CancelRouteAnswer {
-  // A decision reached the held run's holds first: the cancel wrote nothing,
-  // so it must not answer as a cancellation.
+  // A decision reached the holds first: the cancel wrote nothing.
   // fails-when: a cancel that lost to an approve or a reject answers 200 cancelled
   // breaks-if-wrong: a cancelled held run must still answer 200 cancelled
   if (result.decidedBeforeCancel) {
@@ -38,11 +36,8 @@ export function cancelRouteAnswer(result: CancelRunResult): CancelRouteAnswer {
       accessNote: REFUSAL_NOTES[result.decidedBeforeCancel],
     };
   }
-  // `unreachable` counts jobs whose owning coordinator is alive but could not
-  // be reached, so the cancel did not land and the job is very likely still
-  // running. Reporting `cancelled` there would tell the caller the deploy
-  // stopped while it runs on. The run stays `cancelling` and the re-drive sweep
-  // tries again.
+  // An `unreachable` job very likely still runs, so answering `cancelled` would
+  // claim the deploy stopped; the run stays `cancelling` for the re-drive sweep.
   const status =
     result.agentsNotified > 0 || result.unreachable > 0
       ? ExecutionRunStatus.enum.cancelling

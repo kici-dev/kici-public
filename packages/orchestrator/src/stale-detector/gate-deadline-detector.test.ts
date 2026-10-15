@@ -1,25 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ExecutionJobStatus, TimeoutReason } from '@kici-dev/engine';
 import { GateDeadlineDetector, type GateDeadlineDetectorDeps } from './gate-deadline-detector.js';
-
-/** Chainable mock mimicking Kysely's select builder for buildOverdueQuery. */
-function createSelectChain(executeResult: unknown[]) {
-  const chain: Record<string, any> = {};
-  for (const m of ['select', 'where']) {
-    chain[m] = vi.fn(() => chain);
-  }
-  chain.execute = vi.fn(async () => executeResult);
-  return chain;
-}
+import { createMockDb } from '../__test-helpers__/mock-db.js';
 
 function makeDeps(
   overdue: unknown[],
   onJobStatus: ReturnType<typeof vi.fn>,
 ): GateDeadlineDetectorDeps {
   return {
-    db: {
-      selectFrom: vi.fn(() => createSelectChain(overdue)),
-    } as unknown as GateDeadlineDetectorDeps['db'],
+    db: createMockDb({ selectRows: overdue }).db as GateDeadlineDetectorDeps['db'],
     executionTracker: { onJobStatus } as unknown as GateDeadlineDetectorDeps['executionTracker'],
     scanIntervalMs: 60_000,
   };

@@ -66,9 +66,6 @@ export interface SecretStoreLike {
   getSecrets(orgId: string, scope: string): Promise<Record<string, string>>;
 }
 
-/**
- * Dependencies for the SecretResolver.
- */
 export interface SecretResolverDeps {
   bindingStore: BindingStoreLike;
   /** Map of backend name to store. Replaces single secretStore. */
@@ -145,7 +142,6 @@ export class SecretResolver implements SecretResolverApi {
   /**
    * Resolve secrets for a job dispatch.
    *
-   * @param orgId - Organization ID
    * @param context - The matched context row and the name the job declared
    * @param hostCtx - Optional fan-out child identity for per-host resolution.
    *   When supplied, each binding is gated by its `host_pattern` and its
@@ -327,7 +323,7 @@ export class SecretResolver implements SecretResolverApi {
   }
 
   /**
-   * Resolve secrets with metadata (per, for secrets.getMeta).
+   * Resolve secrets with metadata (for secrets.getMeta).
    *
    * Returns the secret value along with which backend and scope provided it.
    */
@@ -342,7 +338,6 @@ export class SecretResolver implements SecretResolverApi {
 
     const { secrets: allPrefixedSecrets, failedBackends } = await this.collectAllSecrets(orgId);
 
-    // Apply scoped failure check
     if (failedBackends.size > 0) {
       this.checkScopedFailure(bindings, allPrefixedSecrets, failedBackends, contextName);
     }
@@ -367,7 +362,7 @@ export class SecretResolver implements SecretResolverApi {
 
   /**
    * Collect all secrets from all backend stores, prefixing scopes.
-   * Per /: unreachable backends are tracked but not fatal here.
+   * Unreachable backends are tracked but not fatal here.
    * Callers apply scoped failure policy based on job bindings.
    */
   private async collectAllSecrets(

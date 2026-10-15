@@ -58,7 +58,7 @@ const uploadsInitBodySchema = testRelayUploadsInitRequestSchema.omit({
   routingKey: true,
 });
 
-/** Trigger body: the relay request minus the fields the server owns. */
+/** Trigger body, likewise. */
 const triggerBodySchema = testRelayTriggerRequestSchema.omit({
   type: true,
   requestId: true,
@@ -106,7 +106,6 @@ export function testDirectRouteDeps(
   return { tokenManager: input.adminDeps.tokenManager, rbac: input.adminDeps.rbac, ...rest };
 }
 
-/** Answer 403 unless the caller's role holds `permission`. */
 function denyUnlessPermitted(
   c: TestDirectContext,
   deps: TestDirectRouteDeps,
@@ -280,11 +279,11 @@ async function runRoute(
 export function createTestDirectRoutes(deps: TestDirectRouteDeps) {
   const app = createAdminApp<TestDirectEnv>(logger);
 
-  // An independent orchestrator has no Platform connection to provision the
-  // `remote:<org>` anchor `resolveOrgId` maps a test run back through, so the
-  // first write provisions it once per process. A connected orchestrator's
-  // anchor is provisioned on connect with its cluster id, which an upsert from
-  // here would overwrite with null, so this never runs there.
+  // Independent mode has no Platform connection to provision the `remote:<org>`
+  // anchor `resolveOrgId` maps a test run back through, so the first write
+  // provisions it once per process. Never on a connected orchestrator: its
+  // anchor is provisioned on connect with its cluster id, which this upsert
+  // would overwrite with null.
   let anchorReady: Promise<void> | undefined;
   const ensureAnchor: EnsureAnchor = async (orgId) => {
     if (deps.mode !== OrchestratorMode.enum.independent) return;

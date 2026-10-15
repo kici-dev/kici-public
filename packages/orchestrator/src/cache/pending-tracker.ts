@@ -1,16 +1,10 @@
 /**
- * Generic pending-job tracker for coordinating two-phase orchestrator pipelines
- * (build-then-execute, init-then-execute, dynamic-eval-then-execute).
+ * Pending-job tracker for two-phase pipelines (build / init / dynamic eval,
+ * then execute): a deferred Promise per precursor jobId that resolves with a
+ * typed payload, or rejects on failure / disconnect.
  *
- * The orchestrator dispatches a precursor job (build / init / dynamic eval) and
- * needs to wait for the agent to report completion before continuing. This
- * tracker exposes a deferred Promise per jobId that resolves with a typed
- * payload (or rejects on failure / disconnect).
- *
- * Usage:
- * - dispatcher calls track(jobId), awaits the returned promise
- * - terminal-status handler calls resolve(jobId, value) or reject(jobId, err)
- * - cleanup(jobId) is invoked on agent disconnect to reject with a fixed error
+ * The dispatcher awaits track(jobId); the terminal-status handler calls
+ * resolve or reject; cleanup(jobId) rejects with a fixed error on disconnect.
  */
 
 import { createLogger } from '@kici-dev/shared';
@@ -27,11 +21,7 @@ export interface PendingTrackerOptions<T> {
   itemLabel: string;
   /** Error message used when cleanup() rejects a pending entry on disconnect. */
   disconnectError: string;
-  /**
-   * Optional extractor that derives extra structured log fields from the
-   * resolved value (e.g. `jobCount` for dynamic-eval results). The returned
-   * keys are merged into the `resolve` log line for telemetry / debugging.
-   */
+  /** Extra fields for the `resolve` log line (e.g. dynamic-eval `jobCount`). */
   extractResolveMeta?: (value: T) => Record<string, unknown>;
 }
 
@@ -46,13 +36,9 @@ export class PendingTracker<T> {
   }
 
   /**
-   * Register a pending job and return a promise that resolves when the agent
-   * reports completion (or rejects on failure / disconnect).
-   *
-   * Each call creates a new Promise. If track() is called for the same jobId
-   * twice, the previous Promise's callbacks are replaced -- the previous
-   * caller's Promise will never settle (orphaned). Callers (e.g. BuildCoordinator)
-   * are responsible for coalescing duplicate work upstream.
+   * A second track() for the same jobId replaces the callbacks, orphaning the
+   * first caller's Promise forever. Callers (e.g. BuildCoordinator) coalesce
+   * duplicate work upstream.
    */
   track(jobId: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -64,9 +50,7 @@ export class PendingTracker<T> {
     });
   }
 
-  /**
-   * Resolve a pending entry (agent reported success).
-   */
+  /** Agent reported success. */
   resolve(jobId: string, value: T): void {
     const entry = this.pending.get(jobId);
     if (entry) {
@@ -81,9 +65,7 @@ export class PendingTracker<T> {
     }
   }
 
-  /**
-   * Reject a pending entry (agent reported failure).
-   */
+  /** Agent reported failure. */
   reject(jobId: string, error: Error): void {
     const entry = this.pending.get(jobId);
     if (entry) {
@@ -96,9 +78,7 @@ export class PendingTracker<T> {
     }
   }
 
-  /**
-   * Clean up on agent disconnect. Rejects with the configured disconnect error.
-   */
+  /** On agent disconnect: rejects with the configured disconnect error. */
   cleanup(jobId: string): void {
     const entry = this.pending.get(jobId);
     if (entry) {
@@ -108,28 +88,20 @@ export class PendingTracker<T> {
     }
   }
 
-  /**
-   * Check if an entry is pending for a given jobId.
-   */
   has(jobId: string): boolean {
     return this.pending.has(jobId);
   }
 
-  /**
-   * Number of pending entries (for metrics / debugging).
-   */
+  /** For metrics / debugging. */
   get size(): number {
     return this.pending.size;
   }
 
   /**
-   * The job ids currently awaited, for the shared-database channel.
-   *
-   * The local agent socket is one of two channels that settle an entry. A job
-   * this coordinator dispatched may be claimed from the shared queue by an
-   * agent connected to a sibling coordinator, whose terminal frame never
-   * reaches this process — the sibling writes it to `execution_jobs` instead.
-   * `PendingPrecursorDbWatcher` polls those rows for exactly this set.
+   * The awaited job ids, for the shared-database channel. A sibling
+   * coordinator's agent may claim the job from the shared queue; its terminal
+   * frame never reaches this process but lands in `execution_jobs`, which
+   * `PendingPrecursorDbWatcher` polls for exactly this set.
    */
   trackedJobIds(): string[] {
     return [...this.pending.keys()];

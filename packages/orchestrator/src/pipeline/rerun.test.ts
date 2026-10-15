@@ -1,12 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { handleRerun, settlePendingRoundReevaluations, type RerunDeps } from './rerun.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
+import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
-// The generic mock DB cannot enforce real `INSERT … ON CONFLICT` dedup
-// semantics (that is covered against a real Postgres in
-// `request-idempotency.test.ts`). Here we mock the claim with an in-memory
-// stateful implementation so `handleRerun`'s wiring — a `claimed: false`
-// re-send short-circuits before dispatch — is exercised deterministically.
+// The mock DB cannot enforce `INSERT … ON CONFLICT` dedup (real Postgres
+// covers it in `request-idempotency.test.ts`), so an in-memory claim exercises
+// `handleRerun`'s wiring: a `claimed: false` re-send short-circuits before dispatch.
 const idempotency = vi.hoisted(() => {
   const claims = new Map<string, string>();
   let counter = 0;
@@ -30,11 +29,10 @@ vi.mock('./request-idempotency.js', () => ({
   pruneRequestIdempotency: vi.fn(async () => 0),
 }));
 
-// The organization-wide pass is driven end-to-end by its own suite
-// (`process-webhook-globals-eval-round.test.ts`). Here it is stubbed so the
-// round-rerun tests observe WHAT the rerun asks it to do — the scope, the
-// repository, the commit — rather than re-testing the pass itself. Everything
-// else in `process-webhook.js` stays real.
+// The organization-wide pass has its own suite
+// (`process-webhook-globals-eval-round.test.ts`); stubbed here so the
+// round-rerun tests observe the scope, repository and commit the rerun asks
+// for. Everything else in `process-webhook.js` stays real.
 const globalsPass = vi.hoisted(() => ({
   impl: null as null | ((args: Record<string, unknown>) => Promise<unknown>),
 }));
@@ -48,10 +46,9 @@ vi.mock('./process-webhook.js', async (importOriginal) => {
   };
 });
 
-// The shared pipeline is what a cross-repository global re-run dispatches
-// through. Stubbed so the tests observe the context the re-run hands it — the
-// recorded commits, the lineage, the job list — rather than re-testing the
-// pipeline. Unset, every call reaches the real implementation.
+// Stubs the shared pipeline a cross-repository global re-run dispatches
+// through, so tests observe the recorded commits, lineage and job list it is
+// handed. Unset, every call reaches the real implementation.
 const pipeline = vi.hoisted(() => ({
   spy: null as null | ((ctx: Record<string, unknown>) => Promise<unknown>),
 }));
@@ -205,13 +202,11 @@ const LOCK_FILE = {
       contentHash: 'content-hash-1',
       triggers: [{ _type: 'push', branches: ['main'] }],
       jobs: [
-        {
-          _type: 'static',
+        staticJob({
           name: 'test',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'run tests', run: 'npm test' }],
-          needs: [],
-        },
+        }),
       ],
     },
   ],
@@ -268,29 +263,25 @@ describe('handleRerun', () => {
   it('loads original run from DB, reads payload, re-fetches lock file, dispatches jobs with parent_run_id', async () => {
     const result = await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
-    // Should have a newRunId
     expect(result.newRunId).toBeDefined();
     expect(typeof result.newRunId).toBe('string');
 
-    // Should read payload from storage
     expect(logStorage.read).toHaveBeenCalledWith(
       'executions/original-run-123/webhook-payload.json',
     );
 
-    // Should re-fetch lock file at original SHA
+    // The lock file is re-fetched at the original SHA.
     expect(providerBundle.lockFileFetcher!.fetchLockFile).toHaveBeenCalledWith(
       'owner/repo',
       'abc123def',
       expect.objectContaining({ installationId: 42 }),
     );
 
-    // Should dispatch jobs
     expect(dispatcher.dispatch).toHaveBeenCalled();
     const dispatchArg = dispatcher.dispatch.mock.calls[0][0];
     expect(dispatchArg.workflowName).toBe('ci');
     expect(dispatchArg.sha).toBe('abc123def');
 
-    // Should track execution with parent_run_id (via executionTracker.onExecutionStarted)
     expect(executionTracker.onExecutionStarted).toHaveBeenCalled();
   });
 
@@ -316,14 +307,12 @@ describe('handleRerun', () => {
           contentHash: 'content-hash-1',
           triggers: [{ _type: 'push', branches: ['main'] }],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'test',
               runsOn: [{ kind: 'exact', value: 'default' }],
               steps: [{ name: 'run tests', run: 'npm test' }],
-              needs: [],
               matrix: { _type: 'static', values: { variant: ['a', 'b'] } },
-            },
+            }),
           ],
         },
       ],
@@ -352,14 +341,12 @@ describe('handleRerun', () => {
           contentHash: 'content-hash-1',
           triggers: [{ _type: 'push', branches: ['main'] }],
           jobs: [
-            {
-              _type: 'static',
+            staticJob({
               name: 'test',
               runsOn: [{ kind: 'exact', value: 'default' }],
               steps: [{ name: 'run tests', run: 'npm test' }],
-              needs: [],
               gitCredentials: declared,
-            },
+            }),
           ],
         },
       ],
@@ -367,10 +354,9 @@ describe('handleRerun', () => {
 
     await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
-    // `routeOrDispatchJobs` persists the same map on the job row, which is what
-    // the credential relay authorizes a request against. Without it here the
-    // agent's map is empty on a re-run, so `credential: 'x'` throws and
-    // `default` silently falls back to the source credential.
+    // `routeOrDispatchJobs` persists the same map on the job row, which the
+    // credential relay authorizes against. Without it a re-run's map is empty:
+    // `credential: 'x'` throws and `default` silently uses the source credential.
     const dispatched = dispatcher.dispatch.mock.calls[0][0];
     expect(dispatched.jobConfig.gitCredentials).toEqual(declared);
   });
@@ -396,25 +382,18 @@ describe('handleRerun', () => {
   });
 
   it('succeeds with no payload (cron/schedule runs) — no payload stored for new run', async () => {
-    // Simulate a cron/schedule run that has no webhook payload
     logStorage = createMockLogStorage(null);
     logStorage.read.mockResolvedValue({ data: null, cursor: 0, complete: true });
     deps.logStorage = logStorage as any;
 
     const result = await handleRerun('original-run-123', null, null, deps, 'req-test');
 
-    // Should succeed
     expect(result.newRunId).toBeDefined();
-
-    // Should NOT store a payload for the new run
     expect(logStorage.append).not.toHaveBeenCalled();
-
-    // Should still dispatch jobs
     expect(dispatcher.dispatch).toHaveBeenCalled();
 
-    // commitMessage should be undefined (no payload to extract from)
     const trackerCall = executionTracker.onExecutionStarted.mock.calls[0];
-    // commitMessage is arg 13 (0-indexed)
+    // commitMessage (arg 13, 0-indexed) is undefined: no payload to extract from.
     expect(trackerCall[13]).toBeUndefined();
   });
 
@@ -428,13 +407,12 @@ describe('handleRerun', () => {
 
   describe('an organization-wide run that executed against another repository', () => {
     /**
-     * `repo_identifier` names the repository the run acted on. For an
-     * organization-wide workflow that is the SOURCE repository, while the
-     * workflow itself lives in `workflow_repo_identifier` at `workflow_sha`.
+     * `repo_identifier` is the SOURCE repository the run acted on; the
+     * workflow lives in `workflow_repo_identifier` at `workflow_sha`.
      *
      * The row also carries the `event_log` columns (`org_id`, `event`,
-     * `action`): the mock DB serves this one row to every select whose
-     * predicates it satisfies, including the delivery lookup.
+     * `action`): the mock DB serves it to every select whose predicates it
+     * satisfies, the delivery lookup included.
      */
     const SOURCE_REPO = 'org/app';
     const WORKFLOW_REPO = 'org/ci';
@@ -463,13 +441,11 @@ describe('handleRerun', () => {
         hasFilter: true,
         triggers: [{ _type: 'push', repos: ['org/*'] }],
         jobs: [
-          {
-            _type: 'static',
+          staticJob({
             name: jobName,
             runsOn: [{ kind: 'exact', value: 'default' }],
             steps: [{ name: 'run', run: 'true' }],
-            needs: [],
-          },
+          }),
           { _type: 'dynamic', name: 'gen', source: '.kici/workflows/org-ci.ts' },
         ],
       };
@@ -769,9 +745,8 @@ describe('handleRerun', () => {
     });
 
     it("would otherwise have silently run the source repo's same-named workflow", async () => {
-      // The record of what routing on the marker prevents: with it absent the
-      // run is indistinguishable from a per-repository one, so the source
-      // repository's lock file resolves and its own workflow is what executes.
+      // What routing on the marker prevents: without it the run looks
+      // per-repository, so the source repository's own workflow executes.
       const { workflow_repo_identifier: _dropped, ...unmarked } = GLOBAL_RUN;
       deps.db = makeMockDb({ ...unmarked, workflow_name: 'ci' }) as any;
 
@@ -788,7 +763,7 @@ describe('handleRerun', () => {
 
     it('allows a rerun when the workflow lives in the repository the run acted on', async () => {
       // A same-repo value is not a cross-repo dispatch: it takes the
-      // per-repository path, as it did before the column was populated.
+      // per-repository path.
       deps.db = makeMockDb({
         ...TERMINAL_RUN,
         workflow_repo_identifier: TERMINAL_RUN.repo_identifier,
@@ -802,10 +777,9 @@ describe('handleRerun', () => {
   });
 
   it('throws RunArchivedNotRerunnableError on PG miss when cold-store cannot replay', async () => {
-    // A PG miss goes through cold-store replay before failing.
-    // With deps.coldStore=null (the default test harness) replay is skipped
-    // and the gate surfaces the structured archive error so the Platform
-    // proxy can map to HTTP 410.
+    // A PG miss tries cold-store replay first. With deps.coldStore=null (the
+    // harness default) replay is skipped and the gate surfaces the structured
+    // archive error, which the Platform proxy maps to HTTP 410.
     db = makeMockDb(null);
     deps.db = db as any;
 
@@ -826,11 +800,9 @@ describe('handleRerun', () => {
   it('passes parentRunId and triggeredBy to executionTracker.onExecutionStarted', async () => {
     const result = await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
-    // executionTracker.onExecutionStarted should have been called with parentRunId and triggeredBy
-    // as the last two positional arguments
     expect(executionTracker.onExecutionStarted).toHaveBeenCalled();
     const call = executionTracker.onExecutionStarted.mock.calls[0];
-    // parentRunId is arg 14 (0-indexed), triggeredBy is arg 15
+    // The last two positional args (0-indexed): parentRunId 14, triggeredBy 15.
     expect(call[14]).toBe('original-run-123'); // parentRunId
     expect(call[15]).toBe('user@test.com'); // triggeredBy
 
@@ -885,10 +857,9 @@ describe('handleRerun', () => {
   });
 
   it('routes via the cluster coordinator when one is available (cross-peer rerun)', async () => {
-    // Coordinator stubbed so it answers with one locally-dispatched job and one
-    // rerouted to a peer. The failure mode it guards: the Platform proxies the
-    // rerun to a peer that cannot satisfy the labels, and without coordinator
-    // routing the job sits in dispatch_queue forever.
+    // One job dispatched locally, one rerouted. Guards a rerun proxied to a
+    // peer that cannot satisfy the labels: without coordinator routing the job
+    // sits in dispatch_queue forever.
     const coordinator = {
       routeJobs: vi.fn().mockResolvedValue({
         localJobs: [{ jobName: 'test', jobId: 'local-job-1' }],
@@ -900,7 +871,6 @@ describe('handleRerun', () => {
 
     await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
-    // Coordinator was asked to route the jobs
     expect(coordinator.routeJobs).toHaveBeenCalledOnce();
     const [runCtx, jobs] = coordinator.routeJobs.mock.calls[0];
     expect(runCtx.routingKey).toBe('github:42');
@@ -915,10 +885,9 @@ describe('handleRerun', () => {
     // Inner labels are double-wrapped as required by RunCoordinator
     expect(jobs[0].runsOnLabels).toEqual([['default']]);
 
-    // Standalone direct dispatch was NOT called — coordinator owns dispatch
+    // The coordinator owns dispatch.
     expect(dispatcher.dispatch).not.toHaveBeenCalled();
 
-    // Locally-dispatched job id is registered with the tracker
     expect(executionTracker.addJobsToRun).toHaveBeenCalledOnce();
     const addArgs = executionTracker.addJobsToRun.mock.calls[0];
     expect(typeof addArgs[0]).toBe('string');
@@ -929,23 +898,18 @@ describe('handleRerun', () => {
 
   // ── `run.rerun.request` orchestrator-side trust model (security invariant) ──
   //
-  // Threat: a compromised Platform credential or a rogue Platform process
-  // driving the Platform→Orchestrator dispatch surface. The orchestrator's rerun
-  // pipeline trusts Platform on user-identity attribution (`actor` / `triggeredBy`
-  // are Platform-supplied; orch has no independent OIDC trust to Keycloak) — that
-  // is by-design under the 3-tier auth model and out of scope here. The
-  // tenant-isolation invariants below ARE in scope; the tests pin them so a
-  // future regression that erodes them shows up as a loud test failure.
+  // Threat: a compromised Platform credential or rogue Platform process driving
+  // the Platform→Orchestrator dispatch surface. Trusting Platform on identity
+  // attribution (`actor` / `triggeredBy`; the orchestrator has no independent
+  // OIDC trust to Keycloak) is by design under the 3-tier auth model and out of
+  // scope. The tenant-isolation invariants below are in scope and pinned here.
   describe('tenant-isolation invariants under a rogue Platform', () => {
     it('rejects with RunArchivedNotRerunnableError when cold-store is wired but returns chunkId=null', async () => {
-      // Tenant-isolation invariant 1: a runId Platform names that is missing
-      // from the orchestrator DB AND has no cold-store match must NOT lead to
-      // any dispatch — neither a dispatched job nor a recorded execution-start
-      // row. Today's behavior throws `RunArchivedNotRerunnableError` before
-      // any of those side effects fire. The existing test at line ~280 covers
-      // the `coldStore = null` branch; this test covers the `coldStore wired
-      // but returns chunkId=null` branch (cold-store reachable, but no
-      // manifest matches the rowId / tenantId pair Platform supplied).
+      // Tenant-isolation invariant 1: a Platform-named runId missing from the
+      // orchestrator DB with no cold-store match dispatches nothing and records
+      // no execution start; `RunArchivedNotRerunnableError` throws first. The
+      // `coldStore = null` branch is tested above; this is the branch where the
+      // cold store is reachable but no manifest matches the rowId / tenantId pair.
       db = makeMockDb(null);
       deps.db = db as any;
       const replayRow = vi.fn().mockResolvedValue({ inserted: 0, skipped: 0, chunkId: null });
@@ -962,17 +926,15 @@ describe('handleRerun', () => {
         ),
       ).rejects.toThrow(/archived to cold storage|chunk could not be replayed/);
 
-      // Side-effect-free: nothing got dispatched; nothing got recorded.
       expect(dispatcher.dispatch).not.toHaveBeenCalled();
       expect(executionTracker.onExecutionStarted).not.toHaveBeenCalled();
       expect(executionTracker.addJobsToRun).not.toHaveBeenCalled();
       expect(eventRouter.emit).not.toHaveBeenCalled();
 
-      // Cold-store WAS consulted with Platform-supplied routingKeyHint as
-      // tenantId — that IS the tenant-scoped lookup. Cross-orch isolation
-      // here holds at the AWS-IAM layer (each orchestrator has its own
-      // KICI_COLD_STORE_BUCKET / KICI_COLD_STORE_PREFIX env-config), so this
-      // tenantId can only point at the orchestrator's own bucket prefix.
+      // The cold store is consulted with the Platform-supplied routingKeyHint as
+      // tenantId. Cross-orchestrator isolation holds at the AWS-IAM layer (each
+      // orchestrator has its own KICI_COLD_STORE_BUCKET / KICI_COLD_STORE_PREFIX),
+      // so this tenantId can only point at the orchestrator's own bucket prefix.
       expect(replayRow).toHaveBeenCalledWith(
         expect.objectContaining({
           db: 'orchestrator',
@@ -984,16 +946,11 @@ describe('handleRerun', () => {
     });
 
     it('downstream operations use originalRun.routing_key, not Platform-supplied routingKeyHint', async () => {
-      // Tenant-isolation invariant 3: once `loadAndValidateOriginalRun`
-      // returns a row, every subsequent operation MUST authority-derive
-      // from `originalRun.routing_key` (read from the orchestrator's own
-      // DB), NOT from the Platform-supplied `routingKeyHint`. This is what
-      // pins the trust boundary post-load: even if Platform fakes a
-      // routingKeyHint to bias the cold-store lookup (invariant 1 above
-      // already shows the cold-store is per-orchestrator-scoped, but
-      // defense-in-depth), the rerun executes against the lock file +
-      // provider bundle for the run's OWN routing key, not the attacker's
-      // chosen one.
+      // Tenant-isolation invariant 3: once `loadAndValidateOriginalRun` returns
+      // a row, every operation derives authority from `originalRun.routing_key`
+      // (the orchestrator's own DB), NOT the Platform-supplied `routingKeyHint`.
+      // A faked hint still runs the lock file and provider bundle of the run's
+      // OWN routing key: defense in depth beyond invariant 1's scoped cold store.
       const realKey = 'github:42';
       const attackerHint = 'github:99-rogue';
       db = makeMockDb({ ...TERMINAL_RUN, routing_key: realKey });
@@ -1001,8 +958,6 @@ describe('handleRerun', () => {
 
       await handleRerun('original-run-123', null, null, deps, 'req-test', attackerHint);
 
-      // The provider bundle resolution MUST have been keyed by the run's
-      // own routing_key, not the Platform-supplied hint.
       const getByRoutingKey = (
         deps.providerRegistry as unknown as { getByRoutingKey: ReturnType<typeof vi.fn> }
       ).getByRoutingKey;
@@ -1010,10 +965,8 @@ describe('handleRerun', () => {
       expect(callArgs).toContain(realKey);
       expect(callArgs).not.toContain(attackerHint);
 
-      // The dispatched job's repoUrl MUST derive from the run's own
-      // (provider-bundle-resolved) routing key, not the attacker's hint.
-      // The mock buildCloneUrl echoes the repo identifier, so this test
-      // confirms the dispatch reached the legitimate provider bundle.
+      // The mock buildCloneUrl echoes the repo identifier, so repoUrl proves the
+      // dispatch reached the legitimate provider bundle.
       expect(dispatcher.dispatch).toHaveBeenCalledTimes(1);
       const dispatchedJob = dispatcher.dispatch.mock.calls[0][0];
       expect(dispatchedJob.repoUrl).toBe('https://github.com/owner/repo.git');
@@ -1023,25 +976,21 @@ describe('handleRerun', () => {
   /**
    * Re-running a failed global evaluation round re-evaluates the original event.
    *
-   * A round decides which organization-wide workflows apply to an event; a round
-   * that fails suppresses every workflow it was deciding on and is recorded as
-   * one errored run. Re-running that run re-drives the evaluation for the round's
-   * own workflow repository — it resolves no workflow out of a lock file, so the
-   * cross-repository refusal (which exists to stop exactly that) does not apply.
+   * A failed round suppresses every organization-wide workflow it was deciding
+   * on and records one errored run. Re-running it re-drives the evaluation for
+   * the round's own workflow repository and resolves no workflow out of a lock
+   * file, so the cross-repository refusal does not apply.
    */
   describe('re-running a failed global evaluation round', () => {
     const SOURCE_REPO = 'owner/source-repo';
     const WORKFLOW_REPO = 'owner/org-workflows';
 
     /**
-     * The round's run row.
-     *
-     * It also carries the `event` / `action` / `org_id` columns the delivery's
-     * `event_log` row holds: the mock DB serves one configured row to every
-     * select whose predicates it satisfies, and both queries filter on values
-     * this row declares. `org_id` matching `customer_id` is what makes the
-     * org-scoped delivery lookup find it — a fixture whose `org_id` names
-     * another tenant is the regression case below.
+     * The round's run row, also carrying the delivery's `event_log` columns
+     * (`event` / `action` / `org_id`), since the mock DB serves one row to every
+     * select whose predicates it satisfies. `org_id` matching `customer_id` lets
+     * the org-scoped delivery lookup find it; another tenant's `org_id` is the
+     * regression case below.
      */
     const ROUND_RUN = {
       ...TERMINAL_RUN,
@@ -1100,11 +1049,10 @@ describe('handleRerun', () => {
     /**
      * Re-run the round, then settle the re-evaluation it detached.
      *
-     * The request is answered as soon as the claim is taken: the round itself is
-     * a dispatched agent job whose budget is minutes, and the relayed dashboard
-     * call it answers has ten seconds. So an assertion about the PASS has to
-     * wait for the detached work rather than for the call — and settling also
-     * keeps a still-running re-evaluation from reaching the next test's mocks.
+     * The request is answered once the claim is taken: the round is an agent
+     * job with a budget of minutes, and the relayed dashboard call has ten
+     * seconds. So a PASS assertion waits for the detached work, and settling
+     * keeps a running re-evaluation away from the next test's mocks.
      */
     async function rerunRound(
       requestId: string,
@@ -1116,10 +1064,9 @@ describe('handleRerun', () => {
     }
 
     it('answers the request before the round it detached has finished', async () => {
-      // The defect this guards: the whole re-evaluation used to run inside the
-      // reply, so a round that takes longer than the relay's ten-second budget
-      // — which every real round does — returned a gateway timeout to the
-      // operator while completing unobserved.
+      // A re-evaluation inside the reply outlasts the relay's ten-second budget
+      // (every real round does), so the operator gets a gateway timeout while
+      // it completes unobserved.
       let releaseRound: () => void = () => {};
       const roundStarted = new Promise<void>((startResolve) => {
         dispatchGlobals.mockImplementation(async () => {
@@ -1139,7 +1086,7 @@ describe('handleRerun', () => {
 
       const result = await handleRerun('original-run-123', null, null, deps, 'req-round-async');
 
-      // Answered while the round is still in flight — the point of the fix.
+      // Answered while the round is still in flight.
       expect(result.newRunId).toBe('original-run-123');
       await roundStarted;
       expect(postSucceeded).not.toHaveBeenCalled();
@@ -1166,8 +1113,8 @@ describe('handleRerun', () => {
       expect(passArgs.releasedHold).toBeUndefined();
       expect(passArgs.repoIdentifier).toBe(SOURCE_REPO);
       expect(passArgs.ref).toBe('abc123def');
-      // No workflow is resolved out of the source repo's lock file — that is the
-      // whole reason the refusal does not apply here.
+      // No workflow comes from the source repo's lock file, which is why the
+      // refusal does not apply.
       expect(providerBundle.lockFileFetcher!.fetchLockFile).not.toHaveBeenCalled();
     });
 
@@ -1185,9 +1132,8 @@ describe('handleRerun', () => {
     });
 
     it('does not read an event_log row that belongs to another org', async () => {
-      // Same `delivery_id`, different tenant: a second org's generic source can
-      // choose `X-Delivery-Id` freely, so this row is reachable by delivery id
-      // alone. Scoping by org is what keeps it out of this round's re-evaluation.
+      // Same `delivery_id`, different tenant: another org's generic source picks
+      // `X-Delivery-Id` freely, so only org scoping keeps this row out.
       deps.db = makeMockDb({ ...ROUND_RUN, org_id: 'org-2' }) as any;
 
       await expect(
@@ -1197,11 +1143,10 @@ describe('handleRerun', () => {
     });
 
     it('refuses a round that recorded no workflow repository', async () => {
-      // The pass skips every registration authored in the source repository
-      // BEFORE it applies the scope, so scoping on the source repo matches
-      // nothing, evaluates nothing, and reports no failure — which the success
-      // check would then read as a clean re-evaluation. There is no reading of a
-      // NULL column that re-evaluates anything, so refusing is the honest answer.
+      // The pass skips source-repository registrations BEFORE applying the
+      // scope, so scoping on the source repo evaluates nothing and reports no
+      // failure, which the success check would read as clean. No reading of a
+      // NULL column re-evaluates anything, so the re-run refuses.
       deps.db = makeMockDb({ ...ROUND_RUN, workflow_repo_identifier: null }) as any;
 
       await expect(
@@ -1212,9 +1157,9 @@ describe('handleRerun', () => {
 
     /**
      * A cross-provider global resolves its lock file through ANOTHER source's
-     * bundle, so the round's `provider_context` holds that source's dispatch
-     * credentials while its `routing_key` names the inbound one. Pairing the two
-     * hands one source's credentials to the other source's API client.
+     * bundle, so the round's `provider_context` holds that source's credentials
+     * while `routing_key` names the inbound source. Pairing the two hands one
+     * source's credentials to the other's API client.
      */
     describe('a round whose dispatch source is not the inbound source', () => {
       const DISPATCH_KEY = 'github:99';
@@ -1298,11 +1243,10 @@ describe('handleRerun', () => {
     });
 
     it('posts no success check when the pass reported no verdict for the round', async () => {
-      // The false-assurance case: a coordinator with no pending-eval tracker (or
-      // no registration index) suppresses every candidate, deliberately raises
-      // no round failure, and evaluates nothing. Reading that silence as a clean
-      // re-evaluation would flip the gating check to success and unblock a merge
-      // bot on work that provably did not run.
+      // A coordinator with no pending-eval tracker or registration index
+      // suppresses every candidate and deliberately raises no round failure.
+      // Reading that silence as clean would flip the gating check to success
+      // and unblock a merge bot on work that did not run.
       dispatchGlobals.mockResolvedValue({
         matchedCount: 0,
         matchedRunIds: [],
@@ -1318,9 +1262,8 @@ describe('handleRerun', () => {
     });
 
     it('posts the success check for a repo the pass decided but admitted nothing for', async () => {
-      // The other half of the same rule: "decided" is the positive signal, not
-      // "dispatched something". A round whose verdicts all came back `run: false`
-      // evaluated the repository fully and cleanly.
+      // "Decided" is the positive signal, not "dispatched something": all
+      // `run: false` verdicts are a full, clean evaluation.
       dispatchGlobals.mockResolvedValue({
         matchedCount: 0,
         matchedRunIds: [],
@@ -1335,9 +1278,8 @@ describe('handleRerun', () => {
     });
 
     it('posts no success check when the trust policy skipped the pass', async () => {
-      // A pass the policy did not admit evaluated nothing, so it reports no
-      // round failure either. Reading that as a clean re-evaluation would post
-      // success for work that never ran.
+      // A pass the policy did not admit evaluates nothing and reports no round
+      // failure; reading that as clean would post success for work never run.
       dispatchGlobals.mockImplementation(async (args) => {
         const decision = args.securityDecision as { action: string };
         if (decision.action !== 'pass') {
@@ -1380,10 +1322,9 @@ describe('handleRerun', () => {
     });
 
     it('rejects an event it can no longer normalize on both hops of a re-send', async () => {
-      // `normalizeEvent` is read-only validation, so it must run BEFORE the
-      // requestId claim: claimed first, the second hop of a relay failover
-      // re-send short-circuits on the claim and answers HTTP 200 with the round's
-      // own run id — telling the operator the re-run succeeded when nothing ran.
+      // `normalizeEvent` is read-only, so it runs BEFORE the requestId claim.
+      // Claimed first, a failover re-send's second hop would answer HTTP 200
+      // with the round's run id, reporting success when nothing ran.
       const requestId = 'req-round-normalize-first';
       normalizeEvent.mockReturnValue(null);
 
@@ -1431,13 +1372,11 @@ describe('handleRerun', () => {
   });
   describe('a re-run inherits the original run pull-request head context', () => {
     /**
-     * `trigger_event` on a re-run is `'rerun'`, which carries no head of its own,
-     * so the columns have to be copied from the run being re-run. Leaving them
-     * NULL renders every fork claim `'unresolved'` — fail-closed, but wrong in
-     * both directions: the documented trust policy pins `is_fork = 'false'`, so
-     * re-running an ordinary push would be refused, while re-running a fork pull
-     * request would report the fork question as unanswered when the original run
-     * had answered it.
+     * A re-run's `trigger_event` is `'rerun'`, with no head of its own, so the
+     * columns are copied from the run being re-run. NULL would render every fork
+     * claim `'unresolved'` (fail-closed, but wrong both ways): a re-run of an ordinary push would fail the
+     * documented `is_fork = 'false'` policy, and a fork PR re-run would leave
+     * unanswered a question the original run answered.
      */
     const EVENT_CONTEXT_ARG_INDEX = 26;
 
@@ -1487,10 +1426,9 @@ describe('handleRerun', () => {
     });
 
     /**
-     * `subjectTriggerEvent` is the piece the OIDC subject is derived from.
-     * `trigger_event` on the new row says `'rerun'`, which is not
-     * pull-request family, so without this the re-run would present the
-     * branch-shaped identity a trusted push to the base branch presents.
+     * The OIDC subject derives from `subjectTriggerEvent`. The new row's
+     * `trigger_event` is `'rerun'`, not pull-request family, so without it the
+     * re-run would present a trusted base-branch push's branch-shaped identity.
      */
     it('reads the original run own inherited event first, so a re-run of a re-run keeps the shape', async () => {
       deps.db = makeMockDb({
@@ -1520,8 +1458,7 @@ describe('handleRerun', () => {
       await handleRerun('original-run-123', null, null, deps, 'req-rerun-no-event');
 
       const call = executionTracker.onExecutionStarted.mock.calls[0];
-      // NULL stays NULL. The column means "use `trigger_event`", so a row that
-      // recorded no event must not gain a guessed one.
+      // NULL means "use `trigger_event`", so it stays NULL, never a guess.
       expect(call[EVENT_CONTEXT_ARG_INDEX].subjectTriggerEvent).toBeNull();
     });
   });

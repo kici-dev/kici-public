@@ -63,7 +63,7 @@ describe('GET /org-ids', () => {
     ]);
   });
 
-  // fails-when: the attached org is listed only once a table row names it (Review Focus 4)
+  // fails-when: the attached org is listed only once a table row names it
   it('lists an attached org that no table names yet', async () => {
     const body = await list(
       await app({ role: 'owner', getPlatformOrgId: () => 'org_new' }).request('/org-ids'),
@@ -92,7 +92,7 @@ describe('GET /org-ids', () => {
   });
 
   // fails-when: requireUnscopedToken is dropped — a routing-key-scoped token enumerates
-  // every org (Review Focus 1)
+  // every org
   it('refuses a routing-key-scoped token', async () => {
     const res = await app({ role: 'owner', routingKey: 'generic:org_a:x' }).request('/org-ids');
     expect(res.status).toBe(403);

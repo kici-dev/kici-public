@@ -7,22 +7,19 @@
  * value, so a stale value blocks writes rather than merely mislabelling a
  * control.
  *
- * Polling rather than an in-process event: the setting lives in shared cluster
- * state, so every coordinator converges on its own next read. An event only
- * reaches the coordinator that handled the write, and the control plane may
- * resolve a browser to any of the others.
+ * Polling rather than an in-process event: an event only reaches the coordinator
+ * that handled the write, and the control plane may resolve a browser to any of
+ * the others; every coordinator converges on its own next read of shared state.
  *
  * An unreadable tick HOLDS the last known issuer rather than reporting a
- * change. "Could not read the setting" and "the operator opted out" would
- * otherwise be the same event, so a transient database failure would move the
- * browser's key-fetch trust root back to the hosted control plane until the
- * next successful poll. There is no staleness bound: downgrading on a timer
- * would reintroduce that silently, just more slowly.
+ * change; otherwise a transient database failure would look like an operator
+ * opt-out and move the browser's key-fetch trust root back to the hosted
+ * control plane until the next successful poll. There is no staleness bound:
+ * downgrading on a timer would reintroduce that silently, just more slowly.
  *
- * The surrounding try/catch is defence-in-depth, not the failure path — the
- * reader reports `{ ok: false }` and never rejects. It stays because the tick
- * body is a floating promise inside an interval, where an uncaught rejection
- * would take down the process.
+ * The try/catch is defence-in-depth: the reader reports `{ ok: false }` and
+ * never rejects, but the tick body is a floating promise inside an interval,
+ * where an uncaught rejection would take down the process.
  */
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { tryResolveVerifiedIssuer, type VerifiedIssuerReader } from './verified-issuer.js';
@@ -52,8 +49,7 @@ export function startVerifiedIssuerPoller(opts: VerifiedIssuerPollerOptions): ()
       try {
         const read = await tryResolveVerifiedIssuer(opts.reader);
         if (!read.ok) {
-          // Hold: leave `last` alone so the next readable tick still compares
-          // against the value the control plane actually has.
+          // Hold `last`: it is the value the control plane actually has.
           logger.warn('cluster settings unreadable; holding the last known verified issuer');
           return;
         }

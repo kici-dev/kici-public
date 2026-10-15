@@ -151,9 +151,8 @@ describe('applyNpmRegistryConfig', () => {
       jobIdShort: 'JOB12345',
     });
     const npmrc = await readFile(join(kiciDir, '.npmrc'), 'utf8');
-    // Every emitted ${VAR} placeholder must have a matching extraEnv entry —
-    // if any is missing, npm would write the literal `${VAR}` into the on-disk
-    // resolved .npmrc and silently fail auth.
+    // A ${VAR} with no extraEnv entry is written literally into the resolved
+    // .npmrc and silently fails auth.
     const placeholders = [...npmrc.matchAll(/\$\{(KICI_NPM_TOKEN_[A-Za-z0-9_]+)\}/g)].map(
       (m) => m[1],
     );

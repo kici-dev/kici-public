@@ -1,11 +1,4 @@
-/**
- * Service management entry point.
- *
- * Re-exports all types and provides a factory function that returns
- * the correct ServiceManager implementation for the detected (or
- * specified) platform. Uses dynamic imports to avoid loading all
- * platform-specific code on every platform.
- */
+/** Service management entry point: re-exports and the per-platform ServiceManager factory. */
 
 export type {
   ServiceManager,
@@ -35,7 +28,7 @@ export {
   launchedRelease,
 } from './windows-env-file.js';
 
-// Instance types + helpers (folder-anchored targeting).
+// Folder-anchored instance targeting.
 export type {
   Component,
   InstanceManifest,
@@ -45,7 +38,6 @@ export type {
 } from './instance/types.js';
 export { COMPONENTS, isComponent } from './instance/types.js';
 
-// Manifest read/write.
 export {
   manifestFilename,
   manifestPath,
@@ -60,7 +52,6 @@ export {
   type NpmInstallTarget,
 } from './instance/manifest.js';
 
-// Reconciled instance index cache.
 export {
   indexPath,
   readIndex,
@@ -69,7 +60,6 @@ export {
   removeIndexEntry,
 } from './instance/index-file.js';
 
-// Resolve dispatcher + reconciled listing + refusal formatter.
 export {
   candidatePlatforms,
   listInstances,
@@ -88,16 +78,7 @@ export type {
 
 import type { ServiceManager, ServicePlatform } from './types.js';
 
-/**
- * Create a ServiceManager for the given platform.
- *
- * Uses dynamic imports so only the relevant platform code is loaded.
- * For example, on Linux only the systemd module is imported, not
- * Windows or launchd code.
- *
- * @param platform - Target platform (from detectPlatform() or --platform flag)
- * @returns The appropriate ServiceManager implementation
- */
+/** Dynamic imports load only the target platform's driver. */
 export async function createServiceManager(platform: ServicePlatform): Promise<ServiceManager> {
   switch (platform) {
     case 'systemd': {

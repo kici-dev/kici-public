@@ -1,16 +1,13 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add key_version column to config_versions so that sensitive-field encryption
- * can be rotated via `kici-admin rotate-key`.
+ * `config_versions.key_version`, so `kici-admin rotate-key` can rotate sensitive-field encryption.
  *
- * Existing rows are backfilled to 1 via the DEFAULT clause (every historical
- * row was encrypted under the first master-key generation). After rotation,
- * `SharedConfigStore` writes the next integer (MAX(key_version) + 1) and
- * stores the active generation alongside the ciphertext.
+ * The DEFAULT backfills existing rows to 1 (all encrypted under the first master-key
+ * generation). After rotation, `SharedConfigStore` writes MAX(key_version) + 1 beside the
+ * ciphertext.
  *
- * No index is needed: rotation does a full-table scan; reads are by
- * `version` primary key and never filter on `key_version`.
+ * No index: rotation full-scans; reads go by the `version` primary key.
  */
 
 export async function up(db: Kysely<any>): Promise<void> {

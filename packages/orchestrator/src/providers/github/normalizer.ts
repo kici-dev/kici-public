@@ -10,8 +10,6 @@ import { verifySignature as verifyHmacSignature } from '@kici-dev/engine/webhook
 import { githubFilterText } from './commit-message.js';
 
 /**
- * GitHub-specific implementation of WebhookNormalizer.
- *
  * Maps GitHub webhook headers and payloads to KiCI's universal format.
  * Headers are expected lowercase (Hono normalizes them).
  */
@@ -19,8 +17,6 @@ export class GitHubWebhookNormalizer implements WebhookNormalizer {
   readonly provider = 'github' as const;
 
   /**
-   * Extract routing key from GitHub webhook headers.
-   *
    * Uses the X-GitHub-Hook-Installation-Target-ID header which identifies
    * the GitHub App receiving the webhook.
    *
@@ -69,7 +65,7 @@ export class GitHubWebhookNormalizer implements WebhookNormalizer {
   /**
    * Normalize a GitHub webhook event into a SimulatedEvent.
    *
-   * Handles all 15 supported GitHub event types:
+   * Handles all 14 supported GitHub event types:
    * - pull_request, push, issue_comment, pull_request_review,
    *   pull_request_review_comment, repository_dispatch, release,
    *   create, delete, status, workflow_run, fork, star, watch
@@ -94,8 +90,6 @@ export class GitHubWebhookNormalizer implements WebhookNormalizer {
   }
 
   /**
-   * Extract repository identifier from a GitHub webhook payload.
-   *
    * Prefers repository.full_name, falls back to owner.login/name.
    */
   extractRepoIdentifier(payload: unknown): string | null {
@@ -143,8 +137,6 @@ export class GitHubWebhookNormalizer implements WebhookNormalizer {
   }
 
   /**
-   * Extract GitHub-specific credentials from a webhook payload.
-   *
    * Extracts installationId from payload.installation.id, needed for
    * generating installation tokens for repo access.
    */

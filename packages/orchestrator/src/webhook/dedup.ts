@@ -51,12 +51,10 @@ export class DedupCache {
    * Checks in-memory cache first (fast path), then DB.
    */
   async exists(deliveryId: string): Promise<boolean> {
-    // Fast path: check in-memory cache
     if (this.memoryCache.has(deliveryId)) {
       return true;
     }
 
-    // Slow path: check database
     const rows = await this.db
       .selectFrom('dedup_cache')
       .select('delivery_id')
@@ -157,7 +155,6 @@ export class DedupCache {
       .where('expires_at', '<', now as unknown as Date)
       .executeTakeFirst();
 
-    // Trim in-memory cache if it exceeds max size
     this.trimMemoryCache();
 
     return Number(result.numDeletedRows);
@@ -171,7 +168,6 @@ export class DedupCache {
       this.memoryCache.add(deliveryId);
       this.insertionOrder.push(deliveryId);
 
-      // Trim if over limit
       if (this.memoryCache.size > MAX_MEMORY_CACHE_SIZE) {
         this.trimMemoryCache();
       }

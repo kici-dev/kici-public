@@ -1,21 +1,15 @@
 /**
- * The metric-kind vocabulary shared by the orchestrator's push reporter, the
- * Platform's admission filter, and the runtime-metrics drift guard.
- *
- * The catalog records the OTel instrument kind (`observableGauge`, …) while the
- * wire carries a narrower set, so admission needs a compatibility relation
- * rather than equality. Keeping one implementation is what stops the guard and
- * the runtime path from disagreeing about which series are admissible.
+ * Metric kinds shared by the orchestrator's push reporter, the Platform's
+ * admission filter and the runtime-metrics drift guard. The catalog records
+ * the OTel instrument kind (`observableGauge`, …) while the wire carries a
+ * narrower set, so admission uses a compatibility relation, not equality. One
+ * implementation keeps the guard and the runtime path agreeing.
  */
 
 /** Metric kinds that appear on the orchestrator → Platform wire. */
 export type WireMetricKind = 'counter' | 'histogram' | 'gauge' | 'upDownCounter';
 
-/**
- * OTel `DataPointType` enum values, mirrored as plain numbers so this module
- * stays dependency-free. `@opentelemetry/sdk-metrics` is not an engine
- * dependency and must not become one.
- */
+/** OTel `DataPointType` values; `@opentelemetry/sdk-metrics` must not become an engine dep. */
 export const OTEL_DATA_POINT_TYPE = { HISTOGRAM: 0, GAUGE: 2, SUM: 3 } as const;
 
 /** Derive the wire kind from an OTel descriptor's data-point type. */

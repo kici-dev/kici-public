@@ -1,34 +1,24 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Cold-store chunk index (cold-store purge).
+ * Cold-store chunk index: one row per archived chunk the GC sweep can later
+ * purge from S3. Written in the `markArchivedAndDelete` transaction, so a chunk
+ * is fully recorded (S3 + index + rollup + audit) or fully absent.
  *
- * One row per archived chunk that the GC sweep can later purge from S3.
- * Inserted inside the same transaction as `markArchivedAndDelete` so a
- * chunk is either fully recorded (S3 + index + rollup + audit) or fully
- * absent (no orphan rows).
+ * - `chunk_id` is the deterministic 16-hex chunk filename stem; the primary key
+ *   `(db, table_name, chunk_id)` lets the framework `DELETE` without scanning.
+ *   `db` is always `'orchestrator'` here, for shape parity with
+ *   `cold_store_chunk_counts` and the Platform-side migration.
+ * - `bucket` is the S3 prefix segment (`'30d'` / `'180d'` / `'1y'` / `'2y'` /
+ *   `'forever'`), for `cold-store list-chunks` / `list-purgeable` filtering.
+ * - `max_cold_days` is the row-level retention horizon, TEXT to hold numbers
+ *   and `'forever'`. The GC sweep checks `max_cold_days != 'forever' AND
+ *   now() > archived_at + (max_cold_days || ' days')::interval`.
+ * - `object_key` is the chunk's full S3 key, so the GC sweep calls
+ *   `DeleteObject` without recomputing it.
  *
- * Schema notes:
- *
- * - `chunk_id` is the deterministic 16-hex chunk filename stem; primary
- *   key is `(db, table_name, chunk_id)` so the framework can `DELETE`
- *   without scanning. The `db` column matches `cold_store_chunk_counts`
- *   (always `'orchestrator'` here, included for shape parity with the
- *   Platform-side migration).
- * - `bucket` is the S3 prefix segment (`'30d'` / `'180d'` / `'1y'` /
- *   `'2y'` / `'forever'`). Carried for `cold-store list-chunks` /
- *   `list-purgeable` filtering.
- * - `max_cold_days` is the row-level retention horizon — TEXT to
- *   accommodate both numeric values and the literal `'forever'`. The
- *   GC sweep checks `max_cold_days != 'forever' AND now() > archived_at
- *   + (max_cold_days || ' days')::interval`.
- * - `object_key` is the full S3 key of the data chunk; the GC sweep
- *   uses this to issue `DeleteObject` directly without recomputing the
- *   key from the prefix.
- *
- * V1-manifest chunks are NOT in this table — they live
- * forever. Adapters that don't opt into per-bucket archival via
- * `coldTtlDays` don't insert here either.
+ * V1-manifest chunks are NOT here — they live forever — nor are chunks from
+ * adapters that do not opt into per-bucket archival via `coldTtlDays`.
  */
 
 export async function up(db: Kysely<unknown>): Promise<void> {
@@ -49,9 +39,8 @@ export async function up(db: Kysely<unknown>): Promise<void> {
     )
   `.execute(db);
 
-  // Purge-sweep predicate covers: (table_name, max_cold_days != 'forever',
-  // archived_at). Partial index excludes 'forever' rows entirely so the
-  // sweep scans only what it can purge.
+  // Partial index for the purge sweep: excluding 'forever' rows means it scans
+  // only what it can purge.
   await sql`
     CREATE INDEX cold_store_chunks_purge_idx
       ON public.cold_store_chunks (table_name, archived_at)

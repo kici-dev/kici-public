@@ -77,7 +77,6 @@ export class LockFileCache {
       return this.fetchAndValidate(fetcher, repoIdentifier, ref, credentials, undefined);
     }
 
-    // Check cache
     const cached = this.cache.get(cacheKey);
     if (cached !== undefined) {
       this.hits++;

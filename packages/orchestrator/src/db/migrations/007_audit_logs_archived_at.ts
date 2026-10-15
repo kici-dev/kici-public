@@ -1,39 +1,20 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * `secret_audit_log` and `access_log` cold-store schema additions, plus
- * the removal of `access_log`'s `expires_at`-based hard delete.
+ * Cold-store columns for `secret_audit_log` and `access_log`, and removal of `access_log`'s
+ * `expires_at` hard delete.
  *
- * Part of the cold-storage archival system.
+ * Both tables get the `archived_at` / `archive_object_key` pair (as in
+ * `006_runs_jobs_steps_archived_at.ts`), set in the archive tx before the DELETE.
  *
- * Both tables get the same `archived_at TIMESTAMPTZ NULL` /
- * `archive_object_key TEXT NULL` pair that `run_events` carries
- * (in the Platform's schema) and that `execution_runs` / `execution_jobs` /
- * `execution_steps` got in `006_runs_jobs_steps_archived_at.ts`. Set inside
- * the archive transaction before the DELETE; survivors carry NULL.
+ * `idx_secret_audit_log_routing_timestamp` lets the archiver's per-tenant scan use one index;
+ * the single-column `idx_secret_audit_log_timestamp` would force a filter step. `access_log`'s
+ * existing `access_log_org_created_idx (org_id, created_at DESC)` already serves its scan.
  *
- * `secret_audit_log` gets a composite
- * `idx_secret_audit_log_routing_timestamp (routing_key, timestamp)` so
- * the archiver's per-tenant scan can use a single index. The existing
- * `idx_secret_audit_log_timestamp` is single-column and would force a
- * filter step.
- *
- * `access_log` already has `access_log_org_created_idx (org_id,
- * created_at DESC)`, which is sufficient for the per-tenant scan
- * (range scans use either direction).
- *
- * Drops `access_log.expires_at` column and `access_log_expires_idx`.
- * Before this migration, `expires_at` powered a 90-day hard-delete sweep in
- * `packages/orchestrator/src/audit/access-log.ts:cleanup` (called from
- * `packages/orchestrator/src/queue/cleanup.ts:runCleanup` step 5). With
- * cold-store, `access_log` rows older than 30 days are archived rather
- * than deleted, so the TTL becomes effectively "forever". Keeping the
- * column would mean either (a) double-evicting rows or (b) silently
- * mismatching the new contract. Drop it.
- *
- * `down()` recreates `expires_at` with a default of `now() + 90 days`
- * — best effort; rows inserted between `up()` and a hypothetical
- * `down()` would not have meaningful retention bounds.
+ * `expires_at` drove a 90-day hard-delete sweep; cold-store archives `access_log` rows older
+ * than 30 days instead, so keeping the column would double-evict rows or contradict that
+ * contract. `down()` recreates it with a `now() + 90 days` default, best effort: rows inserted
+ * after `up()` get no meaningful retention bound.
  */
 
 export async function up(db: Kysely<unknown>): Promise<void> {

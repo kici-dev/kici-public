@@ -1,8 +1,7 @@
-// Container-only ESM loader hook: transforms `.ts` / `.tsx` files on import via
-// TypeScript's pure-JS `transpileModule` — no native binding — so it loads
-// inside an arbitrary customer job container where the native oxc-transform
-// hook cannot resolve. Registered via `module.register('file:///opt/kici/ts-loader-hook.js', …)`
-// from the containerized workflow runner. bwrap/firecracker keep the oxc hook.
+// Container-only ESM loader hook: transpiles `.ts` / `.tsx` with TypeScript's pure-JS
+// `transpileModule`, because the native oxc-transform hook cannot resolve inside an arbitrary
+// customer job container. The containerized workflow runner registers it as
+// `file:///opt/kici/ts-loader-hook.js`; bwrap/firecracker keep the oxc hook.
 
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -77,9 +76,8 @@ export async function load(
     compilerOptions: {
       module: ts.ModuleKind.ESNext,
       target: ts.ScriptTarget.ES2022,
-      // `inlineSourceMap` embeds the base64 map directly in `outputText`, so
-      // stack traces point at the original `.ts` line. It is mutually exclusive
-      // with `sourceMap`, so only this one is set.
+      // Stack traces point at the `.ts` line via the map embedded in `outputText`;
+      // `inlineSourceMap` excludes `sourceMap`, so only this one is set.
       inlineSourceMap: true,
       inlineSources: true,
       allowImportingTsExtensions: true,

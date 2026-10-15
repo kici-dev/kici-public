@@ -1,47 +1,36 @@
 /**
- * Chunk encoding / decoding.
- *
- * Each chunk is a newline-delimited JSON stream, gzipped. This format
- * is chosen for debuggability (grep + jq works on any chunk) over
- * columnar alternatives.
- *
- * The encoder accumulates the gzipped body in memory. The eligibility
- * SELECT is capped by `maxChunkBytes`
- * (default 50 MB, ceiling 100 MB for `execution_steps` / `run_events`),
- * so one chunk never exceeds a few hundred MB of uncompressed rows —
- * well within Node heap budgets.
+ * A chunk is gzipped JSONL, chosen over columnar formats so grep + jq work on
+ * any chunk. The body is built in memory: `maxChunkBytes` (default 50 MB,
+ * ceiling 100 MB for `execution_steps` / `run_events`) caps the eligibility
+ * SELECT, so a chunk stays within a few hundred MB uncompressed.
  */
 import { gzipSync } from 'node:zlib';
 import { sha256 } from '@kici-dev/core';
 
 export interface EncodedChunk {
-  /** Gzipped JSONL body; ready to PutObject. */
+  /** Gzipped JSONL body, ready to PutObject. */
   data: Buffer;
   /** sha256 hex of `data`. */
   contentHash: string;
   rowCount: number;
-  /** Size of the uncompressed JSONL body (bytes). */
+  /** Uncompressed body size, bytes. */
   byteCount: number;
-  /** Size of `data` (bytes). */
+  /** `data` size, bytes. */
   gzipByteCount: number;
   minRowId: string | number;
   maxRowId: string | number;
   /**
-   * Exact row IDs that appear in this chunk, in stream (PK) order.
-   * Used by the archive loop to drive `markArchivedAndDelete` — we
-   * delete exactly what we encoded, never a range that might include
+   * Exact row IDs in stream (PK) order, passed to `markArchivedAndDelete` so the
+   * delete covers exactly what was encoded, never a range that could include
    * rows inserted after discovery.
    */
   rowIds: Array<string | number>;
-  /** ISO timestamp — min of partition column across rows. */
+  /** ISO; min / max of the partition column across rows. */
   minTimestamp: string;
-  /** ISO timestamp — max of partition column across rows. */
   maxTimestamp: string;
   /**
-   * Natural-key lookup tokens (e.g. UUID `run_id`) for every
-   * row in the chunk, populated only when the caller provided
-   * `replayLookupKey`. Empty / undefined for tables that don't support
-   * single-row replay.
+   * Natural-key tokens (e.g. UUID `run_id`) per row; set only when the caller
+   * passed `replayLookupKey`.
    */
   replayLookupKeys?: string[];
 }
@@ -53,10 +42,8 @@ export interface EncodeChunkArgs<TRow> {
   rowId: (row: TRow) => string | number;
   rowTimestamp: (row: TRow) => Date | string;
   /**
-   * Optional. When provided, the encoder collects the
-   * returned token for every row into `replayLookupKeys`, which the
-   * archive flow persists on the chunk's manifest. Returning
-   * `undefined` for a row omits it from the index.
+   * Tokens go into `replayLookupKeys`, which the archive flow persists on the
+   * manifest; `undefined` omits the row from the index.
    */
   replayLookupKey?: (row: TRow) => string | undefined;
 }
@@ -120,13 +107,9 @@ export interface DecodeChunkArgs<TRow> {
 }
 
 /**
- * Decode a chunk back into a row stream.
- *
- * Implemented as a one-shot gunzip + split rather than an incremental
- * streaming parser because chunks are capped at ~100 MB compressed
- * (~500 MB uncompressed worst case) — well within memory for our
- * single-chunk rehydrate access pattern. A streaming decoder is worth
- * adding only if profiling shows heap pressure.
+ * One-shot gunzip + split, not a streaming parser: chunks are capped at ~100 MB
+ * compressed (~500 MB uncompressed worst case), which fits memory for
+ * single-chunk rehydrate. Stream only if profiling shows heap pressure.
  */
 export async function* decodeChunk<TRow>(args: DecodeChunkArgs<TRow>): AsyncIterable<TRow> {
   const { gunzipSync } = await import('node:zlib');

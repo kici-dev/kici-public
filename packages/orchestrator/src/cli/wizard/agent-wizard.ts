@@ -1,43 +1,29 @@
 /**
- * Interactive wizard for agent service setup.
- *
- * Walks the user through essential agent configuration
- * (orchestrator URL, token, labels). Returns a config object
- * that the install command uses to write the env file.
+ * Interactive agent setup: the install command writes the env file from the
+ * result.
  */
 
 import { promptUrl, promptSecret } from './prompts.js';
 import { input } from '@inquirer/prompts';
 
-/** Config produced by the agent wizard. */
 interface AgentInstallConfig {
   orchestratorUrl: string;
   agentToken: string;
   labels: string[];
 }
 
-/**
- * Run the interactive agent setup wizard.
- *
- * Asks only essential questions:
- * 1. Orchestrator URL
- * 2. Agent authentication token
- * 3. Labels (optional, comma-separated)
- */
+/** Asks only for the orchestrator URL, the agent token and optional comma-separated labels. */
 export async function runAgentWizard(): Promise<AgentInstallConfig> {
   console.log('');
   console.log('KiCI agent setup wizard');
   console.log('=======================');
   console.log('');
 
-  // 1. Orchestrator URL
   const orchestratorUrl = await promptUrl('Orchestrator URL:', 'http://localhost:4000');
 
-  // 2. Agent token
   console.log('');
   const agentToken = await promptSecret('Agent authentication token:');
 
-  // 3. Labels
   console.log('');
   const labelsInput = await input({
     message: 'Agent labels (comma-separated; empty = only the kici:* labels every agent reports):',

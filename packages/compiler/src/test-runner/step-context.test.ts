@@ -6,9 +6,8 @@ import { createStepContext } from './step-context.js';
 
 describe('createStepContext', () => {
   it('pins ctx.$ to the provided repoRoot, not process.cwd()', async () => {
-    // A throwaway directory that is not the current cwd. The scoped shell
-    // must resolve `pwd` against this dir, proving the cwd override on the
-    // zx shell took effect (local-dispatch parity with agent execution).
+    // `pwd` resolving here proves the zx shell's cwd override (parity with
+    // agent execution).
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-step-ctx-'));
     try {
       const { ctx } = createStepContext(
@@ -18,7 +17,7 @@ describe('createStepContext', () => {
       );
 
       const result = await ctx.$`pwd`;
-      // On macOS, /tmp is a symlink to /private/tmp, so compare via realpath.
+      // On macOS /tmp is a symlink to /private/tmp.
       expect(fs.realpathSync(result.stdout.trim())).toBe(fs.realpathSync(tmp));
       expect(fs.realpathSync(result.stdout.trim())).not.toBe(fs.realpathSync(process.cwd()));
     } finally {

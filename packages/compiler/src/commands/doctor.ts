@@ -1,9 +1,8 @@
 /**
- * kici doctor — walk the onboarding funnel and diagnose where a developer's
- * setup breaks. Each check reports pass/warn/fail with the exact next command
- * to run. Composed from client-side state: the stored config, the run target
- * (one `whoami` read for a direct orchestrator target), one authenticated
- * Platform infrastructure read, and local filesystem/git state.
+ * kici doctor — walk the onboarding funnel; each check reports pass/warn/fail
+ * with the exact next command. Inputs: the stored config, the run target (one
+ * `whoami` read for a direct orchestrator target), one authenticated Platform
+ * infrastructure read, and local filesystem/git state.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -43,34 +42,30 @@ import { isLockStaticJob, type LockFile } from '../types.js';
 
 const execFileAsync = promisify(execFile);
 
-/** A doctor check result: a shared DiagnoseResult plus the exact fix command. */
 export interface DoctorCheckResult extends DiagnoseResult {
   nextCommand?: string;
 }
 
-/** A check body before the runner stamps its measured duration. */
+/** A check before the runner stamps its duration. */
 export type DoctorCheckBody = Omit<DoctorCheckResult, 'durationMs'>;
 
-/** The outcome of the single authenticated infrastructure probe. */
 export type ProbeOutcome =
   | { ok: true; infra: DiagnosticsInfrastructureResponse }
   | { ok: false; kind: DashboardErrorKind; message: string };
 
-/** The outcome of the `whoami` probe against a direct orchestrator target. */
 type DirectProbe =
   | { ok: true; whoami: DirectWhoami }
   | { ok: false; kind: 'auth' | 'unreachable' | 'unavailable' | 'error'; message: string };
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Where a direct target came from, as the run-target row names it. */
 const DIRECT_SOURCE_LABEL: Record<'flag' | 'env' | 'saved', string> = {
   flag: '--orchestrator-url',
   env: 'KICI_ORCHESTRATOR_TOKEN',
   saved: 'kici connect',
 };
 
-/** Check 0: where `kici run remote` sends a run, and whether a direct target answers. */
+/** Where `kici run remote` sends a run, and whether a direct target answers. */
 function checkRunTarget(
   resolution: RunTargetResolution,
   probe: DirectProbe | null,
@@ -111,7 +106,6 @@ function checkRunTarget(
   return { name, status: 'pass', message: `${where} as ${who}.` };
 }
 
-/** A warning row for config fields that are deprecated, or null when there are none. */
 function checkDeprecatedConfig(config: GlobalConfig): DoctorCheckBody | null {
   if (config.routingKey === undefined) return null;
   return {
@@ -122,12 +116,12 @@ function checkDeprecatedConfig(config: GlobalConfig): DoctorCheckBody | null {
   };
 }
 
-/** Is a stored token + endpoint present (regardless of expiry)? */
+/** Regardless of expiry. */
 export function hasCredentials(config: GlobalConfig): boolean {
   return Boolean(config.pat && config.platformEndpoint);
 }
 
-/** Check 1: logged in with an unexpired token. */
+/** Logged in with an unexpired token. */
 export function checkLogin(config: GlobalConfig, now: number): DoctorCheckBody {
   const name = 'login';
   const endpoint = config.platformEndpoint;
@@ -164,7 +158,6 @@ export function checkLogin(config: GlobalConfig, now: number): DoctorCheckBody {
   return { name, status: 'pass', message: `Logged in to ${endpoint}.` };
 }
 
-/** Check 2: an active organization is selected. */
 export function checkActiveOrg(config: GlobalConfig): DoctorCheckBody {
   const name = 'active-org';
   if (!config.activeOrgId) {
@@ -178,7 +171,6 @@ export function checkActiveOrg(config: GlobalConfig): DoctorCheckBody {
   return { name, status: 'pass', message: `Active organization: ${config.activeOrgId}.` };
 }
 
-/** Check 3: the Platform accepted the stored token (live-token probe). */
 export function checkLiveToken(probe: ProbeOutcome | null): DoctorCheckBody {
   const name = 'token-live';
   if (probe === null) {
@@ -202,16 +194,14 @@ export function checkLiveToken(probe: ProbeOutcome | null): DoctorCheckBody {
   return { name, status: 'warn', message: `Could not verify token: ${probe.message}` };
 }
 
-/** Local + git state of the compiled lock file. */
 export interface LockState {
   exists: boolean;
   fresh: boolean; // lock mtime >= newest workflow-source mtime
-  committed: boolean; // git working tree clean for the lock path
-  gitAvailable: boolean; // false when the workspace is not a git repo
-  lock: LockFile | null; // parsed contents when present
+  committed: boolean; // working tree clean for the lock path
+  gitAvailable: boolean; // false outside a git repo
+  lock: LockFile | null;
 }
 
-/** Check 4: an orchestrator is connected for this org. */
 export function checkOrchestrator(probe: ProbeOutcome | null): DoctorCheckBody {
   const name = 'orchestrator';
   if (probe === null || !probe.ok) {
@@ -238,7 +228,6 @@ export function checkOrchestrator(probe: ProbeOutcome | null): DoctorCheckBody {
   return { name, status: 'pass', message: `${connected.length} orchestrator(s) connected.` };
 }
 
-/** Check 5: the lock file is present, fresh, and committed. */
 export function checkLockFile(state: LockState): DoctorCheckBody {
   const name = 'lock-file';
   if (!state.exists) {
@@ -268,21 +257,16 @@ export function checkLockFile(state: LockState): DoctorCheckBody {
   return { name, status: 'pass', message: 'Lock file present, fresh, and committed.' };
 }
 
-/** A job's targeting constraint: the runsOn set it needs, minus the labels it excludes. */
 interface LabelRequirement {
   runsOn: readonly LabelMatcher[];
   exclude: readonly LabelMatcher[];
 }
 
 /**
- * A label group satisfies a requirement only when it matches EVERY runsOn
- * matcher AND matches NONE of the excludeLabels — the same authority the
- * orchestrator's job queue applies (`runsOn.every` && `!exclude.some`).
- *
- * Both sides are folded first, and both arms of the check get the fold: the
- * probe reports canonical agent labels while lock matchers carry whatever case
- * the workflow author wrote, so comparing them raw would report a dispatchable
- * job unreachable and would let an excluded label slip past on case alone.
+ * Same rule as the orchestrator's job queue: EVERY runsOn matcher and NONE of
+ * the excludeLabels. Both sides are case-folded: the probe reports canonical
+ * labels while lock matchers keep the author's case, so a raw compare would
+ * call a dispatchable job unreachable and let an excluded label slip past.
  */
 function requirementSatisfiedBy(req: LabelRequirement, labels: ReadonlySet<string>): boolean {
   const canonical = canonicalizeLabelSet([...labels]);
@@ -298,8 +282,8 @@ function describeRequirement(req: LabelRequirement): string {
 }
 
 /**
- * Collect the label groups that can satisfy a runsOn set on their own: each
- * connected agent's label set, and each scaler labelSet.
+ * Groups that can satisfy a runsOn set alone: each connected agent's labels and
+ * each scaler labelSet.
  */
 function availableLabelGroups(infra: DiagnosticsInfrastructureResponse): Set<string>[] {
   const groups: Set<string>[] = [];
@@ -311,7 +295,6 @@ function availableLabelGroups(infra: DiagnosticsInfrastructureResponse): Set<str
   return groups;
 }
 
-/** Check 6: every workflow's runsOn labels are satisfiable by a connected agent or scaler. */
 export function checkLabels(lock: LockFile | null, probe: ProbeOutcome | null): DoctorCheckBody {
   const name = 'labels';
   if (!lock) {
@@ -325,7 +308,7 @@ export function checkLabels(lock: LockFile | null, probe: ProbeOutcome | null): 
     for (const job of wf.jobs) {
       if (!isLockStaticJob(job)) continue; // dynamic-job factories target at agent runtime
       const runsOn = job.runsOn ?? [];
-      if (runsOn.length === 0) continue; // no constraint — any agent works
+      if (runsOn.length === 0) continue;
       required.push({ runsOn, exclude: job.excludeLabels ?? [] });
     }
   }
@@ -368,19 +351,18 @@ export interface DoctorOptions {
   kiciDir?: string;
 }
 
-/** Injectable seams so every path is unit-testable without real IO. */
+/** Injectable seams for unit tests. */
 export interface DoctorDeps {
   loadConfig: () => Promise<GlobalConfig>;
   probe: (config: GlobalConfig) => Promise<ProbeOutcome | null>;
   gatherLockState: (kiciDir: string) => Promise<LockState>;
   now: () => number;
-  /** Probe a direct orchestrator target; defaults to `GET /api/v1/test/whoami`. */
+  /** Defaults to `GET /api/v1/test/whoami`. */
   probeDirect?: (url: string, token: string) => Promise<DirectProbe>;
-  /** The environment the run target resolves against; defaults to `process.env`. */
+  /** Run-target resolution env; defaults to `process.env`. */
   env?: NodeJS.ProcessEnv;
 }
 
-/** Default direct probe: one `whoami` read, classified for the run-target row. */
 async function defaultProbeDirect(url: string, token: string): Promise<DirectProbe> {
   try {
     return { ok: true, whoami: await new DirectRunClient({ url, token }).whoami() };
@@ -395,7 +377,7 @@ async function defaultProbeDirect(url: string, token: string): Promise<DirectPro
   }
 }
 
-/** Newest mtime (ms) across every *.ts under the workflows directory, or 0. */
+/** Newest *.ts mtime (ms) directly in the workflows directory, or 0. */
 async function newestWorkflowMtime(workflowsDir: string): Promise<number> {
   let newest = 0;
   let entries: string[];
@@ -416,7 +398,6 @@ async function newestWorkflowMtime(workflowsDir: string): Promise<number> {
   return newest;
 }
 
-/** Is the working tree clean for the given path? gitAvailable=false when not a repo. */
 async function gitCleanForPath(
   filePath: string,
 ): Promise<{ gitAvailable: boolean; committed: boolean }> {
@@ -430,7 +411,6 @@ async function gitCleanForPath(
   }
 }
 
-/** Default gatherer: read the lock file, compute freshness by mtime, check git. */
 async function defaultGatherLockState(kiciDir: string): Promise<LockState> {
   const abs = resolveKiciDir(kiciDir);
   const lockPath = path.join(abs, 'kici.lock.json');
@@ -459,7 +439,7 @@ async function probeInfrastructure(client: DashboardClient): Promise<ProbeOutcom
   }
 }
 
-/** Default probe: attempt one authenticated infrastructure read, or null when not eligible. */
+/** Null without credentials or an active org. */
 async function defaultProbe(config: GlobalConfig): Promise<ProbeOutcome | null> {
   if (!hasCredentials(config) || !config.activeOrgId) return null;
   let client: DashboardClient;
@@ -497,7 +477,6 @@ function colorizeStatus(status: string): string {
   }
 }
 
-/** Render the funnel as a status table with a trailing next-command hint per row. */
 export function renderDoctorTable(
   response: DiagnoseResponse & { checks: DoctorCheckResult[] },
 ): string {
@@ -512,9 +491,8 @@ export function renderDoctorTable(
 }
 
 /**
- * Run the onboarding-funnel diagnostic and return the process exit code
- * (0 all pass · 1 any warn · 2 any fail). The single infrastructure probe is
- * timed and attributed to the token-live check; the local checks are instant.
+ * Returns the exit code (0 all pass · 1 any warn · 2 any fail). The
+ * infrastructure probe's time is attributed to token-live; local checks are instant.
  */
 export async function doctorCommand(
   options: DoctorOptions = {},
@@ -533,8 +511,8 @@ export async function doctorCommand(
   const directMs = Math.max(0, deps.now() - directStart);
   const runTarget = { ...checkRunTarget(resolution, directProbe), durationMs: directMs };
 
-  // A developer who runs only against an orchestrator has no Platform login,
-  // and telling them to `kici login` would send them the wrong way.
+  // A direct-orchestrator-only developer has no Platform login; `kici login`
+  // advice would send them the wrong way.
   const platformRows = hasCredentials(config) || !direct;
   const lockFile = { ...checkLockFile(lockState), durationMs: 0 };
   const deprecated = checkDeprecatedConfig(config);

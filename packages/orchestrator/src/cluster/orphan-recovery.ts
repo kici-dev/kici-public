@@ -6,7 +6,7 @@
  * to prevent multiple orchestrators from racing to recover the same run.
  *
  * Recovery logic:
- * 1. Find runs with status='running' and stale last update (> threshold)
+ * 1. Find runs with status='running' that started before the stale threshold
  * 2. Check if the coordinator is still a connected peer
  * 3. If coordinator is disconnected/unknown, this is an orphan run
  * 4. Check job statuses: terminal jobs stay, stuck jobs get marked failed
@@ -42,15 +42,15 @@ interface OrphanRecoveryDeps {
   raft: RaftNode;
   peerRegistry: PeerRegistry;
   executionTracker: ExecutionTracker;
-  /** Reader for fleet-wide cluster tunables (reroute flap-grace override). */
+  /** Source of the reroute flap-grace override. */
   clusterSettings: ClusterSettingsReader;
   /** Cluster default for the reroute flap-grace window (config.rerouteFlapGraceMs). */
   rerouteFlapGraceFallbackMs: number;
   /** Scan interval in ms. Default: 60000 (1 minute). */
   scanIntervalMs?: number;
-  /** How long a run must be stale before considered orphaned. Default: 5 minutes. */
+  /** Default: 5 minutes. */
   staleThresholdMs?: number;
-  /** How long a stuck job must have no heartbeat before marking as failed. Default: 3 minutes. */
+  /** Default: 3 minutes. */
   jobStuckThresholdMs?: number;
 }
 
@@ -78,10 +78,7 @@ export class OrphanRecovery {
     this.jobStuckThresholdMs = deps.jobStuckThresholdMs ?? DEFAULT_JOB_STUCK_THRESHOLD_MS;
   }
 
-  /**
-   * Start periodic orphan recovery scans.
-   * Only runs recovery logic when this node is the Raft leader.
-   */
+  /** Recovery logic runs only while this node is the Raft leader. */
   start(): void {
     if (this.scanTimer) return;
 
@@ -103,9 +100,6 @@ export class OrphanRecovery {
     });
   }
 
-  /**
-   * Stop periodic orphan recovery scans.
-   */
   stop(): void {
     if (this.scanTimer) {
       clearInterval(this.scanTimer);
@@ -115,17 +109,11 @@ export class OrphanRecovery {
     logger.info('Orphan recovery stopped');
   }
 
-  /**
-   * Scan for orphaned runs and recover them.
-   * Only runs when this node is the Raft leader.
-   */
   async scanForOrphans(): Promise<void> {
-    // Guard: only leader runs recovery
     if (!this.raft.isLeader()) {
       return;
     }
 
-    // Find runs stuck in 'running' with stale update timestamps
     const staleThreshold = new Date(Date.now() - this.staleThresholdMs);
 
     const staleRuns = await this.db
@@ -153,15 +141,11 @@ export class OrphanRecovery {
    * finished. Run once per leader transition (`start()`), which covers a boot
    * and a failover.
    *
-   * A slot outlives its run whenever the release path did not run — a
-   * coordinator crash between "the run finished" and "the slot was released".
-   * On a `max: 1` deploy gate a single leaked slot blocks every later deploy
-   * forever, and nothing else would ever notice: the DB says the slot is held
-   * and the run that held it is gone.
-   *
-   * `getActiveRuns` reconciles the same way inside its own transaction on every
-   * acquire, so this is the sweep for a scope nobody happens to ask about —
-   * which is why once per leader transition is enough.
+   * A coordinator crash between "the run finished" and "the slot was released"
+   * leaks the slot; on a `max: 1` deploy gate it blocks every later deploy
+   * forever, and nothing else notices. `getActiveRuns` reconciles the same way
+   * on every acquire, so this only sweeps scopes nobody asks about — hence once
+   * per leader transition is enough.
    */
   async releaseLeakedConcurrencySlots(): Promise<void> {
     const leaked = await this.db
@@ -185,9 +169,6 @@ export class OrphanRecovery {
     logger.info('Released concurrency slots held by finished runs', { released: leaked.length });
   }
 
-  /**
-   * Attempt to recover a single potentially orphaned run.
-   */
   private async recoverRun(run: {
     run_id: string;
     routing_key: string | null;
@@ -196,22 +177,19 @@ export class OrphanRecovery {
     repo_identifier: string;
     sha: string;
   }): Promise<void> {
-    // Check if the coordinator orchestrator is still connected.
-    // We use the routing key to identify the coordinator. If any peer
-    // shares the same routing key and is connected, the run may not be orphaned.
+    // The routing key identifies the coordinator: a connected peer sharing it
+    // means the run may not be orphaned.
     const isCoordinatorConnected = this.isCoordinatorStillConnected(run.routing_key);
 
     if (isCoordinatorConnected) {
-      // Coordinator still alive -- not orphaned, skip
       return;
     }
 
-    // A run that is still making progress is NOT orphaned, whatever the peer
-    // registry says. The candidate query selects on `started_at`, so any run
-    // LONGER than the stale threshold lands here, and the peer check
-    // above can never vouch for a single-node orchestrator (it has no peers).
-    // Without this guard, a healthy long run on a single-node deployment is
-    // force-failed by its own coordinator.
+    // A run still making progress is not orphaned, whatever the peer registry
+    // says. The candidate query selects on `started_at`, so every run longer than
+    // the threshold lands here, and the peer check never vouches for a
+    // single-node orchestrator: without this guard its own coordinator
+    // force-fails a healthy long run.
     if (await this.hasRecentProgress(run.run_id)) {
       logger.debug('Skipping orphan recovery: run is still making progress', {
         runId: run.run_id,
@@ -225,7 +203,6 @@ export class OrphanRecovery {
       workflowName: run.workflow_name,
     });
 
-    // Get all jobs for this run
     const jobs = await this.db
       .selectFrom('execution_jobs')
       .select(['job_id', 'job_name', 'status', 'last_heartbeat_at', 'rerouted_to_peer'])
@@ -233,7 +210,6 @@ export class OrphanRecovery {
       .execute();
 
     if (jobs.length === 0) {
-      // No jobs recorded -- mark run as failed directly
       await this.db
         .updateTable('execution_runs')
         .set({
@@ -249,27 +225,24 @@ export class OrphanRecovery {
         runId: run.run_id,
       });
 
-      // Notify Platform of terminal status via completeRunIfAllJobsTerminal's DB-fallback path.
-      // With 0 jobs, the method will see the run is already terminal and skip,
-      // so we also need to forward the status explicitly.
+      // No terminal status is forwarded from here: the infra event records the
+      // recovery, and the Platform's run-mirror reconciler re-pulls a mirror row
+      // that is still non-terminal.
       this.executionTracker.emitInfraEvent(run.run_id, 'orchestrator.run.orphan_recovered', {
         metadata: { routingKey: run.routing_key, reason: 'No jobs found' },
       });
       return;
     }
 
-    // Check each job's status
     const jobStuckThreshold = new Date(Date.now() - this.jobStuckThresholdMs);
     for (const job of jobs) {
       if (TERMINAL_JOB_STATES.has(job.status)) {
-        // Job already terminal, nothing to do
         continue;
       }
 
-      // Job is non-terminal (running/pending). If it was rerouted to a worker
-      // peer that is connected — or was seen within the flap-grace window of a
-      // transient reconnect — defer the force-fail: the worker's terminal
-      // status may still be replayed from its durable outbox.
+      // A job rerouted to a worker peer that is connected, or seen within the
+      // flap-grace window, is deferred: the worker may still replay its terminal
+      // status from its durable outbox.
       const flapGraceMs = await this.clusterSettings.getNumber(
         'reroute_flap_grace_ms',
         this.rerouteFlapGraceFallbackMs,
@@ -286,12 +259,9 @@ export class OrphanRecovery {
         continue;
       }
 
-      // Check if heartbeat is stale
       const lastHeartbeat = job.last_heartbeat_at ? new Date(job.last_heartbeat_at) : new Date(0);
 
       if (lastHeartbeat < jobStuckThreshold) {
-        // Job is stuck -- mark as failed
-
         await this.db
           .updateTable('execution_jobs')
           .set({
@@ -304,7 +274,6 @@ export class OrphanRecovery {
           .where('status', '=', job.status)
           .execute();
 
-        // Update in-memory tracker if available
         this.executionTracker.updateInMemoryJob(
           run.run_id,
           job.job_id,
@@ -313,7 +282,6 @@ export class OrphanRecovery {
 
         const errorMsg = 'Orphan recovery: coordinator crashed, job stuck with no heartbeat';
 
-        // Forward terminal status to Platform
         this.executionTracker.forwardJobTerminalStatus(
           run.run_id,
           job.job_id,
@@ -322,10 +290,9 @@ export class OrphanRecovery {
           errorMsg,
         );
 
-        // Cancel any in-progress steps so dashboard doesn't show stale running indicators
+        // So the dashboard shows no stale running steps.
         await this.executionTracker.cancelStepsForJob(run.run_id, job.job_id, errorMsg);
 
-        // Emit infrastructure event for dashboard timeline
         this.executionTracker.emitInfraEvent(run.run_id, 'orchestrator.job.orphan_recovered', {
           jobId: job.job_id,
           metadata: { jobName: job.job_name, reason: errorMsg },
@@ -337,26 +304,23 @@ export class OrphanRecovery {
           jobName: job.job_name,
         });
       }
-      // If heartbeat is recent, the job might still be running on an agent
-      // connected to a different orchestrator -- leave it alone for now
+      // A recent heartbeat means the job may still run on an agent connected to
+      // another orchestrator, so it is left alone.
     }
 
-    // Emit infrastructure event for dashboard timeline before finalizing
     this.executionTracker.emitInfraEvent(run.run_id, 'orchestrator.run.orphan_recovered', {
       metadata: { routingKey: run.routing_key, workflowName: run.workflow_name },
     });
 
-    // Check if all jobs are now terminal and finalize the run.
-    // This method handles DB update, Platform notification, commit status updates,
-    // and workflow completion callbacks — same path used by StaleRunDetector.
+    // Finalizes the run (DB, Platform, commit status, completion callbacks) on the
+    // same path StaleRunDetector uses.
     await this.executionTracker.completeRunIfAllJobsTerminal(run.run_id);
   }
 
   /**
-   * Whether any job of the run moved within the stale window — a heartbeat, a
-   * start, or a completion. A crashed coordinator stops producing all three, so
-   * a genuinely orphaned run becomes eligible again within one window; a healthy
-   * long run never does.
+   * Whether any job had a heartbeat, start or completion within the stale
+   * window. A crashed coordinator stops all three, so an orphaned run becomes
+   * eligible within one window; a healthy long run never does.
    */
   private async hasRecentProgress(runId: string): Promise<boolean> {
     const cutoff = new Date(Date.now() - this.staleThresholdMs);
@@ -374,10 +338,6 @@ export class OrphanRecovery {
     return stamps.some((t) => t != null && new Date(t) >= cutoff);
   }
 
-  /**
-   * Check if a coordinator with the given routing key is still connected
-   * as a peer in the cluster.
-   */
   private isCoordinatorStillConnected(routingKey: string | null): boolean {
     if (!routingKey) return false;
 

@@ -1,11 +1,8 @@
 /**
- * Admin API routes for secrets management.
+ * Admin API routes: contexts, secrets, tokens, audit log queries and key
+ * rotation, all behind Bearer token authentication and RBAC permission checks.
  *
- * Provides CRUD endpoints for contexts, secrets, tokens, audit log queries,
- * and key rotation. All routes are protected by Bearer token authentication
- * and RBAC permission checks.
- *
- * Secret values are write-only -- there is deliberately no "get secret value"
+ * Secret values are write-only: there is deliberately no "get secret value"
  * endpoint. Values are only read during dispatch resolution.
  */
 import { Hono } from 'hono';
@@ -70,22 +67,18 @@ const logger = createLogger({ prefix: 'admin-api' });
 export interface AdminRouteDeps {
   tokenManager: TokenManager;
   /**
-   * Connection string handed to the DB migration routes, which run schema work
-   * on their own timeout-free pool. Optional so WS-only / test admins can omit
-   * it; omitting it makes those routes fall back to the shared pool.
+   * Connection string for the DB migration routes, which run schema work on
+   * their own timeout-free pool. When omitted (WS-only / test admins) those
+   * routes fall back to the shared pool.
    */
   databaseUrl?: string;
-  /**
-   * Orchestrator operating mode. Gates mode-specific admin behavior. Optional so
-   * WS-only / test admins can omit it.
-   */
+  /** Gates mode-specific admin behavior. Omitted by WS-only / test admins. */
   mode?: OrchestratorMode;
   /**
-   * Whether the Platform connection is up right now, read per request.
-   *
-   * Reported by the trust-policy directory route so an operator can tell a
-   * directory that is merely old from one that cannot refresh at all. Absent on
-   * an independent orchestrator and on a test admin, which have no connection.
+   * Whether the Platform connection is up right now, read per request. The
+   * trust-policy directory route reports it so an operator can tell a directory
+   * that is merely old from one that cannot refresh at all. Absent on an
+   * independent orchestrator and on a test admin, which have no connection.
    */
   platformConnected?: () => boolean;
   /**
@@ -99,49 +92,40 @@ export interface AdminRouteDeps {
   auditLogger: AuditLogger;
   /**
    * Fleet-wide default for the global-workflows master switch, applied when the
-   * cluster column is NULL. Optional so WS-only / test admins can omit it;
-   * omitting it means the secure default (disabled).
+   * cluster column is NULL. Omitted means the secure default (disabled).
    */
   globalWorkflowsEnabledDefault?: boolean;
   /**
-   * Optional -- the coordinator drain controller. When provided, the
-   * `POST`/`GET /api/v1/admin/orchestrator/drain` routes are mounted (backing
-   * the `kici-admin orchestrator drain` verbs). Omitted on WS-only admins.
+   * When provided, mounts `POST`/`GET /api/v1/admin/orchestrator/drain` (the
+   * `kici-admin orchestrator drain` verbs). Omitted on WS-only admins.
    */
   drainController?: DrainController;
-  /** Optional -- for agent token CRUD endpoints. */
+  /** Backs the agent token CRUD endpoints. */
   tokenStore?: AgentTokenStore;
   /**
-   * Optional -- for kicking in-flight agent WS on token revoke.
+   * DELETE /api/v1/agent-tokens/:id calls `agentRegistry.disconnectByTokenId(id)`
+   * synchronously after `tokenStore.revoke(id)` so a revoked token loses
+   * data-plane authority immediately instead of staying live until the agent
+   * disconnects. Mirrors the orch->Platform leg (`disconnectByKeyId`).
    *
-   * The DELETE /api/v1/agent-tokens/:id route calls
-   * `agentRegistry.disconnectByTokenId(id)` synchronously after
-   * `tokenStore.revoke(id)` so a revoked token loses data-plane
-   * authority immediately instead of staying live until the agent
-   * itself disconnects. Mirrors the fix on the orch->Platform
-   * leg (`disconnectByKeyId`).
-   *
-   * When unset, the DELETE route returns 503 — agent-token revoke is
-   * meaningless without the kick path because a revoked token would
-   * still grant in-flight authority for hours-to-days.
+   * When unset, the DELETE route returns 503: without the kick path a revoked
+   * token would still grant in-flight authority for hours-to-days.
    */
   agentRegistry?: AgentRegistry;
   /**
-   * Optional -- fan out the revoke to every peer in a clustered orchestrator.
+   * Fans the revoke out to every peer in a clustered orchestrator. The DELETE
+   * route calls it after the synchronous local kick, so each peer's
+   * `AgentRegistry.disconnectByTokenId(tokenId)` closes its own in-flight WS for
+   * the same token. Mirrors the Valkey fan-out pattern on the orch->Platform leg.
    *
-   * The DELETE /api/v1/agent-tokens/:id route calls this after the synchronous
-   * local kick, so every peer's `AgentRegistry.disconnectByTokenId(tokenId)`
-   * runs locally and closes its own in-flight WS for the same token. Mirrors
-   *'s Valkey fan-out pattern on the orch->Platform leg.
-   *
-   * Unset on standalone deployments (no peer fabric) -- the local kick alone
-   * is sufficient there.
+   * Unset on standalone deployments (no peer fabric), where the local kick
+   * alone is sufficient.
    */
   broadcastAgentTokenRevoke?: (tokenId: string) => void;
-  /** Optional -- for source management endpoints. */
+  /** Backs the source management endpoints. */
   sourceStore?: SourceStore;
   /**
-   * Optional -- resolves the public webhook URL for a newly added source so
+   * Resolves the public webhook URL for a newly added source so
    * `kici-admin source add` can print it. The rules per mode live in
    * `sources/webhook-url-resolvers.ts`.
    */
@@ -151,92 +135,86 @@ export interface AdminRouteDeps {
     sourceId: string;
   }) => Promise<WebhookUrlResolution>;
   /**
-   * Optional -- resolves the org-scoped GitHub webhook URL for the manifest
-   * setup pre-flight (before any App exists), by mode.
+   * Resolves the org-scoped GitHub webhook URL for the manifest setup
+   * pre-flight (before any App exists), by mode.
    */
   resolveGithubWebhookUrl?: () => Promise<WebhookUrlResolution>;
-  /** Optional — builds the direct-ingress URL `source list` prints per GitHub source. */
+  /** Builds the direct-ingress URL `source list` prints per GitHub source. */
   resolveSourceIngressUrl?: (row: { id: string; customerId: string | null }) => string | null;
-  /** Optional -- for DB migration endpoints. */
+  /** Backs the DB migration endpoints. */
   db?: Kysely<any>;
-  /** Optional -- for DB migration endpoints. */
+  /** Backs the DB migration endpoints. */
   pool?: pg.Pool;
-  /** Optional -- for cluster join token creation. */
+  /** Backs cluster join token creation. */
   joinTokenManager?: JoinTokenManager;
-  /** Optional -- for secret backend management endpoints. */
+  /** Backs the secret backend management endpoints. */
   backendRegistry?: BackendRegistry;
-  /** Optional -- for secret backend health checking. */
   backendHealthChecker?: BackendHealthChecker;
-  /** Optional -- for secret backend scope sync. */
   backendSyncManager?: BackendSyncManager;
   /**
-   * Optional -- for `POST /api/v1/admin/rotate-key`.
-   *
-   * When set, `rotate-key` re-encrypts `config_versions` alongside
-   * `scoped_secrets` in two sequential transactions. When unset (e.g. a
-   * secret-store-only admin deployment), config rotation is skipped and the
+   * When set, `POST /api/v1/admin/rotate-key` re-encrypts `config_versions`
+   * alongside `scoped_secrets` in two sequential transactions. When unset (e.g.
+   * a secret-store-only admin deployment), config rotation is skipped and the
    * response reports `reEncryptedConfigs: 0`.
    */
   sharedStore?: SharedConfigStore;
   /**
-   * Optional -- the resolved master key, for `POST /api/v1/admin/rotate-key`.
-   *
-   * When set, `rotate-key` additionally sweeps the four remaining
+   * When set, `POST /api/v1/admin/rotate-key` also sweeps the remaining
    * master-key-wrapped stores: `orchestrator_signing_keys`,
-   * `dashboard_encryption_keys`, `run_ephemeral_keys` and `run_secret_outputs`.
+   * `dashboard_encryption_keys`, `run_ephemeral_keys`, `run_secret_outputs` and the
+   * sealed job secrets in `pending_job_contexts`.
    * When unset the secrets subsystem is off and there is nothing wrapped to
    * sweep, so those counts report 0.
    */
   masterKeys?: ResolvedMasterKeys | null;
   /**
-   * Optional -- attribution writer for routes that emit an `access_log`
-   * row directly (today: org-settings dashboard-write policy flips). When
-   * unset, those routes execute the mutation without recording — the
-   * write is best-effort, never gating.
+   * Attribution writer for routes that emit an `access_log` row directly
+   * (today: org-settings dashboard-write policy flips). When unset, those
+   * routes run the mutation without recording: the write is best-effort, never
+   * gating.
    */
   accessLog?: AccessLogWriter;
   /**
-   * Optional -- the coordinator's live-VM listing and stop, for this node or a
-   * `--target` peer. Backs `GET /api/v1/admin/scaler/orphans` and
+   * The coordinator's live-VM listing and stop, for this node or a `--target`
+   * peer. Backs `GET /api/v1/admin/scaler/orphans` and
    * `POST /api/v1/admin/scaler/orphans/stop` (`kici-admin scaler orphans`).
    * Bound by orchestrator-core once the cluster is up.
    */
   scalerOrphans?: ScalerOrphansRouteDeps;
   /**
-   * Optional -- reload the scaler config here and on every connected peer.
-   * Backs `POST /api/v1/admin/scaler/reload` (`kici-admin scaler reload`).
-   * Bound by orchestrator-core once the cluster is up.
+   * Reloads the scaler config here and on every connected peer. Backs
+   * `POST /api/v1/admin/scaler/reload` (`kici-admin scaler reload`). Bound by
+   * orchestrator-core once the cluster is up.
    */
   scalerReload?: ScalerReloadRouteDeps;
   /**
-   * Optional -- forget a departed peer here and on every connected sibling
-   * coordinator. Backs `POST /api/v1/admin/peers/forget` (`kici-admin peer
-   * forget`). Bound by orchestrator-core once the cluster is up.
+   * Forgets a departed peer here and on every connected sibling coordinator.
+   * Backs `POST /api/v1/admin/peers/forget` (`kici-admin peer forget`). Bound by
+   * orchestrator-core once the cluster is up.
    */
   peerForget?: PeerForgetRouteDeps;
   /**
-   * Optional -- the peer view behind
-   * `GET /api/v1/admin/cluster-settings/propagation` (the propagation section of
-   * `kici-admin cluster-settings show`). Bound by orchestrator-core once the
-   * cluster is up; the route is not mounted without it.
+   * The peer view behind `GET /api/v1/admin/cluster-settings/propagation` (the
+   * propagation section of `kici-admin cluster-settings show`). Bound by
+   * orchestrator-core once the cluster is up; the route is not mounted without it.
    */
   clusterSettingsPropagation?: ClusterSettingsPropagationSource;
   /**
-   * Optional -- fulfil deferred attestations on demand (mints in the running
-   * orchestrator process, which owns the Platform WS). Backs
-   * `POST /api/v1/admin/attestations/retry` (the `kici-admin attestations retry`
-   * command). Unset on a WS-only / non-coordinator admin.
+   * Fulfils deferred attestations on demand (mints in the running orchestrator
+   * process, which owns the Platform WS). Backs
+   * `POST /api/v1/admin/attestations/retry` (`kici-admin attestations retry`).
+   * Unset on a WS-only / non-coordinator admin.
    */
   retryAttestations?: (opts: {
     runId?: string;
     includeRejected?: boolean;
   }) => Promise<{ minted: number; stillPending: number; rejected: number }>;
   /**
-   * Optional -- the resume wiring behind `kici-admin held-run approve|reject`.
-   * When set (alongside `db` + `accessLog`), the local held-run read and
-   * decision routes are mounted; they refuse with 409 on a Platform-attached
-   * orchestrator. Unset leaves them unmounted, which is the honest state for an
-   * app that cannot dispatch a released hold.
+   * The resume wiring behind `kici-admin held-run approve|reject`. When set
+   * (alongside `db` + `accessLog`), the local held-run read and decision routes
+   * are mounted; they refuse with 409 on a Platform-attached orchestrator. Unset
+   * leaves them unmounted, the honest state for an app that cannot dispatch a
+   * released hold.
    */
   heldRunRelease?: HeldRunReleaseWiring;
 }
@@ -269,12 +247,7 @@ const createJoinTokenSchema = z.object({
   expiryMs: z.number().positive().optional(),
 });
 
-/**
- * Create admin API routes with Bearer token authentication and RBAC.
- *
- * @param deps - Admin route dependencies (token manager, RBAC, secret store, audit logger, etc.)
- * @returns Hono app with admin routes mounted at /api/v1/admin/*
- */
+/** Admin routes under /api/v1/admin/* (and /api/v1/agent-tokens), Bearer-authed with RBAC. */
 export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
 
@@ -295,10 +268,8 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   // an unscoped admin token.
 
   /**
-   * Load the registered secret backends for one request.
-   *
-   * A registry failure propagates to a 5xx rather than degrading to the
-   * default store. `secrets/scope-routing.ts` owns the loading rules — see
+   * Loads the registered secret backends for one request. A registry failure
+   * propagates to a 5xx rather than degrading to the default store; see
    * `loadRoutableStores` for why the `pg` entry is always `deps.secretStore`.
    */
   const loadStores = (): Promise<Map<string, ScopedSecretStore>> =>
@@ -308,12 +279,10 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       deps.secretStore,
     );
 
-  /** Resolve a wire-form scope against the live backend registry. */
   const routeScope = async (wireScope: string) =>
     resolveScope(wireScope, await loadStores(), deps.secretStore);
 
-  // List an org's scopes across every registered backend, each qualified as
-  // `<backend>:<path>`.
+  // Each scope is qualified as `<backend>:<path>`.
   app.get('/api/v1/admin/secrets/scopes', requireUnscoped, async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'secret.read');
     const orgId = c.req.query('orgId');
@@ -326,8 +295,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
           scopes.push(toWireScope(backendName, path));
         }
       } catch (err) {
-        // One unreachable backend must not blank the whole listing — the
-        // operator still needs to see the backends that ARE reachable.
+        // One unreachable backend must not blank the listing of the reachable ones.
         logger.warn('Skipping unreachable secret backend during scope listing', {
           backendName,
           error: toErrorMessage(err),
@@ -338,7 +306,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     return c.json({ scopes }, 200);
   });
 
-  // List secret key names in a scope (no values)
+  // Key names only, never values.
   app.get('/api/v1/admin/secrets/keys', requireUnscoped, async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'secret.read');
     const orgId = c.req.query('orgId');
@@ -393,10 +361,10 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     const stores = await loadStores();
     const from = resolveScope(parsed.oldScope, stores, deps.secretStore);
     const to = resolveScope(parsed.newScope, stores, deps.secretStore);
-    // A rename is a per-backend operation — the source store re-encrypts each
-    // row under the new scope's AAD. Moving a scope BETWEEN backends is a
-    // copy plus a delete, which this route does not perform, so reject it
-    // outright rather than silently renaming inside the source backend.
+    // A rename is per-backend: the source store re-encrypts each row under the
+    // new scope's AAD. A cross-backend move is a copy plus a delete, which this
+    // route does not do, so reject it rather than silently renaming inside the
+    // source backend.
     if (from.backendName !== to.backendName) {
       return c.json(
         {
@@ -476,10 +444,10 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     const resolved = await routeScope(scope);
     const scopeError = validateScopeName(resolved.path);
     if (scopeError) return c.json({ error: scopeError }, 400);
-    // Write-path only. A `:` in the key would make the at-rest AAD
+    // Write-path only: a `:` in the key would make the at-rest AAD
     // `orgId:scope:key` ambiguous, so two locations could share one binding.
-    // Read and delete stay unvalidated so a key stored before this rule
-    // remains readable and deletable.
+    // Read and delete stay unvalidated so an older key remains readable and
+    // deletable.
     const keyError = validateSecretKey(key);
     if (keyError) return c.json({ error: keyError }, 400);
     await resolved.store.setSecret(orgId, resolved.path, key, parsed.value);
@@ -533,10 +501,9 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
 
   app.post('/api/v1/admin/rotate-key', requireUnscoped, async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'key.rotate');
-    // Two sequential transactions — secrets first, then config. Keeps the
-    // secrets rotation atomic on its own so a config-rotation bug can't
-    // roll back a successful secrets rotation. Both are idempotent, so on
-    // partial failure the operator just re-runs `rotate-key`.
+    // Secrets first, then config, in separate transactions so a config-rotation
+    // bug can't roll back a successful secrets rotation. Both are idempotent, so
+    // on partial failure the operator re-runs `rotate-key`.
     const secretsResult = await deps.secretStore.rotateKey();
     const configsResult = deps.sharedStore
       ? await deps.sharedStore.rotateKey()
@@ -547,13 +514,11 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     const backendsResult = deps.backendRegistry
       ? await deps.backendRegistry.rotateKey()
       : { reEncrypted: 0, skipped: 0 };
-    // Sweeps four through eight: the provenance signing key, the
+    // The master-key-wrapped stores: the provenance signing key, the
     // dashboard-encryption key, run ephemeral keys, stored secret outputs and
-    // the sealed secrets of stored jobs.
-    // Each has its own transaction for the same reason as the three above.
-    // Leaving them out is what made the published rotation procedure
-    // destructive: dropping the old key stranded every one of them, and for
-    // the signing key that means the next boot throws.
+    // the sealed secrets of stored jobs, each in its own transaction for the
+    // same reason. Skipping them makes rotation destructive: dropping the old
+    // key strands every one, and for the signing key the next boot throws.
     const wrapped =
       deps.masterKeys && deps.db
         ? await rotateMasterKeyWrappedTables(deps.db, deps.masterKeys, (message, meta) =>
@@ -622,10 +587,9 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     deps.rbac.requirePermission(c.get('role'), 'audit.read');
     const tokenRoutingKey = c.get('routingKey');
     const requestedRoutingKey = c.req.query('routingKey') ?? undefined;
-    // Routing-key-scoped tokens can only read audit rows that match
-    // their scope. If the caller asked for a different routing key,
-    // refuse; otherwise force the filter so unfiltered queries don't
-    // leak rows from other routing keys.
+    // A routing-key-scoped token reads only its own routing key's rows: refuse
+    // a different requested key, and force the filter so an unfiltered query
+    // can't leak other routing keys' rows.
     if (tokenRoutingKey) {
       if (requestedRoutingKey && requestedRoutingKey !== tokenRoutingKey) {
         const denied = enforceRoutingKeyScope(c, requestedRoutingKey);
@@ -664,7 +628,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     return c.json({ token: result.token, id: result.id }, 201);
   });
 
-  // List tokens (without hashes)
+  // Hashes are never returned.
   app.get('/api/v1/admin/tokens', requireUnscoped, async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'token.manage');
     const tokens = await deps.tokenManager.listTokens();
@@ -677,9 +641,8 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     return c.json({ revoked: true }, 200);
   });
 
-  // ── Agent Token CRUD ──────────────────────────────────────────────
+  // ── Agent token CRUD ──────────────────────────────────────────────
 
-  // Create static agent token
   app.post('/api/v1/agent-tokens', async (c) => {
     if (!deps.tokenStore) {
       return c.json({ error: 'Agent token management not available' }, 503);
@@ -694,7 +657,6 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       mandatoryLabels: parsed.mandatoryLabels,
       createdBy: parsed.createdBy ?? c.get('userId'),
     });
-    // Fetch the created row for full response (without hash)
     const tokens = await deps.tokenStore.list();
     const created = tokens.find((t) => t.id === result.id);
     return c.json(
@@ -710,7 +672,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   });
 
-  // List agent tokens (non-revoked)
+  // Non-revoked tokens only.
   app.get('/api/v1/agent-tokens', async (c) => {
     if (!deps.tokenStore) {
       return c.json({ error: 'Agent token management not available' }, 503);
@@ -733,16 +695,14 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     });
   });
 
-  // Revoke agent token
   app.delete('/api/v1/agent-tokens/:id', async (c) => {
     if (!deps.tokenStore) {
       return c.json({ error: 'Agent token management not available' }, 503);
     }
     if (!deps.agentRegistry) {
-      // Refuse to revoke without the kick path. A 204 here would
-      // be a silent regression — the DB row would flip but every
-      // in-flight WS authenticated by this token would retain
-      // data-plane authority until it disconnected.
+      // Without the kick path the DB row would flip but every in-flight WS
+      // authenticated by this token would keep data-plane authority until it
+      // disconnected, so refuse rather than report success.
       return c.json({ error: 'Agent registry not available' }, 503);
     }
     const denied = requireUnscopedToken(c);
@@ -753,14 +713,10 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     if (!revoked) {
       return c.json({ error: 'Agent token not found or already revoked' }, 404);
     }
-    // Synchronous local kick: close every in-flight WS authenticated
-    // under this token before responding so the operator's CLI
-    // feedback reflects what actually happened on the wire.
+    // Kick synchronously before responding so the CLI's feedback reflects what
+    // actually happened on the wire.
     const kicked = deps.agentRegistry.disconnectByTokenId(id);
-    // Fan out the revoke to every peer in a clustered orchestrator so
-    // each peer kicks its own in-flight WS for the same token. The
-    // helper is unset on standalone deployments — the local kick is
-    // sufficient there.
+    // Each peer kicks its own in-flight WS; unset on standalone deployments.
     deps.broadcastAgentTokenRevoke?.(id);
     logger.info('Agent token revoked', { tokenId: id, kicked });
     return c.json({ kicked }, 200);
@@ -768,7 +724,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
 
   // ── Join token management ──────────────────────────────────────────
 
-  // Create join token (for cluster bootstrap)
+  // For cluster bootstrap.
   app.post('/api/v1/admin/join-tokens', async (c) => {
     if (!deps.joinTokenManager) {
       return c.json({ error: 'Join token management not available' }, 503);
@@ -785,14 +741,12 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       expiryMs: parsed.expiryMs,
     });
 
-    // Calculate expiry for response
     const expiryMs = parsed.expiryMs ?? 3600_000;
     const expiresAt = new Date(Date.now() + expiryMs).toISOString();
 
     return c.json({ token, expiresAt }, 201);
   });
 
-  // Mount source management routes (optional -- only when sourceStore is provided)
   if (deps.sourceStore) {
     app.route(
       '/api/v1/admin',
@@ -805,7 +759,6 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Mount DB migration routes (optional -- only when db and pool are provided)
   if (deps.db && deps.pool) {
     app.route(
       '/api/v1/admin',
@@ -813,7 +766,6 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Mount backend management routes (optional -- only when registry and healthChecker are provided)
   if (deps.backendRegistry && deps.backendHealthChecker) {
     app.route(
       '/api/v1/admin',
@@ -825,7 +777,6 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Mount org-settings routes (optional -- only when db is provided).
   // Backs the `kici-admin org-settings global-workflows` subcommands.
   if (deps.db) {
     app.route(
@@ -840,16 +791,14 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Mount trust-policy routes (optional -- only when db is provided).
-  // Backs the `kici-admin trust-policy {show,set,directory}` subcommands. PATCH refuses
-  // server-side on a Platform-attached orchestrator, where the Platform owns
-  // the policy and the next push would clobber a local write.
-  // The audit sink is part of the mount condition, not an optional extra: the
-  // route's contract is that a trust-policy write is always attributable, so an
-  // orchestrator assembled without an access log gets NO trust-policy route
-  // rather than an unauditable one. A wired orchestrator always has one
+  // Backs `kici-admin trust-policy {show,set,directory}`. PATCH refuses
+  // server-side on a Platform-attached orchestrator, where the Platform owns the
+  // policy and the next push would clobber a local write.
+  // The audit sink is part of the mount condition: a trust-policy write is
+  // always attributable, so without an access log there is NO trust-policy
+  // route rather than an unauditable one. A wired orchestrator always has one
   // (`accessLogWriter` is non-optional on the subsystem bundle), so this only
-  // ever bites a partially-constructed test harness.
+  // bites a partially-constructed test harness.
   if (deps.db && deps.accessLog) {
     const accessLog = deps.accessLog;
     app.route(
@@ -865,17 +814,13 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Mount held-run routes (optional -- db, an audit sink, AND the resume
-  // wiring). Backs the `kici-admin held-run {list,approve,reject}` subcommands,
-  // which refuse server-side on a Platform-attached orchestrator where the
-  // Platform's own held-run trust gate is the authority.
-  //
-  // The resume wiring is part of the mount condition rather than an optional
-  // extra: without it an approve would flip the row and never dispatch the job
-  // it released, which reads as success and does nothing. The audit sink is in
-  // the condition for the same reason it is on the trust-policy route — a
-  // locally-answered hold that lands unattributed is worse than one that cannot
-  // be answered at all.
+  // Backs `kici-admin held-run {list,approve,reject}`, which refuse server-side
+  // on a Platform-attached orchestrator, where the Platform's own held-run trust
+  // gate is the authority.
+  // The resume wiring is part of the mount condition: without it an approve
+  // would flip the row and never dispatch the released job, which reads as
+  // success and does nothing. The audit sink is in it as on the trust-policy
+  // route: an unattributed local answer is worse than no answer at all.
   if (deps.db && deps.accessLog && deps.heldRunRelease) {
     app.route(
       '/api/v1/admin',
@@ -891,9 +836,8 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Mount cluster-settings routes (optional -- only when db is provided).
-  // Backs the `kici-admin cluster-settings {show,set,reset}` subcommands (the
-  // fleet-wide tunables on cluster_settings).
+  // Backs `kici-admin cluster-settings {show,set,reset}` (the fleet-wide
+  // tunables on cluster_settings).
   if (deps.db) {
     app.route(
       '/api/v1/admin',
@@ -905,8 +849,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Mount cluster-name routes (optional -- only when db is provided).
-  // Backs the `kici-admin cluster-name {get,set}` subcommands.
+  // Backs `kici-admin cluster-name {get,set}`.
   if (deps.db) {
     app.route(
       '/api/v1/admin',
@@ -914,14 +857,13 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Mount the provenance signing-key listing (optional -- only when db is
-  // provided). Backs `kici-admin signing-key list` over the admin API.
+  // Provenance signing-key listing; backs `kici-admin signing-key list`.
   if (deps.db) {
     app.route('/api/v1/admin', createAdminSigningKeyRoutes({ db: deps.db, rbac: deps.rbac }));
   }
 
   // The org ids this orchestrator holds (`kici-admin org list`, the `Org:` line
-  // of `kici-admin orchestrator status`). Optional -- only when db is provided.
+  // of `kici-admin orchestrator status`).
   if (deps.db) {
     const db = deps.db;
     app.route(
@@ -934,14 +876,13 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Mount maintenance routes (queue clear, purge-stale, secrets purge).
-  // Optional -- only when db is provided (never a WS-only admin).
+  // Maintenance routes (queue clear, purge-stale, secrets purge); never on a
+  // WS-only admin.
   if (deps.db) {
     app.route('/api/v1/admin', createMaintenanceRoutes({ db: deps.db }));
   }
 
-  // Mount orchestrator drain routes (drain/resume/status for pre-upgrade
-  // quiescing). Optional -- only when the coordinator drain controller is wired.
+  // Drain/resume/status for pre-upgrade quiescing.
   if (deps.drainController) {
     app.route(
       '/api/v1/admin',
@@ -950,7 +891,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   }
 
   // Live orphaned Firecracker VMs on this node or a --target peer
-  // (`kici-admin scaler orphans`). Mounted whenever the coordinator wires it.
+  // (`kici-admin scaler orphans`).
   if (deps.scalerOrphans) {
     app.route(
       '/api/v1/admin',
@@ -963,7 +904,6 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
   }
 
   // Reload the scaler config across the cluster (`kici-admin scaler reload`).
-  // Mounted whenever the coordinator wires it.
   if (deps.scalerReload) {
     app.route(
       '/api/v1/admin',
@@ -975,8 +915,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Forget a departed peer (`kici-admin peer forget`). Mounted whenever the
-  // coordinator wires it.
+  // Forget a departed peer (`kici-admin peer forget`).
   if (deps.peerForget) {
     app.route(
       '/api/v1/admin',
@@ -988,8 +927,8 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     );
   }
 
-  // Mount the deferred-attestation retry route. Optional -- only when the
-  // retrier is wired (coordinator with a Platform connection).
+  // Deferred-attestation retry; wired only on a coordinator with a Platform
+  // connection.
   if (deps.retryAttestations) {
     const retry = deps.retryAttestations;
     app.post('/api/v1/admin/attestations/retry', async (c) => {
@@ -1005,9 +944,9 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
       } catch {
         runId = undefined;
       }
-      // Cluster-wide mutating op: draining / re-arming the deferred-attestation
-      // outbox affects the whole orchestrator, so require an unscoped token and
-      // the dedicated attestation.retry permission (owner+admin, not auditor).
+      // Draining / re-arming the deferred-attestation outbox affects the whole
+      // orchestrator, so require an unscoped token and the attestation.retry
+      // permission (owner+admin, not auditor).
       const denied = requireUnscopedToken(c);
       if (denied) return denied;
       deps.rbac.requirePermission(c.get('role'), 'attestation.retry');
@@ -1035,14 +974,12 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     });
   }
 
-  // Mount context management routes (create/bind/set-policy/list/show/template).
-  // Optional -- only when db is provided.
+  // Context management (create/bind/set-policy/list/show/template).
   if (deps.db) {
     app.route('/api/v1/admin', createAdminContextRoutes({ db: deps.db, rbac: deps.rbac }));
   }
 
-  // Mount queue + execution read routes (5a #3 /).
-  // Optional -- only when db is provided.
+  // Queue and execution read routes.
   if (deps.db) {
     app.route('/api/v1/admin', createAdminQueueExecutionRoutes({ db: deps.db, rbac: deps.rbac }));
   }

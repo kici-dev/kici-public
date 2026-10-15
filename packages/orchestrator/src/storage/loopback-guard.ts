@@ -1,9 +1,7 @@
 /**
- * Startup guard: an orchestrator that runs non-co-located agents (any scaler
- * backend) must not hand them a loopback storage URL. Loopback is only
- * reachable by a co-located process, so a scaled agent would fail with an
- * opaque ECONNREFUSED. This module detects the misconfiguration so the
- * orchestrator can refuse to start with a clear, actionable error.
+ * Startup guard: an orchestrator running non-co-located agents must not hand them a loopback
+ * storage URL, which only a co-located process reaches (a scaled agent fails with an opaque
+ * ECONNREFUSED). It refuses to start with an actionable error instead.
  */
 import { ScalerBackendType } from '@kici-dev/engine';
 import { createLogger } from '@kici-dev/shared';
@@ -13,15 +11,12 @@ import type { ScalerConfig } from '../scaler/types.js';
 const logger = createLogger({ prefix: 'storage' });
 
 /**
- * Backends that place the agent outside the orchestrator's loopback (separate
- * netns, microVM, or host) whenever the entry does not say otherwise.
- * `kubernetes` is included defensively even though `ScalerEntry.type` excludes
- * it today.
+ * Backends that place the agent outside the orchestrator's loopback (separate netns, microVM,
+ * or host) unless the entry says otherwise. `kubernetes` is included defensively although
+ * `ScalerEntry.type` excludes it.
  *
- * Backend type alone is an imprecise signal — a `bare-metal` scaler may spawn
- * on this very machine or on a rack of remote hosts — so it is only the
- * fallback. When an entry declares its own `orchestratorUrl`, that URL says
- * where the agent will be, and `scalerIsColocated` reads it instead.
+ * Backend type is only the fallback signal (a `bare-metal` scaler may spawn locally or
+ * remotely): an entry's own `orchestratorUrl` takes precedence in `scalerIsColocated`.
  */
 export const NON_COLOCATED_BACKENDS: ReadonlySet<ScalerBackendType> = new Set([
   ScalerBackendType.enum.container,
@@ -31,13 +26,9 @@ export const NON_COLOCATED_BACKENDS: ReadonlySet<ScalerBackendType> = new Set([
 ]);
 
 /**
- * Rewrite an IPv4-mapped IPv6 address to the dotted quad it carries, so both
- * predicates below decide it on its real IPv4 value. Returns null for anything
- * that is not such an address.
- *
- * Both spellings occur: an operator writes `::ffff:127.0.0.1`, and the WHATWG
- * URL parser serializes that same literal to the hex form `::ffff:7f00:1`, so
- * `parseHost` hands the hex form to `isLoopbackHost`.
+ * Rewrite an IPv4-mapped IPv6 address to its dotted quad, so the predicates below decide it on
+ * its real IPv4 value; null for anything else. Both spellings occur: an operator writes
+ * `::ffff:127.0.0.1`, and the WHATWG URL parser serializes it to `::ffff:7f00:1`.
  */
 function unmapIpv4(host: string): string | null {
   const dotted = host.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
@@ -68,12 +59,9 @@ function isIpv4Loopback(host: string): boolean {
 }
 
 /**
- * Answers "could an agent in another netns/VM/host reach this address?" — the
- * question a DESTINATION URL asks. A wildcard (`0.0.0.0`, `::`) is not a
- * destination at all, so it is reported as loopback here.
- *
- * For a listener's bind address the question is the opposite one; use
- * `isLoopbackBind`.
+ * Whether a DESTINATION URL host is unreachable from another netns/VM/host. A wildcard
+ * (`0.0.0.0`, `::`) is not a destination, so it counts as loopback here. For a listener's
+ * bind address, use `isLoopbackBind`.
  */
 export function isLoopbackHost(hostname: string): boolean {
   const h = normalizeHost(hostname);
@@ -84,10 +72,9 @@ export function isLoopbackHost(hostname: string): boolean {
 }
 
 /**
- * Answers "does a listener on this address stay on this machine?" — the
- * question a BIND address asks. A wildcard (`0.0.0.0`, `::`) accepts every
- * interface, so it is NOT loopback here, which is the one case where this
- * predicate and `isLoopbackHost` disagree.
+ * Whether a listener on this BIND address stays on this machine. A wildcard (`0.0.0.0`, `::`)
+ * accepts every interface, so it is NOT loopback here: the only disagreement with
+ * `isLoopbackHost`.
  */
 export function isLoopbackBind(hostname: string): boolean {
   const h = normalizeHost(hostname);
@@ -108,14 +95,10 @@ function parseHost(url: string): string | null {
 /**
  * Whether a scaler places its agents on this machine.
  *
- * An entry that declares its own `orchestratorUrl` has already stated where its
- * agents will connect from: a loopback URL there means the agent runs beside
- * this process, so a loopback storage URL is reachable for it. That is exactly
- * the local dev plane's shape — its scalers point at `ws://127.0.0.1:<port>/ws`
- * — and reading the URL is what lets the plane keep a loopback storage base
- * instead of advertising a LAN address to satisfy a type-only check.
- *
- * With no `orchestratorUrl`, the backend type is the only signal left.
+ * A loopback `orchestratorUrl` on the entry means its agents run beside this process, so a
+ * loopback storage URL reaches them. The local dev plane relies on this (its scalers point at
+ * `ws://127.0.0.1:<port>/ws`) to keep a loopback storage base instead of advertising a LAN
+ * address to satisfy a type-only check. Without `orchestratorUrl`, the backend type decides.
  */
 function scalerIsColocated(entry: { type: ScalerBackendType; orchestratorUrl?: string }): boolean {
   if (entry.orchestratorUrl) {
@@ -126,9 +109,8 @@ function scalerIsColocated(entry: { type: ScalerBackendType; orchestratorUrl?: s
 }
 
 /**
- * Decide whether an agent-facing storage URL is a loopback address that a
- * non-co-located agent could not reach. Returns a remediation message, or null
- * when the configuration is safe.
+ * A remediation message when the agent-facing storage URL is a loopback address a
+ * non-co-located agent cannot reach; null when the configuration is safe.
  */
 export function checkLoopbackAgentEndpoint(input: {
   agentFacingUrl: string | null;
@@ -158,9 +140,8 @@ export function checkLoopbackAgentEndpoint(input: {
 }
 
 /**
- * Resolve the URL an AGENT would use to reach storage, plus the env var an
- * operator would set to fix a loopback misconfiguration. Returns null when the
- * storage backend has no agent-facing URL to validate.
+ * The URL an AGENT uses to reach storage, and the env var that fixes a loopback
+ * misconfiguration; null when the backend has no agent-facing URL.
  */
 export function resolveAgentFacingStorage(
   config: AppConfig,
@@ -224,24 +205,17 @@ export function assertAgentReachableStorage(
  * bound to something other than a loopback address.
  *
  * `KICI_AGENT_AUTH=none` answers `auth.success` to any `auth.request`
- * (`ws/agent-handler.ts`), so a listener on a routable address hands anyone who
- * can reach the port a registered agent: it receives dispatched jobs — with the
- * org's resolved secrets in hybrid mode — and streams results back as the
- * operator's own agent. No credential is involved anywhere in that sequence.
+ * (`ws/agent-handler.ts`), so on a routable address anyone who reaches the port becomes a
+ * registered agent with no credential: it receives dispatched jobs (with the org's resolved
+ * secrets in hybrid mode) and reports results as the operator's own agent.
  *
- * `none` is a local-development affordance, and any bind other hosts can reach
- * is never an intended pairing with it. The one-shot startup warning that used
- * to be the only signal was demonstrably not enough — the local dev plane
- * shipped in exactly this state — so this refuses, following the sibling guard
- * above: an orchestrator misconfiguration that produces a confusing failure
- * later must refuse to start with an actionable message.
+ * `none` is a local-development affordance, never intended with a bind other hosts can reach.
+ * A startup warning alone proved insufficient, so this refuses to start, like the storage
+ * guard above.
  *
- * The bind question is `isLoopbackBind`, not `isLoopbackHost`. The default
- * `KICI_HOST` is the wildcard `0.0.0.0`, which `isLoopbackHost` reports as
- * loopback because a wildcard is not a reachable destination — true of a
- * storage URL, and the opposite of what a listener on it does. So the guard
- * covers the default bind, which is the configuration an operator reaches
- * without setting `KICI_HOST` at all.
+ * It uses `isLoopbackBind`, not `isLoopbackHost`: the default `KICI_HOST` is the wildcard
+ * `0.0.0.0`, which `isLoopbackHost` reports as loopback, so only `isLoopbackBind` covers the
+ * default bind an operator gets without setting `KICI_HOST`.
  */
 export function assertAgentAuthBindSafe(config: AppConfig): void {
   if (config.agentAuth !== 'none') return;

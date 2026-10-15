@@ -359,12 +359,10 @@ export type {
 // Zod re-export for event schema authoring
 export { z } from 'zod';
 
-// Event scaler vocabulary: the reserved scale-up / scale-down event names and
-// their payload schemas, so a provisioning or teardown workflow subscribes with
-// the same constant the orchestrator emits and parses the payload instead of
-// casting it. Defined in `@kici-dev/engine` — the shared floor between the SDK
-// and the orchestrator — and re-exported here because a workflow file may
-// import `@kici-dev/sdk` and nothing else.
+// Event scaler vocabulary (reserved scale-up / scale-down event names and payload
+// schemas), so a provisioning workflow subscribes with the constant the
+// orchestrator emits. Re-exported from `@kici-dev/engine` because a workflow
+// file may import `@kici-dev/sdk` and nothing else.
 export {
   SCALER_EVENT_NAMES,
   ScaleDownReason,
@@ -383,11 +381,9 @@ export type {
   AgentCloudInitOptions,
 } from './agent-cloud-init.js';
 
-// Forge-typed git credentials and repo handles.
-// `resolveCredential` is deliberately NOT on the barrel yet: its consumer is the
-// agent-side clone/withWrite path, and a published export with no consumer is
-// what the public-test-surface gate exists to prevent. It joins the barrel with
-// that path.
+// Forge-typed git credentials and repo handles. `resolveCredential` stays off the
+// barrel until its consumer, the agent-side clone/withWrite path, lands: the
+// public-test-surface gate forbids a published export with no consumer.
 export { assertSecretName } from './git-types.js';
 export type {
   ForgeName,

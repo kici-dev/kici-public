@@ -1,10 +1,7 @@
 import { SecretNotFoundError } from './errors.js';
 
-/**
- * Metadata about a resolved secret -- which backend and scope provided it.
- */
+/** Metadata about a resolved secret -- which backend and scope provided it. */
 export interface SecretMeta {
-  /** The resolved secret value. */
   value: string;
   /** Backend name that provided the secret (e.g., 'pg', 'openbao'). */
   backend: string;
@@ -12,56 +9,38 @@ export interface SecretMeta {
   scope: string;
 }
 
-/**
- * Options for materialising one or more existing secret values as a file
- * on-disk inside the per-step tmpdir.
- */
+/** Options for materialising existing secret values as a file inside the per-step tmpdir. */
 export interface SecretFileOptions {
   /**
-   * Names of existing secret keys to concatenate (in order) into the file.
-   * Each key must resolve via `ctx.secrets.get(key)`; missing keys cause
-   * `SecretNotFoundError` to be thrown (carrying every missing key).
+   * Secret keys to concatenate, in order, into the file. Each must resolve via
+   * `ctx.secrets.get(key)`; missing keys throw `SecretNotFoundError` (carrying
+   * every missing key).
    */
   sources: string[];
-  /**
-   * Optional separator written between concatenated source values.
-   * Default: no divider (values are joined back-to-back).
-   */
+  /** Separator between source values. Default: none (values joined back-to-back). */
   divider?: string;
-  /**
-   * File mode to chmod the materialised file to. Default `0o600`
-   * (owner read/write only).
-   */
+  /** File mode. Default `0o600` (owner read/write only). */
   mode?: number;
-  /**
-   * Optional filename inside the per-step tmpdir. When omitted, the
-   * runtime auto-generates a unique name (`secret-1`, `secret-2`, ...).
-   */
+  /** Filename inside the per-step tmpdir. Default: a unique `secret-1`, `secret-2`, ... */
   name?: string;
 }
 
-/**
- * Result of a `mountFile` / `exposeFile` call.
- */
+/** Result of a `mountFile` / `exposeFile` call. */
 export interface MountedFile {
   /** Absolute path to the materialised file inside the per-step tmpdir. */
   path: string;
 }
 
 /**
- * Host-side adapter passed by the agent to back the file-mount API.
- *
- * The SDK owns the public surface (`mountFile` / `exposeFile`) but defers
- * disk and `process.env` operations to the agent so the SDK stays free of
- * any `node:fs` / `node:os` imports. Local preview/run mode (`kici preview` / `kici run --local`) plugs
- * in the same adapter shape against `os.tmpdir()`.
+ * Agent-side adapter behind `mountFile` / `exposeFile`, so the SDK has no
+ * `node:fs` / `node:os` imports. `kici preview` / `kici run --local` plug in
+ * the same shape against `os.tmpdir()`.
  */
 export interface StepSecretsFileHost {
   /**
-   * Materialise the concatenated content to a file inside the per-step
-   * tmpdir. The host is responsible for chmod + masker registration
-   * (when applicable) and for remembering the file for cleanup.
-   * Returns the absolute path on success.
+   * Write the content to a file in the per-step tmpdir and return its absolute
+   * path. The host owns chmod, masker registration (when applicable) and
+   * remembering the file for cleanup.
    */
   writeMountedFile(args: {
     content: string;
@@ -69,17 +48,13 @@ export interface StepSecretsFileHost {
     mode: number;
     name?: string;
   }): Promise<string>;
-  /**
-   * Track an env var that was set as part of `exposeFile`, so the
-   * runtime can `delete process.env[envVar]` during `dispose()`.
-   */
+  /** Track an `exposeFile` env var so `dispose()` can `delete process.env[envVar]`. */
   trackExposedEnv(envVar: string): void;
 }
 
 /**
- * Async accessor interface for step secrets.
- * Secrets are never automatically injected into environment variables.
- * Use get() to read a secret value, expose() to explicitly inject into env.
+ * Async accessor for step secrets. Secrets are never injected into environment
+ * variables automatically: use get() to read one, expose() to inject it.
  */
 export interface StepSecrets {
   /** Retrieve a secret value by key. Rejects with SecretNotFoundError if not found. */
@@ -91,114 +66,84 @@ export interface StepSecrets {
   /** Retrieve metadata about a resolved secret (backend name and scope). Returns undefined if key not found. */
   getMeta(key: string): SecretMeta | undefined;
   /**
-   * Return every secret key available to this step, sorted alphabetically.
-   * Synchronous, never throws. Returns names only -- call `getMeta(key)` to
-   * inspect backend / scope for a specific key.
+   * Every secret key available to this step, sorted alphabetically. Synchronous,
+   * never throws. Names only -- `getMeta(key)` gives backend / scope.
    */
   list(): string[];
   /**
-   * Materialise one or more existing secrets as a tmpfile inside a
-   * per-step tmpdir. Returns the absolute file path. The file is removed
-   * automatically when the step completes (success, failure, or timeout).
-   * Rejects with `SecretNotFoundError` if any source key is missing.
+   * Materialise existing secrets as a file in a per-step tmpdir and return its
+   * absolute path. The file is removed when the step completes (success,
+   * failure, or timeout). Rejects with `SecretNotFoundError` if any source key
+   * is missing.
    */
   mountFile(opts: SecretFileOptions): Promise<MountedFile>;
   /**
-   * Sugar: call `mountFile(opts)`, then set `process.env[envVar]` to the
-   * resulting path. The env var is unset and the file is removed when
-   * the step completes.
+   * `mountFile(opts)`, then set `process.env[envVar]` to the path. Both are
+   * cleaned up when the step completes.
    */
   exposeFile(envVar: string, opts: SecretFileOptions): Promise<MountedFile>;
 }
 
-/**
- * Extended StepSecrets with access tracking.
- * Tracks which secret keys were accessed via get() or expose() calls.
- * Only key names are recorded -- never values.
- */
+/** StepSecrets that records the key names (never values) accessed via get() or expose(). */
 export interface TrackedStepSecrets extends StepSecrets {
   /** Returns sorted array of secret key names accessed via get() or expose(). */
   getAccessLog(): string[];
   /**
-   * Returns sorted array of secret key names referenced via `mountFile()` /
-   * `exposeFile()`. Mounts are tracked separately from plain `get` / `expose`
-   * accesses so the orchestrator can render a distinct audit row.
+   * Sorted key names referenced via `mountFile()` / `exposeFile()`, tracked
+   * apart from `get` / `expose` so the orchestrator renders a distinct audit row.
    */
   getMountedKeys(): string[];
-  /**
-   * Returns the audit records of every mount call (in order). Used by the
-   * agent to emit `step.secret_mount` IPC events. Each record carries
-   * `{ sources, target, envVar?, kind }`. `target` is the absolute path the
-   * file was materialised to.
-   */
+  /** Every mount call's audit record, in order; the agent emits them as `step.secret_mount` IPC events. */
   getMountRecords(): readonly StepSecretMountRecord[];
 }
 
-/**
- * Kinds of secret-file materialisation operations. Surfaced as the `kind`
- * discriminator on the IPC event so the orchestrator can distinguish a
- * plain mount from a mount-with-env-var binding.
- */
+/** The IPC event's `kind`, distinguishing a plain mount from a mount with an env var binding. */
 export type StepSecretMountKind = 'mountFile' | 'exposeFile';
 
-/**
- * Audit record for a single secret-file materialisation operation.
- * Never contains the file content -- only the key names and the
- * resulting path / env var.
- */
+/** Audit record for one secret-file mount: key names and path / env var, never the content. */
 export interface StepSecretMountRecord {
-  /** Source secret keys (in concatenation order). */
+  /** In concatenation order. */
   sources: string[];
-  /** Absolute path the file was materialised to. */
+  /** Absolute path. */
   target: string;
   /** Env var set when `kind === 'exposeFile'`; otherwise undefined. */
   envVar?: string;
-  /** Discriminator between `mountFile` and `exposeFile`. */
   kind: StepSecretMountKind;
 }
 
 /**
- * Result of {@link createStepSecrets}: the secrets surface itself plus a
- * `dispose` callback the agent invokes from the step-loop `finally` to
- * remove materialised files and clear any exposed env vars.
- *
- * `dispose` swallows its own errors -- it never throws. Failures are
- * surfaced via the optional `onDisposeError` callback passed when the
- * file-mount host was wired in.
+ * Result of {@link createStepSecrets}. The agent calls `dispose` from the
+ * step-loop `finally` to remove materialised files and clear exposed env vars.
+ * `dispose` never throws; failures go to the wiring's `onDisposeError`.
  */
 export interface StepSecretsHandle {
-  /** The secrets surface bound into `ctx.secrets`. */
+  /** Bound into `ctx.secrets`. */
   secrets: TrackedStepSecrets;
-  /** Tear down any materialised files and unset exposed env vars. */
   dispose: () => Promise<void>;
 }
 
 /**
- * Optional wiring for the file-mount + cleanup path. When omitted, calls
- * to `mountFile` / `exposeFile` throw -- the SDK alone cannot mount files
- * (no `node:fs` dependency). Production wires a host implementation in
- * the agent; local test mode wires a minimal `os.tmpdir`-backed host.
+ * File-mount + cleanup wiring. Without it `mountFile` / `exposeFile` throw:
+ * the SDK has no `node:fs` dependency. The agent wires a host; local test mode
+ * wires a minimal `os.tmpdir`-backed one.
  */
 export interface StepSecretsFileWiring {
-  /** The host adapter (see {@link StepSecretsFileHost}). */
   host: StepSecretsFileHost;
-  /** Callback for `dispose()` errors. Receives the error for logging. */
+  /** Receives `dispose()` errors for logging. */
   onDisposeError?: (err: unknown) => void;
-  /** Tear down callback invoked by `dispose()` (removes the tmpdir, etc.). */
+  /** Invoked by `dispose()` (removes the tmpdir, etc.). */
   cleanup: () => Promise<void>;
 }
 
 /**
- * Create a StepSecrets instance backed by a plain secrets map.
- * The env parameter receives exposed secrets via expose().
- * Tracks which secrets are accessed for audit/observability purposes.
+ * Create a StepSecrets backed by a plain secrets map, tracking accessed keys
+ * for audit.
  *
  * @param secretsMap - Flat key-value secrets map
- * @param env - Process environment to inject exposed secrets into
- * @param metaMap - Optional metadata map: the backend and scope each secret key resolved from
- * @param fileWiring - Optional file-mount host adapter. When omitted, `mountFile`
- *   and `exposeFile` throw -- callers that don't wire a host can still use the
- *   string-only `get` / `expose` / `has` / `list` surface.
+ * @param env - Process environment that expose() injects into
+ * @param metaMap - The backend and scope each secret key resolved from
+ * @param fileWiring - When omitted, `mountFile` and `exposeFile` throw; the
+ *   string-only `get` / `expose` / `has` / `list` surface still works.
  */
 export function createStepSecrets(
   secretsMap: Record<string, string>,
@@ -239,10 +184,7 @@ export function createStepSecrets(
       parts.push(secretsMap[key]);
     }
     if (missing.length > 0) {
-      // Throw a single SecretNotFoundError carrying the first missing key in
-      // its `key` field plus every available key for a helpful message. When
-      // more than one source is missing, include the full list in the
-      // message so the workflow author sees them all.
+      // One error: `key` is the first missing key; the message lists them all.
       const err = new SecretNotFoundError(missing[0], Object.keys(secretsMap));
       if (missing.length > 1) {
         (err as Error).message =

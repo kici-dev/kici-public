@@ -2,17 +2,14 @@
  * Pre-formatted ext4 templates for the per-VM overlay drive.
  *
  * Every Firecracker VM gets a writable overlay drive: a sparse file holding an
- * empty ext4 filesystem. Formatting it per spawn runs `mkfs.ext4`, which calls
- * `fsync` on the new file. On a host whose disk has a large write-back backlog
- * (a slow disk, or another tenant writing hundreds of MB) that `fsync` waits
- * behind the whole backlog, and a step that takes 86 ms on an idle disk takes
- * tens of seconds.
+ * empty ext4 filesystem. A per-spawn `mkfs.ext4` calls `fsync`, which on a host
+ * with a large write-back backlog (a slow disk, or another tenant writing
+ * hundreds of MB) turns an 86 ms step into tens of seconds.
  *
  * So the filesystem is formatted once per drive size per host, into
  * `<chrootBaseDir>/firecracker/.overlay-templates/overlay-<MiB>mib.ext4`, and each spawn
- * copies it with `cp --sparse=always`. The copy writes only the allocated
- * blocks (about 2 MB for a 2 GiB drive) into the page cache and never calls
- * `fsync`, so its duration does not depend on the disk backlog.
+ * copies it with `cp --sparse=always`: only the allocated blocks (about 2 MB for
+ * a 2 GiB drive) go to the page cache, with no `fsync`.
  *
  * A template is reused only when its size matches and the ext4 superblock
  * magic is present; anything else is rebuilt. A build writes to a temporary

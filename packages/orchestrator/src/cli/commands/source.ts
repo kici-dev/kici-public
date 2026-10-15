@@ -1,23 +1,6 @@
 /**
- * Source management commands for kici-admin.
- *
- * Provides subcommands for webhook source CRUD:
- *   source add github         Add a new GitHub App source
- *   source add generic        Add a new generic webhook source
- *   source list               List all configured sources
- *   source get <id>           Get details of a specific generic source
- *   source update <routingKey> Update a GitHub source
- *   source update-generic <id> Update a generic source
- *   source remove <routingKey> Remove a source (GitHub or generic with --generic flag)
- *   source redeliver <routingKey> Replay a window of GitHub webhook deliveries
- *   source enable <id>        Enable a generic source
- *   source disable <id>       Disable a generic source
- *
- * Supports multiple secret input modes:
- *   --private-key <value>      Direct value
- *   --private-key @/path/file  Read from file (@ prefix)
- *   --from-env <VAR_NAME>      Read from environment variable
- *   --stdin                    Read from stdin
+ * `kici-admin source` commands: webhook source CRUD. A secret flag takes a
+ * literal value, `@/path/file`, `--from-env <VAR_NAME>` or `--stdin`.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -49,10 +32,8 @@ import {
   DIRECT_DB_URL_HELP,
 } from './shared/cli-action.js';
 
-/** Run `fn` with a GenericSourceManager backed by a one-shot pool built from
- *  `dbUrl`, always closing the pool. GenericSourceManager's constructor takes
- *  only a Kysely handle (no secret store), so this is the full offline path for
- *  generic + local sources. */
+/** Run `fn` on a one-shot pool, always closing it. GenericSourceManager needs
+ *  no secret store, so this is the full offline path for generic + local sources. */
 async function withGenericManager<T>(
   dbUrl: string,
   fn: (mgr: GenericSourceManager) => Promise<T>,
@@ -65,8 +46,8 @@ async function withGenericManager<T>(
   }
 }
 
-/** Shape of a GitHub `sources` row as the HTTP `/api/v1/admin/sources` route
- *  returns it — kept byte-shape-identical so a direct read is a drop-in. */
+/** A GitHub `sources` row, byte-shape-identical to the HTTP
+ *  `/api/v1/admin/sources` response so a direct read is a drop-in. */
 interface GithubSourceRow {
   id: string;
   routingKey: string;
@@ -76,14 +57,11 @@ interface GithubSourceRow {
   config: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
-  /** This orchestrator's direct-ingress URL. Set by the HTTP route only; a
-   *  direct DB read leaves it unset (it needs the running orchestrator). */
+  /** Direct-ingress URL; HTTP route only, since it needs the running orchestrator. */
   ingressUrl?: string | null;
 }
 
-/** Secret-free direct read of the GitHub `sources` table, shaped to the same
- *  row the HTTP `/api/v1/admin/sources` route returns. No PgSecretStore needed
- *  — listing never touches secrets. */
+/** Direct read of the GitHub `sources` table; listing never touches secrets. */
 async function listGithubSourcesDirect(dbUrl: string): Promise<GithubSourceRow[]> {
   const pool = createPool(dbUrl);
   try {
@@ -104,10 +82,8 @@ async function listGithubSourcesDirect(dbUrl: string): Promise<GithubSourceRow[]
   }
 }
 
-/** Secret-free direct customer_id update on the GitHub `sources` table.
- *  SourceStore.updateSource({ customerId }) touches only the row (no secret
- *  store), so we run the minimal Kysely UPDATE directly and skip building a
- *  PgSecretStore (which would need master-key material the offline CLI lacks). */
+/** Direct customer_id update on the GitHub `sources` table. The column is
+ *  secret-free, so this skips PgSecretStore and the master key the offline CLI lacks. */
 async function updateGithubCustomerIdDirect(
   dbUrl: string,
   routingKey: string,
@@ -129,9 +105,7 @@ async function updateGithubCustomerIdDirect(
   }
 }
 
-/** Structural row a listed generic/local source exposes for text rendering.
- *  Both the HTTP `GenericSourceResponse` and the DB `GenericWebhookSource`
- *  satisfy it, so `renderSourceListText` renders either transport's output. */
+/** Satisfied by both the HTTP `GenericSourceResponse` and the DB `GenericWebhookSource`. */
 interface ListableGenericRow {
   id: string;
   name: string;
@@ -140,10 +114,8 @@ interface ListableGenericRow {
   deleted_at?: unknown;
 }
 
-/** Render the human-readable `source list` output shared by the HTTP and the
- *  direct-DB branches. `hasOrg` mirrors whether `--org` was passed (generic
- *  sources are only listed for a specific org). `opts.directDb` marks a direct
- *  DB read, which has no ingress URLs to print. */
+/** Render `source list` text for both transports. Generic sources list only with
+ *  `--org` (`hasOrg`); a direct DB read (`opts.directDb`) has no ingress URLs. */
 export function renderSourceListText(
   githubSources: Array<{
     routingKey: string;
@@ -191,12 +163,10 @@ export function renderSourceListText(
   }
 }
 
-/** Default orchestrator base URL for the webhook trigger route, matching the
- *  kici-admin global `--url` default. */
+/** Matches the kici-admin global `--url` default. */
 const DEFAULT_ORCH_URL = process.env.KICI_ADMIN_URL ?? DEFAULT_ADMIN_URL;
 
-/** Parse a generic source's git_config (string or object) into a LocalSourceConfig.
- *  Returns null when the row is not a valid local source. */
+/** Null when the row is not a valid local source. */
 function parseLocalConfig(
   s: GenericSourceResponse,
 ): { repoBasePath: string; cloneUrlBase?: string } | null {
@@ -206,12 +176,8 @@ function parseLocalConfig(
   return parsed.success ? parsed.data : null;
 }
 
-/**
- * Read a local source's stored config over whichever transport the caller is
- * already on — direct DB when `--database-url` / KICI_DATABASE_URL is in play,
- * otherwise the admin API. Used to preserve `repoBasePath` when only the clone
- * base is being changed; returns null when the id names no local source.
- */
+/** Read a local source's config over the caller's transport (direct DB or admin
+ *  API); null when the id names no local source. */
 async function readLocalSourceConfig(
   id: string,
   databaseUrl: string | undefined,
@@ -234,17 +200,13 @@ function safeParse(value: string): unknown {
   }
 }
 
-/**
- * Resolve a secret value from various input modes.
- * Returns undefined if no input mode is specified.
- */
+/** Undefined when no input mode is given. */
 async function resolveSecret(opts: {
   value?: string;
   stdin?: boolean;
   fromEnv?: string;
 }): Promise<string | undefined> {
   if (opts.value) {
-    // @file: prefix reads from file
     if (opts.value.startsWith('@')) {
       return (await readFile(opts.value.slice(1), 'utf-8')).trim();
     }
@@ -274,12 +236,8 @@ async function readFromStdin(): Promise<string> {
 export const BOTH_STDIN_ERROR =
   'cannot read both the private key and the webhook secret from stdin — use @file or --from-env for one of them';
 
-/**
- * Resolve the `--webhook-secret` value. A literal value passes through; `-`
- * reads the secret from stdin; absent stays undefined. The private key can also
- * be piped via `--stdin`, and stdin can only be consumed once — so `-` here
- * while the private key also reads stdin is a hard error.
- */
+/** `-` reads stdin. Stdin is consumable once, so `-` while the private key also
+ *  reads `--stdin` is a hard error. */
 export async function resolveWebhookSecret(
   opts: { value?: string; privateKeyFromStdin: boolean },
   readStdin: () => Promise<string> = readFromStdin,
@@ -344,9 +302,8 @@ function printRedeliverResult(res: RedeliverResponseJson): void {
     console.log(`${res.routingKey}: no deliveries in ${window}.`);
     return;
   }
-  // A truncated walk must never read as a complete one: the tally below counts
-  // only what was gathered, and an operator recovering an outage would
-  // otherwise believe the window was fully replayed.
+  // A truncated walk must never read as complete, or an operator recovering an
+  // outage believes the window was fully replayed.
   if (res.truncated) {
     console.log(
       `${res.routingKey}: WARNING — more deliveries exist in ${window} than could be listed. ` +
@@ -376,10 +333,6 @@ function printRedeliverResult(res: RedeliverResponseJson): void {
   console.log(`  ${res.redelivered} redelivered, ${res.failed} failed${partial}.`);
 }
 
-/**
- * Print a `source refresh` result, showing old → new for name + slug, then any
- * missing event or permission.
- */
 function printRefreshResult(r: RefreshResultJson): void {
   if (!r.changed) {
     console.log(`${r.routingKey}: up to date (name "${r.newName}", slug "${r.newSlug}")`);
@@ -419,9 +372,6 @@ function printRequirementGaps(r: RefreshResultJson): void {
   }
 }
 
-/**
- * Format a generic source for display.
- */
 function formatGenericSource(s: GenericSourceResponse): void {
   console.log(`  ID:                   ${s.id}`);
   console.log(`  Name:                 ${s.name}`);
@@ -464,9 +414,7 @@ function formatGenericSource(s: GenericSourceResponse): void {
     } catch {
       gc = null;
     }
-    // A local (`file://`) source stores its config in the same git_config column,
-    // discriminated by provider_type='local'. Render its fields, not the
-    // universal-git ones.
+    // A local source shares the git_config column, discriminated by provider_type='local'.
     if (gc && s.provider_type === 'local') {
       console.log(`  Local (file://):      yes`);
       if (typeof gc.repoBasePath === 'string') {
@@ -499,9 +447,6 @@ function formatGenericSource(s: GenericSourceResponse): void {
   }
 }
 
-/**
- * Parse a comma-separated string into an array, or return undefined.
- */
 function parseCommaSeparated(value: string | undefined): string[] | undefined {
   if (!value) return undefined;
   return value
@@ -510,11 +455,7 @@ function parseCommaSeparated(value: string | undefined): string[] | undefined {
     .filter(Boolean);
 }
 
-/**
- * Read a PEM-ish string from either a literal value or a file (when the
- * value begins with '@'). Used by the --ssh-known-hosts-pem flag, which
- * follows the same @-prefix convention as --private-key / --secret.
- */
+/** A literal value, or a file when it begins with `@` (the --private-key convention). */
 async function readPemMaybeFromFile(value: string | undefined): Promise<string | undefined> {
   if (!value) return undefined;
   if (value.startsWith('@')) {
@@ -524,12 +465,9 @@ async function readPemMaybeFromFile(value: string | undefined): Promise<string |
 }
 
 /**
- * Universal-git flag set shared by `source add generic` and
- * `source update-generic`. Assembles a `gitConfig` object from CLI flags,
- * or returns `undefined` if none of the universal-git flags are set.
- *
- * Throws (caught by the caller) with a clear message on required-flag
- * combinations that would otherwise fail at Zod validation later.
+ * Build `gitConfig` from the universal-git flags of `source add generic` and
+ * `source update-generic`; undefined when none is set. Throws a clear message on
+ * a missing required flag that would otherwise fail later at Zod validation.
  */
 async function buildUniversalGitConfigFromOpts(
   opts: Record<string, unknown>,
@@ -611,8 +549,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     )
     .option('--json', 'Emit raw JSON (the API response) instead of formatted text')
     .action(async (opts) => {
-      // One-click manifest setup creates AND configures the App for the
-      // operator; the manual path below only stores already-created credentials.
+      // Manifest setup creates the App; the manual path only stores existing credentials.
       if (opts.manifest) {
         try {
           await runGithubManifestSetup(
@@ -709,10 +646,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--allowed-events <events>', 'Comma-separated list of allowed event types')
     .option('--strip-headers <headers>', 'Comma-separated list of headers to strip')
     .option('--rate-limit <rpm>', 'Rate limit in requests per minute (default: 600)', parseInt)
-    // Universal-git flags: present iff the source should also know
-    // how to clone, fetch lock files, and match triggers against a real git
-    // server. Supplying --preset or --git-url-template flips this source
-    // into a universal-git source; omitting them keeps it payload-only.
+    // Universal-git flags make the source clone, fetch lock files and match
+    // triggers against a real git server; without them it stays payload-only.
     .option(
       '--preset <name>',
       'Universal-git preset: forgejo, gitea, gogs, gitlab-repo, github-repo, custom',
@@ -734,7 +669,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--json', 'Emit raw JSON (the full source row) instead of formatted text')
     .action(
       cliAction(async (opts) => {
-        // Build verification config from secret input
         const secret = await resolveSecret({
           value: opts.secret,
           stdin: opts.stdin,
@@ -794,10 +728,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // source add local
-  // Register a git repository present on the agent's filesystem as a file://
-  // source. Verification is 'none' by design (no remote forge to sign the
-  // payload) — only point it at repos the operator trusts.
+  // Verification is 'none' by design (no remote forge signs the payload): point
+  // it only at repos the operator trusts.
   add
     .command('local')
     .description('Register a git repo present on the agent filesystem as a file:// source')
@@ -872,11 +804,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source list-presets --
-  // Dump the built-in universal-git preset table so operators can discover
-  // which forge shapes KiCI knows natively without digging into source code.
-  // Intentionally local (no network call) — listing presets is a pure code
-  // concern and stays operable even when the orchestrator is offline.
+  // Local by design (no network call): works while the orchestrator is offline.
   src
     .command('list-presets')
     .description('List built-in universal-git presets (forge shapes supported out of the box)')
@@ -919,7 +847,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       console.log('Use with: kici-admin source add generic --preset <name> ...');
     });
 
-  // -- source list --
   src
     .command('list')
     .description('List all configured sources (GitHub and generic)')
@@ -949,7 +876,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           return;
         }
 
-        // List GitHub sources
         const { sources: githubSources } = await getClient().get<{
           sources: Array<{
             id: string;
@@ -990,7 +916,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source get-webhook-secret <routingKey> --
   src
     .command('get-webhook-secret <routingKey>')
     .description('Get the webhook secret for a source (for GitHub webhook configuration)')
@@ -1013,7 +938,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source get <id> --
   src
     .command('get <id>')
     .description('Get details of a generic webhook source')
@@ -1030,7 +954,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source update <routingKey> (GitHub sources) --
   src
     .command('update <routingKey>')
     .description('Update a GitHub source')
@@ -1045,10 +968,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       cliAction(async (routingKey: string, opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (dbUrl) {
-          // Direct-DB mode only reassigns customer_id (the secret-free column).
-          // Secret / key / name updates touch the secret store, which the
-          // offline CLI has no master key for — reject them with a clear hint
-          // rather than silently dropping the changes.
+          // Direct-DB mode reassigns only customer_id: other updates touch the
+          // secret store, which needs a master key. Reject them, never drop them silently.
           if (opts.privateKey || opts.webhookSecret || opts.stdin || opts.fromEnv || opts.name) {
             console.error(
               'Error: --database-url mode supports only --org updates; ' +
@@ -1084,12 +1005,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source refresh <routingKey> --
-  // Re-sync a GitHub source's display name + slug from GitHub. GitHub is the
-  // source of truth: this fetches `GET /app` now and applies any drift, printing
-  // old → new for both fields, then warns about any missing event or permission
-  // and any installation pending approval. With --all, every GitHub source is
-  // refreshed.
+  // GitHub is the source of truth: fetch `GET /app` and apply any name/slug drift.
   src
     .command('refresh [routingKey]')
     .description(
@@ -1134,11 +1050,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source redeliver <routingKey> --
-  // Ask GitHub to resend every delivery for this App in a time window. The
-  // orchestrator holds the App private key, so it is the only tier that can
-  // drive GitHub's App-level delivery endpoints. Use it to recover a window
-  // whose deliveries never landed: GitHub does not retry on its own.
+  // Only the orchestrator holds the App private key that GitHub's App-level
+  // delivery endpoints need. GitHub does not retry failed deliveries on its own.
   src
     .command('redeliver <routingKey>')
     .description("Ask GitHub to resend a GitHub App source's webhook deliveries from a window")
@@ -1174,7 +1087,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source update-generic <id> --
   src
     .command('update-generic <id>')
     .description('Update a generic webhook source')
@@ -1195,9 +1107,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--allowed-events <events>', 'Comma-separated list of allowed event types')
     .option('--strip-headers <headers>', 'Comma-separated list of headers to strip')
     .option('--rate-limit <rpm>', 'Rate limit in requests per minute', parseInt)
-    // Universal-git flags mirror `source add generic`. Supplying any of them
-    // re-validates the full gitConfig; pass --clear-git-config to revert the
-    // source to payload-only.
+    // Any universal-git flag re-validates the full gitConfig.
     .option('--preset <name>', 'Universal-git preset')
     .option('--git-url-template <url>', 'Clone URL template')
     .option('--credential-ref <key>', 'Secret key name')
@@ -1275,8 +1185,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source update-local <id> --
-  // Update a local (file://) source's repoBasePath / cloneUrlBase.
   src
     .command('update-local <id>')
     .description('Update a local filesystem (file://) source')
@@ -1292,13 +1200,10 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           localConfig?: { repoBasePath: string; cloneUrlBase?: string };
         } = {};
         if (opts.name) data.name = opts.name;
-        // `--clone-url-base` applies on its own, without `--path`: switching a
-        // local source from file:// to a git daemon changes only the clone
-        // base, so the operator does not have to re-supply the unchanged path.
+        // `--clone-url-base` applies without `--path`, keeping the stored path.
         if (opts.path !== undefined || opts.cloneUrlBase !== undefined) {
           let repoBasePath: string | undefined = opts.path;
           if (repoBasePath === undefined) {
-            // Keep the stored path when only the clone base is being changed.
             const existing = await readLocalSourceConfig(id, opts.databaseUrl, getClient);
             if (!existing) {
               console.error(`Error: no local source with id ${id}`);
@@ -1347,7 +1252,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source remove <routingKey> --
   src
     .command('remove <routingKey>')
     .description('Remove a source (GitHub, or generic/local with --generic / --local)')
@@ -1365,9 +1269,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
 
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (dbUrl) {
-          // Direct-DB delete only covers generic/local rows (GenericSourceManager
-          // owns no secret store). GitHub-source removal touches secret material,
-          // so it stays HTTP-only.
+          // GitHub-source removal touches secret material, so it stays HTTP-only.
           if (!opts.generic && !opts.local) {
             console.error(
               'Error: --database-url mode supports only --generic / --local removal; ' +
@@ -1384,8 +1286,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           return;
         }
 
-        // Local sources are generic_webhook_sources rows, so they soft/hard
-        // delete through the same admin endpoint as --generic.
+        // Local sources are generic_webhook_sources rows: same endpoint as --generic.
         if (opts.generic || opts.local) {
           const result = await getClient().deleteGenericSource(routingKey, opts.hard);
           const mode = result.hard ? 'permanently deleted' : 'soft-deleted';
@@ -1402,7 +1303,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source enable <id> --
   src
     .command('enable <id>')
     .description('Enable a generic webhook source')
@@ -1419,7 +1319,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source disable <id> --
   src
     .command('disable <id>')
     .description('Disable a generic webhook source')
@@ -1430,11 +1329,8 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source trigger-local <id> --
-  // Drive a run against a local source by POSTing a synthetic GitHub-shaped
-  // webhook to the orchestrator's generic webhook route. When --ref/--sha are
-  // omitted, HEAD is read from the local repo (so this must run where the repo
-  // is reachable).
+  // POSTs a synthetic GitHub-shaped webhook to the generic webhook route. Without
+  // --ref/--sha it reads HEAD, so it must run where the repo is reachable.
   src
     .command('trigger-local <id>')
     .description('Trigger a run against a local source (reads HEAD when --ref/--sha omitted)')
@@ -1457,9 +1353,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         }
         const head =
           opts.ref && opts.sha ? { ref: opts.ref, sha: opts.sha } : readRepoHead(cfg.repoBasePath);
-        // The generic webhook route resolves a source by (customer_id, name) —
-        // NOT by the routing key's id segment — so the trigger URL must carry
-        // the source's org + name.
+        // The route resolves a source by (customer_id, name), not the routing key's id segment.
         const orgId = source.customer_id;
         const sourceId = source.name;
         const req = buildLocalTriggerRequest({
@@ -1478,8 +1372,6 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       }),
     );
 
-  // -- source install-hook <id> --
-  // Write a post-receive hook into the local repo so every push triggers a run.
   src
     .command('install-hook <id>')
     .description('Install a post-receive hook in the local source repo that triggers runs on push')

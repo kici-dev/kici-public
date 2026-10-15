@@ -19,6 +19,7 @@ import {
 } from './test-pipeline.js';
 import type { ProcessingDeps } from './processor.js';
 import type { ActorPrincipal } from '@kici-dev/engine';
+import { lockFileFixture, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 describe('repoIdentityFromInlineInput', () => {
   it('derives identity from the event payload, never the routing key', () => {
@@ -47,24 +48,15 @@ describe('repoIdentityFromInlineInput', () => {
 // --- Mock helpers ---
 
 /**
- * Kysely-like `updateTable` builder mock.
+ * Kysely-like `updateTable` builder mock with chainable `.where()`:
+ * `insertEdgesForRun` and `recomputeNeedsSatisfied` chain several, and a
+ * non-chaining `.where()` throws into the callers' catch, silently leaving the
+ * root jobs unmarked. `.where()` discards its predicates, so a test observes
+ * WHAT an update set, not WHICH rows it targeted.
  *
- * In Kysely every `.where()` returns a builder that itself exposes `.where()`
- * and `.execute()`, so predicates chain. `insertEdgesForRun` marks a run's root
- * jobs with `.where('run_id', ...).where('job_name', ...).execute()` and
- * `recomputeNeedsSatisfied` chains three, so a `.where()` that resolves to a
- * bare `{ execute }` makes those updates throw — and their callers catch and
- * log the throw, which leaves the mocked run's root jobs silently unmarked and
- * hides the real update from any assertion.
- *
- * The mock reproduces the chaining only: `.where()` discards its predicate
- * arguments, so a test can observe WHAT an update set, not WHICH rows it
- * targeted.
- *
- * @param onSet observer for the `.set()` payload, called as soon as `.set()` is
- *   applied — even if the chain never reaches `.execute()`.
- * @param onExecute observer for the same payload, called only when the built
- *   update actually reaches `.execute()` — i.e. the whole chain resolved.
+ * @param onSet called as soon as `.set()` is applied, even if the chain never
+ *   reaches `.execute()`.
+ * @param onExecute called only when the whole chain reaches `.execute()`.
  */
 function makeUpdateTableMock(
   onSet?: (payload: Record<string, unknown>) => void,
@@ -85,13 +77,12 @@ function makeUpdateTableMock(
 }
 
 function createMockLockFile(workflows: any[] = []) {
-  return {
+  return lockFileFixture({
     schemaVersion: 4 as const,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
     contentHash: 'abc123',
     lockfileHash: 'lock123',
     workflows,
-  };
+  });
 }
 
 function createMockWorkflow(name: string, jobs: any[] = []) {
@@ -110,14 +101,12 @@ function createMockWorkflow(name: string, jobs: any[] = []) {
       jobs.length > 0
         ? jobs
         : [
-            {
-              _type: 'static' as const,
+            staticJob({
               name: 'test-job',
               runsOn: [{ kind: 'exact', value: 'default' }],
               steps: [{ name: 'echo', run: 'echo hello' }],
-              needs: [],
               rules: [],
-            },
+            }),
           ],
   };
 }
@@ -174,8 +163,8 @@ describe('processTestTrigger', () => {
     (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
 
     const setCalls: Array<Record<string, unknown>> = [];
-    // The is_test_run / fixture_id stamp now happens inside the shared core
-    // (recordRunStart) via deps.db, driven by the testRun meta the adapter sets.
+    // The shared core (recordRunStart) stamps is_test_run / fixture_id via
+    // deps.db, from the testRun meta the adapter sets.
     const mockDb = {
       // resolveOrgId chain → no source row → '__default__'.
       selectFrom: vi.fn(() => ({
@@ -212,7 +201,6 @@ describe('processTestTrigger', () => {
 
     // The in-memory test-run marker fires before dispatch.
     expect(executionTracker.markTestRun).toHaveBeenCalledWith(result.runId);
-    // Verify execution tracker registered the run.
     expect(executionTracker.onExecutionStarted).toHaveBeenCalledOnce();
     const trackerArgs = executionTracker.onExecutionStarted.mock.calls[0];
     expect(trackerArgs[0]).toBe(result.runId); // runId
@@ -247,15 +235,13 @@ describe('processTestTrigger', () => {
 
   it('expands a matrix job into N dispatches each carrying matrixValues', async () => {
     const matrixWorkflow = createMockWorkflow('ci', [
-      {
-        _type: 'static' as const,
+      staticJob({
         name: 'test-job',
         runsOn: [{ kind: 'exact', value: 'default' }],
         steps: [{ name: 'echo', run: 'echo hello' }],
-        needs: [],
         rules: [],
         matrix: { _type: 'static', values: { variant: ['a', 'b'] } },
-      },
+      }),
     ]);
     (deps.lockFileCache.get as any).mockResolvedValue(createMockLockFile([matrixWorkflow]));
 
@@ -273,22 +259,18 @@ describe('processTestTrigger', () => {
 
   it('honors the needs DAG: only the root job is dispatched, the downstream stays gated', async () => {
     const needsWorkflow = createMockWorkflow('ci', [
-      {
-        _type: 'static' as const,
-        name: 'build',
+      staticJob({
         runsOn: [{ kind: 'exact', value: 'default' }],
         steps: [{ name: 'b', run: 'echo build' }],
-        needs: [],
         rules: [],
-      },
-      {
-        _type: 'static' as const,
+      }),
+      staticJob({
         name: 'deploy',
         runsOn: [{ kind: 'exact', value: 'default' }],
         steps: [{ name: 'd', run: 'echo deploy' }],
         needs: ['build'],
         rules: [],
-      },
+      }),
     ]);
     (deps.lockFileCache.get as any).mockResolvedValue(createMockLockFile([needsWorkflow]));
 
@@ -296,9 +278,8 @@ describe('processTestTrigger', () => {
     const result = await processTestTrigger(createMockInput(), deps);
 
     expect(result.status).toBe('accepted');
-    // Only the root `build` reaches the dispatcher; `deploy` is gated by the
-    // needs scheduler until `build` completes (the webhook-path behavior, now
-    // shared by kici run via the unified core).
+    // Only the root `build` reaches the dispatcher; the needs scheduler gates
+    // `deploy` until `build` completes, as on the webhook path.
     const dispatchedNames = dispatchSpy.mock.calls.map((c: any[]) => c[0].jobName);
     expect(dispatchedNames).toEqual(['build']);
   });
@@ -347,8 +328,7 @@ describe('processTestTrigger', () => {
 
     expect(result.status).toBe('accepted');
     const dispatchedNames = dispatchSpy.mock.calls.map((c: any[]) => c[0].jobName).sort();
-    // One pinned execution per host (the kici run analog of the webhook-only
-    // runsonall fan-out).
+    // One pinned execution per host, as in the webhook runsOnAll fan-out.
     expect(dispatchedNames).toEqual(['fan (h1)', 'fan (h2)']);
   });
 
@@ -462,14 +442,12 @@ describe('processTestTrigger', () => {
           },
         ],
         jobs: [
-          {
-            _type: 'static' as const,
+          staticJob({
             name: 'gates',
             runsOn: [{ kind: 'exact', value: 'default' }],
             steps: [{ name: 'echo', run: 'echo hello' }],
-            needs: [],
             rules: [],
-          },
+          }),
         ],
       };
     }
@@ -550,10 +528,8 @@ describe('processTestTrigger', () => {
   });
 
   it('accepts the full ProcessingDeps bag (hostRosterStore + maxFanoutHosts) and dispatches', async () => {
-    // The test path now receives the same ProcessingDeps the webhook entry
-    // builds, so the host/init/dynamic deps are present (single-orch: no
-    // coordinator). This proves the type migration: a ProcessingDeps carrying
-    // hostRosterStore/maxFanoutHosts is a valid input to processTestTrigger.
+    // The test path takes the same ProcessingDeps the webhook entry builds
+    // (single-orch: no coordinator).
     const procDeps = createMockDeps({
       hostRosterStore: { findFanoutTargets: vi.fn().mockResolvedValue([]) } as any,
       maxFanoutHosts: 1024,
@@ -703,9 +679,8 @@ describe('processTestTrigger', () => {
     const dispatchSpy = deps.dispatcher.dispatch as any;
     await processTestTrigger(input, deps);
 
-    // The fixture mapping { contextName: contextName } is resolved into
-    // namespaced secrets, never forwarded verbatim as the dead `testSecrets`
-    // field (which only the local test-runner ever consumed).
+    // The fixture mapping resolves into namespaced secrets, never forwarded
+    // verbatim as `testSecrets`.
     const jobConfig = dispatchSpy.mock.calls[0][0].jobConfig;
     expect(jobConfig.testSecrets).toBeUndefined();
   });
@@ -885,15 +860,13 @@ describe('processTestTrigger', () => {
 
     it('skips a non-test-allowed bound env on a fullRepo run (no longer rejects)', async () => {
       const workflowWithEnv = createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'deploy-job',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
-          needs: [],
           rules: [],
           contexts: [{ value: 'production', dynamic: false }],
-        },
+        }),
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
 
@@ -927,15 +900,13 @@ describe('processTestTrigger', () => {
 
     it('applies a test-allowed bound env on a fullRepo run', async () => {
       const workflowWithEnv = createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'deploy-job',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
-          needs: [],
           rules: [],
           contexts: [{ value: 'staging', dynamic: false }],
-        },
+        }),
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
 
@@ -963,15 +934,13 @@ describe('processTestTrigger', () => {
 
     it('skips a non-test-allowed bound env on a real-repo (remote) run', async () => {
       const workflowWithEnv = createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'deploy-job',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
-          needs: [],
           rules: [],
           contexts: [{ value: 'production', dynamic: false }],
-        },
+        }),
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
@@ -1029,18 +998,16 @@ describe('processTestTrigger', () => {
 
     it('warns but dispatches with the test-allowed env when a job binds [test-allowed, non-test]', async () => {
       const workflowWithEnv = createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'deploy-job',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
-          needs: [],
           rules: [],
           contexts: [
             { value: 'staging', dynamic: false },
             { value: 'production', dynamic: false },
           ],
-        },
+        }),
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
 
@@ -1070,15 +1037,13 @@ describe('processTestTrigger', () => {
 
     it('warns (does not reject) when a bound env is unconfigured on a test run', async () => {
       const workflowWithEnv = createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'deploy-job',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
-          needs: [],
           rules: [],
           contexts: [{ value: 'ghost-env', dynamic: false }],
-        },
+        }),
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
 
@@ -1119,9 +1084,8 @@ describe('processTestTrigger', () => {
   describe('test-scoped secret resolution', () => {
     const TEST_ORG = 'org-secret-test';
 
-    // Build a db mock that answers resolveOrgId (sources lookup), the env gate +
-    // fixture-namespaced env lookups, and the core's env-rules concurrency query,
-    // keyed on the table name.
+    // Answers resolveOrgId, the env gate + fixture-namespaced env lookups, and
+    // the core's env-rules concurrency query, keyed on the table name.
     function makeSecretDb(envRows: Record<string, { allow_local_execution: boolean }>) {
       return {
         fn: { countAll: () => ({ as: () => ({}) }) },
@@ -1272,15 +1236,13 @@ describe('processTestTrigger', () => {
 
     it('CLI-uploaded secrets override test-env values', async () => {
       const workflowWithEnv = createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'test-job',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'echo', run: 'echo hi' }],
-          needs: [],
           rules: [],
           contexts: [{ value: 'test-database', dynamic: false }],
-        },
+        }),
       ]);
       const lockFile = createMockLockFile([workflowWithEnv]);
       const perEnv = new Map<string, Record<string, string>>([
@@ -1413,15 +1375,13 @@ describe('processTestTrigger', () => {
 
     function staticContextWorkflow() {
       return createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'deploy-job',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
-          needs: [],
           rules: [],
           contexts: [{ value: 'test-db', dynamic: false }],
-        },
+        }),
       ]);
     }
 
@@ -1444,10 +1404,8 @@ describe('processTestTrigger', () => {
       const result = await processTestTrigger(input, deps);
 
       expect(result.status).toBe('accepted');
-      // insertEdgesForRun marks the run's root jobs with a chained
-      // `.where().where().execute()` update. A mock whose `.where()` is not
-      // itself chainable makes that update throw into the caller's catch, so
-      // asserting the execute landed is what keeps the mock honest.
+      // Asserting the chained root-job update reached `.execute()` keeps the
+      // mock honest (see `makeUpdateTableMock`).
       expect(executed.some((payload) => payload.needs_satisfied === true)).toBe(true);
     });
 
@@ -1589,16 +1547,14 @@ describe('processTestTrigger', () => {
 
     function staticEnvWorkflow() {
       return createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'deploy-job',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
-          needs: [],
           rules: [],
           contexts: [{ value: 'test-db', dynamic: false }],
           env: { FOO: 'bar' },
-        },
+        }),
       ]);
     }
 
@@ -1647,15 +1603,13 @@ describe('processTestTrigger', () => {
       // The agent's init job resolves a dynamic env, so the dispatched job
       // carries no in-process jobEnv — the field takes the init marker.
       const dynamicEnvJobWorkflow = createMockWorkflow('ci', [
-        {
-          _type: 'static' as const,
+        staticJob({
           name: 'deploy-job',
           runsOn: [{ kind: 'exact', value: 'default' }],
           steps: [{ name: 'deploy', run: 'echo deploy' }],
-          needs: [],
           rules: [],
           dynamicEnv: true,
-        },
+        }),
       ]);
       const lockFile = createMockLockFile([dynamicEnvJobWorkflow]);
       (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
@@ -1708,16 +1662,10 @@ describe('processTestTrigger', () => {
 });
 
 /**
- * Attribution of a remote test run onto `execution_runs`.
- *
- * `triggered_by` existed and was documented as "user identity that triggered
- * this run", but the relayed test path never populated it — no actor reached
- * this pipeline at all — so a `kici run remote` run was the one run shape with
- * no initiator recorded anywhere in the orchestrator.
- *
- * The rendering deliberately reuses the pair the dashboard re-run path already
- * uses (`stringifyActor` + `agentLabelOf`), rather than inventing a second one:
- * two renderings of one identity is how they drift.
+ * Attribution of a remote test run (`kici run remote`) onto
+ * `execution_runs.triggered_by`. The rendering reuses the dashboard re-run
+ * path's `stringifyActor` + `agentLabelOf`: two renderings of one identity
+ * drift.
  */
 describe('processTestTrigger records the triggering actor', () => {
   let deps: ProcessingDeps;
@@ -1726,11 +1674,9 @@ describe('processTestTrigger records the triggering actor', () => {
   });
 
   /**
-   * Positional indices into `onExecutionStarted`, whose signature is a long
-   * positional list. Read off the call sites in `dispatch-matched-workflow.ts`,
-   * which label the agent-label argument in a trailing comment. If the
-   * signature is ever reordered these assertions fail rather than silently
-   * reading a neighbouring argument, which is the right failure direction.
+   * Positional indices into `onExecutionStarted`, read off the call sites in
+   * `dispatch-matched-workflow.ts`. A reordered signature fails these
+   * assertions rather than silently reading a neighbouring argument.
    */
   const TRIGGERED_BY_ARG = 15;
   const TRIGGERED_BY_AGENT_LABEL_ARG = 23;
@@ -1776,8 +1722,7 @@ describe('processTestTrigger records the triggering actor', () => {
   it('records a plain user actor as triggered_by with no agent label', async () => {
     const args = await runWithActor({ type: 'user', sub: 'kc-sub-123' });
     expect(args[TRIGGERED_BY_ARG]).toBe('user:kc-sub-123');
-    // Null, not the string "null" and not a stray label: the column is the
-    // provenance half and a non-agent run genuinely has none.
+    // Null, not "null" or a stray label: a non-agent run has no agent label.
     expect(args[TRIGGERED_BY_AGENT_LABEL_ARG]).toBeNull();
   });
 

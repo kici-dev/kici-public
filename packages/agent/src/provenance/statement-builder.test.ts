@@ -54,8 +54,8 @@ describe('buildProvenanceStatement', () => {
       finishedOn: '2026-06-11T00:00:00.000Z',
     });
     expect(() => kiciProvenanceStatementSchema.parse(stmt)).not.toThrow();
-    // Coerces to the exact shape the live verifier (crossCheckBuildContext)
-    // now accepts for null claims: repository/ref/path → '', commit omitted.
+    // The shape crossCheckBuildContext accepts for null claims:
+    // repository/ref/path → '', commit omitted.
     const wf = stmt.predicate.buildDefinition.externalParameters.workflow;
     expect(wf.repository).toBe('');
     expect(wf.ref).toBe('');
@@ -113,7 +113,7 @@ describe('buildLocalProvenanceStatement — cross-checkable against a live mint'
     finishedOn: '2026-06-11T00:01:00.000Z',
   };
 
-  /** The orchestrator's context, derived from the same run row the mint reads. */
+  /** Derived from the run row the mint reads. */
   const context = {
     repository: claims.repository,
     ref: claims.ref,
@@ -153,8 +153,8 @@ describe('buildLocalProvenanceStatement — cross-checkable against a live mint'
       ...TIMES,
     });
 
-    // The ONLY difference is the deferred marker. Anything else would be a
-    // field the capture cross-check would reject on every legitimate defer.
+    // Only the deferred marker may differ; anything else fails the capture
+    // cross-check on every legitimate defer.
     const stripOrigin = (s: typeof frozen) => {
       const ip = { ...s.predicate.buildDefinition.internalParameters };
       delete (ip as Record<string, unknown>).attestationOrigin;
@@ -183,9 +183,8 @@ describe('buildLocalProvenanceStatement — cross-checkable against a live mint'
   });
 
   it('still builds a schema-valid statement with no orchestrator context', () => {
-    // The fallback an older orchestrator's dispatch leaves the agent with. It
-    // is schema-valid, and it fails the capture cross-check — which is the
-    // point: the defer is dropped rather than stored unchecked.
+    // An older orchestrator's dispatch leaves this fallback: schema-valid, and
+    // failing the capture cross-check, so the defer is dropped, not stored unchecked.
     const fallback = buildLocalProvenanceStatement({
       context: {
         repository: 'acme/app',

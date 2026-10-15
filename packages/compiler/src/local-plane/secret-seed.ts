@@ -1,18 +1,15 @@
 /**
- * Seed a project's local `secrets.yaml` (and `.kici/.secrets` INI) contexts into
- * the local dev plane's real `scoped_secrets` store, preserving context/scope
- * structure so the plane's real `SecretResolver` honors scoping at dispatch —
- * the routed local run resolves scoped secrets through the plane's real
- * resolver rather than a flat merge.
+ * Seeds a project's local `secrets.yaml` (and `.kici/.secrets` INI) contexts
+ * into the local dev plane's real `scoped_secrets` store, keeping the
+ * context/scope structure so the plane's real `SecretResolver` honors scoping
+ * at dispatch, not a flat merge.
  *
- * Local secret files are READ-ONLY here: values are only READ and transit into
- * the local plane's Postgres via the admin secret API. Nothing is written back
- * to a secret file, and nothing leaves this machine (the plane is local).
+ * Local secret files are READ-ONLY: values only transit into the local plane's
+ * Postgres via the admin secret API, and nothing leaves this machine.
  *
- * Scope model: each `secrets.yaml` top-level key is a context name. The seeder
- * creates a context of that name, binds it to a scope pattern equal to the
- * context name, and stores each secret at that scope. So a workflow job bound to
- * context `production` resolves `production`-scoped secrets through the resolver.
+ * Each top-level key is a context, bound to a scope pattern equal to its name,
+ * with each secret stored at that scope: a job bound to `production` resolves
+ * `production`-scoped secrets.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -21,7 +18,7 @@ import { parse as parseYaml } from 'yaml';
 import { AdminApiClient } from '@kici-dev/orchestrator';
 import { parseSecretsFile } from '../test-runner/secrets-file.js';
 
-/** Minimal AdminApiClient surface the seeder needs (for test injection). */
+/** For test injection. */
 export interface SecretSeedClient {
   createContext(data: {
     orgId: string;
@@ -37,15 +34,11 @@ export interface SecretSeedClient {
   setSecret(orgId: string, scope: string, key: string, value: string): Promise<void>;
 }
 
-/** Result of a seed run: the contexts seeded and how many secret keys landed. */
 export interface SeededSecrets {
   contexts: string[];
   secretCount: number;
 }
 
-/**
- * Read a file, returning null when it does not exist.
- */
 async function readFileOrNull(filePath: string): Promise<string | null> {
   try {
     return await readFile(filePath, 'utf-8');
@@ -58,9 +51,8 @@ async function readFileOrNull(filePath: string): Promise<string | null> {
 }
 
 /**
- * Parse `secrets.yaml`, PRESERVING its top-level context structure (a flat merge
- * would collapse the contexts). Top-level keys are context names; values are
- * key→value maps. Non-scalar leaf values are stringified.
+ * Keeps the top-level context structure (a flat merge would collapse it).
+ * Scalar leaf values are stringified; non-scalar leaves are dropped.
  */
 function parseSecretsYamlContexts(content: string): Record<string, Record<string, string>> {
   const parsed = parseYaml(content);
@@ -82,18 +74,15 @@ function parseSecretsYamlContexts(content: string): Record<string, Record<string
 }
 
 /**
- * Collect the per-context secrets from a project's `.kici/` directory,
- * preserving context structure. Reads `.kici/.secrets` (INI sections) and
- * `.kici/secrets.yaml` (top-level contexts). The yaml layer wins on key
- * collisions within a context. Flat (context-less) secrets are ignored here —
- * a routed job only resolves secrets for the contexts it binds.
+ * `.secrets` INI sections, then `secrets.yaml` contexts, which win on key
+ * collisions. Flat (context-less) secrets are ignored: a routed job only
+ * resolves secrets for the contexts it binds.
  */
 export async function loadLocalSecretContexts(
   kiciDir: string,
 ): Promise<Record<string, Record<string, string>>> {
   const contexts: Record<string, Record<string, string>> = {};
 
-  // 1. .secrets INI sections (lowest priority).
   const iniContent = await readFileOrNull(path.join(kiciDir, '.secrets'));
   if (iniContent !== null) {
     const parsed = parseSecretsFile(iniContent);
@@ -102,7 +91,6 @@ export async function loadLocalSecretContexts(
     }
   }
 
-  // 2. secrets.yaml contexts (override .secrets on key collision).
   const yamlContent = await readFileOrNull(path.join(kiciDir, 'secrets.yaml'));
   if (yamlContent !== null) {
     for (const [ctx, vals] of Object.entries(parseSecretsYamlContexts(yamlContent))) {
@@ -114,10 +102,8 @@ export async function loadLocalSecretContexts(
 }
 
 /**
- * Seed the local plane's `scoped_secrets` store from a project's `secrets.yaml`
- * / `.secrets` contexts. Idempotent: `createContext` upserts, `bind` is a no-op
- * when the scope is already bound, and `setSecret` overwrites in place. Returns
- * the contexts + secret-key count seeded (never the values).
+ * Idempotent: `createContext` upserts, `bind` is a no-op when the scope is
+ * already bound, and `setSecret` overwrites in place. Never returns values.
  */
 export async function seedLocalSecrets(
   planeUrl: string,
@@ -130,8 +116,7 @@ export async function seedLocalSecrets(
   const seeded: string[] = [];
   let secretCount = 0;
   for (const [contextName, secrets] of Object.entries(contexts)) {
-    // Create the context (allowLocalExecution so a CLI-initiated local run can
-    // resolve its secrets) and bind a scope equal to the context name.
+    // allowLocalExecution lets a CLI-initiated local run resolve its secrets.
     await client.createContext({ orgId: opts.orgId, name: contextName, allowLocalExecution: true });
     await client.bindContext({
       orgId: opts.orgId,

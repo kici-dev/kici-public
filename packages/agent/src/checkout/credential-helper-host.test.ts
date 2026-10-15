@@ -42,7 +42,6 @@ describe('startCredentialHelperHost', () => {
     const answer = vi.fn().mockResolvedValue({ username: 'x-access-token', password: 'ghs_x' });
     const h = await host(answer);
 
-    // Spawn the shim exactly as git would.
     const stdout = await run(h.helperPath, 'get', GIT_INPUT);
 
     expect(stdout).toBe('username=x-access-token\npassword=ghs_x\n');

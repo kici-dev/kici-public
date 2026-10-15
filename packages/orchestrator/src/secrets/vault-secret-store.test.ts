@@ -3,7 +3,6 @@ import { VaultSecretStore } from './vault-secret-store.js';
 import type { VaultConfig } from './vault-secret-store.js';
 import type { Logger } from '@kici-dev/shared';
 
-// Mock hashi-vault-js
 vi.mock('hashi-vault-js', () => {
   return {
     default: vi.fn().mockImplementation(function () {

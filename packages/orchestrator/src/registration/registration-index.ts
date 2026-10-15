@@ -105,7 +105,6 @@ export class RegistrationIndex {
     const version = await this.store.getVersion();
     const rows = await this.store.getAll();
 
-    // Rebuild indexes
     const entries = new Map<string, RegisteredWorkflow[]>();
     const byTriggerType = new Map<string, RegisteredWorkflow[]>();
     const globalByTriggerType = new Map<string, RegisteredWorkflow[]>();
@@ -206,9 +205,6 @@ export class RegistrationIndex {
     }
   }
 
-  /**
-   * Get the current in-memory version.
-   */
   getVersion(): number {
     return this.version;
   }
@@ -235,9 +231,6 @@ export class RegistrationIndex {
     return entries.filter((e) => !e.disabled);
   }
 
-  /**
-   * Get all workflows registered for a specific routing key and repo.
-   */
   getByRoutingKeyAndRepo(routingKey: string, repoIdentifier: string): RegisteredWorkflow[] {
     const key = `${routingKey}:${repoIdentifier}`;
     return this.entries.get(key) ?? [];
@@ -354,9 +347,6 @@ export class RegistrationIndex {
   }
 }
 
-/**
- * Convert a RegistrationRow to a RegisteredWorkflow.
- */
 function rowToRegistered(row: RegistrationRow): RegisteredWorkflow {
   return {
     id: row.id,

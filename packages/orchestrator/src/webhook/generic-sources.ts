@@ -22,9 +22,6 @@ import {
 
 const logger = createLogger({ prefix: 'generic-sources' });
 
-/**
- * Input for creating a new generic webhook source.
- */
 interface CreateSourceInput {
   orgId: string;
   name: string;
@@ -68,8 +65,6 @@ type UpdateSourceInput = Partial<Omit<CreateSourceInput, 'orgId' | 'gitConfig' |
 };
 
 /**
- * Generic webhook source manager.
- *
  * Manages CRUD operations for generic_webhook_sources table.
  * Sources are identified by routing keys with format `generic:<orgId>:<sourceId>`.
  */
@@ -77,7 +72,6 @@ export class GenericSourceManager {
   constructor(private readonly db: Kysely<Database>) {}
 
   /**
-   * Create a new generic webhook source.
    * Generates a routing key in format `generic:<orgId>:<sourceId>`.
    */
   async create(input: CreateSourceInput): Promise<GenericWebhookSource> {
@@ -202,9 +196,6 @@ export class GenericSourceManager {
     return result ?? null;
   }
 
-  /**
-   * List all sources for an org.
-   */
   async list(orgId: string, includeDeleted = false): Promise<GenericWebhookSource[]> {
     let query = this.db
       .selectFrom('generic_webhook_sources')
@@ -276,9 +267,6 @@ export class GenericSourceManager {
       .execute();
   }
 
-  /**
-   * Update a source's configuration.
-   */
   async update(id: string, input: UpdateSourceInput): Promise<GenericWebhookSource | null> {
     const updates: Record<string, unknown> = {};
 
@@ -378,9 +366,6 @@ export class GenericSourceManager {
     logger.info('Generic webhook source hard-deleted', { id });
   }
 
-  /**
-   * Enable a source.
-   */
   async enable(id: string): Promise<void> {
     await this.db
       .updateTable('generic_webhook_sources')
@@ -392,9 +377,6 @@ export class GenericSourceManager {
     logger.info('Generic webhook source enabled', { id });
   }
 
-  /**
-   * Disable a source.
-   */
   async disable(id: string): Promise<void> {
     await this.db
       .updateTable('generic_webhook_sources')
@@ -410,12 +392,10 @@ export class GenericSourceManager {
    * Check if a request is a duplicate within the dedup window.
    * Uses the kici_events table for idempotency checking.
    *
-   * @param sourceId - Source ID
    * @param idempotencyKey - Idempotency key from header or payload
    * @returns true if this is a duplicate request
    */
   async checkIdempotency(sourceId: string, idempotencyKey: string): Promise<boolean> {
-    // Get source's dedup window
     const source = await this.getById(sourceId);
     if (!source) return false;
 
@@ -436,7 +416,6 @@ export class GenericSourceManager {
    * Inserts a `__dedup:<key>` event into kici_events so that
    * checkIdempotency can detect retries within the dedup window.
    *
-   * @param sourceId - Source ID
    * @param idempotencyKey - Idempotency key from header or payload
    */
   async markIdempotency(sourceId: string, idempotencyKey: string): Promise<void> {
@@ -463,7 +442,6 @@ export class GenericSourceManager {
   /**
    * Check if payload size is within the source's limit.
    *
-   * @param sourceId - Source ID
    * @param bodyLength - Length of the request body in bytes
    * @returns Whether the payload is allowed and what the max is
    */

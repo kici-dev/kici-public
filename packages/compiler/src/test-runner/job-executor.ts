@@ -18,11 +18,7 @@ import type { SimulatedEvent } from '@kici-dev/engine';
 import type { EventPayload, RuleResult } from '@kici-dev/sdk';
 import type { ParsedSecrets } from './secrets-file.js';
 
-/**
- * SDK output setters resolved from the workflow's module instance.
- * When the SDK is externalized in rolldown, the workflow shares the same
- * module instance. We use these to set up output infrastructure.
- */
+/** SDK output setters from the workflow's module instance (shared when rolldown externalizes the SDK). */
 interface SdkOutputSetters {
   setStepOutputsMap: (map: OutputsMap) => void;
   setStepRefMap: (map: StepRefMap) => void;
@@ -30,12 +26,9 @@ interface SdkOutputSetters {
 }
 
 /**
- * Resolve SDK output setter functions from the workflow's module instance.
- * This ensures the output maps are set on the same SDK module that the
- * workflow code uses for .result proxy resolution and ctx.outputsOf(). The
- * setters live only on the `@kici-dev/sdk/internal` subpath.
- *
- * Falls back to the compiler's own SDK import if dynamic resolution fails.
+ * Resolve the setters from the workflow's own SDK module (the
+ * `@kici-dev/sdk/internal` subpath), so the maps land where its .result proxy
+ * and ctx.outputsOf() read them. Falls back to the compiler's own SDK import.
  */
 async function resolveSdkSetters(kiciDir?: string): Promise<SdkOutputSetters> {
   if (kiciDir) {
@@ -49,7 +42,7 @@ async function resolveSdkSetters(kiciDir?: string): Promise<SdkOutputSetters> {
         setJobOutputsMap: sdk.setJobOutputsMap,
       };
     } catch {
-      // Fall back to compiler's SDK import
+      // Fall back to the compiler's SDK import.
     }
   }
   return {
@@ -89,9 +82,6 @@ interface WorkflowResult {
   error?: Error;
 }
 
-/**
- * Execute a single step.
- */
 async function executeStep(step: Step, ctx: StepContext, jobName: string): Promise<StepResult> {
   formatter.logStepStart(jobName, step.name);
   const startTime = Date.now();
@@ -121,9 +111,7 @@ async function executeStep(step: Step, ctx: StepContext, jobName: string): Promi
   }
 }
 
-/**
- * Execute a job sequentially (steps run in order).
- */
+/** Steps run in order. */
 export async function executeJob(
   job: Job,
   workflowName: string,
@@ -141,7 +129,6 @@ export async function executeJob(
   const startTime = Date.now();
   const stepResults: StepResult[] = [];
 
-  // Evaluate job rules first
   let ruleResults: RuleResult[] | undefined;
   if (job.rules && job.rules.length > 0) {
     const ruleContext = createRuleContext({
@@ -154,9 +141,7 @@ export async function executeJob(
 
     if (!ruleEval.allPassed) {
       const durationMs = Date.now() - startTime;
-      // A rule's check() threw -- fail the job (non-zero test-runner result) so
-      // the crash surfaces rather than silently skipping. A clean return false
-      // still skips.
+      // A throwing check() fails the job so the crash surfaces; a clean false skips.
       if (ruleEval.evaluationError) {
         return {
           name: job.name,
@@ -179,9 +164,8 @@ export async function executeJob(
     }
   }
 
-  // Set up output infrastructure for .result proxy and ctx.outputsOf() resolution
-  // Set maps on both the workflow's SDK instance (for .result proxy) and the
-  // compiler's SDK instance (for ctx.outputsOf/jobOutputs in step-context)
+  // Set the maps on the workflow's SDK (for the .result proxy) and the
+  // compiler's SDK (for ctx.outputsOf/jobOutputs in step-context).
   const outputsMap: OutputsMap = new Map();
   const refMap: StepRefMap = new WeakMap();
   setters.setStepOutputsMap(outputsMap);
@@ -189,10 +173,8 @@ export async function executeJob(
   setStepOutputsMapLocal(outputsMap);
   setStepRefMapLocal(refMap);
 
-  // Create step context. The shared builder owns the job-scoped temp allocator
-  // backing `ctx.mktemp`/`ctx.mktempFile`; `dispose` drains it (and secrets
-  // state) at job end. This path runs no job-end hooks, so the drain is wired
-  // directly via the `finally` below rather than through a hook.
+  // `dispose` drains the job-scoped `ctx.mktemp`/`ctx.mktempFile` allocator and
+  // secrets state. This path runs no job-end hooks, so the `finally` below calls it.
   const { ctx, dispose } = createStepContext(
     { name: workflowName },
     {
@@ -209,10 +191,8 @@ export async function executeJob(
   );
 
   try {
-    // Execute steps sequentially
     let stepCounter = 0;
     for (const stepOrFn of job.steps) {
-      // Normalize bare functions to Step-like objects
       let normalizedStep: Step;
       if (typeof stepOrFn === 'function') {
         stepCounter++;
@@ -225,10 +205,9 @@ export async function executeJob(
         } as Step;
       } else {
         normalizedStep = stepOrFn as Step;
-        // Assign the counter name onto the ORIGINAL object (not a clone) so the
-        // SDK's late-bound .result proxy resolves, and so each id-less step gets
-        // a distinct step-N key in outputsMap. This loop iterates each step object
-        // once, so mutating it in place is sufficient (no repeat-encounter clone).
+        // Name the ORIGINAL object, not a clone, so the SDK's late-bound .result
+        // proxy resolves and each id-less step gets a distinct step-N key. Each
+        // step object is visited once, so in-place mutation is safe.
         if (!normalizedStep.name) {
           stepCounter++;
           (normalizedStep as { name: string }).name = `step-${stepCounter}`;
@@ -236,13 +215,11 @@ export async function executeJob(
       }
       const result = await executeStep(normalizedStep, ctx, job.name);
 
-      // Store successful step outputs in the map for .result proxy resolution
       if (result.status === 'success' && result.outputs != null) {
         outputsMap.set(normalizedStep.name, result.outputs);
       }
       stepResults.push(result);
 
-      // Fail fast on step failure
       if (result.status === 'failure') {
         const durationMs = Date.now() - startTime;
         formatter.logJobFailure(job.name, durationMs, result.error!);
@@ -269,9 +246,8 @@ export async function executeJob(
       ruleResults,
     };
   } finally {
-    // Reclaim the job's `ctx.mktemp`/`ctx.mktempFile` allocations on success,
-    // failure, and throw alike. A cleanup failure must NEVER change the job's
-    // terminal status, so any drain error is swallowed into a warn.
+    // Runs on success, failure and throw. A cleanup failure must NEVER change
+    // the job's terminal status, so a drain error becomes a warn.
     await dispose().catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
       logger.warn(`local job temp scope cleanup failed: ${message}`);
@@ -279,10 +255,7 @@ export async function executeJob(
   }
 }
 
-/**
- * Execute a workflow with parallel job execution.
- * Jobs run in parallel where dependencies allow (respecting needs).
- */
+/** Jobs run in parallel where their `needs` allow. */
 export async function executeWorkflow(
   workflow: Workflow,
   event: SimulatedEvent,
@@ -293,10 +266,8 @@ export async function executeWorkflow(
   logger.info(`\n${pc.bold('▶ Running workflow:')} ${workflow.name}\n`);
   const startTime = Date.now();
 
-  // Resolve SDK setters from the workflow's module instance
   const sdkSetters = await resolveSdkSetters(kiciDir);
 
-  // Evaluate workflow rules first
   let ruleResults: RuleResult[] | undefined;
   if (workflow.rules && workflow.rules.length > 0) {
     const ruleContext = createRuleContext({
@@ -309,8 +280,7 @@ export async function executeWorkflow(
 
     if (!ruleEval.allPassed) {
       const durationMs = Date.now() - startTime;
-      // A rule's check() threw -- fail the workflow (non-zero exit). A clean
-      // return false is a legitimate skip.
+      // A throwing check() fails the workflow (non-zero exit); a clean false skips.
       if (ruleEval.evaluationError) {
         const error = new Error(
           `rule '${ruleEval.evaluationError.label}' errored: ${ruleEval.evaluationError.message}`,
@@ -336,21 +306,17 @@ export async function executeWorkflow(
     }
   }
 
-  // Build job dependency graph
   const staticJobs = workflow.jobs.filter((j): j is Job => typeof j !== 'function');
   const jobMap = new Map(staticJobs.map((j) => [j.name, j]));
   const completed = new Map<string, JobResult>();
   const pending = new Set(staticJobs.map((j) => j.name));
 
-  // Cross-job output collection: maps job name -> aggregated step outputs
-  // Used by ctx.jobOutputs() and jobRef.result for cross-job output chaining
+  // Job name → aggregated step outputs, read by ctx.jobOutputs() and jobRef.result.
   const jobOutputsMap: OutputsMap = new Map();
   sdkSetters.setJobOutputsMap(jobOutputsMap);
   setJobOutputsMapLocal(jobOutputsMap);
 
-  // Execute jobs respecting dependencies
   while (pending.size > 0) {
-    // Find jobs ready to run (all dependencies completed successfully)
     const ready = [...pending].filter((jobName) => {
       const job = jobMap.get(jobName)!;
       if (!job.needs || job.needs.length === 0) return true;
@@ -381,7 +347,6 @@ export async function executeWorkflow(
       break;
     }
 
-    // Execute ready jobs in parallel
     const results = await Promise.allSettled(
       ready.map((jobName) => {
         const job = jobMap.get(jobName)!;
@@ -390,7 +355,6 @@ export async function executeWorkflow(
       }),
     );
 
-    // Record results and collect cross-job outputs
     for (let i = 0; i < ready.length; i++) {
       const result = results[i];
       const jobName = ready[i];
@@ -398,16 +362,14 @@ export async function executeWorkflow(
       if (result.status === 'fulfilled') {
         completed.set(jobName, result.value);
 
-        // Collect job outputs for cross-job chaining
         if (result.value.status === 'success') {
           const jobResult = result.value;
           const stepsWithOutputs = jobResult.steps.filter((s) => s.outputs != null);
 
           if (stepsWithOutputs.length === 1 && jobResult.steps.length === 1) {
-            // Single-step job (run shorthand): flatten outputs directly (no step-name nesting)
+            // A single-step (run shorthand) job's outputs are not nested under a step name.
             jobOutputsMap.set(jobName, stepsWithOutputs[0].outputs!);
           } else if (stepsWithOutputs.length > 0) {
-            // Multi-step job: nest outputs under step names
             const aggregated: Record<string, unknown> = {};
             for (const stepResult of stepsWithOutputs) {
               aggregated[stepResult.name] = stepResult.outputs;
@@ -416,7 +378,6 @@ export async function executeWorkflow(
           }
         }
 
-        // Fail fast on job failure
         if (result.value.status === 'failure') {
           const durationMs = Date.now() - startTime;
           logger.info(pc.red(`\n✗ Workflow failed\n`));
@@ -429,7 +390,6 @@ export async function executeWorkflow(
           };
         }
       } else {
-        // Promise rejected (unexpected)
         completed.set(jobName, {
           name: jobName,
           status: 'failure',

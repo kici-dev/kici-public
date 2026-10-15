@@ -1,13 +1,7 @@
 /**
- * Execution read CLI commands for kici-admin.
- *
- *   execution list [--routing-key <k>] [--status <s>] [--workflow-name <n>] [--limit <n>]
- *   execution show <runId>
- *
- * READ-ONLY — mutations (purge-stale) live in `maintenance.ts` instead.
- * Dual-mode: HTTP (via AdminApiClient) or `--database-url` (direct DB).
- *
- * The rows come from execution_runs / execution_jobs, not dedup_cache.
+ * `kici-admin execution list|show`, READ-ONLY (`purge-stale` lives in
+ * `maintenance.ts`), over HTTP or `--database-url`. Rows come from
+ * execution_runs / execution_jobs, not dedup_cache.
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
@@ -70,8 +64,7 @@ function printRunShow(run: ExecutionRunRow, jobs: ExecutionJobRow[]): void {
 }
 
 export function registerExecutionCommands(program: Command, getClient: () => AdminApiClient): void {
-  // Re-use the `execution` namespace if maintenance.ts already created it
-  // (for `execution purge-stale`), otherwise create a fresh one.
+  // maintenance.ts may already have created the group for `purge-stale`.
   const existing = program.commands.find((c) => c.name() === 'execution');
   const exec = existing ?? program.command('execution').description('Execution read + maintenance');
 

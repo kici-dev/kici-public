@@ -7,20 +7,18 @@ import pc from 'picocolors';
  */
 type ErrorCode = string;
 
-/** Diagnostic severity. Errors abort compilation; warnings are advisory (compile still succeeds). */
+/** Errors abort compilation; warnings are advisory and compilation still succeeds. */
 export enum DiagnosticSeverity {
   Error = 'error',
   Warning = 'warning',
 }
 
-/** Source location for error reporting */
 export interface SourceLocation {
   readonly file: string;
   readonly line: number;
   readonly column: number;
 }
 
-/** Compiler error with all context */
 export interface CompilerError {
   readonly code: ErrorCode;
   readonly message: string;
@@ -30,7 +28,8 @@ export interface CompilerError {
 }
 
 /**
- * Format error in GNU standard format: file:line:column: error [CODE]: message
+ * Formats an error as `file:line:column error [CODE]: message`, close to the
+ * GNU standard, with an optional indented suggestion line.
  *
  * Example output:
  * .kici/workflows/ci.ts:15:3 error [E102]: Circular dependency detected
@@ -39,19 +38,16 @@ export interface CompilerError {
 export function formatError(error: CompilerError): string {
   const parts: string[] = [];
 
-  // Location prefix (GNU standard)
   if (error.location) {
     parts.push(pc.cyan(`${error.location.file}:${error.location.line}:${error.location.column}`));
   }
 
-  // Severity label with code
   const label =
     error.severity === DiagnosticSeverity.Warning ? pc.yellow('warning') : pc.red('error');
   parts.push(label + pc.gray(` [${error.code}]`) + ': ' + error.message);
 
   let output = parts.join(' ');
 
-  // Optional suggestion
   if (error.suggestion) {
     output += '\n  ' + pc.dim(`Suggestion: ${error.suggestion}`);
   }
@@ -59,7 +55,7 @@ export function formatError(error: CompilerError): string {
   return output;
 }
 
-/** Create a CompilerError and throw it */
+/** Creates a CompilerError and returns it; the caller throws it. */
 export function compilerError(
   code: ErrorCode,
   message: string,
@@ -78,7 +74,7 @@ export function compilerError(
   };
 }
 
-/** Check if an error is a CompilerError (codes are E + digits, e.g. E001, E102) */
+/** Matches only `E<digits>` codes (e.g. E001, E102), never a `W` warning. */
 export function isCompilerError(error: unknown): error is CompilerError {
   return (
     typeof error === 'object' &&

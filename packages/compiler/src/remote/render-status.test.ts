@@ -1,19 +1,13 @@
-// Status-colouring tests for `colorStatus`, in their own file because they need
-// colour support forced ON.
-//
-// picocolors decides at import time whether the terminal supports colour, and
-// when it does not EVERY colorizer becomes `String` — so `pc.red(s)`,
-// `pc.gray(s)` and `s` are the same value and a "this is red, not gray"
-// assertion passes no matter what the code does. Forcing `FORCE_COLOR` before
-// picocolors loads is what makes these assertions able to fail. The sibling
-// `render.test.ts` deliberately keeps the unforced world so it can still test
-// the NO_COLOR passthrough.
+// `colorStatus` tests, in their own file because they force colour ON.
+// picocolors decides at import time; without colour EVERY colorizer is `String`,
+// so a "red, not gray" assertion passes whatever the code does. The sibling
+// `render.test.ts` stays unforced to test the NO_COLOR passthrough.
 import { describe, expect, it, vi } from 'vitest';
 import pc from 'picocolors';
 import { CANONICAL_STATUSES, ExecutionJobStatus, ExecutionRunStatus } from '@kici-dev/engine';
 import { colorStatus } from './render.js';
 
-// Hoisted above the imports above, so it runs before picocolors is evaluated.
+// Hoisted above the imports, so it runs before picocolors is evaluated.
 vi.hoisted(() => {
   process.env.FORCE_COLOR = '1';
   delete process.env.NO_COLOR;

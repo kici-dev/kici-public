@@ -12,14 +12,12 @@
  * 3. **Extract** from the file into a scratch dir under a time bound, then
  *    move the tree into the repository.
  *
- * Downloading first matters because extraction (tens of thousands of small
- * files) is far slower than the network: a body streamed straight into `tar`
- * would hold the connection open for the whole extraction, and an object store
- * that closes it meanwhile fails the restore.
+ * Download comes first because extraction (tens of thousands of small files)
+ * is far slower than the network: streaming the body into `tar` would hold the
+ * connection open throughout, and an object store closing it fails the restore.
  *
- * The temp root is a sibling of `.kici/` at the repository root, never inside
- * it: the workflow `contentHash` walks `.kici/`, so a leftover there would
- * change it.
+ * The temp root sits beside `.kici/` at the repository root, never inside: the
+ * workflow `contentHash` walks `.kici/`, so a leftover there would change it.
  */
 
 import { mkdir } from 'node:fs/promises';
@@ -53,9 +51,9 @@ const logger = createLogger({ prefix: 'dep-restore' });
 /** Download bounds plus the bound on extraction. */
 export interface DepRestoreLimits extends DownloadLimits {
   /**
-   * Gunzip + tar extraction from the downloaded file. Matches the inline
-   * install bound (`INSTALL_TIMEOUT_MS`, 10 min): an extraction slower than
-   * installing from the registry is not worth waiting for.
+   * Gunzip + tar extraction. Matches the inline install bound
+   * (`INSTALL_TIMEOUT_MS`, 10 min): an extraction slower than a registry
+   * install is not worth waiting for.
    */
   extractTimeoutMs: number;
 }
@@ -73,44 +71,28 @@ export interface RestoreDepsOptions {
 }
 
 /**
- * Basename prefix of the per-restore temp root at the repository root. The
- * clone phase registers {@link SCRATCH_DIR_GIT_EXCLUDE_GLOB} in
- * `.git/info/exclude`, so the glob and the prefix are defined together.
+ * Basename prefix of the per-restore temp root. The clone phase registers
+ * {@link SCRATCH_DIR_GIT_EXCLUDE_GLOB}, so glob and prefix live together.
  */
 const TEMP_ROOT_PREFIX = '.kici-dep-restore-';
 
-/**
- * `.git/info/exclude` pattern matching every temp root {@link restoreDeps}
- * creates, anchored at the repository root.
- */
+/** `.git/info/exclude` pattern for every {@link restoreDeps} temp root, anchored at the repository root. */
 export const SCRATCH_DIR_GIT_EXCLUDE_GLOB = `/${TEMP_ROOT_PREFIX}*`;
 
 /**
- * Append `SCRATCH_DIR_GIT_EXCLUDE_GLOB` to `${repoWorkDir}/.git/info/exclude`
- * so an in-flight or leftover dep-restore temp root is invisible to
- * `git status` / `git add` inside the customer's cloned working tree.
+ * Hides in-flight or leftover dep-restore temp roots from `git status` /
+ * `git add` in the customer's clone. `.gitignore` is committed customer
+ * content we MUST NOT modify (it would show up as a diff in their PRs);
+ * `.git/info/exclude` is per-clone and on-disk only, and `git init` /
+ * `git clone` already created it.
  *
- * Why `.git/info/exclude` and not `.gitignore`:
- * - `.gitignore` lives in the customer's repo and is committed; we MUST NOT
- *   modify it. Doing so would surface the rule in their PRs and create a
- *   diff customers never asked for.
- * - `.git/info/exclude` is per-clone, on-disk only, and exactly the git
- *   mechanism for "ignore these patterns in THIS working tree". Git creates
- *   an empty (template-commented) file on `git init` / `git clone`, so it
- *   already exists by the time we're called.
+ * Best-effort: a missing exclude file (e.g. a sandbox blocked `git clone`) is
+ * logged, since failing the job is worse than the cosmetic issue. Idempotent
+ * for repeat calls (dual-clone path, retry after partial setup).
  *
- * Best-effort: if the exclude file is missing (e.g. caller sandbox blocked
- * `git clone` and the dir layout differs) we log and continue — failing the
- * job over a missing git ignore wiring would be worse than the cosmetic
- * issue we're solving.
- *
- * Idempotent: callers may invoke this multiple times (dual-clone path, retry
- * after partial setup). We skip the append if the glob is already present.
- *
- * @param repoWorkDir - The git working tree root (the dir that contains
- *   `.git/`). For normal workflows this is the agent's job workDir; for
- *   global workflows it is the workflow repo dir (whose `.kici/` the restore
- *   fills).
+ * @param repoWorkDir - The working tree root containing `.git/`: the job
+ *   workDir for normal workflows, the workflow repo dir (whose `.kici/` the
+ *   restore fills) for global workflows.
  */
 export async function excludeScratchFromGit(repoWorkDir: string): Promise<void> {
   const excludePath = join(repoWorkDir, '.git', 'info', 'exclude');
@@ -134,11 +116,9 @@ export async function excludeScratchFromGit(repoWorkDir: string): Promise<void> 
 }
 
 /**
- * Rewrite localhost URLs to use the orchestrator host.
- *
- * The orchestrator rewrites file:// cache URLs to http://localhost:PORT/...
- * but agent containers can't reach localhost. This utility replaces the
- * host with the orchestrator's host derived from KICI_ORCHESTRATOR_URL.
+ * The orchestrator rewrites file:// cache URLs to http://localhost:PORT/...,
+ * which agent containers cannot reach; this swaps in the host from
+ * KICI_ORCHESTRATOR_URL.
  */
 export function resolveOrchestratorUrl(url: string): string {
   if (!url.match(/^https?:\/\/(localhost|127\.0\.0\.1)[:/]/)) return url;
@@ -160,16 +140,12 @@ export function resolveOrchestratorUrl(url: string): string {
 }
 
 /**
- * Move a fully-extracted scratch tree into the cloned repo. The dep tarball is
- * packed repo-root-relative, so the scratch holds repo-root entries:
- * `.kici/node_modules` for every manager, plus (for pnpm) the root
- * `node_modules/.pnpm` store and in-repo workspace sibling dirs. `.kici/` itself
- * already exists in the work tree (cloned or source-restored), so its children
- * are moved individually; every other top-level entry is moved wholesale.
- *
+ * The scratch holds repo-root-relative entries (see {@link restoreDeps}).
+ * `.kici/` already exists in the work tree (cloned or source-restored), so its
+ * children move individually; every other top-level entry moves wholesale.
  * On a cache-hit execution agent the destinations do not pre-exist (source
- * restore excludes node_modules and never carries sibling dirs), so the renames
- * have nothing to race; the defensive `rm` covers re-runs.
+ * restore excludes node_modules and sibling dirs), so the renames race
+ * nothing; the defensive `rm` covers re-runs.
  */
 async function moveScratchIntoRepo(scratchDir: string, workDir: string): Promise<void> {
   for (const child of await fsPromises.readdir(scratchDir)) {
@@ -184,7 +160,7 @@ async function moveScratchIntoRepo(scratchDir: string, workDir: string): Promise
   }
 }
 
-/** Move `src` to `dest`, creating the parent and clearing any stale dest. */
+/** Creates the parent and clears any stale `dest`. */
 async function moveInto(src: string, dest: string): Promise<void> {
   await mkdir(dirname(dest), { recursive: true });
   await fsPromises.rm(dest, { recursive: true, force: true });
@@ -192,10 +168,9 @@ async function moveInto(src: string, dest: string): Promise<void> {
 }
 
 /**
- * Remove the temp root. After a failed extraction `tar` may still be flushing
- * writes into it, which `rm` meets as `ENOTEMPTY`; `maxRetries` absorbs that.
- * A leftover sits outside `.kici/`, is hidden from git, and goes with the job
- * workdir.
+ * After a failed extraction `tar` may still be flushing writes, which `rm`
+ * meets as `ENOTEMPTY`; `maxRetries` absorbs that. A leftover sits outside
+ * `.kici/`, is hidden from git, and goes with the job workdir.
  */
 async function removeTempRoot(tempRoot: string): Promise<void> {
   try {
@@ -213,19 +188,15 @@ function toReportAttempt(a: DownloadAttempt): DepRestoreReport['attempts'][numbe
 }
 
 /**
- * Restore dependencies from a cached tarball into the cloned repo.
+ * The tarball is packed repo-root-relative (`dep-packer.ts`): every manager
+ * carries `.kici/node_modules`; pnpm also carries the root `node_modules/.pnpm`
+ * store and the in-repo workspace siblings `.kici` resolves.
  *
- * The tarball is packed repo-root-relative (see `dep-packer.ts`): every manager
- * carries `.kici/node_modules`; pnpm additionally carries the root
- * `node_modules/.pnpm` store and the in-repo workspace siblings `.kici`
- * resolves.
+ * Resolves with the report; rejects with a {@link DepRestoreError} carrying it
+ * ({@link DepTarballHashMismatchError} for a hash mismatch).
  *
- * Resolves with the restore's report; rejects with a {@link DepRestoreError}
- * (a {@link DepTarballHashMismatchError} for a hash mismatch) carrying it.
- *
- * @param workDir - Root directory of the cloned repository
- * @param depsUrl - URL to the dependency tarball (http://, https://, or file://)
- * @param depsHash - Optional expected SHA-256 hash of the tarball
+ * @param depsUrl - http://, https:// or file://
+ * @param depsHash - Expected SHA-256 of the tarball
  */
 export async function restoreDeps(
   workDir: string,

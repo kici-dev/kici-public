@@ -1,13 +1,8 @@
 /**
- * Manual schedule handler for the orchestrator.
- *
- * Dispatches a new run for a cron-scheduled workflow triggered manually
- * from the dashboard UI. Uses direct dispatch (not eventRouter.emit) so
- * the newRunId can be returned synchronously in the WS response.
- *
- * This is intentionally separate from the automatic cron path which uses
- * eventRouter fire-and-forget. The manual path needs request/response
- * correlation to return the newRunId to the dashboard.
+ * Dispatches a new run for a cron-scheduled workflow triggered manually from
+ * the dashboard. It dispatches directly, not through the fire-and-forget
+ * `eventRouter.emit` the automatic cron path uses, so the WS response can
+ * return the newRunId synchronously.
  */
 
 import { createLogger } from '@kici-dev/shared';
@@ -38,20 +33,18 @@ export async function handleManualSchedule(
   triggeredByAgentLabel: string | null,
   deps: ManualScheduleDeps,
   /**
-   * Platform-minted `requestId`. Stable across an HA relay failover re-send, so
-   * it is the idempotency key: after the read-only validation, the first
-   * coordinator to claim it creates the run and a failover re-send returns that
-   * same run instead of minting a second one.
+   * Platform-minted idempotency key, stable across an HA relay failover
+   * re-send: the first coordinator to claim it creates the run, and a re-send
+   * returns that same run.
    */
   requestId: string,
 ): Promise<{ newRunId: string }> {
   const { registration, commitSha, provider } = validateScheduleRequest(registrationId, deps);
   const workflow = registration.lockEntry;
 
-  // Claim this request by its Platform `requestId` BEFORE the first write. On a
-  // relay failover re-send a sibling coordinator already owns this requestId, so
-  // return its run id without minting a second run. Validation above is
-  // read-only and identical across hops, so it is never masked by the claim.
+  // Claim the `requestId` BEFORE the first write; on a failover re-send a
+  // sibling already owns it, so return its run id. Validation above is
+  // read-only and identical across hops, so the claim never masks it.
   const { newRunId, claimed } = await claimRequestId(deps.db, requestId);
   if (!claimed) {
     logger.info('Manual-schedule requestId already claimed by a sibling; returning existing run', {
@@ -192,10 +185,8 @@ export function mergeScheduleInputs(
 
 export function buildManualJobConfig(workflow: LockWorkflow, mat: MaterializedJob) {
   const job = mat.lockJob;
-  // A schedule fire carries no operator input — resolve the declared defaults
-  // so steps and rules see them as ctx.dispatchInputs. A workflow may declare
-  // several schedule() triggers; a manual fire targets none in particular, so
-  // merge every schedule's defaults rather than only the first.
+  // A schedule fire carries no operator input: steps and rules see the declared
+  // defaults of every schedule() trigger as ctx.dispatchInputs.
   const scheduleTriggers = workflow.triggers.filter(
     (t): t is LockScheduleTrigger => t._type === 'schedule',
   );
@@ -207,11 +198,9 @@ export function buildManualJobConfig(workflow: LockWorkflow, mat: MaterializedJo
     steps: job.steps,
     needs: job.needs,
     rules: job.rules,
-    // The job's named git credentials, as declared in the lock. Values are
-    // secret NAMES. `routeOrDispatchJobs` persists the same map on the job row,
-    // which is what the credential relay authorizes a request against — so
-    // omitting it here leaves the agent with an empty map on a scheduled or
-    // manual fire, where `credential: 'x'` throws and `default` silently falls
+    // Values are secret NAMES. `routeOrDispatchJobs` persists the same map on
+    // the job row for the credential relay; omitting it here leaves the agent
+    // an empty map, where `credential: 'x'` throws and `default` silently falls
     // back to the source credential.
     ...(job.gitCredentials && { gitCredentials: job.gitCredentials }),
     ...(dispatchInputs && { dispatchInputs }),
@@ -223,11 +212,9 @@ export function buildManualJobConfig(workflow: LockWorkflow, mat: MaterializedJo
 }
 
 /**
- * Record execution start BEFORE dispatch so that when jobs are rerouted
- * to peers, the coordinator's rerouted onExecutionStarted call hits
- * ON CONFLICT DO NOTHING and preserves the row inserted here with full
- * manual-schedule metadata (triggeredBy, triggerEvent='manual_schedule').
- * Jobs are added below via executionTracker.addJobsToRun once dispatched.
+ * Runs BEFORE dispatch, so a peer-rerouted onExecutionStarted hits ON CONFLICT
+ * DO NOTHING and keeps this row's manual-schedule metadata (triggeredBy,
+ * triggerEvent='manual_schedule'). Jobs join via addJobsToRun once dispatched.
  */
 async function recordExecutionStart(args: {
   newRunId: string;
@@ -281,11 +268,9 @@ async function recordExecutionStart(args: {
     triggeredByAgentLabel, // triggeredByAgentLabel
     undefined, // prNumber
     undefined, // workflowRepo
-    // A manual schedule is a registration-driven dispatch with no pull request
-    // anywhere in its provenance, so `false` is its true resolved fork state —
-    // the same reasoning a push follows. Leaving it unresolved would make the
-    // documented `is_fork = 'false'` trust policy reject a legitimate scheduled
-    // run.
+    // No pull request is in a manual schedule's provenance, so `false` is its
+    // true fork state, as for a push. Left unresolved, the documented
+    // `is_fork = 'false'` trust policy would reject a legitimate scheduled run.
     { headRef: null, headRepository: null, isFork: false },
   );
 }

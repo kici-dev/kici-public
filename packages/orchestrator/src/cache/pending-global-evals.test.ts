@@ -4,11 +4,9 @@ import { describe, expect, it } from 'vitest';
 import { PendingGlobalEvalTracker, parseGlobalEvalResult } from './pending-global-evals.js';
 
 /**
- * Hostile payloads an agent can put on `job.status`.
- *
- * `jobStatusSchema.data` is `z.record(z.string(), z.unknown())`, so
- * `globalEvalResult` reaches the orchestrator entirely unchecked — any agent
- * that owns the round job can send any of these, and a version-skewed customer
+ * Hostile payloads an agent can put on `job.status`. `jobStatusSchema.data` is
+ * `z.record(z.string(), z.unknown())`, so the round result arrives unchecked:
+ * any agent owning the round job can send these, and a version-skewed customer
  * agent can send them by accident.
  */
 const HOSTILE: Array<[label: string, payload: unknown]> = [
@@ -27,8 +25,7 @@ const HOSTILE: Array<[label: string, payload: unknown]> = [
 
 describe('parseGlobalEvalResult', () => {
   it('accepts a well-formed result', () => {
-    // Positive control: the parser is not simply rejecting everything, so the
-    // rejections below mean something.
+    // Positive control: the parser does not reject everything.
     const parsed = parseGlobalEvalResult({
       candidates: [{ workflowName: 'org-ci', run: true, jobs: [{ name: 'gen-a' }] }],
     });
@@ -72,11 +69,10 @@ describe('PendingGlobalEvalTracker', () => {
   it.each(HOSTILE)(
     'survives %s reaching resolve() directly, without throwing on the message path',
     async (_label, payload) => {
-      // `PendingTracker.resolve` calls `extractResolveMeta` SYNCHRONOUSLY, on
-      // the agent WebSocket message path. A throw there escapes into a promise
-      // nobody awaits, which the process-level handler turns into a shutdown —
-      // so this asserts the call itself does not throw, not merely that the
-      // tracked promise settles.
+      // `PendingTracker.resolve` calls `extractResolveMeta` SYNCHRONOUSLY on the agent
+      // WebSocket message path; a throw there escapes into an unawaited promise, which
+      // the process-level handler turns into a shutdown. So this asserts the call
+      // itself does not throw, not merely that the tracked promise settles.
       const tracker = new PendingGlobalEvalTracker();
       const promise = tracker.track('job-1');
       expect(() => tracker.resolve('job-1', payload as never)).not.toThrow();
@@ -86,16 +82,13 @@ describe('PendingGlobalEvalTracker', () => {
 });
 
 /**
- * Source-level guard on the message boundary.
- *
- * No unit test can observe `createApp`'s `onJobStatus` callback without standing
- * up the whole agent WebSocket server, but the property that matters is textual
- * and exact: the round result must be **parsed** where it arrives, never cast.
- * The arrival point is `settlePendingPrecursor` (`precursor-result.ts`), which
- * `app.ts` hands every agent `job.status` frame to — so both files are read:
- * the settle function for the parse, `app.ts` for the fact that it routes
- * through it rather than reading the payload itself. Same idiom the agent uses
- * for its own cross-file ordering guards.
+ * Source-level guard on the message boundary. A unit test cannot observe
+ * `createApp`'s `onJobStatus` callback without the whole agent WebSocket server,
+ * but the property is textual: the round result must be **parsed** where it
+ * arrives, never cast. It arrives in `settlePendingPrecursor`
+ * (`precursor-result.ts`), which `app.ts` hands every agent `job.status` frame
+ * to, so both files are read. Same idiom as the agent's cross-file ordering
+ * guards.
  */
 describe('the agent job.status boundary wires the round result through the parser', () => {
   const settleSource = readFileSync(
@@ -114,8 +107,8 @@ describe('the agent job.status boundary wires the round result through the parse
 
   it('parses that read instead of casting it', () => {
     expect(settleSource).toContain('parseGlobalEvalResult(data.globalEvalResult)');
-    // The cast this replaced would silently hand arbitrary agent JSON to a
-    // consumer that dereferences it.
+    // A cast would silently hand arbitrary agent JSON to a consumer that
+    // dereferences it.
     expect(settleSource).not.toContain('as GlobalEvalRoundResult');
     expect(appSource).not.toContain('as GlobalEvalRoundResult');
   });

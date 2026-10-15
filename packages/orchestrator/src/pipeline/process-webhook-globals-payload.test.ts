@@ -1,13 +1,12 @@
 /**
  * A cross-repo global workflow run stores the webhook payload that triggered it.
  *
- * The per-repository dispatch path persists `info.payload` to
+ * The per-repository path persists `info.payload` to
  * `executions/<runId>/webhook-payload.json` (`dispatch-matched-workflow.ts`,
- * `setupDispatchContext`), which is what the dashboard's Payload tab reads and
- * what a re-run copies onto the new run. A global run goes through the same
- * pipeline, so it stores the payload too — the event the workflow reacted to,
- * which for a global workflow comes from a repo the author may not even own, is
- * the one thing that explains why the run exists.
+ * `setupDispatchContext`), which the
+ * dashboard's Payload tab reads and a re-run copies. A global run stores it too:
+ * the triggering event, from a repo the author may not own, is the one thing
+ * that explains why the run exists.
  *
  * Both global paths are covered because they are separate call sites:
  * `tryDispatchGlobalsWithoutLockFile` (Phase F, no lock file resolves) and
@@ -18,6 +17,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { processWebhook } from './process-webhook.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import { webhookPayloadPath } from './webhook-payload-store.js';
+import { lockFileFixture, lockWorkflow, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 const SOURCE_REPO = 'acme/app';
 const GLOBAL_REPO = 'acme/org-workflows';
@@ -51,13 +51,11 @@ function makeGlobalRegistration() {
         { _type: 'pr', events: ['opened'], targetBranches: [], sourceBranches: [], paths: [] },
       ],
       jobs: [
-        {
-          _type: 'static',
+        staticJob({
           name: 'scan',
           runsOn: [{ kind: 'exact', value: 'default' }],
-          needs: [],
           steps: [{ name: 'scan', hasOutputs: false }],
-        },
+        }),
       ],
     },
   };
@@ -109,26 +107,24 @@ function makeDeps(over: { withLockFile?: boolean; logStorage?: boolean } = {}): 
       getByOrgAndEvent: () => [],
     },
     dispatcher: { dispatch },
-    // Absent when `logStorage: false` — the orchestrator runs without object
-    // storage configured, and the dispatch must still succeed.
+    // Absent when `logStorage: false` (no object storage); dispatch must still succeed.
     ...(over.logStorage === false ? {} : { logStorage: { append } }),
     lockFileCache: {
       get: vi.fn(async () =>
         over.withLockFile
-          ? {
+          ? lockFileFixture({
               schemaVersion: 9,
-              source: { file: '.kici/workflows/ci.ts', export: '#default' },
               contentHash: 'srchash',
               workflows: [
-                {
+                lockWorkflow({
                   name: 'src-push-only',
                   contentHash: 'shash',
                   compileSchemaVersion: 1,
                   triggers: [{ _type: 'push', branches: [], paths: [] }],
                   jobs: [],
-                },
+                }),
               ],
-            }
+            })
           : null,
       ),
     },
@@ -174,8 +170,8 @@ describe('a global workflow run stores its triggering webhook payload', () => {
   });
 
   it('dispatches even when the payload write fails', async () => {
-    // A storage outage must not cost the run: the per-repository path logs and
-    // continues, and this one behaves identically.
+    // A storage outage must not cost the run: log and continue, as the
+    // per-repository path does.
     const { deps, dispatch, append } = makeDeps();
     append.mockRejectedValue(new Error('storage down'));
 

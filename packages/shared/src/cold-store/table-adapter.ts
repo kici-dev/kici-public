@@ -1,19 +1,13 @@
 /**
- * TableAdapter interface — the concrete per-table contract.
- *
- * Each adapter (`run_events`, `execution_runs`, `execution_jobs`,
- * `execution_steps`, …) lives next to its owning
- * package (`packages/{platform,orchestrator}/src/cold-store/tables/`)
- * and is registered on the respective `BaseColdStore` subclass.
+ * The per-table cold-store contract. Each adapter lives in its owning package
+ * (`packages/{platform,orchestrator}/src/cold-store/tables/`) and is registered
+ * on that package's `BaseColdStore` subclass.
  */
 import type { ColdStoreTableConfig } from './config.js';
 import type { DbKind } from './key.js';
 import type { ColdRetention } from './types.js';
 
-/**
- * Discovered (tenant, partition-day) tuple eligible for archival.
- * Yielded by `listEligiblePartitions` in PK-ordered streams.
- */
+/** A (tenant, partition-day) eligible for archival, yielded by `listEligiblePartitions` in PK order. */
 export interface EligiblePartition {
   tenantId: string;
   /** `YYYY-MM-DD`. */
@@ -21,12 +15,10 @@ export interface EligiblePartition {
 }
 
 /**
- * Arguments to `writeAuditAndChunkCount`. The adapter's implementation
- * is responsible for writing a row into whichever audit surface its DB
- * has (Platform → `audit_log`, Orchestrator → `access_log` in later
- * phases) AND upserting the per-(db, table, tenant) row in
- * `cold_store_chunk_counts` — both inside the same transaction as the
- * data-mutation in `markArchivedAndDelete`.
+ * Arguments to `writeAuditAndChunkCount`, which writes an audit row (Platform →
+ * `audit_log`, Orchestrator → `access_log`) and upserts the per-(db, table,
+ * tenant) `cold_store_chunk_counts` row, both in the `markArchivedAndDelete`
+ * transaction.
  */
 export interface ChunkCommitMetadata {
   chunkId: string;
@@ -37,14 +29,11 @@ export interface ChunkCommitMetadata {
   gzipByteCount: number;
   objectKey: string;
   /**
-   * Present on chunks written by adapters that implement
-   * `coldTtlDays(row)` (the per-bucket layout). Adapters use this to
-   * INSERT a corresponding row into `cold_store_chunks` inside the same
-   * transaction as the data delete + audit + rollup updates.
-   *
-   * V1 chunks omit both fields — adapters skip the
-   * `cold_store_chunks` insert in that case and the GC sweep treats
-   * the chunk as `'forever'`.
+   * Set only by adapters that implement `coldTtlDays(row)` (the per-bucket
+   * layout); the adapter then inserts a `cold_store_chunks` row in the same
+   * transaction as the delete, audit and rollup updates. V1 chunks omit both
+   * fields: no `cold_store_chunks` insert, and the GC sweep treats the chunk as
+   * `'forever'`.
    */
   bucket?: string;
   /** See `bucket`. Numeric day-count or `'forever'`. */
@@ -53,33 +42,26 @@ export interface ChunkCommitMetadata {
 
 export interface TableAdapter<TRow> {
   readonly db: DbKind;
-  /** Postgres table name the adapter archives. */
   readonly table: string;
   /** Column used to shard S3 keys (e.g. `org_id`, `routing_key`). */
   readonly tenantColumn: string;
   /** Column used for day-partitioning (e.g. `created_at`). */
   readonly partitionColumn: string;
-  /** Effective per-table config after merging defaults + overrides. */
+  /** Defaults merged with per-table overrides. */
   readonly config: ColdStoreTableConfig;
 
   /**
-   * Stream the distinct (tenant, partitionDate) combinations that carry
-   * rows older than `warmCutoff`. The framework iterates these and,
-   * per combination, calls `selectEligible` inside `withPartitionLock`.
-   *
-   * Order: `(tenantId, partitionDate)` ascending. This lets the
-   * framework pause mid-iteration at a byte / row cap and resume on
-   * the next cycle without skipping partitions.
+   * Distinct (tenant, partitionDate) pairs with rows older than `warmCutoff`;
+   * the framework calls `selectEligible` per pair inside `withPartitionLock`.
+   * Ascending `(tenantId, partitionDate)` order lets the framework stop at a
+   * byte / row cap and resume next cycle without skipping partitions.
    */
   listEligiblePartitions(args: { warmCutoff: Date }): AsyncIterable<EligiblePartition>;
 
   /**
-   * Approximate size-in-bytes of warm rows for a single tenant.
-   * Used to enforce `minWarmTenantBytes` — we skip archival for
-   * low-traffic tenants where the chunk would be tiny.
-   *
-   * Implementations MAY approximate via `pg_column_size` sum + row
-   * count; accuracy within ~20% is fine.
+   * Approximate warm-row bytes for one tenant, for `minWarmTenantBytes` (skip
+   * archival when the chunk would be tiny). A `pg_column_size` sum plus row
+   * count is fine; ~20% accuracy suffices.
    */
   countTenantWarmBytes(args: { tenantId: string; warmCutoff: Date }): Promise<number>;
 
@@ -87,8 +69,7 @@ export interface TableAdapter<TRow> {
    * Run `fn` while holding a Postgres advisory lock keyed by
    * `hashtext('cold-store|<db>|<table>|<tenantId>|<partitionDate>')`.
    *
-   * Returns the `fn` result on successful lock acquisition, or `null`
-   * when another archiver replica already holds the lock. The adapter
+   * Returns `null` when another archiver replica holds the lock. The adapter
    * owns this because the lock lives on its Kysely instance.
    *
    * `PgTableAdapterBase` implements it with a session lock
@@ -101,9 +82,8 @@ export interface TableAdapter<TRow> {
   ): Promise<T | null>;
 
   /**
-   * Stream the eligible rows for one (tenant, partitionDate) combination,
-   * up to the adapter's byte/row cap. Rows yielded in PK order so min/max
-   * bounds are computed correctly.
+   * Eligible rows for one (tenant, partitionDate), up to the byte/row cap, in
+   * PK order so the min/max bounds are correct.
    */
   selectEligible(args: {
     tenantId: string;
@@ -111,25 +91,20 @@ export interface TableAdapter<TRow> {
     limit: number;
   }): AsyncIterable<TRow>;
 
-  /** Stringify a row for the JSONL body. */
+  /** JSONL line codec. */
   encodeRow(row: TRow): string;
-  /** Parse a row back from a JSONL line. */
   decodeRow(line: string): TRow;
-  /** Extract the primary key; used for chunk-id bounds. */
+  /** Primary key; used for chunk-id bounds. */
   rowId(row: TRow): string | number;
-  /** Extract the partition-column timestamp; used for manifest bounds. */
+  /** Partition-column timestamp; used for manifest bounds. */
   rowTimestamp(row: TRow): Date | string;
 
   /**
-   * Optional natural-key extractor used by
-   * `BaseColdStore.replayRow()` to find a chunk by an externally
-   * meaningful identifier (e.g. UUID `run_id`) rather than the internal
-   * SERIAL `id` returned by `rowId()`. Adapters that implement this
-   * method opt the table into single-row replay-into-PG: every chunk
-   * persisted afterwards carries a `replayLookupKeys` array on its
-   * manifest. Adapters whose primary key already IS the natural key
-   * (e.g. `event_log` keyed by UUID) can leave this undefined — the
-   * `minRowId`/`maxRowId` range comparison covers them.
+   * Natural key (e.g. UUID `run_id`, not the SERIAL `rowId()`) that
+   * `BaseColdStore.replayRow()` finds a chunk by. Implementing it opts the table
+   * into single-row replay: every chunk written afterwards carries
+   * `replayLookupKeys` on its manifest. Omit it when the PK is already the
+   * natural key (e.g. `event_log`); the `minRowId`/`maxRowId` range covers it.
    */
   replayLookupKey?(row: TRow): string;
 
@@ -140,8 +115,7 @@ export interface TableAdapter<TRow> {
    *  3. Call `writeAuditAndChunkCount` with `chunkMeta` on the same
    *     transaction handle (adapter-internal wiring).
    *
-   * Implemented inside each adapter because the row-ID column name
-   * varies per table.
+   * Per adapter because the row-ID column name varies per table.
    */
   markArchivedAndDelete(args: {
     rowIds: ReadonlyArray<string | number>;
@@ -149,13 +123,10 @@ export interface TableAdapter<TRow> {
   }): Promise<void>;
 
   /**
-   * Replay a chunk's rows back into PG.
-   *
-   * Optional. Adapters that do NOT implement this method cannot be
-   * promoted back into PG via `BaseColdStore.replayChunk()` /
-   * `replayRow()` — only those tables whose rerun / rehydrate path
-   * genuinely needs read-after-write semantics on PG (currently only
-   * `execution_runs` on both DBs) opt in.
+   * Replay a chunk's rows back into PG. Without it, `BaseColdStore.replayChunk()`
+   * / `replayRow()` cannot promote the table; only tables whose rerun /
+   * rehydrate path needs read-after-write on PG (`execution_runs` on both DBs)
+   * opt in.
    *
    * Contract:
    *  1. INSERT each row, clearing `archived_at` / `archive_object_key`,
@@ -175,8 +146,7 @@ export interface TableAdapter<TRow> {
    * All three steps run in one transaction — either everything commits
    * or nothing does.
    *
-   * Returns `{ inserted, skipped }`. `skipped` covers rows whose unique
-   * key already exists in PG (idempotent replays — fine).
+   * `skipped` counts rows whose unique key already exists in PG.
    */
   replayInsert?(args: {
     rows: ReadonlyArray<TRow>;
@@ -184,30 +154,21 @@ export interface TableAdapter<TRow> {
   }): Promise<{ inserted: number; skipped: number }>;
 
   /**
-   * Per-row cold-retention TTL.
+   * Days the row's chunk lives in S3 after archival, or `'forever'`. Rows are
+   * grouped by `coldDaysToBucket(coldTtlDays(row))` so each chunk spans one
+   * bucket subprefix; the manifest carries the chunk's MAXIMUM `coldTtlDays`, so
+   * the GC sweep keys off row retention, not the bucket name.
    *
-   * Returns the number of days the row's chunk should live in S3 after
-   * archival, or `'forever'` to never purge. The framework groups rows by
-   * `coldDaysToBucket(coldTtlDays(row))` at archive time so each chunk
-   * spans a single bucket subprefix; the chunk's manifest carries the
-   * MAXIMUM `coldTtlDays` of any row in the chunk so the GC sweep keys
-   * off row-level retention rather than the bucket name.
-   *
-   * Adapters that don't implement this method opt out of the per-bucket
-   * layout: every chunk is written to the day-prefix root with the
-   * single-chunk (v1) manifest and is treated as `'forever'` by the GC sweep.
-   * Audit-style adapters (`audit_log`, `access_log`, `secret_audit_log`)
-   * implement this; the high-volume execution / event tables retain
-   * their existing layout until their own retention policy is finalized.
+   * Without it, every chunk goes to the day-prefix root with the v1 manifest and
+   * the GC sweep treats it as `'forever'`. The audit-style adapters (`audit_log`,
+   * `access_log`, `secret_audit_log`) implement it; the high-volume execution /
+   * event tables do not.
    */
   coldTtlDays?(row: TRow): ColdRetention;
 
   /**
-   * Transactionally purge a chunk's PG bookkeeping after the
-   * S3 objects have been deleted.
-   *
-   * Implementations MUST run all three steps in one transaction so a
-   * partial failure doesn't leave inconsistent state:
+   * Purge a chunk's PG bookkeeping after its S3 objects are deleted. All steps
+   * MUST run in one transaction:
    *   1. `DELETE FROM cold_store_chunks WHERE chunk_id = $1`.
    *   2. Decrement `cold_store_chunk_counts` (`chunk_count -= 1`,
    *      `total_bytes -= gzipBytes`, `total_rows -= rowCount`,
@@ -217,8 +178,7 @@ export interface TableAdapter<TRow> {
    *      with `actor_id='cold-store-purge:<instanceId>'` and details
    *      `{ bucket, maxColdDays, gzipBytes, rowCount, objectKey }`.
    *
-   * Optional — adapters that don't opt into the per-bucket layout via
-   * `coldTtlDays` also can't be purged, so they don't need this hook.
+   * Only adapters that implement `coldTtlDays` can be purged, so only they need it.
    */
   purgeChunkRecord?(args: {
     tenantId: string;

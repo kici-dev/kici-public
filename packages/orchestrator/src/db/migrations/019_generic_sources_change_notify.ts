@@ -1,25 +1,21 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add a Postgres trigger on `generic_webhook_sources` that emits
- * `pg_notify('generic_sources_change', routing_key)` on every INSERT,
- * UPDATE, and DELETE. Soft-deletes (UPDATE that sets `deleted_at`) ride
- * the same UPDATE path — the listener treats a row with `deleted_at IS
- * NOT NULL` (or a row that no longer exists for that routing_key) as a
- * de-registration signal.
+ * Add a trigger on `generic_webhook_sources` that emits
+ * `pg_notify('generic_sources_change', routing_key)` on every INSERT, UPDATE
+ * and DELETE. A soft-delete (UPDATE setting `deleted_at`) rides the UPDATE
+ * path; the listener reads `deleted_at IS NOT NULL` or a missing row as
+ * de-registration.
  *
- * The consumer is `GenericSourcesChangeListener`
- * (`packages/orchestrator/src/webhook/generic-sources-listener.ts`),
- * which runs in every orchestrator peer, LISTENs on the channel, and
- * mutates the local `ProviderRegistry` in place
- * (`registerProviderBundleForSource` for INSERT/UPDATE; `unregister` for
- * DELETE / soft-delete). Without this round-trip, peers other than the
- * one that handled `kici-admin source add generic` would 404 incoming
- * webhooks until restart.
+ * `GenericSourcesChangeListener`
+ * (`packages/orchestrator/src/webhook/generic-sources-listener.ts`) LISTENs in
+ * every peer and updates its local `ProviderRegistry`
+ * (`registerProviderBundleForSource` / `unregister`). Without it, peers other
+ * than the one that ran `kici-admin source add generic` 404 the webhooks until
+ * restart.
  *
- * Mirrors the existing GitHub-app `sources` trigger
- * (`notify_sources_change()` + `sources_change_trigger`, defined in
- * `001_initial.ts`).
+ * Mirrors the GitHub-app `sources` trigger (`notify_sources_change()` +
+ * `sources_change_trigger` in `001_initial.ts`).
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`

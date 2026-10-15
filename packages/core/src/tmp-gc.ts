@@ -1,18 +1,13 @@
 /**
- * Age-based garbage collection for KiCI-owned temp directories.
- *
- * Work directories under the temp root normally remove themselves (job
- * runners clean up in `finally`), but two paths legitimately outlive their
- * creator: `kici run --local` checkouts retained for inspection after a failed
- * run, and any workdir whose process died hard (SIGKILL, OOM) before its
- * cleanup ran. Without a collector they accumulate node_modules-sized trees
- * until the temp filesystem runs out of inodes. Callers invoke this at a
- * natural moment (next run, process startup) with a pattern matching ONLY
+ * Age-based GC for KiCI-owned temp directories. Two kinds outlive their
+ * creator's `finally` cleanup: `kici run --local` checkouts kept after a failed
+ * run, and workdirs of a process that died hard (SIGKILL, OOM). Uncollected,
+ * their node_modules-sized trees exhaust the temp filesystem's inodes. Callers
+ * run this at a natural moment (next run, startup) with a pattern matching ONLY
  * the directory family they own.
  *
- * Node-API module (filesystem): exported via the `@kici-dev/core/tmp-gc`
- * subpath, NOT the package barrel, so browser consumers of the barrel never
- * pull in `node:fs`.
+ * Exported via the `@kici-dev/core/tmp-gc` subpath, NOT the barrel, so browser
+ * consumers never pull in `node:fs`.
  */
 
 import { readdir, rm, stat } from 'node:fs/promises';
@@ -26,19 +21,17 @@ export interface GcStaleTmpDirsOptions {
   /** Children with mtime older than this are removed. */
   maxAgeMs: number;
   /**
-   * Basenames that are NEVER removed even when they match `pattern` and exceed
-   * `maxAgeMs`. Lets a broad pattern coexist with deterministic persistent
-   * caches whose names structurally collide with the pattern.
+   * Basenames NEVER removed, so a broad pattern can coexist with persistent
+   * caches whose names collide with it.
    */
   exclude?: ReadonlySet<string>;
-  /** Optional per-removal / per-failure logger. */
+  /** Per-removal / per-failure logger. */
   log?: (message: string) => void;
 }
 
 /**
- * Remove stale matching directories under `base`. Never throws: a missing
- * base is a no-op and per-directory failures are logged and skipped — GC
- * must never break the caller's actual work. Returns the removed paths.
+ * Returns the removed paths. Never throws: GC must never break the caller's
+ * work, so a missing base is a no-op and per-directory failures are logged.
  */
 export async function gcStaleTmpDirs(opts: GcStaleTmpDirsOptions): Promise<string[]> {
   const { base, pattern, maxAgeMs, exclude, log } = opts;

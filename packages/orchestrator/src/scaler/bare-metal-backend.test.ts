@@ -1,13 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { ScalerEventType } from './types.js';
 import type { LabelSetConfig } from './types.js';
 
-// Create a reusable mock ChildProcess factory.
-// stdout/stderr are real PassThrough streams so the backend's internal
-// `.pipe(merged)` wiring works and tests can feed captured output by writing
-// to mockChildProcess.stdout / .stderr.
+// stdout/stderr are real PassThrough streams, so the backend's `.pipe(merged)`
+// wiring works and a test feeds captured output by writing to them.
 function createMockChildProcess(pid: number = 12345) {
   const emitter = new EventEmitter();
   return Object.assign(emitter, {
@@ -556,9 +557,8 @@ describe('BareMetalScalerBackend', () => {
     });
 
     it('handles NaN PID when spawn failed before PID assignment', async () => {
-      // Simulate spawn failing before PID is assigned (e.g. ENOENT)
+      // A spawn that fails before a PID is assigned (ENOENT) leaves pid undefined.
       const noPidProcess = createMockChildProcess(12345);
-      // Override pid to undefined (like when spawn fails with ENOENT)
       Object.defineProperty(noPidProcess, 'pid', { value: undefined });
       mockChildProcess = noPidProcess;
 
@@ -569,14 +569,12 @@ describe('BareMetalScalerBackend', () => {
         'http://localhost:4000',
       );
 
-      // backendRef should be "undefined" string since pid was undefined
       expect(managed.backendRef).toBe('undefined');
       expect(backend.getActiveCount()).toBe(1);
 
-      // destroy() should handle NaN PID gracefully without calling process.kill
+      // The NaN-PID guard: destroy() never calls process.kill.
       await backend.destroy('agent-nopid');
       expect(backend.getActiveCount()).toBe(0);
-      // process.kill should NOT have been called (NaN PID guard)
       expect(killSpy).not.toHaveBeenCalled();
     });
   });
@@ -634,7 +632,6 @@ describe('BareMetalScalerBackend', () => {
       await backend.spawn(['linux', 'bare-metal'], 'agent-1', 'http://localhost:4000');
       expect(backend.getActiveCount()).toBe(1);
 
-      // Simulate process exit
       mockChildProcess.emit('exit', 0, null);
       expect(backend.getActiveCount()).toBe(0);
     });
@@ -669,6 +666,31 @@ describe('BareMetalScalerBackend', () => {
       expect(
         backend.reload([{ labels: ['linux', 'bare-metal'], binaryPath: '/opt/a&b/kici-agent' }]),
       ).toEqual({ valid: true });
+    });
+
+    it('refuses a binaryPath that is a version-manager shim, as startup does', () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-bm-reload-'));
+      try {
+        const mise = path.join(tmp, 'bin', 'mise');
+        fs.mkdirSync(path.dirname(mise), { recursive: true });
+        fs.writeFileSync(mise, '#!/bin/sh\n', { mode: 0o755 });
+        const shim = path.join(tmp, 'mise', 'shims', 'kici-agent');
+        fs.mkdirSync(path.dirname(shim), { recursive: true });
+        fs.symlinkSync(mise, shim);
+        const backend = createBackend();
+        // fails-when: a SIGHUP reload accepts the shim the startup check refuses.
+        const result = backend.reload([{ labels: ['linux', 'bare-metal'], binaryPath: shim }]);
+        expect(result.valid).toBe(false);
+        if (!result.valid) {
+          expect(result.errors).toEqual([
+            expect.stringMatching(
+              /^Label set \[0\]: binaryPath .* is a version-manager shim \(mise\)/,
+            ),
+          ]);
+        }
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
     });
 
     it('updates label sets on successful reload', () => {
@@ -828,16 +850,11 @@ describe('BareMetalScalerBackend', () => {
   });
 
   /**
-   * Startup-time tool requirements reported by the scaler. Missing tools
-   * here cause orchestrator startup to fail with a clear error (see
-   * validateRequiredTools in @kici-dev/shared). The KICI_SANDBOX opt-in
-   * must gate a bwrap `path-binary` requirement so that:
-   *
-   * 1. Linux operators who typo `KICI_SANDBOX=true` without installing
-   *    bubblewrap learn at deploy time, not at first job dispatch.
-   * 2. macOS and Windows operators cannot enable KICI_SANDBOX at all —
-   *    `which bwrap` / `where bwrap` both fail on those platforms, so the
-   *    startup check rejects the config immediately.
+   * A missing startup tool fails orchestrator startup with a clear error
+   * (`validateRequiredTools` in @kici-dev/shared). KICI_SANDBOX gates a bwrap
+   * `path-binary` requirement, so a Linux operator who sets it without
+   * bubblewrap learns at deploy time, not at first job dispatch, and macOS and
+   * Windows reject it at startup (`which bwrap` / `where bwrap` fail there).
    */
   describe('getRequiredTools (KICI_SANDBOX opt-in)', () => {
     const entry = {

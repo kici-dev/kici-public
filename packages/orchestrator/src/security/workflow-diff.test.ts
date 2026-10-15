@@ -1,16 +1,16 @@
 import { describe, it, expect } from 'vitest';
 import { detectWorkflowModifications } from './workflow-diff.js';
 import type { LockFile, LockWorkflow } from '@kici-dev/engine';
+import { lockFileFixture, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 // -- Helpers --
 
 function makeLockFile(workflows: LockWorkflow[]): LockFile {
-  return {
+  return lockFileFixture({
     schemaVersion: 9,
-    source: { file: '.kici/workflows/ci.ts', export: '#default' },
     contentHash: 'deadbeef',
     workflows,
-  };
+  });
 }
 
 function makeWorkflow(name: string, overrides?: Partial<LockWorkflow>): LockWorkflow {
@@ -26,13 +26,10 @@ function makeWorkflow(name: string, overrides?: Partial<LockWorkflow>): LockWork
       },
     ],
     jobs: [
-      {
-        _type: 'static',
-        name: 'build',
+      staticJob({
         runsOn: 'default',
-        needs: [],
         steps: [{ name: 'install', hasOutputs: false }],
-      },
+      }),
     ],
     ...overrides,
   };
@@ -103,27 +100,21 @@ describe('detectWorkflowModifications', () => {
   it('detects step modification', () => {
     const baseWf = makeWorkflow('ci', {
       jobs: [
-        {
-          _type: 'static',
-          name: 'build',
+        staticJob({
           runsOn: 'default',
-          needs: [],
           steps: [{ name: 'install', hasOutputs: false }],
-        },
+        }),
       ],
     });
     const headWf = makeWorkflow('ci', {
       jobs: [
-        {
-          _type: 'static',
-          name: 'build',
+        staticJob({
           runsOn: 'default',
-          needs: [],
           steps: [
             { name: 'install', hasOutputs: false },
             { name: 'test', hasOutputs: true },
           ],
-        },
+        }),
       ],
     });
 
@@ -168,8 +159,7 @@ describe('detectWorkflowModifications', () => {
           },
         ],
       }),
-      // deploy removed
-      makeWorkflow('e2e'), // 'e2e' added
+      makeWorkflow('e2e'),
     ]);
 
     const result = detectWorkflowModifications(base, head);
@@ -186,7 +176,6 @@ describe('detectWorkflowModifications', () => {
     // contentHash is volatile (changes with compile) -- we only compare triggers/jobs/rules
     const baseWf = makeWorkflow('ci');
     const headWf = makeWorkflow('ci');
-    // Both have same triggers/jobs but different contentHash
     const base = makeLockFile([{ ...baseWf, contentHash: 'hash-v1' }]);
     const head = makeLockFile([{ ...headWf, contentHash: 'hash-v2' }]);
 

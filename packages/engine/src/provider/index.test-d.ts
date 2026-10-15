@@ -3,9 +3,8 @@ import type * as engine from '../index.js';
 import type * as provider from './index.js';
 
 /**
- * The contributor-resolution surface is gone from the provider abstraction.
- * `ContributorResolver` and its companions were type-only, so no runtime probe
- * can see them return; only the compiler can.
+ * `ContributorResolver` and its companions are type-only, so only the compiler
+ * can prove they stay out of the provider abstraction.
  */
 describe('provider barrel', () => {
   // fails-when: ContributorResolver is exported from the provider barrel again

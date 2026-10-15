@@ -3,13 +3,11 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 /**
- * The eval child's boundary, asserted where it is decided: in the import graph
- * and in the message union.
- *
- * A behavioural test cannot see this. The defect was that customer workflow
- * modules were `import()`ed in the AGENT process, and the fix is that the agent
- * no longer has the loader in its module graph at all — so the assertion is
- * static, with a positive control on every negative claim.
+ * The eval child's boundary, asserted where it is decided: the import graph and
+ * the message union. The defect was customer modules `import()`ed in the AGENT
+ * process; the fix removes the loader from the agent's module graph, which no
+ * behavioural test can see, so these assertions are static, with a positive
+ * control on every negative claim.
  */
 const read = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 
@@ -65,9 +63,8 @@ describe('the eval request carries no secrets', () => {
     expect(evalRequestBlock).not.toContain('secrets');
     expect(evalRequestBlock).not.toContain('namespacedSecrets');
 
-    // The agent-side builder enumerates the dispatch fields it forwards. Its
-    // comments are stripped first: one of them says the request carries no
-    // secrets, and matching that sentence would make this assertion vacuous.
+    // Comments are stripped first: one says the request carries no secrets,
+    // and matching it would make this assertion vacuous.
     const builder = jobRunnerSrc
       .slice(
         jobRunnerSrc.indexOf('  private runEvaluation<T>('),

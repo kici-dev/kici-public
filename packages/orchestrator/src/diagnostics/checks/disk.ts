@@ -1,9 +1,4 @@
-/**
- * Disk space diagnostic check.
- *
- * Uses `df` command to check available disk space on the root partition.
- * Thresholds: warn < 1GB, fail < 100MB.
- */
+/** Disk space check on the root partition via `df`: warn < 1GB, fail < 100MB. */
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -19,7 +14,7 @@ export async function checkDiskSpace(_deps: DiagnosticDeps): Promise<DiagnosticR
   const start = Date.now();
 
   try {
-    // Use df to get available space on root partition (POSIX output, 1K blocks)
+    // POSIX output, 1K blocks
     const { stdout } = await execFileAsync('df', ['-Pk', '/']);
     const lines = stdout.trim().split('\n');
 
@@ -32,7 +27,7 @@ export async function checkDiskSpace(_deps: DiagnosticDeps): Promise<DiagnosticR
       };
     }
 
-    // Parse second line: filesystem 1K-blocks used available capacity mountpoint
+    // filesystem 1K-blocks used available capacity mountpoint
     const parts = lines[1].split(/\s+/);
     const availableKb = parseInt(parts[3], 10);
     const availableBytes = availableKb * 1024;

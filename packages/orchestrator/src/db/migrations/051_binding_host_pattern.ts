@@ -1,23 +1,19 @@
 import { type Kysely, sql } from 'kysely';
 
 /**
- * Add a per-host dimension to environment secret bindings:
+ * Per-host environment secret bindings:
  *
- * - `environment_bindings.host_pattern text NOT NULL DEFAULT '**'` — the host
- *   selector a binding applies to (exact / glob / regex, matched against a
- *   fan-out child's agentId / hostname / labels). `'**'` matches every host, so
- *   existing rows are backfilled to `'**'` and keep their fleet-wide behaviour.
- * - The binding unique key widens from `(environment_id, scope_pattern)` to
- *   `(environment_id, scope_pattern, host_pattern)` so the same scope can carry
- *   distinct per-host selectors.
+ * - `host_pattern` — exact / glob / regex host selector, matched against a fan-out child's
+ *   agentId / hostname / labels. Existing rows backfill to `'**'` (every host), keeping their
+ *   fleet-wide behaviour.
+ * - The unique key widens to `(environment_id, scope_pattern, host_pattern)`, so one scope can
+ *   carry distinct per-host selectors.
  *
- * Idempotent: re-running on a DB that already has the column / index is a no-op.
- * Additive — existing data is preserved.
+ * Idempotent and additive.
  */
 export async function up(db: Kysely<unknown>): Promise<void> {
   await sql`ALTER TABLE public.environment_bindings
     ADD COLUMN IF NOT EXISTS host_pattern text NOT NULL DEFAULT '**'`.execute(db);
-  // Replace the old 2-column unique with a 3-column unique that includes host_pattern.
   await sql`ALTER TABLE public.environment_bindings
     DROP CONSTRAINT IF EXISTS environment_bindings_env_id_scope_unique`.execute(db);
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS environment_bindings_env_scope_host_uniq

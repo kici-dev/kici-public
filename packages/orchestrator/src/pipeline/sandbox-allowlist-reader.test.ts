@@ -2,9 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { createSandboxAllowListReader } from './sandbox-allowlist-reader.js';
 
 /**
- * Fake Kysely handle: only the `selectFrom('org_settings').select(...)
- * .where(...).executeTakeFirst()` chain the reader uses is modelled. The
- * executeTakeFirst spy lets each test control the org_settings row (or throw).
+ * Fake Kysely handle modelling only the reader's `selectFrom('org_settings')`
+ * chain; the executeTakeFirst spy controls the row (or throws).
  */
 const mkDb = (executeTakeFirst: () => Promise<unknown>) => {
   const chain = {

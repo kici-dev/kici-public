@@ -1,14 +1,12 @@
 /**
  * Metering of the Tier-2 global eval round.
  *
- * The round decides which global workflows run at all, and it does so on an
- * agent — so without these counters an operator cannot tell a wave of
- * deliberate `filter` exclusions from a fleet-wide round failure, and cannot
- * tell a cache that is answering from one that is never even consulted.
+ * The round decides on an agent which global workflows run; these counters let
+ * an operator tell deliberate `filter` exclusions from a fleet-wide round
+ * failure, and an answering cache from one never consulted.
  *
- * The instruments are mocked at the module boundary because the real ones are
- * lazily-bound OTel counters whose recorded values are not readable without a
- * MeterProvider — the assertion here is about what the round decided to record.
+ * The instruments are mocked at the module boundary: the real lazily-bound OTel
+ * counters are unreadable without a MeterProvider.
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { LockWorkflow } from '@kici-dev/engine';
@@ -218,9 +216,8 @@ describe('global eval round metrics', () => {
   });
 
   it('counts an unserializable input as a third outcome, not as a miss', async () => {
-    // A lookup that never reaches the cache is neither a hit nor a miss.
-    // Counting only two outcomes would drop it from the denominator and make
-    // the hit rate read higher than it is.
+    // A lookup that never reaches the cache is neither hit nor miss; dropping it
+    // from the denominator would inflate the hit rate.
     const circular: Record<string, unknown> = { type: 'push', targetBranch: 'main' };
     circular.self = circular;
     const cache = new GlobalEvalRoundCache({ max: 8 });
@@ -255,10 +252,9 @@ describe('candidates a round never ran for', () => {
   beforeEach(() => vi.clearAllMocks());
 
   /**
-   * The fail-closed skip — no pending-eval tracker, so a round could never
-   * settle — suppresses EVERY global workflow for a delivery. It returns before
-   * `runGlobalEvalRounds` is reached, so nothing inside the round can meter it,
-   * and it used to leave a single `logger.warn` as its whole record.
+   * The fail-closed skip (no pending-eval tracker, so a round could never
+   * settle) suppresses EVERY global workflow for a delivery, and returns before
+   * `runGlobalEvalRounds`, so nothing inside the round can meter it.
    */
   it('counts them as entered and as indeterminate', () => {
     recordUnrunCandidates(3);
@@ -277,9 +273,8 @@ describe('candidates a round never ran for', () => {
   });
 
   it('keeps candidates equal to the sum of verdicts on a normal round', async () => {
-    // The invariant the metric's own JSDoc now claims. Asserting it here is
-    // what stops the doc from drifting back into the false "not derivable"
-    // form: if a future path emits one without the other, this fails.
+    // The invariant the metric's JSDoc claims; fails if a path emits one
+    // without the other.
     const h = harness({
       candidates: [
         { workflowName: 'a', run: true },
