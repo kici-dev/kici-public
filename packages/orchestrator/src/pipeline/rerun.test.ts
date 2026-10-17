@@ -892,7 +892,7 @@ describe('handleRerun', () => {
     const addArgs = executionTracker.addJobsToRun.mock.calls[0];
     expect(typeof addArgs[0]).toBe('string');
     expect(addArgs[1]).toEqual([
-      { jobId: 'local-job-1', jobName: 'test', runsOnLabels: ['default'] },
+      { jobId: 'local-job-1', jobName: 'test', runsOnLabels: ['default'], workflowName: 'ci' },
     ]);
   });
 

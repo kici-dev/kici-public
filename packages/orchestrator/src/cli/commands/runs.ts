@@ -10,6 +10,8 @@ import { renderTable } from './shared/table.js';
 interface RunSummaryDTO {
   runId: string;
   workflowName: string;
+  /** Every workflow the run spans, `workflowName` first; absent from an older orchestrator. */
+  workflowNames?: string[];
   status: string;
   provider: string;
   repoIdentifier: string;
@@ -57,6 +59,8 @@ interface StepDTO {
 interface JobDTO {
   jobId: string;
   jobName: string;
+  /** The workflow that defines the job; null when not recorded, absent from an older orchestrator. */
+  workflowName?: string | null;
   status: string;
   matrixValues: Record<string, unknown> | null;
   agentId: string | null;
@@ -76,6 +80,8 @@ interface JobDTO {
 interface RunDetailDTO {
   runId: string;
   workflowName: string;
+  /** Every workflow the run spans, `workflowName` first; absent from an older orchestrator. */
+  workflowNames?: string[];
   status: string;
   provider: string;
   repoIdentifier: string;
@@ -173,6 +179,28 @@ function formatDuration(ms: number | null): string {
   return `${mins}m${remainSecs}s`;
 }
 
+/** Every workflow a run spans; an older orchestrator reports only the first. */
+function runWorkflows(run: { workflowName: string; workflowNames?: string[] }): string[] {
+  return run.workflowNames?.length ? run.workflowNames : [run.workflowName];
+}
+
+/**
+ * The `workflow` cell of `runs list`: the run's workflow, plus how many more it
+ * spans (`hello-world +3`), so a run of several workflows never reads as one.
+ */
+function workflowListCell(run: { workflowName: string; workflowNames?: string[] }): string {
+  const names = runWorkflows(run);
+  return names.length > 1 ? `${names[0]} +${names.length - 1}` : names[0];
+}
+
+/**
+ * A job's label in the per-job lines: qualified with its workflow when the run
+ * spans several, where two jobs can share a name.
+ */
+function jobLabel(job: JobDTO, spansWorkflows: boolean): string {
+  return spansWorkflows && job.workflowName ? `${job.workflowName} / ${job.jobName}` : job.jobName;
+}
+
 /**
  * Header lines naming where an organization-wide run's workflow is defined.
  * "Defined in" prints only when the workflow repository differs from the run's
@@ -223,7 +251,10 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
       '--status <statuses>',
       'Filter by run status. Accepts a single value or a comma-separated list (e.g. success,failed)',
     )
-    .option('--workflow-name <name>', 'Filter by workflow name')
+    .option(
+      '--workflow-name <name>',
+      'Filter by workflow name. A run that spans several workflows matches any of them',
+    )
     .option('--repo <ownerRepo>', 'Filter by repo identifier (owner/repo)')
     .option(
       '--since <iso8601>',
@@ -283,7 +314,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         ];
         const rows = data.runs.map((r) => [
           r.runId,
-          r.workflowName,
+          workflowListCell(r),
           r.status,
           r.repoIdentifier,
           r.ref,
@@ -325,9 +356,12 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         }
 
         const { run, jobs } = data;
+        const workflows = runWorkflows(run);
+        const spansWorkflows = workflows.length > 1;
 
         console.log(`Run: ${run.runId}`);
-        console.log(`  Workflow:    ${run.workflowName}`);
+        if (spansWorkflows) console.log(`  Workflows:   ${workflows.join(', ')}`);
+        else console.log(`  Workflow:    ${run.workflowName}`);
         console.log(`  Status:      ${run.status}`);
         console.log(`  Repo:        ${run.repoIdentifier}`);
         console.log(`  Ref:         ${run.ref}`);
@@ -352,10 +386,11 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         }
 
         console.log('');
-        const jobHeaders = ['job_id', 'name', 'status', 'agent', 'duration', 'steps'];
+        const jobHeaders = ['job_id', 'name', 'workflow', 'status', 'agent', 'duration', 'steps'];
         const jobRows = jobs.map((j) => [
           j.jobId,
           j.jobName,
+          j.workflowName ?? '-',
           j.status,
           j.agentId ?? '-',
           formatDuration(j.durationMs),
@@ -375,7 +410,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         if (unroutableJobs.length > 0) {
           console.log('');
           for (const job of unroutableJobs) {
-            console.log(`  ! ${job.jobName}: ${job.routingReason}`);
+            console.log(`  ! ${jobLabel(job, spansWorkflows)}: ${job.routingReason}`);
           }
         }
 
@@ -383,7 +418,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         if (jobsWithSteps.length > 0) {
           for (const job of jobsWithSteps) {
             console.log('');
-            console.log(`Steps for ${job.jobName} (${job.jobId}):`);
+            console.log(`Steps for ${jobLabel(job, spansWorkflows)} (${job.jobId}):`);
             const stepHeaders = ['#', 'name', 'status', 'exit', 'duration', 'type'];
             const stepRows = (job.steps ?? []).map((s) => [
               String(s.stepIndex),
@@ -478,10 +513,11 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
           return;
         }
 
-        const headers = ['job_id', 'name', 'status', 'agent', 'duration', 'started_at'];
+        const headers = ['job_id', 'name', 'workflow', 'status', 'agent', 'duration', 'started_at'];
         const rows = response.jobs.map((j) => [
           j.jobId,
           j.jobName,
+          j.workflowName ?? '-',
           j.status,
           j.agentId ?? '-',
           formatDuration(j.durationMs),
@@ -490,11 +526,13 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         console.log(renderTable(headers, rows));
 
         if (opts.includeSteps) {
+          const spansWorkflows =
+            new Set(response.jobs.map((j) => j.workflowName).filter(Boolean)).size > 1;
           for (const job of response.jobs) {
             const steps = job.steps ?? [];
             if (steps.length === 0) continue;
             console.log('');
-            console.log(`Steps for ${job.jobName} (${job.jobId}):`);
+            console.log(`Steps for ${jobLabel(job, spansWorkflows)} (${job.jobId}):`);
             const stepHeaders = ['#', 'name', 'status', 'exit', 'duration'];
             const stepRows = steps.map((s) => [
               String(s.stepIndex),

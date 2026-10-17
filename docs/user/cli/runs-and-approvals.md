@@ -13,7 +13,7 @@ Execute workflows locally or remotely. A bare `kici run [event]` performs a real
 
 Run a workflow on this machine as a real routed dispatch. `kici run <event> --local` compiles your workflows, matches triggers against the specified event, expands matrices, and executes the matched jobs — this machine joins as an ephemeral agent through the warm local dev plane. No orchestrator deployment is required.
 
-`kici run local` (the old direct-execution subcommand) is retired: every run is now a real routed dispatch. Invoking `kici run local <event>` prints a hint pointing at `kici run <event> --local` and exits without running.
+`kici run local` is retired, because every run is a real routed dispatch. Invoking `kici run local <event>` prints a hint pointing at `kici run <event> --local` and exits without running.
 
 ```bash
 kici run [event] --local [options]
@@ -46,6 +46,8 @@ Set the `KICI_TMPDIR` environment variable to place the isolated checkout (and e
 Secrets are always sourced from your real `.kici/` directory, not from the isolated checkout. Gitignored secret files (such as `.kici/.env.local` and `.kici/secrets.yaml`) are never copied into the checkout, so a step that reads a secret still gets it from the original location.
 
 Pass `--in-place` to run against the real working directory instead — useful when you explicitly want in-tree execution. Both modes need a git repository, because the run triggers on a commit. Outside a git work tree, the command fails and tells you to initialize a repository (`git init`).
+
+The run's event carries the branch you have checked out, in both modes, so a `push({ branches })` filter matches as it would for a push to that branch. On a detached `HEAD`, the branch is `kici-local` (a `kici run remote` fixture uses `main`).
 
 The run's changed files are the commit it runs. In the default isolated mode, that commit holds your uncommitted changes, so `paths` filters and `ctx.changedFiles` rules see those files. With no uncommitted changes, or with `--in-place`, the run uses your `HEAD` commit, so they see the files `HEAD` changed.
 
@@ -182,6 +184,10 @@ fixtures run through the normal remote pipeline (honoring `--parallel`,
 - A name that is not in the compiled lock file stops the run before anything
   is uploaded. The error lists the workflows the lock file contains.
 - `--workflow` cannot be combined with `--pick`.
+
+Without `--workflow`, a fixture runs every workflow whose triggers match its
+event, as one run. `kici runs show` and the dashboard name every workflow of
+such a run, and name each job with its workflow.
 
 #### Host narrowing with `--target`
 
@@ -333,6 +339,12 @@ data as the dashboard, so they require `kici login` and an active org
 List runs with optional filters. Output is a table (run id, workflow, status,
 branch, trigger, started, duration); pagination is reported at the bottom.
 
+A run can span several workflows: a fixture run with no `--workflow` runs every
+workflow whose triggers match. Its `workflow` cell shows the first workflow and a
+count of the others (`hello-world +3`). `--workflow` matches a run that spans
+the named workflow. An archived run matches its first workflow only. In `--json`, each run carries `workflowNames`, every
+workflow with the first one first, next to `workflowName`.
+
 When no runs match, `kici runs list` checks whether any webhooks arrived
 recently. If deliveries came in but nothing produced a run, it prints a
 one-line summary ("3 webhooks received in the last hour, 0 matched") and
@@ -359,6 +371,11 @@ run-level failure, and per job the reason it did not run — a job a
 rule. Any approval hold on the run is listed too, with its context, hold type,
 status and reason. If the run id is not on the Platform but exists in your
 local run history (from `kici run <event> --local`), the local record is shown instead.
+
+For a run that spans several workflows, the header shows `workflows=` with every
+workflow name, and each job is named `<workflow> / <job>`. Two workflows can
+each define a job of the same name. In `--json`, each job in `detail.jobs`
+carries `workflowName`.
 
 For a run started with `kici run remote`, the Platform reads the jobs and steps
 from the orchestrator cluster that ran the run. When the Platform cannot get them

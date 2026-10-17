@@ -68,11 +68,16 @@ export async function handleRunState(
 
   const jobRows = await deps.db
     .selectFrom('execution_jobs')
-    .select(['job_id', 'job_name', 'status'])
+    .select(['job_id', 'job_name', 'workflow_name', 'status'])
     .where('run_id', '=', req.runId)
     .execute();
 
-  const jobs = jobRows.map((j) => ({ jobId: j.job_id, jobName: j.job_name, status: j.status }));
+  const jobs = jobRows.map((j) => ({
+    jobId: j.job_id,
+    jobName: j.job_name,
+    ...(j.workflow_name && { workflowName: j.workflow_name }),
+    status: j.status,
+  }));
 
   const run: StateReplayRun = {
     runId: row.run_id,

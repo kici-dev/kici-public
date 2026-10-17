@@ -10,7 +10,7 @@ import { resolveWorkdir, readParentSha, LOCAL_RUN_BRANCH } from './source-provid
 function makeRepo(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-src-repo-'));
   const git = (args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
-  git(['init', '-q']);
+  git(['init', '-q', '--initial-branch=feature/x']);
   git(['config', 'user.email', 'test@kici.dev']);
   git(['config', 'user.name', 'test']);
   fs.writeFileSync(path.join(dir, 'committed.txt'), 'base\n');
@@ -69,11 +69,29 @@ describe('LocalSourceProvider resolveWorkdir', () => {
   it('isolated materializes a clone carrying the committed base tree', async () => {
     const wd = await resolveWorkdir({ inPlace: false, repoRoot: repo });
     expect(wd.dir).not.toBe(repo);
-    expect(wd.branch).toBe(LOCAL_RUN_BRANCH);
-    expect(wd.ref).toBe(`refs/heads/${LOCAL_RUN_BRANCH}`);
+    // fails-when: the isolated run swaps the developer's branch for a synthetic one, so a
+    // push({ branches }) filter on that branch never matches a local run
+    expect(wd.branch).toBe('feature/x');
+    expect(wd.ref).toBe('refs/heads/feature/x');
+    expect(
+      execFileSync('git', ['rev-parse', wd.ref], { cwd: wd.dir, encoding: 'utf8' }).trim(),
+    ).toBe(wd.sha);
     expect(fs.readFileSync(path.join(wd.dir, 'committed.txt'), 'utf-8')).toBe('base\n');
     await wd.cleanup();
     expect(fs.existsSync(wd.dir)).toBe(false);
+  });
+
+  it('names the run branch kici-local on a detached HEAD, in both modes', async () => {
+    execFileSync('git', ['checkout', '-q', '--detach'], { cwd: repo });
+    const isolated = await resolveWorkdir({ inPlace: false, repoRoot: repo });
+    const inPlace = await resolveWorkdir({ inPlace: true, repoRoot: repo });
+    try {
+      expect(isolated.ref).toBe(`refs/heads/${LOCAL_RUN_BRANCH}`);
+      // fails-when: in-place reads --abbrev-ref and reports refs/heads/HEAD
+      expect(inPlace.ref).toBe(`refs/heads/${LOCAL_RUN_BRANCH}`);
+    } finally {
+      await isolated.cleanup();
+    }
   });
 
   it('isolated commits the dirty + untracked overlay into the clone sha', async () => {

@@ -24,8 +24,20 @@ interface TagUpdate {
   runId: string;
 }
 
+/** The workflow of the gate job the proxies belong to. */
+const GATE_WORKFLOW = 'gate-wf';
+
 function mockDb(tags: TagUpdate[]): Kysely<Database> {
   return {
+    // The gate's execution_jobs row, read for the workflow its proxies inherit.
+    selectFrom: () => {
+      const chain = {
+        select: () => chain,
+        where: () => chain,
+        executeTakeFirst: async () => ({ workflow_name: GATE_WORKFLOW }),
+      };
+      return chain;
+    },
     updateTable: () => {
       const pending: Partial<TagUpdate> = {};
       const chain = {
@@ -103,6 +115,8 @@ describe('runInvokeGate', () => {
     expect(proxies.map((p) => p.summonedRunId)).toEqual(['r1', 'r2']);
     expect(proxies.every((p) => p.jobKind === JobKind.Proxy)).toBe(true);
     expect(proxies.every((p) => p.baseJobName === 'repo-tests')).toBe(true);
+    // fails-when: a proxy row records no workflow, unlike the gate it belongs to
+    expect(proxies.map((p) => p.workflowName)).toEqual([GATE_WORKFLOW, GATE_WORKFLOW]);
     expect(proxies.map((p) => p.variantLabel)).toEqual([
       'myorg/backend:unit',
       'myorg/backend:lint',

@@ -74,6 +74,29 @@ function stubClient(detail: unknown, status: string = ExecutionRunStatus.enum.su
 }
 
 describe('runsShowCommand', () => {
+  it('names every workflow of a run spanning several, and each job with its own', async () => {
+    vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
+      getRun: async () => ({ ...runSummary(), workflowNames: ['ci', 'repro-461'] }),
+      getRunDetailWithSource: proxied({
+        jobs: ['ci', 'repro-461'].map((workflowName, i) => ({
+          jobId: `j${i}`,
+          jobName: 'mise-pinned',
+          workflowName,
+          status: ExecutionJobStatus.enum.success,
+          steps: [],
+        })),
+      }),
+    } as never);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await runsShowCommand('r1', {});
+    const printed = log.mock.calls.map((c) => String(c[0])).join('\n');
+    // fails-when: the header names only the first workflow
+    expect(printed).toContain('workflows=ci,repro-461');
+    // fails-when: the two same-named jobs print identically
+    expect(printed).toContain('ci / mise-pinned');
+    expect(printed).toContain('repro-461 / mise-pinned');
+  });
+
   it('prints the run header and the jobs/steps tree', async () => {
     stubClient({
       jobs: [
@@ -101,6 +124,9 @@ describe('runsShowCommand', () => {
     expect(printed).toContain('r1');
     expect(printed).toContain('build');
     expect(printed).toContain('checkout');
+    // breaks-if-wrong: a run of one workflow keeps its header and bare job names
+    expect(printed).toContain('workflow=ci');
+    expect(printed).not.toContain(' / build');
     // A run with neither an init failure nor a hold renders neither section.
     expect(printed).not.toContain('Init failure');
     expect(printed).not.toContain('Approval holds');

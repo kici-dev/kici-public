@@ -45,6 +45,8 @@ export interface BackfillJobRow {
   run_id: string;
   job_id: string;
   job_name: string;
+  /** Optional: a loader that does not select it forwards no workflow. */
+  workflow_name?: string | null;
   status: string;
   started_at: Date | null;
   completed_at: Date | null;
@@ -107,6 +109,7 @@ export async function backfillRunToPlatform(deps: BackfillRunDeps, runId: string
       runId: job.run_id,
       jobId: job.job_id,
       jobName: job.job_name,
+      ...(job.workflow_name ? { workflowName: job.workflow_name } : {}),
       status: job.status,
       ...(ms(job.started_at) !== undefined ? { startedAt: ms(job.started_at) } : {}),
       ...(ms(job.completed_at) !== undefined ? { completedAt: ms(job.completed_at) } : {}),

@@ -1077,7 +1077,7 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
     // The same row shape a per-repository run registers: an unexpanded job
     // carries no `baseJobName` (a materialized child does, see below).
     expect(h.addJobsToRun.mock.calls[0][1]).toEqual([
-      { jobId: 'job-scan', jobName: 'scan', runsOnLabels: ['default'] },
+      { jobId: 'job-scan', jobName: 'scan', runsOnLabels: ['default'], workflowName: 'org-ci' },
     ]);
   });
 
@@ -1125,7 +1125,7 @@ describe('an admitted cross-repo global workflow creates its run row', () => {
     expect(h.callOrder.filter((c) => c === 'run-start')).toEqual(['run-start']);
     expect(h.callOrder.indexOf('run-start')).toBeLessThan(h.callOrder.indexOf('dispatch:gen-a'));
     expect(h.addJobsToRun.mock.calls[0][1]).toEqual([
-      { jobId: 'job-gen-a', jobName: 'gen-a', runsOnLabels: ['default'] },
+      { jobId: 'job-gen-a', jobName: 'gen-a', runsOnLabels: ['default'], workflowName: 'org-ci' },
     ]);
   });
 

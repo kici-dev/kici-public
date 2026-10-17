@@ -58,7 +58,7 @@ This:
 1. Revokes the PAT on the server (preventing further use)
 2. Detaches the local dev plane if it is attached, so a logged-out user is not left with a hybrid plane holding an orphaned orchestrator key
 3. Clears the auth fields from the local config file — the PAT, its id and expiry, your email, and the active organization
-4. Preserves the connection settings (per-org default clusters, Platform endpoint, orchestrator endpoint, OIDC issuer, routing key)
+4. Preserves the connection settings (per-org default clusters, Platform endpoint, orchestrator endpoint, OIDC issuer, the orchestrator saved by `kici connect`, and the deprecated routing key)
 
 Server revocation is best-effort: if the network call fails, the local config is still cleared.
 
@@ -94,15 +94,17 @@ Displays the currently active organization name and ID.
 
 ## Auth status
 
-`kici org current` shows your current login state and active organization:
+`kici doctor` reports your login state: its `login` row checks for stored,
+unexpired Platform credentials, and its `token-live` row probes the token
+against the Platform:
 
 ```bash
-kici org current
+kici doctor
 ```
 
-It reports whether you are logged in and which organization is active. PAT
-expiry and the full list of your tokens are managed from the dashboard (see
-"Dashboard management" below).
+`kici org current` shows only the active organization: its name when your PAT
+can fetch it, else its ID. PAT expiry and the full list of your tokens are
+managed from the dashboard (see "Dashboard management" below).
 
 ## Personal access tokens
 
@@ -237,7 +239,8 @@ The CLI stores authentication data in `~/.kici/config` with `0600` permissions (
 - Active organization ID
 - Per-org default orchestrator clusters
 - Platform endpoint URL, orchestrator endpoint URL, and the OIDC issuer the PAT was minted against
-- Routing key for webhook source identification
+- The orchestrator URL and token saved by `kici connect`
+- The routing key written by `kici login --routing-key`, which no command reads (deprecated; `kici doctor` warns when it is present)
 
 The web dashboard holds none of these. It keeps only the tokens of your current
 sign-in, in browser storage for the tab's origin. It does not request offline

@@ -398,6 +398,7 @@ describe('kici init', () => {
       // fails-when: init interpolates the raw branch (`export const pushCi/kici`)
       expect(fixture).toContain('export const pushCiKici = fixture("push-ci/kici", {');
       expect(fixture).toContain('event: push({ branches: ["ci/kici"] }),');
+      expect(fixture).toContain('branch: "ci/kici",');
 
       const prChecks = await fs.readFile(
         path.join(tempDir, '.kici', 'workflows', 'pr-checks.ts'),

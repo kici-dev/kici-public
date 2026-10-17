@@ -28,7 +28,8 @@ export function rewriteTemplateDefaultBranch(content: string, defaultBranch: str
 /**
  * The sample push fixture for `.kici/tests/push-test.ts`. Its ID is
  * `push-<branch>`, and its export name is built from the branch name
- * (`ci/kici` gives `pushCiKici`).
+ * (`ci/kici` gives `pushCiKici`). It pins `branch`, so the event is a push to
+ * that branch whichever branch is checked out.
  */
 export function generateSampleFixture(defaultBranch: string): string {
   const fixtureId = `push-${defaultBranch}`;
@@ -43,6 +44,8 @@ export function generateSampleFixture(defaultBranch: string): string {
  */
 export const ${toIdentifier('push', defaultBranch)} = fixture(${JSON.stringify(fixtureId)}, {
   event: push({ branches: [${JSON.stringify(defaultBranch)}] }),
+  // The event's branch. Without it, the run uses the branch you have checked out.
+  branch: ${JSON.stringify(defaultBranch)},
 });
 `;
 }

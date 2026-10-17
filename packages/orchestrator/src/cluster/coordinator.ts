@@ -1194,7 +1194,7 @@ export class RunCoordinator {
       // The rerouted job is not in the tracker's run.jobs and has no local
       // dispatch_queue row, so without the seeded name the step-log path
       // resolver files its early relayed chunks under the bare jobId, unreadable.
-      this.executionTracker.registerJobName(runId, jobId, job.jobName);
+      this.executionTracker.registerJobName(runId, jobId, job.jobName, runContext.workflowName);
       await this.executionTracker.markJobReroutedToPeer(runId, jobId, peerId);
     }
   }

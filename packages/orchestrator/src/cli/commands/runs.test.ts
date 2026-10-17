@@ -453,6 +453,61 @@ describe('kici-admin runs CLI commands', () => {
     });
   });
 
+  describe('runs spanning several workflows', () => {
+    const multiJobs = [
+      { ...sampleJob, jobId: 'job-a', jobName: 'mise-pinned', workflowName: 'repro-407' },
+      { ...sampleJob, jobId: 'job-b', jobName: 'mise-pinned', workflowName: 'repro-461' },
+    ];
+
+    it('R-30: runs list counts the workflows beyond the first', async () => {
+      mockListRuns.mockResolvedValue({
+        runs: [{ ...sampleRun, workflowNames: ['ci', 'repro-407', 'repro-461'] }],
+        total: 1,
+        limit: 20,
+        offset: 0,
+      });
+      const { stdout } = await runCommand(['runs', 'list'], client);
+      // fails-when: the row names only the first workflow
+      expect(stdout).toContain('ci +2');
+    });
+
+    it('R-31: runs list keeps a lone workflow, and an older orchestrator', async () => {
+      // breaks-if-wrong: a run of one workflow, or a response with no workflowNames, prints the name alone
+      const { stdout } = await runCommand(['runs', 'list'], client);
+      expect(stdout).toContain(' ci ');
+      expect(stdout).not.toContain('ci +');
+    });
+
+    it('R-32: runs show names every workflow and each job with its own', async () => {
+      mockGetRun.mockResolvedValue({
+        run: { ...sampleRunDetail, workflowNames: ['ci', 'repro-407', 'repro-461'] },
+      });
+      mockGetRunJobs.mockResolvedValue({ jobs: multiJobs });
+      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+      // fails-when: the header reads as a run of the first workflow alone
+      expect(stdout).toContain('Workflows:   ci, repro-407, repro-461');
+      expect(stdout).not.toContain('Workflow:    ci');
+      // fails-when: the job table has no workflow column, so the two jobs read the same
+      expect(stdout).toMatch(/job-a\s+│?\s*mise-pinned\s+│?\s*repro-407/);
+      expect(stdout).toMatch(/job-b\s+│?\s*mise-pinned\s+│?\s*repro-461/);
+      expect(stdout).toContain('Steps for repro-407 / mise-pinned (job-a)');
+    });
+
+    it('R-33: runs jobs shows each job workflow', async () => {
+      mockGetRunJobs.mockResolvedValue({ jobs: multiJobs });
+      const { stdout } = await runCommand(['runs', 'jobs', 'run-abc-123'], client);
+      // fails-when: the jobs table has no workflow column
+      expect(stdout).toContain('workflow');
+      expect(stdout).toContain('repro-461');
+    });
+
+    it('R-34: a job with no recorded workflow shows a dash', async () => {
+      const { stdout } = await runCommand(['runs', 'jobs', 'run-abc-123'], client);
+      // breaks-if-wrong: a job from an older orchestrator still renders its row
+      expect(stdout).toMatch(/job-test\s+│?\s*test\s+│?\s*-/);
+    });
+  });
+
   describe('runs jobs', () => {
     it('R-20: default call excludes steps', async () => {
       const { stdout } = await runCommand(['runs', 'jobs', 'run-abc-123'], client);

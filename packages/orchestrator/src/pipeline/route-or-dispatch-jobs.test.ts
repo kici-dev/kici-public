@@ -192,6 +192,7 @@ describe('registerDispatchedJobs', () => {
     const executionTracker = { addJobsToRun: vi.fn(), onJobStatus: vi.fn() };
     await registerDispatchedJobs({
       newRunId: 'run-1',
+      workflowName: 'nightly',
       dispatchedJobs: [],
       rejectedJobs: [],
       executionTracker: executionTracker as never,
@@ -204,12 +205,14 @@ describe('registerDispatchedJobs', () => {
     const executionTracker = { addJobsToRun: vi.fn(), onJobStatus: vi.fn() };
     await registerDispatchedJobs({
       newRunId: 'run-1',
+      workflowName: 'nightly',
       dispatchedJobs: [{ jobId: 'rejected-x', jobName: 'beat' }],
       rejectedJobs: [{ jobId: 'rejected-x', reason: 'no capacity' }],
       executionTracker: executionTracker as never,
     });
+    // fails-when: the registered job row records no workflow
     expect(executionTracker.addJobsToRun).toHaveBeenCalledWith('run-1', [
-      { jobId: 'rejected-x', jobName: 'beat' },
+      { jobId: 'rejected-x', jobName: 'beat', workflowName: 'nightly' },
     ]);
     expect(executionTracker.onJobStatus).toHaveBeenCalledWith(
       'run-1',

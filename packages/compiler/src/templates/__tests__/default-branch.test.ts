@@ -19,12 +19,19 @@ interface GeneratedLiterals {
   exportNames: string[];
   fixtureIds: string[];
   branches: string[];
+  fixtureBranches: string[];
   prTargets: string[];
 }
 
 /** The names and string values a parser reads back out of generated source. */
 function literalsOf(fileName: string, source: string): GeneratedLiterals {
-  const found: GeneratedLiterals = { exportNames: [], fixtureIds: [], branches: [], prTargets: [] };
+  const found: GeneratedLiterals = {
+    exportNames: [],
+    fixtureIds: [],
+    branches: [],
+    fixtureBranches: [],
+    prTargets: [],
+  };
   const visit = (node: ts.Node): void => {
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
       found.exportNames.push(node.name.text);
@@ -41,6 +48,9 @@ function literalsOf(fileName: string, source: string): GeneratedLiterals {
         for (const el of initializer.elements) {
           if (ts.isStringLiteral(el)) found.branches.push(el.text);
         }
+      }
+      if (node.name.text === 'branch' && ts.isStringLiteral(initializer)) {
+        found.fixtureBranches.push(initializer.text);
       }
       if (node.name.text === 'target' && ts.isStringLiteral(initializer)) {
         found.prTargets.push(initializer.text);
@@ -75,6 +85,9 @@ describe('default-branch scaffold', () => {
       exportNames: [exportName],
       fixtureIds: [`push-${branch}`],
       branches: [branch],
+      // fails-when: the sample fixture leaves its branch to the checkout, so push-main
+      // runs as a push to whatever branch the developer is on
+      fixtureBranches: [branch],
       prTargets: [],
     });
     const prChecks = rewriteTemplateDefaultBranch(prChecksTemplate, branch);

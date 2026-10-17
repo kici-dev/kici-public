@@ -108,7 +108,7 @@ describe('handleTestTrigger', () => {
     const initMeta = vi.fn().mockResolvedValue(undefined);
     const getUrl = vi.fn().mockResolvedValue('https://dl.example/tarball.enc');
     const { db } = makeDbMock({
-      uploadRow: { storage_key: 'k/up.enc', encryption_private_key: 'priv-b64' },
+      uploadRow: { storage_key: 'k/up.enc', encryption_private_key: 'priv-b64', sha: 'c0ffee' },
     });
     vi.mocked(testPipeline.processTestTrigger).mockResolvedValue({
       runId: 'run-1',
@@ -148,6 +148,8 @@ describe('handleTestTrigger', () => {
       cliPublicKey: 'overlay-pub-b64',
       orchestratorPrivateKey: 'priv-b64',
     });
+    // fails-when: the upload's commit is not handed on, so a run whose event names no SHA records a branch
+    expect(call.uploadSha).toBe('c0ffee');
     expect(result).toEqual({ runId: 'run-1', status: 'accepted', jobIds: ['j1', 'j2'] });
     expect(record).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'run.trigger', outcome: 'allowed', actor: ACTOR }),

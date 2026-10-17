@@ -59,6 +59,8 @@ export interface TestTriggerInput {
   routingKey: string;
   /** Uploaded tarball reference. */
   uploadId?: string;
+  /** The commit the uploaded overlay was built from, as its upload recorded it. */
+  uploadSha?: string;
   /** Fixture secret context mappings `{ contextName: envName }`. */
   secrets?: Record<string, string>;
   /** Base64 X25519+AES-GCM blob of the developer's local secrets ({flat, contexts}). */
@@ -404,6 +406,30 @@ function resolveDispatchInputs(
   return { values: r.values };
 }
 
+function nonEmpty(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/**
+ * The commit a test run acts on: the SHA the event names (a push `after`, a PR
+ * head, a status or workflow-run SHA), else the commit the overlay was built
+ * from. With neither, the branch: a run with no overlay clones by this value.
+ */
+function testRunCommitSha(event: SimulatedEvent, uploadSha?: string): string {
+  const p = event.payload as Record<string, unknown>;
+  const pr = p.pull_request as { head?: { sha?: unknown } } | undefined;
+  const wr = p.workflow_run as { head_sha?: unknown } | undefined;
+  return (
+    nonEmpty(p.after) ??
+    nonEmpty(pr?.head?.sha) ??
+    nonEmpty(p.sha) ??
+    nonEmpty(wr?.head_sha) ??
+    nonEmpty(uploadSha) ??
+    event.sourceBranch ??
+    event.targetBranch
+  );
+}
+
 /** Assemble a `WorkflowDispatchContext` for one matched workflow decision. */
 function buildTestDispatchContext(
   shared: TestDispatchShared,
@@ -423,7 +449,7 @@ function buildTestDispatchContext(
     credentials: {},
     event: shared.simulatedEvent,
     eventWithFiles: shared.simulatedEvent,
-    ref: shared.simulatedEvent.sourceBranch ?? shared.simulatedEvent.targetBranch,
+    ref: testRunCommitSha(shared.simulatedEvent, shared.input.uploadSha),
     fullLockFile: shared.fullLockFile,
     resolvedOrgId: shared.resolvedOrgId,
     workflow,
@@ -437,10 +463,10 @@ function buildTestDispatchContext(
     // identity never gets two drifting renderings.
     triggeredBy: stringifyActor(shared.input.actor),
     triggeredByAgentLabel: agentLabelOf(shared.input.actor),
-    // `kici run` is operator-initiated against a synthetic event, with no PR
-    // provenance (contributor, fork, base-vs-head diff) to evaluate. The
-    // central evaluator short-circuits a non-PR event to `pass`, so this is
-    // the same verdict, not a bypass.
+    // `kici run` is started by an authenticated operator on their own working
+    // tree, against a synthetic event. Even a simulated PR event names no
+    // contributor or fork to evaluate, so the contributor-trust gate has nothing
+    // to decide.
     securityDecision: { action: 'pass' },
     extraJobConfig: shared.extraJobConfig,
     testRun: { fixtureId: shared.input.fixtureId },
@@ -554,16 +580,31 @@ export async function processTestTrigger(
   const jobIds: string[] = [];
   const warnings: string[] = [];
   let deferredJobCount = 0;
-  for (const decision of matchedDecisions) {
-    const workflow = fullLockFile.workflows.find(
-      (w: LockWorkflow) => w.name === decision.workflowName,
-    );
-    if (!workflow) continue;
-    const ctx = buildTestDispatchContext(shared, workflow, decision, runId);
-    const result = await dispatchMatchedWorkflow(ctx);
-    jobIds.push(...result.dispatchedJobIds);
-    deferredJobCount += result.deferredJobCount ?? 0;
-    if (result.envWarnings?.length) warnings.push(...result.envWarnings);
+  // Every matched workflow runs under this one run id. Hold the run open from
+  // its first registration until the last workflow has registered: a workflow
+  // whose jobs all end before the next one registers would otherwise complete
+  // the run, and the next workflow would start it over.
+  let runHeld = false;
+  const holdRunOpen = (): void => {
+    if (!runHeld && matchedDecisions.length > 1) {
+      runHeld = deps.executionTracker?.holdRunForPendingJobs(runId) ?? false;
+    }
+  };
+  try {
+    for (const decision of matchedDecisions) {
+      const workflow = fullLockFile.workflows.find(
+        (w: LockWorkflow) => w.name === decision.workflowName,
+      );
+      if (!workflow) continue;
+      const ctx = buildTestDispatchContext(shared, workflow, decision, runId);
+      ctx.onRunRegistered = holdRunOpen;
+      const result = await dispatchMatchedWorkflow(ctx);
+      jobIds.push(...result.dispatchedJobIds);
+      deferredJobCount += result.deferredJobCount ?? 0;
+      if (result.envWarnings?.length) warnings.push(...result.envWarnings);
+    }
+  } finally {
+    if (runHeld) await deps.executionTracker?.releasePendingJobsHold(runId);
   }
 
   // Jobs with a dynamic context, or a deferred init, dispatch from the agent

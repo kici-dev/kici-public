@@ -6,11 +6,18 @@
 import type { TriggerConfig } from './triggers/types.js';
 
 export interface FixtureOptions {
-  /** The trigger event to simulate */
+  /**
+   * The trigger event to simulate. Its filters, such as `push({ branches })`, are
+   * the trigger-side shape: they do not set the event's branch.
+   */
   event: TriggerConfig;
-  /** Override branch name (defaults to git-detected) */
+  /**
+   * The event's branch. Defaults to the checked-out branch, and to `main` on a
+   * detached HEAD. For a PR event it is the base branch (default `main`), and the
+   * checked-out branch is the head. For a tag event it is the tag name.
+   */
   branch?: string;
-  /** Override commit SHA (defaults to HEAD) */
+  /** The event's commit SHA. Defaults to the HEAD commit. */
   sha?: string;
   /** Override repository (defaults to git-detected) */
   repo?: string;

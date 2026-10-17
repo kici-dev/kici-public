@@ -12,6 +12,12 @@ export interface RunsListOptions extends RunsListFilters {
   json?: boolean;
 }
 
+/** The run's first workflow plus how many more it spans (`hello-world +3`). */
+export function workflowCell(run: { workflowName: string; workflowNames?: string[] }): string {
+  const names = run.workflowNames?.length ? run.workflowNames : [run.workflowName];
+  return names.length > 1 ? `${names[0]} +${names.length - 1}` : (names[0] ?? '—');
+}
+
 export async function runsListCommand(options: RunsListOptions = {}): Promise<boolean> {
   try {
     const client = await DashboardClient.load();
@@ -45,7 +51,7 @@ export async function runsListCommand(options: RunsListOptions = {}): Promise<bo
     }
     const rows = page.runs.map((r) => [
       r.runId,
-      r.workflowName ?? '—',
+      workflowCell(r),
       colorStatus(r.status),
       r.ref ?? '—',
       r.triggerEvent ?? '—',

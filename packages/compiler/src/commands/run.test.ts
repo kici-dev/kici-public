@@ -132,6 +132,13 @@ vi.mock('../fixtures/compiler.js', () => ({
   filterFixtures: vi.fn(),
 }));
 
+// The checked-out branch the fixture event defaults to.
+const mockDetectCurrentBranch = vi.fn<(repoRoot: string) => string | undefined>();
+vi.mock('../test-runner/git-detector.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../test-runner/git-detector.js')>()),
+  detectCurrentBranch: (repoRoot: string) => mockDetectCurrentBranch(repoRoot),
+}));
+
 vi.mock('./compile.js', () => ({
   compileCommand: vi.fn().mockResolvedValue(true),
 }));
@@ -255,12 +262,13 @@ describe('kici run command', () => {
       done: true,
     });
     mockClient.cancel.mockResolvedValue({ cancelled: true });
+    mockDetectCurrentBranch.mockReturnValue('feature/x');
   });
 
   const fixture = {
     id: 'push-main',
     sourceFile: '/mock/.kici/tests/push.ts',
-    fixture: { id: 'push-main', options: { event: { _type: 'push' }, branch: 'main' } },
+    fixture: { id: 'push-main', options: { event: { _tag: 'PushTrigger' }, branch: 'main' } },
   };
 
   describe('runRemoteCommand — Platform-first flow', () => {
@@ -298,6 +306,48 @@ describe('kici run command', () => {
         platformEndpoint: 'https://platform.invalid',
         token: 'test-pat',
       });
+    });
+
+    it('defaults the fixture event to the current branch and the HEAD commit', async () => {
+      // push({ branches }) is a filter: it must not set the event ref.
+      const unpinned = {
+        id: 'push-ci',
+        sourceFile: '/mock/.kici/tests/push.ts',
+        fixture: {
+          id: 'push-ci',
+          options: { event: { _tag: 'PushTrigger', branches: [{ pattern: 'main' }] } },
+        },
+      };
+      compileFixtures.mockResolvedValue([unpinned]);
+      filterFixtures.mockReturnValue([unpinned]);
+
+      expect(await runRemoteCommand('push-ci', { kiciDir: '.kici', wait: false })).toBe(true);
+
+      const body = mockClient.trigger.mock.calls[0][2];
+      // fails-when: the event carries a hardcoded refs/heads/main instead of the checkout (#470)
+      expect(body.event.targetBranch).toBe('feature/x');
+      expect(body.event.payload.ref).toBe('refs/heads/feature/x');
+      // fails-when: the overlay's HEAD SHA is dropped from the event
+      expect(body.event.payload.after).toBe('abc123');
+      expect(mockDetectCurrentBranch).toHaveBeenCalledWith(expect.stringMatching(/\/mock$/));
+    });
+
+    it('warns and falls back to main on a detached HEAD', async () => {
+      mockDetectCurrentBranch.mockReturnValue(undefined);
+      const unpinned = {
+        ...fixture,
+        fixture: { ...fixture.fixture, options: { event: { _tag: 'PushTrigger' } } },
+      };
+      compileFixtures.mockResolvedValue([unpinned]);
+      filterFixtures.mockReturnValue([unpinned]);
+      const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      try {
+        expect(await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false })).toBe(true);
+        expect(mockClient.trigger.mock.calls[0][2].event.payload.ref).toBe('refs/heads/main');
+        expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toContain('HEAD is detached');
+      } finally {
+        stderr.mockRestore();
+      }
     });
 
     it('prints skipped-environment warnings from the accepted trigger response', async () => {
@@ -391,7 +441,10 @@ describe('kici run command', () => {
       const f2 = {
         id: 'pr-open',
         sourceFile: '/mock/.kici/tests/pr.ts',
-        fixture: { id: 'pr-open', options: { event: { _type: 'pr' }, branch: 'feature' } },
+        fixture: {
+          id: 'pr-open',
+          options: { event: { _tag: 'PrTrigger', events: ['opened'] }, branch: 'feature' },
+        },
       };
       compileFixtures.mockResolvedValue([fixture, f2]);
 
@@ -419,6 +472,12 @@ describe('kici run command', () => {
         expect.anything(),
         expect.objectContaining({ workflowName: 'ci', fixtureId: 'direct:ci' }),
       );
+      // fails-when: a bare --workflow run reports branch main whatever is checked out
+      expect(mockClient.trigger.mock.calls[0][2].event).toMatchObject({
+        type: 'manual',
+        targetBranch: 'feature/x',
+        payload: { after: 'abc123' },
+      });
     });
 
     it('compiles repeated --target values into an AND-combined host selector', async () => {
@@ -471,7 +530,10 @@ describe('kici run command', () => {
     const prFixture = {
       id: 'pr-open',
       sourceFile: '/mock/.kici/tests/pr.ts',
-      fixture: { id: 'pr-open', options: { event: { _type: 'pr' }, branch: 'feature' } },
+      fixture: {
+        id: 'pr-open',
+        options: { event: { _tag: 'PrTrigger', events: ['opened'] }, branch: 'feature' },
+      },
     };
 
     beforeEach(() => {
@@ -522,7 +584,7 @@ describe('kici run command', () => {
       // fails-when: only the first fixture carries the workflow, or a fixture's event is replaced.
       expect(bodies.map((b) => [b.fixtureId, b.workflowName, b.event.type])).toEqual([
         ['push-main', 'ci', 'push'],
-        ['pr-open', 'ci', 'pr'],
+        ['pr-open', 'ci', 'pull_request'],
       ]);
     });
 

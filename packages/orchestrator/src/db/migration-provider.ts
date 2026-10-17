@@ -162,6 +162,7 @@ import * as m156 from './migrations/156_kici_events_match_outcome.js';
 import * as m157 from './migrations/157_host_roster_identity_source.js';
 import * as m158 from './migrations/158_normalize_legacy_values.js';
 import * as m159 from './migrations/159_org_id_widen_to_source_width.js';
+import * as m160 from './migrations/160_execution_jobs_workflow_name.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -326,6 +327,7 @@ export function createMigrationProvider(): MigrationProvider {
         '157_host_roster_identity_source': m157,
         '158_normalize_legacy_values': m158,
         '159_org_id_widen_to_source_width': m159,
+        '160_execution_jobs_workflow_name': m160,
       };
     },
   };

@@ -19,6 +19,8 @@ export interface JobStatusForwardFrameArgs {
   runId: string;
   jobId: string;
   jobName: string;
+  /** The workflow that defines the job, when recorded. */
+  workflowName?: string;
   status: ExecutionJobStatus;
   timestamp: number;
   orchestratorId: string;
@@ -41,6 +43,7 @@ export function buildJobStatusForwardFrame(args: JobStatusForwardFrameArgs): Job
     runId: args.runId,
     jobId: args.jobId,
     jobName: args.jobName,
+    ...(args.workflowName && { workflowName: args.workflowName }),
     status: args.status,
     timestamp: args.timestamp,
     ...(args.startedAt !== undefined && { startedAt: args.startedAt }),

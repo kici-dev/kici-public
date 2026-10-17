@@ -411,6 +411,12 @@ export const jobStatusForwardSchema = z.object({
   runId: z.string().max(STATUS_ID_MAX),
   jobId: z.string().max(STATUS_ID_MAX),
   jobName: z.string().max(STATUS_ID_MAX),
+  /**
+   * The workflow that defines this job. A fixture run with no `--workflow`
+   * runs every matched workflow under one run id, so the run name alone does
+   * not say which workflow a job belongs to. Absent from an older orchestrator.
+   */
+  workflowName: z.string().max(STATUS_ID_MAX).optional(),
   status: ExecutionJobStatus,
   matrixValues: z.record(z.string().max(STATUS_ID_MAX), z.unknown()).optional(),
   startedAt: z.number().optional(),
@@ -475,6 +481,8 @@ export const stateReplayRunSchema = z.object({
       z.object({
         jobId: z.string().max(STATUS_ID_MAX),
         jobName: z.string().max(STATUS_ID_MAX),
+        /** Same contract as on `job.status.forward`; absent from an older orchestrator. */
+        workflowName: z.string().max(STATUS_ID_MAX).optional(),
         status: z.string().max(STATUS_ID_MAX),
         startedAt: z.number().optional(),
         completedAt: z.number().optional(),

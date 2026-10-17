@@ -19,7 +19,7 @@ import { setupStepsFirst } from '../reporting/step-display-order.js';
 import { Hono } from 'hono';
 import { createLogger } from '@kici-dev/shared';
 import { CANONICAL_STATUSES } from '@kici-dev/engine';
-import type { Kysely } from 'kysely';
+import type { ExpressionBuilder, Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import type { TokenManager } from '../secrets/token-manager.js';
 import type { RbacEnforcer } from '../secrets/rbac.js';
@@ -33,6 +33,7 @@ import { mapToAgentRunResult } from '../reporting/agent-run-result-mapper.js';
 import { readStepLogLines, toAgentStepLogs } from '../reporting/step-log-reader.js';
 import type { LogStorage } from '../reporting/log-storage.js';
 import { visibleRoutingReason } from '../reporting/run-aggregator.js';
+import { jobWorkflowName, loadRunWorkflowNames } from '../reporting/run-workflow-names.js';
 import { createBearerAuthMiddleware } from './admin-auth.js';
 import { type AdminEnv, createAdminApp } from './admin-env.js';
 
@@ -88,6 +89,24 @@ export interface AdminRunRoutesDeps {
   logStorage?: LogStorage;
 }
 
+/**
+ * Matches a run that spans `workflowName`: its own workflow, or the workflow of
+ * one of its jobs (a fixture run spanning several workflows).
+ */
+function spansWorkflow(workflowName: string) {
+  return (eb: ExpressionBuilder<Database, 'execution_runs'>) =>
+    eb.or([
+      eb('execution_runs.workflow_name', '=', workflowName),
+      eb.exists(
+        eb
+          .selectFrom('execution_jobs')
+          .select('execution_jobs.job_id')
+          .whereRef('execution_jobs.run_id', '=', 'execution_runs.run_id')
+          .where('execution_jobs.workflow_name', '=', workflowName),
+      ),
+    ]);
+}
+
 /** Run routes, mounted at /api/v1/admin/runs. */
 export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
@@ -138,7 +157,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
     if (statuses && statuses.length === 1)
       countQuery = countQuery.where('status', '=', statuses[0]);
     if (statuses && statuses.length > 1) countQuery = countQuery.where('status', 'in', statuses);
-    if (workflowName) countQuery = countQuery.where('workflow_name', '=', workflowName);
+    if (workflowName) countQuery = countQuery.where(spansWorkflow(workflowName));
     if (repo) countQuery = countQuery.where('repo_identifier', '=', repo);
     if (deliveryId) countQuery = countQuery.where('delivery_id', '=', deliveryId);
     if (since) countQuery = countQuery.where('created_at', '>', since);
@@ -181,7 +200,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
 
     if (statuses && statuses.length === 1) query = query.where('status', '=', statuses[0]);
     if (statuses && statuses.length > 1) query = query.where('status', 'in', statuses);
-    if (workflowName) query = query.where('workflow_name', '=', workflowName);
+    if (workflowName) query = query.where(spansWorkflow(workflowName));
     if (repo) query = query.where('repo_identifier', '=', repo);
     if (deliveryId) query = query.where('delivery_id', '=', deliveryId);
     if (since) query = query.where('created_at', '>', since);
@@ -191,12 +210,14 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
       query.orderBy('created_at', 'desc').limit(limit).offset(offset).execute(),
       countQuery.executeTakeFirstOrThrow(),
     ]);
+    const workflowNames = await loadRunWorkflowNames(deps.db, runs);
 
     return c.json(
       {
         runs: runs.map((r) => ({
           runId: r.run_id,
           workflowName: r.workflow_name,
+          workflowNames: workflowNames.get(r.run_id) ?? [r.workflow_name],
           status: r.status,
           provider: r.provider,
           repoIdentifier: r.repo_identifier,
@@ -263,12 +284,15 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
 
     const denied = enforceRoutingKeyScope(c, run.routing_key);
     if (denied) return denied;
+    const workflowNames = await loadRunWorkflowNames(deps.db, [run]);
 
     return c.json(
       {
         run: {
           runId: run.run_id,
           workflowName: run.workflow_name,
+          // Every workflow the run spans; `workflowName` is the first of them.
+          workflowNames: workflowNames.get(run.run_id) ?? [run.workflow_name],
           status: run.status,
           provider: run.provider,
           repoIdentifier: run.repo_identifier,
@@ -309,7 +333,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
     // Tells "run missing" (404) apart from "no jobs yet".
     const runExists = await deps.db
       .selectFrom('execution_runs')
-      .select(['run_id', 'routing_key'])
+      .select(['run_id', 'routing_key', 'workflow_name', 'is_test_run'])
       .where('run_id', '=', runId)
       .executeTakeFirst();
     if (!runExists) {
@@ -323,6 +347,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
       .select([
         'job_id',
         'job_name',
+        'workflow_name',
         'status',
         'matrix_values',
         'agent_id',
@@ -394,6 +419,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
           const entry: Record<string, unknown> = {
             jobId: job.job_id,
             jobName: job.job_name,
+            workflowName: jobWorkflowName(job.workflow_name, runExists),
             status: job.status,
             // `matrix_values` and `runs_on_labels` are JSONB, already parsed by
             // the driver; a `JSON.parse` here throws on the coerced string and

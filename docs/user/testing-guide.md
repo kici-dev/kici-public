@@ -209,6 +209,20 @@ export const pushFeature = fixture('push-feature', {
 
 When not specified, these default to values detected from your local git repo (current branch, HEAD SHA, remote URL).
 
+### Branch and commit
+
+The trigger you pass as `event` only selects the event type. Its filters are the trigger-side shape, so they do not set the event's branch. `push({ branches: ['main'] })` in a fixture does not make the event a push to `main`.
+
+The event gets its branch and commit as follows:
+
+- **Branch:** the fixture's `branch` when you set it, else the branch you have checked out. The step sees it as `refs/heads/<branch>` in the payload `ref` and as the branch name in `ctx.repo.ref`.
+- **Commit:** the fixture's `sha` when you set it, else your `HEAD` commit. The run records this commit as its SHA.
+- **PR events:** `branch` is the base branch (default `main`), and the branch you have checked out is the head branch.
+- **Tag events:** `branch` is the tag name (default `v0.0.0`).
+- **Detached `HEAD`:** the event uses `main` (the head branch of a PR event uses `feature/test`), and `kici run remote` prints a warning. Set `branch` to choose one. (`kici run <event> --local` uses `kici-local` on a detached `HEAD`.)
+
+So a fixture without `branch` follows your checkout: run it from `feature/auth` and the event is a push to `feature/auth`. A workflow that triggers on `push({ branches: ['main'] })` then does not match. Set `branch: 'main'` on the fixture to test that workflow from any branch.
+
 ### Secret context mappings
 
 Map secret contexts to your fixture:
@@ -272,7 +286,7 @@ Bypass trigger matching and run a specific workflow directly:
 kici run remote --workflow ci
 ```
 
-This skips the trigger evaluation step and runs all jobs in the named workflow.
+This skips the trigger evaluation step and runs all jobs in the named workflow. The run carries the branch you have checked out and your `HEAD` commit.
 
 Add a fixture to send that fixture's event to the named workflow only:
 
@@ -519,8 +533,12 @@ import { fixture, push } from '@kici-dev/sdk';
 
 export const pushMain = fixture("push-main", {
   event: push({ branches: ["main"] }),
+  // The event's branch. Without it, the run uses the branch you have checked out.
+  branch: "main",
 });
 ```
+
+The fixture sets `branch`, so `kici run remote push-main` simulates a push to `main` from any branch you have checked out.
 
 The fixture ID is `push-` followed by the branch name. The export name is `push` followed by
 each word of the branch name, with a capital first letter. Characters other than ASCII letters

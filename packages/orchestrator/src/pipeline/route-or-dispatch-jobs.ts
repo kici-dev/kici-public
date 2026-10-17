@@ -22,7 +22,7 @@ import type {
   RunCoordinator,
 } from '../cluster/coordinator.js';
 import type { Dispatcher } from '../agent/dispatcher.js';
-import type { ExecutionTracker } from '../reporting/execution-tracker.js';
+import { jobsOfWorkflow, type ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { QueuedJobInput } from '../queue/job-queue.js';
 
 const ROUTE_JOBS_TIMEOUT_MS = 30_000;
@@ -328,6 +328,8 @@ async function dispatchDirectly(
 
 export interface RegisterDispatchedJobsOptions {
   newRunId: string;
+  /** The workflow the jobs belong to, recorded on each job row. */
+  workflowName: string;
   dispatchedJobs: DispatchedJobEntry[];
   rejectedJobs: RejectedJobEntry[];
   executionTracker: ExecutionTracker;
@@ -335,12 +337,12 @@ export interface RegisterDispatchedJobsOptions {
 
 /** Register dispatched jobs, then fail synthetic-rejected ones. No-op when none dispatched. */
 export async function registerDispatchedJobs(opts: RegisterDispatchedJobsOptions): Promise<void> {
-  const { newRunId, dispatchedJobs, rejectedJobs, executionTracker } = opts;
+  const { newRunId, workflowName, dispatchedJobs, rejectedJobs, executionTracker } = opts;
   if (dispatchedJobs.length === 0) {
     return;
   }
 
-  await executionTracker.addJobsToRun(newRunId, dispatchedJobs);
+  await executionTracker.addJobsToRun(newRunId, jobsOfWorkflow(workflowName, dispatchedJobs));
 
   // Synthetic rejected IDs come from FanoutError or a direct-dispatch rejection;
   // the coordinator logs its own failed jobs and produces none here.

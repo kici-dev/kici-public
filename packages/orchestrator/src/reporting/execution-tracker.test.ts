@@ -922,6 +922,7 @@ describe('ExecutionTracker', () => {
         undefined, // logBytes (only set on terminal)
         undefined, // initFailure (only set on synthetic rejected-*/init-failed-* jobs)
         undefined, // contexts (only set for multi-context jobs)
+        'ci', // workflowName
       );
 
       const secondRunning = firstRunning + 4000;
@@ -947,6 +948,7 @@ describe('ExecutionTracker', () => {
         undefined, // logBytes (only set on terminal)
         undefined, // initFailure (only set on synthetic rejected-*/init-failed-* jobs)
         undefined, // contexts (only set for multi-context jobs)
+        'ci', // workflowName
       );
     });
 
@@ -4921,11 +4923,11 @@ describe('ExecutionTracker', () => {
         }),
       );
 
-      // The onJobStatusChange callback receives initFailure as the second-to-last
-      // positional arg (environments is the final one).
+      // The onJobStatusChange callback receives initFailure as its 13th
+      // positional arg (contexts and workflowName follow).
       const lastCall = onJobStatusChange.mock.calls.at(-1)!;
       expect(lastCall[3]).toBe(ExecutionJobStatus.enum.failed);
-      expect(lastCall.at(-2)).toMatchObject({
+      expect(lastCall[12]).toMatchObject({
         category: 'context_rules',
         scope: 'job',
         jobName: 'deploy',

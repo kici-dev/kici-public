@@ -145,6 +145,11 @@ const dashboardStepDetailSchema = z.object({
 export const dashboardJobDetailSchema = z.object({
   jobId: z.string(),
   jobName: z.string(),
+  /**
+   * The workflow that defines this job; a run can span several workflows (a
+   * fixture run with no `--workflow`). null/absent when not recorded.
+   */
+  workflowName: z.string().nullable().optional(),
   status: z.string(),
   matrixValues: z.record(z.string(), z.unknown()).nullable(),
   /** Base (logical) job name for a fan-out child; null for non-fanned jobs. */
@@ -2938,6 +2943,12 @@ const runListSourceSchema = z.object({
 export const runListItemSchema = z.object({
   runId: z.string(),
   workflowName: z.string(),
+  /**
+   * Every workflow the run spans, `workflowName` first. A fixture run with no
+   * `--workflow` runs each matched workflow under one run id. Optional so a
+   * response from an older Platform still validates.
+   */
+  workflowNames: z.array(z.string()).optional(),
   status: z.string(),
   repoIdentifier: z.string().nullable(),
   /**

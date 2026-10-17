@@ -27,6 +27,7 @@ sequenceDiagram
     O->>O: Trigger matching (branch + path filters)
     O->>A: job.dispatch (via WebSocket)
 
+    A->>O: job.ack
     A->>O: job.status (state: running)
     A->>A: Create sandbox (container/bare-metal/firecracker)
     A->>O: job.context (runtime details)
@@ -149,7 +150,7 @@ If no agent with matching labels is connected, the job is queued and dispatched 
 
 The agent receives the `job.dispatch` message and runs the full job lifecycle. Customer code runs inside an `ExecutionSandbox` (container, bare-metal, or firecracker), never in the agent's V8 isolate:
 
-1. **Report running:** Send `job.status: running` immediately
+1. **Acknowledge and report running:** Send `job.ack` on accepting the dispatch (a busy or draining agent sends `job.reject` instead, and the orchestrator requeues the job), then `job.status: running`
 2. **Create sandbox:** Determine execution mode and create the appropriate sandbox backend
 3. **Sandbox setup:** Prepare the execution environment (container: create + start; bare-metal: validate; firecracker: detect)
 4. **Emit context:** Send `job.context` with runtime details (Node version, OS, arch, sandbox type)
@@ -158,7 +159,7 @@ The agent receives the `job.dispatch` message and runs the full job lifecycle. C
    - Restore source: download the cached `.kici/` source tarball (`sourceTarUrl`), verify it against `sourceTarDigest`, and replace the clone's `.kici/` with it, so no `npm ci` or compile of `.kici/` is needed at execution time
    - Restore deps: download the cached dependency tarball (`depsUrl`) to a file, verify its SHA-256, then extract it. Install inline instead if the cache missed or the restore failed for a reason other than a hash mismatch
    - Load workflow: register the shared `@kici-dev/core/ts-loader-hook` and dynamic-`import()` the workflow `.ts` from the extracted source. Verify the computed `contentHash` against the lock file's value (drift guard) before any step runs.
-   - Evaluate rules: run job-level rules sequentially with fail-fast (if any rule fails, job is skipped)
+   - Evaluate rules: run job-level rules sequentially with fail-fast (a rule that returns `false` skips the job; a rule that throws fails it)
    - Execute steps: run each step sequentially with timeout and abort support
 6. **Stream logs:** Send `log.chunk` messages to the orchestrator during execution (batched by `LogStreamer`)
 7. **Report status:** Send `step.status` and `job.status` messages at each lifecycle boundary
@@ -209,7 +210,7 @@ When a workflow's `contentHash` is not in the cache:
 
 ### Lock files without a content hash
 
-A workflow entry without a `contentHash` field bypasses the cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow. A lock old enough to lack one (schema version 1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. The current lock file schema version is 42. The orchestrator does not require an exact match: it accepts a compatibility window of schema versions. A lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
+A workflow entry without a `contentHash` field bypasses the cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow. A lock old enough to lack one (schema version 1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. The current lock file schema version is 44. The orchestrator does not require an exact match: it accepts a compatibility window of schema versions. A lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
 
 ### Prometheus metrics
 
@@ -265,7 +266,7 @@ The single shared helper means per-workflow dispatch features apply uniformly to
 
 ### Fan-out semantics
 
-The cross-source branch fans out to **all** matching registrations in the same org. Mirrors how `kiciEvent()` and `lifecycle()` triggers behave today — each match becomes its own run with its own clone, dispatch, and execution tracking via the registration's routing-key context. There is no first-match shortcut, no soft cap, and no hard cap in v1. The `kici_cross_source_fanout_size` histogram exists so operators can set a sensible cap later if real-world fan-out turns pathological. Adding a cap before having data would hide real bugs.
+The cross-source branch fans out to **all** matching registrations in the same org. Mirrors how `kiciEvent()` and `lifecycle()` triggers behave today — each match becomes its own run with its own clone, dispatch, and execution tracking via the registration's routing-key context. There is no first-match shortcut, no soft cap, and no hard cap. The `kici_cross_source_fanout_size` histogram exists so operators can set a sensible cap later if real-world fan-out turns pathological. Adding a cap before having data would hide real bugs.
 
 ### Universal-git / cross-provider global workflows
 

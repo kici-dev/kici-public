@@ -115,16 +115,18 @@ export async function handleTestTrigger(
   // upload's stored private key — never `encryptedSecretsKey`, which keys only
   // the optional secrets blob and is absent on runs with no secrets.
   const cliPublicKey = msg.cliPublicKey;
+  let uploadSha: string | undefined;
   let resolvedOverlay:
     { tarballUrl: string; cliPublicKey: string; orchestratorPrivateKey: string } | undefined;
 
   if (msg.uploadId && cliPublicKey && deps.cacheStorage) {
     const upload = await deps.db
       .selectFrom('test_uploads')
-      .select(['storage_key', 'encryption_private_key'])
+      .select(['storage_key', 'encryption_private_key', 'sha'])
       .where('upload_id', '=', msg.uploadId)
       .executeTakeFirst();
 
+    uploadSha = upload?.sha ?? undefined;
     if (upload?.storage_key && upload.encryption_private_key) {
       // Presigned uploads set no S3 metadata, which getUrl() requires.
       await deps.cacheStorage.initMeta(upload.storage_key);
@@ -145,6 +147,7 @@ export async function handleTestTrigger(
       event: msg.event,
       routingKey: msg.routingKey,
       uploadId: msg.uploadId,
+      ...(uploadSha && { uploadSha }),
       resolvedOverlay,
       secrets: msg.secrets,
       encryptedSecrets: msg.encryptedSecrets,

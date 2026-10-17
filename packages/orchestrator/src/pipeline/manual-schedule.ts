@@ -119,6 +119,7 @@ export async function handleManualSchedule(
 
   await registerDispatchedJobs({
     newRunId,
+    workflowName: workflow.name,
     dispatchedJobs,
     rejectedJobs,
     executionTracker: deps.executionTracker,

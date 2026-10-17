@@ -2,6 +2,15 @@
 
 Release notes for the public KiCI packages.
 
+## v0.20.1 — 2026-10-17
+
+### Fixes
+
+- `kici run remote <fixture>` now sends the event on the branch you have checked out and your HEAD commit, unless the fixture sets `branch` or `sha`. A `push({ branches })` filter in a fixture no longer stands in for the event branch, and `pr()` and other non-push fixtures are sent as their own event type instead of a push. With an orchestrator at this version, the run records the real commit SHA, not a branch name.
+- `kici run <event> --local` now runs on the branch you have checked out in its default isolated mode, so a `push({ branches })` filter matches as it does with `--in-place`. A detached HEAD runs on `kici-local`.
+- `kici init` now sets `branch` on its sample fixture, so `kici run remote push-<branch>` simulates a push to the default branch from any checkout.
+- A fixture run that matches several workflows now names every one of them. `kici-admin runs list`, `runs show` and `runs jobs`, `kici runs list` and `runs show`, and the dashboard show each workflow of the run and the workflow of each job, and the failure summary names each failed job with its workflow. The `--json` output adds `workflowNames` on the run and `workflowName` on each job, and the workflow filter matches a run that spans the named workflow.
+
 ## v0.20.0 — 2026-10-17
 
 ### Features

@@ -79,7 +79,7 @@ Six job types are handled. Only the first uses the step sandbox; the other five 
 
 See [Job execution lifecycle](./execution/job-execution.md) for details.
 
-1. **Report running** -- Send `job.status: running` immediately upon accepting the dispatch
+1. **Acknowledge and report running** -- Send `job.ack` on accepting the dispatch (a busy or draining agent sends `job.reject` instead), then `job.status: running`
 2. **Sandbox selection** -- Determine execution mode (container, bare-metal, firecracker) from job config and environment
 3. **Sandbox setup** -- Create and start the execution environment (container: `docker create`/`start`; bare-metal: validate; firecracker: detect)
 4. **Context emission** -- Send `job.context` to orchestrator with runtime details (Node version, OS, arch, sandbox type)
@@ -232,7 +232,7 @@ A miss on either cache triggers a build job, and the job carries `buildSourceNee
 
 ### Cross-source / no-contentHash workflows
 
-- **A workflow entry without `contentHash`** skips the source cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow, and a lock old enough to lack one (schema v1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. Regenerate it with `kici compile`. The current lock file schema version is 42.
+- **A workflow entry without `contentHash`** skips the source cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow, and a lock old enough to lack one (schema v1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. Regenerate it with `kici compile`. The current lock file schema version is 44.
 - **Cross-source dispatch** (a workflow registered against source A fired by a generic webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
 - **Global-workflow dispatch** (a workflow defined in repository A with `repos:`, fired by an event from repository B) uses both caches when A's registration records a commit. The build job packs A's `.kici/` at that commit under A's `contentHash`, and the dependency cache is keyed by the `lockfileHash` and `siblingsDigest` the registration stored from A's lock file. A registration with no commit clones and installs on the agent. See [global workflows](global-workflows.md#which-repository-each-decision-uses).
 
@@ -246,7 +246,7 @@ The coalescing map is per coordinator. The build job itself sits on the cluster-
 
 If cache storage is unavailable or a download fails:
 
-- **Source tarball download failure:** Hard failure today — the agent does not fall back to rebuilding `.kici/` from the checkout. In practice this is rare because the same orchestrator that issued the pre-signed URL controls the cache backend.
+- **Source tarball download failure:** Hard failure — the agent does not fall back to rebuilding `.kici/` from the checkout. In practice this is rare because the same orchestrator that issued the pre-signed URL controls the cache backend.
 - **Dep tarball download or extraction failure:** The agent installs the dependencies inline instead. This applies to every job kind: execution, init and evaluation jobs.
 - **Dep tarball hash mismatch:** The agent fails the job after one download, before it extracts anything (no fallback for integrity failures).
 - **Source tarball drift (extracted `contentHash` ≠ lock file):** Hard failure with "Lock file is out of date: workflow source changed without regenerating kici.lock.json" — see [Lock file and drift](../user/lock-file-and-drift.md).
@@ -566,15 +566,15 @@ CronScheduler (runs every 30 seconds, Raft leader only):
 
 Recovery on leader election loads the `cron_last_fired` table into the
 last-fired cache and fires once per missed schedule. Because the claim and
-the event-row insert now share a transaction, a crash between the two no
-longer leaves `last_fired_at` advanced with no event row — the rollback
-discards both writes and the next tick fires cleanly.
+the event-row insert share a transaction, a crash between the two never
+leaves `last_fired_at` advanced with no event row — the rollback discards
+both writes and the next tick fires cleanly.
 
 #### Timing characteristics
 
 - **Tick interval:** Hardcoded at 30 s (`evaluationIntervalMs` defaults to `30_000` in `CronScheduler` and is not exposed via orchestrator config or env vars). Changing it requires a code change.
 - **Fire jitter:** A schedule due at time `T` fires at the first tick `>= T`, i.e. `0–30 s` after the scheduled moment, never before. The event payload's `scheduledAt` carries the cron-computed time (not the dispatch time), so downstream consumers see the intended schedule.
-- **Per-tick concurrency:** All schedules are processed serially in a single `for` loop on the leader (`packages/orchestrator/src/cron/cron-scheduler.ts`, `evaluate()`). Each registration costs one in-memory cron computation plus two DB writes (`tryClaimFire` upsert + `eventStore.write` + `pg_notify`). Throughput is therefore bounded by sequential DB write latency: at ~5–15 ms per registration, 50 schedules firing in the same tick complete in well under a second between the first and last fire.
+- **Per-tick concurrency:** All schedules are processed serially in a single `for` loop on the leader (`packages/orchestrator/src/cron/cron-scheduler.ts`, `evaluate()`). Each registration costs one in-memory cron computation plus one transaction holding the `tryClaimFire` upsert, the event-row insert (`EventStore.writeWith`) and the `pg_notify`. Throughput is therefore bounded by sequential DB write latency: at ~5–15 ms per registration, 50 schedules firing in the same tick complete in well under a second between the first and last fire.
 - **Recovery semantics:** On leader election, `recoverMissedSchedules()` calls `cron.previousRuns(1)` per schedule -- it fires at most one event per schedule regardless of how long the cluster was leaderless. There is no backfill for multiple missed scheduled instants.
 - **Multi-node deduplication:** During cluster startup multiple nodes may transiently self-elect (dormant mode). The atomic `tryClaimFire` upsert with a `last_fired_at < firedAt` `WHERE` guard ensures only one node's emit succeeds; losing nodes update their local cache and skip emit.
 - **Sub-minute crons:** Supported but bounded by the 30 s tick. `* * * * *` fires roughly once per minute with up to 30 s of drift; sub-30-second cadences are not achievable without lowering the interval in code.
@@ -816,34 +816,23 @@ The compiler processes the workflow definition:
 - The lock file records `hasOutputs: true` for steps with Zod output schemas
 - Step counters are scoped per job; job counters are scoped per workflow
 
-### Execution time (local test runner)
+### Execution time (agent sandbox)
 
-When `kici run <event> --local` runs a workflow:
+Every run executes its steps in the agent sandbox: a `kici run <event> --local` run too, because this machine joins the local dev plane as an ephemeral agent. For each job, the sandbox:
 
-1. **SDK module resolution:** The runner resolves `setStepOutputsMap` / `setJobOutputsMap` from the `@kici-dev/sdk/internal` subpath of the same SDK copy that the workflow uses (ensures the proxy reads from the same map)
-2. **Map injection:** Fresh `OutputsMap` and `StepRefMap` are created and injected via `setStepOutputsMap()` / `setStepRefMap()` before each job
-3. **Step execution:** Each step runs sequentially. If the step returns a value, it is stored in the `OutputsMap` keyed by step name
-4. **Bare function normalization:** Bare functions in the steps array are assigned counter names and registered in the `StepRefMap` (maps function reference to step name)
-5. **Proxy resolution:** When a subsequent step accesses `stepRef.result.field`, the proxy reads from the `OutputsMap`
-6. **ctx.outputsOf():** Resolves step outputs by reference (Step object or bare function). For bare functions, looks up the step name in the `StepRefMap`
+1. **SDK module resolution:** Resolves `setStepOutputsMap` / `setStepRefMap` / `setJobOutputsMap` from the `@kici-dev/sdk/internal` subpath of the same SDK copy that the workflow imports (`resolveWorkflowSdkSetters` in `packages/agent/src/execution/workflow-loader.ts`), so the proxies read the maps the sandbox fills
+2. **Map injection:** Creates a fresh `OutputsMap` and `StepRefMap` and injects them via `setStepOutputsMap()` / `setStepRefMap()`. It fills a `jobOutputsMap` from the dispatch's `upstreamJobOutputs` and injects it via `setJobOutputsMap()`
+3. **Step execution:** Runs each step in order. A step's return value is stored in the `OutputsMap` keyed by step name, and travels to the agent on the `step.complete` IPC message (optional `outputs` field)
+4. **Bare function normalization:** Assigns counter names to bare functions in the steps array and registers them in the `StepRefMap` (maps function reference to step name)
+5. **Proxy resolution:** When a later step reads `stepRef.result.field`, the proxy reads from the `OutputsMap`
+6. **ctx.outputsOf():** Resolves step outputs by reference (Step object or bare function). For a bare function, it looks up the step name in the `StepRefMap`
 
-### Cross-job output aggregation
+### Cross-job output transport
 
-After each job completes in the local test runner:
-
-1. Step outputs from the completed job are aggregated into the `jobOutputsMap`
-2. **Multi-step jobs:** Outputs are nested under step names: `{ stepName: { field: value }, ... }`
-3. **Single-step jobs (run shorthand):** Outputs are flattened directly: `{ field: value }` (no step-name nesting)
-4. The `jobOutputsMap` is injected via `setJobOutputsMap()`, enabling `jobRef.result.stepName.field` or `jobRef.result.field` access
-
-### IPC transport (agent sandbox)
-
-In the agent sandbox (remote pipeline execution):
-
-1. Step return values are captured and included in `step.complete` IPC messages (optional `outputs` field)
-2. The agent aggregates step outputs and includes them in the `job.complete` IPC message
-3. **Within-job chaining:** The sandbox populates the `OutputsMap` as steps complete, so `.result` and `ctx.outputsOf()` resolve correctly within a single job
-4. **Cross-job chaining:** The orchestrator collects plain outputs from completed upstream jobs at dispatch time (querying the DB for jobs listed in `needs`), then passes them as `upstreamJobOutputs` in the `job.dispatch` message. The sandbox receives this map and populates the `jobOutputsMap` via `setJobOutputsMap()`, enabling `ctx.jobOutputs()` and `jobRef.result` access across job boundaries. Secret outputs follow a separate encrypted path via `SecretOutputStore`.
+1. At job end, the sandbox sends the job's `OutputsMap` on the `job.complete` IPC message, keyed by step name (`{ stepName: { field: value }, ... }`). The agent forwards it on `job.status`, and the orchestrator stores it on the job's `execution_jobs` row
+2. When it dispatches a downstream job, the orchestrator reads the stored outputs of the jobs listed in `needs` and passes them as `upstreamJobOutputs` in `job.dispatch`, keyed by base job name. A job that fanned out into matrix children gets a `{ byMatrix, merged }` envelope, and a host fan-out gets a `byHost` envelope
+3. The sandbox fills `jobOutputsMap` from that map (step 2 above), so `ctx.jobOutputs()` and `jobRef.result` resolve across job boundaries
+4. Secret outputs follow a separate encrypted path via `SecretOutputStore`
 
 #### Within-job output flow
 

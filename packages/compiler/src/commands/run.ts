@@ -36,6 +36,13 @@ import {
 import { resolveRunTarget } from '../remote/target.js';
 import { compileFixtures, filterFixtures, type CompiledFixture } from '../fixtures/compiler.js';
 import { describeEvent } from '../fixtures/describe-event.js';
+import {
+  buildFixtureEvent,
+  currentBranchFallback,
+  FALLBACK_BRANCH,
+  type GitHead,
+} from '../fixtures/event.js';
+import { detectCurrentBranch } from '../test-runner/git-detector.js';
 import { runFixturePicker, FixturePickerCancelledError } from '../fixtures/picker.js';
 import { createOverlayTarball, getSizeWarning } from '../remote/uploader.js';
 import {
@@ -575,6 +582,11 @@ async function prepareOverlay(options: RemoteRunOptions): Promise<{
   return { tarballPath, summary, hasRemote, inlineLockFile, kiciDir, repoRoot };
 }
 
+/** The branch and commit the overlay was built from: the defaults for the run's event. */
+function localGitHead(overlay: { repoRoot: string; summary: { sha: string } }): GitHead {
+  return { branch: detectCurrentBranch(overlay.repoRoot), sha: overlay.summary.sha };
+}
+
 /** Inits the upload (control plane), then PUTs the encrypted tarball straight to the object store (data plane). */
 async function initAndUpload(
   ctx: RunRemoteTransport,
@@ -636,10 +648,17 @@ async function runSingleFixture(
     const overlay = await prepareOverlay(options);
     const uploaded = await initAndUpload(ctx, overlay, options);
 
+    const head = localGitHead(overlay);
+    const fallback = head.branch ? undefined : currentBranchFallback(opts);
+    if (fallback) {
+      warnStderr(
+        `HEAD is detached, so fixture ${fixture.id} uses branch '${fallback}' in place of the current branch.`,
+      );
+    }
+    const event = buildFixtureEvent(opts, head);
     // Stamp the real origin `owner/repo` and provider when the tree has a
     // recognized git remote, else a synthetic `local/<repo>` identity, so the
     // dashboard never builds a broken external link.
-    const event = buildEventFromFixture(opts);
     {
       const identity = buildLocalRepoIdentity(overlay.repoRoot);
       const repo = event.payload.repository as Record<string, unknown> | undefined;
@@ -1006,40 +1025,6 @@ function jobsFromStatus(
   }));
 }
 
-/** Returns a SimulatedEvent-compatible object. */
-function buildEventFromFixture(opts: import('@kici-dev/sdk').FixtureOptions): {
-  type: string;
-  action?: string;
-  targetBranch: string;
-  sourceBranch?: string;
-  payload: Record<string, unknown>;
-  changedFiles?: string[];
-} {
-  const event = opts.event;
-  const eventObj = event as unknown as Record<string, unknown>;
-
-  const type = String(eventObj._type ?? 'push');
-  const action = eventObj.action ? String(eventObj.action) : undefined;
-
-  const targetBranch = opts.branch ?? 'main';
-  const sourceBranch = type === 'pr' ? (opts.branch ?? 'feature/test') : undefined;
-
-  return {
-    type,
-    action,
-    targetBranch,
-    sourceBranch,
-    payload: {
-      ref: `refs/heads/${targetBranch}`,
-      repository: {
-        full_name: opts.repo ?? 'owner/repo',
-      },
-      ...(opts.sha && { after: opts.sha }),
-      ...(opts.pr && { number: opts.pr }),
-    },
-  };
-}
-
 /** Runs a workflow directly, bypassing trigger matching. */
 async function runDirectWorkflow(
   workflowName: string,
@@ -1072,8 +1057,15 @@ async function runDirectWorkflow(
 
     // Real origin identity, else synthetic `local/<repo>` (see runSingleFixture).
     const identity = buildLocalRepoIdentity(overlay.repoRoot);
+    const head = localGitHead(overlay);
+    if (!head.branch) {
+      warnStderr(
+        `HEAD is detached, so workflow ${workflowName} uses branch '${FALLBACK_BRANCH}' in place of the current branch.`,
+      );
+    }
     const payload: Record<string, unknown> = {
       repository: { full_name: identity.repoIdentifier, provider: identity.provider },
+      ...(head.sha && { after: head.sha }),
     };
 
     const encrypted = await buildEncryptedSecrets(
@@ -1085,7 +1077,11 @@ async function runDirectWorkflow(
 
     const triggerResult = await ctx.trigger({
       fixtureId,
-      event: { type: 'manual', targetBranch: 'main', payload },
+      event: {
+        type: 'manual',
+        targetBranch: head.branch ?? FALLBACK_BRANCH,
+        payload,
+      },
       uploadId: uploaded.uploadId,
       cliPublicKey: uploaded.cliPublicKey,
       ...(encrypted && {

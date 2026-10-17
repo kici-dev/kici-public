@@ -5,8 +5,8 @@
  * repo whose HEAD carries the workflow and lock to run.
  *
  * - **default (isolated):** a tmp clone at HEAD with dirty and untracked files
- *   committed onto a `kici-local` branch, so the agent sees uncommitted work
- *   without touching the developer's tree.
+ *   committed onto the current branch's name (`kici-local` when detached), so the
+ *   agent sees uncommitted work without touching the developer's tree.
  * - **`--in-place`:** the repo root directly (the profile CI deploy jobs use).
  */
 
@@ -22,6 +22,7 @@ import {
   type OverlayEntries,
 } from '../remote/overlay-links.js';
 import { selectOverlayFiles } from '../remote/uploader.js';
+import { detectCurrentBranch } from '../test-runner/git-detector.js';
 import { shQuote } from '@kici-dev/core';
 
 export const LOCAL_RUN_BRANCH = 'kici-local';
@@ -53,7 +54,7 @@ export async function resolveWorkdir(opts: {
 }
 
 function resolveInPlace(repoRoot: string): ResolvedWorkdir {
-  const branch = gitOut(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  const branch = detectCurrentBranch(repoRoot) ?? LOCAL_RUN_BRANCH;
   const sha = gitOut(repoRoot, ['rev-parse', 'HEAD']);
   return {
     dir: repoRoot,
@@ -101,7 +102,8 @@ async function materializeIsolated(
 
   // So the agent's clone-by-sha and the ref-scoped trigger resolve a sha that
   // carries the overlay.
-  execFileSync('git', ['checkout', '-B', LOCAL_RUN_BRANCH], { cwd: tmpDir, stdio: 'ignore' });
+  const branch = detectCurrentBranch(repoRoot) ?? LOCAL_RUN_BRANCH;
+  execFileSync('git', ['checkout', '-B', branch], { cwd: tmpDir, stdio: 'ignore' });
   execFileSync('git', ['add', '-A'], { cwd: tmpDir, stdio: 'ignore' });
   if (gitOut(tmpDir, ['status', '--porcelain'])) {
     execFileSync(
@@ -124,9 +126,9 @@ async function materializeIsolated(
 
   return {
     dir: tmpDir,
-    ref: `refs/heads/${LOCAL_RUN_BRANCH}`,
+    ref: `refs/heads/${branch}`,
     sha: committed,
-    branch: LOCAL_RUN_BRANCH,
+    branch,
     cleanup,
     warnings: overlaySkipWarnings(entries.skipped, SkipContext.LocalRun),
   };

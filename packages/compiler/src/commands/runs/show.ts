@@ -59,7 +59,7 @@ export async function runsShowCommand(
     }
     printHeader(run);
     printInitFailure(detail.initFailure);
-    printJobs(detail.jobs);
+    printJobs(detail.jobs, runWorkflows(run).length > 1);
     printHolds(holds);
     return true;
   } catch (err) {
@@ -106,12 +106,19 @@ async function loadHolds(runId: string): Promise<HoldsResult> {
   }
 }
 
+function runWorkflows(run: RunListItem): string[] {
+  return run.workflowNames?.length ? run.workflowNames : [run.workflowName];
+}
+
 function printHeader(run: RunListItem): void {
   const f = (v: string | undefined | null): string => (v == null ? '—' : v);
+  const workflows = runWorkflows(run);
+  const workflowField =
+    workflows.length > 1 ? `workflows=${workflows.join(',')}` : `workflow=${f(run.workflowName)}`;
   console.log(pc.bold(`\nRun ${run.runId}`) + `  ${colorStatus(run.status)}`);
   console.log(
     pc.gray(
-      `  workflow=${f(run.workflowName)} repo=${f(run.repoIdentifier)} branch=${f(run.ref)} ` +
+      `  ${workflowField} repo=${f(run.repoIdentifier)} branch=${f(run.ref)} ` +
         `sha=${f(run.sha)} trigger=${f(run.triggerEvent)} by=${f(run.triggeredBy)}`,
     ),
   );
@@ -128,10 +135,11 @@ function printInitFailure(initFailure: InitFailure | undefined): void {
   console.log(`    ${initFailure.message}`);
 }
 
-function printJobs(jobs: DashboardJobDetail[]): void {
+function printJobs(jobs: DashboardJobDetail[], spansWorkflows: boolean): void {
   for (const j of jobs) {
+    const label = spansWorkflows && j.workflowName ? `${j.workflowName} / ${j.jobName}` : j.jobName;
     console.log(
-      `\n  ${pc.bold(j.jobName)} ${colorStatus(j.status)} ` +
+      `\n  ${pc.bold(label)} ${colorStatus(j.status)} ` +
         pc.gray(j.durationMs ? formatDuration(j.durationMs) : ''),
     );
     printJobFailure(j);

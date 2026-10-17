@@ -420,6 +420,8 @@ export interface ExecutionTrackerDeps {
     initFailure?: InitFailure,
     /** Ordered bound deployment-context names for this job (multi-env jobs). */
     contexts?: string[],
+    /** The workflow that defines the job, when recorded. */
+    workflowName?: string,
   ) => void;
   /**
    * Optional callback to emit run.event messages to Platform.
@@ -571,6 +573,8 @@ interface RunState {
     string,
     {
       name: string;
+      /** The workflow that defines the job; see {@link TrackedJobRow.workflowName}. */
+      workflowName?: string;
       status: string;
       startedAt?: number;
       agentId?: string;
@@ -590,6 +594,13 @@ interface RunState {
 export interface TrackedJobRow {
   jobId: string;
   jobName: string;
+  /**
+   * The workflow that defines the job. A fixture run with no `--workflow` runs
+   * every matched workflow under one run id, so the run's own workflow does not
+   * name it. `onExecutionStarted` stamps its own workflow on a job without one;
+   * `addJobsToRun` inherits it from the placeholder the job replaces.
+   */
+  workflowName?: string;
   matrixValues?: Record<string, unknown>;
   runsOnLabels?: string[];
   baseJobName?: string;
@@ -617,6 +628,26 @@ export interface TrackedJobRow {
 }
 
 /**
+ * `Failed jobs: a, b` for a run's failed jobs, or undefined when none failed.
+ * A run spanning several workflows names each job with its workflow
+ * (`repro-406 / init-fails`), so the summary points at the workflow to fix.
+ */
+function failedJobsSummary(
+  jobs: ReadonlyArray<{ name: string; workflowName?: string | null; status: string }>,
+): string | undefined {
+  const workflows = new Set(jobs.map((j) => j.workflowName).filter(Boolean));
+  const failed = jobs
+    .filter((j) => isFailureStatus(j.status))
+    .map((j) => (workflows.size > 1 && j.workflowName ? `${j.workflowName} / ${j.name}` : j.name));
+  return failed.length > 0 ? `Failed jobs: ${failed.join(', ')}` : undefined;
+}
+
+/** Stamp each job with `workflowName`, keeping a workflow a job already names. */
+export function jobsOfWorkflow<T extends TrackedJobRow>(workflowName: string, jobs: T[]): T[] {
+  return jobs.map((job) => ({ ...job, workflowName: job.workflowName ?? workflowName }));
+}
+
+/**
  * Build the mutable column set for a tracked job's execution_jobs upsert — the
  * fields written on both the initial INSERT and the (run_id, job_id) conflict
  * update. `run_id` / `job_id` / `routing_key` / `matrix_values` are set by the
@@ -629,6 +660,7 @@ function trackedJobMutableColumns(
 ): Updateable<ExecutionJobTable> & { job_name: string } {
   return {
     job_name: job.jobName,
+    ...(job.workflowName && { workflow_name: job.workflowName }),
     ...(job.baseJobName && { base_job_name: job.baseJobName }),
     ...(job.variantKind && { variant_kind: job.variantKind }),
     ...(job.variantLabel && { variant_label: job.variantLabel }),
@@ -855,20 +887,12 @@ export class ExecutionTracker {
     const crossRepoProvenance = crossRepoProvenanceOf(repoIdentifier, workflowRepo);
     const crossRepoWorkflowRepo = crossRepoProvenance?.identifier;
 
-    const jobMap = new Map<
-      string,
-      {
-        name: string;
-        status: string;
-        startedAt?: number;
-        agentId?: string;
-        runsOnLabels?: string[];
-        contexts?: string[];
-      }
-    >();
-    for (const job of jobs) {
+    const workflowJobs = jobsOfWorkflow(workflowName, jobs);
+    const jobMap: RunState['jobs'] = new Map();
+    for (const job of workflowJobs) {
       jobMap.set(job.jobId, {
         name: job.jobName,
+        ...(job.workflowName && { workflowName: job.workflowName }),
         status: ExecutionJobStatus.enum.pending,
         ...(job.runsOnLabels?.length && { runsOnLabels: job.runsOnLabels }),
         ...(job.contexts?.length && { contexts: job.contexts }),
@@ -881,31 +905,42 @@ export class ExecutionTracker {
         ? ((providerContext as Record<string, unknown>).installationId as number)
         : undefined;
 
-    this.runs.set(runId, {
-      status: ExecutionRunStatus.enum.pending,
-      workflowName,
-      provider,
-      repoIdentifier,
-      ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
-      sha,
-      ...(localWorkingTree && { localWorkingTree: true }),
-      installationId,
-      requestId: getRequestContext().requestId,
-      routingKey,
-      ref,
-      triggerEvent,
-      commitMessage,
-      parentRunId,
-      originalRunId,
-      triggeredBy,
-      triggeredByAgentLabel,
-      triggerActorUsername,
-      triggerActorUserId,
-      concurrency,
-      ...(checkMode != null && { checkMode }),
-      startedAt: now.getTime(),
-      jobs: jobMap,
-    });
+    // A run spanning several workflows registers once per workflow under one
+    // run id (a fixture run with no `--workflow`). A later workflow joins the
+    // live run: replacing it would drop the jobs already registered, and the run
+    // would complete while they are still running.
+    const liveRun = this.runs.get(runId);
+    const joinsLiveRun = liveRun !== undefined && liveRun.completedAt === undefined;
+    if (joinsLiveRun) {
+      for (const [jobId, job] of jobMap) {
+        if (!liveRun.jobs.has(jobId)) liveRun.jobs.set(jobId, job);
+      }
+    } else
+      this.runs.set(runId, {
+        status: ExecutionRunStatus.enum.pending,
+        workflowName,
+        provider,
+        repoIdentifier,
+        ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
+        sha,
+        ...(localWorkingTree && { localWorkingTree: true }),
+        installationId,
+        requestId: getRequestContext().requestId,
+        routingKey,
+        ref,
+        triggerEvent,
+        commitMessage,
+        parentRunId,
+        originalRunId,
+        triggeredBy,
+        triggeredByAgentLabel,
+        triggerActorUsername,
+        triggerActorUserId,
+        concurrency,
+        ...(checkMode != null && { checkMode }),
+        startedAt: now.getTime(),
+        jobs: jobMap,
+      });
 
     // A pre-dispatch path may already have written the row; the conflict path
     // below fills only the gaps it left.
@@ -975,11 +1010,11 @@ export class ExecutionTracker {
       .execute();
 
     // Upsert, to tolerate a race with onJobStatus.
-    await this.insertTrackedJobRows(runId, routingKey ?? null, dispatchedContexts, jobs);
+    await this.insertTrackedJobRows(runId, routingKey ?? null, dispatchedContexts, workflowJobs);
 
-    executionsTotal.add(1, { status: ExecutionRunStatus.enum.pending });
+    if (!joinsLiveRun) executionsTotal.add(1, { status: ExecutionRunStatus.enum.pending });
 
-    logger.info('Execution started', {
+    logger.info(joinsLiveRun ? 'Workflow joined running execution' : 'Execution started', {
       runId,
       workflowName,
       jobCount: jobs.length,
@@ -993,11 +1028,14 @@ export class ExecutionTracker {
       this.writeOrchLog(runId, job.jobId, OrchLogPhase.enum.dispatch, 'Job dispatched to queue');
     }
 
+    // A joining workflow forwards the run as it stands: its status, its first
+    // workflow and its start, with the job count across every workflow.
+    const run = this.runs.get(runId)!;
     this.onExecutionStatusChange?.(
       runId,
-      ExecutionRunStatus.enum.pending,
+      run.status,
       {
-        workflowName,
+        workflowName: run.workflowName,
         provider,
         repoIdentifier,
         ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
@@ -1015,8 +1053,8 @@ export class ExecutionTracker {
         triggerActorUsername,
         triggerActorUserId,
       },
-      jobs.length,
-      now.getTime(),
+      run.jobs.size,
+      run.startedAt,
     );
   }
 
@@ -1298,6 +1336,13 @@ export class ExecutionTracker {
       return;
     }
 
+    // A caller that knows no workflow (a needs-gated release, an invoke gate)
+    // inherits it from the placeholder the job replaces.
+    if (replaceSyntheticId) {
+      const inherited = await this.placeholderWorkflowName(run, runId, replaceSyntheticId);
+      if (inherited) jobs = jobsOfWorkflow(inherited, jobs);
+    }
+
     // Cluster correctness: the synthetic row may be in the shared DB but not in
     // this peer's run.jobs (the ingesting peer inserted it; this peer got only
     // the rerouted upstream job), so the DB delete is unconditional.
@@ -1348,6 +1393,7 @@ export class ExecutionTracker {
       }
       run.jobs.set(job.jobId, {
         name: job.jobName,
+        ...(job.workflowName && { workflowName: job.workflowName }),
         status,
         ...(preservedStartedAt !== undefined && { startedAt: preservedStartedAt }),
         ...(preservedAgentId !== undefined && { agentId: preservedAgentId }),
@@ -1384,6 +1430,26 @@ export class ExecutionTracker {
         await this.finalizeRunCompletion(run, runId, Date.now(), new Date());
       }
     }
+  }
+
+  /**
+   * The workflow of the placeholder a job replaces: from memory, or from its
+   * row when another peer registered it.
+   */
+  private async placeholderWorkflowName(
+    run: RunState,
+    runId: string,
+    placeholderId: string,
+  ): Promise<string | undefined> {
+    const known = run.jobs.get(placeholderId)?.workflowName;
+    if (known) return known;
+    const row = await this.db
+      .selectFrom('execution_jobs')
+      .select('workflow_name')
+      .where('run_id', '=', runId)
+      .where('job_id', '=', placeholderId)
+      .executeTakeFirst();
+    return row?.workflow_name ?? undefined;
   }
 
   /** Mark a run as a test run for observer broadcasting (called by the test pipeline). */
@@ -1620,7 +1686,7 @@ export class ExecutionTracker {
   private async syncRunJobsFromRows(run: RunState, runId: string): Promise<void> {
     const rows = await this.db
       .selectFrom('execution_jobs')
-      .select(['job_id', 'job_name', 'status'])
+      .select(['job_id', 'job_name', 'workflow_name', 'status'])
       .where('run_id', '=', runId)
       .execute();
     for (const row of rows) {
@@ -1630,7 +1696,11 @@ export class ExecutionTracker {
       const status = typeof row.status === 'string' ? row.status : ExecutionJobStatus.enum.pending;
       const known = run.jobs.get(row.job_id);
       if (!known) {
-        run.jobs.set(row.job_id, { name: row.job_name ?? row.job_id, status });
+        run.jobs.set(row.job_id, {
+          name: row.job_name ?? row.job_id,
+          ...(row.workflow_name && { workflowName: row.workflow_name }),
+          status,
+        });
         continue;
       }
       if (!TERMINAL_JOB_STATES.has(known.status) && TERMINAL_JOB_STATES.has(status)) {
@@ -1884,12 +1954,16 @@ export class ExecutionTracker {
 
     const queueEntry = await this.db
       .selectFrom('dispatch_queue')
-      .select(['job_name'])
+      .select(['job_name', 'workflow_name'])
       .where('id', '=', jobId)
       .executeTakeFirst();
 
     const jobName = queueEntry?.job_name ?? jobId;
-    run.jobs.set(jobId, { name: jobName, status: ExecutionJobStatus.enum.pending } as any);
+    run.jobs.set(jobId, {
+      name: jobName,
+      ...(queueEntry?.workflow_name && { workflowName: queueEntry.workflow_name }),
+      status: ExecutionJobStatus.enum.pending,
+    } as any);
     const job = run.jobs.get(jobId)!;
 
     logger.info('Recovered in-memory job state from dispatch_queue', {
@@ -1985,6 +2059,7 @@ export class ExecutionTracker {
         run_id: runId,
         job_id: jobId,
         job_name: jobName,
+        ...(job?.workflowName && { workflow_name: job.workflowName }),
         // Denormalized (migration 006); set by onExecutionStarted or copied from
         // execution_runs by the DB-recovery branch.
         routing_key: run?.routingKey ?? null,
@@ -2177,6 +2252,7 @@ export class ExecutionTracker {
       jobLogBytesTotal,
       initFailure,
       job.contexts,
+      job.workflowName,
     );
   }
 
@@ -4052,11 +4128,16 @@ export class ExecutionTracker {
    * worker's first status update creates the `execution_jobs` row. An existing
    * entry is never clobbered, so a later terminal status survives.
    */
-  registerJobName(runId: string, jobId: string, jobName: string): void {
+  registerJobName(runId: string, jobId: string, jobName: string, workflowName?: string): void {
     const run = this.runs.get(runId);
     if (!run || run.jobs.has(jobId)) return;
-    // Same shape as recoverJobFromDispatchQueue; resolveJobName needs only the name.
-    run.jobs.set(jobId, { name: jobName, status: ExecutionJobStatus.enum.pending } as any);
+    // Same shape as recoverJobFromDispatchQueue; the workflow names the row the
+    // worker's first status update creates.
+    run.jobs.set(jobId, {
+      name: jobName,
+      ...(workflowName && { workflowName }),
+      status: ExecutionJobStatus.enum.pending,
+    } as any);
   }
 
   /**
@@ -4232,6 +4313,7 @@ export class ExecutionTracker {
     jobs: Array<{
       jobId: string;
       jobName: string;
+      workflowName?: string;
       status: string;
       startedAt?: number;
       completedAt?: number;
@@ -4262,6 +4344,7 @@ export class ExecutionTracker {
       jobs: Array<{
         jobId: string;
         jobName: string;
+        workflowName?: string;
         status: string;
         startedAt?: number;
         completedAt?: number;
@@ -4282,6 +4365,7 @@ export class ExecutionTracker {
       const jobs: Array<{
         jobId: string;
         jobName: string;
+        workflowName?: string;
         status: string;
         startedAt?: number;
         completedAt?: number;
@@ -4294,6 +4378,7 @@ export class ExecutionTracker {
         jobs.push({
           jobId,
           jobName: job.name,
+          ...(job.workflowName && { workflowName: job.workflowName }),
           status: job.status,
           ...(job.startedAt !== undefined && { startedAt: job.startedAt }),
           ...(job.agentId && { agentId: job.agentId }),
@@ -4416,19 +4501,24 @@ export class ExecutionTracker {
 
     const dbJobsByRun = new Map<
       string,
-      Array<{ jobId: string; jobName: string; status: string }>
+      Array<{ jobId: string; jobName: string; workflowName?: string; status: string }>
     >();
     try {
       const jobIds = dbRuns.filter((r) => !seen.has(r.run_id)).map((r) => r.run_id);
       if (jobIds.length > 0) {
         const dbJobs = await this.db
           .selectFrom('execution_jobs')
-          .select(['run_id', 'job_id', 'job_name', 'status'])
+          .select(['run_id', 'job_id', 'job_name', 'workflow_name', 'status'])
           .where('run_id', 'in', jobIds)
           .execute();
         for (const j of dbJobs) {
           const arr = dbJobsByRun.get(j.run_id) ?? [];
-          arr.push({ jobId: j.job_id, jobName: j.job_name, status: j.status });
+          arr.push({
+            jobId: j.job_id,
+            jobName: j.job_name,
+            ...(j.workflow_name && { workflowName: j.workflow_name }),
+            status: j.status,
+          });
           dbJobsByRun.set(j.run_id, arr);
         }
       }
@@ -4521,6 +4611,7 @@ export class ExecutionTracker {
       undefined,
       undefined,
       job?.contexts,
+      job?.workflowName,
     );
   }
 
@@ -4838,7 +4929,7 @@ export class ExecutionTracker {
   private async completeRunFromDbFallback(runId: string): Promise<void> {
     const jobs = await this.db
       .selectFrom('execution_jobs')
-      .select(['status', 'job_name'])
+      .select(['status', 'job_name', 'workflow_name'])
       .where('run_id', '=', runId)
       .execute();
 
@@ -4963,10 +5054,15 @@ export class ExecutionTracker {
 
     // Same shared classification as `buildRunDescription`, so a run failed only
     // by a job that never ran does not get an empty `Failed jobs:`.
-    const failedJobNames = jobs.filter((j) => isFailureStatus(j.status)).map((j) => j.job_name);
     const description =
-      overallStatus !== ExecutionRunStatus.enum.success && failedJobNames.length > 0
-        ? `Failed jobs: ${failedJobNames.join(', ')}`
+      overallStatus !== ExecutionRunStatus.enum.success
+        ? failedJobsSummary(
+            jobs.map((j) => ({
+              name: j.job_name,
+              workflowName: j.workflow_name,
+              status: j.status,
+            })),
+          )
         : undefined;
 
     this.onExecutionComplete?.(
@@ -5150,18 +5246,7 @@ export class ExecutionTracker {
       return 'Drift detected in check mode (--fail-on-drift)';
     }
 
-    const failedNames: string[] = [];
-    for (const job of run.jobs.values()) {
-      if (isFailureStatus(job.status)) {
-        failedNames.push(job.name);
-      }
-    }
-
-    if (failedNames.length > 0) {
-      return `Failed jobs: ${failedNames.join(', ')}`;
-    }
-
-    return undefined;
+    return failedJobsSummary([...run.jobs.values()]);
   }
 
   /**

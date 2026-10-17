@@ -319,6 +319,7 @@ export async function runServer(
             logBytes,
             initFailure,
             contexts,
+            workflowName,
           ) => {
             try {
               platformClient.send(
@@ -341,6 +342,7 @@ export async function runServer(
                   logBytes,
                   initFailure,
                   contexts,
+                  workflowName,
                   orchestratorId: config.instanceId,
                 }),
               );
@@ -1913,6 +1915,7 @@ export async function runServer(
                         'run_id',
                         'job_id',
                         'job_name',
+                        'workflow_name',
                         'status',
                         'agent_id',
                         'started_at',
@@ -1924,6 +1927,7 @@ export async function runServer(
                       run_id: j.run_id,
                       job_id: j.job_id,
                       job_name: j.job_name,
+                      workflow_name: j.workflow_name,
                       status: j.status,
                       started_at: j.started_at,
                       completed_at: j.completed_at,

@@ -13,6 +13,7 @@ import { ExecutionJobStatus, type InitFailure } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import { groupNeedsByJobName } from '../dashboard/needs-edges.js';
 import { safeJsonParse } from '../helpers/json.js';
+import { jobWorkflowName } from './run-workflow-names.js';
 
 /** A run-detail step row as queried from execution_steps (warm + cold paths). */
 export interface RunDetailStepRow {
@@ -56,6 +57,8 @@ export function mapRunDetailStep(step: RunDetailStepRow) {
 export interface RunDetailJobRow {
   job_id: string;
   job_name: string;
+  /** Absent from an archived row written before the column existed. */
+  workflow_name?: string | null;
   status: string;
   matrix_values: unknown;
   base_job_name: string | null;
@@ -82,6 +85,8 @@ export interface RunDetailJobLookups {
   stepsByJob: Map<string, RunDetailStepRow[]>;
   secretKeysByJob: Map<string, string[]>;
   needsByJob: Map<string, Array<{ upstreamName: string; runOn: ExecutionJobStatus[] }>>;
+  /** The run's own workflow, naming a job row that records none; see {@link jobWorkflowName}. */
+  runWorkflow?: { workflow_name: string; is_test_run: boolean };
 }
 
 /**
@@ -101,13 +106,16 @@ export function visibleRoutingReason(status: string, routingReason: string | nul
 
 /** Map queried job + step rows into the dashboard run-detail job DTO shape. */
 export function buildRunDetailJobs(jobs: RunDetailJobRow[], lookups: RunDetailJobLookups) {
-  const { stepsByJob, secretKeysByJob, needsByJob } = lookups;
+  const { stepsByJob, secretKeysByJob, needsByJob, runWorkflow } = lookups;
   return jobs.map((job) => {
     const jobSteps = stepsByJob.get(job.job_id) ?? [];
     const jobInitFailure = (job.init_failure as InitFailure | null) ?? undefined;
     return {
       jobId: job.job_id,
       jobName: job.job_name,
+      workflowName: runWorkflow
+        ? jobWorkflowName(job.workflow_name ?? null, runWorkflow)
+        : (job.workflow_name ?? null),
       status: job.status,
       matrixValues: (job.matrix_values as Record<string, unknown> | null) ?? null,
       baseJobName: job.base_job_name ?? null,
@@ -218,6 +226,7 @@ export async function aggregateRunDetail(
       'init_failure',
       'provider_context',
       'routing_key',
+      'is_test_run',
     ])
     .where('run_id', '=', runId)
     .executeTakeFirst();
@@ -233,6 +242,7 @@ export async function aggregateRunDetail(
       .select([
         'job_id',
         'job_name',
+        'workflow_name',
         'status',
         'matrix_values',
         'base_job_name',
@@ -314,6 +324,7 @@ export async function aggregateRunDetail(
     stepsByJob,
     secretKeysByJob,
     needsByJob,
+    runWorkflow: run,
   });
 
   return {

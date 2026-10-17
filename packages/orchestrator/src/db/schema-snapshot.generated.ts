@@ -1778,6 +1778,11 @@ export const SCHEMA_SNAPSHOT: SchemaFingerprint = {
       nullable: true,
       default: null,
     },
+    'execution_jobs.workflow_name': {
+      type: 'text',
+      nullable: true,
+      default: null,
+    },
     'execution_runs.archive_object_key': {
       type: 'text',
       nullable: true,

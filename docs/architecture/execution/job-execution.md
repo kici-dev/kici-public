@@ -11,20 +11,21 @@ When the orchestrator dispatches a job to an agent, the agent creates an `Execut
 
 ```mermaid
 flowchart TD
-    D["job.dispatch received"] --> CC{"At capacity?"}
-    CC -->|Yes| NACK["Send agent.status (NACK)"]
-    CC -->|No| DRAIN{"Drain mode?"}
-    DRAIN -->|Yes| NACK
-    DRAIN -->|No| INIT{"Init-only job?"}
-    INIT -->|Yes| INITJOB["Handle init job (in-process)"]
+    D["job.dispatch received"] --> DRAIN{"Drain mode?"}
+    DRAIN -->|Yes| DNACK["Send job.reject (draining) + agent.status"]
+    DRAIN -->|No| CC{"At capacity?"}
+    CC -->|Yes| NACK["Send job.reject (busy) + agent.status"]
+    CC -->|No| ACK["Send job.ack"]
+    ACK --> INIT{"Init-only job?"}
+    INIT -->|Yes| INITJOB["Handle init job (agent + eval child)"]
     INIT -->|No| GEVAL{"Global eval round?"}
-    GEVAL -->|Yes| GEVALJOB["Handle global eval round (in-process)"]
+    GEVAL -->|Yes| GEVALJOB["Handle global eval round (agent + eval child)"]
     GEVAL -->|No| DYN{"DynamicJobFn eval?"}
-    DYN -->|Yes| DYNJOB["Handle DynamicJobFn eval (in-process)"]
+    DYN -->|Yes| DYNJOB["Handle DynamicJobFn eval (agent + eval child)"]
     DYN -->|No| BRINGUP{"Bring-up job?"}
     BRINGUP -->|Yes| BRINGUPJOB["Handle bring-up job (in-process, SSH)"]
     BRINGUP -->|No| BUILD{"Build-only job?"}
-    BUILD -->|Yes| BUILDJOB["Handle build job (in-process)"]
+    BUILD -->|Yes| BUILDJOB["Handle build job (agent + eval child)"]
     BUILD -->|No| RUN["Report job.status: running"]
     RUN --> MODE["Step 1: Determine execution mode"]
     MODE --> SANDBOX["Step 2: Create sandbox (container/bare-metal/firecracker)"]
@@ -153,7 +154,7 @@ After loading the module, the sandbox extracts the target workflow by export nam
 
 Rules are evaluated sequentially with fail-fast behavior. Each rule's `check` function is called with a `RuleContext` providing the event payload, changed files, environment variables, and a zx `$` shell. Rules can be synchronous or asynchronous.
 
-If any rule check returns `false` (or throws), the job is **skipped** (not failed). The remaining rules are not evaluated. Rule evaluation results (label, passed, duration, error) are included in the `job.status` message data.
+If a rule check returns `false`, the job is **skipped** (not failed): it reports `success` with every step skipped. If a rule check throws, the job **fails** with the error, because a rule that could not decide must not read as "do not run". In both cases the remaining rules are not evaluated. Rule evaluation results (label, passed, duration, error) are included in the `job.status` message data.
 
 > See `packages/agent/src/execution/rule-evaluator.ts` for the implementation.
 
@@ -321,17 +322,19 @@ When running in container mode, the agent uses the `ContainerSandbox`. The workf
 
 ## Concurrency control
 
-The agent enforces single-job concurrency: only one job runs at a time. When a `job.dispatch` arrives and the agent is already running a job, the dispatch is rejected by sending an `agent.status` message back to the orchestrator. The orchestrator then queues the job and re-dispatches when the agent reports available capacity.
+The agent enforces single-job concurrency: only one job runs at a time. When a `job.dispatch` arrives and the agent is already running a job, the agent sends `job.reject` with reason `busy`, then an `agent.status` with its current counts. The explicit reject lets the orchestrator requeue the job at once instead of leaving it bound to this agent until disconnect.
 
 > See `packages/agent/src/server.ts` for the concurrency gating logic.
 
 **Capacity flow:**
 
 1. `job.dispatch` arrives
-2. Check `jobRunner.activeJobs.size > 0`
-3. If already running: send `agent.status` with current `activeJobs` count
-4. If idle: accept and execute
+2. If the agent is draining: send `job.reject` with reason `draining`, then `agent.status`
+3. If `jobRunner.activeJobs.size > 0`: send `job.reject` with reason `busy`, then `agent.status`
+4. If idle: send `job.ack` (before any clone work, so a slow clone cannot use up the orchestrator's acknowledgement deadline), then execute
 5. On job completion: send `agent.status` with updated counts
+
+The container scaler sets `KICI_SCALER_SINGLE_JOB=1` on an agent container it starts from the label set's agent image rather than a per-job image. Such a single-job agent enters drain mode the moment it accepts its job and reports the drain on `agent.status`, so the orchestrator never offers it a second job. It exits when the job ends.
 
 ## Cancellation
 
@@ -351,12 +354,13 @@ When the orchestrator sends `job.cancel`, the agent:
 
 The agent supports a drain mode for graceful scaling down. When `SIGUSR1` is received:
 
-1. Stop accepting new job dispatches
+1. Stop accepting new job dispatches, and report the drain on `agent.status` so the orchestrator stops offering jobs
 2. Wait for all active jobs to complete (polls every 1 second)
 3. Stop metrics reporter (final metrics flush)
 4. Disconnect from orchestrator
 5. Stop HTTP server
-6. Exit
+6. On a scaler-managed agent, wait 1 second so the WebSocket close frame flushes
+7. Exit
 
 ## See also
 

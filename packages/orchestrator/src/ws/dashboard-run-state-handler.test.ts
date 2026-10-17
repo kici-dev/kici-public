@@ -74,17 +74,27 @@ describe('handleRunState (dashboard.run.state system read)', () => {
           status_epoch: 1,
         },
       },
-      jobs: { 'run-1': [{ job_id: 'j1', job_name: 'build', status: 'success' }] },
+      jobs: {
+        'run-1': [
+          { job_id: 'j1', job_name: 'build', workflow_name: 'ci', status: 'success' },
+          { job_id: 'j2', job_name: 'old', workflow_name: null, status: 'success' },
+        ],
+      },
     });
     const resp = await handleRunState({ db }, req('run-1'));
     expect(resp.type).toBe('dashboard.run.state.response');
     expect(resp.run?.runId).toBe('run-1');
     expect(resp.run?.status).toBe('success');
     expect(resp.run?.routingKey).toBe('github:1');
-    expect(resp.run?.jobCount).toBe(1);
+    expect(resp.run?.jobCount).toBe(2);
     expect(resp.run?.startedAt).toBe(1_700_000_000_000);
     expect(resp.run?.completedAt).toBe(1_700_000_005_000);
-    expect(resp.run?.jobs).toEqual([{ jobId: 'j1', jobName: 'build', status: 'success' }]);
+    // fails-when: the recovered run drops each job's workflow
+    // breaks-if-wrong: a row with no recorded workflow carries no field
+    expect(resp.run?.jobs).toEqual([
+      { jobId: 'j1', jobName: 'build', workflowName: 'ci', status: 'success' },
+      { jobId: 'j2', jobName: 'old', status: 'success' },
+    ]);
     // fails-when: the pull drops the generation — the Platform reads the run as
     // an older orchestrator's and applies it unguarded.
     expect(resp.run?.statusEpoch).toBe(1);

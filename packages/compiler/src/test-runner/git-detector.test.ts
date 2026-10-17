@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { detectRepoFromGit } from './git-detector.js';
-import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { detectCurrentBranch, detectRepoFromGit } from './git-detector.js';
+import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -87,5 +88,39 @@ describe('detectRepoFromGit', () => {
 
     const result = await detectRepoFromGit(tempDir);
     expect(result).toBeNull();
+  });
+});
+
+describe('detectCurrentBranch', () => {
+  let repo: string;
+  const git = (...args: string[]) =>
+    execFileSync('git', args, { cwd: repo, encoding: 'utf-8' }).trim();
+
+  beforeAll(async () => {
+    repo = await mkdtemp(path.join(tmpdir(), 'kici-fixture-head-'));
+    git('init', '--quiet', '--initial-branch=ci/kici');
+    git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-qm', 'init');
+  });
+
+  afterAll(async () => {
+    await rm(repo, { recursive: true, force: true });
+  });
+
+  it('reads a slash-named branch', () => {
+    // fails-when: the branch is read with --short and a same-named tag yields heads/<name>
+    git('tag', 'ci/kici');
+    expect(detectCurrentBranch(repo)).toBe('ci/kici');
+  });
+
+  it('returns undefined on a detached HEAD and outside a repository', async () => {
+    git('checkout', '--quiet', '--detach');
+    expect(detectCurrentBranch(repo)).toBeUndefined();
+    git('checkout', '--quiet', 'ci/kici');
+    const empty = await mkdtemp(path.join(tmpdir(), 'kici-fixture-nogit-'));
+    try {
+      expect(detectCurrentBranch(empty)).toBeUndefined();
+    } finally {
+      await rm(empty, { recursive: true, force: true });
+    }
   });
 });

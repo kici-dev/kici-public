@@ -790,14 +790,16 @@ export const pushMain = fixture('push-main', {
 
 ### FixtureOptions
 
-| Property       | Type                     | Description                                                                                        |
-| -------------- | ------------------------ | -------------------------------------------------------------------------------------------------- |
-| `event`        | `TriggerConfig`          | The trigger event to simulate (required)                                                           |
-| `branch`       | `string`                 | Override branch name (defaults to git-detected)                                                    |
-| `sha`          | `string`                 | Override commit SHA (defaults to HEAD)                                                             |
-| `repo`         | `string`                 | Override repository (defaults to git-detected)                                                     |
-| `pr`           | `number`                 | For PR events, override PR number                                                                  |
-| `secrets`      | `Record<string, string>` | Secret context mappings: `{ localName: 'remote-context' }`                                         |
-| `workflowName` | `string`                 | Bypass trigger matching and run this workflow directly. `kici run remote --workflow` overrides it. |
+| Property       | Type                     | Description                                                                                                                               |
+| -------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `event`        | `TriggerConfig`          | The trigger event to simulate (required). Its filters do not set the event's branch.                                                      |
+| `branch`       | `string`                 | The event's branch (defaults to the checked-out branch). For a PR event, the base branch (default `main`); for a tag event, the tag name. |
+| `sha`          | `string`                 | The event's commit SHA (defaults to the `HEAD` commit)                                                                                    |
+| `repo`         | `string`                 | Override repository (defaults to git-detected)                                                                                            |
+| `pr`           | `number`                 | For PR events, override PR number                                                                                                         |
+| `secrets`      | `Record<string, string>` | Secret context mappings: `{ localName: 'remote-context' }`                                                                                |
+| `workflowName` | `string`                 | Bypass trigger matching and run this workflow directly. `kici run remote --workflow` overrides it.                                        |
+
+`event` takes the same trigger config a workflow's `on:` takes, but in a fixture it only selects the event type. A filter such as `push({ branches: ['main'] })` does not make the event a push to `main`: the event's branch is `branch` when you set it, else the branch you have checked out. To simulate a push to `main` from any branch, set `branch: 'main'`. See [Branch and commit](../testing-guide.md#branch-and-commit) in the testing guide.
 
 Options can also be provided as an async factory function for dynamic fixture generation.

@@ -71,6 +71,7 @@ import type { SandboxAllowList } from './sandbox-allowlist-reader.js';
 import { flattenLockSteps } from './flatten-lock-steps.js';
 import { storeWebhookPayload } from './webhook-payload-store.js';
 import type { Database, HeldRun } from '../db/types.js';
+import { jobsOfWorkflow } from '../reporting/execution-tracker.js';
 import type { RerunLineage, TrackedJobRow } from '../reporting/execution-tracker.js';
 import { HostIdentitySource, JobKind } from '../db/types.js';
 import { NEEDS_PENDING_JOB_ID_PREFIX } from '../db/synthetic-job-ids.js';
@@ -397,6 +398,12 @@ export interface WorkflowDispatchContext {
    */
   runRegisteredBeforeDispatch?: boolean;
   /**
+   * Called each time this dispatch registers the run with the tracker. A
+   * fixture run dispatches several workflows under one run id, and holds the
+   * run open from the first registration until every workflow has registered.
+   */
+  onRunRegistered?: () => void;
+  /**
    * Set once `setupDispatchContext` posted the queued `kici/<workflow>` check
    * and one `kici/<workflow>/job/<name>` per static job. They go up BEFORE the
    * start decision, so every exit owes them a conclusion. Named early exits
@@ -556,6 +563,7 @@ async function startTrackedRun(
     // Where the code came from, which `event.targetBranch` deliberately omits.
     runEventContextFor(ctx, event),
   );
+  ctx.onRunRegistered?.();
   await stampChainDepth(ctx);
 }
 
@@ -3965,16 +3973,19 @@ async function registerGeneratedInvokeGate(args: {
   });
   const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${jobName}-${randomUUID()}`;
   if (deps.executionTracker) {
-    await deps.executionTracker.addJobsToRun(runId, [
-      {
-        jobId: syntheticId,
-        jobName,
-        jobKind: JobKind.Gate,
-        runsOnLabels: [],
-        ...(matrixValues && { matrixValues }),
-        ...(invokeParams.timeoutMs !== undefined && { timeoutMs: invokeParams.timeoutMs }),
-      },
-    ]);
+    await deps.executionTracker.addJobsToRun(
+      runId,
+      jobsOfWorkflow(ctx.workflow.name, [
+        {
+          jobId: syntheticId,
+          jobName,
+          jobKind: JobKind.Gate,
+          runsOnLabels: [],
+          ...(matrixValues && { matrixValues }),
+          ...(invokeParams.timeoutMs !== undefined && { timeoutMs: invokeParams.timeoutMs }),
+        },
+      ]),
+    );
   }
   logger.info('Generated invoke gate registered (pending summon)', {
     runId,
@@ -4083,16 +4094,19 @@ async function recordContextRuleRejectionAfterInit(args: {
     });
   };
   await tracker
-    .addJobsToRun(runId, [
-      {
-        jobId,
-        jobName: mat.expandedName,
-        ...(mat.variantValues && { matrixValues: mat.variantValues }),
-        ...variantTrackingFields(mat),
-        runsOnLabels: runsOnSelectorsForLockJob(mat.lockJob).runsOnLabels,
-        ...(jobEnvData.contextNames?.length && { contexts: jobEnvData.contextNames }),
-      },
-    ])
+    .addJobsToRun(
+      runId,
+      jobsOfWorkflow(ctx.workflow.name, [
+        {
+          jobId,
+          jobName: mat.expandedName,
+          ...(mat.variantValues && { matrixValues: mat.variantValues }),
+          ...variantTrackingFields(mat),
+          runsOnLabels: runsOnSelectorsForLockJob(mat.lockJob).runsOnLabels,
+          ...(jobEnvData.contextNames?.length && { contexts: jobEnvData.contextNames }),
+        },
+      ]),
+    )
     .catch(onError);
   await tracker
     .onJobStatus(runId, jobId, ExecutionJobStatus.enum.failed, Date.now(), undefined, {
@@ -4548,7 +4562,7 @@ async function recordRunStart(args: {
     if (executionJobs.length > 0) {
       await deps.executionTracker.addJobsToRun(
         runId,
-        executionJobs,
+        jobsOfWorkflow(ctx.workflow.name, executionJobs),
         declaredContexts.length > 0 ? [...declaredContexts] : undefined,
       );
     }
@@ -4870,7 +4884,7 @@ async function holdExecutionAfterInit(args: {
     // NOT swallowed: the placeholder alone keeps the run open, so the error
     // propagates to the flow-back's catch, which records a visible init-failure.
     try {
-      await deps.executionTracker.addJobsToRun(runId, heldJobs);
+      await deps.executionTracker.addJobsToRun(runId, jobsOfWorkflow(ctx.workflow.name, heldJobs));
     } catch (err) {
       logger.error('Failed to register a held job placeholder after init', {
         runId,
@@ -4971,14 +4985,17 @@ async function dispatchExecutionAfterInit(args: {
     if (routeResult.localJobs.length > 0 && deps.executionTracker) {
       for (const local of routeResult.localJobs) {
         deps.executionTracker
-          .addJobsToRun(runId, [
-            {
-              jobId: local.jobId,
-              jobName: local.jobName,
-              runsOnLabels: jobInput.runsOnLabels,
-              ...trackedFields,
-            },
-          ])
+          .addJobsToRun(
+            runId,
+            jobsOfWorkflow(ctx.workflow.name, [
+              {
+                jobId: local.jobId,
+                jobName: local.jobName,
+                runsOnLabels: jobInput.runsOnLabels,
+                ...trackedFields,
+              },
+            ]),
+          )
           .catch((err) => {
             logger.error('Failed to add deferred init job to execution tracker', {
               runId,
@@ -4992,15 +5009,18 @@ async function dispatchExecutionAfterInit(args: {
     dispatchStatus = result.status;
     if (result.status === 'rejected' && deps.executionTracker) {
       const syntheticId = `rejected-${randomUUID()}`;
-      await deps.executionTracker.addJobsToRun(runId, [
-        {
-          jobId: syntheticId,
-          jobName: mat.expandedName,
-          ...(matrixValues && { matrixValues }),
-          runsOnLabels: jobInput.runsOnLabels,
-          ...trackedFields,
-        },
-      ]);
+      await deps.executionTracker.addJobsToRun(
+        runId,
+        jobsOfWorkflow(ctx.workflow.name, [
+          {
+            jobId: syntheticId,
+            jobName: mat.expandedName,
+            ...(matrixValues && { matrixValues }),
+            runsOnLabels: jobInput.runsOnLabels,
+            ...trackedFields,
+          },
+        ]),
+      );
       await deps.executionTracker.onJobStatus(
         runId,
         syntheticId,
@@ -5011,15 +5031,18 @@ async function dispatchExecutionAfterInit(args: {
       );
     } else if (result.status !== 'rejected' && deps.executionTracker) {
       deps.executionTracker
-        .addJobsToRun(runId, [
-          {
-            jobId: result.jobId,
-            jobName: mat.expandedName,
-            ...(matrixValues && { matrixValues }),
-            runsOnLabels: jobInput.runsOnLabels,
-            ...trackedFields,
-          },
-        ])
+        .addJobsToRun(
+          runId,
+          jobsOfWorkflow(ctx.workflow.name, [
+            {
+              jobId: result.jobId,
+              jobName: mat.expandedName,
+              ...(matrixValues && { matrixValues }),
+              runsOnLabels: jobInput.runsOnLabels,
+              ...trackedFields,
+            },
+          ]),
+        )
         .catch((err) => {
           logger.error('Failed to add deferred init job to execution tracker', {
             runId,
@@ -5064,7 +5087,10 @@ async function dispatchResolvedDynamicMatrix(args: {
     if (err instanceof FanoutError && deps.executionTracker) {
       const jobId = `matrix-failed-${randomUUID()}`;
       await deps.executionTracker
-        .addJobsToRun(runId, [{ jobId, jobName: mat.baseName, runsOnLabels: [] }])
+        .addJobsToRun(
+          runId,
+          jobsOfWorkflow(ctx.workflow.name, [{ jobId, jobName: mat.baseName, runsOnLabels: [] }]),
+        )
         .catch(() => {});
       await deps.executionTracker
         .onJobStatus(runId, jobId, ExecutionJobStatus.enum.failed, Date.now(), undefined, {
@@ -5292,14 +5318,17 @@ function startDeferredInitDispatch(args: {
         if (deps.executionTracker) {
           const jobId = `init-failed-${mat.expandedName}`;
           await deps.executionTracker
-            .addJobsToRun(runId, [
-              {
-                jobId,
-                jobName: mat.expandedName,
-                ...(mat.variantValues && { matrixValues: mat.variantValues }),
-                runsOnLabels: runsOnSelectorsForLockJob(lockJob).runsOnLabels,
-              },
-            ])
+            .addJobsToRun(
+              runId,
+              jobsOfWorkflow(ctx.workflow.name, [
+                {
+                  jobId,
+                  jobName: mat.expandedName,
+                  ...(mat.variantValues && { matrixValues: mat.variantValues }),
+                  runsOnLabels: runsOnSelectorsForLockJob(lockJob).runsOnLabels,
+                },
+              ]),
+            )
             .catch(() => {});
           const carried = err instanceof AgentJobFailedError ? err.initFailure : undefined;
           await deps.executionTracker
@@ -5495,12 +5524,16 @@ async function dispatchEvalJob(args: {
 async function recordGeneratedMatrixFailure(
   deps: WorkflowDispatchContext['deps'],
   runId: string,
+  workflowName: string,
   err: FanoutError,
 ): Promise<void> {
   if (!deps.executionTracker) return;
   const jobId = `matrix-failed-${randomUUID()}`;
   await deps.executionTracker
-    .addJobsToRun(runId, [{ jobId, jobName: err.jobName, runsOnLabels: [] }])
+    .addJobsToRun(
+      runId,
+      jobsOfWorkflow(workflowName, [{ jobId, jobName: err.jobName, runsOnLabels: [] }]),
+    )
     .catch(() => {});
   await deps.executionTracker
     .onJobStatus(runId, jobId, ExecutionJobStatus.enum.failed, Date.now(), undefined, {
@@ -5699,7 +5732,7 @@ export async function resolveGeneratedJobConfigs(
         job: err.jobName,
         error: err.message,
       });
-      await recordGeneratedMatrixFailure(deps, runId, err);
+      await recordGeneratedMatrixFailure(deps, runId, ctx.workflow.name, err);
       const before = remaining.length;
       const idx = remaining.findIndex((j) => j.name === err.jobName);
       if (idx >= 0) remaining.splice(idx, 1);
@@ -5839,15 +5872,18 @@ async function recordDroppedGeneratedJob(args: {
     });
   };
   await tracker
-    .addJobsToRun(ctx.runId, [
-      {
-        jobId,
-        jobName: mat.expandedName,
-        ...(mat.variantValues && { matrixValues: mat.variantValues }),
-        ...variantTrackingFields(mat),
-        runsOnLabels: runsOnLabelsOrNone(mat.lockJob),
-      },
-    ])
+    .addJobsToRun(
+      ctx.runId,
+      jobsOfWorkflow(ctx.workflow.name, [
+        {
+          jobId,
+          jobName: mat.expandedName,
+          ...(mat.variantValues && { matrixValues: mat.variantValues }),
+          ...variantTrackingFields(mat),
+          runsOnLabels: runsOnLabelsOrNone(mat.lockJob),
+        },
+      ]),
+    )
     .catch(onError);
   await tracker
     .onJobStatus(ctx.runId, jobId, ExecutionJobStatus.enum.failed, Date.now(), undefined, {
@@ -5981,15 +6017,18 @@ async function gateAndStoreNonRootGeneratedJobs(args: {
     });
     const syntheticId = `${NEEDS_PENDING_JOB_ID_PREFIX}${genJob.name}-${randomUUID()}`;
     if (deps.executionTracker) {
-      await deps.executionTracker.addJobsToRun(runId, [
-        {
-          jobId: syntheticId,
-          jobName: genJob.name,
-          runsOnLabels,
-          ...(matrixValues && { matrixValues }),
-          ...(gitCredentials && { gitCredentials }),
-        },
-      ]);
+      await deps.executionTracker.addJobsToRun(
+        runId,
+        jobsOfWorkflow(ctx.workflow.name, [
+          {
+            jobId: syntheticId,
+            jobName: genJob.name,
+            runsOnLabels,
+            ...(matrixValues && { matrixValues }),
+            ...(gitCredentials && { gitCredentials }),
+          },
+        ]),
+      );
     }
     logger.info('Generated job gated by cross-domain needs', {
       runId,
@@ -6038,7 +6077,10 @@ async function holdGeneratedJobs(args: {
     });
   }
   if (placeholders.length > 0 && deps.executionTracker) {
-    await deps.executionTracker.addJobsToRun(runId, placeholders);
+    await deps.executionTracker.addJobsToRun(
+      runId,
+      jobsOfWorkflow(ctx.workflow.name, placeholders),
+    );
   }
 }
 
@@ -6075,15 +6117,18 @@ async function directDispatchGeneratedJobs(args: {
       }
       const genResult = await setup.dispatcher.dispatch(genJobInput);
       if (genResult.status !== 'rejected' && deps.executionTracker) {
-        await deps.executionTracker.addJobsToRun(runId, [
-          {
-            jobId: genResult.jobId,
-            jobName: genJob.name,
-            runsOnLabels,
-            ...(matrixValues && { matrixValues }),
-            ...(gitCredentials && { gitCredentials }),
-          },
-        ]);
+        await deps.executionTracker.addJobsToRun(
+          runId,
+          jobsOfWorkflow(ctx.workflow.name, [
+            {
+              jobId: genResult.jobId,
+              jobName: genJob.name,
+              runsOnLabels,
+              ...(matrixValues && { matrixValues }),
+              ...(gitCredentials && { gitCredentials }),
+            },
+          ]),
+        );
       }
       logger.info('Dynamic generated job dispatched (direct)', {
         runId,
@@ -6208,17 +6253,20 @@ async function routeRootGeneratedJobs(args: {
     if (deps.executionTracker) {
       const matchingConfig = unpinnedConfigs.find((c) => c.genJob.name === local.jobName);
       deps.executionTracker
-        .addJobsToRun(runId, [
-          {
-            jobId: local.jobId,
-            jobName: local.jobName,
-            runsOnLabels: matchingConfig?.runsOnLabels ?? [],
-            ...(matchingConfig?.matrixValues && { matrixValues: matchingConfig.matrixValues }),
-            ...(matchingConfig?.gitCredentials && {
-              gitCredentials: matchingConfig.gitCredentials,
-            }),
-          },
-        ])
+        .addJobsToRun(
+          runId,
+          jobsOfWorkflow(ctx.workflow.name, [
+            {
+              jobId: local.jobId,
+              jobName: local.jobName,
+              runsOnLabels: matchingConfig?.runsOnLabels ?? [],
+              ...(matchingConfig?.matrixValues && { matrixValues: matchingConfig.matrixValues }),
+              ...(matchingConfig?.gitCredentials && {
+                gitCredentials: matchingConfig.gitCredentials,
+              }),
+            },
+          ]),
+        )
         .catch((err) => {
           logger.error('Failed to add generated job to execution tracker', {
             runId,
@@ -6527,9 +6575,12 @@ async function registerDeferredEvalJob(args: {
   // eval id when the gate opens.
   const syntheticId = `dynamic-eval-pending-${evalJobName}-${randomUUID()}`;
   if (deps.executionTracker) {
-    await deps.executionTracker.addJobsToRun(runId, [
-      { jobId: syntheticId, jobName: evalJobName, runsOnLabels: [] },
-    ]);
+    await deps.executionTracker.addJobsToRun(
+      runId,
+      jobsOfWorkflow(ctx.workflow.name, [
+        { jobId: syntheticId, jobName: evalJobName, runsOnLabels: [] },
+      ]),
+    );
   }
 
   const edgeRows = upstreamNames.map((upstreamName) => ({
@@ -6674,7 +6725,9 @@ async function processDynamicEntry(args: {
     if (deps.executionTracker) {
       await deps.executionTracker.addJobsToRun(
         runId,
-        [{ jobId: evalJobId, jobName: evalJobName, runsOnLabels }],
+        jobsOfWorkflow(ctx.workflow.name, [
+          { jobId: evalJobId, jobName: evalJobName, runsOnLabels },
+        ]),
         undefined,
         replaceSyntheticId,
       );
@@ -6740,7 +6793,10 @@ async function processDynamicEntry(args: {
         carried?.jobName ?? dynamicEntry.group ?? `__dynamic__${dynamicEntry.source.index}`;
       const jobId = `dynamic-eval-failed-${dynamicEntry.source.index}`;
       await deps.executionTracker
-        .addJobsToRun(runId, [{ jobId, jobName, runsOnLabels: [] }])
+        .addJobsToRun(
+          runId,
+          jobsOfWorkflow(ctx.workflow.name, [{ jobId, jobName, runsOnLabels: [] }]),
+        )
         .catch(() => {});
       await deps.executionTracker
         .onJobStatus(runId, jobId, ExecutionJobStatus.enum.failed, Date.now(), undefined, {

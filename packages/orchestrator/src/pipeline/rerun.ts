@@ -230,6 +230,7 @@ export async function handleRerun(
 
   await registerDispatchedJobs({
     newRunId,
+    workflowName: originalRun.workflow_name,
     dispatchedJobs,
     rejectedJobs,
     executionTracker: deps.executionTracker,

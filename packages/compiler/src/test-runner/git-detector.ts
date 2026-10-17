@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -27,5 +28,20 @@ export async function detectRepoFromGit(cwd = process.cwd()): Promise<RepoInfo |
     return { owner: match[1], name: match[2] };
   } catch {
     return null;
+  }
+}
+
+/** The checked-out branch of `repoRoot`, or undefined on a detached `HEAD` or outside git. */
+export function detectCurrentBranch(repoRoot: string): string | undefined {
+  try {
+    // The full ref, not `--short`: a tag with the same name makes the short form `heads/<name>`.
+    const ref = execFileSync('git', ['symbolic-ref', '--quiet', 'HEAD'], {
+      cwd: repoRoot,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : undefined;
+  } catch {
+    return undefined;
   }
 }

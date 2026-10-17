@@ -31,6 +31,10 @@ const TAG_TO_EVENT: Record<string, string> = {
   WebhookTrigger: 'webhook',
 };
 
+export function eventLabelForTag(tag: unknown): string | undefined {
+  return typeof tag === 'string' ? TAG_TO_EVENT[tag] : undefined;
+}
+
 export function describeEvent(event: unknown): string {
   if (!event || typeof event !== 'object') return 'unknown';
   const e = event as Record<string, unknown>;

@@ -29,7 +29,7 @@ import type { LockInvoke, LockJob } from '@kici-dev/engine';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import { JobKind } from '../db/types.js';
-import type { ExecutionTracker } from '../reporting/execution-tracker.js';
+import { jobsOfWorkflow, type ExecutionTracker } from '../reporting/execution-tracker.js';
 
 const logger = createLogger({ prefix: 'invoke-gate' });
 
@@ -424,7 +424,17 @@ async function createProxies(
     ...(bounded && { waveMaxParallel: maxParallel, waveFailFast: failFast ?? false }),
   }));
 
-  await deps.executionTracker.addJobsToRun(runId, proxies);
+  // A proxy belongs to its gate's workflow.
+  const gateRow = await deps.db
+    .selectFrom('execution_jobs')
+    .select('workflow_name')
+    .where('run_id', '=', runId)
+    .where('job_id', '=', args.gateJobId)
+    .executeTakeFirst();
+  await deps.executionTracker.addJobsToRun(
+    runId,
+    gateRow?.workflow_name ? jobsOfWorkflow(gateRow.workflow_name, proxies) : proxies,
+  );
 
   // Tag each spawned run with its summoning gate + proxy, so proxy completion
   // resolves even if the run finalizes on another HA instance. Then reconcile:

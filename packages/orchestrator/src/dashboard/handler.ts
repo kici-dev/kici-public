@@ -79,7 +79,11 @@ import {
 
 /** Page size for the org-wide attestations list (offset+count pagination). */
 const ATTESTATIONS_PAGE_SIZE = 25;
-import { buildRunDetailJobs, aggregateRunDetail } from '../reporting/run-aggregator.js';
+import {
+  buildRunDetailJobs,
+  aggregateRunDetail,
+  type RunDetailJobLookups,
+} from '../reporting/run-aggregator.js';
 import { mapToAgentRunResult } from '../reporting/agent-run-result-mapper.js';
 import type { LogStorage } from '../reporting/log-storage.js';
 import { resolveStepLogPath } from '../reporting/step-log-reader.js';
@@ -195,6 +199,16 @@ interface DashboardHandlerDeps {
    * a relay failover. The shipped default is undefined (no delay).
    */
   beforeRerun?: () => Promise<void>;
+}
+
+/** The run's own workflow, naming a job row that records none (see `jobWorkflowName`). */
+function runWorkflowLookup(
+  run: { workflow_name: string | null; is_test_run: boolean | null } | undefined,
+): Pick<RunDetailJobLookups, 'runWorkflow'> {
+  if (!run?.workflow_name) return {};
+  return {
+    runWorkflow: { workflow_name: run.workflow_name, is_test_run: run.is_test_run === true },
+  };
 }
 
 export class DashboardHandler {
@@ -381,6 +395,8 @@ export class DashboardHandler {
             contributor_username: string | null;
             init_failure: InitFailure | null;
             check_mode: string | null;
+            workflow_name: string | null;
+            is_test_run: boolean | null;
           }
         | undefined = await this.db
         .selectFrom('execution_runs')
@@ -390,6 +406,8 @@ export class DashboardHandler {
           'contributor_username',
           'init_failure',
           'check_mode',
+          'workflow_name',
+          'is_test_run',
         ])
         .where('run_id', '=', msg.runId)
         .executeTakeFirst();
@@ -399,6 +417,7 @@ export class DashboardHandler {
         .select([
           'job_id',
           'job_name',
+          'workflow_name',
           'status',
           'matrix_values',
           'base_job_name',
@@ -505,6 +524,7 @@ export class DashboardHandler {
         stepsByJob,
         secretKeysByJob,
         needsByJob,
+        ...runWorkflowLookup(runRow),
       });
 
       const trustContext =
@@ -3190,11 +3210,14 @@ export class DashboardHandler {
           contributor_username: string | null;
           init_failure: InitFailure | null;
           check_mode: string | null;
+          workflow_name: string | null;
+          is_test_run: boolean | null;
         }
       | undefined;
     jobs: Array<{
       job_id: string;
       job_name: string;
+      workflow_name: string | null;
       status: string;
       matrix_values: string | null;
       base_job_name: string | null;
@@ -3236,11 +3259,14 @@ export class DashboardHandler {
             contributor_username: string | null;
             init_failure: InitFailure | null;
             check_mode: string | null;
+            workflow_name: string | null;
+            is_test_run: boolean | null;
           }
         | undefined,
       jobs: [] as Array<{
         job_id: string;
         job_name: string;
+        workflow_name: string | null;
         status: string;
         matrix_values: string | null;
         base_job_name: string | null;
@@ -3316,11 +3342,14 @@ export class DashboardHandler {
           typeof r.contributor_username === 'string' ? r.contributor_username : null,
         init_failure: (r.init_failure as InitFailure | null) ?? null,
         check_mode: typeof r.check_mode === 'string' ? r.check_mode : null,
+        workflow_name: typeof r.workflow_name === 'string' ? r.workflow_name : null,
+        is_test_run: typeof r.is_test_run === 'boolean' ? r.is_test_run : null,
       };
     }
     out.jobs = jobRows.map((r) => ({
       job_id: String(r.job_id ?? ''),
       job_name: String(r.job_name ?? ''),
+      workflow_name: typeof r.workflow_name === 'string' ? r.workflow_name : null,
       status: String(r.status ?? ''),
       matrix_values: typeof r.matrix_values === 'string' ? r.matrix_values : null,
       base_job_name: typeof r.base_job_name === 'string' ? r.base_job_name : null,

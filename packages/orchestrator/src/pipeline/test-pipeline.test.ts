@@ -233,6 +233,48 @@ describe('processTestTrigger', () => {
     expect(result.jobIds.length).toBeGreaterThan(0);
   });
 
+  it('holds a run of several workflows open until the last workflow registers', async () => {
+    const lockFile = createMockLockFile([createMockWorkflow('ci'), createMockWorkflow('deploy')]);
+    (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
+    const events: string[] = [];
+    deps.executionTracker = {
+      onExecutionStarted: vi.fn(async (_runId: string, workflowName: string) => {
+        events.push(`start:${workflowName}`);
+      }),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => {
+        events.push('hold');
+        return true;
+      }),
+      releasePendingJobsHold: vi.fn(async () => {
+        events.push('release');
+      }),
+      markTestRun: vi.fn(),
+    } as any;
+
+    const result = await processTestTrigger(createMockInput(), deps);
+    expect(result.status).toBe('accepted');
+
+    // Open tokens after each event, from the first registration to the last.
+    const first = events.indexOf('start:ci');
+    const last = events.indexOf('start:deploy');
+    expect(first).toBeGreaterThanOrEqual(0);
+    expect(last).toBeGreaterThan(first);
+    let open = 0;
+    const openBetween: number[] = [];
+    events.forEach((e, i) => {
+      if (e === 'hold') open++;
+      if (e === 'release') open--;
+      if (i > first && i < last) openBetween.push(open);
+    });
+    // fails-when: the first workflow's own release drops the run to zero holds
+    // before the second workflow registers, so the run can complete in between
+    expect(openBetween.length).toBeGreaterThan(0);
+    expect(Math.min(...openBetween)).toBeGreaterThan(0);
+    // breaks-if-wrong: every hold is released, so the run can still complete
+    expect(open).toBe(0);
+  });
+
   it('expands a matrix job into N dispatches each carrying matrixValues', async () => {
     const matrixWorkflow = createMockWorkflow('ci', [
       staticJob({
@@ -1745,5 +1787,70 @@ describe('processTestTrigger records the triggering actor', () => {
       ownerSub: 'kc-sub-123',
     });
     expect(args[TRIGGERED_BY_ARG]).toBe('api_key:key-1');
+  });
+});
+
+describe('processTestTrigger records the commit the run acted on', () => {
+  /** Positional indices into `onExecutionStarted` (see the actor block above). */
+  const BRANCH_ARG = 4;
+  const SHA_ARG = 5;
+  const HEAD_SHA = '0123456789abcdef0123456789abcdef01234567';
+
+  async function runWith(input: Partial<TestTriggerInput>) {
+    const deps = createMockDeps();
+    (deps.lockFileCache.get as any).mockResolvedValue(
+      createMockLockFile([createMockWorkflow('ci')]),
+    );
+    const executionTracker = {
+      onExecutionStarted: vi.fn().mockResolvedValue(undefined),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
+      markTestRun: vi.fn(),
+    };
+    deps.executionTracker = executionTracker as any;
+    const result = await processTestTrigger(createMockInput(input), deps);
+    expect(result.status).toBe('accepted');
+    return executionTracker.onExecutionStarted.mock.calls[0];
+  }
+
+  it("records the push event's commit SHA, not its branch name", async () => {
+    const args = await runWith({
+      event: {
+        type: 'push',
+        targetBranch: 'main',
+        payload: { ref: 'refs/heads/main', after: HEAD_SHA },
+      },
+    });
+    expect(args[BRANCH_ARG]).toBe('main');
+    // fails-when: the run's sha column holds the branch name (#470)
+    expect(args[SHA_ARG]).toBe(HEAD_SHA);
+  });
+
+  it("records a PR event's head SHA", async () => {
+    const args = await runWith({
+      workflowName: 'ci',
+      event: {
+        type: 'pull_request',
+        action: 'opened',
+        targetBranch: 'main',
+        sourceBranch: 'feature/x',
+        payload: { pull_request: { head: { ref: 'feature/x', sha: HEAD_SHA } } },
+      },
+    });
+    expect(args[SHA_ARG]).toBe(HEAD_SHA);
+  });
+
+  it("falls back to the overlay upload's commit when the event names none", async () => {
+    const args = await runWith({ uploadSha: HEAD_SHA, workflowName: 'ci' });
+    // fails-when: a bare --workflow run (manual event, no SHA field) records a branch name
+    expect(args[SHA_ARG]).toBe(HEAD_SHA);
+  });
+
+  it('keeps the branch when nothing names a commit', async () => {
+    // breaks-if-wrong: a provider-fetch test run clones by this value, so a
+    // missing SHA must still resolve to a cloneable ref
+    const args = await runWith({});
+    expect(args[SHA_ARG]).toBe('main');
   });
 });

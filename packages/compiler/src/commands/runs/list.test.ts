@@ -1,8 +1,18 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { runsListCommand } from './list.js';
+import { runsListCommand, workflowCell } from './list.js';
 import * as clientMod from '../../remote/dashboard-client.js';
 
 afterEach(() => vi.restoreAllMocks());
+
+describe('workflowCell', () => {
+  it('counts the workflows a run spans beyond the first', () => {
+    // fails-when: a run of several workflows lists only the first
+    expect(workflowCell({ workflowName: 'ci', workflowNames: ['ci', 'a', 'b'] })).toBe('ci +2');
+    // breaks-if-wrong: one workflow, or an older Platform with no list, prints the name alone
+    expect(workflowCell({ workflowName: 'ci', workflowNames: ['ci'] })).toBe('ci');
+    expect(workflowCell({ workflowName: 'ci' })).toBe('ci');
+  });
+});
 
 describe('runsListCommand', () => {
   it('renders a table of runs and passes filters to the client', async () => {
