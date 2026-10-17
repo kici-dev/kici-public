@@ -408,6 +408,7 @@ function deps(over: Partial<DoctorDeps> = {}): DoctorDeps {
     }),
     now: () => FIXED_NOW,
     env: {},
+    inspectAgentDeps: async () => false,
     ...over,
   };
 }
@@ -494,6 +495,19 @@ describe('run-target check', () => {
       row: parsed.checks.find((c) => c.name === 'run-target')!,
     };
   }
+
+  it('warns with the fix command when .kici/ cannot run on an agent', async () => {
+    const { checks, code } = await run({
+      loadConfig: async () => DIRECT,
+      probeDirect: async () => ({ ok: true, whoami: WHOAMI }),
+      inspectAgentDeps: async () => true,
+    });
+    const row = checks.find((c) => c.name === 'agent-deps');
+    // fails-when: doctor never inspects the .kici/ layout
+    expect(row).toMatchObject({ status: 'warn', nextCommand: 'kici init --workspace' });
+    expect(row?.message).toContain('no .kici/package.json');
+    expect(code).toBe(1);
+  });
 
   it('passes for a reachable direct target and names url, source, caller, role and mode', async () => {
     const { row } = await run({

@@ -2,7 +2,9 @@ import type { $ as Shell } from 'zx';
 import type { GenericInitConfig, CacheSpec } from '@kici-dev/sdk';
 import { ExecutionStepStatus, LogStream, TimeoutReason } from '@kici-dev/engine';
 import { toErrorMessage } from '@kici-dev/shared';
+import { failureDetail } from '../failure-tail.js';
 import type { RunnerToAgentMessage } from '../sandbox/ipc-protocol.js';
+import { composeInitEnv } from './init-env.js';
 
 /** Used when a spec sets no timeout: 10 minutes. */
 const DEFAULT_INIT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -49,11 +51,17 @@ export interface RunInitPhaseOptions {
   /** Run in order. Empty or undefined is a no-op (ok:true). */
   specs: GenericInitConfig[];
   /**
-   * The workflow-runner builds a fresh zx$ shell per init (cwd=clone root,
-   * env=process.env, log->IPC) so each spec's `env` overlay and KICI_ENV/KICI_PATH
-   * files apply.
+   * Returns the shell for the i-th init command, bound to `env`: that command's
+   * whole environment. `env` is the job environment (`process.env`, with
+   * KICI_ENV / KICI_PATH already pointing at this init's capture files) with the
+   * spec's `env` laid over it. The workflow-runner passes `buildInitShellFor`.
    */
-  shellFor: (spec: GenericInitConfig, index: number) => typeof Shell;
+  shellFor: (spec: GenericInitConfig, index: number, env: NodeJS.ProcessEnv) => typeof Shell;
+  /**
+   * Keys a spec's `env` must never override: the operator-injected secret keys.
+   * Keys that start with `KICI_` are refused whether or not they appear here.
+   */
+  protectedEnvKeys?: ReadonlySet<string>;
   /** The step loop's masked sender. */
   sendIpc: (msg: RunnerToAgentMessage) => void;
   /** stepIndex for init:0; subsequent specs use base+1, base+2, … (after user steps + hook indices). */
@@ -62,6 +70,8 @@ export interface RunInitPhaseOptions {
   cache?: InitCachePort;
   /** When set, capture before each init and apply the delta after success. */
   env?: InitEnvPort;
+  /** Masks secrets in one line of a failed command's output before it is cut into the error. */
+  maskLine?: (line: string) => string;
 }
 
 export interface RunInitPhaseResult {
@@ -70,6 +80,8 @@ export interface RunInitPhaseResult {
   failedInitIndex?: number;
   /** Set when ok=false. */
   error?: string;
+  /** Exit code of the failed command, when it exited with one. */
+  exitCode?: number;
   /** The init exceeded its `timeout`. */
   timedOut?: boolean;
   /** `job_timeout` when `timedOut` is true. */
@@ -89,6 +101,7 @@ export async function runInitPhase(opts: RunInitPhaseOptions): Promise<RunInitPh
         ok: false,
         failedInitIndex: i,
         error: outcome.error,
+        ...(outcome.exitCode !== undefined && { exitCode: outcome.exitCode }),
         ...(outcome.timedOut && { timedOut: true, reason: outcome.reason }),
       };
     }
@@ -160,13 +173,46 @@ async function saveInitCache(
   }
 }
 
+/**
+ * Compose one init command's environment and log every refused spec key by
+ * name on the init step. The value is never logged.
+ */
+function composeSpecEnv(
+  spec: GenericInitConfig,
+  stepIndex: number,
+  opts: RunInitPhaseOptions,
+): NodeJS.ProcessEnv {
+  const composed = composeInitEnv({
+    base: process.env,
+    specEnv: spec.env,
+    protectedKeys: opts.protectedEnvKeys ?? new Set<string>(),
+  });
+  const warn = (line: string): void =>
+    opts.sendIpc({ type: 'log.line', stepIndex, stream: LogStream.enum.stderr, line });
+  for (const key of composed.reservedKeys) {
+    warn(`[kici] init env: ignored "${key}"; keys that start with KICI_ are reserved for KiCI`);
+  }
+  for (const key of composed.secretKeys) {
+    warn(
+      `[kici] init env: ignored "${key}"; it names an operator secret, which init env cannot override`,
+    );
+  }
+  return composed.env;
+}
+
 async function runOneInit(
   spec: GenericInitConfig,
   index: number,
   stepIndex: number,
   stepType: string,
   opts: RunInitPhaseOptions,
-): Promise<{ ok: boolean; error?: string; timedOut?: boolean; reason?: TimeoutReason }> {
+): Promise<{
+  ok: boolean;
+  error?: string;
+  exitCode?: number;
+  timedOut?: boolean;
+  reason?: TimeoutReason;
+}> {
   opts.sendIpc({ type: 'step.start', stepIndex, stepName: stepType, step_type: stepType });
   const start = Date.now();
   const shell = spec.shell ?? 'bash';
@@ -176,12 +222,16 @@ async function runOneInit(
     if (spec.cache && opts.cache) {
       cacheHit = await restoreInitCache(spec.cache, opts.cache, stepIndex, opts.sendIpc);
     }
-    // Before opts.shellFor: the shell reads live process.env at spawn, so an
-    // unset KICI_ENV/KICI_PATH is unbound under `set -u`.
+    // Allocate fresh KICI_ENV/KICI_PATH files and point process.env at them so
+    // the command can export env + PATH to later inits and steps. Compose the
+    // command's environment after that, so the snapshot carries both files;
+    // otherwise they are unbound under `set -u`.
     await opts.env?.beginCapture();
-    const $ = opts.shellFor(spec, index);
-    // The shell's env carries job env, secrets and KICI_ENV/KICI_PATH. On a
-    // timeout the init fails with job_timeout before any later step runs.
+    const env = composeSpecEnv(spec, stepIndex, opts);
+    const $ = opts.shellFor(spec, index, env);
+    // The shell's env is the job env + secrets + KICI_ENV/KICI_PATH, with the
+    // spec's env laid over it for this command only. On a timeout the init
+    // fails with job_timeout before any later step runs.
     const timeoutMs = spec.timeout ?? DEFAULT_INIT_TIMEOUT_MS;
     await withInitTimeout($`${shell} -c ${spec.run}`, timeoutMs);
     if (spec.cache && opts.cache && !cacheHit) {
@@ -198,7 +248,9 @@ async function runOneInit(
     });
     return { ok: true };
   } catch (e) {
-    const error = toErrorMessage(e);
+    // The bounded tail, masked before the cut; the full output already streamed
+    // to this init step's log.
+    const error = failureDetail(e, { mask: opts.maskLine });
     const timedOut = e instanceof InitTimeoutError;
     const exitCode =
       e && typeof e === 'object' && 'exitCode' in e && typeof e.exitCode === 'number'
@@ -212,6 +264,11 @@ async function runOneInit(
       error: { message: error, ...(exitCode !== undefined && { exitCode }) },
       step_type: stepType,
     });
-    return { ok: false, error, ...(timedOut && { timedOut: true, reason: e.reason }) };
+    return {
+      ok: false,
+      error,
+      ...(exitCode !== undefined && { exitCode }),
+      ...(timedOut && { timedOut: true, reason: e.reason }),
+    };
   }
 }

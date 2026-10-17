@@ -1,6 +1,8 @@
 /**
- * Applies private-npm-registry auth to a workflow's `.kici/.npmrc` for one
- * `npm install`, then restores the file on cleanup. The closure cleanup
+ * Applies private-npm-registry auth to the `.npmrc` an install reads for one
+ * install, then restores the file on cleanup: `.kici/.npmrc`, or the workspace
+ * root `.npmrc` for an npm or pnpm workspace member (those managers read a
+ * member's config from the workspace root). The closure cleanup
  * (like `setupSshAuth.cleanup()` in `checkout/git-clone.ts`) exists because
  * the committed `.kici/.npmrc` may carry literal `${VAR}` placeholders or
  * unrelated scope mappings that must NOT be clobbered permanently.
@@ -33,6 +35,12 @@ export interface NpmRegistrySpec {
 export interface ApplyNpmRegistryConfigArgs {
   /** Absolute path to the workflow's `.kici/` directory. */
   kiciDir: string;
+  /**
+   * The directory whose `.npmrc` the install reads; defaults to `kiciDir`. npm
+   * and pnpm read a workspace member's config from the workspace root and
+   * ignore `.kici/.npmrc`, so a member passes the repo root here.
+   */
+  npmrcDir?: string;
   npmRegistries: readonly NpmRegistrySpec[] | undefined;
   /** Bare-name resolved secrets to project as install env vars. */
   installEnvSecrets: Record<string, string> | undefined;
@@ -50,7 +58,7 @@ export interface ApplyNpmRegistryConfigResult {
   extraEnv: Record<string, string>;
   /** Token bytes the caller MUST mask out of stdout/stderr before logging. */
   tokensForRedaction: string[];
-  /** Restore `.kici/.npmrc` to its pre-call state. Idempotent; never throws. */
+  /** Restore the `.npmrc` to its pre-call state. Idempotent; never throws. */
   cleanup: () => Promise<void>;
 }
 
@@ -113,7 +121,7 @@ export async function applyNpmRegistryConfig(
     return noopResult();
   }
 
-  const npmrcPath = join(args.kiciDir, '.npmrc');
+  const npmrcPath = join(args.npmrcDir ?? args.kiciDir, '.npmrc');
   const original = await readOriginalNpmrc(npmrcPath);
 
   const tokenEnv: Record<string, string> = {};

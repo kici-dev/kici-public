@@ -801,13 +801,14 @@ Request a snapshot of a run's status.
 
 Request the next chunk of a run's logs from a cursor.
 
-| Field     | Type                    | Required | Description                     |
-| --------- | ----------------------- | -------- | ------------------------------- |
-| type      | `"test.relay.run.logs"` | Yes      | Message discriminator           |
-| requestId | string                  | Yes      | Correlation ID for the response |
-| actor     | ActorPrincipal          | Yes      | Authenticated principal         |
-| runId     | string                  | Yes      | Execution run ID                |
-| cursor    | number                  | Yes      | Log cursor to read from         |
+| Field     | Type                    | Required | Description                                                                                                                                      |
+| --------- | ----------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| type      | `"test.relay.run.logs"` | Yes      | Message discriminator                                                                                                                            |
+| requestId | string                  | Yes      | Correlation ID for the response                                                                                                                  |
+| actor     | ActorPrincipal          | Yes      | Authenticated principal                                                                                                                          |
+| runId     | string                  | Yes      | Execution run ID                                                                                                                                 |
+| cursor    | number                  | Yes      | Lines of the sorted stream already delivered; read when logCursor is absent                                                                      |
+| logCursor | string                  | No       | Opaque per-file cursor: a prior `nextLogCursor`, or the empty string to start. When present, the orchestrator reads from it and ignores `cursor` |
 
 #### test.relay.cancel
 
@@ -868,16 +869,17 @@ A run-status snapshot.
 
 #### test.relay.run.logs.response
 
-The next log chunk plus a monotonic cursor.
+The next log chunk and the cursors to read on from.
 
-| Field      | Type                             | Required | Description                                       |
-| ---------- | -------------------------------- | -------- | ------------------------------------------------- |
-| type       | `"test.relay.run.logs.response"` | Yes      | Message discriminator                             |
-| requestId  | string                           | Yes      | ID of the request being responded to              |
-| lines      | string[]                         | No       | Log output lines                                  |
-| nextCursor | number                           | No       | Cursor for the next `test.relay.run.logs` request |
-| done       | boolean                          | No       | Whether the log stream is exhausted               |
-| error      | string                           | No       | Failure reason                                    |
+| Field         | Type                             | Required | Description                                                                            |
+| ------------- | -------------------------------- | -------- | -------------------------------------------------------------------------------------- |
+| type          | `"test.relay.run.logs.response"` | Yes      | Message discriminator                                                                  |
+| requestId     | string                           | Yes      | ID of the request being responded to                                                   |
+| lines         | string[]                         | No       | Log output lines                                                                       |
+| nextCursor    | number                           | No       | Cursor for the next `test.relay.run.logs` request                                      |
+| nextLogCursor | string                           | No       | Opaque per-file cursor for the next request; present when the request sent `logCursor` |
+| done          | boolean                          | No       | Whether the log stream is exhausted                                                    |
+| error         | string                           | No       | Failure reason                                                                         |
 
 #### test.relay.cancel.response
 
@@ -900,7 +902,7 @@ KiCI defines custom close codes in the 4000-4999 range (reserved for application
 | 1001 | `WS_CLOSE_GOING_AWAY`              | Server shutdown or browser navigating away. The orchestrator also sends it to an agent that reaches the ownership-violation threshold (5 frames for jobs it does not own within 60 seconds)                                                                                                                                                                                                                                                                                                                                                                              | Server  |
 | 4001 | `WS_CLOSE_UNAUTHORIZED`            | Client failed authentication. Also sent when the Platform times out an unauthenticated connection, when a client's API key is revoked mid-session, on an operator force-disconnect, and when a dashboard session loses its org membership or exceeds its connection limit. On the orchestrator peer channel it closes a rate-limited, unauthenticated, or role-mismatched peer                                                                                                                                                                                           | Server  |
 | 4002 | `WS_CLOSE_AUTH_TIMEOUT`            | Auth timeout expired. The orchestrator also sends it to an agent that authenticates but does not send `agent.register` in time                                                                                                                                                                                                                                                                                                                                                                                                                                           | Server  |
-| 4003 | `WS_CLOSE_INVALID_MESSAGE`         | Invalid or unparseable message received. The orchestrator also sends it to an agent whose first message is not `agent.register`, that exceeds the message rate limit, or that registers an agent ID already bound to a different token                                                                                                                                                                                                                                                                                                                                   | Server  |
+| 4003 | `WS_CLOSE_INVALID_MESSAGE`         | Invalid or unparseable message received. The orchestrator also sends it to an agent whose first message is not `agent.register`, that exceeds the message rate limit, or that registers an agent ID already bound to a different token. The Platform sends it to an orchestrator whose frame is not JSON or has no `type`, and to one that sends five invalid frames within 60 seconds.                                                                                                                                                                                  | Server  |
 | 4004 | `WS_CLOSE_HEARTBEAT_TIMEOUT`       | Heartbeat timed out (180 seconds)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | Server  |
 | 4005 | `WS_CLOSE_PROTOCOL_ERROR`          | Protocol-level error: an unsupported protocol version, or an out-of-order authentication message on the Platform channel. On the orchestrator peer channel it closes a peer whose handshake breaks the protocol or whose authentication scheme lacks mutual authentication                                                                                                                                                                                                                                                                                               | Server  |
 | 4006 | `WS_CLOSE_INTERNAL_ERROR`          | Unexpected internal server error                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Server  |

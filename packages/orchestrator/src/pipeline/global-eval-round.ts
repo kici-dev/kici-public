@@ -29,6 +29,7 @@ import {
   GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
   INIT_RUNNER_ROLE_LABEL,
   isLockDynamicJobFn,
+  truncateReasonText,
 } from '@kici-dev/engine';
 import {
   globalEvalCacheLookupsTotal,
@@ -780,26 +781,6 @@ function roundDecidedNothing(verdicts: Map<string, GlobalEvalCandidateResult>): 
  * best-effort post, so the check would vanish.
  */
 export const MAX_ROUND_REASON_CHARS = 4_000;
-
-/** Appended to a cut string so a summary never silently stops mid-sentence. */
-const TRUNCATION_MARKER = '… (truncated)';
-
-/**
- * Truncate `text` to at most `max` UTF-16 code units, marking that it was cut.
- *
- * - A `max` no larger than the marker returns the truncated marker, never a
- *   string longer than `max`.
- * - The cut backs off one unit rather than split a surrogate pair.
- */
-export function truncateReasonText(text: string, max: number): string {
-  if (max <= 0) return '';
-  if (text.length <= max) return text;
-  if (max <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, max);
-  let cut = max - TRUNCATION_MARKER.length;
-  const last = text.charCodeAt(cut - 1);
-  if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
-  return text.slice(0, cut) + TRUNCATION_MARKER;
-}
 
 /** The distinct reasons a round gave, for the error a failed or partial round reports. */
 function distinctReasons(verdicts: Iterable<GlobalEvalCandidateResult>): string {

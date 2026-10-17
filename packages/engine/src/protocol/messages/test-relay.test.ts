@@ -11,6 +11,11 @@ import {
   testRelayCancelRequestSchema,
   dashboardPlatformToOrchSchema,
   dashboardOrchToPlatformSchema,
+  RUN_DETAIL_SOURCE_HEADER,
+  RUN_DETAIL_FALLBACK_REASON_HEADER,
+  RunDetailSource,
+  RunDetailFallbackReason,
+  TEST_RUN_LOG_CURSOR_START,
 } from './dashboard.js';
 
 const actor = { type: 'user' as const, sub: 'sub-1' };
@@ -84,6 +89,29 @@ describe('test-relay control messages', () => {
       cursor: 0,
     });
     expect(logsReq.cursor).toBe(0);
+    // breaks-if-wrong: an older CLI's request, numeric cursor only, still parses
+    expect(logsReq).not.toHaveProperty('logCursor');
+    const perFile = testRelayRunLogsRequestSchema.parse({
+      type: 'test.relay.run.logs',
+      requestId: 'r4b',
+      actor,
+      runId: 'run-1',
+      cursor: 0,
+      logCursor: TEST_RUN_LOG_CURSOR_START,
+    });
+    // fails-when: the schema drops logCursor, so the orchestrator's frame parse
+    // strips it and the per-file cursor never reaches the handler
+    expect(perFile.logCursor).toBe('');
+    expect(
+      testRelayRunLogsResponseSchema.parse({
+        type: 'test.relay.run.logs.response',
+        requestId: 'r4b',
+        lines: [],
+        nextCursor: 0,
+        nextLogCursor: 'e30',
+        done: false,
+      }).nextLogCursor,
+    ).toBe('e30');
     const logsRes = testRelayRunLogsResponseSchema.parse({
       type: 'test.relay.run.logs.response',
       requestId: 'r4',
@@ -132,5 +160,17 @@ describe('test-relay control messages', () => {
     for (const r of responses) {
       expect(dashboardOrchToPlatformSchema.parse(r).type).toBe(r.type);
     }
+  });
+});
+
+describe('run-detail source headers', () => {
+  it('names the source and fallback-reason headers and their values', () => {
+    expect(RUN_DETAIL_SOURCE_HEADER).toBe('X-Detail-Source');
+    expect(RUN_DETAIL_FALLBACK_REASON_HEADER).toBe('X-Detail-Fallback-Reason');
+    // breaks-if-wrong: the existing header values stay byte-identical, so a
+    // dashboard or test that reads `orchestrator-proxy` keeps working
+    expect(RunDetailSource.options).toEqual(['orchestrator-proxy', 'platform-db']);
+    expect(RunDetailFallbackReason.safeParse('orchestrator_timeout').success).toBe(true);
+    expect(RunDetailFallbackReason.safeParse('anything-else').success).toBe(false);
   });
 });

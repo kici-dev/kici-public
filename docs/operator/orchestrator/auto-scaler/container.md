@@ -61,14 +61,15 @@ Use these fields to control runtime selection explicitly:
 1. **Image pull** -- The scaler ensures the image is available before creating the container. With the default `imagePullPolicy: IfNotPresent` it inspects the local image and pulls only when it is missing, so a warm image is reused across spawns instead of being re-pulled every time. First spawn for a new image may be slow (30--60s for large images). Warm pools naturally pre-pull images.
 
 2. **Container creation** -- The container is created with:
-   - Environment variables: `KICI_ORCHESTRATOR_URL`, `KICI_AGENT_ID`, `KICI_LABELS`, `KICI_SCALER_MANAGED=1`, `KICI_EXECUTION_MODE=bare-metal`, and `KICI_RUNTIME_IMAGE` set to the label set's own `image` (the agent materializes the KiCI runtime from it when it nests a job container — see [The injected runtime](../../agent/configuration.md#the-injected-runtime)); optionally `KICI_AGENT_TOKEN` (when auth is configured) and `KICI_BACKPRESSURE_MODE`; then the host variables forwarded through the [`KICI_AGENT_ENV_` prefix](./common-config.md#environment-variable-forwarding), and finally any per-label-set `env` entries, which win on a conflict.
+   - Environment variables: `KICI_ORCHESTRATOR_URL`, `KICI_AGENT_ID`, `KICI_LABELS`, `KICI_SCALER_MANAGED=1`, `KICI_EXECUTION_MODE=bare-metal`, and `KICI_RUNTIME_IMAGE` set to the label set's own `image` (the agent materializes the KiCI runtime from it when it nests a job container — see [The injected runtime](../../agent/configuration.md#the-injected-runtime)), and `KICI_SCALER_SINGLE_JOB=1` when the agent runs from the pool's own image; optionally `KICI_AGENT_TOKEN` (when auth is configured) and `KICI_BACKPRESSURE_MODE`; then the host variables forwarded through the [`KICI_AGENT_ENV_` prefix](./common-config.md#environment-variable-forwarding), and finally any per-label-set `env` entries, which win on a conflict.
    - Container labels for management: `kici-managed=true`, `kici-scaler-name`, `kici-agent-id`, `kici-labels`. When the spawn is bound to a specific job (the normal on-demand path), the container also carries `kici-bound-job-id` and `kici-run-id`, so `podman ps --filter label=kici-run-id=<id>` maps a running container back to the run it serves. Warm-pool spawns are unbound and omit these two labels.
+   - For an agent started from the pool's own image, the supplementary group `1990` (`kici-sudo` in the agent image), which gives the job's steps passwordless `sudo`. A job that names its own image does not get it.
    - Resource limits from the label set or global defaults.
    - Optional container runtime socket bind mount.
 
 3. **Start** -- The container starts and the agent inside connects to the orchestrator via WebSocket.
 
-4. **Execution** -- The agent receives a single job, executes it, and reports status.
+4. **Execution** -- The agent receives one job, executes it, and reports status. An agent started from the pool's own image takes no second job: when it accepts its job it reports itself draining, and it exits when the job ends.
 
 5. **Removal** -- After the job completes and the agent disconnects, the scaler stops and removes the container. `AutoRemove` is set to `false` so the scaler controls the full removal lifecycle.
 
@@ -289,7 +290,7 @@ scalers:
     maxAgents: 10
     labelSets:
       - labels: [linux, container]
-        image: kici/agent:latest
+        image: quay.io/kici-dev/kici-agent:<version>
 ```
 
 ### Podman-specific configuration
@@ -307,7 +308,7 @@ scalers:
     maxAgents: 5
     labelSets:
       - labels: [linux, container]
-        image: kici/agent:latest
+        image: quay.io/kici-dev/kici-agent:<version>
 ```
 
 ### Single container scaler with two label sets

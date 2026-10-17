@@ -167,15 +167,16 @@ InFlightJob: `{ jobId: string, runId: string }`
 
 Periodic capacity update. Tells the orchestrator how many job slots are available.
 
-| Field             | Type             | Required | Description                                         |
-| ----------------- | ---------------- | -------- | --------------------------------------------------- |
-| type              | `"agent.status"` | Yes      | Message discriminator                               |
-| messageId         | string           | Yes      | Unique message ID                                   |
-| agentId           | string           | Yes      | Unique agent identifier                             |
-| activeJobs        | number           | Yes      | Number of currently running jobs                    |
-| memoryUsedMb      | number           | No       | Used memory in MiB (`os.totalmem() - os.freemem()`) |
-| memoryAvailableMb | number           | No       | Available memory in MiB (`os.freemem()`)            |
-| uptimeSeconds     | number           | No       | System uptime in seconds (`os.uptime()`)            |
+| Field             | Type             | Required | Description                                                                                                                                                                                                   |
+| ----------------- | ---------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type              | `"agent.status"` | Yes      | Message discriminator                                                                                                                                                                                         |
+| messageId         | string           | Yes      | Unique message ID                                                                                                                                                                                             |
+| agentId           | string           | Yes      | Unique agent identifier                                                                                                                                                                                       |
+| activeJobs        | number           | Yes      | Number of currently running jobs                                                                                                                                                                              |
+| memoryUsedMb      | number           | No       | Used memory in MiB (`os.totalmem() - os.freemem()`)                                                                                                                                                           |
+| memoryAvailableMb | number           | No       | Available memory in MiB (`os.freemem()`)                                                                                                                                                                      |
+| uptimeSeconds     | number           | No       | System uptime in seconds (`os.uptime()`)                                                                                                                                                                      |
+| draining          | boolean          | No       | `true` when the agent takes no new job: it is draining, or it is a single-job agent that has accepted its job. The orchestrator then offers it no more work. A later report without the flag does not undo it |
 
 > Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts` -- `agentStatusSchema`
 
@@ -398,25 +399,25 @@ Request a pre-signed upload URL for cache storage (source bundle or dependency t
 | arch            | string                   | Yes      | CPU architecture (e.g., `x64`, `arm64`)                                                                                                   |
 | depsHash        | string                   | Deps     | SHA-256 of the dep tarball, so the orchestrator can sign a content-addressed URL. Required on a deps upload, absent on a source upload    |
 | sourceTarDigest | string                   | Source   | SHA-256 of the source tarball, so the orchestrator can sign a content-addressed URL. Required on a source upload, absent on a deps upload |
-| siblingsDigest  | string                   | No       | In-repo `workspace:` sibling closure digest; part of the dependency pointer key                                                           |
+| siblingsDigest  | string                   | No       | In-repo workspace sibling closure digest; part of the dependency pointer key                                                              |
 
 #### cache.upload.complete
 
 Confirm that an upload finished so the orchestrator can update metadata and publish the cache pointer. The orchestrator holds the same job's terminal success until this processing finishes, bounded by the org's cache upload settle timeout.
 
-| Field           | Type                      | Required | Description                                                                     |
-| --------------- | ------------------------- | -------- | ------------------------------------------------------------------------------- |
-| type            | `"cache.upload.complete"` | Yes      | Message discriminator                                                           |
-| messageId       | string                    | Yes      | Unique message ID                                                               |
-| jobId           | string                    | Yes      | Job that produced the artifact                                                  |
-| cacheType       | enum                      | Yes      | One of: `source`, `deps`                                                        |
-| contentHash     | string                    | No       | Content hash for cache keying                                                   |
-| lockfileHash    | string                    | No       | Lockfile hash for cache keying                                                  |
-| platform        | string                    | Yes      | OS platform (e.g., `linux`)                                                     |
-| arch            | string                    | Yes      | CPU architecture (e.g., `x64`, `arm64`)                                         |
-| depsHash        | string                    | Deps     | SHA-256 of the dep tarball (for agent-side integrity checking)                  |
-| sourceTarDigest | string                    | Source   | SHA-256 of the source tarball (for agent-side integrity checking)               |
-| siblingsDigest  | string                    | No       | In-repo `workspace:` sibling closure digest; part of the dependency pointer key |
+| Field           | Type                      | Required | Description                                                                  |
+| --------------- | ------------------------- | -------- | ---------------------------------------------------------------------------- |
+| type            | `"cache.upload.complete"` | Yes      | Message discriminator                                                        |
+| messageId       | string                    | Yes      | Unique message ID                                                            |
+| jobId           | string                    | Yes      | Job that produced the artifact                                               |
+| cacheType       | enum                      | Yes      | One of: `source`, `deps`                                                     |
+| contentHash     | string                    | No       | Content hash for cache keying                                                |
+| lockfileHash    | string                    | No       | Lockfile hash for cache keying                                               |
+| platform        | string                    | Yes      | OS platform (e.g., `linux`)                                                  |
+| arch            | string                    | Yes      | CPU architecture (e.g., `x64`, `arm64`)                                      |
+| depsHash        | string                    | Deps     | SHA-256 of the dep tarball (for agent-side integrity checking)               |
+| sourceTarDigest | string                    | Source   | SHA-256 of the source tarball (for agent-side integrity checking)            |
+| siblingsDigest  | string                    | No       | In-repo workspace sibling closure digest; part of the dependency pointer key |
 
 #### cache.user.restore.request
 
@@ -932,6 +933,14 @@ On `rejected`, `reason` is either deliberate rejection wording — an invalid pe
 These messages flow from the orchestrator upstream to KiCI for execution metadata tracking and real-time dashboard updates.
 
 > Authoritative source: `packages/engine/src/protocol/messages/execution-status.ts`
+
+### Free-text bounds
+
+Text that describes a failure or a commit is clamped, not refused. The clamped fields are `errorMessage` (on `job.status.forward` and on each `state.replay` job), `failureReason` (on `execution.status` and on each `state.replay` run), `commitMessage`, and `initFailure.message`. A value longer than 2,000 UTF-16 code units is cut to that length and ends with `… (truncated)`. The cut never splits a character.
+
+The orchestrator clamps these fields before it sends them. The receiver clamps them again, so a message from an older orchestrator is stored shortened instead of refused. The same bounds apply where a dashboard response reuses these shapes.
+
+Identifier fields keep strict bounds: `runId`, `jobId`, `jobName`, `workflowName`, `stepName`, `sha`, `ref` and the other ids. A longer identifier makes the whole message invalid. The [`nack` section of the overview](./overview.md#nack) describes what happens to an invalid message.
 
 ### execution.status
 

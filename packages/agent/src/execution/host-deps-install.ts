@@ -129,6 +129,7 @@ export interface InstallKiciDepsOnHostArgs {
   runtimeInjected: boolean;
   /** The agent's sanitized environment; the install reads only locale, temp and PATH. */
   baseEnv: NodeJS.ProcessEnv;
+  /** Writes one line to the job's workflow-level log. */
   log: (line: string) => void;
   signal?: AbortSignal;
   fileExists: (path: string) => Promise<boolean>;

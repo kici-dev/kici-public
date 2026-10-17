@@ -3,8 +3,8 @@ import { SCHEMA_VERSION } from './types.js';
 import type { LockJob } from './types.js';
 
 describe('lock schema container.dockerfile', () => {
-  it('bumped SCHEMA_VERSION for global-workflow approval enforcement', () => {
-    expect(SCHEMA_VERSION).toBe(42);
+  it('carries the current SCHEMA_VERSION', () => {
+    expect(SCHEMA_VERSION).toBe(44);
   });
 
   it('carries a dockerfile build with its context, target and args', () => {

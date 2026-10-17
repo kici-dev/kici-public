@@ -42,7 +42,7 @@ import { MetricsReporter } from './metrics/metrics-reporter.js';
 import { verifyNpmAvailable } from './execution/npm-resolver.js';
 import { gcStaleAgentTmpDirs } from './execution/tmp-gc.js';
 import { issueReboot } from './execution/reboot.js';
-import { decideIdleShutdown } from './idle-shutdown.js';
+import { decideIdleShutdown, idleShutdownDelayMs } from './idle-shutdown.js';
 import { agentToolRequirements } from './required-tools.js';
 import { pidOneWarning } from './pid-one.js';
 
@@ -176,6 +176,8 @@ await guardStartup(logger, async () => {
   }
 
   let isDraining = false;
+  // A single-job agent has accepted its one job (KICI_SCALER_SINGLE_JOB).
+  let servedJob = false;
   let idleShutdownTimer: NodeJS.Timeout | undefined;
 
   // Set by a `restartHost()` step's acked `host.requestReboot` call (the
@@ -254,6 +256,7 @@ await guardStartup(logger, async () => {
       memoryUsedMb: Math.round((os.totalmem() - os.freemem()) / (1024 * 1024)),
       memoryAvailableMb: Math.round(os.freemem() / (1024 * 1024)),
       uptimeSeconds: Math.round(os.uptime()),
+      ...(isDraining && { draining: true }),
     });
   }
 
@@ -327,6 +330,14 @@ await guardStartup(logger, async () => {
             jobId: dispatch.jobId,
             timestamp: Date.now(),
           });
+
+          // A single-job agent stops taking work the moment it accepts its job,
+          // and says so, so the orchestrator never offers it a second one.
+          if (config.scalerSingleJob) {
+            servedJob = true;
+            isDraining = true;
+            sendAgentStatus();
+          }
 
           logger.info('Accepting job dispatch', {
             jobId: dispatch.jobId,
@@ -420,7 +431,11 @@ await guardStartup(logger, async () => {
   });
 
   function startIdleShutdownTimer(): void {
-    const idleMs = config.scalerIdleTimeoutMs;
+    const idleMs = idleShutdownDelayMs({
+      scalerIdleTimeoutMs: config.scalerIdleTimeoutMs,
+      singleJob: config.scalerSingleJob,
+      servedJob,
+    });
     if (idleShutdownTimer) clearTimeout(idleShutdownTimer);
     if (idleMs <= 0) {
       logger.info('Scaler-managed agent idle after job completion, shutting down');
@@ -446,11 +461,16 @@ await guardStartup(logger, async () => {
   //   applies instead; the dispatch handler cancels it when the job arrives.
   // `decideIdleShutdown` holds the branch choice so tests share it.
   client.onRegistered = ({ pendingDispatch, warmPool }) => {
+    // A fresh registration is never draining on the orchestrator side; say it
+    // again, so a reconnect mid-job does not reopen a single-job agent (or a
+    // SIGUSR1 drain) to new work.
+    if (isDraining) sendAgentStatus();
     const decision = decideIdleShutdown({
       scalerManaged: config.scalerManaged,
       activeJobs: jobRunner.activeJobs.size,
       pendingDispatch,
       warmPool,
+      singleJobServed: config.scalerSingleJob && servedJob,
     });
     if (decision === 'none') {
       return;
@@ -648,6 +668,8 @@ await guardStartup(logger, async () => {
   process.on('SIGUSR1', () => {
     logger.info('Received SIGUSR1, entering drain mode');
     isDraining = true;
+    // Tell the orchestrator, so it stops offering jobs this agent would reject.
+    sendAgentStatus();
 
     if (jobRunner.activeJobs.size === 0) {
       logger.info('No active jobs, shutting down immediately');

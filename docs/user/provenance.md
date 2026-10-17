@@ -161,6 +161,16 @@ two forms:
   }
   ```
 
+A trust-root URL must use `https://` or a loopback address (`localhost`,
+`127.0.0.1`, `[::1]`). `kici verify-attestation` refuses a plain `http://`
+trust root on another host, and also a discovery document that points the JWKS
+at one, or a redirect from `https://` to one. An attacker on the network can
+replace the signing keys that such a URL serves, and then a forged bundle
+verifies. The command exits `1` and writes the reason to stderr. Use an
+`https://` trust root or a trust-root file. To accept the risk, add
+`--allow-insecure-trust-root`: the command then verifies and writes a warning to
+stderr.
+
 Pass an optional `[artifact]` to also digest-check the file against the
 attestation subject — this is what binds the attestation to a specific set of
 bytes. Omit it to verify the signatures and identity only. Use `--json` for a

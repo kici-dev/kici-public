@@ -61,3 +61,27 @@ describe('miseExpander (win32)', () => {
     expect(cfg.cache!.paths).toEqual(['~/AppData/Local/mise']);
   });
 });
+
+describe('miseExpander version', () => {
+  it('passes the bare pinned version to the Windows resolver', async () => {
+    const seen: (string | undefined)[] = [];
+    const cfg = await miseExpander.expand({
+      cloneRoot: dir,
+      config: { version: 'v2026.5.1' },
+      platform: 'win32',
+      resolveWindowsAsset: async (_arch, version) => {
+        seen.push(version);
+        return 'https://example/mise-v2026.5.1-windows-x64.zip';
+      },
+    });
+    // fails-when: the expander resolves the latest release for a pinned preset
+    expect(seen).toEqual(['2026.5.1']);
+    expect(cfg.run).toContain("$kiciMiseWant = '2026.5.1'");
+  });
+
+  it('rejects an invalid pin before building a script', async () => {
+    await expect(
+      miseExpander.expand({ cloneRoot: dir, config: { version: 'latest' }, platform: 'linux' }),
+    ).rejects.toThrow(/is not a mise release/);
+  });
+});

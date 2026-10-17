@@ -249,6 +249,45 @@ example — has no secret to name. Use the `*Value` half of the pair instead:
 auth: { username: 'AWS', tokenValue: fetchedAtRuntime }
 ```
 
+## The default agent image
+
+A job without `container` runs in the agent's own image when a container pool of
+the auto-scaler runs it. The published image, `quay.io/kici-dev/kici-agent`, is
+Debian 13 with these tools:
+
+| Tools                                   | Debian package                                                  |
+| --------------------------------------- | --------------------------------------------------------------- |
+| `git`, `bash`, `curl`, `perl`           | as named                                                        |
+| `gzip`, `xz`, `unzip`, `zstd`           | `gzip`, `xz-utils`, `unzip`, `zstd`                             |
+| `ps`, `hostname`, `ip`, `ping`, `which` | `procps`, `hostname`, `iproute2`, `iputils-ping`, `debianutils` |
+| `jq`, `file`, `less`, `rsync`, `sudo`   | `jq`, `file`, `less`, `rsync`, `sudo`                           |
+| `node`, `npm`, `pnpm`, `yarn`           | the image's Node.js build                                       |
+
+Steps run as the `node` user. In a container that the auto-scaler starts,
+`node` can run `sudo` without a password, so a step can install a package:
+
+```typescript
+step('install-tree', async (ctx) => {
+  await ctx.$`sudo apt-get update`;
+  await ctx.$`sudo apt-get install -y tree`;
+});
+```
+
+To install packages before any step runs, use the
+[`apt` init preset](./sdk/core.md#toolchain-presets):
+`init: { apt: { packages: ['make'] } }`.
+
+Each container that the auto-scaler starts from the pool's image runs one job
+and is then removed. A package that one job installs never reaches another job.
+
+In an agent container that you start yourself, steps cannot run `sudo`. Start it
+with `--group-add 1990` to give its steps the same `sudo`. The container then runs
+job after job, so a change one job makes as root stays for the next job.
+
+The image has no compilers, no Python, no editors and no ssh client. When a job needs many
+tools, set `container` on the job to a fuller image, such as `debian:13` or
+your own image. That is faster than installing the tools in every run.
+
 ## Where container jobs run
 
 A container job needs a container runtime on the host that runs it. Each agent

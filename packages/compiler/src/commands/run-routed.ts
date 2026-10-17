@@ -92,12 +92,26 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
   const kiciDir = resolveKiciDir(options.kiciDir);
   const repoRoot = path.resolve(kiciDir, '..');
 
+  // An isolated run clones into a temp dir with no root node_modules, as an
+  // agent does; an in-place run uses the developer's own node_modules.
+  const warnMissingKiciManifest = !options.inPlace;
   // The plane fetches (and the overlay commits) the on-disk lock.
   const compileOk = quiet
     ? await withStdoutOnStderr(() =>
-        compileCommand({ kiciDir, check: false, verbose: options.debug ?? false, quiet: true }),
+        compileCommand({
+          kiciDir,
+          check: false,
+          verbose: options.debug ?? false,
+          quiet: true,
+          warnMissingKiciManifest,
+        }),
       )
-    : await compileCommand({ kiciDir, check: false, verbose: options.debug ?? false });
+    : await compileCommand({
+        kiciDir,
+        check: false,
+        verbose: options.debug ?? false,
+        warnMissingKiciManifest,
+      });
   if (!compileOk) return false;
 
   // The local plane matches only the host's own kici:os:* label.

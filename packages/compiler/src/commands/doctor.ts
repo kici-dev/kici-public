@@ -34,6 +34,11 @@ import { AuthenticationError, ConnectionError } from '../remote/platform-client.
 import { resolveRunTarget, type RunTargetResolution } from '../remote/target.js';
 import { resolveKiciDir } from '../execution/index.js';
 import {
+  MISSING_KICI_MANIFEST_FIX,
+  MISSING_KICI_MANIFEST_MESSAGE,
+  kiciDirNeedsManifest,
+} from './agent-deps-preflight.js';
+import {
   DashboardClient,
   DashboardClientError,
   type DashboardErrorKind,
@@ -113,6 +118,17 @@ function checkDeprecatedConfig(config: GlobalConfig): DoctorCheckBody | null {
     status: 'warn',
     message:
       'The routingKey field in ~/.kici/config is deprecated and unused; delete it (removed in v1.0.0).',
+  };
+}
+
+/** A warning row when `.kici/` cannot run on an agent, or null when it can. */
+function checkAgentDeps(needsManifest: boolean): DoctorCheckBody | null {
+  if (!needsManifest) return null;
+  return {
+    name: 'agent-deps',
+    status: 'warn',
+    message: MISSING_KICI_MANIFEST_MESSAGE,
+    nextCommand: MISSING_KICI_MANIFEST_FIX,
   };
 }
 
@@ -361,6 +377,8 @@ export interface DoctorDeps {
   probeDirect?: (url: string, token: string) => Promise<DirectProbe>;
   /** Run-target resolution env; defaults to `process.env`. */
   env?: NodeJS.ProcessEnv;
+  /** Whether `.kici/` has workflows but no package.json; defaults to reading the disk. */
+  inspectAgentDeps?: (kiciDir: string) => Promise<boolean>;
 }
 
 async function defaultProbeDirect(url: string, token: string): Promise<DirectProbe> {
@@ -516,6 +534,9 @@ export async function doctorCommand(
   const platformRows = hasCredentials(config) || !direct;
   const lockFile = { ...checkLockFile(lockState), durationMs: 0 };
   const deprecated = checkDeprecatedConfig(config);
+  const inspect =
+    deps.inspectAgentDeps ?? ((dir: string) => kiciDirNeedsManifest(resolveKiciDir(dir)));
+  const agentDeps = checkAgentDeps(await inspect(options.kiciDir ?? '.kici'));
 
   let checks: DoctorCheckResult[];
   if (platformRows) {
@@ -534,6 +555,7 @@ export async function doctorCommand(
   } else {
     checks = [runTarget, lockFile];
   }
+  if (agentDeps) checks.push({ ...agentDeps, durationMs: 0 });
   if (deprecated) checks.push({ ...deprecated, durationMs: 0 });
 
   const response: DiagnoseResponse & { checks: DoctorCheckResult[] } = {

@@ -21,7 +21,7 @@ import type {
   LockTextMatch,
 } from '@kici-dev/engine';
 import { assertSafeRegex } from '@kici-dev/engine/safe-regex';
-import { computeSiblingsDigest } from './workspace-siblings.js';
+import { computeSiblingsDigest, isWorkspaceMember } from './workspace-siblings.js';
 import type { NeedsWhenInput } from '@kici-dev/sdk';
 import {
   normalizeRunsOnToMatchers,
@@ -142,7 +142,8 @@ export function detectGitRoot(): string {
  * exists.
  *
  * The authoritative lockfile differs by manager: `.kici/package-lock.json` for
- * npm, the repo-root `pnpm-lock.yaml` / `yarn.lock` for a pnpm / yarn workspace
+ * npm, or the repo-root `package-lock.json` when `.kici` is an npm workspace
+ * member; the repo-root `pnpm-lock.yaml` / `yarn.lock` for a pnpm / yarn workspace
  * (a `.kici/` member resolves against the root lockfile). A standalone `.kici`
  * yarn project is keyed on `.kici/yarn.lock`. The hash input is prefixed with
  * the manager name (plus the yarn flavor, `yarn-classic` / `yarn-berry`), so a
@@ -167,7 +168,12 @@ export function computeLockfileHash(gitRoot: string): string | null {
       ? [path.join(gitRoot, 'pnpm-lock.yaml'), path.join(gitRoot, '.kici', 'pnpm-lock.yaml')]
       : m === PackageManager.Yarn
         ? [path.join(gitRoot, 'yarn.lock'), path.join(gitRoot, '.kici', 'yarn.lock')]
-        : [path.join(gitRoot, '.kici', 'package-lock.json')];
+        : [
+            path.join(gitRoot, '.kici', 'package-lock.json'),
+            // An npm workspace member has no lockfile of its own: npm writes the
+            // single package-lock.json at the workspace root.
+            ...(isWorkspaceMember(gitRoot) ? [path.join(gitRoot, 'package-lock.json')] : []),
+          ];
 
   const order: PackageManager[] = [
     pm,

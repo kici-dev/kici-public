@@ -39,3 +39,49 @@ describe('selectMiseTemplate', () => {
     expect(() => selectMiseTemplate('aix' as never)).toThrow(/unsupported/i);
   });
 });
+
+describe('selectMiseTemplate env handoff', () => {
+  it('pwsh un-doubles the quote PowerShell doubles inside a single-quoted value', () => {
+    // fails-when: a value such as it''s reaches steps with the doubled quote kept
+    expect(selectMiseTemplate('win32').run).toContain(`$Matches[2] -replace "''", "'"`);
+  });
+});
+
+describe('selectMiseTemplate with a pin', () => {
+  it('bash: installs into the KiCI-owned dir with MISE_VERSION and checks the version', () => {
+    const t = selectMiseTemplate('linux', '2026.5.1');
+    expect(t.run).toContain("kici_mise_want='2026.5.1'");
+    expect(t.run).toContain('MISE_VERSION="v$kici_mise_want"');
+    expect(t.run).toContain('mise version mismatch');
+    // fails-when: the pinned path still trusts any mise already on PATH
+    expect(t.run).not.toContain('command -v mise');
+    const pinnedLine = t.run.indexOf('echo "$kici_mise_dir" >> "$KICI_PATH"');
+    const shimsLine = t.run.indexOf('/.local/share/mise/shims" >> "$KICI_PATH"');
+    expect(pinnedLine).toBeGreaterThan(-1);
+    expect(pinnedLine).toBeLessThan(shimsLine);
+  });
+
+  it('pwsh: pins the dir, checks the version, and adds the pinned bin before bin-paths', () => {
+    const t = selectMiseTemplate('win32', '2026.5.1');
+    expect(t.run).toContain("$kiciMiseWant = '2026.5.1'");
+    expect(t.run).toContain('throw "mise version mismatch');
+    expect(t.run).not.toContain('if (-not (Get-Command mise -ErrorAction SilentlyContinue))');
+    expect(t.run.indexOf('-Value $kiciMiseBin')).toBeLessThan(
+      t.run.indexOf('Invoke-Mise bin-paths'),
+    );
+  });
+
+  it('refuses a version that is not a bare release', () => {
+    // fails-when: an unvalidated value is substituted into the install script
+    expect(() => selectMiseTemplate('linux', "2026.5.1'; curl evil")).toThrow(
+      /invalid mise version/,
+    );
+    expect(() => selectMiseTemplate('linux', 'v2026.5.1')).toThrow(/invalid mise version/);
+  });
+
+  it('unpinned templates carry no pin', () => {
+    // breaks-if-wrong: the refactor leaks pinned pieces into the default preset
+    expect(selectMiseTemplate('linux').run).not.toMatch(/kici_mise_(want|dir|version)/);
+    expect(selectMiseTemplate('win32').run).not.toContain('kiciMise');
+  });
+});

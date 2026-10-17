@@ -18,8 +18,11 @@ vi.mock('node:fs/promises', () => ({
   readFile: vi.fn().mockResolvedValue(JSON.stringify({ mediaType: 'x' })),
 }));
 
-vi.mock('../provenance-trust-root.js', () => ({
-  resolveTrustRoot: vi.fn().mockResolvedValue({ issuer: 'https://i', jwks: { keys: [] } }),
+vi.mock('../provenance-trust-root.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../provenance-trust-root.js')>()),
+  resolveTrustRoot: vi
+    .fn()
+    .mockResolvedValue({ issuer: 'https://i', jwks: { keys: [] }, warnings: [] }),
 }));
 
 vi.mock('@kici-dev/engine/provenance/verify', () => ({
@@ -32,7 +35,7 @@ vi.mock('../remote/config.js', () => ({
 }));
 
 import { sha256File } from '@kici-dev/core';
-import { resolveTrustRoot } from '../provenance-trust-root.js';
+import { InsecureTrustRootError, resolveTrustRoot } from '../provenance-trust-root.js';
 import { verifyKiciBundle } from '@kici-dev/engine/provenance/verify';
 import { loadGlobalConfig } from '../remote/config.js';
 import { verifyAttestationCommand } from './verify-attestation.js';
@@ -47,7 +50,7 @@ describe('kici verify-attestation', () => {
     vi.clearAllMocks();
     logOutput.length = 0;
     consoleOutput.length = 0;
-    mockResolve.mockResolvedValue({ issuer: 'https://i', jwks: { keys: [] } });
+    mockResolve.mockResolvedValue({ issuer: 'https://i', jwks: { keys: [] }, warnings: [] });
     mockSha.mockResolvedValue('a'.repeat(64));
     mockLoadConfig.mockResolvedValue({}); // no configured orchestrator by default
     vi.spyOn(console, 'log').mockImplementation((msg: string) => consoleOutput.push(msg));
@@ -252,7 +255,7 @@ describe('kici verify-attestation', () => {
     });
     const ok = await verifyAttestationCommand(undefined, { bundle: '/tmp/b.json' });
     expect(ok).toBe(true);
-    expect(mockResolve).toHaveBeenCalledWith('https://orch.example');
+    expect(mockResolve).toHaveBeenCalledWith('https://orch.example', { allowInsecure: false });
     expect(logOutput.join('\n')).toContain('configured orchestrator');
   });
 
@@ -285,5 +288,56 @@ describe('kici verify-attestation', () => {
     expect(mockVerify).toHaveBeenCalledWith(
       expect.objectContaining({ expectedAudience: 'custom-aud' }),
     );
+  });
+
+  describe('a plain-HTTP trust root on a host that is not loopback', () => {
+    const verified = { verified: true, mode: 'kici', checks: {}, claims: {}, failures: [] };
+    let stderr: string[];
+    beforeEach(() => {
+      stderr = [];
+      vi.spyOn(process.stderr, 'write').mockImplementation((chunk: string | Uint8Array) => {
+        stderr.push(String(chunk));
+        return true;
+      });
+      mockVerify.mockResolvedValue(verified);
+    });
+
+    // fails-when: the refusal goes to stdout (the logger), or the command
+    // still verifies — CI reads the exit code and stdout.
+    it('refuses with exit 1, the reason on stderr, and nothing on stdout', async () => {
+      mockResolve.mockRejectedValue(new InsecureTrustRootError('http://10.0.0.5:10143/x'));
+      const ok = await verifyAttestationCommand(undefined, {
+        bundle: '/tmp/b.json',
+        trustRoot: 'http://10.0.0.5:10143',
+        json: true,
+      });
+      expect(ok).toBe(false);
+      expect(mockVerify).not.toHaveBeenCalled();
+      expect(consoleOutput).toEqual([]);
+      expect(logOutput).toEqual([]);
+      const err = stderr.join('');
+      expect(err).toContain('http://10.0.0.5:10143/x');
+      expect(err).toContain('--allow-insecure-trust-root');
+    });
+
+    // breaks-if-wrong: with the flag the command still verifies, and --json
+    // stdout stays parseable while the warning goes to stderr.
+    it('verifies with --allow-insecure-trust-root and warns on stderr only', async () => {
+      mockResolve.mockResolvedValue({
+        issuer: 'http://10.0.0.5:10143',
+        jwks: { keys: [] },
+        warnings: ['trust root URL http://10.0.0.5:10143 is plain HTTP'],
+      });
+      const ok = await verifyAttestationCommand(undefined, {
+        bundle: '/tmp/b.json',
+        trustRoot: 'http://10.0.0.5:10143',
+        json: true,
+        allowInsecureTrustRoot: true,
+      });
+      expect(ok).toBe(true);
+      expect(mockResolve).toHaveBeenCalledWith('http://10.0.0.5:10143', { allowInsecure: true });
+      expect(JSON.parse(consoleOutput.join(''))).toMatchObject({ verified: true });
+      expect(stderr.join('')).toContain('Warning: trust root URL http://10.0.0.5:10143');
+    });
   });
 });

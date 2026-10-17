@@ -226,36 +226,84 @@ export function writeInstallManifest(
  * Where an npm-source upgrade installs, from a unit's launch spec.
  * `owningPackage` is the top-level global package ExecStart runs (`kici-admin`
  * when the component loads through its nested node_modules, else
- * `@kici-dev/<component>`). `npmPath` sits beside the pinned node, so
- * `npm install -g` lands in the prefix ExecStart resolves from, whatever the
- * shell's active node.
+ * `@kici-dev/<component>`). `globalPrefix` is the npm prefix the launch entry
+ * lives in; every npm call passes it as `--prefix`, because the caller's
+ * environment can name another one (`npx` exports `npm_config_prefix`).
+ * `npmInvocation` runs `npm-cli.js` with the pinned node when it sits beside
+ * that node, so a version-manager wrapper at `npmPath` (mise's reshim needs
+ * mise on PATH) is never started.
  */
 export interface NpmInstallTarget {
   nodeExecPath: string;
   npmPath: string;
   owningPackage: string;
+  globalPrefix: string;
+  npmInvocation: { cmd: string; preArgs: string[] };
 }
+
+/**
+ * The resolution of a launch spec to an install target. `no-entry` covers an
+ * opaque `--binary` install and a path outside `node_modules`; `not-global`
+ * an entry under a local `node_modules` tree, whose prefix the unit's npm
+ * cannot install into with `-g`.
+ */
+export type NpmInstallResolution =
+  | { ok: true; target: NpmInstallTarget }
+  | { ok: false; reason: 'no-entry' }
+  | { ok: false; reason: 'not-global'; entry: string };
 
 export function resolveNpmInstallTarget(
   spec: LaunchSpec,
   component: Component,
-  opts: { windows: boolean },
-): NpmInstallTarget | null {
+  opts: { windows: boolean; exists?: (p: string) => boolean },
+): NpmInstallResolution {
   const entryRe = new RegExp(
     `[/\\\\]@kici-dev[/\\\\]${component}[/\\\\]dist[/\\\\](?:server|standalone)\\.js$`,
   );
   const entry = [spec.execPath, ...spec.args].find((a) => entryRe.test(a));
-  if (!entry) return null;
+  if (!entry) return { ok: false, reason: 'no-entry' };
 
   const owningPackage = firstGlobalPackage(entry);
-  if (!owningPackage) return null;
+  if (!owningPackage) return { ok: false, reason: 'no-entry' };
 
   // The unit's path flavor, not the host's: a posix host must still produce
   // `C:\node\npm.cmd` for a Windows unit, and vice versa.
   const p = opts.windows ? path.win32 : path.posix;
-  const npmBin = opts.windows ? 'npm.cmd' : 'npm';
-  const npmPath = p.join(p.dirname(spec.execPath), npmBin);
-  return { nodeExecPath: spec.execPath, npmPath, owningPackage };
+  const globalPrefix = globalPrefixOf(entry, opts.windows);
+  if (!globalPrefix) return { ok: false, reason: 'not-global', entry };
+
+  const nodeDir = p.dirname(spec.execPath);
+  const npmPath = p.join(nodeDir, opts.windows ? 'npm.cmd' : 'npm');
+  // npm's own layout beside a node install: `<prefix>/lib/node_modules/npm`
+  // on posix, `<prefix>\node_modules\npm` on Windows.
+  const npmCliJs = opts.windows
+    ? p.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js')
+    : p.join(nodeDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  const exists = opts.exists ?? fs.existsSync;
+  const npmInvocation = exists(npmCliJs)
+    ? { cmd: spec.execPath, preArgs: [npmCliJs] }
+    : { cmd: npmPath, preArgs: [] };
+  return {
+    ok: true,
+    target: { nodeExecPath: spec.execPath, npmPath, owningPackage, globalPrefix, npmInvocation },
+  };
+}
+
+/**
+ * The npm global prefix holding `entry`, split on its FIRST `node_modules`
+ * segment like {@link firstGlobalPackage}. Windows lays a global install out as
+ * `<prefix>\node_modules\<pkg>`; posix as `<prefix>/lib/node_modules/<pkg>`, so
+ * there the segment before must be `lib`, which tells a global install from a
+ * local `node_modules` tree. Null for anything else.
+ */
+function globalPrefixOf(entry: string, windows: boolean): string | null {
+  const p = windows ? path.win32 : path.posix;
+  const segments = entry.split(/[/\\]/);
+  const idx = segments.indexOf('node_modules');
+  if (idx < 1) return null;
+  if (windows) return segments.slice(0, idx).join(p.sep) || null;
+  if (idx < 2 || segments[idx - 1] !== 'lib') return null;
+  return segments.slice(0, idx - 1).join(p.sep) || p.sep;
 }
 
 /**

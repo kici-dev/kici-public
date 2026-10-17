@@ -1,9 +1,10 @@
 /**
  * Packs a build agent's installed dependency closure into a gzip tarball for
  * the dep cache, **repo-root-relative** (cwd = clone root), so restore is one
- * layout for every package manager (entries: `closureEntries`). pnpm and yarn
- * link `.kici/node_modules` into the root store and in-repo siblings outside
- * `.kici/`, so those travel with it or the links dangle.
+ * layout for every package manager (entries: `closureEntries`). pnpm links
+ * `.kici/node_modules` into the root store; npm and yarn hoist a workspace
+ * member's tree to the repo-root `node_modules`; every manager links in-repo
+ * siblings outside `.kici/`. Those travel with it or the links dangle.
  *
  * Portable mode strips user/group info; symlinks stay symlinks so the pnpm link
  * graph restores intact; hard links are packed as regular files.
@@ -17,15 +18,20 @@ import {
   PackageManager,
 } from '@kici-dev/shared/package-manager';
 import { packGzipTarball } from './tar-pack.js';
-import { collectInRepoSiblings, resolveYarnNodeModulesRoot } from './workspace-siblings.js';
+import {
+  collectInRepoSiblings,
+  collectSiblingsFromRoots,
+  resolveKiciNodeModulesLayout,
+} from './workspace-siblings.js';
 
 const logger = createLogger({ prefix: 'dep-packer' });
 
 /**
  * Pack the dependency closure and compute its SHA-256 hash.
  *
- * @throws Error if the node_modules root (`.kici/node_modules`, or a hoisted
- *   yarn member's repo-root `node_modules`) does not exist.
+ * @throws Error if no node_modules root `.kici` resolves from exists
+ *   (`.kici/node_modules`, or a hoisted npm or yarn member's repo-root
+ *   `node_modules`).
  */
 export async function packNodeModules(kiciDir: string): Promise<{ tarball: Buffer; hash: string }> {
   const workDir = dirname(kiciDir);
@@ -34,15 +40,6 @@ export async function packNodeModules(kiciDir: string): Promise<{ tarball: Buffe
     (await detectPackageManagerFromManifests(workDir)) ??
     (await detectPackageManagerFromManifests(kiciDir)) ??
     PackageManager.Npm;
-
-  // A yarn workspace member hoists to the repo-root node_modules.
-  const nmRoot =
-    packageManager === PackageManager.Yarn
-      ? resolveYarnNodeModulesRoot(workDir, kiciDir)
-      : join(kiciDir, 'node_modules');
-  if (!existsSync(nmRoot)) {
-    throw new Error(`node_modules not found at ${nmRoot}`);
-  }
 
   const entries = await closureEntries(workDir, kiciDir, packageManager);
 
@@ -65,35 +62,42 @@ export async function packNodeModules(kiciDir: string): Promise<{ tarball: Buffe
 }
 
 /**
- * Repo-root-relative entries. npm: `.kici/node_modules`. pnpm: that plus the
- * root `node_modules/.pnpm` store and in-repo siblings. yarn: the resolved
- * node_modules root plus in-repo siblings; berry's forced node-modules linker
- * packs the same shape as classic.
+ * Repo-root-relative entries. pnpm: `.kici/node_modules`, the root
+ * `node_modules/.pnpm` store and in-repo siblings. npm and yarn (classic and
+ * berry, whose forced node-modules linker packs the same shape): the
+ * node_modules roots `.kici` resolves from (`.kici/node_modules` standalone;
+ * the hoisted repo-root `node_modules` of a workspace member; both when the
+ * manager nested a conflicting version under `.kici/`) plus the in-repo
+ * siblings linked from them. npm takes the repo-root `node_modules` only when
+ * it links `.kici`, so a standalone npm `.kici` never packs the repo's own
+ * dependencies.
  */
 async function closureEntries(
   workDir: string,
   kiciDir: string,
   packageManager: PackageManager,
 ): Promise<string[]> {
+  const kiciNm = join(kiciDir, 'node_modules');
   if (packageManager === PackageManager.Pnpm) {
-    const entries = [relative(workDir, join(kiciDir, 'node_modules'))];
+    if (!existsSync(kiciNm)) throw new Error(`node_modules not found at ${kiciNm}`);
+    const entries = [relative(workDir, kiciNm)];
     if (existsSync(join(workDir, 'node_modules', '.pnpm'))) {
       entries.push(join('node_modules', '.pnpm'));
     }
-    for (const sibling of await collectInRepoSiblings(workDir, kiciDir)) {
-      entries.push(sibling);
-    }
+    for (const sibling of await collectInRepoSiblings(workDir, kiciDir)) entries.push(sibling);
     return entries;
   }
 
-  if (packageManager === PackageManager.Yarn) {
-    const nmRoot = resolveYarnNodeModulesRoot(workDir, kiciDir);
-    const entries = [relative(workDir, nmRoot)];
-    for (const sibling of await collectInRepoSiblings(workDir, kiciDir, nmRoot)) {
-      entries.push(sibling);
-    }
-    return entries;
+  const layout = await resolveKiciNodeModulesLayout(workDir, kiciDir);
+  const roots =
+    packageManager === PackageManager.Npm && !layout.hoistedMember
+      ? layout.roots.filter((nm) => nm === kiciNm)
+      : layout.roots;
+  if (roots.length === 0) {
+    throw new Error(`node_modules not found at ${kiciNm} or ${join(workDir, 'node_modules')}`);
   }
-
-  return [relative(workDir, join(kiciDir, 'node_modules'))];
+  return [
+    ...roots.map((nm) => relative(workDir, nm)),
+    ...(await collectSiblingsFromRoots(workDir, kiciDir, roots)),
+  ];
 }

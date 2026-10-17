@@ -3,6 +3,8 @@
 
 export { loadConfig, type AppConfig } from './config.js';
 export { installDeps, type InstallDepsOptions } from './execution/dep-installer.js';
+export { packNodeModules } from './execution/dep-packer.js';
+export { restoreDeps } from './execution/dep-restore.js';
 export {
   findLocalProtocolDeps,
   assertResolvableDeps,

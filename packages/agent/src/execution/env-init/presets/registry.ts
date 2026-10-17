@@ -1,5 +1,6 @@
 import type { GenericInitConfig } from '@kici-dev/sdk';
 import { miseExpander } from './mise/expander.js';
+import { aptExpander } from './apt/expander.js';
 
 /**
  * Clone root + typed config -> a concrete generic init config. The agent
@@ -13,8 +14,10 @@ export interface PresetExpander<C> {
   }): Promise<GenericInitConfig>;
 }
 
+/** The set of typed presets, keyed by the name a job's `init` uses. */
 export const PRESET_REGISTRY = {
   mise: miseExpander,
+  apt: aptExpander,
 } satisfies Record<string, PresetExpander<any>>;
 
 export type PresetName = keyof typeof PRESET_REGISTRY;

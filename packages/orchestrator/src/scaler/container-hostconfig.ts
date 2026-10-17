@@ -19,6 +19,14 @@ import type { EffectiveLimits } from './types.js';
 export const AGENT_CONTAINER_PIDS_LIMIT = 4096;
 
 /**
+ * Group id of `kici-sudo` in the KiCI agent image (`packages/agent/Dockerfile`
+ * creates it). `/etc/sudoers.d/kici-sudo` grants that group passwordless sudo.
+ * The container scaler adds the group only to the single-job containers it
+ * starts from a pool's own image, so root never outlives one job.
+ */
+export const AGENT_SUDO_GROUP_GID = 1990;
+
+/**
  * Why this container is NOT capability-dropped, though the job containers the
  * agent starts are.
  *
@@ -46,6 +54,8 @@ export interface AgentContainerHostConfigInput {
   binds?: string[];
   /** Extra `host:ip` entries (e.g. a private registry alias). */
   extraHosts?: string[];
+  /** Extra group ids for the container's process (`GroupAdd`). */
+  supplementaryGroups?: number[];
 }
 
 /**
@@ -65,6 +75,9 @@ export function buildAgentContainerHostConfig(
     ...(typeof cpus === 'number' && cpus > 0 ? { NanoCpus: Math.round(cpus * 1e9) } : {}),
     ...(input.binds && input.binds.length > 0 ? { Binds: input.binds } : {}),
     ...(input.extraHosts && input.extraHosts.length > 0 ? { ExtraHosts: input.extraHosts } : {}),
+    ...(input.supplementaryGroups && input.supplementaryGroups.length > 0
+      ? { GroupAdd: input.supplementaryGroups.map(String) }
+      : {}),
     // Never auto-remove: the teardown paths read the exited container's logs to
     // explain why an agent never registered.
     AutoRemove: false,

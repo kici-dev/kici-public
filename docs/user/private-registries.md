@@ -55,24 +55,25 @@ Per-field rules:
 
 ### How tokens reach `npm install`
 
-The agent never writes the token bytes to your `.kici/.npmrc`. Each registry token is exposed to the install subprocess as a job-scoped env var (`KICI_NPM_TOKEN_<jobIdShort>_<i>`), and the on-disk auth line carries a `${VAR}` reference that npm substitutes at read time. The job-scoped nonce makes the env var name unguessable from outside the install subprocess.
+The agent never writes the token bytes to your `.npmrc`. Each registry token is exposed to the install subprocess as a job-scoped env var (`KICI_NPM_TOKEN_<jobIdShort>_<i>`), and the on-disk auth line carries a `${VAR}` reference that npm substitutes at read time. The job-scoped nonce makes the env var name unguessable from outside the install subprocess.
 
-After the install completes (success or failure), the agent restores the original `.kici/.npmrc` — your committed file is never permanently modified.
+After the install completes (success or failure), the agent restores the original `.npmrc` — your committed file is never permanently modified.
 
 ### Package managers
 
 The agent detects the package manager from the cloned repo — npm, pnpm, or yarn (classic and berry are both supported) — and applies the auth overlay the detected manager actually reads:
 
-| Detected manager        | Auth file the agent overlays | Notes                                                                                                                                       |
-| ----------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| npm, pnpm, yarn classic | `.kici/.npmrc`               | Auth lines carry `${VAR}` references to the job-scoped token env vars.                                                                      |
-| yarn berry (v2+)        | `.kici/.yarnrc.yml`          | Berry reads `.yarnrc.yml` instead of `.npmrc`, so the overlay uses berry's own registry/scope/auth keys with the same `${VAR}` indirection. |
+| Detected manager                                 | Auth file the agent overlays | Notes                                                                                                                                       |
+| ------------------------------------------------ | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| npm, pnpm, yarn classic                          | `.kici/.npmrc`               | Auth lines carry `${VAR}` references to the job-scoped token env vars.                                                                      |
+| npm or pnpm, with `.kici/` as a workspace member | the workspace-root `.npmrc`  | npm and pnpm read the configuration of a workspace member from the workspace root only, and ignore `.kici/.npmrc`.                          |
+| yarn berry (v2+)                                 | `.kici/.yarnrc.yml`          | Berry reads `.yarnrc.yml` instead of `.npmrc`, so the overlay uses berry's own registry/scope/auth keys with the same `${VAR}` indirection. |
 
 Either file is restored on cleanup, exactly as described above.
 
 ## Option C — committed `.kici/.npmrc` + `installEnv:`
 
-If you'd rather hand-craft the `.npmrc`, commit it under `.kici/.npmrc` with `${VAR}` placeholders, then list each variable in the workflow's `installEnv:` block using the same qualified syntax as `tokenSecret`.
+If you'd rather hand-craft the `.npmrc`, commit it under `.kici/.npmrc` with `${VAR}` placeholders, then list each variable in the workflow's `installEnv:` block using the same qualified syntax as `tokenSecret`. If `.kici/` is a member of an npm or pnpm workspace, commit the file as the workspace-root `.npmrc` instead, because npm and pnpm read the configuration of a workspace member from the workspace root only.
 
 ```ini
 # .kici/.npmrc
@@ -110,7 +111,7 @@ This path is the right answer when:
 
 AWS CodeArtifact authorization tokens expire after 12 hours; GCP Artifact Registry tokens after 60 minutes. Storing one as a long-lived `tokenSecret` does not work — by the time a build runs, the token may be expired.
 
-The supported pattern is a **setup job** that mints a fresh token, writes `.kici/.npmrc`, and downstream jobs install with it.
+The supported pattern is a **setup job** that mints a fresh token, writes `.kici/.npmrc`, and downstream jobs install with it. For a `.kici/` that is a member of an npm or pnpm workspace, the setup job writes the workspace-root `.npmrc` instead.
 
 ```typescript
 import { workflow, job, step, push } from '@kici-dev/sdk';
@@ -230,7 +231,7 @@ OIDC identity token for a Cloudsmith credential — see
 
 - **Per-context scoping.** Every `tokenSecret` and `installEnv` entry is qualified with a context name. The orchestrator runs the same protection-rule pipeline (branch / trust / concurrency / reviewer / wait-timer) against each named context **before** resolving any secret, so a workflow that wants a `production` token from a feature branch is rejected exactly like a job that tries to deploy to `production` from a feature branch. A reviewer-gated install context **pauses** the whole workflow dispatch as a workflow-scoped held run instead of resolving the token — see [Reviewer-gated installs](#reviewer-gated-installs) below.
 - **Untrusted refs get no tokens.** When the trust resolution returns anything other than `trusted` — every fork pull request does — the orchestrator strips `npmRegistries`, `installEnvSecrets`, and a container job's [registry credentials](container-jobs.md#private-images) out of the dispatch. The install runs without auth and fails naturally on the first private dep, and a private base image fails to pull. A fork pull request cannot observe a registry token, even if a context lacks an explicit [minimum trust](contexts.md#minimum-trust) rule.
-- **Lifecycle scripts disabled.** Whenever a private registry is in scope, the agent runs the install with `--ignore-scripts` (npm, pnpm, and yarn classic alike; yarn berry gets the equivalent `enableScripts: false`). A malicious `preinstall` / `postinstall` hook in committed `package.json` cannot read the synthesized token env vars, even though they exist in the install subprocess. For a pnpm or yarn workspace, the agent builds your in-repo dependency closure as a separate step **after** the install's auth is torn down, so build scripts never see the tokens either.
+- **Lifecycle scripts disabled.** Whenever a private registry is in scope, the agent runs the install with `--ignore-scripts` (npm, pnpm, and yarn classic alike; yarn berry gets the equivalent `enableScripts: false`). A malicious `preinstall` / `postinstall` hook in committed `package.json` cannot read the synthesized token env vars, even though they exist in the install subprocess. For a pnpm, npm, or yarn workspace, the agent builds your in-repo dependency closure as a separate step **after** the install's auth is torn down, so build scripts never see the tokens either.
 - **Install output is redacted.** If the install fails, the job error carries the installer's exit code, the end of its stderr and stdout, and for npm the end of npm's debug log. The agent masks every token literal out of them before it logs or reports the error.
 - **Job-scoped env-var names.** The synthesized auth env var is `KICI_NPM_TOKEN_<jobIdShort>_<i>` where `jobIdShort` is the first 8 chars of the dispatched job id. The name is unguessable from outside the install subprocess and not reused across jobs.
 - **`.npmrc` restored.** Whatever the agent appended for one install is stripped (or the file unlinked) on cleanup, so the workspace is never permanently modified.

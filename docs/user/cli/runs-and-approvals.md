@@ -229,7 +229,7 @@ When an org has more than one connected orchestrator cluster, the CLI picks the 
 
 `kici run remote` uses two independent paths:
 
-- **Control plane** — run initiation, trigger, status, log retrieval, and cancellation flow from your machine through the Platform, which relays them over a WebSocket connection to the org's orchestrator. In [direct mode](#direct-mode) they go to the orchestrator's HTTP API instead, with the same requests and responses. The CLI polls the Platform for log chunks (tracked by a monotonic line cursor) and run status until the run reaches a terminal state; there is no direct streaming socket to the orchestrator.
+- **Control plane** — run initiation, trigger, status, log retrieval, and cancellation flow from your machine through the Platform, which relays them over a WebSocket connection to the org's orchestrator. In [direct mode](#direct-mode) they go to the orchestrator's HTTP API instead, with the same requests and responses. The CLI polls for log chunks and run status until the run reaches a terminal state; there is no direct streaming socket to the orchestrator. The log position records how far each log file was read, so output from a step that starts later is never skipped.
 - **Data plane** — your working-tree overlay tarball uploads **directly** from your machine to the orchestrator's object store via a presigned PUT URL. The overlay never passes through the Platform. This is why the orchestrator's object-store upload endpoint must be reachable from your machine; see [Storage layout](../../operator/orchestrator/storage-layout.md).
 
 #### Direct mode
@@ -344,6 +344,19 @@ rule. Any approval hold on the run is listed too, with its context, hold type,
 status and reason. If the run id is not on the Platform but exists in your
 local run history (from `kici run <event> --local`), the local record is shown instead.
 
+For a run started with `kici run remote`, the Platform reads the jobs and steps
+from the orchestrator cluster that ran the run. When the Platform cannot get them
+from that orchestrator, it shows the jobs it stored, without steps. The command
+then prints a note on standard error that names the reason, for example:
+
+```text
+step detail unavailable: the Platform could not read it from the orchestrator that ran this run (no orchestrator that can serve this run is connected)
+```
+
+Standard output and the exit code do not change. See
+[Troubleshooting](../../operator/troubleshooting.md#step-detail-unavailable-from-kici-runs-show-or-kici-runs-logs)
+for each reason.
+
 ```bash
 kici runs show <run-id> [options]
 ```
@@ -378,6 +391,10 @@ setup key never contains a `/` and a step key always does, so a step named
   "deploy/prod/apply": ["step output"]
 }
 ```
+
+`kici runs logs` prints the same step-detail note as `kici runs show`. When a
+job's setup log cannot be read, a note on standard error names the job and the
+error. Standard output and the exit code do not change.
 
 ```bash
 kici runs logs <run-id> [options]
@@ -718,17 +735,17 @@ Synopsis: `kici runs list [options]`
 
 **Options**
 
-| Option                  | Default | Description                                               |
-| ----------------------- | ------- | --------------------------------------------------------- |
-| `--status <s>`          |         | Filter by status                                          |
-| `--workflow <w>`        |         | Filter by workflow name                                   |
-| `--branch <b>`          |         | Filter by branch/ref                                      |
-| `--repo <r>`            |         | Filter by repository                                      |
-| `--trigger <t>`         |         | Filter by trigger type                                    |
-| `--source <routingKey>` |         | Filter by source routing key                              |
-| `--since <ts>`          |         | Only runs since (ISO-8601 or epoch ms)                    |
-| `--cursor <cursor>`     |         | Keyset cursor for the next page (from a prior nextCursor) |
-| `--json`                | `false` | Output raw JSON                                           |
+| Option                  | Default | Description                                                |
+| ----------------------- | ------- | ---------------------------------------------------------- |
+| `--status <s>`          |         | Filter by status                                           |
+| `--workflow <w>`        |         | Filter by workflow name                                    |
+| `--branch <b>`          |         | Filter by branch/ref                                       |
+| `--repo <r>`            |         | Filter by repository                                       |
+| `--trigger <t>`         |         | Filter by trigger type                                     |
+| `--source <routingKey>` |         | Filter by source routing key, or by provider (e.g. github) |
+| `--since <ts>`          |         | Only runs since (ISO-8601 or epoch ms)                     |
+| `--cursor <cursor>`     |         | Keyset cursor for the next page (from a prior nextCursor)  |
+| `--json`                | `false` | Output raw JSON                                            |
 
 ### `kici runs logs`
 

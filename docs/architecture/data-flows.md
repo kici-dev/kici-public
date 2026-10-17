@@ -111,7 +111,7 @@ Developer machine                Platform relay            Orchestrator         
 
 ### Control plane
 
-Run initiation (`upload-init`), the trigger, status polling, log retrieval, and cancellation all flow from the developer machine to the Platform, which relays them over its WebSocket connection to the org's orchestrator. On this path the developer machine never talks to the orchestrator's HTTP API. The CLI polls the Platform for log chunks, tracked by a monotonic line cursor, and for run status until the run reaches a terminal state. There is no streaming socket between the developer machine and the orchestrator.
+Run initiation (`upload-init`), the trigger, status polling, log retrieval, and cancellation all flow from the developer machine to the Platform, which relays them over its WebSocket connection to the org's orchestrator. On this path the developer machine never talks to the orchestrator's HTTP API. The CLI polls the Platform for log chunks and for run status until the run reaches a terminal state. The log cursor records how many lines of each log file the CLI received, so a step whose log file appears later is read from its first line. There is no streaming socket between the developer machine and the orchestrator.
 
 ### Data plane
 
@@ -120,6 +120,8 @@ The working-tree overlay tarball uploads **directly** from the developer machine
 ### Org anchor
 
 The run is dispatched to the developer's active organization (selected with `kici org use`, or overridden per-run). The orchestrator anchors its bound organization with a system-managed **remote source** (routing key `remote:<orgId>`) that it auto-provisions — no manual webhook source is required, so a zero-source org is immediately routable for remote runs. The Platform forces the run's routing key to `remote:<orgId>` server-side; the developer never sets a routing key. When an org has more than one connected orchestrator cluster, the CLI selects the target cluster explicitly (or relies on the per-org default), and a single connected cluster is auto-selected.
+
+The Platform records the cluster it relays the trigger to. Later reads of the run, such as the dashboard run page, `kici runs show` and `kici runs logs`, go to that cluster, because no orchestrator registers the `remote:<orgId>` routing key. A run with no recorded cluster, or whose cluster is not connected, is read through any coordinator of the organization.
 
 ### Direct path
 

@@ -204,6 +204,14 @@ const configSchema = z.object({
     .string()
     .optional()
     .transform((s) => s === '1'),
+  // Set by the container scaler on an agent it starts from a pool's own agent
+  // image. Such an agent runs exactly one job: it stops taking work when it
+  // accepts its job and exits when that job ends, so nothing a job leaves in
+  // the container reaches another job.
+  scalerSingleJob: z
+    .string()
+    .optional()
+    .transform((s) => s === '1'),
   // Image to copy the pinned glibc-2.17 Node out of when this agent NESTS a job
   // container, since a job image may lack Node. The tree goes into a named
   // volume as the scaler does it (a bind mount needs a host path, and the agent
@@ -309,6 +317,7 @@ export const envDef = defineEnv({
     sandboxNanoCpus: 'KICI_SANDBOX_NANO_CPUS',
     scalerManaged: 'KICI_SCALER_MANAGED',
     jobImageAgent: 'KICI_JOB_IMAGE_AGENT',
+    scalerSingleJob: 'KICI_SCALER_SINGLE_JOB',
     runtimeImage: 'KICI_RUNTIME_IMAGE',
     runtimeNodeSource: 'KICI_RUNTIME_NODE_SOURCE',
     containerBuildCli: 'KICI_CONTAINER_BUILD_CLI',

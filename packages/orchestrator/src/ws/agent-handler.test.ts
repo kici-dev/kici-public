@@ -1037,6 +1037,54 @@ describe('createAgentWsHandler', () => {
       expect(registry.get('agent-1')?.busyHeldUntil).toBeUndefined();
       expect(registry.findAvailable([])).toHaveLength(1);
     });
+
+    /** Register agent-1 with a free slot and return a sender for its agent.status reports. */
+    async function registeredStatusSender(): Promise<
+      (messageId: string, activeJobs: number, draining?: boolean) => Promise<void>
+    > {
+      const handler = createAgentWsHandler({ registry, dispatcher, agentAuthMode: 'none' });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      registry.get('agent-1')!.activeJobs = 0;
+      return async (messageId, activeJobs, draining) => {
+        await handler.onMessage!(
+          makeMessageEvent({
+            type: 'agent.status',
+            messageId,
+            agentId: 'agent-1',
+            activeJobs,
+            ...(draining !== undefined && { draining }),
+          }),
+          ws as any,
+        );
+      };
+    }
+
+    it('stops routing to an agent that reports draining', async () => {
+      const sendStatus = await registeredStatusSender();
+      await sendStatus('m-drain', 1, true);
+
+      // fails-when: a single-job agent that accepted its job is still offered a
+      // follow-up job, which it rejects and which spends a dispatch attempt
+      expect(registry.get('agent-1')?.draining).toBe(true);
+      expect(registry.findAvailable([])).toHaveLength(0);
+      // Only the register-time drain ran; the status did not trigger another.
+      expect(dispatcher.onAgentAvailable).toHaveBeenCalledTimes(1);
+
+      // A later report without the flag does not lift the drain.
+      await sendStatus('m-after', 0);
+      expect(registry.findAvailable([])).toHaveLength(0);
+    });
+
+    it('keeps routing to an agent whose status carries no draining flag', async () => {
+      const sendStatus = await registeredStatusSender();
+      await sendStatus('m-plain', 0, false);
+
+      // breaks-if-wrong: an ordinary or static agent must stay routable
+      expect(registry.get('agent-1')?.draining).toBe(false);
+      expect(registry.findAvailable([])).toHaveLength(1);
+    });
   });
 
   describe('job.status with success', () => {

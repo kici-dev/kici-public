@@ -8,7 +8,7 @@
 
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { makeTempDir } from '@kici-dev/test-support/tmp';
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -30,7 +30,12 @@ import {
   installRelease,
   npmReleaseReadsEnvFile,
 } from './versioned-upgrade.js';
-import { SERVICE_TEXT, writeManifest, writeIndex } from '../../service/index.js';
+import {
+  SERVICE_TEXT,
+  resolveNpmInstallTarget,
+  writeManifest,
+  writeIndex,
+} from '../../service/index.js';
 import type {
   InstanceManifest,
   LaunchSpec,
@@ -882,6 +887,29 @@ describe('planNpmSourceUpgrade', () => {
     if (action.kind === 'error') expect(action.reason).toMatch(/requires --version/);
   });
 
+  // fails-when: a local node_modules entry self-drives, and `npm install -g`
+  // lands in a prefix the unit never reads.
+  it('refuses a launch entry outside a global npm install, naming both runtimes', () => {
+    const action = planNpmSourceUpgrade({
+      component: 'orchestrator',
+      spec: {
+        execPath: NODE,
+        args: ['/srv/app/node_modules/@kici-dev/orchestrator/dist/server.js'],
+      },
+      invoked: '0.1.27',
+      requestedVersion: '0.1.27',
+      restartOnly: false,
+      force: false,
+      windows: false,
+    });
+    expect(action.kind).toBe('error');
+    if (action.kind === 'error') {
+      expect(action.reason).toMatch(/not inside a global npm install/);
+      expect(action.reason).toContain(`The unit runs ${NODE}`);
+      expect(action.reason).toContain(`this kici-admin runs ${process.execPath}`);
+    }
+  });
+
   it('errors when self-driving an opaque --binary install', () => {
     const action = planNpmSourceUpgrade({
       component: 'orchestrator',
@@ -915,9 +943,13 @@ describe('installGlobalPackage', () => {
     nodeExecPath: '/n/bin/node',
     npmPath: '/n/bin/npm',
     owningPackage: 'kici-admin',
+    globalPrefix: '/n',
+    npmInvocation: { cmd: '/n/bin/node', preArgs: ['/n/lib/node_modules/npm/bin/npm-cli.js'] },
   };
 
-  it('runs `<npm> install -g <pkg>@<version>` and reports success', () => {
+  // fails-when: the install drops --prefix, or runs npmPath instead of the
+  // pinned node with npm-cli.js.
+  it('runs `<node> <npm-cli.js> install -g <pkg>@<version> --prefix=<unit prefix>`', () => {
     const calls: Array<[string, string[]]> = [];
     const run = (cmd: string, args: string[]) => {
       calls.push([cmd, args]);
@@ -925,18 +957,73 @@ describe('installGlobalPackage', () => {
     };
     const res = installGlobalPackage(target, '0.1.27', run);
     expect(res.ok).toBe(true);
-    expect(calls).toEqual([['/n/bin/npm', ['install', '-g', 'kici-admin@0.1.27']]]);
+    expect(calls).toEqual([
+      [
+        '/n/bin/node',
+        [
+          '/n/lib/node_modules/npm/bin/npm-cli.js',
+          'install',
+          '-g',
+          'kici-admin@0.1.27',
+          '--prefix=/n',
+        ],
+      ],
+    ]);
   });
 
-  it('runs npm under the pinned node by prepending its bin dir to the spawn PATH', () => {
-    let capturedEnv: NodeJS.ProcessEnv | undefined;
-    const run = (_cmd: string, _args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
-      capturedEnv = opts?.env;
+  /** The environment installGlobalPackage hands npm. */
+  const installEnv = (): NodeJS.ProcessEnv | undefined => {
+    let env: NodeJS.ProcessEnv | undefined;
+    installGlobalPackage(target, '0.1.27', (_cmd, _args, opts) => {
+      env = opts?.env;
       return { status: 0, stdout: '', stderr: '' };
-    };
-    installGlobalPackage(target, '0.1.27', run);
+    });
+    return env;
+  };
+
+  it('runs npm under the pinned node by prepending its bin dir to the spawn PATH', () => {
     // The pinned node's bin dir must be first so npm's `env node` resolves the unit's node.
-    expect(capturedEnv?.PATH?.split(path.delimiter)[0]).toBe('/n/bin');
+    expect(installEnv()?.PATH?.split(path.delimiter)[0]).toBe('/n/bin');
+  });
+
+  // breaks-if-wrong: an operator-set registry must still reach npm.
+  it('keeps the caller npm_config_registry in the child environment', () => {
+    vi.stubEnv('npm_config_registry', 'http://registry.example:4873');
+    try {
+      expect(installEnv()?.npm_config_registry).toBe('http://registry.example:4873');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  // fails-when: the npm.cmd fallback passes `--prefix=C:\…`, which
+  // windowsShellCommand refuses, or leaves the caller's npm_config_prefix in place.
+  it('passes the prefix through npm_config_prefix on the npm.cmd fallback', () => {
+    vi.stubEnv('npm_config_prefix', 'C:\\caller');
+    vi.stubEnv('NPM_CONFIG_GLOBAL_PREFIX', 'C:\\caller');
+    try {
+      const cmdTarget = {
+        nodeExecPath: 'C:\\node\\node.exe',
+        npmPath: 'C:\\node\\npm.cmd',
+        owningPackage: 'kici-admin',
+        globalPrefix: 'C:\\p',
+        npmInvocation: { cmd: 'C:\\node\\npm.cmd', preArgs: [] },
+      };
+      const calls: Array<[string, string[], NodeJS.ProcessEnv | undefined]> = [];
+      const run = (cmd: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
+        calls.push([cmd, args, opts?.env]);
+        return { status: 0, stdout: '', stderr: '' };
+      };
+      installGlobalPackage(cmdTarget, '0.1.27', run);
+      const [cmd, args, env] = calls[0]!;
+      expect(cmd).toBe('C:\\node\\npm.cmd');
+      expect(args).toEqual(['install', '-g', 'kici-admin@0.1.27']);
+      expect(() => windowsShellCommand(cmd, args)).not.toThrow();
+      expect(env?.npm_config_prefix).toBe('C:\\p');
+      expect(env?.NPM_CONFIG_GLOBAL_PREFIX).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('reports failure with captured stderr on non-zero exit', () => {
@@ -945,6 +1032,105 @@ describe('installGlobalPackage', () => {
     expect(res.ok).toBe(false);
     expect(res.stderr).toMatch(/EACCES/);
   });
+});
+
+describe('installGlobalPackage — a real npm under a leaked caller prefix', () => {
+  // npm ships beside the node running this test in every standard layout
+  // (mise, nvm, the official tarball); without it the hermetic install cannot run.
+  const hostNpm = path.join(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm');
+  const hasHostNpm =
+    process.platform !== 'win32' && fs.existsSync(path.join(hostNpm, 'bin', 'npm-cli.js'));
+  if (!hasHostNpm) {
+    console.warn(`skipping the real-npm install test: no npm package at ${hostNpm}`);
+  }
+
+  let tmp: string;
+  beforeEach(() => {
+    tmp = makeTempDir('kici-npm-prefix-');
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it.skipIf(!hasHostNpm)(
+    "installs into the unit's prefix, never the caller's, and skips the npm wrapper",
+    () => {
+      // R: the unit's runtime. Its bin/npm is a wrapper that fails, as mise's
+      // reshim does without mise on PATH.
+      const R = path.join(tmp, 'R');
+      fs.mkdirSync(path.join(R, 'bin'), { recursive: true });
+      fs.mkdirSync(path.join(R, 'lib', 'node_modules'), { recursive: true });
+      fs.symlinkSync(process.execPath, path.join(R, 'bin', 'node'));
+      fs.symlinkSync(hostNpm, path.join(R, 'lib', 'node_modules', 'npm'));
+      fs.writeFileSync(path.join(R, 'bin', 'npm'), '#!/bin/sh\nexit 97\n', { mode: 0o755 });
+      // D: the decoy prefix a caller's `npx` environment names.
+      const D = path.join(tmp, 'D');
+      fs.mkdirSync(D);
+
+      const fixture = path.join(tmp, 'fixture');
+      fs.mkdirSync(fixture);
+      fs.writeFileSync(
+        path.join(fixture, 'package.json'),
+        JSON.stringify({ name: 'kici-prefix-probe', version: '1.0.0' }),
+      );
+      execFileSync(
+        process.execPath,
+        [path.join(hostNpm, 'bin', 'npm-cli.js'), 'pack', '--pack-destination', tmp],
+        {
+          cwd: fixture,
+          stdio: 'pipe',
+          env: { ...process.env, npm_config_cache: path.join(tmp, 'cache') },
+        },
+      );
+      const tarball = path.join(tmp, 'kici-prefix-probe-1.0.0.tgz');
+
+      const resolution = resolveNpmInstallTarget(
+        {
+          execPath: path.join(R, 'bin', 'node'),
+          args: [
+            path.join(
+              R,
+              'lib',
+              'node_modules',
+              'kici-admin',
+              'node_modules',
+              '@kici-dev',
+              'agent',
+              'dist',
+              'server.js',
+            ),
+          ],
+        },
+        'agent',
+        { windows: false },
+      );
+      if (!resolution.ok) throw new Error(`unresolved: ${resolution.reason}`);
+      const target = { ...resolution.target, owningPackage: 'kici-prefix-probe' };
+
+      vi.stubEnv('npm_config_prefix', D);
+      vi.stubEnv('npm_config_global_prefix', D);
+      vi.stubEnv('npm_config_cache', path.join(tmp, 'cache'));
+      vi.stubEnv('npm_config_offline', 'true');
+      vi.stubEnv('npm_config_audit', 'false');
+      vi.stubEnv('npm_config_fund', 'false');
+      vi.stubEnv('npm_config_update_notifier', 'false');
+      const res = installGlobalPackage(target, `file:${tarball}`);
+
+      expect(res.stderr).not.toMatch(/ERR/);
+      expect(res.ok).toBe(true);
+      // fails-when: --prefix is dropped — npm honours the leaked
+      // npm_config_prefix (the npx case) and installs into D.
+      expect(
+        fs.existsSync(path.join(R, 'lib', 'node_modules', 'kici-prefix-probe', 'package.json')),
+      ).toBe(true);
+      expect(fs.existsSync(path.join(D, 'lib', 'node_modules', 'kici-prefix-probe'))).toBe(false);
+      // fails-when: the upgrade runs the version-manager wrapper R/bin/npm,
+      // which exits 97 — the install above would have failed.
+      expect(target.npmInvocation.cmd).toBe(path.join(R, 'bin', 'node'));
+    },
+    120_000,
+  );
 });
 
 describe('restartOntoInstalledPackage — the end of every npm-source upgrade', () => {
@@ -1122,7 +1308,13 @@ describe('npm-source paths end in restartOntoInstalledPackage', () => {
       instanceDir: tmp,
     };
     const action = {
-      target: { nodeExecPath: spec.execPath, npmPath: 'npm', owningPackage: 'kici-admin' },
+      target: {
+        nodeExecPath: spec.execPath,
+        npmPath: 'npm',
+        owningPackage: 'kici-admin',
+        globalPrefix: '/p',
+        npmInvocation: { cmd: 'npm', preArgs: [] },
+      },
       version: '0.2.0',
     };
     return { manager, spec, resolvedInstance, config, action };
@@ -1156,12 +1348,12 @@ describe('npm-source paths end in restartOntoInstalledPackage', () => {
     });
     expect(run).toHaveBeenCalledWith(
       'npm',
-      ['view', '@kici-dev/shared@0.2.0', 'exports', '--json'],
+      ['view', '@kici-dev/shared@0.2.0', 'exports', '--json', '--prefix=/p'],
       expect.anything(),
     );
     expect(run).toHaveBeenCalledWith(
       'npm',
-      ['install', '-g', 'kici-admin@0.2.0'],
+      ['install', '-g', 'kici-admin@0.2.0', '--prefix=/p'],
       expect.anything(),
     );
     expect(manager.install).toHaveBeenCalledWith(
@@ -1253,7 +1445,7 @@ describe('npm-source paths end in restartOntoInstalledPackage', () => {
     expect(run).toHaveBeenCalledTimes(1);
     expect(run).toHaveBeenCalledWith(
       'npm',
-      ['install', '-g', 'kici-admin@0.2.0'],
+      ['install', '-g', 'kici-admin@0.2.0', '--prefix=/p'],
       expect.anything(),
     );
     expect(manager.install).not.toHaveBeenCalled();
@@ -1266,7 +1458,32 @@ describe('npmReleaseReadsEnvFile — the registry check before a Windows npm-sou
     nodeExecPath: '/n/bin/node',
     npmPath: '/n/bin/npm',
     owningPackage: 'kici-admin',
+    globalPrefix: '/n',
+    npmInvocation: { cmd: '/n/bin/node', preArgs: ['/n/lib/node_modules/npm/bin/npm-cli.js'] },
   };
+
+  // fails-when: the registry check runs without the unit's prefix, so a
+  // caller's npmrc under another prefix answers it.
+  it('asks through the pinned node and npm-cli.js, with the unit prefix', () => {
+    const calls: Array<[string, string[]]> = [];
+    npmReleaseReadsEnvFile(target, '0.12.0', (cmd, args) => {
+      calls.push([cmd, args]);
+      return { status: 0, stdout: '', stderr: '' };
+    });
+    expect(calls).toEqual([
+      [
+        '/n/bin/node',
+        [
+          '/n/lib/node_modules/npm/bin/npm-cli.js',
+          'view',
+          '@kici-dev/shared@0.12.0',
+          'exports',
+          '--json',
+          '--prefix=/n',
+        ],
+      ],
+    ]);
+  });
   const answer =
     (stdout: string, status = 0) =>
     () => ({ status, stdout, stderr: '' });
@@ -1383,7 +1600,13 @@ describe('the bare-metal binaryPath check before an orchestrator upgrade', () =>
       instanceDir: tmp,
     };
     const action = {
-      target: { nodeExecPath: spec.execPath, npmPath: 'npm', owningPackage: 'kici-admin' },
+      target: {
+        nodeExecPath: spec.execPath,
+        npmPath: 'npm',
+        owningPackage: 'kici-admin',
+        globalPrefix: '/p',
+        npmInvocation: { cmd: 'npm', preArgs: [] },
+      },
       version: '0.17.0',
     };
     const run = vi.fn((_cmd: string, _args: string[]) => ({ status: 0, stdout: '', stderr: '' }));
@@ -1453,7 +1676,7 @@ describe('the bare-metal binaryPath check before an orchestrator upgrade', () =>
     });
     expect(run).toHaveBeenCalledWith(
       'npm',
-      ['install', '-g', 'kici-admin@0.17.0'],
+      ['install', '-g', 'kici-admin@0.17.0', '--prefix=/p'],
       expect.anything(),
     );
     expect(manager.start).toHaveBeenCalledTimes(1);

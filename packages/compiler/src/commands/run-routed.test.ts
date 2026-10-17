@@ -121,6 +121,12 @@ describe('runRoutedCommand', () => {
     );
     const wd = await (resolveWorkdir as ReturnType<typeof vi.fn>).mock.results[0].value;
     expect(wd.cleanup).toHaveBeenCalled();
+    const { compileCommand } = await import('./compile.js');
+    // fails-when: an isolated run (a temp clone with no root node_modules, as on an
+    // agent) compiles without the missing-manifest preflight
+    expect(compileCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ warnMissingKiciManifest: true }),
+    );
   });
 
   it('prints each workdir warning on stderr, also under --quiet', async () => {
@@ -160,6 +166,11 @@ describe('runRoutedCommand', () => {
       quiet: true,
     });
     expect(resolveWorkdir).toHaveBeenCalledWith({ inPlace: true, repoRoot: '/repo' });
+    const { compileCommand } = await import('./compile.js');
+    // breaks-if-wrong: this repository's own --in-place runs must stay quiet
+    expect(compileCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ warnMissingKiciManifest: false }),
+    );
   });
 
   it('does NOT patch the lock for a non-trusted run (default-off)', async () => {

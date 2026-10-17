@@ -171,6 +171,9 @@ importers:
       jose:
         specifier: ^6.2.12
         version: 6.2.12
+      picomatch:
+        specifier: ^4.0.7
+        version: 4.0.7
       tar:
         specifier: ^7.5.22
         version: 7.5.22

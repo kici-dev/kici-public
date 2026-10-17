@@ -12,6 +12,7 @@ import {
 } from './job-runner.js';
 import type { JobExecutionResult } from './sandbox/types.js';
 import { DepRestoreError, DepTarballHashMismatchError } from './dep-restore-errors.js';
+import { FAILURE_TAIL_MAX_LINES } from './failure-tail.js';
 import { DepRestoreOutcome, type DepRestoreReport } from './dep-restore-report.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -462,6 +463,26 @@ describe('JobRunner', () => {
       stepCount: 0,
       error: 'init[1] mise provision failed: mise: command failed (exit 1)',
     });
+  });
+
+  it('a sandbox failure relayed from the runner is bounded before it is reported', async () => {
+    resetSandboxMocks({
+      status: 'failed',
+      stepResults: [],
+      durationMs: 10,
+      error: Array.from({ length: 300 }, (_, i) => `[workflow-runner] Fatal: frame ${i}`).join(
+        '\n',
+      ),
+    });
+    const deps = makeDeps();
+
+    await new JobRunner(deps).execute(makeDispatch());
+
+    const failed = deps.messages.find(
+      (m) => m.type === 'job.status' && (m as { state: string }).state === 'failed',
+    ) as { data?: Record<string, unknown> };
+    // fails-when: the relayed runner error (a fatal report, say) leaves the agent unbounded
+    expect((failed.data?.error as string).split('\n')).toHaveLength(FAILURE_TAIL_MAX_LINES);
   });
 
   it('failed steps: lists each failed step error as stepErrors in the failure line', async () => {
@@ -952,6 +973,23 @@ describe('JobRunner', () => {
       );
       expect(lines.join('\n')).not.toMatch(/SECRET/);
       expect(workflowLog?.destroy).toHaveBeenCalled();
+    });
+
+    it('a failed host install with long output reports only its last lines, redacted', async () => {
+      const output = Array.from(
+        { length: 400 },
+        (_, i) => `npm error line ${i} for tok-SECRET-1`,
+      ).join('\n');
+      vi.mocked(runHostIsolatedInstall).mockRejectedValue(new Error(output));
+      const deps = injectingDeps();
+
+      await new JobRunner(deps).execute(containerJob({ container: { dockerfile: 'Dockerfile' } }));
+
+      const error = failedStatus(deps)?.data?.error as string;
+      // fails-when: the whole 400-line installer output becomes job.status.error
+      expect(error.split('\n')).toHaveLength(FAILURE_TAIL_MAX_LINES);
+      expect(error.endsWith('npm error line 399 for ***REDACTED***')).toBe(true);
+      expect(error).not.toMatch(/SECRET/);
     });
 
     it('a job cancelled during the host install is cancelled without creating its container', async () => {

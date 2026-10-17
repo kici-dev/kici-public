@@ -165,12 +165,12 @@ The sandbox collects job-level hooks (`beforeStep`, `afterStep`, `onSuccess`, `o
 
 When a job declares `init` (see [Per-job init](../../user/sdk/core.md#per-job-init)), an init phase runs **after the hooks are collected and before the step loop begins** — provisioning a repo-declared toolchain so it is on the environment every step sees. Each init spec runs through the **same sandbox shell** that steps use (cwd at the clone root, the job's environment, masked log streaming), and each surfaces as an `init:<n>` pseudo-step in the run timeline alongside the step list (mirroring how `hook:*` rows appear).
 
-Typed presets (`'mise'` / `{ mise }`) and `'auto'` detection are expanded into concrete init specs **at the agent init phase**, where the clone root is on disk to hash for the cache key and scan for marker files. A preset registry maps each preset name to an OS-branched expander, and an ordered auto-detect table maps marker files to presets; both produce the same generic init spec the phase below loops over, so the run/cache/env/timeout machinery is unchanged.
+Typed presets (`'mise'` / `{ mise }` / `{ apt }`) and `'auto'` detection are expanded into concrete init specs **at the agent init phase**, where the clone root is on disk to hash for the cache key and scan for marker files. A preset registry maps each preset name to an OS-branched expander, and an ordered auto-detect table maps marker files to presets. Both produce the same generic init spec that the phase below loops over, so the run/cache/env/timeout machinery is unchanged.
 
 For each init spec, in declaration order:
 
 1. **Cache restore** — if the spec sets `cache`, the agent restores the cached paths before the command, so a warm key skips the download.
-2. **Run the command** — the init command runs in the sandbox shell against a per-init wall-clock timeout. Before it runs, the agent allocates fresh `$KICI_ENV` / `$KICI_PATH` files and points the shell's environment at them.
+2. **Run the command** — the init command runs in the sandbox shell against a per-init wall-clock timeout. Before it runs, the agent allocates fresh `$KICI_ENV` / `$KICI_PATH` files and points the shell's environment at them. The command's environment is the job's environment with the spec's `env` laid over it, for that command only. Keys that start with `KICI_` and operator secret keys keep the job's value, and the init step's log names each refused key.
 3. **Apply the env / PATH delta** — after the command succeeds, the agent reads the `KEY=value` lines from `$KICI_ENV` and the directory lines from `$KICI_PATH`, applies the delta (PATH entries prepended), and the result becomes visible to every subsequent init and step.
 4. **Cache save** — if the spec set `cache` and the key missed on restore, the agent saves the cached paths after the command.
 

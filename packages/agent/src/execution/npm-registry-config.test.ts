@@ -35,6 +35,33 @@ async function fileExists(path: string): Promise<boolean> {
 }
 
 describe('applyNpmRegistryConfig', () => {
+  it('writes to npmrcDir (a workspace root) and restores the committed file there', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kici-npmrc-root-'));
+    try {
+      await writeFile(join(root, '.npmrc'), '@acme:registry=https://acme.example/\n');
+      const r = await applyNpmRegistryConfig({
+        kiciDir,
+        npmrcDir: root,
+        npmRegistries: [reg()],
+        installEnvSecrets: undefined,
+        jobIdShort: 'abcd1234',
+      });
+      // fails-when: the overlay is written to .kici/.npmrc, which npm and pnpm ignore
+      // for a workspace member, so the private registry is never used
+      const merged = await readFile(join(root, '.npmrc'), 'utf8');
+      expect(merged.startsWith('@acme:registry=https://acme.example/\n')).toBe(true);
+      expect(merged).toContain('//npm.example.com/:_authToken=${KICI_NPM_TOKEN_abcd1234_0}');
+      expect(await fileExists(join(kiciDir, '.npmrc'))).toBe(false);
+      await r.cleanup();
+      // breaks-if-wrong: the committed root .npmrc is restored byte-for-byte
+      expect(await readFile(join(root, '.npmrc'), 'utf8')).toBe(
+        '@acme:registry=https://acme.example/\n',
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('is a no-op when nothing is supplied', async () => {
     const r = await applyNpmRegistryConfig({
       kiciDir,

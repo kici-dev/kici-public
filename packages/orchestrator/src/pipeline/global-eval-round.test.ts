@@ -11,7 +11,6 @@ import {
   isRoundGenerator,
   partitionCandidates,
   runGlobalEvalRounds,
-  truncateReasonText,
   MAX_ROUND_REASON_CHARS,
   MIN_GLOBAL_EVAL_AGENT_VERSION,
   type GlobalEvalCandidate,
@@ -1243,23 +1242,12 @@ describe('candidate-budget clamp', () => {
   });
 });
 
-describe('truncateReasonText', () => {
+describe('decided-nothing round reasons', () => {
   /**
    * Agent-authored, so unbounded, and copied into a check's `output.summary`,
    * which GitHub caps at 65535 characters with a 422 the best-effort post
    * swallows — the check would vanish exactly when needed.
    */
-  it('caps an oversize string and says it was cut', () => {
-    const out = truncateReasonText('x'.repeat(500), 100);
-    expect(out).toHaveLength(100);
-    expect(out.endsWith('… (truncated)')).toBe(true);
-  });
-
-  it('leaves a string within the cap byte-identical', () => {
-    const text = 'the filter threw: boom';
-    expect(truncateReasonText(text, MAX_ROUND_REASON_CHARS)).toBe(text);
-  });
-
   it('bounds the reasons a decided-nothing round reports', async () => {
     // The joined reasons are ~3x the cap before truncation.
     const huge = (n: number) => `${'r'.repeat(MAX_ROUND_REASON_CHARS)}-${n}`;
@@ -1282,35 +1270,6 @@ describe('truncateReasonText', () => {
     // Positive control: the reason reached the error.
     expect(failures[0].error).toContain('rrr');
     expect(failures[0].error.length).toBeLessThanOrEqual(MAX_ROUND_REASON_CHARS + 200);
-  });
-});
-
-describe('truncateReasonText edges', () => {
-  it('never returns more than max, even below the marker length', () => {
-    // Below the marker's length, a naive form returns a string LONGER than max.
-    for (const max of [1, 5, 13, 14]) {
-      expect(truncateReasonText('x'.repeat(200), max).length).toBeLessThanOrEqual(max);
-    }
-  });
-
-  it('does not split a surrogate pair', () => {
-    // '𝍢' is a surrogate pair, so an odd cut leaves a lone high surrogate an API rejects.
-    const text = '𝍢'.repeat(50);
-    let oddCuts = 0;
-    for (let max = 14; max < 40; max++) {
-      const out = truncateReasonText(text, max);
-      const body = out.slice(0, out.length - '… (truncated)'.length);
-      const last = body.charCodeAt(body.length - 1);
-      expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
-      expect(out.length).toBeLessThanOrEqual(max);
-      if ((max - 13) % 2 === 1) oddCuts++;
-    }
-    // Positive control: the loop exercised mid-pair cuts.
-    expect(oddCuts).toBeGreaterThan(0);
-  });
-
-  it('returns empty for a non-positive max', () => {
-    expect(truncateReasonText('anything', 0)).toBe('');
   });
 });
 

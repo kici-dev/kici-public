@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import { handleRunState } from './dashboard-run-state-handler.js';
-import type { DashboardRunStateRequest } from '@kici-dev/engine';
+import { STATUS_FREE_TEXT_MAX, type DashboardRunStateRequest } from '@kici-dev/engine';
 
 /**
  * Minimal fake of the two Kysely read chains `handleRunState` drives:
@@ -176,5 +176,15 @@ describe('handleRunState workflow repo attribution', () => {
     });
     const resp = await handleRunState({ db }, req('run-global'));
     expect(resp.run?.workflowRepoIdentifier).toBeUndefined();
+  });
+
+  it('clamps a long failure reason to the wire bound', async () => {
+    const { db } = makeFakeDb({
+      runs: { 'run-global': { ...runRow(null), failure_reason: 'f'.repeat(9_000) } },
+      jobs: { 'run-global': [] },
+    });
+    const resp = await handleRunState({ db }, req('run-global'));
+    // fails-when: the reconciliation answer carries a failure reason the Platform must shorten
+    expect(resp.run?.failureReason).toHaveLength(STATUS_FREE_TEXT_MAX);
   });
 });

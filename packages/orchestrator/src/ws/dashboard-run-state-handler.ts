@@ -15,6 +15,7 @@
 import type { Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import {
+  clampStatusFreeText,
   ExecutionRunStatus,
   RunFailureClass,
   type DashboardRunStateRequest,
@@ -90,7 +91,7 @@ export async function handleRunState(
     originalRunId: row.original_run_id,
     triggeredBy: row.triggered_by,
     triggeredByAgentLabel: row.triggered_by_agent_label,
-    ...(row.failure_reason && { failureReason: row.failure_reason }),
+    ...(row.failure_reason && { failureReason: clampStatusFreeText(row.failure_reason) }),
     ...(row.failure_class && { failureClass: row.failure_class as RunFailureClass }),
     jobCount: jobs.length,
     startedAt: row.started_at.getTime(),

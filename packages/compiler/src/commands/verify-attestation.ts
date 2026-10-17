@@ -10,13 +10,22 @@
  * provenance issuer. With neither, the command fails naming both remedies. The
  * token `iss` is pinned to the trust root out-of-band, so a bundle can never
  * name its own trusted issuer.
+ *
+ * A trust root fetched over plain HTTP from a host that is not loopback is
+ * refused (exit 1, the reason on stderr, nothing on stdout), because a network
+ * attacker can replace its keys; `--allow-insecure-trust-root` accepts it with
+ * a stderr warning. Both go to stderr directly, so `--json` stdout stays JSON.
  */
 import { readFile } from 'node:fs/promises';
 import { logger, sha256File, toErrorMessage } from '@kici-dev/core';
 import pc from 'picocolors';
 import { KICI_PROVENANCE_AUDIENCE } from '@kici-dev/engine/provenance/bundle';
 import { verifyKiciBundle } from '@kici-dev/engine/provenance/verify';
-import { resolveTrustRoot, type TrustRoot } from '../provenance-trust-root.js';
+import {
+  InsecureTrustRootError,
+  resolveTrustRoot,
+  type ResolvedTrustRoot,
+} from '../provenance-trust-root.js';
 import { getConfigPath, loadGlobalConfig } from '../remote/config.js';
 
 export interface VerifyAttestationOptions {
@@ -28,6 +37,8 @@ export interface VerifyAttestationOptions {
   audience?: string;
   /** Emit the structured `VerifyResult`. */
   json?: boolean;
+  /** Accept a plain-HTTP trust root on a host that is not loopback, with a warning. */
+  allowInsecureTrustRoot?: boolean;
 }
 
 export async function verifyAttestationCommand(
@@ -63,10 +74,16 @@ export async function verifyAttestationCommand(
 
     const bundle = JSON.parse(await readBundle(options.bundle)) as unknown;
 
-    let resolved: TrustRoot;
+    let resolved: ResolvedTrustRoot;
     try {
-      resolved = await resolveTrustRoot(trustRoot);
+      resolved = await resolveTrustRoot(trustRoot, {
+        allowInsecure: options.allowInsecureTrustRoot ?? false,
+      });
     } catch (error) {
+      if (error instanceof InsecureTrustRootError) {
+        process.stderr.write(pc.red(`Error: ${error.message}`) + '\n');
+        return false;
+      }
       const msg = toErrorMessage(error);
       if (usingDefault && /\b503\b/.test(msg)) {
         const where = `your configured orchestrator (${trustRoot})`;
@@ -81,7 +98,10 @@ export async function verifyAttestationCommand(
       }
       throw error;
     }
-    const { issuer, jwks } = resolved;
+    const { issuer, jwks, warnings } = resolved;
+    for (const warning of warnings) {
+      process.stderr.write(pc.yellow(`Warning: ${warning}`) + '\n');
+    }
     const expectedDigest = artifact
       ? { alg: 'sha256', hex: await sha256File(artifact) }
       : undefined;

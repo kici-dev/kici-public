@@ -18,19 +18,31 @@ import {
 import {
   workflowPaths,
   generatePackageJson,
-  sdkDependencyRange,
+  generateSampleFixture,
+  rewriteTemplateDefaultBranch,
+  resolveVersionPin,
   tsconfigTemplate,
   agentsMdTemplate,
 } from '../templates/index.js';
 import { getTypeScriptPaths } from '../execution/sdk-alias.js';
+import { isWorkspaceMember } from '../lockfile/workspace-siblings.js';
 import { detectHookTools, installHook, findGitDir } from '../hooks/index.js';
 import type { HookToolName } from '../hooks/index.js';
 import { rewriteRunsOnForHost, shouldOfferFirstRun } from './init-host-os.js';
 import {
+  MemberRegistration,
+  addMissingVersion,
+  memberEntry,
+  memberSiblingSpecifier,
+  registerKiciWorkspaceMember,
+} from './init-workspace.js';
+import {
   PackageManager,
   WorkspaceKind,
+  YarnFlavor,
   detectPackageManager,
   detectWorkspaceRoot,
+  detectYarnFlavor,
   installBuildPolicyArgs,
   installCommand,
   parsePackageManager,
@@ -67,6 +79,7 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
 
     const exists = await checkExists(kiciDir);
     if (exists && !options.force) {
+      if (options.workspace) return await migrateToWorkspaceMember(kiciDir, options);
       logger.error(pc.red('\nError: .kici/ directory already exists.'));
       logger.error(pc.gray('Use --force to overwrite.\n'));
       return false;
@@ -91,13 +104,7 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
       logger.info(pc.gray(`Writing .kici/workflows/${workflow}.ts`));
       const sourcePath = workflowPaths[workflow as keyof typeof workflowPaths];
       let content = await readFile(sourcePath, 'utf-8');
-      if (defaultBranch !== 'main') {
-        content = content.replaceAll("targeting('main')", `targeting('${defaultBranch}')`);
-        content = content.replaceAll(
-          'targeting the main branch',
-          `targeting the ${defaultBranch} branch`,
-        );
-      }
+      content = rewriteTemplateDefaultBranch(content, defaultBranch);
       // Rewrite the template runsOn to the host's own kici:os:* so the first
       // `kici run push --local` dispatches on this machine (no-op on Linux).
       content = rewriteRunsOnForHost(content, os.platform(), os.arch());
@@ -133,11 +140,9 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
 
     if (mode.kind === 'integrate') {
       logger.info(
-        pc.cyan(
-          `Integrating .kici/ into the ${mode.workspaceKind} workspace at ${mode.workspaceRoot}`,
-        ),
+        pc.cyan(`Adding .kici/ to the ${mode.workspaceKind} workspace at ${mode.workspaceRoot}`),
       );
-      await wireIntegrateDeps(kiciDir, mode.workspaceRoot, devMode, options);
+      await wireMemberDeps(kiciDir, mode, devMode, options);
     } else {
       await wireStandaloneDeps(kiciDir, devMode, options);
     }
@@ -165,27 +170,7 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
       }
     }
 
-    logger.info(pc.green('\n✓ kici initialized successfully!\n'));
-    logger.info(pc.gray('Next steps:'));
-    logger.info(pc.gray('  1. Edit workflows in .kici/workflows/'));
-    if (mode.kind === 'integrate') {
-      logger.info(
-        pc.gray(
-          '  2. Import your workspace packages from .kici/workflows/ (e.g. @your-scope/utils)',
-        ),
-      );
-      logger.info(pc.gray('  3. Compile: kici compile'));
-      logger.info(pc.gray('  4. Commit .kici/ to your repository\n'));
-    } else if (options.mjs || options.skipInstall) {
-      logger.info(
-        pc.gray('  2. Run your package manager install in .kici/ to generate a lockfile'),
-      );
-      logger.info(pc.gray('  3. Preview matching: kici preview push'));
-      logger.info(pc.gray('  4. Commit .kici/ to your repository\n'));
-    } else {
-      logger.info(pc.gray('  2. Preview matching: kici preview push'));
-      logger.info(pc.gray('  3. Commit .kici/ to your repository\n'));
-    }
+    await printNextSteps(mode, options);
 
     // Default No: spinning up the warm plane is opt-in. Skipped in CI / non-TTY
     // / --mjs / --skip-install, where it cannot compile the workflow.
@@ -217,6 +202,34 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
     }
 
     return false;
+  }
+}
+
+/** Print the success line and the next steps for the layout just scaffolded. */
+async function printNextSteps(mode: ScaffoldMode, options: InitOptions): Promise<void> {
+  logger.info(pc.green('\n✓ kici initialized successfully!\n'));
+  logger.info(pc.gray('Next steps:'));
+  logger.info(pc.gray('  1. Edit workflows in .kici/workflows/'));
+  if (mode.kind === 'integrate') {
+    const flavor =
+      mode.workspaceKind === WorkspaceKind.Yarn
+        ? await detectYarnFlavor(mode.workspaceRoot)
+        : YarnFlavor.Classic;
+    const spec = memberSiblingSpecifier(mode.workspaceKind, flavor);
+    logger.info(
+      pc.gray(
+        `  2. To import a workspace package in a workflow, declare it in .kici/package.json (e.g. "@your-scope/utils": "${spec}")`,
+      ),
+    );
+    logger.info(pc.gray('  3. Compile: kici compile'));
+    logger.info(pc.gray('  4. Commit .kici/ and the workspace file changes to your repository\n'));
+  } else if (options.mjs || options.skipInstall) {
+    logger.info(pc.gray('  2. Run your package manager install in .kici/ to generate a lockfile'));
+    logger.info(pc.gray('  3. Preview matching: kici preview push'));
+    logger.info(pc.gray('  4. Commit .kici/ to your repository\n'));
+  } else {
+    logger.info(pc.gray('  2. Preview matching: kici preview push'));
+    logger.info(pc.gray('  3. Commit .kici/ to your repository\n'));
   }
 }
 
@@ -260,8 +273,11 @@ async function selectWorkflows(): Promise<string[]> {
 
 /** origin/HEAD (set after clone), then the current branch, then 'main'. */
 async function detectDefaultBranch(): Promise<string> {
+  // zx keeps the working directory it had at import; read the repository the
+  // scaffold is written into.
+  const git = $({ cwd: process.cwd(), quiet: true });
   try {
-    const result = await $`git symbolic-ref refs/remotes/origin/HEAD`.quiet();
+    const result = await git`git symbolic-ref refs/remotes/origin/HEAD`;
     const ref = result.stdout.trim();
     const branch = ref.replace('refs/remotes/origin/', '');
     if (branch) return branch;
@@ -270,7 +286,7 @@ async function detectDefaultBranch(): Promise<string> {
   }
 
   try {
-    const result = await $`git rev-parse --abbrev-ref HEAD`.quiet();
+    const result = await git`git rev-parse --abbrev-ref HEAD`;
     const branch = result.stdout.trim();
     if (branch && branch !== 'HEAD') return branch;
   } catch {
@@ -358,7 +374,8 @@ async function wireStandaloneDeps(
   options: InitOptions,
 ): Promise<void> {
   logger.info(pc.gray('Writing .kici/package.json'));
-  await writeFile(path.join(kiciDir, 'package.json'), generatePackageJson(devMode), 'utf-8');
+  const versionPin = await resolveVersionPin(devMode, process.cwd());
+  await writeFile(path.join(kiciDir, 'package.json'), generatePackageJson(versionPin), 'utf-8');
 
   const devNpmrc = devMode ? devRegistryNpmrc() : null;
   if (devMode && !devNpmrc) {
@@ -384,69 +401,161 @@ async function wireStandaloneDeps(
 }
 
 /**
- * Writes NO .kici/package.json: its absence is the externally-managed signal
- * the compiler honors. The SDK goes into the workspace-root manifest and the
- * install runs at the root.
+ * Member dep wiring: `.kici/` keeps its own package.json and joins the
+ * workspace package list, so every install of the workspace (the developer's
+ * and the agent's) installs `.kici/` too. Writes a root .npmrc in dev mode and
+ * .kici/tsconfig in TypeScript mode, then installs at the workspace root. Each
+ * step leaves an existing file alone and the install runs only when a step
+ * changed something, so re-running on a complete layout changes nothing.
+ *
+ * @returns true when any file was written.
  */
-async function wireIntegrateDeps(
+async function wireMemberDeps(
   kiciDir: string,
-  workspaceRoot: string,
+  mode: IntegrateMode,
   devMode: boolean,
   options: InitOptions,
-): Promise<void> {
-  await addSdkToRootManifest(workspaceRoot, devMode);
+): Promise<boolean> {
+  let changed = false;
+  const manifestPath = path.join(kiciDir, 'package.json');
+  if (!(await checkExists(manifestPath))) {
+    logger.info(pc.gray('Writing .kici/package.json (workspace member)'));
+    const versionPin = await resolveVersionPin(devMode, mode.workspaceRoot);
+    await writeFile(manifestPath, generatePackageJson(versionPin), 'utf-8');
+    changed = true;
+  } else if (mode.workspaceKind === WorkspaceKind.Yarn) {
+    const raw = await readFile(manifestPath, 'utf-8');
+    const withVersion = addMissingVersion(raw);
+    if (withVersion !== raw) {
+      logger.info(
+        pc.gray('Adding "version" to .kici/package.json (yarn ignores a member without one)'),
+      );
+      await writeFile(manifestPath, withVersion, 'utf-8');
+      changed = true;
+    }
+  }
+
+  const registration = await registerKiciWorkspaceMember(
+    mode.workspaceRoot,
+    mode.workspaceKind,
+    kiciDir,
+  );
+  if (registration === MemberRegistration.Added) {
+    logger.info(
+      pc.gray(
+        `Added ${memberEntry(mode.workspaceRoot, kiciDir)} to the ${mode.workspaceKind} workspace packages`,
+      ),
+    );
+    changed = true;
+  }
 
   const devNpmrc = devMode ? devRegistryNpmrc() : null;
   if (devMode && !devNpmrc) {
     logger.info(pc.yellow('Dev mode: KICI_DEV_REGISTRY is unset, writing no .npmrc.'));
   }
-  if (devNpmrc) {
-    const rootNpmrc = path.join(workspaceRoot, '.npmrc');
-    if (!(await checkExists(rootNpmrc))) {
-      logger.info(pc.gray('Writing workspace-root .npmrc (dev registry scope)'));
-      await writeFile(rootNpmrc, devNpmrc, 'utf-8');
-    }
+  const rootNpmrc = path.join(mode.workspaceRoot, '.npmrc');
+  if (devNpmrc && !(await checkExists(rootNpmrc))) {
+    logger.info(pc.gray('Writing workspace-root .npmrc (dev registry scope)'));
+    await writeFile(rootNpmrc, devNpmrc, 'utf-8');
+    changed = true;
   }
 
-  if (!options.mjs) {
+  if (!options.mjs && !(await checkExists(path.join(kiciDir, 'tsconfig.json')))) {
     await writeTsConfigAndTypesDir(kiciDir);
+    changed = true;
   }
 
-  if (!options.skipInstall) {
-    const pm = await resolvePackageManager(options.packageManager, workspaceRoot);
-    await runInstall(pm, workspaceRoot);
+  await noteRootSdkDeclaration(mode.workspaceRoot);
+
+  if (changed && !options.skipInstall) {
+    const pm = await resolvePackageManager(options.packageManager, mode.workspaceRoot);
+    await runInstall(pm, mode.workspaceRoot);
   }
+  return changed;
 }
 
-/** Never clobbers an existing @kici-dev/sdk declaration (dev or prod dep). */
-async function addSdkToRootManifest(workspaceRoot: string, devMode: boolean): Promise<void> {
-  const manifestPath = path.join(workspaceRoot, 'package.json');
-  let raw: string;
-  try {
-    raw = await readFile(manifestPath, 'utf-8');
-  } catch {
-    throw new Error(`Cannot integrate: no package.json at workspace root ${workspaceRoot}`);
-  }
-  const pkg = JSON.parse(raw) as {
-    dependencies?: Record<string, string>;
-    devDependencies?: Record<string, string>;
-  };
-  const existing = pkg.devDependencies?.['@kici-dev/sdk'] ?? pkg.dependencies?.['@kici-dev/sdk'];
-  if (existing) {
-    logger.info(
-      pc.gray(`@kici-dev/sdk already declared in ${manifestPath} (${existing}) — leaving as-is`),
+/**
+ * `kici init --workspace` on an existing `.kici/`: complete the workspace-member
+ * layout in place. It writes `.kici/package.json` and `.kici/tsconfig.json`
+ * when missing and adds `.kici` to the workspace packages when not listed. It
+ * never touches workflows, tests or the dependencies in the root manifest, and
+ * installs only when it changed something. A complete layout is left as it is.
+ * A `.kici/` with its own package.json that the workspace does not list is a
+ * standalone scaffold with its own lockfile. It is refused, because a member
+ * would leave that lockfile stale.
+ */
+async function migrateToWorkspaceMember(kiciDir: string, options: InitOptions): Promise<boolean> {
+  if (options.standalone) throw new Error(WORKSPACE_STANDALONE_CONFLICT);
+  const mode = await resolveWorkspaceMode();
+  const listed = isWorkspaceMember(mode.workspaceRoot, memberEntry(mode.workspaceRoot, kiciDir));
+  if (!listed && (await checkExists(path.join(kiciDir, 'package.json')))) {
+    logger.error(
+      pc.red(
+        `\nError: .kici/ has its own package.json but is not a member of the ${mode.workspaceKind} workspace at ${mode.workspaceRoot}.`,
+      ),
     );
+    logger.error(
+      pc.gray(
+        'Add .kici to the workspace packages and remove the lockfile inside .kici/, ' +
+          'or run kici init --workspace --force to scaffold .kici/ again (this replaces it).\n',
+      ),
+    );
+    return false;
+  }
+  const changed = await wireMemberDeps(kiciDir, mode, await detectDevelopmentMode(), options);
+  logger.info(
+    changed
+      ? pc.green(
+          `\n✓ .kici/ is now a member of the ${mode.workspaceKind} workspace at ${mode.workspaceRoot}\n`,
+        )
+      : pc.green('\n✓ .kici/ is already a workspace member; nothing to change\n'),
+  );
+  return true;
+}
+
+/**
+ * `.kici/` resolves @kici-dev/sdk from its own package.json. A root declaration
+ * stays where it is, because other workspace code may import the SDK. This
+ * names it so the developer can remove it when nothing else uses it.
+ */
+async function noteRootSdkDeclaration(workspaceRoot: string): Promise<void> {
+  const manifestPath = path.join(workspaceRoot, 'package.json');
+  let pkg: { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+  try {
+    pkg = JSON.parse(await readFile(manifestPath, 'utf-8')) as typeof pkg;
+  } catch {
     return;
   }
-  const range = sdkDependencyRange(devMode);
-  pkg.devDependencies = { ...(pkg.devDependencies ?? {}), '@kici-dev/sdk': range };
-  await writeFile(manifestPath, JSON.stringify(pkg, null, 2) + '\n', 'utf-8');
-  logger.info(pc.gray(`Added @kici-dev/sdk (${range}) to ${manifestPath}`));
+  const range = pkg.devDependencies?.['@kici-dev/sdk'] ?? pkg.dependencies?.['@kici-dev/sdk'];
+  if (range === undefined) return;
+  logger.info(
+    pc.gray(
+      `${manifestPath} still declares @kici-dev/sdk (${range}). .kici/ does not need it; ` +
+        'remove it if no other workspace package imports the SDK.',
+    ),
+  );
 }
+
+const WORKSPACE_STANDALONE_CONFLICT = 'Cannot combine --workspace and --standalone.';
 
 type ScaffoldMode =
   | { kind: 'standalone' }
   | { kind: 'integrate'; workspaceRoot: string; workspaceKind: WorkspaceKind };
+
+/** The integrate (workspace-member) scaffold mode. */
+type IntegrateMode = Extract<ScaffoldMode, { kind: 'integrate' }>;
+
+/** The workspace at or above the current directory, or an error naming the fix. */
+async function resolveWorkspaceMode(): Promise<IntegrateMode> {
+  const ws = await detectWorkspaceRoot(process.cwd());
+  if (!ws) {
+    throw new Error(
+      'Cannot integrate: no pnpm/npm/yarn workspace found at or above the current directory. ' +
+        'Run from a workspace root, or omit --workspace for a standalone .kici/.',
+    );
+  }
+  return { kind: 'integrate', workspaceRoot: ws.root, workspaceKind: ws.kind };
+}
 
 /**
  * Flags win; otherwise a detected workspace prompts in interactive mode and
@@ -454,22 +563,12 @@ type ScaffoldMode =
  */
 async function resolveScaffoldMode(options: InitOptions): Promise<ScaffoldMode> {
   if (options.workspace && options.standalone) {
-    throw new Error('Cannot combine --workspace and --standalone.');
+    throw new Error(WORKSPACE_STANDALONE_CONFLICT);
   }
   if (options.standalone) return { kind: 'standalone' };
+  if (options.workspace) return resolveWorkspaceMode();
 
   const ws = await detectWorkspaceRoot(process.cwd());
-
-  if (options.workspace) {
-    if (!ws) {
-      throw new Error(
-        'Cannot integrate: no pnpm/npm/yarn workspace found at or above the current directory. ' +
-          'Run from a workspace root, or omit --workspace for a standalone .kici/.',
-      );
-    }
-    return { kind: 'integrate', workspaceRoot: ws.root, workspaceKind: ws.kind };
-  }
-
   if (!ws) return { kind: 'standalone' };
   if (!process.stdout.isTTY || isCiEnvironment()) return { kind: 'standalone' };
   const choice = await promptScaffoldMode(ws.kind);
@@ -483,7 +582,7 @@ async function promptScaffoldMode(kind: WorkspaceKind): Promise<'standalone' | '
     message: `A ${kind} workspace was detected. How should the workflows be set up?`,
     choices: [
       {
-        name: 'Standalone — self-contained .kici/ with its own package.json',
+        name: 'Standalone — self-contained .kici/ with its own lockfile and install',
         value: 'standalone',
       },
       {
@@ -685,25 +784,6 @@ ${npmrcScopeLine}//${url.replace(/^https?:\/\//, '')}/:_authToken=\${MY_NPM_TOKE
     logger.info(pc.gray('Writing .kici/.npmrc.example'));
     await writeFile(npmrcPath, npmrcExample, 'utf-8');
   }
-}
-
-function generateSampleFixture(defaultBranch: string): string {
-  return `import { fixture, push } from '@kici-dev/sdk';
-
-/**
- * Sample test fixture: push to ${defaultBranch} branch.
- *
- * Run with: kici run remote push-${defaultBranch}
- * List all:  kici run remote
- */
-export const push${capitalize(defaultBranch)} = fixture('push-${defaultBranch}', {
-  event: push({ branches: ['${defaultBranch}'] }),
-});
-`;
-}
-
-function capitalize(s: string): string {
-  return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
 /** Repo-root .kiciignore: what `kici run --remote` uploads. */

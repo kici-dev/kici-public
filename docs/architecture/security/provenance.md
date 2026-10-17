@@ -113,8 +113,11 @@ only build-supplied input.
   rather than following the issuer named in the token. `kici verify-attestation`
   defaults its trust root to the configured orchestrator; it can also verify
   offline against an exported `{ issuer, jwks }` file (air-gap) or against the
-  orchestrator's native `POST /v1/verify-attestation` endpoint. The hosted
-  platform publishes no provenance issuer or JWKS.
+  orchestrator's native `POST /v1/verify-attestation` endpoint. A key set
+  fetched over plain HTTP from a host that is not loopback, directly or through
+  any redirect hop, is refused unless `--allow-insecure-trust-root` accepts the
+  risk, because a network attacker could replace it. The hosted platform
+  publishes no provenance issuer or JWKS.
 - **The bundle format is forward-compatible.** Verification dispatches on the
   bundle's media type, so additional bundle formats can be added without
   changing the verifier's existing path.

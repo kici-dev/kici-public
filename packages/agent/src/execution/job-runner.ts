@@ -27,6 +27,7 @@ import { cloneJobRepos } from '../checkout/clone-job-repos.js';
 import { GIT_CREDENTIAL_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/git-credential-relay';
 import { startJobGitCredentials, type JobGitCredentials } from '../checkout/job-git-credentials.js';
 import { packKiciSource } from './source-packer.js';
+import { boundJobFailureData } from './failure-tail.js';
 import { restoreSource } from './source-restore.js';
 import type { InitResult } from './init-runner.js';
 import { withBootstrapInterception } from '../bootstrap/api-intercept.js';
@@ -350,7 +351,7 @@ interface BuildJobConfig {
   buildOnly: true;
   contentHash?: string;
   lockfileHash?: string;
-  /** In-repo `workspace:` sibling closure digest; part of the dep pointer key. */
+  /** In-repo workspace sibling closure digest; part of the dep pointer key. */
   siblingsDigest?: string;
   buildSourceNeeded?: boolean;
   buildDepsNeeded?: boolean;
@@ -2549,6 +2550,10 @@ export class JobRunner {
     // Buffered: a terminal transition lost to an at-completion disconnect would
     // leave the run "running" until stale detection, so it rides the
     // reconnect-replay buffer, not the silent-drop unbuffered path.
+    //
+    // Every job failure leaves through here (setup, bring-up, build, global
+    // evaluation, init and dynamic jobs, and the runner's own report), so its
+    // text is bounded once, here.
     this.send({
       type: 'job.status',
       messageId: randomUUID(),
@@ -2556,7 +2561,7 @@ export class JobRunner {
       jobId: dispatch.jobId,
       state,
       timestamp: Date.now(),
-      ...(data && { data }),
+      ...(data && { data: boundJobFailureData(data) }),
       ...(secretOutputs && { secretOutputs }),
     });
   }

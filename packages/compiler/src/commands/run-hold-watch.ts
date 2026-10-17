@@ -78,9 +78,11 @@ export async function handleNewHolds(args: {
   output?: HoldOutput;
   /** Replaces the `kici approve` hint (a direct run names `kici-admin`). */
   answerHint?: (hold: HeldRunSummary) => string;
-  /** Defaults to the shared Platform held-run context. */
+  /** Test override; defaults to the shared Platform held-run context. */
   resolveContext?: () => Promise<HeldRunContext | null>;
+  /** Test override. */
   approve?: (ctx: HeldRunContext, heldRunId: string, autoApprove?: boolean) => Promise<boolean>;
+  /** Test override. */
   reject?: (ctx: HeldRunContext, heldRunId: string, reason: string) => Promise<boolean>;
 }): Promise<Set<string>> {
   const { actions, seen } = classifyNewHolds(args.holds, args.seen, args.isTty);

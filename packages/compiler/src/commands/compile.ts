@@ -18,6 +18,8 @@ import {
   computeLockfileHash,
   schemaWindowWarning,
 } from '../lockfile/index.js';
+import { isWorkspaceMember } from '../lockfile/workspace-siblings.js';
+import { warnIfKiciManifestMissing } from './agent-deps-preflight.js';
 import { formatError, isCompilerError } from '../errors/index.js';
 import { SCHEMA_VERSION, type LockFile } from '../types.js';
 import type { GlobalConfig } from '../remote/config.js';
@@ -40,6 +42,13 @@ export interface CompileOptions {
    * goes to.
    */
   orchestratorUrl?: string;
+  /**
+   * Warn when `.kici/` has workflows but no `.kici/package.json`, a layout no
+   * agent can install. Set by `kici compile`, `kici run remote` and an isolated
+   * `kici run --local`. Never set by an in-place local run, which uses the
+   * developer's own node_modules.
+   */
+  warnMissingKiciManifest?: boolean;
 }
 
 async function readExistingLockfileHash(lockPath: string): Promise<string | undefined> {
@@ -53,11 +62,17 @@ async function readExistingLockfileHash(lockPath: string): Promise<string | unde
 }
 
 /**
- * Detects the package manager from `.kici/`'s lock file: `npm ci` fails against
- * a pnpm lock, and worse against a stale npm lock left beside one.
+ * Reinstall `.kici/` dependencies with the project's package manager.
+ *
+ * A workspace member is reinstalled by the workspace's manager, detected at the
+ * workspace root where its lockfile and `packageManager` field live, so a pnpm
+ * member is never reinstalled with npm, which cannot resolve `workspace:*`. A
+ * standalone `.kici/` is detected from `.kici/` itself, so `npm ci` never runs
+ * against a pnpm or yarn lock.
  */
-async function reinstallDeps(kiciDir: string): Promise<void> {
-  const pm = detectPackageManagerSync(kiciDir);
+async function reinstallDeps(kiciDir: string, gitRoot: string): Promise<void> {
+  const member = isWorkspaceMember(gitRoot, path.relative(gitRoot, kiciDir));
+  const pm = detectPackageManagerSync(member ? gitRoot : kiciDir);
   const command =
     pm === PackageManager.Pnpm
       ? 'pnpm install'
@@ -79,11 +94,12 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
   }
 
   try {
+    if (options.warnMissingKiciManifest) await warnIfKiciManifestMissing(absoluteKiciDir);
     const lockPath = path.join(absoluteKiciDir, 'kici.lock.json');
 
-    // Reinstall when deps changed. A missing `.kici/package.json` means a
-    // workspace member whose deps install at the repo root: `npm install` here
-    // would walk up to `workspace:*` refs npm cannot resolve.
+    // Reinstall when deps changed. Skip when `.kici/package.json` is absent:
+    // such a `.kici/` declares no dependencies of its own, so there is nothing
+    // under `.kici/` to reinstall.
     if (existsSync(path.join(absoluteKiciDir, 'package.json'))) {
       const existingHash = await readExistingLockfileHash(lockPath);
       if (existingHash) {
@@ -91,7 +107,7 @@ export async function compileCommand(options: CompileOptions): Promise<boolean> 
         const currentHash = computeLockfileHash(gitRoot);
         if (currentHash && currentHash !== existingHash) {
           logger.info(pc.yellow('Dependencies changed') + ' — reinstalling before compile...');
-          await reinstallDeps(absoluteKiciDir);
+          await reinstallDeps(absoluteKiciDir, gitRoot);
         }
       }
     }

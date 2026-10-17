@@ -117,7 +117,8 @@ import { executeStepLoop, type StepNode } from './step-loop.js';
 import { runInStepCapture, currentCaptureStepIndex } from './capture-context.js';
 import { StepTaskRegistry } from './step-task-registry.js';
 import type { JobHooks, StepLoopOptions } from './step-loop.js';
-import { runInitPhase } from '../env-init/init-phase.js';
+import { runInitPhase, type RunInitPhaseOptions } from '../env-init/init-phase.js';
+import { formatInitFailureMessage } from '../failure-tail.js';
 import { normalizeInitItems } from '../env-init/presets/directives.js';
 import { expandInitDirectives } from '../env-init/presets/expand.js';
 import { armJobDeadline } from './job-deadline.js';
@@ -128,6 +129,7 @@ import { tryRestoreDeps } from '../dep-restore-fallback.js';
 import { redactUrl } from '../resumable-download.js';
 import { runSetupThenSendDepRestoreReport, type DepRestoreReport } from '../dep-restore-report.js';
 import { installDeps } from '../dep-installer.js';
+import { kiciDepsPresent } from '../workspace-siblings.js';
 import {
   loadWorkflowSource,
   extractWorkflow,
@@ -1288,7 +1290,9 @@ function buildStepSecrets(
  *
  * `process.env` is bound by reference, so a same-step ctx.setEnv / ctx.addPath
  * (applyEnvDelta writes live process.env) reaches that step's own subprocesses,
- * per the SDK's "visible to this step" contract.
+ * per the SDK's "visible to this step" contract. A caller may pass `env` to bind a
+ * composed snapshot instead; the init phase does, so each init command gets the
+ * spec's `env` overlay.
  *
  * zx never writes child output to process.stdout; it only calls $.log() with
  * `{ kind: 'stdout'|'stderr', verbose }`, so `makeStreamingZxLog` turns both kinds
@@ -1307,10 +1311,11 @@ export function buildSandboxShell(
   stepIndex: number,
   maskedSendFn: (msg: RunnerToAgentMessage) => void,
   signal?: AbortSignal,
+  env: NodeJS.ProcessEnv = process.env,
 ): typeof $ {
   return zx$({
     cwd,
-    env: process.env as Record<string, string>,
+    env: env as Record<string, string>,
     verbose: true,
     quiet: false,
     // zx kills the child when the step aborts. Without it, a step `timeout` or job
@@ -1730,7 +1735,7 @@ async function installDependenciesIfNeeded(
     return;
   }
 
-  if (fileExists(join(kiciDir, 'node_modules'))) {
+  if (await kiciDepsPresent(workflowDir, kiciDir)) {
     trace('node_modules already exists, skipping install');
     send({
       type: 'log.line',
@@ -2561,19 +2566,36 @@ export function buildStepEnvFileHooks(
 }
 
 /**
+ * The init phase's shell factory: a fresh sandbox shell per init command at the
+ * clone root, logging under that init's `init:<n>` step index, bound to the
+ * environment `runInitPhase` composed for the command (the job environment with
+ * the spec's `env` laid over it).
+ */
+export function buildInitShellFor(
+  stepCwd: string,
+  maskedSend: (msg: RunnerToAgentMessage) => void,
+): RunInitPhaseOptions['shellFor'] {
+  return (_spec, index, env) =>
+    buildSandboxShell(stepCwd, INIT_STEP_INDEX_BASE + index, maskedSend, undefined, env);
+}
+
+/**
  * Run the per-job init phase; a failed or timed-out init fails the job with no steps.
  *
  * Ports for `runInitPhase`:
- * - shell: a fresh `buildSandboxShell` per init at the clone root. It snapshots
- *   `process.env`, which `beginCapture` pointed at the shared KICI_ENV/KICI_PATH
- *   files, so an init hands env + PATH to later inits and every step.
+ * - shell: `buildInitShellFor` — a fresh sandbox shell per init at the clone root,
+ *   bound to that command's composed environment: `process.env` (which
+ *   `beginCapture` has pointed at the shared KICI_ENV/KICI_PATH files) with the
+ *   spec's `env` laid over it. `KICI_` keys and `operatorSecretKeys` keep the
+ *   job's value. An init hands env + PATH to later inits and every step.
  * - cache: the same transport-backed `CacheApi` as `ctx.cache`; restore before,
  *   save on key miss after.
  * - env: the KICI_ENV/KICI_PATH lifecycle over the shared `envFiles`, with the step
  *   loop's `operatorSecretKeys` guard.
  *
- * On failure: `job.complete{failed}` with `stepResults: []` and the error (with the
- * timeout reason when `timedOut`), then `process.exit(1)`.
+ * On failure: `job.complete{failed}` with `stepResults: []` (no step ran), the
+ * bounded `init[<n>] failed (exit <code>): <tail>` error (or the timeout reason),
+ * and `process.exit(1)` — the step loop never executes.
  */
 async function runInitPhaseOrFailJob(args: {
   job: Job | undefined;
@@ -2581,8 +2603,9 @@ async function runInitPhaseOrFailJob(args: {
   envFiles: EnvFiles;
   operatorSecretKeys: Set<string>;
   maskedSend: (msg: RunnerToAgentMessage) => void;
+  maskLine: (line: string) => string;
 }): Promise<void> {
-  const { job, stepCwd, envFiles, operatorSecretKeys, maskedSend } = args;
+  const { job, stepCwd, envFiles, operatorSecretKeys, maskedSend, maskLine } = args;
   const directives = normalizeInitItems(job);
   if (directives.length === 0) return;
   // Expanded here because the clone root is on disk to hash for the cache key and
@@ -2610,22 +2633,26 @@ async function runInitPhaseOrFailJob(args: {
 
   const initResult = await runInitPhase({
     specs: initSpecs,
-    shellFor: (_spec, i) => buildSandboxShell(stepCwd, INIT_STEP_INDEX_BASE + i, maskedSend),
+    shellFor: buildInitShellFor(stepCwd, maskedSend),
+    protectedEnvKeys: operatorSecretKeys,
     sendIpc: maskedSend,
     stepIndexBase: INIT_STEP_INDEX_BASE,
     cache: initCache,
     env: initEnv,
+    maskLine,
   });
 
   if (!initResult.ok) {
-    const errorBody = initResult.error ?? '';
     maskedSend({
       type: 'job.complete',
       status: ExecutionJobStatus.enum.failed,
       stepResults: [],
-      error: initResult.reason
-        ? `init[${initResult.failedInitIndex}] ${initResult.reason}: ${errorBody}`.trim()
-        : `init[${initResult.failedInitIndex}] failed: ${errorBody}`.trim(),
+      error: formatInitFailureMessage({
+        index: initResult.failedInitIndex ?? 0,
+        detail: initResult.error ?? '',
+        exitCode: initResult.exitCode,
+        reason: initResult.reason,
+      }),
     });
     process.exit(1);
   }
@@ -2788,6 +2815,7 @@ async function main(): Promise<void> {
       envFiles,
       operatorSecretKeys,
       maskedSend,
+      maskLine: (line) => masker.mask(line),
     });
   }
 

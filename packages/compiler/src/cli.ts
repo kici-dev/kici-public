@@ -90,6 +90,9 @@ export function buildProgram(): Command {
     .action(async (options) => {
       const { compileCommand, watchCommand } = await import('./commands/index.js');
       if (options.watch) {
+        const { warnIfKiciManifestMissing } = await import('./commands/agent-deps-preflight.js');
+        const { resolveKiciDir } = await import('./execution/index.js');
+        await warnIfKiciManifestMissing(resolveKiciDir(options.kiciDir));
         // Runs indefinitely and handles its own exit.
         await watchCommand({
           kiciDir: options.kiciDir,
@@ -100,6 +103,7 @@ export function buildProgram(): Command {
           kiciDir: options.kiciDir,
           check: options.check,
           verbose: options.verbose,
+          warnMissingKiciManifest: true,
         });
         process.exit(success ? 0 : 1);
       }
@@ -326,7 +330,7 @@ export function buildProgram(): Command {
     .option('--mjs', 'JavaScript-only mode (no TypeScript, no dependencies)', false)
     .option(
       '--workspace',
-      'Integrate .kici/ into the detected pnpm/npm/yarn workspace so workflows can import sibling packages',
+      'Make .kici/ a member of the detected pnpm/npm/yarn workspace so workflows can import sibling packages',
       false,
     )
     .option('--standalone', 'Force a self-contained .kici/ even inside a workspace', false)
@@ -739,7 +743,7 @@ Environment variables:
     .option('--branch <b>', 'Filter by branch/ref')
     .option('--repo <r>', 'Filter by repository')
     .option('--trigger <t>', 'Filter by trigger type')
-    .option('--source <routingKey>', 'Filter by source routing key')
+    .option('--source <routingKey>', 'Filter by source routing key, or by provider (e.g. github)')
     .option('--since <ts>', 'Only runs since (ISO-8601 or epoch ms)')
     .option('--cursor <cursor>', 'Keyset cursor for the next page (from a prior nextCursor)')
     .option('--json', 'Output raw JSON', false)
@@ -1095,6 +1099,11 @@ Environment variables:
     )
     .option('--audience <aud>', 'Expected token audience')
     .option('--json', 'Output structured JSON result', false)
+    .option(
+      '--allow-insecure-trust-root',
+      'Accept a trust root fetched over plain HTTP from a host that is not loopback',
+      false,
+    )
     .action(async (artifact, options) => {
       const { verifyAttestationCommand } = await import('./commands/index.js');
       const success = await verifyAttestationCommand(artifact, options);

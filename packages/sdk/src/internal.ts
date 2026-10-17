@@ -29,3 +29,5 @@ export { buildKiciApi } from './api-types.js';
 export { createStepSecrets } from './secrets.js';
 export { setStepOutputsMap, setJobOutputsMap, setStepRefMap } from './outputs.js';
 export { expandMatrix, applyIncludeExclude } from './matrix/index.js';
+export { normalizeMiseVersion } from './mise-version.js';
+export { isAptPackageSpec } from './apt-package.js';

@@ -672,8 +672,19 @@ export function planNpmSourceUpgrade(opts: {
     };
   }
 
-  const target = spec ? resolveNpmInstallTarget(spec, component, { windows }) : null;
-  if (!target) {
+  const resolution = spec ? resolveNpmInstallTarget(spec, component, { windows }) : null;
+  if (resolution && !resolution.ok && resolution.reason === 'not-global') {
+    return {
+      kind: 'error',
+      reason:
+        `npm-source upgrade cannot self-install: the unit's launch target ${resolution.entry} ` +
+        "is not inside a global npm install, so the unit's npm has no global prefix that holds it. " +
+        `The unit runs ${spec!.execPath}; this kici-admin runs ${process.execPath}. ` +
+        'Use an archive upgrade (--from <archive> / --url <url> + --version), or pre-install the ' +
+        'package and re-run with --restart-only.',
+    };
+  }
+  if (!resolution?.ok) {
     return {
       kind: 'error',
       reason:
@@ -683,7 +694,7 @@ export function planNpmSourceUpgrade(opts: {
         'package and re-run with --restart-only.',
     };
   }
-  return { kind: 'self-drive', target, version: requestedVersion };
+  return { kind: 'self-drive', target: resolution.target, version: requestedVersion };
 }
 
 /** Process runner for the npm calls; tests inject it. */
@@ -712,10 +723,15 @@ export function windowsShellCommand(cmd: string, args: string[]): string {
   return [`"${cmd}"`, ...args].join(' ');
 }
 
+/**
+ * Only a Windows batch file (`npm.cmd`) goes through cmd.exe; the pinned
+ * `node.exe` running npm-cli.js spawns directly, with no shell to parse its
+ * `C:\…` arguments.
+ */
 const defaultSpawnRunner: SpawnRunner = (cmd, args, opts) => {
   const env = opts?.env ?? process.env;
   const r =
-    process.platform === 'win32'
+    process.platform === 'win32' && /\.cmd$/i.test(cmd)
       ? spawnSync(windowsShellCommand(cmd, args), { encoding: 'utf-8', shell: true, env })
       : spawnSync(cmd, args, { encoding: 'utf-8', env });
   return {
@@ -726,12 +742,42 @@ const defaultSpawnRunner: SpawnRunner = (cmd, args, opts) => {
 };
 
 /**
- * The environment npm runs in: the unit's pinned node first on PATH, because
- * npm derives its global prefix from the node that runs it.
+ * The environment npm runs in: the unit's pinned node first on PATH, so a
+ * wrapper fallback (`npmPath`, an `env node` shebang) resolves that node. The
+ * caller's `npm_config_*` stay, so an operator-set registry or proxy still
+ * applies.
+ *
+ * On the `npm.cmd` fallback the prefix goes through `npm_config_prefix`:
+ * {@link windowsShellCommand} refuses the `\`, `:` and `=` a `--prefix=C:\…`
+ * argument holds. Every other invocation passes `--prefix` on the command
+ * line ({@link npmArgs}), which npm ranks above the environment.
  */
 function npmEnv(target: NpmInstallTarget): NodeJS.ProcessEnv {
   const pinnedBinDir = path.dirname(target.nodeExecPath);
-  return { ...process.env, PATH: `${pinnedBinDir}${path.delimiter}${process.env.PATH ?? ''}` };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: `${pinnedBinDir}${path.delimiter}${process.env.PATH ?? ''}`,
+  };
+  if (prefixViaEnv(target)) {
+    // npm reads npm_config_* case-insensitively; drop every spelling so the
+    // caller's value cannot win over this one.
+    for (const key of Object.keys(env)) {
+      if (/^npm_config_(global_)?prefix$/i.test(key)) delete env[key];
+    }
+    env.npm_config_prefix = target.globalPrefix;
+  }
+  return env;
+}
+
+/** Whether the prefix travels in the environment: the `npm.cmd` fallback. */
+function prefixViaEnv(target: NpmInstallTarget): boolean {
+  return target.npmInvocation.preArgs.length === 0 && /\.cmd$/i.test(target.npmInvocation.cmd);
+}
+
+/** The argv for one npm call: npm-cli.js first when the pinned node runs it, `--prefix` last. */
+function npmArgs(target: NpmInstallTarget, args: string[]): string[] {
+  const prefix = prefixViaEnv(target) ? [] : [`--prefix=${target.globalPrefix}`];
+  return [...target.npmInvocation.preArgs, ...args, ...prefix];
 }
 
 /**
@@ -744,9 +790,11 @@ export function npmReleaseReadsEnvFile(
   version: string,
   run: SpawnRunner = defaultSpawnRunner,
 ): { ok: true; reads: boolean } | { ok: false; error: string } {
-  const res = run(target.npmPath, ['view', `@kici-dev/shared@${version}`, 'exports', '--json'], {
-    env: npmEnv(target),
-  });
+  const res = run(
+    target.npmInvocation.cmd,
+    npmArgs(target, ['view', `@kici-dev/shared@${version}`, 'exports', '--json']),
+    { env: npmEnv(target) },
+  );
   if (res.status !== 0) {
     return { ok: false, error: res.stderr.trim() || `npm view exited with ${res.status}` };
   }
@@ -771,22 +819,24 @@ export function npmReleaseReadsEnvFile(
 }
 
 /**
- * Install `<owningPackage>@<version>` globally under the unit's pinned node, so
- * it lands in the prefix the unit's ExecStart resolves from. npm derives its
- * global prefix from the node that runs npm-cli.js, and the unit's
- * `<pinned>/bin/npm` (an `env node` shebang or a version-manager wrapper)
- * resolves `node` off PATH; run bare it would inherit the shell's active node,
- * the mise/nvm/asdf drift this upgrade fixes. Hence the pinned bin dir goes
- * first on PATH ({@link npmEnv}).
+ * Install `<owningPackage>@<version>` globally into the prefix the unit's
+ * ExecStart resolves from, with the unit's pinned node. Without an explicit
+ * prefix npm derives one from the node that runs npm-cli.js, or takes the
+ * `npm_config_prefix` the caller's environment carries (`npx` exports its
+ * own), so the install would land where the unit never reads it. The pinned
+ * node runs npm-cli.js directly, skipping a version-manager wrapper at
+ * `<pinned>/bin/npm`, which also keeps the shell's active node out of it.
  */
 export function installGlobalPackage(
   target: NpmInstallTarget,
   version: string,
   run: SpawnRunner = defaultSpawnRunner,
 ): { ok: boolean; stderr: string } {
-  const res = run(target.npmPath, ['install', '-g', `${target.owningPackage}@${version}`], {
-    env: npmEnv(target),
-  });
+  const res = run(
+    target.npmInvocation.cmd,
+    npmArgs(target, ['install', '-g', `${target.owningPackage}@${version}`]),
+    { env: npmEnv(target) },
+  );
   return { ok: res.status === 0, stderr: res.stderr };
 }
 
@@ -1268,8 +1318,10 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<vo
   }
 
   if (!opts.yes) {
-    console.log(`This will install ${target.owningPackage}@${version} using ${target.npmPath}`);
-    console.log(`  (node runtime: ${target.nodeExecPath}), then restart "${config.name}".`);
+    console.log(
+      `This will install ${target.owningPackage}@${version} with ${target.nodeExecPath} into ` +
+        `${target.globalPrefix} (the unit's runtime), then restart "${config.name}".`,
+    );
     console.log('');
     const ok = await confirm('Proceed with upgrade?');
     if (!ok) {
@@ -1278,7 +1330,10 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<vo
     }
   }
 
-  console.log(`Installing ${target.owningPackage}@${version} under the unit's runtime...`);
+  console.log(
+    `Installing ${target.owningPackage}@${version} with ${target.nodeExecPath} into ` +
+      `${target.globalPrefix} (the unit's runtime)...`,
+  );
   const result = installGlobalPackage(target, version, args.run);
   if (!result.ok) {
     const hint = /EACCES|permission denied|EPERM/i.test(result.stderr)

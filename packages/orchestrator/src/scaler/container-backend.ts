@@ -11,7 +11,7 @@ import Docker from 'dockerode';
 import { createLogger, toErrorMessage, type ToolRequirement } from '@kici-dev/shared';
 import { KICI_AGENT_ENV_PREFIX, scalerAgentLabels, ScalerBackendType } from '@kici-dev/engine';
 import { normalizeLabelSet } from './label-matcher.js';
-import { buildAgentContainerHostConfig } from './container-hostconfig.js';
+import { AGENT_SUDO_GROUP_GID, buildAgentContainerHostConfig } from './container-hostconfig.js';
 import { containerRuntimeForSocketPath } from './container-runtime.js';
 import {
   validateNftablesAvailability,
@@ -109,6 +109,25 @@ export async function detectRuntime(
  * Create a LogCapture from a running container's stdout/stderr streams.
  * Uses dockerode's demuxStream to strip Docker's 8-byte multiplexed headers.
  */
+/**
+ * The cpu / memory ceiling for one spawn. `effectiveLimits` from ScalerManager
+ * wins: it already folds in job overrides, label-set and scaler defaults.
+ * Otherwise the label set's (or the scaler's default) `resources.limits` apply.
+ */
+function resolveSpawnLimits(
+  effectiveLimits: EffectiveLimits | undefined,
+  resources: ResourceRequest | undefined,
+): EffectiveLimits {
+  if (effectiveLimits && (effectiveLimits.cpus || effectiveLimits.memBytes)) {
+    return effectiveLimits;
+  }
+  const limits = resources?.limits;
+  return {
+    ...(limits?.memory ? { memBytes: parseMemoryString(limits.memory) } : {}),
+    ...(limits?.cpus ? { cpus: limits.cpus } : {}),
+  };
+}
+
 async function createContainerLogCapture(docker: Docker, containerId: string): Promise<LogCapture> {
   const stream = (await docker.getContainer(containerId).logs({
     follow: true,
@@ -603,20 +622,10 @@ export class ContainerScalerBackend implements ScalerBackend {
         binds.push(`${this.resolvedSocketPath}:${this.resolvedSocketPath}`);
       }
 
-      // `effectiveLimits` from ScalerManager wins: it already folds in job
-      // overrides, label-set and scaler defaults.
-      let resolvedLimits: EffectiveLimits;
-
-      if (effectiveLimits && (effectiveLimits.cpus || effectiveLimits.memBytes)) {
-        resolvedLimits = effectiveLimits;
-      } else {
-        const resources = matchedLabelSet.resources ?? this.defaultResources;
-        const limits = resources?.limits;
-        resolvedLimits = {
-          ...(limits?.memory ? { memBytes: parseMemoryString(limits.memory) } : {}),
-          ...(limits?.cpus ? { cpus: limits.cpus } : {}),
-        };
-      }
+      const resolvedLimits = resolveSpawnLimits(
+        effectiveLimits,
+        matchedLabelSet.resources ?? this.defaultResources,
+      );
 
       // Default pull policy IfNotPresent: KiCI agent images are pinned and
       // immutable, so re-pulling every spawn only storms the registry/socket; a
@@ -660,6 +669,9 @@ export class ContainerScalerBackend implements ScalerBackend {
         agentInit = runtimeInitCommand(await agentImageLabels(this.docker, matchedLabelSet.image!));
       }
 
+      // One job per pool-image agent: what a job leaves here, as root too, dies with it.
+      if (!jobContainer) env.push('KICI_SCALER_SINGLE_JOB=1');
+
       emit(ScalerEventType.enum['scaler.provisioning'], 'creating container');
       const normalizedLabelSetStr = normalizeLabelSet(labelSet);
       const container = await this.docker.createContainer({
@@ -683,6 +695,7 @@ export class ContainerScalerBackend implements ScalerBackend {
           limits: resolvedLimits,
           binds,
           ...(this.extraHosts ? { extraHosts: this.extraHosts } : {}),
+          ...(!jobContainer && { supplementaryGroups: [AGENT_SUDO_GROUP_GID] }),
         }),
         ...(this.networkIsolation && {
           NetworkingConfig: {

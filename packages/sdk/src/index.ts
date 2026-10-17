@@ -191,6 +191,7 @@ export type {
   JobOptions,
   GenericInitConfig,
   MiseInitConfig,
+  AptInitConfig,
   InitPreset,
   InitItem,
   InitConfig,

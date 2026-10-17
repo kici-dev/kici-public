@@ -30,6 +30,11 @@ import type {
 import type { Database } from '../db/types.js';
 import type { CacheStorage } from '../storage/types.js';
 import type { LogStorage } from '../reporting/log-storage.js';
+import {
+  decodeRunLogCursor,
+  encodeRunLogCursor,
+  type RunLogFileOffsets,
+} from './test-run-log-cursor.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { initTestUpload } from '../routes/uploads.js';
 import { processTestTrigger } from '../pipeline/test-pipeline.js';
@@ -256,10 +261,13 @@ export async function handleTestRunStatus(
   };
 }
 
+/** Response payload for `test.relay.run.logs.response` (minus envelope fields). */
 export interface TestRunLogsPayload {
   lines: string[];
   nextCursor: number;
   done: boolean;
+  /** Opaque per-file cursor for the next poll; present when the request sent `logCursor`. */
+  nextLogCursor?: string;
 }
 
 /**
@@ -268,12 +276,27 @@ export interface TestRunLogsPayload {
  */
 const LOG_PATH_RE = /job-([^/]+)\/step-(-?\d+)\.log$/;
 
+/** One stored log file of a run. `key` is its path below `executions/<runId>/`. */
+interface RunLogFile {
+  key: string;
+  path: string;
+  jobName: string;
+  stepIndex: number;
+}
+
 /**
- * Return the next chunk of a run's logs from a monotonic line-offset cursor:
- * lines are concatenated in `(jobName ASC, stepIndex ASC, lineIndex ASC)` order
- * and `cursor` counts lines already delivered. `done` is true only when the run
- * is terminal AND the cursor reached the end, so a live or not-yet-drained poll
- * returns what exists with `done: false` and no line is dropped.
+ * Return the next chunk of a run's logs.
+ *
+ * With `logCursor` (the per-file cursor), each log file is read from its own
+ * offset, so a file that appears later is read from its first line wherever it
+ * sorts. Without it, the stream is the flat `(jobName, stepIndex, lineIndex)`
+ * concatenation and `cursor` counts the lines already delivered, which an
+ * older CLI sends.
+ *
+ * `done` is true only once the run is terminal and the stream is delivered to
+ * its end. For a terminal run, pending log appends are drained first, because
+ * the agent's chunks are persisted fire-and-forget and the status can turn
+ * terminal while the last write is still in flight.
  */
 export async function handleTestRunLogs(
   msg: TestRelayRunLogsRequest,
@@ -290,11 +313,15 @@ export async function handleTestRunLogs(
   }
 
   const terminal = TERMINAL_RUN_STATES.has(run.status);
-  // Chunks persist fire-and-forget, so a run can turn terminal with the last
-  // write pending; draining first means `done: true` never omits the last line.
   if (terminal) await deps.logWriter?.drain(msg.runId);
-  const allLines = await collectRunLogLines(msg.runId, deps.logStorage);
 
+  if (msg.logCursor !== undefined) {
+    const offsets = decodeRunLogCursor(msg.logCursor);
+    if (!offsets) return { error: 'Invalid log cursor' };
+    return readFromFileOffsets(msg.runId, deps.logStorage, offsets, terminal);
+  }
+
+  const allLines = await collectRunLogLines(msg.runId, deps.logStorage);
   const cursor = Math.max(0, msg.cursor);
   const lines = allLines.slice(cursor);
   const nextCursor = cursor + lines.length;
@@ -304,32 +331,67 @@ export async function handleTestRunLogs(
   return { lines, nextCursor, done };
 }
 
+/** A run's stored log files, ordered by `(jobName, stepIndex)`. */
+async function listRunLogFiles(runId: string, logStorage: LogStorage): Promise<RunLogFile[]> {
+  return (await logStorage.list(`executions/${runId}`))
+    .map((path) => {
+      const m = path.match(LOG_PATH_RE);
+      if (!m) return null;
+      return {
+        key: `job-${m[1]}/step-${m[2]}.log`,
+        path,
+        jobName: m[1]!,
+        stepIndex: parseInt(m[2]!, 10),
+      };
+    })
+    .filter((f): f is RunLogFile => f !== null)
+    .sort((a, b) => a.jobName.localeCompare(b.jobName) || a.stepIndex - b.stepIndex);
+}
+
+/** A log file's non-empty lines; its unterminated last line only when `withTail`. */
+function splitLogLines(data: string, withTail: boolean): string[] {
+  const parts = data.split('\n');
+  const tail = parts.pop() ?? '';
+  const lines = parts.filter((line) => line.length > 0);
+  if (withTail && tail.length > 0) lines.push(tail);
+  return lines;
+}
+
 /** Reads every step log under `executions/<runId>`; empty with no log storage. */
 async function collectRunLogLines(
   runId: string,
   logStorage: LogStorage | undefined,
 ): Promise<string[]> {
   if (!logStorage) return [];
-
-  const prefix = `executions/${runId}`;
-  const allFiles = await logStorage.list(prefix);
-
-  const logFiles = allFiles
-    .map((f) => {
-      const m = f.match(LOG_PATH_RE);
-      return m ? { path: f, jobName: m[1], stepIndex: parseInt(m[2], 10) } : null;
-    })
-    .filter((f): f is NonNullable<typeof f> => f !== null)
-    .sort((a, b) => a.jobName.localeCompare(b.jobName) || a.stepIndex - b.stepIndex);
-
   const lines: string[] = [];
-  for (const entry of logFiles) {
-    const result = await logStorage.read(entry.path);
-    for (const line of result.data.split('\n')) {
-      if (line.length > 0) lines.push(line);
-    }
+  for (const file of await listRunLogFiles(runId, logStorage)) {
+    lines.push(...splitLogLines((await logStorage.read(file.path)).data, true));
   }
   return lines;
+}
+
+/**
+ * Read each log file from its own offset. A live file's last line can still
+ * be mid-write, so it is read once it ends, or once the run is terminal.
+ */
+async function readFromFileOffsets(
+  runId: string,
+  logStorage: LogStorage | undefined,
+  offsets: RunLogFileOffsets,
+  terminal: boolean,
+): Promise<TestRunLogsPayload> {
+  const next: RunLogFileOffsets = { ...offsets };
+  const lines: string[] = [];
+  if (logStorage) {
+    for (const file of await listRunLogFiles(runId, logStorage)) {
+      const fileLines = splitLogLines((await logStorage.read(file.path)).data, terminal);
+      const from = Math.min(offsets[file.key] ?? 0, fileLines.length);
+      lines.push(...fileLines.slice(from));
+      next[file.key] = Math.max(offsets[file.key] ?? 0, fileLines.length);
+    }
+  }
+  const delivered = Object.values(next).reduce((sum, n) => sum + n, 0);
+  return { lines, nextCursor: delivered, done: terminal, nextLogCursor: encodeRunLogCursor(next) };
 }
 
 export interface TestCancelPayload {

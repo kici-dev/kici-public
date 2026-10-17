@@ -17,12 +17,29 @@ export function decideIdleShutdown(input: {
   activeJobs: number;
   pendingDispatch?: boolean;
   warmPool?: boolean;
+  /** A single-job agent that has run its job: it waits for nothing. */
+  singleJobServed?: boolean;
 }): IdleShutdownDecision {
   if (!input.scalerManaged || input.activeJobs > 0) return 'none';
+  // fails-when: a single-job agent that reconnects after its job reads as warm
+  // and stays up, draining, where the warm-pool reaper never looks.
+  if (input.singleJobServed) return 'idle';
   // Warm first: both derive from one `boundJobId`, so they are exclusive, and an
   // ack carrying both must not arm a timer — the warm-pool reaper alone owns a
   // warm agent's lifetime.
   if (input.warmPool) return 'warm';
   if (input.pendingDispatch) return 'pending-dispatch';
   return 'idle';
+}
+
+/**
+ * How long a scaler-managed agent waits for a follow-up job once it is idle.
+ * A single-job agent that has run its job waits for nothing and exits at once.
+ */
+export function idleShutdownDelayMs(input: {
+  scalerIdleTimeoutMs: number;
+  singleJob: boolean;
+  servedJob: boolean;
+}): number {
+  return input.singleJob && input.servedJob ? 0 : input.scalerIdleTimeoutMs;
 }

@@ -46,7 +46,7 @@ The tarball is **platform-agnostic** — raw `.kici/` source files are identical
 
 **Dependency tarball** is keyed by:
 
-- **Lockfile hash**: SHA-256 of the workflow's lock file — `.kici/package-lock.json` for an npm project, or the repo-root `pnpm-lock.yaml` / `yarn.lock` for a pnpm/yarn workspace. The hash input is prefixed with the detected manager name, so switching managers is a guaranteed cache miss
+- **Lockfile hash**: SHA-256 of the workflow's lock file — `.kici/package-lock.json` for an npm project (the repo-root `package-lock.json` when `.kici` is an npm workspace member), or the repo-root `pnpm-lock.yaml` / `yarn.lock` for a pnpm/yarn workspace. The hash input is prefixed with the detected manager name, so switching managers is a guaranteed cache miss
 - **Platform**: detected from the target agent (e.g., `linux`, `darwin`, `win32`; defaults to `linux` when no agents are registered)
 - **Arch**: detected from the target agent (e.g., `x64`, `arm64`; defaults to `x64` when no agents are registered)
 
@@ -62,10 +62,10 @@ When the lockfile changes (new dependency added, version bumped), the cache key 
 
 KiCI maintains two caches that share the same storage backend:
 
-| Cache        | Key Format                                                                   | Contents                                                                                                     | Invalidation                                                                                                | Platform scope             |
-| ------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- | -------------------------- |
-| Source cache | `source/v2/{orgId}/{sourceTarDigest}.tar.gz`                                 | Raw `.kici/` directory minus `node_modules/` (deterministic gzip tar)                                        | Any non-ignored `.kici/` file or any `hashFiles` asset changes; `COMPILE_SCHEMA_VERSION` bump               | Shared (platform-agnostic) |
-| Dep cache    | `deps/{platform}-{arch}/{depsHash}.tar.gz` (+ `{lockfileHash}.hash` pointer) | `.kici/node_modules/` packed by the detected manager's install — npm, pnpm, or yarn (deterministic gzip tar) | Lock file changes (`package-lock.json`, `pnpm-lock.yaml`, or `yarn.lock`); separate entry per platform/arch | Platform-specific          |
+| Cache        | Key Format                                                                   | Contents                                                                                                                                                                                                                           | Invalidation                                                                                                | Platform scope             |
+| ------------ | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | -------------------------- |
+| Source cache | `source/v2/{orgId}/{sourceTarDigest}.tar.gz`                                 | Raw `.kici/` directory minus `node_modules/` (deterministic gzip tar)                                                                                                                                                              | Any non-ignored `.kici/` file or any `hashFiles` asset changes; `COMPILE_SCHEMA_VERSION` bump               | Shared (platform-agnostic) |
+| Dep cache    | `deps/{platform}-{arch}/{depsHash}.tar.gz` (+ `{lockfileHash}.hash` pointer) | The installed dependency tree packed by the detected manager's install — `.kici/node_modules/`, plus the repo-root `node_modules/` and linked in-repo siblings for a workspace member (npm, pnpm, or yarn; deterministic gzip tar) | Lock file changes (`package-lock.json`, `pnpm-lock.yaml`, or `yarn.lock`); separate entry per platform/arch | Platform-specific          |
 
 Both use the same `KICI_STORAGE_*` configuration. A single build job handles both caches when both miss — the build agent clones, installs dependencies with the detected manager (npm, pnpm, or yarn), then packs `.kici/` source and `node_modules/` in parallel and uploads each via its own pre-signed `PUT` URL.
 

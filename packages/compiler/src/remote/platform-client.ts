@@ -9,7 +9,11 @@
  */
 
 import { toErrorMessage } from '@kici-dev/core';
-import type { CheckMode, HostTargetSelector } from '@kici-dev/engine';
+import {
+  TEST_RUN_LOG_CURSOR_START,
+  type CheckMode,
+  type HostTargetSelector,
+} from '@kici-dev/engine';
 
 export class AuthenticationError extends Error {
   constructor(message = 'Invalid or expired token. Run `kici login` to authenticate.') {
@@ -143,7 +147,31 @@ export interface PlatformRunStatusResponse {
 export interface PlatformRunLogsResponse {
   lines: string[];
   nextCursor: number;
+  /** Opaque per-file cursor; absent from a server that predates it. */
+  nextLogCursor?: string;
   done: boolean;
+}
+
+/** Where the next log poll reads from: the numeric cursor, and the per-file cursor when known. */
+export interface RunLogPosition {
+  cursor: number;
+  logCursor?: string;
+}
+
+/** The first log poll's position: line 0, asking for the per-file cursor. */
+export const FIRST_LOG_POSITION: RunLogPosition = {
+  cursor: 0,
+  logCursor: TEST_RUN_LOG_CURSOR_START,
+};
+
+/**
+ * The position after `res`. A response with no per-file cursor comes from a
+ * server that predates it, so later polls send the numeric cursor alone.
+ */
+export function nextLogPosition(res: PlatformRunLogsResponse): RunLogPosition {
+  return res.nextLogCursor !== undefined
+    ? { cursor: res.nextCursor, logCursor: res.nextLogCursor }
+    : { cursor: res.nextCursor };
 }
 
 export interface PlatformCancelResponse {
@@ -220,15 +248,16 @@ export class PlatformRunClient {
     return (await response.json()) as PlatformRunStatusResponse;
   }
 
-  /** GET /test/runs/:runId/logs?cursor=<n> — next log chunk from a cursor. */
+  /** GET /test/runs/:runId/logs — next log chunk from a position. */
   async runLogs(
     orgId: string,
     runId: string,
-    cursor: number,
+    position: RunLogPosition,
     target: ClusterTarget = {},
   ): Promise<PlatformRunLogsResponse> {
     const params = new URLSearchParams();
-    params.set('cursor', String(cursor));
+    params.set('cursor', String(position.cursor));
+    if (position.logCursor !== undefined) params.set('logCursor', position.logCursor);
     if (target.orchestrator) params.set('orchestrator', target.orchestrator);
     if (target.defaultCluster) params.set('defaultCluster', target.defaultCluster);
     const path = `/api/v1/orgs/${orgId}/test/runs/${runId}/logs?${params.toString()}`;

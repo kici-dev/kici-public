@@ -8,7 +8,9 @@
  * auth and links version-range siblings; yarn berry reads a synthesized
  * `.kici/.yarnrc.yml` with a forced `nodeLinker: node-modules` (so the runner's
  * plain node resolution holds) and resolves `workspace:`/`portal:` siblings.
- * No manager builds a linked sibling, so the agent builds the in-repo closure.
+ * npm installs a workspace member hoisted at the workspace root and links
+ * version-range siblings there. No manager builds a linked sibling, so the
+ * agent builds the in-repo closure.
  *
  * Security: a per-invocation cache/store dir stops one repo's package.json
  * poisoning later builds. `--ignore-scripts` applies to every manager: a
@@ -40,7 +42,11 @@ import {
 } from './npm-registry-config.js';
 import { applyYarnrcBerryConfig } from './yarnrc-berry-config.js';
 import { assertResolvableDeps, kiciHasLocalProtocolDeps } from './validate-kici-deps.js';
-import { collectInRepoSiblings, resolveYarnNodeModulesRoot } from './workspace-siblings.js';
+import {
+  collectSiblingsFromRoots,
+  isKiciWorkspaceMember,
+  resolveKiciNodeModulesLayout,
+} from './workspace-siblings.js';
 
 const logger = createLogger({ prefix: 'dep-installer' });
 
@@ -148,6 +154,11 @@ export async function installDeps(kiciDir: string, opts: InstallDepsOptions = {}
       })
     : await applyNpmRegistryConfig({
         kiciDir,
+        // npm and pnpm read a workspace member's .npmrc from the workspace root.
+        npmrcDir:
+          packageManager !== PackageManager.Yarn && (await isKiciWorkspaceMember(repoRoot, kiciDir))
+            ? repoRoot
+            : kiciDir,
         npmRegistries: opts.npmRegistries,
         installEnvSecrets: opts.installEnvSecrets,
         jobIdShort: opts.jobIdShort ?? '00000000',
@@ -181,8 +192,10 @@ export async function installDeps(kiciDir: string, opts: InstallDepsOptions = {}
     await buildWorkspaceClosure(repoRoot, baseEnv);
   }
 
-  if (packageManager === PackageManager.Yarn) {
-    await buildYarnWorkspaceClosure(repoRoot, kiciDir, yarnFlavor, baseEnv);
+  // npm and yarn link a workspace sibling (by version range, or yarn berry's
+  // `workspace:`/`portal:`) but do not build it.
+  if (packageManager === PackageManager.Yarn || packageManager === PackageManager.Npm) {
+    await buildLinkedSiblingClosure({ repoRoot, kiciDir, packageManager, yarnFlavor, baseEnv });
   }
 
   const durationMs = Date.now() - startTime;
@@ -377,36 +390,71 @@ async function assertYarnAvailable(): Promise<void> {
   }
 }
 
+/** The argv and working directory that run one linked sibling's `build` script. */
+export interface SiblingBuildCommand {
+  bin: string;
+  argv: string[];
+  cwd: string;
+}
+
 /**
- * Run each linked sibling's `build` script leaf-first (reverse discovery), with
- * no registry tokens in the env. Deep sibling chains may build out of strict
- * topological order; real `.kici` closures are shallow.
+ * How to run a linked sibling's `build` with the repo's manager. npm runs from
+ * the sibling's own directory, so a workspace member's script runs as that
+ * member. yarn classic takes the global `--cwd`, which berry dropped, so berry
+ * runs from the sibling's directory. No argument follows the script name, so
+ * nothing extra reaches the build command.
  */
-async function buildYarnWorkspaceClosure(
-  repoRoot: string,
-  kiciDir: string,
-  yarnFlavor: YarnFlavor,
-  baseEnv: NodeJS.ProcessEnv,
-): Promise<void> {
-  const nmRoot = resolveYarnNodeModulesRoot(repoRoot, kiciDir);
-  const siblings = await collectInRepoSiblings(repoRoot, kiciDir, nmRoot);
+export function siblingBuildCommand(a: {
+  packageManager: PackageManager;
+  yarnFlavor: YarnFlavor;
+  repoRoot: string;
+  sibDir: string;
+  npmCliPath: string | undefined;
+  nodeExe: string;
+}): SiblingBuildCommand {
+  if (a.packageManager === PackageManager.Npm) {
+    return a.npmCliPath
+      ? { bin: a.nodeExe, argv: [a.npmCliPath, 'run', 'build'], cwd: a.sibDir }
+      : { bin: 'npm', argv: ['run', 'build'], cwd: a.sibDir };
+  }
+  if (a.yarnFlavor === YarnFlavor.Berry) {
+    return { bin: 'yarn', argv: ['run', 'build'], cwd: a.sibDir };
+  }
+  return { bin: 'yarn', argv: ['--cwd', a.sibDir, 'run', 'build'], cwd: a.repoRoot };
+}
+
+/**
+ * Build the in-repo workspace siblings `.kici` depends on, for a manager that
+ * links them on install but does not build them (npm, yarn classic, yarn
+ * berry). Walks siblings from every node_modules root `.kici` resolves from and
+ * runs each sibling's `build` script in leaf-first (reverse-discovery) order,
+ * with no registry tokens in the env. npm builds only for a hoisted workspace
+ * member: a standalone npm `.kici` is never built. Deep cross-sibling chains
+ * may build out of strict topological order; real `.kici` closures are shallow.
+ */
+async function buildLinkedSiblingClosure(args: {
+  repoRoot: string;
+  kiciDir: string;
+  packageManager: PackageManager;
+  yarnFlavor: YarnFlavor;
+  baseEnv: NodeJS.ProcessEnv;
+}): Promise<void> {
+  const layout = await resolveKiciNodeModulesLayout(args.repoRoot, args.kiciDir);
+  if (args.packageManager === PackageManager.Npm && !layout.hoistedMember) return;
+  const siblings = await collectSiblingsFromRoots(args.repoRoot, args.kiciDir, layout.roots);
   if (siblings.length === 0) return;
-  const { nodeDir } = resolveNpm();
-  const env = envWithNodeOnPath({}, nodeDir, baseEnv);
+  const { npmCliPath, nodeExe, nodeDir } = resolveNpm();
+  const env = envWithNodeOnPath({}, nodeDir, args.baseEnv);
   for (const rel of [...siblings].reverse()) {
-    const sibDir = join(repoRoot, rel);
+    const sibDir = join(args.repoRoot, rel);
     if (!(await siblingHasBuildScript(sibDir))) continue;
-    // Berry dropped classic's global `--cwd`, so it runs from the member dir.
-    const [argv, cwd]: [string[], string] =
-      yarnFlavor === YarnFlavor.Berry
-        ? [['run', 'build'], sibDir]
-        : [['--cwd', sibDir, 'run', 'build'], repoRoot];
+    const cmd = siblingBuildCommand({ ...args, sibDir, npmCliPath, nodeExe });
     process.stderr.write(
-      `[dep-installer:trace] building yarn sibling (${yarnFlavor}): yarn ${argv.join(' ')} @ ${cwd}\n`,
+      `[dep-installer:trace] building ${args.packageManager} sibling: ${cmd.bin} ${cmd.argv.join(' ')} @ ${cmd.cwd}\n`,
     );
     try {
-      await execFileAsync('yarn', argv, {
-        cwd,
+      await execFileAsync(cmd.bin, cmd.argv, {
+        cwd: cmd.cwd,
         env,
         timeout: INSTALL_TIMEOUT_MS,
         maxBuffer: INSTALL_MAX_BUFFER,
@@ -414,7 +462,7 @@ async function buildYarnWorkspaceClosure(
     } catch (e) {
       logSubprocessStreams(e, []);
       throw new Error(
-        `Failed to build .kici yarn workspace sibling ${rel}: ${describeExecError(e)}`,
+        `Failed to build .kici ${args.packageManager} workspace sibling ${rel}: ${describeExecError(e)}`,
       );
     }
   }

@@ -22,7 +22,10 @@ export interface WarmPoolCallbacks {
   countAvailable: (labels: string[]) => number;
   /**
    * Agents this backend spawned that match the label set and have never run a
-   * job. `registeredAt` doubles as "idle since": scaler agents are single-use.
+   * job. `registeredAt` stands in for "idle since". That is exact for a
+   * container-backend agent, which exits after its one job. An agent of another
+   * backend can finish a job and wait out its idle window before it exits, so it
+   * can read as idle for longer than it has been.
    *
    * Scoped to the backend because the reaper destroys what it is given; a
    * matching static agent is ready capacity, not this pool's to tear down.

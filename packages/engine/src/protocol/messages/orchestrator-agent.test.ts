@@ -851,6 +851,14 @@ describe('agentStatusSchema', () => {
     const roundTripped = JSON.parse(JSON.stringify(validStatus));
     expect(agentStatusSchema.parse(roundTripped)).toEqual(validStatus);
   });
+
+  it('keeps the draining flag', () => {
+    // fails-when: the schema strips draining, so the orchestrator never learns the agent stopped taking work
+    expect(agentStatusSchema.parse({ ...validStatus, draining: true })).toEqual({
+      ...validStatus,
+      draining: true,
+    });
+  });
 });
 
 describe('jobStatusSchema', () => {

@@ -36,6 +36,7 @@ import {
   EventLogSource,
   InitFailureCategory,
   PLATFORM_CONNECTED_MODES,
+  truncateReasonText,
 } from '@kici-dev/engine';
 import type { OrchestratorMode } from '@kici-dev/engine';
 import { isLockDynamicJobFn, isLockStaticJob } from '@kici-dev/engine';
@@ -109,7 +110,6 @@ import {
   partitionCandidates,
   recordUnrunCandidates,
   runGlobalEvalRounds,
-  truncateReasonText,
   ROUND_JOB_PREFIX,
   type GlobalEvalCandidate,
   type GlobalEvalDispatcher,

@@ -301,6 +301,12 @@ describe('run routes', () => {
     expect(vi.mocked(relay.handleTestRunLogs).mock.calls[0][0].cursor).toBe(0);
     await call(makeApp(), 'dev', 'GET', '/api/v1/test/runs/run-1/logs?cursor=7');
     expect(vi.mocked(relay.handleTestRunLogs).mock.calls[1][0].cursor).toBe(7);
+    await call(makeApp(), 'dev', 'GET', '/api/v1/test/runs/run-1/logs?cursor=0&logCursor=e30');
+    // fails-when: the direct route drops logCursor, so a direct run keeps the
+    // flat cursor that loses step lines
+    expect(vi.mocked(relay.handleTestRunLogs).mock.calls[2][0].logCursor).toBe('e30');
+    // breaks-if-wrong: a caller without logCursor still gets the numeric stream
+    expect(vi.mocked(relay.handleTestRunLogs).mock.calls[1][0].logCursor).toBeUndefined();
   });
 
   it('cancels a run with the caller as actor and the HTTP source', async () => {

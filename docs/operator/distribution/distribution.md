@@ -82,10 +82,10 @@ OCI-compliant container images are built for the orchestrator and agent.
 
 ### Available images
 
-| Image                         | Contents                                                                                |
-| ----------------------------- | --------------------------------------------------------------------------------------- |
-| `kici-orchestrator:<version>` | Orchestrator with all dependencies, ready for Docker/Podman/Kubernetes                  |
-| `kici-agent:<version>`        | Agent with git, bash, node, npm, and the native TypeScript loader binding pre-installed |
+| Image                         | Contents                                                                                                                                                                                     |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kici-orchestrator:<version>` | Orchestrator with all dependencies, ready for Docker/Podman/Kubernetes                                                                                                                       |
+| `kici-agent:<version>`        | Agent with git, bash, node, npm, pnpm, yarn, the native TypeScript loader binding, and common CLI tools. See [the default agent image](../../user/container-jobs.md#the-default-agent-image) |
 
 The agent container image is self-contained -- it includes all required runtime dependencies and can execute workflows without any additional host-level tools. The image's entrypoint is tini, which runs the agent as its child and reaps the processes a job leaves behind.
 
@@ -254,13 +254,19 @@ The image name and tag are configured in the scaler YAML:
 
 ```yaml
 # scalers.yaml
+version: 1
 scalers:
-  - type: container
-    image: kici-agent:latest
-    labels: [linux, x64]
+  - name: container-agents
+    type: container
+    maxAgents: 5
+    labelSets:
+      - labels: [linux, x64]
+        image: quay.io/kici-dev/kici-agent:<version>
 ```
 
-The container image includes git, bash, node, npm, and the native TypeScript loader binding -- no additional dependencies are needed.
+The container image includes git, bash, node, npm, pnpm, yarn, the native TypeScript loader binding and
+common CLI tools -- no additional dependencies are needed. See
+[the default agent image](../../user/container-jobs.md#the-default-agent-image).
 
 ### npm package (bare-metal)
 
@@ -344,7 +350,7 @@ Every agent deployment requires the following runtime dependencies, regardless o
 
 The container image and Firecracker rootfs include all required dependencies. A full standalone `kici-agent` package includes node, npm and the TypeScript loader binding, so the host provides git and the shell. For any other bare-metal deployment, the operator must ensure these are available on the host.
 
-npm is the only package manager used -- pnpm is not bundled. npm ships with Node.js and the agent resolves `npm-cli.js` from the Node installation directory.
+npm ships with Node.js, and the agent resolves `npm-cli.js` from the Node installation directory. The container image also carries pnpm and yarn, activated through corepack, for projects that use them.
 
 Some Node.js packages, such as Debian's, have no npm of their own. For a container job's host install, an agent on such a Node.js also uses the npm at `/usr/share/nodejs/npm` or an npm on its `PATH`, at version 11.10.0 or later. See [Where `.kici/` dependencies install](../agent/configuration.md#where-kici-dependencies-install).
 

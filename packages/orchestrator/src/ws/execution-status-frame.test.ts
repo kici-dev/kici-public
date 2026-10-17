@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ExecutionRunStatus } from '@kici-dev/engine';
+import { ExecutionRunStatus, STATUS_FREE_TEXT_MAX, executionStatusSchema } from '@kici-dev/engine';
 import type { ExecutionContext } from '../reporting/execution-tracker.js';
 import { buildExecutionStatusFrame } from './execution-status-frame.js';
 
@@ -90,5 +90,26 @@ describe('buildExecutionStatusFrame statusEpoch', () => {
     const built = frame(context());
     expect('statusEpoch' in built).toBe(true);
     expect(built.statusEpoch).toBe(0);
+  });
+});
+
+describe('buildExecutionStatusFrame free text', () => {
+  it('clamps a long failure reason, commit message and init-failure message', () => {
+    const built = buildExecutionStatusFrame({
+      messageId: 'msg-1',
+      runId: 'run-1',
+      status: ExecutionRunStatus.enum.failed,
+      context: context({ commitMessage: 'c'.repeat(5_000) }),
+      jobCount: 1,
+      startedAt: 1,
+      timestamp: 2,
+      failureReason: `Failed jobs: ${'job-x, '.repeat(800)}`,
+      initFailure: { scope: 'run', category: 'secret_resolution', message: 'm'.repeat(5_000) },
+    });
+    // fails-when: a long matrix's "Failed jobs: …" reason leaves the orchestrator unbounded
+    expect(built.failureReason).toHaveLength(STATUS_FREE_TEXT_MAX);
+    expect(built.commitMessage).toHaveLength(STATUS_FREE_TEXT_MAX);
+    expect(built.initFailure!.message).toHaveLength(STATUS_FREE_TEXT_MAX);
+    expect(executionStatusSchema.parse(built)).toEqual(built);
   });
 });

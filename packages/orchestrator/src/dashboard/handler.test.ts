@@ -70,6 +70,15 @@ function makeHandler(
  * `{ routing_key: null }` from #1 short-circuits #2 / #3: the handler falls back to its
  * bound (null/null) context, and the access recorder is a no-op without an `accessLog`.
  */
+/** An `execution_runs` row with no trust context or init failure: the run exists. */
+const EXISTING_RUN_ROW = {
+  trust_tier: null,
+  lock_file_source: null,
+  contributor_username: null,
+  init_failure: null,
+  check_mode: null,
+};
+
 function mockNoopResolveOrgForRun(executeTakeFirst: ReturnType<typeof vi.fn>): void {
   executeTakeFirst.mockResolvedValueOnce({ routing_key: null });
 }
@@ -210,9 +219,12 @@ describe('DashboardHandler', () => {
       const {
         handler,
         send,
-        mocks: { selectExecute: execute },
+        mocks: { selectExecute: execute, selectExecuteTakeFirst: executeTakeFirst },
       } = makeHandler();
 
+      mockNoopResolveOrgForRun(executeTakeFirst);
+      // The run exists: its execution_runs row is found.
+      executeTakeFirst.mockResolvedValueOnce(EXISTING_RUN_ROW);
       execute.mockResolvedValueOnce([]); // No jobs
       execute.mockResolvedValueOnce([]); // No steps
 
@@ -229,6 +241,33 @@ describe('DashboardHandler', () => {
       expect(response.requestId).toBe('req-3');
       expect(response.jobs).toEqual([]);
       expect(response.error).toBeUndefined();
+    });
+
+    it('answers a run it does not hold with an error, not an empty job list', async () => {
+      const {
+        handler,
+        send,
+        mocks: { selectExecute: execute, selectExecuteTakeFirst: executeTakeFirst },
+      } = makeHandler();
+
+      mockNoopResolveOrgForRun(executeTakeFirst);
+      executeTakeFirst.mockResolvedValueOnce(undefined); // no execution_runs row
+      execute.mockResolvedValueOnce([]); // no jobs
+      execute.mockResolvedValueOnce([]); // no steps
+
+      await handler.handleRunDetail({
+        type: 'dashboard.run.detail',
+        requestId: 'req-unknown',
+        actor: { type: 'user', sub: 'tester@example.com' },
+        runId: 'run-unknown',
+      });
+
+      // fails-when: an unknown run is answered with jobs: [] and no error, which
+      // the Platform reports as "the orchestrator reported no jobs".
+      const response = send.mock.calls[0][0];
+      expect(response.type).toBe('dashboard.run.detail.response');
+      expect(response.jobs).toEqual([]);
+      expect(response.error).toBe('Run not found');
     });
 
     it('validates outgoing response against engine schema', async () => {
@@ -2718,8 +2757,9 @@ describe('DashboardHandler', () => {
       executeTakeFirst.mockResolvedValueOnce({ routing_key: 'generic:right-org:src-1' });
       executeTakeFirst.mockResolvedValueOnce(undefined);
       executeTakeFirst.mockResolvedValueOnce({ customer_id: 'right-org' });
-      // 4. handleRunDetail's own trust-context lookup on execution_runs
-      executeTakeFirst.mockResolvedValueOnce(undefined);
+      // 4. handleRunDetail's own trust-context lookup on execution_runs: the
+      //    run the resolver just found exists here too
+      executeTakeFirst.mockResolvedValueOnce(EXISTING_RUN_ROW);
       // 5. jobs query, 6. steps query, 7. run_secret_outputs query
       execute.mockResolvedValueOnce([]);
       execute.mockResolvedValueOnce([]);

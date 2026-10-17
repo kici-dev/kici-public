@@ -176,6 +176,18 @@ describe('ContainerScalerBackend', () => {
   });
 
   describe('spawn()', () => {
+    it('starts a pool-image agent as a single-job agent in the sudo group', async () => {
+      const backend = await createBackend();
+      await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
+
+      const args = mockCreateContainer.mock.calls[0][0];
+      // fails-when: a pool agent can take a follow-up job in a container an
+      // earlier job has already changed (as root, through the image's sudo)
+      expect(args.Env).toContain('KICI_SCALER_SINGLE_JOB=1');
+      // fails-when: the single-job pool container gets no sudo group
+      expect(args.HostConfig.GroupAdd).toEqual(['1990']);
+    });
+
     it('creates container with correct env vars', async () => {
       const backend = await createBackend();
       await backend.spawn(['linux', 'docker'], 'agent-1', 'http://localhost:4000');
@@ -1363,9 +1375,15 @@ describe('ContainerScalerBackend per-job image', () => {
     const created = mockCreateContainer.mock.calls.at(-1)![0] as {
       Image: string;
       Cmd?: string[];
-      HostConfig: { Binds?: string[] };
+      Env: string[];
+      HostConfig: { Binds?: string[]; GroupAdd?: string[] };
     };
     expect(created.Image).toBe('reg.internal:5000/acme/ci:1.2');
+    // breaks-if-wrong: a job-image agent is held to its bound job by
+    // canAgentRunJob, and gid 1990 means nothing (or something else) in a
+    // customer's image, so it gets neither the flag nor the group.
+    expect(created.Env).not.toContain('KICI_SCALER_SINGLE_JOB=1');
+    expect(created.HostConfig.GroupAdd).toBeUndefined();
     // The injected runtime is what lets an arbitrary image run without Node.
     expect(created.HostConfig.Binds?.some((b) => b.endsWith(':/opt/kici:ro'))).toBe(true);
     // A per-job image declares its OWN default CMD, so without naming the agent

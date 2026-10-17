@@ -1937,5 +1937,8 @@ describe('fatal and early-exit paths send through the job masker', () => {
       expect(body, signature).not.toContain('sendMessage(');
     }
     expect(source).toContain('evaluateConcurrencyGroupIfPresent(workflow, request, maskedSend)');
+    // fails-when: the init failure sends the raw error instead of the bounded message
+    expect(bodyOf('async function runInitPhaseOrFailJob(')).toContain('formatInitFailureMessage(');
+    expect(source).toContain('maskLine: (line) => masker.mask(line)');
   });
 });

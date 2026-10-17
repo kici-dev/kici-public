@@ -15,6 +15,7 @@ import {
   listHeldRunsForRun,
   HeldRunRequestError,
 } from '../held-run-client.js';
+import { printNotes, stepDetailNotes } from './detail-notes.js';
 
 export interface RunsShowOptions {
   json?: boolean;
@@ -35,7 +36,9 @@ export async function runsShowCommand(
       }
       throw err;
     }
-    const detail = await client.getRunDetail(runId);
+    const read = await client.getRunDetailWithSource(runId);
+    const detail = read.detail;
+    printNotes(stepDetailNotes(read), new Set());
     const holds = await loadHolds(runId);
     if (options.json) {
       // `heldRunsUnavailable` separates "no holds" from "holds unreadable": both

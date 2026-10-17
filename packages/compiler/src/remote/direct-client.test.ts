@@ -42,9 +42,17 @@ describe('DirectRunClient requests', () => {
   });
 
   it('builds the log cursor query', async () => {
-    const calls = stubFetch(json({ lines: [], nextCursor: 3, done: false }));
-    await client().runLogs('run-1', 3);
+    const calls = stubFetch(
+      json({ lines: [], nextCursor: 3, done: false }),
+      json({ lines: [], nextCursor: 3, done: false }),
+    );
+    await client().runLogs('run-1', { cursor: 3 });
+    await client().runLogs('run-1', { cursor: 3, logCursor: 'e30' });
     expect(calls[0].url).toBe('https://ci.example.com/kici/api/v1/test/runs/run-1/logs?cursor=3');
+    // fails-when: the direct client drops logCursor
+    expect(calls[1].url).toBe(
+      'https://ci.example.com/kici/api/v1/test/runs/run-1/logs?cursor=3&logCursor=e30',
+    );
   });
 });
 

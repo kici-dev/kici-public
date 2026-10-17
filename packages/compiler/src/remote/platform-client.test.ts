@@ -8,6 +8,7 @@ import {
   AccessDeniedError,
   NotFoundError,
   ConnectionError,
+  nextLogPosition,
 } from './platform-client.js';
 
 describe('PlatformRunClient', () => {
@@ -100,16 +101,41 @@ describe('PlatformRunClient', () => {
     expect(init.method).toBe('GET');
   });
 
-  it('runLogs sends the cursor and returns the chunk', async () => {
-    fetchMock.mockResolvedValue(jsonResponse({ lines: ['a', 'b'], nextCursor: 2, done: false }));
-
-    const res = await client.runLogs('org_a', 'run-1', 5, { orchestrator: 'c1' });
-
-    expect(res).toEqual({ lines: ['a', 'b'], nextCursor: 2, done: false });
-    const [url] = fetchMock.mock.calls[0];
-    expect(url).toBe(
-      'https://api.kici.dev/api/v1/orgs/org_a/test/runs/run-1/logs?cursor=5&orchestrator=c1',
+  it('runLogs sends the cursor and the per-file cursor, and returns the chunk', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ lines: ['a', 'b'], nextCursor: 2, nextLogCursor: 'e30', done: false }),
     );
+
+    const res = await client.runLogs(
+      'org_a',
+      'run-1',
+      { cursor: 5, logCursor: '' },
+      { orchestrator: 'c1' },
+    );
+
+    expect(res).toEqual({ lines: ['a', 'b'], nextCursor: 2, nextLogCursor: 'e30', done: false });
+    const [url] = fetchMock.mock.calls[0];
+    // fails-when: the empty start token is dropped, so the server never starts per-file mode
+    expect(url).toBe(
+      'https://api.kici.dev/api/v1/orgs/org_a/test/runs/run-1/logs?cursor=5&logCursor=&orchestrator=c1',
+    );
+  });
+
+  it('runLogs sends only the numeric cursor when there is no per-file cursor', async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ lines: [], nextCursor: 5, done: false }));
+    await client.runLogs('org_a', 'run-1', { cursor: 5 });
+    // breaks-if-wrong: against an older server the CLI keeps the numeric cursor alone
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      'https://api.kici.dev/api/v1/orgs/org_a/test/runs/run-1/logs?cursor=5',
+    );
+  });
+
+  it('nextLogPosition follows the per-file cursor when the response offers it', () => {
+    expect(
+      nextLogPosition({ lines: [], nextCursor: 3, nextLogCursor: 'e30', done: false }),
+    ).toEqual({ cursor: 3, logCursor: 'e30' });
+    // breaks-if-wrong: an older server's response drops the per-file cursor for good
+    expect(nextLogPosition({ lines: [], nextCursor: 3, done: false })).toEqual({ cursor: 3 });
   });
 
   it('cancel POSTs to the cancel route', async () => {

@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/agent",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "description": "Customer-deployable agent for the KiCI CI/CD stack. Connects to an orchestrator, clones the workflow repo, executes steps, and streams logs back.",
   "keywords": [
     "ci",
@@ -71,6 +71,7 @@
     "dockerode": "^5.0.1",
     "hono": "^4.13.7",
     "jose": "^6.2.12",
+    "picomatch": "^4.0.7",
     "tar": "^7.5.22",
     "winston": "^3.19.0",
     "ws": "^8.21.3",

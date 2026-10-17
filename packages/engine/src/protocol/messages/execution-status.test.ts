@@ -27,6 +27,8 @@ import {
   STATUS_EPOCH_MAX,
 } from './execution-status.js';
 import { orchestratorToPlatformMessageSchema } from './platform-orchestrator.js';
+import { TRUNCATION_MARKER } from './bounded-text.js';
+import { dashboardRunStateResponseSchema } from './dashboard.js';
 
 describe('jobStatusForwardSchema', () => {
   const validJobStatus = {
@@ -733,18 +735,114 @@ describe('flood-hardening field bounds', () => {
     expect(r.success).toBe(false);
   });
 
-  it('accepts a failureReason at STATUS_FREE_TEXT_MAX and rejects over', () => {
+  it('keeps a failureReason at STATUS_FREE_TEXT_MAX and clamps a longer one', () => {
+    const atLimit = 'x'.repeat(STATUS_FREE_TEXT_MAX);
+    // breaks-if-wrong: a value at the bound arrives byte-identical
     expect(
-      executionStatusSchema.safeParse({
-        ...baseStatus,
-        failureReason: 'x'.repeat(STATUS_FREE_TEXT_MAX),
-      }).success,
-    ).toBe(true);
+      executionStatusSchema.parse({ ...baseStatus, failureReason: atLimit }).failureReason,
+    ).toBe(atLimit);
+    const clamped = executionStatusSchema.parse({
+      ...baseStatus,
+      failureReason: 'x'.repeat(STATUS_FREE_TEXT_MAX + 1),
+    }).failureReason!;
+    // fails-when: an over-long failureReason makes the whole frame invalid again
+    expect(clamped).toHaveLength(STATUS_FREE_TEXT_MAX);
+    expect(clamped.endsWith(TRUNCATION_MARKER)).toBe(true);
+  });
+
+  it('clamps every free-text field of the status family and keeps identifiers strict', () => {
+    const LONG = '\rDownloading 42%'.repeat(650); // 10,400 characters of redraws
+    const job = {
+      type: 'job.status.forward' as const,
+      messageId: 'm',
+      runId: 'r',
+      jobId: 'j',
+      jobName: 'build',
+      status: 'failed' as const,
+      timestamp: 1,
+    };
+    const replayRun = (extra: Record<string, unknown>, jobExtra: Record<string, unknown> = {}) => ({
+      runId: 'r',
+      workflowName: 'w',
+      status: 'failed' as const,
+      jobCount: 1,
+      startedAt: 1,
+      statusEpoch: 0,
+      jobs: [{ jobId: 'j', jobName: 'build', status: 'failed', ...jobExtra }],
+      ...extra,
+    });
+    const replay = (run: Record<string, unknown>) => ({
+      type: 'state.replay' as const,
+      messageId: 'm',
+      timestamp: 1,
+      runs: [run],
+    });
+    const initFailure = {
+      scope: 'run' as const,
+      category: 'secret_resolution' as const,
+      message: LONG,
+    };
+    const cases: Array<[string, () => string | null | undefined]> = [
+      [
+        'execution.status failureReason',
+        () => executionStatusSchema.parse({ ...baseStatus, failureReason: LONG }).failureReason,
+      ],
+      [
+        'execution.status commitMessage',
+        () => executionStatusSchema.parse({ ...baseStatus, commitMessage: LONG }).commitMessage,
+      ],
+      [
+        'execution.status initFailure.message',
+        () => executionStatusSchema.parse({ ...baseStatus, initFailure }).initFailure?.message,
+      ],
+      [
+        'job.status.forward errorMessage',
+        () => jobStatusForwardSchema.parse({ ...job, errorMessage: LONG }).errorMessage,
+      ],
+      [
+        'job.status.forward initFailure.message',
+        () => jobStatusForwardSchema.parse({ ...job, initFailure }).initFailure?.message,
+      ],
+      [
+        'state.replay failureReason',
+        () =>
+          stateReplaySchema.parse(replay(replayRun({ failureReason: LONG }))).runs[0]!
+            .failureReason,
+      ],
+      [
+        'state.replay commitMessage',
+        () =>
+          stateReplaySchema.parse(replay(replayRun({ commitMessage: LONG }))).runs[0]!
+            .commitMessage,
+      ],
+      [
+        'state.replay job errorMessage',
+        () =>
+          stateReplaySchema.parse(replay(replayRun({}, { errorMessage: LONG }))).runs[0]!.jobs[0]!
+            .errorMessage,
+      ],
+      [
+        'dashboard.run.state.response failureReason',
+        () =>
+          dashboardRunStateResponseSchema.parse({
+            type: 'dashboard.run.state.response',
+            requestId: 'q',
+            run: replayRun({ failureReason: LONG }),
+          }).run?.failureReason,
+      ],
+    ];
+    for (const [name, read] of cases) {
+      const out = read();
+      // fails-when: any free-text field of the family still refuses an over-long value
+      expect(out, name).toHaveLength(STATUS_FREE_TEXT_MAX);
+      expect(out!.endsWith(TRUNCATION_MARKER), name).toBe(true);
+    }
+    // breaks-if-wrong: identifiers are not clamped; an over-long id still makes the frame invalid
     expect(
-      executionStatusSchema.safeParse({
-        ...baseStatus,
-        failureReason: 'x'.repeat(STATUS_FREE_TEXT_MAX + 1),
-      }).success,
+      jobStatusForwardSchema.safeParse({ ...job, jobId: 'J'.repeat(STATUS_ID_MAX + 1) }).success,
+    ).toBe(false);
+    expect(
+      jobStatusForwardSchema.safeParse({ ...job, jobName: 'J'.repeat(STATUS_ID_MAX + 1) }).success,
     ).toBe(false);
   });
 
@@ -761,20 +859,6 @@ describe('flood-hardening field bounds', () => {
         repoIdentifier: 'x'.repeat(REPO_IDENTIFIER_MAX + 1),
       }).success,
     ).toBe(false);
-  });
-
-  it('rejects an over-long errorMessage on job.status.forward', () => {
-    const r = jobStatusForwardSchema.safeParse({
-      type: 'job.status.forward',
-      messageId: 'm',
-      runId: 'r',
-      jobId: 'j',
-      jobName: 'build',
-      status: 'failed',
-      timestamp: 1,
-      errorMessage: 'x'.repeat(STATUS_FREE_TEXT_MAX + 1),
-    });
-    expect(r.success).toBe(false);
   });
 
   it('rejects a runsOnLabels array over RUNS_ON_LABELS_MAX', () => {

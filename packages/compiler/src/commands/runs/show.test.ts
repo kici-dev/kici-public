@@ -7,6 +7,7 @@ import {
   HeldRunStatus,
   HoldType,
   InitFailureCategory,
+  RunDetailSource,
 } from '@kici-dev/engine';
 import { runsShowCommand } from './show.js';
 import * as clientMod from '../../remote/dashboard-client.js';
@@ -44,6 +45,15 @@ beforeEach(() => {
 
 afterEach(() => vi.restoreAllMocks());
 
+/** A detail read the Platform served from the orchestrator. */
+function proxied(detail: unknown) {
+  return async () => ({
+    detail,
+    source: RunDetailSource.enum['orchestrator-proxy'],
+    fallbackReason: null,
+  });
+}
+
 function runSummary(status: string = ExecutionRunStatus.enum.success) {
   return {
     runId: 'r1',
@@ -59,7 +69,7 @@ function runSummary(status: string = ExecutionRunStatus.enum.success) {
 function stubClient(detail: unknown, status: string = ExecutionRunStatus.enum.success): void {
   vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
     getRun: async () => runSummary(status),
-    getRunDetail: async () => detail,
+    getRunDetailWithSource: proxied(detail),
   } as never);
 }
 
@@ -103,7 +113,7 @@ describe('runsShowCommand', () => {
         status: ExecutionRunStatus.enum.success,
         createdAt: '2026-06-12',
       }),
-      getRunDetail: async () => ({ jobs: [] }),
+      getRunDetailWithSource: proxied({ jobs: [] }),
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     await runsShowCommand('r1', { json: true });
@@ -316,5 +326,56 @@ describe('runsShowCommand', () => {
     const printed = log.mock.calls.map((c) => String(c[0])).join('\n');
     const parsed = JSON.parse(printed) as { heldRuns?: { id: string }[] };
     expect(parsed.heldRuns?.[0]?.id).toBe('h1');
+  });
+
+  it('prints the stored-copy note on stderr and leaves stdout unchanged', async () => {
+    const detail = {
+      jobs: [
+        {
+          jobId: 'j1',
+          jobName: 'build',
+          status: ExecutionJobStatus.enum.failed,
+          matrixValues: null,
+          startedAt: 1_700_000_000_000,
+          completedAt: 1_700_000_060_000,
+          durationMs: 60_000,
+          agentId: 'a1',
+          errorMessage: null,
+          steps: [],
+        },
+      ],
+    };
+    const render = async (source: string, fallbackReason: string | null) => {
+      mockedResolve.mockResolvedValue({
+        endpoint: 'https://api.example.test',
+        token: 't',
+        orgId: 'org-1',
+      });
+      mockedListHolds.mockResolvedValue([]);
+      vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
+        getRun: async () => runSummary(ExecutionRunStatus.enum.failed),
+        getRunDetailWithSource: async () => ({ detail, source, fallbackReason }),
+      } as never);
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const ok = await runsShowCommand('r1', {});
+      const out = {
+        ok,
+        stdout: log.mock.calls.map((c) => String(c[0])).join('\n'),
+        stderr: err.mock.calls.map((c) => String(c[0])).join('\n'),
+      };
+      vi.restoreAllMocks();
+      return out;
+    };
+    const stored = await render(RunDetailSource.enum['platform-db'], 'orchestrator_unreachable');
+    const proxiedRead = await render(RunDetailSource.enum['orchestrator-proxy'], null);
+    // fails-when: a stored-copy read prints the empty tree with no explanation
+    expect(stored.stderr).toContain(
+      'step detail unavailable: the Platform could not read it from the orchestrator that ran this run (no orchestrator that can serve this run is connected)',
+    );
+    // breaks-if-wrong: stdout and the exit code do not depend on the source
+    expect(stored.stdout).toBe(proxiedRead.stdout);
+    expect(stored.ok).toBe(true);
+    expect(proxiedRead.stderr).not.toContain('step detail unavailable');
   });
 });

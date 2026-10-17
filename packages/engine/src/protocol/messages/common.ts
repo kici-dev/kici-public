@@ -37,19 +37,33 @@ export const ackSchema = z.object({
 });
 
 /**
+ * Why a NACK was sent.
+ *
+ * - `unsupported_type` — the frame's `type` is unknown to the receiver (version
+ *   skew). A NACK without a `code` means the same.
+ * - `invalid_frame` — the receiver knows the `type`, but the frame failed
+ *   validation and was dropped.
+ */
+export const NackCode = z.enum(['unsupported_type', 'invalid_frame']);
+export type NackCode = z.infer<typeof NackCode>;
+
+/**
  * Negative acknowledgment - message received but could not be processed.
  *
  * Doubles as the version-skew signal: a peer that receives a message type it
  * does not understand replies with a NACK naming the `receivedType`, instead of
- * dropping the frame (which surfaces only as a downstream proxy timeout).
- * Both fields are optional, so a fire-and-forget frame with no `messageId`
- * still yields a valid NACK.
+ * dropping the frame (which surfaces only as a downstream proxy timeout). The
+ * Platform also NACKs a frame of a known type that it dropped as invalid, with
+ * `code` `invalid_frame`. The correlation fields are optional, so a
+ * fire-and-forget frame with no `messageId` still yields a valid NACK.
  */
 export const nackSchema = z.object({
   type: z.literal('nack'),
+  /** Why the frame was NACKed; absent means `unsupported_type`. */
+  code: NackCode.optional(),
   /** Correlation id echoed from the offending frame, when it carried one. */
   messageId: z.string().optional(),
-  /** The unsupported/unrecognized message type that triggered this NACK. */
+  /** The message type that triggered this NACK. */
   receivedType: z.string().optional(),
   reason: z.string(),
 });
@@ -76,8 +90,8 @@ export const NACK_EXEMPT_MESSAGE_TYPES: ReadonlySet<string> = new Set([
  * - `raw` is not an object with a non-empty string `type` (malformed garbage); OR
  * - the `type` is in `NACK_EXEMPT_MESSAGE_TYPES`; OR
  * - the `type` is in `knownTypes`: a KNOWN type that failed the chain is
- *   malformed (e.g. a field past its length bound), not version skew. The
- *   caller must close the connection, never keep it alive with a NACK.
+ *   malformed (e.g. an identifier past its length bound), not version skew.
+ *   The caller handles it as an invalid frame, never with a skew NACK.
  *
  * `side` names the local peer emitting the NACK (the behind party) for the
  * operator-facing upgrade hint, matching the lock-window "upgrade the

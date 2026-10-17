@@ -550,7 +550,7 @@ kici-admin source add github \
   --webhook-secret whsec_partner_secret
 ```
 
-See `docs/operator/orchestrator/kici-admin-cli.md` for the full `source` command reference.
+See the [kici-admin CLI reference](kici-admin/sources.md) for the full `source` command reference.
 
 Each app registers its own routing key (e.g., `github:12345`, `github:67890`) with the Platform relay via `source.register` messages. The `ProviderRegistry` maps each routing key to its own provider bundle (normalizer, lock file fetcher, clone token provider, etc.).
 

@@ -199,6 +199,7 @@ describe('run remote --approve-all / --yes option wiring', () => {
   it('parses --approve-all and --yes to approveAll:true', () => {
     for (const flag of ['--approve-all', '--yes']) {
       const remote = runRemoteCommand();
+      // Neutralise the action so parsing does not run the real command.
       remote.action(() => {});
       remote.parse(['fixture-id', flag], { from: 'user' });
       expect(remote.opts().approveAll, `${flag} should set approveAll`).toBe(true);

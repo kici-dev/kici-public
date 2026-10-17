@@ -99,6 +99,8 @@ kici verify-attestation [artifact] --bundle <path-or-url> [--trust-root <url-or-
   }
   ```
 
+**Plain HTTP:** a trust-root URL must use `https://` or a loopback address (`localhost`, `127.0.0.1`, `[::1]`). The command refuses a plain `http://` trust root on another host, a `jwks_uri` on one, and a redirect from `https://` to one, because an attacker on the network can replace the signing keys. It exits 1 and writes the reason to stderr. `--allow-insecure-trust-root` accepts the risk: the command verifies and writes a warning to stderr.
+
 **Examples:**
 
 ```bash
@@ -194,6 +196,7 @@ doctor` checks **your own setup**, in onboarding order:
 - `orchestrator` — a connected orchestrator for the org.
 - `labels` — every workflow's `runsOn` labels are satisfiable by a
   connected agent or scaler.
+- `agent-deps` — shown only when `.kici/` has workflows but no `.kici/package.json`. Agents install the `.kici/` dependencies from that file only, so without it `@kici-dev/sdk` does not resolve on an agent.
 - `config` — shown only when `~/.kici/config` carries a deprecated field.
 
 If you run only against an orchestrator (a direct target and no Platform
@@ -386,15 +389,15 @@ Synopsis: `kici notifications channels add [options]`
 
 **Options**
 
-| Option                 | Default | Description                                    |
-| ---------------------- | ------- | ---------------------------------------------- |
-| `--type <slack         | email>` |                                                | Channel transport type |
-| `--name <name>`        |         | Channel display name                           |
-| `--connection <id>`    |         | Slack connection id (slack channels)           |
-| `--slack-channel <id>` |         | Slack channel id (slack channels)              |
-| `--from-name <name>`   |         | Sender name (email channels)                   |
-| `--reply-to <email>`   |         | Reply-to address (email channels)              |
-| `--org <id>`           |         | Target organization (overrides the active org) |
+| Option                  | Default | Description                                    |
+| ----------------------- | ------- | ---------------------------------------------- |
+| `--type <slack\|email>` |         | Channel transport type                         |
+| `--name <name>`         |         | Channel display name                           |
+| `--connection <id>`     |         | Slack connection id (slack channels)           |
+| `--slack-channel <id>`  |         | Slack channel id (slack channels)              |
+| `--from-name <name>`    |         | Sender name (email channels)                   |
+| `--reply-to <email>`    |         | Reply-to address (email channels)              |
+| `--org <id>`            |         | Target organization (overrides the active org) |
 
 ### `kici notifications channels list`
 
@@ -441,14 +444,14 @@ Synopsis: `kici notifications roster add [options]`
 
 **Options**
 
-| Option                           | Default   | Description                                    |
-| -------------------------------- | --------- | ---------------------------------------------- |
-| `--connection <id>`              |           | Slack connection id                            |
-| `--subject-kind <kici_user       | git_login | email>`                                        |      | What the subject keys on       |
-| `--subject <value>`              |           | The KiCI user sub, git login, or email         |
-| `--value <slackIdEmailOrHandle>` |           | Slack member id, email, or @handle             |
-| `--input-form <id                | username  | email>`                                        | `id` | How --value should be resolved |
-| `--org <id>`                     |           | Target organization (overrides the active org) |
+| Option                                         | Default | Description                                    |
+| ---------------------------------------------- | ------- | ---------------------------------------------- |
+| `--connection <id>`                            |         | Slack connection id                            |
+| `--subject-kind <kici_user\|git_login\|email>` |         | What the subject keys on                       |
+| `--subject <value>`                            |         | The KiCI user sub, git login, or email         |
+| `--value <slackIdEmailOrHandle>`               |         | Slack member id, email, or @handle             |
+| `--input-form <id\|username\|email>`           | `id`    | How --value should be resolved                 |
+| `--org <id>`                                   |         | Target organization (overrides the active org) |
 
 ### `kici notifications roster list`
 
@@ -495,21 +498,21 @@ Synopsis: `kici notifications subscriptions add [options]`
 
 **Options**
 
-| Option                       | Default | Description                                         |
-| ---------------------------- | ------- | --------------------------------------------------- |
-| `--channel <id>`             |         | Target channel id                                   |
-| `--on-status <csv>`          |         | Statuses to notify on (e.g. failed,success)         |
-| `--level <run                | job>`   | `run`                                               | Subscription granularity |
-| `--scope <org                | team    | user                                                | actor>`                  | `org` | Subscription scope |
-| `--scope-id <id>`            |         | Scope id (required for team/user scope)             |
-| `--repo-glob <glob>`         |         | Match runs whose repo matches this glob             |
-| `--workflow-glob <glob>`     |         | Match runs whose workflow matches this glob         |
-| `--job-glob <glob>`          |         | Match jobs matching this glob (job level)           |
-| `--mentions <csv>`           |         | Literal Slack member/group ids or emails to mention |
-| `--recipient-override <csv>` |         | Override the email recipient set                    |
-| `--on-failure-class <csv>`   |         | Only match these failure classes                    |
-| `--accumulate-for <ms>`      |         | Digest accumulation window in milliseconds          |
-| `--org <id>`                 |         | Target organization (overrides the active org)      |
+| Option                             | Default | Description                                         |
+| ---------------------------------- | ------- | --------------------------------------------------- |
+| `--channel <id>`                   |         | Target channel id                                   |
+| `--on-status <csv>`                |         | Statuses to notify on (e.g. failed,success)         |
+| `--level <run\|job>`               | `run`   | Subscription granularity                            |
+| `--scope <org\|team\|user\|actor>` | `org`   | Subscription scope                                  |
+| `--scope-id <id>`                  |         | Scope id (required for team/user scope)             |
+| `--repo-glob <glob>`               |         | Match runs whose repo matches this glob             |
+| `--workflow-glob <glob>`           |         | Match runs whose workflow matches this glob         |
+| `--job-glob <glob>`                |         | Match jobs matching this glob (job level)           |
+| `--mentions <csv>`                 |         | Literal Slack member/group ids or emails to mention |
+| `--recipient-override <csv>`       |         | Override the email recipient set                    |
+| `--on-failure-class <csv>`         |         | Only match these failure classes                    |
+| `--accumulate-for <ms>`            |         | Digest accumulation window in milliseconds          |
+| `--org <id>`                       |         | Target organization (overrides the active org)      |
 
 ### `kici notifications subscriptions list`
 
@@ -599,11 +602,12 @@ Synopsis: `kici verify-attestation [artifact] [options]`
 
 **Options**
 
-| Option                       | Default | Description                                                                                           |
-| ---------------------------- | ------- | ----------------------------------------------------------------------------------------------------- |
-| `--bundle <path>`            |         | Path or URL to the attestation bundle JSON                                                            |
-| `--trust-root <url-or-file>` |         | Trusted issuer URL, or a self-contained { issuer, jwks } file (default: your configured orchestrator) |
-| `--audience <aud>`           |         | Expected token audience                                                                               |
-| `--json`                     | `false` | Output structured JSON result                                                                         |
+| Option                        | Default | Description                                                                                           |
+| ----------------------------- | ------- | ----------------------------------------------------------------------------------------------------- |
+| `--bundle <path>`             |         | Path or URL to the attestation bundle JSON                                                            |
+| `--trust-root <url-or-file>`  |         | Trusted issuer URL, or a self-contained { issuer, jwks } file (default: your configured orchestrator) |
+| `--audience <aud>`            |         | Expected token audience                                                                               |
+| `--json`                      | `false` | Output structured JSON result                                                                         |
+| `--allow-insecure-trust-root` | `false` | Accept a trust root fetched over plain HTTP from a host that is not loopback                          |
 
 <!-- END GENERATED: kici-notifications-and-diagnostics -->

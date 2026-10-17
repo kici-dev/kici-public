@@ -391,8 +391,9 @@ export const build = workflow('build', {
           set -euo pipefail
           command -v mise >/dev/null || curl -fsSL https://mise.run | sh
           export PATH="$HOME/.local/bin:$PATH"
+          mise trust
           mise install
-          mise env -s bash | sed -n 's/^export //p' >> "$KICI_ENV"
+          mise env --dotenv | sed '/^PATH=/d' >> "$KICI_ENV"
           echo "$HOME/.local/share/mise/shims" >> "$KICI_PATH"
         `,
         cache: { key: 'mise-jq-1.7.1', paths: ['~/.local/share/mise'] },
@@ -412,13 +413,13 @@ export const build = workflow('build', {
 
 **`GenericInitConfig` shape:**
 
-| Field     | Type                    | Required | Description                                                                                                                                                                                                                                                             |
-| --------- | ----------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `run`     | `string`                | yes      | Command run after clone, before steps. Runs in the job's sandbox at the clone root. Must be a non-empty command.                                                                                                                                                        |
-| `shell`   | `string`                | no       | Shell used to run `run`. Defaults to `bash`.                                                                                                                                                                                                                            |
-| `cache`   | `CacheSpec`             | no       | Cache spec for binaries the command installs -- restored before the command, saved after on a key miss. A failed restore runs the command without the cache, and a failed save does not fail the job. The init step's log names the error. See [Caching](./caching.md). |
-| `timeout` | `number`                | no       | Max wall-clock for this init command in milliseconds. Defaults to 10 minutes. On breach the init is aborted and the job is reported timed out.                                                                                                                          |
-| `env`     | `Record<string,string>` | no       | Static environment variables available to the command.                                                                                                                                                                                                                  |
+| Field     | Type                    | Required | Description                                                                                                                                                                                                                                                                                                                                                                      |
+| --------- | ----------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `run`     | `string`                | yes      | Command run after clone, before steps. Runs in the job's sandbox at the clone root. Must be a non-empty command.                                                                                                                                                                                                                                                                 |
+| `shell`   | `string`                | no       | Shell used to run `run`. Defaults to `bash`.                                                                                                                                                                                                                                                                                                                                     |
+| `cache`   | `CacheSpec`             | no       | Cache spec for binaries the command installs -- restored before the command, saved after on a key miss. A failed restore runs the command without the cache, and a failed save does not fail the job. The init step's log names the error. See [Caching](./caching.md).                                                                                                          |
+| `timeout` | `number`                | no       | Max wall-clock for this init command in milliseconds. Defaults to 10 minutes. On breach the init is aborted and the job is reported timed out.                                                                                                                                                                                                                                   |
+| `env`     | `Record<string,string>` | no       | Environment variables for this command only. A key here wins over the job's value for the command. The agent ignores a key that starts with `KICI_` (in any letter case) or that names an operator secret, and the init step's log names each ignored key. A `PATH` key replaces the job's `PATH` for the command. To add a directory for later steps, write it to `$KICI_PATH`. |
 
 **The `$KICI_ENV` / `$KICI_PATH` handoff.** The init command does not mutate the step environment directly. Instead it writes what it wants visible to later steps to two files the agent allocates and exposes as environment variables:
 
@@ -429,6 +430,8 @@ The agent reads both files after the command succeeds, applies the delta, and th
 
 **Failure before steps.** If the init command exits non-zero or exceeds its `timeout`, the job **fails before any step runs** -- the init surfaces as a failed `init:<n>` pseudo-step in the run timeline (alongside the step list), its logs are attached, and the step loop never executes. This makes a broken toolchain a clear, early failure rather than a confusing mid-run error.
 
+The job's error message names the failed init and its exit code, then the last lines the command wrote to standard error: `init[<n>] failed (exit <code>): <lines>`. It keeps up to 20 lines and 1,500 characters. A progress bar that redraws one line shows only its final state, and color codes are removed. When the command wrote nothing to standard error, the lines come from standard output. The init step's log keeps the full output.
+
 **Arrays run in order.** Passing `GenericInitConfig[]` runs the inits sequentially; each one's `$KICI_ENV` / `$KICI_PATH` delta is applied before the next runs, so a later init sees an earlier init's tools on `PATH`. The first init to fail stops the sequence and fails the job.
 
 **`init: false`** is an explicit opt-out; it behaves the same as omitting `init`.
@@ -438,7 +441,8 @@ The agent reads both files after the command succeeds, applies the delta, and th
 For the common case, a typed preset removes the hand-written `run` block entirely. The agent expands the preset to the same generic init it would otherwise run.
 
 - **`init: 'mise'`** -- zero-config. Installs mise, trusts and runs `mise install` against the committed mise config (`mise.toml` / `.mise.toml` / `.tool-versions`), hands mise's env + shims dir to subsequent steps, and caches mise's data dir under a key derived from the committed config (so a config change rotates the cache). The committed config is trusted automatically — committing it to your repo is the trust signal.
-- **`init: { mise: { cache, timeout, env, shell } }`** -- the same preset with overrides. These tune the generic fields a hand-written init exposes (minus `run`): `cache: false` disables caching, a `CacheSpec` replaces the default key/paths, and `timeout` / `env` / `shell` map straight through. `init: 'mise'` is exactly `init: { mise: {} }`.
+- **`init: { mise: { cache, timeout, env, shell, version } }`** -- the same preset with overrides. `cache: false` disables caching, a `CacheSpec` replaces the default key and paths, and `timeout`, `env` and `shell` work as they do on a hand-written init. `version` pins mise itself (see below). `init: 'mise'` is exactly `init: { mise: {} }`.
+- **`init: { apt: { packages, cache, timeout, env, shell } }`** -- installs Debian packages before the steps. Each entry in `packages` is a Debian package name, optionally pinned as `name=version` (`'make'`, `'make=4.4.1-2'`). `job()` rejects anything else. The agent runs `apt-get update` and `apt-get install -y --no-install-recommends` as root, or through `sudo -n` as any other user. `env` reaches apt-get, also through `sudo`, so use it for a proxy. `cache: true` keeps the downloaded `.deb` files in the job cache. The cache key comes from the distribution release, the CPU architecture and the package list. The init fails, with the reason in its log, in these cases: on a runner without apt-get (macOS, Windows, a Linux distribution other than Debian or Ubuntu), and as a user that is not root and may not run `sudo` without a password. An agent older than the release that adds this preset fails the job before any step runs.
 
 ```typescript
 const build = job('build', {
@@ -453,6 +457,29 @@ const build = job('build', {
 });
 ```
 
+```typescript
+const compile = job('compile', {
+  runsOn: 'linux',
+  init: { apt: { packages: ['make', 'libssl-dev'] } },
+  steps: [step('make', async (ctx) => ctx.$`make`)],
+});
+```
+
+**Pinning mise (`version`).** Set `version` to a mise release, such as `'2026.5.1'` or `'v2026.5.1'`. `job()` rejects any other value. With a pin, the preset does these things:
+
+- It installs that release into `~/.local/share/kici/mise/<version>` (on Windows, `%USERPROFILE%\.local\share\kici\mise\<version>`). When that release is already there, it uses it again.
+- It puts that directory first on `PATH` for the init command. The pinned mise comes before any other mise on the host, and before a `PATH` that you set in `env`.
+- It fails the init when `mise --version` shows a different release.
+- It adds that directory to `PATH` for the job's steps, so a step that runs `mise` gets the pinned release.
+
+Without `version`, the preset uses a mise that is already on `PATH`. If there is none, it installs the release that the mise installer selects: the newest release that is at least 24 hours old. An older agent that does not know `version` ignores it and installs mise without the pin. Upgrade your agents before you rely on the pin.
+
+**npm tools and the low-download check.** mise installs `npm:` tools with its embedded aube package manager. aube refuses a package that has fewer weekly downloads than its threshold (1000 by default), and the init then fails. KiCI does not turn this check off for you. To install such a package, use one of these options from the [mise npm backend docs](https://mise.jdx.dev/dev-tools/backends/npm):
+
+- First check the package name and publisher. Then set `allow_low_downloads = true` on that tool's `[tools]` entry.
+- Create `mise.lock` with `mise lock` and commit it. A tool that mise resolves from `mise.lock` passes the check.
+- Set `env: { MISE_NPM_PACKAGE_MANAGER: 'npm' }` on the preset. mise then installs `npm:` tools with npm instead of aube.
+
 #### Auto-detect (`init: 'auto'`)
 
 **`init: 'auto'`** detects the toolchain from committed files instead of naming a preset. The agent scans the clone root and selects a preset when a marker is present: `mise.toml` / `.mise.toml` / `.tool-versions` -> the mise preset. With no markers found, `'auto'` is a logged no-op.
@@ -461,7 +488,7 @@ const build = job('build', {
 
 #### Cross-platform
 
-The mise preset works on Linux, macOS, and Windows. On Linux and macOS mise is installed via its standalone install script; on Windows it is installed from its standalone GitHub release. The resulting toolchain reaches every step the same way on all three. On Windows the standalone mise binary requires the Microsoft Visual C++ runtime (`vc_redist.x64`) to be present on the agent host — install it once when provisioning a Windows agent that uses the mise preset.
+The mise preset works on Linux, macOS, and Windows. On Linux and macOS mise is installed via its standalone install script; on Windows it is installed from its standalone GitHub release. The resulting toolchain reaches every step the same way on all three. On Windows the standalone mise binary requires the Microsoft Visual C++ runtime (`vc_redist.x64`) to be present on the agent host — install it once when provisioning a Windows agent that uses the mise preset. With `version` on Windows, the agent downloads the zip of that GitHub release tag.
 
 ## Step & job authoring patterns
 

@@ -5,6 +5,7 @@ import {
   PROTOCOL_VERSION,
   JoinErrorCode,
   buildJoinRefusal,
+  STATUS_FREE_TEXT_MAX,
   type OrchestratorToPlatformMessage,
 } from '@kici-dev/engine';
 import {
@@ -695,6 +696,22 @@ describe('PlatformClient', () => {
       mock.emit('close', 4003, Buffer.from('Invalid message'));
       return mock;
     }
+
+    it('sends the replay with its free text clamped', async () => {
+      const client = createClient();
+      const mock = authenticateClient(client);
+      mock.sentMessages = [];
+
+      await client.sendStateReplay([
+        { ...makeReplayRun('r-long'), failureReason: 'f'.repeat(9_000) },
+      ]);
+
+      const replay = getSentMessages(mock).find(
+        (m) => (m as { type?: string }).type === 'state.replay',
+      ) as { runs: Array<{ failureReason: string }> };
+      // fails-when: the replay sends the raw frame instead of the parsed (clamped) one
+      expect(replay.runs[0]!.failureReason).toHaveLength(STATUS_FREE_TEXT_MAX);
+    });
 
     it('opens after three replay-attributed disconnects and then skips the replay', async () => {
       const client = createClient();

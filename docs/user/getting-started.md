@@ -38,12 +38,12 @@ The package manager is detected from your repo's `packageManager` field, lockfil
 | `--skip-install`                      | Create files without installing dependencies                 |
 | `--package-manager <npm\|pnpm\|yarn>` | Force a package manager for the install step (default: auto) |
 | `--mjs`                               | JavaScript-only mode (no TypeScript, no deps)                |
-| `--workspace`                         | Integrate `.kici/` into the surrounding workspace            |
+| `--workspace`                         | Make `.kici/` a member of the surrounding workspace          |
 | `--standalone`                        | Force a self-contained `.kici/` even inside a workspace      |
 
 ### Workspace integration
 
-If you run `kici init` inside a pnpm, npm, or yarn workspace, it offers to **integrate** `.kici/` into that workspace instead of scaffolding a self-contained folder. In integrate mode there is no `.kici/package.json`: `@kici-dev/sdk` is added to your workspace-root `package.json`, and your workflows can `import` your other workspace packages directly — for example shared build or deploy utilities. Pass `--workspace` to opt in non-interactively, or `--standalone` to keep the self-contained layout. In CI the default is standalone. See the [`kici init` reference](./cli/account-and-org.md#kici-init) for details.
+If you run `kici init` inside a pnpm, npm, or yarn workspace, it offers to make `.kici/` a **member** of that workspace instead of a self-contained folder. `.kici/` keeps its own `package.json`, and `kici init` adds `.kici` to the workspace package list: `pnpm-workspace.yaml` for pnpm, or the `workspaces` field of the root `package.json` for npm and yarn. Your workflows can then `import` your other workspace packages, for example shared build or deploy utilities. Declare each package that a workflow imports in `.kici/package.json`. Use `workspace:*` with pnpm and yarn berry. Use the version range of the package with npm and yarn classic. Pass `--workspace` to opt in non-interactively, or `--standalone` to keep the self-contained layout. In CI the default is standalone. See the [`kici init` reference](./cli/account-and-org.md#kici-init) for details.
 
 ### MJS mode
 
@@ -230,7 +230,7 @@ Every `.kici/` dependency must be resolvable from the **single cloned repository
 In practice:
 
 - **From a registry** — the common case. Pin a published version (a private registry works — see [Private registries](./private-registries.md)). Available for any package manager.
-- **From an in-repo workspace sibling** — if your `.kici/` is a member of a **pnpm workspace** or a **yarn berry workspace** (a `workspaces` array in the repo-root `package.json`), it can depend on a sibling package in the same repo via `workspace:*` (yarn berry also accepts `portal:`). The whole repo is cloned, so the sibling is present and resolves; the agent also builds your `.kici/` dependency closure after install, so a sibling's build output exists before the workflow that imports it loads. A `file:`/`link:`/`portal:` path is allowed only when it stays inside the repository.
+- **From an in-repo workspace sibling** — if your `.kici/` is a member of a **pnpm workspace** or a **yarn berry workspace** (a `workspaces` array in the repo-root `package.json`), it can depend on a sibling package in the same repo via `workspace:*` (yarn berry also accepts `portal:`). In an **npm** or **yarn classic** workspace, declare the sibling with its version range (for example `^1.0.0`): those managers link the workspace package of the same name. The whole repo is cloned, so the sibling is present and resolves; the agent also builds your `.kici/` dependency closure after install, so a sibling's build output exists before the workflow that imports it loads. A `file:`/`link:`/`portal:` path is allowed only when it stays inside the repository.
 
 What fails fast (with an actionable error naming the dependency, not a raw package-manager error): a `workspace:` dependency in an **npm** project (npm has no workspace protocol — pin a published version or switch to pnpm), a `workspace:`/`portal:` dependency in a **yarn classic** project (v1 has neither — use a version range, pnpm, or yarn berry), a `workspace:` dependency in a **yarn berry** project whose repo-root `package.json` has no `workspaces` array, and any `file:`/`link:`/`portal:` path that points outside the cloned repo.
 
@@ -260,9 +260,9 @@ export default workflow('deploy', {
 
 When the KiCI agent runs your workflow, dependencies are handled automatically:
 
-1. **First run (cache miss):** A build agent installs dependencies from `.kici/package.json`, packs the resolved dependency tree into a tarball, and uploads it to cache storage. For a pnpm workspace this closure includes the shared store and any in-repo workspace siblings `.kici` resolves.
+1. **First run (cache miss):** A build agent installs dependencies from `.kici/package.json`, packs the resolved dependency tree into a tarball, and uploads it to cache storage. For a pnpm workspace this closure includes the shared store and any in-repo workspace siblings `.kici` resolves. For an npm or yarn workspace member, it includes the repo-root `node_modules` and the in-repo workspace packages `.kici` links to.
 2. **Subsequent runs (cache hit):** The execution agent downloads the cached tarball and extracts it -- no install needed.
-3. **Lockfile changes:** When your lockfile changes (`.kici/package-lock.json` for npm, or the repo-root `pnpm-lock.yaml` for a pnpm workspace), the cache is invalidated and a fresh build runs.
+3. **Lockfile changes:** When your lockfile changes (`.kici/package-lock.json` for npm, the repo-root `package-lock.json` for an npm workspace member, or the repo-root `pnpm-lock.yaml` / `yarn.lock` for a pnpm / yarn workspace), the cache is invalidated and a fresh build runs.
 
 This means the first run after a dependency change is slower (build + execution), but all subsequent runs are fast.
 
@@ -273,12 +273,14 @@ Every KiCI project needs a `.kici/package.json`. This file:
 - Declares workflow dependencies (including `@kici-dev/sdk`)
 - Signals the agent to run the dependency cache step
 - Is generated automatically by `kici init`
+- Is the only file an agent installs `.kici/` dependencies from. Without it, `kici compile`, `kici run remote` and `kici doctor` warn.
 
 If you are setting up a project manually (without `kici init`), create a minimal `.kici/package.json`:
 
 ```json
 {
   "name": "@kici-dev/workflows",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
   "devDependencies": {
@@ -287,7 +289,7 @@ If you are setting up a project manually (without `kici init`), create a minimal
 }
 ```
 
-Then run `npm install` in `.kici/` to generate the lockfile. Commit both `package.json` and `package-lock.json` to your repository.
+Then run `npm install` in `.kici/` to generate the lockfile. Commit both `package.json` and `package-lock.json` to your repository. Keep the `version` field: yarn classic ignores a workspace member that has no version.
 
 ## Development mode
 

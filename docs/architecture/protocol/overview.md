@@ -93,14 +93,17 @@ Positive acknowledgment of a received message. Used for generic message-level ac
 
 Negative acknowledgment -- the message was received but could not be processed. Also the **version-skew diagnosability** signal: when a peer receives a message type it does not understand (the other side is running a newer build), it replies with a NACK naming the unsupported type instead of silently dropping the frame. Without this, an unknown type surfaces only as a downstream proxy timeout; the NACK turns it into an explicit, logged, upgrade-actionable error. `nack` is a member of both the Platform-to-orchestrator and orchestrator-to-Platform unions -- either side can NACK the other.
 
-| Field        | Type     | Required | Description                                                         |
-| ------------ | -------- | -------- | ------------------------------------------------------------------- |
-| type         | `"nack"` | Yes      | Message discriminator                                               |
-| messageId    | string   | No       | ID of the offending frame, echoed when it carried one (correlation) |
-| receivedType | string   | No       | The unsupported/unrecognized message type that triggered the NACK   |
-| reason       | string   | Yes      | Human-readable rejection reason, including an upgrade hint          |
+| Field        | Type     | Required | Description                                                                                                 |
+| ------------ | -------- | -------- | ----------------------------------------------------------------------------------------------------------- |
+| type         | `"nack"` | Yes      | Message discriminator                                                                                       |
+| messageId    | string   | No       | ID of the offending frame, echoed when it carried one (correlation)                                         |
+| code         | enum     | No       | `invalid_frame` when the receiver dropped a frame of a known type as invalid. Absent on a version-skew NACK |
+| receivedType | string   | No       | The unsupported/unrecognized message type that triggered the NACK                                           |
+| reason       | string   | Yes      | Human-readable rejection reason, including an upgrade hint                                                  |
 
-**Behavior on an unknown frame:** the receiver first runs its normal recognition schemas; only a frame that fails them all AND carries a `type` this build does not recognize is NACKed. The connection stays open -- a single unknown frame from an ahead-running peer must not tear down the whole link. The receiver distinguishes version skew from malformation using a recognized-type set derived from the schema discriminators. A frame whose `type` IS recognized but still failed validation (e.g. an oversized field past its length bound) is malformed, not skewed, so it gets no NACK. It is handled like any other invalid frame: the Platform closes the connection, and the orchestrator drops the frame with a warning rather than tearing down its own uplink. Two classes are deliberately exempt and stay drop-and-warn: a `nack` itself (loop guard -- a NACK is never NACKed) and pure streaming frames (`log.chunk` / `orch-log.chunk`, which cannot be correlated). A genuinely malformed frame with no `type` field is not NACKed either; it falls through to the connection-level close.
+**Behavior on an unknown frame:** the receiver first runs its normal recognition schemas. Only a frame that fails them all AND carries a `type` this build does not recognize is NACKed as version skew. The connection stays open -- a single unknown frame from an ahead-running peer must not tear down the whole link. The receiver tells version skew from malformation with a recognized-type set derived from the schema discriminators. Two classes are exempt and stay drop-and-warn: a `nack` itself (loop guard -- a NACK is never NACKed) and pure streaming frames (`log.chunk` / `orch-log.chunk`, which cannot be correlated).
+
+**Behavior on an invalid frame of a known type:** a frame whose `type` is recognized but still fails validation is malformed, not skewed. The Platform drops it and logs `Invalid orchestrator frame dropped` with the message type and the failing field paths, never the field values. When the frame carries a `messageId`, the Platform answers with a `nack` whose `code` is `invalid_frame` and whose `reason` names the failing fields. The connection stays open until it sends five invalid frames within 60 seconds; the Platform then closes it with code 4003. A frame that is not JSON, or has no `type` field, still closes the connection at once. The orchestrator drops an invalid Platform frame with a warning and keeps its uplink open.
 
 > Authoritative source: `packages/engine/src/protocol/messages/common.ts` -- `nackSchema`, `buildUnsupportedMessageNack`
 

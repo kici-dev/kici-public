@@ -1,71 +1,80 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { generatePackageJson, sdkDependencyRange } from '../package-json.js';
+import { VersionPin } from '../version-pin.js';
 
-describe('sdkDependencyRange', () => {
-  it('returns the latest dist-tag in dev mode', () => {
-    // fails-when: dev mode goes back to a semver range. Verdaccio builds are
-    // prereleases past 0.0.1 (0.8.0-9726 at the time of writing), and npm
-    // semver excludes a prerelease from every range whose comparators carry a
-    // different major.minor.patch — `>=0.0.1-0` matched 0.0.1-2856 and
-    // nothing since. A dist-tag is resolved by name, so it cannot go stale.
-    expect(sdkDependencyRange(true)).toBe('latest');
-  });
+const CLI_VERSION = '0.17.0';
 
-  it('returns a caret range in production mode', () => {
-    expect(sdkDependencyRange(false)).toMatch(/^\^\d+\.\d+\.\d+/);
-  });
+interface ScaffoldedPackageJson {
+  name: string;
+  private: boolean;
+  type: string;
+  scripts: Record<string, string>;
+  devDependencies: Record<string, string>;
+}
 
-  it('is the same range generatePackageJson embeds', () => {
-    const prod = JSON.parse(generatePackageJson(false));
-    expect(prod.devDependencies['@kici-dev/sdk']).toBe(sdkDependencyRange(false));
-    const dev = JSON.parse(generatePackageJson(true));
-    expect(dev.devDependencies['@kici-dev/sdk']).toBe(sdkDependencyRange(true));
-  });
+function scaffold(pin: VersionPin): ScaffoldedPackageJson {
+  return JSON.parse(generatePackageJson(pin)) as ScaffoldedPackageJson;
+}
+
+beforeEach(() => {
+  vi.stubGlobal('KICI_VERSION', CLI_VERSION);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe('package-json template', () => {
-  it('emits a caret-semver SDK pin in production mode', () => {
-    const out = generatePackageJson(false);
-    const parsed = JSON.parse(out);
-    const sdkPin = parsed.devDependencies['@kici-dev/sdk'];
-    // When built via build-ts.mjs the rolldown define inlines KICI_VERSION,
-    // so the pin reflects the current workspace version. When this test runs
-    // from source via vitest (which reads the .ts directly), KICI_VERSION is
-    // undefined at runtime and the source falls through to the '0.0.1'
-    // fallback. Either way the shape is caret + semver.
-    expect(sdkPin).toMatch(/^\^\d+\.\d+\.\d+/);
+  it.each([
+    [VersionPin.Caret, `^${CLI_VERSION}`, '^6.0.3', `npx --yes kici@${CLI_VERSION} compile`],
+    [VersionPin.Exact, CLI_VERSION, '6.0.3', `npx --yes kici@${CLI_VERSION} compile`],
+    [VersionPin.Latest, 'latest', '^6.0.3', 'npx --yes kici@latest compile'],
+  ])('%s: SDK %s, TypeScript %s, compile script %s', (pin, sdk, typescript, compile) => {
+    const pkg = scaffold(pin);
+    expect(pkg.devDependencies['@kici-dev/sdk']).toBe(sdk);
+    expect(pkg.devDependencies.typescript).toBe(typescript);
+    expect(pkg.scripts.compile).toBe(compile);
+    expect(pkg.devDependencies['@kici-dev/compiler']).toBeUndefined();
   });
 
-  it('emits the latest dist-tag in dev mode', () => {
-    const out = generatePackageJson(true);
-    const parsed = JSON.parse(out);
-    expect(parsed.devDependencies['@kici-dev/sdk']).toBe('latest');
+  it.each([VersionPin.Caret, VersionPin.Exact])(
+    '%s: the compile script runs the SDK version',
+    (pin) => {
+      const pkg = scaffold(pin);
+      const sdkVersion = pkg.devDependencies['@kici-dev/sdk'].replace(/^\^/, '');
+      // fails-when: the compile script floats on a dist-tag while the SDK is pinned,
+      // so a newer compiler writes a lock file the project's orchestrator rejects
+      expect(pkg.scripts.compile).toBe(`npx --yes kici@${sdkVersion} compile`);
+    },
+  );
+
+  it('keeps the latest dist-tag for the SDK in development mode', () => {
+    // breaks-if-wrong: dev builds are prereleases (0.8.0-9726 and later), and a
+    // prerelease only satisfies a comparator with the same major.minor.patch, so
+    // no range reaches them; a dist-tag resolves by name
+    expect(sdkDependencyRange(VersionPin.Latest)).toBe('latest');
   });
 
-  it('ends with a trailing newline', () => {
-    expect(generatePackageJson(false).endsWith('\n')).toBe(true);
-    expect(generatePackageJson(true).endsWith('\n')).toBe(true);
+  it('ends with a trailing newline and keeps the top-level shape', () => {
+    for (const pin of [VersionPin.Caret, VersionPin.Exact, VersionPin.Latest]) {
+      const out = generatePackageJson(pin);
+      expect(out.endsWith('\n')).toBe(true);
+      expect(JSON.parse(out)).toMatchObject({
+        name: '@kici-dev/workflows',
+        private: true,
+        type: 'module',
+        scripts: { typecheck: 'tsc --noEmit' },
+      });
+    }
   });
+});
 
-  it('parses as valid JSON with the expected top-level keys', () => {
-    const parsed = JSON.parse(generatePackageJson(false));
-    expect(parsed).toMatchObject({
-      name: '@kici-dev/workflows',
-      private: true,
-      type: 'module',
-    });
-    expect(parsed.scripts).toBeDefined();
-    expect(parsed.scripts.compile).toBeDefined();
-    expect(parsed.scripts.typecheck).toBeDefined();
-    expect(parsed.devDependencies).toBeDefined();
-    expect(parsed.devDependencies['@kici-dev/sdk']).toBeDefined();
-  });
-
-  it('scaffolds typescript so --check / the typecheck script can run', () => {
-    const prod = JSON.parse(generatePackageJson(false));
-    expect(prod.devDependencies.typescript).toBeDefined();
-    expect(prod.devDependencies.typescript).toMatch(/^\^\d+\.\d+\.\d+/);
-    const dev = JSON.parse(generatePackageJson(true));
-    expect(dev.devDependencies.typescript).toBe(prod.devDependencies.typescript);
+describe('package-json template version', () => {
+  it('declares a version, which yarn classic requires of every workspace member', () => {
+    // fails-when: the manifest has no version, so yarn classic prints "Missing version
+    // in workspace at .kici, ignoring" and a workspace member installs nothing
+    for (const pin of [VersionPin.Caret, VersionPin.Exact, VersionPin.Latest]) {
+      expect(JSON.parse(generatePackageJson(pin)).version).toBe('0.0.0');
+    }
   });
 });

@@ -21,6 +21,10 @@ import {
   type DashboardRunDetailApiResponse,
   type DashboardStepLogsApiResponse,
   type RegistrationItem,
+  RUN_DETAIL_SOURCE_HEADER,
+  RUN_DETAIL_FALLBACK_REASON_HEADER,
+  RunDetailSource,
+  RunDetailFallbackReason,
 } from '@kici-dev/engine';
 import { loadGlobalConfig, type GlobalConfig } from './config.js';
 
@@ -47,12 +51,22 @@ export class DashboardClientError extends Error {
   }
 }
 
+/** A run's detail, and how the Platform served it. */
+export interface RunDetailRead {
+  detail: DashboardRunDetailApiResponse;
+  /** The path that served it; null when the Platform did not say. */
+  source: RunDetailSource | null;
+  /** Why the stored copy was served; null when it was not, or the reason is not one this CLI knows. */
+  fallbackReason: RunDetailFallbackReason | null;
+}
+
 export interface RunsListFilters {
   status?: string;
   workflow?: string;
   branch?: string;
   repo?: string;
   trigger?: string;
+  /** A source routing key (`generic:<org>:<id>`), or a bare provider prefix (`github`). */
   source?: string;
   since?: string;
   /** Opaque keyset cursor from a prior page's `nextCursor`; absent = first page. */
@@ -192,7 +206,7 @@ export class DashboardClient {
     return `${this.endpoint}/api/v1/orgs/${this.orgId}/${path.replace(/^\//, '')}`;
   }
 
-  private async request(method: string, path: string, body?: unknown): Promise<unknown> {
+  private async send(method: string, path: string, body?: unknown): Promise<Response> {
     const res = await fetch(this.orgUrl(path), {
       method,
       headers: {
@@ -203,12 +217,13 @@ export class DashboardClient {
     }).catch((err: unknown) => {
       throw new DashboardClientError('http', `Network error: ${String(err)}`);
     });
+    if (!res.ok) return this.throwForStatus(res);
+    return res;
+  }
 
-    if (res.ok) {
-      const text = await res.text();
-      return text ? (JSON.parse(text) as unknown) : {};
-    }
-    return this.throwForStatus(res);
+  private async request(method: string, path: string, body?: unknown): Promise<unknown> {
+    const text = await (await this.send(method, path, body)).text();
+    return text ? (JSON.parse(text) as unknown) : {};
   }
 
   private async throwForStatus(res: Response): Promise<never> {
@@ -254,7 +269,10 @@ export class DashboardClient {
     if (filters.branch) qs.set('branch', filters.branch);
     if (filters.repo) qs.set('repository', filters.repo);
     if (filters.trigger) qs.set('triggerType', filters.trigger);
-    if (filters.source) qs.set('source', filters.source);
+    // A routing key always holds a colon and is matched exactly as `routingKey`;
+    // a bare provider (`github`) is the API's `source` prefix filter.
+    if (filters.source)
+      qs.set(filters.source.includes(':') ? 'routingKey' : 'source', filters.source);
     if (filters.since) qs.set('since', filters.since);
     if (filters.cursor) qs.set('cursor', filters.cursor);
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
@@ -272,7 +290,23 @@ export class DashboardClient {
   }
 
   async getRunDetail(runId: string): Promise<DashboardRunDetailApiResponse> {
-    return dashboardRunDetailApiResponseSchema.parse(await this.getJson(`/runs/${runId}/detail`));
+    return (await this.getRunDetailWithSource(runId)).detail;
+  }
+
+  /** A run's detail with the headers that say how the Platform served it. */
+  async getRunDetailWithSource(runId: string): Promise<RunDetailRead> {
+    const res = await this.send('GET', `/runs/${runId}/detail`);
+    const text = await res.text();
+    const detail = dashboardRunDetailApiResponseSchema.parse(text ? JSON.parse(text) : {});
+    const source = RunDetailSource.safeParse(res.headers.get(RUN_DETAIL_SOURCE_HEADER));
+    const reason = RunDetailFallbackReason.safeParse(
+      res.headers.get(RUN_DETAIL_FALLBACK_REASON_HEADER),
+    );
+    return {
+      detail,
+      source: source.success ? source.data : null,
+      fallbackReason: reason.success ? reason.data : null,
+    };
   }
 
   async getStepLogs(

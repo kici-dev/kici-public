@@ -21,6 +21,7 @@ import {
   type PlatformTriggerResponse,
   type PlatformUploadInitInput,
   type PlatformUploadInitResponse,
+  type RunLogPosition,
 } from './platform-client.js';
 import { normalizeOrchestratorUrl } from './target.js';
 
@@ -102,11 +103,12 @@ export class DirectRunClient {
     return this.json(`/api/v1/test/runs/${encodeURIComponent(runId)}`, { method: 'GET' });
   }
 
-  runLogs(runId: string, cursor: number): Promise<PlatformRunLogsResponse> {
-    return this.json(
-      `/api/v1/test/runs/${encodeURIComponent(runId)}/logs?cursor=${encodeURIComponent(String(cursor))}`,
-      { method: 'GET' },
-    );
+  runLogs(runId: string, position: RunLogPosition): Promise<PlatformRunLogsResponse> {
+    const params = new URLSearchParams({ cursor: String(position.cursor) });
+    if (position.logCursor !== undefined) params.set('logCursor', position.logCursor);
+    return this.json(`/api/v1/test/runs/${encodeURIComponent(runId)}/logs?${params.toString()}`, {
+      method: 'GET',
+    });
   }
 
   cancel(runId: string): Promise<PlatformCancelResponse> {

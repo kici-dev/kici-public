@@ -148,35 +148,22 @@ RUN rm -f .npmrc \
 #   a native N-API binding; pre-baked in the builder stage and copied verbatim)
 # Optional host-level tools (not included, operator installs): bwrap, docker/podman.
 #
-# Runtime base is the -dev variant because the agent needs apt-installed
-# host tools (git/bash/iptables) at runtime. ca-certificates ships with
-# the DHI base, so it isn't installed here.
+# Runtime base is the -dev variant: the agent needs apt-installed host tools
+# (git/bash/iptables), and a job installs more Debian packages with apt.
+# ca-certificates ships with the DHI base, so it isn't installed here.
 FROM ${DHI_PREFIX}/node:24.21.0-1-debian13-dev
 
-# Install the CI userland, then strip perl ENTIRELY — including the Essential
-# perl-base. The agent never invokes perl, so removing it eliminates the whole
-# perl-source CVE surface (e.g. DEBIAN-CVE-2026-8376/12087/42496, which OSV
-# maps to the perl SOURCE package and would otherwise surface via the retained
-# perl-base on the node base image). Customer CI steps that shell out to perl
-# are unsupported by design — this is a deliberate operator decision to keep the
-# image perl-free rather than carry the perl CVEs.
+# Install the CI userland: what the agent needs (listed above), then the
+# baseline a CI job expects on a Debian host — ps, hostname, ip, ping, unzip,
+# zstd, jq, file, less, rsync and sudo. Compilers, python3, editors and the ssh
+# client are left out; a job installs them with apt. The ssh client stays out
+# because its trixie build carries a CRITICAL advisory with no trixie fix.
 #
-# Order matters: first force-remove the non-Essential perl set
-# (perl-modules-5.40 / libperl5.40 / liberror-perl and the perl metapackage),
-# then purge the Essential perl-base with --force-remove-essential. Debian's
-# git declares a hard `Depends: perl, liberror-perl` and debconf depends on
-# perl-base, so --force-depends is required to drop them without cascade-
-# removing git; --force-remove-essential is additionally required for perl-base.
-# The git binary does not link libperl — only perl-subcommands (git svn /
-# send-email / add -i) need it, and those are out of scope for the agent — so
-# core git clone / checkout / fetch keep working after the purge.
-#
-# The DHI node base ships its SBOM as one stub file per package under
-# /var/lib/dpkg/status.d/ (the distroless SBOM convention), which dpkg does NOT
-# manage — so a dpkg purge leaves the perl SBOM stubs behind and OSV-Scanner
-# still attributes the perl-source CVEs to the image. Now that the perl files
-# are genuinely gone, delete the matching SBOM stubs so the image's SBOM
-# reflects reality and the CVE gate sees no perl.
+# perl stays. Debian's git declares `Depends: perl, liberror-perl`, and apt
+# refuses every install while an installed package has an unmet dependency —
+# APT::Get::Fix-Broken and `apt-get install -f <pkg>` do not change that with
+# the apt 3 solver. An image without perl leaves a job unable to install
+# anything.
 #
 # curl and libcurl4t64 are installed as an explicitly matched pair, and the
 # `--allow-downgrades` this needs is NOT a security downgrade.
@@ -200,23 +187,42 @@ FROM ${DHI_PREFIX}/node:24.21.0-1-debian13-dev
 # would instead go stale and either break the build again or hold the library
 # back at a patch level Debian has moved past.
 #
-# The `rm` of the libcurl SBOM stub below is the same fix the perl purge needs,
-# for the same reason: apt records the replacement in the real dpkg database,
+# The `rm` of the libcurl SBOM stub below: apt records the replacement in the
+# real dpkg database,
 # but the DHI base's distroless SBOM stub under /var/lib/dpkg/status.d/ is not
 # dpkg-managed and keeps claiming `+dhi0`. Left in place, the image advertises a
 # library it does not contain and OSV-Scanner reports every curl CVE twice —
 # once against the library that is installed, once against a phantom.
+#
+# pam-auth-update writes /etc/pam.d/common-*. The DHI base carries
+# libpam-runtime without having run its postinst, so the files are missing and
+# every sudo call aborts with "unable to initialize PAM". `--force` is needed
+# because the missing files read as local edits.
+#
+# The `which` alternatives link: debianutils ships /usr/bin/which.debianutils,
+# but the base never ran the postinst that links /usr/bin/which to it.
+#
+# passwd provides groupadd, which the DHI base does not ship.
+#
+# Passwordless sudo goes to the `kici-sudo` group, not to `node`. The container
+# scaler adds that group (AGENT_SUDO_GROUP_GID in
+# packages/orchestrator/src/scaler/container-hostconfig.ts) only to the
+# containers it starts from this image, and each of those runs one job. A
+# long-lived container someone runs from this image has no sudo unless it is
+# started with `--group-add 1990`.
 RUN apt-get update \
   && CURL_VER="$(apt-cache policy curl | awk '/Candidate:/{print $2}')" \
   && { [ -n "$CURL_VER" ] && [ "$CURL_VER" != '(none)' ]; } \
   && apt-get install -y --no-install-recommends --allow-downgrades \
        git bash "curl=$CURL_VER" "libcurl4t64=$CURL_VER" gzip xz-utils iptables tini \
+       procps hostname iproute2 iputils-ping unzip zstd jq file less rsync sudo passwd \
   && rm -f /var/lib/dpkg/status.d/libcurl4t64 \
-  && dpkg --remove --force-depends perl perl-modules-5.40 libperl5.40 liberror-perl \
-  && dpkg --purge --force-depends --force-remove-essential perl-base \
-  && rm -f /var/lib/dpkg/status.d/perl /var/lib/dpkg/status.d/perl-base \
-       /var/lib/dpkg/status.d/perl-modules-5.40 /var/lib/dpkg/status.d/libperl5.40 \
-       /var/lib/dpkg/status.d/liberror-perl \
+  && DEBIAN_FRONTEND=noninteractive pam-auth-update --package --force \
+  && update-alternatives --install /usr/bin/which which /usr/bin/which.debianutils 0 \
+  && groupadd --system --gid 1990 kici-sudo \
+  && printf '%%kici-sudo ALL=(ALL:ALL) NOPASSWD: ALL\n' > /etc/sudoers.d/kici-sudo \
+  && chmod 0440 /etc/sudoers.d/kici-sudo \
+  && visudo -cf /etc/sudoers.d/kici-sudo \
   && rm -rf /var/lib/apt/lists/* \
   && git config --system --add safe.directory '*'
 

@@ -140,7 +140,7 @@ kici init --package-manager pnpm
 # JavaScript mode (no TypeScript)
 kici init --mjs
 
-# Integrate into the surrounding workspace (workflows can import sibling packages)
+# Make .kici/ a member of the surrounding workspace (workflows can import sibling packages)
 kici init --workspace
 
 # Force a self-contained .kici/ even inside a workspace
@@ -182,15 +182,19 @@ In interactive mode (TTY), `kici init` prompts you to:
 1. Select which workflow templates to include
 2. Optionally install a pre-commit hook
 
+**Default branch:** `kici init` detects the default branch of the repository: the `origin` HEAD, else the current branch, else `main`. The `pr-checks` workflow targets that branch, and the sample fixture in `tests/push-test.ts` simulates a push to it.
+
 **Host-OS runsOn:** the scaffolded workflows target `kici:os:<your OS>` — `kici init` detects the host operating system (like it detects the default branch) and writes `kici:os:linux`, `kici:os:macos`, or `kici:os:windows` so your very first `kici run push --local` dispatches on this machine. A workflow authored on one OS and run locally on another prints a hint naming the OS it wants versus the host it found.
 
 **First run:** in interactive mode, after setup `kici init` offers to run the scaffolded workflow immediately (`kici run push --local`), defaulting to No. It is skipped in CI, non-interactive shells, `--mjs`, and `--skip-install` (where dependencies are not installed yet).
 
 **Package manager:** the dependency install step uses the package manager detected for your repo — the `packageManager` field in the nearest `package.json` (Corepack convention), then a lockfile in the project root (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, `package-lock.json` → npm), then the package manager that invoked `kici` (`pnpm dlx` / `yarn dlx` / `npx`), defaulting to npm. Pass `--package-manager <npm|pnpm|yarn>` to override detection, or `--skip-install` to set up the files and install later yourself.
 
-**Standalone vs workspace integration:** by default `kici init` scaffolds a self-contained `.kici/` with its own `package.json`. When run inside a pnpm, npm, or yarn workspace, it offers an **integrate** option (or pass `--workspace`): `.kici/` joins the workspace, `@kici-dev/sdk` is added to your workspace-root `package.json`, and your workflows can `import` your other workspace packages (e.g. shared build or deploy utilities). In this mode there is no `.kici/package.json` — the workspace root manages dependencies, and the root install resolves the SDK. Your workflows resolve sibling packages through the workspace-root `node_modules`: under npm and yarn every workspace member is hoisted there automatically, while pnpm links only your root's declared dependencies, so under pnpm add the package you want to import to your workspace-root `dependencies` (this is how KiCI's own repository imports its packages from workflows). Pass `--standalone` to force the self-contained layout even inside a workspace. In CI / non-interactive runs the default is standalone; use `--workspace` to opt in explicitly. `--workspace` and `--standalone` are mutually exclusive, and `--workspace` errors if no workspace is found at or above the current directory.
+**Standalone vs workspace member:** by default `kici init` scaffolds a self-contained `.kici/` with its own `package.json` and its own install. When run inside a pnpm, npm, or yarn workspace, it offers to make `.kici/` a workspace member (or pass `--workspace`). In this layout `.kici/` still has its own `package.json`, and `kici init` adds `.kici` to the workspace package list. For pnpm that list is `pnpm-workspace.yaml`, and its comments and other entries stay as they are. For npm and yarn it is the `workspaces` field of the root `package.json`. The install runs at the workspace root, and agents install `.kici/` the same way. Your workflows can `import` your other workspace packages, for example shared build or deploy utilities. Declare each one in `.kici/package.json`: `workspace:*` with pnpm and yarn berry, or the version range of the package with npm and yarn classic. `kici init` does not change the dependencies in your root `package.json`. If the root `package.json` declares `@kici-dev/sdk`, `kici init` names it, and you can remove it when no other package imports the SDK. Run `kici init --workspace` again on an existing `.kici/` to add what is missing, which is a `.kici/package.json` and the workspace entry. Your workflows and the dependencies in your root `package.json` do not change, and the command does nothing when the layout is already complete. It refuses a `.kici/` that has its own `package.json` but is not in the workspace package list. Such a `.kici/` is a standalone project with its own lockfile. Pass `--standalone` to force the self-contained layout even inside a workspace. In CI / non-interactive runs the default is standalone; use `--workspace` to opt in explicitly. `--workspace` and `--standalone` are mutually exclusive, and `--workspace` errors if no workspace is found at or above the current directory.
 
-**Development mode:** When `KICI_DEV=true` or `package.json` has `"kici": { "development": true }`, the generated `package.json` pins `@kici-dev/sdk` to the `latest` dist-tag so npm resolves Verdaccio's newest prerelease build.
+**Version pins:** the generated `package.json` pins `@kici-dev/sdk` to the version of the `kici` CLI that ran `kici init`, as a caret range (`^<version>`). TypeScript also gets a caret range. If your repository `.npmrc` tells npm to save exact versions (`save-exact=true`, or an empty `save-prefix`), both get exact versions. The `compile` script runs the same CLI version (`npx --yes kici@<version> compile`). Thus the compiler that writes `kici.lock.json` is never newer than your SDK. To upgrade KiCI, change the SDK version and the version in the `compile` script together.
+
+**Development mode:** When `KICI_DEV=true` or `package.json` has `"kici": { "development": true }`, the generated `package.json` pins `@kici-dev/sdk` to the `latest` dist-tag, and the `compile` script runs `kici@latest`, so npm resolves Verdaccio's newest prerelease build. In this mode, `kici init` does not read `.npmrc` for version pins.
 
 ### kici org
 
@@ -389,18 +393,18 @@ Synopsis: `kici init [options]`
 
 **Options**
 
-| Option                             | Default                | Description                                                                                         |
-| ---------------------------------- | ---------------------- | --------------------------------------------------------------------------------------------------- |
-| `--force`                          | `false`                | Overwrite existing .kici/ directory                                                                 |
-| `--skip-install`                   | `false`                | Create files without installing dependencies                                                        |
-| `--package-manager <npm            | pnpm                   | yarn>`                                                                                              |     | Force a package manager for the install step (default: auto-detect) |
-| `--mjs`                            | `false`                | JavaScript-only mode (no TypeScript, no dependencies)                                               |
-| `--workspace`                      | `false`                | Integrate .kici/ into the detected pnpm/npm/yarn workspace so workflows can import sibling packages |
-| `--standalone`                     | `false`                | Force a self-contained .kici/ even inside a workspace                                               |
-| `--no-agents-md`                   |                        | Skip writing .kici/AGENTS.md (LLM authoring context)                                                |
-| `--private-registry <url>`         |                        | Scaffold a workflow registries: entry pointing at <url>                                             |
-| `--private-registry-scope <scope>` |                        | Optional npm package scope (e.g. @my-org) for the private registry                                  |
-| `--private-registry-secret <ref>`  | `production:NPM_TOKEN` | Qualified secret reference (env:NAME) the private registry token comes from                         |
+| Option                                | Default                | Description                                                                                           |
+| ------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------- |
+| `--force`                             | `false`                | Overwrite existing .kici/ directory                                                                   |
+| `--skip-install`                      | `false`                | Create files without installing dependencies                                                          |
+| `--package-manager <npm\|pnpm\|yarn>` |                        | Force a package manager for the install step (default: auto-detect)                                   |
+| `--mjs`                               | `false`                | JavaScript-only mode (no TypeScript, no dependencies)                                                 |
+| `--workspace`                         | `false`                | Make .kici/ a member of the detected pnpm/npm/yarn workspace so workflows can import sibling packages |
+| `--standalone`                        | `false`                | Force a self-contained .kici/ even inside a workspace                                                 |
+| `--no-agents-md`                      |                        | Skip writing .kici/AGENTS.md (LLM authoring context)                                                  |
+| `--private-registry <url>`            |                        | Scaffold a workflow registries: entry pointing at <url>                                               |
+| `--private-registry-scope <scope>`    |                        | Optional npm package scope (e.g. @my-org) for the private registry                                    |
+| `--private-registry-secret <ref>`     | `production:NPM_TOKEN` | Qualified secret reference (env:NAME) the private registry token comes from                           |
 
 ### `kici login`
 

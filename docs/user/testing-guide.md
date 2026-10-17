@@ -502,16 +502,22 @@ Running `kici init` in a new project scaffolds a sample test fixture alongside t
 .kiciignore            # Default exclusion patterns
 ```
 
-The generated fixture uses the detected default branch:
+The generated fixture uses the detected default branch. On a `main` branch, the file contains this fixture:
 
+<!-- prettier-ignore -->
 ```typescript
 // .kici/tests/push-test.ts
 import { fixture, push } from '@kici-dev/sdk';
 
-export const pushMain = fixture('push-main', {
-  event: push({ branches: ['main'] }),
+export const pushMain = fixture("push-main", {
+  event: push({ branches: ["main"] }),
 });
 ```
+
+The fixture ID is `push-` followed by the branch name. The export name is `push` followed by
+each word of the branch name, with a capital first letter. Characters other than ASCII letters
+and digits separate the words. On a `ci/kici` branch, the export is `pushCiKici` and the
+fixture ID is `push-ci/kici`.
 
 ## See also
 

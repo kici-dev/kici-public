@@ -33,6 +33,7 @@ import {
   DashboardResponseErrorCode,
   buildUnsupportedMessageNack,
   collectDiscriminatorTypes,
+  NackCode,
   PLATFORM_TO_ORCH_RECOGNIZED_TYPES,
   CLUSTER_MEMBERSHIP_MAX_WORKERS,
   type OrchCapabilities,
@@ -43,6 +44,7 @@ import {
 } from '@kici-dev/engine';
 import type { PlanHeadroomStore } from '../cluster/plan-headroom-store.js';
 import { runDetached } from '../helpers/run-detached.js';
+import { guardOutboundFrame } from './outbound-frame-guard.js';
 import { EventBuffer } from './event-buffer.js';
 import { RelayBufferRegistry, type RelayStartMeta } from '../webhook/relay-buffer.js';
 import type { AdmitResult } from '../webhook/ingest-admission.js';
@@ -694,12 +696,18 @@ export class PlatformClient {
     this._state = 'disconnected';
   }
 
-  /** Send now when authenticated, otherwise buffer for the next connection. */
+  /**
+   * Send now when authenticated, otherwise buffer for the next connection. A
+   * status frame the Platform would refuse is dropped here (see
+   * `guardOutboundFrame`), so the buffer only ever holds frames that can be sent.
+   */
   send(message: OrchestratorToPlatformMessage): void {
+    const frame = guardOutboundFrame(message);
+    if (!frame) return;
     if (this._state === 'authenticated' && this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(message));
+      this.ws.send(JSON.stringify(frame));
     } else {
-      this.eventBuffer.add(message);
+      this.eventBuffer.add(frame);
     }
   }
 
@@ -754,7 +762,8 @@ export class PlatformClient {
         return { sent, chunks: index, skipped: 'invalid' };
       }
 
-      const payload = JSON.stringify(frame);
+      // The parsed frame carries the clamped free text.
+      const payload = JSON.stringify(parsed.data);
       this.ws.send(payload);
       // Deliberately NOT cleared on send completion: the Platform's rejection
       // close arrives after the write succeeds. A close is replay-attributed when
@@ -1220,9 +1229,19 @@ export class PlatformClient {
         break;
 
       case 'nack':
+        wsNackReceivedTotal.add(1, { received_type: msg.receivedType ?? 'unknown' });
+        if (msg.code === NackCode.enum.invalid_frame) {
+          // The Platform dropped one of this orchestrator's frames as invalid: a
+          // bug in this build, not version skew. The connection stays open.
+          logger.error('Platform dropped an invalid frame (NACK)', {
+            receivedType: msg.receivedType,
+            messageId: msg.messageId,
+            reason: msg.reason,
+          });
+          break;
+        }
         // Surface skew in Loki instead of a phantom timeout. Never NACK a NACK
         // (the loop guard lives at the send site).
-        wsNackReceivedTotal.add(1, { received_type: msg.receivedType ?? 'unknown' });
         logger.warn('Platform rejected a message (NACK) — likely version skew', {
           receivedType: msg.receivedType,
           messageId: msg.messageId,
@@ -1571,13 +1590,35 @@ export class PlatformClient {
     }
   }
 
+  /**
+   * Send the frames buffered while disconnected, in order. A frame that cannot
+   * be serialized is dropped alone and the rest still go out. When the socket
+   * stops being open part-way, the frames not yet written go back into the
+   * buffer for the next connection instead of being lost.
+   */
   private flushBuffer(): void {
     const messages = this.eventBuffer.flush();
-    if (messages.length > 0) {
-      logger.info('Flushing event buffer', { count: messages.length });
-      for (const msg of messages) {
-        this.sendDirect(msg);
+    if (messages.length === 0) return;
+    logger.info('Flushing event buffer', { count: messages.length });
+    for (const [index, msg] of messages.entries()) {
+      if (this.ws?.readyState !== WebSocket.OPEN) {
+        for (const pending of messages.slice(index)) this.eventBuffer.add(pending);
+        logger.warn('Platform connection closed during the buffer flush; kept the unsent frames', {
+          kept: messages.length - index,
+        });
+        return;
       }
+      let payload: string;
+      try {
+        payload = JSON.stringify(msg);
+      } catch (err) {
+        logger.error('Dropping a buffered frame that cannot be serialized', {
+          messageType: msg.type,
+          error: toErrorMessage(err),
+        });
+        continue;
+      }
+      this.ws.send(payload);
     }
   }
 

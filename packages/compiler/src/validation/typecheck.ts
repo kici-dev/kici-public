@@ -72,8 +72,26 @@ function typecheckUnavailable(): CompilerError {
 }
 
 /**
- * Opt-in `tsc --noEmit` over `kiciDir`. Prefers the workspace-local `tsc`,
- * else `npx typescript`; a single `E121` when the compiler cannot be resolved.
+ * The `tsc` the workspace installed for `.kici/`: `.kici/node_modules/.bin/tsc`
+ * for a standalone `.kici/` or a pnpm member, or the hoisted
+ * `node_modules/.bin/tsc` of an enclosing directory for an npm or yarn member.
+ * The search stops at the repository root (the directory holding `.git`).
+ */
+export function resolveLocalTsc(kiciDir: string): string | null {
+  let dir = path.resolve(kiciDir);
+  for (;;) {
+    const bin = path.join(dir, 'node_modules', '.bin', 'tsc');
+    if (existsSync(bin)) return bin;
+    if (existsSync(path.join(dir, '.git'))) return null;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * Opt-in `tsc --noEmit` over `kiciDir`. Prefers the `tsc` the workspace
+ * installed (see `resolveLocalTsc`), else `npx typescript`; a single `E121` when the compiler cannot be resolved.
  */
 export async function runTypecheck(kiciDir: string): Promise<TypecheckResult> {
   const tsconfigPath = path.join(kiciDir, 'tsconfig.json');
@@ -81,9 +99,9 @@ export async function runTypecheck(kiciDir: string): Promise<TypecheckResult> {
     return { ran: false, errors: [] };
   }
 
-  const localBin = path.join(kiciDir, 'node_modules', '.bin', 'tsc');
-  const usedLocal = existsSync(localBin);
-  const invocation = usedLocal ? [localBin] : ['npx', '--yes', '-p', 'typescript', 'tsc'];
+  const localBin = resolveLocalTsc(kiciDir);
+  const usedLocal = localBin !== null;
+  const invocation = localBin ? [localBin] : ['npx', '--yes', '-p', 'typescript', 'tsc'];
   const tscArgs = ['--noEmit', '--pretty', 'false', '-p', tsconfigPath];
 
   let out;

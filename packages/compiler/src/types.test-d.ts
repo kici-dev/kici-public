@@ -1,5 +1,11 @@
 import { describe, it, expectTypeOf } from 'vitest';
-import type { CacheSpec, GenericInitConfig, InitConfig, MiseInitConfig } from '@kici-dev/sdk';
+import type {
+  AptInitConfig,
+  CacheSpec,
+  GenericInitConfig,
+  InitConfig,
+  MiseInitConfig,
+} from '@kici-dev/sdk';
 import type { LockCacheSpec, LockInitConfig } from '@kici-dev/engine';
 import type { LockJob } from './types.js';
 
@@ -80,6 +86,8 @@ describe('engine lock mirrors of SDK shapes', () => {
     expectTypeOf<keyof LockCacheSpec>().toEqualTypeOf<keyof CacheSpec>();
     expectTypeOf<keyof LockGeneric>().toEqualTypeOf<keyof GenericInitConfig>();
     expectTypeOf<keyof LockMise>().toEqualTypeOf<keyof MiseInitConfig>();
+    type LockApt = Extract<LockInitConfig, { readonly apt: unknown }>['apt'];
+    expectTypeOf<keyof LockApt>().toEqualTypeOf<keyof AptInitConfig>();
   });
 
   // control: the matcher rejects a shape the lock never carries, so the assertion above can fail

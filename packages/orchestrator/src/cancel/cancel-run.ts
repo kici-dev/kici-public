@@ -205,11 +205,12 @@ export async function cancelRunWithReason(
   await withdrawPendingHoldsOfActiveRun(deps, runId, reason);
 
   // Ownership is resolved from the DATABASE, not this process's `jobToAgent`
-  // map: the Platform routes `run.cancel.request` by routing key and
-  // `requestByRoutingKey` picks any connected pool member, so this coordinator
-  // owns the jobs only by chance. A per-process map made sibling-dispatched
-  // jobs look orphaned, and the orphan branch reported a cancel while the run
-  // completed on the other coordinator.
+  // map: the Platform routes `run.cancel.request` through its run resolver
+  // (`requestForRun`), which picks any connected member of the run's routing-key
+  // pool, cluster or organization, so this coordinator owns the jobs only by
+  // chance. A per-process map made sibling-dispatched jobs look orphaned, and
+  // the orphan branch reported a cancel while the run completed on the other
+  // coordinator.
   const dispatchedJobs = await jobQueue.getDispatchedJobOwnersByRunId(runId);
   const ownership = await resolveJobOwners(deps, dispatchedJobs);
   let agentsNotified = 0;

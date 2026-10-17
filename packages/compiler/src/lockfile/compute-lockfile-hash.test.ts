@@ -146,4 +146,39 @@ describe('computeLockfileHash', () => {
     expect(pnpmHash).not.toBeNull();
     expect(npmHash).not.toBe(pnpmHash);
   });
+
+  it('hashes the repo-root package-lock.json for an npm workspace member', async () => {
+    await writeFile(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'r', workspaces: ['.kici', 'packages/*'] }),
+    );
+    await writeFile(join(root, 'package-lock.json'), '{"lockfileVersion":3}');
+    // fails-when: npm is searched only at .kici/package-lock.json, so a member gets
+    // no lockfileHash and every agent installs from the registry
+    expect(computeLockfileHash(root)).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('never keys a standalone .kici on an unrelated root package-lock.json', async () => {
+    await writeFile(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'r', workspaces: ['packages/*'] }),
+    );
+    await writeFile(join(root, 'package-lock.json'), '{"lockfileVersion":3}');
+    // breaks-if-wrong: a standalone .kici keyed on the root lock restores stale deps
+    // after a .kici/package.json edit that leaves the root lock unchanged
+    expect(computeLockfileHash(root)).toBeNull();
+  });
+
+  it("prefers the member's own .kici/package-lock.json over the root lock", async () => {
+    await writeFile(
+      join(root, 'package.json'),
+      JSON.stringify({ name: 'r', workspaces: ['.kici'] }),
+    );
+    await writeFile(join(root, '.kici', 'package-lock.json'), '{"a":1}');
+    await writeFile(join(root, 'package-lock.json'), '{"root":1}');
+    const withRoot = computeLockfileHash(root);
+    await writeFile(join(root, 'package-lock.json'), '{"root":2}');
+    // property: the root lock's bytes do not move the key while .kici has its own lock
+    expect(computeLockfileHash(root)).toBe(withRoot);
+  });
 });

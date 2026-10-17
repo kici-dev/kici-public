@@ -8,9 +8,16 @@
  * `workflowRepoIdentifier` that is load-bearing: the tracker records it only
  * when the repository that defines the workflow differs from the one the run
  * acted on, so its presence marks a cross-repository global run downstream.
+ * Free text is clamped to the wire bound here, at the source.
  */
 import type { ExecutionContext } from '../reporting/execution-tracker.js';
-import type { ExecutionRunStatus, ExecutionStatus, InitFailure } from '@kici-dev/engine';
+import {
+  clampInitFailure,
+  clampStatusFreeText,
+  type ExecutionRunStatus,
+  type ExecutionStatus,
+  type InitFailure,
+} from '@kici-dev/engine';
 
 export interface ExecutionStatusFrameArgs {
   messageId: string;
@@ -50,7 +57,7 @@ export function buildExecutionStatusFrame(args: ExecutionStatusFrameArgs): Execu
     sha: context.sha,
     ...(context.ref && { ref: context.ref }),
     ...(context.triggerEvent && { triggerEvent: context.triggerEvent }),
-    ...(context.commitMessage && { commitMessage: context.commitMessage }),
+    ...(context.commitMessage && { commitMessage: clampStatusFreeText(context.commitMessage) }),
     ...(context.parentRunId != null && { parentRunId: context.parentRunId }),
     ...(context.originalRunId != null && { originalRunId: context.originalRunId }),
     ...(context.triggeredBy != null && { triggeredBy: context.triggeredBy }),
@@ -70,9 +77,11 @@ export function buildExecutionStatusFrame(args: ExecutionStatusFrameArgs): Execu
     timestamp: args.timestamp,
     ...(args.completedAt !== undefined && { completedAt: args.completedAt }),
     ...(args.durationMs !== undefined && { durationMs: args.durationMs }),
-    ...(args.failureReason !== undefined && { failureReason: args.failureReason }),
+    ...(args.failureReason !== undefined && {
+      failureReason: clampStatusFreeText(args.failureReason),
+    }),
     ...(args.logBytes !== undefined && { logBytes: args.logBytes }),
-    ...(args.initFailure && { initFailure: args.initFailure }),
+    ...(args.initFailure && { initFailure: clampInitFailure(args.initFailure) }),
     ...(context.failureClass && { failureClass: context.failureClass }),
     // Always sent: the Platform applies its keep-terminal rule only to a frame
     // that carries a generation, and reads one without it as an older

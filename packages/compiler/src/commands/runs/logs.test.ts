@@ -4,17 +4,27 @@ import {
   ExecutionRunStatus,
   ExecutionStepStatus,
   JobKind,
+  RunDetailSource,
 } from '@kici-dev/engine';
 import { runsLogsCommand } from './logs.js';
 import * as clientMod from '../../remote/dashboard-client.js';
 
 afterEach(() => vi.restoreAllMocks());
 
+/** A detail read the Platform served from the orchestrator. */
+function proxied(detail: unknown) {
+  return async () => ({
+    detail,
+    source: RunDetailSource.enum['orchestrator-proxy'],
+    fallbackReason: null,
+  });
+}
+
 describe('runsLogsCommand', () => {
   it('prints step logs in order with headers', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
-      getRunDetail: async () => ({
+      getRunDetailWithSource: proxied({
         jobs: [
           {
             jobId: 'j1',
@@ -41,7 +51,7 @@ describe('runsLogsCommand', () => {
     const getStepLogs = vi.fn(async () => ({ lines: ['x'], totalLines: 1 }));
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
-      getRunDetail: async () => ({
+      getRunDetailWithSource: proxied({
         jobs: [
           {
             jobId: 'j1',
@@ -83,7 +93,7 @@ describe('runsLogsCommand', () => {
   it("prints a job's setup log under a setup heading, ahead of its steps", async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
-      getRunDetail: async () => SETUP_DETAIL,
+      getRunDetailWithSource: proxied(SETUP_DETAIL),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) =>
         stepIndex === -1
           ? { lines: ['[host-install] Dependencies installed'], totalLines: 1 }
@@ -105,25 +115,98 @@ describe('runsLogsCommand', () => {
   it('prints no setup heading when the orchestrator serves no setup log', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
-      getRunDetail: async () => SETUP_DETAIL,
+      getRunDetailWithSource: proxied(SETUP_DETAIL),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) => {
         if (stepIndex === -1) throw new Error('Step not found');
         return { lines: ['compiled'], totalLines: 1 };
       },
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     // breaks-if-wrong: an older orchestrator must not fail the command.
     expect(await runsLogsCommand('r1', {})).toBe(true);
     const printed = log.mock.calls.map((c) => String(c[0])).join('\n');
     expect(printed).not.toContain('setup');
     expect(printed).toContain('compiled');
+    // The older orchestrator's refusal is reported on stderr, not swallowed.
+    expect(err.mock.calls.map((c) => String(c[0])).join('\n')).toContain(
+      'setup log unavailable for job build: Step not found',
+    );
+  });
+
+  it('names on stderr why the setup log could not be read, leaving stdout and the exit code unchanged', async () => {
+    vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
+      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRunDetailWithSource: proxied(SETUP_DETAIL),
+      getStepLogs: async (_r: string, _j: string, stepIndex: number) => {
+        if (stepIndex === -1) {
+          throw new clientMod.DashboardClientError(
+            'orchestrator_offline',
+            'Orchestrator timed out — try again shortly.',
+            504,
+          );
+        }
+        return { lines: ['compiled'], totalLines: 1 };
+      },
+    } as never);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    expect(await runsLogsCommand('r1', {})).toBe(true);
+    // fails-when: the setup-log error is swallowed into an empty page
+    expect(err.mock.calls.map((c) => String(c[0])).join('\n')).toContain(
+      'setup log unavailable for job build: Orchestrator timed out — try again shortly.',
+    );
+    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain('compiled');
+  });
+
+  it('names the reason on stderr when the recorded cluster is offline and the fallback cannot serve the run', async () => {
+    const STARTED_NO_STEPS = {
+      jobs: [
+        {
+          jobId: 'j1',
+          jobName: 'initfail',
+          status: ExecutionJobStatus.enum.failed,
+          matrixValues: null,
+          startedAt: 1_700_000_000_000,
+          completedAt: 1_700_000_060_000,
+          durationMs: 60_000,
+          agentId: 'a1',
+          errorMessage: null,
+          steps: [],
+        },
+      ],
+    };
+    vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
+      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.failed }),
+      getRunDetailWithSource: async () => ({
+        detail: STARTED_NO_STEPS,
+        source: 'platform-db',
+        fallbackReason: 'orchestrator_error',
+      }),
+      getStepLogs: async () => {
+        throw new clientMod.DashboardClientError('http', 'Run not found', 500);
+      },
+    } as never);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // breaks-if-wrong: the exit code stays true; only stderr explains
+    expect(await runsLogsCommand('r1', {})).toBe(true);
+    const stderr = err.mock.calls.map((c) => String(c[0])).join('\n');
+    // fails-when: the command exits 0 having printed nothing anywhere
+    expect(stderr).toContain(
+      'step detail unavailable: the Platform could not read it from the orchestrator that ran this run (the orchestrator returned an error)',
+    );
+    expect(stderr).toContain('setup log unavailable for job initfail: Run not found');
+    // The stored copy has no steps, so stdout carries no step section.
+    expect(log.mock.calls.map((c) => String(c[0])).join('\n')).not.toContain('initfail ›');
   });
 
   function mockSetupPage(setupPage: Record<string, unknown>): void {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
-      getRunDetail: async () => SETUP_DETAIL,
+      getRunDetailWithSource: proxied(SETUP_DETAIL),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) =>
         stepIndex === -1 ? setupPage : { lines: ['compiled'], totalLines: 1 },
     } as never);
@@ -176,7 +259,7 @@ describe('runsLogsCommand', () => {
     ];
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
-      getRunDetail: async () => ({ jobs: notStarted }),
+      getRunDetailWithSource: proxied({ jobs: notStarted }),
       getStepLogs: async () => ({ lines: [], totalLines: 0, recorded: false }),
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -225,7 +308,7 @@ describe('runsLogsCommand', () => {
   function mockSetupAndStep(detail: unknown): void {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
-      getRunDetail: async () => detail,
+      getRunDetailWithSource: proxied(detail),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) => ({
         lines: [stepIndex === -1 ? 'setup-line' : 'step-line'],
         totalLines: 1,
@@ -282,7 +365,7 @@ describe('runsLogsCommand', () => {
   it('prints no setup key in --json when no job wrote a setup log', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
-      getRunDetail: async () => SETUP_DETAIL,
+      getRunDetailWithSource: proxied(SETUP_DETAIL),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) => {
         if (stepIndex === -1) throw new Error('Step not found');
         return { lines: ['step-line'], totalLines: 1 };
@@ -323,7 +406,7 @@ describe('runsLogsCommand unwraps stored log envelopes', () => {
     // shows the store's {"ts":…,"level":"stdout","msg":…} for every line.
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
-      getRunDetail: async () => ({
+      getRunDetailWithSource: proxied({
         jobs: [
           {
             jobId: 'j1',
@@ -348,7 +431,7 @@ describe('runsLogsCommand unwraps stored log envelopes', () => {
   it('unwraps in --follow mode too', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
-      getRunDetail: async () => ({
+      getRunDetailWithSource: proxied({
         jobs: [
           {
             jobId: 'j1',

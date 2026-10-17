@@ -80,6 +80,10 @@ export {
   type OrchestratorToPlatformMessage,
 } from './protocol/messages/platform-orchestrator.js';
 
+// --- Protocol: bounded free text (clamp, never refuse) ---
+export * from './protocol/messages/bounded-text.js';
+export * from './protocol/messages/frame-issues.js';
+
 // --- Protocol: Execution status (orchestrator -> Platform, in main union) ---
 export * from './protocol/messages/execution-status.js';
 

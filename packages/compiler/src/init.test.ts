@@ -1,7 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { parse as parseYaml } from 'yaml';
+import { logger } from '@kici-dev/core';
 import { initCommand } from './commands/init.js';
+import { VersionPin, generatePackageJson } from './templates/index.js';
 
 describe('kici init', () => {
   let tempDir: string;
@@ -187,7 +191,6 @@ describe('kici init', () => {
       expect(pkg.devDependencies).toBeDefined();
       expect(pkg.devDependencies['@kici-dev/sdk']).toBe('^0.0.1');
       expect(pkg.devDependencies['@kici-dev/compiler']).toBeUndefined();
-      expect(pkg.scripts.compile).toBe('npx --yes kici@latest compile');
       expect(pkg.dependencies).toBeUndefined();
     });
   });
@@ -353,6 +356,111 @@ describe('kici init', () => {
     });
   });
 
+  describe('default branch', () => {
+    /** Make tempDir its own git repository whose only branch is `branch`. */
+    function gitInitOn(branch: string): void {
+      execFileSync('git', ['init', '-q', '-b', branch], { cwd: tempDir });
+      execFileSync(
+        'git',
+        [
+          '-c',
+          'user.email=init@test.kici.dev',
+          '-c',
+          'user.name=init test',
+          '-c',
+          'commit.gpgsign=false',
+          '-c',
+          'core.hooksPath=/dev/null',
+          'commit',
+          '-q',
+          '--allow-empty',
+          '-m',
+          'init',
+        ],
+        { cwd: tempDir },
+      );
+    }
+
+    /** Scaffold into a repository on `branch`; return a generated file under .kici/. */
+    async function scaffoldOn(branch: string, file: string): Promise<string> {
+      gitInitOn(branch);
+      expect(await initCommand({ skipInstall: true })).toBe(true);
+      return fs.readFile(path.join(tempDir, '.kici', file), 'utf-8');
+    }
+
+    it('detects the branch of the repository it scaffolds into', async () => {
+      // fails-when: the branch is read from the directory the process started in
+      expect(await scaffoldOn('develop', 'tests/push-test.ts')).toContain('push-develop');
+    });
+
+    it('writes a loadable fixture and a pr-checks target for a slash-named branch', async () => {
+      const fixture = await scaffoldOn('ci/kici', 'tests/push-test.ts');
+      // fails-when: init interpolates the raw branch (`export const pushCi/kici`)
+      expect(fixture).toContain('export const pushCiKici = fixture("push-ci/kici", {');
+      expect(fixture).toContain('event: push({ branches: ["ci/kici"] }),');
+
+      const prChecks = await fs.readFile(
+        path.join(tempDir, '.kici', 'workflows', 'pr-checks.ts'),
+        'utf-8',
+      );
+      // fails-when: the rewrite looks for an anchor the template no longer carries
+      expect(prChecks).toContain('target: "ci/kici"');
+      expect(prChecks).not.toContain("target: 'main'");
+    });
+  });
+
+  describe('version pins', () => {
+    const CLI_VERSION = '0.17.0';
+
+    beforeEach(() => {
+      vi.stubGlobal('KICI_VERSION', CLI_VERSION);
+    });
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    async function scaffoldedPackageJson(): Promise<{
+      scripts: Record<string, string>;
+      devDependencies: Record<string, string>;
+    }> {
+      return JSON.parse(await fs.readFile(path.join(tempDir, '.kici', 'package.json'), 'utf-8'));
+    }
+
+    it('pins a caret SDK and a compile script on the same CLI version', async () => {
+      expect(await initCommand({ skipInstall: true })).toBe(true);
+      const pkg = await scaffoldedPackageJson();
+      // fails-when: the compile script floats on kici@latest while the SDK is pinned
+      expect(pkg.scripts.compile).toBe(`npx --yes kici@${CLI_VERSION} compile`);
+      expect(pkg.devDependencies['@kici-dev/sdk']).toBe(`^${CLI_VERSION}`);
+      expect(pkg.devDependencies.typescript).toBe('^6.0.3');
+    });
+
+    it.each(['save-exact=true\n', "save-prefix=''\n"])(
+      'writes exact versions under a repository .npmrc of %j',
+      async (npmrc) => {
+        await fs.writeFile(path.join(tempDir, '.npmrc'), npmrc, 'utf-8');
+        expect(await initCommand({ skipInstall: true })).toBe(true);
+        const pkg = await scaffoldedPackageJson();
+        // fails-when: init never reads the repository .npmrc
+        expect(pkg.devDependencies['@kici-dev/sdk']).toBe(CLI_VERSION);
+        expect(pkg.devDependencies.typescript).toBe('6.0.3');
+        expect(pkg.scripts.compile).toBe(`npx --yes kici@${CLI_VERSION} compile`);
+      },
+    );
+
+    it('keeps the latest dist-tag in development mode, whatever the .npmrc says', async () => {
+      process.env.KICI_DEV = 'true';
+      await fs.writeFile(path.join(tempDir, '.npmrc'), 'save-exact=true\n', 'utf-8');
+      expect(await initCommand({ skipInstall: true })).toBe(true);
+      const pkg = await scaffoldedPackageJson();
+      // breaks-if-wrong: no semver range reaches a dev-registry prerelease
+      expect(pkg.devDependencies['@kici-dev/sdk']).toBe('latest');
+      expect(pkg.scripts.compile).toBe('npx --yes kici@latest compile');
+      expect(pkg.devDependencies.typescript).toBe('^6.0.3');
+    });
+  });
+
   describe('.gitignore handling', () => {
     it('creates .gitignore with .kici/node_modules/ if not exists', async () => {
       const success = await initCommand({ skipInstall: true });
@@ -466,16 +574,94 @@ describe('kici init', () => {
       await fs.writeFile(path.join(tempDir, '.git'), 'gitdir: x\n');
     }
 
-    it('omits .kici/package.json and adds @kici-dev/sdk to the root manifest', async () => {
+    it('writes .kici/package.json and adds .kici to pnpm-workspace.yaml', async () => {
       await makePnpmWorkspace();
-      const ok = await initCommand({ workspace: true, skipInstall: true });
-      expect(ok).toBe(true);
+      expect(await initCommand({ workspace: true, skipInstall: true })).toBe(true);
 
-      expect(await exists(path.join(tempDir, '.kici', 'package.json'))).toBe(false);
+      // fails-when: --workspace leaves .kici/ with no manifest, so no agent install path
+      // runs and @kici-dev/sdk never resolves on an agent
+      const kiciPkg = JSON.parse(
+        await fs.readFile(path.join(tempDir, '.kici', 'package.json'), 'utf-8'),
+      );
+      expect(kiciPkg.devDependencies['@kici-dev/sdk']).toBeDefined();
       expect(await exists(path.join(tempDir, '.kici', 'tsconfig.json'))).toBe(true);
-
+      const ws = parseYaml(
+        await fs.readFile(path.join(tempDir, 'pnpm-workspace.yaml'), 'utf-8'),
+      ) as { packages: string[] };
+      expect(ws.packages).toEqual(['packages/*', '.kici']);
+      // breaks-if-wrong: the root manifest is no longer where the SDK is declared
       const root = JSON.parse(await fs.readFile(path.join(tempDir, 'package.json'), 'utf-8'));
-      expect(root.devDependencies['@kici-dev/sdk']).toBeDefined();
+      expect(root.devDependencies?.['@kici-dev/sdk']).toBeUndefined();
+    });
+
+    it.each([
+      ['npm', { workspaces: ['packages/*'] }],
+      ['yarn', { workspaces: { packages: ['packages/*'] }, packageManager: 'yarn@1.22.22' }],
+    ])('adds .kici to the root package.json workspaces of a %s workspace', async (_kind, extra) => {
+      await fs.writeFile(
+        path.join(tempDir, 'package.json'),
+        JSON.stringify({ name: 'root', private: true, ...extra }, null, 2) + '\n',
+      );
+      await fs.writeFile(path.join(tempDir, '.git'), 'gitdir: x\n');
+      expect(await initCommand({ workspace: true, skipInstall: true })).toBe(true);
+      const root = JSON.parse(await fs.readFile(path.join(tempDir, 'package.json'), 'utf-8'));
+      const list = Array.isArray(root.workspaces) ? root.workspaces : root.workspaces.packages;
+      expect(list).toEqual(['packages/*', '.kici']);
+      expect(await exists(path.join(tempDir, '.kici', 'package.json'))).toBe(true);
+    });
+
+    it('writes the same .kici/package.json the standalone scaffold writes', async () => {
+      await makePnpmWorkspace();
+      await initCommand({ workspace: true, skipInstall: true });
+      // fails-when: the member layout writes its own manifest, so a pin-policy change
+      // to generatePackageJson reaches only the standalone layout
+      expect(await fs.readFile(path.join(tempDir, '.kici', 'package.json'), 'utf-8')).toBe(
+        generatePackageJson(VersionPin.Caret),
+      );
+    });
+
+    it('writes exact versions when the workspace root .npmrc sets save-exact', async () => {
+      await makePnpmWorkspace();
+      await fs.writeFile(path.join(tempDir, '.npmrc'), 'save-exact=true\n', 'utf-8');
+      await initCommand({ workspace: true, skipInstall: true });
+      // fails-when: the member layout never reads the workspace .npmrc
+      expect(await fs.readFile(path.join(tempDir, '.kici', 'package.json'), 'utf-8')).toBe(
+        generatePackageJson(VersionPin.Exact),
+      );
+    });
+
+    it('leaves an existing root @kici-dev/sdk declaration byte-identical and names it', async () => {
+      await makePnpmWorkspace();
+      const rootRaw =
+        JSON.stringify(
+          { name: 'root', private: true, devDependencies: { '@kici-dev/sdk': '1.2.3' } },
+          null,
+          2,
+        ) + '\n';
+      await fs.writeFile(path.join(tempDir, 'package.json'), rootRaw);
+      const info = vi.spyOn(logger, 'info');
+      try {
+        await initCommand({ workspace: true, skipInstall: true });
+        expect(await fs.readFile(path.join(tempDir, 'package.json'), 'utf-8')).toBe(rootRaw);
+        expect(info.mock.calls.map(([m]) => String(m)).join('\n')).toContain(
+          'still declares @kici-dev/sdk (1.2.3)',
+        );
+      } finally {
+        info.mockRestore();
+      }
+    });
+
+    it('prints the sibling specifier for the detected manager', async () => {
+      await makePnpmWorkspace();
+      const info = vi.spyOn(logger, 'info');
+      try {
+        await initCommand({ workspace: true, skipInstall: true });
+        expect(info.mock.calls.map(([m]) => String(m)).join('\n')).toContain(
+          '"@your-scope/utils": "workspace:*"',
+        );
+      } finally {
+        info.mockRestore();
+      }
     });
 
     it('dev mode writes the root .npmrc, not .kici/.npmrc', async () => {
@@ -506,21 +692,6 @@ describe('kici init', () => {
       }
     });
 
-    it('does not clobber an existing root @kici-dev/sdk', async () => {
-      await makePnpmWorkspace();
-      await fs.writeFile(
-        path.join(tempDir, 'package.json'),
-        JSON.stringify(
-          { name: 'root', private: true, devDependencies: { '@kici-dev/sdk': '1.2.3' } },
-          null,
-          2,
-        ) + '\n',
-      );
-      await initCommand({ workspace: true, skipInstall: true });
-      const root = JSON.parse(await fs.readFile(path.join(tempDir, 'package.json'), 'utf-8'));
-      expect(root.devDependencies['@kici-dev/sdk']).toBe('1.2.3');
-    });
-
     it('--workspace with no workspace fails', async () => {
       // A .git marker but no workspace manifest → detection returns null.
       await fs.writeFile(path.join(tempDir, '.git'), 'gitdir: x\n');
@@ -545,6 +716,165 @@ describe('kici init', () => {
       await makePnpmWorkspace();
       await initCommand({ skipInstall: true });
       expect(await exists(path.join(tempDir, '.kici', 'package.json'))).toBe(true);
+    });
+  });
+
+  describe('re-running --workspace on an older workspace scaffold', () => {
+    const ROOT_OLD = {
+      name: 'root',
+      private: true,
+      scripts: { build: 'tsc -b' },
+      dependencies: { lodash: '^4.17.21' },
+      devDependencies: { '@kici-dev/sdk': '^0.17.0', vitest: '^4.0.0' },
+    };
+
+    /** The layout an older `kici init --workspace` left, plus a user-edited workflow. */
+    async function makeOldScaffold(
+      workspaceFile: 'pnpm' | 'npm',
+      listKici: boolean,
+    ): Promise<void> {
+      await fs.writeFile(path.join(tempDir, '.git'), 'gitdir: x\n');
+      if (workspaceFile === 'pnpm') {
+        await fs.writeFile(
+          path.join(tempDir, 'pnpm-workspace.yaml'),
+          `# members\npackages:\n  - 'packages/*'\n${listKici ? "  - '.kici'\n" : ''}`,
+        );
+        await fs.writeFile(
+          path.join(tempDir, 'package.json'),
+          JSON.stringify(ROOT_OLD, null, 2) + '\n',
+        );
+      } else {
+        const workspaces = listKici ? ['packages/*', '.kici'] : ['packages/*'];
+        await fs.writeFile(
+          path.join(tempDir, 'package.json'),
+          JSON.stringify({ ...ROOT_OLD, workspaces }, null, 2) + '\n',
+        );
+      }
+      await fs.mkdir(path.join(tempDir, '.kici', 'workflows'), { recursive: true });
+      await fs.writeFile(
+        path.join(tempDir, '.kici', 'workflows', 'ci.ts'),
+        '// user edit\nexport {};\n',
+      );
+      await fs.writeFile(
+        path.join(tempDir, '.kici', 'tsconfig.json'),
+        '{"compilerOptions":{"strict":true}}\n',
+      );
+    }
+
+    const TRACKED = [
+      'package.json',
+      'pnpm-workspace.yaml',
+      '.kici/package.json',
+      '.kici/tsconfig.json',
+      '.kici/workflows/ci.ts',
+    ];
+    async function snapshot(): Promise<Record<string, string | null>> {
+      const out: Record<string, string | null> = {};
+      for (const rel of TRACKED) {
+        out[rel] = await fs.readFile(path.join(tempDir, rel), 'utf-8').catch(() => null);
+      }
+      return out;
+    }
+
+    it.each([false, true])(
+      'pnpm (.kici already listed: %s): completes the member layout, then a second run changes nothing',
+      async (listKici) => {
+        await makeOldScaffold('pnpm', listKici);
+        const before = await snapshot();
+
+        // fails-when: --workspace on an existing .kici/ refuses with "already exists",
+        // so an older scaffold can never be repaired without --force deleting the workflows
+        expect(await initCommand({ workspace: true, skipInstall: true })).toBe(true);
+
+        const after = await snapshot();
+        expect(after['.kici/package.json']).not.toBeNull();
+        const wsRaw = after['pnpm-workspace.yaml']!;
+        // fails-when: an already-listed .kici is appended a second time
+        expect(
+          (parseYaml(wsRaw) as { packages: string[] }).packages.filter((p) => p === '.kici'),
+        ).toEqual(['.kici']);
+        expect(wsRaw).toContain('# members');
+        // breaks-if-wrong: the user's root manifest (other dependencies, scripts and the stale
+        // SDK line) and their workflow and tsconfig are byte-identical
+        expect(after['package.json']).toBe(before['package.json']);
+        expect(after['.kici/workflows/ci.ts']).toBe(before['.kici/workflows/ci.ts']);
+        expect(after['.kici/tsconfig.json']).toBe(before['.kici/tsconfig.json']);
+
+        const info = vi.spyOn(logger, 'info');
+        try {
+          expect(await initCommand({ workspace: true, skipInstall: true })).toBe(true);
+          // property: the second run writes nothing
+          expect(await snapshot()).toEqual(after);
+          expect(info.mock.calls.map(([m]) => String(m)).join('\n')).toContain(
+            'already a workspace member',
+          );
+        } finally {
+          info.mockRestore();
+        }
+      },
+    );
+
+    it('npm: adds .kici to workspaces and keeps every root dependency map as it was', async () => {
+      await makeOldScaffold('npm', false);
+      expect(await initCommand({ workspace: true, skipInstall: true })).toBe(true);
+      const root = JSON.parse(await fs.readFile(path.join(tempDir, 'package.json'), 'utf-8'));
+      expect(root.workspaces).toEqual(['packages/*', '.kici']);
+      // The stale SDK line is left in place: init cannot tell who wrote it.
+      expect(root.dependencies).toEqual(ROOT_OLD.dependencies);
+      expect(root.devDependencies).toEqual(ROOT_OLD.devDependencies);
+      expect(root.scripts).toEqual(ROOT_OLD.scripts);
+      const once = await snapshot();
+      expect(await initCommand({ workspace: true, skipInstall: true })).toBe(true);
+      expect(await snapshot()).toEqual(once);
+    });
+
+    it('yarn: adds a missing version to a listed .kici/package.json, then changes nothing', async () => {
+      await fs.writeFile(path.join(tempDir, '.git'), 'gitdir: x\n');
+      await fs.writeFile(
+        path.join(tempDir, 'package.json'),
+        JSON.stringify(
+          { name: 'root', private: true, packageManager: 'yarn@1.22.22', workspaces: ['.kici'] },
+          null,
+          2,
+        ) + '\n',
+      );
+      await fs.mkdir(path.join(tempDir, '.kici', 'workflows'), { recursive: true });
+      await fs.writeFile(path.join(tempDir, '.kici', 'tsconfig.json'), '{}\n');
+      await fs.writeFile(
+        path.join(tempDir, '.kici', 'package.json'),
+        JSON.stringify({ name: '@kici-dev/workflows', private: true }, null, 2) + '\n',
+      );
+      expect(await initCommand({ workspace: true, skipInstall: true })).toBe(true);
+      const once = await snapshot();
+      // fails-when: an existing yarn member keeps its version-less manifest, which yarn ignores
+      expect(JSON.parse(once['.kici/package.json']!).version).toBe('0.0.0');
+      expect(await initCommand({ workspace: true, skipInstall: true })).toBe(true);
+      expect(await snapshot()).toEqual(once);
+    });
+
+    it('refuses a standalone .kici/ that the workspace does not list, and changes nothing', async () => {
+      await makeOldScaffold('pnpm', false);
+      await fs.writeFile(
+        path.join(tempDir, '.kici', 'package.json'),
+        '{"name":"@kici-dev/workflows"}\n',
+      );
+      const before = await snapshot();
+      expect(await initCommand({ workspace: true, skipInstall: true })).toBe(false);
+      expect(await snapshot()).toEqual(before);
+    });
+
+    it('plain kici init on an existing .kici/ still refuses', async () => {
+      await makeOldScaffold('pnpm', false);
+      // breaks-if-wrong: only --workspace gains the in-place path
+      expect(await initCommand({ skipInstall: true })).toBe(false);
+      expect(await exists(path.join(tempDir, '.kici', 'package.json'))).toBe(false);
+    });
+
+    it('--workspace --standalone on an existing .kici/ still fails', async () => {
+      await makeOldScaffold('pnpm', false);
+      expect(await initCommand({ workspace: true, standalone: true, skipInstall: true })).toBe(
+        false,
+      );
     });
   });
 

@@ -2595,7 +2595,7 @@ export class ScalerManager {
       return;
     }
 
-    // All agents are single-use: always destroy on disconnect. The durable row
+    // A scaler agent never outlives its connection: always destroy on disconnect. The durable row
     // goes only once the teardown resolved: an event row is the sole pointer to
     // a running cloud instance, and the reaper retries a failed teardown from
     // it. The teardown targets the spawn-recorded `provisioningTargets`, not

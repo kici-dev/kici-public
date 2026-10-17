@@ -128,23 +128,32 @@ describe('findPortHolderPid', () => {
 });
 
 describe('isPortFree / waitForPortFree', () => {
+  // A port the OS hands out, never a fixed number: a fixed port in the
+  // ephemeral range can be the local end of any outgoing connection on the host.
+  async function listenOnFreePort(): Promise<{ server: net.Server; port: number }> {
+    const server = net.createServer();
+    await new Promise<void>((r) => server.listen({ port: 0, host: '127.0.0.1' }, () => r()));
+    return { server, port: (server.address() as net.AddressInfo).port };
+  }
+  const close = (server: net.Server) => new Promise<void>((r) => server.close(() => r()));
+
   it('reports a free port as free', async () => {
-    expect(await isPortFree(45997)).toBe(true);
+    const { server, port } = await listenOnFreePort();
+    await close(server);
+    expect(await isPortFree(port)).toBe(true);
   });
 
   it('reports a held port as not free, then free once released', async () => {
-    const server = net.createServer();
-    await new Promise<void>((r) => server.listen({ port: 45996, host: '127.0.0.1' }, () => r()));
-    expect(await isPortFree(45996)).toBe(false);
-    await new Promise<void>((r) => server.close(() => r()));
-    expect(await waitForPortFree(45996, 2_000)).toBe(true);
+    const { server, port } = await listenOnFreePort();
+    expect(await isPortFree(port)).toBe(false);
+    await close(server);
+    expect(await waitForPortFree(port, 2_000)).toBe(true);
   });
 
   it('waitForPortFree returns false while the port stays held', async () => {
-    const server = net.createServer();
-    await new Promise<void>((r) => server.listen({ port: 45995, host: '127.0.0.1' }, () => r()));
-    expect(await waitForPortFree(45995, 300)).toBe(false);
-    await new Promise<void>((r) => server.close(() => r()));
+    const { server, port } = await listenOnFreePort();
+    expect(await waitForPortFree(port, 300)).toBe(false);
+    await close(server);
   });
 });
 

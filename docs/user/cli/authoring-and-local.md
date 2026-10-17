@@ -43,6 +43,8 @@ The `--check` flag is useful in CI pipelines and pre-commit hooks. It validates 
 
 The type-check requires `.kici/tsconfig.json` and a `typescript` dependency — both are scaffolded by `kici init`. In a JavaScript-only workspace (`kici init --mjs`, which has no `tsconfig.json`), the type-check is skipped with a notice and validation still runs. When the type-check finds errors, `kici compile --check` prints each one in `file:line:column error [E120]: message` form and exits non-zero.
 
+If `.kici/` has workflows but no `.kici/package.json`, `kici compile` warns: agents install the `.kici/` dependencies from that file only, so the workflows cannot run on an agent. `kici run remote` and `kici run --local` print the same warning. `kici run --local --in-place` does not, because it uses the `node_modules` already in your working tree. To fix it, run `kici init --workspace` in a workspace, or add a `.kici/package.json` that declares `@kici-dev/sdk`.
+
 Compile and validation errors carry the real `file:line:column` of the offending job or step (anchored to the job's first step location), so you can jump straight to the source instead of a generic line 1.
 
 **Auto-type regeneration:** When [`kici types`](#kici-types) has a source (a direct orchestrator target, a Platform login with an active organization, or local secret files), `kici compile` refreshes `.kici/types/secrets.d.ts` after each successful compilation. The refresh keeps type declarations in sync with your secret contexts. The type regeneration is non-blocking -- if the source is unreachable, compilation still succeeds with a warning. The `--check` flag skips type regeneration since a check writes no files.
@@ -271,6 +273,8 @@ The command auto-detects existing hook tools in your project:
 - **pre-commit** (`.pre-commit-config.yaml`): Adds a kici hook to the config, then runs `pre-commit install`
 - **prek** (`prek.toml` or `.prek.toml`): Adds a kici hook to `.pre-commit-config.yaml`, then runs `prek install`
 - **Raw git** (`--git`): Writes `.git/hooks/pre-commit`
+
+The hook runs `npx -y kici@<version> compile`, where `<version>` is the version of the `kici` CLI that installed the hook. When you upgrade `@kici-dev/sdk`, change the version in the hook too.
 
 If multiple tools are detected, you are prompted to choose. In a non-interactive shell or CI, the command uses the first tool in the list above. If no tool is detected, an interactive shell offers a raw git hook; a non-interactive shell installs nothing and tells you to pass `--git`.
 

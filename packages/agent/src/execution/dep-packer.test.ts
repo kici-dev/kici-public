@@ -161,6 +161,7 @@ describe('packNodeModules + restoreDeps round-trip', () => {
     await writeFile(join(src, 'yarn.lock'), '# yarn lockfile v1\n'); // marks yarn
     await writeFile(join(sib, 'index.js'), 'module.exports=1');
     await symlink('../../../packages/sib', join(kiciDir, 'node_modules', '@t', 'sib'));
+    await writeFile(join(kiciDir, 'package.json'), '{"dependencies":{"@t/sib":"^1.0.0"}}');
 
     const { tarball, hash } = await packNodeModules(kiciDir);
     expect(hash).toMatch(/^[0-9a-f]{64}$/);
@@ -184,6 +185,7 @@ describe('packNodeModules + restoreDeps round-trip', () => {
     await writeFile(join(src, 'node_modules', 'lodash', 'index.js'), 'module.exports=1');
     await writeFile(join(sib, 'index.js'), 'module.exports=2');
     await symlink('../../packages/sib', join(src, 'node_modules', '@t', 'sib'));
+    await writeFile(join(kiciDir, 'package.json'), '{"dependencies":{"@t/sib":"^1.0.0"}}');
 
     const { tarball } = await packNodeModules(kiciDir);
 
@@ -193,5 +195,92 @@ describe('packNodeModules + restoreDeps round-trip', () => {
     expect(existsSync(join(dst, 'node_modules', 'lodash', 'index.js'))).toBe(true);
     expect(existsSync(join(dst, 'node_modules', '@t', 'sib'))).toBe(true);
     expect(existsSync(join(dst, 'packages', 'sib', 'index.js'))).toBe(true);
+  });
+
+  async function npmMember(src: string): Promise<string> {
+    const kiciDir = join(src, '.kici');
+    await mkdir(kiciDir, { recursive: true });
+    await writeFile(
+      join(src, 'package.json'),
+      JSON.stringify({ name: 'r', workspaces: ['.kici', 'packages/*'] }),
+    );
+    await writeFile(join(src, 'package-lock.json'), '{}'); // marks npm
+    await writeFile(
+      join(kiciDir, 'package.json'),
+      '{"name":"@kici-dev/workflows","dependencies":{"@e2e/utils":"^0.0.0"}}',
+    );
+    await mkdir(join(src, 'node_modules', 'zod'), { recursive: true });
+    await writeFile(join(src, 'node_modules', 'zod', 'index.js'), 'zod-hoisted');
+    await mkdir(join(src, 'node_modules', '@kici-dev'), { recursive: true });
+    await symlink('../../.kici', join(src, 'node_modules', '@kici-dev', 'workflows'));
+    await mkdir(join(src, 'packages', 'utils', 'dist'), { recursive: true });
+    await writeFile(join(src, 'packages', 'utils', 'dist', 'index.js'), 'utils');
+    await mkdir(join(src, 'node_modules', '@e2e'), { recursive: true });
+    await symlink('../../packages/utils', join(src, 'node_modules', '@e2e', 'utils'));
+    return kiciDir;
+  }
+
+  it('npm workspace member: packs the hoisted root node_modules and the linked siblings', async () => {
+    const kiciDir = await npmMember(join(root, 'src-npm-member'));
+    // fails-when: npm packs only .kici/node_modules, which a hoisted member does not
+    // have, so packNodeModules throws and the build job fails
+    const { tarball } = await packNodeModules(kiciDir);
+    const dst = join(root, 'dst-npm-member');
+    await mkdir(join(dst, '.kici'), { recursive: true });
+    await restoreDeps(dst, await tarballUrl(root, tarball));
+    expect(await readFile(join(dst, 'node_modules', 'zod', 'index.js'), 'utf-8')).toBe(
+      'zod-hoisted',
+    );
+    expect(await realpath(join(dst, 'node_modules', '@e2e', 'utils'))).toBe(
+      await realpath(join(dst, 'packages', 'utils')),
+    );
+    expect(
+      await readFile(join(dst, 'node_modules', '@e2e', 'utils', 'dist', 'index.js'), 'utf-8'),
+    ).toBe('utils');
+  });
+
+  it('npm workspace member with a nested conflict: packs both node_modules roots', async () => {
+    const src = join(root, 'src-npm-nested');
+    const kiciDir = await npmMember(src);
+    await mkdir(join(kiciDir, 'node_modules', 'zod'), { recursive: true });
+    await writeFile(join(kiciDir, 'node_modules', 'zod', 'index.js'), 'zod-nested');
+    const { tarball } = await packNodeModules(kiciDir);
+    const dst = join(root, 'dst-npm-nested');
+    await mkdir(join(dst, '.kici'), { recursive: true });
+    await restoreDeps(dst, await tarballUrl(root, tarball));
+    expect(await readFile(join(dst, '.kici', 'node_modules', 'zod', 'index.js'), 'utf-8')).toBe(
+      'zod-nested',
+    );
+    expect(await readFile(join(dst, 'node_modules', 'zod', 'index.js'), 'utf-8')).toBe(
+      'zod-hoisted',
+    );
+  });
+
+  it('npm standalone .kici: never packs an unrelated root node_modules', async () => {
+    const src = join(root, 'src-npm-standalone');
+    const kiciDir = join(src, '.kici');
+    await mkdir(join(kiciDir, 'node_modules', 'foo'), { recursive: true });
+    await writeFile(join(kiciDir, 'node_modules', 'foo', 'index.js'), 'foo');
+    await writeFile(join(src, 'package-lock.json'), '{}');
+    await mkdir(join(src, 'node_modules', 'repo-only'), { recursive: true });
+    const { tarball } = await packNodeModules(kiciDir);
+    const dst = join(root, 'dst-npm-standalone');
+    await mkdir(join(dst, '.kici'), { recursive: true });
+    await restoreDeps(dst, await tarballUrl(root, tarball));
+    // breaks-if-wrong: the standalone tarball carries the repo's own root dependencies
+    expect(existsSync(join(dst, 'node_modules'))).toBe(false);
+    expect(await readFile(join(dst, '.kici', 'node_modules', 'foo', 'index.js'), 'utf-8')).toBe(
+      'foo',
+    );
+  });
+
+  it('npm with no .kici/node_modules and an unrelated root node_modules: throws', async () => {
+    const src = join(root, 'src-npm-uninstalled');
+    await mkdir(join(src, '.kici'), { recursive: true });
+    await writeFile(join(src, 'package-lock.json'), '{}');
+    await mkdir(join(src, 'node_modules', 'repo-only'), { recursive: true });
+    // fails-when: npm falls back to any root node_modules like yarn does, so an
+    // uninstalled standalone .kici uploads the repo's own dependencies as its cache
+    await expect(packNodeModules(join(src, '.kici'))).rejects.toThrow(/node_modules not found/);
   });
 });

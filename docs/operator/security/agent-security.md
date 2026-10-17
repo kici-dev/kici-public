@@ -95,6 +95,13 @@ The container backend provides the strongest practical isolation for most deploy
 - Process isolation (container PID namespace)
 - Environment isolation (sanitized env only, no KICI\_\* variables)
 
+**The agent container itself.** When a container pool runs a job that names no image, the steps run inside
+the agent's own container, as the `node` user. That user can run `sudo` without a password. Root there has
+the container runtime's default capabilities, without `NET_ADMIN`. The network isolation rules live on the
+orchestrator's host, outside the container, so root inside the container cannot change them. The container
+runs one job and is then removed. The per-job containers described below are unchanged: they keep
+`CapDrop: ALL` and `no-new-privileges`.
+
 **Hardened by default.** Every per-job container is created with a secure-by-default posture (matching the bwrap backend's capability/privilege stance and exceeding it with cgroup caps):
 
 | Protection           | Default                                           | Knob                                    |

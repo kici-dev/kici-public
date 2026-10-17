@@ -126,6 +126,7 @@ import { provisionRemoteSource } from './pipeline/remote-source-store.js';
 import { readDeploymentIdentity, readConfigPaths } from './deployment/deployment-identity.js';
 import { dispatchTestRelay } from './ws/test-relay-handlers.js';
 import { buildExecutionStatusFrame } from './ws/execution-status-frame.js';
+import { buildJobStatusForwardFrame } from './ws/job-status-forward-frame.js';
 import type { ReleaseSignal } from './contexts/held-runs.js';
 import type { OrchestratorHooks } from './orchestrator-core.js';
 // Type-only: the test-only fault-injection policy. `import type` erases at
@@ -317,31 +318,32 @@ export async function runServer(
             runsOnLabels,
             logBytes,
             initFailure,
-            environments,
+            contexts,
           ) => {
             try {
-              platformClient.send({
-                type: 'job.status.forward',
-                messageId: crypto.randomUUID(),
-                runId,
-                jobId,
-                jobName,
-                // Cast to the shared enum, never to a hand-listed union: the wire
-                // schema's field IS `ExecutionJobStatus`, so a literal list here
-                // silently goes stale every time a status joins the enum.
-                status: status as ExecutionJobStatus,
-                timestamp,
-                ...(startedAt !== undefined && { startedAt }),
-                ...(completedAt !== undefined && { completedAt }),
-                ...(durationMs !== undefined && { durationMs }),
-                ...(errorMessage !== undefined && { errorMessage }),
-                ...(logBytes !== undefined && { logBytes }),
-                ...(agentId && { agentId }),
-                ...(runsOnLabels?.length && { runsOnLabels }),
-                ...(environments?.length && { environments }),
-                ...(initFailure && { initFailure }),
-                orchestratorId: config.instanceId,
-              });
+              platformClient.send(
+                buildJobStatusForwardFrame({
+                  messageId: crypto.randomUUID(),
+                  runId,
+                  jobId,
+                  jobName,
+                  // Cast to the shared enum, never to a hand-listed union: the wire
+                  // schema's field IS `ExecutionJobStatus`, so a literal list here
+                  // silently goes stale every time a status joins the enum.
+                  status: status as ExecutionJobStatus,
+                  timestamp,
+                  startedAt,
+                  completedAt,
+                  durationMs,
+                  errorMessage,
+                  agentId,
+                  runsOnLabels,
+                  logBytes,
+                  initFailure,
+                  contexts,
+                  orchestratorId: config.instanceId,
+                }),
+              );
             } catch (err) {
               logger.warn('Failed to forward job status to Platform', {
                 runId,

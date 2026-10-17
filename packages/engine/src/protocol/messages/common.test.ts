@@ -3,6 +3,7 @@ import {
   heartbeatSchema,
   ackSchema,
   nackSchema,
+  NackCode,
   errorSchema,
   buildUnsupportedMessageNack,
   NACK_EXEMPT_MESSAGE_TYPES,
@@ -177,5 +178,22 @@ describe('errorSchema', () => {
     };
     const roundTripped = JSON.parse(JSON.stringify(msg));
     expect(errorSchema.parse(roundTripped)).toEqual(msg);
+  });
+});
+
+describe('nackSchema code', () => {
+  it('accepts an invalid-frame nack and a nack without a code', () => {
+    // breaks-if-wrong: a version-skew nack (no code) from either side still parses
+    expect(nackSchema.safeParse({ type: 'nack', reason: 'skew' }).success).toBe(true);
+    const parsed = nackSchema.parse({
+      type: 'nack',
+      code: NackCode.enum.invalid_frame,
+      messageId: 'm',
+      receivedType: 'job.status.forward',
+      reason: 'invalid job.status.forward frame dropped: jobId failed validation',
+    });
+    expect(parsed.code).toBe('invalid_frame');
+    // fails-when: an unknown code is accepted, so the enum guards nothing
+    expect(nackSchema.safeParse({ type: 'nack', code: 'other', reason: 'x' }).success).toBe(false);
   });
 });

@@ -45,4 +45,30 @@ describe('normalizeInitItems', () => {
   it("throws when 'auto' appears inside an array", () => {
     expect(() => normalizeInitItems(jobWith(['mise', 'auto'] as never))).toThrow(/auto/);
   });
+
+  it('refuses an object preset this agent does not know, naming its keys', () => {
+    // fails-when: an unknown { nix } item falls through as a generic config with no run
+    expect(() => normalizeInitItems(jobWith({ nix: { packages: ['hello'] } } as never))).toThrow(
+      /init\[0\]: unknown init item \{ nix \}.*upgrade the agent/,
+    );
+  });
+
+  it('refuses an unknown preset string', () => {
+    expect(() => normalizeInitItems(jobWith(['mise', 'nix'] as never))).toThrow(
+      /init\[1\]: unknown init item 'nix'/,
+    );
+  });
+
+  it('maps { apt } to an apt preset directive', () => {
+    // fails-when: the agent refuses the apt preset as an unknown item
+    expect(normalizeInitItems(jobWith({ apt: { packages: ['make'] } }))).toEqual([
+      { kind: 'preset', name: 'apt', config: { packages: ['make'] } },
+    ]);
+  });
+
+  it('still accepts a generic config with extra fields', () => {
+    // breaks-if-wrong: a valid { run } spec is refused
+    const cfg = { run: 'echo hi', env: { A: '1' }, timeout: 5 };
+    expect(normalizeInitItems(jobWith(cfg))).toEqual([{ kind: 'generic', config: cfg }]);
+  });
 });

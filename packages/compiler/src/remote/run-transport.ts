@@ -22,6 +22,7 @@ import type {
   PlatformTriggerResponse,
   PlatformUploadInitInput,
   PlatformUploadInitResponse,
+  RunLogPosition,
 } from './platform-client.js';
 import { HoldsUnavailableError, type DirectRunClient, type DirectWhoami } from './direct-client.js';
 import { uploadTarball, type UploadResult } from './uploader.js';
@@ -51,7 +52,7 @@ export interface RunRemoteTransport {
   }): Promise<UploadResult>;
   trigger(body: PlatformTriggerInput): Promise<PlatformTriggerResponse>;
   status(runId: string): Promise<PlatformRunStatusResponse>;
-  logs(runId: string, cursor: number): Promise<PlatformRunLogsResponse>;
+  logs(runId: string, position: RunLogPosition): Promise<PlatformRunLogsResponse>;
   cancel(runId: string): Promise<PlatformCancelResponse>;
   readonly holds: RunHoldAccess;
 }
@@ -93,7 +94,7 @@ export function createPlatformTransport(opts: {
     uploadTarball: uploadWithDiagnosis,
     trigger: (body) => client.trigger(orgId, target, body),
     status: (runId) => client.runStatus(orgId, runId, target),
-    logs: (runId, cursor) => client.runLogs(orgId, runId, cursor, target),
+    logs: (runId, position) => client.runLogs(orgId, runId, position, target),
     cancel: (runId) => client.cancel(orgId, runId, target),
     holds: {
       list: (runId) => listHeldRunsForRun(holdContext, runId),
@@ -135,7 +136,7 @@ export function createDirectTransport(opts: {
     uploadTarball: uploadWithDiagnosis,
     trigger: (body) => client.trigger(body),
     status: (runId) => client.runStatus(runId),
-    logs: (runId, cursor) => client.runLogs(runId, cursor),
+    logs: (runId, position) => client.runLogs(runId, position),
     cancel: (runId) => client.cancel(runId),
     holds: {
       list: async (runId) => {

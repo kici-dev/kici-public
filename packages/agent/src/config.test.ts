@@ -433,6 +433,14 @@ describe('loadConfig', () => {
   });
 
   describe('scaler / execution mode fields', () => {
+    it('parses KICI_SCALER_SINGLE_JOB=1 and defaults it to false', () => {
+      process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
+      expect(loadConfig().scalerSingleJob).toBe(false);
+      process.env.KICI_SCALER_SINGLE_JOB = '1';
+      // fails-when: the flag the container scaler sets is never read
+      expect(loadConfig().scalerSingleJob).toBe(true);
+    });
+
     it('parses KICI_SCALER_MANAGED=1 as boolean true', () => {
       process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
       process.env.KICI_SCALER_MANAGED = '1';

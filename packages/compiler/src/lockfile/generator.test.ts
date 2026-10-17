@@ -43,7 +43,14 @@ import type {
   LockTagTrigger,
 } from '@kici-dev/engine';
 import { computeContentHash, COMPILE_SCHEMA_VERSION } from './hasher.js';
-import { SCHEMA_VERSION, BREAKING_FLOOR, type WorkflowWithSource } from '../types.js';
+import {
+  SCHEMA_VERSION,
+  BREAKING_FLOOR,
+  isLockStaticJob,
+  type LockFile,
+  type LockJob,
+  type WorkflowWithSource,
+} from '../types.js';
 
 // No git dependency in tests.
 vi.mock('node:child_process', () => ({
@@ -83,14 +90,29 @@ describe('generator - schema compatibility window', () => {
   });
 });
 
+/** The static job at `index` of the lock's first workflow; fails loudly on any other kind. */
+function staticJobAt(lockFile: LockFile, index: number): LockJob {
+  const lockJob = lockFile.workflows[0].jobs[index];
+  // fails-when: the job is emitted as dynamic, which would skip every assertion on it
+  expect(isLockStaticJob(lockJob)).toBe(true);
+  if (!isLockStaticJob(lockJob)) throw new Error(`expected a static lock job at index ${index}`);
+  return lockJob;
+}
+
+/** The single static job of a one-job lock; fails loudly if the generator emitted another kind. */
+function onlyStaticJob(lockFile: LockFile): LockJob {
+  return staticJobAt(lockFile, 0);
+}
+
 describe('schemaWindowWarning', () => {
   it('returns null when the floor is below the current version (additive era)', () => {
     expect(schemaWindowWarning(30, 31)).toBeNull();
   });
 
-  it('warns when the lock requires the current version (the floor is the current schema)', () => {
-    const warning = schemaWindowWarning(BREAKING_FLOOR, SCHEMA_VERSION);
-    expect(warning).toContain(`v${SCHEMA_VERSION}`);
+  it('stays silent in the additive era (the current floor is below the current version)', () => {
+    // fails-when: the v44 bump is stamped as breaking (minReaderVersion = SCHEMA_VERSION)
+    expect(BREAKING_FLOOR).toBeLessThan(SCHEMA_VERSION);
+    expect(schemaWindowWarning(BREAKING_FLOOR, SCHEMA_VERSION)).toBeNull();
   });
 
   it('warns and names the required version when the current version is itself breaking', () => {
@@ -106,20 +128,16 @@ describe('generator - approval config', () => {
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    const lockJob = lockFile.workflows[0].jobs[0];
-    if (lockJob._type === 'static') {
-      expect(lockJob.steps[0].approval).toEqual({ clauses: [{ team: 'leads' }], when: 'always' });
-    }
+    const lockJob = onlyStaticJob(lockFile);
+    expect(lockJob.steps[0].approval).toEqual({ clauses: [{ team: 'leads' }], when: 'always' });
   });
 
   it('maps job approval into LockJob.approval', () => {
     const j = job('deploy', { runsOn: 'linux', run: async () => {}, approval: true });
     const w = workflow('ci', { jobs: [j] });
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    const lockJob = lockFile.workflows[0].jobs[0];
-    if (lockJob._type === 'static') {
-      expect(lockJob.approval).toEqual({ clauses: [], when: 'always' });
-    }
+    const lockJob = onlyStaticJob(lockFile);
+    expect(lockJob.approval).toEqual({ clauses: [], when: 'always' });
   });
 
   it('maps workflow approval (object form) into LockWorkflow.approval', () => {
@@ -147,13 +165,11 @@ describe('generator - approval config', () => {
     const j = job('build', { runsOn: 'linux', steps: [s] });
     const w = workflow('ci', { jobs: [j] });
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    const lockJob = lockFile.workflows[0].jobs[0];
-    if (lockJob._type === 'static') {
-      expect(lockJob.steps[0].approval).toEqual({
-        clauses: [{ team: 'ops' }],
-        when: 'drift',
-      });
-    }
+    const lockJob = onlyStaticJob(lockFile);
+    expect(lockJob.steps[0].approval).toEqual({
+      clauses: [{ team: 'ops' }],
+      when: 'drift',
+    });
   });
 
   it('rejects a when:drift step with no check facet at compile time', () => {
@@ -200,11 +216,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      expect(lockJob._type).toBe('static');
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].continueOnError).toBe(true);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].continueOnError).toBe(true);
     });
 
     it('serializes timeout to LockStep', () => {
@@ -216,10 +229,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].timeout).toBe(60000);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].timeout).toBe(60000);
     });
 
     it('serializes both continueOnError and timeout', () => {
@@ -232,11 +243,9 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].continueOnError).toBe(true);
-        expect(lockJob.steps[0].timeout).toBe(120000);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].continueOnError).toBe(true);
+      expect(lockJob.steps[0].timeout).toBe(120000);
     });
 
     it('serializes the retry data subset to LockStep without retryIf', () => {
@@ -248,16 +257,14 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].retry).toEqual({
-          maxAttempts: 4,
-          delayMs: 1000,
-          backoff: 'exponential',
-          maxDelayMs: 30000,
-        });
-        expect(lockJob.steps[0].retry).not.toHaveProperty('retryIf');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].retry).toEqual({
+        maxAttempts: 4,
+        delayMs: 1000,
+        backoff: 'exponential',
+        maxDelayMs: 30000,
+      });
+      expect(lockJob.steps[0].retry).not.toHaveProperty('retryIf');
     });
 
     it('omits continueOnError and timeout when not set', () => {
@@ -266,11 +273,9 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0]).not.toHaveProperty('continueOnError');
-        expect(lockJob.steps[0]).not.toHaveProperty('timeout');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0]).not.toHaveProperty('continueOnError');
+      expect(lockJob.steps[0]).not.toHaveProperty('timeout');
     });
   });
 
@@ -281,10 +286,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.checkout).toBe(false);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.checkout).toBe(false);
     });
 
     it('serializes container string to LockJob', () => {
@@ -297,10 +300,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.container).toBe('node:20-alpine');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.container).toBe('node:20-alpine');
     });
 
     it('serializes container config object to LockJob', () => {
@@ -313,10 +314,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.container).toEqual({ image: 'node:20', env: { NODE_ENV: 'ci' } });
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.container).toEqual({ image: 'node:20', env: { NODE_ENV: 'ci' } });
     });
 
     it('serializes container registry auth (secret key-names) to LockJob', () => {
@@ -369,10 +368,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.sandbox).toEqual({ capabilities: ['NET_ADMIN'], network: 'host' });
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.sandbox).toEqual({ capabilities: ['NET_ADMIN'], network: 'host' });
     });
 
     it('omits the sandbox key when not requested (additive — no floor bump)', () => {
@@ -381,10 +378,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('sandbox');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob).not.toHaveProperty('sandbox');
     });
 
     it('omits checkout and container when not set', () => {
@@ -393,11 +388,9 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('checkout');
-        expect(lockJob).not.toHaveProperty('container');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob).not.toHaveProperty('checkout');
+      expect(lockJob).not.toHaveProperty('container');
     });
   });
 
@@ -415,14 +408,11 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      expect(lockJob._type).toBe('static');
-      if (lockJob._type === 'static') {
-        expect(lockJob.cache).toEqual([{ key: 'job-k', paths: ['dist'] }]);
-        expect(lockJob.steps[0].cache).toEqual([
-          { key: 's-k', paths: ['~/.cache'], restoreKeys: ['s-'] },
-        ]);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.cache).toEqual([{ key: 'job-k', paths: ['dist'] }]);
+      expect(lockJob.steps[0].cache).toEqual([
+        { key: 's-k', paths: ['~/.cache'], restoreKeys: ['s-'] },
+      ]);
     });
 
     it('omits cache when not set on job or step', () => {
@@ -431,11 +421,9 @@ describe('generator - agent execution fields', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('cache');
-        expect(lockJob.steps[0]).not.toHaveProperty('cache');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob).not.toHaveProperty('cache');
+      expect(lockJob.steps[0]).not.toHaveProperty('cache');
     });
   });
 
@@ -450,14 +438,11 @@ describe('generator - agent execution fields', () => {
       const w = workflow('w', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      expect(lockJob._type).toBe('static');
-      if (lockJob._type === 'static') {
-        expect(lockJob.init).toEqual({
-          run: 'mise install',
-          cache: { key: 'm', paths: ['~/.local/share/mise'] },
-        });
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.init).toEqual({
+        run: 'mise install',
+        cache: { key: 'm', paths: ['~/.local/share/mise'] },
+      });
     });
 
     it('emits an array of init configs preserving order', () => {
@@ -470,10 +455,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('w', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.init).toEqual([{ run: 'a' }, { run: 'b' }]);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.init).toEqual([{ run: 'a' }, { run: 'b' }]);
     });
 
     it('emits init: false', () => {
@@ -482,10 +465,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('w', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.init).toBe(false);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.init).toBe(false);
     });
 
     it('serializes a string preset into the lock job', () => {
@@ -494,10 +475,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('w', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.init).toBe('mise');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.init).toBe('mise');
     });
 
     it('serializes an object preset into the lock job', () => {
@@ -510,10 +489,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('w', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.init).toEqual({ mise: { timeout: 300_000, cache: false } });
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.init).toEqual({ mise: { timeout: 300_000, cache: false } });
     });
 
     it('serializes auto into the lock job', () => {
@@ -522,10 +499,49 @@ describe('generator - agent execution fields', () => {
       const w = workflow('w', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.init).toBe('auto');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.init).toBe('auto');
+    });
+
+    it('serializes a pinned mise preset and stays readable by schema-42 orchestrators', () => {
+      const s = step('s', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        init: { mise: { version: 'v2026.5.1', env: { PROBE: 'x' } } },
+      });
+      const lockFile = generateLockFile([makeWorkflowWithSource(workflow('w', { jobs: [j] }))]);
+      expect(onlyStaticJob(lockFile).init).toEqual({
+        mise: { version: 'v2026.5.1', env: { PROBE: 'x' } },
+      });
+      // fails-when: the bump is stamped breaking, so a 0.17.0 orchestrator rejects every lock
+      expect(lockFile.schemaVersion).toBe(44);
+      expect(lockFile.minReaderVersion).toBe(42);
+    });
+
+    it('serializes an apt preset verbatim', () => {
+      const s = step('s', async () => {});
+      const j = job('build', {
+        runsOn: 'linux',
+        steps: [s],
+        init: {
+          apt: {
+            packages: ['make=4.4.1-2', 'tree'],
+            cache: true,
+            env: { http_proxy: 'http://p:3128' },
+          },
+        },
+      });
+      const lockFile = generateLockFile([makeWorkflowWithSource(workflow('w', { jobs: [j] }))]);
+      // fails-when: the generator drops or reshapes a preset it does not know
+      expect(onlyStaticJob(lockFile).init).toEqual({
+        apt: {
+          packages: ['make=4.4.1-2', 'tree'],
+          cache: true,
+          env: { http_proxy: 'http://p:3128' },
+        },
+      });
+      expect(lockFile.minReaderVersion).toBe(42);
     });
 
     it('omits init when not set', () => {
@@ -534,10 +550,8 @@ describe('generator - agent execution fields', () => {
       const w = workflow('w', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('init');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob).not.toHaveProperty('init');
     });
   });
 });
@@ -982,14 +996,12 @@ describe('generator - source locations', () => {
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    const lockJob = lockFile.workflows[0].jobs[0];
-    if (lockJob._type === 'static') {
-      expect(lockJob.steps[0].sourceLocation).toEqual({
-        file: 'src/ci.ts',
-        line: 42,
-        column: 5,
-      });
-    }
+    const lockJob = onlyStaticJob(lockFile);
+    expect(lockJob.steps[0].sourceLocation).toEqual({
+      file: 'src/ci.ts',
+      line: 42,
+      column: 5,
+    });
   });
 
   it('omits sourceLocation when _sourceLocation is undefined (backward compat)', () => {
@@ -999,10 +1011,8 @@ describe('generator - source locations', () => {
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    const lockJob = lockFile.workflows[0].jobs[0];
-    if (lockJob._type === 'static') {
-      expect(lockJob.steps[0]).not.toHaveProperty('sourceLocation');
-    }
+    const lockJob = onlyStaticJob(lockFile);
+    expect(lockJob.steps[0]).not.toHaveProperty('sourceLocation');
   });
 
   it('makes file path relative to git root', () => {
@@ -1019,10 +1029,8 @@ describe('generator - source locations', () => {
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    const lockJob = lockFile.workflows[0].jobs[0];
-    if (lockJob._type === 'static') {
-      expect(lockJob.steps[0].sourceLocation?.file).toBe('.kici/workflows/ci.ts');
-    }
+    const lockJob = onlyStaticJob(lockFile);
+    expect(lockJob.steps[0].sourceLocation?.file).toBe('.kici/workflows/ci.ts');
   });
 
   it('strips .compiled.mjs?t=... suffix from sourceLocation file paths', () => {
@@ -1039,10 +1047,8 @@ describe('generator - source locations', () => {
     const w = workflow('ci', { jobs: [j] });
 
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    const lockJob = lockFile.workflows[0].jobs[0];
-    if (lockJob._type === 'static') {
-      expect(lockJob.steps[0].sourceLocation?.file).toBe('.kici/workflows/ci.ts');
-    }
+    const lockJob = onlyStaticJob(lockFile);
+    expect(lockJob.steps[0].sourceLocation?.file).toBe('.kici/workflows/ci.ts');
   });
 
   it('produces deterministic contentHash regardless of cache-buster timestamp', () => {
@@ -1470,13 +1476,11 @@ describe('generator - auto-IDs and bare function normalization', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].name).toBe('step-1');
-        expect(lockJob.steps[1].name).toBe('step-2');
-        expect(lockJob.steps[0].hasOutputs).toBe(false);
-        expect(lockJob.steps[1].hasOutputs).toBe(false);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].name).toBe('step-1');
+      expect(lockJob.steps[1].name).toBe('step-2');
+      expect(lockJob.steps[0].hasOutputs).toBe(false);
+      expect(lockJob.steps[1].hasOutputs).toBe(false);
     });
 
     it('assigns step-N names to id-less steps (empty name)', () => {
@@ -1486,11 +1490,9 @@ describe('generator - auto-IDs and bare function normalization', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].name).toBe('step-1');
-        expect(lockJob.steps[1].name).toBe('step-2');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].name).toBe('step-1');
+      expect(lockJob.steps[1].name).toBe('step-2');
     });
 
     it('handles mixed named/unnamed steps correctly (counter only increments for unnamed)', () => {
@@ -1501,12 +1503,10 @@ describe('generator - auto-IDs and bare function normalization', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].name).toBe('build');
-        expect(lockJob.steps[1].name).toBe('step-1');
-        expect(lockJob.steps[2].name).toBe('deploy');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].name).toBe('build');
+      expect(lockJob.steps[1].name).toBe('step-1');
+      expect(lockJob.steps[2].name).toBe('deploy');
     });
 
     it('resets step counter per job (counter scoped to job)', () => {
@@ -1516,13 +1516,11 @@ describe('generator - auto-IDs and bare function normalization', () => {
       const w = workflow('ci', { jobs: [j1, j2] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob1 = lockFile.workflows[0].jobs[0];
-      const lockJob2 = lockFile.workflows[0].jobs[1];
-      if (lockJob1._type === 'static' && lockJob2._type === 'static') {
-        expect(lockJob1.steps[0].name).toBe('step-1');
-        expect(lockJob1.steps[1].name).toBe('step-2');
-        expect(lockJob2.steps[0].name).toBe('step-1');
-      }
+      const lockJob1 = staticJobAt(lockFile, 0);
+      const lockJob2 = staticJobAt(lockFile, 1);
+      expect(lockJob1.steps[0].name).toBe('step-1');
+      expect(lockJob1.steps[1].name).toBe('step-2');
+      expect(lockJob2.steps[0].name).toBe('step-1');
     });
   });
 
@@ -1533,12 +1531,10 @@ describe('generator - auto-IDs and bare function normalization', () => {
       const w = workflow('ci', { jobs: [j1, j2] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob1 = lockFile.workflows[0].jobs[0];
-      const lockJob2 = lockFile.workflows[0].jobs[1];
-      if (lockJob1._type === 'static' && lockJob2._type === 'static') {
-        expect(lockJob1.name).toBe('job-1');
-        expect(lockJob2.name).toBe('job-2');
-      }
+      const lockJob1 = staticJobAt(lockFile, 0);
+      const lockJob2 = staticJobAt(lockFile, 1);
+      expect(lockJob1.name).toBe('job-1');
+      expect(lockJob2.name).toBe('job-2');
     });
 
     it('resolves needs references to renamed job-N names for UUID-named jobs', () => {
@@ -1547,14 +1543,12 @@ describe('generator - auto-IDs and bare function normalization', () => {
       const w = workflow('ci', { jobs: [build, test] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockBuild = lockFile.workflows[0].jobs[0];
-      const lockTest = lockFile.workflows[0].jobs[1];
-      if (lockBuild._type === 'static' && lockTest._type === 'static') {
-        expect(lockBuild.name).toBe('job-1');
-        expect(lockTest.name).toBe('job-2');
-        // needs must reference the renamed name, not the original UUID
-        expect(lockTest.needs).toEqual(['job-1']);
-      }
+      const lockBuild = staticJobAt(lockFile, 0);
+      const lockTest = staticJobAt(lockFile, 1);
+      expect(lockBuild.name).toBe('job-1');
+      expect(lockTest.name).toBe('job-2');
+      // needs must reference the renamed name, not the original UUID
+      expect(lockTest.needs).toEqual(['job-1']);
     });
 
     it('resolves needs with mixed named and UUID-named jobs', () => {
@@ -1568,20 +1562,14 @@ describe('generator - auto-IDs and bare function normalization', () => {
       const w = workflow('ci', { jobs: [build, lint, test] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockBuild = lockFile.workflows[0].jobs[0];
-      const lockLint = lockFile.workflows[0].jobs[1];
-      const lockTest = lockFile.workflows[0].jobs[2];
-      if (
-        lockBuild._type === 'static' &&
-        lockLint._type === 'static' &&
-        lockTest._type === 'static'
-      ) {
-        expect(lockBuild.name).toBe('build');
-        expect(lockLint.name).toBe('job-1');
-        expect(lockTest.name).toBe('job-2');
-        // needs must resolve named job as-is and UUID job to its renamed name
-        expect(lockTest.needs).toEqual(['build', 'job-1']);
-      }
+      const lockBuild = staticJobAt(lockFile, 0);
+      const lockLint = staticJobAt(lockFile, 1);
+      const lockTest = staticJobAt(lockFile, 2);
+      expect(lockBuild.name).toBe('build');
+      expect(lockLint.name).toBe('job-1');
+      expect(lockTest.name).toBe('job-2');
+      // needs must resolve named job as-is and UUID job to its renamed name
+      expect(lockTest.needs).toEqual(['build', 'job-1']);
     });
 
     it('handles mixed named/unnamed jobs correctly (counter only increments for unnamed)', () => {
@@ -1591,18 +1579,12 @@ describe('generator - auto-IDs and bare function normalization', () => {
       const w = workflow('ci', { jobs: [j1, j2, j3] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob1 = lockFile.workflows[0].jobs[0];
-      const lockJob2 = lockFile.workflows[0].jobs[1];
-      const lockJob3 = lockFile.workflows[0].jobs[2];
-      if (
-        lockJob1._type === 'static' &&
-        lockJob2._type === 'static' &&
-        lockJob3._type === 'static'
-      ) {
-        expect(lockJob1.name).toBe('ci');
-        expect(lockJob2.name).toBe('job-1');
-        expect(lockJob3.name).toBe('deploy');
-      }
+      const lockJob1 = staticJobAt(lockFile, 0);
+      const lockJob2 = staticJobAt(lockFile, 1);
+      const lockJob3 = staticJobAt(lockFile, 2);
+      expect(lockJob1.name).toBe('ci');
+      expect(lockJob2.name).toBe('job-1');
+      expect(lockJob3.name).toBe('deploy');
     });
   });
 
@@ -1617,12 +1599,10 @@ describe('generator - auto-IDs and bare function normalization', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps).toHaveLength(1);
-        // run shorthand creates a bare function, so it gets a counter name
-        expect(lockJob.steps[0].name).toBe('step-1');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps).toHaveLength(1);
+      // run shorthand creates a bare function, so it gets a counter name
+      expect(lockJob.steps[0].name).toBe('step-1');
     });
   });
 });
@@ -1639,12 +1619,10 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.contexts).toEqual([{ value: 'production', dynamic: false }]);
-        expect(lockJob).not.toHaveProperty('context');
-        expect(lockJob).not.toHaveProperty('dynamicContext');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.contexts).toEqual([{ value: 'production', dynamic: false }]);
+      expect(lockJob).not.toHaveProperty('context');
+      expect(lockJob).not.toHaveProperty('dynamicContext');
     });
 
     it('emits contexts[] in order, marking function elements as dynamic markers', () => {
@@ -1658,13 +1636,11 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.contexts?.[0]).toEqual({ value: 'staging', dynamic: false });
-        // A function element carries only the dynamic marker — never an inline
-        // expression. The agent init round resolves it.
-        expect(lockJob.contexts?.[1]).toEqual({ value: '', dynamic: true });
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.contexts?.[0]).toEqual({ value: 'staging', dynamic: false });
+      // A function element carries only the dynamic marker — never an inline
+      // expression. The agent init round resolves it.
+      expect(lockJob.contexts?.[1]).toEqual({ value: '', dynamic: true });
     });
 
     it('marks an async function element dynamic with no inline value', () => {
@@ -1677,10 +1653,8 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.contexts).toEqual([{ value: '', dynamic: true }]);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.contexts).toEqual([{ value: '', dynamic: true }]);
     });
 
     it('emits the dynamic marker for a function context without console.warn', () => {
@@ -1694,10 +1668,8 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.contexts).toEqual([{ value: '', dynamic: true }]);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.contexts).toEqual([{ value: '', dynamic: true }]);
       expect(warnSpy).not.toHaveBeenCalled();
       warnSpy.mockRestore();
     });
@@ -1708,11 +1680,9 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('contexts');
-        expect(lockJob).not.toHaveProperty('context');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob).not.toHaveProperty('contexts');
+      expect(lockJob).not.toHaveProperty('context');
     });
   });
 
@@ -1727,11 +1697,9 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.env).toEqual({ NODE_ENV: 'production', CI: 'true' });
-        expect(lockJob).not.toHaveProperty('dynamicEnv');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.env).toEqual({ NODE_ENV: 'production', CI: 'true' });
+      expect(lockJob).not.toHaveProperty('dynamicEnv');
     });
 
     it('sets dynamicEnv flag for impure (async) function env', () => {
@@ -1744,11 +1712,9 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.dynamicEnv).toBe(true);
-        expect(lockJob).not.toHaveProperty('env');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.dynamicEnv).toBe(true);
+      expect(lockJob).not.toHaveProperty('env');
     });
 
     it('emits a dynamic marker (no inline expression) for a pure env function', () => {
@@ -1762,13 +1728,11 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.dynamicEnv).toBe(true);
-        // No `{ _type: 'inline', expression }` value is serialized — the agent
-        // init round resolves the function.
-        expect(lockJob.env).toBeUndefined();
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.dynamicEnv).toBe(true);
+      // No `{ _type: 'inline', expression }` value is serialized — the agent
+      // init round resolves the function.
+      expect(lockJob.env).toBeUndefined();
     });
 
     it('omits env fields when not set', () => {
@@ -1777,11 +1741,9 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('env');
-        expect(lockJob).not.toHaveProperty('dynamicEnv');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob).not.toHaveProperty('env');
+      expect(lockJob).not.toHaveProperty('dynamicEnv');
     });
   });
 
@@ -1796,11 +1758,9 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.concurrencyGroup).toBe('deploy-prod');
-        expect(lockJob).not.toHaveProperty('dynamicConcurrencyGroup');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.concurrencyGroup).toBe('deploy-prod');
+      expect(lockJob).not.toHaveProperty('dynamicConcurrencyGroup');
     });
 
     it('sets dynamicConcurrencyGroup flag for function concurrencyGroup', () => {
@@ -1813,11 +1773,9 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.dynamicConcurrencyGroup).toBe(true);
-        expect(lockJob).not.toHaveProperty('concurrencyGroup');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.dynamicConcurrencyGroup).toBe(true);
+      expect(lockJob).not.toHaveProperty('concurrencyGroup');
     });
 
     it('emits a dynamic marker (no inline expression) for a pure concurrencyGroup function', () => {
@@ -1831,12 +1789,10 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.dynamicConcurrencyGroup).toBe(true);
-        // No `{ _type: 'inline', expression }` value serialized.
-        expect(lockJob).not.toHaveProperty('concurrencyGroup');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.dynamicConcurrencyGroup).toBe(true);
+      // No `{ _type: 'inline', expression }` value serialized.
+      expect(lockJob).not.toHaveProperty('concurrencyGroup');
     });
 
     it('omits concurrencyGroup fields when not set', () => {
@@ -1845,11 +1801,9 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('concurrencyGroup');
-        expect(lockJob).not.toHaveProperty('dynamicConcurrencyGroup');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob).not.toHaveProperty('concurrencyGroup');
+      expect(lockJob).not.toHaveProperty('dynamicConcurrencyGroup');
     });
   });
 
@@ -1860,11 +1814,9 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('contexts');
-        expect(lockJob).not.toHaveProperty('dynamicContexts');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob).not.toHaveProperty('contexts');
+      expect(lockJob).not.toHaveProperty('dynamicContexts');
     });
   });
 
@@ -1881,12 +1833,10 @@ describe('generator - context/env/concurrencyGroup', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.contexts).toEqual([{ value: 'production', dynamic: false }]);
-        expect(lockJob.env).toEqual({ DEPLOY_TARGET: 'aws' });
-        expect(lockJob.concurrencyGroup).toBe('deploy-prod');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.contexts).toEqual([{ value: 'production', dynamic: false }]);
+      expect(lockJob.env).toEqual({ DEPLOY_TARGET: 'aws' });
+      expect(lockJob.concurrencyGroup).toBe('deploy-prod');
     });
   });
 });
@@ -1902,10 +1852,8 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].hasOnCancel).toBe(true);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].hasOnCancel).toBe(true);
     });
 
     it('sets hasCleanup for step with cleanup hook', () => {
@@ -1917,10 +1865,8 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].hasCleanup).toBe(true);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].hasCleanup).toBe(true);
     });
 
     it('omits hook flags when hooks are not present', () => {
@@ -1929,11 +1875,9 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0]).not.toHaveProperty('hasOnCancel');
-        expect(lockJob.steps[0]).not.toHaveProperty('hasCleanup');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0]).not.toHaveProperty('hasOnCancel');
+      expect(lockJob.steps[0]).not.toHaveProperty('hasCleanup');
     });
   });
 
@@ -1947,13 +1891,11 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].hasRules).toBe(true);
-        expect(lockJob.steps[0].rules).toHaveLength(1);
-        expect(lockJob.steps[0].rules![0]._type).toBe('dynamic');
-        expect(lockJob.steps[0].rules![0].label).toBe('only main');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].hasRules).toBe(true);
+      expect(lockJob.steps[0].rules).toHaveLength(1);
+      expect(lockJob.steps[0].rules![0]._type).toBe('dynamic');
+      expect(lockJob.steps[0].rules![0].label).toBe('only main');
     });
 
     it('omits rules when step has no rules', () => {
@@ -1962,11 +1904,9 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0]).not.toHaveProperty('hasRules');
-        expect(lockJob.steps[0]).not.toHaveProperty('rules');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0]).not.toHaveProperty('hasRules');
+      expect(lockJob.steps[0]).not.toHaveProperty('rules');
     });
   });
 
@@ -1985,11 +1925,9 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0].hasCheck).toBe(true);
-        expect(lockJob.steps[0].hasWhenInSync).toBe(true);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0].hasCheck).toBe(true);
+      expect(lockJob.steps[0].hasWhenInSync).toBe(true);
     });
 
     it('omits check flags for a plain step', () => {
@@ -1998,11 +1936,9 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.steps[0]).not.toHaveProperty('hasCheck');
-        expect(lockJob.steps[0]).not.toHaveProperty('hasWhenInSync');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.steps[0]).not.toHaveProperty('hasCheck');
+      expect(lockJob.steps[0]).not.toHaveProperty('hasWhenInSync');
     });
   });
 
@@ -2017,10 +1953,8 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.hasOnCancel).toBe(true);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.hasOnCancel).toBe(true);
     });
 
     it('sets all 6 hook flags for job with all hooks', () => {
@@ -2039,15 +1973,13 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.hasOnCancel).toBe(true);
-        expect(lockJob.hasCleanup).toBe(true);
-        expect(lockJob.hasOnSuccess).toBe(true);
-        expect(lockJob.hasOnFailure).toBe(true);
-        expect(lockJob.hasBeforeStep).toBe(true);
-        expect(lockJob.hasAfterStep).toBe(true);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.hasOnCancel).toBe(true);
+      expect(lockJob.hasCleanup).toBe(true);
+      expect(lockJob.hasOnSuccess).toBe(true);
+      expect(lockJob.hasOnFailure).toBe(true);
+      expect(lockJob.hasBeforeStep).toBe(true);
+      expect(lockJob.hasAfterStep).toBe(true);
     });
 
     it('sets gracePeriod on job', () => {
@@ -2060,10 +1992,8 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.gracePeriod).toBe(60);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.gracePeriod).toBe(60);
     });
 
     it('sets timeout on job', () => {
@@ -2072,10 +2002,8 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.timeout).toBe(600_000);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.timeout).toBe(600_000);
     });
 
     it('omits timeout when not set on job', () => {
@@ -2093,17 +2021,15 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('hasOnCancel');
-        expect(lockJob).not.toHaveProperty('hasCleanup');
-        expect(lockJob).not.toHaveProperty('hasOnSuccess');
-        expect(lockJob).not.toHaveProperty('hasOnFailure');
-        expect(lockJob).not.toHaveProperty('hasBeforeStep');
-        expect(lockJob).not.toHaveProperty('hasAfterStep');
-        expect(lockJob).not.toHaveProperty('gracePeriod');
-        expect(lockJob).not.toHaveProperty('resources');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob).not.toHaveProperty('hasOnCancel');
+      expect(lockJob).not.toHaveProperty('hasCleanup');
+      expect(lockJob).not.toHaveProperty('hasOnSuccess');
+      expect(lockJob).not.toHaveProperty('hasOnFailure');
+      expect(lockJob).not.toHaveProperty('hasBeforeStep');
+      expect(lockJob).not.toHaveProperty('hasAfterStep');
+      expect(lockJob).not.toHaveProperty('gracePeriod');
+      expect(lockJob).not.toHaveProperty('resources');
     });
 
     it('emits resources requests-only on job', () => {
@@ -2116,10 +2042,8 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.resources).toEqual({ requests: { cpus: 1, memory: '512m' } });
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.resources).toEqual({ requests: { cpus: 1, memory: '512m' } });
     });
 
     it('emits resources limits-only on job', () => {
@@ -2132,10 +2056,8 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.resources).toEqual({ limits: { cpus: 2, memory: '2g' } });
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.resources).toEqual({ limits: { cpus: 2, memory: '2g' } });
     });
 
     it('emits resources with both requests and limits', () => {
@@ -2151,13 +2073,11 @@ describe('generator - hook flags', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.resources).toEqual({
-          requests: { cpus: 1, memory: '1g' },
-          limits: { cpus: 2, memory: '2g' },
-        });
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.resources).toEqual({
+        requests: { cpus: 1, memory: '1g' },
+        limits: { cpus: 2, memory: '2g' },
+      });
     });
 
     it('rejects invalid memory format at compile time', () => {
@@ -2291,11 +2211,9 @@ describe('generator - runsOn normalization and validation', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'linux' }]);
-        expect(lockJob).not.toHaveProperty('excludeLabels');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'linux' }]);
+      expect(lockJob).not.toHaveProperty('excludeLabels');
     });
 
     it('passes through array runsOn as-is', () => {
@@ -2304,14 +2222,12 @@ describe('generator - runsOn normalization and validation', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.runsOn).toEqual([
-          { kind: 'exact', value: 'linux' },
-          { kind: 'exact', value: 'docker' },
-        ]);
-        expect(lockJob).not.toHaveProperty('excludeLabels');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.runsOn).toEqual([
+        { kind: 'exact', value: 'linux' },
+        { kind: 'exact', value: 'docker' },
+      ]);
+      expect(lockJob).not.toHaveProperty('excludeLabels');
     });
 
     it('normalizes object runsOn with single label to matchers', () => {
@@ -2320,11 +2236,9 @@ describe('generator - runsOn normalization and validation', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'linux' }]);
-        expect(lockJob.excludeLabels).toEqual([{ kind: 'exact', value: 'gpu' }]);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'linux' }]);
+      expect(lockJob.excludeLabels).toEqual([{ kind: 'exact', value: 'gpu' }]);
     });
 
     it('normalizes object runsOn with array labels and array exclude', () => {
@@ -2336,14 +2250,12 @@ describe('generator - runsOn normalization and validation', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.runsOn).toEqual([
-          { kind: 'exact', value: 'linux' },
-          { kind: 'exact', value: 'docker' },
-        ]);
-        expect(lockJob.excludeLabels).toEqual([{ kind: 'exact', value: 'gpu' }]);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.runsOn).toEqual([
+        { kind: 'exact', value: 'linux' },
+        { kind: 'exact', value: 'docker' },
+      ]);
+      expect(lockJob.excludeLabels).toEqual([{ kind: 'exact', value: 'gpu' }]);
     });
 
     it('omits excludeLabels when object runsOn has no exclude', () => {
@@ -2352,11 +2264,9 @@ describe('generator - runsOn normalization and validation', () => {
       const w = workflow('ci', { jobs: [j] });
 
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'linux' }]);
-        expect(lockJob).not.toHaveProperty('excludeLabels');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'linux' }]);
+      expect(lockJob).not.toHaveProperty('excludeLabels');
     });
   });
 
@@ -2368,14 +2278,12 @@ describe('generator - runsOn normalization and validation', () => {
       });
       const w = workflow('ci', { jobs: [j] });
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.runsOnAll).toEqual({
-          include: [[{ kind: 'exact', value: 'role:web' }]],
-          exclude: [{ kind: 'exact', value: 'kici:host:web-01' }],
-        });
-        expect(lockJob).not.toHaveProperty('runsOn');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.runsOnAll).toEqual({
+        include: [[{ kind: 'exact', value: 'role:web' }]],
+        exclude: [{ kind: 'exact', value: 'kici:host:web-01' }],
+      });
+      expect(lockJob).not.toHaveProperty('runsOn');
     });
 
     it('lowers onUnreachable alongside runsOnAll', () => {
@@ -2386,10 +2294,8 @@ describe('generator - runsOn normalization and validation', () => {
       });
       const w = workflow('ci', { jobs: [j] });
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.onUnreachable).toBe('fail');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.onUnreachable).toBe('fail');
     });
 
     it('lowers includeUninitialized alongside runsOnAll', () => {
@@ -2400,20 +2306,16 @@ describe('generator - runsOn normalization and validation', () => {
       });
       const w = workflow('ci', { jobs: [j] });
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.includeUninitialized).toBe(true);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.includeUninitialized).toBe(true);
     });
 
     it('omits includeUninitialized when not set', () => {
       const j = job('patch', { runsOnAll: 'role:web', steps: [step('s', async () => {})] });
       const w = workflow('ci', { jobs: [j] });
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.includeUninitialized).toBeUndefined();
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.includeUninitialized).toBeUndefined();
     });
 
     it('rejects a job that sets both runsOn and runsOnAll', () => {
@@ -2432,11 +2334,9 @@ describe('generator - runsOn normalization and validation', () => {
       });
       const w = workflow('ci', { jobs: [j] });
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.maxParallel).toBe(2);
-        expect(lockJob.failFast).toBe(true);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.maxParallel).toBe(2);
+      expect(lockJob.failFast).toBe(true);
     });
 
     it('lowers maxParallel onto a matrix fan-out (fan-out-generic)', () => {
@@ -2448,10 +2348,8 @@ describe('generator - runsOn normalization and validation', () => {
       });
       const w = workflow('ci', { jobs: [j] });
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob.maxParallel).toBe(1);
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob.maxParallel).toBe(1);
     });
 
     it('rejects maxParallel < 1', () => {
@@ -2470,11 +2368,9 @@ describe('generator - runsOn normalization and validation', () => {
       const j = job('patch', { runsOnAll: 'role:web', steps: [step('s', async () => {})] });
       const w = workflow('ci', { jobs: [j] });
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-      const lockJob = lockFile.workflows[0].jobs[0];
-      if (lockJob._type === 'static') {
-        expect(lockJob).not.toHaveProperty('maxParallel');
-        expect(lockJob).not.toHaveProperty('failFast');
-      }
+      const lockJob = onlyStaticJob(lockFile);
+      expect(lockJob).not.toHaveProperty('maxParallel');
+      expect(lockJob).not.toHaveProperty('failFast');
     });
   });
 
@@ -2597,11 +2493,8 @@ describe('generator - runsOn kici: selectors', () => {
     const j = job('build', { runsOn: 'kici:os:linux', run: async () => {} });
     const w = workflow('ci', { jobs: [j] });
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    const lockJob = lockFile.workflows[0].jobs[0];
-    expect(lockJob._type).toBe('static');
-    if (lockJob._type === 'static') {
-      expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'kici:os:linux' }]);
-    }
+    const lockJob = onlyStaticJob(lockFile);
+    expect(lockJob.runsOn).toEqual([{ kind: 'exact', value: 'kici:os:linux' }]);
   });
 
   it('accepts an array of kici: labels in runsOn', () => {
@@ -2611,14 +2504,11 @@ describe('generator - runsOn kici: selectors', () => {
     });
     const w = workflow('ci', { jobs: [j] });
     const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
-    const lockJob = lockFile.workflows[0].jobs[0];
-    expect(lockJob._type).toBe('static');
-    if (lockJob._type === 'static') {
-      expect(lockJob.runsOn).toEqual([
-        { kind: 'exact', value: 'kici:os:linux' },
-        { kind: 'exact', value: 'kici:arch:arm64' },
-      ]);
-    }
+    const lockJob = onlyStaticJob(lockFile);
+    expect(lockJob.runsOn).toEqual([
+      { kind: 'exact', value: 'kici:os:linux' },
+      { kind: 'exact', value: 'kici:arch:arm64' },
+    ]);
   });
 
   it('accepts a scaler-assigned kici: label in runsOn (targeting is not granting)', () => {

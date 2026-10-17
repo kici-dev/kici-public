@@ -68,7 +68,7 @@ See [job execution](../architecture/execution/job-execution.md) and [hooks and r
 
 ## How a reused agent stays clean between jobs
 
-An ephemeral agent is discarded after one job, so residue never matters. A **reused agent** — a long-lived process on a shared host (the bare-metal profile) — serves many jobs in turn. Between them, the agent runs a supervisor-owned cleanup phase so one job's leftovers never reach the next:
+An agent the auto-scaler starts from a container pool's own image runs one job and is then discarded, so residue never matters. Other auto-scaled agents are discarded too, but one can take a follow-up job that arrives within its idle window (`KICI_SCALER_IDLE_TIMEOUT`, 5 seconds by default), and runs the cleanup below in between. A **reused agent** — a long-lived process on a shared host (the bare-metal profile) — serves many jobs in turn. Between them, the agent runs a supervisor-owned cleanup phase so one job's leftovers never reach the next:
 
 1. **It reaps the finished job's process tree.** A step may background a daemon that outlives the job. The agent runs each job's process in its own process group and signals the whole group when the job ends, so a stray daemon does not survive into the next job. Set `KICI_AGENT_ORPHAN_CLEANUP=false` to keep only the runner and leave a backgrounded process alive on purpose.
 2. **It re-runs declared cleanup after a hard kill.** A job's `cleanup` / `onFailure` hooks normally run in the job process. If that process is killed hard (out of memory, forced stop), the agent re-runs the declared cleanup against the preserved work directory.

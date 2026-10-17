@@ -45,6 +45,10 @@
  * Schema version 42 (BREAKING): approval enforced on organization-wide workflows (a v41
  *   reader dispatches a global workflow without consulting its `approval`), and
  *   `minReaderVersion` is required. The floor moves to 42.
+ * Schema version 43 (additive): adds LockMiseInitConfig.version (a pinned mise release for the
+ *   mise init preset; an older agent ignores it and installs mise unpinned).
+ * Schema version 44 (additive): adds the apt init preset ({ apt: LockAptInitConfig }) to
+ *   LockJob.init; an agent without the preset fails the job and never skips the item.
  */
 
 import { z } from 'zod';
@@ -60,7 +64,7 @@ import { isFailureStatus } from '../status/presentation.js';
  * schema change (additive or breaking); the bump history above records which.
  * See `BREAKING_FLOOR` for the compatibility window.
  */
-export const SCHEMA_VERSION = 42 as const;
+export const SCHEMA_VERSION = 44 as const;
 
 /**
  * Oldest lock schema version this codebase reads correctly — the lower bound of
@@ -613,9 +617,23 @@ interface LockMiseInitConfig {
   readonly timeout?: number;
   readonly env?: Record<string, string>;
   readonly shell?: string;
+  readonly version?: string;
 }
 
-type LockInitItem = LockGenericInitConfig | 'mise' | { readonly mise: LockMiseInitConfig };
+/** Lock-file form of the SDK `AptInitConfig`. */
+interface LockAptInitConfig {
+  readonly packages: readonly string[];
+  readonly cache?: boolean;
+  readonly timeout?: number;
+  readonly env?: Record<string, string>;
+  readonly shell?: string;
+}
+
+type LockInitItem =
+  | LockGenericInitConfig
+  | 'mise'
+  | { readonly mise: LockMiseInitConfig }
+  | { readonly apt: LockAptInitConfig };
 
 /**
  * Per-job init config as serialized into the lock file. Mirrors the SDK
@@ -1205,9 +1223,10 @@ export interface LockFile {
    */
   readonly lockfileHash?: string;
   /**
-   * SHA-256 over the git-tracked source of every in-repo `workspace:` /
-   * `file:` / `link:` / `portal:` sibling package `.kici` depends on,
-   * transitively.
+   * SHA-256 over the git-tracked source of every in-repo sibling package
+   * `.kici` depends on, transitively: a `workspace:` / `file:` / `link:` /
+   * `portal:` specifier, or a version range that npm or yarn links to a
+   * workspace package of the same name.
    *
    * The deps tarball carries those sibling directories WITH their built output.
    * Editing a sibling's source moves no package-manager lock file, so with

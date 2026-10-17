@@ -89,6 +89,20 @@ currently offline" above an otherwise-empty panel, the run-detail page is
 working from Platform's cached metadata — start the orchestrator (or wait
 for its WebSocket to reconnect) to retrieve step output.
 
+### `step detail unavailable` from `kici runs show` or `kici runs logs`
+
+The Platform could not read the run's jobs and steps from the orchestrator that ran it, so it served its stored copy. The stored copy has the jobs but no steps. The note names the reason. The run-detail API returns the same reason in the `X-Detail-Fallback-Reason` response header.
+
+| Reason in the note                                   | Header value               | What to do                                                                                                                                                                                                      |
+| ---------------------------------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| no orchestrator that can serve this run is connected | `orchestrator_unreachable` | Start the orchestrator that ran the run, or wait for it to reconnect. `kici orchestrators list` shows the connected clusters.                                                                                   |
+| the orchestrator did not respond in time             | `orchestrator_timeout`     | The orchestrator is connected but did not answer. Check its logs.                                                                                                                                               |
+| the orchestrator returned an error                   | `orchestrator_error`       | The orchestrator that answered does not have the run: another cluster of the organization answered, or the run was deleted from the orchestrator database. Make sure the cluster that ran the run is connected. |
+| the orchestrator response was not valid              | `invalid_response`         | The orchestrator and the Platform do not agree on the response. Upgrade the orchestrator.                                                                                                                       |
+| the orchestrator reported no jobs                    | `no_jobs`                  | The orchestrator has no jobs recorded for the run.                                                                                                                                                              |
+
+`no step detail for job <name>` means the job ran on an agent but the orchestrator reports no steps for it. For example, the job failed in its setup, before its first step. Read the setup log with `kici runs logs <run-id> --job <name>`.
+
 ## No jobs dispatched (no matching agent)
 
 ### Symptom
@@ -251,6 +265,28 @@ log around the connection attempt — the close code names the cause.
   the binary, make the image pullable, repair the microVM boot inputs) — the
   per-backend pages under [Auto-scaler](./orchestrator/auto-scaler.md) cover each
   backend's prerequisites.
+
+## The orchestrator's Platform connection closes with code 4003
+
+### Symptom
+
+The orchestrator log shows `Platform connection closed` with code `4003`, and the orchestrator connects again. Run and job status can lag in the dashboard until it reconnects.
+
+### Cause
+
+The Platform checks every message an orchestrator sends. It drops a message with a field it cannot accept, such as an identifier that is too long, and keeps the connection open. It answers with a `nack` that names the failing fields. The Platform closes the connection when the orchestrator sends five such messages within 60 seconds, or sends a message that is not JSON or has no `type`.
+
+Long failure text does not cause this. The Platform shortens an error message, a failure reason or a commit message to 2,000 characters.
+
+### Diagnose
+
+Read the orchestrator log for `Platform dropped an invalid frame (NACK)`. Each line names the message type and the fields that failed:
+
+    kici-admin orchestrator logs --name <service-name> --no-follow
+
+### Fix
+
+Upgrade the orchestrator to the current release with `kici-admin orchestrator upgrade`. If the lines continue on the current release, the orchestrator sends a message the Platform cannot read. Send the log lines to KiCI support, with a [diagnostics bundle](#capturing-a-diagnostics-bundle).
 
 ## Database errors while the orchestrator handles a message
 

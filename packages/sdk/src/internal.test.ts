@@ -23,6 +23,8 @@ const RUNTIME_INTERNALS = [
   'evaluateRules',
   'expandMatrix',
   'flattenStepInputs',
+  'isAptPackageSpec',
+  'normalizeMiseVersion',
   'normalizeApproval',
   'normalizeCacheSpecs',
   'setJobOutputsMap',

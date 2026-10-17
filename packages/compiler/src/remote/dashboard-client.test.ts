@@ -46,6 +46,23 @@ describe('DashboardClient.fromConfig', () => {
     );
   });
 
+  it('sends a --source routing key as the exact routingKey filter', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(JSON.stringify({ runs: [] }), { status: 200 }));
+    const client = DashboardClient.fromConfig(baseConfig);
+    await client.listRuns({ source: 'generic:org-1:src-1' }).catch(() => undefined);
+    await client.listRuns({ source: 'github' }).catch(() => undefined);
+    const urls = fetchMock.mock.calls.map((c) => new URL(String(c[0])));
+    // fails-when: a routing key goes out as `source`, the API's provider-prefix
+    // filter, which matches no run for a full key.
+    expect(urls[0]!.searchParams.get('routingKey')).toBe('generic:org-1:src-1');
+    expect(urls[0]!.searchParams.has('source')).toBe(false);
+    // breaks-if-wrong: a bare provider still filters by prefix.
+    expect(urls[1]!.searchParams.get('source')).toBe('github');
+    expect(urls[1]!.searchParams.has('routingKey')).toBe(false);
+  });
+
   it('maps 403 to a permission DashboardClientError', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ error: 'Insufficient permission: runs.read needed' }), {
@@ -91,6 +108,42 @@ describe('DashboardClient.fromConfig', () => {
 });
 
 describe('DashboardClient typed methods', () => {
+  it('getRunDetailWithSource reads the source and fallback-reason headers', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ jobs: [] }), {
+        status: 200,
+        headers: {
+          'X-Detail-Source': 'platform-db',
+          'X-Detail-Fallback-Reason': 'orchestrator_timeout',
+        },
+      }),
+    );
+    const read = await DashboardClient.fromConfig(baseConfig).getRunDetailWithSource('r1');
+    // fails-when: the client discards the headers, so the commands cannot say
+    // the detail came from the stored copy
+    expect(read).toEqual({
+      detail: { jobs: [] },
+      source: 'platform-db',
+      fallbackReason: 'orchestrator_timeout',
+    });
+  });
+
+  it('getRunDetailWithSource reads an unknown header value as not reported', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ jobs: [] }), {
+        status: 200,
+        headers: {
+          'X-Detail-Source': 'platform-db',
+          'X-Detail-Fallback-Reason': 'a-newer-reason',
+        },
+      }),
+    );
+    const read = await DashboardClient.fromConfig(baseConfig).getRunDetailWithSource('r1');
+    // breaks-if-wrong: a reason added by a newer Platform must not fail an older CLI
+    expect(read.fallbackReason).toBeNull();
+    expect(read.source).toBe('platform-db');
+  });
+
   it('listRuns builds a query string from filters and validates the response', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(

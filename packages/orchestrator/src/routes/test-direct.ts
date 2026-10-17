@@ -317,7 +317,12 @@ export function createTestDirectRoutes(deps: TestDirectRouteDeps) {
   app.get('/api/v1/test/runs/:runId/logs', (c) =>
     runRoute(c, deps, 'test_run.read', (msg, d) =>
       handleTestRunLogs(
-        { type: 'test.relay.run.logs', ...msg, cursor: parseCursor(c.req.query('cursor')) },
+        {
+          type: 'test.relay.run.logs',
+          ...msg,
+          cursor: parseCursor(c.req.query('cursor')),
+          logCursor: c.req.query('logCursor'),
+        },
         d,
       ),
     ),

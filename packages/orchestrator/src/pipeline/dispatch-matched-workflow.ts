@@ -271,7 +271,7 @@ export interface WorkflowDispatchContext {
   fullLockFile: {
     workflows: readonly LockWorkflow[];
     lockfileHash?: string;
-    /** In-repo `workspace:` sibling closure digest; part of the dep pointer key. */
+    /** In-repo workspace sibling closure digest; part of the dep pointer key. */
     siblingsDigest?: string;
     source: { file: string };
   };
@@ -7615,8 +7615,9 @@ async function dispatchMatchedWorkflowInner(
     dispatchedJobs,
     rejectedJobs,
   });
-  // Unmaterialized fan-outs get a synthetic terminal row so downstreams keep a
-  // real edge: failed as matrix_expansion, or skipped when narrowed to empty.
+  // Unmaterialized fan-outs get a synthetic terminal row so the run never reads
+  // as complete with no jobs and downstreams keep a real edge: failed as
+  // matrix_expansion, or skipped when narrowed to empty.
   for (const failure of buildPrep.matrixFailures) {
     dispatchedJobs.push({ jobId: failure.jobId, jobName: failure.jobName });
     rejectedJobs.push(

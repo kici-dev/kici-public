@@ -115,8 +115,16 @@ export interface AgentEntry {
    * In memory rather than DB-backed, unlike reboot-pending: the destroy is issued by
    * this process, lasts seconds, and ends with the WebSocket close that removes the
    * entry — there is nothing to outlive.
+   *
+   * Also set when the agent itself reports `draining` on `agent.status` (a SIGUSR1
+   * drain, or a single-job agent that accepted its job); see {@link drainReported}.
    */
   draining: boolean;
+  /**
+   * The agent reported `draining` itself. Its drain is terminal for this connection,
+   * so {@link AgentRegistry.clearDraining} (the warm-pool undo) leaves it draining.
+   */
+  drainReported?: boolean;
   /**
    * Epoch ms until which the agent is held out of routing after it rejected a
    * dispatch as busy. Unset when no hold is in force. See {@link AgentRegistry.markBusyHeld}.
@@ -833,8 +841,11 @@ export class AgentRegistry {
   }
 
   /**
-   * Condemn an agent before a warm-pool destroy: it stays registered and finishes its
-   * current work, but takes no new dispatches.
+   * Condemn an agent: it stays registered and keeps finishing its current work,
+   * but takes no new dispatches.
+   *
+   * Called before a warm-pool destroy is issued. An agent that reports its own
+   * drain goes through {@link markDrainReported} instead.
    *
    * @returns the agent's `activeJobs`, so the caller can see a job claimed between its
    *   idle check and this mark and back out; `undefined` when not registered
@@ -904,10 +915,26 @@ export class AgentRegistry {
     }
   }
 
-  /** Undo {@link markDraining} — a destroy that was rejected leaves the agent alive. */
+  /**
+   * The agent reported on `agent.status` that it takes no new job: a drain, or a
+   * single-job agent that has accepted its job. Terminal for this connection.
+   */
+  markDrainReported(agentId: string): void {
+    const entry = this.agents.get(agentId);
+    if (!entry) return;
+    entry.draining = true;
+    entry.drainReported = true;
+  }
+
+  /**
+   * Undo {@link markDraining} — a destroy that was rejected leaves the agent alive.
+   * An agent that reported its own drain stays draining.
+   */
   clearDraining(agentId: string): void {
     const entry = this.agents.get(agentId);
-    if (entry) entry.draining = false;
+    // fails-when: a warm-pool undo racing the agent's own drain report reopens a
+    // single-job agent to a second job
+    if (entry) entry.draining = entry.drainReported === true;
   }
 
   get(agentId: string): AgentEntry | undefined {

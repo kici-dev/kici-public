@@ -328,6 +328,12 @@ export const agentStatusSchema = z.object({
   memoryAvailableMb: z.number().optional(),
   /** System uptime in seconds (os.uptime()) */
   uptimeSeconds: z.number().optional(),
+  /**
+   * The agent takes no new job: it is draining, or it is a single-job agent that
+   * has accepted its job. The orchestrator stops offering it work. A drain is
+   * terminal, so a later report without the flag does not lift it. Omitted when false.
+   */
+  draining: z.boolean().optional(),
 });
 
 /** Job execution state transition report. */
@@ -597,7 +603,7 @@ const cacheUploadRequestSchema = z.discriminatedUnion('cacheType', [
     arch: z.string(),
     /** SHA-256 of the dependency tarball about to be uploaded. */
     depsHash: z.string(),
-    /** In-repo `workspace:` sibling closure digest; part of the dep pointer key. */
+    /** In-repo workspace sibling closure digest; part of the dep pointer key. */
     siblingsDigest: z.string().optional(),
   }),
 ]);
@@ -632,7 +638,7 @@ const cacheUploadCompleteSchema = z.discriminatedUnion('cacheType', [
     arch: z.string(),
     /** SHA-256 hash of the dependency tarball for integrity verification. */
     depsHash: z.string(),
-    /** In-repo `workspace:` sibling closure digest; part of the dep pointer key. */
+    /** In-repo workspace sibling closure digest; part of the dep pointer key. */
     siblingsDigest: z.string().optional(),
   }),
 ]);

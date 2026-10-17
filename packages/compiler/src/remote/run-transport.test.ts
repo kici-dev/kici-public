@@ -56,13 +56,18 @@ describe('createPlatformTransport', () => {
     await t.trigger(body);
     await t.initUpload({ sha: 'x' });
     await t.status('r');
-    await t.logs('r', 4);
+    await t.logs('r', { cursor: 4, logCursor: 'e30' });
     await t.cancel('r');
     // breaks-if-wrong: the Platform path stays identical
     expect(client.trigger).toHaveBeenCalledWith('org_1', target, body);
     expect(client.initUpload).toHaveBeenCalledWith('org_1', target, { sha: 'x' });
     expect(client.runStatus).toHaveBeenCalledWith('org_1', 'r', target);
-    expect(client.runLogs).toHaveBeenCalledWith('org_1', 'r', 4, target);
+    expect(client.runLogs).toHaveBeenCalledWith(
+      'org_1',
+      'r',
+      { cursor: 4, logCursor: 'e30' },
+      target,
+    );
     expect(client.cancel).toHaveBeenCalledWith('org_1', 'r', target);
     expect(t.holds.answerHint(HOLD)).toBe('kici approve r1 --hold h1');
     expect(t.kind).toBe('platform');

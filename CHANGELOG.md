@@ -2,6 +2,54 @@
 
 Release notes for the public KiCI packages.
 
+## v0.19.0 — 2026-10-17
+
+### Features
+
+- The run-detail API names why it served the stored copy, in the X-Detail-Fallback-Reason response header.
+- The `mise` init preset takes a `version` (for example `'v2026.5.1'`). The agent installs that mise release, puts it first on `PATH`, and fails the init when a different release answers. `job()` rejects a value that is not a mise release. Lock files move to schema v43; orchestrators at schema v42 still read them.
+- kici compile, kici run remote, kici run --local and kici doctor warn when .kici/ has workflows but no .kici/package.json, a layout whose workflows cannot resolve @kici-dev/sdk on an agent. kici run --local --in-place stays quiet.
+- The agent image ships common CLI tools (ps, ip, ping, jq, rsync, unzip, zstd, which and more), and apt installs packages in it again. In a container that the auto-scaler starts, steps can run sudo without a password.
+- New `apt` init preset: `init: { apt: { packages: ['make'] } }` installs Debian packages before a job's steps, as root or through passwordless sudo. `job()` rejects a name that is not a Debian package name. Lock files move to schema v44; orchestrators at schema v42 still read them.
+
+### Fixes
+
+- An orchestrator's connection to the Platform no longer drops when a job error, failure reason, init-failure message or commit message is longer than 2,000 characters. The text is shortened and marked instead.
+- kici runs show, kici runs logs and the dashboard run page show steps and logs for kici run remote runs.
+- The dashboard's orchestration-log history loads for kici run remote runs.
+- The Platform drops a single invalid message from an orchestrator and answers with a nack that names the failing fields, instead of closing the connection. It closes the connection after five invalid messages within a minute.
+- The orchestrator shortens long failure text before it sends run and job status to the Platform, and a job's bound contexts now reach the Platform with its live status.
+- The orchestrator never sends a status message the Platform would refuse, logs a nack for an invalid message as an error, and keeps buffered status messages when its connection drops during a resend.
+- A failed init command reports init[<n>] failed (exit <code>): and the last lines of its error output, with progress bars reduced to their final state, instead of its whole output.
+- The MCP run tools (structured result, step logs, cancel, re-run, approve and reject) work for kici run remote runs.
+- Agent job failure messages keep their last 20 lines and up to 1,500 characters; the full output stays in the job log.
+- kici run remote keeps following its run when another orchestrator cluster connects during the run.
+- kici run remote no longer skips the step output a job writes after its init commands.
+- kici runs show and kici runs logs print a note on standard error when step detail or a setup log cannot be read, and name the reason.
+- A job's `init` `env` now reaches the init command, for a hand-written `init` and for the `mise` preset. A key that starts with `KICI_` or names an operator secret is ignored, and the init step's log names the key.
+- The `mise` init preset hands environment values that mise quotes, such as values with spaces or quote characters, to steps without the quotes.
+- An agent fails a job with a named error when the job's `init` holds an item the agent does not know, such as a preset added in a newer release.
+- The `mise-init` example workflow now runs `mise trust` before `mise install`, so it works with the committed `mise.toml`, and hands mise's environment to steps with `mise env --dotenv`, so values reach steps without shell quotes.
+- kici init --workspace makes .kici/ a workspace member: it writes .kici/package.json and adds .kici to pnpm-workspace.yaml or to the workspaces of the root package.json, so the workflows it scaffolds run on agents. It no longer adds @kici-dev/sdk to the root package.json.
+- kici compile keys the dependency cache of an npm workspace member on the repo-root package-lock.json, and siblingsDigest follows the workspace packages that npm and yarn link by version range, so an edit to such a package rebuilds the cached dependencies.
+- kici compile reinstalls the dependencies of a .kici/ workspace member with the package manager of the workspace, and kici compile --check uses the TypeScript compiler that a workspace installs at its root.
+- Agents cache and restore the dependencies of a .kici/ npm workspace member, which npm installs at the repository root, and build the workspace packages it depends on before the workflow loads.
+- kici init --workspace on an existing .kici/ adds what a workspace member needs, which is .kici/package.json and the workspace entry, without changing your workflows or the dependencies in your root package.json. It does nothing when the layout is already complete.
+- An agent the container auto-scaler starts from a pool's own image now runs exactly one job. It stops taking work when it accepts its job and exits when the job ends, so a follow-up job always gets a fresh container.
+- Agents build and cache only the workspace packages a .kici/ npm or yarn workspace member declares, not every package in the workspace, so a failing build in an unrelated package no longer fails the job.
+- For a .kici/ that is a member of an npm or pnpm workspace, agents apply the private-registry auth from registries: to the workspace-root .npmrc, which npm and pnpm read for a member, instead of .kici/.npmrc, which they ignore.
+- kici init writes a version into .kici/package.json, and kici init --workspace adds one to an existing .kici/package.json in a yarn workspace, because yarn classic ignores a workspace member that has no version and installs nothing for it.
+- kici init writes a valid sample fixture for any branch name: on a ci/kici branch the fixture exports pushCiKici with ID push-ci/kici. The scaffolded pr-checks workflow now targets the detected default branch.
+- kici init and kici hook install pin the compile script and the pre-commit hook to the kici version that ran them, instead of kici@latest. kici init writes exact SDK and TypeScript versions when the repository .npmrc sets save-exact=true or an empty save-prefix.
+- `kici-admin orchestrator upgrade` and `kici-admin agent upgrade` install into the service's own npm prefix, also when started through `npx`. When the service's launch entry is not in a global npm install, the upgrade stops before it installs anything and names both Node.js runtimes. Use an archive upgrade, or install the package yourself and add `--restart-only`.
+- `kici verify-attestation` refuses a trust root that it must fetch over plain HTTP from a host that is not loopback, because an attacker on the network can replace the signing keys of such a trust root. Use an `https://` trust root or a trust-root file. To accept the risk, add `--allow-insecure-trust-root`. Loopback addresses such as `http://localhost` still work.
+- kici runs show and the dashboard name the orchestrator error when the orchestrator no longer holds a run, instead of reporting that the run has no jobs
+- kici runs list --source matches a source routing key exactly, as documented; a bare provider such as github still filters by provider
+
+### Documentation
+
+- The kici CLI reference renders option tables whose flags contain a pipe, such as kici init --package-manager <npm|pnpm|yarn>, as one row each.
+
 ## v0.18.0 — 2026-10-15
 
 ### Features

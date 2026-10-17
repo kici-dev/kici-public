@@ -6,32 +6,82 @@ import type {
   InitItem,
   Job,
   JobOptions,
+  MiseInitConfig,
+  AptInitConfig,
   StepInput,
   InferJobOutputsFromSteps,
   StepContextWithNeeds,
 } from './types.js';
 import type { StepContext } from './context.js';
 import { createJobOutputProxy } from './outputs.js';
+import { normalizeMiseVersion } from './mise-version.js';
+import { isAptPackageSpec } from './apt-package.js';
 import {
   assertSecretName,
   validateGitCredentials,
   type ContainerRegistryAuth,
 } from './git-types.js';
 
-/** A typed preset is a `'mise'` string or a `{ mise }` object — neither carries `run`. */
-function isPreset(item: InitItem): boolean {
-  return item === 'mise' || (typeof item === 'object' && item !== null && 'mise' in item);
+/** A `{ mise }` object preset. */
+function isMiseObject(item: InitItem): item is { mise: MiseInitConfig } {
+  return typeof item === 'object' && item !== null && 'mise' in item;
+}
+
+/** A pinned mise preset must name a mise release; the agent installs exactly that release. */
+function validateMisePreset(config: MiseInitConfig, jobName: string, index: number): void {
+  if (config.version === undefined) return;
+  if (typeof config.version !== 'string' || normalizeMiseVersion(config.version) === undefined) {
+    throw new Error(
+      `job('${jobName}'): init[${index}].mise.version must be a mise release such as ` +
+        `'2026.5.1' or 'v2026.5.1', got ${JSON.stringify(config.version)}`,
+    );
+  }
+}
+
+/** A `{ apt }` object preset. */
+function isAptObject(item: InitItem): item is { apt: AptInitConfig } {
+  return typeof item === 'object' && item !== null && 'apt' in item;
+}
+
+/** An apt preset must list Debian packages; the agent hands them to apt-get. */
+function validateAptPreset(config: AptInitConfig, jobName: string, index: number): void {
+  const at = `job('${jobName}'): init[${index}].apt`;
+  if (!Array.isArray(config.packages) || config.packages.length === 0) {
+    throw new Error(`${at}.packages must list at least one Debian package`);
+  }
+  config.packages.forEach((spec, p) => {
+    if (typeof spec !== 'string' || !isAptPackageSpec(spec)) {
+      throw new Error(
+        `${at}.packages[${p}] must be a Debian package name such as 'make' or ` +
+          `'make=4.4.1-2', got ${JSON.stringify(spec)}`,
+      );
+    }
+  });
+  if (config.cache !== undefined && typeof config.cache !== 'boolean') {
+    throw new Error(`${at}.cache must be true or false`);
+  }
 }
 
 /**
- * `undefined` / `false` / `'auto'` and typed presets pass; every other generic
- * spec must carry a non-empty `run`. The error names the offending index.
+ * Validate a job's `init` config. `undefined` / `false` / `'auto'` are no-ops,
+ * and so is the `'mise'` string preset. A `{ mise }` preset's `version`, when
+ * set, must be a mise release. An `{ apt }` preset must list Debian package
+ * names. Every generic spec must carry a non-empty `run`.
+ * Throws with the offending index when validation fails.
  */
 function validateInit(init: JobOptions['init'], jobName: string): void {
   if (init === undefined || init === false || init === 'auto') return;
   const items = Array.isArray(init) ? init : [init];
   items.forEach((item, i) => {
-    if (isPreset(item)) return;
+    if (item === 'mise') return;
+    if (isMiseObject(item)) {
+      validateMisePreset(item.mise, jobName, i);
+      return;
+    }
+    if (isAptObject(item)) {
+      validateAptPreset(item.apt, jobName, i);
+      return;
+    }
     const spec = item as GenericInitConfig;
     if (typeof spec.run !== 'string' || spec.run.trim().length === 0) {
       throw new Error(`job('${jobName}'): init[${i}].run must be a non-empty command`);

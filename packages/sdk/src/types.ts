@@ -627,7 +627,11 @@ export interface GenericInitConfig {
   cache?: import('./cache-types.js').CacheSpec;
   /** Max wall-clock for this init command in ms. Reuses the step/job timeout semantics. */
   timeout?: number;
-  /** Static environment variables available to the command. */
+  /**
+   * Environment variables for this command only. A key here wins over the job's
+   * value for the command; a key that starts with `KICI_` or names an operator
+   * secret is ignored.
+   */
   env?: Record<string, string>;
 }
 
@@ -641,14 +645,49 @@ export interface MiseInitConfig {
   cache?: import('./cache-types.js').CacheSpec | false;
   /** Max wall-clock for the mise init command in ms. Defaults to 600000. */
   timeout?: number;
-  /** Static environment variables available to the mise command. */
+  /**
+   * Environment variables for the mise command only. A key here wins over the
+   * job's value for the command; a key that starts with `KICI_` or names an
+   * operator secret is ignored.
+   */
   env?: Record<string, string>;
   /** Shell used to run the mise command. Defaults to the OS template's shell. */
+  shell?: string;
+  /**
+   * mise release to install, such as `'2026.5.1'` or `'v2026.5.1'`. With a pin,
+   * the preset installs exactly this release into a KiCI-owned directory, puts
+   * that directory first on `PATH`, and fails the init when `mise --version`
+   * reports another release. Without it, the preset uses a mise already on
+   * `PATH`, or installs the release the mise installer selects.
+   */
+  version?: string;
+}
+
+/**
+ * Settings for the `apt` init preset, which installs Debian packages before the
+ * job's steps. The agent runs apt-get as root directly, or through `sudo -n` as
+ * any other user. The init fails on a runner without apt-get, or as a user that
+ * is not root and may not run sudo without a password.
+ */
+export interface AptInitConfig {
+  /** Debian packages to install, each optionally pinned as `name=version` (`'make'`, `'make=4.4.1-2'`). */
+  packages: string[];
+  /** Keep the downloaded `.deb` files in the job cache between runs. Defaults to `false`. */
+  cache?: boolean;
+  /** Max wall-clock for the install in ms. Defaults to 600000. */
+  timeout?: number;
+  /**
+   * Environment variables for the install command, such as a proxy. Each key
+   * that is a shell name reaches apt-get, also through sudo. A key that starts
+   * with `KICI_` or names an operator secret is ignored.
+   */
+  env?: Record<string, string>;
+  /** Shell used to run the install. Defaults to `sh`. */
   shell?: string;
 }
 
 /** A typed toolchain preset: zero-config string or an object with overrides. */
-export type InitPreset = 'mise' | { mise: MiseInitConfig };
+export type InitPreset = 'mise' | { mise: MiseInitConfig } | { apt: AptInitConfig };
 
 /** One init directive: a hand-written generic config or a typed preset. */
 export type InitItem = GenericInitConfig | InitPreset;

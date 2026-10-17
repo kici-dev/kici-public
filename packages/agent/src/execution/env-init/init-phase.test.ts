@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
+import { $ } from 'zx';
 import { runInitPhase } from './init-phase.js';
+import { FAILURE_TAIL_MAX_CHARS } from '../failure-tail.js';
 import type { GenericInitConfig, CacheSpec } from '@kici-dev/sdk';
 import { TimeoutReason } from '@kici-dev/engine';
 import type { RunnerToAgentMessage } from '../sandbox/ipc-protocol.js';
@@ -359,4 +361,52 @@ describe('runInitPhase', () => {
     expect(applyDelta).not.toHaveBeenCalled();
     expect(saveSpy).not.toHaveBeenCalled();
   }, 5_000);
+});
+
+describe('runInitPhase failure text (real shell)', () => {
+  it('reports the exit code and the visible tail of stderr, not the redraws', async () => {
+    const quiet = $({ quiet: true }) as unknown as typeof $;
+    const { send, msgs } = collectIpc();
+    const run = [
+      'for i in $(seq 1 400); do printf "\\rDownloading toolchain %3d%%" "$i" >&2; done',
+      'printf "\\n" >&2',
+      'printf "\\033[31merror:\\033[0m checksum mismatch for jq\\n" >&2',
+      'echo "KICI_INIT_FAIL_MARKER" >&2',
+      'exit 3',
+    ].join('\n');
+
+    const result = await runInitPhase({
+      specs: [{ run } as GenericInitConfig],
+      shellFor: () => quiet,
+      sendIpc: send,
+      stepIndexBase: 0,
+    });
+
+    expect(result.ok).toBe(false);
+    // fails-when: the exit code is dropped, so the job error cannot name it
+    expect(result.exitCode).toBe(3);
+    // fails-when: the whole stderr (about 10 KB of carriage-return redraws) is the error
+    expect(result.error).toBe(
+      'Downloading toolchain 400%\nerror: checksum mismatch for jq\nKICI_INIT_FAIL_MARKER',
+    );
+    expect(result.error!.length).toBeLessThanOrEqual(FAILURE_TAIL_MAX_CHARS);
+    const complete = msgs.find((m) => m.type === 'step.complete') as {
+      error?: { message: string; exitCode?: number };
+    };
+    expect(complete.error).toEqual({ message: result.error, exitCode: 3 });
+  });
+
+  it('masks a secret in stderr before it reaches the error', async () => {
+    const quiet = $({ quiet: true }) as unknown as typeof $;
+    const { send } = collectIpc();
+    const result = await runInitPhase({
+      specs: [{ run: 'echo "token=SECRET-VALUE-123" >&2; exit 1' } as GenericInitConfig],
+      shellFor: () => quiet,
+      sendIpc: send,
+      stepIndexBase: 0,
+      maskLine: (line) => line.split('SECRET-VALUE-123').join('***'),
+    });
+    // fails-when: the init error is built without the job's masker
+    expect(result.error).toBe('token=***');
+  });
 });

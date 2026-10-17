@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { AccessLogSource, ExecutionRunStatus, type ActorPrincipal } from '@kici-dev/engine';
+import {
+  AccessLogSource,
+  ExecutionRunStatus,
+  TEST_RUN_LOG_CURSOR_START,
+  type ActorPrincipal,
+} from '@kici-dev/engine';
 import { DispatchQueueStatus } from '../queue/job-queue.js';
 import {
   handleTestUploadsInit,
@@ -484,6 +489,131 @@ describe('handleTestRunLogs', () => {
       deps,
     );
     expect(drain).not.toHaveBeenCalled();
+  });
+
+  /** A storage whose files the test appends to between polls. */
+  function liveStorage(files: Record<string, string>) {
+    return {
+      list: vi.fn(async () => Object.keys(files)),
+      read: vi.fn(async (p: string) => ({ data: files[p] ?? '', cursor: 0, complete: true })),
+    };
+  }
+
+  type Page = { lines: string[]; nextCursor: number; nextLogCursor?: string; done: boolean };
+
+  async function poll(deps: TestRelayHandlerDeps, logCursor: string): Promise<Page> {
+    return (await handleTestRunLogs(
+      {
+        type: 'test.relay.run.logs',
+        requestId: 'r',
+        actor: ACTOR,
+        runId: 'run-1',
+        cursor: 0,
+        logCursor,
+      },
+      deps,
+    )) as Page;
+  }
+
+  it('delivers a step file that appears after an already-read init file, with no line lost or repeated', async () => {
+    const { db } = makeDbMock({
+      runRow: { run_id: 'run-1', status: 'running', is_test_run: true },
+    });
+    // Setup and init ran first. The step's file appears later but sorts before
+    // init, because init steps index from 1_000_000.
+    const files: Record<string, string> = {
+      'executions/run-1/job-build/step--1.log': 'setup-1\n',
+      'executions/run-1/job-build/step-1000000.log': 'init-1\ninit-2\n',
+    };
+    const deps = { db, logStorage: liveStorage(files) } as unknown as TestRelayHandlerDeps;
+
+    const first = await poll(deps, TEST_RUN_LOG_CURSOR_START);
+    expect(first.lines).toEqual(['setup-1', 'init-1', 'init-2']);
+
+    files['executions/run-1/job-build/step-0.log'] = 'step-failure-line\nstep-2\n';
+    const second = await poll(deps, first.nextLogCursor!);
+
+    // fails-when: the cursor is one offset into the flat sorted stream, so the
+    // poll returns init's tail again and skips the step's first line
+    expect(second.lines).toEqual(['step-failure-line', 'step-2']);
+    expect(second.done).toBe(false);
+  });
+
+  it('delivers every line exactly once, in file order, whatever order the files grow in', async () => {
+    const paths = [
+      'executions/run-1/job-a/step--1.log',
+      'executions/run-1/job-a/step-0.log',
+      'executions/run-1/job-a/step-1000000.log',
+      'executions/run-1/job-b/step-0.log',
+    ];
+    // A seeded generator keeps every schedule reproducible.
+    let seed = 7;
+    const next = () => (seed = (seed * 1_103_515_245 + 12_345) % 2 ** 31);
+    for (let schedule = 0; schedule < 40; schedule++) {
+      const { db } = makeDbMock({
+        runRow: { run_id: 'run-1', status: 'running', is_test_run: true },
+      });
+      const files: Record<string, string> = {};
+      const written: Record<string, string[]> = Object.fromEntries(paths.map((p) => [p, []]));
+      const delivered: string[] = [];
+      const deps = { db, logStorage: liveStorage(files) } as unknown as TestRelayHandlerDeps;
+      let cursor = TEST_RUN_LOG_CURSOR_START;
+      for (let i = 0; i < 24; i++) {
+        const path = paths[next() % paths.length]!;
+        const line = `${path.slice(-12)}#${written[path]!.length}`;
+        written[path]!.push(line);
+        files[path] = `${files[path] ?? ''}${line}\n`;
+        if (next() % 2 === 0) {
+          const page = await poll(deps, cursor);
+          delivered.push(...page.lines);
+          cursor = page.nextLogCursor!;
+        }
+      }
+      delivered.push(...(await poll(deps, cursor)).lines);
+      // fails-when: a file that appears between polls is offset by lines read
+      // from other files, so a line is lost or delivered twice
+      for (const path of paths) {
+        const suffix = path.slice(-12);
+        expect(delivered.filter((l) => l.startsWith(`${suffix}#`))).toEqual(written[path]);
+      }
+      expect(delivered).toHaveLength(Object.values(written).flat().length);
+    }
+  });
+
+  it('holds back an unterminated last line until it ends', async () => {
+    const { db } = makeDbMock({
+      runRow: { run_id: 'run-1', status: 'running', is_test_run: true },
+    });
+    const files: Record<string, string> = { 'executions/run-1/job-build/step-0.log': 'a\nhal' };
+    const deps = { db, logStorage: liveStorage(files) } as unknown as TestRelayHandlerDeps;
+    const first = await poll(deps, TEST_RUN_LOG_CURSOR_START);
+    // fails-when: a half-written line is delivered and counted, so its end is lost
+    expect(first.lines).toEqual(['a']);
+    files['executions/run-1/job-build/step-0.log'] = 'a\nhalf-done\n';
+    expect((await poll(deps, first.nextLogCursor!)).lines).toEqual(['half-done']);
+  });
+
+  it('delivers an unterminated last line once the run is terminal', async () => {
+    const { db } = makeDbMock({
+      runRow: { run_id: 'run-1', status: 'success', is_test_run: true },
+    });
+    const deps = {
+      db,
+      logStorage: liveStorage({ 'executions/run-1/job-build/step-0.log': 'a\nno-newline' }),
+    } as unknown as TestRelayHandlerDeps;
+    const page = await poll(deps, TEST_RUN_LOG_CURSOR_START);
+    // breaks-if-wrong: a file that never ends in a newline still delivers its
+    // last line before `done`
+    expect(page.lines).toEqual(['a', 'no-newline']);
+    expect(page.done).toBe(true);
+  });
+
+  it('refuses a malformed cursor', async () => {
+    const { db } = makeDbMock({
+      runRow: { run_id: 'run-1', status: 'running', is_test_run: true },
+    });
+    const deps = { db, logStorage: liveStorage({}) } as unknown as TestRelayHandlerDeps;
+    expect(await poll(deps, 'not-a-cursor')).toEqual({ error: 'Invalid log cursor' });
   });
 });
 

@@ -5,6 +5,7 @@ import path from 'node:path';
 import type { HookToolName } from './detector.js';
 import { findGitDir } from './detector.js';
 import { getHookTemplate, hasKiciHook } from './templates.js';
+import { scaffoldKiciVersion } from '../templates/package-json.js';
 
 const execAsync = promisify(exec);
 
@@ -33,7 +34,10 @@ export interface InstallResult {
 export interface InstallOptions {
   /** Defaults to process.cwd(). */
   cwd?: string;
-  /** Use @kici-dev/compiler from local Verdaccio instead of the public kici package. */
+  /**
+   * Run @kici-dev/compiler@latest from the dev registry instead of the public
+   * kici package, which is pinned to this CLI's version.
+   */
   useVerdaccio?: boolean;
 }
 
@@ -46,7 +50,11 @@ export async function installHook(
   options: InstallOptions = {},
 ): Promise<InstallResult> {
   const cwd = options.cwd ?? process.cwd();
-  const npxCmd = options.useVerdaccio ? 'npx -y @kici-dev/compiler@latest' : 'npx -y kici@latest';
+  // The public package runs at this CLI's version, the version `kici init`
+  // pins the SDK to, so the hook never compiles with a newer KiCI than the SDK.
+  const npxCmd = options.useVerdaccio
+    ? 'npx -y @kici-dev/compiler@latest'
+    : `npx -y kici@${scaffoldKiciVersion()}`;
   const command = `${npxCmd} compile && git add .kici/kici.lock.json`;
 
   switch (tool) {

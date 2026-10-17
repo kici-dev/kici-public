@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdir, rm, writeFile, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -9,6 +9,7 @@ describe('installHook', { timeout: 30_000 }, () => {
   let tempDir: string;
 
   beforeEach(async () => {
+    vi.stubGlobal('KICI_VERSION', '0.17.0');
     tempDir = path.join(
       os.tmpdir(),
       `kici-install-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -17,6 +18,7 @@ describe('installHook', { timeout: 30_000 }, () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
     await rm(tempDir, { recursive: true, force: true });
   });
 
@@ -32,7 +34,9 @@ describe('installHook', { timeout: 30_000 }, () => {
 
       const content = await readFile(path.join(tempDir, '.husky', 'pre-commit'), 'utf-8');
       expect(content).toContain('#!/usr/bin/env sh');
-      expect(content).toContain('npx -y kici@latest compile');
+      // fails-when: the hook floats on kici@latest, a compiler newer than the project's SDK
+      expect(content).toContain('npx -y kici@0.17.0 compile && git add .kici/kici.lock.json');
+      expect(content).not.toContain('kici@latest');
       expect(content).toContain(KICI_HOOK_MARKER);
       expect(content).not.toContain('husky.sh');
     });
@@ -53,7 +57,7 @@ npm test
 
       const content = await readFile(path.join(tempDir, '.husky', 'pre-commit'), 'utf-8');
       expect(content).toContain('npm test');
-      expect(content).toContain('npx -y kici@latest compile');
+      expect(content).toContain('npx -y kici@0.17.0 compile');
       expect(content).toContain(KICI_HOOK_MARKER);
     });
 
@@ -95,7 +99,7 @@ kici compile --check
 
       expect(result.success).toBe(true);
       const content = await readFile(path.join(tempDir, '.husky', 'pre-commit'), 'utf-8');
-      expect(content).toContain('npx -y kici@latest compile && git add .kici/kici.lock.json');
+      expect(content).toContain('npx -y kici@0.17.0 compile && git add .kici/kici.lock.json');
     });
 
     it('uses @kici-dev/compiler when useVerdaccio is true', async () => {
@@ -135,7 +139,7 @@ kici compile --check
       const hookPath = path.join(tempDir, '.git', 'hooks', 'pre-commit');
       const content = await readFile(hookPath, 'utf-8');
       expect(content).toContain('#!/bin/sh');
-      expect(content).toContain('npx -y kici@latest compile');
+      expect(content).toContain('npx -y kici@0.17.0 compile');
       expect(content).toContain(KICI_HOOK_MARKER);
     });
 
@@ -155,7 +159,7 @@ npm test
 
       const content = await readFile(path.join(hookDir, 'pre-commit'), 'utf-8');
       expect(content).toContain('npm test');
-      expect(content).toContain('npx -y kici@latest compile');
+      expect(content).toContain('npx -y kici@0.17.0 compile');
     });
 
     it('skips if kici hook already installed', async () => {
@@ -207,7 +211,7 @@ kici compile
       expect(result.success).toBe(true);
       const hookPath = path.join(tempDir, '.git', 'hooks', 'pre-commit');
       const content = await readFile(hookPath, 'utf-8');
-      expect(content).toContain('npx -y kici@latest compile && git add .kici/kici.lock.json');
+      expect(content).toContain('npx -y kici@0.17.0 compile && git add .kici/kici.lock.json');
     });
   });
 
@@ -230,7 +234,7 @@ pre-commit:
 
       const content = await readFile(path.join(tempDir, 'lefthook.yml'), 'utf-8');
       expect(content).toContain('kici-compile:');
-      expect(content).toContain('run: npx -y kici@latest compile');
+      expect(content).toContain('run: npx -y kici@0.17.0 compile');
       expect(content).toContain('eslint');
     });
 
@@ -315,7 +319,7 @@ commit-msg:
 
       expect(result.success).toBe(true);
       const content = await readFile(path.join(tempDir, 'lefthook.yml'), 'utf-8');
-      expect(content).toContain('run: npx -y kici@latest compile && git add .kici/kici.lock.json');
+      expect(content).toContain('run: npx -y kici@0.17.0 compile && git add .kici/kici.lock.json');
     });
 
     it('adds commands to pre-commit when commands: exists only in another section', async () => {
@@ -382,7 +386,7 @@ pre-commit:
       expect(content).toContain('- repo: local');
       expect(content).toContain('id: kici-compile');
       expect(content).toContain('name: KiCI Compile');
-      expect(content).toContain('entry: npx -y kici@latest compile');
+      expect(content).toContain('entry: npx -y kici@0.17.0 compile');
       expect(content).toContain('language: system');
       expect(content).toContain('trailing-whitespace'); // Original content preserved
     });
@@ -423,7 +427,7 @@ pre-commit:
       expect(result.success).toBe(true);
       const content = await readFile(path.join(tempDir, '.pre-commit-config.yaml'), 'utf-8');
       expect(content).toContain(
-        'entry: npx -y kici@latest compile && git add .kici/kici.lock.json',
+        'entry: npx -y kici@0.17.0 compile && git add .kici/kici.lock.json',
       );
     });
   });
@@ -479,7 +483,7 @@ pre-commit:
       expect(result.success).toBe(true);
       const content = await readFile(path.join(tempDir, '.pre-commit-config.yaml'), 'utf-8');
       expect(content).toContain(
-        'entry: npx -y kici@latest compile && git add .kici/kici.lock.json',
+        'entry: npx -y kici@0.17.0 compile && git add .kici/kici.lock.json',
       );
     });
   });
@@ -525,7 +529,7 @@ pre-commit:
       expect(result.path).toBe(path.join(mainGitDir, 'hooks', 'pre-commit'));
 
       const content = await readFile(path.join(mainGitDir, 'hooks', 'pre-commit'), 'utf-8');
-      expect(content).toContain('npx -y kici@latest compile');
+      expect(content).toContain('npx -y kici@0.17.0 compile');
     });
 
     it('handles nested subdirectory for git hooks', async () => {

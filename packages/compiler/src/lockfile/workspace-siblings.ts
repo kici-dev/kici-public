@@ -1,6 +1,7 @@
 /**
- * Static resolution of the in-repo sibling closure `.kici` depends on, and a
- * digest over its source.
+ * Static resolution of the in-repo sibling closure `.kici` depends on (the
+ * workspace packages it reaches by an in-repo protocol, or by version range as
+ * an npm or yarn workspace member), and a digest over its source.
  *
  * The deps tarball carries those siblings **with their built output**
  * (`packKiciDeps`), but its pointer is keyed on `lockfileHash`, which a sibling
@@ -17,6 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { sha256 } from '@kici-dev/core';
+import picomatch from 'picomatch';
 import { parse as parseYaml } from 'yaml';
 
 const IN_REPO_PROTOCOLS = ['workspace:', 'file:', 'link:', 'portal:'];
@@ -69,6 +71,31 @@ export function readWorkspaceGlobs(gitRoot: string): string[] {
   if (Array.isArray(ws)) return ws;
   if (ws && Array.isArray(ws.packages)) return ws.packages;
   return [];
+}
+
+/** A workspace glob or member path as globs are matched: POSIX, no `./`, no trailing `/`. */
+function normalizeWorkspacePath(p: string): string {
+  return p.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/+$/, '');
+}
+
+/**
+ * Whether `memberDir` (repo-relative) is a member of the workspace declared at
+ * `gitRoot`: a positive workspace glob matches it and no `!` glob excludes it.
+ * Wildcards do not match a leading dot (`dot: false`), so a `*` glob never
+ * counts as registering `.kici`. An explicit entry next to a dot-matching glob
+ * is harmless, so reading "not a member" in that case only adds an entry.
+ */
+export function isWorkspaceMember(gitRoot: string, memberDir = '.kici'): boolean {
+  const member = normalizeWorkspacePath(memberDir);
+  let included = false;
+  for (const raw of readWorkspaceGlobs(gitRoot)) {
+    const negated = raw.startsWith('!');
+    const glob = normalizeWorkspacePath(negated ? raw.slice(1) : raw);
+    if (!picomatch.isMatch(member, glob, { dot: false })) continue;
+    if (negated) return false;
+    included = true;
+  }
+  return included;
 }
 
 /**
@@ -131,7 +158,10 @@ function resolveSpecifier(
 
 /**
  * The transitive in-repo siblings of `.kici`, as sorted repo-relative POSIX
- * paths. `.kici` itself is excluded: `contentHash` covers it, and including it
+ * paths. A sibling is reached through a `workspace:` / `file:` / `link:` /
+ * `portal:` specifier, or, when `.kici` is a member of an npm or yarn
+ * workspace, through a plain version range naming a workspace package (those
+ * managers link it by name). `.kici` itself is excluded: `contentHash` covers it, and including it
  * would make a `.kici` edit invalidate the dep cache.
  */
 export function collectInRepoSiblings(gitRoot: string, kiciDir = '.kici'): string[] {
@@ -139,6 +169,11 @@ export function collectInRepoSiblings(gitRoot: string, kiciDir = '.kici'): strin
   if (!kiciManifest) return [];
 
   const workspacePkgs = workspacePackageDirs(gitRoot, readWorkspaceGlobs(gitRoot));
+  // npm and yarn (classic and berry) link a workspace package into a member by
+  // name when its version satisfies the declared range; pnpm links only a
+  // `workspace:` specifier and resolves a plain range from the registry.
+  const linksByName =
+    isWorkspaceMember(gitRoot, kiciDir) && !existsSync(path.join(gitRoot, 'pnpm-workspace.yaml'));
   const found = new Set<string>();
   const queue: Array<{ dir: string; manifest: Manifest }> = [
     { dir: kiciDir, manifest: kiciManifest },
@@ -148,8 +183,12 @@ export function collectInRepoSiblings(gitRoot: string, kiciDir = '.kici'): strin
   while (queue.length > 0) {
     const { dir, manifest } = queue.shift()!;
     for (const [name, spec] of allSpecifiers(manifest)) {
-      if (!IN_REPO_PROTOCOLS.some((p) => spec.startsWith(p))) continue;
-      const target = resolveSpecifier(name, spec, dir, gitRoot, workspacePkgs);
+      const inRepoProtocol = IN_REPO_PROTOCOLS.some((p) => spec.startsWith(p));
+      const target = inRepoProtocol
+        ? resolveSpecifier(name, spec, dir, gitRoot, workspacePkgs)
+        : linksByName && !spec.startsWith('npm:')
+          ? (workspacePkgs.get(name) ?? null)
+          : null;
       if (target === null || visited.has(target)) continue;
       visited.add(target);
       found.add(target);

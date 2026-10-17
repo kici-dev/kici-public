@@ -2,7 +2,8 @@
  * Bare-metal scaler backend: ephemeral agent processes via child_process.spawn.
  * On Linux and macOS each agent leads its own process group, which teardown
  * signals; on Windows teardown ends the agent's process tree with taskkill.
- * All agents are single-use: destroyed after job completion.
+ * An agent exits once it is idle past its idle window (a follow-up job that
+ * arrives within the window reuses it), and the backend destroys it on disconnect.
  */
 
 import type { ChildProcess } from 'node:child_process';

@@ -327,7 +327,7 @@ scalers:
     roles: [builder] # Handles build + execution jobs
     labelSets:
       - labels: [linux, container]
-        image: kici-agent:latest
+        image: quay.io/kici-dev/kici-agent:<version>
 
   - name: exec-only
     type: bare-metal
@@ -458,7 +458,7 @@ Each label set can configure a `networkPolicy` that controls outbound network ac
 ```yaml
 labelSets:
   - labels: [default]
-    image: kici-agent:latest
+    image: quay.io/kici-dev/kici-agent:<version>
     networkPolicy:
       allowlist:
         - 10.0.5.0/24 # Allow specific internal subnet

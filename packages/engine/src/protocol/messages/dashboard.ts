@@ -2483,22 +2483,37 @@ export const testRelayRunStatusResponseSchema = z.object({
 });
 export type TestRelayRunStatusResponse = z.infer<typeof testRelayRunStatusResponseSchema>;
 
+/**
+ * The start token of the per-file log cursor: the empty string. A caller sends
+ * it on its first poll; every later poll sends the `nextLogCursor` it received.
+ */
+export const TEST_RUN_LOG_CURSOR_START = '';
+
 /** Request the next chunk of a run's logs from a cursor. */
 export const testRelayRunLogsRequestSchema = z.object({
   type: z.literal('test.relay.run.logs'),
   requestId: z.string(),
   actor: actorPrincipalSchema,
   runId: z.string(),
+  /** Lines of the flat, sorted stream already delivered. Read when `logCursor` is absent. */
   cursor: z.number(),
+  /**
+   * Opaque per-file cursor: a prior response's `nextLogCursor`, or
+   * `TEST_RUN_LOG_CURSOR_START`. When present, the orchestrator reads from it
+   * and ignores `cursor`.
+   */
+  logCursor: z.string().optional(),
 });
 export type TestRelayRunLogsRequest = z.infer<typeof testRelayRunLogsRequestSchema>;
 
-/** Response carrying the next log chunk + a monotonic cursor. */
+/** Response carrying the next log chunk and the cursors to read on from. */
 export const testRelayRunLogsResponseSchema = z.object({
   type: z.literal('test.relay.run.logs.response'),
   requestId: z.string(),
   lines: z.array(z.string()).optional(),
   nextCursor: z.number().optional(),
+  /** Opaque per-file cursor for the next request; present when the request sent `logCursor`. */
+  nextLogCursor: z.string().optional(),
   done: z.boolean().optional(),
   error: z.string().optional(),
 });
@@ -2848,6 +2863,34 @@ export const dashboardRunDetailApiResponseSchema = z.object({
    */
   initFailure: initFailureSchema.optional(),
 });
+
+/** Response header the run-detail route sets to name the path that served the response. */
+export const RUN_DETAIL_SOURCE_HEADER = 'X-Detail-Source';
+
+/** Which path served a run-detail response: the orchestrator, or the Platform's stored copy. */
+export const RunDetailSource = z.enum(['orchestrator-proxy', 'platform-db']);
+export type RunDetailSource = z.infer<typeof RunDetailSource>;
+
+/** Response header the run-detail route sets when it serves the stored copy, naming why. */
+export const RUN_DETAIL_FALLBACK_REASON_HEADER = 'X-Detail-Fallback-Reason';
+
+/**
+ * Why the run-detail route served the Platform's stored copy (jobs, no steps)
+ * instead of the orchestrator's answer.
+ */
+export const RunDetailFallbackReason = z.enum([
+  /** No orchestrator that can serve the run is connected. */
+  'orchestrator_unreachable',
+  /** The orchestrator did not answer within the request timeout. */
+  'orchestrator_timeout',
+  /** The orchestrator answered with an error, for example that it does not have the run. */
+  'orchestrator_error',
+  /** The orchestrator's answer did not match the response schema. */
+  'invalid_response',
+  /** The orchestrator reported no jobs and no init failure. */
+  'no_jobs',
+]);
+export type RunDetailFallbackReason = z.infer<typeof RunDetailFallbackReason>;
 
 /** REST API response for step logs. */
 export const dashboardStepLogsApiResponseSchema = z.object({

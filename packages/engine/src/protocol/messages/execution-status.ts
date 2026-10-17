@@ -1,17 +1,21 @@
 import { z } from 'zod';
+import { boundedFreeText, truncateReasonText } from './bounded-text.js';
 
 // --- Field-size bounds (flood hardening) ---
 //
 // A customer-controlled orchestrator can stream fabricated execution/job/replay
 // messages; unbounded fields would let one message carry megabytes into the
 // browser fan-out and DB writes. These ceilings bound the per-message blast
-// radius, following `platform-orchestrator.ts` conventions.
+// radius, following `platform-orchestrator.ts` conventions. Free text (a
+// failure reason, an error message, a commit message) is clamped to
+// `STATUS_FREE_TEXT_MAX` instead of refused: its length depends on tool output
+// no sender controls, and refusing it would make the whole message invalid.
 
 /** Max length for ids and short identifier fields (runId, jobId, sha, ref, …). */
 export const STATUS_ID_MAX = 128;
 /** Max length for the repo identifier (`owner/repo`). */
 export const REPO_IDENTIFIER_MAX = 256;
-/** Max length for free-text fields (commit message, failure/error reason). */
+/** Length free-text fields are clamped to (commit message, failure/error reason). */
 export const STATUS_FREE_TEXT_MAX = 2000;
 /** Max number of runs in a single `state.replay` snapshot. */
 export const STATE_REPLAY_MAX_RUNS = 500;
@@ -237,7 +241,7 @@ export const initFailureSchema = z.object({
   scope: z.enum(['run', 'job']),
   category: InitFailureCategory,
   /** Human-readable failure message (same content surfaced by RunFailureSummary). */
-  message: z.string().max(STATUS_FREE_TEXT_MAX),
+  message: boundedFreeText(STATUS_FREE_TEXT_MAX),
   /** Set when scope === 'job'. */
   jobName: z.string().max(STATUS_ID_MAX).optional(),
 });
@@ -331,7 +335,7 @@ export const executionStatusSchema = z.object({
   /** Trigger event type (e.g. "push", "pr:open"). */
   triggerEvent: z.string().max(STATUS_ID_MAX).optional(),
   /** First line of the commit message. */
-  commitMessage: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
+  commitMessage: boundedFreeText(STATUS_FREE_TEXT_MAX).optional(),
   jobCount: z.number().optional(),
   startedAt: z.number(),
   completedAt: z.number().optional(),
@@ -356,7 +360,7 @@ export const executionStatusSchema = z.object({
   triggerActorUsername: z.string().max(REPO_IDENTIFIER_MAX).nullable().optional(),
   triggerActorUserId: z.string().max(STATUS_ID_MAX).nullable().optional(),
   /** Human-readable reason why the run failed (only present for failed runs). */
-  failureReason: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
+  failureReason: boundedFreeText(STATUS_FREE_TEXT_MAX).optional(),
   /**
    * Raw log bytes across all jobs, summed by the orchestrator from the agent's
    * per-step `logBytesStreamed`. Set only on terminal states; feeds the
@@ -412,7 +416,7 @@ export const jobStatusForwardSchema = z.object({
   startedAt: z.number().optional(),
   completedAt: z.number().optional(),
   durationMs: z.number().optional(),
-  errorMessage: z.string().max(STATUS_FREE_TEXT_MAX).nullable().optional(),
+  errorMessage: boundedFreeText(STATUS_FREE_TEXT_MAX).nullable().optional(),
   agentId: z.string().max(STATUS_ID_MAX).nullable().optional(),
   orchestratorId: z.string().max(STATUS_ID_MAX).nullable().optional(),
   /** Labels used for agent routing. */
@@ -451,7 +455,7 @@ export const stateReplayRunSchema = z.object({
   sha: z.string().max(STATUS_ID_MAX).optional(),
   ref: z.string().max(STATUS_ID_MAX).optional(),
   triggerEvent: z.string().max(STATUS_ID_MAX).optional(),
-  commitMessage: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
+  commitMessage: boundedFreeText(STATUS_FREE_TEXT_MAX).optional(),
   jobCount: z.number(),
   startedAt: z.number(),
   completedAt: z.number().optional(),
@@ -461,7 +465,7 @@ export const stateReplayRunSchema = z.object({
   triggeredBy: z.string().max(STATUS_ID_MAX).nullable().optional(),
   triggeredByAgentLabel: z.string().max(STATUS_ID_MAX).nullable().optional(),
   /** Human-readable reason why the run failed (only present for failed runs). */
-  failureReason: z.string().max(STATUS_FREE_TEXT_MAX).optional(),
+  failureReason: boundedFreeText(STATUS_FREE_TEXT_MAX).optional(),
   /** Why the run failed (`RunFailureClass`); only present for failed/cancelled runs. */
   failureClass: RunFailureClass.optional(),
   /** The run's status generation, with the same meaning as on `execution.status`. */
@@ -475,7 +479,7 @@ export const stateReplayRunSchema = z.object({
         startedAt: z.number().optional(),
         completedAt: z.number().optional(),
         durationMs: z.number().optional(),
-        errorMessage: z.string().max(STATUS_FREE_TEXT_MAX).nullable().optional(),
+        errorMessage: boundedFreeText(STATUS_FREE_TEXT_MAX).nullable().optional(),
         agentId: z.string().max(STATUS_ID_MAX).nullable().optional(),
         runsOnLabels: z.array(z.string().max(STATUS_ID_MAX)).max(RUNS_ON_LABELS_MAX).optional(),
         contexts: z.array(z.string().max(STATUS_ID_MAX)).max(CONTEXTS_MAX).optional(),
@@ -497,3 +501,15 @@ export const stateReplaySchema = z.object({
 
 export type ExecutionStatus = z.infer<typeof executionStatusSchema>;
 export type StepStatusForward = z.infer<typeof stepStatusForwardSchema>;
+
+export type JobStatusForward = z.infer<typeof jobStatusForwardSchema>;
+
+/** Clamp one free-text status value to {@link STATUS_FREE_TEXT_MAX}, the bound the wire applies on receipt. */
+export function clampStatusFreeText(text: string): string {
+  return truncateReasonText(text, STATUS_FREE_TEXT_MAX);
+}
+
+/** An init-failure signal whose message is clamped to {@link STATUS_FREE_TEXT_MAX}. */
+export function clampInitFailure(failure: InitFailure): InitFailure {
+  return { ...failure, message: clampStatusFreeText(failure.message) };
+}

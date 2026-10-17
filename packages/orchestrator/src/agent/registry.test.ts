@@ -391,6 +391,16 @@ describe('AgentRegistry', () => {
       expect(registry.hasMatchingAgent(['linux'])).toBe(true);
     });
 
+    it('keeps an agent that reported its own drain draining through a warm-pool undo', () => {
+      registry.register('agent-1', mockWs(), ['linux']);
+      registry.markDrainReported('agent-1');
+      registry.markDraining('agent-1');
+      registry.clearDraining('agent-1');
+      // fails-when: the warm-pool undo reopens a single-job agent that accepted its job
+      expect(registry.findAvailable(['linux'])).toHaveLength(0);
+      expect(registry.get('agent-1')?.draining).toBe(true);
+    });
+
     it('registers a reconnecting agent as not draining', () => {
       registry.register('agent-1', mockWs(), ['linux']);
       registry.markDraining('agent-1');

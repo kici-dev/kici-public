@@ -457,6 +457,14 @@ export class DashboardHandler {
         if (cold.steps.length > 0) steps = cold.steps as typeof steps;
       }
 
+      // No run row and no jobs, hot or archived: this orchestrator does not hold
+      // the run. Answer with an error, so the Platform falls back as
+      // `orchestrator_error` rather than reporting that the run has no jobs.
+      if (!runRow && jobs.length === 0) {
+        this.sendRunDetailNotFound(ctx, msg);
+        return;
+      }
+
       // Secret output key names only: values are NOT sent to the dashboard.
       const secretOutputRows = await this.db
         .selectFrom('run_secret_outputs')
@@ -580,6 +588,28 @@ export class DashboardHandler {
         error: 'Internal error querying run detail',
       });
     }
+  }
+
+  /** Answer a run-detail read for a run this orchestrator does not hold. */
+  private sendRunDetailNotFound(
+    ctx: ReturnType<DashboardHandler['contextOrFallback']>,
+    msg: DashboardRunDetailRequest,
+  ): void {
+    this.access.recordIn(
+      ctx,
+      msg.actor,
+      'run.detail.read',
+      { type: 'run', id: msg.runId },
+      msg.requestId,
+      'error',
+      'run not found',
+    );
+    this.send({
+      type: 'dashboard.run.detail.response',
+      requestId: msg.requestId,
+      jobs: [],
+      error: 'Run not found',
+    });
   }
 
   /**

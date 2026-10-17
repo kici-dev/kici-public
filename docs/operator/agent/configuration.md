@@ -60,6 +60,7 @@ and the rotated-file logger live in the [environment variable reference](../env-
 | `KICI_SCALER_IDLE_TIMEOUT`                 | no       | 5000       | number                                  |         |             |
 | `KICI_SCALER_MANAGED`                      | no       |            | string                                  |         |             |
 | `KICI_SCALER_PENDING_DISPATCH_TIMEOUT`     | no       | 60000      | number                                  |         |             |
+| `KICI_SCALER_SINGLE_JOB`                   | no       |            | string                                  |         |             |
 | `KICI_TRUSTED_ENV`                         | no       | "false"    | string                                  |         |             |
 
 <!-- END GENERATED: agent-env -->
@@ -496,7 +497,7 @@ KICI_AGENT_TOKEN=kat_<64 hex chars>
 4. On success, orchestrator responds with `auth.success` and the agent proceeds to send `agent.register`
 5. On failure, the orchestrator responds with `auth.failure` and closes the connection
 
-**Auth failure behavior:** If authentication fails, the agent logs an error and **permanently stops reconnection**. A bad token cannot self-heal, so retrying wastes resources. Fix the token and restart the agent.
+**Auth failure behavior:** If authentication fails, the agent logs an error, **permanently stops reconnection**, and exits with code 1. A bad token cannot self-heal, so retrying wastes resources. The non-zero exit lets a service manager report the failure. Fix the token and restart the agent. An agent that starts with `KICI_SCALER_CLAIM_CODE` and no `KICI_AGENT_TOKEN` exits with code 1 in the same way when its claim fails: the code is invalid, expired or already used, or the exchange fails.
 
 **Scaler-managed agents:** Agents spawned by the orchestrator's auto-scaler receive automatically generated ephemeral tokens. No manual token configuration is needed for scaler-managed agents.
 
@@ -564,7 +565,7 @@ KICI_DEFAULT_STEP_TIMEOUT_MS=3600000
 
 ## See also
 
-- [Agent Getting Started](getting-started.md) -- deployment guide with Docker and Kubernetes
-- [Orchestrator Configuration](../orchestrator/configuration.md) -- environment variables for the orchestrator agents connect to
-- [Job Execution Lifecycle](../../architecture/execution/job-execution.md) -- how the agent uses these configuration values during execution
-- [Protocol Messages](../../architecture/protocol-messages.md) -- agent-to-orchestrator message schemas
+- [Agent getting started](getting-started.md) -- deployment guide with Docker and Kubernetes
+- [Orchestrator configuration](../orchestrator/configuration.md) -- environment variables for the orchestrator agents connect to
+- [Job execution lifecycle](../../architecture/execution/job-execution.md) -- how the agent uses these configuration values during execution
+- [Protocol messages](../../architecture/protocol-messages.md) -- agent-to-orchestrator message schemas

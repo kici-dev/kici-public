@@ -1,10 +1,11 @@
 /** `kici runs logs`: step logs for a run. */
 import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
-import { JobKind, TERMINAL_RUN_STATES, type DashboardJobDetail, sleep } from '@kici-dev/engine';
+import { TERMINAL_RUN_STATES, type DashboardJobDetail, sleep } from '@kici-dev/engine';
 import { DashboardClient, DashboardClientError } from '../../remote/dashboard-client.js';
 import { unwrapStoredLogLine } from '../../remote/output/streaming.js';
 import { colorStatus } from '../../remote/render.js';
+import { printNotes, ranOnAnAgent, stepDetailNotes } from './detail-notes.js';
 
 export interface RunsLogsOptions {
   job?: string;
@@ -43,17 +44,21 @@ export async function runsLogsCommand(
 ): Promise<boolean> {
   try {
     const client = await DashboardClient.load();
+    // Each note prints once, however many polls or jobs bring it back.
+    const printed = new Set<string>();
     if (options.json) {
-      const detail = await client.getRunDetail(runId);
-      const out = await collectAllLogs(client, runId, detail.jobs, options.job);
+      const read = await client.getRunDetailWithSource(runId);
+      printNotes(stepDetailNotes(read), printed);
+      const out = await collectAllLogs(client, runId, read.detail.jobs, printed, options.job);
       console.log(JSON.stringify(out, null, 2));
       return true;
     }
     if (options.follow) {
-      return await followLogs(client, runId, options.job);
+      return await followLogs(client, runId, printed, options.job);
     }
-    const detail = await client.getRunDetail(runId);
-    await printAllLogs(client, runId, detail.jobs, options.job);
+    const read = await client.getRunDetailWithSource(runId);
+    printNotes(stepDetailNotes(read), printed);
+    await printAllLogs(client, runId, read.detail.jobs, printed, options.job);
     return true;
   } catch (err) {
     logger.error(pc.red(err instanceof DashboardClientError ? err.message : toErrorMessage(err)));
@@ -69,11 +74,13 @@ interface SetupLog {
   lines: string[];
   /** Whether the orchestrator stored one; absent when it does not report it. */
   recorded?: boolean;
+  /** Why it could not be read; absent when it was. */
+  error?: string;
 }
 
 /**
- * An orchestrator that serves no setup log answers with an error; that reads as
- * "no setup lines", never as a failure.
+ * A job's setup log. A failed read yields no lines and its error, which the
+ * caller reports on stderr; it never fails the command.
  */
 async function fetchSetupLog(
   client: DashboardClient,
@@ -83,18 +90,19 @@ async function fetchSetupLog(
   try {
     const { lines, recorded } = await client.getStepLogs(runId, jobId, SETUP_STEP_INDEX);
     return { lines, recorded };
-  } catch {
-    return { lines: [] };
+  } catch (err) {
+    return {
+      lines: [],
+      error: err instanceof DashboardClientError ? err.message : toErrorMessage(err),
+    };
   }
 }
 
-/**
- * Only a job that started on an agent can have written a setup log: not one
- * never started (queued, skipped, cancelled first) or run on no agent (an
- * invoke gate, a summoned-run proxy).
- */
-function ranOnAnAgent(job: DashboardJobDetail): boolean {
-  return job.startedAt !== null && (job.jobKind ?? JobKind.enum.standard) === JobKind.enum.standard;
+/** The stderr note for a setup log that could not be read. */
+function setupLogErrorNotes(job: DashboardJobDetail, setup: SetupLog): string[] {
+  return setup.error === undefined
+    ? []
+    : [`setup log unavailable for job ${job.jobName}: ${setup.error}`];
 }
 
 /**
@@ -115,10 +123,12 @@ async function printAllLogs(
   client: DashboardClient,
   runId: string,
   jobs: DashboardJobDetail[],
+  printed: Set<string>,
   jobFilter?: string,
 ): Promise<void> {
   for (const j of selectJobs(jobs, jobFilter)) {
     const setup = await fetchSetupLog(client, runId, j.jobId);
+    printNotes(setupLogErrorNotes(j, setup), printed);
     const note = emptySetupLogNote(j, setup);
     if (setup.lines.length > 0 || note) {
       console.log(pc.bold(`\n=== ${j.jobName} › ${SETUP_HEADING} ===`));
@@ -140,11 +150,14 @@ async function collectAllLogs(
   client: DashboardClient,
   runId: string,
   jobs: DashboardJobDetail[],
+  printed: Set<string>,
   jobFilter?: string,
 ): Promise<RunLogsJson> {
   const out: RunLogsJson = {};
   for (const j of selectJobs(jobs, jobFilter)) {
-    const { lines: setup } = await fetchSetupLog(client, runId, j.jobId);
+    const setupLog = await fetchSetupLog(client, runId, j.jobId);
+    printNotes(setupLogErrorNotes(j, setupLog), printed);
+    const setup = setupLog.lines;
     // fails-when: a job's setup lines share the `<job>/<step>` keyspace, so a step named
     // `setup` overwrites them
     // breaks-if-wrong: a run whose jobs wrote no setup log keeps the step-only shape
@@ -175,20 +188,19 @@ function printNewLines(
 async function followLogs(
   client: DashboardClient,
   runId: string,
+  notesPrinted: Set<string>,
   jobFilter?: string,
 ): Promise<boolean> {
   const printed: Record<string, number> = {};
   for (;;) {
     const run = await client.getRun(runId);
-    const detail = await client.getRunDetail(runId);
-    for (const j of selectJobs(detail.jobs, jobFilter)) {
+    const read = await client.getRunDetailWithSource(runId);
+    printNotes(stepDetailNotes(read), notesPrinted);
+    for (const j of selectJobs(read.detail.jobs, jobFilter)) {
       const setupKey = `${j.jobId}:${SETUP_STEP_INDEX}`;
-      printNewLines(
-        printed,
-        setupKey,
-        `${j.jobName} › ${SETUP_HEADING}`,
-        (await fetchSetupLog(client, runId, j.jobId)).lines,
-      );
+      const setup = await fetchSetupLog(client, runId, j.jobId);
+      printNotes(setupLogErrorNotes(j, setup), notesPrinted);
+      printNewLines(printed, setupKey, `${j.jobName} › ${SETUP_HEADING}`, setup.lines);
       for (const s of j.steps ?? []) {
         const logs = await client.getStepLogs(runId, j.jobId, s.stepIndex);
         printNewLines(

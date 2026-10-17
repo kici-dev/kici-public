@@ -126,7 +126,7 @@ cmd.exe reads some characters in a path as syntax. On a Windows orchestrator, a 
 
 ## Agent lifecycle
 
-All bare-metal agents are single-use: the agent process is spawned for one job, then stopped after the job completes or the agent disconnects.
+The scaler spawns an agent process for a job. When the job ends, the agent waits for a follow-up job for its idle window (`KICI_SCALER_IDLE_TIMEOUT`, 5 seconds by default). A follow-up job that arrives in that window runs on the same agent. An agent that stays idle past the window exits, and the scaler stops it when it disconnects.
 
 - **Linux and macOS:** the scaler sends SIGTERM to the process group, waits 5 seconds, then sends SIGKILL.
 - **Windows:** the scaler ends the whole process tree at once with `taskkill /T /F /PID <pid>`. The orchestrator cannot send a ctrl-C to a process on Windows, so there is no graceful step. When the tree has already exited, the scaler does nothing.

@@ -186,8 +186,8 @@ The CLI follows a test run by **polling**, over the same HTTP surface it used to
 ### Poll loop
 
 1. The trigger response returns the `runId`.
-2. The CLI polls two endpoints in lockstep on a fixed interval: `GET /api/v1/orgs/:customerId/test/runs/:runId/logs?cursor=<n>` for the next log chunk, and `GET /api/v1/orgs/:customerId/test/runs/:runId` for the status snapshot.
-3. Each log response carries a `nextCursor`; the CLI advances a **monotonic line-offset cursor** so a chunk is never re-printed and never skipped.
+2. The CLI polls two endpoints in lockstep on a fixed interval: `GET /api/v1/orgs/:customerId/test/runs/:runId/logs?cursor=<n>&logCursor=<opaque>` for the next log chunk, and `GET /api/v1/orgs/:customerId/test/runs/:runId` for the status snapshot. Both address the cluster the trigger was relayed to.
+3. Each log response carries `nextLogCursor`, an opaque cursor that records how many lines of each log file were delivered. The CLI sends it on the next poll, so a chunk is never re-printed and never skipped, even when a step's log file appears after a file that sorts later. The first poll sends an empty `logCursor`. When a response has no `nextLogCursor`, because the Platform or the orchestrator is older, the CLI uses the numeric line cursor `nextCursor`.
 4. The run is finished only when the status is terminal **and** the log stream has drained (`logs.done`). A terminal status alone is not enough — the tail of the log can still be arriving.
 
 Because the cursor lives in the CLI and every request is an ordinary authenticated HTTP call, a network blip needs no reconnection protocol: the next poll resumes from the same cursor. `Ctrl-C` cancels the run through the same client rather than just detaching.

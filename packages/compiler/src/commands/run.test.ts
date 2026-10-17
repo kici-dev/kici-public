@@ -24,7 +24,9 @@ vi.mock('../remote/config.js', () => ({
 
 // Capture constructor args so tests can assert org/cluster targeting.
 const platformClientConfigs: Record<string, unknown>[] = [];
-vi.mock('../remote/platform-client.js', () => {
+vi.mock('../remote/platform-client.js', async (importOriginal) => {
+  // The log-position helpers are pure, so the poll loop runs the real ones.
+  const actual = await importOriginal<typeof import('../remote/platform-client.js')>();
   class MockPlatformRunClient {
     constructor(config: Record<string, unknown>) {
       platformClientConfigs.push(config);
@@ -32,6 +34,8 @@ vi.mock('../remote/platform-client.js', () => {
     }
   }
   return {
+    FIRST_LOG_POSITION: actual.FIRST_LOG_POSITION,
+    nextLogPosition: actual.nextLogPosition,
     PlatformRunClient: MockPlatformRunClient,
     AmbiguousClusterError: class extends Error {
       clusters: string[];
@@ -477,6 +481,11 @@ describe('kici run command', () => {
       expect(compileCommand).toHaveBeenCalledWith(
         expect.objectContaining({ kiciDir: '.kici', check: false }),
       );
+      // fails-when: a remote run compiles without the preflight and ships an
+      // agent-unrunnable .kici/ silently
+      expect(compileCommand).toHaveBeenCalledWith(
+        expect.objectContaining({ warnMissingKiciManifest: true }),
+      );
       const compileOrder = compileCommand.mock.invocationCallOrder[0];
       const overlayOrder = createOverlayTarball.mock.invocationCallOrder[0];
       expect(compileOrder).toBeLessThan(overlayOrder);
@@ -899,19 +908,44 @@ describe('kici run command', () => {
       const result = await runRemoteCommand('push-main', { kiciDir: '.kici', quiet: true });
 
       expect(result).toBe(true);
-      // Second poll uses the advanced cursor from the first nextCursor.
+      // The first poll starts the per-file cursor; this server answers without
+      // one, so the second poll falls back to the numeric cursor alone.
       expect(mockClient.runLogs).toHaveBeenNthCalledWith(
         1,
         'org_a',
         'run-123',
-        0,
+        { cursor: 0, logCursor: '' },
         expect.anything(),
       );
+      // breaks-if-wrong: an older Platform or orchestrator keeps working
       expect(mockClient.runLogs).toHaveBeenNthCalledWith(
         2,
         'org_a',
         'run-123',
-        1,
+        { cursor: 1 },
+        expect.anything(),
+      );
+    });
+
+    it('follows the per-file cursor when the server offers one', async () => {
+      mockClient.runLogs
+        .mockResolvedValueOnce({ lines: ['a'], nextCursor: 1, nextLogCursor: 'c1', done: false })
+        .mockResolvedValueOnce({ lines: ['b'], nextCursor: 2, nextLogCursor: 'c2', done: true });
+      mockClient.runStatus
+        .mockResolvedValueOnce({ runId: 'run-123', status: 'running', jobs: [], done: false })
+        .mockResolvedValueOnce({ runId: 'run-123', status: 'success', jobs: [], done: true });
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+
+      await runRemoteCommand('push-main', { kiciDir: '.kici', quiet: true });
+
+      // fails-when: the loop keeps sending the numeric cursor, so a step file
+      // that sorts before an already-read file loses lines
+      expect(mockClient.runLogs).toHaveBeenNthCalledWith(
+        2,
+        'org_a',
+        'run-123',
+        { cursor: 1, logCursor: 'c1' },
         expect.anything(),
       );
     });
@@ -941,7 +975,7 @@ describe('kici run command', () => {
         2,
         'org_a',
         'run-123',
-        0,
+        { cursor: 0, logCursor: '' },
         expect.anything(),
       );
     });

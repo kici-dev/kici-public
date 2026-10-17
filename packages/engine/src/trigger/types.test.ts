@@ -18,9 +18,20 @@ describe('lock schema version window', () => {
 
   it('pins the current window (bump floor ONLY on a breaking schema change)', () => {
     // fails-when: the floor drops below 42 — a reader would accept locks compiled
-    // before the current schema.
-    expect(SCHEMA_VERSION).toBe(42);
+    // before the current schema — or the additive v44 bump moves the floor.
+    expect(SCHEMA_VERSION).toBe(44);
     expect(BREAKING_FLOOR).toBe(42);
+  });
+
+  it('LockJob.init carries a pinned mise version', () => {
+    const lockJob: LockJob = {
+      _type: 'static',
+      name: 'build',
+      needs: [],
+      steps: [],
+      init: { mise: { version: '2026.5.1', env: { PROBE: 'x' } } },
+    };
+    expect(lockJob.init).toEqual({ mise: { version: '2026.5.1', env: { PROBE: 'x' } } });
   });
 
   it('LockJob.invoke carries the invoke gate', () => {
@@ -50,6 +61,7 @@ describe('lock schema version window', () => {
     const withSandbox: LockJob = {
       _type: 'static',
       name: 'build',
+      needs: [],
       steps: [],
       container: 'node:20',
       sandbox: { capabilities: ['NET_ADMIN'], network: 'host' },
@@ -59,8 +71,22 @@ describe('lock schema version window', () => {
 });
 
 describe('lock approval config', () => {
-  it('SCHEMA_VERSION is 42 (approval enforced on organization-wide workflows)', () => {
-    expect(SCHEMA_VERSION).toBe(42);
+  it('SCHEMA_VERSION is 44 (adds the apt init preset)', () => {
+    expect(SCHEMA_VERSION).toBe(44);
+  });
+
+  it('LockJob.init carries an apt preset', () => {
+    const lockJob: LockJob = {
+      _type: 'static',
+      name: 'build',
+      needs: [],
+      steps: [],
+      init: [{ apt: { packages: ['make'], cache: true } }, 'mise'],
+    };
+    expect(JSON.parse(JSON.stringify(lockJob)).init).toEqual([
+      { apt: { packages: ['make'], cache: true } },
+      'mise',
+    ]);
   });
 
   it('LockJob accepts includeUninitialized alongside runsOnAll', () => {

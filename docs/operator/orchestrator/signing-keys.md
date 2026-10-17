@@ -199,7 +199,10 @@ Full procedure: [secret management → key rotation](../security/secrets.md#rota
 ## Verifying against your orchestrator
 
 `kici verify-attestation` defaults its trust root to the configured orchestrator,
-so the common case needs no flag. For air-gapped verification, export the
+so the common case needs no flag. The orchestrator URL must use `https://` or a
+loopback address: the command refuses a plain `http://` URL on another host,
+because an attacker on the network can replace the signing keys, unless you add
+`--allow-insecure-trust-root`. For air-gapped verification, export the
 trust-root file once and pass it with `--trust-root <file>`:
 
 ```bash

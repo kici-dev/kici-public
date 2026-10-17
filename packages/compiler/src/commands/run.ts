@@ -23,6 +23,9 @@ import {
   NotFoundError,
   type PlatformRunLogsResponse,
   type PlatformRunStatusResponse,
+  FIRST_LOG_POSITION,
+  nextLogPosition,
+  type RunLogPosition,
 } from '../remote/platform-client.js';
 import { DirectRunClient, HoldsUnavailableError } from '../remote/direct-client.js';
 import {
@@ -168,6 +171,7 @@ async function compileBeforeRemoteRun(options: RemoteRunOptions): Promise<boolea
       check: false,
       verbose: options.debug ?? false,
       quiet: pureStdout,
+      warnMissingKiciManifest: true,
       // So the types refresh of a direct run never reaches a saved Platform login.
       orchestratorUrl: options.orchestratorUrl,
     });
@@ -712,8 +716,12 @@ function handleRunError(
 }
 
 /**
- * Advances a monotonic line-offset log cursor; the run is done only when the
- * status is terminal and the log stream has drained.
+ * Poll the transport for run completion, streaming log lines as they arrive.
+ *
+ * Each `logs(position)` returns the next chunk and the position to read on
+ * from: the per-file cursor when the server offers it, else the numeric line
+ * cursor. The run is done only when the status is terminal and the log
+ * stream has drained.
  */
 async function pollRunToCompletion(
   ctx: RunRemoteTransport,
@@ -722,7 +730,7 @@ async function pollRunToCompletion(
   options: RemoteRunOptions,
 ): Promise<RemoteRunResult> {
   const startTime = Date.now();
-  let cursor = 0;
+  let position: RunLogPosition = FIRST_LOG_POSITION;
   const tailLines: string[] = [];
   const MAX_TAIL = 50;
 
@@ -751,7 +759,7 @@ async function pollRunToCompletion(
     while (!cancelRequest) {
       let logs: PlatformRunLogsResponse;
       try {
-        logs = await ctx.logs(runId, cursor);
+        logs = await ctx.logs(runId, position);
         lastStatus = await ctx.status(runId);
       } catch (err) {
         if (
@@ -772,7 +780,7 @@ async function pollRunToCompletion(
         tailLines.push(line);
         while (tailLines.length > MAX_TAIL) tailLines.shift();
       }
-      cursor = logs.nextCursor;
+      position = nextLogPosition(logs);
 
       const terminal = lastStatus.done || isTerminalRunStatus(lastStatus.status);
 

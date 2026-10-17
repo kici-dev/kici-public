@@ -1769,7 +1769,12 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
             // takes no work until BUSY_HOLD_MAX_MS passes.
             if (msg.activeJobs === 0) registry.clearBusyHeld(agentId);
 
-            if (entry.activeJobs < entry.maxConcurrency) {
+            // The agent says it takes no new job: a drain, or a single-job agent
+            // that has accepted its job. Mark it so no dispatch path picks it. A
+            // drain is terminal, so a later report without the flag never lifts it.
+            if (msg.draining === true) registry.markDrainReported(agentId);
+
+            if (!entry.draining && entry.activeJobs < entry.maxConcurrency) {
               await dispatcher.onAgentAvailable(agentId);
             }
           }

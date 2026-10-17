@@ -4,6 +4,8 @@
  * autocomplete and type-check per context.
  */
 
+import { isValidIdentifier } from './identifier.js';
+
 export interface ContextMetadata {
   name: string;
   keys: string[];
@@ -22,10 +24,6 @@ export interface GenerateSecretsDtsOptions {
    * tell it from a real snapshot; the caller passes `contexts: []`.
    */
   offline?: boolean;
-}
-
-function isValidIdentifier(name: string): boolean {
-  return /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(name);
 }
 
 function escapeQuotes(s: string): string {

@@ -152,54 +152,121 @@ describe('resolveVersionFromLaunchSpec', () => {
 
 describe('resolveNpmInstallTarget', () => {
   const NODE = '/home/u/.local/share/mise/installs/node/24.15.0/bin/node';
-  const NM = '/home/u/.local/share/mise/installs/node/24.15.0/lib/node_modules';
+  const PREFIX = '/home/u/.local/share/mise/installs/node/24.15.0';
+  const NM = `${PREFIX}/lib/node_modules`;
+  const present = { windows: false, exists: () => true };
+  const absent = { windows: false, exists: () => false };
 
   it('resolves kici-admin when orchestrator is nested under it', () => {
     const spec = {
       execPath: NODE,
       args: [`${NM}/kici-admin/node_modules/@kici-dev/orchestrator/dist/server.js`],
     };
-    expect(resolveNpmInstallTarget(spec, 'orchestrator', { windows: false })).toEqual({
-      nodeExecPath: NODE,
-      npmPath: '/home/u/.local/share/mise/installs/node/24.15.0/bin/npm',
-      owningPackage: 'kici-admin',
+    expect(resolveNpmInstallTarget(spec, 'orchestrator', present)).toEqual({
+      ok: true,
+      target: {
+        nodeExecPath: NODE,
+        npmPath: `${PREFIX}/bin/npm`,
+        owningPackage: 'kici-admin',
+        globalPrefix: PREFIX,
+        npmInvocation: { cmd: NODE, preArgs: [`${NM}/npm/bin/npm-cli.js`] },
+      },
     });
+  });
+
+  it('falls back to the npm beside the pinned node when npm-cli.js is absent', () => {
+    const spec = {
+      execPath: NODE,
+      args: [`${NM}/kici-admin/node_modules/@kici-dev/orchestrator/dist/server.js`],
+    };
+    const r = resolveNpmInstallTarget(spec, 'orchestrator', absent);
+    expect(r.ok && r.target.npmInvocation).toEqual({ cmd: `${PREFIX}/bin/npm`, preArgs: [] });
+  });
+
+  // fails-when: the prefix is taken from dirname(node)/.. instead of the entry.
+  it('takes the prefix from the launch entry, not from the node', () => {
+    const spec = {
+      execPath: '/other/bin/node',
+      args: ['/r/lib/node_modules/kici-admin/node_modules/@kici-dev/orchestrator/dist/server.js'],
+    };
+    const r = resolveNpmInstallTarget(spec, 'orchestrator', present);
+    expect(r.ok && r.target.globalPrefix).toBe('/r');
+    expect(r.ok && r.target.owningPackage).toBe('kici-admin');
   });
 
   it('resolves the standalone scoped package for a direct install', () => {
     const spec = { execPath: NODE, args: [`${NM}/@kici-dev/orchestrator/dist/server.js`] };
-    expect(resolveNpmInstallTarget(spec, 'orchestrator', { windows: false })?.owningPackage).toBe(
-      '@kici-dev/orchestrator',
-    );
+    const r = resolveNpmInstallTarget(spec, 'orchestrator', present);
+    expect(r.ok && r.target.owningPackage).toBe('@kici-dev/orchestrator');
+    expect(r.ok && r.target.globalPrefix).toBe(PREFIX);
   });
 
-  it('uses npm.cmd on windows', () => {
+  it('uses npm-cli.js beside node.exe on windows, else npm.cmd', () => {
     const spec = {
       execPath: 'C:\\node\\node.exe',
       args: ['C:\\node\\node_modules\\kici-admin\\node_modules\\@kici-dev\\agent\\dist\\server.js'],
     };
-    expect(resolveNpmInstallTarget(spec, 'agent', { windows: true })).toEqual({
-      nodeExecPath: 'C:\\node\\node.exe',
-      npmPath: 'C:\\node\\npm.cmd',
-      owningPackage: 'kici-admin',
+    expect(resolveNpmInstallTarget(spec, 'agent', { windows: true, exists: () => true })).toEqual({
+      ok: true,
+      target: {
+        nodeExecPath: 'C:\\node\\node.exe',
+        npmPath: 'C:\\node\\npm.cmd',
+        owningPackage: 'kici-admin',
+        globalPrefix: 'C:\\node',
+        npmInvocation: {
+          cmd: 'C:\\node\\node.exe',
+          preArgs: ['C:\\node\\node_modules\\npm\\bin\\npm-cli.js'],
+        },
+      },
     });
+    const r = resolveNpmInstallTarget(spec, 'agent', { windows: true, exists: () => false });
+    expect(r.ok && r.target.npmInvocation).toEqual({ cmd: 'C:\\node\\npm.cmd', preArgs: [] });
   });
 
-  it('returns null for an opaque --binary install (no entry script)', () => {
+  // breaks-if-wrong: a private Windows prefix outside the node directory must
+  // still resolve as the install prefix.
+  it('resolves a Windows private prefix that differs from the node directory', () => {
+    const spec = {
+      execPath: 'C:\\Program Files\\nodejs\\node.exe',
+      args: ['C:\\p\\node_modules\\kici-admin\\node_modules\\@kici-dev\\agent\\dist\\server.js'],
+    };
+    const r = resolveNpmInstallTarget(spec, 'agent', { windows: true, exists: () => true });
+    expect(r.ok && r.target.globalPrefix).toBe('C:\\p');
+  });
+
+  // fails-when: a local node_modules tree reads as a global install, and
+  // `npm install -g` lands in a prefix the unit never reads.
+  it('reports a launch entry outside a global npm install', () => {
+    for (const entry of [
+      '/srv/app/node_modules/@kici-dev/orchestrator/dist/server.js',
+      '/home/u/lib/x/node_modules/@kici-dev/orchestrator/dist/server.js',
+    ]) {
+      expect(
+        resolveNpmInstallTarget({ execPath: NODE, args: [entry] }, 'orchestrator', present),
+      ).toEqual({ ok: false, reason: 'not-global', entry });
+    }
+  });
+
+  it('reports no entry for an opaque --binary install (no entry script)', () => {
     expect(
-      resolveNpmInstallTarget({ execPath: '/opt/kici/orchestrator', args: [] }, 'orchestrator', {
-        windows: false,
-      }),
-    ).toBeNull();
+      resolveNpmInstallTarget(
+        { execPath: '/opt/kici/orchestrator', args: [] },
+        'orchestrator',
+        present,
+      ),
+    ).toEqual({ ok: false, reason: 'no-entry' });
   });
 
-  it('returns null for a non-node_modules (dev checkout) entry', () => {
+  it('reports no entry for a non-node_modules (dev checkout) entry', () => {
     const spec = {
       execPath: NODE,
       args: ['/home/u/src/kici/packages/orchestrator/dist/server.js'],
     };
-    // no @kici-dev/orchestrator/dist marker under node_modules → entry not found → null
-    expect(resolveNpmInstallTarget(spec, 'orchestrator', { windows: false })).toBeNull();
+    // no @kici-dev/orchestrator/dist marker under node_modules → entry not found
+    expect(resolveNpmInstallTarget(spec, 'orchestrator', present)).toEqual({
+      ok: false,
+      reason: 'no-entry',
+    });
   });
 });
 
