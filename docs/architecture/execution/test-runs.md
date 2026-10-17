@@ -238,19 +238,19 @@ A test-run `job.dispatch` carries the same execution-shaping fields as a product
 A test run applies **two different** `allowLocalExecution` gates, deliberately, because the two declarations mean different things:
 
 - **A bound `job.context` is allow-and-warn.** A test run never rejects on a bound environment. If a statically-named environment is a non-test environment (`allowLocalExecution: false`) or is not configured, it is **skipped** — its variables, secrets, and protection rules do not participate — and the run proceeds. A user-visible warning names the skipped environment(s), surfaced both on the `kici run remote` CLI output and on the dashboard run view. This keeps a job that deploys to a production environment in real runs still locally testable for its non-secret logic, while the `allowLocalExecution: false` boundary that keeps production secrets out of local runs is preserved (the secrets do not flow).
-- **A fixture `secrets:` mapping is fail-closed.** Mapping a secret context to an environment is an explicit request for that environment's secrets. If the named environment is missing or `allowLocalExecution: false`, the run is **rejected** at trigger time with `Fixture secret context '<ctx>' maps to environment '<env>' which does not allow test runs`.
+- **A fixture `secrets:` mapping is fail-closed.** Mapping a secret context to an environment is an explicit request for that environment's secrets. If the named environment is missing or `allowLocalExecution: false`, the run is **rejected** at trigger time with `Fixture secret context '<ctx>' maps to context '<env>' which does not allow test runs`.
 
 ## Upload storage
 
 Test tarballs are stored in the same S3-compatible object storage as dependency caches:
 
-| Setting     | Value                                                 |
-| ----------- | ----------------------------------------------------- |
-| Bucket      | Same as `KICI_STORAGE_BUCKET`                         |
-| Prefix      | `test-uploads/`                                       |
-| Path format | `test-uploads/{routing-key}/{sha}/{timestamp}.tar.gz` |
-| Retention   | 24 hours (S3 lifecycle rule on prefix)                |
-| Encryption  | Client-side ECDH + AES-256-GCM (described above)      |
+| Setting     | Value                                                     |
+| ----------- | --------------------------------------------------------- |
+| Bucket      | Same as `KICI_STORAGE_BUCKET`                             |
+| Prefix      | `test-uploads/`                                           |
+| Path format | `test-uploads/{routing-key}/{sha}/{upload-id}.tar.gz.enc` |
+| Retention   | 24 hours (S3 lifecycle rule on prefix)                    |
+| Encryption  | Client-side ECDH + AES-256-GCM (described above)          |
 
 No additional bucket configuration is required -- operators only need to ensure the `test-uploads/` prefix has a 24-hour lifecycle rule.
 

@@ -115,6 +115,45 @@ export function lookupDispatchInputsDescriptor(
 }
 
 /**
+ * Names the problem when `workflowName` is not a workflow of the compiled lock
+ * file, listing the workflows it does have; undefined when it is. An unparsable
+ * lock returns undefined and leaves the verdict to the orchestrator.
+ */
+export function describeMissingWorkflow(
+  inlineLockFile: string,
+  workflowName: string,
+): string | undefined {
+  let lock: { workflows?: { name: string }[] };
+  try {
+    lock = JSON.parse(inlineLockFile);
+  } catch {
+    return undefined;
+  }
+  const names = (lock.workflows ?? []).map((w) => w.name);
+  if (names.includes(workflowName)) return undefined;
+  const available = names.length
+    ? `Available workflows: ${names.join(', ')}`
+    : 'The lock file has no workflows';
+  return `Workflow '${workflowName}' is not in the compiled lock file. ${available}.`;
+}
+
+/**
+ * Checks `--workflow` against the lock file the compile just wrote, so an
+ * unknown name stops before anything is uploaded. Returns false after logging.
+ */
+async function checkWorkflowInLock(
+  workflowName: string | undefined,
+  options: RemoteRunOptions,
+): Promise<boolean> {
+  if (!workflowName) return true;
+  const lockPath = path.join(resolveKiciDir(options.kiciDir), 'kici.lock.json');
+  const problem = describeMissingWorkflow(await readFile(lockPath, 'utf-8'), workflowName);
+  if (!problem) return true;
+  logger.error(pc.red(problem));
+  return false;
+}
+
+/**
  * Fast-fails on invalid `--input` pairs but returns the **raw** strings: the
  * orchestrator is authoritative and applies coercion and defaults exactly once.
  */
@@ -195,12 +234,7 @@ export async function runRemoteCommand(
     // any compile or dispatch work.
     buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
 
-    if (options.workflow && !fixture && !options.all) {
-      return await runDirectWorkflow(options.workflow, options);
-    }
-
-    const kiciDir = resolveKiciDir(options.kiciDir);
-
+    // --history only reads local history, so it wins over every run selector.
     if (options.history) {
       const history = new RunHistory();
       await history.load();
@@ -208,6 +242,12 @@ export async function runRemoteCommand(
       console.log(history.formatTable(entries));
       return true;
     }
+
+    if (options.workflow && !fixture && !options.all) {
+      return await runDirectWorkflow(options.workflow, options);
+    }
+
+    const kiciDir = resolveKiciDir(options.kiciDir);
 
     const testsDir = path.join(kiciDir, 'tests');
     const fixtures = options.json
@@ -382,6 +422,7 @@ async function runFixturesRemotely(
   options: RemoteRunOptions,
 ): Promise<boolean> {
   if (!(await compileBeforeRemoteRun(options))) return false;
+  if (!(await checkWorkflowInLock(options.workflow, options))) return false;
 
   const config = await loadGlobalConfig();
   const ctx = await resolveRunContext(config, options);
@@ -397,6 +438,13 @@ async function runFixturesRemotely(
 
   if (!options.quiet) {
     for (const line of ctx.banner) logger.info(pc.gray(line));
+    if (options.workflow) {
+      logger.info(
+        pc.gray(
+          `Sending each fixture's event to workflow "${options.workflow}" only (bypassing triggers)`,
+        ),
+      );
+    }
     logger.info(pc.gray(`Fixtures: ${fixtures.length} to run\n`));
   }
 
@@ -575,6 +623,15 @@ async function runSingleFixture(
     logger.info(pc.cyan(`\n--- ${fixture.id} ---`));
   }
 
+  // `--workflow` is the explicit choice for this invocation, so it wins over a
+  // workflow the fixture names itself.
+  if (options.workflow && opts.workflowName && opts.workflowName !== options.workflow) {
+    warnStderr(
+      `fixture ${fixture.id} names workflow '${opts.workflowName}'; running '${options.workflow}' as --workflow asks.`,
+    );
+  }
+  const workflowName = options.workflow ?? opts.workflowName;
+
   try {
     const overlay = await prepareOverlay(options);
     const uploaded = await initAndUpload(ctx, overlay, options);
@@ -615,7 +672,7 @@ async function runSingleFixture(
         encryptedSecrets: encrypted.encryptedSecrets,
         encryptedSecretsKey: encrypted.cliPublicKey,
       }),
-      workflowName: opts.workflowName,
+      workflowName,
       inlineLockFile: overlay.inlineLockFile,
       // The overlay carries the complete working tree; a relayed run never clones.
       fullRepo: true,
@@ -625,10 +682,7 @@ async function runSingleFixture(
         return target ? { target } : {};
       })(),
       ...(() => {
-        const descriptor = lookupDispatchInputsDescriptor(
-          overlay.inlineLockFile,
-          opts.workflowName,
-        );
+        const descriptor = lookupDispatchInputsDescriptor(overlay.inlineLockFile, workflowName);
         const dispatchInputs = buildDispatchInputs(options.inputs ?? [], descriptor);
         return Object.keys(dispatchInputs).length ? { dispatchInputs } : {};
       })(),
@@ -992,6 +1046,7 @@ async function runDirectWorkflow(
   options: RemoteRunOptions,
 ): Promise<boolean> {
   if (!(await compileBeforeRemoteRun(options))) return false;
+  if (!(await checkWorkflowInLock(workflowName, options))) return false;
 
   const config = await loadGlobalConfig();
   const ctx = await resolveRunContext(config, options);
@@ -1052,13 +1107,16 @@ async function runDirectWorkflow(
       })(),
     });
 
+    if (triggerResult.status === 'rejected') {
+      logger.error(pc.red(`Rejected: ${triggerResult.reason ?? 'unknown reason'}`));
+      return false;
+    }
+
     if (!options.quiet) {
       logger.info(pc.green(`Run started: ${triggerResult.runId}`));
     }
 
-    if (options.wait === false) {
-      return triggerResult.status === 'accepted';
-    }
+    if (options.wait === false) return true;
 
     const result = await pollRunToCompletion(ctx, triggerResult.runId, fixtureId, options);
     return result.status === 'success';

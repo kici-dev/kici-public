@@ -26,6 +26,7 @@ contexts
   required_reviewers     JSONB
   wait_timer_seconds     INTEGER
   hold_expiry_seconds    INTEGER
+  minimum_trust          TEXT
   allow_local_execution  BOOLEAN DEFAULT false
   created_by     TEXT
   created_at     TIMESTAMPTZ
@@ -55,9 +56,15 @@ held_runs
   org_id          TEXT NOT NULL
   run_id          TEXT NOT NULL
   job_id          TEXT NOT NULL
-  context_id  UUID FK -> contexts
+  context_id  UUID FK -> contexts (NULL once the context is deleted)
   hold_type       TEXT NOT NULL
-  reason          TEXT NOT NULL
+  hold_scope      TEXT DEFAULT 'job'   -- 'workflow' | 'job' | 'step'
+  step_index      INTEGER              -- step-scoped holds only
+  trigger_source  TEXT                 -- 'context' | 'explicit'
+  queue_type      TEXT                 -- 'context' | 'security'
+  approval_requirement JSONB           -- clauses the hold must satisfy
+  payload         JSONB                -- drift payload of a 'drift' step gate
+  reason          TEXT
   status          TEXT DEFAULT 'pending'
   approved_by     TEXT
   resolved_at     TIMESTAMPTZ
@@ -83,6 +90,7 @@ context_bindings
   org_id          TEXT NOT NULL
   context_id  UUID FK -> contexts
   scope_pattern   TEXT NOT NULL  -- glob pattern, e.g., 'aws/prod/**'
+  host_pattern    TEXT DEFAULT '**'  -- hosts the binding applies to
 ```
 
 ## Dispatch flow
@@ -126,7 +134,7 @@ Each job's ordered bound-context name list is persisted on its `execution_jobs.c
 
 ### Dynamic field resolution
 
-When a lock file job has dynamic fields (`dynamicContext`, `dynamicEnv`, or `dynamicConcurrencyGroup` set to `true`), the orchestrator resolves them before dispatch. It never evaluates workflow code in-process — every dynamic function runs on the eval agent's init runner.
+When a lock file job has dynamic fields (a `contexts` element with `dynamic: true`, or `dynamicEnv` / `dynamicConcurrencyGroup` set to `true`), the orchestrator resolves them before dispatch. It never evaluates workflow code in-process — every dynamic function runs on the eval agent's init runner.
 
 #### Init model
 
@@ -138,7 +146,7 @@ To resolve dynamic fields, the orchestrator uses a two-phase init model:
 2. Agent loads the compiled bundle and extracts the workflow/job
 3. Agent calls the dynamic function(s) with the normalized webhook event
 4. Agent reports resolved values via `job.status` with `data.initResult`
-5. Orchestrator receives: `{ contextName?, env?, concurrencyGroup? }`
+5. Orchestrator receives: `{ contextNames?, env?, concurrencyGroup? }` (`contextNames` holds one resolved name per `contexts` element, in merge order)
 
 **Phase 2 -- Resolution + execution:** 6. Orchestrator treats resolved values as static -- full context lookup, protection rules, secret resolution, variable merge all proceed normally 7. A fresh execution job is dispatched with everything resolved
 
@@ -156,7 +164,7 @@ To resolve dynamic fields, the orchestrator uses a two-phase init model:
   so the job that resumes on approval carries the resolved values
 - All dynamic fields resolved in a single init call (no separate callbacks per field)
 - Init runner runs in its own agent process -- user code never executes in the orchestrator
-- Dynamic function evaluation has a 60-second timeout (configurable per-job)
+- Each dynamic function call has a 60-second timeout
 - If a dynamic function throws, the job fails immediately
 - If a dynamic function returns undefined, the job proceeds without that field
 - Init results are NOT cacheable (functions may be non-deterministic)
@@ -285,7 +293,7 @@ Each context carries an `allow_local_execution` flag (default `false`) that gate
 When the orchestrator resolves secrets for a test run, it combines the developer's CLI-uploaded local secrets (sent encrypted with the run) with test-context secrets resolved from `scoped_secrets`. The test-context side is filtered by `allow_local_execution`:
 
 - The job's own declared `context` and each fixture `secrets: { ctx: envName }` mapping resolve secrets **only** when the target context has `allow_local_execution = true`. Only a statically-named `context` participates — the static name goes through the same gate. Dynamic contexts (resolved on the agent's init step) are not evaluated for test runs and contribute no context-resolved secrets.
-- The gate applies to **all** remote test runs: a run whose matched workflow targets an context with the flag off is rejected before dispatch.
+- The gate applies to **all** remote test runs, and a job's bound context never rejects one: a bound context with the flag off, or one that is not configured, is skipped (its variables, secrets and protection rules do not participate), and a warning names it.
 - A fixture mapping that points a context at a missing context, or at one whose flag is off, **rejects the run** (fail-closed).
 - On a key collision, the CLI-uploaded local value wins over the test-context value, giving a per-run override.
 
@@ -311,24 +319,21 @@ Secrets are NOT injected as environment variables. They flow through IPC and are
 
 ## Held-run lifecycle
 
-A protection gate holds a run or job at the `held` status — a non-terminal member of both `ExecutionRunStatus` and `ExecutionJobStatus`. The orchestrator's execution tracker owns these status transitions:
+A protection gate holds a run at the `held` status — a non-terminal member of `ExecutionRunStatus`. `ExecutionJobStatus` has no `held` member; the `held_runs` row records which job waits. The orchestrator's execution tracker owns these status transitions:
 
 ```
-                    held
-                   /    \
-                  v      v
-pending -> queued -> running -> success
-                          \-> failed
-                          \-> cancelled
+held -> pending -> running -> success
+                           \-> failed
+                           \-> cancelled
 
 held status:
   awaiting approval / timer
-    -> approval satisfied  -> queued -> running
+    -> approval satisfied  -> pending -> running
     -> rejection           -> cancelled
     -> expiry (hold_expiry_seconds exceeded) -> failed
 ```
 
-The `held` status is non-terminal. It resolves to `queued` once the gate is satisfied (a reviewer approves, or a timer elapses).
+The `held` status is non-terminal. It resolves to `pending` once the gate is satisfied (a reviewer approves, or a timer elapses), and the resumed dispatch moves the run on from there. On expiry, a job- or workflow-scoped hold fails the whole run; a step-scoped hold fails only its waiting step.
 
 ## Dashboard CRUD
 
@@ -336,15 +341,14 @@ Context management in the dashboard goes through the same REST-over-WS proxy pat
 
 ## Lock file schema
 
-The lock file (v6+) includes per-job context fields:
+The lock file includes per-job context fields:
 
 ```json
 {
   "jobs": [
     {
       "name": "deploy",
-      "context": "production",
-      "dynamicContext": false,
+      "contexts": [{ "value": "production", "dynamic": false }],
       "env": { "DEPLOY_TARGET": "us-east-1" },
       "dynamicEnv": false,
       "concurrencyGroup": "production-api",
@@ -354,8 +358,7 @@ The lock file (v6+) includes per-job context fields:
 }
 ```
 
-- `context` -- static context name (`string`)
-- `dynamicContext` -- `true` when context is a function (resolved on the agent's init step)
+- `contexts` -- bound contexts in merge order. Each element carries a static context name in `value`; `dynamic` is `true` when the element is a function (resolved on the agent's init step), and its `value` is then empty
 - `env` -- static environment variables (`Record<string, string>`)
 - `dynamicEnv` -- `true` when env is a function
 - `concurrencyGroup` -- static concurrency group name (`string`)

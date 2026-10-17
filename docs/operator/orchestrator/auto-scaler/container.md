@@ -17,7 +17,7 @@ The container backend provisions agents as ephemeral containers via the Docker-c
 
 **Label-set-level fields:**
 
-- `image` — Container image to spawn. Required on every container label set.
+- `image` — Container image to spawn. Required on every container label set. Agents run this image whatever version the orchestrator runs, so pin it to your orchestrator's release (`quay.io/kici-dev/kici-agent:<version>`) and bump the tag when you upgrade. `kici-admin orchestrator upgrade` warns when a label set names a `kici-agent` older than the upgrade target, or `kici-agent:latest` with `imagePullPolicy: IfNotPresent`. See [Upgrade and rollback](../../upgrade-and-rollback.md).
 - `imagePullPolicy` — `IfNotPresent` (default), `Always`, or `Never`. The default inspects the local image and pulls only when it is absent, so a pinned, immutable agent image is not re-pulled on every spawn. Set `Always` on a label set that tracks a **moving tag** (e.g. `:latest`) or otherwise needs a fresh image on each spawn; `Never` fails the spawn if the image is not already local.
 - `volumes` — Bind-mount volumes, e.g. `/host/cache:/cache:ro`.
 - `containerSocket` — Mount the container runtime socket into the agent. Default: `false`. See the [security warning](#container-socket-sharing--security-warning) before enabling.
@@ -103,7 +103,7 @@ scalers:
     host: 'tcp://192.168.1.10:2376'
     labelSets:
       - labels: ['linux', 'container']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
 ```
 
 ## Registry authentication
@@ -186,7 +186,7 @@ scalers:
     maxAgents: 10
     labelSets:
       - labels: ['linux', 'container']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
 ```
 
 ### Wrong runtime detected
@@ -205,7 +205,7 @@ scalers:
     maxAgents: 10
     labelSets:
       - labels: ['linux', 'container']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
 ```
 
 ### Rootless Podman socket not found
@@ -237,7 +237,7 @@ scalers:
     maxAgents: 10
     labelSets:
       - labels: ['linux', 'container']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
 ```
 
 ### Orphaned containers
@@ -323,7 +323,7 @@ scalers:
     maxAgents: 20
     labelSets:
       - labels: ['linux', 'container']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
         resources:
           limits:
             memory: '2g'

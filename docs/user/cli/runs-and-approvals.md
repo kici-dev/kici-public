@@ -130,6 +130,9 @@ kici run remote --all
 # Run a specific workflow directly (bypass trigger matching)
 kici run remote --workflow ci
 
+# Send a fixture's event to one workflow only (bypass trigger matching)
+kici run remote push-main --workflow ci
+
 # Quiet mode -- just pass/fail
 kici run remote push-main --quiet
 
@@ -166,6 +169,19 @@ fixtures run through the normal remote pipeline (honoring `--parallel`,
   `--workflow`. Passing any together exits with code 2.
 - When `stdin` is not a TTY, `--pick` prints the available fixtures and exits
   without running anything — pass a fixture name (or `--all`) in scripts.
+
+**Running one workflow (`--workflow`):**
+
+`--workflow <name>` runs only the named workflow and bypasses trigger matching.
+
+- Without a fixture, the workflow gets a `manual` event.
+- With a fixture (or a glob, or `--all`), each selected fixture's event goes to
+  that workflow only. The other workflows the event matches do not run.
+- `--workflow` wins over a workflow the fixture names itself. The CLI prints a
+  warning when the two differ.
+- A name that is not in the compiled lock file stops the run before anything
+  is uploaded. The error lists the workflows the lock file contains.
+- `--workflow` cannot be combined with `--pick`.
 
 #### Host narrowing with `--target`
 
@@ -433,6 +449,21 @@ kici runs cancel abc123 --force
 kici runs cancel --branch feature/wip
 ```
 
+To cancel a run on an orchestrator directly, for example a run on the local dev
+plane, pass `--orchestrator-url <url>` or set `KICI_ORCHESTRATOR_TOKEN` (with
+`KICI_ORCHESTRATOR_URL` or a saved `kici connect` URL), the same way
+`kici run remote` picks its target. The command then calls that orchestrator's admin API, so
+the token needs the `run.cancel` permission. A target saved with `kici connect`
+is used on its own only when you are not logged in to the Platform. `--branch`
+always goes through the Platform, and it cannot be combined with
+`--orchestrator-url`.
+
+```bash
+KICI_ORCHESTRATOR_URL=http://127.0.0.1:4319 \
+KICI_ORCHESTRATOR_TOKEN="$(cat ~/.kici/local/admin-token)" \
+  kici runs cancel abc123 --force
+```
+
 #### kici runs artifacts list
 
 List the [artifacts](../sdk/artifacts.md) a run uploaded — name, producing job,
@@ -634,7 +665,7 @@ Synopsis: `kici run remote [fixture] [options]`
 
 | Option                      | Default | Description                                                                                               |
 | --------------------------- | ------- | --------------------------------------------------------------------------------------------------------- |
-| `--workflow <name>`         |         | Run a specific workflow directly (bypass triggers)                                                        |
+| `--workflow <name>`         |         | Run only this workflow, bypassing triggers (with a fixture: send its event to this workflow)              |
 | `--all`                     | `false` | Run all available fixtures                                                                                |
 | `-p, --pick`                | `false` | Interactively pick fixtures to run                                                                        |
 | `--parallel`                | `false` | Run matching fixtures concurrently                                                                        |
@@ -722,10 +753,11 @@ Synopsis: `kici runs cancel [run-id] [options]`
 
 **Options**
 
-| Option            | Default | Description                                 |
-| ----------------- | ------- | ------------------------------------------- |
-| `--force`         | `false` | Force cancel (kill immediately, skip hooks) |
-| `--branch <name>` |         | Cancel all in-progress runs on this branch  |
+| Option                     | Default | Description                                                                               |
+| -------------------------- | ------- | ----------------------------------------------------------------------------------------- |
+| `--force`                  | `false` | Force cancel (kill immediately, skip hooks)                                               |
+| `--branch <name>`          |         | Cancel all in-progress runs on this branch                                                |
+| `--orchestrator-url <url>` |         | Cancel on this orchestrator directly (token from KICI_ORCHESTRATOR_TOKEN or kici connect) |
 
 ### `kici runs list`
 

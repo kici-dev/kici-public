@@ -36,6 +36,13 @@ function pinnedMiseVersion(config: MiseInitConfig): string | undefined {
   return bare;
 }
 
+/** Whether the preset's `env` sets PATH for the init command (any case on Windows). */
+function initSetsPath(config: MiseInitConfig, platform: NodeJS.Platform): boolean {
+  return Object.keys(config.env ?? {}).some((key) =>
+    platform === 'win32' ? key.toUpperCase() === 'PATH' : key === 'PATH',
+  );
+}
+
 async function buildRun(
   args: MiseExpandArgs,
   template: MiseTemplate,
@@ -57,7 +64,7 @@ export const miseExpander = {
   async expand(args: MiseExpandArgs): Promise<GenericInitConfig> {
     const platform = args.platform ?? process.platform;
     const version = pinnedMiseVersion(args.config);
-    const template = selectMiseTemplate(platform, version);
+    const template = selectMiseTemplate(platform, version, initSetsPath(args.config, platform));
     const run = await buildRun(args, template, version);
 
     const cache =

@@ -154,7 +154,8 @@ CREATE TABLE config_versions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   created_by TEXT NOT NULL,
   description TEXT,
-  encrypted_paths TEXT[] NOT NULL DEFAULT '{}'
+  encrypted_paths TEXT[] NOT NULL DEFAULT '{}',
+  key_version INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX idx_config_versions_version ON config_versions(version DESC);
@@ -180,7 +181,7 @@ CREATE INDEX idx_config_versions_created_at ON config_versions(created_at DESC);
 
 ### Algorithm
 
-AES-256-GCM via the existing `secrets/crypto.ts` module:
+AES-256-GCM via the shared secret-encryption module (`packages/shared/src/secret-crypto.ts`):
 
 - **Key:** 32-byte AES-256 key derived from the master key (`KICI_SECRET_KEY`)
 - **IV:** Random 12-byte initialization vector per encryption
@@ -303,7 +304,7 @@ A GitHub App source populates all seven. The file-contents capability arrives as
 
 A plain generic webhook source carries only the normalizer, because it has no repository API to fetch a lock file or post a check against. The pipeline skips the stages whose interface is absent rather than failing the delivery.
 
-Provider registrations are managed via the `sources` database table, not via `SharedConfig`. When the orchestrator connects to the Platform relay, it reads source records from the DB and sends `source.register` messages. Changes to sources (add/remove) are detected via PostgreSQL LISTEN/NOTIFY on the `sources_change` channel and pushed to the Platform via `source.secrets` and `source.register`/`source.deregister`.
+Provider registrations are managed via the `sources` database table, not via `SharedConfig`. When the orchestrator connects to the Platform relay, it reads source records from the DB and sends `source.register` messages. Changes to sources (add/remove) are detected via PostgreSQL LISTEN/NOTIFY on the `sources_change` channel and pushed to the Platform via `source.register`/`source.deregister`. No secret material goes to the Platform: the orchestrator verifies each webhook signature itself.
 
 ### Per-App Credentials
 

@@ -2,6 +2,23 @@
 
 Release notes for the public KiCI packages.
 
+## v0.20.0 — 2026-10-17
+
+### Features
+
+- kici-admin orchestrator upgrade warns when a container scaler label set would keep spawning an old agent: a kici-agent image older than the upgrade target, or kici-agent:latest with imagePullPolicy IfNotPresent. The warning names the scaler, the label set and the image line to set.
+
+### Fixes
+
+- kici runs cancel cancels on an orchestrator directly when KICI_ORCHESTRATOR_TOKEN selects one, such as the local dev plane, instead of asking the Platform, which has never seen that run
+- kici run --local cancels its run in the local plane whenever it stops following it early (no agent picked it up, a timeout, an error, or Ctrl-C), so a later plane start never dispatches the abandoned run again
+- The bare-metal quickstart's dual-scaler example (scalers.dual.yaml) pins the kici-agent image to the release instead of :latest, so a host that already pulled :latest no longer keeps an old agent. The compose quickstart's upgrade steps now re-download scalers.yaml, which pins the agent image.
+- The mise init preset now puts the mise CLI on the step PATH without a pinned version, so a step can run mise run, mise exec or mise --version.
+- `kici run remote <fixture> --workflow <name>` now sends the fixture's event to the named workflow only, instead of ignoring `--workflow` and running every workflow the event matches. A glob or `--all` runs each fixture against that workflow, and a name the compiled lock file lacks stops the run before upload with a list of the workflows it has.
+- `kici run remote --workflow <name>` now reports a run the orchestrator rejects and exits 1, instead of printing "Run started" and waiting on a run that does not exist.
+- `kici run remote --history --workflow <name>` now shows the run history instead of starting a run of that workflow.
+- The generic-init mise example in the SDK docs now puts the mise CLI on the step PATH, not only its shims.
+
 ## v0.19.0 — 2026-10-17
 
 ### Features

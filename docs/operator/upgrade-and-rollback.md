@@ -23,9 +23,14 @@ window. Protocol 4 raises it from 3: an orchestrator on protocol 4 refuses an
 agent from 0.15.x or earlier (protocol 3) at connect until the agent is
 upgraded.
 
-- **Ephemeral scaler-spawned agents** update themselves on the next spawn once
-  you update the image reference in the scaler label-set config and reload — each
-  new agent pulls the new image.
+- **Ephemeral scaler-spawned agents** run the image (or `binaryPath`) their
+  label set names, not the orchestrator's version. A container agent moves to
+  the new release only when you set its label set's `image` to the new
+  `quay.io/kici-dev/kici-agent:<version>` and restart the orchestrator; each new
+  agent then pulls the new image. A label set that names `kici-agent:latest`
+  with the default `imagePullPolicy: IfNotPresent` keeps the image the host
+  already pulled, so pin the version, or set `imagePullPolicy: Always` to pull
+  `latest` on every spawn.
 - **Long-lived installed agents** are upgraded with `kici-admin agent upgrade`.
 
 On version skew: the orchestrator enforces a protocol-version floor during the
@@ -132,6 +137,17 @@ versioned directory layout with an atomic symlink flip, and previous versions
 are preserved on disk. See
 [Service installation](./distribution/service-installation.md) for the full
 command reference.
+
+Before it restarts the orchestrator, `kici-admin orchestrator upgrade` reads the
+scaler config (`KICI_SCALER_CONFIG_PATH` and `KICI_SCALER_CONFIG_DIR`) and
+warns about each container label set that would keep spawning an old agent:
+
+- a `kici-agent:<version>` older than the upgrade target
+- `kici-agent:latest` (or no tag) with `imagePullPolicy` absent or `IfNotPresent`
+
+Each warning names the scaler, the label set and the `image:` line to set. The
+upgrade still runs: edit the scaler config, then restart the orchestrator
+(`kici-admin orchestrator restart`) so new agents use the new image.
 
 ## Rolling back
 

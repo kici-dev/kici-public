@@ -52,15 +52,34 @@ rm -f "$kici_mise_env"`;
 
 const BASH_PINNED_PATH = `echo "$kici_mise_dir" >> "$KICI_PATH"`;
 const BASH_SHIMS_PATH = `echo "$HOME/.local/share/mise/shims" >> "$KICI_PATH"`;
+// The PATH the init started with. Steps start from the same PATH, so a mise
+// directory already on it needs no entry in $KICI_PATH. A PATH set in the
+// init's env never reaches steps: then the entry PATH is empty and the mise
+// directory is always added.
+function bashEntryPath(initSetsPath: boolean): string {
+  return initSetsPath ? `kici_mise_entry_path=''` : `kici_mise_entry_path="$PATH"`;
+}
+// The mise CLI for steps: the directory of the mise this init ran, when steps
+// cannot already find it. It goes after the shims dir, so a tool mise manages
+// still resolves through its shim. The assignments fail the init when mise
+// does not resolve.
+const BASH_RESOLVED_MISE_PATH = `kici_mise_cli="$(command -v mise)"
+kici_mise_cli_dir="$(dirname "$kici_mise_cli")"
+case ":$kici_mise_entry_path:" in
+  *":$kici_mise_cli_dir:"*) ;;
+  *) echo "$kici_mise_cli_dir" >> "$KICI_PATH" ;;
+esac`;
 
-function bashRun(version: string | undefined): string {
+function bashRun(version: string | undefined, initSetsPath: boolean): string {
   const pinned = version !== undefined;
   return [
     'set -euo pipefail',
+    ...(pinned ? [] : [bashEntryPath(initSetsPath)]),
     pinned ? BASH_PINNED_INSTALL.replaceAll('<MISE_VERSION>', version) : BASH_LATEST_INSTALL,
     BASH_INSTALL_TOOLS,
     ...(pinned ? [BASH_PINNED_PATH] : []),
     BASH_SHIMS_PATH,
+    ...(pinned ? [] : [BASH_RESOLVED_MISE_PATH]),
   ].join('\n');
 }
 
@@ -141,14 +160,28 @@ const PWSH_BIN_PATHS = `# Add the real tool install dirs (not the shims dir): th
 # re-invoke mise, and bin-paths points straight at the installed binaries.
 Invoke-Mise bin-paths | Add-Content -Path $env:KICI_PATH`;
 
-function pwshRun(version: string | undefined): string {
+// The PATH the init started with; see bashEntryPath.
+function pwshEntryPath(initSetsPath: boolean): string {
+  return initSetsPath ? `$miseEntryPath = ''` : `$miseEntryPath = $env:PATH`;
+}
+// The mise CLI for steps: the directory of the mise this init ran, after the
+// tool dirs, when the entry PATH does not already hold it. Windows paths
+// compare without case and without a trailing backslash.
+const PWSH_RESOLVED_MISE_PATH = `$miseCli = (Get-Command mise -CommandType Application | Select-Object -First 1).Source
+$miseCliDir = (Split-Path -Parent $miseCli).TrimEnd('\\')
+$miseEntryDirs = @($miseEntryPath -split ';' | ForEach-Object { $_.TrimEnd('\\') })
+if ($miseEntryDirs -notcontains $miseCliDir) { Add-Content -Path $env:KICI_PATH -Value $miseCliDir }`;
+
+function pwshRun(version: string | undefined, initSetsPath: boolean): string {
   const pinned = version !== undefined;
   return [
     PWSH_PRELUDE,
+    ...(pinned ? [] : [pwshEntryPath(initSetsPath)]),
     pinned ? PWSH_PINNED_INSTALL.replaceAll('<MISE_VERSION>', version) : PWSH_LATEST_INSTALL,
     PWSH_INSTALL_TOOLS,
     ...(pinned ? [PWSH_PINNED_PATH] : []),
     PWSH_BIN_PATHS,
+    ...(pinned ? [] : [PWSH_RESOLVED_MISE_PATH]),
   ].join('\n');
 }
 
@@ -156,18 +189,32 @@ function pwshRun(version: string | undefined): string {
  * Pick the mise template for a host platform (Node `process.platform` value),
  * pinned to `version` (bare, like `2026.5.1`) when given. The Windows `run`
  * carries an `<ASSET_URL>` placeholder the expander replaces with the resolved
- * GitHub-release zip URL (the pinned tag, or the latest release).
+ * GitHub-release zip URL (the pinned tag, or the latest release). `initSetsPath`
+ * says the preset's `env` sets PATH for the init command, so the init's PATH
+ * is not the PATH steps start from.
  */
-export function selectMiseTemplate(platform: NodeJS.Platform, version?: string): MiseTemplate {
+export function selectMiseTemplate(
+  platform: NodeJS.Platform,
+  version?: string,
+  initSetsPath = false,
+): MiseTemplate {
   // The version is substituted into a shell script: accept only a bare release.
   if (version !== undefined && normalizeMiseVersion(version) !== version) {
     throw new Error(`invalid mise version for the preset template: ${JSON.stringify(version)}`);
   }
   if (platform === 'win32') {
-    return { run: pwshRun(version), shell: 'pwsh', cachePaths: ['~/AppData/Local/mise'] };
+    return {
+      run: pwshRun(version, initSetsPath),
+      shell: 'pwsh',
+      cachePaths: ['~/AppData/Local/mise'],
+    };
   }
   if (platform === 'linux' || platform === 'darwin') {
-    return { run: bashRun(version), shell: 'bash', cachePaths: ['~/.local/share/mise'] };
+    return {
+      run: bashRun(version, initSetsPath),
+      shell: 'bash',
+      cachePaths: ['~/.local/share/mise'],
+    };
   }
   throw new Error(`unsupported platform for mise preset: ${platform}`);
 }

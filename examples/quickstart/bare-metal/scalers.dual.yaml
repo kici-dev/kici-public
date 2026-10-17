@@ -32,7 +32,12 @@ scalers:
     networkIsolation: false
     labelSets:
       - labels: [linux, container]
-        image: quay.io/kici-dev/kici-agent:latest
+        # Agent containers run this image, not the orchestrator's version.
+        # Each release pins this line to itself. When you upgrade the
+        # orchestrator, set the same version here and restart it;
+        # `kici-admin orchestrator upgrade` warns when this image is older
+        # than the upgrade target.
+        image: quay.io/kici-dev/kici-agent:0.20.0@sha256:860c84bf420d76ce0900b0e41fe9fde0a7dfe47862d933028ff48da7efb7d1a4
 
   - name: bare-metal-default
     type: bare-metal

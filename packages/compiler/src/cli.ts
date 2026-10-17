@@ -187,7 +187,10 @@ export function buildProgram(): Command {
     .command('remote')
     .argument('[fixture]', 'Fixture name or glob pattern (omit to list available)')
     .description('Execute fixtures remotely via orchestrator')
-    .option('--workflow <name>', 'Run a specific workflow directly (bypass triggers)')
+    .option(
+      '--workflow <name>',
+      'Run only this workflow, bypassing triggers (with a fixture: send its event to this workflow)',
+    )
     .option('--all', 'Run all available fixtures', false)
     .option('-p, --pick', 'Interactively pick fixtures to run', false)
     .option('--parallel', 'Run matching fixtures concurrently', false)
@@ -800,11 +803,16 @@ Environment variables:
     .description('Cancel a run, or all in-progress runs on a branch')
     .option('--force', 'Force cancel (kill immediately, skip hooks)', false)
     .option('--branch <name>', 'Cancel all in-progress runs on this branch')
+    .option(
+      '--orchestrator-url <url>',
+      'Cancel on this orchestrator directly (token from KICI_ORCHESTRATOR_TOKEN or kici connect)',
+    )
     .action(async (runId, options) => {
       const { runsCancelCommand } = await import('./commands/index.js');
       const success = await runsCancelCommand(runId, {
         force: options.force,
         branch: options.branch,
+        orchestratorUrl: options.orchestratorUrl,
       });
       process.exit(success ? 0 : 1);
     });

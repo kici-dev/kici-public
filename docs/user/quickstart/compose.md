@@ -259,15 +259,16 @@ The Platform handles webhook ingress, relay and audit logging. Your orchestrator
 
 ## Upgrading
 
-When a new KiCI version ships, the published `quay.io/kici-dev/kici-orchestrator` and `quay.io/kici-dev/kici-agent` images move to the new tag and the compose template pins it. Re-download the template, pull, and recreate the stack:
+When a new KiCI version ships, the published `quay.io/kici-dev/kici-orchestrator` and `quay.io/kici-dev/kici-agent` images move to the new tag. The compose template pins the orchestrator image, and `scalers.yaml` pins the agent image. Re-download both files, pull, and recreate the stack:
 
 ```bash
 curl -O https://raw.githubusercontent.com/kici-dev/kici-public/main/examples/quickstart/compose/docker-compose.yaml
+curl -O https://raw.githubusercontent.com/kici-dev/kici-public/main/examples/quickstart/compose/scalers.yaml
 docker compose pull
 docker compose up -d
 ```
 
-`docker compose up -d` recreates the orchestrator from the newer pinned image; your `.env`, the Postgres volume, and `scalers.yaml` are left untouched. Agent containers respawn from the new agent image on the next job, and DB migrations run automatically on first start of the new version.
+`docker compose up -d` recreates the orchestrator from the newer pinned image, which reads the new `scalers.yaml`. Your `.env` and the Postgres volume are left untouched. Agent containers start from the image that `scalers.yaml` names, so the next job runs the new agent. If you edited `scalers.yaml`, keep your copy and set its `image:` line to the new `quay.io/kici-dev/kici-agent:<version>` instead. DB migrations run automatically on first start of the new version.
 
 ## Where to next
 

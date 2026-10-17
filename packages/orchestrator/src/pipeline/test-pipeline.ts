@@ -205,7 +205,10 @@ function selectMatchedDecisions(
       (w: LockWorkflow) => w.name === input.workflowName,
     );
     if (!workflow) {
-      return { rejected: `Workflow '${input.workflowName}' not found in lock file` };
+      const available = fullLockFile.workflows.map((w: LockWorkflow) => w.name).join(', ');
+      return {
+        rejected: `Workflow '${input.workflowName}' not found in lock file. Available workflows: ${available || '(none)'}`,
+      };
     }
     decisions = [
       createWorkflowDecision(input.workflowName, true, [], undefined, 'Direct test run'),

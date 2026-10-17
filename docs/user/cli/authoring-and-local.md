@@ -129,7 +129,7 @@ whenever the plane cannot supply them (for `stopped` that is all of them, and
 `stampVersion` is populated only for `ready`), so read them defensively
 (`jq -r '.pid // empty'`).
 
-A local run also fails fast when no agent claims it: if no scaler label set matches the job's `runsOn`, or the agent cannot start, the run gives up within a short acceptance window (2 minutes by default, overridable with `KICI_LOCAL_ACCEPTANCE_TIMEOUT_MS`) and names the plane log instead of waiting out the full no-progress timeout.
+A local run also fails fast when no agent claims it. If no scaler label set matches the job's `runsOn`, or the agent cannot start, the run gives up within a short acceptance window. The window is 2 minutes by default, and `KICI_LOCAL_ACCEPTANCE_TIMEOUT_MS` overrides it. The CLI then names the plane log instead of waiting out the full no-progress timeout. Whenever the CLI stops following a run before it finishes (a timeout, an error, or Ctrl-C), it cancels the run in the plane, so a later plane start never dispatches it again.
 
 **Verifying an offline-signed bundle:** export the plane's trust root, then pass it to the verifier:
 

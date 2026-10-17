@@ -5,6 +5,7 @@ import {
   buildTargetSelector,
   buildDispatchInputs,
   lookupDispatchInputsDescriptor,
+  describeMissingWorkflow,
   requestRunCancel,
   watchRunHolds,
   withStdoutOnStderr,
@@ -226,7 +227,10 @@ describe('kici run command', () => {
     });
 
     createOverlayTarball.mockResolvedValue(overlay);
-    mockReadFile.mockResolvedValue('{"schemaVersion":4}');
+    // The direct-path tests name these workflows; the CLI checks them against the lock.
+    mockReadFile.mockResolvedValue(
+      '{"schemaVersion":4,"workflows":[{"name":"ci"},{"name":"deploy"}]}',
+    );
 
     uploadTarball.mockResolvedValue({
       uploadId: 'upload-456',
@@ -462,6 +466,169 @@ describe('kici run command', () => {
     });
   });
 
+  describe('--workflow combined with a fixture', () => {
+    const LOCK = '{"schemaVersion":4,"workflows":[{"name":"ci"},{"name":"deploy"}]}';
+    const prFixture = {
+      id: 'pr-open',
+      sourceFile: '/mock/.kici/tests/pr.ts',
+      fixture: { id: 'pr-open', options: { event: { _type: 'pr' }, branch: 'feature' } },
+    };
+
+    beforeEach(() => {
+      mockReadFile.mockResolvedValue(LOCK);
+    });
+
+    // A fixture that names its own workflow.
+    const pinned = {
+      ...fixture,
+      fixture: { ...fixture.fixture, options: { ...fixture.fixture.options, workflowName: 'ci' } },
+    };
+    const useFixtures = (...fs: (typeof fixture)[]) => {
+      compileFixtures.mockResolvedValue(fs);
+      filterFixtures.mockReturnValue(fs);
+    };
+
+    it("sends the fixture's event to the named workflow only", async () => {
+      useFixtures(fixture);
+
+      const result = await runRemoteCommand('push-main', {
+        kiciDir: '.kici',
+        workflow: 'deploy',
+        wait: false,
+      });
+
+      expect(result).toBe(true);
+      expect(mockClient.trigger).toHaveBeenCalledTimes(1);
+      // fails-when: the fixture path drops --workflow (the #462 defect) — workflowName is undefined
+      // and the orchestrator trigger-matches every workflow the push event reaches.
+      expect(mockClient.trigger).toHaveBeenCalledWith(
+        'org_a',
+        expect.anything(),
+        expect.objectContaining({
+          fixtureId: 'push-main',
+          workflowName: 'deploy',
+          event: expect.objectContaining({ type: 'push', targetBranch: 'main' }),
+        }),
+      );
+    });
+
+    it('runs each fixture a glob matches against the one workflow', async () => {
+      useFixtures(fixture, prFixture);
+
+      const result = await runRemoteCommand('*', { kiciDir: '.kici', workflow: 'ci', wait: false });
+
+      expect(result).toBe(true);
+      const bodies = mockClient.trigger.mock.calls.map((c) => c[2]);
+      // fails-when: only the first fixture carries the workflow, or a fixture's event is replaced.
+      expect(bodies.map((b) => [b.fixtureId, b.workflowName, b.event.type])).toEqual([
+        ['push-main', 'ci', 'push'],
+        ['pr-open', 'ci', 'pr'],
+      ]);
+    });
+
+    it('honours --workflow with --all', async () => {
+      compileFixtures.mockResolvedValue([fixture, prFixture]);
+
+      await runRemoteCommand(undefined, {
+        all: true,
+        kiciDir: '.kici',
+        workflow: 'ci',
+        wait: false,
+      });
+
+      // fails-when: --all drops --workflow, as the fixture path did.
+      expect(mockClient.trigger.mock.calls.map((c) => c[2].workflowName)).toEqual(['ci', 'ci']);
+    });
+
+    it('overrides a workflowName the fixture sets itself, with a warning', async () => {
+      useFixtures(pinned);
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      let warned: string;
+      try {
+        await runRemoteCommand('push-main', { kiciDir: '.kici', workflow: 'deploy', wait: false });
+        warned = stderr.mock.calls.map((c) => String(c[0])).join('');
+      } finally {
+        stderr.mockRestore();
+      }
+      // fails-when: the fixture's own workflowName wins over the explicit flag.
+      expect(mockClient.trigger.mock.calls[0][2].workflowName).toBe('deploy');
+      expect(warned).toContain("fixture push-main names workflow 'ci'");
+    });
+
+    it("keeps a fixture's own workflowName when --workflow is absent", async () => {
+      useFixtures(pinned);
+
+      await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+
+      // breaks-if-wrong: a fixture that pins its own workflow must keep doing so.
+      expect(mockClient.trigger.mock.calls[0][2].workflowName).toBe('ci');
+    });
+
+    it('shows history for --history --workflow instead of starting a run', async () => {
+      const result = await runRemoteCommand(undefined, {
+        kiciDir: '.kici',
+        workflow: 'ci',
+        history: true,
+      });
+
+      expect(result).toBe(true);
+      // fails-when: the direct-workflow branch runs before --history and starts a run.
+      expect(createOverlayTarball).not.toHaveBeenCalled();
+      expect(mockClient.trigger).not.toHaveBeenCalled();
+      expect(mockHistory.formatTable).toHaveBeenCalled();
+    });
+
+    it('refuses a workflow the lock file lacks, naming the available ones', async () => {
+      useFixtures(fixture);
+
+      const result = await runRemoteCommand('push-main', {
+        kiciDir: '.kici',
+        workflow: 'hello-wrld',
+        wait: false,
+      });
+
+      expect(result).toBe(false);
+      // fails-when: an unknown name is uploaded and only rejected later, or the
+      // error omits the workflow list.
+      expect(createOverlayTarball).not.toHaveBeenCalled();
+      expect(mockClient.trigger).not.toHaveBeenCalled();
+      const errors = (logger.error as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+      expect(errors.join('\n')).toContain(
+        "Workflow 'hello-wrld' is not in the compiled lock file. Available workflows: ci, deploy",
+      );
+    });
+
+    it('refuses an unknown workflow on the direct path too', async () => {
+      const result = await runRemoteCommand(undefined, {
+        kiciDir: '.kici',
+        workflow: 'nope',
+        wait: false,
+      });
+
+      expect(result).toBe(false);
+      // fails-when: the direct path skips the lock check and uploads first.
+      expect(createOverlayTarball).not.toHaveBeenCalled();
+      expect(mockClient.trigger).not.toHaveBeenCalled();
+    });
+
+    it('reports a direct run the orchestrator rejects instead of polling it', async () => {
+      mockClient.trigger.mockResolvedValueOnce({
+        runId: 'run-x',
+        status: 'rejected',
+        reason: "Workflow 'ci' not found in lock file",
+      });
+
+      const result = await runRemoteCommand(undefined, { kiciDir: '.kici', workflow: 'ci' });
+
+      expect(result).toBe(false);
+      // fails-when: a rejected direct trigger prints "Run started" and polls a run that never existed.
+      expect(mockClient.runStatus).not.toHaveBeenCalled();
+      const infos = (logger.info as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+      expect(infos.some((m) => m.includes('Run started'))).toBe(false);
+      const errors = (logger.error as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+      expect(errors.some((m) => m.includes("Rejected: Workflow 'ci' not found"))).toBe(true);
+    });
+  });
   describe('compiles workflows before a remote run', () => {
     let compileCommand: ReturnType<typeof vi.fn>;
 
@@ -1272,5 +1439,31 @@ describe('requestRunCancel', () => {
     } finally {
       err.restore();
     }
+  });
+});
+
+describe('describeMissingWorkflow', () => {
+  const lock = JSON.stringify({ workflows: [{ name: 'ci' }, { name: 'hello-world' }] });
+
+  it('accepts a workflow the lock file contains', () => {
+    // breaks-if-wrong: a real workflow name must never be refused.
+    expect(describeMissingWorkflow(lock, 'hello-world')).toBeUndefined();
+  });
+
+  it('names the available workflows for an unknown one', () => {
+    // fails-when: the check passes an unknown name, or drops the list.
+    expect(describeMissingWorkflow(lock, 'hello')).toBe(
+      "Workflow 'hello' is not in the compiled lock file. Available workflows: ci, hello-world.",
+    );
+  });
+
+  it('says so when the lock file has no workflows', () => {
+    expect(describeMissingWorkflow('{"workflows":[]}', 'ci')).toBe(
+      "Workflow 'ci' is not in the compiled lock file. The lock file has no workflows.",
+    );
+  });
+
+  it('leaves an unparsable lock file to the orchestrator', () => {
+    expect(describeMissingWorkflow('not json', 'ci')).toBeUndefined();
   });
 });

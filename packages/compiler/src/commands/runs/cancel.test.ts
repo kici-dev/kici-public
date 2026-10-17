@@ -1,9 +1,19 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { logger } from '@kici-dev/core';
 import { runsCancelCommand } from './cancel.js';
 import * as clientMod from '../../remote/dashboard-client.js';
+import * as directMod from '../../remote/direct-cancel.js';
+import * as configMod from '../../remote/config.js';
 
-afterEach(() => vi.restoreAllMocks());
+// The Platform cases below must not pick up a direct target from the shell.
+beforeEach(() => {
+  vi.stubEnv('KICI_ORCHESTRATOR_TOKEN', '');
+  vi.stubEnv('KICI_ORCHESTRATOR_URL', '');
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
 
 describe('runsCancelCommand', () => {
   it('cancels a single run', async () => {
@@ -37,6 +47,42 @@ describe('runsCancelCommand', () => {
     const ok = await runsCancelCommand(undefined, { branch: 'main' });
     expect(ok).toBe(true);
     expect(cancelByBranch).toHaveBeenCalledWith('main');
+  });
+
+  it('cancels on the orchestrator the env selects, not through the Platform', async () => {
+    vi.stubEnv('KICI_ORCHESTRATOR_URL', 'http://127.0.0.1:4319');
+    vi.stubEnv('KICI_ORCHESTRATOR_TOKEN', 'plane-tok');
+    vi.spyOn(configMod, 'loadGlobalConfig').mockResolvedValue({
+      platformEndpoint: 'https://api.kici.dev',
+      pat: 'kici_pat',
+      activeOrgId: 'o',
+    });
+    const direct = vi
+      .spyOn(directMod, 'cancelRunDirect')
+      .mockResolvedValue({ alreadyTerminal: false, cancelledJobs: 1 });
+    const load = vi.spyOn(clientMod.DashboardClient, 'load');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    // fails-when: the command asks the Platform, which has never seen a local-plane run.
+    expect(await runsCancelCommand('r1', { force: true })).toBe(true);
+    expect(direct).toHaveBeenCalledWith('http://127.0.0.1:4319', 'plane-tok', 'r1', {
+      force: true,
+    });
+    expect(load).not.toHaveBeenCalled();
+  });
+
+  it('refuses --branch combined with --orchestrator-url instead of dropping a flag', async () => {
+    const load = vi.spyOn(clientMod.DashboardClient, 'load');
+    const err = vi.spyOn(logger, 'error').mockImplementation(() => logger);
+    // fails-when: one of the two flags is silently ignored.
+    expect(
+      await runsCancelCommand(undefined, {
+        branch: 'main',
+        orchestratorUrl: 'http://127.0.0.1:4319',
+      }),
+    ).toBe(false);
+    expect(String(err.mock.calls[0]?.[0])).toContain('cannot be combined');
+    expect(load).not.toHaveBeenCalled();
   });
 
   it('errors when neither run id nor branch is given', async () => {

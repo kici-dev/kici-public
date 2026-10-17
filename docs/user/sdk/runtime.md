@@ -790,14 +790,14 @@ export const pushMain = fixture('push-main', {
 
 ### FixtureOptions
 
-| Property       | Type                     | Description                                                |
-| -------------- | ------------------------ | ---------------------------------------------------------- |
-| `event`        | `TriggerConfig`          | The trigger event to simulate (required)                   |
-| `branch`       | `string`                 | Override branch name (defaults to git-detected)            |
-| `sha`          | `string`                 | Override commit SHA (defaults to HEAD)                     |
-| `repo`         | `string`                 | Override repository (defaults to git-detected)             |
-| `pr`           | `number`                 | For PR events, override PR number                          |
-| `secrets`      | `Record<string, string>` | Secret context mappings: `{ localName: 'remote-context' }` |
-| `workflowName` | `string`                 | Bypass trigger matching and run this workflow directly     |
+| Property       | Type                     | Description                                                                                        |
+| -------------- | ------------------------ | -------------------------------------------------------------------------------------------------- |
+| `event`        | `TriggerConfig`          | The trigger event to simulate (required)                                                           |
+| `branch`       | `string`                 | Override branch name (defaults to git-detected)                                                    |
+| `sha`          | `string`                 | Override commit SHA (defaults to HEAD)                                                             |
+| `repo`         | `string`                 | Override repository (defaults to git-detected)                                                     |
+| `pr`           | `number`                 | For PR events, override PR number                                                                  |
+| `secrets`      | `Record<string, string>` | Secret context mappings: `{ localName: 'remote-context' }`                                         |
+| `workflowName` | `string`                 | Bypass trigger matching and run this workflow directly. `kici run remote --workflow` overrides it. |
 
 Options can also be provided as an async factory function for dynamic fixture generation.

@@ -95,8 +95,14 @@ passes `registration.providerContext` directly into `lockFileCache.get(...)`.
 
 ### Cache interaction
 
-The shared `LockFileCache` is provider-agnostic — the cache key is
-`${repoIdentifier}:${ref}`, not scoped by fetcher. This means:
+The shared `LockFileCache` wraps every provider's fetcher, and its cache key
+is scoped by provider: `${provider}:${repoIdentifier}:${ref}`. Two fetchers
+for the same repo and ref keep separate entries. A lock file that the github
+fallback fetched therefore never answers a later lookup by the inbound
+fetcher, so the next webhook still takes the fallback path and its
+cross-provider swap. A fetcher whose content can change under a fixed ref
+(a local working tree) sets `cacheable: false`, and every lookup reads the
+current file. This means:
 
 - If a prior real GitHub push webhook has already populated the cache for
   `(<owner>/<repo>, <sha>)`, the fallback's call to the
@@ -141,10 +147,10 @@ The fallback is off when the delivery is a generic one whose cross-source
 repo mode already evaluated the other sources' registrations for the same
 repository: the fallback would re-read exactly those registrations.
 
-**Return type extension:** `resolveLockFileWithFallback` now returns
+**Return type:** `resolveLockFileWithFallback` returns
 `fallbackBundle` (the winning `ProviderBundle`) and `fallbackCredentials`
 (the registration's `providerContext` cast to `Record<string, unknown>`)
-alongside the existing `fallbackRoutingKey`. These are `undefined` when
+alongside `fallbackRoutingKey`. These are `undefined` when
 the lock file was resolved via the inbound path or not at all.
 
 ### Observability

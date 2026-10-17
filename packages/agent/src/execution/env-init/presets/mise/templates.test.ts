@@ -47,6 +47,38 @@ describe('selectMiseTemplate env handoff', () => {
   });
 });
 
+describe('selectMiseTemplate: the mise CLI on the step PATH', () => {
+  it('pwsh unpinned: adds the resolved mise dir after the tool dirs', () => {
+    const run = selectMiseTemplate('win32').run;
+    const cliLine = run.indexOf('-Value $miseCliDir');
+    const binPathsLine = run.indexOf('Invoke-Mise bin-paths');
+    // fails-when: the pwsh preset hands steps only the tool dirs (mise is not recognized)
+    expect(cliLine).toBeGreaterThan(-1);
+    expect(binPathsLine).toBeGreaterThan(-1);
+    // breaks-if-wrong: the mise dir lands ahead of the tool dirs and shadows a tool beside mise
+    expect(cliLine).toBeGreaterThan(binPathsLine);
+    // breaks-if-wrong: a mise dir already on the entry PATH is prepended and reorders the step PATH
+    expect(run).toContain('if ($miseEntryDirs -notcontains $miseCliDir)');
+    // fails-when: the entry PATH is read after the install has prepended the mise dir
+    expect(run.indexOf('$miseEntryPath = $env:PATH')).toBeGreaterThan(-1);
+    expect(run.indexOf('$miseEntryPath = $env:PATH')).toBeLessThan(
+      run.indexOf('if (-not (Get-Command mise'),
+    );
+  });
+
+  it('pwsh unpinned: always adds the mise dir when the init env sets PATH', () => {
+    // fails-when: a PATH from the init env, which steps never see, decides whether steps get mise
+    expect(selectMiseTemplate('win32', undefined, true).run).toContain("$miseEntryPath = ''");
+    // breaks-if-wrong: without an init env PATH the entry PATH is still compared
+    expect(selectMiseTemplate('win32').run).toContain('$miseEntryPath = $env:PATH');
+  });
+
+  it('pwsh pinned: hands steps the pinned bin dir only, never a resolved mise', () => {
+    // breaks-if-wrong: a second, resolved mise dir reaches steps beside the pinned one
+    expect(selectMiseTemplate('win32', '2026.5.1').run).not.toContain('$miseCli');
+  });
+});
+
 describe('selectMiseTemplate with a pin', () => {
   it('bash: installs into the KiCI-owned dir with MISE_VERSION and checks the version', () => {
     const t = selectMiseTemplate('linux', '2026.5.1');

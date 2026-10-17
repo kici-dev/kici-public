@@ -66,7 +66,7 @@ scalers:
     maxAgents: 20
     labelSets:
       - labels: ['linux', 'container']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
 ```
 
 ```yaml
@@ -334,7 +334,7 @@ scalers:
     maxAgents: 20
     labelSets:
       - labels: ['linux', 'container']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
       - labels: ['linux', 'container', 'node20']
         image: 'ghcr.io/myorg/kici-agent-node20:latest'
         resources:
@@ -382,7 +382,7 @@ scalers:
       idleTimeoutSeconds: 300
     labelSets:
       - labels: ['linux', 'container']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
       - labels: ['linux', 'container', 'node20']
         image: 'ghcr.io/myorg/kici-agent-node20:latest'
         resources:

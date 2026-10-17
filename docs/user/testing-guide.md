@@ -274,6 +274,14 @@ kici run remote --workflow ci
 
 This skips the trigger evaluation step and runs all jobs in the named workflow.
 
+Add a fixture to send that fixture's event to the named workflow only:
+
+```bash
+kici run remote push-main --workflow ci
+```
+
+The workflow gets the fixture's branch, SHA and payload, and no other workflow runs. A glob or `--all` runs each selected fixture against that one workflow. A workflow name that is not in the compiled lock file stops the run before upload, and the error lists the workflows that exist.
+
 ### Output modes
 
 ```bash

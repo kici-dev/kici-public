@@ -245,7 +245,9 @@ kici-admin orchestrator restart
 `globalMaxAgents` caps the combined concurrent agents across both scalers.
 Jobs route by label: a job whose `runsOn` includes `container` lands on the
 container scaler (which pulls `quay.io/kici-dev/kici-agent`), while a job whose
-`runsOn` includes `bare-metal` lands on the host-process scaler. Two notes when
+`runsOn` includes `bare-metal` lands on the host-process scaler. The example
+pins the agent image to the release it ships with, so an orchestrator upgrade
+does not change it: see [Upgrading](#upgrading). Two notes when
 the orchestrator runs as an unprivileged (user-level) service:
 
 - Set `networkIsolation: false` on the container scaler — the per-agent network
@@ -410,6 +412,8 @@ kici-admin orchestrator upgrade --version <latest> --yes
 It installs the correct global package under the unit's own pinned node runtime, restarts, and verifies the unit now launches the new version. DB migrations run automatically on first start of the new version.
 
 The install also puts the new `kici-agent` under the runtime of the service unit. Scaler-spawned agents start from the `binaryPath` in `scalers.yaml` for each job, so they run the new agent when `binaryPath` names that file. Before the upgrade installs anything, it checks each bare-metal `binaryPath`. It stops when a `binaryPath` is not an executable file or is a version-manager shim, and the service keeps running. It warns when a `binaryPath` goes through a version-manager alias, or runs an agent from another runtime. Each message names the path to use.
+
+Container-scaler agents do not follow the upgrade: each one starts from the image its label set names. Before you upgrade, set that `image:` line in `scalers.yaml` to the new version, for example `quay.io/kici-dev/kici-agent:<latest>`. The restart loads it. The upgrade warns when a container label set names a `kici-agent` older than the target version, or names `kici-agent:latest` with the default `imagePullPolicy: IfNotPresent`, which keeps the image the host already pulled. Each warning names the scaler, the label set and the line to change.
 
 :::caution[Don't re-run `install` to upgrade]
 `kici-admin orchestrator upgrade` is the whole upgrade — it installs and restarts for you. Re-running `kici-admin orchestrator install` against an already-installed service is **not** the upgrade path — it's for first-time setup. In the same deploy folder, it registers the service again, but it installs no new release. On a terminal, it also runs the setup wizard again, which writes a new env file, unless you pass `--no-wizard`. Against a same-named instance in another deploy folder, it stops with `an orchestrator instance "…" is already installed`. If you see that error, you wanted `kici-admin orchestrator upgrade` instead.

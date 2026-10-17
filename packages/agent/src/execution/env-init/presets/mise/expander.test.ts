@@ -85,3 +85,28 @@ describe('miseExpander version', () => {
     ).rejects.toThrow(/is not a mise release/);
   });
 });
+
+describe('miseExpander: a PATH in the preset env', () => {
+  const resolveWindowsAsset = async (): Promise<string> => 'https://example.invalid/mise.zip';
+
+  it('win32: matches Path in any case and always hands steps the mise dir', async () => {
+    const cfg = await miseExpander.expand({
+      cloneRoot: dir,
+      config: { env: { Path: 'C:\\tools' } },
+      platform: 'win32',
+      resolveWindowsAsset,
+    });
+    // fails-when: the Windows key compare is case-sensitive and Path is missed
+    expect(cfg.run).toContain("$miseEntryPath = ''");
+  });
+
+  it('linux: an env without PATH keeps the entry PATH compare', async () => {
+    const cfg = await miseExpander.expand({
+      cloneRoot: dir,
+      config: { env: { MISE_ENV: 'ci' } },
+      platform: 'linux',
+    });
+    // breaks-if-wrong: any env, not only a PATH, turns the compare off
+    expect(cfg.run).toContain('kici_mise_entry_path="$PATH"');
+  });
+});

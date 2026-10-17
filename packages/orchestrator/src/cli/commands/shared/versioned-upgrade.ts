@@ -46,6 +46,7 @@ import {
 import { makeTempDir } from '@kici-dev/shared/tmp';
 import { confirmPrompt } from './confirm.js';
 import { preflightBareMetalBinaryPaths } from './bare-metal-binary-check.js';
+import { warnAboutContainerAgentImages } from './container-agent-image-check.js';
 import { agentBinaryFromLaunch } from '../../../scaler/agent-binary-location.js';
 
 export type UpgradeComponent = 'orchestrator' | 'agent';
@@ -86,19 +87,22 @@ export interface VersionedUpgradeOptions {
 }
 
 /**
- * Check every bare-metal `binaryPath` of an orchestrator before the upgrade
- * installs or restarts anything. `spec` is the unit's launch command: the
- * `kici-agent` installed with its runtime is the one each `binaryPath` should
+ * Check an orchestrator's scaler config before the upgrade installs or
+ * restarts anything. `spec` is the unit's launch command: the `kici-agent`
+ * installed with its runtime is the one each bare-metal `binaryPath` should
  * name. `expectedVersion` is what that agent runs after the upgrade, when the
  * caller knows it. Throws when a `binaryPath` would stop the restarted service,
- * unless `skip` is set: then every finding is a warning.
+ * unless `skip` is set: then every finding is a warning. Then warns about each
+ * container label set whose agent image stays behind `targetVersion`, the
+ * release the service runs after the upgrade.
  */
-async function checkBareMetalBinaryPathsBeforeUpgrade(args: {
+async function checkScalersBeforeUpgrade(args: {
   component: UpgradeComponent;
   config: ServiceConfig;
   platform: ServicePlatform;
   spec: LaunchSpec | null;
   expectedVersion: string | null;
+  targetVersion: string | null;
   willInstall: boolean;
   skip: boolean;
 }): Promise<void> {
@@ -116,6 +120,12 @@ async function checkBareMetalBinaryPathsBeforeUpgrade(args: {
     expectedVersion: expectedAgent ? args.expectedVersion : null,
     willInstall: args.willInstall && expectedAgent !== null,
     skip: args.skip,
+    warn: (line) => console.warn(line),
+  });
+  await warnAboutContainerAgentImages({
+    envFilePath: args.config.envFilePath,
+    workingDirectory: args.config.workingDirectory,
+    targetVersion: args.targetVersion,
     warn: (line) => console.warn(line),
   });
 }
@@ -1018,12 +1028,13 @@ export async function performVersionedUpgrade(
 
     // Before the archive is fetched or anything changes: a bare-metal
     // binaryPath that is missing or a shim would stop the restarted service.
-    await checkBareMetalBinaryPathsBeforeUpgrade({
+    await checkScalersBeforeUpgrade({
       component,
       config,
       platform,
       spec: await manager.readLaunchSpec(config),
       expectedVersion: null,
+      targetVersion: version,
       willInstall: false,
       skip: opts.skipBinaryPathCheck ?? false,
     });
@@ -1240,12 +1251,13 @@ export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<void> {
     process.exit(1);
   }
 
-  await checkBareMetalBinaryPathsBeforeUpgrade({
+  await checkScalersBeforeUpgrade({
     component: args.component,
     config,
     platform,
     spec,
     expectedVersion: null,
+    targetVersion: verdict.version,
     willInstall: false,
     skip: opts.skipBinaryPathCheck ?? false,
   });
@@ -1287,12 +1299,13 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<vo
 
   // Before anything is installed: a bare-metal binaryPath that is missing or
   // a shim would stop the restarted service.
-  await checkBareMetalBinaryPathsBeforeUpgrade({
+  await checkScalersBeforeUpgrade({
     component,
     config,
     platform,
     spec,
     expectedVersion: `${target.owningPackage}@${version}`,
+    targetVersion: version,
     willInstall: true,
     skip: opts.skipBinaryPathCheck ?? false,
   });
@@ -1549,7 +1562,7 @@ export async function switchToInstalledVersion(args: {
 
   // A recovery switch is never refused for a binaryPath: it only warns, so the
   // operator learns before the restart that the service may not start.
-  await warnAboutBareMetalBinaryPaths(args);
+  await warnAboutScalers(args);
 
   // Here rather than in handleRollback so `--pick`, which can select ANY
   // installed version, inherits it.
@@ -1595,23 +1608,26 @@ export async function switchToInstalledVersion(args: {
 }
 
 /**
- * Print the bare-metal `binaryPath` diagnosis before `--rollback` or `--pick`
- * restarts the service. Never refuses and never throws: both are recovery
- * paths, and a check that cannot run must not block a recovery.
+ * Print the bare-metal `binaryPath` and container agent image diagnoses before
+ * `--rollback` or `--pick` restarts the service. Never refuses and never
+ * throws: both are recovery paths, and a check that cannot run must not block
+ * a recovery.
  */
-async function warnAboutBareMetalBinaryPaths(args: {
+async function warnAboutScalers(args: {
   component: UpgradeComponent;
   platform: ServicePlatform;
   config: ServiceConfig;
   manager: ServiceManager;
+  targetVersion: string;
 }): Promise<void> {
   try {
-    await checkBareMetalBinaryPathsBeforeUpgrade({
+    await checkScalersBeforeUpgrade({
       component: args.component,
       config: args.config,
       platform: args.platform,
       spec: await args.manager.readLaunchSpec(args.config).catch(() => null),
       expectedVersion: null,
+      targetVersion: args.targetVersion,
       willInstall: false,
       skip: true,
     });

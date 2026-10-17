@@ -581,6 +581,8 @@ describe('processTestTrigger', () => {
     expect(result.status).toBe('rejected');
     expect(result.reason).toContain('nonexistent-workflow');
     expect(result.reason).toContain('not found');
+    // fails-when: the rejection stops naming the workflows the lock does have.
+    expect(result.reason).toContain('Available workflows: ci');
     expect(result.jobIds).toEqual([]);
   });
 

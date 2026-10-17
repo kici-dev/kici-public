@@ -389,12 +389,15 @@ export const build = workflow('build', {
       init: {
         run: `
           set -euo pipefail
+          step_path="$PATH"
           command -v mise >/dev/null || curl -fsSL https://mise.run | sh
           export PATH="$HOME/.local/bin:$PATH"
           mise trust
           mise install
           mise env --dotenv | sed '/^PATH=/d' >> "$KICI_ENV"
           echo "$HOME/.local/share/mise/shims" >> "$KICI_PATH"
+          mise_dir="$(dirname "$(command -v mise)")"
+          case ":$step_path:" in *":$mise_dir:"*) ;; *) echo "$mise_dir" >> "$KICI_PATH" ;; esac
         `,
         cache: { key: 'mise-jq-1.7.1', paths: ['~/.local/share/mise'] },
         timeout: 600_000,
@@ -402,6 +405,7 @@ export const build = workflow('build', {
       steps: [
         step('show-jq-version', async (ctx) => {
           // jq is on PATH because the init phase appended the mise shims dir to $KICI_PATH.
+          // The mise CLI is on PATH too: the init appends its directory unless steps already see it.
           const { stdout } = await ctx.$`jq --version`;
           ctx.log.info(`jq version: ${stdout.trim()}`);
         }),
@@ -440,7 +444,7 @@ The job's error message names the failed init and its exit code, then the last l
 
 For the common case, a typed preset removes the hand-written `run` block entirely. The agent expands the preset to the same generic init it would otherwise run.
 
-- **`init: 'mise'`** -- zero-config. Installs mise, trusts and runs `mise install` against the committed mise config (`mise.toml` / `.mise.toml` / `.tool-versions`), hands mise's env + shims dir to subsequent steps, and caches mise's data dir under a key derived from the committed config (so a config change rotates the cache). The committed config is trusted automatically — committing it to your repo is the trust signal.
+- **`init: 'mise'`** -- zero-config. Installs mise, trusts and runs `mise install` against the committed mise config (`mise.toml` / `.mise.toml` / `.tool-versions`), hands mise's env, the tools mise installs and the `mise` CLI itself to subsequent steps, and caches mise's data dir under a key derived from the committed config (so a config change rotates the cache). The committed config is trusted automatically — committing it to your repo is the trust signal.
 - **`init: { mise: { cache, timeout, env, shell, version } }`** -- the same preset with overrides. `cache: false` disables caching, a `CacheSpec` replaces the default key and paths, and `timeout`, `env` and `shell` work as they do on a hand-written init. `version` pins mise itself (see below). `init: 'mise'` is exactly `init: { mise: {} }`.
 - **`init: { apt: { packages, cache, timeout, env, shell } }`** -- installs Debian packages before the steps. Each entry in `packages` is a Debian package name, optionally pinned as `name=version` (`'make'`, `'make=4.4.1-2'`). `job()` rejects anything else. The agent runs `apt-get update` and `apt-get install -y --no-install-recommends` as root, or through `sudo -n` as any other user. `env` reaches apt-get, also through `sudo`, so use it for a proxy. `cache: true` keeps the downloaded `.deb` files in the job cache. The cache key comes from the distribution release, the CPU architecture and the package list. The init fails, with the reason in its log, in these cases: on a runner without apt-get (macOS, Windows, a Linux distribution other than Debian or Ubuntu), and as a user that is not root and may not run `sudo` without a password. An agent older than the release that adds this preset fails the job before any step runs.
 
@@ -473,6 +477,8 @@ const compile = job('compile', {
 - It adds that directory to `PATH` for the job's steps, so a step that runs `mise` gets the pinned release.
 
 Without `version`, the preset uses a mise that is already on `PATH`. If there is none, it installs the release that the mise installer selects: the newest release that is at least 24 hours old. An older agent that does not know `version` ignores it and installs mise without the pin. Upgrade your agents before you rely on the pin.
+
+**The mise CLI in steps.** The preset puts the `mise` command on `PATH` for the job's steps, so a step can run `mise run <task>`, `mise exec` or `mise --version`. With `version`, a step gets the pinned release, ahead of any other mise on its `PATH`. Without `version`, a step gets the mise that the init used: the mise that was already on `PATH`, or the mise that the installer put in `~/.local/bin` (on Windows, `%USERPROFILE%\.local\mise\mise\bin`). The preset adds that directory only when the `PATH` that steps start from does not already hold it, and puts it after the tools, so a tool that mise installs comes from mise. Without `version`, an older agent puts only the tools on `PATH`. On such an agent, run mise by its full path, such as `"$HOME/.local/bin/mise"`.
 
 **npm tools and the low-download check.** mise installs `npm:` tools with its embedded aube package manager. aube refuses a package that has fewer weekly downloads than its threshold (1000 by default), and the init then fails. KiCI does not turn this check off for you. To install such a package, use one of these options from the [mise npm backend docs](https://mise.jdx.dev/dev-tools/backends/npm):
 

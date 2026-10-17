@@ -132,13 +132,14 @@ Agent                          Runner
 ```
 Agent                          Runner
   |                              |
-  |---- abort ----------------→|  (IPC message)
-  |                              |-- attempt graceful shutdown
-  |   ... 10s grace period ...   |
-  |---- SIGTERM --------------→|  (if still running)
-  |   ... 5s more ...            |
-  |---- SIGKILL --------------→|  (force kill)
+  |---- abort ----------------→|  (IPC message, force: false)
+  |---- SIGTERM --------------→|  (sent with the abort)
+  |                              |-- run cancel hooks, shut down
+  |   ... grace period ...       |  (default 30s)
+  |---- SIGKILL --------------→|  (if still running)
 ```
+
+A forced cancel (`job.cancel` with `force: true`, or a second cancel while the first is still in its grace period) skips the grace period: the agent sends `abort` with `force: true` and SIGKILL at once, and no hook runs. A runner that leads its own process group has the whole group killed, so a daemon a step started in the background dies with it.
 
 ## Environment sanitization
 

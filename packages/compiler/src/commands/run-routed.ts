@@ -23,6 +23,7 @@ import { triggerRun } from '../local-plane/plane-trigger.js';
 import { TRUSTED_ROUTING_LABEL, IN_PLACE_ROUTING_LABEL } from '../local-plane/scaler-config.js';
 import { injectRunsOnLabel } from '../local-plane/trusted-routing.js';
 import { followRun } from '../local-plane/run-follow.js';
+import { cancelAbandonedRun, cancelOnSignal } from '../local-plane/run-abandon.js';
 import { detectOsMismatchHints } from '../local-plane/os-mismatch-hint.js';
 import { formatSummary, type RunResult } from '../remote/output/summary.js';
 
@@ -128,6 +129,25 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
 
   let cleanup: (() => Promise<void>) | undefined;
   const restoreLocks: Array<() => void> = [];
+  // Set while a triggered run is followed: an abort cancels it in the plane.
+  let abandon: (() => Promise<boolean>) | undefined;
+  let removeSignalHandlers: (() => void) | undefined;
+  // Runs once, from the finally or from an interrupt (which exits the process
+  // and so never reaches the finally).
+  let finalized = false;
+  const finalize = async (): Promise<void> => {
+    if (finalized) return;
+    finalized = true;
+    // Reverse order: the in-place label was injected last.
+    for (const restore of restoreLocks.reverse()) {
+      try {
+        restore();
+      } catch {
+        /* an isolated clone is removed by cleanup anyway */
+      }
+    }
+    if (cleanup) await cleanup().catch(() => undefined);
+  };
   try {
     if (!quiet) logger.info(pc.dim('Starting the local dev plane…'));
     const resolved = await resolvePlaneForRun({
@@ -233,12 +253,20 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
       { repoBasePath: workdir.dir, logPath: planeLogPath() },
     );
     if (!quiet) logger.info(pc.green(`Run started: ${runId}`));
+    const { url: planeUrl, adminToken: planeToken } = plane;
+    abandon = () => cancelAbandonedRun(planeUrl, planeToken, runId, { quiet });
+    const abandonRun = abandon;
+    removeSignalHandlers = cancelOnSignal(async () => {
+      await abandonRun();
+      await finalize();
+    });
 
     const outcome = await followRun(plane.url, plane.adminToken, runId, {
       quiet,
       onLine: (line) => process.stdout.write(line + '\n'),
       hintLogPath: planeLogPath(),
     });
+    abandon = undefined;
 
     if (!quiet) {
       const result: RunResult = {
@@ -253,17 +281,11 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
     return outcome.status === 'success';
   } catch (error) {
     logger.error(pc.red(`\nError: ${toErrorMessage(error)}\n`));
+    if (abandon) await abandon();
     if (options.debug && error instanceof Error && error.stack) logger.error(pc.gray(error.stack));
     return false;
   } finally {
-    // Reverse order: the in-place label was injected last.
-    for (const restore of restoreLocks.reverse()) {
-      try {
-        restore();
-      } catch {
-        /* an isolated clone is removed by cleanup anyway */
-      }
-    }
-    if (cleanup) await cleanup().catch(() => undefined);
+    removeSignalHandlers?.();
+    await finalize();
   }
 }

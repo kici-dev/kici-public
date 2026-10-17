@@ -161,7 +161,7 @@ scalers:
     roles: [builder]
     labelSets:
       - labels: ['linux']
-        image: kici-agent:latest
+        image: quay.io/kici-dev/kici-agent:<version>
         # Build agents need npm available (ships with Node.js)
         resources: # required for a warm pool — the size of each ready agent
           limits:
@@ -182,7 +182,7 @@ scalers:
     maxAgents: 10
     labelSets:
       - labels: ['default']
-        image: kici-agent:latest
+        image: quay.io/kici-dev/kici-agent:<version>
         resources: # required for a warm pool — the size of each ready agent
           limits:
             cpus: 2

@@ -123,7 +123,7 @@ scalers:
     maxAgents: 5
     labelSets:
       - labels: ['linux', 'heavy']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
         # A limit alone also sets the request: this is
         # resources: { requests: {memory: '8g', cpus: 4}, limits: {memory: '8g', cpus: 4} }
         resources:
@@ -262,7 +262,7 @@ scalers:
       idleTimeoutSeconds: 300 # destroy an agent above that number after 5 minutes
     labelSets:
       - labels: ['linux', 'container']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
         resources: # required for a warm pool — the size of each ready agent
           limits:
             cpus: 2

@@ -86,7 +86,7 @@ scalers:
       arch: arm64
     labelSets:
       - labels: [self-hosted, macos, arm64]
-        image: kici-agent:latest
+        image: quay.io/kici-dev/kici-agent:<version>
 ```
 
 The coordinator routes jobs to workers based on label matching. A job with `runs-on: [self-hosted, macos, arm64]` will be routed to a worker whose scaler advertises those labels.

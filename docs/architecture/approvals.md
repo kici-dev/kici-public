@@ -82,13 +82,12 @@ Each individual decision is recorded — the approver, the decision, and which c
 
 ## Hold lifecycle and resume
 
-A held element uses the shared `held` status — a non-terminal value on both `ExecutionRunStatus` and `ExecutionJobStatus`. There are no approval-specific statuses — workflow- and step-level holds use the same `held` status as the existing job-level hold, and resume, reject, and expire drive it to the ordinary run/job statuses below.
+A hold that gates a run's dispatch puts the run at the shared `held` status — a non-terminal value on `ExecutionRunStatus`. `ExecutionJobStatus` has no `held` member: the element's `held_runs` row records what waits. There are no approval-specific statuses — every approval hold uses the same `held` status as a context hold, and resume, reject, and expire drive it to the ordinary run statuses below.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending
-    pending --> held : gate triggers hold
-    held --> queued : approval satisfied
+    [*] --> held : gate triggers hold
+    held --> pending : approval satisfied
     held --> cancelled : rejection
     held --> failed : expiry
 ```
@@ -129,7 +128,7 @@ sequenceDiagram
     participant Approver
 
     Note over Agent: runs earlier steps
-    Agent->>Orchestrator: step.approval-request<br/>(runId, jobId, stepIndex, requirement)
+    Agent->>Orchestrator: step.approval-request<br/>(runId, jobId, stepIndex, clauses)
     Note over Orchestrator: create step-scoped held element
     Note over Agent: blocks step loop,<br/>keeps heartbeating
     Approver->>Orchestrator: approve (dashboard / kici approve)
@@ -138,7 +137,7 @@ sequenceDiagram
     Note over Agent: runs the held step,<br/>then continues the job
 ```
 
-- **`step.approval-request`** (agent → orchestrator) carries `runId`, `jobId`, `stepIndex`, `stepName`, and the normalized `requirement`. The orchestrator creates a step-scoped held element for it.
+- **`step.approval-request`** (agent → orchestrator) carries `runId`, `jobId`, `stepIndex`, `stepName`, the approver `clauses`, the gate's `reason`, and optionally a per-gate `timeoutSeconds` and the drift `payload` of a `when: 'drift'` gate. The orchestrator computes the expiry and creates a step-scoped held element for it.
 - The agent blocks its step loop and `await`s resolution, keeping the sandbox and workspace live. Heartbeats continue throughout so the agent is not reaped while waiting.
 - **`step.approval-resolved`** (orchestrator → agent) carries `requestId` (correlating to the request), `runId`, `jobId`, `stepIndex`, and an `outcome` of `approved`, `rejected`, or `expired`. On `approved` the agent runs the held step against its intact workspace and continues the job. On `rejected` or `expired` it fails the job with a clear reason.
 

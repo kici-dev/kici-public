@@ -21,7 +21,7 @@ scalers:
     maxAgents: 10
     labelSets:
       - labels: ['linux', 'container']
-        image: 'ghcr.io/myorg/kici-agent:latest'
+        image: 'ghcr.io/myorg/kici-agent:<version>'
 ```
 
 2. Point the orchestrator at it:

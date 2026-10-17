@@ -134,8 +134,8 @@ The container registry is configurable -- images are built locally and can be pu
 
 ```bash
 # Tag and push to your registry
-podman tag kici-agent:latest registry.example.com/kici-agent:latest
-podman push registry.example.com/kici-agent:latest
+podman tag kici-agent:<version> registry.example.com/kici-agent:<version>
+podman push registry.example.com/kici-agent:<version>
 ```
 
 ---

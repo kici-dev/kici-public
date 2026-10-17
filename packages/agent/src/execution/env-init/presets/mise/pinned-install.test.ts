@@ -10,6 +10,7 @@ import { buildInitShellFor } from '../../../sandbox/workflow-runner.js';
 import { createEnvFiles, readEnvDelta } from '../../../sandbox/env-file.js';
 import type { EnvDelta } from '../../../sandbox/env-delta.js';
 import type { RunnerToAgentMessage } from '../../../sandbox/ipc-protocol.js';
+import { applyEnvDelta } from '../../../sandbox/env-delta.js';
 import { miseExpander } from './expander.js';
 
 afterEach(() => {
@@ -64,8 +65,11 @@ async function makeHarness(installerReports: string): Promise<Harness> {
     installer,
     [
       `printf '%s' "$MISE_VERSION" > '${h.marks}/installer-version'`,
-      `cp '${prepared}' "$MISE_INSTALL_PATH"`,
-      'chmod +x "$MISE_INSTALL_PATH"',
+      // Like the real installer: ~/.local/bin/mise unless MISE_INSTALL_PATH says otherwise.
+      'kici_fake_dest="${MISE_INSTALL_PATH:-$HOME/.local/bin/mise}"',
+      'mkdir -p "$(dirname "$kici_fake_dest")"',
+      `cp '${prepared}' "$kici_fake_dest"`,
+      'chmod +x "$kici_fake_dest"',
       '',
     ].join('\n'),
   );
@@ -113,6 +117,21 @@ async function runPreset(h: Harness, config: MiseInitConfig) {
   return { result, delta, text };
 }
 
+/**
+ * What a step running `mise --version` sees: the init delta applied to a step
+ * PATH of `basePath`, then the command run by a real bash with that PATH.
+ */
+function stepMiseVersion(h: Harness, delta: EnvDelta | undefined, basePath: string): string {
+  const target: NodeJS.ProcessEnv = { PATH: basePath };
+  applyEnvDelta(delta ?? { env: {}, pathPrepends: [] }, { operatorSecretKeys: new Set(), target });
+  return execFileSync('/bin/bash', ['-c', 'mise --version'], {
+    env: { PATH: target.PATH, HOME: h.home },
+  })
+    .toString()
+    .trim()
+    .split(' ')[0];
+}
+
 describe('mise preset version pin (real bash, offline fakes)', () => {
   it('installs the pinned release with MISE_VERSION and puts it first on the step PATH', async () => {
     const h = await makeHarness('2026.5.1');
@@ -151,7 +170,53 @@ describe('mise preset version pin (real bash, offline fakes)', () => {
     // breaks-if-wrong: the refactor changes the unpinned path (an installer call, or a pinned dir on PATH)
     expect(result.ok).toBe(true);
     expect(existsSync(join(h.marks, 'curl-calls'))).toBe(false);
+    // breaks-if-wrong: a mise dir already on the PATH (here beside a fake curl) moves ahead of
+    // the step PATH and shadows the tools it holds
     expect(delta?.pathPrepends).toEqual([join(h.home, '.local/share/mise/shims')]);
+  });
+});
+
+describe('the mise CLI on the step PATH (real bash)', () => {
+  it('pinned: a step running mise gets the pinned release over another mise on its PATH', async () => {
+    const h = await makeHarness('2026.5.1');
+    const decoy = join(h.marks, 'decoy-bin');
+    await writeExecutable(join(decoy, 'mise'), fakeMise('2099.1.1'));
+    // Positive control: without the init delta the step PATH resolves the decoy.
+    expect(stepMiseVersion(h, undefined, `${decoy}:/usr/bin:/bin`)).toBe('2099.1.1');
+    const { result, delta } = await runPreset(h, { version: 'v2026.5.1' });
+    expect(result.ok).toBe(true);
+    // fails-when: the pinned dir is missing from $KICI_PATH or lands behind the decoy
+    expect(stepMiseVersion(h, delta, `${decoy}:/usr/bin:/bin`)).toBe('2026.5.1');
+  });
+
+  it('unpinned install: a step can run the mise the installer put in ~/.local/bin', async () => {
+    const h = await makeHarness('2026.5.1');
+    // No mise anywhere on PATH, so the preset runs the installer.
+    vi.stubEnv('PATH', `${h.fakebin}:/usr/bin:/bin`);
+    expect(() => stepMiseVersion(h, undefined, '/usr/bin:/bin')).toThrow();
+    const { result, delta, text } = await runPreset(h, {});
+    expect(result.ok, text).toBe(true);
+    expect(existsSync(join(h.marks, 'curl-calls'))).toBe(true);
+    // fails-when: the preset appends only the shims dir (mise: command not found in the step)
+    expect(stepMiseVersion(h, delta, '/usr/bin:/bin')).toBe('2026.5.1');
+    expect(delta?.pathPrepends).toEqual([
+      join(h.home, '.local/share/mise/shims'),
+      join(h.home, '.local/bin'),
+    ]);
+  });
+
+  it('unpinned: a mise already on PATH keeps answering in steps, with no PATH entry added', async () => {
+    const h = await makeHarness('2026.5.1');
+    const shared = join(h.marks, 'shared-bin');
+    await writeExecutable(join(shared, 'mise'), fakeMise('2099.1.1'));
+    const entryPath = `${h.fakebin}:${shared}:/usr/bin:/bin`;
+    vi.stubEnv('PATH', entryPath);
+    const { result, delta } = await runPreset(h, {});
+    expect(result.ok).toBe(true);
+    // breaks-if-wrong: the shared dir is prepended and reorders the step PATH
+    expect(delta?.pathPrepends).toEqual([join(h.home, '.local/share/mise/shims')]);
+    // breaks-if-wrong: the unpinned path swaps in another mise for steps
+    expect(stepMiseVersion(h, delta, entryPath)).toBe('2099.1.1');
   });
 });
 
@@ -230,6 +295,9 @@ describe('review focus: a user PATH in a pinned preset env', () => {
     expect(result.ok).toBe(true);
     // fails-when: the decoy is unreachable, which would make the pinned case above pass vacuously
     expect(existsSync(decoyHits)).toBe(true);
-    expect(delta?.pathPrepends).toEqual([join(h.home, '.local/share/mise/shims')]);
+    // The init env PATH never reaches steps, so the mise the init ran must be handed over.
+    // fails-when: the preset compares against the init's own PATH and skips the decoy dir
+    expect(delta?.pathPrepends).toEqual([join(h.home, '.local/share/mise/shims'), decoy]);
+    expect(stepMiseVersion(h, delta, '/usr/bin:/bin')).toBe('2099.1.1');
   });
 });

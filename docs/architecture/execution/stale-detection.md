@@ -207,7 +207,7 @@ Jobs waiting in the dispatch queue are subject to a configurable timeout (`queue
 
 The cleanup function then follows the same pattern as the stale run detector:
 
-1. Updates `execution_jobs.status` to `timed_out_stale` with error message `"Queue timeout expired (job was never dispatched to an agent)"`
+1. Updates `execution_jobs.status` to a terminal status that says why the job never ran. A job that no connected agent and no scaler backend could ever run becomes `unroutable`, with a message that names the unmatched `runsOn` selectors. Any other job becomes `timed_out_stale`, with the scaler's last provisioning error when one was recorded, or else `"Queue timeout expired (job was never dispatched to an agent)"`
 2. Calls `executionTracker.updateInMemoryJob()` and `forwardJobTerminalStatus()`
 3. Emits `orchestrator.job.queue_expired` infrastructure event
 4. Checks run completion via `completeRunIfAllJobsTerminal()`
