@@ -6,6 +6,8 @@ import { DashboardClient, DashboardClientError } from '../../remote/dashboard-cl
 import { unwrapStoredLogLine } from '../../remote/output/streaming.js';
 import { colorStatus } from '../../remote/render.js';
 import { printNotes, ranOnAnAgent, stepDetailNotes } from './detail-notes.js';
+import { resolveRunRef } from './run-ref.js';
+import { stepDisplayName, stepsInRunOrder } from './step-order.js';
 
 export interface RunsLogsOptions {
   job?: string;
@@ -39,11 +41,12 @@ function setupJsonKey(jobName: string): string {
  */
 type RunLogsJson = Record<string, string[]>;
 export async function runsLogsCommand(
-  runId: string,
+  runRef: string,
   options: RunsLogsOptions = {},
 ): Promise<boolean> {
   try {
     const client = await DashboardClient.load();
+    const runId = await resolveRunRef(client, runRef);
     // Each note prints once, however many polls or jobs bring it back.
     const printed = new Set<string>();
     if (options.json) {
@@ -135,9 +138,11 @@ async function printAllLogs(
       for (const line of setup.lines) console.log(unwrapStoredLogLine(line));
       if (note) console.log(pc.gray(note));
     }
-    for (const s of j.steps ?? []) {
+    for (const s of stepsInRunOrder(j.steps)) {
       console.log(
-        pc.bold(`\n=== ${j.jobName} › ${s.stepName} `) + colorStatus(s.status) + pc.bold(' ==='),
+        pc.bold(`\n=== ${j.jobName} › ${stepDisplayName(s)} `) +
+          colorStatus(s.status) +
+          pc.bold(' ==='),
       );
       const logs = await client.getStepLogs(runId, j.jobId, s.stepIndex);
       // The orchestrator stores each line as a JSON envelope; print its text.
@@ -162,7 +167,7 @@ async function collectAllLogs(
     // `setup` overwrites them
     // breaks-if-wrong: a run whose jobs wrote no setup log keeps the step-only shape
     if (setup.length > 0) out[setupJsonKey(j.jobName)] = setup;
-    for (const s of j.steps ?? []) {
+    for (const s of stepsInRunOrder(j.steps)) {
       out[`${j.jobName}/${s.stepName}`] = (
         await client.getStepLogs(runId, j.jobId, s.stepIndex)
       ).lines;
@@ -201,12 +206,12 @@ async function followLogs(
       const setup = await fetchSetupLog(client, runId, j.jobId);
       printNotes(setupLogErrorNotes(j, setup), notesPrinted);
       printNewLines(printed, setupKey, `${j.jobName} › ${SETUP_HEADING}`, setup.lines);
-      for (const s of j.steps ?? []) {
+      for (const s of stepsInRunOrder(j.steps)) {
         const logs = await client.getStepLogs(runId, j.jobId, s.stepIndex);
         printNewLines(
           printed,
           `${j.jobId}:${s.stepIndex}`,
-          `${j.jobName} › ${s.stepName}`,
+          `${j.jobName} › ${stepDisplayName(s)}`,
           logs.lines,
         );
       }

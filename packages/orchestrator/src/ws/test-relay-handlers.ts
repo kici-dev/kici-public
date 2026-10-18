@@ -37,7 +37,7 @@ import {
 } from './test-run-log-cursor.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { initTestUpload } from '../routes/uploads.js';
-import { processTestTrigger } from '../pipeline/test-pipeline.js';
+import { processTestTrigger, type TestTriggeredRun } from '../pipeline/test-pipeline.js';
 import type { ProcessingDeps } from '../pipeline/processor.js';
 import { runDetached } from '../helpers/run-detached.js';
 
@@ -94,7 +94,10 @@ export async function handleTestUploadsInit(
 }
 
 export interface TestTriggerPayload {
+  /** The first run of `runs`. */
   runId: string;
+  /** One entry per matched workflow, each its own run. Absent for a shared run. */
+  runs?: TestTriggeredRun[];
   status: 'accepted' | 'rejected';
   reason?: string;
   jobIds: string[];
@@ -158,6 +161,7 @@ export async function handleTestTrigger(
       checkMode: msg.checkMode,
       target: msg.target,
       dispatchInputs: msg.dispatchInputs,
+      ...(msg.acceptsMultipleRuns && { acceptsMultipleRuns: true }),
       requestId: msg.requestId,
       // Attribution, not authorization: see `handleTestRunStatus`.
       actor: msg.actor,
@@ -165,26 +169,31 @@ export async function handleTestTrigger(
     deps,
   );
 
-  runDetached(
-    logger,
-    'Access log write',
-    () =>
-      deps.accessLog?.record({
-        orgId: deps.orgId ?? null,
-        routingKey: deps.routingKey ?? msg.routingKey,
-        actor: msg.actor,
-        action: 'run.trigger',
-        target: { type: 'run', id: result.runId },
-        requestId: msg.requestId,
-        source: deps.accessLogSource ?? AccessLogSource.enum.platform_proxy,
-        outcome: result.status === 'accepted' ? 'allowed' : 'denied',
-        ...(result.reason ? { errorMessage: result.reason } : {}),
-      }),
-    { requestId: msg.requestId, runId: result.runId },
-  );
+  // One access-log row per run, so each run's trail names who triggered it.
+  const runIds = result.runs?.length ? result.runs.map((r) => r.runId) : [result.runId];
+  for (const runId of runIds) {
+    runDetached(
+      logger,
+      'Access log write',
+      () =>
+        deps.accessLog?.record({
+          orgId: deps.orgId ?? null,
+          routingKey: deps.routingKey ?? msg.routingKey,
+          actor: msg.actor,
+          action: 'run.trigger',
+          target: { type: 'run', id: runId },
+          requestId: msg.requestId,
+          source: deps.accessLogSource ?? AccessLogSource.enum.platform_proxy,
+          outcome: result.status === 'accepted' ? 'allowed' : 'denied',
+          ...(result.reason ? { errorMessage: result.reason } : {}),
+        }),
+      { requestId: msg.requestId, runId },
+    );
+  }
 
   return {
     runId: result.runId,
+    ...(result.runs && { runs: result.runs }),
     status: result.status,
     ...(result.reason ? { reason: result.reason } : {}),
     jobIds: result.jobIds,
@@ -203,6 +212,8 @@ export interface TestRunStatusPayload {
     /** Wall-clock; null while the job runs. */
     durationMs?: number | null;
   }>;
+  /** Why the run failed; set for a failure no job records, such as an init failure. */
+  failureReason?: string | null;
   done: boolean;
 }
 
@@ -236,7 +247,7 @@ export async function handleTestRunStatus(
 ): Promise<TestRunStatusPayload | { error: string }> {
   const run = await deps.db
     .selectFrom('execution_runs')
-    .select(['run_id', 'status', 'is_test_run'])
+    .select(['run_id', 'status', 'is_test_run', 'failure_reason'])
     .where('run_id', '=', msg.runId)
     .executeTakeFirst();
 
@@ -260,6 +271,7 @@ export async function handleTestRunStatus(
       errorMessage: j.error_message ?? null,
       durationMs: j.duration_ms ?? null,
     })),
+    failureReason: run.failure_reason ?? null,
     done: TERMINAL_RUN_STATES.has(run.status),
   };
 }
@@ -271,6 +283,8 @@ export interface TestRunLogsPayload {
   done: boolean;
   /** Opaque per-file cursor for the next poll; present when the request sent `logCursor`. */
   nextLogCursor?: string;
+  /** The job that wrote each line, index for index with `lines`; sent with `nextLogCursor`. */
+  lineJobNames?: string[];
 }
 
 /**
@@ -385,16 +399,25 @@ async function readFromFileOffsets(
 ): Promise<TestRunLogsPayload> {
   const next: RunLogFileOffsets = { ...offsets };
   const lines: string[] = [];
+  const lineJobNames: string[] = [];
   if (logStorage) {
     for (const file of await listRunLogFiles(runId, logStorage)) {
       const fileLines = splitLogLines((await logStorage.read(file.path)).data, terminal);
       const from = Math.min(offsets[file.key] ?? 0, fileLines.length);
-      lines.push(...fileLines.slice(from));
+      const fresh = fileLines.slice(from);
+      lines.push(...fresh);
+      for (let i = 0; i < fresh.length; i++) lineJobNames.push(file.jobName);
       next[file.key] = Math.max(offsets[file.key] ?? 0, fileLines.length);
     }
   }
   const delivered = Object.values(next).reduce((sum, n) => sum + n, 0);
-  return { lines, nextCursor: delivered, done: terminal, nextLogCursor: encodeRunLogCursor(next) };
+  return {
+    lines,
+    lineJobNames,
+    nextCursor: delivered,
+    done: terminal,
+    nextLogCursor: encodeRunLogCursor(next),
+  };
 }
 
 export interface TestCancelPayload {

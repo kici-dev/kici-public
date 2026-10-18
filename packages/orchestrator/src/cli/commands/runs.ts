@@ -2,9 +2,20 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { ExecutionJobStatus, type AgentStepLogs } from '@kici-dev/engine';
+import {
+  ExecutionJobStatus,
+  StepPhase,
+  compareStepsByPhase,
+  initStepIndex,
+  initStepLabel,
+  initStepType,
+  parseInitStepRef,
+  stepPhase,
+  type AgentStepLogs,
+} from '@kici-dev/engine';
 import { cliAction } from './shared/cli-action.js';
 import { renderTable } from './shared/table.js';
+import { resolveRunRef } from './shared/run-ref.js';
 
 /** Run summary shape returned by GET /api/v1/admin/runs. */
 interface RunSummaryDTO {
@@ -53,6 +64,10 @@ interface StepDTO {
   exitCode: number | null;
   errorMessage: string | null;
   stepType: string;
+  /** The job phase the step ran in; absent from an older orchestrator. */
+  phase?: StepPhase;
+  /** The init position of an init step; absent on other steps and from an older orchestrator. */
+  initIndex?: number;
 }
 
 /** Job detail returned by GET /api/v1/admin/runs/:runId/jobs. */
@@ -165,6 +180,8 @@ interface AgentRunResultDTO {
       status: string;
       exitCode: number | null;
       durationMs: number | null;
+      /** `step` for a plain step. */
+      stepType?: string;
     }>;
   }>;
 }
@@ -217,6 +234,55 @@ function workflowProvenanceLines(run: RunDetailDTO): string[] {
   return lines;
 }
 
+/**
+ * A job's steps in run order: setup and init pseudo-steps first, whatever order the
+ * orchestrator sent. An older orchestrator orders init steps by their stored index, last.
+ */
+function stepsInRunOrder<T extends { stepIndex: number; stepType?: string | null }>(
+  steps: T[],
+): T[] {
+  return [...steps].sort(compareStepsByPhase);
+}
+
+/**
+ * The `#` cell of a step row: the step index, or `init[<n>]` for an init step, whose
+ * stored index is a high internal value and not a position among the steps.
+ */
+function stepNumberCell(step: { stepIndex: number; stepType?: string | null }): string {
+  const initIndex = initStepIndex(step.stepType);
+  return initIndex === undefined ? String(step.stepIndex) : initStepLabel(initIndex);
+}
+
+/** The `type` cell of a `runs show` step row: blank for a plain step, `init` for any init. */
+function stepTypeCell(stepType: string): string {
+  if (stepPhase(stepType) === StepPhase.enum.init) return StepPhase.enum.init;
+  return stepType === 'step' ? '' : stepType;
+}
+
+/**
+ * The stored step index `runs logs --step` names. An init step is shown as `init[<n>]`,
+ * not by its stored index, so that label resolves through the job's steps; any other
+ * value passes through for the server to validate.
+ */
+async function resolveStepRef(
+  client: AdminApiClient,
+  runId: string,
+  jobId: string,
+  step: unknown,
+): Promise<string> {
+  const ref = String(step);
+  const initIndex = parseInitStepRef(ref);
+  if (initIndex === undefined) return ref;
+  const { jobs } = (await client.getRunJobs(runId, {
+    includeSteps: true,
+  })) as unknown as JobsResponse;
+  const job = jobs.find((j) => j.jobId === jobId);
+  if (!job) throw new Error(`Job ${jobId} not found in run ${runId}`);
+  const match = (job.steps ?? []).find((s) => s.stepType === initStepType(initIndex));
+  if (!match) throw new Error(`Job ${jobId} has no ${initStepLabel(initIndex)} step`);
+  return String(match.stepIndex);
+}
+
 /** The step index of a job's setup log: the clone, the install and the module load. */
 const SETUP_LOG_STEP_INDEX = -1;
 
@@ -226,19 +292,22 @@ const SETUP_LOG_STEP_INDEX = -1;
  * lines, or when the orchestrator does not report which case applies.
  */
 export function emptyStepLogNote(
-  stepIndex: number,
+  /** The step index, or an init step's `init[<n>]` label. */
+  step: number | string,
   logs: Pick<AgentStepLogs, 'totalLines' | 'recorded'>,
 ): string | null {
   if (logs.totalLines > 0 || logs.recorded === undefined) return null;
-  if (stepIndex === SETUP_LOG_STEP_INDEX) {
+  if (step === SETUP_LOG_STEP_INDEX) {
     return logs.recorded
       ? '(the setup log for this job is empty)'
       : '(no setup log recorded for this job)';
   }
   return logs.recorded
-    ? `(the log for step ${stepIndex} is empty)`
-    : `(no log recorded for step ${stepIndex})`;
+    ? `(the log for step ${step} is empty)`
+    : `(no log recorded for step ${step})`;
 }
+
+const RUN_ID_ARG_HELP = 'Run id, or its first 4 or more characters';
 
 export function registerRunsCommands(program: Command, getClient: () => AdminApiClient): void {
   const runs = program.command('runs').description('Inspect execution runs, jobs, and steps');
@@ -335,11 +404,13 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
   // Run fields and jobs (?includeSteps=true) are separate endpoints; this
   // composes both into one view.
   runs
-    .command('show <runId>')
+    .command('show')
+    .argument('<runId>', RUN_ID_ARG_HELP)
     .description('Show run detail with jobs and steps')
     .option('--json', 'Emit raw JSON instead of formatted output')
     .action(
-      cliAction(async (runId: string, opts) => {
+      cliAction(async (runRef: string, opts) => {
+        const runId = await resolveRunRef(getClient(), runRef);
         const client = getClient();
         const [runRespRaw, jobsRespRaw] = await Promise.all([
           client.getRun(runId),
@@ -420,13 +491,13 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
             console.log('');
             console.log(`Steps for ${jobLabel(job, spansWorkflows)} (${job.jobId}):`);
             const stepHeaders = ['#', 'name', 'status', 'exit', 'duration', 'type'];
-            const stepRows = (job.steps ?? []).map((s) => [
-              String(s.stepIndex),
+            const stepRows = stepsInRunOrder(job.steps ?? []).map((s) => [
+              stepNumberCell(s),
               s.stepName,
               s.status,
               s.exitCode != null ? String(s.exitCode) : '-',
               formatDuration(s.durationMs),
-              s.stepType === 'step' ? '' : s.stepType,
+              stepTypeCell(s.stepType),
             ]);
             console.log(renderTable(stepHeaders, stepRows));
           }
@@ -438,11 +509,13 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
   // Machine-first provenance-tagged run result. --json is lossless (untrusted
   // envelopes preserved); the human view unwraps for display only.
   runs
-    .command('structured <runId>')
+    .command('structured')
+    .argument('<runId>', RUN_ID_ARG_HELP)
     .description('Show the provenance-tagged structured run result (agent read path; /structured)')
     .option('--json', 'Emit the raw AgentRunResult (untrusted envelopes preserved)')
     .action(
-      cliAction(async (runId: string, opts) => {
+      cliAction(async (runRef: string, opts) => {
+        const runId = await resolveRunRef(getClient(), runRef);
         const result = (await getClient().getRunStructured(runId)) as unknown as AgentRunResultDTO;
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
@@ -479,8 +552,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
           console.log('');
           console.log(`Steps for ${uv(job.jobName)}:`);
           const stepHeaders = ['#', 'name', 'status', 'exit', 'duration'];
-          const stepRows = job.steps.map((s) => [
-            String(s.stepIndex),
+          const stepRows = stepsInRunOrder(job.steps).map((s) => [
+            stepNumberCell(s),
             uv(s.stepName),
             s.status,
             s.exitCode != null ? String(s.exitCode) : '-',
@@ -493,12 +566,14 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
 
   // ── runs jobs <runId> ──────────────────────────────────────────
   runs
-    .command('jobs <runId>')
+    .command('jobs')
+    .argument('<runId>', RUN_ID_ARG_HELP)
     .description('List jobs for a run (admin API: /api/v1/admin/runs/:runId/jobs)')
     .option('--include-steps', 'Embed step list inside each job (default false)')
     .option('--json', 'Emit raw JSON instead of a table')
     .action(
-      cliAction(async (runId: string, opts) => {
+      cliAction(async (runRef: string, opts) => {
+        const runId = await resolveRunRef(getClient(), runRef);
         const response = (await getClient().getRunJobs(runId, {
           includeSteps: Boolean(opts.includeSteps),
         })) as unknown as JobsResponse;
@@ -534,8 +609,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
             console.log('');
             console.log(`Steps for ${jobLabel(job, spansWorkflows)} (${job.jobId}):`);
             const stepHeaders = ['#', 'name', 'status', 'exit', 'duration'];
-            const stepRows = steps.map((s) => [
-              String(s.stepIndex),
+            const stepRows = stepsInRunOrder(steps).map((s) => [
+              stepNumberCell(s),
               s.stepName,
               s.status,
               s.exitCode != null ? String(s.exitCode) : '-',
@@ -554,23 +629,30 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
   // `kici-admin queue list --workflow-name '__globaleval__<owner>/<repo>' --json`
   // (`id` is the job id, `run_id` the run id).
   runs
-    .command('logs <runId>')
+    .command('logs')
+    .argument('<runId>', RUN_ID_ARG_HELP)
     .description(
       'Print a page of a step log (admin API: /api/v1/admin/runs/:runId/jobs/:jobId/steps/:i/logs)',
     )
     .requiredOption('--job <jobId>', 'Job id (the dispatch_queue row id for an eval round)')
-    .option('--step <n>', 'Step index (default 0; -1 is the job setup log)', '0')
+    .option(
+      '--step <n>',
+      'Step index (default 0; -1 is the job setup log), or an init step as init[<n>]',
+      '0',
+    )
     .option('--limit <n>', 'Max lines to return (default 500, server caps at 2000)', '500')
     .option('--cursor <c>', 'Line-offset cursor from a previous page')
     .option('--json', 'Emit raw JSON instead of plain lines')
     .action(
-      cliAction(async (runId: string, opts) => {
+      cliAction(async (runRef: string, opts) => {
+        const runId = await resolveRunRef(getClient(), runRef);
+        const stepIndex = await resolveStepRef(getClient(), runId, String(opts.job), opts.step);
         const params = new URLSearchParams({ limit: String(opts.limit) });
         if (opts.cursor) params.set('cursor', String(opts.cursor));
         const path =
           `/api/v1/admin/runs/${encodeURIComponent(runId)}` +
           `/jobs/${encodeURIComponent(String(opts.job))}` +
-          `/steps/${encodeURIComponent(String(opts.step))}/logs?${params.toString()}`;
+          `/steps/${encodeURIComponent(stepIndex)}/logs?${params.toString()}`;
         const response = await getClient().get<AgentStepLogs>(path);
 
         if (opts.json) {
@@ -582,18 +664,25 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         if (response.nextCursor) {
           console.error(`(more: re-run with --cursor ${response.nextCursor})`);
         }
-        const note = emptyStepLogNote(parseInt(String(opts.step), 10), response);
+        // An init step is named by its label, never by its stored index.
+        const initIndex = parseInitStepRef(String(opts.step));
+        const note = emptyStepLogNote(
+          initIndex === undefined ? parseInt(stepIndex, 10) : initStepLabel(initIndex),
+          response,
+        );
         if (note) console.error(note);
       }),
     );
 
   // ── runs ephemeral-key <runId> ─────────────────────────────────
   runs
-    .command('ephemeral-key <runId>')
+    .command('ephemeral-key')
+    .argument('<runId>', RUN_ID_ARG_HELP)
     .description('Show whether the run-ephemeral key has been scrubbed yet')
     .option('--json', 'Emit raw JSON instead of plain text')
     .action(
-      cliAction(async (runId: string, opts) => {
+      cliAction(async (runRef: string, opts) => {
+        const runId = await resolveRunRef(getClient(), runRef);
         const response = (await getClient().getRunEphemeralKey(
           runId,
         )) as unknown as EphemeralKeyResponse;
@@ -613,7 +702,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
 
   // ── runs secret-outputs <runId> ────────────────────────────────
   runs
-    .command('secret-outputs <runId>')
+    .command('secret-outputs')
+    .argument('<runId>', RUN_ID_ARG_HELP)
     .description('List per-job secret outputs (masked by default; --reveal decrypts and audits)')
     .option('--output-key <key>', 'Filter to a single output_key')
     .option(
@@ -622,7 +712,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
     )
     .option('--json', 'Emit raw JSON instead of a table')
     .action(
-      cliAction(async (runId: string, opts) => {
+      cliAction(async (runRef: string, opts) => {
+        const runId = await resolveRunRef(getClient(), runRef);
         if (opts.reveal) {
           process.stderr.write(
             '⚠  --reveal will decrypt secret values; this call is recorded in secret_audit_log.\n',

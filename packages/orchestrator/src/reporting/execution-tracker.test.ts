@@ -1273,6 +1273,21 @@ describe('ExecutionTracker', () => {
       );
     });
 
+    it('recordRunHeld marks a held test run so the test-run routes can read it', async () => {
+      const { t } = epochTracker();
+      await t.recordRunHeld({ ...heldArgs('run-held-test'), testRun: { fixtureId: 'push-main' } });
+      await t.recordRunHeld(heldArgs('run-held-webhook'));
+      const row = (runId: string) =>
+        mockDb.inserts.find((i) => i.table === 'execution_runs' && i.values.run_id === runId);
+      // fails-when: a held fixture run reads "Run not found" on the test-run status route
+      expect(row('run-held-test')!.values).toMatchObject({
+        is_test_run: true,
+        fixture_id: 'push-main',
+      });
+      // breaks-if-wrong: a webhook hold is never marked a test run
+      expect(row('run-held-webhook')!.values).not.toHaveProperty('is_test_run');
+    });
+
     it('recordRunHeld forwards nothing when its guarded write kept a terminal row', async () => {
       const { t, onStatusChange } = epochTracker();
       await startTestRun(t, 'run-held-done');
@@ -1324,6 +1339,30 @@ describe('ExecutionTracker', () => {
         (u) => u.table === 'execution_jobs' && u.values.status === 'success',
       );
       expect(jobUpdate?.values.log_bytes).toBe(2000);
+    });
+
+    it('persists the step type from either spelling the agent sends', async () => {
+      await startRun(tracker, { jobs: [{ jobId: 'job-1', jobName: 'test' }] });
+      // The sandbox relays the runner's IPC `step_type` (hooks, cache, init); the
+      // host-side image build sends `stepType`; a plain step sends neither.
+      const reports: Array<[number, Record<string, unknown> | undefined]> = [
+        [1_000_000, { step_type: 'init:0' }],
+        [2_000_000, { stepType: 'container:build' }],
+        [0, undefined],
+      ];
+      for (const [index, data] of reports) {
+        await tracker.onStepStatus('run-1', 'job-1', index, `s${index}`, 'running', 1, data);
+      }
+
+      const typeAt = (index: number) =>
+        mockDb.inserts.find((u) => u.table === 'execution_steps' && u.values.step_index === index)
+          ?.values.step_type;
+      // fails-when: only `data.stepType` is read, so every hook, cache and init step is stored as 'step'
+      expect(typeAt(1_000_000)).toBe('init:0');
+      // breaks-if-wrong: the camelCase spelling keeps working
+      expect(typeAt(2_000_000)).toBe('container:build');
+      // breaks-if-wrong: an untyped step keeps the column default
+      expect(typeAt(0)).toBeUndefined();
     });
 
     it('persists a step error as its message, not [object Object]', async () => {
@@ -2133,6 +2172,43 @@ describe('ExecutionTracker', () => {
       );
       expect(first!.values).not.toHaveProperty('parent_run_id');
       expect(first!.values).not.toHaveProperty('original_run_id');
+    });
+
+    it('recordInitFailureRun marks a test run so the test-run routes can read its failure', async () => {
+      const t = new ExecutionTracker({ db: mockDb.db });
+      const base = {
+        workflowName: 'ci',
+        provider: 'local',
+        repoIdentifier: 'local/repo',
+        workflowRepoIdentifier: 'local/repo',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: 'test:d1',
+        providerContext: {},
+        routingKey: 'remote:org',
+        initFailure: {
+          scope: 'run' as const,
+          category: InitFailureCategory.enum.secret_resolution,
+          message: 'secret missing',
+        },
+      };
+      await t.recordInitFailureRun({
+        ...base,
+        runId: 'run-init-test',
+        testRun: { fixtureId: 'push-main' },
+      });
+      await t.recordInitFailureRun({ ...base, runId: 'run-init-webhook' });
+
+      const test = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-init-test',
+      );
+      // fails-when: the row stays is_test_run=false, so `kici run remote` reads "Run not found"
+      expect(test!.values).toMatchObject({ is_test_run: true, fixture_id: 'push-main' });
+      // breaks-if-wrong: a webhook run's init failure is never marked a test run
+      const webhook = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-init-webhook',
+      );
+      expect(webhook!.values).not.toHaveProperty('is_test_run');
     });
 
     it('a late round-job status does not rehydrate and undo the errored round row', async () => {
@@ -3222,8 +3298,10 @@ describe('ExecutionTracker', () => {
   describe('cancelStepsForJob', () => {
     /**
      * Creates a mock DB that supports cancelStepsForJob's query patterns:
-     * - selectFrom('execution_steps').select([...]).where(...).where(...).where('status','not in',...).execute()
-     * - updateTable('execution_steps').set({...}).where(...).where(...).where('status','not in',...).execute()
+     * - selectFrom('execution_steps').select([...]).where(...).where(...).where('status','not
+     * in',...).execute()
+     * - updateTable('execution_steps').set({...}).where(...).where(...).where('status','not
+     * in',...).execute()
      * Plus the standard patterns needed by onExecutionStarted.
      */
     function createCancelStepsMockDb(
@@ -4039,6 +4117,29 @@ describe('ExecutionTracker', () => {
           d.where.some((w) => w[0] === 'job_id' && w[2] === 'needs-pending-deploy-xpeer'),
       );
       expect(deleteOps.length).toBe(1);
+    });
+
+    it('findSyntheticJobId never returns the placeholder of a job whose name extends the asked one', async () => {
+      await startRun(tracker, {
+        runId: 'run-prefix-names',
+        deliveryId: 'delivery-prefix',
+        providerContext: { installationId: 42 },
+        triggerDecision: { matched: true },
+        jobs: [{ jobId: 'job-upstream', jobName: 'lint' }],
+      });
+      await tracker.addJobsToRun('run-prefix-names', [
+        { jobId: 'needs-pending-build-and-push-uuid1', jobName: 'build-and-push' },
+        { jobId: 'needs-pending-build-uuid2', jobName: 'build' },
+      ]);
+
+      // fails-when: the in-memory scan matches on the `needs-pending-build-` prefix alone
+      expect(await tracker.findSyntheticJobId('run-prefix-names', 'build')).toBe(
+        'needs-pending-build-uuid2',
+      );
+      // breaks-if-wrong: the longer name still finds its own placeholder
+      expect(await tracker.findSyntheticJobId('run-prefix-names', 'build-and-push')).toBe(
+        'needs-pending-build-and-push-uuid1',
+      );
     });
 
     it('findSyntheticJobId falls back to DB when another peer inserted the synthetic row', async () => {

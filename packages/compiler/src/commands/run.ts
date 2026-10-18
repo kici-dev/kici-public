@@ -6,8 +6,6 @@ import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
 import {
   parseInputPairs,
   coerceDispatchInputs,
-  toCanonicalStatus,
-  TERMINAL_RUN_STATES,
   type HostTargetSelector,
   type InputsDescriptorMap,
 } from '@kici-dev/engine';
@@ -20,14 +18,9 @@ import {
   AuthenticationError,
   AccessDeniedError,
   ConnectionError,
-  NotFoundError,
-  type PlatformRunLogsResponse,
-  type PlatformRunStatusResponse,
-  FIRST_LOG_POSITION,
-  nextLogPosition,
-  type RunLogPosition,
+  type PlatformTriggerResponse,
 } from '../remote/platform-client.js';
-import { DirectRunClient, HoldsUnavailableError } from '../remote/direct-client.js';
+import { DirectRunClient } from '../remote/direct-client.js';
 import {
   createDirectTransport,
   createPlatformTransport,
@@ -45,30 +38,30 @@ import {
 import { detectCurrentBranch } from '../test-runner/git-detector.js';
 import { runFixturePicker, FixturePickerCancelledError } from '../fixtures/picker.js';
 import { createOverlayTarball, getSizeWarning } from '../remote/uploader.js';
-import {
-  formatSummary,
-  formatErrorHighlight,
-  formatMultiFixtureSummary,
-  type RunResult,
-} from '../remote/output/summary.js';
+import { formatMultiFixtureSummary, type RunResult } from '../remote/output/summary.js';
 import { formatJsonResult } from '../remote/output/json.js';
-import { unwrapStoredLogLine } from '../remote/output/streaming.js';
 import { formatJunitResult } from '../remote/output/junit.js';
 import { RunHistory } from '../remote/history.js';
 import { buildEncryptedSecrets } from '../remote/secret-upload.js';
 import { buildLocalRepoIdentity } from '../remote/local-repo-identity.js';
-import { handleNewHolds } from './run-hold-watch.js';
 import { compileCommand } from './compile.js';
-import { confirm as inquirerConfirm } from '@inquirer/prompts';
+import { followRuns, type FollowedRun } from './run-remote-follow.js';
 import type { RemoteRunOptions, RemoteRunResult } from './preview.js';
 
 /**
- * Resolves through the engine's canonical vocabulary, not a hand-written literal
- * set, so a newly-added terminal status never leaves `kici run` polling forever.
+ * The runs a trigger created: one per matched workflow, or the single `runId`
+ * of an orchestrator that predates `runs`.
  */
-function isTerminalRunStatus(status: string): boolean {
-  const canonical = toCanonicalStatus(status.toLowerCase());
-  return canonical !== undefined && TERMINAL_RUN_STATES.has(canonical);
+function triggeredRuns(response: PlatformTriggerResponse): FollowedRun[] {
+  if (response.runs?.length) {
+    return response.runs.map((r) => ({ runId: r.runId, workflowName: r.workflowName }));
+  }
+  return [{ runId: response.runId }];
+}
+
+/** `Run started: <id>`, naming the workflow when the server did. */
+function runStartedLine(run: FollowedRun): string {
+  return `Run started: ${run.runId}${run.workflowName ? ` (${run.workflowName})` : ''}`;
 }
 
 /**
@@ -176,16 +169,6 @@ export function buildDispatchInputs(
   }
   return raw;
 }
-
-const POLL_INTERVAL_MS = 750;
-
-/**
- * The trigger answers once the orchestrator creates the run, but the Platform's
- * view arrives over the relay later, so the first poll can legitimately 404.
- * Within this budget, and only until the first successful read, a 404 retries;
- * after that it is a genuinely missing run.
- */
-const RUN_VISIBILITY_GRACE_MS = 30_000;
 
 /**
  * Compiling evaluates every user workflow and fixture module, and a top-level
@@ -503,6 +486,7 @@ async function renderResults(
       status: r.status as 'success' | 'failed' | 'cancelled',
       totalDurationMs: r.durationMs ?? 0,
       jobs: r.jobs ?? [],
+      ...(r.runs && { runs: r.runs }),
     }));
 
   if (options.json) {
@@ -705,6 +689,8 @@ async function runSingleFixture(
         const dispatchInputs = buildDispatchInputs(options.inputs ?? [], descriptor);
         return Object.keys(dispatchInputs).length ? { dispatchInputs } : {};
       })(),
+      // This CLI follows every run, so each matched workflow gets its own.
+      acceptsMultipleRuns: true,
     });
 
     if (triggerResult.status === 'rejected') {
@@ -719,33 +705,52 @@ async function runSingleFixture(
       };
     }
 
+    const runs = triggeredRuns(triggerResult);
     if (!options.quiet) {
-      logger.info(pc.green(`Run started: ${triggerResult.runId}`));
+      for (const run of runs) logger.info(pc.green(runStartedLine(run)));
       for (const warning of triggerResult.warnings ?? []) {
         logger.warn(pc.yellow(`⚠ ${warning}`));
       }
     }
 
-    await history.addEntry({
-      runId: triggerResult.runId,
-      fixtureId: fixture.id,
-      status: 'running',
-      startedAt: new Date().toISOString(),
-      endpoint: ctx.endpoint,
-    });
-
-    if (options.wait === false) {
-      return { fixtureId: fixture.id, runId: triggerResult.runId, status: 'accepted' };
+    // One history entry per run, so `kici runs show <id>` finds each one.
+    const startedAt = new Date().toISOString();
+    for (const run of runs) {
+      await history.addEntry({
+        runId: run.runId,
+        fixtureId: fixture.id,
+        ...(run.workflowName && { workflowName: run.workflowName }),
+        status: 'running',
+        startedAt,
+        endpoint: ctx.endpoint,
+      });
     }
 
-    const result = await pollRunToCompletion(ctx, triggerResult.runId, fixture.id, options);
+    if (options.wait === false) {
+      return {
+        fixtureId: fixture.id,
+        runId: triggerResult.runId,
+        status: 'accepted',
+        runs: runs.map((r) => ({ ...r, status: 'accepted', jobs: [] })),
+      };
+    }
 
-    await history.updateEntry(triggerResult.runId, {
-      status: result.status as 'success' | 'failed' | 'cancelled',
-      completedAt: new Date().toISOString(),
-      durationMs: result.durationMs,
-      jobs: result.jobs,
-    });
+    const result = await followRuns(ctx, runs, fixture.id, options);
+
+    const completedAt = new Date().toISOString();
+    for (const run of result.runs ?? []) {
+      await history.updateEntry(run.runId, {
+        status:
+          run.status === 'error' ? 'failed' : (run.status as 'success' | 'failed' | 'cancelled'),
+        completedAt,
+        ...(run.durationMs !== undefined && { durationMs: run.durationMs }),
+        jobs: run.jobs.map(({ name, status, durationMs }) => ({
+          name,
+          status,
+          ...(durationMs !== undefined && { durationMs }),
+        })),
+      });
+    }
 
     return result;
   } catch (error) {
@@ -786,243 +791,6 @@ function handleRunError(
   }
 
   return { fixtureId, runId: '', status: 'error', reason: toErrorMessage(error) };
-}
-
-/**
- * Poll the transport for run completion, streaming log lines as they arrive.
- *
- * Each `logs(position)` returns the next chunk and the position to read on
- * from: the per-file cursor when the server offers it, else the numeric line
- * cursor. The run is done only when the status is terminal and the log
- * stream has drained.
- */
-async function pollRunToCompletion(
-  ctx: RunRemoteTransport,
-  runId: string,
-  fixtureId: string,
-  options: RemoteRunOptions,
-): Promise<RemoteRunResult> {
-  const startTime = Date.now();
-  let position: RunLogPosition = FIRST_LOG_POSITION;
-  const tailLines: string[] = [];
-  const MAX_TAIL = 50;
-
-  // Ctrl-C cancels the run and returns once the cancel settles; a second Ctrl-C
-  // exits at once.
-  let cancelRequest: Promise<void> | null = null;
-  const cancelHandler = () => {
-    if (!cancelRequest) {
-      cancelRequest = requestRunCancel(ctx, runId, options);
-    } else {
-      process.stderr.write(
-        pc.yellow(`Exiting without waiting. Run ${runId} may still be running.\n`),
-      );
-      process.exit(SIGINT_EXIT_CODE);
-    }
-  };
-  process.on('SIGINT', cancelHandler);
-
-  try {
-    let lastStatus: PlatformRunStatusResponse | null = null;
-    const holdState: HoldWatchState = { seen: new Set<string>(), unavailable: false };
-
-    // See RUN_VISIBILITY_GRACE_MS.
-    let runSeen = false;
-
-    while (!cancelRequest) {
-      let logs: PlatformRunLogsResponse;
-      try {
-        logs = await ctx.logs(runId, position);
-        lastStatus = await ctx.status(runId);
-      } catch (err) {
-        if (
-          err instanceof NotFoundError &&
-          !runSeen &&
-          Date.now() - startTime < RUN_VISIBILITY_GRACE_MS
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-          continue;
-        }
-        throw err;
-      }
-      runSeen = true;
-
-      for (const raw of logs.lines) {
-        const line = unwrapStoredLogLine(raw);
-        if (!options.quiet) process.stdout.write(line + '\n');
-        tailLines.push(line);
-        while (tailLines.length > MAX_TAIL) tailLines.shift();
-      }
-      position = nextLogPosition(logs);
-
-      const terminal = lastStatus.done || isTerminalRunStatus(lastStatus.status);
-
-      if (terminal && logs.done) {
-        return finishRun(fixtureId, runId, lastStatus, startTime, tailLines, options);
-      }
-
-      if (!terminal) {
-        await watchRunHolds(runId, holdState, ctx, options);
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-    }
-
-    await cancelRequest;
-    return {
-      fixtureId,
-      runId,
-      status: 'cancelled',
-      durationMs: Date.now() - startTime,
-      jobs: jobsFromStatus(lastStatus),
-    };
-  } finally {
-    // A Ctrl-C during the last poll tick still sends its cancel before the
-    // command reports and exits.
-    if (cancelRequest) await cancelRequest;
-    process.removeListener('SIGINT', cancelHandler);
-  }
-}
-
-const CANCEL_REQUEST_TIMEOUT_MS = 15_000;
-
-/** 128 + SIGINT, the shell convention. */
-const SIGINT_EXIT_CODE = 130;
-
-/** Never throws: a failed or unanswered cancel is reported, and the command still ends. */
-export async function requestRunCancel(
-  ctx: Pick<RunRemoteTransport, 'cancel'>,
-  runId: string,
-  options: Pick<RemoteRunOptions, 'quiet'>,
-  timeoutMs = CANCEL_REQUEST_TIMEOUT_MS,
-): Promise<void> {
-  // Quiet / --json keeps stdout for the result, so the notes go to stderr.
-  const note = (line: string): void => {
-    if (options.quiet) process.stderr.write(`${line}\n`);
-    else logger.info(line);
-  };
-  note(pc.yellow(`\nCancelling run ${runId}... Press Ctrl-C again to exit without waiting.`));
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    const answer = await Promise.race([
-      ctx.cancel(runId),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`the orchestrator did not answer within ${timeoutMs / 1000}s`)),
-          timeoutMs,
-        );
-      }),
-    ]);
-    note(
-      pc.yellow(
-        answer.cancelled
-          ? `Cancelled run ${runId}.`
-          : `Run ${runId} had already finished; nothing to cancel.`,
-      ),
-    );
-  } catch (err) {
-    process.stderr.write(
-      `${pc.red(`Could not cancel run ${runId}: ${toErrorMessage(err)}. The run may still be running.`)}\n`,
-    );
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-export interface HoldWatchState {
-  /** Hold ids already prompted or notified, once each. */
-  seen: Set<string>;
-  /** Set once the transport says it cannot list holds; listing then stops. */
-  unavailable: boolean;
-}
-
-/**
- * A transport that cannot list holds says so once (`HoldsUnavailableError`) and
- * is not asked again. Any other failure is swallowed: hold visibility is
- * best-effort and must never abort the run watch.
- */
-export async function watchRunHolds(
-  runId: string,
-  state: HoldWatchState,
-  transport: Pick<RunRemoteTransport, 'kind' | 'holds'>,
-  options: RemoteRunOptions,
-): Promise<void> {
-  if (state.unavailable) return;
-  const quiet = Boolean(options.quiet);
-  // Quiet / --json: never block on a stdin prompt (it would hang the run, and
-  // --approve-all auto-approves instead), and write hold text to stderr.
-  const output = quiet
-    ? (line: string) => void process.stderr.write(line + '\n')
-    : (line: string) => logger.info(line);
-  try {
-    const holds = await transport.holds.list(runId);
-    if (holds.length === 0) return;
-
-    const isTty = quiet ? false : Boolean(process.stdin.isTTY && process.stdout.isTTY);
-    await handleNewHolds({
-      holds,
-      seen: state.seen,
-      isTty,
-      output,
-      approveAll: Boolean(options.approveAll),
-      confirm: (message) => inquirerConfirm({ message, default: false }),
-      resolveContext: () => transport.holds.context(),
-      approve: (ctx, id, auto) => transport.holds.approve(ctx, id, auto),
-      reject: (ctx, id, reason) => transport.holds.reject(ctx, id, reason),
-      ...(transport.kind === 'direct' && { answerHint: transport.holds.answerHint }),
-    });
-  } catch (err) {
-    if (err instanceof HoldsUnavailableError) {
-      state.unavailable = true;
-      output(pc.yellow(`[kici] ${err.message}`));
-    }
-  }
-}
-
-function finishRun(
-  fixtureId: string,
-  runId: string,
-  status: PlatformRunStatusResponse,
-  startTime: number,
-  tailLines: string[],
-  options: RemoteRunOptions,
-): RemoteRunResult {
-  const durationMs = Date.now() - startTime;
-  const jobs = jobsFromStatus(status);
-  const finalStatus = status.status as RemoteRunResult['status'];
-
-  if (!options.quiet) {
-    const runResult: RunResult = {
-      fixtureId,
-      runId,
-      status:
-        finalStatus === 'failed' ? 'failed' : finalStatus === 'cancelled' ? 'cancelled' : 'success',
-      totalDurationMs: durationMs,
-      jobs,
-    };
-    process.stdout.write('\n' + formatSummary(runResult) + '\n');
-
-    if (finalStatus === 'failed' && tailLines.length > 0) {
-      const failedJob = status.jobs.find((j) => j.status === 'failed');
-      process.stdout.write(
-        '\n' + formatErrorHighlight(failedJob?.jobName ?? 'run', tailLines) + '\n',
-      );
-    }
-  }
-
-  return { fixtureId, runId, status: finalStatus, durationMs, jobs };
-}
-
-function jobsFromStatus(
-  status: PlatformRunStatusResponse | null,
-): Array<{ name: string; status: string; durationMs?: number }> {
-  if (!status) return [];
-  return status.jobs.map((j) => ({
-    name: j.jobName,
-    status: j.status,
-    // An unreported duration prints as `-` in the summary table.
-    ...(typeof j.durationMs === 'number' && { durationMs: j.durationMs }),
-  }));
 }
 
 /** Runs a workflow directly, bypassing trigger matching. */
@@ -1108,13 +876,15 @@ async function runDirectWorkflow(
       return false;
     }
 
+    // `--workflow` names one workflow, so the trigger creates one run.
+    const runs = triggeredRuns(triggerResult);
     if (!options.quiet) {
-      logger.info(pc.green(`Run started: ${triggerResult.runId}`));
+      for (const run of runs) logger.info(pc.green(runStartedLine(run)));
     }
 
     if (options.wait === false) return true;
 
-    const result = await pollRunToCompletion(ctx, triggerResult.runId, fixtureId, options);
+    const result = await followRuns(ctx, runs, fixtureId, options);
     return result.status === 'success';
   } catch (error) {
     const result = handleRunError(fixtureId, error, options, ctx.kind);

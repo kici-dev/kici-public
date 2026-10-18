@@ -6,8 +6,12 @@ import {
   JobKind,
   RunDetailSource,
 } from '@kici-dev/engine';
+import { logger } from '@kici-dev/core';
 import { runsLogsCommand } from './logs.js';
 import * as clientMod from '../../remote/dashboard-client.js';
+
+/** A run id the commands accept as a full id. */
+const RUN = '0f1e2d3c-0000-4000-8000-000000000001';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -21,9 +25,29 @@ function proxied(detail: unknown) {
 }
 
 describe('runsLogsCommand', () => {
+  it('reads the logs of the run a unique short id names', async () => {
+    const full = '709c899a-b06f-45d0-a3e2-d0a14fa62094';
+    const getRunDetailWithSource = vi.fn(proxied({ jobs: [] }));
+    vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
+      listRuns: async () => ({ runs: [{ runId: full }], hasMore: false }),
+      getRunDetailWithSource,
+    } as never);
+    // fails-when: the short id is sent as a run id
+    expect(await runsLogsCommand('709c899a', { json: true })).toBe(true);
+    expect(getRunDetailWithSource).toHaveBeenCalledWith(full);
+  });
+
+  it('refuses text that cannot be a run id with a clear message', async () => {
+    const load = vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({} as never);
+    const err = vi.spyOn(logger, 'error').mockImplementation(() => logger);
+    expect(await runsLogsCommand('not-a-run', {})).toBe(false);
+    expect(String(err.mock.calls[0]?.[0])).toContain("Invalid run id 'not-a-run'");
+    expect(load).toHaveBeenCalled();
+  });
+
   it('prints step logs in order with headers', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied({
         jobs: [
           {
@@ -39,7 +63,7 @@ describe('runsLogsCommand', () => {
       getStepLogs: async () => ({ lines: ['hello', 'world'], totalLines: 2 }),
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const ok = await runsLogsCommand('r1', {});
+    const ok = await runsLogsCommand(RUN, {});
     expect(ok).toBe(true);
     const printed = log.mock.calls.map((c) => String(c[0])).join('\n');
     expect(printed).toContain('build');
@@ -50,7 +74,7 @@ describe('runsLogsCommand', () => {
   it('filters to a single job with --job', async () => {
     const getStepLogs = vi.fn(async () => ({ lines: ['x'], totalLines: 1 }));
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied({
         jobs: [
           {
@@ -70,11 +94,11 @@ describe('runsLogsCommand', () => {
       getStepLogs,
     } as never);
     vi.spyOn(console, 'log').mockImplementation(() => {});
-    await runsLogsCommand('r1', { job: 'test' });
+    await runsLogsCommand(RUN, { job: 'test' });
     // The job's setup log (step -1), then its one step; nothing from 'build'.
     expect(getStepLogs.mock.calls).toEqual([
-      ['r1', 'j2', -1],
-      ['r1', 'j2', 0],
+      [RUN, 'j2', -1],
+      [RUN, 'j2', 0],
     ]);
   });
 
@@ -92,7 +116,7 @@ describe('runsLogsCommand', () => {
 
   it("prints a job's setup log under a setup heading, ahead of its steps", async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied(SETUP_DETAIL),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) =>
         stepIndex === -1
@@ -101,7 +125,7 @@ describe('runsLogsCommand', () => {
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await runsLogsCommand('r1', {});
+    await runsLogsCommand(RUN, {});
 
     const printed = log.mock.calls.map((c) => String(c[0]));
     const setupHeading = printed.findIndex((l) => l.includes('build › (setup)'));
@@ -114,7 +138,7 @@ describe('runsLogsCommand', () => {
 
   it('prints no setup heading when the orchestrator serves no setup log', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied(SETUP_DETAIL),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) => {
         if (stepIndex === -1) throw new Error('Step not found');
@@ -125,7 +149,7 @@ describe('runsLogsCommand', () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     // breaks-if-wrong: an older orchestrator must not fail the command.
-    expect(await runsLogsCommand('r1', {})).toBe(true);
+    expect(await runsLogsCommand(RUN, {})).toBe(true);
     const printed = log.mock.calls.map((c) => String(c[0])).join('\n');
     expect(printed).not.toContain('setup');
     expect(printed).toContain('compiled');
@@ -137,7 +161,7 @@ describe('runsLogsCommand', () => {
 
   it('names on stderr why the setup log could not be read, leaving stdout and the exit code unchanged', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied(SETUP_DETAIL),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) => {
         if (stepIndex === -1) {
@@ -152,7 +176,7 @@ describe('runsLogsCommand', () => {
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
-    expect(await runsLogsCommand('r1', {})).toBe(true);
+    expect(await runsLogsCommand(RUN, {})).toBe(true);
     // fails-when: the setup-log error is swallowed into an empty page
     expect(err.mock.calls.map((c) => String(c[0])).join('\n')).toContain(
       'setup log unavailable for job build: Orchestrator timed out — try again shortly.',
@@ -178,7 +202,7 @@ describe('runsLogsCommand', () => {
       ],
     };
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.failed }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.failed }),
       getRunDetailWithSource: async () => ({
         detail: STARTED_NO_STEPS,
         source: 'platform-db',
@@ -192,7 +216,7 @@ describe('runsLogsCommand', () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     // breaks-if-wrong: the exit code stays true; only stderr explains
-    expect(await runsLogsCommand('r1', {})).toBe(true);
+    expect(await runsLogsCommand(RUN, {})).toBe(true);
     const stderr = err.mock.calls.map((c) => String(c[0])).join('\n');
     // fails-when: the command exits 0 having printed nothing anywhere
     expect(stderr).toContain(
@@ -205,7 +229,7 @@ describe('runsLogsCommand', () => {
 
   function mockSetupPage(setupPage: Record<string, unknown>): void {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied(SETUP_DETAIL),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) =>
         stepIndex === -1 ? setupPage : { lines: ['compiled'], totalLines: 1 },
@@ -216,7 +240,7 @@ describe('runsLogsCommand', () => {
     mockSetupPage({ lines: [], totalLines: 0, recorded: false });
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await runsLogsCommand('r1', {});
+    await runsLogsCommand(RUN, {});
 
     const printed = log.mock.calls.map((c) => String(c[0]));
     const setupHeading = printed.findIndex((l) => l.includes('build › (setup)'));
@@ -230,7 +254,7 @@ describe('runsLogsCommand', () => {
     mockSetupPage({ lines: [], totalLines: 0, recorded: true });
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await runsLogsCommand('r1', {});
+    await runsLogsCommand(RUN, {});
 
     const printed = log.mock.calls.map((c) => String(c[0]));
     const setupHeading = printed.findIndex((l) => l.includes('build › (setup)'));
@@ -258,13 +282,13 @@ describe('runsLogsCommand', () => {
       },
     ];
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied({ jobs: notStarted }),
       getStepLogs: async () => ({ lines: [], totalLines: 0, recorded: false }),
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await runsLogsCommand('r1', {});
+    await runsLogsCommand(RUN, {});
 
     // fails-when: every queued, skipped or gate job prints "no setup log recorded"
     const printed = log.mock.calls.map((c) => String(c[0])).join('\n');
@@ -275,7 +299,7 @@ describe('runsLogsCommand', () => {
     mockSetupPage({ lines: [], totalLines: 0 });
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await runsLogsCommand('r1', {});
+    await runsLogsCommand(RUN, {});
 
     // breaks-if-wrong: an orchestrator that does not report `recorded` keeps the silent output
     const printed = log.mock.calls.map((c) => String(c[0])).join('\n');
@@ -287,7 +311,7 @@ describe('runsLogsCommand', () => {
     mockSetupPage({ lines: [], totalLines: 0, recorded: false });
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await runsLogsCommand('r1', { json: true });
+    await runsLogsCommand(RUN, { json: true });
 
     // breaks-if-wrong: the note is human output only; the JSON keeps the step-only shape
     expect(JSON.parse(String(log.mock.calls[0]![0]))).toEqual({ 'build/compile': ['compiled'] });
@@ -307,7 +331,7 @@ describe('runsLogsCommand', () => {
 
   function mockSetupAndStep(detail: unknown): void {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied(detail),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) => ({
         lines: [stepIndex === -1 ? 'setup-line' : 'step-line'],
@@ -320,7 +344,7 @@ describe('runsLogsCommand', () => {
     mockSetupAndStep(STEP_NAMED_SETUP);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await runsLogsCommand('r1', { json: true });
+    await runsLogsCommand(RUN, { json: true });
 
     // fails-when: the setup lines are keyed `build/setup`, the step's own key, and one of the
     // two overwrites the other
@@ -342,7 +366,7 @@ describe('runsLogsCommand', () => {
     });
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await runsLogsCommand('r1', { json: true });
+    await runsLogsCommand(RUN, { json: true });
 
     const out = JSON.parse(String(log.mock.calls[0]![0])) as Record<string, unknown>;
     // fails-when: a job name's `/` or `%` reaches the key unencoded, so
@@ -364,7 +388,7 @@ describe('runsLogsCommand', () => {
 
   it('prints no setup key in --json when no job wrote a setup log', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied(SETUP_DETAIL),
       getStepLogs: async (_r: string, _j: string, stepIndex: number) => {
         if (stepIndex === -1) throw new Error('Step not found');
@@ -373,7 +397,7 @@ describe('runsLogsCommand', () => {
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await runsLogsCommand('r1', { json: true });
+    await runsLogsCommand(RUN, { json: true });
 
     // breaks-if-wrong: a run with no setup log keeps the step-only `<job>/<step>` shape
     expect(JSON.parse(String(log.mock.calls[0]![0]))).toEqual({ 'build/compile': ['step-line'] });
@@ -383,7 +407,7 @@ describe('runsLogsCommand', () => {
     mockSetupAndStep(STEP_NAMED_SETUP);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
 
-    await runsLogsCommand('r1', {});
+    await runsLogsCommand(RUN, {});
 
     const printed = log.mock.calls.map((c) => String(c[0]));
     const setupHeading = printed.findIndex((l) => l.includes('build › (setup)'));
@@ -405,7 +429,7 @@ describe('runsLogsCommand unwraps stored log envelopes', () => {
     // fails-when: the text mode prints `logs.lines` verbatim, so `kici runs logs`
     // shows the store's {"ts":…,"level":"stdout","msg":…} for every line.
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied({
         jobs: [
           {
@@ -419,7 +443,7 @@ describe('runsLogsCommand unwraps stored log envelopes', () => {
       getStepLogs: async () => ({ lines: [ENVELOPE, 'plain line'], totalLines: 2 }),
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    await runsLogsCommand('r1', {});
+    await runsLogsCommand(RUN, {});
     const printed = log.mock.calls.map((c) => String(c[0]));
     expect(printed).toContain('smoke test passed');
     expect(printed).not.toContain(ENVELOPE);
@@ -430,7 +454,7 @@ describe('runsLogsCommand unwraps stored log envelopes', () => {
 
   it('unwraps in --follow mode too', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
-      getRun: async () => ({ runId: 'r1', status: ExecutionRunStatus.enum.success }),
+      getRun: async () => ({ runId: RUN, status: ExecutionRunStatus.enum.success }),
       getRunDetailWithSource: proxied({
         jobs: [
           {
@@ -444,7 +468,7 @@ describe('runsLogsCommand unwraps stored log envelopes', () => {
       getStepLogs: async () => ({ lines: [ENVELOPE], totalLines: 1 }),
     } as never);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const ok = await runsLogsCommand('r1', { follow: true });
+    const ok = await runsLogsCommand(RUN, { follow: true });
     expect(ok).toBe(true);
     const printed = log.mock.calls.map((c) => String(c[0]));
     expect(printed).toContain('smoke test passed');

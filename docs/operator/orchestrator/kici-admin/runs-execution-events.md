@@ -17,13 +17,15 @@ kici-admin runs secret-outputs <runId> [--output-key <k>] [--reveal] [--json]
 kici-admin runs logs <runId> --job <jobId> [--step <n>] [--limit <n>] [--cursor <c>] [--json]
 ```
 
-Inspects execution runs, jobs, ephemeral keys, and secret outputs. Useful for investigating run status and failures — and, with `secret-outputs --reveal`, for recovering a job's output values during incident response — without direct database access.
+Inspects execution runs, jobs, ephemeral keys, and secret outputs. Every `<runId>` takes a full run id or its first characters (at least 4), like a git short SHA: `kici-admin runs show 709c899a` finds the one run whose id starts with `709c899a`. A prefix that matches several runs fails and lists them, so type more characters. A prefix that matches none, or text that cannot start a run id, fails and says so. An orchestrator older than `kici-admin` cannot look up a prefix, so `kici-admin` asks for the full run id. `runs list` shows full run ids. The admin API answers a run id that is not a full UUID with a 400 that names it. It filters the run list by prefix with `?runIdPrefix=`. Useful for investigating run status and failures — and, with `secret-outputs --reveal`, for recovering a job's output values during incident response — without direct database access.
 
 Shows run header (status, repo, ref, SHA, provider, timing, context, trust tier), jobs table, and steps per job. Internally composes two admin API calls: `GET /admin/runs/:runId` (run header) + `GET /admin/runs/:runId/jobs?includeSteps=true`.
 
 For an organization-wide workflow — one defined in another repository and fired by an event from this one — the header also shows where the workflow comes from. `Defined in:` names the repository that defines the workflow, `Workflow SHA:` the commit of that repository the run dispatched, and `Workflow branch:` its registered branch. A run of a repository's own workflow shows none of these lines. `--json` carries the same values as `workflowRepoIdentifier`, `workflowSha`, and `workflowBranch`, each `null` on a run of a repository's own workflow.
 
-A run can span several workflows. A fixture run with no `--workflow` (`kici run remote <fixture>`) runs every workflow whose triggers match, under one run id. Such a run shows a `Workflows:` line with every workflow name in place of the `Workflow:` line. The jobs table has a `workflow` column, and each step heading and the failure summary name the job as `<workflow> / <job>`, because two workflows can each define a job of the same name. `runs list` shows the run's first workflow and a count of the others (`hello-world +3`), and `--workflow-name` matches a run that spans the named workflow. In `--json`, the run carries `workflowNames` (every workflow, the first one first) next to `workflowName` (the first one), and each job carries `workflowName`. A job row written by an earlier orchestrator version records no workflow. It shows `-` on a fixture run, and the run's workflow on any other run.
+A run can span several workflows. `kici run remote <fixture>` gives each matched workflow its own run, but a `kici` older than 0.21.0 gets one shared run for all of them, when their job names cannot collide. Such a run shows a `Workflows:` line with every workflow name in place of the `Workflow:` line. The jobs table has a `workflow` column, and each step heading and the failure summary name the job as `<workflow> / <job>`, because two workflows can each define a job of the same name. `runs list` shows the run's first workflow and a count of the others (`hello-world +3`), and `--workflow-name` matches a run that spans the named workflow. In `--json`, the run carries `workflowNames` (every workflow, the first one first) next to `workflowName` (the first one), and each job carries `workflowName`. A job row written by an earlier orchestrator version records no workflow. It shows `-` on a fixture run, and the run's workflow on any other run.
+
+Steps are listed in the order they ran. A job's image build comes first, then its `init` commands, then its steps. The `#` column shows a step's index, and an `init` command as `init[<n>]`, where `<n>` is its position in the job's `init` list. `runs jobs --include-steps` and `runs structured` list steps the same way. In the `--json` output of `runs show` and `runs jobs --include-steps`, `stepIndex` is the stored index, which for an `init` command is a large internal number. Each step also carries `phase` (`setup`, `init` or `steps`), and an `init` command carries `initIndex`, its position in the list.
 
 Shows the machine-first, provenance-tagged structured run result — the same shape an automation agent reads over the admin API (`GET /admin/runs/:runId/structured`). Trusted fields (run/job/step ids, enum statuses, exit codes, durations, hashes, the derived failure category) are plain; untrusted fields (workflow / repo / job / step names, refs, error text, job output values) are wrapped in an `{ untrusted: true, value }` envelope so a consumer can keep user-controlled content out of an instruction channel. Secret output **values** are never returned — only their key names. The human view unwraps envelopes for display; `--json` is lossless. See [Agent run-result API](../agent-run-result-api.md) for the full contract.
 
@@ -50,6 +52,8 @@ kici-admin runs logs <run_id> --job <id>
 
 **Run this recipe with an owner or admin token — an auditor token cannot complete it.** The two steps sit on different permissions: step 1 reads the dispatch queue, which requires `secret.read`, so an auditor is refused with a 403 and never reaches step 2. Only step 2 falls under the `run.read` grant described next. (An operator with database access can take step 1 offline instead, via `kici-admin queue list --database-url <url>`, which bypasses the admin API and its role check entirely.)
 
+`--step 'init[<n>]'` prints the log of the `init` command that `runs show` labels `init[<n>]`. Quote the value, because some shells (zsh) read the brackets as a file pattern.
+
 `--step=-1` prints a job's setup log. It holds the clone, the `.kici/` dependency install, and the workflow module load, plus a container job's host-side checkout and dependency install.
 
 When a step has no lines, a note on stderr says which case applies. For `--step=-1` the note reads `(no setup log recorded for this job)` or `(the setup log for this job is empty)`; any other step gets the same pair, naming its index. Standard output stays empty, so it remains pipeable. `--json` prints the response as-is, and its `recorded` field carries the same answer.
@@ -65,7 +69,7 @@ kici-admin execution purge-stale --routing-key <key> --confirm
 kici-admin execution purge-stale --routing-key <key> --confirm --database-url $URL
 ```
 
-- `list` / `show` are read-only inspection verbs over `execution_runs` / `execution_jobs` (dual-mode).
+- `list` / `show` are read-only inspection verbs over `execution_runs` / `execution_jobs` (dual-mode). Over the admin API, `show` takes a run id prefix like `runs show`. With `--database-url` it needs the full run id.
 - `purge-stale` deletes `execution_runs` + `execution_jobs` whose `routing_key` differs from the current cluster (or is NULL). Used by redeploy workflows that move a cluster to a new `routing_key` — leftover rows from the previous key would otherwise violate FK constraints on restart.
 
 ### check-run -- check-run tracking reads
@@ -342,7 +346,7 @@ Synopsis: `kici-admin execution purge-stale [options]`
 
 ### `kici-admin execution show`
 
-Show one run + its jobs (by run_id)
+Show one run + its jobs (by run_id, or its first 4+ characters)
 
 Synopsis: `kici-admin execution show <runId> [options]`
 
@@ -531,9 +535,9 @@ Synopsis: `kici-admin runs ephemeral-key <runId> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `runId`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                               |
+| -------- | -------- | -------- | ----------------------------------------- |
+| `runId`  | yes      | no       | Run id, or its first 4 or more characters |
 
 **Options**
 
@@ -549,9 +553,9 @@ Synopsis: `kici-admin runs jobs <runId> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `runId`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                               |
+| -------- | -------- | -------- | ----------------------------------------- |
+| `runId`  | yes      | no       | Run id, or its first 4 or more characters |
 
 **Options**
 
@@ -587,19 +591,19 @@ Synopsis: `kici-admin runs logs <runId> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `runId`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                               |
+| -------- | -------- | -------- | ----------------------------------------- |
+| `runId`  | yes      | no       | Run id, or its first 4 or more characters |
 
 **Options**
 
-| Option          | Default | Description                                            |
-| --------------- | ------- | ------------------------------------------------------ |
-| `--job <jobId>` |         | Job id (the dispatch_queue row id for an eval round)   |
-| `--step <n>`    | `0`     | Step index (default 0; -1 is the job setup log)        |
-| `--limit <n>`   | `500`   | Max lines to return (default 500, server caps at 2000) |
-| `--cursor <c>`  |         | Line-offset cursor from a previous page                |
-| `--json`        |         | Emit raw JSON instead of plain lines                   |
+| Option          | Default | Description                                                                   |
+| --------------- | ------- | ----------------------------------------------------------------------------- |
+| `--job <jobId>` |         | Job id (the dispatch_queue row id for an eval round)                          |
+| `--step <n>`    | `0`     | Step index (default 0; -1 is the job setup log), or an init step as init[<n>] |
+| `--limit <n>`   | `500`   | Max lines to return (default 500, server caps at 2000)                        |
+| `--cursor <c>`  |         | Line-offset cursor from a previous page                                       |
+| `--json`        |         | Emit raw JSON instead of plain lines                                          |
 
 ### `kici-admin runs secret-outputs`
 
@@ -609,9 +613,9 @@ Synopsis: `kici-admin runs secret-outputs <runId> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `runId`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                               |
+| -------- | -------- | -------- | ----------------------------------------- |
+| `runId`  | yes      | no       | Run id, or its first 4 or more characters |
 
 **Options**
 
@@ -629,9 +633,9 @@ Synopsis: `kici-admin runs show <runId> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `runId`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                               |
+| -------- | -------- | -------- | ----------------------------------------- |
+| `runId`  | yes      | no       | Run id, or its first 4 or more characters |
 
 **Options**
 
@@ -647,9 +651,9 @@ Synopsis: `kici-admin runs structured <runId> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `runId`  | yes      | no       |             |
+| Argument | Required | Variadic | Description                               |
+| -------- | -------- | -------- | ----------------------------------------- |
+| `runId`  | yes      | no       | Run id, or its first 4 or more characters |
 
 **Options**
 

@@ -1,8 +1,8 @@
 /**
  * The workflows a run spans, read from its job rows.
  *
- * A fixture run with no `--workflow` runs every matched workflow under one run
- * id. `execution_runs.workflow_name` holds the first of them; each job row
+ * An older `kici`'s shared fixture run holds every
+ * matched workflow. `execution_runs.workflow_name` holds the first of them; each job row
  * records its own in `execution_jobs.workflow_name`.
  */
 import type { Kysely } from 'kysely';

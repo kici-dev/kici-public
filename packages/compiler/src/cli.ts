@@ -758,7 +758,7 @@ Environment variables:
 
   runsCommand
     .command('show')
-    .argument('<run-id>', 'Run ID to inspect')
+    .argument('<run-id>', 'Run ID to inspect, or its first 4 or more characters')
     .description(
       'Show a run summary with its jobs and steps, why a job did not run, and any approval hold',
     )
@@ -771,7 +771,7 @@ Environment variables:
 
   runsCommand
     .command('logs')
-    .argument('<run-id>', 'Run ID')
+    .argument('<run-id>', 'Run ID, or its first 4 or more characters')
     .description('Print step logs for a run')
     .option('--job <name>', 'Only logs for this job')
     .option('-f, --follow', 'Tail logs for a live run', false)

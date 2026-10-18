@@ -5,6 +5,8 @@
  */
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
+import { parseRunIdRef } from '@kici-dev/engine';
+import { resolveRunRef } from './shared/run-ref.js';
 import {
   listExecutionRunsDirect,
   showExecutionRunDirect,
@@ -19,6 +21,20 @@ import {
   DIRECT_DB_URL_HELP,
   printJsonOr,
 } from './shared/cli-action.js';
+
+/**
+ * The full run id `execution show` was given. Over the admin API a prefix resolves
+ * like `kici-admin runs show`; the direct-database path takes a full id only.
+ */
+async function resolveExecutionRunRef(ref: string, client?: AdminApiClient): Promise<string> {
+  if (client) return resolveRunRef(client, ref);
+  const parsed = parseRunIdRef(ref);
+  if (parsed.kind === 'uuid') return parsed.runId;
+  throw new Error(
+    `Invalid run id '${ref}': --database-url needs a full run id. Drop --database-url to ` +
+      "look up a prefix over the admin API ('kici-admin execution list' shows full run ids).",
+  );
+}
 
 function printRunsTable(runs: ExecutionRunRow[]): void {
   if (runs.length === 0) {
@@ -107,12 +123,13 @@ export function registerExecutionCommands(program: Command, getClient: () => Adm
 
   exec
     .command('show <runId>')
-    .description('Show one run + its jobs (by run_id)')
+    .description('Show one run + its jobs (by run_id, or its first 4+ characters)')
     .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')
     .action(
-      cliAction(async (runId: string, opts) => {
+      cliAction(async (runRef: string, opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        const runId = await resolveExecutionRunRef(runRef, dbUrl ? undefined : getClient());
         const result = dbUrl
           ? await showExecutionRunDirect(dbUrl, { runId })
           : await getClient().get<{ run: ExecutionRunRow; jobs: ExecutionJobRow[] }>(

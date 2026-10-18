@@ -118,10 +118,25 @@ export interface PlatformTriggerInput {
    * validates, coerces and defaults them authoritatively against the lock descriptor.
    */
   dispatchInputs?: Record<string, string>;
+  /**
+   * The CLI follows every run in the response's `runs`, so the orchestrator
+   * creates one run per matched workflow.
+   */
+  acceptsMultipleRuns?: boolean;
+}
+
+/** One run a trigger created: a matched workflow and the run that executes it. */
+interface TriggeredRun {
+  runId: string;
+  workflowName: string;
+  jobIds?: string[];
 }
 
 export interface PlatformTriggerResponse {
+  /** The first run; the only one from an orchestrator that predates `runs`. */
   runId: string;
+  /** One entry per matched workflow; absent from an orchestrator that predates it. */
+  runs?: TriggeredRun[];
   status: 'accepted' | 'rejected';
   reason?: string;
   jobIds?: string[];
@@ -141,6 +156,8 @@ export interface PlatformRunStatusResponse {
     /** Absent or null from an orchestrator that does not report it. */
     durationMs?: number | null;
   }>;
+  /** Why the run failed when no job records it (an init failure). */
+  failureReason?: string | null;
   done: boolean;
 }
 
@@ -149,6 +166,8 @@ export interface PlatformRunLogsResponse {
   nextCursor: number;
   /** Opaque per-file cursor; absent from a server that predates it. */
   nextLogCursor?: string;
+  /** The job that wrote each line, index for index with `lines`; absent from a server that predates it. */
+  lineJobNames?: string[];
   done: boolean;
 }
 

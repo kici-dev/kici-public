@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { buildLocalTriggerRequest, triggerRun, type RunDiscoveryClient } from './plane-trigger.js';
+import { buildLocalTriggerRequest, triggerRuns, type RunDiscoveryClient } from './plane-trigger.js';
+
+/** The first run's id, for the single-workflow cases. */
+async function triggerRun(...args: Parameters<typeof triggerRuns>): Promise<string | undefined> {
+  return (await triggerRuns(...args))[0]?.runId;
+}
 
 describe('buildLocalTriggerRequest', () => {
   it('puts before in the body when given, and omits it when absent', () => {
@@ -96,11 +101,14 @@ describe('triggerRun', () => {
   };
 
   it('sends the webhook and resolves the discovered runId', async () => {
-    const get = vi
-      .fn()
-      .mockResolvedValueOnce({ runs: [] })
-      .mockResolvedValueOnce({ runs: [{ runId: 'run-9' }] });
-    const client: RunDiscoveryClient = { get };
+    let listed = 0;
+    const get = vi.fn(async (path: string) => {
+      if (path.startsWith('/api/v1/admin/event-log')) {
+        return { deliveries: [{ status: 'processed', matchedCount: 1 }] };
+      }
+      return listed++ === 0 ? { runs: [] } : { runs: [{ runId: 'run-9' }] };
+    });
+    const client: RunDiscoveryClient = { get: get as RunDiscoveryClient['get'] };
     const runId = await triggerRun('http://127.0.0.1:4319', 'tok', input, {
       client,
       pollIntervalMs: 1,
@@ -141,6 +149,8 @@ describe('triggerRun', () => {
       client: { get: get as RunDiscoveryClient['get'] },
       pollIntervalMs: 1,
       timeoutMs: 5_000,
+      // This plane's event log does not answer, so discovery settles on the listed run.
+      settleMs: 0,
     });
     expect(runId).toBe('run-mine');
   });
@@ -162,8 +172,91 @@ describe('triggerRun', () => {
       pollIntervalMs: 1,
       resendAfterMs: 1,
       timeoutMs: 5_000,
+      settleMs: 0,
     });
     expect(runId).toBe('run-late');
+  });
+
+  it('waits until every run the plane recorded for the delivery is listed', async () => {
+    // The runs list is newest first; the second workflow's run lands one poll later.
+    const listed = [
+      { runs: [{ runId: 'run-a', workflowName: 'wf-a' }] },
+      {
+        runs: [
+          { runId: 'run-b', workflowName: 'wf-b' },
+          { runId: 'run-a', workflowName: 'wf-a' },
+        ],
+      },
+    ];
+    let poll = 0;
+    const get = vi.fn(async (path: string) => {
+      if (path.startsWith('/api/v1/admin/event-log')) {
+        return { deliveries: [{ status: 'processed', matchedCount: 2 }] };
+      }
+      return listed[Math.min(poll++, listed.length - 1)];
+    });
+    const runs = await triggerRuns('http://127.0.0.1:4319', 'tok', input, {
+      client: { get: get as RunDiscoveryClient['get'] },
+      pollIntervalMs: 1,
+      timeoutMs: 5_000,
+      settleMs: 60_000,
+    });
+    // fails-when: discovery returns on the first listed run and the second workflow goes unwatched
+    expect(runs).toEqual([
+      { runId: 'run-a', workflowName: 'wf-a' },
+      { runId: 'run-b', workflowName: 'wf-b' },
+    ]);
+  });
+
+  it('keeps waiting past the settle window while the plane is still processing the delivery', async () => {
+    // The second workflow's run lands long after the first. The plane writes
+    // the delivery's event-log row once, after its last workflow, so until then
+    // the event log has no row for it.
+    let poll = 0;
+    let secondListed = false;
+    const get = vi.fn(async (path: string) => {
+      if (path.startsWith('/api/v1/admin/event-log')) {
+        return {
+          deliveries: secondListed ? [{ status: 'processed', matchedCount: 2 }] : [],
+        };
+      }
+      const late = ++poll > 20;
+      secondListed ||= late;
+      return {
+        runs: late
+          ? [
+              { runId: 'run-b', workflowName: 'wf-b' },
+              { runId: 'run-a', workflowName: 'wf-a' },
+            ]
+          : [{ runId: 'run-a', workflowName: 'wf-a' }],
+      };
+    });
+    const runs = await triggerRuns('http://127.0.0.1:4319', 'tok', input, {
+      client: { get: get as RunDiscoveryClient['get'] },
+      pollIntervalMs: 1,
+      timeoutMs: 5_000,
+      settleMs: 0,
+    });
+    // fails-when: the settle window runs while the delivery is still being processed
+    expect(runs.map((r) => r.runId)).toEqual(['run-a', 'run-b']);
+  });
+
+  it('returns at once when the plane recorded one matched run', async () => {
+    const get = vi.fn(async (path: string) =>
+      path.startsWith('/api/v1/admin/event-log')
+        ? { deliveries: [{ status: 'processed', matchedCount: 1 }] }
+        : { runs: [{ runId: 'run-a', workflowName: 'wf-a' }] },
+    );
+    const started = Date.now();
+    const runs = await triggerRuns('http://127.0.0.1:4319', 'tok', input, {
+      client: { get: get as RunDiscoveryClient['get'] },
+      pollIntervalMs: 1,
+      timeoutMs: 5_000,
+      settleMs: 60_000,
+    });
+    // breaks-if-wrong: a single-workflow delivery never waits out the settle window
+    expect(runs.map((r) => r.runId)).toEqual(['run-a']);
+    expect(Date.now() - started).toBeLessThan(5_000);
   });
 });
 

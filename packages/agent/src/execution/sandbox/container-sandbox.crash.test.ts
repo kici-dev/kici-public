@@ -297,14 +297,14 @@ describe('ContainerSandbox dep-restore report relay', () => {
   beforeEach(() => vi.clearAllMocks());
 
   /** Run one job whose runner writes `messages`, then job.complete. */
-  async function runWith(messages: unknown[]): Promise<void> {
+  async function runWith(messages: unknown[], onStepStatus = vi.fn()): Promise<void> {
     const stream = hijackedStream();
     const { docker } = mockDocker(stream, 0);
     const sandbox = await sandboxFor(docker);
     const result = sandbox.executeJob({
       signal: new AbortController().signal,
       dispatch: {},
-      onStepStatus: vi.fn(),
+      onStepStatus,
       onLogLine: vi.fn(),
     } as never);
     await new Promise((r) => setTimeout(r, 0));
@@ -333,5 +333,22 @@ describe('ContainerSandbox dep-restore report relay', () => {
       { type: 'dep-restore.report', report: REPORT },
     ]);
     expect(depReportSink).not.toHaveBeenCalled();
+  });
+
+  it('relays a typed step.start with its step type', async () => {
+    const onStepStatus = vi.fn();
+    await runWith(
+      [
+        { type: 'step.start', stepIndex: 1_000_000, stepName: 'init:0', step_type: 'init:0' },
+        { type: 'step.start', stepIndex: 0, stepName: 'build' },
+      ],
+      onStepStatus,
+    );
+    // fails-when: the step type is dropped on step.start, so a running init reads as a plain step
+    expect(onStepStatus).toHaveBeenCalledWith(1_000_000, 'init:0', 'running', {
+      step_type: 'init:0',
+    });
+    // breaks-if-wrong: an untyped step.start keeps its three-argument report
+    expect(onStepStatus).toHaveBeenCalledWith(0, 'build', 'running');
   });
 });

@@ -8,6 +8,8 @@ import {
 import { formatJsonResult } from './json.js';
 import { formatJunitResult } from './junit.js';
 
+const stripAnsi = (text: string): string => text.replace(/\u001b\[[0-9;]*m/g, '');
+
 describe('formatSummary', () => {
   it('renders table with pass/fail/skip statuses', () => {
     const result: RunResult = {
@@ -71,6 +73,65 @@ describe('formatSummary', () => {
     expect(output).toContain('Job');
     expect(output).toContain('Status');
     expect(output).toContain('Duration');
+  });
+});
+
+describe('formatSummary across workflows', () => {
+  const twoWorkflows: RunResult = {
+    fixtureId: 'push-main',
+    runId: 'run-a',
+    status: 'failed',
+    totalDurationMs: 1000,
+    jobs: [
+      { name: 'mise-pinned', status: 'success', workflowName: 'repro-407' },
+      { name: 'mise-pinned', status: 'failed', workflowName: 'repro-461' },
+    ],
+  };
+
+  it('names each job <workflow> / <job> when the jobs span workflows', () => {
+    const output = stripAnsi(formatSummary(twoWorkflows));
+    // fails-when: two workflows' same-named jobs print as two identical rows
+    expect(output).toContain('repro-407 / mise-pinned');
+    expect(output).toContain('repro-461 / mise-pinned');
+  });
+
+  it('keeps the bare job name for a single workflow', () => {
+    const output = stripAnsi(
+      formatSummary({ ...twoWorkflows, jobs: [{ ...twoWorkflows.jobs[0]! }] }),
+    );
+    // breaks-if-wrong: a one-workflow fixture's table is unchanged
+    expect(output).not.toContain('repro-407 /');
+    expect(output).toContain('mise-pinned');
+  });
+
+  it('names junit testcases the same way, so the two jobs stay distinct', () => {
+    const xml = formatJunitResult([twoWorkflows]);
+    expect(xml).toContain('name="repro-407 / mise-pinned"');
+    expect(xml).toContain('name="repro-461 / mise-pinned"');
+  });
+
+  it('adds each run and each job workflow to --json, keeping the counts per fixture', () => {
+    const parsed = JSON.parse(
+      formatJsonResult([
+        {
+          ...twoWorkflows,
+          runs: [
+            { runId: 'run-a', workflowName: 'repro-407', status: 'success', jobs: [] },
+            { runId: 'run-b', workflowName: 'repro-461', status: 'failed', jobs: [] },
+          ],
+        },
+      ]),
+    );
+    expect(parsed.results[0].runs.map((r: { runId: string }) => r.runId)).toEqual([
+      'run-a',
+      'run-b',
+    ]);
+    expect(parsed.results[0].jobs[1]).toMatchObject({
+      name: 'mise-pinned',
+      workflowName: 'repro-461',
+    });
+    // breaks-if-wrong: one fixture still counts once
+    expect(parsed.summary).toEqual({ passed: 0, failed: 1, cancelled: 0, total: 1 });
   });
 });
 

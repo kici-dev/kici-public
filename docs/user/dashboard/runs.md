@@ -16,7 +16,7 @@ Each run is displayed in a table row (desktop) or card (mobile) with:
 - **Status** -- colored badge (green = success, red = failed/error/timed out, amber = running/cancelling, yellow = queued/pending/held, gray = cancelled/skipped)
 - **Source** -- the source that delivered the event, with an icon for its kind. Hover to see the source kind and routing key
 - **Repository** -- the repository the run belongs to (e.g. `owner/repo`)
-- **Workflow** -- the workflow name from your `.kici/workflows/` directory, preceded by an icon for the trigger event. The first line of the commit message shows beneath it. A run that spans several workflows (a `kici run remote` fixture run with no `--workflow`) shows its first workflow and a `+N` badge; hover the badge to see every workflow
+- **Workflow** -- the workflow name from your `.kici/workflows/` directory, preceded by an icon for the trigger event. The first line of the commit message shows beneath it. A run that spans several workflows (the shared fixture run a `kici` older than 0.21.0 starts) shows its first workflow and a `+N` badge; hover the badge to see every workflow
 - **Event** -- the trigger event type (push, pull request, tag, dispatch, etc.)
 - **Branch** -- the git ref that triggered the run
 - **Commit** -- the first 7 characters of the commit SHA, linked to the provider (GitHub)

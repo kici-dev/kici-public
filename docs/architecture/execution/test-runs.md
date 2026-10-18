@@ -26,7 +26,7 @@ Developer workstation            Orchestrator              Agent
   6. PUT signed URL (S3) -----> [Object Storage]             |
        |                              |                      |
   7. POST /test/trigger  ------------>|                      |
-       |<---- { runId } ------------- |                      |
+       |<---- { runs[] } ------------ |                      |
        |                              |                      |
   8. Begin polling logs + status      |                      |
        |                              |                      |
@@ -185,9 +185,9 @@ The CLI follows a test run by **polling**, over the same HTTP surface it used to
 
 ### Poll loop
 
-1. The trigger response returns the `runId`.
-2. The CLI polls two endpoints in lockstep on a fixed interval: `GET /api/v1/orgs/:customerId/test/runs/:runId/logs?cursor=<n>&logCursor=<opaque>` for the next log chunk, and `GET /api/v1/orgs/:customerId/test/runs/:runId` for the status snapshot. Both address the cluster the trigger was relayed to.
-3. Each log response carries `nextLogCursor`, an opaque cursor that records how many lines of each log file were delivered. The CLI sends it on the next poll, so a chunk is never re-printed and never skipped, even when a step's log file appears after a file that sorts later. The first poll sends an empty `logCursor`. When a response has no `nextLogCursor`, because the Platform or the orchestrator is older, the CLI uses the numeric line cursor `nextCursor`.
+1. The trigger response returns `runs`: one `{ runId, workflowName, jobIds }` per matched workflow, because each matched workflow runs as its own run. The CLI follows every run at once and passes only when every run passed. `Ctrl-C` cancels every run. The deprecated top-level `runId` names the first run, for a client that reads only it.
+2. For each run, the CLI polls two endpoints in lockstep on a fixed interval: `GET /api/v1/orgs/:customerId/test/runs/:runId/logs?cursor=<n>&logCursor=<opaque>` for the next log chunk, and `GET /api/v1/orgs/:customerId/test/runs/:runId` for the status snapshot. Both address the cluster the trigger was relayed to.
+3. Each log response carries `lineJobNames`, the job that wrote each line, so the CLI prints an error block per failed job with only that job's output. Each log response also carries `nextLogCursor`, an opaque cursor that records how many lines of each log file were delivered. The CLI sends it on the next poll, so a chunk is never re-printed and never skipped, even when a step's log file appears after a file that sorts later. The first poll sends an empty `logCursor`. When a response has no `nextLogCursor`, because the Platform or the orchestrator is older, the CLI uses the numeric line cursor `nextCursor`.
 4. The run is finished only when the status is terminal **and** the log stream has drained (`logs.done`). A terminal status alone is not enough — the tail of the log can still be arriving.
 
 Because the cursor lives in the CLI and every request is an ordinary authenticated HTTP call, a network blip needs no reconnection protocol: the next poll resumes from the same cursor. `Ctrl-C` cancels the run through the same client rather than just detaching.
@@ -224,7 +224,7 @@ The test adapter:
 1. Resolves the lock file (inline for a local repo with no remote, or the same provider-driven fetch the webhook uses).
 2. Selects matched workflow decisions (normal trigger matching, or a direct `--workflow` bypass).
 3. Enforces the `allowLocalExecution` environment gate and stores the fixture payload.
-4. Builds a dispatch context per matched workflow — a synthetic `WebhookInfo`, the test provenance fields, and a CLI-secret overlay that wins over orchestrator env secrets — and calls the shared core.
+4. Mints one run id per matched workflow, as the webhook adapter does, then builds a dispatch context per matched workflow — a synthetic `WebhookInfo`, the test provenance fields, and a CLI-secret overlay that wins over orchestrator env secrets — and calls the shared core. A run keys its needs edges, pending contexts, placeholders, holds and log paths by job name, so two workflows that define a job of the same name must not share one. A caller that does not send `acceptsMultipleRuns: true` (a `kici` older than 0.21.0) follows only one run: for it, the adapter runs the matched workflows as one shared run when no job name collides, and refuses the trigger when one can.
 5. Marks the execution as `isTestRun` for the orchestrator-side observer broadcast and secret gating.
 
 Because the test adapter calls the same core, a `kici run` exercises the full dispatch behavior — needs-DAG scheduling, `runsOnAll` host fan-out, matrix and fan-out edge wiring, and deferred init/dynamic job dispatch — exactly as a webhook does. A multi-job `needs` workflow run via `kici run` honors the dependency DAG (a downstream job dispatches only after its upstream reaches a matching state), and a `runsOnAll` job fans out to one pinned execution per matching roster host.

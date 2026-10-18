@@ -146,7 +146,7 @@ describe('kici-admin execution CLI', () => {
     const { stdout, exitCode } = await runCommand([
       'execution',
       'show',
-      'run-1',
+      '0a1b2c3d-0000-4000-8000-0000000000e1',
       '--database-url',
       'postgres://x',
     ]);
@@ -164,11 +164,35 @@ describe('kici-admin execution CLI', () => {
     const { stderr, exitCode } = await runCommand([
       'execution',
       'show',
-      'ghost',
+      '0a1b2c3d-0000-4000-8000-0000000000e1',
       '--database-url',
       'postgres://x',
     ]);
     expect(exitCode).toBe(1);
     expect(stderr).toContain('run not found');
+  });
+
+  it('show resolves a short run id over the admin API', async () => {
+    const full = '709c899a-b06f-45d0-a3e2-d0a14fa62094';
+    const client = makeMockClient() as MockClient & { listRuns: ReturnType<typeof vi.fn> };
+    client.listRuns = vi.fn().mockResolvedValue({ runs: [{ runId: full }], total: 1 });
+    client.get.mockResolvedValue({ run: { run_id: full }, jobs: [] });
+    await runCommand(['execution', 'show', '709c899a'], client);
+    // fails-when: the short id is sent to /executions/:runId, which Postgres rejects
+    expect(client.get).toHaveBeenCalledWith(`/api/v1/admin/executions/${full}`);
+  });
+
+  it('show refuses a short run id in direct-database mode before connecting', async () => {
+    const { stderr, exitCode } = await runCommand([
+      'execution',
+      'show',
+      '709c899a',
+      '--database-url',
+      'postgres://x',
+    ]);
+    expect(exitCode).toBe(1);
+    // fails-when: the prefix reaches the uuid column as a raw pg error
+    expect(stderr).toContain('--database-url needs a full run id');
+    expect(mockShowExecutionRunDirect).not.toHaveBeenCalled();
   });
 });

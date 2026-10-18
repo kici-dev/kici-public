@@ -137,7 +137,7 @@ vi.mock('./overlay-applier.js', () => ({
   }),
 }));
 vi.mock('./image-build/build-step.js', () => ({
-  CONTAINER_BUILD_STEP_INDEX: 1_000_000,
+  CONTAINER_BUILD_STEP_INDEX: 2_000_000,
   runJobImageBuild: vi.fn(async (args: { workDir: string }) => {
     workspaceEvents.push(`build:${args.workDir}`);
     return 'localhost/kici-job-image:test';

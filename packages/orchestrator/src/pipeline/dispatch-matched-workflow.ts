@@ -398,9 +398,10 @@ export interface WorkflowDispatchContext {
    */
   runRegisteredBeforeDispatch?: boolean;
   /**
-   * Called each time this dispatch registers the run with the tracker. A
-   * fixture run dispatches several workflows under one run id, and holds the
-   * run open from the first registration until every workflow has registered.
+   * Called each time this dispatch registers the run with the tracker. An older `kici`'s shared
+   * fixture run dispatches several
+   * workflows under one run id, and holds the run open from the first
+   * registration until every workflow has registered.
    */
   onRunRegistered?: () => void;
   /**
@@ -519,7 +520,8 @@ function runEventContextFor(
 ): RunEventContext & { subjectTriggerEvent?: string } {
   return {
     ...resolveRunEventContext(event),
-    // fails-when: a re-run of a pull-request run records no subject event and presents a push identity
+    // fails-when: a re-run of a pull-request run records no subject event and presents a push
+    // identity
     ...(ctx.subjectTriggerEvent !== undefined && { subjectTriggerEvent: ctx.subjectTriggerEvent }),
   };
 }
@@ -789,7 +791,8 @@ interface JobEnvEvalResult {
  * Synthetic job-id prefix every needs-gate site stamps on a held-back job. The
  * release path (`dispatchReadyJob` → `findSyntheticJobId` → `addJobsToRun`)
  * keys on it, so it soundly recovers the gated set without threading a parallel
- * list through both the single-orch and cluster paths. Owned by `db/synthetic-job-ids.ts` so the `contexts/`
+ * list through both the single-orch and cluster paths. Owned by `db/synthetic-job-ids.ts` so the
+ * `contexts/`
  * concurrency sweep need not import this module.
  */
 export { NEEDS_PENDING_JOB_ID_PREFIX };
@@ -5766,7 +5769,8 @@ export async function resolveGeneratedJobConfigs(
     let step = GeneratedJobStep.ContextGate;
     try {
       const jobEnvData = await gateGeneratedJobContexts({ ctx, workflow: args.workflow, mat });
-      // fails-when: a generated job binds a context whose branch / repo / trigger rule refuses the run
+      // fails-when: a generated job binds a context whose branch / repo / trigger rule refuses the
+      // run
       // breaks-if-wrong: a job whose contexts admit the run must still build and dispatch below
       if (jobEnvData.rejected) {
         await recordContextRuleRejectionAfterInit({ ctx, mat, jobEnvData });
@@ -6972,6 +6976,7 @@ async function recordInitFailureFromSkip(args: {
     triggerEvent: dispatchTriggerEvent(ctx),
     commitMessage: extractCommitMessage(setup.info.event, setup.info.payload),
     ...preDispatchRunProvenance(ctx),
+    ...(ctx.testRun && { testRun: ctx.testRun }),
   });
 
   // Not tracker-guarded: checks come from another dependency.
@@ -7039,6 +7044,7 @@ async function holdWorkflowForInstallGate(args: {
       workflowSha: ctx.global?.workflowSha ?? null,
       workflowBranch: ctx.global?.workflowBranch ?? null,
       ...preDispatchRunProvenance(ctx),
+      ...(ctx.testRun && { testRun: ctx.testRun }),
     });
   }
 
@@ -7148,6 +7154,7 @@ async function holdRunForSecurityPolicy(args: {
       workflowSha: ctx.global?.workflowSha ?? null,
       workflowBranch: ctx.global?.workflowBranch ?? null,
       ...preDispatchRunProvenance(ctx),
+      ...(ctx.testRun && { testRun: ctx.testRun }),
     });
   }
 

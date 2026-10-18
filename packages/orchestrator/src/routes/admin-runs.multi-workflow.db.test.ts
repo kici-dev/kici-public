@@ -11,7 +11,7 @@ import { createAdminRunRoutes } from './admin-runs.js';
 
 /**
  * Real-Postgres coverage of the admin run routes for a run that spans several
- * workflows (a fixture run with no `--workflow`), and for a job row written
+ * workflows (an older `kici`'s shared fixture run), and for a job row written
  * before `execution_jobs.workflow_name` existed. Gated on
  * `KICI_TEST_ADMIN_DATABASE_URL`.
  */
@@ -120,6 +120,87 @@ describeWithTestDb<Database>(
       // fails-when: a legacy fixture-run job is labelled with the run's first workflow
       expect((await get(`/${fixtureRun}/jobs`)).jobs[0].workflowName).toBeNull();
       expect((await get(`/${fixtureRun}`)).run.workflowNames).toEqual(['ci']);
+    });
+
+    it('resolves a run id prefix against the UUID column', async () => {
+      const runId = randomUUID();
+      await startRun(new ExecutionTracker({ db }), {
+        runId,
+        workflowName: 'ci',
+        jobs: [{ jobId: `${runId}-a`, jobName: 'build' }],
+      });
+      const short = runId.slice(0, 8);
+      const listed = await get(`?runIdPrefix=${short}&limit=100`);
+      // fails-when: the UUID range does not match the run whose id starts with the prefix
+      expect(listed.runs.map((r: { runId: string }) => r.runId)).toContain(runId);
+      // breaks-if-wrong: every run listed starts with the prefix
+      for (const r of listed.runs as Array<{ runId: string }>)
+        expect(r.runId.startsWith(short)).toBe(true);
+      // A prefix that crosses the first hyphen narrows the range further.
+      const longer = await get(`?runIdPrefix=${runId.slice(0, 13)}`);
+      expect(longer.runs.map((r: { runId: string }) => r.runId)).toEqual([runId]);
+    });
+
+    it('lists a job image build, then its init steps, then its steps, with their phase', async () => {
+      const runId = randomUUID();
+      const jobId = `${runId}-a`;
+      await startRun(new ExecutionTracker({ db }), {
+        runId,
+        workflowName: 'ci',
+        jobs: [{ jobId, jobName: 'build' }],
+      });
+      const step = (step_index: number, step_type: string) => ({
+        run_id: runId,
+        job_id: jobId,
+        step_index,
+        step_name: step_type === 'step' ? `step-${step_index}` : step_type,
+        step_type,
+        started_at: null,
+        completed_at: null,
+        duration_ms: null,
+        exit_code: null,
+        error_message: null,
+        log_path: null,
+        secrets_accessed: null,
+        check_outcome: null,
+        drift_summary: null,
+        concurrency_kind: null,
+        group_id: null,
+        routing_key: null,
+        archived_at: null,
+        archive_object_key: null,
+      });
+      await db
+        .insertInto('execution_steps')
+        .values([
+          step(0, 'step'),
+          step(1, 'step'),
+          step(1_000_001, 'init:1'),
+          step(1_000_000, 'init:0'),
+          step(2_000_000, 'container:build'),
+          // Only looks like an init: the SQL and in-memory rank must both treat it as a step.
+          step(5, 'init:x'),
+        ])
+        .execute();
+
+      const { jobs } = await get(`/${runId}/jobs?includeSteps=true`);
+      const steps = jobs[0].steps as Array<Record<string, unknown>>;
+      // fails-when: the SQL sort has no init rank, so the init steps come after the steps
+      expect(steps.map((s) => s.stepType)).toEqual([
+        'container:build',
+        'init:0',
+        'init:1',
+        'step',
+        'step',
+        'init:x',
+      ]);
+      // breaks-if-wrong: the stored index reaches the reader unchanged
+      expect(steps[1]).toMatchObject({ stepIndex: 1_000_000, phase: 'init', initIndex: 0 });
+      // fails-when: the additive fields are missing or set on a non-init step
+      expect(steps[0]).toMatchObject({ phase: 'setup' });
+      expect(steps[3]).toMatchObject({ stepIndex: 0, phase: 'steps' });
+      expect(steps[3]).not.toHaveProperty('initIndex');
+      expect(steps[5]).not.toHaveProperty('initIndex');
     });
   },
 );

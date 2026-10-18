@@ -2,6 +2,26 @@
 
 Release notes for the public KiCI packages.
 
+## v0.21.0 — 2026-10-18
+
+### Features
+
+- `kici run remote <fixture>` creates one run per matched workflow, as a webhook does, so two workflows that define a job of the same name no longer collide in one run. A `kici` older than this release still gets one shared run when the matched workflows' job names cannot collide, and a clear refusal naming the shared job names when they can.
+- `kici run remote` follows every run a fixture creates, one per matched workflow. It labels each job `<workflow> / <job>` in the summary table, the error blocks and the JUnit report when the runs span workflows, gives each failed job its own error block with only its own output, and passes only when every run passed. `--json` adds `runs` and each job's `workflowName`; the top-level `runId` is deprecated.
+
+### Fixes
+
+- A job waiting on `needs` is no longer swapped for the placeholder of another job whose name starts with its own (`build` and `build-and-push`).
+- kici-admin --help no longer prints the admin token. When KICI_ADMIN_TOKEN was set, the help showed its value as the default of --token, so shared help output leaked the token. The help now shows the name of the environment variable, as in (env: KICI_ADMIN_TOKEN), and never its value. KICI_ADMIN_URL and the --base-url option of source trigger-local and source install-hook show their environment variable the same way. The options and environment variables work as before.
+- `kici runs show` prints an `error:` line for a job that failed in a step, naming the step and its exit code, even when the job records no error message of its own.
+- A job that builds its container image and also runs init commands no longer loses its image-build step: the two used the same step number, so the init step overwrote the image-build step and their logs mixed.
+- kici-admin runs show, runs jobs --include-steps and runs structured list a job's init steps first, as init[0], init[1] and so on, instead of last with a step number of 1000000. kici runs show, kici runs logs and the dashboard also list init steps before the steps they ran ahead of. kici-admin runs logs --step accepts init[<n>]. In --json, stepIndex is unchanged, and each step adds phase (setup, init or steps) and, for an init step, initIndex.
+- `kici run --local` follows every run an event creates, one per matched workflow, and fails when any of them fails. It followed only the first run before, so a failure in a second matched workflow went unreported.
+- The orchestrator now records the type of hook, cache and init steps. It stored them as plain steps, so the dashboard showed no hook badge on an onCancel or cleanup step, and readers could not tell these steps from the job's own steps.
+- A GitHub check run's progress summary no longer fills with placeholder 'Step N' lines for a job with init commands, an image build, or cache steps. The summary lists each step that reported, init steps first.
+- kici-admin runs show, jobs, logs, structured, ephemeral-key and secret-outputs, kici-admin execution show, and kici runs show and logs, accept a run id prefix of at least 4 characters, like a git short SHA. An ambiguous prefix fails and lists its matches; an unknown prefix or a value that cannot be a run id fails with a message that names it, instead of 'HTTP 400: Invalid request: malformed value for a typed field'. The orchestrator admin API (run reads, execution show and cancel) answers a run id that is not a full UUID with a 400 that names it (cancel answered it with a 500). The orchestrator and Platform run lists accept ?runIdPrefix=.
+- Cancelling a run through the orchestrator admin API with its run id in uppercase now cancels its jobs too. It marked the run cancelled but sent no cancel to the agents running its jobs.
+
 ## v0.20.1 — 2026-10-17
 
 ### Fixes

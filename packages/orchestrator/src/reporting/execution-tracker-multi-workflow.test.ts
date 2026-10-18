@@ -9,10 +9,10 @@ import { describeWithTestDb } from '@kici-dev/test-support/test-db';
 import { startRun } from '../__test-helpers__/tracker.js';
 
 /**
- * Real-Postgres coverage of a run that spans several workflows: a `kici run`
- * fixture run with no `--workflow` dispatches every matched workflow under one
- * run id, so each `onExecutionStarted` call meets the run the previous one
- * registered. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
+ * Real-Postgres coverage of a run that spans several workflows: an older `kici`'s shared fixture
+ * run dispatches every matched
+ * workflow under one run id, so each `onExecutionStarted` call meets the run
+ * the previous one registered. Gated on `KICI_TEST_ADMIN_DATABASE_URL`.
  */
 describeWithTestDb<Database>(
   'ExecutionTracker run spanning several workflows',

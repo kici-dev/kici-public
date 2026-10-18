@@ -6,10 +6,9 @@ import {
   buildDispatchInputs,
   lookupDispatchInputsDescriptor,
   describeMissingWorkflow,
-  requestRunCancel,
-  watchRunHolds,
   withStdoutOnStderr,
 } from './run.js';
+import { requestRunCancel, watchRunHolds } from './run-remote-follow.js';
 
 const mockClient = {
   initUpload: vi.fn(),
@@ -98,7 +97,8 @@ vi.mock('../remote/direct-client.js', () => {
   };
 });
 
-vi.mock('../remote/output/summary.js', () => ({
+vi.mock('../remote/output/summary.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../remote/output/summary.js')>()),
   formatSummary: vi.fn().mockReturnValue('mock-summary-table'),
   formatErrorHighlight: vi.fn().mockReturnValue('mock-error-highlight'),
   formatMultiFixtureSummary: vi.fn().mockReturnValue('mock-multi-summary'),
@@ -683,7 +683,8 @@ describe('kici run command', () => {
       const result = await runRemoteCommand(undefined, { kiciDir: '.kici', workflow: 'ci' });
 
       expect(result).toBe(false);
-      // fails-when: a rejected direct trigger prints "Run started" and polls a run that never existed.
+      // fails-when: a rejected direct trigger prints "Run started" and polls a run that never
+      // existed.
       expect(mockClient.runStatus).not.toHaveBeenCalled();
       const infos = (logger.info as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
       expect(infos.some((m) => m.includes('Run started'))).toBe(false);
@@ -1241,6 +1242,214 @@ describe('kici run command', () => {
 
       const result = await runRemoteCommand('push-main', { kiciDir: '.kici', quiet: true });
       expect(result).toBe(false);
+    });
+  });
+
+  describe('a fixture that matches several workflows', () => {
+    /** Two runs, one per workflow; `outcome` sets each run's final status. */
+    function twoRuns(outcome: Record<string, 'success' | 'failed'>): void {
+      mockClient.trigger.mockResolvedValue({
+        runId: 'run-a',
+        runs: [
+          { runId: 'run-a', workflowName: 'wf-a', jobIds: ['ja'] },
+          { runId: 'run-b', workflowName: 'wf-b', jobIds: ['jb'] },
+        ],
+        status: 'accepted',
+      });
+      mockClient.runLogs.mockImplementation(async (_org: string, runId: string) => ({
+        lines: [`line of ${runId}`],
+        lineJobNames: ['build'],
+        nextCursor: 1,
+        done: true,
+      }));
+      mockClient.runStatus.mockImplementation(async (_org: string, runId: string) => ({
+        runId,
+        status: outcome[runId],
+        jobs: [{ jobId: `j-${runId}`, jobName: 'build', status: outcome[runId] }],
+        done: true,
+      }));
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+    }
+
+    it('asks for one run per workflow and follows every run', async () => {
+      twoRuns({ 'run-a': 'success', 'run-b': 'success' });
+      const result = await runRemoteCommand('push-main', { kiciDir: '.kici', quiet: true });
+
+      // breaks-if-wrong: every run passing passes the command
+      expect(result).toBe(true);
+      expect(mockClient.trigger).toHaveBeenCalledWith(
+        'org_a',
+        expect.anything(),
+        expect.objectContaining({ acceptsMultipleRuns: true }),
+      );
+      // fails-when: the CLI follows only the deprecated top-level runId
+      const polled = new Set(mockClient.runStatus.mock.calls.map((c) => c[1]));
+      expect(polled).toEqual(new Set(['run-a', 'run-b']));
+      // One history entry per run, each naming its workflow.
+      expect(mockHistory.addEntry).toHaveBeenCalledWith(
+        expect.objectContaining({ runId: 'run-a', workflowName: 'wf-a' }),
+      );
+      expect(mockHistory.addEntry).toHaveBeenCalledWith(
+        expect.objectContaining({ runId: 'run-b', workflowName: 'wf-b' }),
+      );
+      expect(mockHistory.updateEntry).toHaveBeenCalledWith(
+        'run-b',
+        expect.objectContaining({ status: 'success' }),
+      );
+    });
+
+    it('fails when any one run fails, even the second', async () => {
+      twoRuns({ 'run-a': 'success', 'run-b': 'failed' });
+      const { formatJsonResult } = await import('../remote/output/json.js');
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        const result = await runRemoteCommand('push-main', { kiciDir: '.kici', json: true });
+        // fails-when: the exit code reads only the first run's status
+        expect(result).toBe(false);
+        const [results] = vi.mocked(formatJsonResult).mock.calls[0]!;
+        expect(results[0]).toMatchObject({
+          runId: 'run-a',
+          status: 'failed',
+          runs: [
+            { runId: 'run-a', workflowName: 'wf-a', status: 'success' },
+            { runId: 'run-b', workflowName: 'wf-b', status: 'failed' },
+          ],
+        });
+        // fails-when: a job does not say which workflow defines it
+        expect(results[0]!.jobs.map((j) => `${j.workflowName}/${j.name}`)).toEqual([
+          'wf-a/build',
+          'wf-b/build',
+        ]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('prints one Run started line per run, naming its workflow', async () => {
+      twoRuns({ 'run-a': 'success', 'run-b': 'success' });
+      await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+      const lines = vi.mocked(logger.info).mock.calls.map((c) => String(c[0]));
+      expect(lines.some((l) => l.includes('Run started: run-a (wf-a)'))).toBe(true);
+      // fails-when: --no-wait names only the first run
+      expect(lines.some((l) => l.includes('Run started: run-b (wf-b)'))).toBe(true);
+    });
+
+    it('keeps following the other runs when one run cannot be read', async () => {
+      const { NotFoundError } = await import('../remote/platform-client.js');
+      twoRuns({ 'run-a': 'success', 'run-b': 'success' });
+      const logs = mockClient.runLogs.getMockImplementation()!;
+      let bPolls = 0;
+      mockClient.runLogs.mockImplementation(
+        async (org: string, runId: string, ...rest: unknown[]) => {
+          if (runId === 'run-b' && bPolls++ > 0) throw new NotFoundError('Run not found');
+          if (runId === 'run-b') return { lines: [], nextCursor: 0, done: false };
+          return logs(org, runId, ...rest);
+        },
+      );
+      mockClient.runStatus.mockImplementation(async (_org: string, runId: string) => ({
+        runId,
+        status: runId === 'run-b' ? 'running' : 'success',
+        jobs: [],
+        done: runId !== 'run-b',
+      }));
+      const result = await runRemoteCommand('push-main', { kiciDir: '.kici', quiet: true });
+      // breaks-if-wrong: the unreadable run still fails the command
+      expect(result).toBe(false);
+      // fails-when: run-b's error aborts the follow before run-a's final status is recorded
+      expect(mockHistory.updateEntry).toHaveBeenCalledWith(
+        'run-a',
+        expect.objectContaining({ status: 'success' }),
+      );
+      // breaks-if-wrong: history keeps a status its readers know
+      expect(mockHistory.updateEntry).toHaveBeenCalledWith(
+        'run-b',
+        expect.objectContaining({ status: 'failed' }),
+      );
+    });
+
+    it("prints each failed job's error block with only that job's lines", async () => {
+      const { formatErrorHighlight } = await import('../remote/output/summary.js');
+      mockClient.trigger.mockResolvedValue({ runId: 'run-a', status: 'accepted' });
+      mockClient.runLogs.mockResolvedValue({
+        lines: ['lint says no', 'build log', 'test says no'],
+        lineJobNames: ['lint', 'build', 'test'],
+        nextCursor: 3,
+        done: true,
+      });
+      mockClient.runStatus.mockResolvedValue({
+        runId: 'run-a',
+        status: 'failed',
+        jobs: [
+          { jobId: '1', jobName: 'lint', status: 'failed' },
+          { jobId: '2', jobName: 'build', status: 'success' },
+          { jobId: '3', jobName: 'test', status: 'failed' },
+        ],
+        done: true,
+      });
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+      const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      try {
+        expect(await runRemoteCommand('push-main', { kiciDir: '.kici' })).toBe(false);
+      } finally {
+        out.mockRestore();
+      }
+      // fails-when: the streamed lines are not filed under the job that wrote them
+      expect(vi.mocked(formatErrorHighlight).mock.calls).toEqual([
+        ['lint', ['lint says no']],
+        ['test', ['test says no']],
+      ]);
+    });
+
+    it('falls back to one block of the run tail when the line job names do not line up', async () => {
+      const { formatErrorHighlight } = await import('../remote/output/summary.js');
+      mockClient.trigger.mockResolvedValue({ runId: 'run-a', status: 'accepted' });
+      mockClient.runLogs.mockResolvedValue({
+        lines: ['one', 'two'],
+        lineJobNames: ['lint'],
+        nextCursor: 2,
+        done: true,
+      });
+      mockClient.runStatus.mockResolvedValue({
+        runId: 'run-a',
+        status: 'failed',
+        jobs: [{ jobId: '1', jobName: 'lint', status: 'failed' }],
+        done: true,
+      });
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+      const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      try {
+        await runRemoteCommand('push-main', { kiciDir: '.kici' });
+      } finally {
+        out.mockRestore();
+      }
+      // breaks-if-wrong: a malformed attribution never files lines under the wrong job
+      expect(vi.mocked(formatErrorHighlight).mock.calls).toEqual([['lint', ['one', 'two']]]);
+    });
+
+    it('cancels every run on Ctrl-C', async () => {
+      twoRuns({ 'run-a': 'success', 'run-b': 'success' });
+      mockClient.runStatus.mockImplementation(async (_org: string, runId: string) => ({
+        runId,
+        status: 'running',
+        jobs: [],
+        done: false,
+      }));
+      mockClient.runLogs.mockImplementationOnce(async () => {
+        process.emit('SIGINT');
+        return { lines: [], nextCursor: 0, done: false };
+      });
+      const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      try {
+        const result = await runRemoteCommand('push-main', { kiciDir: '.kici', quiet: true });
+        expect(result).toBe(false);
+        // fails-when: Ctrl-C cancels only the run whose poll it interrupted
+        expect(mockClient.cancel.mock.calls.map((c) => c[1]).sort()).toEqual(['run-a', 'run-b']);
+      } finally {
+        stderr.mockRestore();
+      }
     });
   });
 

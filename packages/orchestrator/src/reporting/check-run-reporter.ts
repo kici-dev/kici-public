@@ -29,6 +29,7 @@ import {
   buildCheckRunSummary,
   buildAnnotations,
   buildProgressText,
+  applyStepProgress,
   type StepResultData,
   type SourceLocationData,
   type CheckAnnotation,
@@ -231,6 +232,8 @@ interface UpdateStepProgressOptions {
   jobName: string;
   stepIndex: number;
   stepName: string;
+  /** The step's `step_type`, when the agent sent one. */
+  stepType?: string;
   state: 'running' | 'success' | 'failed' | 'skipped' | 'cancelled';
   durationMs?: number;
   installationId?: number;
@@ -1225,29 +1228,13 @@ export class CheckRunReporter {
 
     this.trackRunKey(opts.runId, key);
 
-    let steps = this.stepProgress.get(key);
-    if (!steps) {
-      steps = [];
-      this.stepProgress.set(key, steps);
-    }
-
-    if (opts.stepIndex < steps.length) {
-      steps[opts.stepIndex] = {
-        name: opts.stepName,
-        status: opts.state,
-        durationMs: opts.durationMs,
-      };
-    } else {
-      // Fill gaps with pending entries
-      while (steps.length < opts.stepIndex) {
-        steps.push({ name: `Step ${steps.length}`, status: 'pending' });
-      }
-      steps.push({
-        name: opts.stepName,
-        status: opts.state,
-        durationMs: opts.durationMs,
-      });
-    }
+    const steps = applyStepProgress(this.stepProgress.get(key) ?? [], {
+      name: opts.stepName,
+      status: opts.state,
+      durationMs: opts.durationMs,
+      stepIndex: opts.stepIndex,
+      ...(opts.stepType && { stepType: opts.stepType }),
+    });
 
     // A write failure logs but doesn't block the GitHub update — the in-memory copy stays
     // correct for this orchestrator's lifetime.

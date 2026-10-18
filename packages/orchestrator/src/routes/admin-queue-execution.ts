@@ -12,6 +12,7 @@
 import { Hono } from 'hono';
 import { sql, type Kysely } from 'kysely';
 import { createLogger } from '@kici-dev/shared';
+import { isRunId } from '@kici-dev/engine';
 import type { RbacEnforcer } from '../secrets/rbac.js';
 import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
 import { type AdminEnv, createAdminApp } from './admin-env.js';
@@ -152,7 +153,11 @@ export function createAdminQueueExecutionRoutes(
 
   app.get('/executions/:runId', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'secret.read');
-    const runId = c.req.param('runId');
+    const rawRunId = c.req.param('runId');
+    if (!isRunId(rawRunId)) {
+      return c.json({ error: `Invalid run id '${rawRunId}': a run id is a full UUID.` }, 400);
+    }
+    const runId = rawRunId.toLowerCase();
     const runRow = await sql<{
       id: string;
       run_id: string;

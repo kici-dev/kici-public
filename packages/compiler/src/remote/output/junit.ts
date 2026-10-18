@@ -1,8 +1,8 @@
 /** `--junit` output for CI systems: each fixture is a <testsuite>, each job a <testcase>. */
 
-import type { RunResult } from './summary.js';
+import { jobLabel, spansWorkflows, type RunResult } from './summary.js';
 
-/** @param failureMessages `fixtureId:jobName` -> last lines of output, for failure details. */
+/** @param failureMessages `fixtureId:<testcase name>` -> last lines of output, for failure details. */
 export function formatJunitResult(
   results: RunResult[],
   failureMessages?: Map<string, string>,
@@ -29,27 +29,31 @@ export function formatJunitResult(
       `  <testsuite name="${escapeXml(result.fixtureId)}" tests="${suiteTests}" failures="${suiteFailures}" time="${suiteTimeSeconds.toFixed(3)}">`,
     );
 
+    // A fixture that ran several workflows names each testcase `<workflow> / <job>`,
+    // so two workflows' same-named jobs stay distinct.
+    const labelWorkflow = spansWorkflows(result.jobs);
     for (const job of result.jobs) {
       const jobTimeSeconds = job.durationMs !== undefined ? job.durationMs / 1000 : 0;
+      const name = jobLabel(job, labelWorkflow);
 
       if (job.status === 'failed') {
-        const failureKey = `${result.fixtureId}:${job.name}`;
+        const failureKey = `${result.fixtureId}:${name}`;
         const failureText = failureMessages?.get(failureKey) ?? 'Step failed';
 
         lines.push(
-          `    <testcase name="${escapeXml(job.name)}" classname="${escapeXml(result.fixtureId)}" time="${jobTimeSeconds.toFixed(3)}">`,
+          `    <testcase name="${escapeXml(name)}" classname="${escapeXml(result.fixtureId)}" time="${jobTimeSeconds.toFixed(3)}">`,
         );
         lines.push(`      <failure message="Step failed">${escapeXml(failureText)}</failure>`);
         lines.push('    </testcase>');
       } else if (job.status === 'skipped') {
         lines.push(
-          `    <testcase name="${escapeXml(job.name)}" classname="${escapeXml(result.fixtureId)}" time="${jobTimeSeconds.toFixed(3)}">`,
+          `    <testcase name="${escapeXml(name)}" classname="${escapeXml(result.fixtureId)}" time="${jobTimeSeconds.toFixed(3)}">`,
         );
         lines.push('      <skipped />');
         lines.push('    </testcase>');
       } else {
         lines.push(
-          `    <testcase name="${escapeXml(job.name)}" classname="${escapeXml(result.fixtureId)}" time="${jobTimeSeconds.toFixed(3)}" />`,
+          `    <testcase name="${escapeXml(name)}" classname="${escapeXml(result.fixtureId)}" time="${jobTimeSeconds.toFixed(3)}" />`,
         );
       }
     }

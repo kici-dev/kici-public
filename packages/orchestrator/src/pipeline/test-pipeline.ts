@@ -20,6 +20,10 @@
  *   decorating secret resolver), and the fixture's `secrets` context mapping
  *   resolves into namespaced secrets;
  * - direct workflow execution (bypass trigger matching) is supported.
+ *
+ * Like a webhook, it creates one run per matched workflow. A caller that
+ * follows a single run (no `acceptsMultipleRuns`) gets one shared run instead,
+ * and only when the workflows' job names cannot collide in it.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -100,10 +104,19 @@ export interface TestTriggerInput {
    * here against the matched workflow's lock dispatch descriptor.
    */
   dispatchInputs?: Record<string, string>;
+  /**
+   * The caller follows every run in the result's `runs`. Without it, several
+   * matched workflows share one run, or the trigger is refused when their job
+   * names collide.
+   */
+  acceptsMultipleRuns?: boolean;
 }
 
 interface TestTriggerResult {
+  /** The first run's id: the only run when the caller follows one. */
   runId: string;
+  /** One entry per run, each executing one matched workflow. Absent for a shared run. */
+  runs?: TestTriggeredRun[];
   status: 'accepted' | 'rejected';
   reason?: string;
   jobIds: string[];
@@ -478,14 +491,147 @@ function buildTestDispatchContext(
   };
 }
 
+/** The static job names a workflow defines; null when it has a dynamic job, whose names are unknown until it runs. */
+function staticJobNames(workflow: LockWorkflow): string[] | null {
+  const names: string[] = [];
+  for (const job of workflow.jobs) {
+    if (job._type !== 'static') return null;
+    names.push(job.name);
+  }
+  return names;
+}
+
+/**
+ * The job names two or more matched workflows define, sorted. Null when a
+ * matched workflow has a dynamic job, so the names cannot be compared before
+ * the run.
+ */
+function sharedJobNames(
+  fullLockFile: FullLockFile,
+  matchedDecisions: WorkflowDecision[],
+): string[] | null {
+  const owners = new Map<string, number>();
+  for (const decision of matchedDecisions) {
+    const workflow = fullLockFile.workflows.find((w) => w.name === decision.workflowName);
+    if (!workflow) continue;
+    const names = staticJobNames(workflow);
+    if (names === null) return null;
+    for (const name of new Set(names)) owners.set(name, (owners.get(name) ?? 0) + 1);
+  }
+  return [...owners.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([name]) => name)
+    .sort();
+}
+
+/** One run the trigger creates, and the matched workflows it executes. */
+interface PlannedTestRun {
+  runId: string;
+  decisions: WorkflowDecision[];
+}
+
+/**
+ * Split the matched workflows into runs: one run per workflow, as every other
+ * run producer does.
+ *
+ * A caller that does not set `acceptsMultipleRuns` follows only `runId`. For
+ * it, several matched workflows share one run when their job names cannot
+ * collide (a run keys its needs edges, pending contexts and logs by job name),
+ * and the trigger is refused when they can.
+ */
+function planTestRuns(
+  input: TestTriggerInput,
+  fullLockFile: FullLockFile,
+  matchedDecisions: WorkflowDecision[],
+  firstRunId: string,
+): PlannedTestRun[] | { rejected: string } {
+  if (input.acceptsMultipleRuns || matchedDecisions.length === 1) {
+    return matchedDecisions.map((decision, i) => ({
+      runId: i === 0 ? firstRunId : randomUUID(),
+      decisions: [decision],
+    }));
+  }
+  const shared = sharedJobNames(fullLockFile, matchedDecisions);
+  // fails-when: a caller that follows one run gets two workflows' same-named jobs in that run
+  // breaks-if-wrong: workflows with distinct static job names still share one run for it
+  if (shared === null || shared.length > 0) {
+    const workflows = matchedDecisions.map((d) => d.workflowName).join(', ');
+    const why =
+      shared === null
+        ? 'one of them defines dynamic jobs, whose names cannot be checked before the run'
+        : `they share job names (${shared.join(', ')})`;
+    return {
+      rejected:
+        `This fixture matches several workflows (${workflows}) and ${why}. ` +
+        'This kici version follows a single run, so upgrade kici to run each workflow as its ' +
+        'own run, or pass --workflow <name> to run one workflow.',
+    };
+  }
+  return [{ runId: firstRunId, decisions: matchedDecisions }];
+}
+
+/** One run the trigger created, with the matched workflow it executes. */
+export interface TestTriggeredRun {
+  runId: string;
+  workflowName: string;
+  jobIds: string[];
+}
+
+interface DispatchedTestRun {
+  jobIds: string[];
+  deferredJobCount: number;
+  warnings: string[];
+}
+
+/**
+ * Dispatch one planned run. A run of several workflows (the shared run of a
+ * caller without `acceptsMultipleRuns`) is held open from its first
+ * registration until its last workflow has registered: a workflow whose jobs
+ * all end before the next one registers would otherwise complete the run, and
+ * the next workflow would start it over.
+ */
+async function dispatchPlannedRun(
+  shared: TestDispatchShared,
+  deps: ProcessingDeps,
+  planned: PlannedTestRun,
+): Promise<DispatchedTestRun> {
+  const { runId, decisions } = planned;
+  const out: DispatchedTestRun = { jobIds: [], deferredJobCount: 0, warnings: [] };
+  let runHeld = false;
+  const holdRunOpen = (): void => {
+    if (!runHeld && decisions.length > 1) {
+      runHeld = deps.executionTracker?.holdRunForPendingJobs(runId) ?? false;
+    }
+  };
+  try {
+    for (const decision of decisions) {
+      const workflow = shared.fullLockFile.workflows.find(
+        (w: LockWorkflow) => w.name === decision.workflowName,
+      );
+      if (!workflow) continue;
+      const ctx = buildTestDispatchContext(shared, workflow, decision, runId);
+      ctx.onRunRegistered = holdRunOpen;
+      const result = await dispatchMatchedWorkflow(ctx);
+      out.jobIds.push(...result.dispatchedJobIds);
+      out.deferredJobCount += result.deferredJobCount ?? 0;
+      if (result.envWarnings?.length) out.warnings.push(...result.envWarnings);
+    }
+  } finally {
+    if (runHeld) await deps.executionTracker?.releasePendingJobsHold(runId);
+  }
+  return out;
+}
+
 /**
  * Process a test trigger through the shared dispatch core: one
- * `WorkflowDispatchContext` per matched workflow, into `dispatchMatchedWorkflow`.
+ * `WorkflowDispatchContext` per matched workflow, into `dispatchMatchedWorkflow`,
+ * each under its own run id.
  */
 export async function processTestTrigger(
   input: TestTriggerInput,
   deps: ProcessingDeps,
 ): Promise<TestTriggerResult> {
+  // The first run's id; a rejection before any dispatch reports it too.
   const runId = randomUUID();
   const deliveryId = `test:${randomUUID()}`;
 
@@ -518,6 +664,11 @@ export async function processTestTrigger(
   }
   const matchedDecisions = matchResult;
 
+  const plan = planTestRuns(input, fullLockFile, matchedDecisions, runId);
+  if (!Array.isArray(plan)) {
+    return { runId, status: 'rejected', reason: plan.rejected, jobIds: [] };
+  }
+
   // Resolve the tenant exactly as the webhook pipeline does (sources ->
   // generic_webhook_sources -> '__default__'): a wrong org id would resolve
   // another tenant's contexts and secrets. Resolved ONCE and shared by the
@@ -535,7 +686,7 @@ export async function processTestTrigger(
     return { runId, status: 'rejected', reason: namespacedResult.rejected, jobIds: [] };
   }
 
-  await storeFixturePayload(input, deps, runId);
+  for (const planned of plan) await storeFixturePayload(input, deps, planned.runId);
 
   // The core resolves per-job env secrets through this decorator, so CLI flat
   // secrets win over orchestrator env secrets.
@@ -546,7 +697,7 @@ export async function processTestTrigger(
 
   // Mark BEFORE dispatch so the live-log observer broadcasts to the waiting CLI,
   // without waiting for the core's async is_test_run column write.
-  deps.executionTracker?.markTestRun(runId);
+  for (const planned of plan) deps.executionTracker?.markTestRun(planned.runId);
 
   // Inline (local working tree) runs carry the real origin provider on the
   // payload; provider-fetch runs derive it from the routing-key prefix.
@@ -580,32 +731,22 @@ export async function processTestTrigger(
   const jobIds: string[] = [];
   const warnings: string[] = [];
   let deferredJobCount = 0;
-  // Every matched workflow runs under this one run id. Hold the run open from
-  // its first registration until the last workflow has registered: a workflow
-  // whose jobs all end before the next one registers would otherwise complete
-  // the run, and the next workflow would start it over.
-  let runHeld = false;
-  const holdRunOpen = (): void => {
-    if (!runHeld && matchedDecisions.length > 1) {
-      runHeld = deps.executionTracker?.holdRunForPendingJobs(runId) ?? false;
+  const runs: TestTriggeredRun[] = [];
+  for (const planned of plan) {
+    const dispatched = await dispatchPlannedRun(shared, deps, planned);
+    jobIds.push(...dispatched.jobIds);
+    deferredJobCount += dispatched.deferredJobCount;
+    warnings.push(...dispatched.warnings);
+    if (planned.decisions.length === 1) {
+      runs.push({
+        runId: planned.runId,
+        workflowName: planned.decisions[0]!.workflowName,
+        jobIds: dispatched.jobIds,
+      });
     }
-  };
-  try {
-    for (const decision of matchedDecisions) {
-      const workflow = fullLockFile.workflows.find(
-        (w: LockWorkflow) => w.name === decision.workflowName,
-      );
-      if (!workflow) continue;
-      const ctx = buildTestDispatchContext(shared, workflow, decision, runId);
-      ctx.onRunRegistered = holdRunOpen;
-      const result = await dispatchMatchedWorkflow(ctx);
-      jobIds.push(...result.dispatchedJobIds);
-      deferredJobCount += result.deferredJobCount ?? 0;
-      if (result.envWarnings?.length) warnings.push(...result.envWarnings);
-    }
-  } finally {
-    if (runHeld) await deps.executionTracker?.releasePendingJobsHold(runId);
   }
+  // `runs` names one workflow per run, so a shared run of several workflows has none.
+  const runsField = runs.length === plan.length ? { runs } : {};
 
   // Jobs with a dynamic context, or a deferred init, dispatch from the agent
   // init round, so `jobIds` can be empty with work queued. Reject only when
@@ -617,8 +758,15 @@ export async function processTestTrigger(
       reason:
         'No jobs dispatched (all matched workflows had no static jobs or dispatch was rejected)',
       jobIds: [],
+      ...runsField,
     };
   }
 
-  return { runId, status: 'accepted', jobIds, ...(warnings.length > 0 && { warnings }) };
+  return {
+    runId,
+    status: 'accepted',
+    jobIds,
+    ...runsField,
+    ...(warnings.length > 0 && { warnings }),
+  };
 }

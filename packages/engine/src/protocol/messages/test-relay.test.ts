@@ -72,6 +72,57 @@ describe('test-relay control messages', () => {
     expect(res.status).toBe('accepted');
   });
 
+  it('carries the multi-run capability flag, the per-workflow runs and the per-line job names across both unions', () => {
+    const req = dashboardPlatformToOrchSchema.parse({
+      type: 'test.relay.trigger',
+      requestId: 'r2',
+      actor,
+      routingKey: 'remote:org_abc',
+      fixtureId: 'push-main',
+      event: { type: 'push', targetBranch: 'main', payload: {} },
+      acceptsMultipleRuns: true,
+    });
+    // fails-when: the schema lacks the flag, so the orchestrator's frame parse strips it
+    expect(req).toMatchObject({ acceptsMultipleRuns: true });
+
+    const runs = [
+      { runId: 'run-a', workflowName: 'wf-a', jobIds: ['j1'] },
+      { runId: 'run-b', workflowName: 'wf-b' },
+    ];
+    const res = dashboardOrchToPlatformSchema.parse({
+      type: 'test.relay.trigger.response',
+      requestId: 'r2',
+      runId: 'run-a',
+      runs,
+      status: 'accepted',
+    });
+    // fails-when: the Platform's frame parse strips `runs`, so it records one owner
+    expect(res).toMatchObject({ runId: 'run-a', runs });
+
+    const status = dashboardOrchToPlatformSchema.parse({
+      type: 'test.relay.run.status.response',
+      requestId: 'r3',
+      runId: 'run-a',
+      status: 'failed',
+      jobs: [],
+      failureReason: 'secret not found',
+      done: true,
+    });
+    // fails-when: the status frame drops the run's failure reason
+    expect(status).toMatchObject({ failureReason: 'secret not found' });
+
+    const logs = dashboardOrchToPlatformSchema.parse({
+      type: 'test.relay.run.logs.response',
+      requestId: 'r4',
+      lines: ['a', 'b'],
+      lineJobNames: ['build', 'test'],
+      nextCursor: 2,
+      done: false,
+    });
+    // fails-when: the logs frame drops the per-line job names
+    expect(logs).toMatchObject({ lineJobNames: ['build', 'test'] });
+  });
+
   it('parses run.status / run.logs / cancel', () => {
     expect(
       testRelayRunStatusRequestSchema.parse({

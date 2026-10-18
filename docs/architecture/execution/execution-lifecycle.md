@@ -142,7 +142,7 @@ Hooks execute inside-out, like stack unwinding.
 
 ## Hook step protocol
 
-Each hook execution is reported as a separate step in the protocol, with a `step_type` field distinguishing it from regular steps.
+Each hook execution is reported as a separate step in the protocol. Its step type rides in the message's `data`: as `data.step_type` for a step the sandbox runner reports (hooks, cache and init steps), and as `data.stepType` for the host-side image build. The orchestrator reads either spelling and stores it in `execution_steps.step_type`. The top-level `step_type` field of `step.status` is in the schema, but current agents do not set it.
 
 ```typescript
 // Agent sends step.status for hook execution
@@ -153,7 +153,7 @@ Each hook execution is reported as a separate step in the protocol, with a `step
   stepIndex: 2,        // incremented from the last regular step
   stepName: 'onCancel',
   state: 'running',    // or 'success', 'failed'
-  step_type: 'hook:onCancel',  // hook type identifier
+  data: { step_type: 'hook:onCancel' },  // hook type identifier
 }
 ```
 
@@ -167,7 +167,7 @@ Valid `step_type` values:
 - `hook:beforeStep`
 - `hook:afterStep`
 
-Hooks are not the only pseudo-steps that ride this field. The same convention carries the declarative cache phase (`cache:restore`, `cache:save`), the per-job init phase (`init:<n>`, one per init spec), and the container image build (`container:build`, which a reader sorts ahead of the real steps because it runs strictly first).
+Hooks are not the only pseudo-steps that ride this field. The same convention carries the declarative cache phase (`cache:restore`, `cache:save`), the per-job init phase (`init:<n>`, one per init spec), and the container image build (`container:build`). Readers list steps by phase, in the order they ran: the image build first, then the init steps, then the job's steps with their hooks and cache steps.
 
 Hook steps appear in the dashboard with a distinct visual marker (hook icon) and lighter styling. Each hook gets its own execution_steps row with separate status, timing, and log stream.
 

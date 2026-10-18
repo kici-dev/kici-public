@@ -1,11 +1,14 @@
 /** `kici runs show`: run summary plus the jobs/steps tree. */
 import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
-import type {
-  RunListItem,
-  DashboardJobDetail,
-  HeldRunSummary,
-  InitFailure,
+import { isRunId } from '@kici-dev/engine';
+import {
+  ExecutionStepStatus,
+  toCanonicalStatus,
+  type RunListItem,
+  type DashboardJobDetail,
+  type HeldRunSummary,
+  type InitFailure,
 } from '@kici-dev/engine';
 import { DashboardClient, DashboardClientError } from '../../remote/dashboard-client.js';
 import { colorStatus, relativeTime, formatDuration } from '../../remote/render.js';
@@ -16,17 +19,20 @@ import {
   HeldRunRequestError,
 } from '../held-run-client.js';
 import { printNotes, stepDetailNotes } from './detail-notes.js';
+import { resolveRunRef } from './run-ref.js';
+import { stepDisplayName, stepsInRunOrder } from './step-order.js';
 
 export interface RunsShowOptions {
   json?: boolean;
 }
 
 export async function runsShowCommand(
-  runId: string,
+  runRef: string,
   options: RunsShowOptions = {},
 ): Promise<boolean> {
   try {
     const client = await DashboardClient.load();
+    const runId = await resolveRunRef(client, runRef, await localRunIdsFor(runRef));
     let run: RunListItem;
     try {
       run = await client.getRun(runId);
@@ -143,10 +149,10 @@ function printJobs(jobs: DashboardJobDetail[], spansWorkflows: boolean): void {
         pc.gray(j.durationMs ? formatDuration(j.durationMs) : ''),
     );
     printJobFailure(j);
-    for (const s of j.steps ?? []) {
+    for (const s of stepsInRunOrder(j.steps)) {
       console.log(
         pc.gray('    └─ ') +
-          `${s.stepName} ${colorStatus(s.status)} ` +
+          `${stepDisplayName(s)} ${colorStatus(s.status)} ` +
           pc.gray(
             `${s.durationMs ? formatDuration(s.durationMs) : ''}` +
               `${s.exitCode != null ? ` exit=${s.exitCode}` : ''}`,
@@ -158,9 +164,11 @@ function printJobs(jobs: DashboardJobDetail[], spansWorkflows: boolean): void {
 
 /**
  * The job-scoped init failure (a context-rules rejection carries
- * `context_rules` plus the context and rule) or the plain error message. The
- * init failure wins: on a rejected job both carry the same text, and only the
- * category tells whether a gate or a step failed.
+ * `context_rules` plus the context and rule), else the job's error message,
+ * else its failed step. The init failure wins: on a rejected job both carry
+ * the same text, and only the category tells whether a gate or a step failed.
+ * A job that failed in a step usually records no job error message, so the
+ * failed step names the error.
  */
 function printJobFailure(job: DashboardJobDetail): void {
   if (job.initFailure) {
@@ -170,7 +178,21 @@ function printJobFailure(job: DashboardJobDetail): void {
     );
     return;
   }
-  if (job.errorMessage) console.log(`    ${pc.red('error')}: ${job.errorMessage}`);
+  if (job.errorMessage) {
+    console.log(`    ${pc.red('error')}: ${job.errorMessage}`);
+    return;
+  }
+  const step = (job.steps ?? []).find(
+    (s) => toCanonicalStatus(s.status.toLowerCase()) === ExecutionStepStatus.enum.failed,
+  );
+  if (!step) return;
+  const message = step.errorMessage?.trim();
+  const why = message
+    ? `: ${message}`
+    : step.exitCode != null
+      ? ` exited with code ${step.exitCode}`
+      : ' failed';
+  console.log(`    ${pc.red('error')}: step ${step.stepName}${why}`);
 }
 
 function printHolds(result: HoldsResult): void {
@@ -194,6 +216,14 @@ function printHolds(result: HoldsResult): void {
     if (h.reason) console.log(pc.gray(`      reason: ${h.reason}`));
     if (h.expiresAt) console.log(pc.gray(`      expires: ${relativeTime(h.expiresAt)}`));
   }
+}
+
+/** The local run history's run ids, read only for a short id, which may name one. */
+async function localRunIdsFor(runRef: string): Promise<string[]> {
+  if (isRunId(runRef.trim())) return [];
+  const history = new RunHistory();
+  await history.load();
+  return history.getEntries().map((e) => e.runId);
 }
 
 async function showLocalFallback(runId: string, json: boolean): Promise<boolean> {

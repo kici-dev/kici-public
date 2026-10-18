@@ -31,6 +31,8 @@ export interface HistoryEntry {
   durationMs?: number;
   /** Orchestrator endpoint */
   endpoint: string;
+  /** The workflow the run executed; a fixture creates one run per matched workflow. */
+  workflowName?: string;
   jobs?: Array<{ name: string; status: string; durationMs?: number }>;
 }
 

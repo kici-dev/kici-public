@@ -19,7 +19,7 @@ import { planeLogPath } from '../local-plane/plane-manager.js';
 import { readParentSha, resolveWorkdir } from '../local-plane/source-provider.js';
 import { ensureLocalSource } from '../local-plane/plane-seed.js';
 import { seedLocalSecrets } from '../local-plane/secret-seed.js';
-import { triggerRun } from '../local-plane/plane-trigger.js';
+import { triggerRuns } from '../local-plane/plane-trigger.js';
 import { TRUSTED_ROUTING_LABEL, IN_PLACE_ROUTING_LABEL } from '../local-plane/scaler-config.js';
 import { injectRunsOnLabel } from '../local-plane/trusted-routing.js';
 import { followRun } from '../local-plane/run-follow.js';
@@ -226,7 +226,7 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
     if (!quiet) logger.info(pc.dim(`Triggering ${options.event} …`));
     const dispatch =
       options.event === 'dispatch' ? readDispatchPayload(options.payload) : undefined;
-    const runId = await triggerRun(
+    const runs = await triggerRuns(
       plane.url,
       plane.adminToken,
       {
@@ -252,33 +252,57 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
       // For the timeout diagnosis.
       { repoBasePath: workdir.dir, logPath: planeLogPath() },
     );
-    if (!quiet) logger.info(pc.green(`Run started: ${runId}`));
+    // One run per matched workflow, as for any webhook: follow every one.
+    if (!quiet) {
+      for (const run of runs) {
+        const workflow = run.workflowName ? ` (${run.workflowName})` : '';
+        logger.info(pc.green(`Run started: ${run.runId}${workflow}`));
+      }
+    }
     const { url: planeUrl, adminToken: planeToken } = plane;
-    abandon = () => cancelAbandonedRun(planeUrl, planeToken, runId, { quiet });
+    abandon = async () =>
+      (
+        await Promise.all(
+          runs.map((run) => cancelAbandonedRun(planeUrl, planeToken, run.runId, { quiet })),
+        )
+      ).every(Boolean);
     const abandonRun = abandon;
     removeSignalHandlers = cancelOnSignal(async () => {
       await abandonRun();
       await finalize();
     });
 
-    const outcome = await followRun(plane.url, plane.adminToken, runId, {
-      quiet,
-      onLine: (line) => process.stdout.write(line + '\n'),
-      hintLogPath: planeLogPath(),
-    });
+    const outcomes = await Promise.all(
+      runs.map(async (run) => {
+        const prefix = runs.length > 1 && run.workflowName ? pc.dim(`[${run.workflowName}] `) : '';
+        const outcome = await followRun(planeUrl, planeToken, run.runId, {
+          quiet,
+          onLine: (line) => process.stdout.write(prefix + line + '\n'),
+          hintLogPath: planeLogPath(),
+        });
+        return { run, outcome };
+      }),
+    );
     abandon = undefined;
 
+    // fails-when: the command passes on the first run while a later workflow failed
+    const passed = outcomes.every(({ outcome }) => outcome.status === 'success');
     if (!quiet) {
       const result: RunResult = {
         fixtureId: options.event,
-        runId,
-        status: outcome.status === 'success' ? 'success' : 'failed',
+        runId: runs[0]!.runId,
+        status: passed ? 'success' : 'failed',
         totalDurationMs: 0,
-        jobs: outcome.jobs,
+        jobs: outcomes.flatMap(({ run, outcome }) =>
+          outcome.jobs.map((job) => ({
+            ...job,
+            ...(run.workflowName && { workflowName: run.workflowName }),
+          })),
+        ),
       };
       process.stdout.write('\n' + formatSummary(result) + '\n');
     }
-    return outcome.status === 'success';
+    return passed;
   } catch (error) {
     logger.error(pc.red(`\nError: ${toErrorMessage(error)}\n`));
     if (abandon) await abandon();

@@ -31,6 +31,7 @@ import {
   CheckStepOutcome,
   OrchLogPhase,
   isFailureStatus,
+  stepTypeOf,
 } from '@kici-dev/engine';
 import {
   executionsTotal,
@@ -595,9 +596,9 @@ export interface TrackedJobRow {
   jobId: string;
   jobName: string;
   /**
-   * The workflow that defines the job. A fixture run with no `--workflow` runs
-   * every matched workflow under one run id, so the run's own workflow does not
-   * name it. `onExecutionStarted` stamps its own workflow on a job without one;
+   * The workflow that defines the job. An older `kici`'s shared fixture run holds every matched
+   * workflow, so the run's own workflow
+   * does not name it. `onExecutionStarted` stamps its own workflow on a job without one;
    * `addJobsToRun` inherits it from the placeholder the job replaces.
    */
   workflowName?: string;
@@ -906,7 +907,7 @@ export class ExecutionTracker {
         : undefined;
 
     // A run spanning several workflows registers once per workflow under one
-    // run id (a fixture run with no `--workflow`). A later workflow joins the
+    // run id (an older `kici`'s shared fixture run). A later workflow joins the
     // live run: replacing it would drop the jobs already registered, and the run
     // would complete while they are still running.
     const liveRun = this.runs.get(runId);
@@ -1133,8 +1134,11 @@ export class ExecutionTracker {
     const run = this.runs.get(runId);
     const prefix = `needs-pending-${jobName}-`;
     if (run) {
-      for (const key of run.jobs.keys()) {
-        if (key.startsWith(prefix)) return key;
+      // The prefix alone also matches a longer name that extends this one
+      // (`build` matches `needs-pending-build-and-push-…`), so the job name
+      // must match exactly, as the DB fallback below requires.
+      for (const [key, job] of run.jobs) {
+        if (key.startsWith(prefix) && job.name === jobName) return key;
       }
     }
 
@@ -1889,7 +1893,8 @@ export class ExecutionTracker {
         completed_at: null,
         duration_ms: null,
         // fails-when: a reopened run keeps the failure it left, and shows it while it runs
-        // breaks-if-wrong: the build-failure predicate below still reads the reason before it clears
+        // breaks-if-wrong: the build-failure predicate below still reads the reason before it
+        // clears
         failure_reason: null,
         failure_class: null,
         status_epoch: nextEpoch,
@@ -3055,9 +3060,17 @@ export class ExecutionTracker {
     dispatchedByFailureLifecycle?: boolean;
     /** Re-run lineage, when this run re-runs another. */
     rerunLineage?: RerunLineage;
+    /**
+     * Set for a `kici run` test run, so its init failure stays readable on the
+     * test-run status and log routes, which serve only test runs.
+     */
+    testRun?: { fixtureId: string };
   }): Promise<void> {
     const now = new Date();
     const customerId = await this.resolveCustomerId(args.routingKey);
+    const testRunColumns = args.testRun
+      ? { is_test_run: true, fixture_id: args.testRun.fixtureId }
+      : {};
     const crossRepoWorkflowRepo = crossRepoWorkflowRepoOf(args);
     const applied = await this.db
       .insertInto('execution_runs')
@@ -3082,6 +3095,7 @@ export class ExecutionTracker {
         ...inheritedChainDepth(args.chainDepth),
         ...rerunLineageColumns(args.rerunLineage),
         ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
+        ...testRunColumns,
       })
       // Overwrite a non-terminal row: a `pending` row left untouched strands
       // the run mid-flight. The guard keeps a terminal row, so a finished run
@@ -3111,6 +3125,7 @@ export class ExecutionTracker {
             // any path but `onExecutionStarted` keeps a null marker, read as
             // "the workflow lives in this run's own repository", not "unknown".
             ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
+            ...testRunColumns,
           })
           .where('execution_runs.status', 'not in', [...TERMINAL_RUN_STATES]),
       )
@@ -3360,8 +3375,13 @@ export class ExecutionTracker {
      * {@link ExecutionTracker.recordGlobalEvalRoundFailureRun}).
      */
     dispatchRoutingKey?: string;
+    /** Set for a `kici run` test run, as on {@link ExecutionTracker.recordInitFailureRun}. */
+    testRun?: { fixtureId: string };
   }): Promise<void> {
     const now = new Date();
+    const testRunColumns = args.testRun
+      ? { is_test_run: true, fixture_id: args.testRun.fixtureId }
+      : {};
     // The resume reuses this row and onExecutionStarted's conflict path skips
     // customer_id, so the concurrency gate needs the real org here, not
     // '__default__'.
@@ -3399,6 +3419,7 @@ export class ExecutionTracker {
           args.dispatchRoutingKey !== args.routingKey && {
             dispatch_routing_key: args.dispatchRoutingKey,
           }),
+        ...testRunColumns,
       })
       // Overwrite a non-terminal row: an untouched `pending` row hides the hold
       // from the dashboard run list. A terminal row is kept: never re-held.
@@ -3409,6 +3430,7 @@ export class ExecutionTracker {
             status: ExecutionRunStatus.enum.held,
             ...(args.contextName && { context: args.contextName }),
             ...(args.prNumber != null && { pr_number: args.prNumber }),
+            ...testRunColumns,
             // As on `recordInitFailureRun`: depth only ever set, and
             // `trigger_decision` left alone to keep `recordRunStart`'s superset.
             ...inheritedChainDepth(args.chainDepth),
@@ -3844,10 +3866,9 @@ export class ExecutionTracker {
       routing_key: this.runs.get(runId)?.routingKey ?? null,
     };
 
-    // e.g. 'hook:onCancel', 'hook:cleanup'
-    if (data?.stepType && typeof data.stepType === 'string') {
-      values.step_type = data.stepType;
-    }
+    // e.g. 'hook:onCancel', 'init:0', 'container:build'.
+    const stepType = stepTypeOf(data);
+    if (stepType) values.step_type = stepType;
 
     if (state === ExecutionStepStatus.enum.running) {
       values.started_at = now;

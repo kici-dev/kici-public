@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
+  StepPhase,
+  compareStepsByPhase,
+  initStepIndex,
+  initStepLabel,
+  initStepType,
+  parseInitStepRef,
+  stepPhase,
+  stepTypeOf,
   CacheOutcome,
   CacheRunEventType,
   CacheStepType,
@@ -1142,5 +1150,67 @@ describe('statusEpoch (the run status generation)', () => {
         timestamp: 2,
       }).success,
     ).toBe(false);
+  });
+});
+
+describe('init step types', () => {
+  it('round-trips an init position through its step type and its label', () => {
+    // fails-when: the agent's step type and the readers' parser disagree on the format
+    expect(initStepIndex(initStepType(3))).toBe(3);
+    expect(parseInitStepRef(initStepLabel(3))).toBe(3);
+    expect(parseInitStepRef(initStepType(3))).toBe(3);
+  });
+
+  it('reads no init position from any other step type', () => {
+    // breaks-if-wrong: hooks, cache steps and plain steps are never taken for an init
+    for (const t of [
+      'step',
+      'hook:cleanup',
+      'cache:save',
+      'container:build',
+      'init:',
+      'init:x',
+      'init:1a',
+      null,
+      undefined,
+    ]) {
+      expect(initStepIndex(t)).toBeUndefined();
+    }
+    expect(parseInitStepRef('7')).toBeUndefined();
+    expect(parseInitStepRef('init[x]')).toBeUndefined();
+  });
+
+  it('places each step type in its phase', () => {
+    expect(stepPhase('container:build')).toBe(StepPhase.enum.setup);
+    expect(stepPhase('init:0')).toBe(StepPhase.enum.init);
+    expect(stepPhase('step')).toBe(StepPhase.enum.steps);
+    expect(stepPhase('hook:onFailure')).toBe(StepPhase.enum.steps);
+    expect(stepPhase(undefined)).toBe(StepPhase.enum.steps);
+  });
+
+  it('orders steps by phase, then by index', () => {
+    const steps = [
+      { stepIndex: 1, stepType: 'step' },
+      { stepIndex: 1_000_001, stepType: 'init:1' },
+      { stepIndex: 0 },
+      { stepIndex: 1_000_000, stepType: 'init:0' },
+      { stepIndex: 2_000_000, stepType: 'container:build' },
+    ];
+    // fails-when: the init steps sort by their stored index, after the steps
+    expect(steps.sort(compareStepsByPhase).map((s) => s.stepIndex)).toEqual([
+      2_000_000, 1_000_000, 1_000_001, 0, 1,
+    ]);
+  });
+});
+
+describe('stepTypeOf', () => {
+  it('reads the step type from either spelling a step.status data carries', () => {
+    // fails-when: only the camelCase key is read, and every sandbox-relayed type is lost
+    expect(stepTypeOf({ step_type: 'hook:cleanup' })).toBe('hook:cleanup');
+    // breaks-if-wrong: the host-side camelCase spelling keeps working
+    expect(stepTypeOf({ stepType: 'container:build' })).toBe('container:build');
+    expect(stepTypeOf({ durationMs: 3 })).toBeUndefined();
+    expect(stepTypeOf({ step_type: 7 })).toBeUndefined();
+    expect(stepTypeOf(undefined)).toBeUndefined();
   });
 });

@@ -31,7 +31,7 @@ vi.mock('../local-plane/plane-seed.js', () => ({
     .mockResolvedValue({ orgId: '__default__', sourceId: 'src-1', sourceName: 'kici-local' }),
 }));
 vi.mock('../local-plane/plane-trigger.js', () => ({
-  triggerRun: vi.fn().mockResolvedValue('run-42'),
+  triggerRuns: vi.fn().mockResolvedValue([{ runId: 'run-42', workflowName: 'ci' }]),
 }));
 const restoreLock = vi.fn();
 const injectRunsOnLabel = vi.fn(() => ({ restore: restoreLock }));
@@ -92,7 +92,7 @@ describe('runRoutedCommand', () => {
 
   it('drives the offline routed run and returns true on success', async () => {
     const { runRoutedCommand } = await import('./run-routed.js');
-    const { triggerRun } = await import('../local-plane/plane-trigger.js');
+    const { triggerRuns } = await import('../local-plane/plane-trigger.js');
     const { resolveWorkdir } = await import('../local-plane/source-provider.js');
     const ok = await runRoutedCommand({
       local: true,
@@ -101,7 +101,7 @@ describe('runRoutedCommand', () => {
       quiet: true,
     });
     expect(ok).toBe(true);
-    expect(triggerRun).toHaveBeenCalledWith(
+    expect(triggerRuns).toHaveBeenCalledWith(
       'http://127.0.0.1:4319',
       'kici-local-tok',
       expect.objectContaining({
@@ -214,6 +214,38 @@ describe('runRoutedCommand', () => {
     );
     expect(injectRunsOnLabel).toHaveBeenCalledWith('/tmp/clone-x/.kici/kici.lock.json', 'in-place');
     expect(restoreLock).toHaveBeenCalledTimes(2);
+  });
+
+  it('follows every run of a delivery that matched several workflows, failing if any fails', async () => {
+    const { triggerRuns } = await import('../local-plane/plane-trigger.js');
+    const { followRun } = await import('../local-plane/run-follow.js');
+    vi.mocked(triggerRuns).mockResolvedValueOnce([
+      { runId: 'run-a', workflowName: 'wf-a' },
+      { runId: 'run-b', workflowName: 'wf-b' },
+    ]);
+    vi.mocked(followRun).mockImplementation(async (_url, _tok, runId) => ({
+      runId,
+      status: runId === 'run-b' ? 'failed' : 'success',
+      jobs: [{ name: 'build', status: runId === 'run-b' ? 'failed' : 'success' }],
+    }));
+    try {
+      const { runRoutedCommand } = await import('./run-routed.js');
+      const ok = await runRoutedCommand({ local: true, offline: true, event: 'push', quiet: true });
+      // fails-when: only the first run is followed, so wf-b's failure passes the command
+      expect(ok).toBe(false);
+      expect(
+        vi
+          .mocked(followRun)
+          .mock.calls.map((c) => c[2])
+          .sort(),
+      ).toEqual(['run-a', 'run-b']);
+    } finally {
+      vi.mocked(followRun).mockResolvedValue({
+        runId: 'run-42',
+        status: 'success',
+        jobs: [{ name: 'build', status: 'success' }],
+      });
+    }
   });
 
   it('--trusted restores the lock even when the run throws', async () => {

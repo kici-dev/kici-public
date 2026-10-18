@@ -317,9 +317,14 @@ describe('routing-key scope sweep — admin-runs.ts', () => {
       fn: { countAll: () => ({ as: () => ({}) }) },
     } as any;
     app = createAdminRunRoutes(deps);
-    const res = await request(app, 'GET', 'http://localhost/api/v1/admin/runs/r1', {
-      token: VALID_TOKEN,
-    });
+    const res = await request(
+      app,
+      'GET',
+      'http://localhost/api/v1/admin/runs/00000000-0000-4000-8000-000000000001',
+      {
+        token: VALID_TOKEN,
+      },
+    );
     expect(res.status).toBe(403);
   });
 });

@@ -7,21 +7,50 @@ import {
   type CanonicalStatus,
 } from '@kici-dev/engine';
 
+/** One job of a fixture's result. */
+export interface RunJobResult {
+  name: string;
+  status: string;
+  durationMs?: number;
+  /** The workflow that defines the job, when the server named it. */
+  workflowName?: string;
+}
+
+/** One run of a fixture: a fixture that matches several workflows creates one run per workflow. */
+interface FixtureRunResult {
+  runId: string;
+  workflowName?: string;
+  status: string;
+  jobs: RunJobResult[];
+}
+
 export interface RunResult {
   fixtureId: string;
+  /** The first run's id. */
   runId: string;
+  /** The combined result: `success` only when every run succeeded. */
   status: 'success' | 'failed' | 'cancelled';
   totalDurationMs: number;
-  jobs: Array<{
-    name: string;
-    status: string;
-    durationMs?: number;
-  }>;
+  /** Every run's jobs. */
+  jobs: RunJobResult[];
+  /** Each run the fixture created; absent when the result predates it. */
+  runs?: FixtureRunResult[];
+}
+
+/** True when the jobs come from more than one workflow, so a bare job name is ambiguous. */
+export function spansWorkflows(jobs: readonly RunJobResult[]): boolean {
+  return new Set(jobs.map((j) => j.workflowName).filter((w) => w !== undefined)).size > 1;
+}
+
+/** `<workflow> / <job>` when the result spans workflows, else the job name. */
+export function jobLabel(job: RunJobResult, labelWorkflow: boolean): string {
+  return labelWorkflow && job.workflowName ? `${job.workflowName} / ${job.name}` : job.name;
 }
 
 export function formatSummary(result: RunResult): string {
+  const labelWorkflow = spansWorkflows(result.jobs);
   const rows = result.jobs.map((job) => ({
-    name: job.name,
+    name: jobLabel(job, labelWorkflow),
     status: formatJobStatus(job.status),
     statusRaw: job.status,
     duration: job.durationMs !== undefined ? formatDuration(job.durationMs) : '-',

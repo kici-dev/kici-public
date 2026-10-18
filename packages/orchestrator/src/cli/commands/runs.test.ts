@@ -18,7 +18,7 @@ interface CommandResult {
 }
 
 const sampleRun = {
-  runId: 'run-abc-123',
+  runId: '0a1b2c3d-0000-4000-8000-000000000123',
   workflowName: 'ci',
   status: 'success',
   provider: 'github',
@@ -134,7 +134,7 @@ describe('kici-admin runs CLI commands', () => {
       ],
     });
     mockGetRunStructured = vi.fn().mockResolvedValue({
-      runId: 'run-abc-123',
+      runId: '0a1b2c3d-0000-4000-8000-000000000123',
       workflowName: { untrusted: true, value: 'ci' },
       status: 'failed',
       provider: 'github',
@@ -183,7 +183,7 @@ describe('kici-admin runs CLI commands', () => {
       ],
     });
     mockGet = vi.fn().mockResolvedValue({
-      runId: 'run-eval-1',
+      runId: '0e7a1000-0000-4000-8000-000000000001',
       jobId: 'job-eval-1',
       stepIndex: 0,
       totalLines: 2,
@@ -220,7 +220,7 @@ describe('kici-admin runs CLI commands', () => {
       expect(stdout).toContain('run_id');
       expect(stdout).toContain('workflow');
       expect(stdout).toContain('status');
-      expect(stdout).toContain('run-abc-123');
+      expect(stdout).toContain('0a1b2c3d-0000-4000-8000-000000000123');
     });
 
     it('R-2: --status and --workflow-name are passed to listRuns', async () => {
@@ -294,7 +294,7 @@ describe('kici-admin runs CLI commands', () => {
       const { stdout } = await runCommand(['runs', 'list', '--json'], client);
 
       expect(stdout).toContain('"runs"');
-      expect(stdout).toContain('"run-abc-123"');
+      expect(stdout).toContain('"0a1b2c3d-0000-4000-8000-000000000123"');
       // Must NOT include the table header
       expect(stdout).not.toMatch(/^run_id\s+workflow/m);
     });
@@ -334,18 +334,26 @@ describe('kici-admin runs CLI commands', () => {
 
   describe('runs show', () => {
     it('R-10: displays run header with metadata', async () => {
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
-      expect(mockGetRun).toHaveBeenCalledWith('run-abc-123');
-      expect(mockGetRunJobs).toHaveBeenCalledWith('run-abc-123', { includeSteps: true });
-      expect(stdout).toContain('Run: run-abc-123');
+      expect(mockGetRun).toHaveBeenCalledWith('0a1b2c3d-0000-4000-8000-000000000123');
+      expect(mockGetRunJobs).toHaveBeenCalledWith('0a1b2c3d-0000-4000-8000-000000000123', {
+        includeSteps: true,
+      });
+      expect(stdout).toContain('Run: 0a1b2c3d-0000-4000-8000-000000000123');
       expect(stdout).toContain('Workflow:    ci');
       expect(stdout).toContain('Status:      success');
       expect(stdout).toContain('Repo:        owner/repo');
     });
 
     it('R-11: displays jobs table', async () => {
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
       expect(stdout).toContain('job_id');
       expect(stdout).toContain('job-test');
@@ -353,7 +361,10 @@ describe('kici-admin runs CLI commands', () => {
     });
 
     it('R-12: displays steps per job', async () => {
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
       expect(stdout).toContain('Steps for test (job-test)');
       expect(stdout).toContain('checkout');
@@ -361,18 +372,24 @@ describe('kici-admin runs CLI commands', () => {
     });
 
     it('R-13: --json prints raw JSON composed from both endpoints', async () => {
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123', '--json'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123', '--json'],
+        client,
+      );
 
       expect(stdout).toContain('"run"');
       expect(stdout).toContain('"jobs"');
       expect(stdout).toContain('"steps"');
       // Must NOT include the formatted header
-      expect(stdout).not.toContain('Run: run-abc-123');
+      expect(stdout).not.toContain('Run: 0a1b2c3d-0000-4000-8000-000000000123');
     });
 
     it('R-14: no jobs shows appropriate message', async () => {
       mockGetRunJobs.mockResolvedValue({ jobs: [] });
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
       expect(stdout).toContain('No jobs.');
     });
@@ -386,7 +403,10 @@ describe('kici-admin runs CLI commands', () => {
           workflowBranch: 'main',
         },
       });
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
       // fails-when: the header omits any of the three provenance lines
       expect(stdout).toContain('Defined in:  acme/org-workflows (organization-wide workflow)');
@@ -403,7 +423,10 @@ describe('kici-admin runs CLI commands', () => {
           workflowBranch: null,
         },
       });
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
       // fails-when: a null provenance still prints a "Defined in:" line
       // breaks-if-wrong: the ordinary header lines must still print
@@ -417,7 +440,10 @@ describe('kici-admin runs CLI commands', () => {
       mockGetRun.mockResolvedValue({
         run: { ...sampleRunDetail, workflowRepoIdentifier: 'owner/repo' },
       });
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
       // fails-when: the line is gated on "set" alone, unlike the dashboard,
       // which shows "Defined in" only when the two repositories differ
@@ -433,7 +459,10 @@ describe('kici-admin runs CLI commands', () => {
           workflowBranch: 'main',
         },
       });
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123', '--json'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123', '--json'],
+        client,
+      );
 
       // fails-when: the --json path filters the run object down to known keys
       expect(JSON.parse(stdout).run).toMatchObject({
@@ -445,7 +474,10 @@ describe('kici-admin runs CLI commands', () => {
 
     it('R-19: the run context prints on its own line', async () => {
       mockGetRun.mockResolvedValue({ run: { ...sampleRunDetail, context: 'production' } });
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
       // fails-when: the header reads a field the route does not send
       // (`environment`), so the context line never prints
@@ -483,7 +515,10 @@ describe('kici-admin runs CLI commands', () => {
         run: { ...sampleRunDetail, workflowNames: ['ci', 'repro-407', 'repro-461'] },
       });
       mockGetRunJobs.mockResolvedValue({ jobs: multiJobs });
-      const { stdout } = await runCommand(['runs', 'show', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
       // fails-when: the header reads as a run of the first workflow alone
       expect(stdout).toContain('Workflows:   ci, repro-407, repro-461');
       expect(stdout).not.toContain('Workflow:    ci');
@@ -495,65 +530,371 @@ describe('kici-admin runs CLI commands', () => {
 
     it('R-33: runs jobs shows each job workflow', async () => {
       mockGetRunJobs.mockResolvedValue({ jobs: multiJobs });
-      const { stdout } = await runCommand(['runs', 'jobs', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'jobs', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
       // fails-when: the jobs table has no workflow column
       expect(stdout).toContain('workflow');
       expect(stdout).toContain('repro-461');
     });
 
     it('R-34: a job with no recorded workflow shows a dash', async () => {
-      const { stdout } = await runCommand(['runs', 'jobs', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'jobs', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
       // breaks-if-wrong: a job from an older orchestrator still renders its row
       expect(stdout).toMatch(/job-test\s+│?\s*test\s+│?\s*-/);
     });
   });
 
+  describe('init steps', () => {
+    // An older orchestrator orders steps by index alone, so the init step arrives last.
+    const initStep = {
+      stepIndex: 1_000_000,
+      stepName: 'init:0',
+      status: 'success',
+      startedAt: '2026-04-07T10:00:05.000Z',
+      completedAt: '2026-04-07T10:00:06.000Z',
+      durationMs: 1000,
+      exitCode: null,
+      errorMessage: null,
+      stepType: 'init:0',
+    };
+    const jobWithInit = { ...sampleJob, steps: [...sampleJob.steps, initStep] };
+
+    /** The step-table rows of the one job, in printed order. */
+    function stepRows(stdout: string): string[] {
+      const lines = stdout.split('\n');
+      const start = lines.findIndex((l) => l.startsWith('Steps for test'));
+      return lines.slice(start + 3).filter((l) => l.trim() !== '');
+    }
+
+    it('R-60: runs show labels an init step init[n] and lists it before the steps', async () => {
+      mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInit] });
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
+
+      // fails-when: the # column prints the raw stored index
+      expect(stdout).not.toContain('1000000');
+      const rows = stepRows(stdout);
+      // fails-when: the init step keeps the position its index gives it, after the steps
+      expect(rows[0]).toMatch(/^init\[0\]\s+init:0\s+success\s+-\s+1s\s+init$/);
+      // breaks-if-wrong: the job's own steps keep their index and order after it
+      expect(rows[1]).toMatch(/^0\s+checkout\b/);
+      expect(rows[2]).toMatch(/^1\s+run tests\b/);
+    });
+
+    it('R-61: runs jobs --include-steps labels and orders init steps the same way', async () => {
+      mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInit] });
+      const { stdout } = await runCommand(
+        ['runs', 'jobs', '0a1b2c3d-0000-4000-8000-000000000123', '--include-steps'],
+        client,
+      );
+
+      // fails-when: the second step table still prints the raw index or the index order
+      expect(stdout).not.toContain('1000000');
+      const rows = stepRows(stdout);
+      expect(rows[0]).toMatch(/^init\[0\]\s+init:0\b/);
+      expect(rows[1]).toMatch(/^0\s+checkout\b/);
+    });
+
+    it('R-62: runs structured labels and orders init steps the same way', async () => {
+      const structured = await (mockGetRunStructured as unknown as () => Promise<any>)();
+      const [job] = structured.jobs;
+      mockGetRunStructured.mockResolvedValue({
+        ...structured,
+        jobs: [
+          {
+            ...job,
+            jobName: { untrusted: true, value: 'test' },
+            steps: [
+              ...job.steps,
+              {
+                ...job.steps[0],
+                stepIndex: 1_000_000,
+                stepName: { untrusted: true, value: 'init:0' },
+                stepType: 'init:0',
+                status: 'success',
+                exitCode: null,
+              },
+            ],
+          },
+        ],
+      });
+      const { stdout } = await runCommand(
+        ['runs', 'structured', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
+
+      // fails-when: the structured view prints the raw stored index
+      expect(stdout).not.toContain('1000000');
+      const rows = stepRows(stdout);
+      expect(rows[0]).toMatch(/^init\[0\]\s+init:0\b/);
+      // breaks-if-wrong: the step's own index and name still print
+      expect(rows[1]).toMatch(/^0\s+compile\b/);
+    });
+
+    it('R-64: runs logs --step init[0] reads the init step by its stored index', async () => {
+      mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInit] });
+      await runCommand(
+        [
+          'runs',
+          'logs',
+          '0a1b2c3d-0000-4000-8000-000000000123',
+          '--job',
+          'job-test',
+          '--step',
+          'init[0]',
+        ],
+        client,
+      );
+
+      // fails-when: the label is sent as the step index, which the server rejects
+      expect(mockGet).toHaveBeenCalledWith(
+        '/api/v1/admin/runs/0a1b2c3d-0000-4000-8000-000000000123/jobs/job-test/steps/1000000/logs?limit=500',
+      );
+    });
+
+    it('R-65: runs logs --step init[n] names a missing init step', async () => {
+      mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInit] });
+      const { stderr, exitCode } = await runCommand(
+        [
+          'runs',
+          'logs',
+          '0a1b2c3d-0000-4000-8000-000000000123',
+          '--job',
+          'job-test',
+          '--step',
+          'init[3]',
+        ],
+        client,
+      );
+
+      // fails-when: an unknown init label falls through to an opaque server 400
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain('has no init[3] step');
+      expect(mockGet).not.toHaveBeenCalled();
+    });
+
+    it('R-67: an empty init log names the step init[n], not its stored index', async () => {
+      mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInit] });
+      mockGet.mockResolvedValue({
+        runId: '0a1b2c3d-0000-4000-8000-000000000123',
+        jobId: 'job-test',
+        stepIndex: 1_000_000,
+        totalLines: 0,
+        recorded: false,
+        nextCursor: null,
+        lines: [],
+      });
+      const { stderr } = await runCommand(
+        [
+          'runs',
+          'logs',
+          '0a1b2c3d-0000-4000-8000-000000000123',
+          '--job',
+          'job-test',
+          '--step',
+          'init[0]',
+        ],
+        client,
+      );
+
+      // fails-when: the note prints the stored index the label hides
+      expect(stderr).toContain('(no log recorded for step init[0])');
+      expect(stderr).not.toContain('1000000');
+    });
+
+    it('R-66: runs logs --step with a number does not look up the job', async () => {
+      await runCommand(
+        [
+          'runs',
+          'logs',
+          '0a1b2c3d-0000-4000-8000-000000000123',
+          '--job',
+          'job-test',
+          '--step',
+          '2',
+        ],
+        client,
+      );
+
+      // breaks-if-wrong: a plain index (and an eval round with no run row) needs no lookup
+      expect(mockGetRunJobs).not.toHaveBeenCalled();
+      expect(mockGet).toHaveBeenCalledWith(
+        '/api/v1/admin/runs/0a1b2c3d-0000-4000-8000-000000000123/jobs/job-test/steps/2/logs?limit=500',
+      );
+    });
+
+    it('R-63: --json keeps the raw stepIndex the server sent', async () => {
+      mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInit] });
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123', '--json'],
+        client,
+      );
+
+      // fails-when: the JSON view rewrites the stored index it is meant to carry verbatim
+      const steps = JSON.parse(stdout).jobs[0].steps;
+      expect(steps.map((s: { stepIndex: number }) => s.stepIndex)).toContain(1_000_000);
+    });
+  });
+
+  describe('short run ids', () => {
+    const FULL = '709c899a-b06f-45d0-a3e2-d0a14fa62094';
+
+    it('R-70: runs show resolves a unique prefix to the full run id', async () => {
+      mockListRuns.mockResolvedValue({ runs: [{ runId: FULL }], total: 1, limit: 5, offset: 0 });
+      await runCommand(['runs', 'show', '709c899a'], client);
+
+      // fails-when: the short id goes to the server as a run id (the issue's opaque HTTP 400)
+      expect(mockListRuns).toHaveBeenCalledWith({ runIdPrefix: '709c899a', limit: 5 });
+      expect(mockGetRun).toHaveBeenCalledWith(FULL);
+      expect(mockGetRunJobs).toHaveBeenCalledWith(FULL, { includeSteps: true });
+    });
+
+    it('R-71: runs jobs and runs logs resolve a prefix the same way', async () => {
+      mockListRuns.mockResolvedValue({ runs: [{ runId: FULL }], total: 1, limit: 5, offset: 0 });
+      await runCommand(['runs', 'jobs', '709c899a'], client);
+      expect(mockGetRunJobs).toHaveBeenCalledWith(FULL, { includeSteps: false });
+      await runCommand(['runs', 'logs', '709c899a', '--job', 'j'], client);
+      expect(mockGet).toHaveBeenCalledWith(
+        `/api/v1/admin/runs/${FULL}/jobs/j/steps/0/logs?limit=500`,
+      );
+    });
+
+    it('R-72: an ambiguous prefix names its matches and fetches nothing', async () => {
+      const other = '709c899a-0000-4000-8000-000000000000';
+      mockListRuns.mockResolvedValue({
+        runs: [{ runId: FULL }, { runId: other }],
+        total: 3,
+        limit: 5,
+        offset: 0,
+      });
+      const { stderr, exitCode } = await runCommand(['runs', 'show', '709c899a'], client);
+
+      // fails-when: the first match is picked silently
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain("Run id prefix '709c899a' is ambiguous");
+      expect(stderr).toContain(FULL);
+      expect(stderr).toContain(other);
+      expect(stderr).toContain('and 1 more');
+      expect(mockGetRun).not.toHaveBeenCalled();
+    });
+
+    it('R-73: a prefix no run starts with says so', async () => {
+      mockListRuns.mockResolvedValue({ runs: [], total: 0, limit: 5, offset: 0 });
+      const { stderr, exitCode } = await runCommand(['runs', 'show', 'deadbeef'], client);
+      expect(exitCode).not.toBe(0);
+      expect(stderr).toContain("No run id starts with 'deadbeef'");
+      expect(stderr).toContain('kici-admin runs list');
+    });
+
+    it('R-74: text that cannot be a run id fails before any request', async () => {
+      const { stderr, exitCode } = await runCommand(['runs', 'show', 'not-a-run'], client);
+      expect(exitCode).not.toBe(0);
+      // fails-when: the value reaches the server and returns "malformed value for a typed field"
+      expect(stderr).toContain("Invalid run id 'not-a-run'");
+      expect(stderr).not.toContain('malformed value');
+      expect(mockListRuns).not.toHaveBeenCalled();
+      expect(mockGetRun).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      // fails-when: one match on a page of unrelated runs is picked, though more may exist
+      { total: 40, resolves: false },
+      // breaks-if-wrong: a small install on an older orchestrator still resolves
+      { total: 2, resolves: true },
+    ])(
+      'R-75: an orchestrator that ignores the prefix filter (total $total)',
+      async ({ total, resolves }) => {
+        const unrelated = '11111111-0000-4000-8000-000000000000';
+        mockListRuns.mockResolvedValue({ runs: [{ runId: unrelated }, { runId: FULL }], total });
+        const { stderr } = await runCommand(['runs', 'show', '709c899a'], client);
+        if (resolves) expect(mockGetRun).toHaveBeenCalledWith(FULL);
+        else expect(stderr).toContain("cannot look up the run id prefix '709c899a'");
+      },
+    );
+
+    it('R-76: a full run id is used as typed, with no lookup', async () => {
+      await runCommand(['runs', 'show', FULL], client);
+      // breaks-if-wrong: the common case costs no extra request
+      expect(mockListRuns).not.toHaveBeenCalled();
+      expect(mockGetRun).toHaveBeenCalledWith(FULL);
+    });
+  });
+
   describe('runs jobs', () => {
     it('R-20: default call excludes steps', async () => {
-      const { stdout } = await runCommand(['runs', 'jobs', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'jobs', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
-      expect(mockGetRunJobs).toHaveBeenCalledWith('run-abc-123', { includeSteps: false });
+      expect(mockGetRunJobs).toHaveBeenCalledWith('0a1b2c3d-0000-4000-8000-000000000123', {
+        includeSteps: false,
+      });
       expect(stdout).toContain('job_id');
       expect(stdout).toContain('job-test');
     });
 
     it('R-21: --include-steps passes true to client', async () => {
-      await runCommand(['runs', 'jobs', 'run-abc-123', '--include-steps'], client);
+      await runCommand(
+        ['runs', 'jobs', '0a1b2c3d-0000-4000-8000-000000000123', '--include-steps'],
+        client,
+      );
 
-      expect(mockGetRunJobs).toHaveBeenCalledWith('run-abc-123', { includeSteps: true });
+      expect(mockGetRunJobs).toHaveBeenCalledWith('0a1b2c3d-0000-4000-8000-000000000123', {
+        includeSteps: true,
+      });
     });
 
     it('R-22: --json emits the raw response', async () => {
-      const { stdout } = await runCommand(['runs', 'jobs', 'run-abc-123', '--json'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'jobs', '0a1b2c3d-0000-4000-8000-000000000123', '--json'],
+        client,
+      );
       expect(stdout).toContain('"jobs"');
       expect(stdout).toContain('"job-test"');
     });
 
     it('R-23: empty jobs list prints message', async () => {
       mockGetRunJobs.mockResolvedValue({ jobs: [] });
-      const { stdout } = await runCommand(['runs', 'jobs', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'jobs', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
       expect(stdout).toContain('No jobs for this run.');
     });
   });
 
   describe('runs ephemeral-key', () => {
     it('R-30: prints exists + created_at when the row is present', async () => {
-      const { stdout } = await runCommand(['runs', 'ephemeral-key', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'ephemeral-key', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
-      expect(mockGetRunEphemeralKey).toHaveBeenCalledWith('run-abc-123');
+      expect(mockGetRunEphemeralKey).toHaveBeenCalledWith('0a1b2c3d-0000-4000-8000-000000000123');
       expect(stdout).toContain('exists: true');
       expect(stdout).toContain('created_at: 2026-04-07T10:00:00.000Z');
     });
 
     it('R-31: prints exists: false when scrubbed', async () => {
       mockGetRunEphemeralKey.mockResolvedValue({ exists: false, createdAt: null });
-      const { stdout } = await runCommand(['runs', 'ephemeral-key', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'ephemeral-key', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
       expect(stdout).toContain('exists: false');
     });
 
     it('R-32: --json emits the raw response', async () => {
       const { stdout } = await runCommand(
-        ['runs', 'ephemeral-key', 'run-abc-123', '--json'],
+        ['runs', 'ephemeral-key', '0a1b2c3d-0000-4000-8000-000000000123', '--json'],
         client,
       );
       const parsed = JSON.parse(stdout);
@@ -563,9 +904,12 @@ describe('kici-admin runs CLI commands', () => {
 
   describe('runs secret-outputs', () => {
     it('R-40: default call renders masked rows (no plaintext)', async () => {
-      const { stdout } = await runCommand(['runs', 'secret-outputs', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'secret-outputs', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
 
-      expect(mockGetRunSecretOutputs).toHaveBeenCalledWith('run-abc-123', {
+      expect(mockGetRunSecretOutputs).toHaveBeenCalledWith('0a1b2c3d-0000-4000-8000-000000000123', {
         outputKey: undefined,
         reveal: false,
       });
@@ -576,10 +920,16 @@ describe('kici-admin runs CLI commands', () => {
 
     it('R-41: --output-key filter is passed through', async () => {
       await runCommand(
-        ['runs', 'secret-outputs', 'run-abc-123', '--output-key', 'API_KEY'],
+        [
+          'runs',
+          'secret-outputs',
+          '0a1b2c3d-0000-4000-8000-000000000123',
+          '--output-key',
+          'API_KEY',
+        ],
         client,
       );
-      expect(mockGetRunSecretOutputs).toHaveBeenCalledWith('run-abc-123', {
+      expect(mockGetRunSecretOutputs).toHaveBeenCalledWith('0a1b2c3d-0000-4000-8000-000000000123', {
         outputKey: 'API_KEY',
         reveal: false,
       });
@@ -599,10 +949,10 @@ describe('kici-admin runs CLI commands', () => {
         ],
       });
       const { stdout, stderr } = await runCommand(
-        ['runs', 'secret-outputs', 'run-abc-123', '--reveal'],
+        ['runs', 'secret-outputs', '0a1b2c3d-0000-4000-8000-000000000123', '--reveal'],
         client,
       );
-      expect(mockGetRunSecretOutputs).toHaveBeenCalledWith('run-abc-123', {
+      expect(mockGetRunSecretOutputs).toHaveBeenCalledWith('0a1b2c3d-0000-4000-8000-000000000123', {
         outputKey: undefined,
         reveal: true,
       });
@@ -612,13 +962,16 @@ describe('kici-admin runs CLI commands', () => {
 
     it('R-43: empty list prints message', async () => {
       mockGetRunSecretOutputs.mockResolvedValue({ outputs: [] });
-      const { stdout } = await runCommand(['runs', 'secret-outputs', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'secret-outputs', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
       expect(stdout).toContain('No secret outputs for this run.');
     });
 
     it('R-44: --json emits raw response', async () => {
       const { stdout } = await runCommand(
-        ['runs', 'secret-outputs', 'run-abc-123', '--json'],
+        ['runs', 'secret-outputs', '0a1b2c3d-0000-4000-8000-000000000123', '--json'],
         client,
       );
       expect(stdout).toContain('"outputs"');
@@ -628,16 +981,22 @@ describe('kici-admin runs CLI commands', () => {
 
   describe('runs structured', () => {
     it('R-45: --json prints the raw AgentRunResult (untrusted envelopes preserved)', async () => {
-      const { stdout } = await runCommand(['runs', 'structured', 'run-abc-123', '--json'], client);
-      expect(mockGetRunStructured).toHaveBeenCalledWith('run-abc-123');
+      const { stdout } = await runCommand(
+        ['runs', 'structured', '0a1b2c3d-0000-4000-8000-000000000123', '--json'],
+        client,
+      );
+      expect(mockGetRunStructured).toHaveBeenCalledWith('0a1b2c3d-0000-4000-8000-000000000123');
       const parsed = JSON.parse(stdout);
-      expect(parsed.runId).toBe('run-abc-123');
+      expect(parsed.runId).toBe('0a1b2c3d-0000-4000-8000-000000000123');
       expect(parsed.workflowName).toEqual({ untrusted: true, value: 'ci' });
       expect(parsed.failureCategory).toBe('step_failed');
     });
 
     it('R-46: human view unwraps untrusted values and shows failure category', async () => {
-      const { stdout } = await runCommand(['runs', 'structured', 'run-abc-123'], client);
+      const { stdout } = await runCommand(
+        ['runs', 'structured', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
       expect(stdout).toContain('Workflow:');
       expect(stdout).toContain('ci');
       expect(stdout).toContain('step_failed');
@@ -650,12 +1009,12 @@ describe('kici-admin runs CLI commands', () => {
   describe('runs logs', () => {
     it('R-47: default fetches step 0 with limit=500 and prints only the line values', async () => {
       const { stdout, stderr } = await runCommand(
-        ['runs', 'logs', 'run-eval-1', '--job', 'job-eval-1'],
+        ['runs', 'logs', '0e7a1000-0000-4000-8000-000000000001', '--job', 'job-eval-1'],
         client,
       );
 
       expect(mockGet).toHaveBeenCalledWith(
-        '/api/v1/admin/runs/run-eval-1/jobs/job-eval-1/steps/0/logs?limit=500',
+        '/api/v1/admin/runs/0e7a1000-0000-4000-8000-000000000001/jobs/job-eval-1/steps/0/logs?limit=500',
       );
       expect(stdout).toBe(
         '[global-filter] KICI_SOURCE_REPO_PATH=/w/source\n[global-filter] verdict=true',
@@ -676,26 +1035,41 @@ describe('kici-admin runs CLI commands', () => {
       });
 
       await runCommand(
-        ['runs', 'logs', 'r', '--job', 'j', '--step', '3', '--limit', '10', '--cursor', '40'],
+        [
+          'runs',
+          'logs',
+          '0a1b2c3d-0000-4000-8000-0000000000aa',
+          '--job',
+          'j',
+          '--step',
+          '3',
+          '--limit',
+          '10',
+          '--cursor',
+          '40',
+        ],
         client,
       );
 
       expect(mockGet).toHaveBeenCalledWith(
-        '/api/v1/admin/runs/r/jobs/j/steps/3/logs?limit=10&cursor=40',
+        '/api/v1/admin/runs/0a1b2c3d-0000-4000-8000-0000000000aa/jobs/j/steps/3/logs?limit=10&cursor=40',
       );
     });
 
-    it('R-49: ids are URL-encoded into the path', async () => {
-      await runCommand(['runs', 'logs', 'run/1', '--job', 'job 2', '--step', '1'], client);
+    it('R-49: the job id is URL-encoded into the path', async () => {
+      await runCommand(
+        ['runs', 'logs', '0a1b2c3d-0000-4000-8000-0000000000aa', '--job', 'job 2', '--step', '1'],
+        client,
+      );
 
       expect(mockGet).toHaveBeenCalledWith(
-        '/api/v1/admin/runs/run%2F1/jobs/job%202/steps/1/logs?limit=500',
+        '/api/v1/admin/runs/0a1b2c3d-0000-4000-8000-0000000000aa/jobs/job%202/steps/1/logs?limit=500',
       );
     });
 
     it('R-50: the pagination hint goes to stderr so stdout stays pipeable', async () => {
       mockGet.mockResolvedValue({
-        runId: 'run-eval-1',
+        runId: '0e7a1000-0000-4000-8000-000000000001',
         jobId: 'job-eval-1',
         stepIndex: 0,
         totalLines: 900,
@@ -704,7 +1078,7 @@ describe('kici-admin runs CLI commands', () => {
       });
 
       const { stdout, stderr } = await runCommand(
-        ['runs', 'logs', 'run-eval-1', '--job', 'job-eval-1'],
+        ['runs', 'logs', '0e7a1000-0000-4000-8000-000000000001', '--job', 'job-eval-1'],
         client,
       );
 
@@ -714,7 +1088,7 @@ describe('kici-admin runs CLI commands', () => {
 
     it('R-51: --json emits the raw response with untrusted envelopes preserved', async () => {
       const { stdout } = await runCommand(
-        ['runs', 'logs', 'run-eval-1', '--job', 'job-eval-1', '--json'],
+        ['runs', 'logs', '0e7a1000-0000-4000-8000-000000000001', '--job', 'job-eval-1', '--json'],
         client,
       );
 
@@ -727,7 +1101,10 @@ describe('kici-admin runs CLI commands', () => {
     });
 
     it('R-52: --job is required', async () => {
-      const { stderr } = await runCommand(['runs', 'logs', 'run-eval-1'], client);
+      const { stderr } = await runCommand(
+        ['runs', 'logs', '0e7a1000-0000-4000-8000-000000000001'],
+        client,
+      );
 
       expect(mockGet).not.toHaveBeenCalled();
       expect(stderr).toContain('--job');
@@ -739,7 +1116,7 @@ describe('kici-admin runs CLI commands', () => {
       mockGet.mockResolvedValue({ ...EMPTY_PAGE, stepIndex: -1, recorded: false });
 
       const { stdout, stderr } = await runCommand(
-        ['runs', 'logs', 'r', '--job', 'j', '--step=-1'],
+        ['runs', 'logs', '0a1b2c3d-0000-4000-8000-0000000000aa', '--job', 'j', '--step=-1'],
         client,
       );
 
@@ -753,7 +1130,7 @@ describe('kici-admin runs CLI commands', () => {
       mockGet.mockResolvedValue({ ...EMPTY_PAGE, stepIndex: -1, recorded: true });
 
       const { stdout, stderr } = await runCommand(
-        ['runs', 'logs', 'r', '--job', 'j', '--step=-1'],
+        ['runs', 'logs', '0a1b2c3d-0000-4000-8000-0000000000aa', '--job', 'j', '--step=-1'],
         client,
       );
 
@@ -765,7 +1142,7 @@ describe('kici-admin runs CLI commands', () => {
       mockGet.mockResolvedValue({ ...EMPTY_PAGE, stepIndex: 2, recorded: false });
 
       const { stderr } = await runCommand(
-        ['runs', 'logs', 'r', '--job', 'j', '--step', '2'],
+        ['runs', 'logs', '0a1b2c3d-0000-4000-8000-0000000000aa', '--job', 'j', '--step', '2'],
         client,
       );
 
@@ -775,7 +1152,10 @@ describe('kici-admin runs CLI commands', () => {
     it('R-57: no note when the orchestrator does not report recorded, or the step has lines', async () => {
       // breaks-if-wrong: an older orchestrator's empty page keeps the silent output
       mockGet.mockResolvedValueOnce({ ...EMPTY_PAGE, stepIndex: -1 });
-      const older = await runCommand(['runs', 'logs', 'r', '--job', 'j', '--step=-1'], client);
+      const older = await runCommand(
+        ['runs', 'logs', '0a1b2c3d-0000-4000-8000-0000000000aa', '--job', 'j', '--step=-1'],
+        client,
+      );
       expect(older.stderr).toBe('');
 
       mockGet.mockResolvedValueOnce({
@@ -785,7 +1165,10 @@ describe('kici-admin runs CLI commands', () => {
         lines: [{ untrusted: true, value: '[host-checkout] Clone complete' }],
         recorded: true,
       });
-      const withLines = await runCommand(['runs', 'logs', 'r', '--job', 'j', '--step=-1'], client);
+      const withLines = await runCommand(
+        ['runs', 'logs', '0a1b2c3d-0000-4000-8000-0000000000aa', '--job', 'j', '--step=-1'],
+        client,
+      );
       expect(withLines.stdout).toBe('[host-checkout] Clone complete');
       expect(withLines.stderr).toBe('');
     });
@@ -795,7 +1178,15 @@ describe('kici-admin runs CLI commands', () => {
       mockGet.mockResolvedValue(response);
 
       const { stdout, stderr } = await runCommand(
-        ['runs', 'logs', 'r', '--job', 'j', '--step=-1', '--json'],
+        [
+          'runs',
+          'logs',
+          '0a1b2c3d-0000-4000-8000-0000000000aa',
+          '--job',
+          'j',
+          '--step=-1',
+          '--json',
+        ],
         client,
       );
 
@@ -804,14 +1195,16 @@ describe('kici-admin runs CLI commands', () => {
     });
 
     it('R-53: an API error is reported and exits 1', async () => {
-      mockGet.mockRejectedValue(new Error('HTTP 404: Run run-eval-1 not found'));
+      mockGet.mockRejectedValue(
+        new Error('HTTP 404: Run 0e7a1000-0000-4000-8000-000000000001 not found'),
+      );
 
       const { stderr, exitCode } = await runCommand(
-        ['runs', 'logs', 'run-eval-1', '--job', 'job-eval-1'],
+        ['runs', 'logs', '0e7a1000-0000-4000-8000-000000000001', '--job', 'job-eval-1'],
         client,
       );
 
-      expect(stderr).toContain('Run run-eval-1 not found');
+      expect(stderr).toContain('Run 0e7a1000-0000-4000-8000-000000000001 not found');
       expect(exitCode).toBe(1);
     });
   });

@@ -297,10 +297,10 @@ Synopsis: `kici-admin source install-hook <id> [options]`
 
 **Options**
 
-| Option             | Default                 | Description                                  |
-| ------------------ | ----------------------- | -------------------------------------------- |
-| `--repo <path>`    |                         | Repo path (default: the source repoBasePath) |
-| `--base-url <url>` | `http://localhost:4000` | Orchestrator base URL                        |
+| Option             | Default                                       | Description                                  |
+| ------------------ | --------------------------------------------- | -------------------------------------------- |
+| `--repo <path>`    |                                               | Repo path (default: the source repoBasePath) |
+| `--base-url <url>` | `http://localhost:4000`, env `KICI_ADMIN_URL` | Orchestrator base URL                        |
 
 ### `kici-admin source list`
 
@@ -420,14 +420,14 @@ Synopsis: `kici-admin source trigger-local <id> [options]`
 
 **Options**
 
-| Option                    | Default                 | Description                                                                          |
-| ------------------------- | ----------------------- | ------------------------------------------------------------------------------------ |
-| `--event <event>`         | `push`                  | push \| pull_request                                                                 |
-| `--ref <ref>`             |                         | Git ref (default: repo HEAD branch)                                                  |
-| `--sha <sha>`             |                         | Commit SHA (default: repo HEAD)                                                      |
-| `--before <sha>`          |                         | Commit before the push; the changed files are before..sha (default: parent of --sha) |
-| `--repo-full-name <name>` | `local/repo`            | owner/name identifier used in the payload                                            |
-| `--base-url <url>`        | `http://localhost:4000` | Orchestrator base URL                                                                |
+| Option                    | Default                                       | Description                                                                          |
+| ------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `--event <event>`         | `push`                                        | push \| pull_request                                                                 |
+| `--ref <ref>`             |                                               | Git ref (default: repo HEAD branch)                                                  |
+| `--sha <sha>`             |                                               | Commit SHA (default: repo HEAD)                                                      |
+| `--before <sha>`          |                                               | Commit before the push; the changed files are before..sha (default: parent of --sha) |
+| `--repo-full-name <name>` | `local/repo`                                  | owner/name identifier used in the payload                                            |
+| `--base-url <url>`        | `http://localhost:4000`, env `KICI_ADMIN_URL` | Orchestrator base URL                                                                |
 
 ### `kici-admin source update`
 

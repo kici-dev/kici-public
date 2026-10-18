@@ -7,7 +7,7 @@ import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { sql } from 'kysely';
-import type { Command } from 'commander';
+import { Option, type Command } from 'commander';
 import { DEFAULT_ADMIN_URL } from '../api-client.js';
 import type { AdminApiClient, GenericSourceResponse } from '../api-client.js';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -163,8 +163,12 @@ export function renderSourceListText(
   }
 }
 
-/** Matches the kici-admin global `--url` default. */
-const DEFAULT_ORCH_URL = process.env.KICI_ADMIN_URL ?? DEFAULT_ADMIN_URL;
+/** Mirrors the kici-admin global `--url`: KICI_ADMIN_URL, read at parse time, else the default. */
+function baseUrlOption(): Option {
+  return new Option('--base-url <url>', 'Orchestrator base URL')
+    .env('KICI_ADMIN_URL')
+    .default(DEFAULT_ADMIN_URL);
+}
 
 /** Null when the row is not a valid local source. */
 function parseLocalConfig(
@@ -1342,7 +1346,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       'Commit before the push; the changed files are before..sha (default: parent of --sha)',
     )
     .option('--repo-full-name <name>', 'owner/name identifier used in the payload', 'local/repo')
-    .option('--base-url <url>', 'Orchestrator base URL', DEFAULT_ORCH_URL)
+    .addOption(baseUrlOption())
     .action(
       cliAction(async (id: string, opts) => {
         const { source } = await getClient().getGenericSource(id);
@@ -1376,7 +1380,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .command('install-hook <id>')
     .description('Install a post-receive hook in the local source repo that triggers runs on push')
     .option('--repo <path>', 'Repo path (default: the source repoBasePath)')
-    .option('--base-url <url>', 'Orchestrator base URL', DEFAULT_ORCH_URL)
+    .addOption(baseUrlOption())
     .action(
       cliAction(async (id: string, opts) => {
         const { source } = await getClient().getGenericSource(id);

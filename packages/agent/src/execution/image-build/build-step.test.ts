@@ -4,6 +4,7 @@ import {
   CONTAINER_BUILD_STEP_NAME,
   runJobImageBuild,
 } from './build-step.js';
+import { INIT_STEP_INDEX_BASE } from '../env-init/init-phase.js';
 
 describe('CONTAINER_BUILD_STEP_INDEX', () => {
   it('is non-negative, because step.status refuses a negative index', () => {
@@ -16,6 +17,16 @@ describe('CONTAINER_BUILD_STEP_INDEX', () => {
     const stepCount = 500;
     const cacheCeiling = stepCount * 3 + 100 + (stepCount + 1) * 1000;
     expect(CONTAINER_BUILD_STEP_INDEX).toBeGreaterThan(cacheCeiling);
+  });
+
+  it('sits outside the init block, so a job with an image build and init keeps both rows', () => {
+    // Steps are stored per (run, job, step_index): a shared index overwrites the build row.
+    // fails-when: the build index equals INIT_STEP_INDEX_BASE + n for some init position n
+    const initCapacity = 1_000_000;
+    expect(
+      CONTAINER_BUILD_STEP_INDEX < INIT_STEP_INDEX_BASE ||
+        CONTAINER_BUILD_STEP_INDEX >= INIT_STEP_INDEX_BASE + initCapacity,
+    ).toBe(true);
   });
 });
 

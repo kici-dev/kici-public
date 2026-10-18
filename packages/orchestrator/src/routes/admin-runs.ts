@@ -16,9 +16,16 @@
  */
 
 import { setupStepsFirst } from '../reporting/step-display-order.js';
-import { Hono } from 'hono';
+import { Hono, type MiddlewareHandler } from 'hono';
 import { createLogger } from '@kici-dev/shared';
-import { CANONICAL_STATUSES } from '@kici-dev/engine';
+import {
+  CANONICAL_STATUSES,
+  initStepIndex,
+  isRunId,
+  parseRunIdRef,
+  runIdPrefixRange,
+  stepPhase,
+} from '@kici-dev/engine';
 import type { ExpressionBuilder, Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
 import type { TokenManager } from '../secrets/token-manager.js';
@@ -107,6 +114,39 @@ function spansWorkflow(workflowName: string) {
     ]);
 }
 
+/**
+ * Refuse a `:runId` that is not a full run id before it reaches a UUID column, where
+ * Postgres rejects it as a malformed value and the caller learns nothing. A client
+ * resolves a short id through `?runIdPrefix=` on the list route first.
+ */
+const requireFullRunId: MiddlewareHandler<AdminEnv> = async (c, next) => {
+  const runId = c.req.param('runId') ?? '';
+  if (!isRunId(runId)) {
+    return c.json(
+      {
+        error:
+          `Invalid run id '${runId}': a run id is a full UUID. ` +
+          `List runs (or filter with ?runIdPrefix=) to find it.`,
+      },
+      400,
+    );
+  }
+  return next();
+};
+
+/**
+ * `?runIdPrefix=`: the run ids that start with the given characters, as a UUID range
+ * the primary-key index answers. A full run id is its own one-id range.
+ */
+function parseRunIdPrefixQuery(
+  raw: string | undefined,
+): { low: string; high: string } | { error: string } | undefined {
+  if (raw === undefined || raw === '') return undefined;
+  const ref = parseRunIdRef(raw);
+  if (ref.kind === 'invalid') return { error: `Invalid "runIdPrefix" '${raw}': ${ref.reason}` };
+  return ref.kind === 'uuid' ? { low: ref.runId, high: ref.runId } : runIdPrefixRange(ref.hex);
+}
+
 /** Run routes, mounted at /api/v1/admin/runs. */
 export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
   const app = createAdminApp(logger);
@@ -117,6 +157,8 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
   });
   app.use('/api/v1/admin/runs', authMiddleware);
   app.use('/api/v1/admin/runs/*', authMiddleware);
+  app.use('/api/v1/admin/runs/:runId', requireFullRunId);
+  app.use('/api/v1/admin/runs/:runId/*', requireFullRunId);
 
   app.get('/api/v1/admin/runs', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'run.read');
@@ -125,6 +167,8 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
     const workflowName = c.req.query('workflowName');
     const repo = c.req.query('repo');
     const deliveryId = c.req.query('deliveryId');
+    const runIdPrefix = parseRunIdPrefixQuery(c.req.query('runIdPrefix'));
+    if (runIdPrefix && 'error' in runIdPrefix) return c.json({ error: runIdPrefix.error }, 400);
     const sinceParsed = parseSince(c.req.query('since'));
     if (!sinceParsed.ok) {
       return c.json({ error: 'Invalid "since" query parameter: expected ISO-8601 timestamp' }, 400);
@@ -160,6 +204,10 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
     if (workflowName) countQuery = countQuery.where(spansWorkflow(workflowName));
     if (repo) countQuery = countQuery.where('repo_identifier', '=', repo);
     if (deliveryId) countQuery = countQuery.where('delivery_id', '=', deliveryId);
+    if (runIdPrefix)
+      countQuery = countQuery
+        .where('run_id', '>=', runIdPrefix.low)
+        .where('run_id', '<=', runIdPrefix.high);
     if (since) countQuery = countQuery.where('created_at', '>', since);
     if (tokenRoutingKey) countQuery = countQuery.where('routing_key', '=', tokenRoutingKey);
 
@@ -203,6 +251,8 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
     if (workflowName) query = query.where(spansWorkflow(workflowName));
     if (repo) query = query.where('repo_identifier', '=', repo);
     if (deliveryId) query = query.where('delivery_id', '=', deliveryId);
+    if (runIdPrefix)
+      query = query.where('run_id', '>=', runIdPrefix.low).where('run_id', '<=', runIdPrefix.high);
     if (since) query = query.where('created_at', '>', since);
     if (tokenRoutingKey) query = query.where('routing_key', '=', tokenRoutingKey);
 
@@ -244,7 +294,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
   app.get('/api/v1/admin/runs/:runId', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'run.read');
 
-    const runId = c.req.param('runId');
+    const runId = c.req.param('runId').toLowerCase();
     const run = await deps.db
       .selectFrom('execution_runs')
       .select([
@@ -327,7 +377,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
   app.get('/api/v1/admin/runs/:runId/jobs', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'run.read');
 
-    const runId = c.req.param('runId');
+    const runId = c.req.param('runId').toLowerCase();
     const includeSteps = parseCountFlag(c.req.query('includeSteps'));
 
     // Tells "run missing" (404) apart from "no jobs yet".
@@ -399,6 +449,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
           jobSteps = [];
           stepsByJob.set(step.job_id, jobSteps);
         }
+        const initIndex = initStepIndex(step.step_type);
         jobSteps.push({
           stepIndex: step.step_index,
           stepName: step.step_name,
@@ -409,6 +460,9 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
           exitCode: step.exit_code,
           errorMessage: step.error_message,
           stepType: step.step_type,
+          // Readers tell init steps apart without parsing `stepType`; `stepIndex` stays raw.
+          phase: stepPhase(step.step_type),
+          ...(initIndex !== undefined && { initIndex }),
         });
       }
     }
@@ -451,7 +505,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
   // are never returned (only secret-output key names).
   app.get('/api/v1/admin/runs/:runId/structured', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'run.read');
-    const runId = c.req.param('runId');
+    const runId = c.req.param('runId').toLowerCase();
     const detail = await aggregateRunDetail(deps.db, runId);
     if (!detail) {
       return c.json({ error: `Run ${runId} not found` }, 404);
@@ -465,7 +519,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
   // offset; limit capped at 2000.
   app.get('/api/v1/admin/runs/:runId/jobs/:jobId/steps/:stepIndex/logs', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'run.read');
-    const runId = c.req.param('runId');
+    const runId = c.req.param('runId').toLowerCase();
     const jobId = c.req.param('jobId');
     const stepIndex = parseInt(c.req.param('stepIndex'), 10);
     if (Number.isNaN(stepIndex)) {
@@ -515,7 +569,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
   app.get('/api/v1/admin/runs/:runId/ephemeral-key', async (c) => {
     deps.rbac.requirePermission(c.get('role'), 'run.read');
 
-    const runId = c.req.param('runId');
+    const runId = c.req.param('runId').toLowerCase();
 
     const runExists = await deps.db
       .selectFrom('execution_runs')
@@ -544,7 +598,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
     const role = c.get('role');
     deps.rbac.requirePermission(role, 'run.read');
 
-    const runId = c.req.param('runId');
+    const runId = c.req.param('runId').toLowerCase();
     const outputKeyFilter = c.req.query('outputKey');
     const reveal = parseCountFlag(c.req.query('reveal'));
 

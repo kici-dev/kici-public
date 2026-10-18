@@ -2,7 +2,7 @@
  * Answers the Platform's dashboard.* and run.* WS messages from the local
  * execution tables and LogStorage.
  */
-import { setupStepsFirst } from '../reporting/step-display-order.js';
+import { compareStepRowsForDisplay, setupStepsFirst } from '../reporting/step-display-order.js';
 import { HeldRunCancelRefusedError } from '../cancel/cancel-run.js';
 import { sql, type Kysely } from 'kysely';
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
@@ -3370,8 +3370,8 @@ export class DashboardHandler {
       outputs: typeof r.outputs === 'string' ? r.outputs : null,
       init_failure: (r.init_failure as InitFailure | null) ?? null,
     }));
-    // Order steps by step_index to match the PG path's ORDER BY.
-    stepRows.sort((a, b) => Number(a.step_index ?? 0) - Number(b.step_index ?? 0));
+    // The PG path's ORDER BY: setup and init pseudo-steps first, then by step_index.
+    stepRows.sort(compareStepRowsForDisplay);
     out.steps = stepRows.map((r) => ({
       job_id: String(r.job_id ?? ''),
       step_index: Number(r.step_index ?? 0),

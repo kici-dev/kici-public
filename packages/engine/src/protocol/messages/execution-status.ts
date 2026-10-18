@@ -213,6 +213,76 @@ export function isSetupStepType(stepType: string | null | undefined): boolean {
   return stepType != null && SetupStepType.safeParse(stepType).success;
 }
 
+/**
+ * The `step_type` a `step.status` message carries in its `data`. The agent's host-side
+ * steps send `stepType`; its sandbox relays the runner's `step_type` (hooks, cache
+ * and init steps) as is. Undefined for a plain step.
+ */
+export function stepTypeOf(data: Record<string, unknown> | undefined): string | undefined {
+  const value = data?.stepType ?? data?.step_type;
+  return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
+/**
+ * `step_type` prefix of a job's init commands: the n-th init runs as `init:<n>`.
+ * Its step index sits in a high block (the wire requires a non-negative index),
+ * so readers place init steps by this type, not by index.
+ */
+export const INIT_STEP_TYPE_PREFIX = 'init:';
+
+/** The `step_type` of the init command at `initIndex`. */
+export function initStepType(initIndex: number): string {
+  return `${INIT_STEP_TYPE_PREFIX}${initIndex}`;
+}
+
+/** The init position of an `init:<n>` step type; undefined for any other type. */
+export function initStepIndex(stepType: string | null | undefined): number | undefined {
+  if (stepType == null || !stepType.startsWith(INIT_STEP_TYPE_PREFIX)) return undefined;
+  const rest = stepType.slice(INIT_STEP_TYPE_PREFIX.length);
+  return /^\d+$/.test(rest) ? Number(rest) : undefined;
+}
+
+/** How an init step is named in human output, matching the `init[<n>] failed` job error. */
+export function initStepLabel(initIndex: number): string {
+  return `init[${initIndex}]`;
+}
+
+/** The init position named by `init[<n>]` or `init:<n>`; undefined for any other text. */
+export function parseInitStepRef(ref: string): number | undefined {
+  const label = /^init\[(\d+)\]$/.exec(ref);
+  return label ? Number(label[1]) : initStepIndex(ref);
+}
+
+/**
+ * The phase of a job a step ran in, in run order:
+ *
+ *  - `setup` — a {@link SetupStepType} pseudo-step, on the agent host, before the sandbox.
+ *  - `init`  — an `init:<n>` command, in the sandbox, before the first step.
+ *  - `steps` — the job's steps, with their hooks and cache pseudo-steps.
+ */
+export const StepPhase = z.enum(['setup', 'init', 'steps']);
+export type StepPhase = z.infer<typeof StepPhase>;
+
+/** The {@link StepPhase} a `step_type` belongs to; a missing type is a real step. */
+export function stepPhase(stepType: string | null | undefined): StepPhase {
+  if (isSetupStepType(stepType)) return StepPhase.enum.setup;
+  if (initStepIndex(stepType) !== undefined) return StepPhase.enum.init;
+  return StepPhase.enum.steps;
+}
+
+/**
+ * Display comparator: by {@link StepPhase} in run order, then by step index. Index
+ * alone lists the setup and init pseudo-steps last, although they run first.
+ */
+export function compareStepsByPhase(
+  a: { stepType?: string | null; stepIndex: number },
+  b: { stepType?: string | null; stepIndex: number },
+): number {
+  const rank = (t: string | null | undefined): number => StepPhase.options.indexOf(stepPhase(t));
+  const byPhase = rank(a.stepType) - rank(b.stepType);
+  return byPhase !== 0 ? byPhase : a.stepIndex - b.stepIndex;
+}
+
 /** `run.event` types emitted for user-facing cache operations. */
 export const CacheRunEventType = z.enum(['cache.restore', 'cache.save']);
 export type CacheRunEventType = z.infer<typeof CacheRunEventType>;
@@ -412,9 +482,9 @@ export const jobStatusForwardSchema = z.object({
   jobId: z.string().max(STATUS_ID_MAX),
   jobName: z.string().max(STATUS_ID_MAX),
   /**
-   * The workflow that defines this job. A fixture run with no `--workflow`
-   * runs every matched workflow under one run id, so the run name alone does
-   * not say which workflow a job belongs to. Absent from an older orchestrator.
+   * The workflow that defines this job. An older `kici`'s shared fixture run holds every matched
+   * workflow, so the run name alone
+   * does not say which workflow a job belongs to. Absent from an older orchestrator.
    */
   workflowName: z.string().max(STATUS_ID_MAX).optional(),
   status: ExecutionJobStatus,

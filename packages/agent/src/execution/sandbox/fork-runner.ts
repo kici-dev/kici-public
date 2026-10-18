@@ -885,6 +885,8 @@ function relayChildIpcMessage(
       const startData = {
         ...(msg.concurrencyKind && { concurrencyKind: msg.concurrencyKind }),
         ...(msg.groupId && { groupId: msg.groupId }),
+        // Typed from the start, so a running init or hook step is placed by its type.
+        ...(msg.step_type && { step_type: msg.step_type }),
       };
       if (Object.keys(startData).length > 0) {
         ctx.execOptions.onStepStatus(msg.stepIndex, msg.stepName, startState, startData);

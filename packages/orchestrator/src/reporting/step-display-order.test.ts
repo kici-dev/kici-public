@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { SetupStepType } from '@kici-dev/engine';
-import { compareStepsForDisplay, setupStepsFirst } from './step-display-order.js';
+import { INIT_STEP_TYPE_PREFIX, SetupStepType } from '@kici-dev/engine';
+import {
+  compareStepRowsForDisplay,
+  compareStepsForDisplay,
+  setupStepsFirst,
+} from './step-display-order.js';
 
 describe('setupStepsFirst', () => {
   it('names every setup type, so adding one cannot leave the SQL behind', () => {
@@ -9,6 +13,12 @@ describe('setupStepsFirst', () => {
     for (const t of SetupStepType.options) {
       expect(rendered).toContain(t);
     }
+  });
+
+  it('has an init rank', () => {
+    const rendered = JSON.stringify(setupStepsFirst().toOperationNode());
+    // fails-when: the SQL sort has no init rank, so init steps sort by index, last
+    expect(rendered).toContain('^' + INIT_STEP_TYPE_PREFIX + '[0-9]+$');
   });
 });
 
@@ -44,9 +54,53 @@ describe('compareStepsForDisplay', () => {
     expect([untyped, build].sort(compareStepsForDisplay)).toEqual([build, untyped]);
   });
 
+  it('puts init steps after the image build and before the real steps', () => {
+    const init0 = { step_type: 'init:0', step_index: 1_000_000 };
+    const init1 = { step_type: 'init:1', step_index: 1_000_001 };
+    // fails-when: init steps keep the index order, after every real step
+    expect([second, init1, cacheSave, first, init0, build].sort(compareStepsForDisplay)).toEqual([
+      build,
+      init0,
+      init1,
+      first,
+      second,
+      cacheSave,
+    ]);
+  });
+
+  it('treats a step type that only starts like an init as a real step', () => {
+    const lookalike = { step_type: 'init:x', step_index: 3 };
+    // breaks-if-wrong: the init match stays as narrow as the SQL pattern
+    expect([lookalike, first].sort(compareStepsForDisplay)).toEqual([first, lookalike]);
+  });
+
   it('is a total order — equal ranks fall through to the index', () => {
     const a = { step_type: SetupStepType.enum['container:build'], step_index: 5 };
     const b = { step_type: SetupStepType.enum['container:build'], step_index: 3 };
     expect([a, b].sort(compareStepsForDisplay)).toEqual([b, a]);
+  });
+});
+
+describe('compareStepRowsForDisplay', () => {
+  it('orders cold-store rows the way the PG query does', () => {
+    const rows: Record<string, unknown>[] = [
+      { step_index: 1, step_type: 'step' },
+      { step_index: 1_000_000, step_type: 'init:0' },
+      { step_index: 0, step_type: 'step' },
+      { step_index: 2_000_000, step_type: 'container:build' },
+    ];
+    // fails-when: archived rows sort by index alone, putting the build and init last
+    expect(rows.sort(compareStepRowsForDisplay).map((r) => r.step_index)).toEqual([
+      2_000_000, 1_000_000, 0, 1,
+    ]);
+  });
+
+  it('reads a row with no step_type as a real step', () => {
+    const rows: Record<string, unknown>[] = [
+      { step_index: 2 },
+      { step_index: 1_000_000, step_type: 'init:0' },
+    ];
+    // breaks-if-wrong: an archived row written before step_type existed still sorts
+    expect(rows.sort(compareStepRowsForDisplay).map((r) => r.step_index)).toEqual([1_000_000, 2]);
   });
 });

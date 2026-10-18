@@ -85,6 +85,10 @@ kici run push --local --env NODE_ENV=test --env CI=true
 kici run push --local --quiet
 ```
 
+An event that matches several workflows creates one run per workflow.
+`kici run --local` prints a `Run started:` line for each run, follows all of
+them, and names each job `<workflow> / <job>` in the summary table.
+
 **Exit codes:**
 
 | Code | Meaning                 |
@@ -186,8 +190,27 @@ fixtures run through the normal remote pipeline (honoring `--parallel`,
 - `--workflow` cannot be combined with `--pick`.
 
 Without `--workflow`, a fixture runs every workflow whose triggers match its
-event, as one run. `kici runs show` and the dashboard name every workflow of
-such a run, and name each job with its workflow.
+event. Each matched workflow gets its own run, as it does for a webhook, so two
+workflows that define a job of the same name never share a run:
+
+- The CLI prints one `Run started: <run-id> (<workflow>)` line per run, follows
+  every run at once, and prefixes each streamed log line with its workflow.
+- The summary table, the error blocks and the `--junit` report name each job
+  `<workflow> / <job>`. Each failed job gets its own error block, which holds
+  only that job's output.
+- Ctrl-C cancels every run. `--no-wait` prints every run id and returns.
+- `kici run remote --history` records each run on its own line.
+- `--json` keeps one entry per fixture, so its `summary` counts fixtures. The
+  entry's `status` is the combined result. `runs` lists each run
+  (`runId`, `workflowName`, `status`, `jobs`), and each job carries
+  `workflowName`. The entry's top-level `runId` names the first run and is
+  deprecated: read `runs` instead.
+
+A `kici` older than 0.21.0 follows a single run. For it, the orchestrator runs
+the matched workflows as one shared run when their job names cannot collide.
+When they can collide, it refuses the fixture. That happens when two workflows
+define a job of the same name, or when one defines dynamic jobs. The refusal
+names the shared job names and asks you to upgrade `kici` or pass `--workflow`.
 
 #### Host narrowing with `--target`
 
@@ -218,10 +241,10 @@ for the `when` gating model.
 
 **Exit codes:**
 
-| Code | Meaning                      |
-| ---- | ---------------------------- |
-| 0    | All matched workflows passed |
-| 1    | One or more workflows failed |
+| Code | Meaning                                       |
+| ---- | --------------------------------------------- |
+| 0    | Every run of every matched workflow passed    |
+| 1    | One or more runs failed, or a run was refused |
 
 #### How the run is routed
 
@@ -339,9 +362,9 @@ data as the dashboard, so they require `kici login` and an active org
 List runs with optional filters. Output is a table (run id, workflow, status,
 branch, trigger, started, duration); pagination is reported at the bottom.
 
-A run can span several workflows: a fixture run with no `--workflow` runs every
-workflow whose triggers match. Its `workflow` cell shows the first workflow and a
-count of the others (`hello-world +3`). `--workflow` matches a run that spans
+A run can span several workflows: the shared run that a `kici` older than
+0.21.0 gets for a fixture with no `--workflow`. Its `workflow` cell shows the
+first workflow and a count of the others (`hello-world +3`). `--workflow` matches a run that spans
 the named workflow. An archived run matches its first workflow only. In `--json`, each run carries `workflowNames`, every
 workflow with the first one first, next to `workflowName`.
 
@@ -372,10 +395,23 @@ rule. Any approval hold on the run is listed too, with its context, hold type,
 status and reason. If the run id is not on the Platform but exists in your
 local run history (from `kici run <event> --local`), the local record is shown instead.
 
+`kici runs show` and `kici runs logs` take a full run id or its first characters
+(at least 4), like a git short SHA. A prefix that matches several runs fails and
+lists them, so type more characters. A prefix that matches none, or text that
+cannot start a run id, fails and says so. A prefix also matches archived runs and
+runs in your local run history. `kici runs list` shows full run ids.
+
+Steps are listed in the order they ran: a job's image build, then its `init`
+commands, then its steps. An `init` command is named `init[<n>]`, where `<n>` is
+its position in the job's `init` list. `kici runs logs` uses the same order and
+names in its headings.
+
 For a run that spans several workflows, the header shows `workflows=` with every
-workflow name, and each job is named `<workflow> / <job>`. Two workflows can
-each define a job of the same name. In `--json`, each job in `detail.jobs`
-carries `workflowName`.
+workflow name, and each job is named `<workflow> / <job>`. In `--json`, each
+job in `detail.jobs` carries `workflowName`.
+
+A failed job prints an `error:` line: the job's own error message, or else the
+step that failed and its exit code (`error: step test exited with code 3`).
 
 For a run started with `kici run remote`, the Platform reads the jobs and steps
 from the orchestrator cluster that ran the run. When the Platform cannot get them
@@ -804,9 +840,9 @@ Synopsis: `kici runs logs <run-id> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description |
-| -------- | -------- | -------- | ----------- |
-| `run-id` | yes      | no       | Run ID      |
+| Argument | Required | Variadic | Description                               |
+| -------- | -------- | -------- | ----------------------------------------- |
+| `run-id` | yes      | no       | Run ID, or its first 4 or more characters |
 
 **Options**
 
@@ -842,9 +878,9 @@ Synopsis: `kici runs show <run-id> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description       |
-| -------- | -------- | -------- | ----------------- |
-| `run-id` | yes      | no       | Run ID to inspect |
+| Argument | Required | Variadic | Description                                          |
+| -------- | -------- | -------- | ---------------------------------------------------- |
+| `run-id` | yes      | no       | Run ID to inspect, or its first 4 or more characters |
 
 **Options**
 

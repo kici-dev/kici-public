@@ -72,12 +72,22 @@ export interface RemoteRunOptions extends PreviewOptions {
 
 export interface RemoteRunResult {
   fixtureId: string;
+  /** The first run's id. */
   runId: string;
+  /** The combined result of every run the fixture created. */
   status: 'accepted' | 'rejected' | 'success' | 'failed' | 'cancelled' | 'error';
   reason?: string;
   observeUrl?: string;
   durationMs?: number;
-  jobs?: Array<{ name: string; status: string; durationMs?: number }>;
+  jobs?: Array<{ name: string; status: string; durationMs?: number; workflowName?: string }>;
+  /** One entry per run: a fixture that matches several workflows creates one run per workflow. */
+  runs?: Array<{
+    runId: string;
+    workflowName?: string;
+    status: string;
+    durationMs?: number;
+    jobs: Array<{ name: string; status: string; durationMs?: number; workflowName?: string }>;
+  }>;
 }
 
 /**

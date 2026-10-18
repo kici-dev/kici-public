@@ -1006,6 +1006,8 @@ export class AdminApiClient {
     workflowName?: string;
     repo?: string;
     since?: string;
+    /** Only runs whose id starts with these characters. */
+    runIdPrefix?: string;
     limit?: number;
     offset?: number;
   }): Promise<{
@@ -1019,6 +1021,7 @@ export class AdminApiClient {
       workflowName: opts?.workflowName,
       repo: opts?.repo,
       since: opts?.since,
+      runIdPrefix: opts?.runIdPrefix,
       limit: opts?.limit || undefined,
       offset: opts?.offset || undefined,
     });

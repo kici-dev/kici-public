@@ -1,5 +1,6 @@
 /**
- * Trigger an offline routed run against the local plane and discover its runId.
+ * Trigger an offline routed run against the local plane and discover its runs:
+ * one per matched workflow, as for any webhook.
  *
  * A local repo has no forge, so this posts a GitHub-shaped synthetic push to the
  * plane's generic webhook route (the wire shape `kici-admin source trigger-local`
@@ -107,8 +108,16 @@ export async function sendLocalTrigger(
 }
 
 interface RunsListResponse {
-  runs: Array<{ runId: string }>;
+  runs: Array<{ runId: string; workflowName?: string }>;
 }
+
+/** One run the local trigger created, and the workflow it executes. */
+export interface LocalTriggeredRun {
+  runId: string;
+  workflowName?: string;
+}
+
+const MAX_RUNS_PER_DELIVERY = 100;
 
 export interface TriggerRunOptions {
   client?: RunDiscoveryClient;
@@ -119,6 +128,8 @@ export interface TriggerRunOptions {
   repoBasePath?: string;
   /** Plane log path, named when nothing else explains the timeout. */
   logPath?: string;
+  /** Wait for more runs once the delivery is recorded. Default 5 s. */
+  settleMs?: number;
 }
 
 interface ClusterHealthResponse {
@@ -130,6 +141,8 @@ interface EventLogListResponse {
   deliveries?: Array<{
     status?: string;
     errorMessage?: string | null;
+    /** The runs the delivery created, once it is `processed`. */
+    matchedCount?: number | null;
   }>;
 }
 
@@ -155,17 +168,20 @@ async function readPlaneRole(client: RunDiscoveryClient): Promise<string | null>
   }
 }
 
+/** The delivery's event-log row; null when none is recorded yet, undefined when unreadable. */
 async function readDelivery(
   client: RunDiscoveryClient,
   orgId: string,
   deliveryId: string,
-): Promise<{ status?: string; errorMessage?: string | null } | null> {
+): Promise<
+  { status?: string; errorMessage?: string | null; matchedCount?: number | null } | null | undefined
+> {
   try {
     const qs = new URLSearchParams({ deliveryId, orgId, limit: '1' });
     const res = await client.get<EventLogListResponse>(`/api/v1/admin/event-log?${qs}`);
     return res.deliveries?.[0] ?? null;
   } catch {
-    return null;
+    return undefined;
   }
 }
 
@@ -214,19 +230,22 @@ export async function diagnoseTriggerTimeout(
 /**
  * Send the synthetic push, then poll the admin runs list by this webhook's
  * delivery id (`?deliveryId=`). Correlating on the exact delivery id, not the
- * newest run in a time window, attaches the follower to the run THIS invocation
- * created even when another local run lands concurrently.
+ * newest run in a time window, attaches the follower to the runs THIS
+ * invocation created even when another local run lands concurrently.
+ * The set is complete once the plane records the delivery `processed` with
+ * that many matched runs, or `settleMs` after the first run appears.
  */
-export async function triggerRun(
+export async function triggerRuns(
   planeUrl: string,
   adminToken: string,
   input: LocalTriggerInput,
   opts: TriggerRunOptions = {},
-): Promise<string> {
+): Promise<LocalTriggeredRun[]> {
   const client: RunDiscoveryClient = opts.client ?? new AdminApiClient(planeUrl, adminToken);
   const pollIntervalMs = opts.pollIntervalMs ?? 750;
   const resendAfterMs = opts.resendAfterMs ?? 8_000;
   const timeoutMs = opts.timeoutMs ?? 60_000;
+  const settleMs = opts.settleMs ?? 5_000;
 
   const req = buildLocalTriggerRequest(input);
   // Stable across resends (same x-delivery-id) and routing-key-scoped by the
@@ -235,11 +254,32 @@ export async function triggerRun(
   let deliveryId = (await sendLocalTrigger(planeUrl, req)).deliveryId;
 
   let lastSend = Date.now();
-  const deadline = Date.now() + timeoutMs;
+  let found: LocalTriggeredRun[] = [];
+  // Since the plane recorded the delivery (or its event log could not be read).
+  let settlingSince: number | undefined;
+  let deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (deliveryId) {
-      const runId = await findRunByDelivery(client, deliveryId);
-      if (runId) return runId;
+      const runs = await findRunsByDelivery(client, deliveryId);
+      if (runs.length > 0) {
+        if (found.length === 0) deadline = Date.now() + timeoutMs;
+        found = runs;
+        // fails-when: the follower attaches to the first run while later workflows' runs go
+        // unwatched
+        // breaks-if-wrong: a delivery the plane recorded with one matched run returns at once
+        const delivery = await readDelivery(client, input.orgId, deliveryId);
+        if (
+          delivery?.status === EventLogStatus.enum.processed &&
+          typeof delivery.matchedCount === 'number' &&
+          runs.length >= delivery.matchedCount
+        ) {
+          return runs;
+        }
+        // The plane records a delivery once, after its last workflow: until then
+        // (no row) more runs can appear, so only a recorded or unreadable one settles.
+        if (delivery !== null) settlingSince ??= Date.now();
+        if (settlingSince !== undefined && Date.now() - settlingSince >= settleMs) return runs;
+      }
     }
     if (Date.now() - lastSend > resendAfterMs) {
       // Resends only while no delivery id came back (a send before the source
@@ -249,6 +289,7 @@ export async function triggerRun(
     }
     await sleep(pollIntervalMs);
   }
+  if (found.length > 0) return found;
   const cause = await diagnoseTriggerTimeout(client, {
     deliveryId,
     orgId: input.orgId,
@@ -259,11 +300,14 @@ export async function triggerRun(
   throw new Error(`offline run: ${cause}`);
 }
 
-async function findRunByDelivery(
+/** The delivery's runs, oldest first: the order the plane dispatched the workflows in. */
+async function findRunsByDelivery(
   client: RunDiscoveryClient,
   deliveryId: string,
-): Promise<string | null> {
-  const qs = new URLSearchParams({ deliveryId, limit: '1' });
+): Promise<LocalTriggeredRun[]> {
+  const qs = new URLSearchParams({ deliveryId, limit: String(MAX_RUNS_PER_DELIVERY) });
   const { runs } = await client.get<RunsListResponse>(`/api/v1/admin/runs?${qs}`);
-  return runs[0]?.runId ?? null;
+  return runs
+    .map((r) => ({ runId: r.runId, ...(r.workflowName && { workflowName: r.workflowName }) }))
+    .reverse();
 }

@@ -683,9 +683,9 @@ export interface ExecutionJobTable {
   /** Job name (e.g. "test", "test[node-18]") */
   job_name: string;
   /**
-   * The workflow that defines the job. A run can span several workflows (a
-   * fixture run with no `--workflow`), so the run's own `workflow_name` does not
-   * name it. NULL on a row written before the column existed.
+   * The workflow that defines the job. A run can span several workflows (an older `kici`'s shared
+   * fixture run), so the run's own
+   * `workflow_name` does not name it. NULL on a row written before the column existed.
    */
   workflow_name: ColumnType<string | null, string | null | undefined, string | null>;
   /** Job status: an `ExecutionJobStatus` value (engine). */

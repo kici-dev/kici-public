@@ -86,7 +86,7 @@ import type { SourceLocationData } from './reporting/check-run-summary.js';
 import type { Hono as HonoType } from 'hono';
 import type { PeerWsLike } from './cluster/peer-handler.js';
 import type { PeerToPeerMessage } from '@kici-dev/engine';
-import { ExecutionJobStatus, TERMINAL_RUN_STATES } from '@kici-dev/engine';
+import { ExecutionJobStatus, TERMINAL_RUN_STATES, isRunId, stepTypeOf } from '@kici-dev/engine';
 import type { AgentTokenStore } from './agent/token-store.js';
 import type { OwnershipTracker } from './agent/ownership-tracker.js';
 import type { ObserverRegistry } from './ws/observer-registry.js';
@@ -1003,6 +1003,7 @@ export function createApp(deps: AppDependencies) {
                 jobName: deps.executionTracker.getJobName(msg.runId, msg.jobId) ?? msg.jobId,
                 stepIndex: msg.stepIndex,
                 stepName: msg.stepName,
+                stepType: stepTypeOf(msg.data),
                 state: msg.state as 'running' | 'success' | 'failed' | 'skipped' | 'cancelled',
                 durationMs: (msg.data?.durationMs as number) ?? undefined,
                 installationId: execContext.installationId,
@@ -1352,7 +1353,9 @@ export function createApp(deps: AppDependencies) {
   // row is written for every attempt (success, denial, error) under
   // source='admin_http'.
   app.post('/api/v1/admin/runs/:runId/cancel', async (c) => {
-    const runId = c.req.param('runId');
+    // Lowercased: dispatch_queue.run_id is text, so an uppercase id would cancel the
+    // run but reach none of its jobs.
+    const runId = c.req.param('runId').toLowerCase();
     if (!runId) {
       return c.json({ error: 'Missing runId' }, 400);
     }
@@ -1395,6 +1398,12 @@ export function createApp(deps: AppDependencies) {
     if (!deps.adminDeps.rbac.hasPermission(tokenInfo.role, 'run.cancel')) {
       recordAccess('denied', `role "${tokenInfo.role}" lacks run.cancel`);
       return c.json({ error: 'Permission denied: run.cancel required' }, 403);
+    }
+    // A run id that is not a UUID would fail in Postgres as a server error.
+    if (!isRunId(runId)) {
+      const error = `Invalid run id '${runId}': a run id is a full UUID.`;
+      recordAccess('allowed', error);
+      return c.json({ error }, 400);
     }
 
     try {

@@ -359,6 +359,16 @@ export * from './diagnostics/infra-alert.js';
 export { sleep } from './util/sleep.js';
 export { toIsoString } from './util/date.js';
 export { parseDuration } from './util/parse-duration.js';
+export {
+  RUN_ID_PREFIX_MIN_LENGTH,
+  invalidRunIdMessage,
+  isRunId,
+  parseRunIdRef,
+  pickRunIdMatch,
+  runIdHasPrefix,
+  runIdPrefixRange,
+  type RunIdRef,
+} from './util/run-id-ref.js';
 
 // --- Permission matrix (Platform enforcement + dashboard rendering) ---
 export {

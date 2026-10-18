@@ -3,6 +3,7 @@ import {
   buildCheckRunSummary,
   buildAnnotations,
   buildProgressText,
+  applyStepProgress,
   clampSummaryToLimit,
   SUMMARY_BYTE_LIMIT,
   type StepResultData,
@@ -364,6 +365,49 @@ describe('buildAnnotations', () => {
     expect(annotations[0].raw_details).toContain('Timed out');
     expect(annotations[0].raw_details).toContain('Exit code: 137');
     expect(annotations[0].raw_details).toContain('Step timed out');
+  });
+});
+
+describe('applyStepProgress', () => {
+  it('adds an init step at its high index without padding the gap', () => {
+    let steps: StepProgressEntry[] = [];
+    steps = applyStepProgress(steps, {
+      name: 'init:0',
+      status: 'running',
+      stepIndex: 1_000_000,
+      stepType: 'init:0',
+    });
+    steps = applyStepProgress(steps, { name: 'build', status: 'running', stepIndex: 0 });
+    // fails-when: the list is positional and pads every index below 1_000_000
+    expect(steps).toHaveLength(2);
+    // fails-when: the init step sorts after the step it ran before
+    expect(steps.map((s) => s.name)).toEqual(['init:0', 'build']);
+  });
+
+  it('replaces the entry of a step that reports again', () => {
+    let steps: StepProgressEntry[] = [];
+    steps = applyStepProgress(steps, { name: 'build', status: 'running', stepIndex: 0 });
+    steps = applyStepProgress(steps, {
+      name: 'build',
+      status: 'success',
+      stepIndex: 0,
+      durationMs: 5,
+    });
+    // breaks-if-wrong: a step's running and terminal reports stay one line
+    expect(steps).toEqual([{ name: 'build', status: 'success', stepIndex: 0, durationMs: 5 }]);
+  });
+
+  it('reads an entry persisted without an index by its position', () => {
+    const legacy: StepProgressEntry[] = [
+      { name: 'a', status: 'success' },
+      { name: 'b', status: 'running' },
+    ];
+    const steps = applyStepProgress(legacy, { name: 'b', status: 'success', stepIndex: 1 });
+    // breaks-if-wrong: an older positional list keeps its steps and updates in place
+    expect(steps.map((s) => [s.name, s.status])).toEqual([
+      ['a', 'success'],
+      ['b', 'success'],
+    ]);
   });
 });
 

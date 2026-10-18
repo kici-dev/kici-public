@@ -21,11 +21,13 @@ export const CONTAINER_BUILD_STEP_NAME = 'container:build';
  * - It must clear every in-sandbox allocator index; the cache phase tops out
  *   near `stepCount * 3 + 100 + (stepCount + 1) * 1000`, several hundred steps
  *   of headroom.
+ * - It must clear the init block, `INIT_STEP_INDEX_BASE + n`: a job that builds
+ *   its image AND runs init would otherwise write both to one step row.
  *
  * Display order comes from the `container:build` {@link SetupStepType} tag, not
  * this index: readers sort setup pseudo-steps first by type.
  */
-export const CONTAINER_BUILD_STEP_INDEX = 1_000_000;
+export const CONTAINER_BUILD_STEP_INDEX = 2_000_000;
 
 export interface RunJobImageBuildArgs {
   container: LockJob['container'];

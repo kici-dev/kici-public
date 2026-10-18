@@ -67,7 +67,7 @@ These options apply to every command:
 | `--token <token>`, `-t`            | `KICI_ADMIN_TOKEN`   | (required)              | Admin API Bearer token |
 | `--version`, `-V`, `--cli-version` |                      |                         | Show CLI version       |
 
-Running `--help` on any command works without a token.
+Running `--help` on any command works without a token. The help names the environment variable of an option, as in `(env: KICI_ADMIN_TOKEN)`, and never prints its value, so you can share help output safely.
 
 `kici-admin --version` prints the CLI version only when `--version` comes before the command name. After a command name, `--version` belongs to that command: `kici-admin orchestrator upgrade --version 0.3.0` sets the target version of the upgrade. `-V` and `--cli-version` print the CLI version in any position.
 

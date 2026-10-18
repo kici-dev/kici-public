@@ -117,7 +117,11 @@ import { executeStepLoop, type StepNode } from './step-loop.js';
 import { runInStepCapture, currentCaptureStepIndex } from './capture-context.js';
 import { StepTaskRegistry } from './step-task-registry.js';
 import type { JobHooks, StepLoopOptions } from './step-loop.js';
-import { runInitPhase, type RunInitPhaseOptions } from '../env-init/init-phase.js';
+import {
+  INIT_STEP_INDEX_BASE,
+  runInitPhase,
+  type RunInitPhaseOptions,
+} from '../env-init/init-phase.js';
 import { formatInitFailureMessage } from '../failure-tail.js';
 import { normalizeInitItems } from '../env-init/presets/directives.js';
 import { expandInitDirectives } from '../env-init/presets/expand.js';
@@ -2489,13 +2493,6 @@ function collectJobHooks(job: Job | undefined): JobHooks {
   if (job.cleanup) jobHooks.cleanup = job.cleanup;
   return jobHooks;
 }
-
-/**
- * `init:<n>` occupies `INIT_STEP_INDEX_BASE + n`, ABOVE every hook pseudo-step index
- * the step loop allocates from `steps.length` upward (see step-loop.ts); no realistic
- * step/hook count reaches it.
- */
-const INIT_STEP_INDEX_BASE = 1_000_000;
 
 /**
  * Apply a command's KICI_ENV/KICI_PATH delta through `applyEnvDelta` and truncate the

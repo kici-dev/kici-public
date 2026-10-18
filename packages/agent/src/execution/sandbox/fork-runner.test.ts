@@ -364,7 +364,10 @@ describe('fork-runner cancel state machine', () => {
       step_type: 'hook:onCancel',
     });
 
-    expect(onStepStatus).toHaveBeenCalledWith(2, 'onCancel', 'running');
+    // fails-when: the hook type is dropped on step.start, so the row reads as a plain step
+    expect(onStepStatus).toHaveBeenCalledWith(2, 'onCancel', 'running', {
+      step_type: 'hook:onCancel',
+    });
 
     mockChild.simulateIpc({ type: 'job.complete', status: 'failed', stepResults: [] });
     await handle.result;

@@ -160,6 +160,42 @@ describe('handleTestTrigger', () => {
     );
   });
 
+  it('passes the multi-run flag on, returns every run and writes one access-log row per run', async () => {
+    const { db } = makeDbMock({});
+    const runs = [
+      { runId: 'run-a', workflowName: 'wf-a', jobIds: ['j1'] },
+      { runId: 'run-b', workflowName: 'wf-b', jobIds: ['j2'] },
+    ];
+    vi.mocked(testPipeline.processTestTrigger).mockResolvedValue({
+      runId: 'run-a',
+      runs,
+      status: 'accepted',
+      jobIds: ['j1', 'j2'],
+    });
+    const record = vi.fn().mockResolvedValue(undefined);
+    const result = await handleTestTrigger(
+      {
+        type: 'test.relay.trigger',
+        requestId: 'r8',
+        actor: ACTOR,
+        routingKey: 'remote:org_abc',
+        fixtureId: 'fix-1',
+        event: { type: 'push', targetBranch: 'main', payload: {} },
+        acceptsMultipleRuns: true,
+      },
+      { db, accessLog: { record } } as unknown as TestRelayHandlerDeps,
+    );
+    // fails-when: the handler drops the flag, so the pipeline answers as for an older CLI
+    expect(vi.mocked(testPipeline.processTestTrigger).mock.calls[0][0].acceptsMultipleRuns).toBe(
+      true,
+    );
+    // fails-when: the response names only the first run
+    expect(result).toMatchObject({ runId: 'run-a', runs });
+    await vi.waitFor(() => expect(record).toHaveBeenCalledTimes(2));
+    // fails-when: the access log names only the first run
+    expect(record.mock.calls.map((c) => c[0].target.id).sort()).toEqual(['run-a', 'run-b']);
+  });
+
   it('records the access-log source the caller passes', async () => {
     const { db } = makeDbMock({});
     vi.mocked(testPipeline.processTestTrigger).mockResolvedValue({
@@ -289,8 +325,27 @@ describe('handleTestRunStatus', () => {
       jobs: [
         { jobId: 'j1', jobName: 'build', status: 'success', errorMessage: null, durationMs: 9400 },
       ],
+      failureReason: null,
       done: true,
     });
+  });
+
+  it('carries the reason a run failed with no job, such as an init failure', async () => {
+    const { db } = makeDbMock({
+      runRow: {
+        run_id: 'run-1',
+        status: 'failed',
+        is_test_run: true,
+        failure_reason: 'secret DB_PASSWORD not found',
+      },
+      jobRows: [],
+    });
+    const result = await handleTestRunStatus(
+      { type: 'test.relay.run.status', requestId: 'r', actor: ACTOR, runId: 'run-1' },
+      { db } as unknown as TestRelayHandlerDeps,
+    );
+    // fails-when: the status drops failure_reason, so the CLI shows a failed run with no cause
+    expect(result).toMatchObject({ jobs: [], failureReason: 'secret DB_PASSWORD not found' });
   });
 
   it('reports a null duration for a job that has not finished', async () => {
@@ -539,6 +594,23 @@ describe('handleTestRunLogs', () => {
     // poll returns init's tail again and skips the step's first line
     expect(second.lines).toEqual(['step-failure-line', 'step-2']);
     expect(second.done).toBe(false);
+  });
+
+  it('names the job that wrote each line, index for index', async () => {
+    const { db } = makeDbMock({
+      runRow: { run_id: 'run-1', status: 'failed', is_test_run: true },
+    });
+    const files: Record<string, string> = {
+      'executions/run-1/job-lint/step-0.log': 'lint-1\nlint-2\n',
+      'executions/run-1/job-test/step-0.log': 'test-1\n',
+    };
+    const deps = { db, logStorage: liveStorage(files) } as unknown as TestRelayHandlerDeps;
+    const page = (await poll(deps, TEST_RUN_LOG_CURSOR_START)) as Page & {
+      lineJobNames?: string[];
+    };
+    expect(page.lines).toEqual(['lint-1', 'lint-2', 'test-1']);
+    // fails-when: the lines carry no job, so the CLI's error block for `test` shows lint's output
+    expect(page.lineJobNames).toEqual(['lint', 'lint', 'test']);
   });
 
   it('delivers every line exactly once, in file order, whatever order the files grow in', async () => {

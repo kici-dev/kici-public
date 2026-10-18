@@ -71,6 +71,10 @@ export interface RunsListFilters {
   since?: string;
   /** Opaque keyset cursor from a prior page's `nextCursor`; absent = first page. */
   cursor?: string;
+  /** Only runs whose id starts with these characters. */
+  runIdPrefix?: string;
+  /** Also page into archived runs. */
+  includeArchived?: boolean;
 }
 
 const singleRunSchema = z.object({ run: runListItemSchema });
@@ -275,6 +279,8 @@ export class DashboardClient {
       qs.set(filters.source.includes(':') ? 'routingKey' : 'source', filters.source);
     if (filters.since) qs.set('since', filters.since);
     if (filters.cursor) qs.set('cursor', filters.cursor);
+    if (filters.runIdPrefix) qs.set('runIdPrefix', filters.runIdPrefix);
+    if (filters.includeArchived) qs.set('includeArchived', 'true');
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
     return runListResponseSchema.parse(await this.getJson(`/runs${suffix}`));
   }

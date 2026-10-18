@@ -146,8 +146,8 @@ export const dashboardJobDetailSchema = z.object({
   jobId: z.string(),
   jobName: z.string(),
   /**
-   * The workflow that defines this job; a run can span several workflows (a
-   * fixture run with no `--workflow`). null/absent when not recorded.
+   * The workflow that defines this job; a run can span several workflows (an older `kici`'s shared
+   * fixture run). null/absent when not recorded.
    */
   workflowName: z.string().nullable().optional(),
   status: z.string(),
@@ -2438,14 +2438,40 @@ export const testRelayTriggerRequestSchema = z.object({
   secrets: z.record(z.string(), z.string()).optional(),
   encryptedSecrets: z.string().optional(),
   encryptedSecretsKey: z.string().optional(),
+  /**
+   * The caller follows every run in the response's `runs`, so a fixture that
+   * matches several workflows gets one run per workflow. Without it the
+   * orchestrator answers as for a caller that follows only `runId`.
+   */
+  acceptsMultipleRuns: z.boolean().optional(),
 });
 export type TestRelayTriggerRequest = z.infer<typeof testRelayTriggerRequestSchema>;
+
+/** One run a test trigger created: a matched workflow and the run that executes it. */
+export const testRelayTriggeredRunSchema = z.object({
+  runId: z.string(),
+  workflowName: z.string(),
+  jobIds: z.array(z.string()).optional(),
+});
+export type TestRelayTriggeredRun = z.infer<typeof testRelayTriggeredRunSchema>;
 
 /** Response acknowledging a triggered run. */
 export const testRelayTriggerResponseSchema = z.object({
   type: z.literal('test.relay.trigger.response'),
   requestId: z.string(),
+  /**
+   * The first run of `runs`, or the one run when the request did not set
+   * `acceptsMultipleRuns`.
+   *
+   * @deprecated Read `runs`: a fixture that matches several workflows creates
+   * one run per workflow, and this field names only the first.
+   */
   runId: z.string().optional(),
+  /**
+   * Every run the trigger created, one per matched workflow. Absent from an
+   * orchestrator that predates it; read `runId` then.
+   */
+  runs: z.array(testRelayTriggeredRunSchema).optional(),
   status: z.enum(['accepted', 'rejected']).optional(),
   reason: z.string().optional(),
   jobIds: z.array(z.string()).optional(),
@@ -2483,6 +2509,11 @@ export const testRelayRunStatusResponseSchema = z.object({
       }),
     )
     .optional(),
+  /**
+   * Why the run failed, when it failed before or outside any job (an init
+   * failure records no job). Absent from an orchestrator that predates it.
+   */
+  failureReason: z.string().nullable().optional(),
   done: z.boolean().optional(),
   error: z.string().optional(),
 });
@@ -2519,6 +2550,11 @@ export const testRelayRunLogsResponseSchema = z.object({
   nextCursor: z.number().optional(),
   /** Opaque per-file cursor for the next request; present when the request sent `logCursor`. */
   nextLogCursor: z.string().optional(),
+  /**
+   * The job that wrote each line, index for index with `lines`. Present when
+   * the request sent `logCursor`; absent from an orchestrator that predates it.
+   */
+  lineJobNames: z.array(z.string()).optional(),
   done: z.boolean().optional(),
   error: z.string().optional(),
 });
@@ -2944,9 +2980,9 @@ export const runListItemSchema = z.object({
   runId: z.string(),
   workflowName: z.string(),
   /**
-   * Every workflow the run spans, `workflowName` first. A fixture run with no
-   * `--workflow` runs each matched workflow under one run id. Optional so a
-   * response from an older Platform still validates.
+   * Every workflow the run spans, `workflowName` first. An older `kici`'s shared fixture run holds
+   * every matched workflow. Optional
+   * so a response from an older Platform still validates.
    */
   workflowNames: z.array(z.string()).optional(),
   status: z.string(),

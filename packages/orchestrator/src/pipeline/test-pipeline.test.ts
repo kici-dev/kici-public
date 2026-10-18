@@ -224,6 +224,7 @@ describe('processTestTrigger', () => {
         targetBranch: 'main',
         payload: { ref: 'refs/heads/main' },
       },
+      acceptsMultipleRuns: true,
     });
 
     const result = await processTestTrigger(input, deps);
@@ -231,10 +232,91 @@ describe('processTestTrigger', () => {
     // Both workflows have push triggers matching 'main'
     expect(result.status).toBe('accepted');
     expect(result.jobIds.length).toBeGreaterThan(0);
+    expect(result.runs?.map((r) => r.workflowName)).toEqual(['ci', 'deploy']);
   });
 
-  it('holds a run of several workflows open until the last workflow registers', async () => {
+  it('creates one run per matched workflow for a caller that follows several runs', async () => {
+    // Both workflows define `test-job`, the name collision a shared run cannot hold.
     const lockFile = createMockLockFile([createMockWorkflow('ci'), createMockWorkflow('deploy')]);
+    (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
+    const started: Array<[string, string]> = [];
+    const tracker = {
+      onExecutionStarted: vi.fn(async (runId: string, workflowName: string) => {
+        started.push([runId, workflowName]);
+      }),
+      addJobsToRun: vi.fn().mockResolvedValue(undefined),
+      holdRunForPendingJobs: vi.fn(() => true),
+      releasePendingJobsHold: vi.fn().mockResolvedValue(undefined),
+      markTestRun: vi.fn(),
+    };
+    deps.executionTracker = tracker as any;
+
+    const result = await processTestTrigger(createMockInput({ acceptsMultipleRuns: true }), deps);
+
+    expect(result.status).toBe('accepted');
+    const runs = result.runs ?? [];
+    // fails-when: the matched workflows share the one run id minted before matching
+    expect(runs.map((r) => r.workflowName)).toEqual(['ci', 'deploy']);
+    expect(new Set(runs.map((r) => r.runId)).size).toBe(2);
+    expect(started).toEqual(runs.map((r) => [r.runId, r.workflowName]));
+    // breaks-if-wrong: the deprecated runId still names the first run
+    expect(result.runId).toBe(runs[0]!.runId);
+    for (const run of runs) {
+      expect(run.jobIds.length).toBeGreaterThan(0);
+      expect(tracker.markTestRun).toHaveBeenCalledWith(run.runId);
+    }
+  });
+
+  it('refuses a caller that follows one run when the matched workflows share a job name', async () => {
+    const lockFile = createMockLockFile([createMockWorkflow('ci'), createMockWorkflow('deploy')]);
+    (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
+
+    const result = await processTestTrigger(createMockInput(), deps);
+
+    // fails-when: both workflows' `test-job` land in one run, keyed by the same name
+    expect(result.status).toBe('rejected');
+    expect(result.reason).toContain('share job names (test-job)');
+    expect(result.reason).toContain('--workflow');
+    expect(deps.dispatcher.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('refuses a caller that follows one run when a matched workflow has dynamic jobs', async () => {
+    const dynamic = createMockWorkflow('deploy', [
+      { _type: 'dynamic', source: { file: '.kici/workflows/ci.ts', index: 0 } },
+    ]);
+    const lockFile = createMockLockFile([createMockWorkflow('ci'), dynamic]);
+    (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
+
+    const result = await processTestTrigger(createMockInput(), deps);
+
+    // fails-when: unknowable dynamic job names are treated as collision-free
+    expect(result.status).toBe('rejected');
+    expect(result.reason).toContain('dynamic jobs');
+  });
+
+  it('runs a single matched workflow as one run whether or not the caller follows several', async () => {
+    (deps.lockFileCache.get as any).mockResolvedValue(
+      createMockLockFile([createMockWorkflow('ci')]),
+    );
+    const result = await processTestTrigger(createMockInput(), deps);
+    // breaks-if-wrong: an older CLI's single-workflow fixture keeps running
+    expect(result.status).toBe('accepted');
+    expect(result.runs?.map((r) => [r.runId, r.workflowName])).toEqual([[result.runId, 'ci']]);
+  });
+
+  it('holds a shared run of several workflows open until the last workflow registers', async () => {
+    // A caller without acceptsMultipleRuns, and job names that cannot collide.
+    const job = (name: string) =>
+      staticJob({
+        name,
+        runsOn: [{ kind: 'exact', value: 'default' }],
+        steps: [{ name: 'echo', run: 'echo hello' }],
+        rules: [],
+      });
+    const lockFile = createMockLockFile([
+      createMockWorkflow('ci', [job('ci-job')]),
+      createMockWorkflow('deploy', [job('deploy-job')]),
+    ]);
     (deps.lockFileCache.get as any).mockResolvedValue(lockFile);
     const events: string[] = [];
     deps.executionTracker = {
@@ -254,6 +336,8 @@ describe('processTestTrigger', () => {
 
     const result = await processTestTrigger(createMockInput(), deps);
     expect(result.status).toBe('accepted');
+    // A shared run names no single workflow, so it carries no `runs`.
+    expect(result.runs).toBeUndefined();
 
     // Open tokens after each event, from the first registration to the last.
     const first = events.indexOf('start:ci');

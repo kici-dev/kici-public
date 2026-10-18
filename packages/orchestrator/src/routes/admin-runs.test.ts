@@ -69,6 +69,18 @@ function createMockDb() {
   };
 }
 
+/** Run ids the routes accept (a full UUID). */
+const ID1 = '00000000-0000-4000-8000-000000000001';
+const ID2 = '00000000-0000-4000-8000-000000000002';
+const ID3 = '00000000-0000-4000-8000-000000000003';
+const ID4 = '00000000-0000-4000-8000-000000000004';
+const ID5 = '00000000-0000-4000-8000-000000000005';
+const ID6 = '00000000-0000-4000-8000-000000000006';
+const ID7 = '00000000-0000-4000-8000-000000000007';
+const ID8 = '00000000-0000-4000-8000-000000000008';
+const ID9 = '00000000-0000-4000-8000-000000000009';
+const ID10 = '00000000-0000-4000-8000-000000000010';
+
 /** Master secret key used only for test reveal round-trips. */
 const TEST_SECRET_KEY = 'a'.repeat(64);
 const TEST_OLD_SECRET_KEY = 'b'.repeat(64);
@@ -184,7 +196,7 @@ describe('admin run routes', () => {
       const now = new Date();
       deps.mockDb.mockExecute.mockResolvedValueOnce([
         {
-          run_id: 'run-1',
+          run_id: ID1,
           workflow_name: 'ci',
           status: 'success',
           provider: 'github',
@@ -208,7 +220,7 @@ describe('admin run routes', () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.runs).toHaveLength(1);
-      expect(body.runs[0].runId).toBe('run-1');
+      expect(body.runs[0].runId).toBe(ID1);
       expect(body.runs[0].workflowName).toBe('ci');
       expect(body.total).toBe(1);
     });
@@ -266,6 +278,29 @@ describe('admin run routes', () => {
       expect(deps.mockDb.whereCalls).toContainEqual(['delivery_id', '=', 'rk:mine']);
     });
 
+    it('filters by a run id prefix as a UUID range on ?runIdPrefix=', async () => {
+      const res = await request(app, '?runIdPrefix=709C899A', { token: validToken });
+      expect(res.status).toBe(200);
+      // fails-when: the prefix is ignored, so runs show resolves against every run
+      expect(deps.mockDb.whereCalls).toContainEqual([
+        'run_id',
+        '>=',
+        '709c899a-0000-0000-0000-000000000000',
+      ]);
+      expect(deps.mockDb.whereCalls).toContainEqual([
+        'run_id',
+        '<=',
+        '709c899a-ffff-ffff-ffff-ffffffffffff',
+      ]);
+    });
+
+    it('rejects a ?runIdPrefix= that cannot start a run id with 400', async () => {
+      const res = await request(app, '?runIdPrefix=xyz', { token: validToken });
+      // fails-when: the bad prefix reaches the UUID column as a malformed value
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toContain('runIdPrefix');
+    });
+
     it('does not filter by delivery_id when the param is absent', async () => {
       await request(app, '', { token: validToken });
       expect(deps.mockDb.whereCalls.some((c) => c[0] === 'delivery_id')).toBe(false);
@@ -274,10 +309,27 @@ describe('admin run routes', () => {
 
   // ── GET /admin/runs/:runId (run header only) ────────────────────
 
+  describe('a run id that is not a full UUID', () => {
+    it.each([
+      '/709c899a',
+      '/709c899a/jobs',
+      '/709c899a/jobs/j/steps/0/logs',
+      '/709c899a/secret-outputs',
+    ])('is refused with a 400 naming the id on %s', async (path) => {
+      const res = await request(app, path, { token: validToken });
+      // fails-when: the short id reaches Postgres and comes back as an opaque 22P02 400
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toContain("Invalid run id '709c899a'");
+      expect(body.error).not.toContain('malformed value');
+      expect(deps.mockDb.selectFromCalls).toEqual([]);
+    });
+  });
+
   describe('GET /api/v1/admin/runs/:runId', () => {
     it('returns 404 for non-existent run', async () => {
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
-      const res = await request(app, '/run-nonexistent', { token: validToken });
+      const res = await request(app, `/${ID7}`, { token: validToken });
       expect(res.status).toBe(404);
       const body = await res.json();
       expect(body.error).toContain('not found');
@@ -286,7 +338,7 @@ describe('admin run routes', () => {
     it('returns run fields only (no jobs, no steps)', async () => {
       const now = new Date();
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
-        run_id: 'run-1',
+        run_id: ID1,
         workflow_name: 'ci',
         status: 'success',
         provider: 'github',
@@ -309,10 +361,10 @@ describe('admin run routes', () => {
         failure_reason: null,
         created_at: now,
       });
-      const res = await request(app, '/run-1', { token: validToken });
+      const res = await request(app, `/${ID1}`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body.run.runId).toBe('run-1');
+      expect(body.run.runId).toBe(ID1);
       // The split endpoint must NOT return jobs or steps.
       expect(body.jobs).toBeUndefined();
       expect(body.steps).toBeUndefined();
@@ -324,7 +376,7 @@ describe('admin run routes', () => {
     it('returns the workflow repository provenance of an organization-wide run', async () => {
       const now = new Date();
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
-        run_id: 'run-global',
+        run_id: ID5,
         workflow_name: 'org-ci',
         status: 'success',
         provider: 'github',
@@ -339,7 +391,7 @@ describe('admin run routes', () => {
         workflow_sha: 'def5678',
         workflow_branch: 'main',
       });
-      const res = await request(app, '/run-global', { token: validToken });
+      const res = await request(app, `/${ID5}`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
       // fails-when: the route drops any of the three columns from the response
@@ -351,7 +403,7 @@ describe('admin run routes', () => {
     it('returns null workflow provenance for a run whose workflow lives in its own repo', async () => {
       const now = new Date();
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
-        run_id: 'run-local',
+        run_id: ID6,
         workflow_name: 'ci',
         status: 'success',
         provider: 'github',
@@ -366,7 +418,7 @@ describe('admin run routes', () => {
         workflow_sha: null,
         workflow_branch: null,
       });
-      const res = await request(app, '/run-local', { token: validToken });
+      const res = await request(app, `/${ID6}`, { token: validToken });
       const body = await res.json();
       // fails-when: an absent value is omitted instead of sent as null, so a
       // consumer cannot tell "same-repo run" from "field not supported"
@@ -383,7 +435,7 @@ describe('admin run routes', () => {
   describe('GET /api/v1/admin/runs/:runId/jobs', () => {
     it('returns 404 when the run does not exist', async () => {
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined); // run existence check
-      const res = await request(app, '/run-x/jobs', { token: validToken });
+      const res = await request(app, `/${ID9}/jobs`, { token: validToken });
       expect(res.status).toBe(404);
     });
 
@@ -392,7 +444,7 @@ describe('admin run routes', () => {
     // that re-parses would look correct yet return null against a live database.
     it('passes JSONB columns through as the driver already parsed them', async () => {
       const now = new Date();
-      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: ID1 });
       deps.mockDb.mockExecute.mockResolvedValueOnce([
         {
           job_id: 'job-matrix',
@@ -409,7 +461,7 @@ describe('admin run routes', () => {
         },
       ]);
       deps.mockDb.mockExecute.mockResolvedValueOnce([]); // execution_job_needs
-      const res = await request(app, '/run-1/jobs', { token: validToken });
+      const res = await request(app, `/${ID1}/jobs`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.jobs[0].runsOnLabels).toEqual(['kici:scaler:github-actions', 'kici:os:linux']);
@@ -418,7 +470,7 @@ describe('admin run routes', () => {
 
     it('returns jobs for a run without steps by default', async () => {
       const now = new Date();
-      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: ID1 });
       deps.mockDb.mockExecute.mockResolvedValueOnce([
         {
           job_id: 'job-test',
@@ -436,7 +488,7 @@ describe('admin run routes', () => {
       ]);
       // execution_job_needs query (no edges for this run).
       deps.mockDb.mockExecute.mockResolvedValueOnce([]);
-      const res = await request(app, '/run-1/jobs', { token: validToken });
+      const res = await request(app, `/${ID1}/jobs`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.jobs).toHaveLength(1);
@@ -448,7 +500,7 @@ describe('admin run routes', () => {
 
     it('attaches resolved dependency edges (needs) grouped by downstream job', async () => {
       const now = new Date();
-      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: ID1 });
       deps.mockDb.mockExecute.mockResolvedValueOnce([
         {
           job_id: 'job-build',
@@ -485,7 +537,7 @@ describe('admin run routes', () => {
           run_on: JSON.stringify(['failed', 'timed_out_stale']),
         },
       ]);
-      const res = await request(app, '/run-1/jobs', { token: validToken });
+      const res = await request(app, `/${ID1}/jobs`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
       const build = body.jobs.find((j: { jobName: string }) => j.jobName === 'build');
@@ -498,7 +550,7 @@ describe('admin run routes', () => {
 
     it('embeds steps when ?includeSteps=true', async () => {
       const now = new Date();
-      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: ID1 });
       deps.mockDb.mockExecute.mockResolvedValueOnce([
         {
           job_id: 'job-test',
@@ -530,7 +582,7 @@ describe('admin run routes', () => {
           step_type: 'step',
         },
       ]);
-      const res = await request(app, '/run-1/jobs?includeSteps=true', { token: validToken });
+      const res = await request(app, `/${ID1}/jobs?includeSteps=true`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.jobs[0].steps).toHaveLength(1);
@@ -543,16 +595,16 @@ describe('admin run routes', () => {
   describe('GET /api/v1/admin/runs/:runId/ephemeral-key', () => {
     it('returns 404 when the run does not exist', async () => {
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
-      const res = await request(app, '/run-x/ephemeral-key', { token: validToken });
+      const res = await request(app, `/${ID9}/ephemeral-key`, { token: validToken });
       expect(res.status).toBe(404);
     });
 
     it('returns {exists: true, createdAt} when the row is present', async () => {
       const now = new Date();
       deps.mockDb.mockExecuteTakeFirst
-        .mockResolvedValueOnce({ run_id: 'run-1' })
-        .mockResolvedValueOnce({ run_id: 'run-1', created_at: now });
-      const res = await request(app, '/run-1/ephemeral-key', { token: validToken });
+        .mockResolvedValueOnce({ run_id: ID1 })
+        .mockResolvedValueOnce({ run_id: ID1, created_at: now });
+      const res = await request(app, `/${ID1}/ephemeral-key`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body).toEqual({ exists: true, createdAt: now.toISOString() });
@@ -560,9 +612,9 @@ describe('admin run routes', () => {
 
     it('returns {exists: false, createdAt: null} when the row has been scrubbed', async () => {
       deps.mockDb.mockExecuteTakeFirst
-        .mockResolvedValueOnce({ run_id: 'run-1' })
+        .mockResolvedValueOnce({ run_id: ID1 })
         .mockResolvedValueOnce(undefined);
-      const res = await request(app, '/run-1/ephemeral-key', { token: validToken });
+      const res = await request(app, `/${ID1}/ephemeral-key`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body).toEqual({ exists: false, createdAt: null });
@@ -571,14 +623,14 @@ describe('admin run routes', () => {
     it('never leaks the public_key or encrypted_private_key', async () => {
       const now = new Date();
       deps.mockDb.mockExecuteTakeFirst
-        .mockResolvedValueOnce({ run_id: 'run-1' })
+        .mockResolvedValueOnce({ run_id: ID1 })
         .mockResolvedValueOnce({
-          run_id: 'run-1',
+          run_id: ID1,
           created_at: now,
           public_key: 'must-not-appear',
           encrypted_private_key: 'must-not-appear',
         });
-      const res = await request(app, '/run-1/ephemeral-key', { token: validToken });
+      const res = await request(app, `/${ID1}/ephemeral-key`, { token: validToken });
       const body = await res.json();
       expect(JSON.stringify(body)).not.toContain('must-not-appear');
     });
@@ -589,13 +641,13 @@ describe('admin run routes', () => {
   describe('GET /api/v1/admin/runs/:runId/secret-outputs', () => {
     it('returns 404 when the run does not exist', async () => {
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
-      const res = await request(app, '/run-x/secret-outputs', { token: validToken });
+      const res = await request(app, `/${ID9}/secret-outputs`, { token: validToken });
       expect(res.status).toBe(404);
     });
 
     it('returns masked rows by default (no value field)', async () => {
       const now = new Date();
-      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: ID1 });
       deps.mockDb.mockExecute.mockResolvedValueOnce([
         {
           id: 'out-1',
@@ -605,7 +657,7 @@ describe('admin run routes', () => {
           created_at: now,
         },
       ]);
-      const res = await request(app, '/run-1/secret-outputs', { token: validToken });
+      const res = await request(app, `/${ID1}/secret-outputs`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.outputs).toHaveLength(1);
@@ -624,7 +676,7 @@ describe('admin run routes', () => {
         routingKey: null,
         label: 'test',
       });
-      const res = await request(app, '/run-1/secret-outputs?reveal=true', { token: validToken });
+      const res = await request(app, `/${ID1}/secret-outputs?reveal=true`, { token: validToken });
       expect(res.status).toBe(403);
     });
 
@@ -637,14 +689,14 @@ describe('admin run routes', () => {
         label: 'test',
       });
       const appNoKey = createAdminRunRoutes(depsNoKey);
-      const res = await request(appNoKey, '/run-1/secret-outputs?reveal=true', {
+      const res = await request(appNoKey, `/${ID1}/secret-outputs?reveal=true`, {
         token: validToken,
       });
       expect(res.status).toBe(503);
     });
 
     it('decrypts values on ?reveal=true and writes a single audit row', async () => {
-      const runId = 'run-1';
+      const runId = ID1;
       const plaintext = 'super-secret';
       const keyBuf = deriveKey(TEST_SECRET_KEY);
       const { data: ciphertext } = encrypt(plaintext, keyBuf, 1, `secret-output:${runId}`);
@@ -678,7 +730,7 @@ describe('admin run routes', () => {
     });
 
     it('reveals a row still sealed under the OLD master key', async () => {
-      const runId = 'run-1';
+      const runId = ID1;
       const { data: ciphertext } = encrypt(
         'sealed-before-rotation',
         deriveKey(TEST_OLD_SECRET_KEY),
@@ -724,7 +776,7 @@ describe('admin run routes', () => {
     });
 
     it('records a revealError row when the ciphertext cannot be decrypted', async () => {
-      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: 'run-1' });
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: ID1 });
       deps.mockDb.mockExecute.mockResolvedValueOnce([
         {
           id: 'out-1',
@@ -734,7 +786,7 @@ describe('admin run routes', () => {
           created_at: new Date(),
         },
       ]);
-      const res = await request(app, '/run-1/secret-outputs?reveal=true', { token: validToken });
+      const res = await request(app, `/${ID1}/secret-outputs?reveal=true`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.outputs[0].masked).toBe(true);
@@ -753,7 +805,7 @@ describe('admin run routes', () => {
 
   describe('GET /api/v1/admin/runs/:runId/structured', () => {
     const headerRow = {
-      run_id: 'run-1',
+      run_id: ID1,
       workflow_name: 'ci',
       status: 'failed',
       provider: 'github',
@@ -774,10 +826,10 @@ describe('admin run routes', () => {
 
     it('returns a provenance-tagged result with untrusted-wrapped names', async () => {
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(headerRow);
-      const res = await request(app, '/run-1/structured', { token: validToken });
+      const res = await request(app, `/${ID1}/structured`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body.runId).toBe('run-1');
+      expect(body.runId).toBe(ID1);
       expect(body.workflowName).toEqual({ untrusted: true, value: 'ci' });
       expect(body.sha).toBe('abc123');
       expect(body.jobs).toEqual([]);
@@ -785,7 +837,7 @@ describe('admin run routes', () => {
 
     it('404s for an unknown run', async () => {
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
-      const res = await request(app, '/nope/structured', { token: validToken });
+      const res = await request(app, `/${ID10}/structured`, { token: validToken });
       expect(res.status).toBe(404);
     });
 
@@ -800,7 +852,7 @@ describe('admin run routes', () => {
         ...headerRow,
         routing_key: 'scope-b',
       });
-      const res = await request(app, '/run-1/structured', { token: validToken });
+      const res = await request(app, `/${ID1}/structured`, { token: validToken });
       expect(res.status).toBe(403);
     });
   });
@@ -810,9 +862,9 @@ describe('admin run routes', () => {
   describe('GET /api/v1/admin/runs/:runId/jobs/:jobId/steps/:stepIndex/logs', () => {
     it('returns untrusted-wrapped log lines', async () => {
       deps.mockDb.mockExecuteTakeFirst
-        .mockResolvedValueOnce({ run_id: 'run-1', routing_key: null }) // run existence
-        .mockResolvedValueOnce({ log_path: 'executions/run-1/job-a/step-0.log' }); // step lookup
-      const res = await request(app, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+        .mockResolvedValueOnce({ run_id: ID1, routing_key: null }) // run existence
+        .mockResolvedValueOnce({ log_path: `executions/${ID1}/job-a/step-0.log` }); // step lookup
+      const res = await request(app, `/${ID1}/jobs/job-a/steps/0/logs`, { token: validToken });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.lines.every((l: any) => l.untrusted === true)).toBe(true);
@@ -825,7 +877,7 @@ describe('admin run routes', () => {
 
     it('serves the workflow-level log at step -1, which has no step row', async () => {
       deps.mockDb.mockExecuteTakeFirst
-        .mockResolvedValueOnce({ run_id: 'run-1', routing_key: null }) // run existence
+        .mockResolvedValueOnce({ run_id: ID1, routing_key: null }) // run existence
         .mockResolvedValueOnce(undefined) // execution_steps: step -1 never has a row
         .mockResolvedValueOnce({ job_name: 'build' }); // execution_jobs
       (deps.logStorage!.exists as any).mockResolvedValueOnce(true);
@@ -835,7 +887,7 @@ describe('admin run routes', () => {
         complete: true,
       });
 
-      const res = await request(app, '/run-1/jobs/job-a/steps/-1/logs', { token: validToken });
+      const res = await request(app, `/${ID1}/jobs/job-a/steps/-1/logs`, { token: validToken });
 
       // fails-when: the route or the reader treats -1 as "no such step", so
       // `kici-admin runs logs --step=-1` prints nothing for every job.
@@ -844,17 +896,17 @@ describe('admin run routes', () => {
       expect(body.stepIndex).toBe(-1);
       expect(body.lines).toEqual([{ untrusted: true, value: '[host-checkout] Clone complete' }]);
       expect(body.recorded).toBe(true);
-      expect(deps.logStorage!.read).toHaveBeenCalledWith('executions/run-1/job-build/step--1.log');
+      expect(deps.logStorage!.read).toHaveBeenCalledWith(`executions/${ID1}/job-build/step--1.log`);
     });
 
     it('reports recorded: false for a job that wrote no setup log', async () => {
       deps.mockDb.mockExecuteTakeFirst
-        .mockResolvedValueOnce({ run_id: 'run-1', routing_key: null }) // run existence
+        .mockResolvedValueOnce({ run_id: ID1, routing_key: null }) // run existence
         .mockResolvedValueOnce(undefined) // execution_steps: step -1 never has a row
         .mockResolvedValueOnce({ job_name: 'build' }); // execution_jobs
       (deps.logStorage!.exists as any).mockResolvedValueOnce(false);
 
-      const res = await request(app, '/run-1/jobs/job-a/steps/-1/logs', { token: validToken });
+      const res = await request(app, `/${ID1}/jobs/job-a/steps/-1/logs`, { token: validToken });
 
       // fails-when: the route drops the reader's flag, so a missing setup log and
       // an empty one answer the same body
@@ -865,13 +917,13 @@ describe('admin run routes', () => {
     });
 
     it('400s on a non-numeric stepIndex', async () => {
-      const res = await request(app, '/run-1/jobs/job-a/steps/abc/logs', { token: validToken });
+      const res = await request(app, `/${ID1}/jobs/job-a/steps/abc/logs`, { token: validToken });
       expect(res.status).toBe(400);
     });
 
     it('404s for an unknown run', async () => {
       deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce(undefined);
-      const res = await request(app, '/nope/jobs/job-a/steps/0/logs', { token: validToken });
+      const res = await request(app, `/${ID10}/jobs/job-a/steps/0/logs`, { token: validToken });
       expect(res.status).toBe(404);
     });
 
@@ -884,7 +936,7 @@ describe('admin run routes', () => {
         label: 'test',
       });
       const appNoLog = createAdminRunRoutes(depsNoLog);
-      const res = await request(appNoLog, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+      const res = await request(appNoLog, `/${ID1}/jobs/job-a/steps/0/logs`, { token: validToken });
       expect(res.status).toBe(503);
     });
   });
@@ -914,15 +966,15 @@ describe('admin run routes', () => {
     it('serves logs for a runId known only to dispatch_queue', async () => {
       deps.mockDb.mockExecuteTakeFirst
         .mockResolvedValueOnce(undefined) // execution_runs: no row for an eval round
-        .mockResolvedValueOnce({ run_id: 'run-eval-1', routing_key: 'github:42' }) // dispatch_queue
-        .mockResolvedValueOnce({ log_path: 'executions/run-eval-1/job-eval-1/step-0.log' });
+        .mockResolvedValueOnce({ run_id: ID2, routing_key: 'github:42' }) // dispatch_queue
+        .mockResolvedValueOnce({ log_path: `executions/${ID2}/job-eval-1/step-0.log` });
       (deps.logStorage!.read as any).mockResolvedValueOnce({
         data: '[global-filter] verdict=true\n',
         cursor: 0,
         complete: true,
       });
 
-      const res = await request(app, '/run-eval-1/jobs/job-eval-1/steps/0/logs', {
+      const res = await request(app, `/${ID2}/jobs/job-eval-1/steps/0/logs`, {
         token: validToken,
       });
 
@@ -940,18 +992,18 @@ describe('admin run routes', () => {
         deps.mockDb.whereCallsByTable
           .filter((w) => w.table === 'dispatch_queue')
           .map((w) => w.args),
-      ).toContainEqual(['run_id', '=', 'run-eval-1']);
+      ).toContainEqual(['run_id', '=', ID2]);
     });
 
     it('still 404s a runId in neither table', async () => {
       // Both lookups miss (the mock's default resolves to undefined).
-      const res = await request(app, '/run-nope/jobs/job-nope/steps/0/logs', {
+      const res = await request(app, `/${ID8}/jobs/job-nope/steps/0/logs`, {
         token: validToken,
       });
 
       expect(res.status).toBe(404);
       const body = await res.json();
-      expect(body.error).toBe('Run run-nope not found');
+      expect(body.error).toBe('Run 00000000-0000-4000-8000-000000000008 not found');
       expect(deps.mockDb.selectFromCalls).toEqual(['execution_runs', 'dispatch_queue']);
     });
 
@@ -959,9 +1011,9 @@ describe('admin run routes', () => {
       useScopedToken('github:99');
       deps.mockDb.mockExecuteTakeFirst
         .mockResolvedValueOnce(undefined) // execution_runs: no row
-        .mockResolvedValueOnce({ run_id: 'run-eval-2', routing_key: 'github:42' }); // dispatch_queue
+        .mockResolvedValueOnce({ run_id: ID3, routing_key: 'github:42' }); // dispatch_queue
 
-      const res = await request(app, '/run-eval-2/jobs/job-eval-2/steps/0/logs', {
+      const res = await request(app, `/${ID3}/jobs/job-eval-2/steps/0/logs`, {
         token: validToken,
       });
 
@@ -974,10 +1026,10 @@ describe('admin run routes', () => {
       useScopedToken('github:42');
       deps.mockDb.mockExecuteTakeFirst
         .mockResolvedValueOnce(undefined) // execution_runs: no row
-        .mockResolvedValueOnce({ run_id: 'run-eval-3', routing_key: 'github:42' }) // dispatch_queue
-        .mockResolvedValueOnce({ log_path: 'executions/run-eval-3/job-eval-3/step-0.log' });
+        .mockResolvedValueOnce({ run_id: ID4, routing_key: 'github:42' }) // dispatch_queue
+        .mockResolvedValueOnce({ log_path: `executions/${ID4}/job-eval-3/step-0.log` });
 
-      const res = await request(app, '/run-eval-3/jobs/job-eval-3/steps/0/logs', {
+      const res = await request(app, `/${ID4}/jobs/job-eval-3/steps/0/logs`, {
         token: validToken,
       });
 
@@ -986,10 +1038,10 @@ describe('admin run routes', () => {
 
     it('does not query dispatch_queue when execution_runs already has the row', async () => {
       deps.mockDb.mockExecuteTakeFirst
-        .mockResolvedValueOnce({ run_id: 'run-1', routing_key: null }) // execution_runs hit
-        .mockResolvedValueOnce({ log_path: 'executions/run-1/job-a/step-0.log' });
+        .mockResolvedValueOnce({ run_id: ID1, routing_key: null }) // execution_runs hit
+        .mockResolvedValueOnce({ log_path: `executions/${ID1}/job-a/step-0.log` });
 
-      const res = await request(app, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+      const res = await request(app, `/${ID1}/jobs/job-a/steps/0/logs`, { token: validToken });
 
       expect(res.status).toBe(200);
       expect(deps.mockDb.selectFromCalls).toEqual(['execution_runs', 'execution_steps']);
@@ -999,12 +1051,9 @@ describe('admin run routes', () => {
       // A found run with a null routing key must stay a scope denial, never a
       // 404 and never a fallthrough to dispatch_queue.
       useScopedToken('github:42');
-      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({
-        run_id: 'run-1',
-        routing_key: null,
-      });
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: ID1, routing_key: null });
 
-      const res = await request(app, '/run-1/jobs/job-a/steps/0/logs', { token: validToken });
+      const res = await request(app, `/${ID1}/jobs/job-a/steps/0/logs`, { token: validToken });
 
       expect(res.status).toBe(403);
       expect(deps.mockDb.selectFromCalls).toEqual(['execution_runs']);

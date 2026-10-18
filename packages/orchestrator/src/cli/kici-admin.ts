@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 
-import { Command, type ParseOptionsResult } from 'commander';
+import { Command, Option, type ParseOptionsResult } from 'commander';
 import { AdminApiClient, DEFAULT_ADMIN_URL } from './api-client.js';
 import { registerSecretCommands } from './commands/secret.js';
 import { registerRotateCommand } from './commands/rotate.js';
@@ -105,8 +105,14 @@ export function buildProgram(): Command {
       `-V, ${ROOT_VERSION_FLAG}`,
       'output the version number (--version also works before a command)',
     )
-    .option('-u, --url <url>', 'Orchestrator URL', process.env.KICI_ADMIN_URL ?? DEFAULT_ADMIN_URL)
-    .option('-t, --token <token>', 'Admin API token', process.env.KICI_ADMIN_TOKEN);
+    // .env() reads the variable at parse time and shows only its name in --help;
+    // an env value passed as the default would be printed verbatim.
+    .addOption(
+      new Option('-u, --url <url>', 'Orchestrator URL')
+        .env('KICI_ADMIN_URL')
+        .default(DEFAULT_ADMIN_URL),
+    )
+    .addOption(new Option('-t, --token <token>', 'Admin API token').env('KICI_ADMIN_TOKEN'));
 
   /** Lazy, so --help works without --token. */
   function getClient(): AdminApiClient {

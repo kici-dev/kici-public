@@ -12,6 +12,7 @@
  */
 
 import { formatDuration } from '@kici-dev/shared';
+import { compareStepsByPhase } from '@kici-dev/engine';
 import type { StepLogBuffer } from './step-log-buffer.js';
 
 // ---------------------------------------------------------------------------
@@ -52,6 +53,24 @@ export interface StepProgressEntry {
   name: string;
   status: 'pending' | 'running' | 'success' | 'failed' | 'skipped' | 'cancelled';
   durationMs?: number;
+  /** The step's stored index. An entry without one is read by its position (defensive). */
+  stepIndex?: number;
+  /** The step's `step_type`; places setup and init pseudo-steps first. */
+  stepType?: string;
+}
+
+/**
+ * Record one step's progress: replace the entry for its index, or add it in display
+ * order. Pseudo-steps have high indices (init at 1_000_000 + n), so the list is keyed
+ * by index rather than position; a positional list would pad every gap up to it.
+ */
+export function applyStepProgress(
+  steps: StepProgressEntry[],
+  entry: StepProgressEntry & { stepIndex: number },
+): StepProgressEntry[] {
+  const indexed = steps.map((s, position) => ({ ...s, stepIndex: s.stepIndex ?? position }));
+  const rest = indexed.filter((s) => s.stepIndex !== entry.stepIndex);
+  return [...rest, entry].sort(compareStepsByPhase);
 }
 
 // ---------------------------------------------------------------------------
