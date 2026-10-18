@@ -24,6 +24,8 @@ import type {
   StepApprovalRequestIpc,
   JobExecutionRequest,
 } from './ipc-protocol.js';
+import { withAgentSshCapability } from './git-grant-capability.js';
+import { sshCredentialNames } from './ssh-client-preflight.js';
 import { buildSanitizedEnv } from './env-sanitizer.js';
 import { encryptSecretOutputs } from './secret-encryption.js';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -158,6 +160,16 @@ export function buildCloneRequest(
   };
 }
 
+/** `sshGitCredentials` for a host-path job that declares any; nothing otherwise. */
+function sshCredentialsFor(
+  jobConfig: Record<string, unknown>,
+  credentialHelperPath: string | undefined,
+): { sshGitCredentials?: string[] } {
+  if (!credentialHelperPath) return {};
+  const names = sshCredentialNames(jobConfig.gitCredentials);
+  return names.length > 0 ? { sshGitCredentials: names } : {};
+}
+
 /** Map a JobDispatch to the subset the workflow runner needs. */
 export function buildRequest(
   dispatch: JobDispatch,
@@ -176,6 +188,7 @@ export function buildRequest(
     jobId: dispatch.jobId,
     workDir,
     ...buildCloneRequest(dispatch, extra),
+    ...sshCredentialsFor(jobConfig, extra?.credentialHelperPath),
     ...(extra?.allowInstallScripts ? { allowInstallScripts: true } : {}),
     sourceTarUrl: dispatch.sourceTarUrl,
     sourceTarDigest: dispatch.sourceTarDigest,
@@ -730,7 +743,8 @@ function relayGitGrantRequest(msg: GitGrantRequestIpc, ctx: ForkRunnerCtx): void
     });
     return;
   }
-  ctx.execOptions.onGitGrantRequest(msg).then(
+  const request = withAgentSshCapability(msg, Boolean(ctx.execOptions.credentialHelperPath));
+  ctx.execOptions.onGitGrantRequest(request).then(
     (response) => safeSendToChild(ctx.child, response),
     (err) =>
       safeSendToChild(ctx.child, {

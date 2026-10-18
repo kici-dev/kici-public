@@ -127,9 +127,12 @@ interface StepSecretMountMessage {
 /** The entire job has completed. */
 interface JobCompleteMessage {
   type: 'job.complete';
-  status: 'success' | 'failed';
+  status: 'success' | 'failed' | 'skipped';
   stepResults: SandboxStepResult[];
-  /** Set when the job failed before step execution (e.g. clone, deps, compile). */
+  /**
+   * Set when the job failed before step execution (e.g. clone, deps, compile), or
+   * the reason a job-level rule skipped the job.
+   */
   error?: string;
   /** Step outputs by step name; present on success when steps produce outputs. */
   outputs?: Record<string, Record<string, unknown>>;
@@ -244,6 +247,12 @@ export interface GitGrantRequestIpc {
   permissions?: Record<string, string>;
   /** Named credential from the job's `gitCredentials` map. `elevate` only. */
   credentialName?: string;
+  /**
+   * The runner's git can read files the agent writes (a host-path job with the
+   * credential helper). An SSH-key credential is refused without it: a
+   * container job's git cannot reach the key on the agent's host. `elevate` only.
+   */
+  sshCapable?: boolean;
   /** Grant id returned by a previous `elevate`. `revoke` only. */
   grantId?: string;
 }
@@ -439,6 +448,11 @@ export interface GitGrantResponseIpc {
   grantId?: string;
   /** What the credential can actually do. `elevate` only, on success. */
   granted?: { scoped: false } | { scoped: true; permissions: Record<string, string> };
+  /**
+   * For an SSH-key credential: the ssh command the runner sets as the
+   * checkout's `core.sshCommand` for the window. `elevate` only, on success.
+   */
+  sshCommand?: string;
   /** Error description (present when elevation or revocation failed). */
   error?: string;
 }
@@ -576,6 +590,12 @@ export interface JobExecutionRequest {
    * job, whose git has no route to the agent's socket.
    */
   credentialHelperPath?: string;
+  /**
+   * Names of the job's SSH-key git credentials (`gitCredentials` entries with
+   * `kind: 'ssh'`). Set only with `credentialHelperPath`: only a host-path
+   * job can use the key, so only it is refused when no ssh client is on PATH.
+   */
+  sshGitCredentials?: string[];
   /** SHA-256 of the source tarball bytes, for integrity verification. */
   sourceTarDigest?: string;
 

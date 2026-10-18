@@ -131,7 +131,7 @@ Operator-facing read access to the orchestrator's `access_log` table — every r
 
 Output includes actor (type + id + optional metadata), action, source, outcome, target (if any), request ID, and timestamps.
 
-`list --agent-only` keeps only agent-attributed rows, and `--agent-label <label>` filters by an exact agent label. `show --org <orgId>` names the tenant to scan in cold storage when the row is archived (older than 30 days). Without it, `show` scans only the synthetic `__orchestrator__` tenant, so it cannot find an archived row that carries an org id.
+`list --agent-only` keeps only agent-attributed rows, and `--agent-label <label>` filters by an exact agent label. `show --org <orgId>` names the tenant to scan in cold storage when the row is archived. A row moves to cold storage after 30, 180 or 365 days, depending on its action. Without it, `show` scans only the synthetic `__orchestrator__` tenant, so it cannot find an archived row that carries an org id.
 
 ### event-log -- inbound webhook delivery log
 

@@ -88,13 +88,13 @@ InvokeResult: `{ repo, workflow, runId, status, outputs }` -- one summoned run's
 
 GitAuth:
 
-| Field            | Type   | Required    | Description                                                                                                         |
-| ---------------- | ------ | ----------- | ------------------------------------------------------------------------------------------------------------------- |
-| kind             | enum   | Yes         | One of: `basic` (HTTPS Basic auth, PAT/password) or `ssh` (SSH private key)                                         |
-| user             | string | No          | Basic-auth username (omit for SSH; defaults filled in by the provider, e.g. `x-access-token` for GitHub-style PATs) |
-| secret           | string | Yes         | Basic-auth password/PAT, or PEM-encoded SSH private key                                                             |
-| sshHostKeyPolicy | enum   | No          | SSH-only. `accept-new` trusts first-seen host keys; `pinned` requires `sshKnownHostsPem`                            |
-| sshKnownHostsPem | string | Conditional | SSH-only, required when `sshHostKeyPolicy === 'pinned'`. OpenSSH `known_hosts` content                              |
+| Field            | Type   | Required    | Description                                                                                                                       |
+| ---------------- | ------ | ----------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| kind             | enum   | Yes         | One of: `basic` (HTTPS Basic auth, PAT/password) or `ssh` (SSH private key)                                                       |
+| user             | string | No          | Basic-auth username (omit for SSH; defaults filled in by the provider, e.g. `x-access-token` for GitHub-style PATs)               |
+| secret           | string | Yes         | Basic-auth password/PAT, or PEM-encoded SSH private key                                                                           |
+| sshHostKeyPolicy | enum   | No          | SSH-only. `accept-new` uses an empty per-clone known_hosts file, so it accepts any host key; `pinned` requires `sshKnownHostsPem` |
+| sshKnownHostsPem | string | Conditional | SSH-only, required when `sshHostKeyPolicy === 'pinned'`. OpenSSH `known_hosts` content                                            |
 
 **requestId persistence through the dispatch queue:** When a job is dispatched immediately (agent available), `requestId` is read from the current AsyncLocalStorage context. When a job is queued (no agent available) and later drained, the `requestId` is persisted in the `dispatch_queue` database table and restored when the job is dequeued. This ensures the `job.dispatch` message always carries the original webhook's trace ID, enabling end-to-end traceability even for delayed dispatches.
 
@@ -127,7 +127,7 @@ Acknowledges agent registration and sends confirmed config back to the agent. Th
 | scalerManaged   | boolean          | No       | Whether agent is managed by auto-scaler (default: `false`)                                                                                                                                                                                                                                                                                                                                                                                    |
 | pendingDispatch | boolean          | No       | When set, the orchestrator's scaler bound a specific queued job to this agent at spawn time and the `job.dispatch` message is in flight. Scaler-managed agents that see this flag must not arm the short `KICI_SCALER_IDLE_TIMEOUT` timer on register — the `KICI_SCALER_PENDING_DISPATCH_TIMEOUT` safety net still applies if the dispatch never arrives.                                                                                    |
 | warmPool        | boolean          | No       | When set, the orchestrator pre-spawned this agent for a warm pool rather than for a specific queued job. An agent that sees this flag must not arm any idle-shutdown timer on register: the orchestrator's warm-pool reaper owns its lifetime and either dispatches a job to it or destroys it. Absent for a job-bound spawn and for a static agent. An agent that ignores the flag arms the short `KICI_SCALER_IDLE_TIMEOUT` timer as usual. |
-| capabilities    | object           | No       | Agent-facing capabilities this orchestrator advertises. Every flag is optional and absent means unsupported. Protocol 4 defines no flag, so the orchestrator sends an empty object.                                                                                                                                                                                                                                                           |
+| capabilities    | object           | No       | Agent-facing capabilities this orchestrator advertises. Every flag is optional and absent means unsupported. `acceptsSkippedJobStatus: true` means the orchestrator settles a `skipped` job status; without it, the agent reports a job its rule skipped as `success`.                                                                                                                                                                        |
 
 > Authoritative source: `packages/engine/src/protocol/messages/orchestrator-agent.ts` -- `registerAckSchema`
 
@@ -201,9 +201,9 @@ Reports a job execution state transition. Sent at each lifecycle boundary (queue
 `job.status` (and `step.status` below) ride the agent's durable send path: when the
 WebSocket is down or the agent has not yet re-registered, the frame is enqueued in
 the agent's reconnect buffer and replayed after `register.ack`, in order, ahead of
-new frames. A terminal transition (`success`/`failed`/`cancelled`) reported the
+new frames. A terminal transition (`success`/`failed`/`skipped`/`cancelled`) reported the
 instant the connection drops is therefore delivered on reconnect rather than lost —
-the same replay guarantee log lines have. The orchestrator treats a re-delivered
+the same replay guarantee log lines have. A buffered `skipped` frame is checked against the capabilities of the orchestrator that receives it. The orchestrator treats a re-delivered
 terminal frame idempotently (a completed dispatch row is not reopened). Only
 connection-liveness frames like `job.heartbeat` remain unbuffered.
 

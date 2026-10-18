@@ -5489,6 +5489,39 @@ describe('run rollup agrees with the on-failure needs edge', () => {
   }
 });
 
+describe('run rollup with a rule-skipped job', () => {
+  it.each([
+    [
+      [ExecutionJobStatus.enum.success, ExecutionJobStatus.enum.skipped],
+      ExecutionRunStatus.enum.success,
+    ],
+    [
+      [ExecutionJobStatus.enum.failed, ExecutionJobStatus.enum.skipped],
+      ExecutionRunStatus.enum.failed,
+    ],
+  ] as const)('jobs %j roll up to %s', async (statuses, expected) => {
+    const db = createMockDb();
+    const onComplete = vi.fn();
+    const t = new ExecutionTracker({ db: db.db, onExecutionComplete: onComplete });
+    const runId = `run-mixed-${statuses.join('-')}`;
+
+    await startRun(t, {
+      runId,
+      ref: 'main',
+      sha: 'abc',
+      deliveryId: null,
+      jobs: statuses.map((_, i) => ({ jobId: `job-${i}`, jobName: `job-${i}` })),
+    });
+    for (const [i, status] of statuses.entries()) {
+      await t.onJobStatus(runId, `job-${i}`, status, Date.now());
+    }
+
+    // fails-when: a skipped job counts as a failure in the run roll-up.
+    expect(onComplete).toHaveBeenCalled();
+    expect(onComplete.mock.calls[0][1]).toBe(expected);
+  });
+});
+
 /**
  * A global workflow lives in one repository and fires on events from many others. The run
  * is attributed to the SOURCE repository; the DEFINING repository is recorded on the run

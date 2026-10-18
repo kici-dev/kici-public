@@ -287,6 +287,30 @@ describe('runsShowCommand', () => {
     expect(printed).toContain('Step 2 exited with code 1');
   });
 
+  it('renders a skipped job reason as a skip, not an error', async () => {
+    stubClient(
+      {
+        jobs: [
+          {
+            jobId: 'j1',
+            jobName: 'publish',
+            status: ExecutionJobStatus.enum.skipped,
+            durationMs: 0,
+            errorMessage: "rule 'push to main' returned false",
+            steps: [],
+          },
+        ],
+      },
+      ExecutionRunStatus.enum.success,
+    );
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await runsShowCommand(RUN, {});
+    const printed = printedPlain(log);
+    // fails-when: a skipped job's reason prints as a red "error:" line.
+    expect(printed).toContain("skipped: rule 'push to main' returned false");
+    expect(printed).not.toContain('error:');
+  });
+
   it("renders a failed step's error for a job that records no error message of its own", async () => {
     const step = (stepName: string, status: string, exitCode: number | null) => ({
       stepIndex: 0,

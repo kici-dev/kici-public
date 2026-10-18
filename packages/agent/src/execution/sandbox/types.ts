@@ -192,11 +192,14 @@ export interface JobExecutionOptions {
 // --- Job execution result ---
 
 export interface JobExecutionResult {
-  status: 'success' | 'failed' | 'cancelled';
+  status: 'success' | 'failed' | 'skipped' | 'cancelled';
   /** In execution order. */
   stepResults: SandboxStepResult[];
   durationMs: number;
-  /** Set when the runner process crashed (no job.complete received). */
+  /**
+   * Set when the runner process crashed (no job.complete received), or the reason
+   * a job-level rule skipped the job.
+   */
   error?: string;
   /** Step outputs by step name (present on success when steps return values). */
   outputs?: Record<string, Record<string, unknown>>;

@@ -1,9 +1,8 @@
 import { afterAll, describe, expect, it } from 'vitest';
-import { readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import ts from 'typescript';
-import { workflowPaths } from '../index.js';
-import { generateSampleFixture, rewriteTemplateDefaultBranch } from '../default-branch.js';
+import { generateSampleFixture } from '../default-branch.js';
 import { makeSdkTypecheckDir, typecheckAgainstSdk } from './sdk-typecheck.test-helpers.js';
 
 /** Branch names git accepts, with the export name the sample fixture must get. */
@@ -20,7 +19,6 @@ interface GeneratedLiterals {
   fixtureIds: string[];
   branches: string[];
   fixtureBranches: string[];
-  prTargets: string[];
 }
 
 /** The names and string values a parser reads back out of generated source. */
@@ -30,7 +28,6 @@ function literalsOf(fileName: string, source: string): GeneratedLiterals {
     fixtureIds: [],
     branches: [],
     fixtureBranches: [],
-    prTargets: [],
   };
   const visit = (node: ts.Node): void => {
     if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
@@ -52,9 +49,6 @@ function literalsOf(fileName: string, source: string): GeneratedLiterals {
       if (node.name.text === 'branch' && ts.isStringLiteral(initializer)) {
         found.fixtureBranches.push(initializer.text);
       }
-      if (node.name.text === 'target' && ts.isStringLiteral(initializer)) {
-        found.prTargets.push(initializer.text);
-      }
     }
     ts.forEachChild(node, visit);
   };
@@ -62,7 +56,6 @@ function literalsOf(fileName: string, source: string): GeneratedLiterals {
   return found;
 }
 
-const prChecksTemplate = readFileSync(workflowPaths['pr-checks'], 'utf-8');
 const tmpDir = makeSdkTypecheckDir('kici-default-branch-');
 
 afterAll(() => {
@@ -70,15 +63,6 @@ afterAll(() => {
 });
 
 describe('default-branch scaffold', () => {
-  it('the pr-checks template carries the PR target the rewrite replaces', () => {
-    const rewritten = rewriteTemplateDefaultBranch(prChecksTemplate, 'develop');
-    // fails-when: the template's PR target changes shape and the rewrite matches nothing
-    expect(rewritten).toContain('target: "develop"');
-    expect(rewritten).not.toContain("target: 'main'");
-    // breaks-if-wrong: a repository on main keeps the template byte for byte
-    expect(rewriteTemplateDefaultBranch(prChecksTemplate, 'main')).toBe(prChecksTemplate);
-  });
-
   it.each(BRANCHES)('generated literals read back the branch %j exactly', (branch, exportName) => {
     // fails-when: the branch goes into a quoted literal unescaped (`'feat/it's-x'`)
     expect(literalsOf('push-test.ts', generateSampleFixture(branch))).toEqual({
@@ -88,10 +72,7 @@ describe('default-branch scaffold', () => {
       // fails-when: the sample fixture leaves its branch to the checkout, so push-main
       // runs as a push to whatever branch the developer is on
       fixtureBranches: [branch],
-      prTargets: [],
     });
-    const prChecks = rewriteTemplateDefaultBranch(prChecksTemplate, branch);
-    expect(literalsOf('pr-checks.ts', prChecks).prTargets).toEqual([branch]);
   });
 
   it('quotes the fixture ID in the "Run with" line only when a shell needs it', () => {
@@ -105,13 +86,11 @@ describe('default-branch scaffold', () => {
 
   // Builds a TypeScript program over the whole SDK source tree: budgeted like
   // the agents-md snippet check, not left to the package-wide 15s timeout.
-  it('every generated fixture and pr-checks variant type-checks against the real SDK', () => {
-    const files = BRANCHES.flatMap(([branch], i) => {
+  it('every generated fixture type-checks against the real SDK', () => {
+    const files = BRANCHES.map(([branch], i) => {
       const fixtureFile = resolve(tmpDir, `push-test-${i}.ts`);
       writeFileSync(fixtureFile, generateSampleFixture(branch), 'utf-8');
-      const prChecksFile = resolve(tmpDir, `pr-checks-${i}.ts`);
-      writeFileSync(prChecksFile, rewriteTemplateDefaultBranch(prChecksTemplate, branch), 'utf-8');
-      return [fixtureFile, prChecksFile];
+      return fixtureFile;
     });
     const rendered = typecheckAgainstSdk(files).join('\n');
     // fails-when: the export name is not an identifier (`export const pushCi/kici = …`)

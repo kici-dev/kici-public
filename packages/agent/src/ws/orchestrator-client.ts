@@ -25,6 +25,8 @@ import {
   ArtifactCompleteAckOutcome,
   AGENT_CAPABILITIES,
   AGENT_FEATURE_LABELS,
+  ExecutionJobStatus,
+  type OrchAgentCapabilities,
 } from '@kici-dev/engine';
 import type {
   CacheRequestIpc,
@@ -140,6 +142,31 @@ export interface OrchestratorClientOptions {
 }
 
 /**
+ * Adapts a frame to what the receiving orchestrator settles. An orchestrator
+ * without `acceptsSkippedJobStatus` drops a `skipped` job status, so the job
+ * would never settle: it gets `success` with no `data.error`, the frame an
+ * agent sent for a rule-skipped job before the capability existed.
+ */
+export function adaptJobStatusForOrchestrator(
+  message: AgentToOrchestratorMessage,
+  caps: OrchAgentCapabilities,
+): AgentToOrchestratorMessage {
+  if (
+    message.type !== 'job.status' ||
+    message.state !== ExecutionJobStatus.enum.skipped ||
+    caps.acceptsSkippedJobStatus === true
+  ) {
+    return message;
+  }
+  const adapted = { ...message, state: ExecutionJobStatus.enum.success };
+  if (message.data) {
+    const { error: _error, ...data } = message.data;
+    adapted.data = data;
+  }
+  return adapted;
+}
+
+/**
  * WebSocket client from the agent to the customer orchestrator: registration
  * handshake, heartbeats, auto-reconnect with exponential backoff (1s initial,
  * 1.5x, jitter, 60s max), job dispatch / cancel routing, and event buffering
@@ -148,6 +175,11 @@ export interface OrchestratorClientOptions {
  */
 export class OrchestratorClient {
   private ws: WebSocket | null = null;
+  /**
+   * The current connection's `register.ack` capabilities. Empty until the ack,
+   * so a frame sent on a socket that has not acked is judged conservatively.
+   */
+  private orchCapabilities: OrchAgentCapabilities = {};
   private _state: ConnectionState = 'disconnected';
   private readonly eventBuffer: EventBuffer;
   private readonly logBuffer: LogBuffer;
@@ -397,7 +429,7 @@ export class OrchestratorClient {
   /** Sends immediately when registered; otherwise buffers for later delivery. */
   send(message: AgentToOrchestratorMessage): void {
     if (this._state === 'registered' && this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(message));
+      this.ws.send(JSON.stringify(adaptJobStatusForOrchestrator(message, this.orchCapabilities)));
     } else {
       this.eventBuffer.add(message);
     }
@@ -406,7 +438,7 @@ export class OrchestratorClient {
   /** Sends without buffering, for heartbeat and other protocol messages that must not be buffered. */
   sendDirect(message: AgentToOrchestratorMessage): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(message));
+      this.ws.send(JSON.stringify(adaptJobStatusForOrchestrator(message, this.orchCapabilities)));
     }
   }
 
@@ -1042,6 +1074,7 @@ export class OrchestratorClient {
 
   private doConnect(): void {
     this._state = 'connecting';
+    this.orchCapabilities = {};
 
     try {
       this.ws = new WebSocket(this.url, {
@@ -1444,8 +1477,12 @@ export class OrchestratorClient {
       scalerManaged: msg.scalerManaged,
       pendingDispatch: msg.pendingDispatch ?? false,
       warmPool: msg.warmPool ?? false,
+      acceptsSkippedJobStatus: msg.capabilities?.acceptsSkippedJobStatus ?? false,
     });
 
+    // Before the flush: a frame buffered during an outage is judged against the
+    // orchestrator it is delivered to.
+    this.orchCapabilities = msg.capabilities ?? {};
     this._state = 'registered';
     this.reconnectAttempts = 0;
     this.startHeartbeat();

@@ -1,9 +1,11 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startJobGitCredentials, type JobGitCredentials } from './job-git-credentials.js';
+import { FORGE_KNOWN_HOSTS } from './forge-known-hosts.js';
 
 const GIT_INPUT = 'protocol=https\nhost=github.com\npath=kici-dev/tester.git\n\n';
 const cleanups: Array<() => Promise<void>> = [];
@@ -34,6 +36,20 @@ async function start(sendApiRequest: ReturnType<typeof vi.fn>): Promise<JobGitCr
     await rm(dir, { recursive: true, force: true });
   });
   return creds;
+}
+
+/** `start` with a declared `gitCredentials` map. */
+async function startDeclaring(
+  sendApiRequest: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
+  credentials: Record<string, Record<string, string>>,
+): Promise<{ creds: JobGitCredentials; dir: string }> {
+  const dir = await mkdtemp(join(tmpdir(), 'kici-jobcred-'));
+  const creds = await startJobGitCredentials({ jobId: 'job-1', dir, sendApiRequest, credentials });
+  cleanups.push(async () => {
+    await creds.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+  return { creds, dir };
 }
 
 const basic = (secret: string) => ({
@@ -162,16 +178,8 @@ describe('startJobGitCredentials', () => {
 
   it('sends the declared default credential ref with the request', async () => {
     const send = vi.fn().mockResolvedValue(basic('ghs_x'));
-    const dir = await mkdtemp(join(tmpdir(), 'kici-jobcred-'));
-    const creds = await startJobGitCredentials({
-      jobId: 'job-1',
-      dir,
-      sendApiRequest: send,
-      credentials: { default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' } },
-    });
-    cleanups.push(async () => {
-      await creds.close();
-      await rm(dir, { recursive: true, force: true });
+    const { creds } = await startDeclaring(send, {
+      default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' },
     });
 
     await run(creds.helperPath, 'get', GIT_INPUT);
@@ -196,19 +204,9 @@ describe('startJobGitCredentials', () => {
       ...basic('ghs_x'),
       grant: { scoped: true, permissions: { contents: 'write' } },
     });
-    const dir = await mkdtemp(join(tmpdir(), 'kici-jobcred-'));
-    const creds = await startJobGitCredentials({
-      jobId: 'job-1',
-      dir,
-      sendApiRequest: send,
-      credentials: {
-        default: { kind: 'token', tokenSecret: 'ci:DEFAULT' },
-        forge: { kind: 'token', tokenSecret: 'ci:FORGE' },
-      },
-    });
-    cleanups.push(async () => {
-      await creds.close();
-      await rm(dir, { recursive: true, force: true });
+    const { creds } = await startDeclaring(send, {
+      default: { kind: 'token', tokenSecret: 'ci:DEFAULT' },
+      forge: { kind: 'token', tokenSecret: 'ci:FORGE' },
     });
 
     await creds.onGitGrantRequest({
@@ -228,16 +226,8 @@ describe('startJobGitCredentials', () => {
 
   it('reports an unknown credential name instead of silently using the default', async () => {
     const send = vi.fn().mockResolvedValue(basic('ghs_x'));
-    const dir = await mkdtemp(join(tmpdir(), 'kici-jobcred-'));
-    const creds = await startJobGitCredentials({
-      jobId: 'job-1',
-      dir,
-      sendApiRequest: send,
-      credentials: { default: { kind: 'token', tokenSecret: 'ci:DEFAULT' } },
-    });
-    cleanups.push(async () => {
-      await creds.close();
-      await rm(dir, { recursive: true, force: true });
+    const { creds } = await startDeclaring(send, {
+      default: { kind: 'token', tokenSecret: 'ci:DEFAULT' },
     });
 
     const result = await creds.onGitGrantRequest({
@@ -250,6 +240,140 @@ describe('startJobGitCredentials', () => {
     });
     expect(result.error).toMatch(/Unknown git credential 'typo'/);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  describe('the window names the credential', () => {
+    it("the helper asks for the window's named credential, not the default", async () => {
+      const send = vi.fn().mockResolvedValue(basic('ghs_x'));
+      const { creds } = await startDeclaring(send, {
+        default: { kind: 'token', tokenSecret: 'ci:DEFAULT' },
+        forge: { kind: 'token', tokenSecret: 'ci:FORGE' },
+      });
+
+      // Positive control: outside any window the helper asks for the default.
+      await run(creds.helperPath, 'get', GIT_INPUT);
+      expect(send.mock.lastCall![1]).toMatchObject({
+        ref: { kind: 'token', tokenSecret: 'ci:DEFAULT' },
+        permissions: { contents: 'read' },
+      });
+
+      await creds.onGitGrantRequest({
+        type: 'git.grant.request',
+        requestId: 'r1',
+        op: 'elevate',
+        repository: 'kici-dev/tester',
+        permissions: { contents: 'write' },
+        credentialName: 'forge',
+      });
+      // fails-when: answer() omits the grant's credentialName (it then asks ci:DEFAULT).
+      await run(creds.helperPath, 'get', GIT_INPUT);
+      expect(send.mock.lastCall![1]).toMatchObject({
+        ref: { kind: 'token', tokenSecret: 'ci:FORGE' },
+        permissions: { contents: 'write' },
+      });
+    });
+  });
+
+  describe('ssh-key credentials inside a write window', () => {
+    const PEM = '-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n-----END OPENSSH PRIVATE KEY-----';
+    const sshResult = { kind: 'ssh', secret: PEM, grant: { scoped: false }, expiresAt: null };
+    const DEPLOY = { kind: 'ssh', privateKeySecret: 'ci:DEPLOY' };
+
+    const sshCreds = () => startDeclaring(vi.fn().mockResolvedValue(sshResult), { deploy: DEPLOY });
+
+    const elevate = (creds: JobGitCredentials, requestId: string, sshCapable?: boolean) =>
+      creds.onGitGrantRequest({
+        type: 'git.grant.request',
+        requestId,
+        op: 'elevate',
+        repository: 'acme/app',
+        permissions: { contents: 'write' },
+        credentialName: 'deploy',
+        ...(sshCapable === undefined ? {} : { sshCapable }),
+      });
+
+    const keyPathOf = (cmd: string): string => /^ssh -i '([^']+)'/.exec(cmd)![1]!;
+
+    it('an ssh elevation returns an ssh command whose key file holds the key', async () => {
+      const { creds } = await sshCreds();
+      const res = await elevate(creds, 'r1', true);
+      expect(res.error).toBeUndefined();
+      expect(res.grantId).toBeDefined();
+      expect(res.granted).toEqual({ scoped: false });
+      expect(res.sshCommand).toMatch(
+        /^ssh -i '.+\/id' -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o 'UserKnownHostsFile=".+\/known_hosts" "~\/\.ssh\/known_hosts"'$/,
+      );
+      const keyPath = keyPathOf(res.sshCommand!);
+      expect(await readFile(keyPath, 'utf8')).toBe(`${PEM}\n`);
+      expect((await stat(keyPath)).mode & 0o777).toBe(0o600);
+      const knownHosts = /UserKnownHostsFile="([^"]+)"/.exec(res.sshCommand!)![1]!;
+      expect(await readFile(knownHosts, 'utf8')).toBe(FORGE_KNOWN_HOSTS);
+    });
+
+    // fails-when: someone switches the policy to trust-on-first-use.
+    it('the command never weakens host-key checking', async () => {
+      const { creds } = await sshCreds();
+      const cmd = (await elevate(creds, 'r1', true)).sshCommand!;
+      expect(cmd).toContain('StrictHostKeyChecking=yes');
+      expect(cmd).not.toContain('accept-new');
+      expect(cmd).not.toMatch(/StrictHostKeyChecking=no/);
+    });
+
+    // fails-when: sshCapable is ignored and the key is written for a container job.
+    it('refuses an ssh key for a runner that cannot read it', async () => {
+      const { creds, dir } = await sshCreds();
+      const res = await elevate(creds, 'r1');
+      expect(res.error).toMatch(/works only in a job without container:/);
+      expect(res.grantId).toBeUndefined();
+      expect(existsSync(join(dir, 'ssh'))).toBe(false);
+    });
+
+    it('revoke deletes the key once no window uses it', async () => {
+      const { creds } = await sshCreds();
+      const first = await elevate(creds, 'r1', true);
+      const second = await elevate(creds, 'r2', true);
+      expect(second.sshCommand).toBe(first.sshCommand);
+      const keyPath = keyPathOf(first.sshCommand!);
+
+      await creds.onGitGrantRequest({
+        type: 'git.grant.request',
+        requestId: 'r3',
+        op: 'revoke',
+        grantId: first.grantId!,
+      });
+      expect(existsSync(keyPath)).toBe(true);
+
+      await creds.onGitGrantRequest({
+        type: 'git.grant.request',
+        requestId: 'r4',
+        op: 'revoke',
+        grantId: second.grantId!,
+      });
+      expect(existsSync(keyPath)).toBe(false);
+    });
+
+    it('close removes every key', async () => {
+      const { creds, dir } = await sshCreds();
+      await elevate(creds, 'r1', true);
+      expect(existsSync(join(dir, 'ssh'))).toBe(true);
+      await creds.close();
+      expect(existsSync(join(dir, 'ssh'))).toBe(false);
+    });
+
+    it('never puts an ssh command on a token elevation', async () => {
+      const send = vi.fn().mockResolvedValue(basic('ghs_x'));
+      const creds = await start(send);
+      const res = await creds.onGitGrantRequest({
+        type: 'git.grant.request',
+        requestId: 'r1',
+        op: 'elevate',
+        repository: 'acme/app',
+        permissions: { contents: 'write' },
+        sshCapable: true,
+      });
+      expect(res.grantId).toBeDefined();
+      expect(res).not.toHaveProperty('sshCommand');
+    });
   });
 
   describe('withRef (the getToken path)', () => {

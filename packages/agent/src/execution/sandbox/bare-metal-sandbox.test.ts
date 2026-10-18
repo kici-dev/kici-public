@@ -25,7 +25,8 @@ vi.mock('node:fs', () => ({
 }));
 
 import { BareMetalSandbox } from './bare-metal-sandbox.js';
-import { fork } from 'node:child_process';
+import { fork, spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { access } from 'node:fs/promises';
 import type { RunnerToAgentMessage } from './ipc-protocol.js';
 
@@ -151,6 +152,60 @@ describe('BareMetalSandbox', () => {
       await expect(sandbox.setup({ workDir: '/workspace', env: {} })).rejects.toThrow(
         /Bubblewrap \(bwrap\) not found\. Install bubblewrap or set sandbox=false/,
       );
+    });
+  });
+
+  describe('executeJob: the git credential directory under bwrap', () => {
+    const HELPER = '/tmp/kici-gitcred-job-1/git-credential-kici.cjs';
+    const bindOf = (args: string[]): number =>
+      args.findIndex((a, i) => a === '--ro-bind' && args[i + 1] === '/tmp/kici-gitcred-job-1');
+
+    async function spawnArgs(useBwrap: boolean): Promise<string[] | undefined> {
+      vi.mocked(existsSync).mockImplementation((p) => p === '/tmp/kici-gitcred-job-1');
+      mockExecSync.mockReturnValue(Buffer.from('/usr/bin/bwrap\n'));
+      const fakeChild = createFakeChild();
+      vi.mocked(spawn).mockReturnValue(fakeChild);
+      mockFork.mockReturnValue(fakeChild);
+      const sandbox = new BareMetalSandbox({
+        runnerPath: '/opt/kici/runner.js',
+        sandbox: useBwrap,
+        env: {},
+      });
+      await sandbox.setup({ workDir: '/workspace', env: {} });
+      const execPromise = sandbox.executeJob({
+        dispatch: createTestDispatch(),
+        credentialHelperPath: HELPER,
+        onStepStatus: vi.fn(),
+        onLogLine: vi.fn(),
+        onEventEmit: vi.fn(),
+        onConcurrencyReport: vi.fn(),
+        signal: new AbortController().signal,
+      });
+      const args = useBwrap ? (vi.mocked(spawn).mock.calls[0]![1] as string[]) : undefined;
+      fakeChild.emit('message', {
+        type: 'job.complete',
+        status: 'success',
+        stepResults: [],
+      } satisfies RunnerToAgentMessage);
+      await execPromise;
+      vi.mocked(existsSync).mockReset().mockReturnValue(false);
+      return args;
+    }
+
+    // fails-when: the directory is not bound — bwrap's private /tmp then hides
+    // the helper, its socket and any SSH key from the runner's git.
+    it('binds the directory read-only, after the private /tmp', async () => {
+      const args = (await spawnArgs(true))!;
+      const bind = bindOf(args);
+      expect(bind).toBeGreaterThan(-1);
+      // A bind placed before the tmpfs would be hidden by it.
+      expect(bind).toBeGreaterThan(args.indexOf('/tmp'));
+      expect(args[args.indexOf('/tmp') - 1]).toBe('--tmpfs');
+    });
+
+    it('spawns no bwrap without the sandbox', async () => {
+      expect(await spawnArgs(false)).toBeUndefined();
+      expect(vi.mocked(spawn)).not.toHaveBeenCalled();
     });
   });
 

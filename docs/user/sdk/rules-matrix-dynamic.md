@@ -9,6 +9,10 @@ Rules control conditional execution of workflows and jobs. A rule that returns `
 
 A rule's check function that **returns `false`** cleanly skips the job or step. A check function that **throws** counts as an evaluation failure, not a skip. The job or step **fails** with the error surfaced (both on a remote run and when running locally with `kici run --local`), so a broken rule can never silently pass as a green run. For example, `rule('main only', (ctx) => ctx.event.ref.endsWith('main'))` throws on an event whose `ref` is undefined — that run fails with the error instead of quietly skipping every step. Fix the thrown error (guard the access) rather than relying on the skip.
 
+A job whose rule returns `false` ends with the status `skipped`. The run detail, `kici runs show` and the dashboard show the reason `rule '<label>' returned false`, which names the first rule that did not pass. The job's GitHub check run completes with the `skipped` conclusion, and its summary starts with `Job '<name>' skipped` and the same reason. A skipped job does not fail the run. A step whose rule returns `false` is reported `skipped` too.
+
+A job that `needs` a rule-skipped job follows its [run condition](./core.md#job-dependencies-needs): with the default `when: 'on-success'`, the dependent is skipped too. To run it after a skipped upstream, use `when: 'on-skip'`.
+
 ### rule(label) / rule(label, check)
 
 Create a rule.

@@ -154,7 +154,7 @@ After loading the module, the sandbox extracts the target workflow by export nam
 
 Rules are evaluated sequentially with fail-fast behavior. Each rule's `check` function is called with a `RuleContext` providing the event payload, changed files, environment variables, and a zx `$` shell. Rules can be synchronous or asynchronous.
 
-If a rule check returns `false`, the job is **skipped** (not failed): it reports `success` with every step skipped. If a rule check throws, the job **fails** with the error, because a rule that could not decide must not read as "do not run". In both cases the remaining rules are not evaluated. Rule evaluation results (label, passed, duration, error) are included in the `job.status` message data.
+If a rule check returns `false`, the job is **skipped** (not failed): it reports `skipped` with every step skipped, and its error names the rule (`rule '<label>' returned false`). To an orchestrator that does not advertise `acceptsSkippedJobStatus` on `register.ack`, the agent reports `success` instead. If a rule check throws, the job **fails** with the error, because a rule that could not decide must not read as "do not run". In both cases the remaining rules are not evaluated. Rule evaluation results (label, passed, duration, error) are included in the `job.status` message data.
 
 > See `packages/agent/src/execution/rule-evaluator.ts` for the implementation.
 
@@ -276,18 +276,18 @@ Log chunks are sent via the buffered `send()` path (not `sendDirect()`), so they
 
 The agent reports status at each lifecycle point using `sendDirect()`, which bypasses the event buffer to ensure protocol messages are delivered immediately when the connection is available. Log chunks use the buffered `send()` path to participate in event buffering during disconnection.
 
-| Message                       | When                                 | Key data                              |
-| ----------------------------- | ------------------------------------ | ------------------------------------- |
-| `job.status: running`         | Job starts                           | runId, jobId                          |
-| `job.context`                 | Before sandbox execution             | runtime, sandboxType, envVars         |
-| `job.heartbeat`               | Periodic during execution            | runId, jobId, timestamp               |
-| `step.status: running`        | Each step starts (via IPC)           | stepIndex, stepName                   |
-| `step.status: success/failed` | Each step completes (via IPC)        | durationMs, exitCode, signal          |
-| `log.chunk`                   | During execution (via IPC)           | lines (batched)                       |
-| `job.status: success`         | All steps pass                       | durationMs, stepResults               |
-| `job.status: failed`          | Any step fails                       | durationMs, stepResults, error        |
-| `job.status: cancelled`       | Abort signal                         | --                                    |
-| `job.status: success`         | Rule check fails (all steps skipped) | durationMs, stepResults (all skipped) |
+| Message                               | When                                                                 | Key data                                     |
+| ------------------------------------- | -------------------------------------------------------------------- | -------------------------------------------- |
+| `job.status: running`                 | Job starts                                                           | runId, jobId                                 |
+| `job.context`                         | Before sandbox execution                                             | runtime, sandboxType, envVars                |
+| `job.heartbeat`                       | Periodic during execution                                            | runId, jobId, timestamp                      |
+| `step.status: running`                | Each step starts (via IPC)                                           | stepIndex, stepName                          |
+| `step.status: success/failed/skipped` | Each step completes (via IPC); `skipped` when its rule returns false | durationMs, exitCode, signal                 |
+| `log.chunk`                           | During execution (via IPC)                                           | lines (batched)                              |
+| `job.status: success`                 | All steps pass                                                       | durationMs, stepResults                      |
+| `job.status: failed`                  | Any step fails                                                       | durationMs, stepResults, error               |
+| `job.status: cancelled`               | Abort signal                                                         | --                                           |
+| `job.status: skipped`                 | Rule check returns false                                             | durationMs, stepResults (all skipped), error |
 
 ## Cleanup
 

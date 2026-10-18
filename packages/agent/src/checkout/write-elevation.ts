@@ -26,6 +26,8 @@ const DEFAULT_GRANT_TTL_MS = 60 * 60 * 1000;
 export interface ElevateArgs {
   repository: string;
   permissions: Permissions;
+  /** Named credential the window uses; stored on the grant for the credential helper. */
+  credentialName?: string;
   grants: GrantTable;
   request: (args: {
     repository: string;
@@ -58,6 +60,7 @@ export async function elevateForWrite(
   const grantId = args.grants.add({
     repoPath: args.repository,
     permissions: args.permissions,
+    ...(args.credentialName !== undefined ? { credentialName: args.credentialName } : {}),
     expiresAt: expiry,
   });
   return { grantId, granted: grant };

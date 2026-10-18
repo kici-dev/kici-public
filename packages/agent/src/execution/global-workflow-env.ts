@@ -20,14 +20,6 @@ export interface GlobalWorkflowRepos {
   workflowRepo: RepoInfo;
 }
 
-/**
- * Derive an `owner/repo` identifier from a clone URL, stripping the trailing
- * `.git` and any `http(s)://host/` prefix.
- */
-export function repoIdentifierFromUrl(repoUrl: string): string {
-  return repoUrl.replace(/\.git$/, '').replace(/^https?:\/\/[^/]+\//, '');
-}
-
 /** Every env key {@link applyGlobalWorkflowEnv} writes, in one place. */
 export const GLOBAL_WORKFLOW_ENV_KEYS = [
   'KICI_IS_GLOBAL_WORKFLOW',

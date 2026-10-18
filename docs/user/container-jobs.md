@@ -288,6 +288,9 @@ The image has no compilers, no Python, no editors and no ssh client. When a job 
 tools, set `container` on the job to a fuller image, such as `debian:13` or
 your own image. That is faster than installing the tools in every run.
 
+A job that pushes with an SSH-key git credential needs an ssh client: see
+[Git credentials](./patterns/git-credentials.md#ssh-keys).
+
 ## Where container jobs run
 
 A container job needs a container runtime on the host that runs it. Each agent

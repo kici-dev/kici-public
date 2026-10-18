@@ -1960,7 +1960,7 @@ describe('createAgentWsHandler', () => {
       };
     }
 
-    function statusMsg(state: 'success' | 'failed' = 'success') {
+    function statusMsg(state: 'success' | 'failed' | 'skipped' = 'success') {
       return {
         type: 'job.status',
         messageId: 'st-1',
@@ -2180,18 +2180,16 @@ describe('createAgentWsHandler', () => {
       expect(onJobStatus).toHaveBeenCalledTimes(1);
     });
 
-    it('a failed build is not held', async () => {
+    // fails-when (skipped): the cache-upload hold keys on any terminal state, not success.
+    it.each(['failed', 'skipped'] as const)('a %s job is not held', async (state) => {
       const publish = deferred();
       const { deps } = setup({ publish: () => publish.promise });
       const handler = createAgentWsHandler(deps);
       const ws = await connect(handler);
 
       const upload = handler.onMessage!(makeMessageEvent(uploadCompleteMsg()), ws as any);
-      await handler.onMessage!(makeMessageEvent(statusMsg('failed')), ws as any);
-      expect(onJobStatus).toHaveBeenCalledWith(
-        'agent-1',
-        expect.objectContaining({ state: 'failed' }),
-      );
+      await handler.onMessage!(makeMessageEvent(statusMsg(state)), ws as any);
+      expect(onJobStatus).toHaveBeenCalledWith('agent-1', expect.objectContaining({ state }));
 
       publish.resolve();
       await upload;
@@ -2935,7 +2933,7 @@ describe('createAgentWsHandler', () => {
       });
     });
 
-    it('register.ack advertises an empty capability set', async () => {
+    it('register.ack advertises that it settles a skipped job status', async () => {
       const { handler } = setup({});
       const ws = mockWs();
       handler.onOpen!(new Event('open'), ws as any);
@@ -2944,8 +2942,9 @@ describe('createAgentWsHandler', () => {
       const ack = (ws.send as ReturnType<typeof vi.fn>).mock.calls
         .map((c) => JSON.parse(c[0]))
         .find((m) => m.type === 'register.ack');
-      // fails-when: the orchestrator advertises a removed flag such as artifactCompleteAck again.
-      expect(ack?.capabilities).toEqual({});
+      // fails-when: the orchestrator advertises a removed flag such as artifactCompleteAck
+      // again, or drops acceptsSkippedJobStatus (every agent then downgrades skipped).
+      expect(ack?.capabilities).toEqual({ acceptsSkippedJobStatus: true });
     });
 
     it('artifacts.download.request replies found with the presigned GET', async () => {
@@ -3542,6 +3541,64 @@ describe('createAgentWsHandler', () => {
           encrypted: 'dGVzdC1lbmNyeXB0ZWQ=',
         },
       });
+    });
+
+    /** Registers an agent and sends it one job.status frame for job-1. */
+    async function sendJobStatusFrame(state: string, extra: Record<string, unknown> = {}) {
+      const onSecretOutputs = vi.fn().mockResolvedValue(undefined);
+      const onScalerJobComplete = vi.fn();
+      const handler = createAgentWsHandler({
+        registry,
+        dispatcher,
+        agentAuthMode: 'none',
+        onJobStatus: onJobStatus as AgentWsHandlerDeps['onJobStatus'],
+        onSecretOutputs,
+        onScalerJobComplete,
+      });
+      const ws = mockWs();
+      handler.onOpen!(new Event('open'), ws as any);
+      await handler.onMessage!(makeMessageEvent(registerMsg()), ws as any);
+      await handler.onMessage!(
+        makeMessageEvent({
+          type: 'job.status',
+          messageId: `msg-${state}`,
+          runId: 'run-1',
+          jobId: 'job-1',
+          state,
+          timestamp: Date.now(),
+          ...extra,
+        }),
+        ws as any,
+      );
+      return { onSecretOutputs, onScalerJobComplete };
+    }
+
+    it('settles an agent-reported skipped job as terminal, without secret outputs', async () => {
+      const { onSecretOutputs, onScalerJobComplete } = await sendJobStatusFrame('skipped', {
+        data: { error: "rule 'gate' returned false" },
+        secretOutputs: { API_KEY: { agentPublicKey: 'dGVzdA==', encrypted: 'dGVzdA==' } },
+      });
+
+      // fails-when: skipped stays in the informational arm, so the job never settles.
+      expect(dispatcher.onJobComplete).toHaveBeenCalledTimes(1);
+      expect(dispatcher.onJobComplete).toHaveBeenCalledWith('agent-1', 'job-1');
+      expect(dispatcher.onAgentAvailable).toHaveBeenCalledWith('agent-1');
+      expect(onScalerJobComplete).toHaveBeenCalledTimes(1);
+      expect(onJobStatus).toHaveBeenCalledTimes(1);
+      expect(onJobStatus).toHaveBeenCalledWith(
+        'agent-1',
+        expect.objectContaining({ jobId: 'job-1', state: 'skipped' }),
+      );
+      expect(onSecretOutputs).not.toHaveBeenCalled();
+    });
+
+    it('treats a queued job status as informational', async () => {
+      const { onScalerJobComplete } = await sendJobStatusFrame('queued');
+
+      // breaks-if-wrong: moving skipped must not drag queued into the terminal arm.
+      expect(dispatcher.onJobComplete).not.toHaveBeenCalled();
+      expect(onScalerJobComplete).not.toHaveBeenCalled();
+      expect(onJobStatus).not.toHaveBeenCalled();
     });
 
     it('does not call onSecretOutputs when state is not success', async () => {

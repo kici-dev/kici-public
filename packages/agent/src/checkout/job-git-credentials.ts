@@ -11,6 +11,7 @@
 import { GIT_CREDENTIAL_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/git-credential-relay';
 import { GrantTable } from './grant-table.js';
 import { elevateForWrite } from './write-elevation.js';
+import { createSshWriteKeys } from './ssh-write-keys.js';
 import {
   startCredentialHelperHost,
   type CredentialHelperHost,
@@ -39,7 +40,7 @@ export interface JobGitCredentials {
    * this it would carry no ref and fall back to the source credential.
    */
   withRef(params: Record<string, unknown>): Record<string, unknown>;
-  /** Release the socket. Idempotent. */
+  /** Release the socket and delete every SSH key a window wrote. Idempotent. */
   close(): Promise<void>;
 }
 
@@ -57,11 +58,21 @@ export async function startJobGitCredentials(args: {
    * resolves them. `default` applies when a call names none.
    */
   credentials?: Readonly<Record<string, Readonly<Record<string, string>>>>;
-  /** Job-scoped directory for the socket and shim. */
+  /** Job-scoped directory for the socket, the shim and SSH write keys. */
   dir: string;
+  /**
+   * The runner's identity under `KICI_RUNNER_USER`. The directory, shim,
+   * socket and SSH keys are chowned to it, so the runner's git can run the
+   * helper and ssh can read the key.
+   */
+  owner?: { uid: number; gid: number };
   sendApiRequest: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
 }): Promise<JobGitCredentials> {
   const grants = new GrantTable();
+  const sshKeys = createSshWriteKeys({
+    dir: args.dir,
+    ...(args.owner ? { owner: args.owner } : {}),
+  });
 
   /**
    * A per-call name wins; otherwise the map's `default`; otherwise undefined,
@@ -104,7 +115,8 @@ export async function startJobGitCredentials(args: {
 
     const grant = grants.lookup(repository);
     const permissions = grant ? grant.permissions : { contents: 'read' };
-    const credential = await ask(repository, permissions);
+    // Inside a window, the credential the window named; outside, the default.
+    const credential = await ask(repository, permissions, grant?.credentialName);
     // git has no credential helper for SSH (that stays on GIT_SSH_COMMAND), so
     // return null rather than hand git a key as a password.
     if (!credential || credential.kind !== 'basic') return null;
@@ -114,27 +126,60 @@ export async function startJobGitCredentials(args: {
   let host: CredentialHelperHost | undefined = await startCredentialHelperHost({
     dir: args.dir,
     answer,
+    ...(args.owner ? { owner: args.owner } : {}),
   });
 
   const onGitGrantRequest = async (request: GitGrantRequestIpc): Promise<GitGrantResponseIpc> => {
     try {
       if (request.op === 'revoke') {
-        if (request.grantId) grants.revoke(request.grantId);
+        if (request.grantId) {
+          await sshKeys.release(request.grantId);
+          grants.revoke(request.grantId);
+        }
         return { type: 'git.grant.response', requestId: request.requestId };
       }
       if (!request.repository) {
         throw new Error('git.grant.request: elevate requires a repository');
       }
+      let resolved: BrokerResult | undefined;
       const { grantId, granted } = await elevateForWrite({
         repository: request.repository,
         permissions: request.permissions ?? { contents: 'write' },
+        ...(request.credentialName !== undefined ? { credentialName: request.credentialName } : {}),
         grants,
         request: async ({ repository, permissions }) => {
-          const result = await ask(repository, permissions, request.credentialName);
-          return { grant: result.grant, expiresAt: result.expiresAt };
+          resolved = await ask(repository, permissions, request.credentialName);
+          return { grant: resolved.grant, expiresAt: resolved.expiresAt };
         },
       });
-      return { type: 'git.grant.response', requestId: request.requestId, grantId, granted };
+      if (resolved?.kind !== 'ssh') {
+        return { type: 'git.grant.response', requestId: request.requestId, grantId, granted };
+      }
+      // git has no credential helper for SSH: the key reaches git only as a
+      // file named by core.sshCommand, which the runner's git must be able to read.
+      if (!request.sshCapable) {
+        grants.revoke(grantId);
+        throw new Error(
+          "an SSH-key git credential works only in a job without container:, because the key stays on the agent's host",
+        );
+      }
+      try {
+        const sshCommand = await sshKeys.acquire(
+          grantId,
+          request.credentialName ?? 'default',
+          resolved.secret,
+        );
+        return {
+          type: 'git.grant.response',
+          requestId: request.requestId,
+          grantId,
+          granted,
+          sshCommand,
+        };
+      } catch (err) {
+        grants.revoke(grantId);
+        throw err;
+      }
     } catch (err) {
       return {
         type: 'git.grant.response',
@@ -178,6 +223,7 @@ export async function startJobGitCredentials(args: {
       const open = host;
       host = undefined;
       if (open) await open.close();
+      await sshKeys.closeAll();
     },
   };
 }

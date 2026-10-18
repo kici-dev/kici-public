@@ -109,6 +109,72 @@ describe('git credential relay handler', () => {
     expect(broker.resolve).not.toHaveBeenCalled();
   });
 
+  describe("the job's own checkout", () => {
+    const TOKEN_REF = { kind: 'token', tokenSecret: 'ci:T' } as const;
+    const checkoutFacts = (overrides: Partial<JobCredentialContext> = {}) =>
+      jobFacts({
+        sourceRepo: '.',
+        checkoutRepo: 'file:///srv/app',
+        declaredCredentials: { default: { ...TOKEN_REF } },
+        ...overrides,
+      });
+
+    it("admits a write for the job's own non-https checkout", async () => {
+      const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
+      await handlerWith(broker, checkoutFacts())('agent-1', {
+        jobId: 'job-1',
+        repositories: ['file:///srv/app'],
+        ref: { ...TOKEN_REF },
+        permissions: { contents: 'write' },
+      });
+      expect(broker.resolve).toHaveBeenCalled();
+    });
+
+    it('still refuses a different repository beside the checkout', async () => {
+      const broker = { resolve: vi.fn() };
+      await expect(
+        handlerWith(broker, checkoutFacts())('agent-1', {
+          jobId: 'job-1',
+          repositories: ['file:///srv/app', 'other/repo'],
+          ref: { ...TOKEN_REF },
+          permissions: { contents: 'write' },
+        }),
+      ).rejects.toThrow(/'other\/repo': outside the organisation/);
+      expect(broker.resolve).not.toHaveBeenCalled();
+    });
+
+    it('still refuses the checkout URL when the checkout is unknown', async () => {
+      const broker = { resolve: vi.fn() };
+      await expect(
+        handlerWith(broker, checkoutFacts({ checkoutRepo: undefined }))('agent-1', {
+          jobId: 'job-1',
+          repositories: ['file:///srv/app'],
+          ref: { ...TOKEN_REF },
+          permissions: { contents: 'write' },
+        }),
+      ).rejects.toThrow(/outside the organisation/);
+      expect(broker.resolve).not.toHaveBeenCalled();
+    });
+
+    it('admits an ssh-cloned checkout by its owner/repo name only', async () => {
+      const broker = { resolve: vi.fn() };
+      // A checkout cloned from git@host:fork/app is admitted as 'fork/app';
+      // a sibling in the fork's org is not, because the fence still anchors
+      // on the source repository's organisation.
+      await expect(
+        handlerWith(broker, checkoutFacts({ sourceRepo: 'acme/app', checkoutRepo: 'fork/app' }))(
+          'agent-1',
+          {
+            jobId: 'job-1',
+            repositories: ['fork/other'],
+            ref: { ...TOKEN_REF },
+            permissions: { contents: 'write' },
+          },
+        ),
+      ).rejects.toThrow(/'fork\/other'/);
+    });
+  });
+
   it('forwards every requested repository to the broker', async () => {
     const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
     await handlerWith(broker)('agent-1', {

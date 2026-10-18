@@ -73,6 +73,75 @@ If the app was not granted a permission you request, the forge refuses to issue
 the credential at all. The error names the repository and the permissions you
 asked for, **before any git command runs** — not at the end of a long build.
 
+## SSH keys
+
+A `kind: 'ssh'` credential is a private deploy key. Use it when a forge accepts a
+key and not a token, or to push to a repository the KiCI app cannot reach.
+
+### The job needs an ssh client
+
+The machine that runs the job must have an `ssh` command on its `PATH`. The
+[default agent image](../container-jobs.md#the-default-agent-image) has none.
+Install one with the [apt preset](../sdk/core.md#toolchain-presets):
+
+```typescript
+job('publish', {
+  runsOn: 'linux',
+  init: { apt: { packages: ['openssh-client'] } },
+  gitCredentials: { pages: { kind: 'ssh', privateKeySecret: 'ci:PAGES_DEPLOY_KEY' } },
+  steps: [publish],
+});
+```
+
+If no ssh client is on `PATH` after the init phase, the job fails before its
+first step. The error names the credentials and the fix.
+
+### Push to the SSH URL inside `withWrite`
+
+The key applies only inside a `withWrite` callback, and only to git commands
+that run in the job's checkout (`repo.path`) and reach an SSH URL. KiCI does
+not change `origin`, which stays an HTTPS URL. Name the SSH URL in the push:
+
+```typescript
+await repo.withWrite({ permissions: { contents: 'write' }, credential: 'pages' }, async () => {
+  await $`git push git@github.com:acme/site.git HEAD:refs/heads/gh-pages`;
+});
+```
+
+For the length of the callback, the checkout's `core.sshCommand` setting points
+ssh at the key. When the callback ends, KiCI puts back the previous setting. Git
+in another directory, or outside the callback, does not use the key.
+
+The key is a file that the job's processes can read while the window is open.
+KiCI deletes it when the last window that uses it closes.
+
+### Host keys are checked strictly
+
+ssh refuses a host whose key it does not already know. It never trusts a key on
+first use, and KiCI never writes a host key for you. ssh accepts a host key from
+these places:
+
+- The keys that GitHub (`github.com`), GitLab (`gitlab.com`) and Bitbucket Cloud
+  (`bitbucket.org`) publish. The agent includes them.
+- `~/.ssh/known_hosts` of the user that runs the job.
+- The machine's `/etc/ssh/ssh_known_hosts`.
+
+To push to another host, add its key to `~/.ssh/known_hosts` in a step before
+`withWrite`. Take the key from a source you trust, such as the forge's
+documentation. Do not take it from `ssh-keyscan` during the run: that trusts
+whatever key the network shows. If a forge changes its key before your agent is
+updated, add the new key the same way.
+
+An unknown host fails the push with `Host key verification failed`.
+
+### What an SSH key cannot do
+
+- **Permissions do not narrow it.** The key can do what the forge allows it to
+  do, whatever `permissions` the window asks for.
+- **Container jobs cannot use it.** The key stays on the agent's host, so a job
+  with `container:` cannot read it. Opening the write window fails and names
+  `container:`.
+
 ## Clone more than one repository
 
 A workflow often needs several repositories, not just its own. Mint one token
@@ -249,5 +318,7 @@ does at the start, and no credential is ever written into `.git/config`, into
 - **A credential you supply yourself cannot be narrowed.** A personal access
   token or SSH key grants whatever it was created with, so a requested permission
   set is reported as unscoped rather than pretended to be enforced.
+- **An SSH key has its own requirements:** an ssh client on the job's machine,
+  a push to an SSH URL, and a known host key. See [SSH keys](#ssh-keys).
 - **Being allowed to push is not the same as the push succeeding.** A branch
   protection rule or repository ruleset can still reject it.

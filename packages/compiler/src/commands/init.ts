@@ -3,7 +3,7 @@
  * (package.json + node_modules) or MJS mode (pure JS).
  */
 
-import { readFile, writeFile, mkdir, access, rm } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, access, rm, stat } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { $ } from 'zx';
@@ -19,7 +19,8 @@ import {
   workflowPaths,
   generatePackageJson,
   generateSampleFixture,
-  rewriteTemplateDefaultBranch,
+  scaffoldPrChecks,
+  PR_CHECKS_WORKFLOW,
   resolveVersionPin,
   tsconfigTemplate,
   agentsMdTemplate,
@@ -29,6 +30,12 @@ import { isWorkspaceMember } from '../lockfile/workspace-siblings.js';
 import { detectHookTools, installHook, findGitDir } from '../hooks/index.js';
 import type { HookToolName } from '../hooks/index.js';
 import { rewriteRunsOnForHost, shouldOfferFirstRun } from './init-host-os.js';
+import {
+  DefaultBranchSource,
+  type DetectedDefaultBranch,
+  detectCheckedOutBranch,
+  detectDefaultBranch,
+} from './init-branches.js';
 import {
   MemberRegistration,
   addMissingVersion,
@@ -98,25 +105,7 @@ export async function initCommand(options: InitOptions = {}): Promise<boolean> {
     logger.info(pc.gray('Creating .kici/workflows/'));
     await mkdir(path.join(kiciDir, 'workflows'), { recursive: true });
 
-    const defaultBranch = await detectDefaultBranch();
-
-    for (const workflow of workflows) {
-      logger.info(pc.gray(`Writing .kici/workflows/${workflow}.ts`));
-      const sourcePath = workflowPaths[workflow as keyof typeof workflowPaths];
-      let content = await readFile(sourcePath, 'utf-8');
-      content = rewriteTemplateDefaultBranch(content, defaultBranch);
-      // Rewrite the template runsOn to the host's own kici:os:* so the first
-      // `kici run push --local` dispatches on this machine (no-op on Linux).
-      content = rewriteRunsOnForHost(content, os.platform(), os.arch());
-      await writeFile(path.join(kiciDir, 'workflows', `${workflow}.ts`), content, 'utf-8');
-    }
-
-    logger.info(pc.gray('Creating .kici/tests/'));
-    await mkdir(path.join(kiciDir, 'tests'), { recursive: true });
-    logger.info(pc.gray('Writing .kici/tests/push-test.ts'));
-    const fixtureContent = generateSampleFixture(defaultBranch);
-    await writeFile(path.join(kiciDir, 'tests', 'push-test.ts'), fixtureContent, 'utf-8');
-    logger.info(pc.green('Created sample test fixture at .kici/tests/push-test.ts'));
+    await writeScaffoldTemplates(kiciDir, workflows);
 
     const kiciIgnorePath = path.resolve('.kiciignore');
     if (!(await checkExists(kiciIgnorePath))) {
@@ -233,6 +222,56 @@ async function printNextSteps(mode: ScaffoldMode, options: InitOptions): Promise
   }
 }
 
+/** pr-checks targets the default branch; the fixture pushes to the checked-out branch, else the default. */
+async function writeScaffoldTemplates(kiciDir: string, workflows: string[]): Promise<void> {
+  const cwd = process.cwd();
+  const defaultBranch = await detectDefaultBranch(cwd);
+  const fixtureBranch = (await detectCheckedOutBranch(cwd)) ?? defaultBranch.branch;
+  const hasSrcDir = await isDirectory(path.resolve('src'));
+
+  for (const workflow of workflows) {
+    logger.info(pc.gray(`Writing .kici/workflows/${workflow}.ts`));
+    const sourcePath = workflowPaths[workflow as keyof typeof workflowPaths];
+    let content = await readFile(sourcePath, 'utf-8');
+    if (workflow === PR_CHECKS_WORKFLOW) {
+      content = scaffoldPrChecks(content, { defaultBranch: defaultBranch.branch, hasSrcDir });
+      logger.info(pc.gray(describePrTarget(defaultBranch)));
+    }
+    // Rewrite the template runsOn to the host's own kici:os:* so the first
+    // `kici run push --local` dispatches on this machine (no-op on Linux).
+    content = rewriteRunsOnForHost(content, os.platform(), os.arch());
+    await writeFile(path.join(kiciDir, 'workflows', `${workflow}.ts`), content, 'utf-8');
+  }
+
+  logger.info(pc.gray('Creating .kici/tests/'));
+  await mkdir(path.join(kiciDir, 'tests'), { recursive: true });
+  logger.info(pc.gray('Writing .kici/tests/push-test.ts'));
+  const fixtureContent = generateSampleFixture(fixtureBranch);
+  await writeFile(path.join(kiciDir, 'tests', 'push-test.ts'), fixtureContent, 'utf-8');
+  logger.info(pc.green('Created sample test fixture at .kici/tests/push-test.ts'));
+}
+
+/** The log line naming the branch pr-checks targets and where it came from. */
+function describePrTarget({ branch, source }: DetectedDefaultBranch): string {
+  switch (source) {
+    case DefaultBranchSource.OriginHead:
+      return `pr-checks targets '${branch}', the default branch in origin/HEAD.`;
+    case DefaultBranchSource.RemoteHead:
+      return `pr-checks targets '${branch}', the default branch of the origin remote.`;
+    case DefaultBranchSource.Fallback:
+      return `pr-checks targets '${branch}': no origin remote named a default branch. Edit .kici/workflows/pr-checks.ts if yours differs.`;
+  }
+}
+
+/** True when `targetPath` is a directory; false when it is absent or anything else. */
+async function isDirectory(targetPath: string): Promise<boolean> {
+  try {
+    return (await stat(targetPath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 async function checkExists(targetPath: string): Promise<boolean> {
   try {
     await access(targetPath);
@@ -269,31 +308,6 @@ async function selectWorkflows(): Promise<string[]> {
   }
 
   return selected;
-}
-
-/** origin/HEAD (set after clone), then the current branch, then 'main'. */
-async function detectDefaultBranch(): Promise<string> {
-  // zx keeps the working directory it had at import; read the repository the
-  // scaffold is written into.
-  const git = $({ cwd: process.cwd(), quiet: true });
-  try {
-    const result = await git`git symbolic-ref refs/remotes/origin/HEAD`;
-    const ref = result.stdout.trim();
-    const branch = ref.replace('refs/remotes/origin/', '');
-    if (branch) return branch;
-  } catch {
-    // origin/HEAD not set (e.g. git init without remote)
-  }
-
-  try {
-    const result = await git`git rev-parse --abbrev-ref HEAD`;
-    const branch = result.stdout.trim();
-    if (branch && branch !== 'HEAD') return branch;
-  } catch {
-    // Not a git repo or detached HEAD
-  }
-
-  return 'main';
 }
 
 /**

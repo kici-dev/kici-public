@@ -43,7 +43,7 @@ import {
 import { MatrixExpansionError } from './dynamic-job-serializer.js';
 import { runGlobalEvalRound } from './global-eval-runner.js';
 import { runEvalChild } from './sandbox/eval-fork-runner.js';
-import { buildCloneRequest } from './sandbox/fork-runner.js';
+import { buildCloneRequest, resolveRunnerUser } from './sandbox/fork-runner.js';
 import type { EvalRequest } from './sandbox/ipc-protocol.js';
 import type { GlobalEvalRoundJobConfig } from './global-eval-types.js';
 import { jobWorkspaceLayout } from './job-workspace-layout.js';
@@ -609,8 +609,14 @@ export class JobRunner {
       this.activeSandbox = null;
       this.betweenJobsFacts = null;
       this.jobGitCredentials.delete(jobId);
-      await gitCredentials?.close().catch(() => {
-        /* best effort — the socket lives in the job dir, reaped with it */
+      // Closes the socket and deletes any SSH key a write window wrote, then
+      // removes the credential directory itself (under the OS temp dir, not
+      // the job workdir, so nothing else reaps it).
+      await gitCredentials?.credentials.close().catch(() => {
+        /* best effort: a failed close must not stop the directory removal */
+      });
+      await gitCredentials?.removeDir().catch(() => {
+        /* best effort: the job is already reported */
       });
 
       // Owns the workdir deletion so the out-of-band cleanup re-run can use the
@@ -634,13 +640,19 @@ export class JobRunner {
   private async startGitCredentials(
     jobId: string,
     jobConfig: Record<string, unknown>,
-  ): Promise<JobGitCredentials | undefined> {
+  ): Promise<{ credentials: JobGitCredentials; removeDir: () => Promise<void> } | undefined> {
     if (!this._sendApiRequest) return undefined;
+    let removeDir: (() => Promise<void>) | undefined;
     try {
-      const { path: dir } = await makeTempDir(`gitcred-${jobId}`);
+      const { path: dir, cleanup } = await makeTempDir(`gitcred-${jobId}`);
+      removeDir = cleanup;
+      // A KICI_RUNNER_USER runner has another uid: it must own the helper and
+      // any SSH key it reads. Only the bare-metal backend runs as that user.
+      const owner = resolveRunnerUser(this.config.runnerUser);
       const credentials = await startJobGitCredentials({
         jobId,
         dir,
+        ...(owner ? { owner } : {}),
         sendApiRequest: this._sendApiRequest,
         // The job's `gitCredentials`, carried from the lock through `jobConfig`.
         // Values are secret names: the agent resolves nothing, and the
@@ -650,8 +662,9 @@ export class JobRunner {
           Readonly<Record<string, Readonly<Record<string, string>>>> | undefined,
       });
       this.jobGitCredentials.set(jobId, credentials);
-      return credentials;
+      return { credentials, removeDir: cleanup };
     } catch (err) {
+      await removeDir?.().catch(() => undefined);
       logger.warn('Could not start git credentials for job; git push will not work', {
         jobId,
         error: toErrorMessage(err),
@@ -837,7 +850,10 @@ export class JobRunner {
         abortController,
         logStreamers,
       );
-      jobFailed = result.status !== ExecutionJobStatus.enum.success;
+      // A rule-skipped job is not a failure: no on-failure reset, as for success.
+      jobFailed =
+        result.status !== ExecutionJobStatus.enum.success &&
+        result.status !== ExecutionJobStatus.enum.skipped;
 
       this.reportExecutionResult(dispatch, result, logStreamers);
     } catch (error) {

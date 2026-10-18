@@ -6,11 +6,14 @@
  * - **orchestrator → Platform** (`orchCapabilitiesSchema`, sent in `auth.request`
  *   and rebroadcast as `orch.capabilities.update`): the orchestrator's role and
  *   the dashboard settings the Platform caches per org.
+ * - **orchestrator → agent** (`orchAgentCapabilitiesSchema`, on `register.ack`):
+ *   the job-status forms this orchestrator settles (`acceptsSkippedJobStatus`).
  * - **Platform → orchestrator** (`platformCapabilitiesSchema`, advertised once
- *   after auth), **orchestrator → agent** (`orchAgentCapabilitiesSchema`, on
- *   `register.ack`) and **agent → orchestrator** (`agentCapabilitiesSchema`, on
+ *   after auth) and **agent → orchestrator** (`agentCapabilitiesSchema`, on
  *   `agent.register`): each defines no flag at protocol 4 and is advertised
- *   empty. A later release adds a flag to one of them without a protocol bump.
+ *   empty.
+ *
+ * A release adds a flag to any of them without a protocol bump.
  *
  * Every schema uses `.passthrough()`, so a newer peer's unknown fields are
  * preserved rather than stripped.
@@ -70,12 +73,23 @@ export type PlatformCapabilities = z.infer<typeof platformCapabilitiesSchema>;
 export const PLATFORM_CAPABILITIES = Object.freeze({} satisfies PlatformCapabilities);
 
 /** Orchestrator -> agent capabilities, advertised on `register.ack`. */
-export const orchAgentCapabilitiesSchema = z.object({}).passthrough();
+export const orchAgentCapabilitiesSchema = z
+  .object({
+    /**
+     * This orchestrator settles an agent-reported `skipped` job status as
+     * terminal. An agent reports a rule-skipped job as `success` to an
+     * orchestrator without it, which would otherwise never settle the job.
+     */
+    acceptsSkippedJobStatus: z.boolean().optional(),
+  })
+  .passthrough();
 
 export type OrchAgentCapabilities = z.infer<typeof orchAgentCapabilitiesSchema>;
 
 /** Default orchestrator -> agent capabilities advertised on register.ack. */
-export const ORCH_AGENT_CAPABILITIES = Object.freeze({} satisfies OrchAgentCapabilities);
+export const ORCH_AGENT_CAPABILITIES = Object.freeze({
+  acceptsSkippedJobStatus: true,
+} satisfies OrchAgentCapabilities);
 
 /** Agent -> orchestrator capabilities, advertised on `agent.register`. */
 export const agentCapabilitiesSchema = z.object({}).passthrough();

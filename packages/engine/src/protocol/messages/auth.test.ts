@@ -67,6 +67,38 @@ describe('authSuccessSchema', () => {
     expect(authSuccessSchema.parse(roundTripped)).toEqual(validSuccess);
   });
 
+  // fails-when: the schema does not declare dashboardUrl, so z.object strips it and a
+  //   newer orchestrator never learns the dashboard base.
+  it('carries dashboardUrl when the Platform sends it', () => {
+    expect(
+      authSuccessSchema.parse({ ...validSuccess, dashboardUrl: 'https://app.kici.dev' })
+        .dashboardUrl,
+    ).toBe('https://app.kici.dev');
+  });
+
+  // breaks-if-wrong: a required dashboardUrl makes every orchestrator refuse an older
+  //   Platform's handshake.
+  it('accepts an auth.success without dashboardUrl (older Platform)', () => {
+    const parsed = authSuccessSchema.parse(validSuccess);
+    expect(parsed).not.toHaveProperty('dashboardUrl');
+  });
+
+  // fails-when: the field gains .url() or .min(1); an odd Platform value would then
+  //   refuse the whole handshake instead of producing an odd link.
+  it('accepts any string dashboardUrl', () => {
+    expect(
+      authSuccessSchema.safeParse({ ...validSuccess, dashboardUrl: 'not a url' }).success,
+    ).toBe(true);
+    expect(authSuccessSchema.safeParse({ ...validSuccess, dashboardUrl: '' }).success).toBe(true);
+  });
+
+  // The Platform omits the key when it has no base; a null is not a valid value.
+  it('refuses a null dashboardUrl', () => {
+    expect(authSuccessSchema.safeParse({ ...validSuccess, dashboardUrl: null }).success).toBe(
+      false,
+    );
+  });
+
   it('carries the canonical orgId and orgPublicAlias', () => {
     const msg = authSuccessSchema.parse(validSuccess);
     expect(msg.orgId).toBe('org_abc123def456');

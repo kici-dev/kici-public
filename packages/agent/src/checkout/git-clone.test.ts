@@ -330,7 +330,7 @@ describe('gitClone', () => {
     expect(env!.GIT_SSH_COMMAND).toContain('StrictHostKeyChecking=accept-new');
     // Per-call known_hosts even for accept-new: otherwise ssh falls back to the
     // runtime user's ~/.ssh/known_hosts, where a stale entry can block the clone.
-    expect(env!.GIT_SSH_COMMAND).toContain('UserKnownHostsFile=');
+    expect(env!.GIT_SSH_COMMAND).toMatch(/'UserKnownHostsFile="[^"]+\/known_hosts"'/);
   });
 
   it('writes known_hosts and sets StrictHostKeyChecking=yes for pinned ssh', async () => {
@@ -350,7 +350,7 @@ describe('gitClone', () => {
     const cloneCall = execFileSyncCalls[0];
     const env = cloneCall.opts.env as Record<string, string> | undefined;
     expect(env!.GIT_SSH_COMMAND).toContain('StrictHostKeyChecking=yes');
-    expect(env!.GIT_SSH_COMMAND).toContain('UserKnownHostsFile=');
+    expect(env!.GIT_SSH_COMMAND).toMatch(/'UserKnownHostsFile="[^"]+\/known_hosts"'/);
   });
 
   describe('credential helper configuration', () => {

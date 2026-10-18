@@ -28,6 +28,7 @@ import {
   reservedEventNamePrefix,
   LogStream,
   TimeoutReason,
+  repoIdentifierFromUrl,
 } from '@kici-dev/engine';
 import type { ChangedFilesStatus } from '@kici-dev/engine';
 import { computeChangedFiles } from '../../checkout/changed-files.js';
@@ -139,7 +140,9 @@ import {
 } from '../workflow-loader.js';
 import type { SdkOutputSetters } from '../workflow-loader.js';
 import type { GeneratorRepoPair } from '../generator-context.js';
-import { applyGlobalWorkflowEnv, repoIdentifierFromUrl } from '../global-workflow-env.js';
+import { applyGlobalWorkflowEnv } from '../global-workflow-env.js';
+import { openSshWriteWindow } from './ssh-write-window.js';
+import { failJobOnMissingSshClient } from './ssh-client-preflight.js';
 import { restoreSource } from '../source-restore.js';
 import { evaluateRules, createRuleContext, type RuleEvaluationResult } from '../rule-evaluator.js';
 import { applyOverlay } from '../overlay-applier.js';
@@ -419,6 +422,11 @@ function waitForGitGrant(requestId: string): Promise<GitGrantResponseIpc> {
 /**
  * Open a write window for one repository, run `fn`, and close it. The revoke rides a
  * `finally`; the agent's TTL is the backstop if this process dies outright.
+ *
+ * `window` names the checkout and whether this runner's git can read files the
+ * agent writes. When the credential is an SSH key, the agent answers with an ssh
+ * command, set as the checkout's `core.sshCommand` around `fn` and released
+ * BEFORE the revoke, so the agent never deletes a key a live setting names.
  */
 export async function withRepoWrite(
   repository: string,
@@ -426,6 +434,7 @@ export async function withRepoWrite(
   fn: () => Promise<void>,
   send: (msg: RunnerToAgentMessage) => void,
   wait: (requestId: string) => Promise<GitGrantResponseIpc>,
+  window?: { repoPath: string; sshCapable: boolean },
 ): Promise<void> {
   const requestId = randomUUID();
   send({
@@ -435,24 +444,43 @@ export async function withRepoWrite(
     repository,
     permissions: opts.permissions ?? { contents: 'write' },
     ...(opts.credential ? { credentialName: opts.credential } : {}),
+    ...(window?.sshCapable ? { sshCapable: true } : {}),
   });
   const granted = await wait(requestId);
   if (granted.error) {
     throw new Error(`Cannot open a git write window for '${repository}': ${granted.error}`);
   }
 
-  try {
-    await fn();
-  } finally {
-    const revokeId = randomUUID();
+  const revoke = (): void => {
     send({
       type: 'git.grant.request',
-      requestId: revokeId,
+      requestId: randomUUID(),
       op: 'revoke',
       grantId: granted.grantId,
     });
     // Not awaited: the agent revokes on receipt, and a hung agent must not turn a
     // successful push into a failed step.
+  };
+
+  let releaseSsh: (() => void) | undefined;
+  if (granted.sshCommand) {
+    try {
+      if (!window) throw new Error('an SSH-key git credential needs the checkout path');
+      releaseSsh = openSshWriteWindow(window.repoPath, granted.sshCommand);
+    } catch (err) {
+      revoke();
+      throw new Error(`Cannot open a git write window for '${repository}': ${toErrorMessage(err)}`);
+    }
+  }
+
+  try {
+    await fn();
+  } finally {
+    try {
+      releaseSsh?.();
+    } finally {
+      revoke();
+    }
   }
 }
 /**
@@ -1522,6 +1550,8 @@ export function createSandboxStepContext(
           fn,
           sendMessage,
           waitForGitGrant,
+          // Only a host-path job's git can read the key the agent writes.
+          { repoPath: workDir, sshCapable: Boolean(request.credentialHelperPath) },
         ),
     },
     attestProvenance: buildAttestProvenanceFn(request, workDir, (o) => kici.oidc.token(o)),
@@ -2378,7 +2408,8 @@ export async function resolveChangedFilesForRules(
  *
  * - a rule's `check()` **threw** (`evaluationError`) → `failed` with the error:
  *   "couldn't decide" read as "don't run" would be a false green.
- * - a rule cleanly returned `false` → `success` with every step skipped.
+ * - a rule cleanly returned `false` → `skipped` with every step skipped, and an
+ *   `error` naming the first rule that did not pass.
  *
  * Pure, so it is unit-testable without `process.exit`.
  */
@@ -2404,10 +2435,12 @@ export function buildJobRuleCompletion(
     };
   }
 
+  const label = ruleResult.results.find((r) => !r.passed)?.label ?? 'unknown';
   return {
     type: 'job.complete',
-    status: ExecutionJobStatus.enum.success,
+    status: ExecutionJobStatus.enum.skipped,
     stepResults: skippedResults,
+    error: `rule '${label}' returned false`,
   };
 }
 
@@ -2811,6 +2844,8 @@ async function main(): Promise<void> {
       maskedSend,
       maskLine: (line) => masker.mask(line),
     });
+    // After init, so a client the init phase installed counts.
+    failJobOnMissingSshClient({ request, maskedSend });
   }
 
   // Phase 9b. A cleanup-only re-run passes no specs: a restore could clobber the

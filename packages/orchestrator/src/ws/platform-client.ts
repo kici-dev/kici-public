@@ -411,6 +411,8 @@ export class PlatformClient {
 
   private _githubWebhookUrl?: string | null;
 
+  private _dashboardUrl?: string;
+
   getOrgPublicAlias(): string | undefined {
     return this._orgPublicAlias;
   }
@@ -433,6 +435,15 @@ export class PlatformClient {
    */
   getGithubWebhookUrl(): string | null | undefined {
     return this._githubWebhookUrl;
+  }
+
+  /**
+   * The Platform's public dashboard base from the last `auth.success`, which the
+   * check-run reporter builds `details_url` from. `undefined` before the first
+   * successful auth, or when the Platform sends no base (or an empty one).
+   */
+  getDashboardUrl(): string | undefined {
+    return this._dashboardUrl;
   }
 
   constructor(options: PlatformClientOptions) {
@@ -1371,6 +1382,8 @@ export class PlatformClient {
     this._orgId = msg.orgId;
     this.onOrgIdentified?.({ orgId: msg.orgId, clusterId: this.clusterId ?? null });
     this._githubWebhookUrl = msg.githubWebhookUrl;
+    // Assigned on every auth, so a reconnect to a Platform that sends no base clears it.
+    this._dashboardUrl = msg.dashboardUrl || undefined;
     this.startHeartbeat();
     this.startClusterMembership();
 

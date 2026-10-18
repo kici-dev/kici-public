@@ -20,7 +20,8 @@ import { tsconfigTemplate } from './tsconfig-json.js';
 export { helloWorldWorkflow } from './workflows/hello-world.js';
 export { prChecksWorkflow } from './workflows/pr-checks.js';
 export { generatePackageJson } from './package-json.js';
-export { generateSampleFixture, rewriteTemplateDefaultBranch } from './default-branch.js';
+export { generateSampleFixture } from './default-branch.js';
+export { scaffoldPrChecks } from './pr-checks-scaffold.js';
 export { VersionPin, resolveVersionPin } from './version-pin.js';
 export { tsconfigTemplate } from './tsconfig-json.js';
 export { agentsMdTemplate } from './agents-md.js';
@@ -35,6 +36,9 @@ export const workflowPaths = {
   'hello-world': path.join(__dirname, 'workflows', 'hello-world.ts'),
   'pr-checks': path.join(__dirname, 'workflows', 'pr-checks.ts'),
 } as const;
+
+/** The workflow `kici init` fits to the repository with `scaffoldPrChecks`. */
+export const PR_CHECKS_WORKFLOW = 'pr-checks' satisfies keyof typeof workflowPaths;
 
 /**
  * Real workflow objects map

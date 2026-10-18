@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from 'node:util';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { WorkflowDecision } from '@kici-dev/engine';
 import type { LockWorkflow } from '../types.js';
@@ -44,8 +45,45 @@ describe('displayDryRun', () => {
     expect(out).toContain('DRY RUN');
     expect(out).toContain('Workflow: ci');
     expect(out).toContain('build');
-    expect(out).toContain('run');
+    const lines = out.split('\n').map((l) => stripVTControlCharacters(l));
+    // fails-when: the step bullet prints an empty name ('        - ')
+    expect(lines).toContain('        - run');
     expect(out).toContain('Dry run complete');
+  });
+
+  it('prints a parallel group with its children under it', () => {
+    const wf = {
+      ...lockWorkflow,
+      jobs: [
+        {
+          _type: 'static',
+          name: 'build',
+          runsOn: [],
+          needs: [],
+          steps: [
+            { name: 'build' },
+            {
+              kind: 'parallel',
+              name: 'checks',
+              failFast: true,
+              children: [{ name: 'lint' }, { name: 'step-1' }],
+            },
+          ],
+        },
+      ],
+    } as unknown as LockWorkflow;
+    displayDryRun([wf], [decision], {});
+    const lines = loggerInfo.mock.calls.map((c) => stripVTControlCharacters(String(c[0])));
+    const start = lines.indexOf('      steps (3):');
+    // fails-when: the header counts the group wrapper ('steps (2):') or drops its children
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(lines.slice(start, start + 5)).toEqual([
+      '      steps (3):',
+      '        - build',
+      '        - checks (parallel)',
+      '          - lint',
+      '          - step-1',
+    ]);
   });
 
   it('never renders init-job lines (dynamic values resolve in the agent init round)', () => {

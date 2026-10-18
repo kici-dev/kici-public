@@ -182,7 +182,9 @@ In interactive mode (TTY), `kici init` prompts you to:
 1. Select which workflow templates to include
 2. Optionally install a pre-commit hook
 
-**Default branch:** `kici init` detects the default branch of the repository: the `origin` HEAD, else the current branch, else `main`. The `pr-checks` workflow targets that branch, and the sample fixture in `tests/push-test.ts` simulates a push to it.
+**Default branch:** `kici init` finds the default branch of the repository from `origin/HEAD`. If that is not set, it asks the `origin` remote for its HEAD. If neither names a branch, it uses `main`. It never uses the branch you have checked out. The `pr-checks` workflow targets the default branch, and `kici init` prints the branch it chose. The sample fixture in `tests/push-test.ts` simulates a push to the branch you have checked out. On a detached `HEAD`, the fixture uses the default branch.
+
+**Source directory:** if the repository has a `src/` directory, `pr-checks` runs only when a pull request changes files under `src/`. If it has no `src/` directory, `pr-checks` has no `paths` filter and no `require-src-changes` rule, so it runs on every pull request.
 
 **Host-OS runsOn:** the scaffolded workflows target `kici:os:<your OS>` — `kici init` detects the host operating system (like it detects the default branch) and writes `kici:os:linux`, `kici:os:macos`, or `kici:os:windows` so your very first `kici run push --local` dispatches on this machine. A workflow authored on one OS and run locally on another prints a hint naming the OS it wants versus the host it found.
 

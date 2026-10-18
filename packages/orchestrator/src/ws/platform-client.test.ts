@@ -157,6 +157,44 @@ describe('PlatformClient', () => {
     });
   });
 
+  describe('getDashboardUrl', () => {
+    /** Authenticates once per frame on one socket, returning the base after each. */
+    function basesAfter(...extras: Array<Record<string, unknown>>): Array<string | undefined> {
+      const client = createClient();
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      return extras.map((extra) => {
+        simulateMessage(mock, {
+          type: 'auth.success',
+          connectionId: 'c1',
+          orgId: 'org_a',
+          orgPublicAlias: 'oal_test',
+          githubWebhookUrl: null,
+          ...extra,
+        });
+        return client.getDashboardUrl();
+      });
+    }
+
+    it('is undefined before auth', () => {
+      expect(createClient().getDashboardUrl()).toBeUndefined();
+    });
+
+    // fails-when: handleAuthSuccess only assigns when the field is present, so a
+    //   reconnect to a Platform that sends no base keeps linking to the old one.
+    it('tracks the base of the last auth.success, clearing it when omitted', () => {
+      expect(basesAfter({ dashboardUrl: 'https://app.kici.dev' }, {})).toEqual([
+        'https://app.kici.dev',
+        undefined,
+      ]);
+    });
+
+    it('treats an empty base as absent', () => {
+      expect(basesAfter({ dashboardUrl: '' })).toEqual([undefined]);
+    });
+  });
+
   describe('connection lifecycle', () => {
     it('starts in disconnected state', () => {
       const client = createClient();

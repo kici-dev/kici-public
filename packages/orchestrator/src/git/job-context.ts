@@ -11,7 +11,7 @@
 
 import type { Kysely } from 'kysely';
 import type { TrustTier } from '@kici-dev/engine';
-import { TrustTierSchema } from '@kici-dev/engine';
+import { TrustTierSchema, repoIdentifierFromUrl } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import type { JobCredentialContext } from '../ws/git-credential-relay.js';
 
@@ -60,37 +60,57 @@ function asDeclaredCredentials(raw: unknown): DeclaredCredentials | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** What the job's dispatch record contributes to the credential context. */
+interface DispatchRecordFacts {
+  declared: DeclaredCredentials | undefined;
+  /** `owner/repo` of the clone URL the orchestrator chose for this job's checkout. */
+  checkoutRepo: string | undefined;
+}
+
 /**
- * The declaration as it was written into the job's DISPATCH record.
+ * The job's DISPATCH record: its declaration and its checkout URL.
  *
- * This is the copy that exists before the agent can act on the job. The
- * pipeline sends the dispatch first and persists `execution_jobs` afterwards
- * (`recordRunStart` runs once the whole dispatch loop has finished), so an
- * agent whose first credential request lands inside that window finds no job
- * row at all — and a missing row read as "declared nothing" refuses a
- * credential the workflow correctly declared. `dispatch_queue` is written by
- * `insertDispatched` / `enqueue` BEFORE `onDispatch` puts the job on the wire,
- * so by the time any agent can ask, this row is there.
+ * The declaration here is the copy that exists before the agent can act on
+ * the job. The pipeline sends the dispatch first and persists `execution_jobs`
+ * afterwards (`recordRunStart` runs once the whole dispatch loop has
+ * finished), so an agent whose first credential request lands inside that
+ * window finds no job row at all — and a missing row read as "declared
+ * nothing" refuses a credential the workflow correctly declared.
+ * `dispatch_queue` is written by `insertDispatched` / `enqueue` BEFORE
+ * `onDispatch` puts the job on the wire, so by the time any agent can ask,
+ * this row is there.
  *
  * It is the same value from the same lock entry that `execution_jobs` receives
  * — `buildJobConfig` and the tracked row both copy `lockJob.gitCredentials`
  * verbatim — and nothing an agent sends ever reaches it, so reading it can
  * admit exactly what the lock declared and nothing more.
+ *
+ * `repo_url` is the clone URL the orchestrator wrote for this job, so the
+ * repository it names is the job's own checkout, whatever its URL scheme.
  */
-async function declaredFromDispatchRecord(
+async function readDispatchRecord(
   db: Kysely<Database>,
   jobId: string,
-): Promise<DeclaredCredentials | undefined> {
-  if (!UUID.test(jobId)) return undefined;
+): Promise<DispatchRecordFacts> {
+  const none: DispatchRecordFacts = { declared: undefined, checkoutRepo: undefined };
+  if (!UUID.test(jobId)) return none;
   const row = await db
     .selectFrom('dispatch_queue')
-    .select('job_config')
+    .select(['job_config', 'repo_url'])
     .where('id', '=', jobId)
     .executeTakeFirst();
-  if (!row?.job_config) return undefined;
+  if (!row) return none;
+  const checkoutRepo = row.repo_url ? repoIdentifierFromUrl(row.repo_url) : undefined;
+  return { declared: declaredFromJobConfig(row.job_config), checkoutRepo };
+}
+
+function declaredFromJobConfig(
+  jobConfig: string | null | undefined,
+): DeclaredCredentials | undefined {
+  if (!jobConfig) return undefined;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(row.job_config);
+    parsed = JSON.parse(jobConfig);
   } catch {
     return undefined;
   }
@@ -168,8 +188,8 @@ export function createJobCredentialContextReader(db: Kysely<Database>) {
     // declared one being refused during the window before the tracked row
     // exists. Nothing found anywhere stays "declared nothing", which refuses
     // every workflow-supplied ref.
-    const declaredCredentials =
-      asDeclaredCredentials(job?.git_credentials) ?? (await declaredFromDispatchRecord(db, jobId));
+    const dispatch = await readDispatchRecord(db, jobId);
+    const declaredCredentials = asDeclaredCredentials(job?.git_credentials) ?? dispatch.declared;
 
     return {
       orgId: run.customer_id,
@@ -178,6 +198,7 @@ export function createJobCredentialContextReader(db: Kysely<Database>) {
       trustTier: parseTrustTier(run.trust_tier),
       ...resolveCredentialPolicy(run),
       triggerType: run.trigger_event ?? '',
+      ...(dispatch.checkoutRepo ? { checkoutRepo: dispatch.checkoutRepo } : {}),
     };
   };
 }

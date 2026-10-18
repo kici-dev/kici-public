@@ -17,6 +17,7 @@ export {
 } from './request-context.js';
 export { formatBytes } from './format-bytes.js';
 export { shQuote } from './shell-quote.js';
+export { sshFileListOption } from './ssh-option.js';
 export { redactConfig, scrubText } from './diagnostics-redaction.js';
 export { REPO_ANCHOR, HOME_ANCHOR } from './cache-anchors.js';
 export { formatDuration, formatUptime } from './format-duration.js';

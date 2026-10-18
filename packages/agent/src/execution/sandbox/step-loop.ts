@@ -708,7 +708,7 @@ async function evaluateStepRulesAndMaybeSkip(
   opts.sendIpc({
     type: 'step.complete',
     stepIndex,
-    status: ExecutionStepStatus.enum.failed, // IPC says failed; the returned result says skipped
+    status: ExecutionStepStatus.enum.skipped,
     durationMs: 0,
   });
   opts.sendIpc({

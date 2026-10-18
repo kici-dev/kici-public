@@ -287,6 +287,7 @@ Under the default profile, any variable not in the allowlist is stripped, includ
 - Optional bubblewrap (bwrap) wrapping:
   - `child_process.spawn('bwrap', [...args, node, runner])` with stdio IPC fd
   - Read-only system mounts, writable workspace at `/workspace`
+  - Read-only binds, placed after the private `/tmp`, for a `file://` clone source and for the job's git credential directory (credential helper, its socket, SSH-key files for a write window)
   - PID and IPC namespace isolation (`--unshare-pid`, `--unshare-ipc`)
   - Network isolation via `--unshare-net` (loopback only, no external connectivity)
   - Die-with-parent and new-session for lifecycle safety
@@ -441,7 +442,7 @@ Agent                    Orchestrator
 
 **agent.register** (agent to orchestrator): The agent sends its labels, max concurrent job count, and optional agent ID.
 
-**register.ack** (orchestrator to agent): The orchestrator confirms the registration and sends back the agent's confirmed configuration: agentId, labels, and scalerManaged flag.
+**register.ack** (orchestrator to agent): The orchestrator confirms the registration and sends back the agent's confirmed configuration: agentId, labels, and scalerManaged flag. It also carries the orchestrator's agent-facing capabilities. `acceptsSkippedJobStatus` tells the agent that the orchestrator settles a `skipped` job status. Without it, the agent reports a rule-skipped job as `success`, which an older orchestrator settles.
 
 **config.ack** (agent to orchestrator): The agent confirms it received and applied the register.ack config. For Firecracker/scaler-managed agents, this is sent after blocking MMDS access via iptables.
 

@@ -1,6 +1,6 @@
 import pc from 'picocolors';
 import { logger } from '@kici-dev/core';
-import type { LockWorkflow, LockJob } from '../types.js';
+import { isLockParallelStep, type LockWorkflow, type LockJob } from '../types.js';
 import { formatLabelMatchers, type WorkflowDecision } from '@kici-dev/engine';
 
 interface DryRunOptions {
@@ -71,9 +71,20 @@ export function displayDryRun(
         }
       }
 
-      logger.info(pc.gray(`      steps (${job.steps.length}):`));
+      const stepCount = job.steps.reduce(
+        (n, s) => n + (isLockParallelStep(s) ? s.children.length : 1),
+        0,
+      );
+      logger.info(pc.gray(`      steps (${stepCount}):`));
       for (const step of job.steps) {
-        logger.info(pc.gray(`        - ${step.name}`));
+        if (isLockParallelStep(step)) {
+          logger.info(pc.gray(`        - ${step.name} (parallel)`));
+          for (const child of step.children) {
+            logger.info(pc.gray(`          - ${child.name}`));
+          }
+        } else {
+          logger.info(pc.gray(`        - ${step.name}`));
+        }
       }
     }
 

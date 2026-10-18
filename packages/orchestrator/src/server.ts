@@ -1754,13 +1754,17 @@ export async function runServer(
             );
           }
 
-          // Late-bind the public-alias resolver on the check-run emitter.
-          // The reporter was constructed in orchestrator-core (before
-          // PlatformClient existed); the resolver pulls the alias that
-          // Platform supplies on `auth.success`, so `details_url` on each
-          // outbound check run points at the dashboard's alias resolver
-          // route instead of leaking the canonical `org_<12-char>` id.
+          // Late-bind the public-alias and dashboard-base resolvers on the
+          // check-run emitter. The reporter was constructed in
+          // orchestrator-core (before PlatformClient existed); both resolvers
+          // pull what the Platform supplies on `auth.success`, so
+          // `details_url` on each outbound check run points at the
+          // dashboard's alias resolver route instead of leaking the canonical
+          // `org_<12-char>` id, with no KICI_DASHBOARD_URL needed.
           sub.checkRunReporter.setOrgPublicAliasResolver(() => platformClient.getOrgPublicAlias());
+          sub.checkRunReporter.setPlatformDashboardUrlResolver(() =>
+            platformClient.getDashboardUrl(),
+          );
 
           logPullSendFn = (msg) => platformClient.sendRaw(msg);
 

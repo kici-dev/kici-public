@@ -121,6 +121,47 @@ describe('reportJobCheckRunCompletion', () => {
     expect(updateJobStatus).not.toHaveBeenCalled();
   });
 
+  describe('a skipped job names its reason', () => {
+    function reported(input: {
+      status: ExecutionJobStatus;
+      data?: Record<string, unknown>;
+      description?: string;
+    }) {
+      const { updateJobStatus, deps } = makeDeps();
+      reportJobCheckRunCompletion(deps, { runId: 'run-1', jobId: 'job-1', jobName: 'x', ...input });
+      return updateJobStatus.mock.calls[0][0] as { description?: string };
+    }
+
+    it('describes a skip by its reason', () => {
+      // fails-when: a skipped status carries no description, so the check reads a bare "Job skipped".
+      expect(
+        reported({
+          status: ExecutionJobStatus.enum.skipped,
+          data: { error: 'upstream_unmet: build (failed)' },
+        }).description,
+      ).toBe('Job skipped: upstream_unmet: build (failed)');
+    });
+
+    it('keeps an explicit description', () => {
+      expect(
+        reported({
+          status: ExecutionJobStatus.enum.skipped,
+          data: { error: 'upstream_unmet: build (failed)' },
+          description: 'explicit',
+        }).description,
+      ).toBe('explicit');
+    });
+
+    it.each([
+      [ExecutionJobStatus.enum.success, { error: 'not a reason' }],
+      [ExecutionJobStatus.enum.skipped, { error: 42 }],
+      [ExecutionJobStatus.enum.skipped, { error: '' }],
+    ])('leaves %s with %j to the mapper', (status, data) => {
+      // breaks-if-wrong: only a skipped job with a non-empty string reason is described.
+      expect(reported({ status, data }).description).toBeUndefined();
+    });
+  });
+
   it('builds a failure description from the agent payload on failure', () => {
     const { updateJobStatus, deps } = makeDeps();
 
@@ -156,14 +197,14 @@ describe('reportJobCheckRunCompletion', () => {
     );
   });
 
-  it('leaves the description to the mapper for non-failure terminal statuses', () => {
+  it('leaves the description to the mapper for a cancelled job', () => {
     const { updateJobStatus, deps } = makeDeps();
 
     reportJobCheckRunCompletion(deps, {
       runId: 'run-1',
       jobId: 'job-1',
       jobName: 'build',
-      status: ExecutionJobStatus.enum.skipped,
+      status: ExecutionJobStatus.enum.cancelled,
       data: { error: 'condition not met' },
     });
 

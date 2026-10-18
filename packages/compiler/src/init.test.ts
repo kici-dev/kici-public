@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { logger } from '@kici-dev/core';
@@ -11,6 +12,7 @@ describe('kici init', () => {
   let tempDir: string;
   let originalCwd: string;
   let originalCI: string | undefined;
+  let originalCeiling: string | undefined;
 
   beforeEach(async () => {
     originalCwd = process.cwd();
@@ -22,11 +24,16 @@ describe('kici init', () => {
     const packageDir = path.resolve(import.meta.dirname, '..');
     tempDir = await fs.mkdtemp(path.join(packageDir, '.test-init-'));
     process.chdir(tempDir);
+    // tempDir sits inside this checkout: keep git from reading the checkout's origin.
+    originalCeiling = process.env.GIT_CEILING_DIRECTORIES;
+    process.env.GIT_CEILING_DIRECTORIES = path.dirname(tempDir);
   });
 
   afterEach(async () => {
     process.chdir(originalCwd);
     process.env.CI = originalCI;
+    if (originalCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+    else process.env.GIT_CEILING_DIRECTORIES = originalCeiling;
     delete process.env.KICI_DEV;
     delete process.env.KICI_DEV_REGISTRY;
     await fs.rm(tempDir, { recursive: true, force: true });
@@ -357,28 +364,23 @@ describe('kici init', () => {
   });
 
   describe('default branch', () => {
+    const COMMIT_FLAGS = [
+      '-c',
+      'user.email=init@test.kici.dev',
+      '-c',
+      'user.name=init test',
+      '-c',
+      'commit.gpgsign=false',
+      '-c',
+      'core.hooksPath=/dev/null',
+    ];
+
     /** Make tempDir its own git repository whose only branch is `branch`. */
     function gitInitOn(branch: string): void {
       execFileSync('git', ['init', '-q', '-b', branch], { cwd: tempDir });
-      execFileSync(
-        'git',
-        [
-          '-c',
-          'user.email=init@test.kici.dev',
-          '-c',
-          'user.name=init test',
-          '-c',
-          'commit.gpgsign=false',
-          '-c',
-          'core.hooksPath=/dev/null',
-          'commit',
-          '-q',
-          '--allow-empty',
-          '-m',
-          'init',
-        ],
-        { cwd: tempDir },
-      );
+      execFileSync('git', [...COMMIT_FLAGS, 'commit', '-q', '--allow-empty', '-m', 'init'], {
+        cwd: tempDir,
+      });
     }
 
     /** Scaffold into a repository on `branch`; return a generated file under .kici/. */
@@ -393,20 +395,76 @@ describe('kici init', () => {
       expect(await scaffoldOn('develop', 'tests/push-test.ts')).toContain('push-develop');
     });
 
-    it('writes a loadable fixture and a pr-checks target for a slash-named branch', async () => {
+    async function readPrChecks(): Promise<string> {
+      return fs.readFile(path.join(tempDir, '.kici', 'workflows', 'pr-checks.ts'), 'utf-8');
+    }
+
+    it('writes a loadable fixture for a slash-named branch, and targets main with no remote', async () => {
       const fixture = await scaffoldOn('ci/kici', 'tests/push-test.ts');
       // fails-when: init interpolates the raw branch (`export const pushCi/kici`)
       expect(fixture).toContain('export const pushCiKici = fixture("push-ci/kici", {');
       expect(fixture).toContain('event: push({ branches: ["ci/kici"] }),');
       expect(fixture).toContain('branch: "ci/kici",');
 
-      const prChecks = await fs.readFile(
-        path.join(tempDir, '.kici', 'workflows', 'pr-checks.ts'),
+      // No remote and no src/: the target is main and there is no paths filter.
+      // fails-when: the PR target follows the checked-out branch (#496)
+      expect(await readPrChecks()).toContain("on: pr({ target: 'main' }),");
+    });
+
+    it('targets the origin default branch from a feature branch, and keeps paths with src/', async () => {
+      const originRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'kici-init-origin-'));
+      try {
+        const seed = path.join(originRoot, 'seed');
+        await fs.mkdir(seed);
+        execFileSync('git', ['init', '-q', '-b', 'trunk'], { cwd: seed });
+        execFileSync('git', [...COMMIT_FLAGS, 'commit', '-q', '--allow-empty', '-m', 'seed'], {
+          cwd: seed,
+        });
+        const bare = path.join(originRoot, 'origin.git');
+        execFileSync('git', ['clone', '-q', '--bare', seed, bare]);
+
+        // A remote added by hand never sets origin/HEAD, so this reaches ls-remote.
+        execFileSync('git', ['init', '-q', '-b', 'trunk'], { cwd: tempDir });
+        execFileSync('git', ['remote', 'add', 'origin', bare], { cwd: tempDir });
+        execFileSync('git', ['fetch', '-q', 'origin'], { cwd: tempDir });
+        execFileSync('git', ['checkout', '-q', '-b', 'feature/x', 'origin/trunk'], {
+          cwd: tempDir,
+        });
+        await fs.mkdir(path.join(tempDir, 'src'));
+
+        const info = vi.spyOn(logger, 'info');
+        expect(await initCommand({ skipInstall: true })).toBe(true);
+
+        const prChecks = await readPrChecks();
+        // fails-when: the target is the checked-out feature/x, or the ls-remote step is missing (main)
+        expect(prChecks).toContain("on: pr({ target: 'trunk', paths: ['src/**'] }),");
+        // breaks-if-wrong: a repository with src/ keeps the src/ rule
+        expect(prChecks).toContain("rule('require-src-changes'");
+        const fixture = await fs.readFile(
+          path.join(tempDir, '.kici', 'tests', 'push-test.ts'),
+          'utf-8',
+        );
+        // fails-when: the fixture follows the default branch instead of the checked-out one
+        expect(fixture).toContain('branch: "feature/x",');
+        // fails-when: init does not say which branch pr-checks targets
+        expect(
+          info.mock.calls.some(([line]) => String(line).includes("pr-checks targets 'trunk'")),
+        ).toBe(true);
+      } finally {
+        vi.restoreAllMocks();
+        await fs.rm(originRoot, { recursive: true, force: true });
+      }
+    });
+
+    it('uses main and push-main with no git repository', async () => {
+      expect(await initCommand({ skipInstall: true })).toBe(true);
+      // fails-when: git walks up into the enclosing checkout (its origin/HEAD is master)
+      expect(await readPrChecks()).toContain("on: pr({ target: 'main' }),");
+      const fixture = await fs.readFile(
+        path.join(tempDir, '.kici', 'tests', 'push-test.ts'),
         'utf-8',
       );
-      // fails-when: the rewrite looks for an anchor the template no longer carries
-      expect(prChecks).toContain('target: "ci/kici"');
-      expect(prChecks).not.toContain("target: 'main'");
+      expect(fixture).toContain('push-main');
     });
   });
 

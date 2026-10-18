@@ -11,7 +11,7 @@ type RunRow = {
   workflow_branch?: string | null;
 };
 type JobRow = { git_credentials: Record<string, Record<string, string>> | null };
-type DispatchRow = { job_config: string };
+type DispatchRow = { job_config: string; repo_url?: string };
 
 /** A dispatch-queue id is a uuid column, so the fixture uses a real one. */
 const JOB_ID = '3f9b6c02-3a1f-4c19-9a2f-6b0d1e7c4a55';
@@ -220,6 +220,37 @@ describe('createJobCredentialContextReader', () => {
     const tables = (db as unknown as { selectFrom: { mock: { calls: string[][] } } }).selectFrom
       .mock.calls;
     expect(tables.map((c) => c[0])).toEqual(['execution_runs', 'execution_jobs']);
+  });
+
+  it("names the job's checkout from the dispatch record's clone URL", async () => {
+    const read = createJobCredentialContextReader(
+      fakeDb({
+        execution_runs: RUN,
+        execution_jobs: { git_credentials: DECLARED },
+        dispatch_queue: { ...dispatchRow(undefined), repo_url: 'git@github.com:acme/main.git' },
+      }),
+    );
+    await expect(read('run-1', JOB_ID)).resolves.toMatchObject({ checkoutRepo: 'acme/main' });
+  });
+
+  it('keeps a file:// checkout URL whole', async () => {
+    const read = createJobCredentialContextReader(
+      fakeDb({
+        execution_runs: RUN,
+        dispatch_queue: { ...dispatchRow(DECLARED), repo_url: 'file:///srv/repos/app' },
+      }),
+    );
+    await expect(read('run-1', JOB_ID)).resolves.toMatchObject({
+      checkoutRepo: 'file:///srv/repos/app',
+      declaredCredentials: DECLARED,
+    });
+  });
+
+  it('names no checkout when the dispatch record is missing', async () => {
+    const read = createJobCredentialContextReader(fakeDb({ execution_runs: RUN }));
+    const ctx = await read('run-1', JOB_ID);
+    expect(ctx).not.toBeNull();
+    expect(ctx).not.toHaveProperty('checkoutRepo');
   });
 
   it('reads an absent trust tier as undefined — the lenient reading', async () => {

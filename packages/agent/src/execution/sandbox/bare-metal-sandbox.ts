@@ -12,6 +12,7 @@
  */
 
 import { access } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { createLogger } from '@kici-dev/shared';
 import { ExecutionJobStatus } from '@kici-dev/engine';
 import type {
@@ -109,8 +110,16 @@ export class BareMetalSandbox implements ExecutionSandbox {
   async executeJob(options: JobExecutionOptions): Promise<JobExecutionResult> {
     // Under bwrap, a `file://` repo URL (the internal provider clones local
     // repos) needs its source dir bound read-only, or the runner's `git clone`
-    // fails with `does not appear to be a git repository`.
-    const extraReadOnlyBinds = this.useBwrap ? fileCloneSourceBinds(options.dispatch.repoUrl) : [];
+    // fails with `does not appear to be a git repository`. The git credential
+    // directory (helper shim, socket, SSH write keys) lives under the host temp
+    // dir, which bwrap's private /tmp hides; a read-only bind still lets git run
+    // the shim, connect to the socket and ssh read a key.
+    const extraReadOnlyBinds = this.useBwrap
+      ? [
+          ...fileCloneSourceBinds(options.dispatch.repoUrl),
+          ...(options.credentialHelperPath ? [dirname(options.credentialHelperPath)] : []),
+        ]
+      : [];
     this.lastOptions = options;
 
     this.runner = createForkRunner(

@@ -32,6 +32,8 @@ vi.mock('@kici-dev/engine', () => ({
 
 vi.mock('../lockfile/generator.js', () => ({
   transformTriggers: vi.fn().mockReturnValue([]),
+  transformSteps: vi.fn().mockReturnValue([]),
+  detectGitRoot: vi.fn().mockReturnValue('/repo'),
 }));
 
 vi.mock('@kici-dev/core', () => ({

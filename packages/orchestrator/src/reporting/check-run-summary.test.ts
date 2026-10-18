@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+import { ExecutionJobStatus } from '@kici-dev/engine';
 import {
   buildCheckRunSummary,
   buildAnnotations,
@@ -31,6 +32,7 @@ describe('buildCheckRunSummary', () => {
 
     const summary = buildCheckRunSummary({
       jobName: 'ci/test',
+      jobStatus: ExecutionJobStatus.enum.success,
       stepResults,
       logBuffer,
       runId,
@@ -70,6 +72,7 @@ describe('buildCheckRunSummary', () => {
 
     const summary = buildCheckRunSummary({
       jobName: 'ci/test',
+      jobStatus: ExecutionJobStatus.enum.failed,
       stepResults,
       logBuffer,
       runId,
@@ -97,6 +100,7 @@ describe('buildCheckRunSummary', () => {
 
     const summary = buildCheckRunSummary({
       jobName: 'ci/build',
+      jobStatus: ExecutionJobStatus.enum.failed,
       stepResults,
       logBuffer,
       runId,
@@ -129,6 +133,7 @@ describe('buildCheckRunSummary', () => {
 
     const summary = buildCheckRunSummary({
       jobName: 'ci/test',
+      jobStatus: ExecutionJobStatus.enum.failed,
       stepResults,
       logBuffer,
       runId,
@@ -151,6 +156,7 @@ describe('buildCheckRunSummary', () => {
 
     const summary = buildCheckRunSummary({
       jobName: 'ci/test',
+      jobStatus: ExecutionJobStatus.enum.failed,
       stepResults,
       logBuffer,
       runId,
@@ -171,6 +177,7 @@ describe('buildCheckRunSummary', () => {
 
     const summary = buildCheckRunSummary({
       jobName: 'ci/build',
+      jobStatus: ExecutionJobStatus.enum.success,
       stepResults,
       logBuffer,
       runId,
@@ -190,6 +197,7 @@ describe('buildCheckRunSummary', () => {
 
     const summary = buildCheckRunSummary({
       jobName: 'ci/test',
+      jobStatus: ExecutionJobStatus.enum.failed,
       stepResults,
       logBuffer,
       runId,
@@ -211,6 +219,7 @@ describe('buildCheckRunSummary', () => {
 
     const summary = buildCheckRunSummary({
       jobName: 'ci/test',
+      jobStatus: ExecutionJobStatus.enum.failed,
       stepResults,
       logBuffer,
       runId,
@@ -227,6 +236,7 @@ describe('buildCheckRunSummary', () => {
 
     const summary = buildCheckRunSummary({
       jobName: 'ci/build',
+      jobStatus: ExecutionJobStatus.enum.success,
       stepResults,
       logBuffer,
       runId,
@@ -247,6 +257,7 @@ describe('buildCheckRunSummary', () => {
 
     const summary = buildCheckRunSummary({
       jobName: 'ci/deploy',
+      jobStatus: ExecutionJobStatus.enum.success,
       stepResults,
       logBuffer,
       runId,
@@ -473,6 +484,79 @@ describe('buildProgressText', () => {
   });
 });
 
+describe('buildCheckRunSummary headline follows the job status', () => {
+  const base = {
+    logBuffer: new StepLogBuffer(),
+    runId: 'run-1',
+    jobId: 'job-1',
+    traceIds,
+  };
+  const allSkipped: StepResultData[] = [{ name: 'publish', status: 'skipped', durationMs: 0 }];
+  const firstLine = (summary: string) => summary.split('\n')[0];
+
+  it('a rule-skipped job reads skipped and names the rule, never failed', () => {
+    const summary = buildCheckRunSummary({
+      ...base,
+      jobName: 'publish',
+      jobStatus: ExecutionJobStatus.enum.skipped,
+      skipReason: "rule 'push to main' returned false",
+      stepResults: allSkipped,
+    });
+    // fails-when: the headline is derived from step counts (all-skipped reads "failed").
+    expect(firstLine(summary)).toBe(
+      "**Job 'publish' skipped** — rule 'push to main' returned false",
+    );
+    expect(summary).not.toContain('failed');
+    expect(summary).toContain('| publish | \u23ED skipped |');
+  });
+
+  it('a skipped job without a reason reads skipped alone', () => {
+    const summary = buildCheckRunSummary({
+      ...base,
+      jobName: 'publish',
+      jobStatus: ExecutionJobStatus.enum.skipped,
+      stepResults: allSkipped,
+    });
+    expect(firstLine(summary)).toBe("**Job 'publish' skipped**");
+  });
+
+  it.each([
+    [ExecutionJobStatus.enum.success, "**Job 'x' passed** (1/2 steps passed)"],
+    [ExecutionJobStatus.enum.cancelled, "**Job 'x' cancelled** (1/2 steps passed)"],
+    [ExecutionJobStatus.enum.timed_out_stale, "**Job 'x' timed out** (1/2 steps passed)"],
+    // breaks-if-wrong: the failure headline keeps its wording.
+    [ExecutionJobStatus.enum.failed, "**Job 'x' failed** (1/2 steps passed)"],
+    [ExecutionJobStatus.enum.drift_dropped, "**Job 'x' failed** (1/2 steps passed)"],
+  ])('%s → %s', (jobStatus, headline) => {
+    const summary = buildCheckRunSummary({
+      ...base,
+      jobName: 'x',
+      jobStatus,
+      stepResults: [
+        { name: 'build', status: 'success', durationMs: 1 },
+        { name: 'deploy', status: 'skipped' },
+      ],
+    });
+    expect(firstLine(summary)).toBe(headline);
+  });
+
+  it('the minimal fallback keeps the skipped headline', () => {
+    const summary = buildCheckRunSummary({
+      ...base,
+      jobName: 'publish',
+      jobStatus: ExecutionJobStatus.enum.skipped,
+      skipReason: "rule 'push to main' returned false",
+      stepResults: allSkipped,
+      // Leaves no room for any rendered tier, so only the fallback can be returned.
+      reservedBytes: SUMMARY_BYTE_LIMIT,
+    });
+    expect(summary).toContain('_Summary truncated due to size limits._');
+    expect(firstLine(summary)).toBe(
+      "**Job 'publish' skipped** — rule 'push to main' returned false",
+    );
+  });
+});
+
 describe('the summary byte budget', () => {
   /**
    * Renders just under the cap — 64751 bytes, 784 of headroom: the only band where a caller's
@@ -490,6 +574,7 @@ describe('the summary byte budget', () => {
 
   const base = {
     jobName: 'test',
+    jobStatus: ExecutionJobStatus.enum.failed,
     logBuffer: new StepLogBuffer(),
     runId: 'run-1',
     jobId: 'job-1',

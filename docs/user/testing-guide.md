@@ -524,7 +524,7 @@ Running `kici init` in a new project scaffolds a sample test fixture alongside t
 .kiciignore            # Default exclusion patterns
 ```
 
-The generated fixture uses the detected default branch. On a `main` branch, the file contains this fixture:
+The generated fixture uses the branch you have checked out. On a detached `HEAD`, it uses the default branch. On a `main` branch, the file contains this fixture:
 
 <!-- prettier-ignore -->
 ```typescript

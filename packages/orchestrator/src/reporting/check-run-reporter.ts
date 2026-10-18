@@ -3,7 +3,7 @@
  *
  * - Check runs are created (queued) at trigger match time, before an agent picks up the job
  * - Per-job AND overall check runs: kici/{workflow} and kici/{workflow}/job/{job}
- * - Success ONLY if ALL jobs pass; cancelled/timed-out use the 'cancelled' conclusion
+ * - Success ONLY if ALL jobs pass; a skipped job or workflow uses GitHub's 'skipped' conclusion
  * - All API calls are fire-and-forget (non-blocking)
  *
  * Check run IDs are tracked after creation so later updates can call checks.update().
@@ -50,6 +50,7 @@ import {
   type TerminalJobStatus,
 } from '@kici-dev/engine';
 import { runDetached } from '../helpers/run-detached.js';
+import { GithubCheckConclusion } from './github-check-conclusion.js';
 
 interface CheckRunReporterDeps {
   /** Resolves GitHub App credentials by routing key from its CloneTokenProvider config. */
@@ -69,11 +70,17 @@ interface CheckRunReporterDeps {
     jobName: string,
   ) => SourceLocationData[] | undefined;
   /**
-   * Dashboard base URL (e.g. `https://dashboard.example.com/dashboard`). When set AND
-   * `getOrgPublicAlias()` returns an alias, every check-run create/update carries
-   * `details_url = <dashboardUrl>/r/orgs/<alias>/runs/<runId>`; otherwise no `details_url`.
+   * Dashboard base URL from `KICI_DASHBOARD_URL` (e.g.
+   * `https://dashboard.example.com/dashboard`). Overrides {@link getPlatformDashboardUrl}.
+   * With a base AND an alias from `getOrgPublicAlias()`, every check-run create/update
+   * carries `details_url = <base>/r/orgs/<alias>/runs/<runId>`; otherwise no `details_url`.
    */
   dashboardUrl?: string;
+  /**
+   * Typically `PlatformClient.getDashboardUrl()`: the dashboard base the Platform supplies
+   * on `auth.success`, used when `dashboardUrl` is unset or empty.
+   */
+  getPlatformDashboardUrl?: () => string | undefined;
   /**
    * Typically `PlatformClient.getOrgPublicAlias()`: the `oal_<12-char>` alias the Platform
    * supplies on `auth.success`, or `undefined` before auth completes.
@@ -324,12 +331,17 @@ export class CheckRunReporter {
   }
 
   /**
-   * Late-bound from `server.ts` / `standalone.ts` once `PlatformClient` exists: orchestrator-core
-   * can't pass it at construction because the platform client is created after the HTTP server
-   * starts.
+   * Late-bound from `server.ts` once `PlatformClient` exists: orchestrator-core can't pass it
+   * at construction because the platform client is created after the HTTP server starts.
+   * `standalone.ts` has no `PlatformClient`, so an independent orchestrator has no alias.
    */
   setOrgPublicAliasResolver(resolver: () => string | undefined): void {
     this.deps = { ...this.deps, getOrgPublicAlias: resolver };
+  }
+
+  /** Late-bound from `server.ts` beside {@link setOrgPublicAliasResolver}, for the same reason. */
+  setPlatformDashboardUrlResolver(resolver: () => string | undefined): void {
+    this.deps = { ...this.deps, getPlatformDashboardUrl: resolver };
   }
 
   /**
@@ -813,15 +825,17 @@ export class CheckRunReporter {
   }
 
   /**
-   * Dashboard public-alias link (`/r/orgs/<oal_xxx>/runs/<runId>`). Undefined when the
-   * dashboard URL or alias is missing, or runId is the `'N/A'` sentinel from `resolveTraceIds`.
+   * Dashboard public-alias link (`/r/orgs/<oal_xxx>/runs/<runId>`). The base is
+   * `KICI_DASHBOARD_URL` when set and non-empty, else the Platform-supplied base. Undefined
+   * when no base or alias is known, or runId is the `'N/A'` sentinel from `resolveTraceIds`.
    */
   private buildDetailsUrl(runId: string): string | undefined {
-    if (!this.deps.dashboardUrl) return undefined;
+    const configured = this.deps.dashboardUrl || this.deps.getPlatformDashboardUrl?.();
+    if (!configured) return undefined;
     if (!runId || runId === 'N/A') return undefined;
     const alias = this.deps.getOrgPublicAlias?.();
     if (!alias) return undefined;
-    const base = this.deps.dashboardUrl.replace(/\/+$/, '');
+    const base = configured.replace(/\/+$/, '');
     return `${base}/r/orgs/${alias}/runs/${runId}`;
   }
 
@@ -952,6 +966,7 @@ export class CheckRunReporter {
 
       summary = buildCheckRunSummary({
         jobName: opts.jobName,
+        jobStatus: opts.state,
         stepResults,
         logBuffer: this.deps.stepLogBuffer,
         runId: opts.runIdForLogs,
@@ -979,14 +994,22 @@ export class CheckRunReporter {
         }
       }
     } else if (
-      opts.state === ExecutionJobStatus.enum.success &&
+      // `skipped` with step results is the agent's rule skip; without them it is an
+      // orchestrator-set skip, described by the description path below.
+      (opts.state === ExecutionJobStatus.enum.success ||
+        opts.state === ExecutionJobStatus.enum.skipped) &&
       opts.data &&
       Array.isArray(opts.data.stepResults)
     ) {
       const stepResults = opts.data.stepResults as StepResultData[];
+      const skipReason = opts.data.error;
 
       summary = buildCheckRunSummary({
         jobName: opts.jobName,
+        jobStatus: opts.state,
+        ...(typeof skipReason === 'string' &&
+          skipReason !== '' &&
+          opts.state === ExecutionJobStatus.enum.skipped && { skipReason }),
         stepResults,
         logBuffer: this.deps.stepLogBuffer ?? ({ getLastLines: () => undefined } as any),
         runId: opts.runIdForLogs ?? '',
@@ -1436,7 +1459,7 @@ export class CheckRunReporter {
   private mapBuildConclusion(
     status: TerminalJobStatus,
     customDescription?: string,
-  ): { conclusion: CheckRunConclusion; description: string } {
+  ): { conclusion: GithubCheckConclusion; description: string } {
     switch (status) {
       case ExecutionJobStatus.enum.success:
         return {
@@ -1460,11 +1483,10 @@ export class CheckRunReporter {
             customDescription ?? 'Build became stale -- no heartbeat received from agent.',
         };
       case ExecutionJobStatus.enum.skipped:
-        // `CheckRunConclusion` has no `skipped` member, and adding one changes a provider
-        // vocabulary with its own consumers. `cancelled` is the closest "did not run" outcome
-        // and, like GitHub's skipped, does not block a branch; `success` would be a lie.
+        // GitHub's own `skipped` satisfies a required check, like a GitHub Actions job whose
+        // `if` is false; `cancelled` would block the branch.
         return {
-          conclusion: CheckRunConclusion.enum.cancelled,
+          conclusion: GithubCheckConclusion.enum.skipped,
           description: customDescription ?? 'Build skipped',
         };
       case ExecutionJobStatus.enum.drift_dropped:
@@ -1499,7 +1521,7 @@ export class CheckRunReporter {
   private mapJobConclusion(
     state: TerminalJobStatus,
     customDescription?: string,
-  ): { conclusion: CheckRunConclusion; description: string } {
+  ): { conclusion: GithubCheckConclusion; description: string } {
     switch (state) {
       case ExecutionJobStatus.enum.success:
         return {
@@ -1524,10 +1546,10 @@ export class CheckRunReporter {
             'Run became stale -- no heartbeat received. Agent may have died or become unresponsive.',
         };
       case ExecutionJobStatus.enum.skipped:
-        // `CheckRunConclusion` has no `skipped` member; `cancelled` is the
-        // closest available "did not run" outcome and does not block a branch.
+        // GitHub's own `skipped` satisfies a required check, like a GitHub Actions job whose
+        // `if` is false; `cancelled` would block the branch.
         return {
-          conclusion: CheckRunConclusion.enum.cancelled,
+          conclusion: GithubCheckConclusion.enum.skipped,
           description: customDescription ?? 'Job skipped',
         };
       case ExecutionJobStatus.enum.drift_dropped:
@@ -1539,7 +1561,7 @@ export class CheckRunReporter {
         };
       case ExecutionJobStatus.enum.unroutable:
         // A job that could not run must not satisfy a required check, so this
-        // is a `failure` rather than the `cancelled` used for `skipped`.
+        // is a `failure` rather than the `skipped` used for a skipped job.
         return {
           conclusion: CheckRunConclusion.enum.failure,
           description:
@@ -1562,7 +1584,7 @@ export class CheckRunReporter {
   private mapWorkflowConclusion(
     status: TerminalJobStatus,
     customDescription?: string,
-  ): { conclusion: CheckRunConclusion; description: string } {
+  ): { conclusion: GithubCheckConclusion; description: string } {
     switch (status) {
       case ExecutionJobStatus.enum.success:
         return {
@@ -1587,10 +1609,10 @@ export class CheckRunReporter {
             'One or more jobs became stale -- no heartbeat received from agent.',
         };
       case ExecutionJobStatus.enum.skipped:
-        // `CheckRunConclusion` has no `skipped` member; `cancelled` is the
-        // closest available "did not run" outcome and does not block a branch.
+        // GitHub's own `skipped` satisfies a required check, like a GitHub Actions job whose
+        // `if` is false; `cancelled` would block the branch.
         return {
-          conclusion: CheckRunConclusion.enum.cancelled,
+          conclusion: GithubCheckConclusion.enum.skipped,
           description: customDescription ?? 'Workflow skipped',
         };
       case ExecutionJobStatus.enum.drift_dropped:
@@ -1679,7 +1701,7 @@ export class CheckRunReporter {
       repo: string;
       check_run_id: number;
       status: 'completed' | 'in_progress';
-      conclusion?: CheckRunConclusion;
+      conclusion?: GithubCheckConclusion;
       completed_at?: string;
       output: {
         title: string;
@@ -1707,7 +1729,7 @@ export class CheckRunReporter {
       repo: string;
       check_run_id: number;
       status: 'completed' | 'in_progress';
-      conclusion?: CheckRunConclusion;
+      conclusion?: GithubCheckConclusion;
       completed_at?: string;
       output: {
         title: string;

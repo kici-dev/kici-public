@@ -1814,8 +1814,11 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
               onJobStatus?.(agentId, { runId, jobId, state, timestamp, data });
               break;
             }
+            // `skipped`: a job-level rule returned false. Terminal like success,
+            // but it produced no secret outputs and no cache upload to wait for.
             case ExecutionJobStatus.enum.success:
             case ExecutionJobStatus.enum.failed:
+            case ExecutionJobStatus.enum.skipped:
             case ExecutionJobStatus.enum.cancelled: {
               // Fire-and-forget.
               if (
@@ -1875,8 +1878,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
               break;
             }
             case ExecutionJobStatus.enum.pending:
-            case ExecutionJobStatus.enum.queued:
-            case ExecutionJobStatus.enum.skipped: {
+            case ExecutionJobStatus.enum.queued: {
               logger.debug('Job informational status', { agentId, runId, jobId, state });
               break;
             }

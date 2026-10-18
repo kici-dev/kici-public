@@ -2,6 +2,27 @@
 
 Release notes for the public KiCI packages.
 
+## v0.23.0 — 2026-10-18
+
+### Fixes
+
+- A job whose rule returns false now ends skipped instead of success. Its GitHub check reports skipped, and the check summary names the rule. Every skipped job's check now reports skipped instead of cancelled, so a skipped job does not block a required check. This includes a job that a `needs` edge skipped after its upstream failed: to block a pull request when any job fails, require the workflow check `kici/<workflow>`. A job that needs a rule-skipped job now follows its `when` condition: the default skips it, and `when: 'on-skip'` runs it. A step whose rule returns false is now reported skipped, not failed. Job notifications and `job_complete` triggers see a rule-skipped job as skipped, so a trigger that filters on `success` no longer fires for it. A rule-skipped job no longer sends a `job.completed` webhook event.
+- kici preview names every step the way a run does: a run: shorthand step, a bare function step and a step() with no name show their step-N name instead of an empty bullet, and a parallel() group lists its steps under the group. A step layout that kici compile rejects, such as an empty parallel() group, now also fails kici preview with the same error.
+- kici init scaffolds pr-checks to target the repository's default branch (origin/HEAD, else the HEAD the origin remote reports, else main), never the branch you have checked out, and writes it in single quotes. The sample fixture uses the branch you have checked out. In a repository with no src/ directory, pr-checks has no paths filter and no require-src-changes rule, so it runs on every pull request.
+- A universal-git SSH clone now finds its known_hosts file when the temporary directory path contains a space; ssh read such a path as two files and failed host-key verification.
+- repo.identifier now reads owner/repo for a checkout cloned over SSH (git@host:owner/repo.git or ssh://host/owner/repo.git); it used to return the whole clone URL.
+- repo.withWrite now opens a write window for the job's own checkout when it was cloned over SSH or from a file:// URL; the write fence used to refuse it as outside the source repository's organisation.
+- repo.withWrite({ credential: 'name' }) now pushes with the named git credential; git used the job's default credential inside the window even though the window checked the named one.
+- With KICI_RUNNER_USER set, a bare-metal job can now use the git credential helper; the helper and its socket were owned by the agent user, so the runner user could not reach them and git push had no credential.
+- A job that declares an SSH-key git credential now fails before its first step when no ssh client is on PATH, with an error that names the fix (init: { apt: { packages: ['openssh-client'] } }); it used to fail at push time, inside repo.withWrite.
+- Under the bubblewrap sandbox (KICI_SANDBOX=true), a bare-metal job can now reach the git credential helper; the sandbox's private /tmp hid the helper, so git push and repo.withWrite had no credential.
+- An SSH-key git credential (kind: 'ssh') now works inside repo.withWrite: git commands in the checkout push to SSH URLs with the key, and host keys are checked strictly against the published GitHub, GitLab and Bitbucket Cloud keys plus ~/.ssh/known_hosts. The universal-git docs now say that sshHostKeyPolicy accept-new accepts any host key.
+- GitHub check runs now link to the run's page in the KiCI dashboard. An orchestrator connected to the KiCI Platform gets the dashboard address from the Platform, so it needs no configuration; `KICI_DASHBOARD_URL` overrides it.
+
+### Documentation
+
+- The dynamic values guide no longer says kici preview lists the injected **init** job; preview does not show it.
+
 ## v0.22.0 — 2026-10-18
 
 ### Fixes

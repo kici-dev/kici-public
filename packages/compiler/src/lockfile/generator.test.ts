@@ -1469,6 +1469,16 @@ describe('generator - new trigger types', () => {
 
 describe('generator - auto-IDs and bare function normalization', () => {
   describe('step auto-IDs', () => {
+    it("records a run: shorthand job's only step as step-1", () => {
+      const j = job('deploy', { runsOn: 'linux', run: async () => {} });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockJob = onlyStaticJob(generateLockFile([makeWorkflowWithSource(w)]));
+      // fails-when: the shorthand step's recorded name changes (docs/user/sdk/core.md promises step-1)
+      expect(lockJob.steps.length).toBe(1);
+      expect(lockJob.steps[0].name).toBe('step-1');
+    });
+
     it('assigns step-N names to bare function steps', () => {
       const bareFn1 = async () => {};
       const bareFn2 = async () => {};

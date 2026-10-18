@@ -38,6 +38,34 @@ async function host(answer: Parameters<typeof startCredentialHelperHost>[0]['ans
 const GIT_INPUT = 'protocol=https\nhost=github.com\npath=kici-dev/tester.git\n\n';
 
 describe('startCredentialHelperHost', () => {
+  // breaks-if-wrong: a KICI_RUNNER_USER runner must still be served once the
+  // paths are chowned to it (here: to our own identity, which needs no root).
+  it('serves the runner after chowning the helper to its identity', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kici-helper-test-'));
+    const h = await startCredentialHelperHost({
+      dir,
+      answer: async () => ({ username: 'u', password: 'p' }),
+      owner: { uid: process.getuid!(), gid: process.getgid!() },
+    });
+    cleanups.push(async () => {
+      await h.close();
+      await rm(dir, { recursive: true, force: true });
+    });
+    expect(await run(h.helperPath, 'get', GIT_INPUT)).toBe('username=u\npassword=p\n');
+  });
+
+  // fails-when: the owner is ignored — chowning to root as a non-root user is
+  // refused by the kernel, so a host that really chowns rejects here.
+  it.skipIf(process.getuid?.() === 0)('chowns the helper paths to the owner', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'kici-helper-test-'));
+    cleanups.push(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+    await expect(
+      startCredentialHelperHost({ dir, answer: async () => null, owner: { uid: 0, gid: 0 } }),
+    ).rejects.toThrow(/EPERM|operation not permitted/i);
+  });
+
   it('answers a real git credential `get` through the shim', async () => {
     const answer = vi.fn().mockResolvedValue({ username: 'x-access-token', password: 'ghs_x' });
     const h = await host(answer);

@@ -127,7 +127,7 @@ Key methods:
 
 Pure functions with no side effects:
 
-- **`buildCheckRunSummary()`** -- Produces markdown with step table, failure details, log context, and trace footer. Uses progressive truncation (20 -> 10 -> 5 -> 0 log lines) to stay under the 65535 byte GitHub API limit.
+- **`buildCheckRunSummary()`** -- Produces markdown with a headline, step table, failure details, log context, and trace footer. The headline names the job's status: `passed`, `failed`, `cancelled`, `timed out` or `skipped`. A skipped job's headline carries the skip reason instead of a step count. Uses progressive truncation (20 -> 10 -> 5 -> 0 log lines) to stay under the 65535 byte GitHub API limit.
 
 - **`buildAnnotations()`** -- Creates GitHub-compatible annotation objects linking failures to source locations in `.kici/workflows/*.ts`. Capped at 50 per API request.
 
@@ -168,7 +168,9 @@ https://<dashboard-host>/r/orgs/oal_<12-char>/runs/<run-uuid>
 
 - `oal_<12-char>` is a server-generated random alias (16 chars total, ~71 bits of entropy) stored alongside every org. It is **never** derived from the org's display name, and **never** the same string as the canonical org ID, which carries a different `org_` prefix and is only used inside the authenticated system.
 - The `/r/orgs/:alias/*` resolver authenticates the visitor, verifies org membership, and redirects to the canonical dashboard run-detail page. Unauthenticated visitors hit the OIDC login flow and land at the run detail after sign-in. Unknown aliases and non-members get the same uniform 404 — the resolver does not double as an org existence oracle.
-- The orchestrator caches its org's public alias on connect and emits the alias-bearing `details_url` on every `checks.create()` and `checks.update()`. If the orchestrator was deployed without a dashboard URL configured (independent mode without operator config), `details_url` is omitted and the GitHub check still works without a "Details" link.
+- The orchestrator caches its org's public alias on connect and emits the alias-bearing `details_url` on every `checks.create()` and `checks.update()`. Workflow, setup and job check runs of one run all link to the run page.
+- The dashboard base is `KICI_DASHBOARD_URL` when the orchestrator sets it (an empty value counts as unset); otherwise it is the `dashboardUrl` the Platform sends on `auth.success`. The hosted Platform sends the address of its dashboard.
+- An orchestrator in `independent` mode has no Platform connection and so no public alias: it omits `details_url`, even with `KICI_DASHBOARD_URL` set, and the GitHub check still works without a "Details" link.
 
 The split means a public repository can host a KiCI workflow without leaking the org's canonical identifier to anyone reading the repo's check runs.
 
@@ -216,6 +218,22 @@ Trace: abc-123 | Run: def-456
 
 Trace: abc-123 | Run: def-456
 ```
+
+### Skipped job
+
+A job whose own rule returned `false` reports its steps as skipped. Its check run completes with GitHub's `skipped` conclusion:
+
+```markdown
+**Job 'publish' skipped** — rule 'push to main' returned false
+
+| Step    | Status       | Duration |
+| ------- | ------------ | -------- |
+| publish | next skipped | 0.0s     |
+
+Trace: abc-123 | Run: def-456
+```
+
+A job that the orchestrator skips (a `needs` edge whose upstream did not satisfy it) has no step results. Its summary is the description `Job skipped: <reason>`, for example `Job skipped: upstream_unmet: build (failed)`.
 
 ### Live progress (in_progress)
 

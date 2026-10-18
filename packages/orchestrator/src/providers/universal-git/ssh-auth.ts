@@ -29,7 +29,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { makeTempDir } from '@kici-dev/shared/tmp';
 import type { SshHostKeyPolicy } from './config.js';
-import { shQuote } from '@kici-dev/shared';
+import { shQuote, sshFileListOption } from '@kici-dev/shared';
 
 /** Material the caller has prepared (key file + optional known_hosts file). */
 export interface SshAuthArtefacts {
@@ -153,7 +153,7 @@ export function composeGitSshCommand(
     `ssh -i ${shQuote(privateKeyPath)}`,
     '-o IdentitiesOnly=yes',
     '-o BatchMode=yes',
-    `-o UserKnownHostsFile=${shQuote(knownHostsPath)}`,
+    sshFileListOption('UserKnownHostsFile', [knownHostsPath]),
   ];
   flags.push(
     policy === 'pinned' ? '-o StrictHostKeyChecking=yes' : '-o StrictHostKeyChecking=accept-new',

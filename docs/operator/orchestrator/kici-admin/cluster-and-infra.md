@@ -16,7 +16,7 @@ kici-admin orchestrator restart [--platform <type>] [--instance-dir <path>] [--n
 kici-admin orchestrator status [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level] [--json]
 kici-admin orchestrator logs [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level] [--since <duration>] [--level <level>] [--json] [--no-follow]
 kici-admin orchestrator upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--pick] [--restart-only] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
-                                [--skip-backup] [--backup-dir <path>] [--no-drain] [--drain-timeout <seconds>] [--migrate-down]
+                                [--skip-backup] [--backup-dir <path>] [--no-drain] [--drain-timeout <seconds>] [--migrate-down] [--skip-binary-path-check]
                                 [--no-agent-packages] [--agent-package-platforms <list>] [--node-mirror <url>] [--npm-registry <url>]
 ```
 
@@ -109,9 +109,9 @@ By default the command refuses to reap when a local orchestrator reports healthy
 ### firecracker -- host networking provisioning
 
 ```bash
-kici-admin firecracker provision [--bridge <name>] [--cidr <cidr>] [--table <name>] [--host-iface <iface>] [--persist] [--sudo]
-kici-admin firecracker verify [--bridge <name>] [--cidr <cidr>] [--table <name>] [--sudo]
-kici-admin firecracker teardown [--bridge <name>] [--cidr <cidr>] [--table <name>] [--sudo]
+kici-admin firecracker provision --bridge <name> --cidr <cidr> [--table <name>] [--host-iface <iface>] [--persist] [--sudo]
+kici-admin firecracker verify --bridge <name> --cidr <cidr> [--table <name>] [--sudo]
+kici-admin firecracker teardown --bridge <name> [--cidr <cidr>] [--table <name>] [--sudo]
 ```
 
 Provisions and verifies the host-side bridge interface + NAT/egress-isolation rules a Firecracker scaler needs. These commands run on the Firecracker host (not against the orchestrator HTTP API) and typically require root — pass `--sudo` to wrap the privileged steps with `sudo -n` on a non-root host.

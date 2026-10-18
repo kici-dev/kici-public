@@ -46,7 +46,7 @@ Save this token immediately -- it is only shown once. To use a fixed token for a
 export KICI_BOOTSTRAP_ADMIN_TOKEN=my-fixed-admin-token
 ```
 
-The bootstrap token creation is idempotent: if one already exists, it is reused.
+With `KICI_BOOTSTRAP_ADMIN_TOKEN` set, every startup sets the `bootstrap` token to that value with the `owner` role, so a new value replaces the old token. Without it, the orchestrator generates a bootstrap token only when no unrevoked admin token exists.
 
 ### Creating additional tokens
 

@@ -39,6 +39,7 @@ import type {
   ArtifactRequestIpc,
   StepApprovalRequestIpc,
 } from './ipc-protocol.js';
+import { withAgentSshCapability } from './git-grant-capability.js';
 import { buildRequest } from './fork-runner.js';
 import { createDepRestoreReportRelay, type DepRestoreReportRelay } from '../dep-restore-report.js';
 import { runnerLaunchArgv, KICI_RUNTIME_NODE_DIR } from './kici-runtime.js';
@@ -155,7 +156,7 @@ interface ExecStreamContext {
 
 /** Mutated by dispatchRunnerMessage; `awaitJobCompletion` resolves with a snapshot. */
 interface MutableRunnerState {
-  jobStatus: 'success' | 'failed' | 'cancelled';
+  jobStatus: 'success' | 'failed' | 'skipped' | 'cancelled';
   /** The failure reason the runner reported on job.complete. */
   reportedError: string | undefined;
   /** Sibling jobs the runner dropped for lock drift, reported on job.complete. */
@@ -168,7 +169,7 @@ interface MutableRunnerState {
 
 /** The runner's final state, taken just before the abort-signal short-circuit fires. */
 interface RunnerOutcome {
-  jobStatus: 'success' | 'failed' | 'cancelled';
+  jobStatus: 'success' | 'failed' | 'skipped' | 'cancelled';
   stepResults: SandboxStepResult[];
   /** Why the runner crashed, when it exited without sending job.complete. */
   error?: string;
@@ -366,7 +367,8 @@ function relayGitGrantRequest(
     });
     return;
   }
-  options.onGitGrantRequest(grantMsg).then(
+  // A container's git cannot read a key on the agent's host.
+  options.onGitGrantRequest(withAgentSshCapability(grantMsg, false)).then(
     (response) => writeResponse(response as unknown as Record<string, unknown>),
     (err) =>
       writeResponse({
@@ -1148,8 +1150,11 @@ export class ContainerSandbox implements ExecutionSandbox {
     }
 
     // Control flow cannot track the async mutation; cast to the full union.
-    const finalStatus = jobStatus as 'success' | 'failed' | 'cancelled';
-    this.jobFailed = finalStatus !== ExecutionJobStatus.enum.success;
+    const finalStatus = jobStatus as 'success' | 'failed' | 'skipped' | 'cancelled';
+    // A rule-skipped job is not a failure: it never triggers keepFailed retention.
+    this.jobFailed =
+      finalStatus !== ExecutionJobStatus.enum.success &&
+      finalStatus !== ExecutionJobStatus.enum.skipped;
 
     return {
       status: finalStatus,

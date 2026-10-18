@@ -10,13 +10,13 @@
  */
 
 import { join } from 'node:path';
+import { repoIdentifierFromUrl } from '@kici-dev/engine';
 import type { JobDispatch, LogStream, ChangedFilesStatus } from '@kici-dev/engine';
 import type { DynamicJobNeed, RepoInfo, EventPayload } from '@kici-dev/sdk';
 import { buildNeedsContext } from '@kici-dev/sdk/internal';
 import type { $ as Shell } from 'zx';
 import { gitClone } from '../checkout/git-clone.js';
 import { computeChangedFiles, type ChangedFilesResult } from '../checkout/changed-files.js';
-import { repoIdentifierFromUrl } from './global-workflow-env.js';
 import { makeStreamingZxLog } from './streaming-zx-log.js';
 import type { FilterEvalInput } from './init-runner.js';
 import type { GlobalEvalRoundJobConfig } from './global-eval-types.js';

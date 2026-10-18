@@ -32,8 +32,12 @@ function renderDiagnostic(d: ts.Diagnostic): string {
 /**
  * Type-check `files` with `@kici-dev/sdk` resolved to the workspace source, and
  * return the diagnostics located in those files, one rendered line each.
+ * `extraOptions` adds to or overrides the base compiler options.
  */
-export function typecheckAgainstSdk(files: string[]): string[] {
+export function typecheckAgainstSdk(
+  files: string[],
+  extraOptions: ts.CompilerOptions = {},
+): string[] {
   const options: ts.CompilerOptions = {
     target: ts.ScriptTarget.ES2024,
     module: ts.ModuleKind.ESNext,
@@ -44,6 +48,7 @@ export function typecheckAgainstSdk(files: string[]): string[] {
     noEmit: true,
     baseUrl: repoRoot,
     paths: { '@kici-dev/sdk': [sdkEntry] },
+    ...extraOptions,
   };
   const program = ts.createProgram(files, options);
   const fileSet = new Set(files.map((f) => resolve(f)));

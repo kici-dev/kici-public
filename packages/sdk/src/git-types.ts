@@ -61,7 +61,16 @@ export type GitGrant = { scoped: false } | { scoped: true; permissions: Record<s
 export type Sourced<Name extends string> =
   { [K in `${Name}Secret`]: string } | { [K in `${Name}Value`]: string };
 
-/** Where credential material comes from, for each supported credential shape. */
+/**
+ * Where credential material comes from, for each supported credential shape.
+ *
+ * `kind: 'ssh'` is a private deploy key. The job's machine needs an `ssh`
+ * command on its PATH, or the job fails before its first step. The key is used
+ * only inside `withWrite`, by git commands in the checkout that reach an SSH
+ * URL. Host keys are checked strictly: the published GitHub, GitLab and
+ * Bitbucket Cloud keys are built in, and any other host must be in
+ * `~/.ssh/known_hosts`. A job with `container:` cannot use an SSH key.
+ */
 export type GitCredentialRef =
   | ({ kind: 'app' } & Sourced<'appId'> & Sourced<'installationId'> & Sourced<'privateKey'>)
   | ({ kind: 'token'; user?: string } & Sourced<'token'>)

@@ -9,6 +9,8 @@ import {
 } from '@kici-dev/engine';
 import { REDUCED_PRIVILEGE_MARKER } from '../security/reduced-privilege-note.js';
 import { SUMMARY_BYTE_LIMIT } from './check-run-summary.js';
+import { StepLogBuffer } from './step-log-buffer.js';
+import { GithubCheckConclusion } from './github-check-conclusion.js';
 
 vi.mock('../metrics/prometheus.js', () => ({
   githubCheckRunTotal: { add: vi.fn() },
@@ -231,6 +233,63 @@ describe('CheckRunReporter', () => {
           }),
         }),
       );
+    });
+
+    describe('a skipped job', () => {
+      async function completeSkipped(data: Record<string, unknown>, description?: string) {
+        const reporter = new CheckRunReporter({
+          providerRegistry: githubRegistry(),
+          stepLogBuffer: new StepLogBuffer(),
+        });
+        reporter.setPending(pending());
+        await vi.waitFor(() => {
+          expect(mockChecksCreate).toHaveBeenCalledTimes(2);
+        });
+        reporter.updateJobStatus(
+          jobUpdate({
+            state: ExecutionJobStatus.enum.skipped,
+            data,
+            ...(description !== undefined && { description }),
+          }),
+        );
+        await vi.waitFor(() => {
+          expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
+        });
+        return mockChecksUpdate.mock.calls[0][0] as {
+          conclusion: string;
+          output: { summary: string };
+        };
+      }
+
+      it('a rule skip reads skipped, names the rule and shows the skipped step', async () => {
+        const update = await completeSkipped({
+          stepResults: [{ name: 'test', status: 'skipped', durationMs: 0 }],
+          error: "rule 'push to main' returned false",
+        });
+        expect(update.conclusion).toBe(GithubCheckConclusion.enum.skipped);
+        expect(update.output.summary).toMatch(
+          /^\*\*Job 'test' skipped\*\* — rule 'push to main' returned false/,
+        );
+        expect(update.output.summary).toContain('| test | \u23ED skipped |');
+        expect(update.output.summary).not.toContain('failed');
+      });
+
+      it('an orchestrator-set skip keeps its description', async () => {
+        const update = await completeSkipped(
+          { error: 'upstream_unmet: build (failed)' },
+          'Job skipped: upstream_unmet: build (failed)',
+        );
+        expect(update.conclusion).toBe(GithubCheckConclusion.enum.skipped);
+        expect(update.output.summary).toContain('Job skipped: upstream_unmet: build (failed)');
+      });
+
+      it('a non-string reason renders the headline without one', async () => {
+        const update = await completeSkipped({
+          stepResults: [{ name: 'test', status: 'skipped', durationMs: 0 }],
+          error: 42,
+        });
+        expect(update.output.summary.split('\n')[0]).toBe("**Job 'test' skipped**");
+      });
     });
 
     /**
@@ -1521,52 +1580,93 @@ describe('details_url with public alias', () => {
     }
   });
 
-  it('strips a trailing slash on dashboardUrl', async () => {
-    const reporter = new CheckRunReporter({
-      providerRegistry: githubRegistry(),
-      dashboardUrl: 'https://example.test/kici/dashboard/',
-      getOrgPublicAlias: () => ALIAS,
-    });
-
-    reporter.setPending(pending({ workflowName: 'build', runId: RUN_ID }));
-
+  /** The details_url of the first check run a reporter built from `deps` creates. */
+  async function firstDetailsUrl(
+    deps: Omit<ConstructorParameters<typeof CheckRunReporter>[0], 'providerRegistry'>,
+  ): Promise<string | undefined> {
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry(), ...deps });
+    reporter.setPending(pending({ runId: RUN_ID }));
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
     });
+    return (mockChecksCreate.mock.calls[0][0] as { details_url?: string }).details_url;
+  }
 
-    const expectedUrl = `https://example.test/kici/dashboard/r/orgs/${ALIAS}/runs/${RUN_ID}`;
-    expect((mockChecksCreate.mock.calls[0][0] as any).details_url).toBe(expectedUrl);
+  it('strips a trailing slash on dashboardUrl', async () => {
+    expect(
+      await firstDetailsUrl({
+        dashboardUrl: 'https://example.test/kici/dashboard/',
+        getOrgPublicAlias: () => ALIAS,
+      }),
+    ).toBe(`https://example.test/kici/dashboard/r/orgs/${ALIAS}/runs/${RUN_ID}`);
   });
 
-  it('omits details_url when dashboardUrl is unset (preserves today behaviour)', async () => {
+  it('omits details_url with neither KICI_DASHBOARD_URL nor a Platform-supplied URL (independent mode)', async () => {
+    expect(await firstDetailsUrl({ getOrgPublicAlias: () => ALIAS })).toBeUndefined();
+  });
+
+  // fails-when: buildDetailsUrl reads only KICI_DASHBOARD_URL, so a Platform-attached
+  //   orchestrator with no override posts check runs GitHub links to the App homepage.
+  it('falls back to the Platform-supplied dashboard URL on workflow and job check runs', async () => {
     const reporter = new CheckRunReporter({
       providerRegistry: githubRegistry(),
       getOrgPublicAlias: () => ALIAS,
+      getPlatformDashboardUrl: () => 'https://app.test',
     });
 
-    reporter.setPending(pending({ workflowName: 'build', runId: RUN_ID }));
+    reporter.setPending(pending({ runId: RUN_ID }));
 
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
     });
+    const created = mockChecksCreate.mock.calls.map(
+      (c) => c[0] as { name: string; details_url?: string },
+    );
+    // The workflow check and the job check both link to the run page.
+    expect(created.some((c) => c.name.includes('/job/'))).toBe(true);
+    for (const call of created) {
+      expect(call.details_url).toBe(`https://app.test/r/orgs/${ALIAS}/runs/${RUN_ID}`);
+    }
 
-    expect((mockChecksCreate.mock.calls[0][0] as any).details_url).toBeUndefined();
+    reporter.updateJobStatus(jobUpdate({ state: ExecutionJobStatus.enum.success, runId: RUN_ID }));
+    await vi.waitFor(() => {
+      expect(mockChecksUpdate).toHaveBeenCalledTimes(1);
+    });
+    expect((mockChecksUpdate.mock.calls[0][0] as any).details_url).toBe(
+      `https://app.test/r/orgs/${ALIAS}/runs/${RUN_ID}`,
+    );
+  });
+
+  // breaks-if-wrong: the Platform URL wins over an explicit KICI_DASHBOARD_URL.
+  it('prefers KICI_DASHBOARD_URL over the Platform-supplied URL', async () => {
+    expect(
+      await firstDetailsUrl({
+        dashboardUrl: 'https://example.test/kici/dashboard',
+        getOrgPublicAlias: () => ALIAS,
+        getPlatformDashboardUrl: () => 'https://app.test',
+      }),
+    ).toBe(`https://example.test/kici/dashboard/r/orgs/${ALIAS}/runs/${RUN_ID}`);
+  });
+
+  // fails-when: the precedence uses ?? — an empty KICI_DASHBOARD_URL= then wins and
+  //   every check run loses its Details link.
+  it('treats an empty KICI_DASHBOARD_URL as unset', async () => {
+    expect(
+      await firstDetailsUrl({
+        dashboardUrl: '',
+        getOrgPublicAlias: () => ALIAS,
+        getPlatformDashboardUrl: () => 'https://app.test',
+      }),
+    ).toBe(`https://app.test/r/orgs/${ALIAS}/runs/${RUN_ID}`);
   });
 
   it('omits details_url when alias resolver returns undefined', async () => {
-    const reporter = new CheckRunReporter({
-      providerRegistry: githubRegistry(),
-      dashboardUrl: 'https://example.test/kici/dashboard',
-      getOrgPublicAlias: () => undefined,
-    });
-
-    reporter.setPending(pending({ workflowName: 'build', runId: RUN_ID }));
-
-    await vi.waitFor(() => {
-      expect(mockChecksCreate).toHaveBeenCalledTimes(2);
-    });
-
-    expect((mockChecksCreate.mock.calls[0][0] as any).details_url).toBeUndefined();
+    expect(
+      await firstDetailsUrl({
+        dashboardUrl: 'https://example.test/kici/dashboard',
+        getOrgPublicAlias: () => undefined,
+      }),
+    ).toBeUndefined();
   });
 
   it('omits details_url when no real runId is available (N/A sentinel)', async () => {
@@ -1685,41 +1785,42 @@ describe('details_url with public alias', () => {
     expect((mockChecksUpdate.mock.calls[0][0] as any).details_url).toBe(expectedUrl);
   });
 
-  it('setOrgPublicAliasResolver late-binds the resolver', async () => {
-    const reporter = new CheckRunReporter({
-      providerRegistry: githubRegistry(),
-      dashboardUrl: 'https://example.test/kici/dashboard',
-    });
-    reporter.setPending(
+  it.each([
+    {
+      setter: 'setOrgPublicAliasResolver',
+      deps: { dashboardUrl: 'https://example.test/kici/dashboard' },
+      bind: (r: CheckRunReporter) => r.setOrgPublicAliasResolver(() => ALIAS),
+      expected: `https://example.test/kici/dashboard/r/orgs/${ALIAS}/runs/${RUN_ID}`,
+    },
+    {
+      setter: 'setPlatformDashboardUrlResolver',
+      deps: { getOrgPublicAlias: () => ALIAS },
+      bind: (r: CheckRunReporter) => r.setPlatformDashboardUrlResolver(() => 'https://app.test'),
+      expected: `https://app.test/r/orgs/${ALIAS}/runs/${RUN_ID}`,
+    },
+  ])('$setter late-binds the resolver', async ({ deps, bind, expected }) => {
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry(), ...deps });
+    const oneCheck = (key: string) =>
       pending({
-        owner: 'a',
-        repo: 'a',
-        sha: 'a1',
-        workflowName: 'w1',
+        owner: key,
+        repo: key,
+        sha: `${key}1`,
+        workflowName: `w${key}`,
         jobNames: [],
         runId: RUN_ID,
-      }),
-    );
+      });
+    reporter.setPending(oneCheck('a'));
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(1);
     });
     expect((mockChecksCreate.mock.calls[0][0] as any).details_url).toBeUndefined();
 
-    reporter.setOrgPublicAliasResolver(() => ALIAS);
-    reporter.setPending(
-      pending({
-        owner: 'b',
-        repo: 'b',
-        sha: 'b1',
-        workflowName: 'w2',
-        jobNames: [],
-        runId: RUN_ID,
-      }),
-    );
+    bind(reporter);
+    reporter.setPending(oneCheck('b'));
     await vi.waitFor(() => {
       expect(mockChecksCreate).toHaveBeenCalledTimes(2);
     });
-    expect((mockChecksCreate.mock.calls[1][0] as any).details_url).toContain(`r/orgs/${ALIAS}/`);
+    expect((mockChecksCreate.mock.calls[1][0] as any).details_url).toBe(expected);
   });
 });
 
@@ -1741,7 +1842,8 @@ describe('check-run conclusion mappers cover every terminal job status', () => {
     [ExecutionJobStatus.enum.success]: CheckRunConclusion.enum.success,
     [ExecutionJobStatus.enum.failed]: CheckRunConclusion.enum.failure,
     [ExecutionJobStatus.enum.cancelled]: CheckRunConclusion.enum.cancelled,
-    [ExecutionJobStatus.enum.skipped]: CheckRunConclusion.enum.cancelled,
+    // fails-when: a skipped job maps to cancelled, which blocks a required check.
+    [ExecutionJobStatus.enum.skipped]: GithubCheckConclusion.enum.skipped,
     [ExecutionJobStatus.enum.timed_out_stale]: CheckRunConclusion.enum.timed_out,
     [ExecutionJobStatus.enum.drift_dropped]: CheckRunConclusion.enum.failure,
     [ExecutionJobStatus.enum.unroutable]: CheckRunConclusion.enum.failure,

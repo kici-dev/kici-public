@@ -3,7 +3,8 @@
  * results and log buffers. No side effects, no API calls.
  *
  * Output contract:
- * - Summary headline: "Job '{jobName}' failed (N/M steps passed)" or success equivalent
+ * - Summary headline: the job's status, e.g. "Job '{jobName}' failed (N/M steps passed)", or
+ *   "Job '{jobName}' skipped — {reason}" for a job its rule skipped
  * - Step table with Step | Status | Duration columns
  * - Failed steps: error + last 20 log lines in code blocks
  * - Annotations: failure/warning level, capped at 50
@@ -12,7 +13,7 @@
  */
 
 import { formatDuration } from '@kici-dev/shared';
-import { compareStepsByPhase } from '@kici-dev/engine';
+import { compareStepsByPhase, ExecutionJobStatus, type TerminalJobStatus } from '@kici-dev/engine';
 import type { StepLogBuffer } from './step-log-buffer.js';
 
 // ---------------------------------------------------------------------------
@@ -79,6 +80,10 @@ export function applyStepProgress(
 
 interface BuildCheckRunSummaryOptions {
   jobName: string;
+  /** The headline names this status; step counts alone mislabel a skipped or cancelled job. */
+  jobStatus: TerminalJobStatus;
+  /** Why the job was skipped, shown after a `skipped` headline. */
+  skipReason?: string;
   stepResults: StepResultData[];
   logBuffer: StepLogBuffer;
   runId: string;
@@ -180,30 +185,44 @@ function progressEmoji(status: string): string {
 // buildCheckRunSummary
 // ---------------------------------------------------------------------------
 
+/** The headline word for each status; any other terminal status reads `failed`. */
+const HEADLINE_WORD: Partial<Record<TerminalJobStatus, string>> = {
+  [ExecutionJobStatus.enum.success]: 'passed',
+  [ExecutionJobStatus.enum.failed]: 'failed',
+  [ExecutionJobStatus.enum.cancelled]: 'cancelled',
+  [ExecutionJobStatus.enum.timed_out_stale]: 'timed out',
+};
+
+function buildHeadline(opts: BuildCheckRunSummaryOptions): string {
+  const { jobName, jobStatus, stepResults } = opts;
+  if (jobStatus === ExecutionJobStatus.enum.skipped) {
+    const reason = opts.skipReason ? ` — ${opts.skipReason}` : '';
+    return `**Job '${jobName}' skipped**${reason}`;
+  }
+  const passed = stepResults.filter((s) => s.status === 'success').length;
+  const word = HEADLINE_WORD[jobStatus] ?? 'failed';
+  return `**Job '${jobName}' ${word}** (${passed}/${stepResults.length} steps passed)`;
+}
+
 /**
  * Markdown for a check run's output.summary: headline, step table, failure details with log
  * context, trace footer. Fits 65535 bytes minus `reservedBytes` by progressive log truncation.
  */
 export function buildCheckRunSummary(opts: BuildCheckRunSummaryOptions): string {
-  const { stepResults, logBuffer, runId, jobId, traceIds, jobName } = opts;
+  const { stepResults, logBuffer, runId, jobId, traceIds } = opts;
 
-  const passed = stepResults.filter((s) => s.status === 'success').length;
-  const total = stepResults.length;
-  const allPassed = passed === total;
+  const headline = buildHeadline(opts);
   const budget = SUMMARY_BYTE_LIMIT - (opts.reservedBytes ?? 0);
 
   for (const maxLogLines of LOG_LINE_TIERS) {
     const summary = buildSummaryWithLogLimit(
-      jobName,
+      headline,
       stepResults,
       logBuffer,
       runId,
       jobId,
       traceIds,
       opts.jobDurationMs,
-      passed,
-      total,
-      allPassed,
       maxLogLines,
     );
 
@@ -213,33 +232,22 @@ export function buildCheckRunSummary(opts: BuildCheckRunSummaryOptions): string 
   }
 
   // Minimal fallback (should always fit).
-  const headline = allPassed
-    ? `**Job '${jobName}' passed** (${passed}/${total} steps passed)`
-    : `**Job '${jobName}' failed** (${passed}/${total} steps passed)`;
-
   return `${headline}\n\n_Summary truncated due to size limits._\n\nTrace: ${traceIds.requestId} | Run: ${traceIds.runId}`;
 }
 
 function buildSummaryWithLogLimit(
-  jobName: string,
+  headline: string,
   stepResults: StepResultData[],
   logBuffer: StepLogBuffer,
   runId: string,
   jobId: string,
   traceIds: { requestId: string; runId: string },
   jobDurationMs: number | undefined,
-  passed: number,
-  total: number,
-  allPassed: boolean,
   maxLogLines: number,
 ): string {
   const parts: string[] = [];
 
-  if (allPassed) {
-    parts.push(`**Job '${jobName}' passed** (${passed}/${total} steps passed)`);
-  } else {
-    parts.push(`**Job '${jobName}' failed** (${passed}/${total} steps passed)`);
-  }
+  parts.push(headline);
 
   parts.push('');
 

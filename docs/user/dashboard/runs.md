@@ -166,7 +166,7 @@ Metadata is a tab only on mobile. On medium desktop (< 1200px) it opens in a dra
 The metadata panel shows detailed information organized into sections:
 
 - **Run metadata** -- run ID, status, trigger event, branch, commit SHA (linked to provider), workflow name (linked to source file on provider), duration, and timestamps. The **Triggered by** line carries an **agent badge** (with the agent's label) when the run was triggered or cancelled through an agent credential — an agent PAT or an agent org key — so an agent-driven run is obvious from its detail page
-- **Job metadata** -- job name, status, agent ID, matrix values (if present), duration
+- **Job metadata** -- job name, status, agent ID, matrix values (if present), duration. A skipped job also shows its **Skip reason**, for example `rule 'push to main' returned false` or `upstream_unmet: build (failed)`
 - **Step metadata** -- step name, step index, status, duration
 - **Trust context** (any run that carries a trust tier, including cron and event-triggered runs) -- shows the contributor when the run has one, the trust tier (trusted, known, or unknown), and the lock file (head or base branch)
 

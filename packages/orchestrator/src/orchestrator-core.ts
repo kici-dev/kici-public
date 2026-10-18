@@ -2829,10 +2829,9 @@ export async function bootstrapOrchestrator(
   const sourceLocationStore = new SourceLocationStore();
   // CheckRunReporter takes no githubConfig from config
   // -- it uses providerRegistry which is populated by SourceManager.
-  // dashboardUrl is the static base for `details_url` in GitHub Check
-  // Runs; the per-org public alias gets late-bound in server.ts /
-  // standalone.ts via setOrgPublicAliasResolver after PlatformClient
-  // construction.
+  // dashboardUrl (KICI_DASHBOARD_URL) overrides the base for `details_url`
+  // in GitHub Check Runs; the per-org public alias and the Platform-supplied
+  // base are late-bound in server.ts after PlatformClient construction.
   const checkRunTrackingStore = new CheckRunTrackingStore(db);
   const checkRunReporter = new CheckRunReporter({
     providerRegistry,

@@ -8,6 +8,7 @@ import {
   GLOBAL_EVAL_SKIPS_RESULT_AWARE_LABEL,
 } from '@kici-dev/engine';
 import {
+  adaptJobStatusForOrchestrator,
   MAX_COMPLETE_RESEND_ATTEMPTS,
   OrchestratorClient,
   type OrchestratorClientOptions,
@@ -280,6 +281,106 @@ describe('OrchestratorClient', () => {
           reason: 'User cancelled',
         }),
       );
+    });
+  });
+
+  describe('a skipped job status and the orchestrator capability', () => {
+    const REASON = "rule 'gate' returned false";
+    const STEP_RESULTS = [{ name: 'build', status: 'skipped', durationMs: 0 }];
+
+    function skippedStatus(messageId = 'msg-skip'): AgentToOrchestratorMessage {
+      return {
+        type: 'job.status',
+        messageId,
+        runId: 'run-1',
+        jobId: 'job-1',
+        state: 'skipped',
+        timestamp: 1,
+        data: { error: REASON, stepResults: STEP_RESULTS },
+      };
+    }
+
+    function lastJobStatus(mock: MockWsInstance): {
+      state: string;
+      data?: Record<string, unknown>;
+    } {
+      return getSentMessages(mock)
+        .filter((m) => (m as { type: string }).type === 'job.status')
+        .at(-1) as { state: string; data?: Record<string, unknown> };
+    }
+
+    it('adaptJobStatusForOrchestrator rewrites skipped only for an orchestrator without the flag', () => {
+      const adapted = adaptJobStatusForOrchestrator(skippedStatus(), {}) as {
+        state: string;
+        data: Record<string, unknown>;
+      };
+      expect(adapted.state).toBe('success');
+      expect(adapted.data).not.toHaveProperty('error');
+      expect(adapted.data.stepResults).toEqual(STEP_RESULTS);
+
+      const skipped = skippedStatus();
+      expect(adaptJobStatusForOrchestrator(skipped, { acceptsSkippedJobStatus: true })).toBe(
+        skipped,
+      );
+      // breaks-if-wrong: only a skipped job status is rewritten.
+      const failed = { ...skippedStatus(), state: 'failed' } as AgentToOrchestratorMessage;
+      expect(adaptJobStatusForOrchestrator(failed, {})).toBe(failed);
+      const heartbeat = {
+        type: 'heartbeat',
+        timestamp: 1,
+      } as unknown as AgentToOrchestratorMessage;
+      expect(adaptJobStatusForOrchestrator(heartbeat, {})).toBe(heartbeat);
+    });
+
+    it('sends skipped to an orchestrator that advertises acceptsSkippedJobStatus', () => {
+      const client = createClient();
+      const mock = registerClient(client, { capabilities: { acceptsSkippedJobStatus: true } });
+
+      client.send(skippedStatus());
+
+      const sent = lastJobStatus(mock);
+      expect(sent.state).toBe('skipped');
+      expect(sent.data?.error).toBe(REASON);
+    });
+
+    it('sends success without the reason to an orchestrator without the capability', () => {
+      const client = createClient();
+      const mock = registerClient(client);
+
+      client.send(skippedStatus());
+
+      // fails-when: the client forwards skipped to an orchestrator that drops it.
+      const sent = lastJobStatus(mock);
+      expect(sent.state).toBe('success');
+      expect(sent.data).not.toHaveProperty('error');
+    });
+
+    it('judges a buffered frame against the orchestrator it is delivered to', () => {
+      const client = createClient();
+      const mock1 = registerClient(client, { capabilities: { acceptsSkippedJobStatus: true } });
+
+      mock1.readyState = 3;
+      mock1.emit('close', 1006, Buffer.from('abnormal'));
+      client.send(skippedStatus('msg-buffered-1'));
+      expect(client.getBufferedCount()).toBe(1);
+
+      // An older orchestrator answers the reconnect.
+      vi.advanceTimersByTime(2000);
+      const mock2 = getLatestMock();
+      simulateOpen(mock2);
+      simulateRegisterAck(mock2);
+      expect(lastJobStatus(mock2).state).toBe('success');
+
+      // And the reverse: buffered under a capability-less ack, delivered to a new one.
+      mock2.readyState = 3;
+      mock2.emit('close', 1006, Buffer.from('abnormal'));
+      client.send(skippedStatus('msg-buffered-2'));
+      vi.advanceTimersByTime(5000);
+      const mock3 = getLatestMock();
+      expect(mock3).not.toBe(mock2);
+      simulateOpen(mock3);
+      simulateRegisterAck(mock3, { capabilities: { acceptsSkippedJobStatus: true } });
+      expect(lastJobStatus(mock3).state).toBe('skipped');
     });
   });
 

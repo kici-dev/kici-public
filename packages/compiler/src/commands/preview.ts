@@ -1,17 +1,13 @@
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
 import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
-import type { LockFile, LockWorkflow } from '../types.js';
-import { transformTriggers } from '../lockfile/generator.js';
+import { detectGitRoot } from '../lockfile/generator.js';
+import { workflowsToPreviewLock } from './preview-lock.js';
 import { discoverWorkflows, resolveKiciDir } from '../execution/index.js';
 import { buildEventPayload, type PayloadOptions } from '../test-runner/payload-builder.js';
 import { matchAllWorkflows, type CheckMode } from '@kici-dev/engine';
-import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
 import { displayDryRun } from '../test-runner/dry-run.js';
 import { loadSecretsFile, type ParsedSecrets } from '../test-runner/secrets-file.js';
 import type { Workflow } from '@kici-dev/sdk';
-import { flattenStepInputs } from '@kici-dev/sdk/internal';
 import { parseEventArg } from '../test-runner/event-types.js';
 
 export interface PreviewOptions extends PayloadOptions {
@@ -171,8 +167,8 @@ export async function previewEvent(event: string, options: PreviewOptions): Prom
       logger.info(pc.gray(`Changed files: ${simulatedEvent.changedFiles.join(', ')}`));
     }
 
-    const { workflows } = await loadWorkflows(kiciDir);
-    const lockWorkflows = workflowsToLockFormat(workflows);
+    const workflows = await loadWorkflows(kiciDir);
+    const lockWorkflows = workflowsToPreviewLock(workflows, detectGitRoot());
 
     const decisions = matchAllWorkflows(lockWorkflows, simulatedEvent);
     const matchedWorkflows = workflows.filter((_, i) => decisions[i].matched);
@@ -204,81 +200,11 @@ export async function previewEvent(event: string, options: PreviewOptions): Prom
   }
 }
 
-/** Workflows are always discovered (for their runtime functions); the lock file is optional. */
-async function loadWorkflows(
-  kiciDir: string,
-): Promise<{ lockFile?: LockFile; workflows: Workflow[] }> {
-  const lockFilePath = path.join(kiciDir, 'kici.lock.json');
-
-  try {
-    const lockContent = await readFile(lockFilePath, 'utf-8');
-    const lockFile = JSON.parse(lockContent) as LockFile;
-    logger.info(pc.gray(`Using lock file: ${lockFilePath}`));
-
-    const result = await discoverWorkflows(kiciDir);
-    return { lockFile, workflows: result.workflows.map((w) => w.workflow) };
-  } catch {
-    logger.info(pc.gray(`Discovering workflows from ${kiciDir}/workflows/`));
-    const result = await discoverWorkflows(kiciDir);
-    return { workflows: result.workflows.map((w) => w.workflow) };
-  }
-}
-
-/** A lock-like shape for trigger matching. */
-function workflowsToLockFormat(workflows: Workflow[]): LockWorkflow[] {
-  return workflows.map((w) => ({
-    name: w.name,
-    contentHash: '',
-    compileSchemaVersion: 0,
-    triggers: transformTriggers(w.on),
-    jobs: w.jobs.map((j, i) => {
-      if (typeof j === 'function') {
-        return { _type: 'dynamic' as const, source: { file: '', index: i } };
-      }
-      return {
-        _type: 'static' as const,
-        name: j.name,
-        // runsOnAll job has no single-agent selector for the dry-run preview.
-        runsOn:
-          j.runsOn === undefined
-            ? []
-            : normalizeRunsOnToMatchers(j.runsOn as never, `job '${j.name}' runsOn`).include,
-        needs:
-          j.needs?.map((n) => {
-            if (typeof n === 'string') return n;
-            if ('name' in n) return (n as { name: string }).name;
-            if ('group' in n) return `__group:${(n as { group: string }).group}`;
-            return (n as { name: string }).name;
-          }) ?? [],
-        steps: flattenStepInputs(j.steps).map((s) => {
-          if (typeof s === 'function') {
-            return { name: '', hasOutputs: false };
-          }
-          return { name: s.name, hasOutputs: !!s.outputs };
-        }),
-        rules: j.rules?.map((r, ri) => ({
-          _type: 'dynamic' as const,
-          label: r.label,
-          source: { file: '', index: ri },
-        })),
-        matrix: j.matrix
-          ? typeof j.matrix === 'function'
-            ? { _type: 'dynamic' as const, source: { file: '', jobName: j.name } }
-            : {
-                _type: 'static' as const,
-                values: j.matrix as string[] | Record<string, string[]>,
-              }
-          : undefined,
-        description: j.description,
-      };
-    }),
-    rules: w.rules?.map((r, i) => ({
-      _type: 'dynamic' as const,
-      label: r.label,
-      source: { file: '', index: i },
-    })),
-    description: w.description,
-  }));
+/** Discovers the workflows under `kiciDir` (sources, not the lock file). */
+async function loadWorkflows(kiciDir: string): Promise<Workflow[]> {
+  logger.info(pc.gray(`Discovering workflows from ${kiciDir}/workflows/`));
+  const result = await discoverWorkflows(kiciDir);
+  return result.workflows.map((w) => w.workflow);
 }
 
 /** `.kici/.secrets` merged with CLI overrides. */

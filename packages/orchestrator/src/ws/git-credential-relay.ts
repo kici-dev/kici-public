@@ -12,8 +12,8 @@
  *      source credential may reach any repository inside the App installation's
  *      own selection (the forge enforces that selection when the mint names the
  *      repository), so cloning a sibling repo needs no credential in workflow
- *      code. A write must additionally stay inside the organisation that owns
- *      the job's source repository;
+ *      code. A write must additionally be the job's own checkout, or stay
+ *      inside the organisation that owns the job's source repository;
  *   3. the LOCK DECLARATION — a workflow-supplied `ref` must equal an entry of the
  *      job's `gitCredentials` map, which the orchestrator wrote from the lock at
  *      dispatch (`git/job-context.ts` names the rows that carry it and their read
@@ -45,6 +45,13 @@ export interface JobCredentialContext {
   orgId: string;
   /** The event's repository, which the job checks out; anchors the write-credential fence. */
   sourceRepo: string;
+  /**
+   * `owner/repo` of the clone URL the orchestrator wrote for this job's
+   * checkout (`dispatch_queue.repo_url`), or undefined when that row is gone.
+   * The write fence admits it by exact match: an SSH or `file://` clone URL
+   * names the job's own repository in a form `sameOrg` cannot read.
+   */
+  checkoutRepo?: string;
   /**
    * The repository whose policy governs the job's credentials: the workflow
    * repository for a run whose workflow lives in another repository, otherwise
@@ -133,7 +140,11 @@ export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
     // EVERY repository must clear the fence, not just the first, or an in-org name
     // followed by an out-of-org one mints a token covering both.
     if (requestsWrite(params.permissions)) {
-      const outside = params.repositories.filter((r) => !sameOrg(r, job.sourceRepo));
+      // The job's own checkout is admitted by exact match; every other
+      // repository still has to share the source repository's organisation.
+      const outside = params.repositories.filter(
+        (r) => r !== job.checkoutRepo && !sameOrg(r, job.sourceRepo),
+      );
       if (outside.length > 0) {
         throw new Error(
           `Refusing a write credential for ${outside.map((r) => `'${r}'`).join(', ')}: ` +

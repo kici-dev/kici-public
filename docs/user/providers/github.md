@@ -357,12 +357,32 @@ driven by the orchestrator's reporting module; no workflow
 configuration is required beyond installing the App with the
 `checks: write` permission.
 
+Each check run's conclusion follows the job's or workflow's status:
+
+| Status                                  | Check conclusion |
+| --------------------------------------- | ---------------- |
+| `success`                               | `success`        |
+| `failed`, `drift_dropped`, `unroutable` | `failure`        |
+| `cancelled`                             | `cancelled`      |
+| `timed_out_stale`                       | `timed_out`      |
+| `skipped`                               | `skipped`        |
+
+GitHub accepts a `skipped` check as a passed required check. A job that a rule skipped, or that a `needs` edge skipped, therefore does not block a pull request. To block a pull request when any job of a workflow fails, make the workflow check `kici/{workflowName}` required, not only the per-job checks.
+
 Check runs are keyed to the head commit SHA, so they surface whether or
 not a pull request exists: after a `push` you see the pass/fail directly
 on the commit (a red ✗ / green ✓ next to the SHA in GitHub's commit list
 and on the commit page), and the same checks roll up into the **Checks**
 tab of any pull request that later includes the commit. A failing run is
 therefore visible in GitHub itself without opening the KiCI dashboard.
+
+The **Details** link of each check run opens the run in the KiCI dashboard.
+The workflow, setup and job checks of one run all open the same run page. An
+orchestrator connected to the KiCI Platform gets the dashboard address from the
+Platform, so it needs no configuration. To send reviewers to a different
+address, set `KICI_DASHBOARD_URL` on the orchestrator (see the
+[orchestrator configuration reference](../../operator/orchestrator/configuration.md)).
+An orchestrator in `independent` mode posts check runs without a Details link.
 
 For architecture details see
 [GitHub checks architecture](../../architecture/webhooks/github-checks.md).

@@ -12,7 +12,7 @@
  */
 
 import { createServer, type Server, type Socket } from 'node:net';
-import { chmod, mkdir, writeFile } from 'node:fs/promises';
+import { chmod, chown, mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 /** What the shim asks for, and what it gets back. */
@@ -84,6 +84,12 @@ export async function startCredentialHelperHost(args: {
   /** Job-scoped directory for the socket and the shim. */
   dir: string;
   answer: (query: HelperQuery) => Promise<HelperAnswer>;
+  /**
+   * The runner's identity under `KICI_RUNNER_USER`. The directory, shim and
+   * socket are created `0700` by the agent, so a runner with another uid could
+   * neither run the shim nor connect without this.
+   */
+  owner?: { uid: number; gid: number };
 }): Promise<CredentialHelperHost> {
   await mkdir(args.dir, { recursive: true, mode: 0o700 });
   const socketPath = join(args.dir, 'git-credential.sock');
@@ -107,6 +113,17 @@ export async function startCredentialHelperHost(args: {
       resolve();
     });
   });
+
+  if (args.owner) {
+    try {
+      for (const path of [args.dir, helperPath, socketPath]) {
+        await chown(path, args.owner.uid, args.owner.gid);
+      }
+    } catch (err) {
+      await closeServer(server);
+      throw err;
+    }
+  }
 
   return { helperPath, close: () => closeServer(server) };
 }

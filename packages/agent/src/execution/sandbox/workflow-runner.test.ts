@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { buildKiciApi, createStepSecrets } from '@kici-dev/sdk/internal';
+import { job } from '@kici-dev/sdk';
 import { OIDC_TOKEN_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/oidc-token-relay';
 import { LogMasker } from './log-masker.js';
 import type {
@@ -589,18 +590,30 @@ describe('buildJobRuleCompletion (job-level rule outcome)', () => {
     expect(buildJobRuleCompletion(result, steps)).toBeNull();
   });
 
-  it('a rule cleanly returned false → job.complete{success} with steps skipped', () => {
+  it('a rule cleanly returned false → job.complete{skipped} naming the rule', () => {
     const result: RuleEvaluationResult = {
       allPassed: false,
       results: [{ label: 'gate', passed: false, durationMs: 1 }],
     };
     const completion = buildJobRuleCompletion(result, steps);
-    expect(completion?.status).toBe(ExecutionJobStatus.enum.success);
-    expect(completion?.error).toBeUndefined();
+    // fails-when: a clean false ends the job success
+    expect(completion?.status).toBe(ExecutionJobStatus.enum.skipped);
+    expect(completion?.error).toBe("rule 'gate' returned false");
     expect(completion?.stepResults).toHaveLength(2);
     expect(
       completion?.stepResults?.every((s) => s.status === ExecutionStepStatus.enum.skipped),
     ).toBe(true);
+  });
+
+  it('names the first rule that did not pass', () => {
+    const result: RuleEvaluationResult = {
+      allPassed: false,
+      results: [
+        { label: 'first', passed: true, durationMs: 1 },
+        { label: 'second', passed: false, durationMs: 1 },
+      ],
+    };
+    expect(buildJobRuleCompletion(result, steps)?.error).toBe("rule 'second' returned false");
   });
 
   it('a rule check() threw → job.complete{failed} with the error surfaced (NOT success-skip)', () => {
@@ -642,6 +655,10 @@ describe('step-level rule evaluation', () => {
 
     // First step should be skipped, second should run
     expect(step1Run).not.toHaveBeenCalled();
+    // fails-when: step-loop sends ExecutionStepStatus.enum.failed for a rule skip
+    const step0Complete = messages.find((m) => m.type === 'step.complete' && m.stepIndex === 0) as
+      { status: string } | undefined;
+    expect(step0Complete?.status).toBe(ExecutionStepStatus.enum.skipped);
     expect(step2Run).toHaveBeenCalledOnce();
     expect(result.stepResults[0].status).toBe('skipped');
     expect(result.stepResults[1].status).toBe('success');
@@ -1603,6 +1620,12 @@ describe('coerceStep name write-back', () => {
     expect(coerceStep(named, state)).toBe(named);
     coerceStep(anon, state);
     expect(anon.name).toBe('step-1');
+  });
+
+  it("names a run: shorthand job's step step-1", () => {
+    const j = job('deploy', { runsOn: 'linux', run: async () => {} });
+    // fails-when: the agent names the shorthand step differently from the lock (step-1)
+    expect(coerceStep(j.steps[0], freshCoerceState()).name).toBe('step-1');
   });
 
   it('still wraps bare functions into counter-named steps', () => {

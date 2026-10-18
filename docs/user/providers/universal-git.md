@@ -172,17 +172,20 @@ For SSH instead of HTTPS:
      --from-file ~/.ssh/forgejo-deploy-key
    ```
 
-   The orchestrator materialises this PEM into a tempfile (mode `0600`)
-   at every clone and drives `git` with a purpose-built
-   `GIT_SSH_COMMAND` (`IdentitiesOnly=yes`, `BatchMode=yes`, plus the
-   host-key flags below). The tempdir is cleaned up as soon as the
-   clone finishes.
+   The orchestrator (to fetch the lock file) and the agent (to clone the
+   job's checkout) each write this PEM to a temporary file (mode `0600`)
+   and drive `git` with a purpose-built `GIT_SSH_COMMAND`
+   (`IdentitiesOnly=yes`, `BatchMode=yes`, plus the host-key flags
+   below). The temporary directory is removed as soon as the git command
+   finishes. The agent needs an `ssh` command on its `PATH` for the
+   clone; the [default agent image](../container-jobs.md#the-default-agent-image)
+   has none.
 
-**Host-key policy:** `accept-new` (default) auto-trusts the forge on
-first connection (TOFU) and logs a one-time warning. `pinned` sets
-`StrictHostKeyChecking=yes` with `UserKnownHostsFile=<the PEM you
-supplied>` and rejects any host key that doesn't match — use this for
-production supply-chain hardening. `pinned` requires
+**Host-key policy:** `accept-new` (default) starts every clone from an
+empty known_hosts file, so it accepts any host key the forge shows and
+verifies nothing. `pinned` sets `StrictHostKeyChecking=yes` with
+`UserKnownHostsFile=<the PEM you supplied>` and rejects any host key that
+doesn't match. Use `pinned` for anything beyond a first test. `pinned` requires
 `--ssh-known-hosts-pem` (or the equivalent `sshKnownHostsPem` field on
 update); the CLI rejects the request otherwise.
 
@@ -273,6 +276,7 @@ read-access to the repo or the SSH deploy key isn't registered on it.
 
 **SSH clone fails with host-key rejection.** If you set
 `sshHostKeyPolicy: pinned`, verify the known-hosts PEM matches the
-forge's current key. If you're still using `accept-new`, the orch's
-`~/.ssh/known_hosts` has a stale entry — clear it or flip to `pinned`
-with the right PEM.
+forge's current key. `accept-new` never rejects a host key: each clone
+uses its own empty known_hosts file, and `~/.ssh/known_hosts` is never
+read. If the agent's clone fails with `cannot run ssh`, the agent has no
+ssh client: install one on its host or image.

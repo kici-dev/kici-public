@@ -122,6 +122,14 @@ vi.mock('./sandbox/eval-fork-runner.js', () => ({
 }));
 
 // Mock git clone (used by build jobs)
+// Real by default; a test swaps in a stub to observe the credential lifecycle.
+const startJobGitCredentialsMock = vi.hoisted(() => vi.fn());
+vi.mock('../checkout/job-git-credentials.js', async (importActual) => {
+  const actual = await importActual<typeof import('../checkout/job-git-credentials.js')>();
+  startJobGitCredentialsMock.mockImplementation(actual.startJobGitCredentials);
+  return { ...actual, startJobGitCredentials: startJobGitCredentialsMock };
+});
+
 vi.mock('../checkout/git-clone.js', () => ({
   gitClone: vi.fn().mockResolvedValue(undefined),
 }));
@@ -411,6 +419,49 @@ describe('JobRunner', () => {
 
     const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     expect((jobStatuses[jobStatuses.length - 1] as { state: string }).state).toBe('failed');
+  });
+
+  describe('a rule-skipped job', () => {
+    const skippedResult: Partial<JobExecutionResult> = {
+      status: 'skipped',
+      stepResults: [{ name: 'build', stepIndex: 0, status: 'skipped', durationMs: 0 }],
+      durationMs: 1,
+      error: "rule 'gate' returned false",
+    };
+
+    function depsWithController() {
+      const afterJob = vi.fn().mockResolvedValue(undefined);
+      const deps = {
+        ...makeDeps(),
+        betweenJobsController: { afterJob } as unknown as JobRunnerDeps['betweenJobsController'],
+      };
+      return { deps, afterJob };
+    }
+
+    it('sends job.status skipped with the reason, and is not a failure between jobs', async () => {
+      resetSandboxMocks(skippedResult);
+      const { deps, afterJob } = depsWithController();
+
+      await new JobRunner(deps).execute(makeDispatch());
+
+      const last = deps.messages.filter((m) => m.type === 'job.status').at(-1) as {
+        state: string;
+        data?: { error?: unknown };
+      };
+      expect(last.state).toBe(ExecutionJobStatus.enum.skipped);
+      expect(last.data?.error).toBe("rule 'gate' returned false");
+      // fails-when: jobFailed counts skipped as a failure (on-failure reset fires)
+      expect(afterJob).toHaveBeenCalledWith(expect.objectContaining({ jobFailed: false }));
+    });
+
+    it('a failed job still reaches the between-jobs phase as a failure', async () => {
+      resetSandboxMocks({ status: 'failed' });
+      const { deps, afterJob } = depsWithController();
+
+      await new JobRunner(deps).execute(makeDispatch());
+
+      expect(afterJob).toHaveBeenCalledWith(expect.objectContaining({ jobFailed: true }));
+    });
   });
 
   it('failed step with continueOnError: sandbox returns failed with multiple stepResults', async () => {
@@ -1714,6 +1765,42 @@ describe('JobRunner', () => {
   // error must surface as a failed job status.
 
   // --- E2. Bring-up job tests (init-runner SSH bring-up, no sandbox) ---
+
+  // The credential directory lives under the OS temp dir, not the job
+  // workdir, so nothing else reaps it.
+  it('removes the git credential directory after the job, once the credentials are closed', async () => {
+    const order: string[] = [];
+    const close = vi.fn(async () => {
+      order.push('close');
+    });
+    startJobGitCredentialsMock.mockImplementationOnce(async (args: { dir: string }) => ({
+      helperPath: `${args.dir}/git-credential-kici.cjs`,
+      onGitGrantRequest: vi.fn(),
+      withRef: (p: Record<string, unknown>) => p,
+      close,
+    }));
+    mkdtempFn.mockImplementation(async (prefix: string) =>
+      prefix.includes('gitcred') ? '/tmp/kici-gitcred-dir' : '/tmp/kici-test123',
+    );
+    rmFn.mockImplementation(async (path: string) => {
+      if (path === '/tmp/kici-gitcred-dir') order.push('rm');
+    });
+    const deps = { ...makeDeps(), sendApiRequest: vi.fn() };
+    const runner = new JobRunner(deps);
+
+    try {
+      await runner.execute(makeDispatch());
+      // Positive control: the job really got the helper from this directory.
+      expect(mockSandboxInstance.executeJob.mock.calls[0]![0]).toMatchObject({
+        credentialHelperPath: '/tmp/kici-gitcred-dir/git-credential-kici.cjs',
+      });
+      // fails-when: makeTempDir's cleanup is dropped (no 'rm' of the directory).
+      expect(order).toEqual(['close', 'rm']);
+    } finally {
+      mkdtempFn.mockReset().mockResolvedValue('/tmp/kici-test123');
+      rmFn.mockReset().mockResolvedValue(undefined);
+    }
+  });
 
   it('bring-up job: relays ensureInitRunner for the target and reports success', async () => {
     // broughtUp:false (target already live) exercises the no-SSH path; the SSH

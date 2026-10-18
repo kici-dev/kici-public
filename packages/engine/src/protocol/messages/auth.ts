@@ -34,6 +34,14 @@ export const authSuccessSchema = z.object({
    * mode. `null` when the Platform has no public webhook base.
    */
   githubWebhookUrl: z.string().nullable(),
+  /**
+   * The Platform's public dashboard base (e.g. `https://app.kici.dev`). The
+   * orchestrator builds the `details_url` of its GitHub check runs from it unless
+   * `KICI_DASHBOARD_URL` overrides it. Absent when the Platform has no public
+   * base. A plain string, so an odd value yields an odd link, never a refused
+   * handshake.
+   */
+  dashboardUrl: z.string().optional(),
 });
 
 /** Auth failure response sent by Platform to orchestrator when authentication fails. */

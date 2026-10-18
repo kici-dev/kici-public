@@ -34,8 +34,6 @@ When you define a dynamic value as a function, it is resolved on the eval agent 
 
 This resolution appears in the run timeline as an `Init:` entry. The orchestrator never evaluates workflow code — every dynamic `context`, `env`, and `concurrencyGroup` function runs agent-side, whatever it references.
 
-`kici preview` lists the injected `__init__` job under each affected job, so you can spot it before the first run.
-
 **Examples:**
 
 ```typescript
@@ -71,7 +69,6 @@ A static value is baked into the lock file and needs no init step. A dynamic val
 ## Tips
 
 - **Prefer static values when you can.** Most context and env values are the same on every event; only make them dynamic when they truly depend on the event payload.
-- **Run `kici preview`** to see the injected `__init__` job listed under each affected job before your first run.
 - **A runtime error in a dynamic function fails the job.** If your function throws when the init step runs it (e.g., accessing a property on `undefined`), the job fails immediately.
 - **See [how your workflow code executes](./execution-model.md)** for the full picture of where dynamic values run relative to rules, hooks, and step bodies.
 - **The event parameter is the normalized event envelope** — the same shape rules receive as `ctx.event`: `{ type, action, targetBranch, sourceBranch, changedFiles, payload, … }` (see the [event payload reference](./sdk/event-payloads.md) for the complete schema). Narrow on `event.type` (`'push'`, `'pull_request'`, `'tag'`, …) to branch per trigger kind. The raw provider webhook body is nested at `event.payload` (for GitHub pushes: `payload.ref`, `payload.after`, `payload.repository`, …).

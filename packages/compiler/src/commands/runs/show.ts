@@ -3,6 +3,7 @@ import pc from 'picocolors';
 import { logger, toErrorMessage } from '@kici-dev/core';
 import { isRunId } from '@kici-dev/engine';
 import {
+  ExecutionJobStatus,
   ExecutionStepStatus,
   toCanonicalStatus,
   type RunListItem,
@@ -164,8 +165,8 @@ function printJobs(jobs: DashboardJobDetail[], spansWorkflows: boolean): void {
 
 /**
  * The job-scoped init failure (a context-rules rejection carries
- * `context_rules` plus the context and rule), else the job's error message,
- * else its failed step. The init failure wins: on a rejected job both carry
+ * `context_rules` plus the context and rule), else a skipped job's reason, else
+ * the job's error message, else its failed step. The init failure wins: on a rejected job both carry
  * the same text, and only the category tells whether a gate or a step failed.
  * A job that failed in a step usually records no job error message, so the
  * failed step names the error.
@@ -176,6 +177,13 @@ function printJobFailure(job: DashboardJobDetail): void {
       `    ${pc.yellow('init failure')} ${pc.gray(`(${job.initFailure.category})`)}: ` +
         job.initFailure.message,
     );
+    return;
+  }
+  if (
+    job.errorMessage &&
+    toCanonicalStatus(job.status.toLowerCase()) === ExecutionJobStatus.enum.skipped
+  ) {
+    console.log(`    ${pc.gray('skipped')}: ${job.errorMessage}`);
     return;
   }
   if (job.errorMessage) {

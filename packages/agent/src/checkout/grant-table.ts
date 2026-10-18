@@ -18,6 +18,11 @@ export interface WriteGrant {
   /** `owner/repo`, however git spelled it. */
   repoPath: string;
   permissions: Readonly<Record<string, string>>;
+  /**
+   * The job's `gitCredentials` entry the window named, or undefined for the
+   * map's `default`. The credential helper asks the broker for this one.
+   */
+  credentialName?: string;
   /** Epoch millis; the grant is dead after it, revoked or not. */
   expiresAt: number;
 }

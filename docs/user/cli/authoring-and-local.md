@@ -76,6 +76,8 @@ kici preview push --workflow ci
 kici preview push --files src/index.ts --files README.md
 ```
 
+For each matched job, preview lists the steps with the names that a run records. A named step shows its name. A `run:` shorthand step, a bare function step and a `step()` with no name show their `step-N` name. A `parallel()` group shows its steps under the group name. A step layout that `kici compile` rejects, such as an empty `parallel()` group, also makes preview fail with the same error.
+
 **Exit codes:**
 
 | Code | Meaning                                    |

@@ -119,6 +119,19 @@ function runJob(sandbox: ContainerSandbox, ac = new AbortController()) {
 /** Let the exec start and the stream wiring run. */
 const settle = () => new Promise((r) => setImmediate(r));
 
+/** Runs a job whose runner reports `complete` on job.complete, then ends its stream. */
+async function runReportingComplete(complete: Record<string, unknown>, exitCode: number) {
+  const stream = hijackedStream();
+  const { docker, execInspect } = mockDocker(stream, exitCode);
+  const sandbox = await sandboxFor(docker);
+
+  const result = runJob(sandbox);
+  await new Promise((r) => setTimeout(r, 0));
+  stream.push(stdoutFrame(JSON.stringify({ type: 'job.complete', ...complete }) + '\n'));
+  stream.push(null);
+  return { res: await result, sandbox, execInspect };
+}
+
 describe('ContainerSandbox runner that exits without job.complete', () => {
   beforeEach(() => vi.clearAllMocks());
   afterEach(() => vi.useRealTimers());
@@ -204,23 +217,13 @@ describe('ContainerSandbox runner that exits without job.complete', () => {
   });
 
   it('still resolves success when the runner reports job.complete before the stream ends', async () => {
-    const stream = hijackedStream();
-    const { docker, execInspect } = mockDocker(stream, 0);
-    const sandbox = await sandboxFor(docker);
-
-    const result = runJob(sandbox);
-    await new Promise((r) => setTimeout(r, 0));
-    const complete = {
-      type: 'job.complete',
-      status: ExecutionJobStatus.enum.success,
-      stepResults: [],
-    };
-    stream.push(stdoutFrame(JSON.stringify(complete) + '\n'));
-    stream.push(null);
+    const { res, execInspect } = await runReportingComplete(
+      { status: ExecutionJobStatus.enum.success, stepResults: [] },
+      0,
+    );
 
     // breaks-if-wrong: ending the outputs on stream end must not turn a
     // reported success into a crash.
-    const res = await result;
     expect(res.status).toBe(ExecutionJobStatus.enum.success);
     expect(res.error).toBeUndefined();
     expect(execInspect).not.toHaveBeenCalled();
@@ -231,25 +234,18 @@ describe('ContainerSandbox runner that reports a failure on job.complete', () =>
   beforeEach(() => vi.clearAllMocks());
 
   it('carries the runner-reported error and dropped jobs into the result', async () => {
-    const stream = hijackedStream();
-    const { docker, execInspect } = mockDocker(stream, 1);
-    const sandbox = await sandboxFor(docker);
-
-    const result = runJob(sandbox);
-    await new Promise((r) => setTimeout(r, 0));
     // A runner that fails before its first step (clone, deps, compile, rules)
     // sends job.complete with no step results and the reason in `error`.
-    const complete = {
-      type: 'job.complete',
-      status: ExecutionJobStatus.enum.failed,
-      stepResults: [],
-      error: 'Dependency install failed: registry unreachable',
-      droppedJobs: ['sibling-job'],
-    };
-    stream.push(stdoutFrame(JSON.stringify(complete) + '\n'));
-    stream.push(null);
+    const { res, execInspect } = await runReportingComplete(
+      {
+        status: ExecutionJobStatus.enum.failed,
+        stepResults: [],
+        error: 'Dependency install failed: registry unreachable',
+        droppedJobs: ['sibling-job'],
+      },
+      1,
+    );
 
-    const res = await result;
     expect(res.status).toBe(ExecutionJobStatus.enum.failed);
     // fails-when: applyJobComplete drops msg.error — the job reaches the
     // orchestrator with no reason.
@@ -260,25 +256,30 @@ describe('ContainerSandbox runner that reports a failure on job.complete', () =>
     expect(execInspect).not.toHaveBeenCalled();
   });
 
-  it('omits error and droppedJobs when the runner reports neither', async () => {
-    const stream = hijackedStream();
-    const { docker } = mockDocker(stream, 0);
-    const sandbox = await sandboxFor(docker);
+  it('carries a rule skip as skipped with its reason, and not as a failure', async () => {
+    const { res, sandbox } = await runReportingComplete(
+      {
+        status: ExecutionJobStatus.enum.skipped,
+        stepResults: [{ name: 'build', stepIndex: 0, status: 'skipped', durationMs: 0 }],
+        error: "rule 'gate' returned false",
+      },
+      0,
+    );
 
-    const result = runJob(sandbox);
-    await new Promise((r) => setTimeout(r, 0));
-    const complete = {
-      type: 'job.complete',
-      status: ExecutionJobStatus.enum.failed,
-      stepResults: [],
-      droppedJobs: [],
-    };
-    stream.push(stdoutFrame(JSON.stringify(complete) + '\n'));
-    stream.push(null);
+    expect(res.status).toBe(ExecutionJobStatus.enum.skipped);
+    expect(res.error).toBe("rule 'gate' returned false");
+    // fails-when: buildExecutionResult counts skipped as failed (keepFailed retention)
+    expect((sandbox as unknown as { jobFailed: boolean }).jobFailed).toBe(false);
+  });
+
+  it('omits error and droppedJobs when the runner reports neither', async () => {
+    const { res } = await runReportingComplete(
+      { status: ExecutionJobStatus.enum.failed, stepResults: [], droppedJobs: [] },
+      0,
+    );
 
     // breaks-if-wrong: an empty droppedJobs list or an absent error must not
     // surface as a field, matching the fork backend.
-    const res = await result;
     expect(res.status).toBe(ExecutionJobStatus.enum.failed);
     expect(res.error).toBeUndefined();
     expect(res.droppedJobs).toBeUndefined();

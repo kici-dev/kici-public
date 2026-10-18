@@ -56,13 +56,16 @@ const baseSchema = z.object({
   platformUrl: z.string().optional(),
   platformToken: z.string().optional(),
   /**
-   * Base URL of the user-facing dashboard. Used to build `details_url`
-   * on GitHub Check Runs and similar outbound URLs that reach public
-   * surfaces — the `oal_<12-char>` public alias is appended to this
-   * base. When unset, no `details_url` is emitted (preserving today's
-   * behavior). Trailing slash optional.
+   * Overrides the dashboard base the Platform sends on `auth.success` when
+   * building `details_url` on GitHub Check Runs; the `oal_<12-char>` public
+   * alias is appended to it. Trailing slash optional.
    */
-  dashboardUrl: z.string().optional(),
+  dashboardUrl: z
+    .string()
+    .optional()
+    .describe(
+      'Base URL of the KiCI dashboard, used for the Details link on GitHub check runs. Overrides the address the Platform sends on connect. Has no effect in independent mode, which posts check runs without a Details link.',
+    ),
   /**
    * Provenance trust root (the OIDC issuer) used to verify build-provenance
    * bundles when the orchestrator does not sign its own (no

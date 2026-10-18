@@ -917,6 +917,7 @@ export function createApp(deps: AppDependencies) {
                   deps.platformClient &&
                   (msg.state === ExecutionJobStatus.enum.success ||
                     msg.state === ExecutionJobStatus.enum.failed ||
+                    msg.state === ExecutionJobStatus.enum.skipped ||
                     msg.state === ExecutionJobStatus.enum.cancelled)
                 ) {
                   deps.platformClient.send({

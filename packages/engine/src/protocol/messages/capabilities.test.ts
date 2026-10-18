@@ -77,9 +77,38 @@ describe('orchCapabilitiesSchema without negotiation flags', () => {
   });
 });
 
+describe('orchAgentCapabilitiesSchema', () => {
+  it('parses an ack from an orchestrator that predates every flag', () => {
+    expect(orchAgentCapabilitiesSchema.parse({})).toEqual({});
+  });
+
+  it('keeps acceptsSkippedJobStatus and unknown flags', () => {
+    expect(orchAgentCapabilitiesSchema.parse({ acceptsSkippedJobStatus: true })).toEqual({
+      acceptsSkippedJobStatus: true,
+    });
+    expect(orchAgentCapabilitiesSchema.parse({ futureFlag: 1 })).toEqual({ futureFlag: 1 });
+  });
+
+  it('refuses a non-boolean acceptsSkippedJobStatus', () => {
+    expect(orchAgentCapabilitiesSchema.safeParse({ acceptsSkippedJobStatus: 'yes' }).success).toBe(
+      false,
+    );
+  });
+});
+
+describe('ORCH_AGENT_CAPABILITIES', () => {
+  // fails-when: the flag is dropped, so every new agent downgrades skipped to success.
+  it('advertises that this orchestrator settles a skipped job status', () => {
+    expect(ORCH_AGENT_CAPABILITIES).toEqual({ acceptsSkippedJobStatus: true });
+    expect(Object.isFrozen(ORCH_AGENT_CAPABILITIES)).toBe(true);
+    expect(orchAgentCapabilitiesSchema.parse(ORCH_AGENT_CAPABILITIES)).toEqual(
+      ORCH_AGENT_CAPABILITIES,
+    );
+  });
+});
+
 describe.each([
   ['platformCapabilitiesSchema', platformCapabilitiesSchema, PLATFORM_CAPABILITIES],
-  ['orchAgentCapabilitiesSchema', orchAgentCapabilitiesSchema, ORCH_AGENT_CAPABILITIES],
   ['agentCapabilitiesSchema', agentCapabilitiesSchema, AGENT_CAPABILITIES],
 ] as const)('%s', (_name, schema, defaults) => {
   // fails-when: a removed flag (orchMetrics, artifactCompleteAck,

@@ -103,15 +103,17 @@ describe('composeGitSshCommand', () => {
       '/tmp/with space/known_hosts',
     );
     expect(cmd).toContain(`'/tmp/with space/id_key'`);
-    expect(cmd).toContain(`UserKnownHostsFile='/tmp/with space/known_hosts'`);
+    // ssh splits this option's value on whitespace itself: the inner double
+    // quotes keep the path one file once sh has removed the single quotes.
+    expect(cmd).toContain(`'UserKnownHostsFile="/tmp/with space/known_hosts"'`);
   });
 
   it('always wires UserKnownHostsFile (no fallback to ~/.ssh)', () => {
     const acceptNew = composeGitSshCommand('/tmp/k', 'accept-new', '/tmp/kh');
     const pinned = composeGitSshCommand('/tmp/k', 'pinned', '/tmp/kh');
-    expect(acceptNew).toContain(`UserKnownHostsFile='/tmp/kh'`);
+    expect(acceptNew).toContain(`'UserKnownHostsFile="/tmp/kh"'`);
     expect(acceptNew).toContain('StrictHostKeyChecking=accept-new');
-    expect(pinned).toContain(`UserKnownHostsFile='/tmp/kh'`);
+    expect(pinned).toContain(`'UserKnownHostsFile="/tmp/kh"'`);
     expect(pinned).toContain('StrictHostKeyChecking=yes');
   });
 });

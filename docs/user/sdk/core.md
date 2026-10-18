@@ -844,6 +844,8 @@ For full control, pass a raw status-set instead of a keyword: `when: ['skipped',
 
 String and `Job`-reference entries default to `when: 'on-success'`. To override, use the object form (`{ name, when }` for static upstreams, `{ group, when }` for dynamic groups -- `dynamicGroup(name, { when: 'always' })` produces the latter).
 
+A job that its own rule skips ends `skipped`, like any other skipped job, so a `when: 'on-skip'` edge runs after it and the default edge does not.
+
 When an upstream's terminal status is **not** in the edge's set, the downstream transitions directly to `skipped`. Because a skipped job is itself terminal, this propagates transitively: each downstream's `when` set governs whether the skip cascades further.
 
 **Dispatch gate:** `needs` is a hard dispatch gate. A job dispatches only after every upstream in its `needs` array reaches a terminal status that satisfies that edge's `when` set. Root jobs (empty `needs`, no dynamic group refs) dispatch immediately. The scheduler is DB-backed and fully recovers across orchestrator restarts.

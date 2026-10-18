@@ -87,12 +87,18 @@ function postJobCheckRunCompletion(
 
   const [owner, repo] = execContext.repoIdentifier.split('/');
 
-  // Explicit wins; else build one from agent data on failure; else the mapper's wording.
+  // Explicit wins; else build one from agent data on failure, or name a skip's reason;
+  // else the mapper's wording.
+  const skipReason = input.data?.error;
   const description =
     input.description ??
     (input.status === ExecutionJobStatus.enum.failed && input.data
       ? buildJobFailureDescription(input.data)
-      : undefined);
+      : input.status === ExecutionJobStatus.enum.skipped &&
+          typeof skipReason === 'string' &&
+          skipReason !== ''
+        ? `Job skipped: ${skipReason}`
+        : undefined);
 
   deps.checkRunReporter.updateJobStatus({
     provider: execContext.provider,

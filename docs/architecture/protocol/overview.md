@@ -160,8 +160,9 @@ Sent by the server after successful authentication.
 | orgPublicAlias   | string           | Yes      | Public alias (`oal_<12-char>`) of the authenticated orchestrator's owning org. Used by the orchestrator's check-run emitter to build a `details_url` that points at the dashboard's resolver route, so the canonical `org_<12-char>` id never appears in public surfaces |
 | orgId            | string           | Yes      | Canonical org id (`org_<...>`) of the authenticated orchestrator's owning org. The orchestrator auto-provisions a remote-run anchor (`remote:<orgId>`) from it so a relayed `kici run remote` resolves the real tenant.                                                  |
 | githubWebhookUrl | string \| null   | Yes      | The org-scoped GitHub App webhook URL of the hosted Platform (`<base>/webhook/<orgId>/github`). The orchestrator's manifest flow bakes it into a new GitHub App in `platform` and `hybrid` mode. `null` when the Platform has no public webhook base.                    |
+| dashboardUrl     | string           | No       | The hosted Platform's public dashboard base (for example `https://app.kici.dev`). The orchestrator builds the `details_url` of its GitHub check runs from it, unless `KICI_DASHBOARD_URL` overrides it. Absent when the Platform has no public dashboard base.           |
 
-The Platform sends every field above to an orchestrator. The `auth.success` an orchestrator sends to an agent carries only `type` and `connectionId`.
+The Platform sends every required field above to an orchestrator, and `dashboardUrl` when it has a public dashboard base. The `auth.success` an orchestrator sends to an agent carries only `type` and `connectionId`.
 
 > Authoritative source: `packages/engine/src/protocol/messages/auth.ts` -- `authSuccessSchema`
 

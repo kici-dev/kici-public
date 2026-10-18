@@ -259,7 +259,10 @@ export const registerAckSchema = z.object({
    * Absent for a job-bound spawn and for a static agent.
    */
   warmPool: z.boolean().optional(),
-  /** Agent-facing capabilities this orchestrator advertises; none are defined at protocol 4. */
+  /**
+   * Agent-facing capabilities this orchestrator advertises. Absent from an
+   * orchestrator that predates them: the agent then assumes none.
+   */
   capabilities: orchAgentCapabilitiesSchema.optional(),
 });
 

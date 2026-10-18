@@ -396,6 +396,41 @@ function makeDispatch(overrides: Partial<JobDispatch> = {}): JobDispatch {
   };
 }
 
+describe('buildRequest - ssh git credential names', () => {
+  const sshJob = () =>
+    makeDispatch({
+      jobConfig: {
+        workflowName: 'ci',
+        name: 'publish',
+        runsOn: 'kici:os:linux',
+        gitCredentials: {
+          default: { kind: 'token', tokenSecret: 'ci:T' },
+          deploy: { kind: 'ssh', privateKeySecret: 'ci:K' },
+        },
+      },
+    });
+
+  it('names the ssh credentials for a host-path job', async () => {
+    const { buildRequest } = await import('./fork-runner.js');
+    const request = buildRequest(sshJob(), '/workspace', { credentialHelperPath: '/c/helper' });
+    expect(request.sshGitCredentials).toEqual(['deploy']);
+  });
+
+  // breaks-if-wrong: a container job cannot use the key, so it is never refused for it.
+  it('omits them for a container job, which gets no credential helper', async () => {
+    const { buildRequest } = await import('./fork-runner.js');
+    expect(buildRequest(sshJob(), '/workspace')).not.toHaveProperty('sshGitCredentials');
+  });
+
+  it('omits them when the job declares no ssh credential', async () => {
+    const { buildRequest } = await import('./fork-runner.js');
+    const request = buildRequest(makeDispatch(), '/workspace', {
+      credentialHelperPath: '/c/helper',
+    });
+    expect(request).not.toHaveProperty('sshGitCredentials');
+  });
+});
+
 describe('buildRequest - global workflow fields', () => {
   it('non-global workflow (isGlobalWorkflow absent) has no global fields', async () => {
     const { buildRequest } = await import('./fork-runner.js');

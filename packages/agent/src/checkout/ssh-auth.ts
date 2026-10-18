@@ -5,6 +5,7 @@
 
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { sshFileListOption } from '@kici-dev/core';
 import { makeTempDir } from '@kici-dev/core/tmp';
 
 export interface SshAuthSetup {
@@ -57,8 +58,7 @@ export async function setupSshAuth(opts: SetupSshAuthOpts): Promise<SshAuthSetup
     'IdentitiesOnly=yes',
     '-o',
     'BatchMode=yes',
-    '-o',
-    `UserKnownHostsFile=${escapeShellArg(knownHostsPath)}`,
+    sshFileListOption('UserKnownHostsFile', [knownHostsPath]),
   ];
 
   if (opts.hostKeyPolicy === 'pinned') {
@@ -74,6 +74,32 @@ export async function setupSshAuth(opts: SetupSshAuthOpts): Promise<SshAuthSetup
     tempDir,
     cleanup,
   };
+}
+
+/**
+ * The ssh command for an SSH-key git credential inside a write window.
+ *
+ * Host keys are checked strictly: a host whose key is in none of
+ * `knownHostsFiles` (nor the system `/etc/ssh/ssh_known_hosts`, which ssh
+ * reads through its default `GlobalKnownHostsFile`) is refused. No
+ * trust-on-first-use, and ssh never writes to these files.
+ */
+export function buildStrictSshCommand(args: {
+  keyPath: string;
+  knownHostsFiles: readonly string[];
+}): string {
+  return [
+    'ssh',
+    '-i',
+    escapeShellArg(args.keyPath),
+    '-o',
+    'IdentitiesOnly=yes',
+    '-o',
+    'BatchMode=yes',
+    '-o',
+    'StrictHostKeyChecking=yes',
+    sshFileListOption('UserKnownHostsFile', args.knownHostsFiles),
+  ].join(' ');
 }
 
 /** Single-quote a path so backslashes and spaces survive git's shell-parse of `GIT_SSH_COMMAND`. */
