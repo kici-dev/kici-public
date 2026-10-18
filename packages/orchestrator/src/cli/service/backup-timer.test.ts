@@ -21,6 +21,7 @@ import {
   launchdPlistPath,
   parseLaunchdSchedule,
   readEnvValue,
+  readEnvValues,
   renderLaunchdBackupPlist,
   renderSystemdBackupService,
   renderSystemdBackupTimer,
@@ -290,6 +291,18 @@ describe('uninstallBackupTimer', () => {
     expect(() => uninstallBackupTimer('windows', target, io)).toThrow(/Windows Task Scheduler/);
     expect(() => uninstallBackupTimer('compose', target, io)).toThrow(/host cron/);
     expect(io.removed).toEqual([]);
+  });
+});
+
+describe('readEnvValues', () => {
+  it('reads every assignment, the last occurrence of a key winning', () => {
+    const content = '# note\nA=1\n=orphan\nB="two"\nA=3\nno-equals\n';
+    // fails-when: a duplicated key keeps its first value, or a line with an
+    // empty key or no `=` becomes an entry.
+    expect([...readEnvValues(content)]).toEqual([
+      ['A', '3'],
+      ['B', 'two'],
+    ]);
   });
 });
 

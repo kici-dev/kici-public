@@ -2,6 +2,14 @@
 
 Release notes for the public KiCI packages.
 
+## v0.22.0 — 2026-10-18
+
+### Fixes
+
+- kici-admin --help states each option default once. Some options showed their default twice, as in `Vault mount path (default: secret) (default: "secret")`. These options are fixed: - backend add: --auth-method, --mount-path, --scope-filter and --sync-interval. - runs list, attestations list, event-log list, access-log list and event-dlq list: --limit. - runs logs: --step and --limit. - db backup: --keep and --schedule. - workflow register-manual: --provider-context. - context create-template: --type. The options and their defaults work as before.
+- kici-admin runs show, runs jobs --include-steps, runs structured and runs logs --step init[<n>], kici runs show, kici runs logs and the dashboard now also list an init step recorded by an orchestrator older than 0.21.0 first, as init[<n>], instead of last with step number 1000000. That orchestrator stored init steps with no step type; they are recognized from their stored index and their init:<n> name. In --json, such a step reports phase init and its initIndex.
+- `kici-admin orchestrator upgrade` now reads the cache storage config and the S3 credentials for the agent package upload from the env file of the instance that it upgrades, not from the shell. An upgrade from a shell that exports no `KICI_STORAGE_*` variables no longer skips the upload. `kici-admin agent package --upload` takes `--env-file` to read the same config.
+
 ## v0.21.0 — 2026-10-18
 
 ### Features

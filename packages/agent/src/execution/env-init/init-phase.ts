@@ -6,14 +6,6 @@ import { failureDetail } from '../failure-tail.js';
 import type { RunnerToAgentMessage } from '../sandbox/ipc-protocol.js';
 import { composeInitEnv } from './init-env.js';
 
-/**
- * `init:<n>` occupies `INIT_STEP_INDEX_BASE + n`, ABOVE every hook pseudo-step index
- * the step loop allocates from `steps.length` upward (see step-loop.ts); no realistic
- * step/hook count reaches it. Readers place init steps by their `init:<n>` type, not
- * this index.
- */
-export const INIT_STEP_INDEX_BASE = 1_000_000;
-
 /** Used when a spec sets no timeout: 10 minutes. */
 const DEFAULT_INIT_TIMEOUT_MS = 10 * 60 * 1000;
 

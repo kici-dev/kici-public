@@ -263,10 +263,10 @@ Synopsis: `kici-admin db backup [options]`
 | `--database-url <url>`  |         | Source DB URL (else KICI_DATABASE_URL / DATABASE_URL)                                                          |
 | `--output <path>`       |         | Dump output path (default ./kici-orchestrator-backup-<ts>.dump)                                                |
 | `--output-dir <path>`   |         | Write a timestamped dump into this directory, then prune it to --keep dumps                                    |
-| `--keep <n>`            | `7`     | Dumps to retain in --output-dir (default 7)                                                                    |
+| `--keep <n>`            | `7`     | Dumps to retain in --output-dir                                                                                |
 | `--install-timer`       |         | Install a scheduled backup service + timer and exit                                                            |
 | `--uninstall-timer`     |         | Remove the scheduled backup service + timer and exit                                                           |
-| `--schedule <spec>`     | `daily` | Timer calendar spec: a systemd OnCalendar value, or daily / HH:MM (default daily)                              |
+| `--schedule <spec>`     | `daily` | Timer calendar spec: a systemd OnCalendar value, or daily / HH:MM                                              |
 | `--platform <type>`     |         | Force the service platform (systemd, launchd, windows, compose). Default: the platform in the install manifest |
 | `--instance-dir <path>` |         | Deploy folder of the orchestrator instance to schedule                                                         |
 | `--name <name>`         |         | Orchestrator service name to schedule (no default)                                                             |

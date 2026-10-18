@@ -54,7 +54,7 @@ export function registerEventLogCommands(program: Command, getClient: () => Admi
     .option('--from <ts>', 'ISO timestamp lower bound (inclusive)')
     .option('--to <ts>', 'ISO timestamp upper bound (exclusive)')
     .option('--delivery-id <substr>', 'Substring filter on delivery_id')
-    .option('--limit <n>', 'Max results (default 50, max 200)', '50')
+    .option('--limit <n>', 'Max results (max 200)', '50')
     .option('--offset <n>', 'Skip first N results', '0')
     .option(
       '--include-archived',

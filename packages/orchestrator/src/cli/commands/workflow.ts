@@ -163,11 +163,7 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
     .requiredOption('--repo <ident>', 'repo_identifier value (e.g. "owner/repo")')
     .requiredOption('--routing-key <key>', 'Routing key for the source (e.g. "github:42")')
     .requiredOption('--org <id>', 'Org id to attribute rows to')
-    .option(
-      '--provider-context <json>',
-      'Provider-specific context as a JSON object (default: {})',
-      '{}',
-    )
+    .option('--provider-context <json>', 'Provider-specific context as a JSON object', '{}')
     .option('--commit-sha <sha>', 'Optional commit SHA stamped on each row')
     .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .option('--json', 'Emit JSON output')

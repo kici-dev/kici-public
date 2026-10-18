@@ -14,9 +14,11 @@
 
 import { sql, type Expression } from 'kysely';
 import {
+  INIT_STEP_INDEX_BASE,
   INIT_STEP_TYPE_PREFIX,
   SetupStepType,
   StepPhase,
+  UNTYPED_STEP_TYPE,
   compareStepsByPhase,
 } from '@kici-dev/engine';
 
@@ -29,28 +31,35 @@ import {
  * ```
  *
  * Untyped steps and every real step share one key, so `step_index` alone orders each group.
- * The init pattern matches `initStepIndex`: the prefix followed by digits only.
+ * The init match is the engine's `stepInitIndex`: an `init:<n>` type (the prefix followed by
+ * digits only), or an untyped row at `INIT_STEP_INDEX_BASE + n` named `init:<n>`.
  */
 export function setupStepsFirst(): Expression<number> {
   const setupTypes = SetupStepType.options;
   const initPattern = `^${INIT_STEP_TYPE_PREFIX}[0-9]+$`;
+  const base = sql.lit(INIT_STEP_INDEX_BASE);
+  const untypedInit = sql`(step_type is null or step_type = ${sql.lit(UNTYPED_STEP_TYPE)}) and step_index >= ${base} and step_name = (${sql.lit(INIT_STEP_TYPE_PREFIX)} || (step_index - ${base})::text)`;
   return sql<number>`case when step_type in (${sql.join(
     setupTypes.map((t) => sql.lit(t)),
   )}) then ${sql.lit(StepPhase.options.indexOf(StepPhase.enum.setup))} when step_type ~ ${sql.lit(
     initPattern,
-  )} then ${sql.lit(StepPhase.options.indexOf(StepPhase.enum.init))} else ${sql.lit(
+  )} or (${untypedInit}) then ${sql.lit(StepPhase.options.indexOf(StepPhase.enum.init))} else ${sql.lit(
     StepPhase.options.indexOf(StepPhase.enum.steps),
   )} end`;
 }
 
+/** A stored step row, as the run readers select it. */
+interface StepRow {
+  step_type?: string | null;
+  step_index: number;
+  step_name?: string | null;
+}
+
 /** In-memory equivalent over DB rows, kept beside the SQL so the two agree on the phases. */
-export function compareStepsForDisplay(
-  a: { step_type?: string | null; step_index: number },
-  b: { step_type?: string | null; step_index: number },
-): number {
+export function compareStepsForDisplay(a: StepRow, b: StepRow): number {
   return compareStepsByPhase(
-    { stepType: a.step_type, stepIndex: a.step_index },
-    { stepType: b.step_type, stepIndex: b.step_index },
+    { stepType: a.step_type, stepIndex: a.step_index, stepName: a.step_name },
+    { stepType: b.step_type, stepIndex: b.step_index, stepName: b.step_name },
   );
 }
 
@@ -59,9 +68,10 @@ export function compareStepRowsForDisplay(
   a: Record<string, unknown>,
   b: Record<string, unknown>,
 ): number {
-  const typed = (r: Record<string, unknown>) => ({
+  const typed = (r: Record<string, unknown>): StepRow => ({
     step_type: typeof r.step_type === 'string' ? r.step_type : null,
     step_index: Number(r.step_index ?? 0),
+    step_name: typeof r.step_name === 'string' ? r.step_name : null,
   });
   return compareStepsForDisplay(typed(a), typed(b));
 }

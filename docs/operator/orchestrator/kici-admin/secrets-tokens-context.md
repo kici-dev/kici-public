@@ -296,21 +296,21 @@ Synopsis: `kici-admin backend add <name> [options]`
 
 **Options**
 
-| Option                      | Default   | Description                                            |
-| --------------------------- | --------- | ------------------------------------------------------ |
-| `--type <type>`             |           | Backend type: pg or vault                              |
-| `--vault-url <url>`         |           | Vault/OpenBao URL (env: KICI_BACKEND_VAULT_URL)        |
-| `--auth-method <method>`    | `approle` | Vault auth method: approle or token (default: approle) |
-| `--role-id <id>`            |           | Vault AppRole role ID (env: KICI_BACKEND_ROLE_ID)      |
-| `--secret-id <id>`          |           | Vault AppRole secret ID (env: KICI_BACKEND_SECRET_ID)  |
-| `--secret-id-file <path>`   |           | Read Vault secret ID from file (avoids shell history)  |
-| `--token <token>`           |           | Vault token (env: KICI_BACKEND_TOKEN)                  |
-| `--namespace <ns>`          |           | Vault namespace                                        |
-| `--mount-path <path>`       | `secret`  | Vault mount path (default: secret)                     |
-| `--base-path <path>`        |           | Vault base path for secrets                            |
-| `--connection-string <url>` |           | PG connection string (env: KICI_BACKEND_PG_URL)        |
-| `--scope-filter <pattern>`  | `**`      | Scope filter glob pattern (default: **)                |
-| `--sync-interval <ms>`      | `300000`  | Sync interval in milliseconds (default: 300000)        |
+| Option                      | Default   | Description                                           |
+| --------------------------- | --------- | ----------------------------------------------------- |
+| `--type <type>`             |           | Backend type: pg or vault                             |
+| `--vault-url <url>`         |           | Vault/OpenBao URL (env: KICI_BACKEND_VAULT_URL)       |
+| `--auth-method <method>`    | `approle` | Vault auth method: approle or token                   |
+| `--role-id <id>`            |           | Vault AppRole role ID (env: KICI_BACKEND_ROLE_ID)     |
+| `--secret-id <id>`          |           | Vault AppRole secret ID (env: KICI_BACKEND_SECRET_ID) |
+| `--secret-id-file <path>`   |           | Read Vault secret ID from file (avoids shell history) |
+| `--token <token>`           |           | Vault token (env: KICI_BACKEND_TOKEN)                 |
+| `--namespace <ns>`          |           | Vault namespace                                       |
+| `--mount-path <path>`       | `secret`  | Vault mount path                                      |
+| `--base-path <path>`        |           | Vault base path for secrets                           |
+| `--connection-string <url>` |           | PG connection string (env: KICI_BACKEND_PG_URL)       |
+| `--scope-filter <pattern>`  | `**`      | Scope filter glob pattern                             |
+| `--sync-interval <ms>`      | `300000`  | Sync interval in milliseconds                         |
 
 ### `kici-admin backend list`
 
@@ -448,7 +448,7 @@ Synopsis: `kici-admin context create-template [options]`
 | ------------------------------ | ---------- | ------------------------------------------------------- |
 | `--org <id>`                   |            | Org id (kici-admin org list prints the org ids)         |
 | `--template <name>`            |            | Template name                                           |
-| `--type <t>`                   | `template` | Context type (defaults to "template")                   |
+| `--type <t>`                   | `template` | Context type                                            |
 | `--branch-restrictions <json>` |            | JSON array of allowed branches                          |
 | `--required-reviewers <csv>`   |            | CSV of required reviewer user IDs                       |
 | `--wait-timer <seconds>`       |            | Wait timer (seconds)                                    |

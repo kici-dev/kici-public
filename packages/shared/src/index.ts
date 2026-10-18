@@ -164,7 +164,12 @@ export {
   type StoppableServer,
 } from './http-server-stop.js';
 export { kiciTmpBase, kiciMkdtemp } from './tmp-dir.js';
-export { createS3Client, type CreateS3ClientOptions, type SharedS3Config } from './s3-client.js';
+export {
+  createS3Client,
+  type CreateS3ClientOptions,
+  type S3StaticCredentials,
+  type SharedS3Config,
+} from './s3-client.js';
 export {
   assertColdStoreEnabled,
   BaseColdStore,

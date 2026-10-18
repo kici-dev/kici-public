@@ -4,7 +4,7 @@ import {
   CONTAINER_BUILD_STEP_NAME,
   runJobImageBuild,
 } from './build-step.js';
-import { INIT_STEP_INDEX_BASE } from '../env-init/init-phase.js';
+import { INIT_STEP_INDEX_BASE } from '@kici-dev/engine';
 
 describe('CONTAINER_BUILD_STEP_INDEX', () => {
   it('is non-negative, because step.status refuses a negative index', () => {

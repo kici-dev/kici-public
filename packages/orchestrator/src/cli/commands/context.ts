@@ -479,7 +479,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
     .description('Create or update a context template + its seed variables')
     .requiredOption('--org <id>', ORG_ID_HELP)
     .requiredOption('--template <name>', 'Template name')
-    .option('--type <t>', 'Context type (defaults to "template")', 'template')
+    .option('--type <t>', 'Context type', 'template')
     .option('--branch-restrictions <json>', 'JSON array of allowed branches')
     .option('--required-reviewers <csv>', 'CSV of required reviewer user IDs')
     .option('--wait-timer <seconds>', 'Wait timer (seconds)')

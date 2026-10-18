@@ -1034,6 +1034,7 @@ Per-job status forwarded from orchestrator upstream in real-time. Enables live j
 | runId          | string                  | Yes      | Execution run ID                                                                                                                                                                                                                     |
 | jobId          | string                  | Yes      | Job ID within the run                                                                                                                                                                                                                |
 | jobName        | string                  | Yes      | Human-readable job name                                                                                                                                                                                                              |
+| workflowName   | string                  | No       | The workflow that defines this job. A shared fixture run from an older `kici` holds every matched workflow, so the run name alone does not say which workflow a job belongs to. Absent from an older orchestrator                    |
 | status         | enum                    | Yes      | One of: `pending`, `queued`, `running`, `recovering`, `cancelling`, `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable`                                                                    |
 | matrixValues   | Record<string, unknown> | No       | Matrix parameter values for this job instance                                                                                                                                                                                        |
 | startedAt      | number                  | No       | Unix timestamp when job started                                                                                                                                                                                                      |
@@ -1092,18 +1093,19 @@ Each RunSnapshot:
 
 Each JobSnapshot:
 
-| Field        | Type           | Required | Description                                                   |
-| ------------ | -------------- | -------- | ------------------------------------------------------------- |
-| jobId        | string         | Yes      | Job ID                                                        |
-| jobName      | string         | Yes      | Human-readable job name                                       |
-| status       | string         | Yes      | Job status                                                    |
-| startedAt    | number         | No       | Unix timestamp job started                                    |
-| completedAt  | number         | No       | Unix timestamp job ended                                      |
-| durationMs   | number         | No       | Job duration (ms)                                             |
-| errorMessage | string or null | No       | Error message if job failed                                   |
-| agentId      | string or null | No       | Agent ID executing this job                                   |
-| runsOnLabels | string[]       | No       | Labels used for agent routing                                 |
-| contexts     | string[]       | No       | Ordered bound context names for this job (multi-context jobs) |
+| Field        | Type           | Required | Description                                                                                       |
+| ------------ | -------------- | -------- | ------------------------------------------------------------------------------------------------- |
+| jobId        | string         | Yes      | Job ID                                                                                            |
+| jobName      | string         | Yes      | Human-readable job name                                                                           |
+| workflowName | string         | No       | The workflow that defines this job, as on `job.status.forward`. Absent from an older orchestrator |
+| status       | string         | Yes      | Job status                                                                                        |
+| startedAt    | number         | No       | Unix timestamp job started                                                                        |
+| completedAt  | number         | No       | Unix timestamp job ended                                                                          |
+| durationMs   | number         | No       | Job duration (ms)                                                                                 |
+| errorMessage | string or null | No       | Error message if job failed                                                                       |
+| agentId      | string or null | No       | Agent ID executing this job                                                                       |
+| runsOnLabels | string[]       | No       | Labels used for agent routing                                                                     |
+| contexts     | string[]       | No       | Ordered bound context names for this job (multi-context jobs)                                     |
 
 > Authoritative source: `packages/engine/src/protocol/messages/execution-status.ts` -- `stateReplaySchema`, `stateReplayRunSchema`
 

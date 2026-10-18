@@ -9,6 +9,37 @@ import { describeWithTestDb } from '@kici-dev/test-support/test-db';
 import { startRun } from '../__test-helpers__/tracker.js';
 import { createAdminRunRoutes } from './admin-runs.js';
 
+/** An `execution_steps` row with no timing or log data; `step_type` takes its default. */
+function stepRow(
+  runId: string,
+  jobId: string,
+  step_index: number,
+  step_name: string,
+  extra: { step_type?: string } = {},
+) {
+  return {
+    run_id: runId,
+    job_id: jobId,
+    step_index,
+    step_name,
+    ...extra,
+    started_at: null,
+    completed_at: null,
+    duration_ms: null,
+    exit_code: null,
+    error_message: null,
+    log_path: null,
+    secrets_accessed: null,
+    check_outcome: null,
+    drift_summary: null,
+    concurrency_kind: null,
+    group_id: null,
+    routing_key: null,
+    archived_at: null,
+    archive_object_key: null,
+  };
+}
+
 /**
  * Real-Postgres coverage of the admin run routes for a run that spans several
  * workflows (an older `kici`'s shared fixture run), and for a job row written
@@ -45,6 +76,16 @@ describeWithTestDb<Database>(
       });
       expect(res.status).toBe(200);
       return res.json();
+    }
+
+    /** Store the run's step rows, then read them back through `runs jobs --include-steps`. */
+    async function insertStepsAndList(
+      runId: string,
+      rows: Array<ReturnType<typeof stepRow>>,
+    ): Promise<Array<Record<string, unknown>>> {
+      await db.insertInto('execution_steps').values(rows).execute();
+      const { jobs } = await get(`/${runId}/jobs?includeSteps=true`);
+      return jobs[0].steps as Array<Record<string, unknown>>;
     }
 
     async function startFixtureRun(runId: string): Promise<void> {
@@ -149,42 +190,19 @@ describeWithTestDb<Database>(
         workflowName: 'ci',
         jobs: [{ jobId, jobName: 'build' }],
       });
-      const step = (step_index: number, step_type: string) => ({
-        run_id: runId,
-        job_id: jobId,
-        step_index,
-        step_name: step_type === 'step' ? `step-${step_index}` : step_type,
-        step_type,
-        started_at: null,
-        completed_at: null,
-        duration_ms: null,
-        exit_code: null,
-        error_message: null,
-        log_path: null,
-        secrets_accessed: null,
-        check_outcome: null,
-        drift_summary: null,
-        concurrency_kind: null,
-        group_id: null,
-        routing_key: null,
-        archived_at: null,
-        archive_object_key: null,
-      });
-      await db
-        .insertInto('execution_steps')
-        .values([
-          step(0, 'step'),
-          step(1, 'step'),
-          step(1_000_001, 'init:1'),
-          step(1_000_000, 'init:0'),
-          step(2_000_000, 'container:build'),
-          // Only looks like an init: the SQL and in-memory rank must both treat it as a step.
-          step(5, 'init:x'),
-        ])
-        .execute();
-
-      const { jobs } = await get(`/${runId}/jobs?includeSteps=true`);
-      const steps = jobs[0].steps as Array<Record<string, unknown>>;
+      const step = (step_index: number, step_type: string) =>
+        stepRow(runId, jobId, step_index, step_type === 'step' ? `step-${step_index}` : step_type, {
+          step_type,
+        });
+      const steps = await insertStepsAndList(runId, [
+        step(0, 'step'),
+        step(1, 'step'),
+        step(1_000_001, 'init:1'),
+        step(1_000_000, 'init:0'),
+        step(2_000_000, 'container:build'),
+        // Only looks like an init: the SQL and in-memory rank must both treat it as a step.
+        step(5, 'init:x'),
+      ]);
       // fails-when: the SQL sort has no init rank, so the init steps come after the steps
       expect(steps.map((s) => s.stepType)).toEqual([
         'container:build',
@@ -201,6 +219,47 @@ describeWithTestDb<Database>(
       expect(steps[3]).toMatchObject({ stepIndex: 0, phase: 'steps' });
       expect(steps[3]).not.toHaveProperty('initIndex');
       expect(steps[5]).not.toHaveProperty('initIndex');
+    });
+
+    it('lists an init step stored without a type as an init step, before the steps', async () => {
+      const runId = randomUUID();
+      const jobId = `${runId}-a`;
+      await startRun(new ExecutionTracker({ db }), {
+        runId,
+        workflowName: 'ci',
+        jobs: [{ jobId, jobName: 'image-tools' }],
+      });
+      const step = (step_index: number, step_name: string) =>
+        stepRow(runId, jobId, step_index, step_name);
+      // An older orchestrator stored every init step untyped: step_type takes its default.
+      const steps = await insertStepsAndList(runId, [
+        step(0, 'baseline'),
+        step(1, 'sudo-apt'),
+        step(1_000_000, 'init:0'),
+        step(999_999, 'init:-1'),
+        step(1_000_002, 'cache:restore'),
+      ]);
+      // fails-when: the SQL rank reads only step_type, so the untyped init row sorts last
+      expect(steps.map((s) => s.stepName)).toEqual([
+        'init:0',
+        'baseline',
+        'sudo-apt',
+        'init:-1',
+        'cache:restore',
+      ]);
+      // fails-when: phase and initIndex come from step_type alone
+      expect(steps[0]).toMatchObject({
+        stepIndex: 1_000_000,
+        stepType: 'step',
+        phase: 'init',
+        initIndex: 0,
+      });
+      // breaks-if-wrong: a step just below the init base, or a high step with another name,
+      // stays a regular step
+      expect(steps[3]).toMatchObject({ stepIndex: 999_999, phase: 'steps' });
+      expect(steps[3]).not.toHaveProperty('initIndex');
+      expect(steps[4]).toMatchObject({ stepIndex: 1_000_002, phase: 'steps' });
+      expect(steps[4]).not.toHaveProperty('initIndex');
     });
   },
 );

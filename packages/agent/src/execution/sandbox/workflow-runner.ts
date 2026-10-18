@@ -24,6 +24,7 @@ import {
   AGENT_API_REQUEST_TIMEOUT_MS,
   ExecutionJobStatus,
   ExecutionStepStatus,
+  INIT_STEP_INDEX_BASE,
   reservedEventNamePrefix,
   LogStream,
   TimeoutReason,
@@ -117,11 +118,7 @@ import { executeStepLoop, type StepNode } from './step-loop.js';
 import { runInStepCapture, currentCaptureStepIndex } from './capture-context.js';
 import { StepTaskRegistry } from './step-task-registry.js';
 import type { JobHooks, StepLoopOptions } from './step-loop.js';
-import {
-  INIT_STEP_INDEX_BASE,
-  runInitPhase,
-  type RunInitPhaseOptions,
-} from '../env-init/init-phase.js';
+import { runInitPhase, type RunInitPhaseOptions } from '../env-init/init-phase.js';
 import { formatInitFailureMessage } from '../failure-tail.js';
 import { normalizeInitItems } from '../env-init/presets/directives.js';
 import { expandInitDirectives } from '../env-init/presets/expand.js';

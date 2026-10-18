@@ -314,7 +314,15 @@ Payloads are built on your own orchestrator from the sources you already trust �
 
 #### Auto-package on orchestrator upgrade
 
-`kici-admin orchestrator upgrade` refreshes the fleet's payloads automatically: after the orchestrator advances to a new version, it produces and uploads `agent-packages/<version>/kici-agent-<platform>.tar.gz(.sha256)` for the platforms the fleet already runs (discovered from the cache bucket; the glibc-Linux bootstrap set on a fresh cache). It is idempotent — a version whose payloads already exist is skipped — so re-running an upgrade re-uploads nothing. Pass `--no-agent-packages` to skip this and publish payloads out of band, or `--agent-package-platforms <list>` to override the platform set. An orchestrator with no object-storage cache configured skips the step entirely (payloads are served from the cache bucket).
+`kici-admin orchestrator upgrade` refreshes the fleet's payloads automatically. After the orchestrator advances to a new version, it produces and uploads `agent-packages/<version>/kici-agent-<platform>.tar.gz(.sha256)` for the platforms the fleet already runs. It finds those platforms in the cache bucket, and uses the glibc-Linux bootstrap set on a fresh cache. It is idempotent — a version whose payloads already exist is skipped — so re-running an upgrade re-uploads nothing. Pass `--no-agent-packages` to skip this and publish payloads out of band, or `--agent-package-platforms <list>` to override the platform set.
+
+The upgrade reads the cache storage config from the env file of the instance that it upgrades. This is the env file that the service runs with, which `orchestrator install --env-file` records in the instance manifest. It is the same for a systemd, launchd, Windows or compose install. The upgrade reads only these variables from the env file:
+
+- The `KICI_STORAGE_*` variables give the bucket, the endpoint and the other cache storage settings. The upgrade ignores the `KICI_STORAGE_*` variables of the shell that runs it.
+- `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, with `AWS_SESSION_TOKEN` when it is set, give the S3 credentials. When the env file does not set both keys, the upgrade uses its `AWS_PROFILE`. When the env file sets none of them, the upgrade uses the default AWS credential chain of its shell: the environment, the shared credentials file, or an instance role.
+- `AWS_REGION`, or else `AWS_DEFAULT_REGION`, gives the region when `KICI_STORAGE_REGION` is not set.
+
+The upgrade prints the path of the env file it read, and it never prints a credential. When the env file sets no S3 cache storage, the upgrade skips the step and names the env file. Payloads come only from the cache bucket, so an orchestrator with no S3 cache storage has no use for them. When the env file cannot be read, or the upload fails, the upgrade itself is still complete, but the command exits with code 1. It then prints the command that uploads the payloads with the same config: `kici-admin agent package --upload --env-file <env-file>`. Without `--env-file`, `kici-admin agent package --upload` reads the storage config from its shell.
 
 #### Fleet auto-upgrade convergence
 

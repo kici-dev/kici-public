@@ -336,16 +336,12 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
       '--output-dir <path>',
       'Write a timestamped dump into this directory, then prune it to --keep dumps',
     )
-    .option(
-      '--keep <n>',
-      `Dumps to retain in --output-dir (default ${BACKUP_TIMER_DEFAULT_KEEP})`,
-      `${BACKUP_TIMER_DEFAULT_KEEP}`,
-    )
+    .option('--keep <n>', 'Dumps to retain in --output-dir', `${BACKUP_TIMER_DEFAULT_KEEP}`)
     .option('--install-timer', 'Install a scheduled backup service + timer and exit')
     .option('--uninstall-timer', 'Remove the scheduled backup service + timer and exit')
     .option(
       '--schedule <spec>',
-      `Timer calendar spec: a systemd OnCalendar value, or daily / HH:MM (default ${BACKUP_TIMER_DEFAULT_SCHEDULE})`,
+      'Timer calendar spec: a systemd OnCalendar value, or daily / HH:MM',
       BACKUP_TIMER_DEFAULT_SCHEDULE,
     )
     .option(

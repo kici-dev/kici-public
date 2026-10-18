@@ -404,7 +404,8 @@ runs in your local run history. `kici runs list` shows full run ids.
 Steps are listed in the order they ran: a job's image build, then its `init`
 commands, then its steps. An `init` command is named `init[<n>]`, where `<n>` is
 its position in the job's `init` list. `kici runs logs` uses the same order and
-names in its headings.
+names in its headings. An `init` command that an older orchestrator recorded with
+no step type is listed and named the same way.
 
 For a run that spans several workflows, the header shows `workflows=` with every
 workflow name, and each job is named `<workflow> / <job>`. In `--json`, each

@@ -20,7 +20,7 @@ import {
 import { Upload } from '@aws-sdk/lib-storage';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import type { CacheMetadata, CacheStorage } from './types.js';
-import { createLogger, createS3Client } from '@kici-dev/shared';
+import { createLogger, createS3Client, type S3StaticCredentials } from '@kici-dev/shared';
 
 const logger = createLogger({ prefix: 's3-cache' });
 
@@ -51,6 +51,13 @@ export interface S3CacheStorageOptions {
   uploadEndpoint?: string;
   /** Path-style instead of virtual-hosted-style access (most S3-compatible services need it). */
   forcePathStyle?: boolean;
+  /**
+   * Explicit credentials. When unset, the SDK default credential chain applies:
+   * the process environment, the shared config files, an instance role.
+   */
+  credentials?: S3StaticCredentials;
+  /** The shared-config profile the default credential chain reads. */
+  profile?: string;
 }
 
 export class S3CacheStorage implements CacheStorage {

@@ -764,25 +764,26 @@ Request a presigned URL for uploading the working-tree overlay tarball.
 
 Trigger a remote test run using a fixture payload (mirrors the orchestrator's `TestTriggerInput`).
 
-| Field               | Type                   | Required | Description                                                                                                                                                           |
-| ------------------- | ---------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| type                | `"test.relay.trigger"` | Yes      | Message discriminator                                                                                                                                                 |
-| requestId           | string                 | Yes      | Correlation ID for the response                                                                                                                                       |
-| actor               | ActorPrincipal         | Yes      | Authenticated principal initiating the run                                                                                                                            |
-| routingKey          | string                 | Yes      | Provider routing key                                                                                                                                                  |
-| fixtureId           | string                 | Yes      | Fixture identifier                                                                                                                                                    |
-| event               | TestEvent              | Yes      | Simulated event (type, action, branch, payload)                                                                                                                       |
-| workflowName        | string                 | No       | Specific workflow to test (all if omitted)                                                                                                                            |
-| uploadId            | string                 | No       | Upload ID returned by `test.relay.uploads.init.response`                                                                                                              |
-| cliPublicKey        | string                 | No       | CLI ephemeral X25519 public key used to encrypt the overlay tarball                                                                                                   |
-| inlineLockFile      | string                 | No       | Lock file sent inline instead of via upload                                                                                                                           |
-| fullRepo            | boolean                | No       | Whether the upload is the full working tree (not an overlay)                                                                                                          |
-| checkMode           | enum                   | No       | Run mode for idempotent steps, relayed onto the dispatch event. Omitted means `apply`                                                                                 |
-| target              | HostTargetSelector     | No       | Host narrowing from `kici run remote --target`, intersected with each `runsOnAll` job's matched roster. Omitted for webhook runs                                      |
-| dispatchInputs      | Record<string, string> | No       | Raw `kici run remote --input KEY=VALUE` pairs, relayed verbatim. The orchestrator validates, coerces and defaults them against the matched workflow's lock descriptor |
-| secrets             | Record<string, string> | No       | Plaintext secrets for the run                                                                                                                                         |
-| encryptedSecrets    | string                 | No       | Encrypted secrets blob                                                                                                                                                |
-| encryptedSecretsKey | string                 | No       | Key wrapping the encrypted secrets blob                                                                                                                               |
+| Field               | Type                   | Required | Description                                                                                                                                                                                                 |
+| ------------------- | ---------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type                | `"test.relay.trigger"` | Yes      | Message discriminator                                                                                                                                                                                       |
+| requestId           | string                 | Yes      | Correlation ID for the response                                                                                                                                                                             |
+| actor               | ActorPrincipal         | Yes      | Authenticated principal initiating the run                                                                                                                                                                  |
+| routingKey          | string                 | Yes      | Provider routing key                                                                                                                                                                                        |
+| fixtureId           | string                 | Yes      | Fixture identifier                                                                                                                                                                                          |
+| event               | TestEvent              | Yes      | Simulated event (type, action, branch, payload)                                                                                                                                                             |
+| workflowName        | string                 | No       | Specific workflow to test (all if omitted)                                                                                                                                                                  |
+| uploadId            | string                 | No       | Upload ID returned by `test.relay.uploads.init.response`                                                                                                                                                    |
+| cliPublicKey        | string                 | No       | CLI ephemeral X25519 public key used to encrypt the overlay tarball                                                                                                                                         |
+| inlineLockFile      | string                 | No       | Lock file sent inline instead of via upload                                                                                                                                                                 |
+| fullRepo            | boolean                | No       | Whether the upload is the full working tree (not an overlay)                                                                                                                                                |
+| checkMode           | enum                   | No       | Run mode for idempotent steps, relayed onto the dispatch event. Omitted means `apply`                                                                                                                       |
+| target              | HostTargetSelector     | No       | Host narrowing from `kici run remote --target`, intersected with each `runsOnAll` job's matched roster. Omitted for webhook runs                                                                            |
+| dispatchInputs      | Record<string, string> | No       | Raw `kici run remote --input KEY=VALUE` pairs, relayed verbatim. The orchestrator validates, coerces and defaults them against the matched workflow's lock descriptor                                       |
+| secrets             | Record<string, string> | No       | Plaintext secrets for the run                                                                                                                                                                               |
+| encryptedSecrets    | string                 | No       | Encrypted secrets blob                                                                                                                                                                                      |
+| encryptedSecretsKey | string                 | No       | Key wrapping the encrypted secrets blob                                                                                                                                                                     |
+| acceptsMultipleRuns | boolean                | No       | The caller follows every run in the response's `runs`, so a fixture that matches several workflows gets one run per workflow. Without it the orchestrator answers as for a caller that follows only `runId` |     |
 
 TestEvent: `{ type: string, action?: string, targetBranch: string, sourceBranch?: string, payload: Record<string, unknown>, changedFiles?: string[] }`
 
@@ -842,44 +843,49 @@ Presigned upload URL plus the ephemeral encryption key the CLI uses to encrypt t
 
 Acknowledge a triggered run.
 
-| Field     | Type                            | Required | Description                                                                 |
-| --------- | ------------------------------- | -------- | --------------------------------------------------------------------------- |
-| type      | `"test.relay.trigger.response"` | Yes      | Message discriminator                                                       |
-| requestId | string                          | Yes      | ID of the request being responded to                                        |
-| runId     | string                          | No       | Execution run ID                                                            |
-| status    | enum                            | No       | One of: `accepted`, `rejected`                                              |
-| reason    | string                          | No       | Rejection reason (if rejected)                                              |
-| jobIds    | string[]                        | No       | IDs of the jobs created for the run                                         |
-| warnings  | string[]                        | No       | User-visible warnings on acceptance (e.g. a skipped non-test bound context) |
-| error     | string                          | No       | Failure reason                                                              |
+| Field     | Type                            | Required | Description                                                                                                                     |
+| --------- | ------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| type      | `"test.relay.trigger.response"` | Yes      | Message discriminator                                                                                                           |
+| requestId | string                          | Yes      | ID of the request being responded to                                                                                            |
+| runId     | string                          | No       | Deprecated: read `runs`. The first run of `runs`, or the one run when the request did not set `acceptsMultipleRuns`             |
+| runs      | TriggeredRun[]                  | No       | Every run the trigger created, one per matched workflow. Absent from an orchestrator that predates the field; read `runId` then |
+| status    | enum                            | No       | One of: `accepted`, `rejected`                                                                                                  |
+| reason    | string                          | No       | Rejection reason (if rejected)                                                                                                  |
+| jobIds    | string[]                        | No       | IDs of the jobs created for the run                                                                                             |
+| warnings  | string[]                        | No       | User-visible warnings on acceptance (e.g. a skipped non-test bound context)                                                     |
+| error     | string                          | No       | Failure reason                                                                                                                  |
+
+TriggeredRun: `{ runId: string, workflowName: string, jobIds?: string[] }`
 
 #### test.relay.run.status.response
 
 A run-status snapshot.
 
-| Field     | Type                               | Required | Description                                                                                                                                                                                       |
-| --------- | ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| type      | `"test.relay.run.status.response"` | Yes      | Message discriminator                                                                                                                                                                             |
-| requestId | string                             | Yes      | ID of the request being responded to                                                                                                                                                              |
-| runId     | string                             | No       | Execution run ID                                                                                                                                                                                  |
-| status    | string                             | No       | Run status                                                                                                                                                                                        |
-| jobs      | array                              | No       | Per-job status: `{ jobId, jobName, status, exitCode?, errorMessage?, durationMs? }`. `durationMs` is the job's duration in milliseconds; when it is absent, the CLI shows the duration as unknown |
-| done      | boolean                            | No       | Whether the run has reached a terminal state                                                                                                                                                      |
-| error     | string                             | No       | Failure reason                                                                                                                                                                                    |
+| Field         | Type                               | Required | Description                                                                                                                                                                                       |
+| ------------- | ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type          | `"test.relay.run.status.response"` | Yes      | Message discriminator                                                                                                                                                                             |
+| requestId     | string                             | Yes      | ID of the request being responded to                                                                                                                                                              |
+| runId         | string                             | No       | Execution run ID                                                                                                                                                                                  |
+| status        | string                             | No       | Run status                                                                                                                                                                                        |
+| jobs          | array                              | No       | Per-job status: `{ jobId, jobName, status, exitCode?, errorMessage?, durationMs? }`. `durationMs` is the job's duration in milliseconds; when it is absent, the CLI shows the duration as unknown |
+| failureReason | string \| null                     | No       | Why the run failed, when it failed before or outside any job (an init failure records no job). Absent from an orchestrator that predates the field                                                |
+| done          | boolean                            | No       | Whether the run has reached a terminal state                                                                                                                                                      |
+| error         | string                             | No       | Failure reason                                                                                                                                                                                    |
 
 #### test.relay.run.logs.response
 
 The next log chunk and the cursors to read on from.
 
-| Field         | Type                             | Required | Description                                                                            |
-| ------------- | -------------------------------- | -------- | -------------------------------------------------------------------------------------- |
-| type          | `"test.relay.run.logs.response"` | Yes      | Message discriminator                                                                  |
-| requestId     | string                           | Yes      | ID of the request being responded to                                                   |
-| lines         | string[]                         | No       | Log output lines                                                                       |
-| nextCursor    | number                           | No       | Cursor for the next `test.relay.run.logs` request                                      |
-| nextLogCursor | string                           | No       | Opaque per-file cursor for the next request; present when the request sent `logCursor` |
-| done          | boolean                          | No       | Whether the log stream is exhausted                                                    |
-| error         | string                           | No       | Failure reason                                                                         |
+| Field         | Type                             | Required | Description                                                                                                                                                |
+| ------------- | -------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type          | `"test.relay.run.logs.response"` | Yes      | Message discriminator                                                                                                                                      |
+| requestId     | string                           | Yes      | ID of the request being responded to                                                                                                                       |
+| lines         | string[]                         | No       | Log output lines                                                                                                                                           |
+| nextCursor    | number                           | No       | Cursor for the next `test.relay.run.logs` request                                                                                                          |
+| nextLogCursor | string                           | No       | Opaque per-file cursor for the next request; present when the request sent `logCursor`                                                                     |
+| lineJobNames  | string[]                         | No       | The job that wrote each line, index for index with `lines`. Present when the request sent `logCursor`; absent from an orchestrator that predates the field |
+| done          | boolean                          | No       | Whether the log stream is exhausted                                                                                                                        |
+| error         | string                           | No       | Failure reason                                                                                                                                             |
 
 #### test.relay.cancel.response
 

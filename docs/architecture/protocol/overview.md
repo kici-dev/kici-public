@@ -93,13 +93,13 @@ Positive acknowledgment of a received message. Used for generic message-level ac
 
 Negative acknowledgment -- the message was received but could not be processed. Also the **version-skew diagnosability** signal: when a peer receives a message type it does not understand (the other side is running a newer build), it replies with a NACK naming the unsupported type instead of silently dropping the frame. Without this, an unknown type surfaces only as a downstream proxy timeout; the NACK turns it into an explicit, logged, upgrade-actionable error. `nack` is a member of both the Platform-to-orchestrator and orchestrator-to-Platform unions -- either side can NACK the other.
 
-| Field        | Type     | Required | Description                                                                                                 |
-| ------------ | -------- | -------- | ----------------------------------------------------------------------------------------------------------- |
-| type         | `"nack"` | Yes      | Message discriminator                                                                                       |
-| messageId    | string   | No       | ID of the offending frame, echoed when it carried one (correlation)                                         |
-| code         | enum     | No       | `invalid_frame` when the receiver dropped a frame of a known type as invalid. Absent on a version-skew NACK |
-| receivedType | string   | No       | The unsupported/unrecognized message type that triggered the NACK                                           |
-| reason       | string   | Yes      | Human-readable rejection reason, including an upgrade hint                                                  |
+| Field        | Type     | Required | Description                                                                                                                                                                                                 |
+| ------------ | -------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| type         | `"nack"` | Yes      | Message discriminator                                                                                                                                                                                       |
+| messageId    | string   | No       | ID of the offending frame, echoed when it carried one (correlation)                                                                                                                                         |
+| code         | enum     | No       | One of: `unsupported_type` (the receiver does not know the frame's `type`: version skew), `invalid_frame` (the receiver knows the `type` but dropped the frame as invalid). Absent means `unsupported_type` |
+| receivedType | string   | No       | The message type that triggered the NACK                                                                                                                                                                    |
+| reason       | string   | Yes      | Human-readable rejection reason, including an upgrade hint                                                                                                                                                  |
 
 **Behavior on an unknown frame:** the receiver first runs its normal recognition schemas. Only a frame that fails them all AND carries a `type` this build does not recognize is NACKed as version skew. The connection stays open -- a single unknown frame from an ahead-running peer must not tear down the whole link. The receiver tells version skew from malformation with a recognized-type set derived from the schema discriminators. Two classes are exempt and stay drop-and-warn: a `nack` itself (loop guard -- a NACK is never NACKed) and pure streaming frames (`log.chunk` / `orch-log.chunk`, which cannot be correlated).
 

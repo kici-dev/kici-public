@@ -230,6 +230,16 @@ export function stepTypeOf(data: Record<string, unknown> | undefined): string | 
  */
 export const INIT_STEP_TYPE_PREFIX = 'init:';
 
+/**
+ * The step index of the first init command: the agent stores `init:<n>` at
+ * `INIT_STEP_INDEX_BASE + n`, ABOVE every hook and cache pseudo-step index the step
+ * loop allocates from the step count upward. No realistic step or hook count reaches it.
+ */
+export const INIT_STEP_INDEX_BASE = 1_000_000;
+
+/** The `step_type` a stored step has when its recorder sent no type: the column default. */
+export const UNTYPED_STEP_TYPE = 'step';
+
 /** The `step_type` of the init command at `initIndex`. */
 export function initStepType(initIndex: number): string {
   return `${INIT_STEP_TYPE_PREFIX}${initIndex}`;
@@ -263,10 +273,33 @@ export function parseInitStepRef(ref: string): number | undefined {
 export const StepPhase = z.enum(['setup', 'init', 'steps']);
 export type StepPhase = z.infer<typeof StepPhase>;
 
-/** The {@link StepPhase} a `step_type` belongs to; a missing type is a real step. */
-export function stepPhase(stepType: string | null | undefined): StepPhase {
-  if (isSetupStepType(stepType)) return StepPhase.enum.setup;
-  if (initStepIndex(stepType) !== undefined) return StepPhase.enum.init;
+/** A stored step, as every reader of a run holds it. */
+export interface StepRef {
+  stepIndex: number;
+  stepType?: string | null;
+  /** The stored step name; identifies an init step recorded without a type. */
+  stepName?: string | null;
+}
+
+/**
+ * The init position of a stored step, or undefined when it is not an init step.
+ *
+ * An `init:<n>` type names it. An older orchestrator stored every init step
+ * untyped, so an untyped step at `INIT_STEP_INDEX_BASE + n` named `init:<n>` is
+ * read as init step n. The index and the name must agree: no regular step has both.
+ */
+export function stepInitIndex(step: StepRef): number | undefined {
+  const typed = initStepIndex(step.stepType);
+  if (typed !== undefined) return typed;
+  if (step.stepType != null && step.stepType !== UNTYPED_STEP_TYPE) return undefined;
+  const position = step.stepIndex - INIT_STEP_INDEX_BASE;
+  return position >= 0 && step.stepName === initStepType(position) ? position : undefined;
+}
+
+/** The {@link StepPhase} a stored step belongs to; an untyped step is a real step unless it is an init. */
+export function stepPhase(step: StepRef): StepPhase {
+  if (isSetupStepType(step.stepType)) return StepPhase.enum.setup;
+  if (stepInitIndex(step) !== undefined) return StepPhase.enum.init;
   return StepPhase.enum.steps;
 }
 
@@ -274,12 +307,9 @@ export function stepPhase(stepType: string | null | undefined): StepPhase {
  * Display comparator: by {@link StepPhase} in run order, then by step index. Index
  * alone lists the setup and init pseudo-steps last, although they run first.
  */
-export function compareStepsByPhase(
-  a: { stepType?: string | null; stepIndex: number },
-  b: { stepType?: string | null; stepIndex: number },
-): number {
-  const rank = (t: string | null | undefined): number => StepPhase.options.indexOf(stepPhase(t));
-  const byPhase = rank(a.stepType) - rank(b.stepType);
+export function compareStepsByPhase(a: StepRef, b: StepRef): number {
+  const rank = (step: StepRef): number => StepPhase.options.indexOf(stepPhase(step));
+  const byPhase = rank(a) - rank(b);
   return byPhase !== 0 ? byPhase : a.stepIndex - b.stepIndex;
 }
 

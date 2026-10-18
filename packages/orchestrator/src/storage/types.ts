@@ -101,7 +101,7 @@ export interface CacheStorage {
   getObjectSize(key: string): Promise<number | null>;
 }
 
-import type { SharedS3Config } from '@kici-dev/shared';
+import type { S3StaticCredentials, SharedS3Config } from '@kici-dev/shared';
 
 /** S3 backend config: `SharedS3Config` plus the cache-specific `ttlMs`. */
 export type S3CacheStorageConfig = SharedS3Config & {
@@ -109,6 +109,10 @@ export type S3CacheStorageConfig = SharedS3Config & {
   ttlMs: number;
   /** Host-facing pre-signed upload endpoint (see S3CacheStorageOptions.uploadEndpoint). */
   uploadEndpoint?: string;
+  /** Explicit credentials (see S3CacheStorageOptions.credentials). */
+  credentials?: S3StaticCredentials;
+  /** Shared-config profile (see S3CacheStorageOptions.profile). */
+  profile?: string;
 };
 
 /**

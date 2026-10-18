@@ -13,7 +13,7 @@ import { toErrorMessage } from '@kici-dev/shared';
 import { performVersionedUpgrade } from '../shared/versioned-upgrade.js';
 import { buildUpgradeHooks } from '../shared/upgrade-hooks.js';
 import type { AdminApiClient } from '../../api-client.js';
-import { runAgentPackageRefresh, parsePlatforms } from '../agent-package.js';
+import { runAgentPackageRefresh, parsePlatforms, storageEnvFromEnvFile } from '../agent-package.js';
 import type { ServicePlatform } from '../../service/index.js';
 
 export function registerUpgradeCommand(
@@ -93,7 +93,7 @@ export function registerUpgradeCommand(
         skipBinaryPathCheck?: boolean;
       }) => {
         // Commander turns `--no-drain` into `drain: false`; the shared options take `noDrain`.
-        await performVersionedUpgrade(
+        const instance = await performVersionedUpgrade(
           'orchestrator',
           { ...opts, noDrain: opts.drain === false },
           buildUpgradeHooks(tryGetClient),
@@ -103,8 +103,12 @@ export function registerUpgradeCommand(
         // --cleanup and --pick it is an idempotent no-op, so it always runs.
         // --no-agent-packages is for operators who publish payloads out-of-band.
         if (opts.agentPackages === false) return;
+        // The storage config is the instance's own: the env file its service
+        // runs with on every platform, not the shell that runs the upgrade.
+        const { envFilePath } = instance.manifest;
         try {
           await runAgentPackageRefresh({
+            storageEnv: storageEnvFromEnvFile(envFilePath),
             ...(opts.agentPackagePlatforms
               ? { platforms: parsePlatforms(opts.agentPackagePlatforms) }
               : {}),
@@ -116,7 +120,8 @@ export function registerUpgradeCommand(
             `[agent package refresh] failed (orchestrator upgrade itself succeeded): ${toErrorMessage(err)}`,
           );
           console.error(
-            'Run `kici-admin agent package --upload` manually to refresh the fleet payloads.',
+            `Run \`kici-admin agent package --upload --env-file ${envFilePath}\` manually ` +
+              'to refresh the fleet payloads.',
           );
           process.exitCode = 1;
         }

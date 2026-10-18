@@ -6,12 +6,13 @@ import {
   ExecutionJobStatus,
   StepPhase,
   compareStepsByPhase,
-  initStepIndex,
   initStepLabel,
-  initStepType,
   parseInitStepRef,
+  stepInitIndex,
   stepPhase,
+  UNTYPED_STEP_TYPE,
   type AgentStepLogs,
+  type StepRef,
 } from '@kici-dev/engine';
 import { cliAction } from './shared/cli-action.js';
 import { renderTable } from './shared/table.js';
@@ -238,9 +239,7 @@ function workflowProvenanceLines(run: RunDetailDTO): string[] {
  * A job's steps in run order: setup and init pseudo-steps first, whatever order the
  * orchestrator sent. An older orchestrator orders init steps by their stored index, last.
  */
-function stepsInRunOrder<T extends { stepIndex: number; stepType?: string | null }>(
-  steps: T[],
-): T[] {
+function stepsInRunOrder<T extends StepRef>(steps: T[]): T[] {
   return [...steps].sort(compareStepsByPhase);
 }
 
@@ -248,15 +247,15 @@ function stepsInRunOrder<T extends { stepIndex: number; stepType?: string | null
  * The `#` cell of a step row: the step index, or `init[<n>]` for an init step, whose
  * stored index is a high internal value and not a position among the steps.
  */
-function stepNumberCell(step: { stepIndex: number; stepType?: string | null }): string {
-  const initIndex = initStepIndex(step.stepType);
+function stepNumberCell(step: StepRef): string {
+  const initIndex = stepInitIndex(step);
   return initIndex === undefined ? String(step.stepIndex) : initStepLabel(initIndex);
 }
 
 /** The `type` cell of a `runs show` step row: blank for a plain step, `init` for any init. */
-function stepTypeCell(stepType: string): string {
-  if (stepPhase(stepType) === StepPhase.enum.init) return StepPhase.enum.init;
-  return stepType === 'step' ? '' : stepType;
+function stepTypeCell(step: StepDTO): string {
+  if (stepPhase(step) === StepPhase.enum.init) return StepPhase.enum.init;
+  return step.stepType === UNTYPED_STEP_TYPE ? '' : step.stepType;
 }
 
 /**
@@ -278,7 +277,7 @@ async function resolveStepRef(
   })) as unknown as JobsResponse;
   const job = jobs.find((j) => j.jobId === jobId);
   if (!job) throw new Error(`Job ${jobId} not found in run ${runId}`);
-  const match = (job.steps ?? []).find((s) => s.stepType === initStepType(initIndex));
+  const match = (job.steps ?? []).find((s) => stepInitIndex(s) === initIndex);
   if (!match) throw new Error(`Job ${jobId} has no ${initStepLabel(initIndex)} step`);
   return String(match.stepIndex);
 }
@@ -330,7 +329,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
       'Only include runs with created_at strictly later than this ISO-8601 timestamp',
     )
     .option('--count', 'Return only the count of matching runs, skipping the row listing')
-    .option('--limit <n>', 'Max results (default 20, max 100)', '20')
+    .option('--limit <n>', 'Max results (max 100)', '20')
     .option('--offset <n>', 'Skip first N results', '0')
     .option('--json', 'Emit raw JSON instead of a table')
     .action(
@@ -497,7 +496,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
               s.status,
               s.exitCode != null ? String(s.exitCode) : '-',
               formatDuration(s.durationMs),
-              stepTypeCell(s.stepType),
+              stepTypeCell(s),
             ]);
             console.log(renderTable(stepHeaders, stepRows));
           }
@@ -552,9 +551,11 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
           console.log('');
           console.log(`Steps for ${uv(job.jobName)}:`);
           const stepHeaders = ['#', 'name', 'status', 'exit', 'duration'];
-          const stepRows = stepsInRunOrder(job.steps).map((s) => [
+          // Unwrapped for display, and so an untyped init step is placed by its name.
+          const steps = job.steps.map((s) => ({ ...s, stepName: s.stepName && uv(s.stepName) }));
+          const stepRows = stepsInRunOrder(steps).map((s) => [
             stepNumberCell(s),
-            uv(s.stepName),
+            s.stepName ?? '-',
             s.status,
             s.exitCode != null ? String(s.exitCode) : '-',
             formatDuration(s.durationMs),
@@ -635,12 +636,8 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
       'Print a page of a step log (admin API: /api/v1/admin/runs/:runId/jobs/:jobId/steps/:i/logs)',
     )
     .requiredOption('--job <jobId>', 'Job id (the dispatch_queue row id for an eval round)')
-    .option(
-      '--step <n>',
-      'Step index (default 0; -1 is the job setup log), or an init step as init[<n>]',
-      '0',
-    )
-    .option('--limit <n>', 'Max lines to return (default 500, server caps at 2000)', '500')
+    .option('--step <n>', 'Step index (-1 is the job setup log), or an init step as init[<n>]', '0')
+    .option('--limit <n>', 'Max lines to return (server caps at 2000)', '500')
     .option('--cursor <c>', 'Line-offset cursor from a previous page')
     .option('--json', 'Emit raw JSON instead of plain lines')
     .action(

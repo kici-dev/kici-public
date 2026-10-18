@@ -20,10 +20,10 @@ import { Hono, type MiddlewareHandler } from 'hono';
 import { createLogger } from '@kici-dev/shared';
 import {
   CANONICAL_STATUSES,
-  initStepIndex,
   isRunId,
   parseRunIdRef,
   runIdPrefixRange,
+  stepInitIndex,
   stepPhase,
 } from '@kici-dev/engine';
 import type { ExpressionBuilder, Kysely } from 'kysely';
@@ -449,7 +449,12 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
           jobSteps = [];
           stepsByJob.set(step.job_id, jobSteps);
         }
-        const initIndex = initStepIndex(step.step_type);
+        const ref = {
+          stepIndex: step.step_index,
+          stepType: step.step_type,
+          stepName: step.step_name,
+        };
+        const initIndex = stepInitIndex(ref);
         jobSteps.push({
           stepIndex: step.step_index,
           stepName: step.step_name,
@@ -461,7 +466,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
           errorMessage: step.error_message,
           stepType: step.step_type,
           // Readers tell init steps apart without parsing `stepType`; `stepIndex` stays raw.
-          phase: stepPhase(step.step_type),
+          phase: stepPhase(ref),
           ...(initIndex !== undefined && { initIndex }),
         });
       }

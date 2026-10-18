@@ -43,7 +43,7 @@ Every lifecycle command (`uninstall`, `upgrade`, `start`, `stop`, `restart`, `st
 **Fresh-box bootstrap payloads:**
 
 ```bash
-kici-admin agent package [--platform <list>] [--out <dir>] [--upload] [--node-mirror <url>] [--npm-registry <url>] [--node-version <ver>]
+kici-admin agent package [--platform <list>] [--out <dir>] [--upload] [--env-file <path>] [--node-mirror <url>] [--npm-registry <url>] [--node-version <ver>]
 ```
 
 Produces a self-contained agent + Node payload so a fresh host can be brought up without reaching npm or nodejs.org itself.
@@ -51,6 +51,7 @@ Produces a self-contained agent + Node payload so a fresh host can be brought up
 - `--platform` takes a single target, a comma-separated list, or `all` (default: `linux-x64,linux-arm64`).
 - `--out` sets the output directory (default `dist/agent-packages`).
 - `--upload` presign-uploads each payload to the orchestrator cache bucket, which is where the bare-metal scaler fetches it from.
+- `--env-file <path>` (with `--upload`) reads the cache storage config (`KICI_STORAGE_*`) and the S3 credentials (`AWS_*`) from this service env file. Without it, `--upload` reads them from the shell.
 - `--node-version` overrides the vendored Node version (default: the Node version running the CLI); `--node-mirror` / `--npm-registry` point the build at internal mirrors.
 
 `kici-admin orchestrator upgrade` produces and uploads these payloads automatically for the new version — pass `--no-agent-packages` there to skip it, or run `agent package` by hand when you need a one-off payload.
@@ -203,14 +204,15 @@ Synopsis: `kici-admin agent package [options]`
 
 **Options**
 
-| Option                 | Default               | Description                                                               |
-| ---------------------- | --------------------- | ------------------------------------------------------------------------- |
-| `--platform <list>`    |                       | Target platform(s): single \| CSV \| all (default: linux-x64,linux-arm64) |
-| `--out <dir>`          | `dist/agent-packages` | Output directory                                                          |
-| `--upload`             |                       | Presign-upload each payload to the orchestrator cache bucket              |
-| `--node-mirror <url>`  |                       | nodejs.org mirror override                                                |
-| `--npm-registry <url>` |                       | npm registry override                                                     |
-| `--node-version <ver>` |                       | Vendored Node version (default: the Node version running this CLI)        |
+| Option                 | Default               | Description                                                                                  |
+| ---------------------- | --------------------- | -------------------------------------------------------------------------------------------- |
+| `--platform <list>`    |                       | Target platform(s): single \| CSV \| all (default: linux-x64,linux-arm64)                    |
+| `--out <dir>`          | `dist/agent-packages` | Output directory                                                                             |
+| `--upload`             |                       | Presign-upload each payload to the orchestrator cache bucket                                 |
+| `--env-file <path>`    |                       | With --upload: read the cache storage config from this service env file instead of the shell |
+| `--node-mirror <url>`  |                       | nodejs.org mirror override                                                                   |
+| `--npm-registry <url>` |                       | npm registry override                                                                        |
+| `--node-version <ver>` |                       | Vendored Node version (default: the Node version running this CLI)                           |
 
 ### `kici-admin agent register`
 

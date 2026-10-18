@@ -149,6 +149,15 @@ Each warning names the scaler, the label set and the `image:` line to set. The
 upgrade still runs: edit the scaler config, then restart the orchestrator
 (`kici-admin orchestrator restart`) so new agents use the new image.
 
+After the restart, `kici-admin orchestrator upgrade` uploads the fleet agent
+payloads for the new version to the cache bucket. It reads the cache storage
+config (`KICI_STORAGE_*`) and the S3 credentials (`AWS_*`) from the env file
+of the instance that it upgrades. This is the env file that the service runs
+with. The `KICI_STORAGE_*` variables of your shell are not used, so you do not
+have to export the storage config before you upgrade. See
+[Auto-package on orchestrator upgrade](./distribution/distribution.md#auto-package-on-orchestrator-upgrade)
+for the full rules.
+
 ## Rolling back
 
 - **Native service install** — `kici-admin orchestrator upgrade --rollback`

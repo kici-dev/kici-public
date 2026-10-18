@@ -21,10 +21,21 @@ export interface SharedS3Config {
   forcePathStyle?: boolean;
 }
 
+/** Static S3 credentials, as the `AWS_ACCESS_KEY_ID` family of variables holds them. */
+export interface S3StaticCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+}
+
 export interface CreateS3ClientOptions {
   region?: string;
   endpoint?: string;
   forcePathStyle?: boolean;
+  /** Explicit credentials. When unset, the SDK default credential chain applies. */
+  credentials?: S3StaticCredentials;
+  /** The shared-config profile the default credential chain reads. */
+  profile?: string;
 }
 
 export function createS3Client(options: CreateS3ClientOptions): S3Client {
@@ -45,6 +56,12 @@ export function createS3Client(options: CreateS3ClientOptions): S3Client {
   }
   if (options.forcePathStyle !== undefined) {
     config.forcePathStyle = options.forcePathStyle;
+  }
+  if (options.credentials) {
+    config.credentials = options.credentials;
+  }
+  if (options.profile) {
+    config.profile = options.profile;
   }
   return new S3Client(config);
 }

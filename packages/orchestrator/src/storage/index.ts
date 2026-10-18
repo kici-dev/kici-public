@@ -30,6 +30,8 @@ export function createCacheStorage(config: CacheStorageConfig): CacheStorage {
       externalEndpoint: config.externalEndpoint,
       uploadEndpoint: config.uploadEndpoint,
       forcePathStyle: config.forcePathStyle,
+      credentials: config.credentials,
+      profile: config.profile,
     });
   }
   if (config.type === 'filesystem') {

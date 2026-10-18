@@ -27,6 +27,8 @@ A run can span several workflows. `kici run remote <fixture>` gives each matched
 
 Steps are listed in the order they ran. A job's image build comes first, then its `init` commands, then its steps. The `#` column shows a step's index, and an `init` command as `init[<n>]`, where `<n>` is its position in the job's `init` list. `runs jobs --include-steps` and `runs structured` list steps the same way. In the `--json` output of `runs show` and `runs jobs --include-steps`, `stepIndex` is the stored index, which for an `init` command is a large internal number. Each step also carries `phase` (`setup`, `init` or `steps`), and an `init` command carries `initIndex`, its position in the list.
 
+An older orchestrator recorded `init` commands with no step type. Those steps are listed, labeled and reported the same way, from their stored index and their `init:<n>` step name. In `--json`, their `stepType` stays `step`.
+
 Shows the machine-first, provenance-tagged structured run result — the same shape an automation agent reads over the admin API (`GET /admin/runs/:runId/structured`). Trusted fields (run/job/step ids, enum statuses, exit codes, durations, hashes, the derived failure category) are plain; untrusted fields (workflow / repo / job / step names, refs, error text, job output values) are wrapped in an `{ untrusted: true, value }` envelope so a consumer can keep user-controlled content out of an instruction channel. Secret output **values** are never returned — only their key names. The human view unwraps envelopes for display; `--json` is lossless. See [Agent run-result API](../agent-run-result-api.md) for the full contract.
 
 Lists the execution jobs for a single run. Cheaper than `runs show` when you only need job-level state (e.g., for polling). Each job row carries its resolved upstream dependency edges in `needs` (an array of `{ upstreamName, runOn }`, where `runOn` is the per-edge set of upstream terminal statuses that satisfy the edge, or `null` when the job has no upstreams) — the same dependency structure the dashboard run-detail graph view renders.
@@ -291,7 +293,7 @@ Synopsis: `kici-admin event-dlq list [options]`
 
 | Option           | Default | Description                                          |
 | ---------------- | ------- | ---------------------------------------------------- |
-| `--limit <n>`    | `50`    | Max rows (default 50, max 200)                       |
+| `--limit <n>`    | `50`    | Max rows (max 200)                                   |
 | `--before <iso>` |         | Cursor: list events with dlq_at < this ISO timestamp |
 | `--json`         | `false` | Print raw JSON instead of a formatted table          |
 
@@ -579,7 +581,7 @@ Synopsis: `kici-admin runs list [options]`
 | `--repo <ownerRepo>`     |         | Filter by repo identifier (owner/repo)                                                       |
 | `--since <iso8601>`      |         | Only include runs with created_at strictly later than this ISO-8601 timestamp                |
 | `--count`                |         | Return only the count of matching runs, skipping the row listing                             |
-| `--limit <n>`            | `20`    | Max results (default 20, max 100)                                                            |
+| `--limit <n>`            | `20`    | Max results (max 100)                                                                        |
 | `--offset <n>`           | `0`     | Skip first N results                                                                         |
 | `--json`                 |         | Emit raw JSON instead of a table                                                             |
 
@@ -597,13 +599,13 @@ Synopsis: `kici-admin runs logs <runId> [options]`
 
 **Options**
 
-| Option          | Default | Description                                                                   |
-| --------------- | ------- | ----------------------------------------------------------------------------- |
-| `--job <jobId>` |         | Job id (the dispatch_queue row id for an eval round)                          |
-| `--step <n>`    | `0`     | Step index (default 0; -1 is the job setup log), or an init step as init[<n>] |
-| `--limit <n>`   | `500`   | Max lines to return (default 500, server caps at 2000)                        |
-| `--cursor <c>`  |         | Line-offset cursor from a previous page                                       |
-| `--json`        |         | Emit raw JSON instead of plain lines                                          |
+| Option          | Default | Description                                                        |
+| --------------- | ------- | ------------------------------------------------------------------ |
+| `--job <jobId>` |         | Job id (the dispatch_queue row id for an eval round)               |
+| `--step <n>`    | `0`     | Step index (-1 is the job setup log), or an init step as init[<n>] |
+| `--limit <n>`   | `500`   | Max lines to return (server caps at 2000)                          |
+| `--cursor <c>`  |         | Line-offset cursor from a previous page                            |
+| `--json`        |         | Emit raw JSON instead of plain lines                               |
 
 ### `kici-admin runs secret-outputs`
 
@@ -692,15 +694,15 @@ Synopsis: `kici-admin workflow register-manual [options]`
 
 **Options**
 
-| Option                      | Default | Description                                              |
-| --------------------------- | ------- | -------------------------------------------------------- |
-| `--lock-file <path>`        |         | Path to a kici.lock.json file                            |
-| `--repo <ident>`            |         | repo_identifier value (e.g. "owner/repo")                |
-| `--routing-key <key>`       |         | Routing key for the source (e.g. "github:42")            |
-| `--org <id>`                |         | Org id to attribute rows to                              |
-| `--provider-context <json>` | `{}`    | Provider-specific context as a JSON object (default: {}) |
-| `--commit-sha <sha>`        |         | Optional commit SHA stamped on each row                  |
-| `--database-url <url>`      |         | Use direct DB access instead of HTTP (offline mode)      |
-| `--json`                    |         | Emit JSON output                                         |
+| Option                      | Default | Description                                         |
+| --------------------------- | ------- | --------------------------------------------------- |
+| `--lock-file <path>`        |         | Path to a kici.lock.json file                       |
+| `--repo <ident>`            |         | repo_identifier value (e.g. "owner/repo")           |
+| `--routing-key <key>`       |         | Routing key for the source (e.g. "github:42")       |
+| `--org <id>`                |         | Org id to attribute rows to                         |
+| `--provider-context <json>` | `{}`    | Provider-specific context as a JSON object          |
+| `--commit-sha <sha>`        |         | Optional commit SHA stamped on each row             |
+| `--database-url <url>`      |         | Use direct DB access instead of HTTP (offline mode) |
+| `--json`                    |         | Emit JSON output                                    |
 
 <!-- END GENERATED: kici-admin-runs-execution-events -->

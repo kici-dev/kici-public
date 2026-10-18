@@ -563,6 +563,12 @@ describe('kici-admin runs CLI commands', () => {
       stepType: 'init:0',
     };
     const jobWithInit = { ...sampleJob, steps: [...sampleJob.steps, initStep] };
+    // An older orchestrator stored the init step untyped ('step'), at its index and under its name.
+    const STORED_INIT_TYPES = ['init:0', 'step'];
+    const jobWithInitStoredAs = (stepType: string) => ({
+      ...sampleJob,
+      steps: [...sampleJob.steps, { ...initStep, stepType }],
+    });
 
     /** The step-table rows of the one job, in printed order. */
     function stepRows(stdout: string): string[] {
@@ -571,22 +577,25 @@ describe('kici-admin runs CLI commands', () => {
       return lines.slice(start + 3).filter((l) => l.trim() !== '');
     }
 
-    it('R-60: runs show labels an init step init[n] and lists it before the steps', async () => {
-      mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInit] });
-      const { stdout } = await runCommand(
-        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
-        client,
-      );
+    it.each(STORED_INIT_TYPES)(
+      'R-60: runs show labels an init step stored as %s init[n] and lists it first',
+      async (stepType) => {
+        mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInitStoredAs(stepType)] });
+        const { stdout } = await runCommand(
+          ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+          client,
+        );
 
-      // fails-when: the # column prints the raw stored index
-      expect(stdout).not.toContain('1000000');
-      const rows = stepRows(stdout);
-      // fails-when: the init step keeps the position its index gives it, after the steps
-      expect(rows[0]).toMatch(/^init\[0\]\s+init:0\s+success\s+-\s+1s\s+init$/);
-      // breaks-if-wrong: the job's own steps keep their index and order after it
-      expect(rows[1]).toMatch(/^0\s+checkout\b/);
-      expect(rows[2]).toMatch(/^1\s+run tests\b/);
-    });
+        // fails-when: the # column prints the raw stored index (untyped: the row is read as a step)
+        expect(stdout).not.toContain('1000000');
+        const rows = stepRows(stdout);
+        // fails-when: the init step keeps the position its index gives it, after the steps
+        expect(rows[0]).toMatch(/^init\[0\]\s+init:0\s+success\s+-\s+1s\s+init$/);
+        // breaks-if-wrong: the job's own untyped steps keep their index, order and blank type
+        expect(rows[1]).toMatch(/^0\s+checkout\s+success\s+0\s+4s\s*$/);
+        expect(rows[2]).toMatch(/^1\s+run tests\b/);
+      },
+    );
 
     it('R-61: runs jobs --include-steps labels and orders init steps the same way', async () => {
       mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInit] });
@@ -602,62 +611,69 @@ describe('kici-admin runs CLI commands', () => {
       expect(rows[1]).toMatch(/^0\s+checkout\b/);
     });
 
-    it('R-62: runs structured labels and orders init steps the same way', async () => {
-      const structured = await (mockGetRunStructured as unknown as () => Promise<any>)();
-      const [job] = structured.jobs;
-      mockGetRunStructured.mockResolvedValue({
-        ...structured,
-        jobs: [
-          {
-            ...job,
-            jobName: { untrusted: true, value: 'test' },
-            steps: [
-              ...job.steps,
-              {
-                ...job.steps[0],
-                stepIndex: 1_000_000,
-                stepName: { untrusted: true, value: 'init:0' },
-                stepType: 'init:0',
-                status: 'success',
-                exitCode: null,
-              },
-            ],
-          },
-        ],
-      });
-      const { stdout } = await runCommand(
-        ['runs', 'structured', '0a1b2c3d-0000-4000-8000-000000000123'],
-        client,
-      );
+    it.each(STORED_INIT_TYPES)(
+      'R-62: runs structured labels and orders an init step stored as %s the same way',
+      async (stepType) => {
+        const structured = await (mockGetRunStructured as unknown as () => Promise<any>)();
+        const [job] = structured.jobs;
+        mockGetRunStructured.mockResolvedValue({
+          ...structured,
+          jobs: [
+            {
+              ...job,
+              jobName: { untrusted: true, value: 'test' },
+              steps: [
+                ...job.steps,
+                {
+                  ...job.steps[0],
+                  stepIndex: 1_000_000,
+                  stepName: { untrusted: true, value: 'init:0' },
+                  stepType,
+                  status: 'success',
+                  exitCode: null,
+                },
+              ],
+            },
+          ],
+        });
+        const { stdout } = await runCommand(
+          ['runs', 'structured', '0a1b2c3d-0000-4000-8000-000000000123'],
+          client,
+        );
 
-      // fails-when: the structured view prints the raw stored index
-      expect(stdout).not.toContain('1000000');
-      const rows = stepRows(stdout);
-      expect(rows[0]).toMatch(/^init\[0\]\s+init:0\b/);
-      // breaks-if-wrong: the step's own index and name still print
-      expect(rows[1]).toMatch(/^0\s+compile\b/);
-    });
+        // fails-when: the structured view prints the raw stored index
+        expect(stdout).not.toContain('1000000');
+        const rows = stepRows(stdout);
+        expect(rows[0]).toMatch(/^init\[0\]\s+init:0\b/);
+        // breaks-if-wrong: the step's own index and unwrapped name still print
+        expect(rows[1]).toMatch(/^0\s+compile\b/);
+      },
+    );
 
-    it('R-64: runs logs --step init[0] reads the init step by its stored index', async () => {
-      mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInit] });
-      await runCommand(
-        [
-          'runs',
-          'logs',
-          '0a1b2c3d-0000-4000-8000-000000000123',
-          '--job',
-          'job-test',
-          '--step',
-          'init[0]',
-        ],
-        client,
-      );
+    it.each(STORED_INIT_TYPES)(
+      'R-64: runs logs --step init[0] reads an init step stored as %s by its stored index',
+      async (stepType) => {
+        mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInitStoredAs(stepType)] });
+        await runCommand(
+          [
+            'runs',
+            'logs',
+            '0a1b2c3d-0000-4000-8000-000000000123',
+            '--job',
+            'job-test',
+            '--step',
+            'init[0]',
+          ],
+          client,
+        );
 
-      // fails-when: the label is sent as the step index, which the server rejects
-      expect(mockGet).toHaveBeenCalledWith(
-        '/api/v1/admin/runs/0a1b2c3d-0000-4000-8000-000000000123/jobs/job-test/steps/1000000/logs?limit=500',
-      );
-    });
+        // fails-when: the label is sent as the step index, which the server rejects, or an
+        // untyped init step is looked up by its type and reported missing
+        expect(mockGet).toHaveBeenCalledWith(
+          '/api/v1/admin/runs/0a1b2c3d-0000-4000-8000-000000000123/jobs/job-test/steps/1000000/logs?limit=500',
+        );
+      },
+    );
 
     it('R-65: runs logs --step init[n] names a missing init step', async () => {
       mockGetRunJobs.mockResolvedValue({ jobs: [jobWithInit] });

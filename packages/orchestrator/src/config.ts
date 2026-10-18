@@ -1275,14 +1275,18 @@ const REMOVED_ENV_VAR_ADVICE: Record<string, string> = {
 /**
  * Load the startup orchestrator configuration from environment variables.
  *
- * It reads `process.env` through the names declared in `envDef`
- * (KICI_DATABASE_URL, KICI_PORT, …) and refuses unknown `KICI_*` names. The
- * config reloader (`config/resolver.ts`) layers the YAML file and the shared
- * DB config store on top at runtime.
+ * It reads `env` (default `process.env`) through the names declared in
+ * `envDef` (KICI_DATABASE_URL, KICI_PORT, …) and refuses unknown `KICI_*`
+ * names. The config reloader (`config/resolver.ts`) layers the YAML file and
+ * the shared DB config store on top at runtime. `kici-admin orchestrator
+ * upgrade` passes the variables of the instance env file instead.
  */
-export function loadConfig(scope: ConfigScope = ConfigScope.enum.runtime): AppConfig {
+export function loadConfig(
+  scope: ConfigScope = ConfigScope.enum.runtime,
+  env: NodeJS.ProcessEnv = process.env,
+): AppConfig {
   const packaging = scope === ConfigScope.enum.packaging;
-  const data = packaging ? envDef.parse(process.env, packagingConfigSchema) : envDef.parse();
+  const data = packaging ? envDef.parse(env, packagingConfigSchema) : envDef.parse(env);
 
   // Reject typo'd KICI_* env vars at boot. Adds the logger's vars
   // (KICI_LOG_DIR, KICI_LOG_MAX_SIZE, …) and the cold-store overrides to the
@@ -1314,6 +1318,7 @@ export function loadConfig(scope: ConfigScope = ConfigScope.enum.runtime): AppCo
         extraKnown: ['KICI_CONFIG'],
         notStartupVars: { ...OVERLAY_ONLY_ENV_VAR_ADVICE, ...REMOVED_ENV_VAR_ADVICE },
       },
+      env,
     );
   }
 

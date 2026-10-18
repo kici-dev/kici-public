@@ -57,7 +57,7 @@ export function registerAccessLogCommands(program: Command, getClient: () => Adm
     .option('--q <text>', 'Filter by substring of error_message (trigram-indexed full-text search)')
     .option('--agent-label <label>', 'Filter by exact agent label')
     .option('--agent-only', 'Only agent-attributed rows')
-    .option('--limit <n>', 'Max results (default 50, max 200)', '50')
+    .option('--limit <n>', 'Max results (max 200)', '50')
     .option('--cursor <c>', 'Opaque cursor from a previous nextCursor')
     .option('--json', 'Emit raw JSON instead of a table')
     .action(

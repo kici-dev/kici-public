@@ -159,9 +159,9 @@ function escapeXml(s: string): string {
 }
 
 /**
- * Read one key out of a `KEY=value` env file; undefined when absent.
+ * Read every assignment of a `KEY=value` env file.
  *
- * The value is trimmed and its outer quotes stripped, since these files are
+ * Each value is trimmed and its outer quotes stripped, since these files are
  * hand-edited: `"/etc/kici/scalers.yaml"` names the same file. An embedded `=`
  * stays (`B=two=three` reads `two=three`).
  *
@@ -169,20 +169,27 @@ function escapeXml(s: string): string {
  * holds (systemd's `EnvironmentFile=` applies assignments in order), like every
  * other env-file reader in the repo.
  */
-export function readEnvValue(content: string, key: string): string | undefined {
-  let value: string | undefined;
+export function readEnvValues(content: string): Map<string, string> {
+  const values = new Map<string, string>();
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
     const idx = trimmed.indexOf('=');
-    if (idx > 0 && trimmed.slice(0, idx) === key) {
-      value = trimmed
+    if (idx <= 0) continue;
+    values.set(
+      trimmed.slice(0, idx),
+      trimmed
         .slice(idx + 1)
         .trim()
-        .replace(/^["']|["']$/g, '');
-    }
+        .replace(/^["']|["']$/g, ''),
+    );
   }
-  return value;
+  return values;
+}
+
+/** Read one key out of a `KEY=value` env file; undefined when absent. See {@link readEnvValues}. */
+export function readEnvValue(content: string, key: string): string | undefined {
+  return readEnvValues(content).get(key);
 }
 
 /**

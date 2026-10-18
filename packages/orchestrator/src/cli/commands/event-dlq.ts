@@ -49,7 +49,7 @@ export function registerEventDlqCommands(program: Command, getClient: () => Admi
   dlq
     .command('list')
     .description('List events currently in the DLQ (most recent first)')
-    .option('--limit <n>', 'Max rows (default 50, max 200)', '50')
+    .option('--limit <n>', 'Max rows (max 200)', '50')
     .option('--before <iso>', 'Cursor: list events with dlq_at < this ISO timestamp')
     .option('--json', 'Print raw JSON instead of a formatted table', false)
     .action(

@@ -1,5 +1,5 @@
 /** How `kici runs` lists a job's steps: in run order, init steps named `init[<n>]`. */
-import { compareStepsByPhase, initStepIndex, initStepLabel } from '@kici-dev/engine';
+import { compareStepsByPhase, initStepLabel, stepInitIndex } from '@kici-dev/engine';
 
 interface StepRef {
   stepIndex: number;
@@ -14,6 +14,6 @@ export function stepsInRunOrder<T extends StepRef>(steps: readonly T[] | undefin
 
 /** The step's name in human output; an init step reads `init[<n>]`, as in its job error. */
 export function stepDisplayName(step: StepRef): string {
-  const initIndex = initStepIndex(step.stepType);
+  const initIndex = stepInitIndex(step);
   return initIndex === undefined ? step.stepName : initStepLabel(initIndex);
 }

@@ -144,7 +144,7 @@ export function registerAttestationsCommands(
     .description('List provenance attestations from the orchestrator DB (newest first)')
     .option('--run-id <id>', 'Filter to a single run')
     .option('--job-id <id>', 'Filter to a single job')
-    .option('--limit <n>', 'Max results (default 20, max 100)', '20')
+    .option('--limit <n>', 'Max results (max 100)', '20')
     .option('--json', 'Emit the raw JSON envelope instead of a table')
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .action(

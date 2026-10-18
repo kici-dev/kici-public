@@ -252,7 +252,7 @@ Synopsis: `kici-admin access-log list [options]`
 | `--q <text>`            |         | Filter by substring of error_message (trigram-indexed full-text search)          |
 | `--agent-label <label>` |         | Filter by exact agent label                                                      |
 | `--agent-only`          |         | Only agent-attributed rows                                                       |
-| `--limit <n>`           | `50`    | Max results (default 50, max 200)                                                |
+| `--limit <n>`           | `50`    | Max results (max 200)                                                            |
 | `--cursor <c>`          |         | Opaque cursor from a previous nextCursor                                         |
 | `--json`                |         | Emit raw JSON instead of a table                                                 |
 
@@ -293,7 +293,7 @@ Synopsis: `kici-admin attestations list [options]`
 | ---------------------- | ------- | --------------------------------------------- |
 | `--run-id <id>`        |         | Filter to a single run                        |
 | `--job-id <id>`        |         | Filter to a single job                        |
-| `--limit <n>`          | `20`    | Max results (default 20, max 100)             |
+| `--limit <n>`          | `20`    | Max results (max 100)                         |
 | `--json`               |         | Emit the raw JSON envelope instead of a table |
 | `--database-url <url>` |         | Orchestrator DB URL (else KICI_DATABASE_URL)  |
 
@@ -630,7 +630,7 @@ Synopsis: `kici-admin event-log list [options]`
 | `--from <ts>`            |         | ISO timestamp lower bound (inclusive)                                                                       |
 | `--to <ts>`              |         | ISO timestamp upper bound (exclusive)                                                                       |
 | `--delivery-id <substr>` |         | Substring filter on delivery_id                                                                             |
-| `--limit <n>`            | `50`    | Max results (default 50, max 200)                                                                           |
+| `--limit <n>`            | `50`    | Max results (max 200)                                                                                       |
 | `--offset <n>`           | `0`     | Skip first N results                                                                                        |
 | `--include-archived`     |         | Merge cold-store archived rows into the result (requires --routing-key for cold scoping)                    |
 | `--json`                 |         | Emit raw JSON instead of a table                                                                            |

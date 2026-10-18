@@ -933,12 +933,13 @@ async function runPreStopSafety(args: {
  * act on installed versions, no `--from`/`--url` is an npm-source upgrade, and
  * an archive installs a new versioned directory, then stops the service,
  * switches the symlink (Unix) or registration (Windows), and starts it.
+ * Returns the instance it acted on, whichever path ran.
  */
 export async function performVersionedUpgrade(
   component: UpgradeComponent,
   opts: VersionedUpgradeOptions,
   hooks: UpgradeHooks = {},
-): Promise<void> {
+): Promise<ResolvedInstance> {
   try {
     const userLevel = !isRoot();
     const kiciRoot = kiciConfigRoot(userLevel);
@@ -976,7 +977,7 @@ export async function performVersionedUpgrade(
         opts,
         hooks,
       );
-      return;
+      return resolvedInstance;
     }
 
     if (opts.rollback) {
@@ -990,17 +991,17 @@ export async function performVersionedUpgrade(
         opts,
         hooks,
       );
-      return;
+      return resolvedInstance;
     }
 
     if (opts.cleanup) {
       await handleCleanup(component, platform, installBase);
-      return;
+      return resolvedInstance;
     }
 
     if (!opts.from && !opts.url) {
       await performNpmSourceUpgrade(component, config, resolvedInstance, manager, opts, platform);
-      return;
+      return resolvedInstance;
     }
 
     if (!opts.version) {
@@ -1068,7 +1069,7 @@ export async function performVersionedUpgrade(
       const ok = await confirm('Proceed with upgrade?');
       if (!ok) {
         console.log('Upgrade cancelled.');
-        return;
+        return resolvedInstance;
       }
     }
 
@@ -1145,6 +1146,7 @@ export async function performVersionedUpgrade(
     } else {
       console.log(`Upgrade to ${version} complete.`);
     }
+    return resolvedInstance;
   } catch (err) {
     console.error(`Error: ${toErrorMessage(err)}`);
     process.exit(1);

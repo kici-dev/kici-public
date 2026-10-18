@@ -26,6 +26,10 @@
       "import": "./dist/cli-help-secrets.js",
       "types": "./dist/cli-help-secrets.d.ts"
     },
+    "./cli-help-defaults": {
+      "import": "./dist/cli-help-defaults.js",
+      "types": "./dist/cli-help-defaults.d.ts"
+    },
     "./tmp": {
       "import": "./dist/tmp.js",
       "types": "./dist/tmp.d.ts"

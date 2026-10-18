@@ -14,6 +14,18 @@ describe('stepsInRunOrder', () => {
     expect(steps[0].stepName).toBe('checkout');
   });
 
+  it('puts an init step stored without a type ahead of the steps', () => {
+    // An older orchestrator stored the init step untyped, at its index and under its name.
+    const steps = [
+      { stepIndex: 0, stepName: 'baseline', stepType: 'step' },
+      { stepIndex: 1_000_000, stepName: 'init:0', stepType: 'step' },
+      { stepIndex: 999_999, stepName: 'init:-1', stepType: 'step' },
+    ];
+    // fails-when: only an init:<n> type places a step first
+    // breaks-if-wrong: the untyped step just below the init base stays among the steps
+    expect(stepsInRunOrder(steps).map((s) => s.stepIndex)).toEqual([1_000_000, 0, 999_999]);
+  });
+
   it('reads a missing step list as no steps', () => {
     expect(stepsInRunOrder(undefined)).toEqual([]);
   });
@@ -27,5 +39,9 @@ describe('stepDisplayName', () => {
     );
     // breaks-if-wrong: a user step named like an init keeps its name
     expect(stepDisplayName({ stepIndex: 0, stepName: 'init:0', stepType: 'step' })).toBe('init:0');
+    // fails-when: an init step stored without a type keeps its internal name
+    expect(stepDisplayName({ stepIndex: 1_000_001, stepName: 'init:1', stepType: 'step' })).toBe(
+      'init[1]',
+    );
   });
 });

@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
+  INIT_STEP_INDEX_BASE,
   StepPhase,
+  UNTYPED_STEP_TYPE,
   compareStepsByPhase,
   initStepIndex,
   initStepLabel,
   initStepType,
   parseInitStepRef,
+  stepInitIndex,
   stepPhase,
   stepTypeOf,
   CacheOutcome,
@@ -1181,11 +1184,75 @@ describe('init step types', () => {
   });
 
   it('places each step type in its phase', () => {
-    expect(stepPhase('container:build')).toBe(StepPhase.enum.setup);
-    expect(stepPhase('init:0')).toBe(StepPhase.enum.init);
-    expect(stepPhase('step')).toBe(StepPhase.enum.steps);
-    expect(stepPhase('hook:onFailure')).toBe(StepPhase.enum.steps);
-    expect(stepPhase(undefined)).toBe(StepPhase.enum.steps);
+    const phase = (stepType: string | undefined) => stepPhase({ stepIndex: 0, stepType });
+    expect(phase('container:build')).toBe(StepPhase.enum.setup);
+    expect(phase('init:0')).toBe(StepPhase.enum.init);
+    expect(phase('step')).toBe(StepPhase.enum.steps);
+    expect(phase('hook:onFailure')).toBe(StepPhase.enum.steps);
+    expect(phase(undefined)).toBe(StepPhase.enum.steps);
+  });
+
+  describe('an init step stored without a type', () => {
+    const untypedInit = (n: number, stepType: string | null = UNTYPED_STEP_TYPE) => ({
+      stepIndex: INIT_STEP_INDEX_BASE + n,
+      stepName: initStepType(n),
+      stepType,
+    });
+
+    it('is read as an init step from its index and name', () => {
+      // fails-when: only an init:<n> type marks an init step, so an untyped row stays a step
+      expect(stepInitIndex(untypedInit(0))).toBe(0);
+      expect(stepInitIndex(untypedInit(2))).toBe(2);
+      expect(stepPhase(untypedInit(0))).toBe(StepPhase.enum.init);
+      // fails-when: a null type (a row read with no step_type) is not taken as untyped
+      expect(stepInitIndex(untypedInit(1, null))).toBe(1);
+      expect(stepInitIndex({ stepIndex: INIT_STEP_INDEX_BASE, stepName: 'init:0' })).toBe(0);
+    });
+
+    it('keeps a regular step just below the init base a regular step', () => {
+      // breaks-if-wrong: the index alone would take the last allocator index for an init step
+      const below = { stepIndex: INIT_STEP_INDEX_BASE - 1, stepName: 'init:0', stepType: 'step' };
+      expect(stepInitIndex(below)).toBeUndefined();
+      expect(stepPhase(below)).toBe(StepPhase.enum.steps);
+      const belowNamedNegative = { ...below, stepName: 'init:-1' };
+      expect(stepInitIndex(belowNamedNegative)).toBeUndefined();
+    });
+
+    it('needs the init name that matches its index', () => {
+      // breaks-if-wrong: an untyped high-index step (a cache step in a huge job) stays a step
+      const cache = {
+        stepIndex: INIT_STEP_INDEX_BASE + 4,
+        stepName: 'cache:restore',
+        stepType: 'step',
+      };
+      expect(stepInitIndex(cache)).toBeUndefined();
+      const shifted = { stepIndex: INIT_STEP_INDEX_BASE + 1, stepName: 'init:0', stepType: 'step' };
+      expect(stepInitIndex(shifted)).toBeUndefined();
+      expect(stepInitIndex({ stepIndex: 3, stepName: 'init:0', stepType: 'step' })).toBeUndefined();
+    });
+
+    it('is not overridden for a step that carries another type', () => {
+      // breaks-if-wrong: a typed hook or image build at an init index keeps its own phase
+      const hook = { ...untypedInit(0), stepType: 'hook:cleanup' };
+      expect(stepInitIndex(hook)).toBeUndefined();
+      expect(stepPhase(hook)).toBe(StepPhase.enum.steps);
+      const build = { ...untypedInit(0), stepType: 'container:build' };
+      expect(stepPhase(build)).toBe(StepPhase.enum.setup);
+    });
+
+    it('sorts before the steps it ran ahead of', () => {
+      const steps = [
+        { stepIndex: 0, stepName: 'baseline', stepType: 'step' },
+        { stepIndex: 1, stepName: 'sudo-apt', stepType: 'step' },
+        untypedInit(0),
+      ];
+      // fails-when: the untyped init row sorts by its stored index, last
+      expect(steps.sort(compareStepsByPhase).map((s) => s.stepName)).toEqual([
+        'init:0',
+        'baseline',
+        'sudo-apt',
+      ]);
+    });
   });
 
   it('orders steps by phase, then by index', () => {

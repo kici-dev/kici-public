@@ -19,23 +19,19 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
     .requiredOption('--type <type>', 'Backend type: pg or vault')
     // Vault options
     .option('--vault-url <url>', 'Vault/OpenBao URL (env: KICI_BACKEND_VAULT_URL)')
-    .option(
-      '--auth-method <method>',
-      'Vault auth method: approle or token (default: approle)',
-      'approle',
-    )
+    .option('--auth-method <method>', 'Vault auth method: approle or token', 'approle')
     .option('--role-id <id>', 'Vault AppRole role ID (env: KICI_BACKEND_ROLE_ID)')
     .option('--secret-id <id>', 'Vault AppRole secret ID (env: KICI_BACKEND_SECRET_ID)')
     .option('--secret-id-file <path>', 'Read Vault secret ID from file (avoids shell history)')
     .option('--token <token>', 'Vault token (env: KICI_BACKEND_TOKEN)')
     .option('--namespace <ns>', 'Vault namespace')
-    .option('--mount-path <path>', 'Vault mount path (default: secret)', 'secret')
+    .option('--mount-path <path>', 'Vault mount path', 'secret')
     .option('--base-path <path>', 'Vault base path for secrets')
     // PG options
     .option('--connection-string <url>', 'PG connection string (env: KICI_BACKEND_PG_URL)')
     // Common options
-    .option('--scope-filter <pattern>', 'Scope filter glob pattern (default: **)', '**')
-    .option('--sync-interval <ms>', 'Sync interval in milliseconds (default: 300000)', '300000')
+    .option('--scope-filter <pattern>', 'Scope filter glob pattern', '**')
+    .option('--sync-interval <ms>', 'Sync interval in milliseconds', '300000')
     .action(
       cliAction(async (name: string, opts) => {
         const backendType = opts.type;
